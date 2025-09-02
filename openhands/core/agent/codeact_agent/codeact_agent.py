@@ -35,12 +35,7 @@ class CodeActAgent(AgentBase):
             assert tool not in tools, f"{tool} is automatically included and should not be provided."
         super().__init__(llm=llm, tools=tools + BUILT_IN_TOOLS, env_context=env_context)
 
-        self.system_message: TextContent = TextContent(
-            text=render_system_message(
-            prompt_dir=self.prompt_dir,
-            system_prompt_filename=system_prompt_filename,
-            cli_mode=cli_mode
-        ))
+        self.system_message: TextContent = TextContent(text=render_system_message(prompt_dir=self.prompt_dir, system_prompt_filename=system_prompt_filename, cli_mode=cli_mode))
 
         self.max_iterations: int = 10
 

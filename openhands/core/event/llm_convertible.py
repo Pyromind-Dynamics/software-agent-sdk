@@ -102,7 +102,7 @@ class MessageEvent(LLMConvertibleEvent):
         if text_parts:
             content_preview = " ".join(text_parts)
             if len(content_preview) > N_CHAR_PREVIEW:
-                content_preview = content_preview[:N_CHAR_PREVIEW-3] + "..."
+                content_preview = content_preview[: N_CHAR_PREVIEW - 3] + "..."
             microagent_info = f" [Microagents: {', '.join(self.activated_microagents)}]" if self.activated_microagents else ""
             return f"{base_str}\n  {self.llm_message.role}: {content_preview}{microagent_info}"
         else:
