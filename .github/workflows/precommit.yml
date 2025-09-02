@@ -4,6 +4,12 @@ name: Pre-commit checks
 on:
   push:
     branches: ["**"]   # all branches
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
   pre-commit:
@@ -12,6 +18,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -28,3 +37,10 @@ jobs:
         uses: pre-commit/action@v3.0.1
         with:
           extra_args: --all-files
+
+      - name: Auto-commit formatting changes
+        if: failure()
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Auto-format code with ruff\n\nCo-authored-by: openhands <openhands@all-hands.dev>"
+          file_pattern: "*.py"

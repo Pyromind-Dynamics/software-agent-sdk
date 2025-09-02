@@ -1,4 +1,3 @@
-
 from pydantic import BaseModel, Field
 
 from openhands.core.context.utils.prompt import render_microagent_info
