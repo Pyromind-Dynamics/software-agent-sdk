@@ -11,6 +11,8 @@ from pydantic import ValidationError
 
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.context import EnvContext, render_system_message
+from openhands.sdk.context.condenser import Condenser
+from openhands.sdk.context.view import View
 from openhands.sdk.conversation import ConversationCallbackType, ConversationState
 from openhands.sdk.event import (
     ActionEvent,
@@ -20,6 +22,7 @@ from openhands.sdk.event import (
     ObservationEvent,
     SystemPromptEvent,
 )
+from openhands.sdk.event.condenser import Condensation
 from openhands.sdk.llm import LLM, Message, TextContent, get_llm_metadata
 from openhands.sdk.logger import get_logger
 from openhands.sdk.tool import (
@@ -41,6 +44,7 @@ class Agent(AgentBase):
         tools: list[Tool],
         env_context: EnvContext | None = None,
         system_prompt_filename: str = "system_prompt.j2",
+        condenser: Condenser | None = None,
         cli_mode: bool = True,
     ) -> None:
         for tool in BUILT_IN_TOOLS:
@@ -58,6 +62,7 @@ class Agent(AgentBase):
         )
 
         self.max_iterations: int = 10
+        self.condenser = condenser
 
     def init_state(
         self,
@@ -66,8 +71,10 @@ class Agent(AgentBase):
     ) -> None:
         # TODO(openhands): we should add test to test this init_state will actually
         # modify state in-place
-        messages = [e.to_llm_message() for e in state.events]
-        if len(messages) == 0:
+        llm_convertible_messages = [
+            event for event in state.events if isinstance(event, LLMConvertibleEvent)
+        ]
+        if len(llm_convertible_messages) == 0:
             # Prepare system message
             event = SystemPromptEvent(
                 source="agent",
@@ -81,11 +88,29 @@ class Agent(AgentBase):
         state: ConversationState,
         on_event: ConversationCallbackType,
     ) -> None:
+        # If a condenser is registered with the agent, we need to give it an
+        # opportunity to transform the events. This will either produce a list
+        # of events, exactly as expected, or a new condensation that needs to be
+        # processed before the agent can sample another action.
+        if self.condenser is not None:
+            view = View.from_events(state.events)
+            condensation_result = self.condenser.condense(view)
+
+            match condensation_result:
+                case View():
+                    llm_convertible_events = condensation_result.events
+
+                case Condensation():
+                    on_event(condensation_result)
+                    return None
+
+        else:
+            llm_convertible_events = cast(
+                list[LLMConvertibleEvent],
+                [e for e in state.events if isinstance(e, LLMConvertibleEvent)],
+            )
+
         # Get LLM Response (Action)
-        llm_convertible_events = cast(
-            list[LLMConvertibleEvent],
-            [e for e in state.events if isinstance(e, LLMConvertibleEvent)],
-        )
         _messages = LLMConvertibleEvent.events_to_messages(llm_convertible_events)
         logger.debug(
             "Sending messages to LLM: "
