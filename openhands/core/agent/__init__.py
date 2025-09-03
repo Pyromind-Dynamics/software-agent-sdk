@@ -1,8 +1,8 @@
+from openhands.core.agent.agent import Agent
 from openhands.core.agent.base import AgentBase
-from openhands.core.agent.codeact_agent import CodeActAgent
 
 
 __all__ = [
-    "CodeActAgent",
+    "Agent",
     "AgentBase",
 ]

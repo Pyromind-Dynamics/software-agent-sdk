@@ -34,7 +34,7 @@ from openhands.core.tool import (
 logger = get_logger(__name__)
 
 
-class CodeActAgent(AgentBase):
+class Agent(AgentBase):
     def __init__(
         self,
         llm: LLM,

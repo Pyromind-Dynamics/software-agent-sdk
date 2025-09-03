@@ -1,6 +1,6 @@
 from importlib.metadata import PackageNotFoundError, version
 
-from openhands.core.agent import AgentBase, CodeActAgent
+from openhands.core.agent import Agent, AgentBase
 from openhands.core.config import LLMConfig, MCPConfig
 from openhands.core.conversation import Conversation, ConversationCallbackType
 from openhands.core.event import EventBase, EventType, LLMConvertibleEvent
@@ -30,7 +30,7 @@ __all__ = [
     "ImageContent",
     "Tool",
     "AgentBase",
-    "CodeActAgent",
+    "Agent",
     "ActionBase",
     "ObservationBase",
     "LLMConfig",
