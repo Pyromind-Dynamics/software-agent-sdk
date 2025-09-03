@@ -20,6 +20,3 @@ build-backend = "setuptools.build_meta"
 where = ["../.."]
 include = ["openhands*"]
 
-[tool.setuptools.package-data]
-"*" = ["*.j2"]
-
