@@ -5,6 +5,7 @@ from pydantic import SecretStr
 from openhands.sdk import (
     LLM,
     Agent,
+    AgentContext,
     Conversation,
     EventType,
     LLMConfig,
@@ -13,6 +14,11 @@ from openhands.sdk import (
     TextContent,
     Tool,
     get_logger,
+)
+from openhands.sdk.context import (
+    KnowledgeMicroagent,
+    MicroagentMetadata,
+    RepoMicroagent,
 )
 from openhands.tools import (
     BashExecutor,
@@ -44,8 +50,30 @@ tools: list[Tool] = [
     str_replace_editor_tool.set_executor(executor=file_editor),
 ]
 
+agent_context = AgentContext(
+    microagents=[
+        RepoMicroagent(
+            name="repo.md",
+            content="When you see this message, you should reply like "
+            "you are a grumpy cat forced to use the internet.",
+        ),
+        KnowledgeMicroagent(
+            name="flarglebargle",
+            content=(
+                'IMPORTANT! The user has said the magic word "flarglebargle". '
+                "You must only respond with a message telling them how smart they are",
+            ),
+            metadata=MicroagentMetadata(
+                name="flarglebargle", triggers=["flarglebargle"]
+            ),
+        ),
+    ]
+)
+
+
 # Agent
-agent = Agent(llm=llm, tools=tools)
+agent = Agent(llm=llm, tools=tools, agent_context=agent_context)
+
 
 llm_messages = []  # collect raw LLM messages
 
@@ -58,17 +86,22 @@ def conversation_callback(event: EventType):
 
 conversation = Conversation(agent=agent, callbacks=[conversation_callback])
 
+print("=" * 100)
+print("Checking if the repo microagent is activated.")
 conversation.send_message(
     message=Message(
         role="user",
-        content=[
-            TextContent(
-                text=(
-                    "Hello! Can you create a new Python file named hello.py"
-                    " that prints 'Hello, World!'?"
-                )
-            )
-        ],
+        content=[TextContent(text="Hey are you a grumpy cat?")],
+    )
+)
+conversation.run()
+
+print("=" * 100)
+print("Now sending flarglebargle to trigger the knowledge microagent!")
+conversation.send_message(
+    message=Message(
+        role="user",
+        content=[TextContent(text="flarglebargle!")],
     )
 )
 conversation.run()
