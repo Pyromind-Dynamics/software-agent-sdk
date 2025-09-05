@@ -42,7 +42,7 @@ mcp_tools = create_mcp_tools(mcp_config, timeout=30)
 tools.extend(mcp_tools)
 logger.info(f"Added {len(mcp_tools)} MCP tools")
 for tool in mcp_tools:
-    logger.info(f"  - {tool.name}: {tool.description}")
+    logger.info(f"  - {tool.name}: {tool.description.split('\n')[0][:100]}...")
 
 
 # Agent
@@ -65,7 +65,9 @@ conversation = Conversation(
 # Example message that can use MCP tools if available
 message = Message(
     role="user",
-    content=[TextContent(text="Summarize my notion workspace.")],
+    content=[
+        TextContent(text="Can you search about OpenHands V1 in my notion workspace.")
+    ],
 )
 
 logger.info("Starting conversation with MCP integration...")
