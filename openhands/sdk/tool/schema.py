@@ -4,12 +4,9 @@ from typing import Annotated, Any, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, create_model
 from rich.text import Text
 
+import openhands.sdk.security.risk as risk
 from openhands.sdk.llm import ImageContent, TextContent
 from openhands.sdk.llm.message import content_to_str
-from openhands.sdk.tool.security_prompt import (
-    SECURITY_RISK_DESC,
-    SECURITY_RISK_LITERAL,
-)
 from openhands.sdk.utils.discriminated_union import (
     DiscriminatedUnionMixin,
     DiscriminatedUnionType,
@@ -174,8 +171,9 @@ class ActionBase(Schema, DiscriminatedUnionMixin):
     # NOTE: We make it optional since some weaker
     # LLMs may not be able to fill it out correctly.
     # https://github.com/All-Hands-AI/OpenHands/issues/10797
-    security_risk: SECURITY_RISK_LITERAL = Field(
-        default="UNKNOWN", description=SECURITY_RISK_DESC
+    security_risk: risk.SecurityRisk = Field(
+        default=risk.SecurityRisk.UNKNOWN,
+        description="The LLM's assessment of the safety risk of this action.",
     )
 
     @property
