@@ -1,6 +1,7 @@
 """Utility functions for MCP integration."""
 
 import re
+from uuid import uuid4
 
 import mcp.types
 from pydantic import Field, ValidationError
@@ -9,7 +10,8 @@ from openhands.sdk.llm import TextContent
 from openhands.sdk.logger import get_logger
 from openhands.sdk.mcp import MCPToolObservation
 from openhands.sdk.mcp.client import MCPClient
-from openhands.sdk.tool import MCPActionBase, Tool, ToolAnnotations, ToolExecutor
+from openhands.sdk.tool import MCPActionBase, ToolAnnotations, ToolExecutor
+from openhands.sdk.tool.tool import ToolBase
 
 
 logger = get_logger(__name__)
@@ -62,7 +64,7 @@ class MCPToolExecutor(ToolExecutor):
         )
 
 
-class MCPTool(Tool[MCPActionBase, MCPToolObservation]):
+class MCPTool(ToolBase[MCPActionBase, MCPToolObservation]):
     """MCP Tool that wraps an MCP client and provides tool functionality."""
 
     mcp_tool: mcp.types.Tool = Field(description="The MCP tool definition.")
@@ -83,7 +85,7 @@ class MCPTool(Tool[MCPActionBase, MCPToolObservation]):
             )
 
             MCPActionType = MCPActionBase.from_mcp_schema(
-                f"{to_camel_case(mcp_tool.name)}Action",
+                f"{to_camel_case(mcp_tool.name)}{uuid4().hex}",
                 mcp_tool.inputSchema,
             )
 

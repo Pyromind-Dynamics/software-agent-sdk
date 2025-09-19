@@ -11,8 +11,8 @@ import mcp.types
 
 from openhands.sdk.mcp.client import MCPClient
 from openhands.sdk.mcp.tool import MCPActionBase, MCPTool, MCPToolObservation
-from openhands.sdk.tool import Tool
 from openhands.sdk.tool.schema import ActionBase
+from openhands.sdk.tool.tool import ToolBase
 
 
 def create_mock_mcp_tool(name: str = "test_tool") -> mcp.types.Tool:
@@ -52,8 +52,8 @@ def test_mcp_tool_polymorphic_behavior() -> None:
     # Create MCPTool instance
     mcp_tool = MCPTool.create(mock_mcp_tool, mock_client)
 
-    # Should be instance of Tool
-    assert isinstance(mcp_tool, Tool)
+    # Should be instance of ToolBase
+    assert isinstance(mcp_tool, ToolBase)
     assert isinstance(mcp_tool, MCPTool)
 
     # Check basic properties
@@ -73,7 +73,7 @@ def test_mcp_tool_kind_field() -> None:
 
     # Check kind field
     assert hasattr(mcp_tool, "kind")
-    expected_kind = f"{mcp_tool.__class__.__module__}.{mcp_tool.__class__.__name__}"
+    expected_kind = mcp_tool.__class__.__name__
     assert mcp_tool.kind == expected_kind
 
 
@@ -83,9 +83,9 @@ def test_mcp_tool_fallback_behavior() -> None:
     tool_data = {
         "name": "fallback-tool",
         "description": "A fallback test tool",
-        "action_type": "openhands.sdk.tool.schema.ActionBase",  # Use base class
-        "observation_type": "openhands.sdk.mcp.definition.MCPToolObservation",
-        "kind": "openhands.sdk.mcp.tool.MCPTool",
+        "action_type": "MCPActionBase",
+        "observation_type": "MCPToolObservation",
+        "kind": "MCPTool",
         "mcp_tool": {
             "name": "fallback-tool",
             "description": "A fallback test tool",
@@ -93,8 +93,8 @@ def test_mcp_tool_fallback_behavior() -> None:
         },
     }
 
-    deserialized_tool = Tool.model_validate(tool_data)
-    assert isinstance(deserialized_tool, Tool)
+    deserialized_tool = ToolBase.model_validate(tool_data)
+    assert isinstance(deserialized_tool, ToolBase)
     assert deserialized_tool.name == "fallback-tool"
     assert issubclass(deserialized_tool.action_type, ActionBase)
     assert deserialized_tool.observation_type and issubclass(
