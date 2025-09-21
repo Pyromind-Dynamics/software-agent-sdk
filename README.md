@@ -84,8 +84,10 @@ uv run python examples/01_hello_world.py
 ```python
 import os
 from pydantic import SecretStr
-from openhands.sdk import LLM, Agent, Conversation, Message, TextContent
-from openhands.sdk.preset.default import get_default_tools
+from openhands.sdk import LLM, Agent, Conversation
+from openhands.tools.execute_bash import BashTool
+from openhands.tools.str_replace_editor import FileEditorTool
+from openhands.tools.task_tracker import TaskTrackerTool
 
 # Configure LLM
 api_key = os.getenv("LITELLM_API_KEY")
@@ -111,23 +113,8 @@ tools = get_default_tools(working_dir=cwd)
 agent = Agent(llm=llm, tools=tools)
 conversation = Conversation(agent=agent)
 
-# Send messages and run
-conversation.send_message(
-    Message(
-        role="user",
-        content=[TextContent(text=(
-            "Read the current repo and write 3 facts about the project into FACTS.txt."
-        ))],
-    )
-)
-conversation.run()
-
-conversation.send_message(
-    Message(
-        role="user",
-        content=[TextContent(text="Great! Now delete that file.")],
-    )
-)
+# Send message and run
+conversation.send_message("Create a Python file that prints 'Hello, World!'")
 conversation.run()
 ```
 
@@ -138,9 +125,9 @@ conversation.run()
 Agents are the central orchestrators that coordinate between LLMs and tools:
 
 ```python
-import os
-from openhands.sdk import Agent
-from openhands.tools import BashTool, FileEditorTool
+from openhands.sdk import Agent, LLM
+from openhands.tools.execute_bash import BashTool
+from openhands.tools.str_replace_editor import FileEditorTool
 
 # Explicit minimal toolset (bash + editor)
 tools = [
@@ -193,7 +180,10 @@ tools = get_default_tools(working_dir=os.getcwd())
 Or construct the basic tools yourself:
 
 ```python
-from openhands.tools import BashTool, FileEditorTool, TaskTrackerTool
+from openhands.sdk import TextContent, ImageContent
+from openhands.tools.execute_bash import BashTool
+from openhands.tools.str_replace_editor import FileEditorTool
+from openhands.tools.task_tracker import TaskTrackerTool
 
 tools = [
     BashTool.create(working_dir=os.getcwd()),
@@ -207,7 +197,7 @@ tools = [
 We explicitly define a `BashExecutor` in this example and reuse it for custom tools:
 
 ```python
-from openhands.tools import BashExecutor, execute_bash_tool
+from openhands.tools.execute_bash import BashExecutor, execute_bash_tool
 
 # Explicit executor creation for reuse or customization
 bash_executor = BashExecutor(working_dir=os.getcwd())
@@ -263,14 +253,12 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
 Conversations manage the interaction flow between users and agents:
 
 ```python
-from openhands.sdk import Conversation, Message, TextContent
+from openhands.sdk import Conversation
 
 conversation = Conversation(agent=agent)
 
 # Send messages
-conversation.send_message(
-    Message(role="user", content=[TextContent(text="Your request here")])
-)
+conversation.send_message("Your request here")
 
 # Execute the conversation until the agent enters "await user input" state
 conversation.run()
