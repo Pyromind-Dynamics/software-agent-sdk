@@ -19,6 +19,7 @@ from openhands.agent_server.middleware import (
     LocalhostCORSMiddleware,
     ValidateSessionAPIKeyMiddleware,
 )
+from openhands.agent_server.server_details_router import router as server_details_router
 from openhands.agent_server.tool_router import router as tool_router
 
 
@@ -29,13 +30,20 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
         yield
 
 
-api = FastAPI(description="OpenHands Local Server", lifespan=api_lifespan)
+api = FastAPI(
+    title="OpenHands Agent Server",
+    description=(
+        "OpenHands Agent Server - REST/WebSocket interface for OpenHands AI Agent"
+    ),
+    lifespan=api_lifespan,
+)
 config = get_default_config()
 
 
 # Add routers
 api.include_router(conversation_event_router)
 api.include_router(conversation_router)
+api.include_router(server_details_router)
 api.include_router(tool_router)
 
 # Add middleware
