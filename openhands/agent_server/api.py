@@ -23,6 +23,8 @@ from openhands.agent_server.middleware import LocalhostCORSMiddleware
 from openhands.agent_server.server_details_router import server_details_router
 from openhands.agent_server.sockets import sockets_router
 from openhands.agent_server.tool_router import tool_router
+from openhands.agent_server.vscode_router import vscode_router
+from openhands.agent_server.vscode_service import get_vscode_service
 from openhands.sdk.logger import DEBUG, get_logger
 
 
@@ -32,8 +34,25 @@ logger = get_logger(__name__)
 @asynccontextmanager
 async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
     service = get_default_conversation_service()
+    vscode_service = get_vscode_service()
+
+    # Start VSCode service if enabled
+    if vscode_service is not None:
+        vscode_started = await vscode_service.start()
+        if vscode_started:
+            logger.info("VSCode service started successfully")
+        else:
+            logger.warning("VSCode service failed to start, continuing without VSCode")
+    else:
+        logger.info("VSCode service is disabled")
+
     async with service:
-        yield
+        try:
+            yield
+        finally:
+            # Stop VSCode service on shutdown
+            if vscode_service is not None:
+                await vscode_service.stop()
 
 
 def _create_fastapi_instance() -> FastAPI:
@@ -89,6 +108,7 @@ def _add_api_routes(app: FastAPI, config: Config) -> None:
     api_router.include_router(tool_router)
     api_router.include_router(bash_router)
     api_router.include_router(file_router)
+    api_router.include_router(vscode_router)
     app.include_router(api_router)
     app.include_router(sockets_router)
 
