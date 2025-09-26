@@ -136,6 +136,12 @@ RUN mkdir -p /etc/docker && \
 RUN mkdir -p /workspace/project && \
     chown -R ${USERNAME}:${USERNAME} /workspace
 
+# Install Chromium for browser-use tools
+RUN set -eux; \
+    uvx playwright install chromium --with-deps; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
 USER ${USERNAME}
 WORKDIR /
 ENV LOG_JSON=true
