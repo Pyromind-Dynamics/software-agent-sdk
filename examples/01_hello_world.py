@@ -28,7 +28,6 @@ llm = LLM(
 cwd = os.getcwd()
 agent = get_default_agent(
     llm=llm,
-    working_dir=cwd,
     # CLI mode will disable any browser tools
     # which requires dependency like playwright that may not be
     # available in all environments.
@@ -49,9 +48,9 @@ agent = get_default_agent(
 # agent = Agent(
 #     llm=llm,
 #     tools=[
-#         ToolSpec(name="BashTool", params={"working_dir": cwd}),
+#         ToolSpec(name="BashTool"),
 #         ToolSpec(name="FileEditorTool"),
-#         ToolSpec(name="TaskTrackerTool", params={"save_dir": cwd}),
+#         ToolSpec(name="TaskTrackerTool"),
 #     ],
 # )
 
@@ -63,7 +62,11 @@ def conversation_callback(event: EventBase):
         llm_messages.append(event.to_llm_message())
 
 
-conversation = Conversation(agent=agent, callbacks=[conversation_callback])
+conversation = Conversation(
+    agent=agent,
+    callbacks=[conversation_callback],
+    working_dir=cwd,
+)
 
 conversation.send_message(
     "Read the current repo and write 3 facts about the project into FACTS.txt."

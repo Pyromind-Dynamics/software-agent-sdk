@@ -82,13 +82,6 @@ class Config(BaseModel):
             "The location of the directory where conversations and events are stored."
         ),
     )
-    workspace_path: Path = Field(
-        default=Path("workspace/project"),
-        description=(
-            "The location of the project directory where the agent reads/writes. "
-            "Defaults to 'workspace/project'."
-        ),
-    )
     bash_events_dir: Path = Field(
         default=Path("workspace/bash_events"),
         description=(

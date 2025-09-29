@@ -14,7 +14,7 @@ from openhands.sdk.conversation.secrets_manager import SecretsManager
 from openhands.sdk.conversation.types import ConversationID
 from openhands.sdk.event import ActionEvent, ObservationEvent, UserRejectObservation
 from openhands.sdk.event.base import EventBase
-from openhands.sdk.io import FileStore, InMemoryFileStore
+from openhands.sdk.io import FileStore, InMemoryFileStore, LocalFileStore
 from openhands.sdk.logger import get_logger
 from openhands.sdk.security.confirmation_policy import (
     ConfirmationPolicyBase,
@@ -58,6 +58,16 @@ class ConversationState(OpenHandsModel, FIFOLock):
             "LLM changes, etc."
         ),
     )
+    working_dir: str = Field(
+        default="workspace/project",
+        description="Working directory for agent operations and tool execution",
+    )
+    persistence_dir: str | None = Field(
+        default="workspace/conversations",
+        description="Directory for persisting conversation state and events. "
+        "If None, conversation will not be persisted.",
+    )
+
     max_iterations: int = Field(
         default=500,
         gt=0,
@@ -121,17 +131,19 @@ class ConversationState(OpenHandsModel, FIFOLock):
         cls: type["ConversationState"],
         id: ConversationID,
         agent: AgentBase,
+        working_dir: str,
+        persistence_dir: str | None = None,
         max_iterations: int = 500,
         stuck_detection: bool = True,
-        file_store: FileStore | None = None,
     ) -> "ConversationState":
         """
         If base_state.json exists: resume (attach EventLog,
             reconcile agent, enforce id).
         Else: create fresh (agent required), persist base, and return.
         """
-        if file_store is None:
-            file_store = InMemoryFileStore()
+        file_store = (
+            LocalFileStore(persistence_dir) if persistence_dir else InMemoryFileStore()
+        )
 
         try:
             base_text = file_store.read(BASE_STATE)
@@ -176,6 +188,8 @@ class ConversationState(OpenHandsModel, FIFOLock):
         state = cls(
             id=id,
             agent=agent,
+            working_dir=working_dir,
+            persistence_dir=persistence_dir,
             max_iterations=max_iterations,
             stuck_detection=stuck_detection,
         )

@@ -13,7 +13,6 @@ from openhands.sdk.event import (
     PauseEvent,
     UserRejectObservation,
 )
-from openhands.sdk.io import FileStore
 from openhands.sdk.llm import Message, TextContent
 from openhands.sdk.llm.llm_registry import LLMRegistry
 from openhands.sdk.logger import get_logger
@@ -40,7 +39,8 @@ class LocalConversation(BaseConversation):
     def __init__(
         self,
         agent: AgentBase,
-        persist_filestore: FileStore | None = None,
+        working_dir: str,
+        persistence_dir: str | None = None,
         conversation_id: ConversationID | None = None,
         callbacks: list[ConversationCallbackType] | None = None,
         max_iteration_per_run: int = 500,
@@ -52,7 +52,8 @@ class LocalConversation(BaseConversation):
 
         Args:
             agent: The agent to use for the conversation
-            persist_filestore: Optional FileStore to persist conversation state
+            working_dir: Working directory for agent operations and tool execution
+            persistence_dir: Directory for persisting conversation state and events
             conversation_id: Optional ID for the conversation. If provided, will
                       be used to identify the conversation. The user might want to
                       suffix their persistent filestore with this ID.
@@ -64,14 +65,16 @@ class LocalConversation(BaseConversation):
             stuck_detection: Whether to enable stuck detection
         """
         self.agent = agent
-        self._persist_filestore = persist_filestore
 
         # Create-or-resume: factory inspects BASE_STATE to decide
         desired_id = conversation_id or uuid.uuid4()
         self._state = ConversationState.create(
             id=desired_id,
             agent=agent,
-            file_store=self._persist_filestore,
+            working_dir=working_dir,
+            persistence_dir=self.get_persistence_dir(persistence_dir, desired_id)
+            if persistence_dir
+            else None,
             max_iterations=max_iteration_per_run,
             stuck_detection=stuck_detection,
         )

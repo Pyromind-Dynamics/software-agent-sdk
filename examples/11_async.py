@@ -43,9 +43,11 @@ register_tool("BashTool", BashTool)
 register_tool("FileEditorTool", FileEditorTool)
 register_tool("TaskTrackerTool", TaskTrackerTool)
 tools = [
-    ToolSpec(name="BashTool", params={"working_dir": cwd}),
+    ToolSpec(
+        name="BashTool",
+    ),
     ToolSpec(name="FileEditorTool"),
-    ToolSpec(name="TaskTrackerTool", params={"save_dir": cwd}),
+    ToolSpec(name="TaskTrackerTool"),
 ]
 
 # Agent

@@ -52,11 +52,11 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
         default_factory=list,
         description="List of tools to initialize for the agent.",
         examples=[
-            {"name": "BashTool", "params": {"working_dir": "/workspace"}},
+            {"name": "BashTool", "params": {}},
             {"name": "FileEditorTool", "params": {}},
             {
                 "name": "TaskTrackerTool",
-                "params": {"save_dir": "/workspace/.openhands"},
+                "params": {},
             },
         ],
     )
@@ -183,9 +183,9 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
 
         NOTE: state will be mutated in-place.
         """
-        self._initialize()
+        self._initialize(state)
 
-    def _initialize(self):
+    def _initialize(self, state: "ConversationState"):
         """Create an AgentBase instance from an AgentSpec."""
         if self._tools:
             logger.warning("Agent already initialized; skipping re-initialization.")
@@ -193,7 +193,7 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
 
         tools: list[Tool] = []
         for tool_spec in self.tools:
-            tools.extend(resolve_tool(tool_spec))
+            tools.extend(resolve_tool(tool_spec, state))
 
         # Add MCP tools if configured
         if self.mcp_config:

@@ -3,7 +3,6 @@ import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
 
 from pydantic import SecretStr
 
@@ -133,7 +132,6 @@ with ManagedAPIServer(port=8001) as server:
     # Create agent
     agent = get_default_agent(
         llm=llm,
-        working_dir=str(Path.cwd()),
         cli_mode=True,  # Disable browser tools for simplicity
     )
 
