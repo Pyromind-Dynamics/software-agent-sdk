@@ -7,6 +7,7 @@ import time
 from pydantic import SecretStr
 
 from openhands.sdk import LLM, Conversation, RemoteConversation, Workspace, get_logger
+from openhands.sdk.event import ConversationStateUpdateEvent
 from openhands.tools.preset.default import get_default_agent
 
 
@@ -212,6 +213,12 @@ with ManagedAPIServer(port=8001) as server:
             event_types.add(event_type)
         for event_type in sorted(event_types):
             logger.info(f"  - {event_type}")
+
+        # Print all ConversationStateUpdateEvent
+        logger.info("\n🗂️  ConversationStateUpdateEvent events:")
+        for event in conversation.state.events:
+            if isinstance(event, ConversationStateUpdateEvent):
+                logger.info(f"  - {event}")
 
     finally:
         # Clean up

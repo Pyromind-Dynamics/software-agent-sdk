@@ -17,6 +17,10 @@ from openhands.sdk.conversation.state import AgentExecutionStatus
 from openhands.sdk.conversation.types import ConversationCallbackType, ConversationID
 from openhands.sdk.conversation.visualizer import create_default_visualizer
 from openhands.sdk.event.base import EventBase
+from openhands.sdk.event.conversation_state import (
+    FULL_STATE_KEY,
+    ConversationStateUpdateEvent,
+)
 from openhands.sdk.llm import Message, TextContent
 from openhands.sdk.logger import get_logger
 from openhands.sdk.security.confirmation_policy import (
@@ -189,18 +193,52 @@ class RemoteEventsList(EventsListBase):
 class RemoteState(ConversationStateProtocol):
     """A state-like interface for accessing remote conversation state."""
 
-    # TODO: We can also optimize remote state by sending back
-    # updates via WebSocket
     def __init__(self, client: httpx.Client, conversation_id: str):
         self._client = client
         self._conversation_id = conversation_id
         self._events = RemoteEventsList(client, conversation_id)
 
+        # Cache for state information to avoid REST calls
+        self._cached_state: dict | None = None
+        self._lock = threading.RLock()
+
     def _get_conversation_info(self) -> dict:
         """Fetch the latest conversation info from the remote API."""
-        resp = self._client.get(f"/api/conversations/{self._conversation_id}")
-        resp.raise_for_status()
-        return resp.json()
+        with self._lock:
+            # Return cached state if available
+            if self._cached_state is not None:
+                return self._cached_state
+
+            # Fallback to REST API if no cached state
+            resp = self._client.get(f"/api/conversations/{self._conversation_id}")
+            resp.raise_for_status()
+            state = resp.json()
+            self._cached_state = state
+            return state
+
+    def update_state_from_event(self, event: ConversationStateUpdateEvent) -> None:
+        """Update cached state from a ConversationStateUpdateEvent."""
+        with self._lock:
+            # Handle full state snapshot
+            if event.key == FULL_STATE_KEY:
+                # Update cached state with the full snapshot
+                if self._cached_state is None:
+                    self._cached_state = {}
+                self._cached_state.update(event.value)
+            else:
+                # Handle individual field updates
+                if self._cached_state is None:
+                    self._cached_state = {}
+                self._cached_state[event.key] = event.value
+
+    def create_state_update_callback(self) -> ConversationCallbackType:
+        """Create a callback that updates state from ConversationStateUpdateEvent."""
+
+        def callback(event: EventBase) -> None:
+            if isinstance(event, ConversationStateUpdateEvent):
+                self.update_state_from_event(event)
+
+        return callback
 
     @property
     def events(self) -> RemoteEventsList:
@@ -363,6 +401,10 @@ class RemoteConversation(BaseConversation):
         # Add default callback to maintain local event state
         default_callback = self._state.events.create_default_callback()
         self._callbacks.append(default_callback)
+
+        # Add callback to update state from websocket events
+        state_update_callback = self._state.create_state_update_callback()
+        self._callbacks.append(state_update_callback)
 
         # Add default visualizer callback if requested
         if visualize:
