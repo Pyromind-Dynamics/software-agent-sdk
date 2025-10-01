@@ -194,6 +194,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         ),
     )
     service_id: str = Field(
+        default="default",
         description="Unique identifier for LLM. Typically used by LLM registry.",
     )
     metadata: dict[str, Any] = Field(
