@@ -5,6 +5,7 @@ import warnings
 from typing import Any
 
 from litellm.cost_calculator import completion_cost as litellm_completion_cost
+from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
 from litellm.types.utils import CostPerToken, ModelResponse, Usage
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
@@ -49,7 +50,9 @@ class Telemetry(BaseModel):
         self._req_ctx = log_ctx or {}
 
     def on_response(
-        self, resp: ModelResponse, raw_resp: ModelResponse | None = None
+        self,
+        resp: ModelResponse | ResponsesAPIResponse,
+        raw_resp: ModelResponse | None = None,
     ) -> Metrics:
         """
         Side-effects:
@@ -66,11 +69,8 @@ class Telemetry(BaseModel):
         if cost:
             self.metrics.add_cost(cost)
 
-        # 3) tokens - handle both dict and ModelResponse objects
-        if isinstance(resp, dict):
-            usage = resp.get("usage")
-        else:
-            usage = getattr(resp, "usage", None)
+        # 3) tokens - use typed usage field when available
+        usage = getattr(resp, "usage", None)
 
         if usage and self._has_meaningful_usage(usage):
             self._record_usage(
@@ -79,7 +79,7 @@ class Telemetry(BaseModel):
 
         # 4) optional logging
         if self.log_enabled:
-            self._log_completion(resp, cost, raw_resp=raw_resp)
+            self.log_llm_call(resp, cost, raw_resp=raw_resp)
 
         return self.metrics.deep_copy()
 
@@ -88,50 +88,71 @@ class Telemetry(BaseModel):
         return
 
     # ---------- Helpers ----------
-    def _has_meaningful_usage(self, usage) -> bool:
-        """Check if usage has meaningful (non-zero) token counts."""
-        if not usage:
+    def _has_meaningful_usage(self, usage: Usage | ResponseAPIUsage | None) -> bool:
+        """Check if usage has meaningful (non-zero) token counts.
+
+        Supports both Chat Completions Usage and Responses API Usage shapes.
+        """
+        if usage is None:
             return False
-
-        # Handle MagicMock objects safely
         try:
-            if isinstance(usage, dict):
-                prompt_tokens = usage.get("prompt_tokens", 0) or 0
-                completion_tokens = usage.get("completion_tokens", 0) or 0
-            else:
-                prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
-                completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+            prompt_tokens = getattr(usage, "prompt_tokens", None)
+            if prompt_tokens is None:
+                prompt_tokens = getattr(usage, "input_tokens", 0)
+            completion_tokens = getattr(usage, "completion_tokens", None)
+            if completion_tokens is None:
+                completion_tokens = getattr(usage, "output_tokens", 0)
 
-            # Convert to int safely (handles MagicMock objects)
-            prompt_tokens = int(prompt_tokens) if str(prompt_tokens).isdigit() else 0
-            completion_tokens = (
-                int(completion_tokens) if str(completion_tokens).isdigit() else 0
-            )
-
-            return prompt_tokens > 0 or completion_tokens > 0
-        except (ValueError, TypeError, AttributeError):
+            pt = int(prompt_tokens or 0)
+            ct = int(completion_tokens or 0)
+            return pt > 0 or ct > 0
+        except Exception:
             return False
 
     def _record_usage(
-        self, usage: Usage, response_id: str, context_window: int
+        self, usage: Usage | ResponseAPIUsage, response_id: str, context_window: int
     ) -> None:
-        # Handle both dict and Usage objects
-        if isinstance(usage, dict):
-            usage = Usage.model_validate(usage)
+        """
+        Record token usage, supporting both Chat Completions Usage and
+        Responses API Usage.
 
-        prompt_tokens = usage.prompt_tokens or 0
-        completion_tokens = usage.completion_tokens or 0
-        cache_write = usage._cache_creation_input_tokens or 0
+        Chat shape:
+          - prompt_tokens, completion_tokens
+          - prompt_tokens_details.cached_tokens
+          - completion_tokens_details.reasoning_tokens
+          - _cache_creation_input_tokens for cache_write
+        Responses shape:
+          - input_tokens, output_tokens
+          - input_tokens_details.cached_tokens
+          - output_tokens_details.reasoning_tokens
+        """
+        prompt_tokens = int(
+            getattr(usage, "prompt_tokens", None)
+            or getattr(usage, "input_tokens", 0)
+            or 0
+        )
+        completion_tokens = int(
+            getattr(usage, "completion_tokens", None)
+            or getattr(usage, "output_tokens", 0)
+            or 0
+        )
 
         cache_read = 0
-        prompt_token_details = usage.prompt_tokens_details or None
-        if prompt_token_details and prompt_token_details.cached_tokens:
-            cache_read = prompt_token_details.cached_tokens
+        p_details = getattr(usage, "prompt_tokens_details", None) or getattr(
+            usage, "input_tokens_details", None
+        )
+        if p_details is not None:
+            cache_read = int(getattr(p_details, "cached_tokens", 0) or 0)
 
         reasoning_tokens = 0
-        completion_tokens_details = usage.completion_tokens_details or None
-        if completion_tokens_details and completion_tokens_details.reasoning_tokens:
-            reasoning_tokens = completion_tokens_details.reasoning_tokens
+        c_details = getattr(usage, "completion_tokens_details", None) or getattr(
+            usage, "output_tokens_details", None
+        )
+        if c_details is not None:
+            reasoning_tokens = int(getattr(c_details, "reasoning_tokens", 0) or 0)
+
+        # Chat-specific: litellm may set a hidden cache write field
+        cache_write = int(getattr(usage, "_cache_creation_input_tokens", 0) or 0)
 
         self.metrics.add_token_usage(
             prompt_tokens=prompt_tokens,
@@ -143,7 +164,7 @@ class Telemetry(BaseModel):
             response_id=response_id,
         )
 
-    def _compute_cost(self, resp: ModelResponse) -> float | None:
+    def _compute_cost(self, resp: ModelResponse | ResponsesAPIResponse) -> float | None:
         """Try provider header → litellm direct. Return None on failure."""
         extra_kwargs = {}
         if (
@@ -182,11 +203,11 @@ class Telemetry(BaseModel):
             warnings.warn(f"Cost calculation failed: {e}")
             return None
 
-    def _log_completion(
+    def log_llm_call(
         self,
-        resp: ModelResponse,
+        resp: ModelResponse | ResponsesAPIResponse,
         cost: float | None,
-        raw_resp: ModelResponse | None = None,
+        raw_resp: ModelResponse | ResponsesAPIResponse | None = None,
     ) -> None:
         if not self.log_dir:
             return
@@ -212,23 +233,39 @@ class Telemetry(BaseModel):
             try:
                 usage = getattr(resp, "usage", None)
                 if usage:
-                    if isinstance(usage, dict):
-                        usage = Usage.model_validate(usage)
-                    prompt_tokens = int(usage.prompt_tokens or 0)
-                    completion_tokens = int(usage.completion_tokens or 0)
-                    reasoning_tokens = 0
-                    details = usage.completion_tokens_details or None
-                    if details and details.reasoning_tokens:
-                        reasoning_tokens = int(details.reasoning_tokens)
+                    prompt_tokens = int(
+                        getattr(usage, "prompt_tokens", None)
+                        or getattr(usage, "input_tokens", 0)
+                        or 0
+                    )
+                    completion_tokens = int(
+                        getattr(usage, "completion_tokens", None)
+                        or getattr(usage, "output_tokens", 0)
+                        or 0
+                    )
+                    details = getattr(
+                        usage, "completion_tokens_details", None
+                    ) or getattr(usage, "output_tokens_details", None)
+                    reasoning_tokens = (
+                        int(getattr(details, "reasoning_tokens", 0) or 0)
+                        if details
+                        else 0
+                    )
+                    p_details = getattr(
+                        usage, "prompt_tokens_details", None
+                    ) or getattr(usage, "input_tokens_details", None)
+                    cache_read_tokens = (
+                        int(getattr(p_details, "cached_tokens", 0) or 0)
+                        if p_details
+                        else 0
+                    )
+
                     data["usage_summary"] = {
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
                         "reasoning_tokens": reasoning_tokens,
+                        "cache_read_tokens": cache_read_tokens,
                     }
-                    if usage.prompt_tokens_details:
-                        data["usage_summary"]["cache_read_tokens"] = int(
-                            usage.prompt_tokens_details.cached_tokens or 0
-                        )
             except Exception:
                 # Best-effort only; don't fail logging
                 pass
