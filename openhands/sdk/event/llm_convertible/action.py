@@ -29,7 +29,10 @@ class ActionEvent(LLMConvertibleEvent):
         default_factory=list,
         description="Anthropic thinking blocks from the LLM response",
     )
-    action: Action = Field(..., description="Single action (tool call) returned by LLM")
+    action: Action | None = Field(
+        default=None,
+        description="Single tool call returned by LLM (None when non-executable)",
+    )
     tool_name: str = Field(..., description="The name of the tool being called")
     tool_call_id: ToolCallID = Field(
         ..., description="The unique id returned by LLM API for this tool call"
@@ -80,7 +83,12 @@ class ActionEvent(LLMConvertibleEvent):
             content.append("\n\n")
 
         # Display action information using action's visualize method
-        content.append(self.action.visualize)
+        if self.action:
+            content.append(self.action.visualize)
+        else:
+            # When action is None (non-executable), show the function call
+            content.append("Function call:\n", style="bold")
+            content.append(f"- {self.tool_call.name} ({self.tool_call.id})\n")
 
         return content
 
@@ -103,5 +111,13 @@ class ActionEvent(LLMConvertibleEvent):
             if len(thought_text) > N_CHAR_PREVIEW
             else thought_text
         )
-        action_name = self.action.__class__.__name__
-        return f"{base_str}\n  Thought: {thought_preview}\n  Action: {action_name}"
+        if self.action:
+            action_name = self.action.__class__.__name__
+            return f"{base_str}\n  Thought: {thought_preview}\n  Action: {action_name}"
+        else:
+            # When action is None (non-executable), show the tool call
+            call = f"{self.tool_call.name}:{self.tool_call.id}"
+            return (
+                f"{base_str}\n  Thought: {thought_preview}\n  Action: (not executed)"
+                f"\n  Call: {call}"
+            )
