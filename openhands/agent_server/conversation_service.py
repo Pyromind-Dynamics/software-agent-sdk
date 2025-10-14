@@ -176,7 +176,7 @@ class ConversationService:
         conversation_id = uuid4()
         stored = StoredConversation(id=conversation_id, **request.model_dump())
         file_store_path = self.event_services_path / "event_service"
-        file_store_path.mkdir(parents=True)
+        file_store_path.mkdir(parents=True, exist_ok=True)
         event_service = EventService(
             stored=stored,
             file_store_path=file_store_path,
@@ -206,7 +206,7 @@ class ConversationService:
             message = Message(
                 role=initial_message.role, content=initial_message.content
             )
-            await event_service.send_message(message)
+            await event_service.send_message(message, True)
 
         state = await event_service.get_state()
         conversation_info = _compose_conversation_info(event_service.stored, state)
