@@ -213,10 +213,16 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         description="Whether to use native tool calling.",
     )
     reasoning_effort: Literal["low", "medium", "high", "none"] | None = Field(
-        default=None,
+        default="high",
         description="The effort to put into reasoning. "
         "This is a string that can be one of 'low', 'medium', 'high', or 'none'. "
         "Can apply to all reasoning models.",
+    )
+    reasoning_summary: Literal["auto", "concise", "detailed"] | None = Field(
+        default=None,
+        description="The level of detail for reasoning summaries. "
+        "This is a string that can be one of 'auto', 'concise', or 'detailed'. "
+        "Requires verified OpenAI organization. Only sent when explicitly set.",
     )
     enable_encrypted_reasoning: bool = Field(
         default=False,
@@ -311,14 +317,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         model_val = d.get("model")
         if not model_val:
             raise ValueError("model must be specified in LLM")
-
-        # default reasoning_effort unless Gemini 2.5
-        # (we keep consistent with old behavior)
-        excluded_models = ["gemini-2.5-pro", "claude-sonnet-4-5", "claude-haiku-4-5"]
-        if d.get("reasoning_effort") is None and not any(
-            model in model_val for model in excluded_models
-        ):
-            d["reasoning_effort"] = "high"
 
         # Azure default version
         if model_val.startswith("azure") and not d.get("api_version"):
