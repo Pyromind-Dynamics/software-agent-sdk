@@ -76,12 +76,12 @@ def select_chat_options(
         out.pop("tools", None)
         out.pop("tool_choice", None)
 
-    # Pass through litellm_extra_body if provided
-    if llm.litellm_extra_body:
-        out["extra_body"] = llm.litellm_extra_body
-    # non litellm proxy special-case: keep `extra_body` off unless model requires it
-    # or user provided it
-    elif "litellm_proxy" not in llm.model:
+    # Only forward extra_body for litellm_proxy providers
+    is_proxy = "litellm_proxy" in llm.model
+    if is_proxy:
+        if llm.litellm_extra_body:
+            out["extra_body"] = llm.litellm_extra_body
+    else:
         out.pop("extra_body", None)
 
     return out
