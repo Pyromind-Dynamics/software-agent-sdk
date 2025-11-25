@@ -12,6 +12,8 @@ from pydantic import (
     TypeAdapter,
 )
 
+from openhands.agent_server.utils import patch_fastapi_discriminated_union_support
+
 
 logger = logging.getLogger(__name__)
 _rebuild_required = True
@@ -300,3 +302,7 @@ class DiscriminatedUnionMixin(OpenHandsModel, ABC):
 def _rebuild_if_required():
     if _rebuild_required:
         rebuild_all()
+
+
+# Always call the FastAPI patch after DiscriminatedUnionMixin definition
+patch_fastapi_discriminated_union_support()
