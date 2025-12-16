@@ -407,7 +407,9 @@ class EventService:
         workspace = self.stored.workspace
         assert isinstance(workspace, LocalWorkspace)
         Path(workspace.working_dir).mkdir(parents=True, exist_ok=True)
-        agent = Agent.model_validate(self.stored.agent.model_dump())
+        agent = Agent.model_validate(
+            self.stored.agent.model_dump(context={"expose_secrets": True}),
+        )
 
         conversation = LocalConversation(
             agent=agent,
