@@ -108,6 +108,7 @@ class LLMSummarizingCondenser(RollingCondenser):
         self,
         summary_event_content: str,
         forgotten_events: Sequence[LLMConvertibleEvent],
+        summary_offset: int,
     ) -> Condensation:
         """Generate a condensation by using the condenser's LLM to summarize forgotten
         events.
@@ -115,6 +116,7 @@ class LLMSummarizingCondenser(RollingCondenser):
         Args:
             summary_event_content: The content of the previous summary event.
             forgotten_events: The list of events to be summarized.
+            summary_offset: The index where the summary event should be inserted.
 
         Returns:
             Condensation: The generated condensation object.
@@ -146,24 +148,25 @@ class LLMSummarizingCondenser(RollingCondenser):
         return Condensation(
             forgotten_event_ids=[event.id for event in forgotten_events],
             summary=summary,
-            summary_offset=self.keep_first,
+            summary_offset=summary_offset,
             llm_response_id=llm_response.id,
         )
 
     def _get_forgotten_events(
         self, view: View, agent_llm: LLM | None = None
-    ) -> Sequence[LLMConvertibleEvent]:
-        """Identify events to be forgotten.
+    ) -> tuple[Sequence[LLMConvertibleEvent], int]:
+        """Identify events to be forgotten and the summary offset.
 
         Relies on the condensation reasons to determine how many events we need to drop
-        in order to maintain our resource constraints.
+        in order to maintain our resource constraints. Uses manipulation indices to
+        ensure forgetting ranges respect atomic unit boundaries.
 
         Args:
             view: The current view from which to identify forgotten events.
             agent_llm: The LLM used by the agent, required for token-based calculations.
 
         Returns:
-            A sequence of events to be forgotten.
+            A tuple of (events to forget, summary_offset).
         """
         reasons = self.get_condensation_reasons(view, agent_llm=agent_llm)
         assert reasons != set(), "No condensation reasons found."
@@ -188,22 +191,34 @@ class LLMSummarizingCondenser(RollingCondenser):
             total_tokens = get_total_token_count(view.events, agent_llm)
             tokens_to_reduce = total_tokens - (self.max_tokens // 2)
 
-            suffix_length = get_suffix_length_for_token_reduction(
-                events=view.events[self.keep_first :],
-                llm=agent_llm,
-                token_reduction=tokens_to_reduce,
+            suffix_events_to_keep.add(
+                get_suffix_length_for_token_reduction(
+                    events=view.events[self.keep_first :],
+                    llm=agent_llm,
+                    token_reduction=tokens_to_reduce,
+                )
             )
-
-            suffix_events_to_keep.add(suffix_length)
 
         # We might have multiple reasons to condense, so pick the strictest condensation
         # to ensure all resource constraints are met.
         events_from_tail = min(suffix_events_to_keep)
 
-        # Identify events to be forgotten (those not in head or tail)
-        if events_from_tail == 0:
-            return view[self.keep_first :]
-        return view[self.keep_first : -events_from_tail]
+        # Calculate naive forgetting end (without considering atomic boundaries)
+        naive_end = len(view) - events_from_tail
+
+        # Find actual forgetting_start: smallest manipulation index > keep_first
+        forgetting_start = view.find_next_manipulation_index(
+            self.keep_first, strict=True
+        )
+
+        # Find actual forgetting_end: smallest manipulation index >= naive_end
+        forgetting_end = view.find_next_manipulation_index(naive_end, strict=False)
+
+        # Extract events to forget using boundary-aware indices
+        forgotten_events = view[forgetting_start:forgetting_end]
+
+        # Summary offset is the same as forgetting_start
+        return forgotten_events, forgetting_start
 
     @observe(ignore_inputs=["view", "agent_llm"])
     def get_condensation(
@@ -212,9 +227,12 @@ class LLMSummarizingCondenser(RollingCondenser):
         # The condensation is dependent on the events we want to drop and the previous
         # summary.
         summary_event_content = self._get_summary_event_content(view)
-        forgotten_events = self._get_forgotten_events(view, agent_llm=agent_llm)
+        forgotten_events, summary_offset = self._get_forgotten_events(
+            view, agent_llm=agent_llm
+        )
 
         return self._generate_condensation(
             summary_event_content=summary_event_content,
             forgotten_events=forgotten_events,
+            summary_offset=summary_offset,
         )
