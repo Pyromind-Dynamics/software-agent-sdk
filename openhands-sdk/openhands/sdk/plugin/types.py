@@ -15,6 +15,117 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 MARKETPLACE_MANIFEST_DIRS = [".plugin", ".claude-plugin"]
 MARKETPLACE_MANIFEST_FILE = "marketplace.json"
 
+
+class PluginSource(BaseModel):
+    """Specification for a plugin to load.
+
+    This model describes where to find a plugin and is used by load_plugins()
+    to fetch and load plugins from various sources.
+
+    Examples:
+        >>> # GitHub repository
+        >>> PluginSource(source="github:owner/repo", ref="v1.0.0")
+
+        >>> # Plugin from monorepo subdirectory
+        >>> PluginSource(
+        ...     source="github:owner/monorepo",
+        ...     repo_path="plugins/my-plugin"
+        ... )
+
+        >>> # Local path
+        >>> PluginSource(source="/path/to/plugin")
+    """
+
+    source: str = Field(
+        description="Plugin source: 'github:owner/repo', any git URL, or local path"
+    )
+    ref: str | None = Field(
+        default=None,
+        description="Optional branch, tag, or commit (only for git sources)",
+    )
+    repo_path: str | None = Field(
+        default=None,
+        description=(
+            "Subdirectory path within the git repository "
+            "(e.g., 'plugins/my-plugin' for monorepos). "
+            "Only relevant for git sources, not local paths."
+        ),
+    )
+
+    @field_validator("repo_path")
+    @classmethod
+    def validate_repo_path(cls, v: str | None) -> str | None:
+        """Validate repo_path is a safe relative path within the repository."""
+        if v is None:
+            return v
+        # Must be relative (no absolute paths)
+        if v.startswith("/"):
+            raise ValueError("repo_path must be relative, not absolute")
+        # No parent directory traversal
+        if ".." in Path(v).parts:
+            raise ValueError(
+                "repo_path cannot contain '..' (parent directory traversal)"
+            )
+        return v
+
+
+class ResolvedPluginSource(BaseModel):
+    """A plugin source with resolved ref (pinned to commit SHA).
+
+    Used for persistence to ensure deterministic behavior across pause/resume.
+    When a conversation is resumed, the resolved ref ensures we get exactly
+    the same plugin version that was used when the conversation started.
+
+    The resolved_ref is the actual commit SHA that was fetched, even if the
+    original ref was a branch name like 'main'. This prevents drift when
+    branches are updated between pause and resume.
+    """
+
+    source: str = Field(
+        description="Plugin source: 'github:owner/repo', any git URL, or local path"
+    )
+    resolved_ref: str | None = Field(
+        default=None,
+        description=(
+            "Resolved commit SHA (for git sources). None for local paths. "
+            "This is the actual commit that was checked out, even if the "
+            "original ref was a branch name."
+        ),
+    )
+    repo_path: str | None = Field(
+        default=None,
+        description="Subdirectory path within the git repository",
+    )
+    original_ref: str | None = Field(
+        default=None,
+        description="Original ref from PluginSource (for debugging/display)",
+    )
+
+    @classmethod
+    def from_plugin_source(
+        cls, plugin_source: PluginSource, resolved_ref: str | None
+    ) -> ResolvedPluginSource:
+        """Create a ResolvedPluginSource from a PluginSource and resolved ref."""
+        return cls(
+            source=plugin_source.source,
+            resolved_ref=resolved_ref,
+            repo_path=plugin_source.repo_path,
+            original_ref=plugin_source.ref,
+        )
+
+    def to_plugin_source(self) -> PluginSource:
+        """Convert back to PluginSource using the resolved ref.
+
+        When loading from persistence, use the resolved_ref to ensure we get
+        the exact same version that was originally fetched.
+        """
+        return PluginSource(
+            source=self.source,
+            ref=self.resolved_ref,  # Use resolved SHA, not original ref
+            repo_path=self.repo_path,
+        )
+
+
 # Type aliases for marketplace plugin entry configurations
 # These provide better documentation than dict[str, Any] while remaining flexible
 
