@@ -280,6 +280,21 @@ git push -u origin <feature-name>
 ```
 </DOCUMENTATION_WORKFLOW>
 
+<AGENT_TMP_DIRECTORY>
+# Agent Temporary Directory Convention
+
+When tools need to store observation files (e.g., browser session recordings, task tracker data), use `.agent_tmp` as the directory name for consistency.
+
+The browser session recording tool saves recordings to `.agent_tmp/observations/recording-{timestamp}/`.
+
+This convention ensures tool-generated observation files are stored in a predictable location that can be easily:
+- Added to `.gitignore`
+- Cleaned up after agent sessions
+- Identified as agent-generated artifacts
+
+Note: This is separate from `persistence_dir` which is used for conversation state persistence.
+</AGENT_TMP_DIRECTORY>
+
 <REPO>
 <PROJECT_STRUCTURE>
 - `openhands-sdk/` core SDK; `openhands-tools/` built-in tools; `openhands-workspace/` workspace management; `openhands-agent-server/` server runtime; `examples/` runnable patterns; `tests/` split by domain (`tests/sdk`, `tests/tools`, `tests/agent_server`, etc.).
