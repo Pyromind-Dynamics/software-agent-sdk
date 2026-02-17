@@ -153,6 +153,8 @@ MODELS = {
         "display_name": "GLM-5",
         "llm_config": {
             "model": "litellm_proxy/openrouter/z-ai/glm-5",
+            # OpenRouter glm-5 is text-only despite LiteLLM reporting vision support
+            "disable_vision": True,
         },
     },
     "qwen3-coder-next": {
