@@ -172,6 +172,14 @@ class PluginManifest(BaseModel):
     version: str = Field(default="1.0.0", description="Plugin version")
     description: str = Field(default="", description="Plugin description")
     author: PluginAuthor | None = Field(default=None, description="Plugin author")
+    entry_command: str | None = Field(
+        default=None,
+        description=(
+            "Default command to invoke when launching this plugin. "
+            "Should match a command name from the commands/ directory. "
+            "Example: 'now' for a command defined in commands/now.md"
+        ),
+    )
 
     model_config = {"extra": "allow"}
 
@@ -400,6 +408,15 @@ class MarketplacePluginEntry(MarketplaceEntry):
         description="Path to plugin directory or source object for GitHub/git"
     )
 
+    # Plugin-specific fields
+    entry_command: str | None = Field(
+        default=None,
+        description=(
+            "Default command to invoke when launching this plugin. "
+            "Should match a command name from the commands/ directory."
+        ),
+    )
+
     # Claude Code compatibility fields
     strict: bool = Field(
         default=True,
@@ -434,6 +451,7 @@ class MarketplacePluginEntry(MarketplaceEntry):
             version=self.version or "1.0.0",
             description=self.description or "",
             author=self.author,
+            entry_command=self.entry_command,
         )
 
 
