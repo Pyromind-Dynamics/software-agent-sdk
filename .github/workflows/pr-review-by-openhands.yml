@@ -61,5 +61,5 @@ jobs:
                   # Enable experimental sub-agent delegation for file-level reviews
                   use-sub-agents: 'true'
                   llm-api-key: ${{ secrets.LLM_API_KEY }}
-                  github-token: ${{ secrets.OPENHANDS_BOT_GITHUB_PAT_PUBLIC }}
+                  github-token: ${{ secrets.OPENHANDS_BOT_GITHUB_PAT_PUBLIC || github.token }}
                   lmnr-api-key: ${{ secrets.LMNR_SKILLS_API_KEY }}
