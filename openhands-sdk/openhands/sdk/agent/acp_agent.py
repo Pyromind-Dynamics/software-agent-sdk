@@ -42,7 +42,7 @@ from acp.schema import (
     UsageUpdate,
 )
 from acp.transports import default_environment
-from pydantic import Field, PrivateAttr
+from pydantic import Field, PrivateAttr, SecretStr, field_serializer
 
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.conversation.state import ConversationExecutionStatus
@@ -61,6 +61,7 @@ from openhands.sdk.secret import SecretSource
 from openhands.sdk.tool import Tool  # noqa: TC002
 from openhands.sdk.tool.builtins.finish import FinishAction, FinishObservation
 from openhands.sdk.utils import maybe_truncate
+from openhands.sdk.utils.pydantic_secrets import serialize_secret
 
 
 logger = get_logger(__name__)
@@ -701,6 +702,12 @@ class ACPAgent(AgentBase):
         default_factory=dict,
         description="Additional environment variables for the ACP server process",
     )
+
+    @field_serializer("acp_env", when_used="always")
+    def _serialize_acp_env(self, value: dict[str, str], info):
+        """Mask ``acp_env`` values via :func:`serialize_secret`."""
+        return {k: serialize_secret(SecretStr(v), info) for k, v in value.items()}
+
     acp_session_mode: str | None = Field(
         default=None,
         description=(
