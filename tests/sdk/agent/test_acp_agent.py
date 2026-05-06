@@ -13,13 +13,11 @@ from acp.exceptions import RequestError as ACPRequestError
 
 from openhands.sdk.agent.acp_agent import (
     ACPAgent,
-    _build_session_meta,
     _estimate_cost_from_tokens,
     _extract_token_usage,
     _image_url_to_acp_block,
     _maybe_set_session_model,
     _OpenHandsACPBridge,
-    _resolve_bypass_mode,
     _select_auth_method,
     _serialize_tool_content,
 )
@@ -2530,34 +2528,6 @@ class TestClientForkTextRouting:
 
 
 # ---------------------------------------------------------------------------
-# _resolve_bypass_mode
-# ---------------------------------------------------------------------------
-
-
-class TestResolveBypassMode:
-    def test_claude_agent(self):
-        assert _resolve_bypass_mode("claude-agent-acp") == "bypassPermissions"
-
-    def test_claude_agent_with_scope(self):
-        assert (
-            _resolve_bypass_mode("@agentclientprotocol/claude-agent-acp")
-            == "bypassPermissions"
-        )
-
-    def test_codex_acp(self):
-        assert _resolve_bypass_mode("codex-acp") == "full-access"
-
-    def test_codex_acp_with_version(self):
-        assert _resolve_bypass_mode("Codex-ACP v0.9.2") == "full-access"
-
-    def test_unknown_server_defaults_to_full_access(self):
-        assert _resolve_bypass_mode("some-other-agent") == "full-access"
-
-    def test_empty_name_defaults_to_full_access(self):
-        assert _resolve_bypass_mode("") == "full-access"
-
-
-# ---------------------------------------------------------------------------
 # acp_session_mode field
 # ---------------------------------------------------------------------------
 
@@ -2649,19 +2619,6 @@ class TestSelectAuthMethod:
 # ---------------------------------------------------------------------------
 # ACP model overrides
 # ---------------------------------------------------------------------------
-
-
-class TestBuildSessionMeta:
-    def test_claude_agent_adds_model_override(self):
-        assert _build_session_meta("claude-agent-acp", "claude-opus-4-6") == {
-            "claudeCode": {"options": {"model": "claude-opus-4-6"}}
-        }
-
-    def test_codex_agent_does_not_use_session_meta(self):
-        assert _build_session_meta("codex-acp", "gpt-5.4") == {}
-
-    def test_missing_model_does_not_add_session_meta(self):
-        assert _build_session_meta("claude-agent-acp", None) == {}
 
 
 class TestMaybeSetSessionModel:
@@ -2970,14 +2927,6 @@ class TestACPPromptRetry:
 # ---------------------------------------------------------------------------
 # Gemini-specific tests
 # ---------------------------------------------------------------------------
-
-
-class TestGeminiBypassMode:
-    def test_gemini_cli_uses_yolo(self):
-        assert _resolve_bypass_mode("gemini-cli") == "yolo"
-
-    def test_gemini_cli_with_version(self):
-        assert _resolve_bypass_mode("gemini-cli/0.35.3") == "yolo"
 
 
 class TestGeminiSessionModel:
