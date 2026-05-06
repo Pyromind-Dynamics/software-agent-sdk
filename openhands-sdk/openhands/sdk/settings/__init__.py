@@ -2,6 +2,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from .api_models import (
+    SecretCreateRequest,
+    SecretItemResponse,
+    SecretsListResponse,
+    SettingsResponse,
+    SettingsUpdateRequest,
+)
 from .metadata import (
     SETTINGS_METADATA_KEY,
     SETTINGS_SECTION_METADATA_KEY,
@@ -71,13 +78,19 @@ __all__ = [
     "OpenHandsAgentSettings",
     "SETTINGS_METADATA_KEY",
     "SETTINGS_SECTION_METADATA_KEY",
+    # API models for settings endpoints
+    "SecretCreateRequest",
+    "SecretItemResponse",
+    "SecretsListResponse",
     "SettingProminence",
     "SettingsChoice",
     "SettingsFieldMetadata",
     "SettingsFieldSchema",
+    "SettingsResponse",
     "SettingsSchema",
     "SettingsSectionMetadata",
     "SettingsSectionSchema",
+    "SettingsUpdateRequest",
     "VerificationSettings",
     "create_agent_from_settings",
     "default_agent_settings",
