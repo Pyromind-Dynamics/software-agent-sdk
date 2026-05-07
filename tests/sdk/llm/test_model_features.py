@@ -366,6 +366,9 @@ def test_prompt_cache_retention_support(model, expected_retention):
         # DeepSeek reasoner model
         ("deepseek/deepseek-reasoner", True),
         ("DeepSeek/deepseek-reasoner", True),
+        # DeepSeek V4 Pro (dual-mode thinking)
+        ("deepseek/deepseek-v4-pro", True),
+        ("litellm_proxy/deepseek/deepseek-v4-pro", True),
         # DeepSeek V4 Flash (dual-mode thinking)
         ("deepseek/deepseek-v4-flash", True),
         ("litellm_proxy/deepseek/deepseek-v4-flash", True),
