@@ -123,6 +123,10 @@ def test_extended_thinking_support(model, expected_extended_thinking):
         ("anthropic.claude-3-5-sonnet-20241022", True),
         ("anthropic.claude-3-haiku-20240307", True),
         ("anthropic.claude-3-opus-20240229", True),
+        # Gemini explicit context caching through LiteLLM.
+        ("gemini-2.5-pro", True),
+        ("gemini-3.1-pro-preview", True),
+        ("litellm_proxy/gemini-3.1-pro-preview", True),
         ("gpt-4o", False),  # OpenAI doesn't support explicit prompt caching
         ("gemini-1.5-pro", False),
         ("unknown-model", False),

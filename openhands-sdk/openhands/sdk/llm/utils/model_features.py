@@ -112,6 +112,10 @@ PROMPT_CACHE_MODELS: list[str] = [
     "claude-opus-4-6",
     "claude-opus-4-7",
     "claude-sonnet-4-6",
+    # Gemini uses the same cache_control marker format. LiteLLM handles
+    # Vertex/Gemini context-cache creation when these markers are present.
+    "gemini-2.5",
+    "gemini-3",
 ]
 
 # Models that support a top-level prompt_cache_retention parameter
