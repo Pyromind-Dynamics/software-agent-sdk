@@ -5,10 +5,10 @@ import functools
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from openhands.agent_server.server_details_router import update_last_execution_time
-from openhands.sdk.git.exceptions import GitRepositoryError
+from openhands.sdk.git.exceptions import GitError, GitRepositoryError
 from openhands.sdk.git.git_changes import get_git_changes
 from openhands.sdk.git.git_diff import get_git_diff
 from openhands.sdk.git.models import GitChange, GitDiff
@@ -62,7 +62,14 @@ async def git_changes_query(
     ref: str | None = Query(None, description=_REF_QUERY_DESCRIPTION),
 ) -> list[GitChange]:
     """Get git changes using query parameter (preferred method)."""
-    return await _get_git_changes(path, ref)
+    try:
+        return await _get_git_changes(path, ref)
+    except GitError as e:
+        # GitRepositoryError is already handled in the helper (returns []).
+        # Any remaining GitError subclass (e.g. GitCommandError) surfaces as
+        # 400 so the client can show an actionable error instead of an
+        # opaque 500.
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @git_router.get("/diff")
@@ -71,4 +78,11 @@ async def git_diff_query(
     ref: str | None = Query(None, description=_REF_QUERY_DESCRIPTION),
 ) -> GitDiff:
     """Get git diff using query parameter (preferred method)."""
-    return await _get_git_diff(path, ref)
+    try:
+        return await _get_git_diff(path, ref)
+    except GitError as e:
+        # GitRepositoryError is already handled in the helper (returns an
+        # empty diff). Any remaining GitError subclass (e.g. GitCommandError,
+        # GitPathError) surfaces as 400 so the client can show an actionable
+        # error instead of an opaque 500.
+        raise HTTPException(status_code=400, detail=str(e))

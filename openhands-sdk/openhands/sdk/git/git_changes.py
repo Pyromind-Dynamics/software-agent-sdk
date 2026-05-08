@@ -9,7 +9,7 @@ import logging
 import os
 from pathlib import Path
 
-from openhands.sdk.git.exceptions import GitCommandError
+from openhands.sdk.git.exceptions import GitCommandError, GitError
 from openhands.sdk.git.models import GitChange, GitChangeStatus
 from openhands.sdk.git.utils import (
     get_valid_ref,
@@ -226,7 +226,13 @@ def get_git_changes(cwd: str | Path, ref: str | None = None) -> list[GitChange]:
 
     # Add changes from git directories
     for git_dir in git_dirs:
-        git_dir_changes = get_changes_in_repo(str(Path(cwd, git_dir)), ref=ref)
+        try:
+            git_dir_changes = get_changes_in_repo(str(Path(cwd, git_dir)), ref=ref)
+        except GitError:
+            logger.warning(
+                f"Skipping nested git directory {git_dir}: not a valid repository"
+            )
+            continue
         for change in git_dir_changes:
             # Create a new GitChange with the updated path
             updated_change = GitChange(
