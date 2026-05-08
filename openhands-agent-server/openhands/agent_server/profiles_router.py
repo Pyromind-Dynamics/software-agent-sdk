@@ -4,16 +4,24 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Path, status
+from fastapi import APIRouter, HTTPException, Path, Request, status
 from pydantic import BaseModel, Field, SecretStr
 
+from openhands.agent_server._secrets_exposure import (
+    build_expose_context,
+    get_cipher,
+    parse_expose_secrets_header,
+    translate_missing_cipher,
+)
 from openhands.sdk.llm import LLM
+from openhands.sdk.llm.llm import LLM_SECRET_FIELDS
 from openhands.sdk.llm.llm_profile_store import (
     PROFILE_NAME_PATTERN,
     LLMProfileStore,
     ProfileLimitExceeded,
 )
 from openhands.sdk.logger import get_logger
+from openhands.sdk.utils.cipher import Cipher
 
 
 logger = get_logger(__name__)
@@ -92,6 +100,34 @@ def _has_api_key(llm: LLM) -> bool:
     return bool(llm.api_key.get_secret_value().strip())
 
 
+# Fernet tokens always begin with the URL-safe base64 of version byte 0x80,
+# i.e. "gAAAAA". We gate decrypt attempts on this prefix so genuine plaintext
+# secrets pass through untouched (and we don't spam the cipher's failure log).
+_FERNET_TOKEN_PREFIX = "gAAAAA"
+
+
+def _decrypt_incoming_secrets(llm: LLM, cipher: Cipher) -> LLM:
+    """Decrypt any pre-encrypted secret fields posted back by the client.
+
+    FastAPI parses the request body without a cipher in the validation context,
+    so an encrypted blob arrives as ``SecretStr("gAAAAA...")``. Without this
+    pass, ``store.save`` would re-encrypt the blob, producing a double-encrypted
+    value on disk that no longer round-trips. Plaintext input is left untouched.
+    """
+    updates: dict[str, SecretStr] = {}
+    for field in LLM_SECRET_FIELDS:
+        val = getattr(llm, field, None)
+        if not isinstance(val, SecretStr):
+            continue
+        raw = val.get_secret_value()
+        if not raw.startswith(_FERNET_TOKEN_PREFIX):
+            continue
+        decrypted = cipher.decrypt(raw)
+        if decrypted is not None:
+            updates[field] = decrypted
+    return llm.model_copy(update=updates) if updates else llm
+
+
 @profiles_router.get("", response_model=ProfileListResponse)
 async def list_profiles() -> ProfileListResponse:
     """List all saved LLM profiles."""
@@ -102,20 +138,35 @@ async def list_profiles() -> ProfileListResponse:
 
 
 @profiles_router.get("/{name}", response_model=ProfileDetailResponse)
-async def get_profile(name: ProfileName) -> ProfileDetailResponse:
-    """Get a profile's configuration with ``api_key`` nulled out."""
+async def get_profile(request: Request, name: ProfileName) -> ProfileDetailResponse:
+    """Get a profile's configuration.
+
+    Use the ``X-Expose-Secrets`` header to control secret exposure:
+    - ``encrypted``: Returns cipher-encrypted values (safe for frontend clients)
+    - ``plaintext``: Returns raw secret values (backend clients only!)
+    - (absent): Returns nulled ``api_key`` with ``api_key_set`` indicator
+    """
+    expose_mode = parse_expose_secrets_header(request)
+    cipher = get_cipher(request)
+
     store = LLMProfileStore()
     try:
         with _store_errors():
-            llm = store.load(name)
+            llm = store.load(name, cipher=cipher)
     except FileNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Profile '{name}' not found",
         )
 
-    config = llm.model_dump(mode="json")
-    config["api_key"] = None
+    if expose_mode:
+        context = build_expose_context(expose_mode, cipher)
+        with translate_missing_cipher():
+            config: dict[str, Any] = llm.model_dump(mode="json", context=context)
+    else:
+        config = llm.model_dump(mode="json")
+        config["api_key"] = None
+
     return ProfileDetailResponse(
         name=name, config=config, api_key_set=_has_api_key(llm)
     )
@@ -127,6 +178,7 @@ async def get_profile(name: ProfileName) -> ProfileDetailResponse:
     status_code=status.HTTP_201_CREATED,
 )
 async def save_profile(
+    request: Request,
     name: ProfileName,
     body: SaveProfileRequest,
 ) -> ProfileMutationResponse:
@@ -134,14 +186,21 @@ async def save_profile(
 
     Overwrites an existing profile of the same name. Returns 409 if creating
     a new profile would exceed ``MAX_PROFILES``.
+
+    When ``OH_SECRET_KEY`` is configured, secrets are encrypted at rest.
+    Clients can submit cipher-encrypted secrets which will be decrypted
+    server-side before re-encrypting with the storage cipher.
     """
+    cipher = get_cipher(request)
+    llm = _decrypt_incoming_secrets(body.llm, cipher) if cipher else body.llm
     store = LLMProfileStore()
     try:
         with _store_errors():
             store.save(
                 name,
-                body.llm,
+                llm,
                 include_secrets=body.include_secrets,
+                cipher=cipher,
                 max_profiles=MAX_PROFILES,
             )
     except ProfileLimitExceeded:
