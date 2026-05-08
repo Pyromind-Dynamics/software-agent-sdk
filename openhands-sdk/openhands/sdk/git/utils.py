@@ -127,6 +127,16 @@ def get_valid_ref(repo_dir: str | Path, override: str | None = None) -> str | No
         GitCommandError: If ``override`` is provided and does not resolve.
     """
     if override is not None:
+        # ``HEAD`` doesn't resolve in a freshly-init'd repo with no commits.
+        # Treat it the same as the auto-detected path (empty tree) so the
+        # Changes tab on a brand-new workspace renders untracked files as
+        # added instead of erroring out.
+        if override == "HEAD" and not _repo_has_commits(repo_dir):
+            logger.debug(
+                "Override 'HEAD' requested but repo has no commits; "
+                "using empty tree reference"
+            )
+            return GIT_EMPTY_TREE_HASH
         # Resolve explicit override and surface failure to the caller so the
         # difference between "ref not found" and "no changes" stays visible.
         return run_git_command(

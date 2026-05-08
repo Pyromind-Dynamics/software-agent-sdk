@@ -456,6 +456,28 @@ def test_get_changes_in_repo_invalid_ref_raises():
             get_changes_in_repo(temp_dir, ref="definitely-not-a-real-ref")
 
 
+def test_get_changes_in_repo_ref_head_on_empty_repo_returns_untracked_as_added():
+    """``ref='HEAD'`` on a freshly init'd repo (no commits) must not raise.
+
+    Reproduces the Changes-tab bug for new conversation workspaces: the
+    runtime ``git init``s the workspace, the GUI requests ``ref=HEAD`` to get
+    git-status semantics, but ``HEAD`` does not resolve. Untracked files
+    should surface as ADDED instead of bubbling up a ``GitCommandError``.
+    """
+    # Arrange
+    with tempfile.TemporaryDirectory() as temp_dir:
+        setup_git_repo(temp_dir)
+        (Path(temp_dir) / "untracked.txt").write_text("new")
+
+        # Act
+        changes = get_changes_in_repo(temp_dir, ref="HEAD")
+
+        # Assert
+        assert changes == [
+            GitChange(status=GitChangeStatus.ADDED, path=Path("untracked.txt"))
+        ]
+
+
 def test_get_git_changes_propagates_ref():
     """``get_git_changes`` should pass the ref through to inner-repo lookups."""
     with tempfile.TemporaryDirectory() as temp_dir:

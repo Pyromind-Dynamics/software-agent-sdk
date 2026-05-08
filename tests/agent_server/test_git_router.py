@@ -1,5 +1,6 @@
 """Tests for git_router.py endpoints."""
 
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -138,6 +139,43 @@ async def test_git_diff_returns_empty_diff_when_path_is_not_git_repo(client):
         body = response.json()
         assert body["modified"] is None
         assert body["original"] is None
+
+
+@pytest.mark.asyncio
+async def test_git_changes_query_param_ref_head_on_empty_repo_returns_200(
+    client, tmp_path
+):
+    """End-to-end: ``?ref=HEAD`` on a freshly init'd repo must return 200.
+
+    Real git repo (no mock) so the SDK fix is exercised through the router.
+    Reproduces the bug: before the fix this returned 400 with
+    ``Git command failed: git --no-pager rev-parse --verify 'HEAD^{commit}'``.
+    """
+    # Arrange: real empty git repo with a single untracked file.
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "untracked.txt").write_text("new")
+
+    # Act
+    response = client.get(
+        "/api/git/changes",
+        params={"path": str(tmp_path), "ref": "HEAD"},
+    )
+
+    # Assert
+    assert response.status_code == 200
+    assert response.json() == [{"status": "ADDED", "path": "untracked.txt"}]
 
 
 @pytest.mark.asyncio
