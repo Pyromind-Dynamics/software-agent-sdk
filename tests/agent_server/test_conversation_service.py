@@ -2000,7 +2000,9 @@ class TestAutoTitle:
             await self._drain_title_task(lambda: service.stored.title is not None)
 
             MockStore.assert_called_once_with()
-            mock_store_instance.load.assert_called_once_with("cheap-model")
+            mock_store_instance.load.assert_called_once_with(
+                "cheap-model", cipher=service.cipher
+            )
             # Profile-loaded LLM wins over agent.llm
             assert mock_generate_title.called
             assert mock_generate_title.call_args.args[1] is mock_llm
@@ -2180,6 +2182,89 @@ class TestAutoTitle:
         )
         assert service.stored.title == "✨ Generated"
         service.save_meta.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_autotitle_decrypts_cipher_encrypted_title_profile(self, tmp_path):
+        """Regression for #3164: a cipher-encrypted title-LLM profile must be
+        decrypted on load so the title LLM sees the plaintext API key, not
+        Fernet ciphertext.
+        """
+        from litellm.types.utils import (
+            Choices,
+            Message as LiteLLMMessage,
+            ModelResponse,
+            Usage,
+        )
+
+        from openhands.sdk.llm import LLMResponse, MetricsSnapshot
+        from openhands.sdk.llm.llm_profile_store import LLMProfileStore
+        from openhands.sdk.utils.cipher import Cipher
+
+        cipher = Cipher("title-cipher-test-key")
+
+        profile_dir = tmp_path / "profiles"
+        LLMProfileStore(base_dir=profile_dir).save(
+            "title-encrypted",
+            LLM(
+                usage_id="title-llm",
+                model="claude-haiku-4-5",
+                api_key=SecretStr("plaintext-title-key"),
+            ),
+            include_secrets=True,
+            cipher=cipher,
+        )
+
+        service = self._make_service(title_llm_profile="title-encrypted")
+        # Inject the cipher; AutoTitleSubscriber reads it via service.cipher.
+        service.cipher = cipher
+
+        seen_keys: list[str] = []
+
+        def fake_completion(self_llm, _messages, **_kwargs):
+            seen_keys.append(
+                self_llm.api_key.get_secret_value() if self_llm.api_key else ""
+            )
+            msg = LiteLLMMessage(content="✨ Generated", role="assistant")
+            choice = Choices(finish_reason="stop", index=0, message=msg)
+            raw = ModelResponse(
+                id="resp-1",
+                choices=[choice],
+                created=0,
+                model=self_llm.model,
+                object="chat.completion",
+                usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+            return LLMResponse(
+                message=Message.from_llm_chat_message(choice["message"]),
+                metrics=MetricsSnapshot(
+                    model_name=self_llm.model,
+                    accumulated_cost=0.0,
+                    max_budget_per_task=None,
+                    accumulated_token_usage=None,
+                ),
+                raw_response=raw,
+            )
+
+        with (
+            patch(
+                "openhands.sdk.llm.llm_profile_store._DEFAULT_PROFILE_DIR", profile_dir
+            ),
+            patch(
+                "openhands.sdk.llm.llm.LLM.completion",
+                autospec=True,
+                side_effect=fake_completion,
+            ),
+        ):
+            subscriber = AutoTitleSubscriber(service=service)
+            await subscriber(self._user_message_event("Fix the login bug"))
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if service.stored.title is not None:
+                    break
+
+        assert seen_keys == ["plaintext-title-key"], (
+            f"Expected title LLM to receive decrypted key, got: {seen_keys}"
+        )
 
 
 class TestACPActivityHeartbeatWiring:

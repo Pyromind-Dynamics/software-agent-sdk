@@ -9,19 +9,18 @@ from pydantic import BaseModel, Field, SecretStr
 
 from openhands.agent_server._secrets_exposure import (
     build_expose_context,
+    decrypt_incoming_llm_secrets,
     get_cipher,
     parse_expose_secrets_header,
     translate_missing_cipher,
 )
 from openhands.sdk.llm import LLM
-from openhands.sdk.llm.llm import LLM_SECRET_FIELDS
 from openhands.sdk.llm.llm_profile_store import (
     PROFILE_NAME_PATTERN,
     LLMProfileStore,
     ProfileLimitExceeded,
 )
 from openhands.sdk.logger import get_logger
-from openhands.sdk.utils.cipher import Cipher
 
 
 logger = get_logger(__name__)
@@ -100,34 +99,6 @@ def _has_api_key(llm: LLM) -> bool:
     return bool(llm.api_key.get_secret_value().strip())
 
 
-# Fernet tokens always begin with the URL-safe base64 of version byte 0x80,
-# i.e. "gAAAAA". We gate decrypt attempts on this prefix so genuine plaintext
-# secrets pass through untouched (and we don't spam the cipher's failure log).
-_FERNET_TOKEN_PREFIX = "gAAAAA"
-
-
-def _decrypt_incoming_secrets(llm: LLM, cipher: Cipher) -> LLM:
-    """Decrypt any pre-encrypted secret fields posted back by the client.
-
-    FastAPI parses the request body without a cipher in the validation context,
-    so an encrypted blob arrives as ``SecretStr("gAAAAA...")``. Without this
-    pass, ``store.save`` would re-encrypt the blob, producing a double-encrypted
-    value on disk that no longer round-trips. Plaintext input is left untouched.
-    """
-    updates: dict[str, SecretStr] = {}
-    for field in LLM_SECRET_FIELDS:
-        val = getattr(llm, field, None)
-        if not isinstance(val, SecretStr):
-            continue
-        raw = val.get_secret_value()
-        if not raw.startswith(_FERNET_TOKEN_PREFIX):
-            continue
-        decrypted = cipher.decrypt(raw)
-        if decrypted is not None:
-            updates[field] = decrypted
-    return llm.model_copy(update=updates) if updates else llm
-
-
 @profiles_router.get("", response_model=ProfileListResponse)
 async def list_profiles() -> ProfileListResponse:
     """List all saved LLM profiles."""
@@ -192,7 +163,7 @@ async def save_profile(
     server-side before re-encrypting with the storage cipher.
     """
     cipher = get_cipher(request)
-    llm = _decrypt_incoming_secrets(body.llm, cipher) if cipher else body.llm
+    llm = decrypt_incoming_llm_secrets(body.llm, cipher) if cipher else body.llm
     store = LLMProfileStore()
     try:
         with _store_errors():

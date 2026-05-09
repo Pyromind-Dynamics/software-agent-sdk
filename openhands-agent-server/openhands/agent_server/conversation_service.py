@@ -968,7 +968,7 @@ class AutoTitleSubscriber(Subscriber):
             from openhands.sdk.llm.llm_profile_store import LLMProfileStore
 
             profile_store = LLMProfileStore()
-            return profile_store.load(profile_name)
+            return profile_store.load(profile_name, cipher=self.service.cipher)
         except (FileNotFoundError, ValueError) as e:
             logger.warning(
                 f"Failed to load title LLM profile '{profile_name}': {e}. "
