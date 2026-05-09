@@ -130,6 +130,8 @@ When reviewing code, provide constructive feedback:
 - Tool availability filtering belongs in `openhands-sdk/openhands/sdk/tool/registry.py` via `list_usable_tools()`, which preserves registration order and defaults tools to usable unless they expose an `is_usable()` callable. Environment-specific checks like Chromium detection should live on the concrete tool class (`BrowserToolSet.is_usable()`), while agent-server surfaces such as `/server_info` should consume the registry helper rather than re-implement per-tool filtering.
 - Pydantic secret field helpers live in `openhands-sdk/openhands/sdk/utils/pydantic_secrets.py`. `serialize_secret()` handles serialization (cipher / `expose_secrets` / default Pydantic masking); `validate_secret()` handles deserialization (cipher decryption, redacted/empty → `None`); `is_redacted_secret()` checks for the sentinel; `REDACTED_SECRET_VALUE` is the canonical sentinel string. For `dict[str, str]` fields whose values are all secrets, wrap each value in `SecretStr` and call `serialize_secret` per value (see `LookupSecret._serialize_secrets` and `ACPAgent._serialize_acp_env`). Do not hand-roll redaction logic in field serializers.
 
+- `LookupSecret` normalizes hostless URLs against `OH_INTERNAL_SERVER_URL` (set by `openhands-agent-server.__main__` from the bound host/port, rewriting wildcard binds to loopback) and otherwise falls back to `http://127.0.0.1:8000`, so relative secret URLs can safely target the current agent-server instance.
+
 
 
 
