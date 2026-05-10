@@ -568,7 +568,7 @@ class EventService:
         # the wiring lets us log the decision so operators can tell from a
         # log line whether deltas will flow.
         streaming_enabled = any(llm.stream for llm in agent.get_all_llms())
-        logger.info(
+        logger.debug(
             "Token streaming: %s",
             "enabled" if streaming_enabled else "disabled (no LLM has stream=True)",
         )

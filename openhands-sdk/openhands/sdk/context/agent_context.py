@@ -165,7 +165,7 @@ class AgentContext(BaseModel):
             if name not in existing_names:
                 self.skills.append(skill)
             else:
-                logger.warning(
+                logger.debug(
                     f"Skipping auto-loaded skill '{name}' (already in explicit skills)"
                 )
 
