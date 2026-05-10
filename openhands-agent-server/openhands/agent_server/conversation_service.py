@@ -171,15 +171,15 @@ def _prepare_request_workspace(
     if worktree is None:
         return request
 
-    workspace, source_workspace, worktree_root, branch = worktree
+    new_workspace, source_workspace, worktree_root, branch = worktree
     agent = _append_worktree_guidance(
         request.agent,
         source_workspace=source_workspace,
         worktree_root=worktree_root,
-        workspace_dir=Path(workspace.working_dir),
+        workspace_dir=Path(new_workspace.working_dir),
         branch=branch,
     )
-    return request.model_copy(update={"workspace": workspace, "agent": agent})
+    return request.model_copy(update={"workspace": new_workspace, "agent": agent})
 
 
 logger = logging.getLogger(__name__)

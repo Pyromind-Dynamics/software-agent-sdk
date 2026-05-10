@@ -765,7 +765,14 @@ class OpenHandsAgentSettings(AgentSettingsBase):
         if value is None:
             return {}
         dumped = value.model_dump(exclude_none=True, exclude_defaults=True)
-        if info.context and info.context.get("expose_secrets"):
+        # Pass through real env / headers when the caller has signalled trust:
+        # either ``expose_secrets`` (REST plaintext / encrypted modes) or a
+        # ``cipher`` (on-disk persistence path — the storage layer applies its
+        # own access controls and SecretStr fields are encrypted via
+        # ``serialize_secret``). Without one of those signals, fall back to
+        # redacting ``env`` / ``headers`` for the default REST response.
+        ctx = info.context or {}
+        if ctx.get("expose_secrets") or ctx.get("cipher") is not None:
             return dumped
         # ``sanitize_dict`` redacts ``env`` / ``headers`` (REDACT_ALL_VALUES_KEYS).
         return sanitize_dict(dumped)

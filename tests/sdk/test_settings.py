@@ -804,6 +804,43 @@ def test_openhands_agent_settings_mcp_config_redacts_env_and_headers() -> None:
     assert leaky["headers"]["Authorization"] == "Bearer tok-mcp-secret"
 
 
+def test_openhands_agent_settings_mcp_config_passes_through_with_cipher() -> None:
+    """Regression: when a cipher is in the serialization context (the on-disk
+    persistence path), MCP ``env`` / ``headers`` values must round-trip
+    verbatim instead of being overwritten with the literal ``"<redacted>"``.
+
+    Previously the field serializer only checked ``expose_secrets``, so saving
+    settings via ``FileSettingsStore`` (which passes ``{"cipher": cipher}``)
+    irreversibly destroyed every user's MCP credentials.
+    """
+    from openhands.sdk.utils.cipher import Cipher
+
+    mcp_config = MCPConfig.model_validate(
+        {
+            "mcpServers": {
+                "github": {
+                    "command": "uvx",
+                    "args": ["mcp-server-github"],
+                    "env": {"GITHUB_TOKEN": "ghp-mcp-secret"},
+                },
+                "fetch": {
+                    "url": "https://example.com/mcp",
+                    "headers": {"Authorization": "Bearer tok-mcp-secret"},
+                },
+            }
+        }
+    )
+    settings = OpenHandsAgentSettings(mcp_config=mcp_config)
+    cipher = Cipher(secret_key="test-encryption-key")
+
+    dumped = settings.model_dump(mode="json", context={"cipher": cipher})
+
+    servers = dumped["mcp_config"]["mcpServers"]
+    assert servers["github"]["env"]["GITHUB_TOKEN"] == "ghp-mcp-secret"
+    assert servers["fetch"]["headers"]["Authorization"] == "Bearer tok-mcp-secret"
+    assert "<redacted>" not in str(dumped)
+
+
 def test_openhands_agent_settings_create_agent_keeps_real_mcp_secrets() -> None:
     # create_agent must hand the runtime real env/headers (the field serializer
     # redacts mcp_config for transit only).
