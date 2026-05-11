@@ -109,6 +109,21 @@ jobs:
 
                   echo "🐳 Dispatched server.yml image build for v${VERSION}"
 
+            - name: Dispatch release binaries workflow
+              # Same GITHUB_TOKEN limitation applies to release-binaries.yml
+              # which triggers on release:published events.
+              if: steps.check.outputs.exists == 'false'
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  VERSION: ${{ steps.version.outputs.version }}
+              run: |
+                  gh workflow run release-binaries.yml \
+                    --repo "${{ github.repository }}" \
+                    --ref "v${VERSION}" \
+                    -f release_tag="v${VERSION}"
+
+                  echo "📦 Dispatched release-binaries.yml for v${VERSION}"
+
             - name: Summary
               env:
                   VERSION: ${{ steps.version.outputs.version }}
@@ -120,3 +135,4 @@ jobs:
                   echo "" >> "$GITHUB_STEP_SUMMARY"
                   echo "The \`pypi-release.yml\` workflow was dispatched to publish packages to PyPI." >> "$GITHUB_STEP_SUMMARY"
                   echo "The \`server.yml\` workflow was dispatched to build versioned Docker images." >> "$GITHUB_STEP_SUMMARY"
+                  echo "The \`release-binaries.yml\` workflow was dispatched to build and attach release binaries." >> "$GITHUB_STEP_SUMMARY"
