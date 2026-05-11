@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 from base64 import urlsafe_b64encode
@@ -241,18 +242,15 @@ def test_patch_settings_updates_llm_config(client_with_settings):
     assert body["llm_api_key_is_set"] is True
 
 
-def test_patch_settings_persists_mcp_env_vars_verbatim(
+def test_patch_settings_encrypts_mcp_env_and_headers_on_disk(
     client_with_settings, temp_persistence_dir
 ):
-    """PATCH /api/settings must NOT replace MCP env / headers with ``"<redacted>"``
-    on disk.
+    """PATCH /api/settings must encrypt MCP ``env`` / ``headers`` values at
+    rest with the configured cipher — the same way other secret fields are
+    persisted — and never write them as ``"<redacted>"`` or plaintext.
 
-    Regression for the bug where saving MCP settings caused env / header
-    values to be written to ``settings.json`` as the literal string
-    ``"<redacted>"`` — irreversibly losing the user's credentials. The
-    storage path passes a ``cipher`` (and no ``expose_secrets``) in the
-    serialization context, which the MCP serializer was previously
-    treating the same as an untrusted REST default.
+    Reading them back via ``X-Expose-Secrets: plaintext`` must round-trip
+    to the original values (decrypted on load).
     """
     response = client_with_settings.patch(
         "/api/settings",
@@ -276,14 +274,23 @@ def test_patch_settings_persists_mcp_env_vars_verbatim(
     )
     assert response.status_code == 200, response.text
 
-    # Inspect the on-disk settings.json: env / headers must be the values the
-    # client sent, not ``<redacted>``.
-    on_disk = (temp_persistence_dir / "settings.json").read_text()
-    assert "<redacted>" not in on_disk
-    assert "ghp-router-secret" in on_disk
-    assert "tok-router-secret" in on_disk
+    # Inspect the on-disk settings.json: plaintext must NOT appear, the
+    # values must be Fernet ciphertext.
+    on_disk_path = temp_persistence_dir / "settings.json"
+    on_disk_text = on_disk_path.read_text()
+    assert "<redacted>" not in on_disk_text
+    assert "ghp-router-secret" not in on_disk_text
+    assert "tok-router-secret" not in on_disk_text
 
-    # GET with plaintext returns the same round-tripped values.
+    on_disk = json.loads(on_disk_text)
+    servers_on_disk = on_disk["agent_settings"]["mcp_config"]["mcpServers"]
+    assert servers_on_disk["github"]["env"]["GITHUB_TOKEN"].startswith("gAAAA")
+    assert servers_on_disk["remote"]["headers"]["Authorization"].startswith("gAAAA")
+    # Non-secret structure must remain readable.
+    assert servers_on_disk["github"]["command"] == "uvx"
+    assert servers_on_disk["remote"]["url"] == "https://example.com/mcp"
+
+    # GET with plaintext decrypts and returns the original round-tripped values.
     response = client_with_settings.get(
         "/api/settings", headers={"X-Expose-Secrets": "plaintext"}
     )
