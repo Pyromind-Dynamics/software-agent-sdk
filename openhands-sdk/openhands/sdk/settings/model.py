@@ -294,65 +294,6 @@ class VerificationSettings(BaseModel):
         },
     )
 
-    # -- Deprecated (moved to ConversationSettings) --
-    confirmation_mode: bool = Field(
-        default=False,
-        description="Require user confirmation before executing risky actions.",
-        deprecated=(
-            "Deprecated in 1.17.0; use ConversationSettings.confirmation_mode "
-            "instead. Will be removed in 1.22.0."
-        ),
-        json_schema_extra={
-            SETTINGS_METADATA_KEY: SettingsFieldMetadata(
-                label="Confirmation mode",
-                prominence=SettingProminence.MAJOR,
-            ).model_dump()
-        },
-    )
-    security_analyzer: SecurityAnalyzerType | None = Field(
-        default=None,
-        description=("Security analyzer that evaluates actions before execution."),
-        deprecated=(
-            "Deprecated in 1.17.0; use ConversationSettings.security_analyzer "
-            "instead. Will be removed in 1.22.0."
-        ),
-        json_schema_extra={
-            SETTINGS_METADATA_KEY: SettingsFieldMetadata(
-                label="Security analyzer",
-                prominence=SettingProminence.MAJOR,
-                depends_on=("confirmation_mode",),
-            ).model_dump()
-        },
-    )
-
-    @field_validator("confirmation_mode", mode="before")
-    @classmethod
-    def _warn_confirmation_mode(cls, v: Any) -> Any:
-        if v:
-            from openhands.sdk.utils.deprecation import warn_deprecated
-
-            warn_deprecated(
-                "VerificationSettings.confirmation_mode",
-                deprecated_in="1.17.0",
-                removed_in="1.22.0",
-                details="Use ConversationSettings.confirmation_mode instead.",
-            )
-        return v
-
-    @field_validator("security_analyzer", mode="before")
-    @classmethod
-    def _warn_security_analyzer(cls, v: Any) -> Any:
-        if v is not None:
-            from openhands.sdk.utils.deprecation import warn_deprecated
-
-            warn_deprecated(
-                "VerificationSettings.security_analyzer",
-                deprecated_in="1.17.0",
-                removed_in="1.22.0",
-                details="Use ConversationSettings.security_analyzer instead.",
-            )
-        return v
-
 
 def _default_llm_settings() -> LLM:
     model = LLM.model_fields["model"].get_default()
@@ -362,7 +303,7 @@ def _default_llm_settings() -> LLM:
 
 _RequestT = TypeVar("_RequestT")
 
-AGENT_SETTINGS_SCHEMA_VERSION = 2
+AGENT_SETTINGS_SCHEMA_VERSION = 3
 CONVERSATION_SETTINGS_SCHEMA_VERSION = 1
 
 
@@ -484,7 +425,7 @@ def _migrate_agent_settings_v1_to_v2(payload: dict[str, Any]) -> dict[str, Any]:
     persisted payloads carried ``agent_kind: 'llm'``. The two classes are
     field-compatible (``LLMAgentSettings`` is a subclass of
     ``OpenHandsAgentSettings`` that only narrows the discriminator literal),
-    and ``LLMAgentSettings`` is scheduled for removal in v1.22.0. Rewriting
+    and ``LLMAgentSettings`` is scheduled for removal in v1.24.0. Rewriting
     the discriminator on read lets callers that explicitly validate as
     ``OpenHandsAgentSettings`` (the canonical class) accept legacy data
     without losing any fields.
@@ -493,6 +434,19 @@ def _migrate_agent_settings_v1_to_v2(payload: dict[str, Any]) -> dict[str, Any]:
     migrated["schema_version"] = 2
     if migrated.get("agent_kind") == "llm":
         migrated["agent_kind"] = "openhands"
+    return migrated
+
+
+def _migrate_agent_settings_v2_to_v3(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop deprecated verification fields moved to ``ConversationSettings``."""
+    migrated = dict(payload)
+    verification = migrated.get("verification")
+    if isinstance(verification, Mapping):
+        verification = dict(verification)
+        verification.pop("confirmation_mode", None)
+        verification.pop("security_analyzer", None)
+        migrated["verification"] = verification
+    migrated["schema_version"] = 3
     return migrated
 
 
@@ -507,6 +461,7 @@ def _migrate_conversation_settings_v0_to_v1(
 _AGENT_SETTINGS_MIGRATIONS: dict[int, PersistedSettingsMigrator] = {
     0: _migrate_agent_settings_v0_to_v1,
     1: _migrate_agent_settings_v1_to_v2,
+    2: _migrate_agent_settings_v2_to_v3,
 }
 _CONVERSATION_SETTINGS_MIGRATIONS: dict[int, PersistedSettingsMigrator] = {
     0: _migrate_conversation_settings_v0_to_v1,
@@ -1269,7 +1224,7 @@ class LLMAgentSettings(OpenHandsAgentSettings):
 
     Use :class:`OpenHandsAgentSettings` for all new code.
 
-    Scheduled for removal in v1.22.0.
+    Scheduled for removal in v1.24.0.
     """
 
     # Keep agent_kind as Literal["llm"] so the API-breakage checker sees no
@@ -1365,8 +1320,7 @@ class AgentSettings(LLMAgentSettings):
     * Use :func:`validate_agent_settings` to validate raw payloads
       into the correct variant.
 
-    Scheduled for removal in v1.22.0 (5 minor releases after the
-    discriminated-union landing in v1.17.1).
+    Scheduled for removal in v1.23.0.
     """
 
     @classmethod
@@ -1388,7 +1342,7 @@ class AgentSettings(LLMAgentSettings):
         warn_deprecated(
             "AgentSettings",
             deprecated_in="1.17.0",
-            removed_in="1.22.0",
+            removed_in="1.23.0",
             details=(
                 "Use ``OpenHandsAgentSettings`` (for an LLM agent) or "
                 "``ACPAgentSettings`` (for an ACP agent) directly; use "

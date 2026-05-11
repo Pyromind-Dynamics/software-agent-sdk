@@ -353,7 +353,7 @@ def test_agent_settings_from_persisted_migrates_v0_llm_payload() -> None:
     settings = AgentSettings.from_persisted({"llm": {"model": "test-model"}})
 
     assert isinstance(settings, OpenHandsAgentSettings)
-    assert settings.schema_version == 2
+    assert settings.schema_version == 3
     assert settings.agent_kind == "openhands"
     assert settings.llm.model == "test-model"
 
@@ -369,8 +369,8 @@ def test_agent_settings_from_persisted_dispatches_current_acp_payload() -> None:
     )
 
     assert isinstance(settings, ACPAgentSettings)
-    # v1 → v2 is a no-op for ACP payloads, but the schema_version is bumped.
-    assert settings.schema_version == 2
+    # v1 → v2 → v3 keeps ACP payloads intact while bumping schema_version.
+    assert settings.schema_version == 3
     assert settings.acp_command == ["npx", "-y", "claude-agent-acp"]
 
 
@@ -386,14 +386,35 @@ def test_agent_settings_from_persisted_canonicalizes_legacy_llm_kind() -> None:
     )
 
     assert isinstance(settings, OpenHandsAgentSettings)
-    assert settings.schema_version == 2
+    assert settings.schema_version == 3
     assert settings.agent_kind == "openhands"
     assert settings.llm.model == "legacy-model"
 
 
+def test_agent_settings_from_persisted_drops_legacy_verification_fields() -> None:
+    settings = AgentSettings.from_persisted(
+        {
+            "schema_version": 2,
+            "agent_kind": "openhands",
+            "verification": {
+                "critic_enabled": True,
+                "confirmation_mode": True,
+                "security_analyzer": "llm",
+            },
+        }
+    )
+
+    assert isinstance(settings, OpenHandsAgentSettings)
+    assert settings.schema_version == 3
+    verification = settings.verification.model_dump(mode="json")
+    assert verification["critic_enabled"] is True
+    assert "confirmation_mode" not in verification
+    assert "security_analyzer" not in verification
+
+
 def test_agent_settings_from_persisted_rejects_newer_schema_version() -> None:
-    with pytest.raises(ValueError, match="newer than supported version 2"):
-        AgentSettings.from_persisted({"schema_version": 3, "llm": {"model": "m"}})
+    with pytest.raises(ValueError, match="newer than supported version 3"):
+        AgentSettings.from_persisted({"schema_version": 4, "llm": {"model": "m"}})
 
 
 def test_conversation_settings_from_persisted_migrates_v0_payload() -> None:
@@ -654,7 +675,7 @@ def test_legacy_agent_settings_still_instantiates_as_llm_variant() -> None:
         settings = AgentSettings(llm=LLM(model="test-model"))
 
     # The legacy name emits a DeprecationWarning on construction. The
-    # warning's scheduled removal is in 1.22.0 per the class docstring.
+    # warning's scheduled removal is in 1.23.0 per the class docstring.
     assert any("AgentSettings" in str(w.message) for w in caught), (
         f"expected deprecation warning, got: {[str(w.message) for w in caught]}"
     )
