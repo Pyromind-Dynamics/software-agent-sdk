@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -69,6 +70,7 @@ class EventService:
     _lease: ConversationLease | None = field(default=None, init=False)
     _lease_generation: int | None = field(default=None, init=False)
     _lease_task: asyncio.Task | None = field(default=None, init=False)
+    _run_executor: ThreadPoolExecutor | None = field(default=None, init=False)
 
     @property
     def conversation_dir(self):
@@ -718,7 +720,7 @@ class EventService:
 
             async def _run_and_publish():
                 try:
-                    await loop.run_in_executor(None, conversation.run)
+                    await loop.run_in_executor(self._run_executor, conversation.run)
                 except Exception:
                     logger.exception("Error during conversation run")
                 finally:
