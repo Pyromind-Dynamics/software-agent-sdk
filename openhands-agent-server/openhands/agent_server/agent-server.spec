@@ -6,11 +6,16 @@ PyInstaller spec for OpenHands Agent Server with PEP 420 (implicit namespace) la
 from pathlib import Path
 import os
 import site
+import sys
 from PyInstaller.utils.hooks import (
     collect_submodules,
     collect_data_files,
     copy_metadata,
 )
+
+# GNU strip on Windows PE files (notably python3XX.dll) can corrupt the binary
+# and cause LoadLibrary to fail at runtime with "Invalid access to memory location".
+IS_WINDOWS = sys.platform == "win32"
 
 # Get the project root directory (current working directory when running PyInstaller)
 project_root = Path.cwd()
@@ -152,7 +157,7 @@ exe = EXE(
     name="openhands-agent-server",
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True,
+    strip=not IS_WINDOWS,
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
