@@ -72,6 +72,7 @@ class EventService:
     _lease: ConversationLease | None = field(default=None, init=False)
     _lease_generation: int | None = field(default=None, init=False)
     _lease_task: asyncio.Task | None = field(default=None, init=False)
+    _external_lease_renewal: bool = field(default=False, init=False)
     _run_executor: ThreadPoolExecutor | None = field(default=None, init=False)
 
     @property
@@ -103,15 +104,16 @@ class EventService:
             return nullcontext()
         return self._lease.guarded_write(self._lease_generation)
 
-    async def _renew_lease_loop(self) -> None:
+    def renew_lease(self) -> None:
+        """Renew this service's conversation lease.
+
+        Called by a centralized renewal loop (when ``_external_lease_renewal``
+        is True) or by the per-service ``_renew_lease_loop`` background task.
+        """
         if self._lease is None or self._lease_generation is None:
             return
         try:
-            while True:
-                await asyncio.sleep(LEASE_RENEW_INTERVAL_SECONDS)
-                self._lease.renew(self._lease_generation)
-        except asyncio.CancelledError:
-            raise
+            self._lease.renew(self._lease_generation)
         except ConversationOwnershipLostError:
             logger.warning(
                 "Conversation lease lost while renewing: %s",
@@ -122,6 +124,16 @@ class EventService:
                 "Failed to renew conversation lease for %s",
                 self.stored.id,
             )
+
+    async def _renew_lease_loop(self) -> None:
+        if self._lease is None or self._lease_generation is None:
+            return
+        try:
+            while True:
+                await asyncio.sleep(LEASE_RENEW_INTERVAL_SECONDS)
+                self.renew_lease()
+        except asyncio.CancelledError:
+            raise
 
     def get_conversation(self):
         if not self._conversation:
@@ -639,7 +651,8 @@ class EventService:
         conversation.set_security_analyzer(self.stored.security_analyzer)
         self._conversation = conversation
         self._conversation._state.set_write_guard(self._write_guard)
-        self._lease_task = asyncio.create_task(self._renew_lease_loop())
+        if not self._external_lease_renewal:
+            self._lease_task = asyncio.create_task(self._renew_lease_loop())
 
         # Register state change callback to automatically publish updates
         self._conversation._state.set_on_state_change(self._conversation._on_event)
