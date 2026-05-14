@@ -409,6 +409,50 @@ class TestSyncPublicSkills:
             assert success is False
             assert "failed" in message.lower() or "error" in message.lower()
 
+    def test_sync_public_skills_invalidates_in_memory_cache(self):
+        """Successful sync must drop the in-memory cache so the next call
+        re-parses immediately instead of waiting for the TTL."""
+        with (
+            patch(
+                "openhands.agent_server.skills_service.get_skills_cache_dir"
+            ) as mock_cache,
+            patch(
+                "openhands.agent_server.skills_service.update_skills_repository"
+            ) as mock_update,
+            patch(
+                "openhands.agent_server.skills_service._invalidate_public_skills_cache"
+            ) as mock_invalidate,
+        ):
+            mock_cache.return_value = Path("/tmp/cache")
+            mock_update.return_value = Path("/tmp/cache/public-skills")
+
+            success, _ = sync_public_skills()
+
+            assert success is True
+            mock_invalidate.assert_called_once()
+
+    def test_sync_public_skills_failure_does_not_invalidate_cache(self):
+        """A failed sync must not clobber the cache so the previous skills
+        stay available until the next successful refresh."""
+        with (
+            patch(
+                "openhands.agent_server.skills_service.get_skills_cache_dir"
+            ) as mock_cache,
+            patch(
+                "openhands.agent_server.skills_service.update_skills_repository"
+            ) as mock_update,
+            patch(
+                "openhands.agent_server.skills_service._invalidate_public_skills_cache"
+            ) as mock_invalidate,
+        ):
+            mock_cache.return_value = Path("/tmp/cache")
+            mock_update.return_value = None
+
+            success, _ = sync_public_skills()
+
+            assert success is False
+            mock_invalidate.assert_not_called()
+
 
 class TestSkillLoadResult:
     """Tests for SkillLoadResult dataclass."""
