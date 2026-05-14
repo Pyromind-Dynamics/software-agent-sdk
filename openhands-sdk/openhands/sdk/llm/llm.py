@@ -456,6 +456,8 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     _is_subscription: bool = PrivateAttr(default=False)
     _litellm_provider: str | None = PrivateAttr(default=None)
     _prompt_cache_key: str | None = PrivateAttr(default=None)
+    _effective_max_input_tokens: int | None = PrivateAttr(default=None)
+    _effective_max_output_tokens: int | None = PrivateAttr(default=None)
 
     model_config: ClassVar[ConfigDict] = ConfigDict(
         extra="ignore", arbitrary_types_allowed=True
@@ -789,7 +791,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         # 4) request context for telemetry (always include context_window for metrics)
         assert self._telemetry is not None
         # Always pass context_window so metrics are tracked even when logging disabled
-        telemetry_ctx: dict[str, Any] = {"context_window": self.max_input_tokens or 0}
+        telemetry_ctx: dict[str, Any] = {
+            "context_window": self.effective_max_input_tokens or 0
+        }
         if self._telemetry.log_enabled:
             telemetry_ctx.update(
                 {
@@ -937,7 +941,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         # Request context for telemetry (always include context_window for metrics)
         assert self._telemetry is not None
         # Always pass context_window so metrics are tracked even when logging disabled
-        telemetry_ctx: dict[str, Any] = {"context_window": self.max_input_tokens or 0}
+        telemetry_ctx: dict[str, Any] = {
+            "context_window": self.effective_max_input_tokens or 0
+        }
         if self._telemetry.log_enabled:
             telemetry_ctx.update(
                 {
@@ -1221,18 +1227,19 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             model=self._model_name_for_capabilities(),
         )
 
-        # Context window and max_output_tokens
+        self._effective_max_input_tokens = self.max_input_tokens
         if (
-            self.max_input_tokens is None
+            self._effective_max_input_tokens is None
             and self._model_info is not None
             and isinstance(self._model_info.get("max_input_tokens"), int)
         ):
-            self.max_input_tokens = self._model_info.get("max_input_tokens")
+            self._effective_max_input_tokens = self._model_info.get("max_input_tokens")
 
         # Validate context window size
         self._validate_context_window_size()
 
-        if self.max_output_tokens is None:
+        effective_max_output_tokens = self.max_output_tokens
+        if effective_max_output_tokens is None:
             if any(
                 m in self.model
                 for m in [
@@ -1241,16 +1248,19 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     "kimi-k2-thinking",
                 ]
             ):
-                self.max_output_tokens = (
+                effective_max_output_tokens = (
                     64000  # practical cap (litellm may allow 128k with header)
                 )
                 logger.debug(
-                    f"Setting max_output_tokens to {self.max_output_tokens} "
+                    f"Setting effective max_output_tokens to "
+                    f"{effective_max_output_tokens} "
                     f"for {self.model}"
                 )
             elif self._model_info is not None:
                 if isinstance(self._model_info.get("max_output_tokens"), int):
-                    self.max_output_tokens = self._model_info.get("max_output_tokens")
+                    effective_max_output_tokens = self._model_info.get(
+                        "max_output_tokens"
+                    )
                     # Guard: if max_output_tokens >= the context window,
                     # requesting that many output tokens would leave zero
                     # room for input and strict providers (e.g. AWS Bedrock)
@@ -1258,32 +1268,33 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     # headroom. We check both max_input_tokens and
                     # max_tokens since either may represent the context
                     # window depending on the provider.
-                    context_window = self.max_input_tokens or self._model_info.get(
-                        "max_tokens"
+                    context_window = (
+                        self.effective_max_input_tokens
+                        or self._model_info.get("max_tokens")
                     )
                     if (
                         context_window is not None
-                        and self.max_output_tokens is not None
-                        and self.max_output_tokens >= context_window
+                        and effective_max_output_tokens is not None
+                        and effective_max_output_tokens >= context_window
                     ):
-                        capped = self.max_output_tokens // 2
+                        capped = effective_max_output_tokens // 2
                         logger.debug(
                             "Capping max_output_tokens from %s to %s "
                             "for %s (max_output_tokens >= context "
                             "window %s)",
-                            self.max_output_tokens,
+                            effective_max_output_tokens,
                             capped,
                             self.model,
                             context_window,
                         )
-                        self.max_output_tokens = capped
+                        effective_max_output_tokens = capped
                 elif isinstance(self._model_info.get("max_tokens"), int):
                     # 'max_tokens' is ambiguous: some providers use it for total
                     # context window, not output limit. Cap it to avoid requesting
                     # output that exceeds the context window.
                     max_tokens_value = self._model_info.get("max_tokens")
                     assert isinstance(max_tokens_value, int)  # for type checker
-                    self.max_output_tokens = min(
+                    effective_max_output_tokens = min(
                         max_tokens_value, DEFAULT_MAX_OUTPUT_TOKENS_CAP
                     )
                     if max_tokens_value > DEFAULT_MAX_OUTPUT_TOKENS_CAP:
@@ -1291,19 +1302,24 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                             "Capping max_output_tokens from %s to %s for %s "
                             "(max_tokens may be context window, not output)",
                             max_tokens_value,
-                            self.max_output_tokens,
+                            effective_max_output_tokens,
                             self.model,
                         )
 
         if "o3" in self.model:
             o3_limit = 100000
-            if self.max_output_tokens is None or self.max_output_tokens > o3_limit:
-                self.max_output_tokens = o3_limit
+            if (
+                effective_max_output_tokens is None
+                or effective_max_output_tokens > o3_limit
+            ):
+                effective_max_output_tokens = o3_limit
                 logger.debug(
-                    "Clamping max_output_tokens to %s for %s",
-                    self.max_output_tokens,
+                    "Clamping effective max_output_tokens to %s for %s",
+                    effective_max_output_tokens,
                     self.model,
                 )
+
+        self._effective_max_output_tokens = effective_max_output_tokens
 
     def _validate_context_window_size(self) -> None:
         """Validate that the context window is large enough for OpenHands."""
@@ -1316,13 +1332,13 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             return
 
         # Unknown context window - cannot validate
-        if self.max_input_tokens is None:
+        if self.effective_max_input_tokens is None:
             return
 
         # Check minimum requirement
-        if self.max_input_tokens < MIN_CONTEXT_WINDOW_TOKENS:
+        if self.effective_max_input_tokens < MIN_CONTEXT_WINDOW_TOKENS:
             raise LLMContextWindowTooSmallError(
-                self.max_input_tokens, MIN_CONTEXT_WINDOW_TOKENS
+                self.effective_max_input_tokens, MIN_CONTEXT_WINDOW_TOKENS
             )
 
     def vision_is_active(self) -> bool:
@@ -1379,6 +1395,24 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     def model_info(self) -> dict | None:
         """Returns the model info dictionary."""
         return self._model_info
+
+    @property
+    def effective_max_input_tokens(self) -> int | None:
+        """Resolved context window used at runtime.
+
+        ``max_input_tokens`` remains the user-configured value. When it is
+        unset, this property reflects the value discovered from model metadata.
+        """
+        return self.max_input_tokens or self._effective_max_input_tokens
+
+    @property
+    def effective_max_output_tokens(self) -> int | None:
+        """Resolved output token limit used at runtime.
+
+        ``max_output_tokens`` remains the user-configured value. When it is
+        unset, this property reflects provider/model defaults and safety caps.
+        """
+        return self.max_output_tokens or self._effective_max_output_tokens
 
     # =========================================================================
     # Utilities preserved from previous class

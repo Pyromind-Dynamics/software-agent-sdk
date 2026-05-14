@@ -14,12 +14,13 @@ def select_chat_options(
     This keeps the exact provider-aware mappings and precedence.
     """
     # First pass: apply simple defaults without touching user-supplied values
+    max_output_tokens = llm.effective_max_output_tokens
     defaults: dict[str, Any] = {
         "top_k": llm.top_k,
         "top_p": llm.top_p,
         "temperature": llm.temperature,
         # OpenAI-compatible param is `max_completion_tokens`
-        "max_completion_tokens": llm.max_output_tokens,
+        "max_completion_tokens": max_output_tokens,
     }
     out = apply_defaults_if_absent(user_kwargs, defaults)
 
@@ -47,10 +48,13 @@ def select_chat_options(
 
     # Extended thinking models
     if get_features(llm.model).supports_extended_thinking:
-        if llm.extended_thinking_budget:
+        if llm.extended_thinking_budget and max_output_tokens:
             # Anthropic throws errors if thinking budget equals or exceeds max output
             # tokens -- force the thinking budget lower if there's a conflict
-            budget_tokens = min(llm.extended_thinking_budget, llm.max_output_tokens - 1)
+            budget_tokens = min(
+                llm.extended_thinking_budget,
+                max_output_tokens - 1,
+            )
             out["thinking"] = {
                 "type": "enabled",
                 "budget_tokens": budget_tokens,
@@ -63,7 +67,7 @@ def select_chat_options(
                 **existing,
             }
             # Fix litellm behavior
-            out["max_tokens"] = llm.max_output_tokens
+            out["max_tokens"] = max_output_tokens
         # Anthropic models ignore temp/top_p
         out.pop("temperature", None)
         out.pop("top_p", None)

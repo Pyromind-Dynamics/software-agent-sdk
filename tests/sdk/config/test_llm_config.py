@@ -23,8 +23,10 @@ def test_llm_config_defaults():
     assert config.temperature is None  # None to use provider defaults
     assert config.top_p is None  # None to use provider defaults
     assert config.top_k is None
-    assert config.max_input_tokens == 128000  # Auto-populated from model info
-    assert config.max_output_tokens == 16384  # Auto-populated from model info
+    assert config.max_input_tokens is None  # None means use discovered value
+    assert config.max_output_tokens is None  # None means use discovered value
+    assert config.effective_max_input_tokens == 128000
+    assert config.effective_max_output_tokens == 16384
     assert config.input_cost_per_token is None
     assert config.output_cost_per_token is None
     assert config.ollama_base_url is None
@@ -340,12 +342,10 @@ def test_llm_config_optional_fields():
     assert config.aws_region_name is None
     assert config.timeout is None
     assert config.top_k is None
-    assert (
-        config.max_input_tokens == 128000
-    )  # Auto-populated from model info even when set to None
-    assert (
-        config.max_output_tokens == 16384
-    )  # Auto-populated from model info even when set to None
+    assert config.max_input_tokens is None
+    assert config.max_output_tokens is None
+    assert config.effective_max_input_tokens == 128000
+    assert config.effective_max_output_tokens == 16384
     assert config.input_cost_per_token is None
     assert config.output_cost_per_token is None
     assert config.ollama_base_url is None

@@ -18,7 +18,7 @@ def select_responses_options(
     # Note: max_output_tokens is not supported in subscription mode
     defaults = {}
     if not llm.is_subscription:
-        defaults["max_output_tokens"] = llm.max_output_tokens
+        defaults["max_output_tokens"] = llm.effective_max_output_tokens
     out = apply_defaults_if_absent(user_kwargs, defaults)
 
     # Enforce sampling/tool behavior for Responses path

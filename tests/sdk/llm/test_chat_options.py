@@ -20,6 +20,10 @@ class DummyLLM:
     prompt_cache_retention: str | None = "24h"
     _prompt_cache_key: str | None = None
 
+    @property
+    def effective_max_output_tokens(self) -> int:
+        return self.max_output_tokens
+
 
 def test_opus_4_5_uses_reasoning_effort_and_strips_temp_top_p():
     llm = DummyLLM(
