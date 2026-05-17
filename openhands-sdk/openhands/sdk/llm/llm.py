@@ -153,7 +153,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     API authentication, retry logic, and tool calling capabilities.
 
     Attributes:
-        model: Model name (e.g., "claude-sonnet-4-20250514").
+        model: Model name (e.g., "gpt-5.5").
         api_key: API key for authentication.
         base_url: Custom API base URL.
         num_retries: Number of retry attempts for failed requests.
@@ -165,7 +165,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         from pydantic import SecretStr
 
         llm = LLM(
-            model="claude-sonnet-4-20250514",
+            model="gpt-5.5",
             api_key=SecretStr("your-api-key"),
             usage_id="my-agent"
         )
@@ -178,7 +178,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     # =========================================================================
 
     model: str = Field(
-        default="claude-sonnet-4-20250514",
+        default="gpt-5.5",
         description="Model name.",
         json_schema_extra=field_meta(SettingProminence.CRITICAL),
     )
