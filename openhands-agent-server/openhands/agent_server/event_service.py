@@ -740,8 +740,9 @@ class EventService:
         immediately.  When possible, the conversation is driven via its native
         ``arun()`` coroutine so LLM I/O does not tie up a thread-pool worker.
         For conversations that do not expose ``arun()`` (e.g., custom
-        subclasses), the synchronous ``run()`` is executed in the thread pool as
-        before.
+        subclasses) or whose agent only implements sync ``step()`` (no
+        ``astep()`` override), the synchronous ``run()`` is executed
+        in the thread pool as before.
 
         Raises:
             ValueError: If the service is inactive or conversation is already running.
@@ -773,19 +774,23 @@ class EventService:
                     # loop is free during LLM I/O.  Fall back to thread-pool
                     # execution for backward compatibility.
                     #
-                    # Both guards are required:
+                    # All guards are required:
                     #  • iscoroutinefunction – filters out non-async objects
                     #    (e.g. MagicMock in tests).
-                    #  • override check – BaseConversation defines a default
-                    #    ``async def arun()`` that delegates to sync ``run()``,
-                    #    so iscoroutinefunction alone is always True for real
-                    #    subclasses.  We detect an *actual* override to avoid
-                    #    running a sync-only subclass on the event loop.
+                    #  • conversation override – BaseConversation's default
+                    #    ``arun()`` delegates to sync ``run()``, so we require an
+                    #    *actual* override to avoid running a sync-only subclass
+                    #    on the event loop.
+                    #  • agent override – ``LocalConversation`` always overrides
+                    #    ``arun()``, but an agent without an ``astep()`` override
+                    #    runs sync ``step()`` in a worker thread; route it
+                    #    through sync ``run()`` instead.
                     arun = getattr(conversation, "arun", None)
                     has_native_arun = (
                         arun is not None
                         and asyncio.iscoroutinefunction(arun)
                         and type(conversation).arun is not BaseConversation.arun
+                        and type(conversation.agent).astep is not AgentBase.astep
                     )
                     if has_native_arun:
                         await conversation.arun()

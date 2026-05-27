@@ -22,7 +22,7 @@ from openhands.agent_server.models import (
     StoredConversation,
 )
 from openhands.agent_server.pub_sub import Subscriber
-from openhands.sdk import LLM, Agent, Conversation, Message
+from openhands.sdk import LLM, Agent, AgentBase, Conversation, Message
 from openhands.sdk.conversation.fifo_lock import FIFOLock
 from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
@@ -2024,6 +2024,17 @@ class TestSearchEventsBlockedByRunLoop:
         )
 
 
+class _SyncOnlyAgent(AgentBase):
+    """Agent that only implements sync step() (no astep override).
+
+    Defined at module level (not inside a test) because ``AgentBase`` is a
+    discriminated-union member and local classes cannot be registered.
+    """
+
+    def step(self, conversation, on_event, on_token=None):
+        pass
+
+
 class TestEventServiceClose:
     """Tests for EventService.close() awaiting conversation teardown."""
 
@@ -2253,6 +2264,65 @@ class TestEventServiceClose:
         assert run_thread_id is not None, "run() was never called"
         assert run_thread_id != event_loop_thread, (
             "run() executed on the event loop thread — expected thread-pool"
+        )
+
+    async def test_run_uses_executor_for_sync_only_agent(self, event_service):
+        """EventService.run() must use the thread-pool executor when the
+        agent only implements sync step() (no astep() override), even if the
+        conversation overrides arun().  ``LocalConversation`` always overrides
+        arun(), so the conversation-level guard alone would route sync-only
+        custom agents through the native async path, running their sync
+        step() in a worker thread while arun() holds the state lock on the
+        event-loop thread (B5)."""
+        from openhands.sdk.conversation.base import BaseConversation
+
+        run_called = False
+        arun_called = False
+        agent = _SyncOnlyAgent(llm=LLM(model="gpt-4o", usage_id="sync-only"))
+
+        # Stand-in conversation that overrides arun() (like LocalConversation)
+        # but wraps a sync-only agent.  Only the dispatch-relevant members are
+        # implemented.
+        class AsyncConvSyncAgent:
+            def __init__(self):
+                self.agent = agent
+
+            async def arun(self):
+                nonlocal arun_called
+                arun_called = True
+
+            def run(self):
+                nonlocal run_called
+                run_called = True
+
+        conv = AsyncConvSyncAgent()
+        event_service._conversation = conv  # type: ignore[assignment]
+
+        # Sanity: conversation overrides arun() but the agent inherits the
+        # default astep(), so the native async path must NOT be taken.
+        assert type(conv).arun is not BaseConversation.arun
+        assert type(conv.agent).astep is AgentBase.astep
+
+        with (
+            patch.object(
+                type(event_service),
+                "_get_execution_status",
+                new_callable=AsyncMock,
+                return_value=ConversationExecutionStatus.PAUSED,
+            ),
+            patch.object(
+                type(event_service),
+                "_publish_state_update",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await event_service.run()
+            # Give the background task a moment to execute
+            await asyncio.sleep(0.3)
+
+        assert run_called, "sync run() was never called"
+        assert not arun_called, (
+            "arun() was used for a sync-only agent — expected sync run()"
         )
 
 
