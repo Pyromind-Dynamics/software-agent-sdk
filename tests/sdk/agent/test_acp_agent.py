@@ -19,6 +19,7 @@ from openhands.sdk.agent.acp_agent import (
     _image_url_to_acp_block,
     _maybe_set_session_model,
     _OpenHandsACPBridge,
+    _reapply_session_model_on_resume,
     _select_auth_method,
     _serialize_tool_content,
 )
@@ -3236,7 +3237,10 @@ class TestMaybeSetSessionModel:
         )
 
     @pytest.mark.asyncio
-    async def test_non_codex_agent_skips_protocol_override(self):
+    async def test_meta_key_provider_skips_protocol_override_at_init(self):
+        # claude-agent-acp selects its *initial* model via session _meta, so the
+        # one-shot init set_session_model call is skipped (even though the
+        # provider now supports the protocol call for runtime switches).
         conn = AsyncMock()
         await _maybe_set_session_model(
             conn,
@@ -3251,6 +3255,216 @@ class TestMaybeSetSessionModel:
         conn = AsyncMock()
         await _maybe_set_session_model(conn, "codex-acp", "session-1", None)
         conn.set_session_model.assert_not_called()
+
+
+class TestReapplySessionModelOnResume:
+    """Resume reapplies the persisted model via the runtime-switch gate."""
+
+    @pytest.mark.asyncio
+    async def test_claude_reapplies_persisted_model_on_resume(self):
+        # claude selects its initial model via _meta (supports_set_session_model
+        # =False) but DOES support set_session_model for runtime switches.
+        # load_session() carries no _meta, so on resume the persisted model must
+        # be reapplied via the runtime-switch gate — _maybe_set_session_model
+        # would skip it.
+        conn = AsyncMock()
+        await _reapply_session_model_on_resume(
+            conn, "claude-agent-acp", "sess-1", "claude-haiku-4-5-20251001"
+        )
+        conn.set_session_model.assert_awaited_once_with(
+            model_id="claude-haiku-4-5-20251001", session_id="sess-1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_codex_reapplies_persisted_model_on_resume(self):
+        conn = AsyncMock()
+        await _reapply_session_model_on_resume(
+            conn, "codex-acp", "sess-1", "gpt-5.4/low"
+        )
+        conn.set_session_model.assert_awaited_once_with(
+            model_id="gpt-5.4/low", session_id="sess-1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_model_skips_reapply(self):
+        conn = AsyncMock()
+        await _reapply_session_model_on_resume(conn, "claude-agent-acp", "sess-1", None)
+        conn.set_session_model.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unknown_provider_attempts_reapply(self):
+        # provider=None (custom server) is allowed to attempt the switch by
+        # set_acp_model, and such switches are persisted as authoritative — so
+        # resume must mirror that and attempt the reapply too (otherwise the
+        # resumed session would silently revert to the server default).
+        conn = AsyncMock()
+        await _reapply_session_model_on_resume(
+            conn, "some-custom-acp", "sess-1", "whatever"
+        )
+        conn.set_session_model.assert_awaited_once_with(
+            model_id="whatever", session_id="sess-1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_known_unsupported_provider_skips_reapply(self):
+        from openhands.sdk.settings.acp_providers import ACPProviderInfo
+
+        unsupported = ACPProviderInfo(
+            key="legacy",
+            display_name="Legacy",
+            default_command=("legacy",),
+            api_key_env_var=None,
+            base_url_env_var=None,
+            default_session_mode="default",
+            agent_name_patterns=("legacy",),
+            supports_set_session_model=False,
+            supports_runtime_model_switch=False,
+            session_meta_key=None,
+        )
+        conn = AsyncMock()
+        with patch(
+            "openhands.sdk.agent.acp_agent.detect_acp_provider_by_agent_name",
+            return_value=unsupported,
+        ):
+            await _reapply_session_model_on_resume(conn, "legacy-acp", "sess-1", "x")
+        conn.set_session_model.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_client_rejection_is_swallowed_on_resume(self):
+        # A client/protocol rejection (method-not-found = server doesn't support
+        # the call, or invalid model id) must not break resume — mirrors the
+        # load_session fallback. The error is logged, not raised.
+        conn = AsyncMock()
+        conn.set_session_model.side_effect = ACPRequestError(
+            code=-32601, message="method not found"
+        )
+        await _reapply_session_model_on_resume(
+            conn, "some-custom-acp", "sess-1", "whatever"
+        )
+        conn.set_session_model.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_any_request_error_is_swallowed_on_resume(self):
+        # Any ACPRequestError (here a -32603 server error) is tolerated on
+        # resume — like the load_session fallback — so a flaky/stale server
+        # can't break session startup; the session keeps the server default.
+        conn = AsyncMock()
+        conn.set_session_model.side_effect = ACPRequestError(
+            code=-32603, message="internal error"
+        )
+        await _reapply_session_model_on_resume(
+            conn, "codex-acp", "sess-1", "gpt-5.4/low"
+        )
+        conn.set_session_model.assert_awaited_once()
+
+
+class TestSetACPModel:
+    """Runtime (mid-conversation) model switching via set_session_model."""
+
+    @staticmethod
+    def _wire(agent: ACPAgent, agent_name: str) -> ACPAgent:
+        agent._conn = MagicMock()
+        agent._session_id = "sess-1"
+        agent._agent_name = agent_name
+        executor = MagicMock()
+        executor.run_async = MagicMock()
+        agent._executor = executor
+        return agent
+
+    def test_switches_model_on_live_codex_session(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+        agent.set_acp_model("gpt-5.4/low")
+        agent._conn.set_session_model.assert_called_once_with(
+            model_id="gpt-5.4/low", session_id="sess-1"
+        )
+        agent._executor.run_async.assert_called_once()
+        # Sentinel LLM + metrics reflect the live model for cost/token tracking.
+        assert agent.llm.model == "gpt-5.4/low"
+        assert agent.llm.metrics.model_name == "gpt-5.4/low"
+
+    def test_claude_provider_supports_runtime_switch(self):
+        agent = self._wire(_make_agent(), "claude-agent-acp")
+        agent.set_acp_model("claude-haiku-4-5-20251001")
+        agent._conn.set_session_model.assert_called_once_with(
+            model_id="claude-haiku-4-5-20251001", session_id="sess-1"
+        )
+
+    def test_unknown_provider_still_attempts_switch(self):
+        # A custom/unrecognised server (provider=None) is allowed to attempt
+        # the call; the ACP layer errors if it isn't actually supported.
+        agent = self._wire(_make_agent(), "some-custom-acp")
+        agent.set_acp_model("whatever")
+        agent._conn.set_session_model.assert_called_once()
+
+    def test_rejects_empty_model(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+        with pytest.raises(ValueError, match="non-empty"):
+            agent.set_acp_model("   ")
+        agent._conn.set_session_model.assert_not_called()
+
+    def test_raises_before_session_initialized(self):
+        agent = _make_agent()  # no _conn / _session_id / _executor
+        with pytest.raises(RuntimeError, match="not initialized"):
+            agent.set_acp_model("gpt-5.4")
+
+    def test_raises_for_provider_without_protocol_support(self):
+        from openhands.sdk.settings.acp_providers import ACPProviderInfo
+
+        unsupported = ACPProviderInfo(
+            key="legacy",
+            display_name="Legacy",
+            default_command=("legacy",),
+            api_key_env_var=None,
+            base_url_env_var=None,
+            default_session_mode="default",
+            agent_name_patterns=("legacy",),
+            supports_set_session_model=False,
+            supports_runtime_model_switch=False,
+            session_meta_key=None,
+        )
+        agent = self._wire(_make_agent(), "legacy-acp")
+        with patch(
+            "openhands.sdk.agent.acp_agent.detect_acp_provider_by_agent_name",
+            return_value=unsupported,
+        ):
+            with pytest.raises(ValueError, match="does not support runtime"):
+                agent.set_acp_model("x")
+        agent._conn.set_session_model.assert_not_called()
+
+    def test_translates_acp_request_error_to_value_error(self):
+        # A protocol-level rejection (e.g. method-not-found on a custom server,
+        # or an invalid model id) must surface as a ValueError — not leak as a
+        # raw acp.exceptions.RequestError — so the agent-server maps it to 400.
+        agent = self._wire(_make_agent(), "codex-acp")
+        agent._executor.run_async.side_effect = ACPRequestError(
+            code=-32601, message="method not found"
+        )
+        with pytest.raises(ValueError, match="rejected set_session_model"):
+            agent.set_acp_model("bogus-model")
+        # The sentinel LLM must not be mutated when the switch fails.
+        assert agent.llm.model != "bogus-model"
+
+    def test_propagates_server_internal_error(self):
+        # JSON-RPC -32603 is a server-internal failure, not a bad client
+        # request. It must propagate (as the raw ACPRequestError -> 5xx) rather
+        # than be mislabeled as a 400-class ValueError, mirroring the retriable
+        # handling on the prompt path.
+        agent = self._wire(_make_agent(), "codex-acp")
+        agent._executor.run_async.side_effect = ACPRequestError(
+            code=-32603, message="internal error"
+        )
+        with pytest.raises(ACPRequestError):
+            agent.set_acp_model("some-model")
+        # The sentinel LLM must not be mutated when the switch fails.
+        assert agent.llm.model != "some-model"
+
+    def test_passes_timeout_to_run_async(self):
+        # The protocol round-trip runs under the conversation state lock, so it
+        # must be bounded to avoid wedging the lock if the server never answers.
+        agent = self._wire(_make_agent(acp_prompt_timeout=42.0), "codex-acp")
+        agent.set_acp_model("gpt-5.4/low")
+        _, kwargs = agent._executor.run_async.call_args
+        assert kwargs["timeout"] == 42.0
 
 
 # ---------------------------------------------------------------------------

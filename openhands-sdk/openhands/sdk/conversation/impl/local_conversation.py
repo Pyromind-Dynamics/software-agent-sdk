@@ -704,6 +704,59 @@ class LocalConversation(BaseConversation):
             cached = loaded.model_copy(update={"usage_id": usage_id})
         self.switch_llm(cached)
 
+    def switch_acp_model(self, model: str) -> None:
+        """Switch the model on a running ACP conversation (mid-conversation).
+
+        Unlike :meth:`switch_llm`, which swaps OpenHands' own LLM object, this
+        issues a protocol-level ``session/set_model`` call to the ACP
+        subprocess so the new model applies to subsequent turns of the *same*
+        session, preserving conversation context. ``switch_llm`` would not
+        affect an ACP conversation, since the subprocess owns its own model.
+
+        Args:
+            model: Provider-specific model id to switch to.
+
+        Raises:
+            ValueError: If the conversation's agent is not an :class:`ACPAgent`,
+                or the provider does not support runtime model switching, or
+                the ACP server rejects the switch.
+            RuntimeError: If the ACP session is not yet initialized.
+            TimeoutError: If the ACP server does not respond within
+                ``acp_prompt_timeout`` seconds.
+        """
+        if not isinstance(self.agent, ACPAgent):
+            raise ValueError(
+                "switch_acp_model is only supported for ACP conversations."
+            )
+        with self._state:
+            # Perform the live protocol switch first; if it fails we leave the
+            # persisted state untouched.
+            self.agent.set_acp_model(model)
+            # Persist the switched model as the authoritative value. ``acp_model``
+            # is frozen, so we replace the agent with a copy carrying the new
+            # value. This matters on two counts the in-place mutation missed:
+            #   1. A fresh object identity makes the autosave path actually
+            #      write base_state.json (re-assigning the same object is a
+            #      no-op because old == new).
+            #   2. model_post_init / _start_acp_server derive the sentinel model
+            #      and the resumed session model from ``acp_model`` on reload, so
+            #      it must hold the switched value, not the construction-time one.
+            #
+            # model_copy is shallow, so the copy shares the live ACP runtime
+            # (_conn/_executor/_process) with the old agent. Disarm the old
+            # agent's finalizer before dropping it: otherwise ACPAgent.__del__
+            # -> close() on the discarded agent would tear down the session the
+            # copy now owns, leaving the next turn pointing at a dead connection.
+            old_agent = self.agent
+            new_agent = old_agent.model_copy(update={"acp_model": model})
+            old_agent.release_runtime()
+            # ``self.agent`` is the live reference used by subsequent ``step()``
+            # calls; ``self._state.agent`` is what the autosave path serializes
+            # to base_state.json. Update both so the running conversation and the
+            # persisted state agree on the switched model.
+            self.agent = new_agent
+            self._state.agent = new_agent
+
     @observe(name="conversation.send_message")
     def send_message(self, message: str | Message, sender: str | None = None) -> None:
         """Send a message to the agent.
