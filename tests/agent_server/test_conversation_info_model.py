@@ -140,6 +140,40 @@ def test_current_model_id_propagates_init_resolution(
     assert info.current_model_id == expected
 
 
+def test_cold_read_falls_back_to_acp_model_override():
+    """Cold list read (``init_state`` not fired): with no live/persisted current
+    id, the serialized ``acp_model`` is the best last-known hint and is surfaced.
+    """
+    agent = ACPAgent(acp_command=["echo", "test"], acp_model="model-x")
+    # _initialized defaults to False (cold read); _current_model_id defaults None.
+    state = _make_state(agent)
+    stored = _make_stored(state)
+
+    info = _compose_conversation_info(stored, state)
+
+    assert info.current_model_id == "model-x"
+
+
+def test_live_agent_does_not_fall_back_to_unapplied_override():
+    """Live initialized agent whose override was NOT applied (e.g. a resume whose
+    ``set_session_model`` the server rejected): ``current_model_id`` is the
+    authoritative ``None`` and must NOT fall back to ``acp_model`` — that would
+    re-assert an override the live session isn't running.
+    """
+    agent = ACPAgent(acp_command=["echo", "test"], acp_model="model-x")
+    # init_state has fired; the override resolved to None (rejected) and was
+    # recorded as not applied. The persisted hint was cleared by init_state.
+    agent._initialized = True
+    agent._current_model_id = None
+    agent._model_override_applied = False
+    state = _make_state(agent)
+    stored = _make_stored(state)
+
+    info = _compose_conversation_info(stored, state)
+
+    assert info.current_model_id is None
+
+
 def test_available_models_lifted_from_acp_agent():
     """``ConversationInfo.available_models`` mirrors the agent's model list.
 

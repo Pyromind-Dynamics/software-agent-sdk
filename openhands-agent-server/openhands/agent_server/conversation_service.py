@@ -259,13 +259,23 @@ def _compose_conversation_info(
     agent = state.agent
     # current_model_id: live PrivateAttr (fresh after a runtime switch) → the
     # persisted hint → the authoritative ``acp_model`` the agent runs on resume.
-    # The final fallback covers a switched/overridden conversation whose server
-    # never surfaced the UNSTABLE ``models`` block: ``acp_model`` is a real
-    # (serialized) field, so it's the source of truth a cold read can trust.
+    #
+    # The ``acp_model`` fallback is gated on the agent NOT being a live,
+    # initialized one. Once ``init_state`` has fired, ``current_model_id`` is the
+    # authoritative resolved value — including ``None`` when an override couldn't
+    # be applied (unknown provider, or a resume whose ``set_session_model`` the
+    # server rejected) — so falling back to ``acp_model`` there would re-assert an
+    # override the live session isn't actually running. The fallback is only for
+    # *cold* reads (``init_state`` hasn't fired, PrivateAttrs still empty), where
+    # the serialized ``acp_model`` is the best last-known hint. The persisted
+    # ``acp_current_model_id`` hint is kept honest by ``ACPAgent.init_state`` (it
+    # clears the value whenever the override wasn't applied), so it's safe in
+    # both cases.
+    agent_initialized = bool(getattr(agent, "_initialized", False))
     current_model_id = (
         getattr(agent, "current_model_id", None)
         or agent_state.get("acp_current_model_id")
-        or getattr(agent, "acp_model", None)
+        or (None if agent_initialized else getattr(agent, "acp_model", None))
     )
     # available_models: the property returns ``[]`` (never ``None``) for *both* a
     # cold-read agent (PrivateAttr default, init_state hasn't fired) and a live
