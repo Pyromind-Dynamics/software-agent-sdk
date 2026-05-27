@@ -879,12 +879,25 @@ def _load_prev_from_pypi(
         return None
 
 
+# Names of module-level data registries that declare deprecated public
+# re-exports as ``{name: {"deprecated_in": ..., "removed_in": ...}}`` and are
+# consumed by a module-level ``__getattr__``. The SDK uses this form for renamed
+# export aliases (e.g. ``LLMAgentSettings``) that deliberately are NOT
+# ``@deprecated``-decorated on the class itself (the class stays a live internal
+# union member) and whose ``warn_deprecated`` feature name is a dynamic f-string.
+# Such deprecations are invisible to the decorator/call scans below, so we read
+# the registry as a third deprecation source.
+_DEPRECATED_EXPORT_REGISTRY_NAMES = frozenset({"_DEPRECATED_SDK_EXPORTS"})
+
+
 def _find_deprecated_symbols(source_root: Path) -> DeprecatedSymbols:
     """Scan source files for symbols marked with the SDK deprecation helpers.
 
-    Detects two forms:
+    Detects three forms:
     - ``@deprecated(...)`` decorator on a class/function/method
     - ``warn_deprecated('SomeFeature', ...)`` call
+    - entries in a ``_DEPRECATED_SDK_EXPORTS``-style registry dict mapping an
+      export name to ``{"deprecated_in": ..., "removed_in": ...}``
 
     Returns:
         DeprecatedSymbols(top_level=..., qualified=..., metadata=...)
@@ -975,6 +988,40 @@ def _find_deprecated_symbols(source_root: Path) -> DeprecatedSymbols:
 
             self.generic_visit(node)
 
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802
+            self._record_export_registry(node.target, node.value)
+            self.generic_visit(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802
+            for target in node.targets:
+                self._record_export_registry(target, node.value)
+            self.generic_visit(node)
+
+        def _record_export_registry(
+            self, target: ast.expr, value: ast.expr | None
+        ) -> None:
+            """Record exports declared deprecated via a registry dict literal."""
+            if not (
+                isinstance(target, ast.Name)
+                and target.id in _DEPRECATED_EXPORT_REGISTRY_NAMES
+            ):
+                return
+            if not isinstance(value, ast.Dict):
+                return
+            for key_node, val_node in zip(value.keys, value.values):
+                if key_node is None:
+                    continue
+                export = _extract_string_literal(key_node)
+                if export is None or not isinstance(val_node, ast.Dict):
+                    continue
+                metadata = DeprecationMetadata(
+                    deprecated_in=_extract_dict_string_value(val_node, "deprecated_in"),
+                    removed_in=_extract_dict_string_value(val_node, "removed_in"),
+                )
+                self.top_level.add(export)
+                self.qualified.add(export)
+                self.metadata[export] = metadata
+
     top_level: set[str] = set()
     qualified: set[str] = set()
     metadata: dict[str, DeprecationMetadata] = {}
@@ -1004,6 +1051,19 @@ def _extract_string_literal(node: ast.AST) -> str | None:
     """Return the string value if *node* is a simple string literal."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
+    return None
+
+
+def _extract_dict_string_value(node: ast.Dict, key: str) -> str | None:
+    """Return the string value for *key* in an ``ast.Dict`` literal, if present."""
+    for k, v in zip(node.keys, node.values):
+        if (
+            isinstance(k, ast.Constant)
+            and k.value == key
+            and isinstance(v, ast.Constant)
+            and isinstance(v.value, str)
+        ):
+            return v.value
     return None
 
 

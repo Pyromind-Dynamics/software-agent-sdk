@@ -198,6 +198,50 @@ def test_removal_with_warn_deprecated_is_not_undeprecated(tmp_path):
     assert undeprecated == 0
 
 
+def test_find_deprecated_symbols_reads_export_registry(tmp_path):
+    """``_DEPRECATED_SDK_EXPORTS`` registry entries are recognized as deprecated
+    top-level symbols (the SDK's data-driven mechanism for renamed import
+    aliases such as ``LLMAgentSettings``)."""
+    src = tmp_path / "openhands" / "sdk"
+    src.mkdir(parents=True)
+    (src / "__init__.py").write_text(
+        "_DEPRECATED_SDK_EXPORTS: dict[str, dict[str, str]] = {\n"
+        "    'LLMAgentSettings': {'deprecated_in': '1.19.0',"
+        " 'removed_in': '1.24.0'},\n"
+        "}\n"
+    )
+
+    found = _find_deprecated_symbols(tmp_path)
+
+    assert "LLMAgentSettings" in found.top_level
+    assert found.metadata["LLMAgentSettings"].deprecated_in == "1.19.0"
+    assert found.metadata["LLMAgentSettings"].removed_in == "1.24.0"
+
+
+def test_removal_via_export_registry_is_not_undeprecated(tmp_path):
+    """An export deprecated only through the ``_DEPRECATED_SDK_EXPORTS`` registry
+    dict can be removed on schedule without being flagged as an undeprecated
+    removal -- the registry is the only place its deprecation is statically
+    visible (no ``@deprecated`` decorator; f-string ``warn_deprecated`` name)."""
+    old_pkg = _write_pkg_init(tmp_path, "old", ["Foo", "Bar"])
+    old_init = old_pkg / "__init__.py"
+    old_init.write_text(
+        old_init.read_text()
+        + "\n_DEPRECATED_SDK_EXPORTS: dict[str, dict[str, str]] = {\n"
+        + "    'Bar': {'deprecated_in': '1.0', 'removed_in': '2.0'},\n"
+        + "}\n"
+    )
+    _write_pkg_init(tmp_path, "new", ["Foo"])
+
+    old_root = griffe.load("openhands.sdk", search_paths=[str(tmp_path / "old")])
+    new_root = griffe.load("openhands.sdk", search_paths=[str(tmp_path / "new")])
+
+    total_breaks, undeprecated = _prod._compute_breakages(old_root, new_root, _SDK_CFG)
+
+    assert total_breaks == 1
+    assert undeprecated == 0
+
+
 def test_removed_public_method_requires_deprecation(tmp_path):
     old_pkg = _write_pkg_init(tmp_path, "old", ["Foo"])
     new_pkg = _write_pkg_init(tmp_path, "new", ["Foo"])
