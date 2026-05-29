@@ -6,6 +6,7 @@ import asyncio
 import json
 import threading
 import uuid
+from base64 import urlsafe_b64encode
 from concurrent.futures import Future
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -13,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from acp.exceptions import RequestError as ACPRequestError
 from acp.schema import PromptResponse
+from pydantic import SecretStr
 
 from openhands.sdk.agent.acp_agent import (
     ACPAgent,
@@ -43,6 +45,7 @@ from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.llm import ImageContent, Message, TextContent
 from openhands.sdk.skills import KeywordTrigger, Skill
 from openhands.sdk.tool.builtins.finish import FinishAction
+from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.utils.pydantic_secrets import REDACTED_SECRET_VALUE
 from openhands.sdk.workspace.local import LocalWorkspace
 
@@ -54,6 +57,11 @@ from openhands.sdk.workspace.local import LocalWorkspace
 
 def _make_agent(**kwargs) -> ACPAgent:
     return ACPAgent(acp_command=["echo", "test"], **kwargs)
+
+
+def _make_cipher() -> Cipher:
+    """Deterministic Fernet cipher for round-trip tests."""
+    return Cipher(urlsafe_b64encode(b"a" * 32).decode("ascii"))
 
 
 def _make_state(tmp_path) -> ConversationState:
@@ -242,6 +250,104 @@ class TestACPAgentSerialization:
         agent = AgentBase.model_validate(data)
         assert isinstance(agent, ACPAgent)
         assert agent.acp_command == ["echo", "test"]
+
+    def test_acp_env_decrypts_ciphertext_with_cipher_in_context(self):
+        """Round-trip Fernet-encrypted ``acp_env`` values via cipher context.
+
+        Regression for a real production bug in v1.24.0: the on-disk →
+        ACPAgentSettings → ACPAgent path could leave Fernet ciphertext as
+        the field value because only the settings-side variant had a
+        decryption ``field_validator``. The conversation-start flow
+        validates the full :class:`StoredConversation` with cipher
+        context after the agent was already constructed (without cipher)
+        from ``StartConversationRequest.agent_settings`` — and without
+        the validator here, the ciphertext survives that re-validation
+        and reaches the ACP subprocess as the env-var value. The
+        provider call then fails (e.g. Anthropic reads the Fernet token
+        as ``ANTHROPIC_BASE_URL`` and 400s on URL parsing).
+        """
+        cipher = _make_cipher()
+        encrypted_key = cipher.encrypt(SecretStr("sk-real"))
+        encrypted_url = cipher.encrypt(SecretStr("https://api.example.com"))
+        assert encrypted_key is not None
+        assert encrypted_url is not None
+
+        # Build the wire payload an agent-server would receive: an
+        # ACPAgent dict whose ``acp_env`` values are Fernet ciphertext.
+        data = {
+            "kind": "ACPAgent",
+            "acp_command": ["echo", "test"],
+            "acp_env": {
+                "ANTHROPIC_API_KEY": encrypted_key,
+                "ANTHROPIC_BASE_URL": encrypted_url,
+            },
+        }
+
+        restored = AgentBase.model_validate(data, context={"cipher": cipher})
+        assert isinstance(restored, ACPAgent)
+        assert restored.acp_env == {
+            "ANTHROPIC_API_KEY": "sk-real",
+            "ANTHROPIC_BASE_URL": "https://api.example.com",
+        }
+
+    def test_acp_env_no_cipher_in_context_leaves_ciphertext_untouched(self):
+        """The ``cipher is None`` branch of the validator is exercised on
+        every code path that round-trips an agent dict without supplying
+        a cipher (e.g. test serialization helpers, JSON-only diagnostic
+        dumps). In that mode the ciphertext must survive verbatim — both
+        because there's nothing to decrypt with, and because mutating it
+        would defeat a downstream caller that *will* validate again with
+        the cipher present (the conversation-start re-validation step).
+        """
+        cipher = _make_cipher()
+        encrypted = cipher.encrypt(SecretStr("sk-real"))
+        assert encrypted is not None
+
+        data = {
+            "kind": "ACPAgent",
+            "acp_command": ["echo", "test"],
+            "acp_env": {"ANTHROPIC_API_KEY": encrypted},
+        }
+        restored = AgentBase.model_validate(data)
+        assert isinstance(restored, ACPAgent)
+        assert restored.acp_env == {"ANTHROPIC_API_KEY": encrypted}
+
+    def test_acp_env_plaintext_passes_through_with_cipher(self):
+        """First writes from clients that never went through the encryption
+        pipeline carry plaintext. They must still validate cleanly when the
+        server happens to have a cipher in context."""
+        cipher = _make_cipher()
+        data = {
+            "kind": "ACPAgent",
+            "acp_command": ["echo", "test"],
+            "acp_env": {"FOO": "plaintext-value"},
+        }
+        restored = AgentBase.model_validate(data, context={"cipher": cipher})
+        assert isinstance(restored, ACPAgent)
+        assert restored.acp_env == {"FOO": "plaintext-value"}
+
+    def test_acp_env_undecryptable_ciphertext_passes_through_with_warning(self, caplog):
+        """Cipher mismatch / corruption shouldn't crash agent construction.
+
+        Mirrors the MCP env/header pattern: a ciphertext we can't decrypt
+        is left in place with a logged warning so the operator can repair
+        it, rather than turning into a hard failure that bricks the
+        agent.
+        """
+        cipher = _make_cipher()
+        # Looks like a Fernet token (prefix matches) but isn't a valid
+        # one — try_decrypt_str returns None.
+        bogus = "gAAAAA" + ("x" * 80)
+        data = {
+            "kind": "ACPAgent",
+            "acp_command": ["echo", "test"],
+            "acp_env": {"BUSTED": bogus},
+        }
+        with caplog.at_level("WARNING"):
+            restored = AgentBase.model_validate(data, context={"cipher": cipher})
+        assert isinstance(restored, ACPAgent)
+        assert restored.acp_env == {"BUSTED": bogus}
+        assert any("could not be decrypted" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

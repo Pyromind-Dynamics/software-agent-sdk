@@ -44,7 +44,14 @@ from acp.schema import (
     UsageUpdate,
 )
 from acp.transports import default_environment
-from pydantic import Field, PrivateAttr, SecretStr, field_serializer
+from pydantic import (
+    Field,
+    PrivateAttr,
+    SecretStr,
+    ValidationInfo,
+    field_serializer,
+    field_validator,
+)
 
 from openhands.sdk.agent.acp_models import ACPModelInfo
 from openhands.sdk.agent.base import AgentBase
@@ -69,7 +76,10 @@ from openhands.sdk.settings.acp_providers import (
 from openhands.sdk.tool import Tool  # noqa: TC002
 from openhands.sdk.tool.builtins.finish import FinishAction, FinishObservation
 from openhands.sdk.utils import maybe_truncate
-from openhands.sdk.utils.pydantic_secrets import serialize_secret
+from openhands.sdk.utils.pydantic_secrets import (
+    serialize_secret,
+    validate_secret_dict,
+)
 
 
 logger = get_logger(__name__)
@@ -114,6 +124,7 @@ _RETRIABLE_CONNECTION_ERRORS = (OSError, ConnectionError, BrokenPipeError, EOFEr
 # -32603 = "Internal error" (JSON-RPC spec) — covers ACP server crashes,
 #          upstream model 500s, and transient infrastructure errors.
 _RETRIABLE_SERVER_ERROR_CODES: frozenset[int] = frozenset({-32603})
+
 
 # Maximum characters for ACP tool call content — matches MAX_CMD_OUTPUT_SIZE
 # used by the terminal tool and the default max_message_chars in LLM config.
@@ -823,6 +834,34 @@ class ACPAgent(AgentBase):
         default_factory=dict,
         description="Additional environment variables for the ACP server process",
     )
+
+    @field_validator("acp_env", mode="before")
+    @classmethod
+    def _decrypt_acp_env_values(cls, value: Any, info: ValidationInfo) -> Any:
+        """Decrypt persisted ACP environment values when a cipher is available.
+
+        Mirrors the settings-side ``_decrypt_acp_env_values`` on
+        :class:`openhands.sdk.settings.model.ACPAgentSettings`. The
+        settings variant handles the on-disk → memory round-trip,
+        but the conversation-start path goes
+        :class:`StartConversationRequest.agent_settings` → the request's
+        ``_populate_agent_from_settings`` (a ``mode='before'``
+        model_validator that runs *without* cipher context) →
+        ``settings.create_agent()`` → :class:`ACPAgent`. By the time
+        ``conversation_service.start_conversation`` re-validates the full
+        :class:`StoredConversation` with the server's cipher in context,
+        the agent has already been constructed and its ``acp_env`` field
+        still holds ciphertext. Without a validator here, that ciphertext
+        survives the re-validation step and reaches the subprocess as the
+        env-var value — breaking any provider call that interprets the
+        variable (e.g. an Anthropic request reading a Fernet token in
+        place of ``ANTHROPIC_BASE_URL``).
+
+        Legacy plaintext values pass through unchanged so first writes
+        from clients that haven't gone through the encryption pipeline
+        still validate cleanly.
+        """
+        return validate_secret_dict(value, info, description="ACP env")
 
     @field_serializer("acp_env", when_used="always")
     def _serialize_acp_env(self, value: dict[str, str], info):
