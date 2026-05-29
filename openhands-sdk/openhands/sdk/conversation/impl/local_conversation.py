@@ -1209,6 +1209,18 @@ class LocalConversation(BaseConversation):
                             else None
                         )
                     else:
+                        # The state lock is held across this await. Mutations
+                        # performed inside astep() (including native async
+                        # Agent.astep / ACPAgent.astep that mutate on the
+                        # event-loop thread) are intentional and part of this
+                        # critical section. The invariant is only that no
+                        # *unrelated* state mutator may run concurrently while
+                        # the lock is held: because FIFOLock is thread- (not
+                        # task-) reentrant, any unrelated state-mutating
+                        # coroutine awaited on this event-loop thread would
+                        # silently re-enter the lock and corrupt history. Such
+                        # unrelated mutators must be dispatched via
+                        # run_in_executor onto a worker thread.
                         await self.agent.astep(
                             self,
                             on_event=self._on_event,
