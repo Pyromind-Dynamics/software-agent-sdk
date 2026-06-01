@@ -1056,6 +1056,7 @@ class LocalConversation(BaseConversation):
         finally:
             self._cancel_token = None
 
+    @observe(name="conversation.arun")
     async def arun(self) -> None:
         """Async variant of :meth:`run`.
 
