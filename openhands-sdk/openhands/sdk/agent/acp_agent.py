@@ -487,6 +487,34 @@ async def _filter_jsonrpc_lines(source: Any, dest: Any) -> None:
         dest.feed_eof()
 
 
+def _classify_acp_init_error(exc: BaseException) -> str:
+    """Map a cold-start failure to a structured ``ConversationErrorEvent`` code.
+
+    ACP's spawn + auth + ``session/new`` runs in :meth:`ACPAgent.init_state`,
+    which ``LocalConversation.run()``/``arun()`` invoke *before* their try-block
+    (via ``_ensure_agent_ready()``).  These cold-start failures — far more common
+    on cloud than locally — therefore bypass the run loop's error emission, so
+    ``init_state`` surfaces them itself.  The code tells clients *which* failure
+    occurred so they can react (e.g. prompt re-auth vs. report a missing binary):
+
+    - ``ACPAuthRequired``: the ACP server reported a JSON-RPC auth-required error
+      (code ``-32000``) from ``authenticate``/``new_session`` — missing, expired,
+      or rejected credentials.  The most actionable cloud failure, so it gets its
+      own code.
+    - ``ACPSpawnError``: the subprocess could not be launched — the CLI binary is
+      missing or not executable (``FileNotFoundError`` / ``PermissionError`` from
+      ``create_subprocess_exec``).
+    - ``ACPInitError``: anything else during the protocol handshake or session
+      creation (timeouts, transport drops, unexpected protocol errors, cwd
+      mismatch surfaced by the server).
+    """
+    if isinstance(exc, ACPRequestError) and getattr(exc, "code", None) == -32000:
+        return "ACPAuthRequired"
+    if isinstance(exc, (FileNotFoundError, PermissionError)):
+        return "ACPSpawnError"
+    return "ACPInitError"
+
+
 class _OpenHandsACPBridge:
     """Bridge between OpenHands and ACP that accumulates session updates.
 
@@ -1197,6 +1225,28 @@ class ACPAgent(AgentBase):
         except Exception as e:
             logger.error("Failed to start ACP server: %s", e)
             self._cleanup()
+            # init_state runs *outside* run()/arun()'s try-block (it is reached
+            # via _ensure_agent_ready() before the loop starts), so a cold-start
+            # failure — bad/expired auth, missing CLI binary, cwd mismatch — would
+            # otherwise bypass error emission and reach the client as a generic
+            # "remote conversation ended with error".  Emit a typed
+            # ConversationErrorEvent and flip the status to ERROR here, mirroring
+            # what the regular Agent (and ACPAgent.astep) do from inside the run
+            # loop, so clients render their existing error banner instead.
+            # Best-effort: surfacing the error must never mask the original
+            # exception, which still propagates to preserve the existing
+            # cleanup/re-raise contract that run()/arun() rely on.
+            try:
+                state.execution_status = ConversationExecutionStatus.ERROR
+                on_event(
+                    ConversationErrorEvent(
+                        source="agent",
+                        code=_classify_acp_init_error(e),
+                        detail=str(e)[:500],
+                    )
+                )
+            except Exception:
+                logger.exception("Failed to surface ACP init error to client")
             raise
 
         # A successful resume keeps the prior id; cwd mismatch and load_session

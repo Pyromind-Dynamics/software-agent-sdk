@@ -18,6 +18,7 @@ from pydantic import SecretStr
 
 from openhands.sdk.agent.acp_agent import (
     ACPAgent,
+    _classify_acp_init_error,
     _estimate_cost_from_tokens,
     _extract_session_models,
     _extract_token_usage,
@@ -766,6 +767,120 @@ class TestACPAgentInitState:
 
         assert events[0].dynamic_context is not None
         assert "REGISTRY_TOKEN" in events[0].dynamic_context.text
+
+    # -- Cold-start error surfacing (issue #1024) --------------------------
+
+    def _init_state_failure(self, tmp_path, exc: BaseException):
+        """Run init_state with ``_start_acp_server`` raising ``exc``.
+
+        Returns ``(state, events, raised)`` where ``raised`` is the exception
+        that escaped init_state (asserted to be the original ``exc``).
+        """
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        events: list = []
+        with patch(
+            "openhands.sdk.agent.acp_agent.ACPAgent._start_acp_server",
+            side_effect=exc,
+        ):
+            with pytest.raises(type(exc)) as excinfo:
+                agent.init_state(state, on_event=events.append)
+        assert excinfo.value is exc, "original exception must propagate unchanged"
+        return state, events
+
+    def test_init_state_surfaces_auth_required(self, tmp_path):
+        """An auth-required protocol error becomes a typed ACPAuthRequired event
+        with ERROR status — instead of bypassing emission and reaching the
+        client as a generic "remote conversation ended with error"."""
+        exc = ACPRequestError(-32000, "Authentication required")
+        state, events = self._init_state_failure(tmp_path, exc)
+
+        errors = [e for e in events if isinstance(e, ConversationErrorEvent)]
+        assert len(errors) == 1
+        assert errors[0].source == "agent"
+        assert errors[0].code == "ACPAuthRequired"
+        assert "Authentication required" in errors[0].detail
+        assert state.execution_status == ConversationExecutionStatus.ERROR
+
+    def test_init_state_surfaces_spawn_error(self, tmp_path):
+        """A missing/unexecutable CLI binary (FileNotFoundError /
+        PermissionError from create_subprocess_exec) becomes ACPSpawnError."""
+        for exc in (
+            FileNotFoundError("no such file: claude-agent-acp"),
+            PermissionError("permission denied"),
+        ):
+            state, events = self._init_state_failure(tmp_path, exc)
+            errors = [e for e in events if isinstance(e, ConversationErrorEvent)]
+            assert len(errors) == 1
+            assert errors[0].code == "ACPSpawnError"
+            assert state.execution_status == ConversationExecutionStatus.ERROR
+
+    def test_init_state_surfaces_generic_init_error(self, tmp_path):
+        """Any other handshake/session failure falls back to ACPInitError."""
+        exc = RuntimeError("protocol handshake timed out")
+        state, events = self._init_state_failure(tmp_path, exc)
+
+        errors = [e for e in events if isinstance(e, ConversationErrorEvent)]
+        assert len(errors) == 1
+        assert errors[0].code == "ACPInitError"
+        assert "protocol handshake timed out" in errors[0].detail
+        assert state.execution_status == ConversationExecutionStatus.ERROR
+
+    def test_init_state_truncates_long_detail(self, tmp_path):
+        """detail is capped at 500 chars, matching the run-loop error path."""
+        exc = RuntimeError("x" * 1000)
+        _state, events = self._init_state_failure(tmp_path, exc)
+        errors = [e for e in events if isinstance(e, ConversationErrorEvent)]
+        assert len(errors[0].detail) == 500
+
+    def test_init_state_reraises_even_if_emission_fails(self, tmp_path):
+        """A failure while surfacing the error must never mask the original
+        exception — the re-raise contract run()/arun() rely on is preserved."""
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        exc = RuntimeError("boom")
+
+        def _explode(_event):
+            raise ValueError("on_event is broken")
+
+        with patch(
+            "openhands.sdk.agent.acp_agent.ACPAgent._start_acp_server",
+            side_effect=exc,
+        ):
+            with pytest.raises(RuntimeError, match="boom") as excinfo:
+                agent.init_state(state, on_event=_explode)
+        assert excinfo.value is exc
+
+
+# ---------------------------------------------------------------------------
+# _classify_acp_init_error
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyACPInitError:
+    def test_auth_required_code(self):
+        exc = ACPRequestError(-32000, "Authentication required")
+        assert _classify_acp_init_error(exc) == "ACPAuthRequired"
+
+    def test_other_request_error_is_init_error(self):
+        # A protocol error that isn't auth-required (e.g. internal error) is a
+        # generic init failure, not an auth failure.
+        exc = ACPRequestError(-32603, "Internal error")
+        assert _classify_acp_init_error(exc) == "ACPInitError"
+
+    def test_file_not_found_is_spawn_error(self):
+        assert _classify_acp_init_error(FileNotFoundError()) == "ACPSpawnError"
+
+    def test_permission_error_is_spawn_error(self):
+        assert _classify_acp_init_error(PermissionError()) == "ACPSpawnError"
+
+    def test_broken_pipe_is_init_error(self):
+        # A transport drop during the handshake is an OSError subclass but not a
+        # spawn failure — it must classify as ACPInitError, not ACPSpawnError.
+        assert _classify_acp_init_error(BrokenPipeError()) == "ACPInitError"
+
+    def test_generic_exception_is_init_error(self):
+        assert _classify_acp_init_error(RuntimeError("x")) == "ACPInitError"
 
 
 # ---------------------------------------------------------------------------
