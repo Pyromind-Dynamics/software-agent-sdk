@@ -266,6 +266,40 @@ def _select_auth_method(
     return None
 
 
+def _codex_base_url_overrides(
+    command: str, args: list[str], env: dict[str, str]
+) -> list[str]:
+    """Translate ``OPENAI_BASE_URL`` into the codex config key that sets it.
+
+    Unlike claude-agent-acp (which honours ``ANTHROPIC_BASE_URL``) and gemini-cli
+    (whose base URL is supplied via the ``authenticate`` gateway), **codex does
+    not read the ``OPENAI_BASE_URL`` env var** — its supported base-URL config
+    lives in ``config.toml`` (see the codex "Advanced configuration" docs). Its
+    built-in ``openai`` provider otherwise targets ``https://api.openai.com``, so
+    a caller that points codex at a gateway/proxy (eval LiteLLM proxy, a
+    corporate egress, etc.) via ``OPENAI_BASE_URL`` alone would have every turn
+    hit the real OpenAI API with the wrong key and fail ``401 invalid_api_key``
+    — surfaced opaquely as ACP ``-32603 Internal error``. (codex-acp 0.11.1
+    happened to honour the env var; 0.15.0 does not, so the eval/canvas/cloud
+    codex-via-proxy flows broke on the bump.)
+
+    The documented one-liner is ``openai_base_url`` — it overrides the built-in
+    ``openai`` provider's base URL without inventing a separate provider, so the
+    provider's defaults (``OPENAI_API_KEY`` env key, Responses ``wire_api``) keep
+    applying and per-conversation keys keep working. No-op for non-codex servers,
+    when ``OPENAI_BASE_URL`` is unset, or when the caller already pinned a base
+    URL / ``model_provider`` (via ``acp_args``/``-c``), which takes precedence.
+    """
+    if not any("codex-acp" in tok for tok in (command, *args)):
+        return []
+    base_url = env.get("OPENAI_BASE_URL")
+    if not base_url:
+        return []
+    if any("openai_base_url" in tok or "model_provider" in tok for tok in args):
+        return []
+    return ["-c", f'openai_base_url="{base_url}"']
+
+
 def _write_secret_file(path: Path, value: str) -> None:
     """Write ``value`` to ``path`` as a ``0600`` file.
 
@@ -1898,6 +1932,12 @@ class ACPAgent(AgentBase):
 
         command = self.acp_command[0]
         args = list(self.acp_command[1:]) + list(self.acp_args)
+        # codex ignores OPENAI_BASE_URL; translate it into the config key it
+        # reads. Reads the *fully assembled* env above, so it fires regardless of
+        # which channel delivered OPENAI_BASE_URL (agent_context.secrets,
+        # state.secret_registry / StartConversationRequest.secrets, acp_env,
+        # os.environ) — i.e. eval, canvas, and cloud all route the same way.
+        args += _codex_base_url_overrides(command, args, env)
 
         working_dir = str(state.workspace.working_dir)
 

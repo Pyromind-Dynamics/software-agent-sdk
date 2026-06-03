@@ -21,6 +21,7 @@ from openhands.sdk.agent.acp_agent import (
     ACPAgent,
     _classify_acp_init_error,
     _codex_auth_file,
+    _codex_base_url_overrides,
     _estimate_cost_from_tokens,
     _extract_session_models,
     _extract_token_usage,
@@ -4126,6 +4127,58 @@ class TestSelectAuthMethod:
         env = {"GEMINI_API_KEY": "g"}
         with patch("openhands.sdk.agent.acp_agent.Path.home", return_value=tmp_path):
             assert _select_auth_method(methods, env) == "gemini-api-key"
+
+
+# ---------------------------------------------------------------------------
+# _codex_base_url_overrides (codex ignores OPENAI_BASE_URL)
+# ---------------------------------------------------------------------------
+
+
+class TestCodexBaseUrlOverrides:
+    def test_pins_base_url_for_codex(self):
+        # The documented one-liner: override the built-in openai provider's URL.
+        ov = _codex_base_url_overrides(
+            "codex-acp", [], {"OPENAI_BASE_URL": "https://proxy.example"}
+        )
+        assert ov == ["-c", 'openai_base_url="https://proxy.example"']
+
+    def test_detects_codex_in_any_token(self):
+        # e.g. launched via npx with the scoped package name
+        ov = _codex_base_url_overrides(
+            "npx",
+            ["-y", "@zed-industries/codex-acp@0.15.0"],
+            {"OPENAI_BASE_URL": "https://p"},
+        )
+        assert ov == ["-c", 'openai_base_url="https://p"']
+
+    def test_noop_for_non_codex(self):
+        assert (
+            _codex_base_url_overrides(
+                "claude-agent-acp", [], {"OPENAI_BASE_URL": "https://p"}
+            )
+            == []
+        )
+
+    def test_noop_when_no_base_url(self):
+        assert _codex_base_url_overrides("codex-acp", [], {}) == []
+
+    def test_noop_when_caller_already_set_base_url(self):
+        args = ["-c", 'openai_base_url="https://other"']
+        assert (
+            _codex_base_url_overrides(
+                "codex-acp", args, {"OPENAI_BASE_URL": "https://p"}
+            )
+            == []
+        )
+
+    def test_noop_when_caller_already_set_provider(self):
+        args = ["-c", 'model_provider="custom"']
+        assert (
+            _codex_base_url_overrides(
+                "codex-acp", args, {"OPENAI_BASE_URL": "https://p"}
+            )
+            == []
+        )
 
 
 # ---------------------------------------------------------------------------
