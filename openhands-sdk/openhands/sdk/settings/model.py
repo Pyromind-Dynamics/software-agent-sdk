@@ -48,6 +48,7 @@ from openhands.sdk.utils.pydantic_secrets import (
     decrypt_str_with_cipher_or_keep,
     resolve_expose_mode,
     serialize_secret,
+    validate_secret,
     validate_secret_dict,
 )
 from openhands.sdk.utils.redact import sanitize_dict
@@ -353,6 +354,34 @@ class VerificationSettings(BaseModel):
             ).model_dump()
         },
     )
+    critic_api_key: str | SecretStr | None = Field(
+        default=None,
+        description=(
+            "API key used to authenticate with the critic service. "
+            "When None, the LLM's ``api_key`` is reused, which preserves "
+            "the auto-configuration path for the All-Hands LLM proxy."
+        ),
+        json_schema_extra={
+            SETTINGS_METADATA_KEY: SettingsFieldMetadata(
+                label="Critic API Key",
+                prominence=SettingProminence.CRITICAL,
+                depends_on=("critic_enabled",),
+            ).model_dump()
+        },
+    )
+
+    @field_validator("critic_api_key")
+    @classmethod
+    def _validate_critic_api_key(
+        cls, v: str | SecretStr | None, info: ValidationInfo
+    ) -> SecretStr | None:
+        return validate_secret(v, info)
+
+    @field_serializer("critic_api_key", when_used="always")
+    def _serialize_critic_api_key(
+        self, v: SecretStr | None, info: SerializationInfo
+    ) -> Any:
+        return serialize_secret(v, info)
 
 
 def _default_llm_settings() -> LLM:
@@ -913,8 +942,15 @@ class OpenHandsAgentSettings(AgentSettingsBase):
     def build_critic(self) -> CriticBase | None:
         """Create an :class:`APIBasedCritic` from these settings.
 
-        Returns ``None`` when the critic is disabled or when the LLM
-        has no ``api_key`` (the critic service requires authentication).
+        Returns ``None`` when the critic is disabled or when no API key
+        is available (the critic service requires authentication).
+
+        If ``verification.critic_api_key`` is set it is used to
+        authenticate with the critic service; otherwise the LLM's
+        ``api_key`` is reused. This preserves the existing
+        auto-configuration path for the All-Hands LLM proxy while
+        letting deployments route the critic through a different
+        provider (e.g. an LLM proxy with its own credential).
 
         If ``verification.critic_server_url`` or
         ``verification.critic_model_name`` are set they override the
@@ -924,7 +960,7 @@ class OpenHandsAgentSettings(AgentSettingsBase):
         if not self.verification.critic_enabled:
             return None
 
-        api_key = self.llm.api_key
+        api_key = self.verification.critic_api_key or self.llm.api_key
         if api_key is None:
             return None
 

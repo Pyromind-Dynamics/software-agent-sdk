@@ -122,6 +122,15 @@ def test_llm_agent_settings_export_schema_groups_sections() -> None:
         is SettingProminence.CRITICAL
     )
 
+    # The critic API key must surface in the schema as a CRITICAL, secret
+    # field that depends on critic_enabled — this is what the GUI uses to
+    # render a masked input gated on the toggle.
+    critic_api_key = v_fields["verification.critic_api_key"]
+    assert critic_api_key.secret is True
+    assert critic_api_key.value_type == "string"
+    assert critic_api_key.prominence is SettingProminence.CRITICAL
+    assert critic_api_key.depends_on == ["verification.critic_enabled"]
+
 
 def test_acp_agent_settings_export_schema_has_acp_section() -> None:
     schema = ACPAgentSettings.export_schema()
@@ -552,6 +561,77 @@ def test_llm_create_agent_no_critic_without_api_key() -> None:
     )
     agent = settings.create_agent()
     assert agent.critic is None
+
+
+def test_llm_create_agent_critic_uses_explicit_api_key() -> None:
+    """When ``verification.critic_api_key`` is set, the critic authenticates
+    with it instead of the LLM key. The LLM's own key is preserved untouched
+    so the main agent loop still talks to its provider."""
+    settings = OpenHandsAgentSettings(
+        llm=LLM(model="m", api_key=SecretStr("llm-key")),
+        verification=VerificationSettings(
+            critic_enabled=True,
+            critic_api_key=SecretStr("critic-key"),
+        ),
+    )
+    agent = settings.create_agent()
+    assert isinstance(agent.critic, APIBasedCritic)
+    assert isinstance(agent.critic.api_key, SecretStr)
+    assert agent.critic.api_key.get_secret_value() == "critic-key"
+    # LLM key unaffected.
+    assert isinstance(agent.llm.api_key, SecretStr)
+    assert agent.llm.api_key.get_secret_value() == "llm-key"
+
+
+def test_llm_create_agent_critic_falls_back_to_llm_api_key() -> None:
+    """Without ``verification.critic_api_key``, the legacy behavior holds:
+    the critic reuses the LLM key (auto-config path for the All-Hands proxy)."""
+    settings = OpenHandsAgentSettings(
+        llm=LLM(model="m", api_key=SecretStr("llm-key")),
+        verification=VerificationSettings(critic_enabled=True),
+    )
+    agent = settings.create_agent()
+    assert isinstance(agent.critic, APIBasedCritic)
+    assert isinstance(agent.critic.api_key, SecretStr)
+    assert agent.critic.api_key.get_secret_value() == "llm-key"
+
+
+def test_llm_create_agent_critic_with_only_critic_api_key() -> None:
+    """If the LLM has no key but ``critic_api_key`` is supplied, the critic
+    is still built — its credential is independent of the LLM's."""
+    settings = OpenHandsAgentSettings(
+        llm=LLM(model="m", api_key=None),
+        verification=VerificationSettings(
+            critic_enabled=True,
+            critic_api_key=SecretStr("critic-only-key"),
+        ),
+    )
+    agent = settings.create_agent()
+    assert isinstance(agent.critic, APIBasedCritic)
+    assert isinstance(agent.critic.api_key, SecretStr)
+    assert agent.critic.api_key.get_secret_value() == "critic-only-key"
+
+
+def test_verification_settings_critic_api_key_roundtrip() -> None:
+    """``critic_api_key`` survives dump → validate when secrets are exposed,
+    and validates from both plain strings and SecretStr inputs."""
+    settings = VerificationSettings(
+        critic_enabled=True,
+        critic_api_key="plain-string-key",
+    )
+    assert isinstance(settings.critic_api_key, SecretStr)
+    assert settings.critic_api_key.get_secret_value() == "plain-string-key"
+
+    dumped = settings.model_dump(context={"expose_secrets": "plaintext"})
+    assert dumped["critic_api_key"] == "plain-string-key"
+
+    restored = VerificationSettings.model_validate(dumped)
+    assert isinstance(restored.critic_api_key, SecretStr)
+    assert restored.critic_api_key.get_secret_value() == "plain-string-key"
+
+    # Empty strings normalize to None (consistent with LLM.api_key handling).
+    empty = VerificationSettings(critic_enabled=True, critic_api_key="")
+    assert empty.critic_api_key is None
 
 
 def test_llm_create_agent_critic_with_iterative_refinement() -> None:
