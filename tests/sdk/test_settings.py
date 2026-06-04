@@ -633,6 +633,22 @@ def test_acp_custom_server_requires_explicit_command() -> None:
         raise AssertionError("expected ValueError")
 
 
+def test_acp_create_agent_forwards_isolate_data_dir() -> None:
+    """``acp_isolate_data_dir`` propagates from settings to the built agent.
+
+    Off by default, and an explicit True reaches ``ACPAgent`` so a deploying
+    application can opt conversations sharing one sandbox into a per-conversation
+    CLI data dir (#1019).
+    """
+    default_agent = ACPAgentSettings(acp_server="codex").create_agent()
+    assert default_agent.acp_isolate_data_dir is False
+
+    isolated = ACPAgentSettings(
+        acp_server="codex", acp_isolate_data_dir=True
+    ).create_agent()
+    assert isolated.acp_isolate_data_dir is True
+
+
 def test_acp_custom_server_with_command_resolves() -> None:
     settings = ACPAgentSettings(
         acp_server="custom",

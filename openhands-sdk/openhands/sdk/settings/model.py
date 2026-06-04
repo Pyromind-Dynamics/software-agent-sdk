@@ -1100,6 +1100,20 @@ class ACPAgentSettings(AgentSettingsBase):
         },
     )
     # Programmatic / downstream-facing knob, deliberately NOT surfaced in the
+    # settings-form UI (no SETTINGS_METADATA_KEY): the deploying application sets
+    # it (e.g. when conversations share a sandbox under grouping), not the end
+    # user. See ``ACPAgent.acp_isolate_data_dir`` for the full rationale.
+    acp_isolate_data_dir: bool = Field(
+        default=False,
+        description=(
+            "Give the ACP subprocess a per-conversation CLI data/config root "
+            "instead of the shared user HOME. Forwarded to "
+            ":attr:`~openhands.sdk.agent.ACPAgent.acp_isolate_data_dir`; off by "
+            "default. Enable from the deploying application when several "
+            "conversations share one sandbox (see #1019)."
+        ),
+    )
+    # Programmatic / downstream-facing knob, deliberately NOT surfaced in the
     # settings-form UI (no SETTINGS_METADATA_KEY): it's a list of structured
     # specs a downstream application supplies in code to support other ACP CLIs,
     # not an end-user field. The built-in providers work via the default.
@@ -1358,6 +1372,7 @@ class ACPAgentSettings(AgentSettingsBase):
             acp_model=self.acp_model,
             acp_session_mode=self.acp_session_mode,
             acp_prompt_timeout=self.acp_prompt_timeout,
+            acp_isolate_data_dir=self.acp_isolate_data_dir,
             acp_file_secrets=list(self.acp_file_secrets),
             agent_context=agent_context,
         )
