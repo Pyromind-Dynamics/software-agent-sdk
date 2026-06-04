@@ -111,6 +111,67 @@ def _decrypt_mcp_value_or_keep(cipher: Cipher, value: str) -> str:
     return decrypt_str_with_cipher_or_keep(cipher, value, description="MCP env/headers")
 
 
+# ---------------------------------------------------------------------------
+# Shared ``mcp_config`` field (de)serialization, used verbatim by every
+# settings variant that exposes an ``mcp_config: MCPConfig | None`` field
+# (``OpenHandsAgentSettings`` and ``ACPAgentSettings``). Kept here as plain
+# functions so the per-class ``@field_validator`` / ``@field_serializer``
+# stubs — which pydantic requires to live on each model — stay one-liners and
+# the encrypt/decrypt logic has a single source of truth.
+# ---------------------------------------------------------------------------
+
+
+def normalize_empty_mcp_config(value: Any) -> Any:
+    """Coerce an empty/absent ``mcp_config`` to ``None`` (else pass through)."""
+    return None if value in (None, {}) else value
+
+
+def decrypt_mcp_config_secrets(value: Any, info: ValidationInfo) -> Any:
+    """Decrypt MCP ``env`` / ``headers`` values when a cipher is in context.
+
+    The on-disk load path. Values that aren't valid Fernet tokens pass through
+    as plaintext (e.g. migrating from a build that wrote them unencrypted).
+    Mirrors :func:`serialize_mcp_config`'s per-value encryption.
+    """
+    if not isinstance(value, dict):
+        return value
+    cipher: Cipher | None = info.context.get("cipher") if info.context else None
+    if cipher is None:
+        return value
+    return _walk_mcp_secret_values(
+        value, lambda v: _decrypt_mcp_value_or_keep(cipher, v)
+    )
+
+
+def serialize_mcp_config(
+    value: MCPConfig | None, info: SerializationInfo
+) -> dict[str, Any]:
+    """Serialize an ``mcp_config`` field, masking/encrypting env+headers per
+    the active expose mode (``plaintext`` / ``encrypted`` / redacted)."""
+    if value is None:
+        return {}
+    dumped = value.model_dump(exclude_none=True, exclude_defaults=True)
+    ctx = info.context or {}
+    mode = resolve_expose_mode(ctx)
+
+    if mode == "plaintext":
+        return dumped
+
+    if mode == "encrypted":
+        cipher: Cipher | None = ctx.get("cipher")
+        if cipher is None:
+            raise MissingCipherError(
+                "Cannot encrypt MCP env/headers: no cipher configured. "
+                "Set OH_SECRET_KEY environment variable."
+            )
+        # cipher.encrypt returns None only for None input; SecretStr(v) never is.
+        return _walk_mcp_secret_values(
+            dumped, lambda v: cast(str, cipher.encrypt(SecretStr(v)))
+        )
+
+    return sanitize_dict(dumped)
+
+
 SettingsValueType = Literal[
     "string",
     "integer",
@@ -784,59 +845,23 @@ class OpenHandsAgentSettings(AgentSettingsBase):
         },
     )
 
+    # ``mcp_config`` (de)serialization is shared with ACPAgentSettings via the
+    # module-level helpers — these stubs just bind them to the field.
     @field_validator("mcp_config", mode="before")
     @classmethod
     def _normalize_empty_mcp_config(cls, value: Any) -> Any:
-        if value in (None, {}):
-            return None
-        return value
+        return normalize_empty_mcp_config(value)
 
     @field_validator("mcp_config", mode="before")
     @classmethod
     def _decrypt_mcp_secret_values(cls, value: Any, info: ValidationInfo) -> Any:
-        """Decrypt MCP ``env`` / ``headers`` values when a cipher is in
-        context (the on-disk load path). Mirrors ``_serialize_mcp_config``'s
-        per-value encryption.
-
-        Values that aren't valid Fernet tokens are passed through as
-        plaintext (e.g. when migrating from a build that wrote env/headers
-        unencrypted to disk).
-        """
-        if not isinstance(value, dict):
-            return value
-        cipher: Cipher | None = info.context.get("cipher") if info.context else None
-        if cipher is None:
-            return value
-        return _walk_mcp_secret_values(
-            value, lambda v: _decrypt_mcp_value_or_keep(cipher, v)
-        )
+        return decrypt_mcp_config_secrets(value, info)
 
     @field_serializer("mcp_config")
     def _serialize_mcp_config(
         self, value: MCPConfig | None, info: SerializationInfo
     ) -> dict[str, Any]:
-        if value is None:
-            return {}
-        dumped = value.model_dump(exclude_none=True, exclude_defaults=True)
-        ctx = info.context or {}
-        mode = resolve_expose_mode(ctx)
-
-        if mode == "plaintext":
-            return dumped
-
-        if mode == "encrypted":
-            cipher: Cipher | None = ctx.get("cipher")
-            if cipher is None:
-                raise MissingCipherError(
-                    "Cannot encrypt MCP env/headers: no cipher configured. "
-                    "Set OH_SECRET_KEY environment variable."
-                )
-            # cipher.encrypt returns None only for None input; SecretStr(v) never is.
-            return _walk_mcp_secret_values(
-                dumped, lambda v: cast(str, cipher.encrypt(SecretStr(v)))
-            )
-
-        return sanitize_dict(dumped)
+        return serialize_mcp_config(value, info)
 
     def create_agent(self) -> Agent:
         """Build an :class:`Agent` purely from these settings.
@@ -1099,6 +1124,42 @@ class ACPAgentSettings(AgentSettingsBase):
             ).model_dump(),
         },
     )
+    mcp_config: MCPConfig | None = Field(
+        default=None,
+        description=(
+            "MCP servers to make available to the ACP subprocess. Unlike the "
+            "OpenHands agent — where these become in-process MCP tools — the "
+            "servers are forwarded to the ACP server at session creation and it "
+            "owns the connection. Remote (http/sse) servers are only forwarded "
+            "when the ACP server advertises support for that transport; stdio "
+            "servers (which run inside the runtime) are always forwarded."
+        ),
+        json_schema_extra={
+            SETTINGS_METADATA_KEY: SettingsFieldMetadata(
+                label="MCP configuration",
+                prominence=SettingProminence.MINOR,
+                variant="acp",
+            ).model_dump(),
+        },
+    )
+
+    # Same shared ``mcp_config`` (de)serialization as OpenHandsAgentSettings.
+    @field_validator("mcp_config", mode="before")
+    @classmethod
+    def _normalize_empty_mcp_config(cls, value: Any) -> Any:
+        return normalize_empty_mcp_config(value)
+
+    @field_validator("mcp_config", mode="before")
+    @classmethod
+    def _decrypt_mcp_secret_values(cls, value: Any, info: ValidationInfo) -> Any:
+        return decrypt_mcp_config_secrets(value, info)
+
+    @field_serializer("mcp_config")
+    def _serialize_mcp_config(
+        self, value: MCPConfig | None, info: SerializationInfo
+    ) -> dict[str, Any]:
+        return serialize_mcp_config(value, info)
+
     # Programmatic / downstream-facing knob, deliberately NOT surfaced in the
     # settings-form UI (no SETTINGS_METADATA_KEY): the deploying application sets
     # it (e.g. when conversations share a sandbox under grouping), not the end
@@ -1359,6 +1420,14 @@ class ACPAgentSettings(AgentSettingsBase):
                 else AgentContext(current_datetime=None, secrets=merged_secrets)
             )
 
+        # Bypass ``_serialize_mcp_config``: the subprocess needs real
+        # env/headers, not the masked/encrypted on-disk form.
+        mcp_config = (
+            self.mcp_config.model_dump(exclude_none=True, exclude_defaults=True)
+            if self.mcp_config is not None
+            else {}
+        )
+
         return ACPAgent(
             llm=self.llm,
             acp_command=self.resolve_acp_command(),
@@ -1375,6 +1444,7 @@ class ACPAgentSettings(AgentSettingsBase):
             acp_isolate_data_dir=self.acp_isolate_data_dir,
             acp_file_secrets=list(self.acp_file_secrets),
             agent_context=agent_context,
+            mcp_config=mcp_config,
         )
 
 

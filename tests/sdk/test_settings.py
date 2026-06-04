@@ -148,6 +148,13 @@ def test_acp_agent_settings_export_schema_has_acp_section() -> None:
     assert acp_fields["acp_model"].prominence is SettingProminence.CRITICAL
     assert acp_fields["acp_command"].prominence is SettingProminence.MINOR
 
+    # mcp_config is exposed as a single object field (matching the OpenHands
+    # variant) rather than being expanded into nested per-server fields. The
+    # servers are forwarded to the ACP subprocess at session creation.
+    general_fields = {f.key: f for f in sections["general"].fields}
+    assert "mcp_config" in general_fields
+    assert general_fields["mcp_config"].prominence is SettingProminence.MINOR
+
 
 def test_conversation_settings_export_schema_groups_sections() -> None:
     schema = ConversationSettings.export_schema()

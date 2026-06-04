@@ -35,9 +35,14 @@ from acp.schema import (
     AgentMessageChunk,
     AgentThoughtChunk,
     AllowedOutcome,
+    EnvVariable,
+    HttpHeader,
+    HttpMcpServer,
     ImageContentBlock,
+    McpServerStdio,
     PromptResponse,
     RequestPermissionResponse,
+    SseMcpServer,
     TextContentBlock,
     ToolCallProgress,
     ToolCallStart,
@@ -384,6 +389,103 @@ def _extract_session_models(
         info for info in (ACPModelInfo.from_protocol(m) for m in raw) if info.model_id
     ]
     return current, available
+
+
+# The ACP MCP server union accepted by new_session() / load_session().
+_ACPMcpServer = HttpMcpServer | SseMcpServer | McpServerStdio
+
+
+def _mcp_config_to_acp_servers(
+    mcp_config: dict[str, Any],
+    mcp_capabilities: Any,
+) -> list[_ACPMcpServer]:
+    """Translate an OpenHands ``mcp_config`` dict into ACP MCP server objects.
+
+    Reads the standard ``{"mcpServers": {name: {...}}}`` shape (the same shape
+    :attr:`AgentBase.mcp_config` carries for the built-in Agent) and returns the
+    list to pass to ``new_session()`` / ``load_session()`` so the ACP
+    subprocess connects to those servers itself.  Unlike the built-in Agent
+    these are *not* turned into in-process OpenHands MCP tools
+    (:attr:`ACPAgent.supports_openhands_mcp` stays ``False``) — the ACP server
+    owns the MCP connection and exposes the tools through its own turn.
+
+    Each entry maps by transport:
+
+    - ``command`` present → :class:`McpServerStdio` (always forwarded; the
+      protocol gates only the remote transports behind a capability flag).
+    - ``url`` present, transport ``sse`` → :class:`SseMcpServer`, forwarded only
+      when the server advertises ``mcp_capabilities.sse``.
+    - ``url`` present, any other / absent transport → :class:`HttpMcpServer`
+      (covers ``http`` and ``streamable-http``), forwarded only when the server
+      advertises ``mcp_capabilities.http``.
+
+    A remote server whose transport the ACP server does not advertise is dropped
+    with a warning rather than failing init — one misconfigured server should
+    not sink the whole conversation.  ``env`` / ``headers`` maps are converted
+    to the protocol's ``[{name, value}]`` list form; their values were already
+    decrypted by :class:`AgentBase`'s ``mcp_config`` validator.
+    """
+    servers = mcp_config.get("mcpServers")
+    if not isinstance(servers, dict):
+        return []
+    http_ok = bool(getattr(mcp_capabilities, "http", False))
+    sse_ok = bool(getattr(mcp_capabilities, "sse", False))
+    result: list[_ACPMcpServer] = []
+    for name, spec in servers.items():
+        if not isinstance(spec, dict):
+            logger.warning("Skipping malformed ACP MCP server %r", name)
+            continue
+        command = spec.get("command")
+        url = spec.get("url")
+        if command:
+            env = [
+                EnvVariable(name=str(k), value=str(v))
+                for k, v in (spec.get("env") or {}).items()
+            ]
+            result.append(
+                McpServerStdio(
+                    name=str(name),
+                    command=str(command),
+                    args=[str(a) for a in (spec.get("args") or [])],
+                    env=env,
+                )
+            )
+        elif url:
+            headers = [
+                HttpHeader(name=str(k), value=str(v))
+                for k, v in (spec.get("headers") or {}).items()
+            ]
+            is_sse = str(spec.get("transport") or "http").lower() == "sse"
+            if not (sse_ok if is_sse else http_ok):
+                logger.warning(
+                    "ACP server does not advertise %s MCP support; "
+                    "dropping MCP server %r (%s)",
+                    "SSE" if is_sse else "HTTP",
+                    name,
+                    url,
+                )
+                continue
+            # Construct each transport explicitly so the ``type`` literal stays
+            # narrow (the union's two arms require distinct ``Literal``s).
+            if is_sse:
+                result.append(
+                    SseMcpServer(
+                        type="sse", name=str(name), url=str(url), headers=headers
+                    )
+                )
+            else:
+                result.append(
+                    HttpMcpServer(
+                        type="http", name=str(name), url=str(url), headers=headers
+                    )
+                )
+        else:
+            logger.warning(
+                "Skipping ACP MCP server %r: needs a 'command' (stdio) or "
+                "'url' (http/sse)",
+                name,
+            )
+    return result
 
 
 async def _maybe_set_session_model(
@@ -1370,7 +1472,14 @@ class ACPAgent(AgentBase):
 
     @property
     def supports_openhands_mcp(self) -> bool:
-        """``False`` — MCP configuration is owned by the ACP subprocess."""
+        """``False`` — OpenHands does not create in-process MCP *tools* here.
+
+        This stays ``False`` even though ``mcp_config`` is honored: any
+        configured MCP servers are forwarded to the ACP subprocess at session
+        creation (see :func:`_mcp_config_to_acp_servers`) rather than connected
+        in-process. The ACP server owns the MCP connection and surfaces the
+        tools through its own turn.
+        """
         return False
 
     @property
@@ -1466,17 +1575,14 @@ class ACPAgent(AgentBase):
         """Spawn the ACP server and initialize a session."""
         # Validate unsupported execution features. agent_context is allowed
         # because it contributes prompt-only extensions to user messages; ACP
-        # server tools, MCP configuration, and context-window management remain
-        # owned by the server.
+        # server tools and context-window management remain owned by the server.
+        # mcp_config IS supported: its servers are forwarded to the subprocess at
+        # session creation (see _mcp_config_to_acp_servers) rather than turned
+        # into in-process OpenHands MCP tools.
         if self.tools:
             raise NotImplementedError(
                 "ACPAgent does not support custom tools; "
                 "the ACP server manages its own tools"
-            )
-        if self.mcp_config:
-            raise NotImplementedError(
-                "ACPAgent does not support mcp_config; "
-                "configure MCP on the ACP server instead"
             )
         if self.condenser is not None:
             raise NotImplementedError(
@@ -2145,6 +2251,25 @@ class ACPAgent(AgentBase):
                 agent_version,
             )
 
+            # Translate any configured MCP servers into ACP protocol objects,
+            # gating remote (http/sse) transports on what this server advertised
+            # in its initialize response. The same list is passed to both
+            # new_session and load_session: load_session does not persist the
+            # prior MCP set server-side, so a resume must re-send it or the
+            # restored session would silently lose its MCP servers.
+            mcp_caps = (
+                init_response.agent_capabilities.mcp_capabilities
+                if init_response.agent_capabilities is not None
+                else None
+            )
+            acp_mcp_servers = _mcp_config_to_acp_servers(self.mcp_config, mcp_caps)
+            if acp_mcp_servers:
+                logger.info(
+                    "Forwarding %d MCP server(s) to ACP session: %s",
+                    len(acp_mcp_servers),
+                    [s.name for s in acp_mcp_servers],
+                )
+
             # Authenticate if the server requires it.  Some ACP servers
             # (e.g. codex-acp) require an explicit authenticate call
             # before session creation.  We auto-detect the method from
@@ -2192,7 +2317,7 @@ class ACPAgent(AgentBase):
                     load_response = await conn.load_session(
                         cwd=working_dir,
                         session_id=prior_session_id,
-                        mcp_servers=[],
+                        mcp_servers=acp_mcp_servers,
                     )
                     session_id = prior_session_id
                     reported_model_id, available_models = _extract_session_models(
@@ -2222,7 +2347,11 @@ class ACPAgent(AgentBase):
                 # _meta dict in the JSON-RPC request — do NOT wrap in _meta=
                 # (that double-nests).
                 session_meta = build_session_model_meta(agent_name, self.acp_model)
-                response = await conn.new_session(cwd=working_dir, **session_meta)
+                response = await conn.new_session(
+                    cwd=working_dir,
+                    mcp_servers=acp_mcp_servers,
+                    **session_meta,
+                )
                 session_id = response.session_id
                 reported_model_id, available_models = _extract_session_models(response)
                 # Initial-selection protocol call for providers that use it

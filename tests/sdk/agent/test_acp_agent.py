@@ -28,6 +28,7 @@ from openhands.sdk.agent.acp_agent import (
     _image_url_to_acp_block,
     _mask_json_value,
     _maybe_set_session_model,
+    _mcp_config_to_acp_servers,
     _OpenHandsACPBridge,
     _reapply_session_model_on_resume,
     _select_auth_method,
@@ -378,13 +379,20 @@ class TestACPAgentValidation:
             agent.init_state(state, on_event=events.append)
         return events
 
-    def test_rejects_mcp_config(self, tmp_path):
+    def test_allows_mcp_config(self, tmp_path):
+        """mcp_config is forwarded to the ACP subprocess, not rejected.
+
+        The servers are translated and passed to new_session/load_session
+        (see test_acp_mcp.py); here we just assert init_state no longer raises.
+        """
         agent = ACPAgent(
             acp_command=["echo"],
             mcp_config={"mcpServers": {"test": {"command": "echo"}}},
         )
-        with pytest.raises(NotImplementedError, match="mcp_config"):
-            self._init_with_patches(agent, tmp_path)
+        # Should not raise; supports_openhands_mcp stays False (no in-process
+        # tools — the ACP server owns the connection).
+        self._init_with_patches(agent, tmp_path)
+        assert agent.supports_openhands_mcp is False
 
     def test_allows_agent_context_for_prompt_extensions(self, tmp_path):
         agent = ACPAgent(
@@ -6765,6 +6773,158 @@ class TestACPAgentSupportsRuntimeModelSwitch:
         agent._session_id = "sess-1"
         agent._agent_name = "locked-down-provider"
         assert agent.supports_runtime_model_switch is False
+
+
+# ---------------------------------------------------------------------------
+
+# MCP forwarding
+# ---------------------------------------------------------------------------
+
+
+class TestMcpConfigToAcpServers:
+    """Unit tests for the mcp_config -> ACP server translation + gating."""
+
+    @staticmethod
+    def _caps(http: bool, sse: bool):
+        from acp.schema import McpCapabilities
+
+        return McpCapabilities(http=http, sse=sse)
+
+    def test_stdio_always_forwarded(self):
+        from acp.schema import McpServerStdio
+
+        cfg = {
+            "mcpServers": {
+                "fetch": {
+                    "command": "uvx",
+                    "args": ["mcp-server-fetch"],
+                    "env": {"API_KEY": "x"},
+                }
+            }
+        }
+        # Even with no advertised remote capabilities, stdio is forwarded.
+        out = _mcp_config_to_acp_servers(cfg, self._caps(http=False, sse=False))
+        assert len(out) == 1
+        srv = out[0]
+        assert isinstance(srv, McpServerStdio)
+        assert srv.name == "fetch"
+        assert srv.command == "uvx"
+        assert srv.args == ["mcp-server-fetch"]
+        assert [(e.name, e.value) for e in srv.env] == [("API_KEY", "x")]
+
+    def test_http_gated_on_capability(self):
+        from acp.schema import HttpMcpServer
+
+        cfg = {
+            "mcpServers": {
+                "remote": {
+                    "url": "https://h/mcp",
+                    "headers": {"Authorization": "Bearer y"},
+                }
+            }
+        }
+        # Dropped when the server doesn't advertise http.
+        assert _mcp_config_to_acp_servers(cfg, self._caps(http=False, sse=False)) == []
+        # Forwarded when advertised.
+        out = _mcp_config_to_acp_servers(cfg, self._caps(http=True, sse=False))
+        assert len(out) == 1
+        assert isinstance(out[0], HttpMcpServer)
+        assert out[0].type == "http"
+        assert out[0].url == "https://h/mcp"
+        assert [(h.name, h.value) for h in out[0].headers] == [
+            ("Authorization", "Bearer y")
+        ]
+
+    def test_sse_gated_on_capability(self):
+        from acp.schema import SseMcpServer
+
+        cfg = {"mcpServers": {"s": {"url": "https://s/sse", "transport": "sse"}}}
+        assert _mcp_config_to_acp_servers(cfg, self._caps(http=True, sse=False)) == []
+        out = _mcp_config_to_acp_servers(cfg, self._caps(http=True, sse=True))
+        assert len(out) == 1
+        assert isinstance(out[0], SseMcpServer)
+        assert out[0].type == "sse"
+
+    def test_streamable_http_maps_to_http(self):
+        from acp.schema import HttpMcpServer
+
+        cfg = {
+            "mcpServers": {
+                "s": {"url": "https://h/mcp", "transport": "streamable-http"}
+            }
+        }
+        out = _mcp_config_to_acp_servers(cfg, self._caps(http=True, sse=True))
+        assert len(out) == 1
+        assert isinstance(out[0], HttpMcpServer)
+
+    def test_empty_and_malformed_configs(self):
+        caps = self._caps(http=True, sse=True)
+        assert _mcp_config_to_acp_servers({}, caps) == []
+        assert _mcp_config_to_acp_servers({"mcpServers": {}}, caps) == []
+        # Not a dict -> skipped, no crash.
+        assert _mcp_config_to_acp_servers({"mcpServers": {"bad": 123}}, caps) == []
+        # No command and no url -> skipped.
+        assert _mcp_config_to_acp_servers({"mcpServers": {"x": {}}}, caps) == []
+
+    def test_none_capabilities_drops_remote_keeps_stdio(self):
+        from acp.schema import McpServerStdio
+
+        cfg = {
+            "mcpServers": {
+                "fetch": {"command": "echo"},
+                "remote": {"url": "https://h/mcp"},
+            }
+        }
+        out = _mcp_config_to_acp_servers(cfg, None)
+        assert [type(s).__name__ for s in out] == [McpServerStdio.__name__]
+
+
+class TestACPMcpForwarding:
+    """The translated servers reach new_session AND load_session (resume)."""
+
+    @staticmethod
+    def _conn_with_caps(*, http=True, sse=True, load_exc=None):
+        conn = TestACPSessionIdPersistence._make_conn(load_exc=load_exc)
+        conn.initialize.return_value.agent_capabilities.mcp_capabilities = (
+            TestMcpConfigToAcpServers._caps(http=http, sse=sse)
+        )
+        return conn
+
+    def test_new_session_receives_mcp_servers(self, tmp_path):
+        agent = _make_agent(mcp_config={"mcpServers": {"fetch": {"command": "echo"}}})
+        state = _make_state(tmp_path)
+        conn = self._conn_with_caps()
+
+        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+
+        conn.new_session.assert_awaited_once()
+        servers = conn.new_session.call_args.kwargs["mcp_servers"]
+        assert [s.name for s in servers] == ["fetch"]
+
+    def test_resume_load_session_receives_mcp_servers(self, tmp_path):
+        """The key correctness point: resume must re-pass MCP servers, since
+        load_session does not persist them server-side."""
+        agent = _make_agent(mcp_config={"mcpServers": {"fetch": {"command": "echo"}}})
+        state = _make_state(tmp_path)
+        state.agent_state = {**state.agent_state, "acp_session_id": "stored-sess"}
+        conn = self._conn_with_caps()
+
+        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+
+        conn.load_session.assert_awaited_once()
+        servers = conn.load_session.call_args.kwargs["mcp_servers"]
+        assert [s.name for s in servers] == ["fetch"]
+        conn.new_session.assert_not_awaited()
+
+    def test_no_mcp_config_forwards_empty_list(self, tmp_path):
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        conn = self._conn_with_caps()
+
+        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+
+        conn.new_session.assert_awaited_once()
+        assert conn.new_session.call_args.kwargs["mcp_servers"] == []
 
 
 # ---------------------------------------------------------------------------
