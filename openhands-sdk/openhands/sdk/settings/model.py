@@ -1243,13 +1243,13 @@ class ACPAgentSettings(AgentSettingsBase):
         default=None,
         description=(
             "Prompt-only context for the ACP server. ``secrets`` here are "
-            "advertised to the agent (names/descriptions) and injected into the "
-            "subprocess env through two channels: ``state.secret_registry`` (on "
-            "the Python path, ``create_request`` lifts ``agent_context.secrets`` "
-            "into the registry) and a direct drain in "
-            "``ACPAgent._start_acp_server`` for callers that build the request "
-            "outside Python (e.g. canvas-local). ``create_agent`` also folds "
-            "provider credentials into these secrets."
+            "advertised to the agent (names/descriptions) and reach the "
+            "subprocess env through ``state.secret_registry``: "
+            "``LocalConversation`` seeds ``agent_context.secrets`` into the "
+            "registry at conversation init (below ``request.secrets``), so "
+            "callers that build the request outside Python (e.g. canvas-local) "
+            "are covered too, not just the ``create_request`` path. "
+            "``create_agent`` also folds provider credentials into these secrets."
         ),
     )
 
