@@ -994,6 +994,23 @@ class OpenHandsAgentSettings(AgentSettingsBase):
             ).model_dump()
         },
     )
+    tool_concurrency_limit: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Maximum number of tool calls to execute concurrently per agent step. "
+            "1 = sequential (default). Values > 1 enable parallel tool calls; "
+            "concurrent tools share the conversation object, filesystem, and "
+            "working directory, so mutations to shared state may race."
+        ),
+        json_schema_extra={
+            SETTINGS_METADATA_KEY: SettingsFieldMetadata(
+                label="Parallel tool calls",
+                prominence=SettingProminence.MAJOR,
+                variant="openhands",
+            ).model_dump()
+        },
+    )
 
     mcp_config: MCPConfig | None = Field(
         default=None,
@@ -1090,6 +1107,7 @@ class OpenHandsAgentSettings(AgentSettingsBase):
             agent_context=self.agent_context,
             condenser=self.build_condenser(self.llm),
             critic=self.build_critic(),
+            tool_concurrency_limit=self.tool_concurrency_limit,
         )
 
     def build_condenser(self, llm: LLM) -> CondenserBase | None:
