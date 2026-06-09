@@ -142,15 +142,21 @@ MAX_ACP_CONTENT_CHARS: int = 30_000
 # Env vars that must be removed from the subprocess environment when a
 # particular "dominant" env var is present.
 #
-# Rationale: some auth mechanisms are mutually exclusive and their env vars
-# conflict.  For example, CLAUDE_CONFIG_DIR activates Claude Code's OAuth
-# credential-file flow.  If ANTHROPIC_API_KEY or ANTHROPIC_BASE_URL are
-# also present they redirect requests to a different endpoint (e.g. a proxy)
-# that doesn't support OAuth bearer tokens, breaking authentication silently.
-# When CLAUDE_CONFIG_DIR is detected we strip the conflicting vars so the
-# subprocess can reach api.anthropic.com with its own OAuth token.
+# Rationale: Claude Code's subscription auth uses CLAUDE_CODE_OAUTH_TOKEN, a
+# bearer validated against api.anthropic.com. A co-present ANTHROPIC_API_KEY
+# would take precedence over the token (silently bypassing the subscription),
+# and an ANTHROPIC_BASE_URL would route the bearer to a proxy that rejects it —
+# either silently breaks the intended OAuth auth. When the OAuth token is the
+# active credential we strip both so the subprocess authenticates with the
+# token against api.anthropic.com.
+#
+# Keyed on the credential itself (CLAUDE_CODE_OAUTH_TOKEN), NOT on
+# CLAUDE_CONFIG_DIR: the config dir is a *location* lever (data-dir isolation,
+# #1019) that is orthogonal to which credential is active. Keying the strip on
+# it wrongly fired during API-key isolation and missed the conflict when the
+# token arrived via env without isolation (#3588).
 _ENV_CONFLICT_MAP: dict[str, frozenset[str]] = {
-    "CLAUDE_CONFIG_DIR": frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"}),
+    "CLAUDE_CODE_OAUTH_TOKEN": frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"}),
 }
 
 # Number of trailing characters of an ACP session id retained in log lines
@@ -1886,14 +1892,12 @@ class ACPAgent(AgentBase):
         highest precedence and is honoured as the materialisation target too), so
         leave it untouched.
 
-        Claude carve-out: ``CLAUDE_CONFIG_DIR`` also activates Claude Code's
-        OAuth credential-file flow, and :data:`_ENV_CONFLICT_MAP` then strips
-        ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_BASE_URL``. Relocating it while an API
-        key is the active credential (no OAuth token present) would delete a
-        working key + proxy URL and break auth, so skip Claude in that case;
-        codex/gemini have no such coupling. (Claude's transcripts are already
-        cwd-keyed, so the residual shared state is the mostly-inert global
-        config.)
+        Claude note: relocating ``CLAUDE_CONFIG_DIR`` is safe under either auth
+        mode. :data:`_ENV_CONFLICT_MAP` is keyed on the OAuth token
+        (``CLAUDE_CODE_OAUTH_TOKEN``), not on ``CLAUDE_CONFIG_DIR``, so setting
+        the config dir for isolation no longer strips a working
+        ``ANTHROPIC_API_KEY`` — API-key Claude gets the same per-conversation
+        isolation (and pause/resume continuity) as OAuth Claude (#3588).
 
         ``HOME`` (gemini-cli's only lever — it hard-codes ``~/.gemini`` and
         ignores ``XDG``) has a wider blast radius than the surgical
@@ -1904,25 +1908,17 @@ class ACPAgent(AgentBase):
         need a narrower scope can pin ``HOME`` via ``acp_env`` (honoured below)
         or leave isolation off for Gemini.
 
-        Ordering contract: this runs *after* the ``secret_registry`` injection
-        and the ``acp_env`` update in :meth:`_start_acp_server`, so the
-        credential vars it inspects (``ANTHROPIC_API_KEY`` /
-        ``CLAUDE_CODE_OAUTH_TOKEN``) are already hydrated into ``env``. Calling it
-        earlier would misread the active credential and wrongly relocate Claude.
+        Ordering: this runs *after* the ``secret_registry`` injection and the
+        ``acp_env`` update in :meth:`_start_acp_server` so an ``acp_env`` pin of
+        the data-dir var is visible and wins. Relocation is now credential-blind
+        (the auth-conflict strip is keyed on ``CLAUDE_CODE_OAUTH_TOKEN``, not on
+        the config dir), so the data-dir var it sets never affects auth.
         """
         provider = detect_acp_provider_by_command(self.acp_command)
         if provider is None or provider.data_dir_env_var is None:
             return
         env_var = provider.data_dir_env_var
         if env_var in self.acp_env:
-            return
-        # Relies on the ordering contract above: ANTHROPIC_API_KEY /
-        # CLAUDE_CODE_OAUTH_TOKEN must already be hydrated into env.
-        if (
-            env_var == "CLAUDE_CONFIG_DIR"
-            and env.get("ANTHROPIC_API_KEY")
-            and "CLAUDE_CODE_OAUTH_TOKEN" not in env
-        ):
             return
         data_dir = self._acp_file_secret_dir(state, provider.key)
         data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -2091,18 +2087,16 @@ class ACPAgent(AgentBase):
 
         # Relocate the CLI's data/config root to a per-conversation directory so
         # sandbox-sharing conversations don't race on a shared HOME (#1019).
-        # Ordering is load-bearing — this must run AFTER the registry /
-        # registry injection and the acp_env update above (so the credential
-        # vars its Claude carve-out inspects — ANTHROPIC_API_KEY /
-        # CLAUDE_CODE_OAUTH_TOKEN — are already in env, and an acp_env pin wins)
-        # and BEFORE the conflict-strip below (so a CLAUDE_CONFIG_DIR it sets is
-        # still subject to the strip).
+        # Runs after the registry injection and the acp_env update above so an
+        # acp_env pin of the data-dir var wins. Independent of the strip below
+        # (keyed on the OAuth token, not the data-dir var), so ordering relative
+        # to it no longer matters for correctness.
         if self.acp_isolate_data_dir:
             self._isolate_acp_data_dir(state, env)
 
-        # Strip env vars that conflict with an active auth mechanism.
-        # E.g. CLAUDE_CONFIG_DIR (OAuth credential file) conflicts with
-        # ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL (API-key + proxy auth).
+        # Strip env vars that conflict with an active auth mechanism: an active
+        # CLAUDE_CODE_OAUTH_TOKEN must not coexist with ANTHROPIC_API_KEY (which
+        # takes precedence) or ANTHROPIC_BASE_URL (proxies the bearer). See #3588.
         for dominant, conflicts in _ENV_CONFLICT_MAP.items():
             if dominant in env:
                 for conflict in conflicts:
