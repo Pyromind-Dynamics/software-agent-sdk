@@ -338,8 +338,9 @@ def test_responses_retries_without_caching_on_prompt_cache_too_small(mock_respon
 
     # Pick a model that supports prompt caching so is_caching_prompt_active()
     # is True and the retry branch is reachable on the responses() path.
+    # (Gemini no longer uses explicit caching, so use an Anthropic model here.)
     llm = LLM(
-        model="gemini-3-flash",
+        model="claude-sonnet-4-20250514",
         api_key=SecretStr("test_key"),
         usage_id="test-llm",
         caching_prompt=True,
@@ -417,8 +418,10 @@ async def test_aresponses_retries_without_caching_on_prompt_cache_too_small(
     )
     mock_aresponses.side_effect = [cache_error, success_resp]
 
+    # Anthropic model so is_caching_prompt_active() is True (Gemini no longer
+    # uses explicit caching); mirrors the sync test above.
     llm = LLM(
-        model="gemini-3-flash",
+        model="claude-sonnet-4-20250514",
         api_key=SecretStr("test_key"),
         usage_id="test-llm",
         caching_prompt=True,

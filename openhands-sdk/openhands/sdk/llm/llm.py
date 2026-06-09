@@ -2102,8 +2102,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 # Single block: mark it for caching
                 sys_content[0].cache_prompt = True
 
-        # Anthropic and Gemini both use these cache_control markers. LiteLLM
-        # performs the provider-specific cache setup for Gemini downstream.
+        # Second breakpoint: mark the last user/tool message so the cached prefix
+        # extends every turn. Anthropic-only; Gemini is excluded from
+        # PROMPT_CACHE_MODELS because its cache can't extend this way.
         for message in reversed(messages):
             if message.role in ("user", "tool"):
                 message.content[
