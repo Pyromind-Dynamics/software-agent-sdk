@@ -117,6 +117,33 @@ def test_normalize_responses_kwargs_encrypted_reasoning_disabled():
     assert "text.output_text" in out["include"]
 
 
+def test_responses_reasoning_options_not_sent_for_non_reasoning_model():
+    llm = LLM(
+        model="openai/gpt-4o-mini",
+        reasoning_effort="high",
+        reasoning_summary="detailed",
+    )
+
+    out = select_responses_options(
+        llm,
+        {},
+        include=["message.output_text.logprobs"],
+        store=None,
+    )
+
+    assert "reasoning" not in out
+    assert out["include"] == ["message.output_text.logprobs"]
+
+
+def test_responses_encrypted_reasoning_not_added_for_non_reasoning_model():
+    llm = LLM(model="openai/gpt-4o-mini")
+
+    out = select_responses_options(llm, {}, include=None, store=False)
+
+    assert "include" not in out
+    assert "reasoning" not in out
+
+
 @patch("openhands.sdk.llm.llm.litellm_responses")
 def test_llm_responses_end_to_end(mock_responses_call):
     # Configure LLM
