@@ -133,6 +133,7 @@ def test_get_settings_returns_default_settings(client_with_settings):
     assert "conversation_settings" in body
     assert "llm_api_key_is_set" in body
     assert body["llm_api_key_is_set"] is False
+    assert body["active_profile"] is None
 
 
 def test_get_settings_migrates_legacy_openhands_settings_and_resaves_current(
@@ -214,6 +215,7 @@ def test_get_settings_migrates_legacy_openhands_settings_and_resaves_current(
     )
     assert response.status_code == 200
     body = response.json()
+    assert body["active_profile"] == "legacy-profile"
     agent_settings = body["agent_settings"]
     assert agent_settings["schema_version"] == AGENT_SETTINGS_SCHEMA_VERSION
     assert agent_settings["agent_kind"] == "openhands"
@@ -483,6 +485,43 @@ def test_patch_settings_updates_llm_config(client_with_settings):
     assert body["llm_api_key_is_set"] is True
 
 
+def test_patch_settings_updates_active_profile(client_with_settings):
+    """PATCH /api/settings can update and clear the active LLM profile."""
+    response = client_with_settings.patch(
+        "/api/settings",
+        json={"active_profile": "fast-profile"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["active_profile"] == "fast-profile"
+
+    refetch = client_with_settings.get("/api/settings")
+    assert refetch.status_code == 200
+    assert refetch.json()["active_profile"] == "fast-profile"
+
+    clear_response = client_with_settings.patch(
+        "/api/settings",
+        json={"active_profile": None},
+    )
+
+    assert clear_response.status_code == 200
+    assert clear_response.json()["active_profile"] is None
+
+    refetch = client_with_settings.get("/api/settings")
+    assert refetch.status_code == 200
+    assert refetch.json()["active_profile"] is None
+
+
+def test_patch_settings_rejects_invalid_active_profile(client_with_settings):
+    """PATCH /api/settings validates active profile names."""
+    response = client_with_settings.patch(
+        "/api/settings",
+        json={"active_profile": "not a valid profile"},
+    )
+
+    assert response.status_code == 422
+
+
 def test_patch_settings_updates_condenser_config(client_with_settings):
     """PATCH /api/settings can update condenser constructor settings."""
     response = client_with_settings.patch(
@@ -600,7 +639,11 @@ def test_patch_settings_empty_payload_returns_400(client_with_settings):
     response = client_with_settings.patch("/api/settings", json={})
 
     assert response.status_code == 400
-    assert "At least one of" in response.json()["detail"]
+    assert response.json()["detail"] == (
+        "At least one of agent_settings_diff, "
+        "conversation_settings_diff, misc_settings_diff, "
+        "or active_profile must be provided"
+    )
 
 
 # ── misc_settings (opaque frontend-owned container) ─────────────────────

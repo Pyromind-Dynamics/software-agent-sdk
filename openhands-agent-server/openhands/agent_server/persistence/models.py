@@ -289,8 +289,8 @@ class PersistedSettings(BaseModel):
 
         Schema-version history:
 
-        - **v1**: ``agent_settings`` + ``conversation_settings`` only.
-          Missing ``misc_settings`` defaults to an empty dict.
+        - **v1**: ``agent_settings`` + ``conversation_settings`` plus
+          ``active_profile``.
         - **v2** (current): adds the opaque ``misc_settings`` container.
         """
         if not isinstance(data, dict):

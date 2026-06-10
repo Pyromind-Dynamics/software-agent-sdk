@@ -160,6 +160,7 @@ async def get_settings(request: Request) -> SettingsResponse:
                 mode="json"
             ),
             llm_api_key_is_set=settings.llm_api_key_is_set,
+            active_profile=settings.active_profile,
             misc_settings=settings.misc_settings,
         )
 
@@ -170,12 +171,12 @@ async def update_settings(
 ) -> SettingsResponse:
     """Update settings with partial changes.
 
-    Accepts ``agent_settings_diff``, ``conversation_settings_diff``, and/or
-    ``misc_settings_diff`` for incremental updates. All three are deep-merged;
-    nested objects merge recursively, and a ``null`` value **inside a nested
-    map deletes that entry** — the "unset" primitive that lets a client
-    remove a single map key without round-tripping the whole map. To drop one
-    ACP env-var::
+    Accepts ``agent_settings_diff``, ``conversation_settings_diff``,
+    ``misc_settings_diff``, and/or ``active_profile`` for incremental updates.
+    The three ``*_settings_diff`` fields are deep-merged; nested objects merge
+    recursively, and a ``null`` value **inside a nested map deletes that entry**
+    — the "unset" primitive that lets a client remove a single map key without
+    round-tripping the whole map. To drop one ACP env-var::
 
         PATCH /api/settings
         {"agent_settings_diff": {"acp_env": {"STALE_KEY": null}}}
@@ -203,14 +204,16 @@ async def update_settings(
     store = get_settings_store(config)
 
     update_data = payload.model_dump(exclude_none=True)
+    if "active_profile" in payload.model_fields_set:
+        update_data["active_profile"] = payload.active_profile
     if not update_data:
         # No updates provided - this is a client error
         raise HTTPException(
             status_code=400,
             detail=(
                 "At least one of agent_settings_diff, "
-                "conversation_settings_diff, or misc_settings_diff "
-                "must be provided"
+                "conversation_settings_diff, misc_settings_diff, "
+                "or active_profile must be provided"
             ),
         )
 
@@ -265,6 +268,7 @@ async def update_settings(
         agent_settings=settings.agent_settings.model_dump(mode="json"),
         conversation_settings=settings.conversation_settings.model_dump(mode="json"),
         llm_api_key_is_set=settings.llm_api_key_is_set,
+        active_profile=settings.active_profile,
         misc_settings=settings.misc_settings,
     )
 
