@@ -164,6 +164,23 @@ ENV_ALLOW_SHORT_CONTEXT_WINDOWS: Final[str] = "ALLOW_SHORT_CONTEXT_WINDOWS"
 # 16384 is a safe default that works for most models (GPT-4o: 16k, Claude: 8k).
 DEFAULT_MAX_OUTPUT_TOKENS_CAP: Final[int] = 16384
 
+# Some providers (notably AWS Bedrock for Anthropic models) enforce
+# ``input_tokens + max_tokens <= context_window`` on a single shared window.
+# For these providers we clamp the per-request output budget at request time so
+# our injected default ``max_tokens`` (which defaults to the model's full
+# ``max_output_tokens`` -- e.g. 64k for Sonnet 4.5) cannot push large-input
+# requests past the context window. See BerriAI/litellm#17900 for the upstream
+# default change that made this manifest.
+JOINT_BUDGET_SAFETY_MARGIN_TOKENS: Final[int] = 256
+JOINT_BUDGET_MIN_OUTPUT_TOKENS: Final[int] = 1024
+# Provider name prefixes known to enforce a joint input/output token budget.
+# Kept as a narrow allowlist so direct providers (Anthropic, OpenAI, etc.) --
+# which have independent input/output windows -- are not affected. We match by
+# prefix because LiteLLM uses both ``bedrock`` (raw provider inference) and
+# ``bedrock_converse`` (the Anthropic-on-Bedrock route, surfaced via the model
+# registry) for the same underlying API.
+_JOINT_BUDGET_PROVIDER_PREFIXES: Final[tuple[str, ...]] = ("bedrock",)
+
 # Secret-bearing fields on LLM. Kept as a single source of truth so callers that
 # need to walk secrets (e.g. cipher-aware decryption on the save path) stay in
 # sync with the serializer below.
@@ -1022,6 +1039,13 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         has_tools_flag = bool(cc_tools) and use_native_fc
         # Behavior-preserving: delegate to select_chat_options
         call_kwargs = select_chat_options(self, kwargs, has_tools=has_tools_flag)
+
+        # 3a) joint input/output budget clamp (e.g. Bedrock-Anthropic)
+        call_kwargs = self._clamp_max_tokens_for_joint_budget(
+            call_kwargs,
+            formatted_messages,
+            [] if use_mock_tools else cc_tools,
+        )
 
         # 4) request context for telemetry (always include context_window for metrics)
         # Always pass context_window so metrics are tracked even when
@@ -1889,6 +1913,102 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     def _model_name_for_capabilities(self) -> str:
         """Return canonical name for capability lookups (e.g., vision support)."""
         return self.model_canonical_name or self.model
+
+    def _provider_has_joint_token_budget(self) -> bool:
+        """Whether the provider enforces input + max_tokens <= context_window.
+
+        Some providers (notably AWS Bedrock for Anthropic models) share a single
+        token window between input and requested output. Direct providers
+        (Anthropic, OpenAI, etc.) have independent input/output windows.
+        """
+        provider = self._infer_model_info_provider() or ""
+        return any(provider.startswith(p) for p in _JOINT_BUDGET_PROVIDER_PREFIXES)
+
+    def _clamp_max_tokens_for_joint_budget(
+        self,
+        call_kwargs: dict[str, Any],
+        formatted_messages: list[dict[str, Any]],
+        cc_tools: list[ChatCompletionToolParam],
+    ) -> dict[str, Any]:
+        """Clamp per-request output budget for joint-window providers.
+
+        For providers like Bedrock-Anthropic, ``input_tokens + max_tokens`` must
+        not exceed the context window. Our injected default for ``max_tokens`` is
+        the model's full ``max_output_tokens`` (e.g. 64k for Sonnet 4.5), which
+        for any input larger than roughly ``context_window - max_output_tokens``
+        will fail with "Input is too long for requested model" -- even when the
+        actual response would be small. Clamp to the headroom that actually
+        remains, with a safety margin and a floor so we never send ``0``.
+
+        For non-joint providers the parameters are independent budgets and we
+        leave the kwargs untouched.
+        """
+        if not self._provider_has_joint_token_budget():
+            return call_kwargs
+
+        context_window = self.effective_max_input_tokens
+        if not context_window:
+            return call_kwargs
+
+        # Both keys may appear depending on routing (Azure / extended thinking
+        # use ``max_tokens``; everything else uses ``max_completion_tokens``).
+        budget_key = next(
+            (k for k in ("max_tokens", "max_completion_tokens") if k in call_kwargs),
+            None,
+        )
+        if budget_key is None:
+            return call_kwargs
+        current_budget = call_kwargs.get(budget_key)
+        if not isinstance(current_budget, int) or current_budget <= 0:
+            return call_kwargs
+
+        try:
+            input_tokens = int(
+                token_counter(
+                    model=self.model,
+                    messages=formatted_messages,
+                    tools=cc_tools or None,
+                    custom_tokenizer=self._tokenizer,
+                )
+            )
+        except Exception:
+            logger.debug(
+                "Joint-budget clamp: token_counter failed for %s; "
+                "leaving max_tokens unchanged",
+                self.model,
+                exc_info=True,
+            )
+            return call_kwargs
+
+        headroom = context_window - input_tokens - JOINT_BUDGET_SAFETY_MARGIN_TOKENS
+        clamped = max(min(current_budget, headroom), JOINT_BUDGET_MIN_OUTPUT_TOKENS)
+
+        if clamped >= current_budget:
+            return call_kwargs
+
+        if headroom < JOINT_BUDGET_MIN_OUTPUT_TOKENS:
+            logger.warning(
+                "Input tokens (%s) leave only %s tokens of headroom in the %s "
+                "context window for %s; sending the floor of %s. The provider "
+                "may still reject this request -- consider condensing history.",
+                input_tokens,
+                max(headroom, 0),
+                context_window,
+                self.model,
+                JOINT_BUDGET_MIN_OUTPUT_TOKENS,
+            )
+        else:
+            logger.debug(
+                "Clamping %s from %s to %s for %s "
+                "(input_tokens=%s, context_window=%s, joint-budget provider)",
+                budget_key,
+                current_budget,
+                clamped,
+                self.model,
+                input_tokens,
+                context_window,
+            )
+        return {**call_kwargs, budget_key: clamped}
 
     def _init_model_info_and_caps(self) -> None:
         self._model_info = get_litellm_model_info(
