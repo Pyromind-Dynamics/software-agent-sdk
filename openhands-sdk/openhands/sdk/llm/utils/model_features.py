@@ -146,6 +146,11 @@ PROMPT_CACHE_MODELS: list[str] = [
     "claude-opus-4-7",
     "claude-opus-4-8",
     "claude-sonnet-4-6",
+    # https://www.anthropic.com/news/claude-fable-5
+    # Listed explicitly because LiteLLM metadata does not yet recognize this
+    # model. Without it, prompt caching is silently disabled and every turn
+    # re-sends the full (growing) context at full price.
+    "claude-fable-5",
     # Do NOT add Gemini: explicit cache_control markers freeze its cache at the
     # static prefix and disable Google's implicit caching on the growing body
     # (~6-14x cost). Gemini uses implicit prefix caching instead.
