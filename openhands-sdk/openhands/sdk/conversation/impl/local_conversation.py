@@ -10,6 +10,7 @@ from typing import Any, TypeGuard
 
 from openhands.sdk.agent.acp_agent import ACPAgent
 from openhands.sdk.agent.base import AgentBase
+from openhands.sdk.context.condenser import CondenserBase, LLMSummarizingCondenser
 from openhands.sdk.context.prompts.prompt import render_template
 from openhands.sdk.conversation.base import BaseConversation
 from openhands.sdk.conversation.cancellation import CancellationToken
@@ -861,6 +862,34 @@ class LocalConversation(BaseConversation):
                 **existing,
             }
 
+    def _condenser_for_switched_llm(
+        self,
+        current_llm: LLM,
+        new_llm: LLM,
+    ) -> CondenserBase | None:
+        condenser = self.agent.condenser
+        if not isinstance(condenser, LLMSummarizingCondenser):
+            return condenser
+
+        current_config = current_llm.model_dump(
+            mode="json",
+            context={"expose_secrets": True},
+            exclude={"usage_id"},
+        )
+        condenser_config = condenser.llm.model_dump(
+            mode="json",
+            context={"expose_secrets": True},
+            exclude={"usage_id"},
+        )
+        if condenser_config != current_config:
+            return condenser
+
+        condenser_llm = new_llm.model_copy(
+            update={"usage_id": condenser.llm.usage_id},
+        )
+        condenser_llm.reset_metrics()
+        return condenser.model_copy(update={"llm": condenser_llm})
+
     def switch_llm(self, llm: LLM) -> None:
         """Swap the agent's LLM to the given object.
 
@@ -899,6 +928,11 @@ class LocalConversation(BaseConversation):
             ):
                 update["condenser"] = self._subscription_disabled_condenser
                 self._subscription_disabled_condenser = None
+            else:
+                update["condenser"] = self._condenser_for_switched_llm(
+                    self.agent.llm,
+                    new_llm,
+                )
             self.agent = self.agent.model_copy(update=update)
             self._state.agent = self.agent
             self._pin_prompt_cache_key()
