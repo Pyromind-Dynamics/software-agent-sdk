@@ -386,6 +386,7 @@ class LocalConversation(BaseConversation):
             user_id=user_id,
             metadata=observability_metadata,
             tags=observability_tags,
+            conversation_tags=tags,
         )
         self.delete_on_close = delete_on_close
 

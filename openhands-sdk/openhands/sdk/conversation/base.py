@@ -29,6 +29,14 @@ from openhands.sdk.tool.schema import Action, Observation
 from openhands.sdk.workspace.base import BaseWorkspace
 
 
+def _conversation_tag_attributes(
+    tags: Mapping[str, str] | None,
+) -> dict[str, str] | None:
+    if not tags:
+        return None
+    return {f"conversation.tags.{key}": value for key, value in tags.items()}
+
+
 if TYPE_CHECKING:
     from openhands.sdk.agent.base import AgentBase
     from openhands.sdk.conversation.state import ConversationExecutionStatus
@@ -134,6 +142,7 @@ class BaseConversation(ABC):
         user_id: str | None = None,
         metadata: dict[str, TraceMetadataValue] | None = None,
         tags: list[str] | None = None,
+        conversation_tags: Mapping[str, str] | None = None,
     ) -> None:
         """Start a per-conversation observability root span.
 
@@ -142,6 +151,7 @@ class BaseConversation(ABC):
             user_id: Optional user ID to associate with the trace
             metadata: Optional trace-level metadata to attach to observability backends
             tags: Optional span tags to attach to the conversation root span
+            conversation_tags: Optional conversation tags to add as root span attributes
         """
         if not should_enable_observability():
             return
@@ -154,6 +164,7 @@ class BaseConversation(ABC):
             user_id=user_id,
             metadata=metadata,
             tags=tags,
+            attributes=_conversation_tag_attributes(conversation_tags),
         )
 
     def _end_observability_span(self) -> None:

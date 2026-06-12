@@ -100,6 +100,7 @@ def test_base_conversation_span_management():
             user_id=None,
             metadata=None,
             tags=None,
+            attributes=None,
         )
         assert conversation._span_ended is False
         assert conversation._observability_root_span is fake_root
@@ -121,7 +122,8 @@ def test_base_conversation_span_management():
         assert conversation._span_ended is True
 
 
-def test_base_conversation_passes_observability_metadata():
+def test_base_conversation_passes_observability_metadata_and_tag_attributes():
+    """Conversation metadata, span tags, and conversation tags reach the root span."""
     conversation = MockConversation()
 
     with (
@@ -134,18 +136,27 @@ def test_base_conversation_passes_observability_metadata():
         metadata: dict[str, TraceMetadataValue] = {
             "repo_name": "OpenHands/software-agent-sdk"
         }
-        tags = ["repo:OpenHands/software-agent-sdk"]
+        span_tags = ["repo:OpenHands/software-agent-sdk"]
+        conversation_tags = {"automationid": "auto-1", "automationrunid": "run-1"}
 
         conversation._start_observability_span(
-            "test-session-id", metadata=metadata, tags=tags
+            "test-session-id",
+            user_id="user-42",
+            metadata=metadata,
+            tags=span_tags,
+            conversation_tags=conversation_tags,
         )
 
         mock_start_span.assert_called_once_with(
             "conversation",
             session_id="test-session-id",
-            user_id=None,
+            user_id="user-42",
             metadata=metadata,
-            tags=tags,
+            tags=span_tags,
+            attributes={
+                "conversation.tags.automationid": "auto-1",
+                "conversation.tags.automationrunid": "run-1",
+            },
         )
 
 

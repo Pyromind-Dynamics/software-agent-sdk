@@ -805,6 +805,8 @@ class RemoteConversation(BaseConversation):
                 else [],
                 "user_id": user_id,
             }
+            if user_id:
+                payload["user_id"] = user_id
             if stuck_detection_thresholds is not None:
                 # Convert to StuckDetectionThresholds if dict, then serialize
                 if isinstance(stuck_detection_thresholds, Mapping):
@@ -974,6 +976,7 @@ class RemoteConversation(BaseConversation):
             user_id=user_id,
             metadata=observability_metadata,
             tags=observability_tags,
+            conversation_tags=tags,
         )
         # All hooks (including SessionStart/SessionEnd) are executed server-side.
         # hook_config is sent in the creation payload.

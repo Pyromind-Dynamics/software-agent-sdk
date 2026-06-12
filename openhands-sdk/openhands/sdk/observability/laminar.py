@@ -4,7 +4,7 @@ import contextlib
 import functools
 import inspect
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 from openhands.sdk.logger import get_logger
@@ -255,6 +255,7 @@ class RootSpan:
         name: str,
         session_id: str | None = None,
         user_id: str | None = None,
+        attributes: Mapping[str, str] | None = None,
         metadata: dict[str, TraceMetadataValue] | None = None,
         tags: list[str] | None = None,
     ) -> None:
@@ -263,6 +264,10 @@ class RootSpan:
         # ``start_span`` returns a span without attaching it as the current
         # OTel context; we'll restore it on every entry point via ``use_span``.
         self.span = Laminar.start_span(name)
+        if attributes:
+            with contextlib.suppress(Exception):
+                for key, value in attributes.items():
+                    self.span.set_attribute(key, value)
         if session_id or user_id or metadata or tags:
             # These trace/span helpers require an active span; briefly enter
             # the span context to apply conversation-level observability data.
@@ -300,6 +305,7 @@ def start_root_span(
     name: str,
     session_id: str | None = None,
     user_id: str | None = None,
+    attributes: Mapping[str, str] | None = None,
     metadata: dict[str, TraceMetadataValue] | None = None,
     tags: list[str] | None = None,
 ) -> RootSpan | None:
@@ -314,6 +320,7 @@ def start_root_span(
             name,
             session_id=session_id,
             user_id=user_id,
+            attributes=attributes,
             metadata=metadata,
             tags=tags,
         )
