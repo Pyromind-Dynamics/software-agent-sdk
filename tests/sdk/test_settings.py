@@ -211,6 +211,20 @@ def test_conversation_settings_export_schema_groups_sections() -> None:
     assert verification_fields["security_analyzer"].depends_on == ["confirmation_mode"]
 
 
+def test_conversation_settings_validates_observability_metadata() -> None:
+    settings = ConversationSettings(observability_metadata={"repo": "OpenHands/sdk"})
+    assert settings.observability_metadata == {"repo": "OpenHands/sdk"}
+
+    with pytest.raises(ValidationError):
+        ConversationSettings(observability_metadata={"": "missing-key"})
+
+    with pytest.raises(ValidationError):
+        ConversationSettings(observability_metadata=[])  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError):
+        ConversationSettings(observability_tags=[1, 2])  # type: ignore[list-item]
+
+
 def test_conversation_settings_model_dump_roundtrip() -> None:
     settings = ConversationSettings(
         max_iterations=42,

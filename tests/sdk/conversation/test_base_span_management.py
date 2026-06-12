@@ -7,6 +7,7 @@ from uuid import UUID
 
 from openhands.sdk.conversation.base import BaseConversation
 from openhands.sdk.conversation.conversation_stats import ConversationStats
+from openhands.sdk.conversation.types import TraceMetadataValue
 from openhands.sdk.llm.llm import LLM
 from openhands.sdk.tool.schema import Action, Observation
 
@@ -94,7 +95,11 @@ def test_base_conversation_span_management():
         # Start span
         conversation._start_observability_span("test-session-id")
         mock_start_span.assert_called_once_with(
-            "conversation", session_id="test-session-id", user_id=None
+            "conversation",
+            session_id="test-session-id",
+            user_id=None,
+            metadata=None,
+            tags=None,
         )
         assert conversation._span_ended is False
         assert conversation._observability_root_span is fake_root
@@ -114,6 +119,34 @@ def test_base_conversation_span_management():
         conversation._end_observability_span()
         assert mock_end_span.call_count == 1  # Still only called once
         assert conversation._span_ended is True
+
+
+def test_base_conversation_passes_observability_metadata():
+    conversation = MockConversation()
+
+    with (
+        patch(
+            "openhands.sdk.conversation.base.should_enable_observability",
+            return_value=True,
+        ),
+        patch("openhands.sdk.conversation.base.start_root_span") as mock_start_span,
+    ):
+        metadata: dict[str, TraceMetadataValue] = {
+            "repo_name": "OpenHands/software-agent-sdk"
+        }
+        tags = ["repo:OpenHands/software-agent-sdk"]
+
+        conversation._start_observability_span(
+            "test-session-id", metadata=metadata, tags=tags
+        )
+
+        mock_start_span.assert_called_once_with(
+            "conversation",
+            session_id="test-session-id",
+            user_id=None,
+            metadata=metadata,
+            tags=tags,
+        )
 
 
 def test_base_conversation_span_management_disabled():
