@@ -1100,6 +1100,7 @@ class OpenHandsAgentSettings(AgentSettingsBase):
             agent = settings.create_agent()
         """
         from openhands.sdk.agent import Agent
+        from openhands.sdk.llm.auth.openai import create_subscription_llm_from_config
         from openhands.sdk.tool.builtins import BUILT_IN_TOOLS, SwitchLLMTool
 
         # Bypass ``_serialize_mcp_config``: MCP servers need real env/headers.
@@ -1112,13 +1113,15 @@ class OpenHandsAgentSettings(AgentSettingsBase):
         if self.enable_switch_llm_tool:
             include_default_tools.append(SwitchLLMTool.__name__)
 
+        llm = create_subscription_llm_from_config(self.llm)
+        condenser = None if llm.is_subscription else self.build_condenser(llm)
         return Agent(
-            llm=self.llm,
+            llm=llm,
             tools=self.tools,
             mcp_config=mcp_config,
             include_default_tools=include_default_tools,
             agent_context=self.agent_context,
-            condenser=self.build_condenser(self.llm),
+            condenser=condenser,
             critic=self.build_critic(),
             tool_concurrency_limit=self.tool_concurrency_limit,
         )

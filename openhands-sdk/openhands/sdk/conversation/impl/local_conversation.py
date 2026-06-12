@@ -6,7 +6,7 @@ import json
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TypeGuard
+from typing import Any, TypeGuard
 
 from openhands.sdk.agent.acp_agent import ACPAgent
 from openhands.sdk.agent.base import AgentBase
@@ -47,6 +47,7 @@ from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.hooks import HookConfig, HookEventProcessor, create_hook_callback
 from openhands.sdk.io import LocalFileStore
 from openhands.sdk.llm import LLM, Message, TextContent, content_to_str
+from openhands.sdk.llm.auth.openai import create_subscription_llm_from_config
 from openhands.sdk.llm.llm_profile_store import LLMProfileStore
 from openhands.sdk.llm.llm_registry import LLMRegistry
 from openhands.sdk.logger import get_logger
@@ -126,6 +127,7 @@ class LocalConversation(BaseConversation):
     _resolved_plugins: list[ResolvedPluginSource] | None
     _plugins_loaded: bool
     _pending_hook_config: HookConfig | None  # Hook config to combine with plugin hooks
+    _subscription_disabled_condenser: Any | None
 
     def __init__(
         self,
@@ -213,6 +215,7 @@ class LocalConversation(BaseConversation):
         self._plugins_loaded = False
         self._pending_hook_config = hook_config  # Will be combined with plugin hooks
         self._agent_ready = False  # Agent initialized lazily after plugins loaded
+        self._subscription_disabled_condenser = None
 
         # Create-or-resume: factory inspects BASE_STATE to decide
         desired_id = conversation_id or uuid.uuid4()
@@ -860,7 +863,7 @@ class LocalConversation(BaseConversation):
         try:
             new_llm = self.llm_registry.get(llm.usage_id)
         except KeyError:
-            new_llm = llm
+            new_llm = create_subscription_llm_from_config(llm)
             self.llm_registry.add(new_llm)
         # A switch_llm tool runs on a worker thread while run()/arun() holds the
         # state lock across the agent step on another thread, blocked awaiting
@@ -873,7 +876,18 @@ class LocalConversation(BaseConversation):
         skip_lock = self._step_holds_state_lock and not self._state.owned()
         lock = contextlib.nullcontext() if skip_lock else self._state
         with lock:
-            self.agent = self.agent.model_copy(update={"llm": new_llm})
+            update: dict[str, object] = {"llm": new_llm}
+            if new_llm.is_subscription:
+                if self.agent.condenser is not None:
+                    self._subscription_disabled_condenser = self.agent.condenser
+                update["condenser"] = None
+            elif (
+                self.agent.condenser is None
+                and self._subscription_disabled_condenser is not None
+            ):
+                update["condenser"] = self._subscription_disabled_condenser
+                self._subscription_disabled_condenser = None
+            self.agent = self.agent.model_copy(update=update)
             self._state.agent = self.agent
             self._pin_prompt_cache_key()
             self._pin_session_affinity_header(new_llm)

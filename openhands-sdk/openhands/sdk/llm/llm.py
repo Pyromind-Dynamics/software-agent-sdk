@@ -239,6 +239,23 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             label="API Key",
         ),
     )
+    auth_type: Literal["api_key", "subscription"] = Field(
+        default="api_key",
+        description="Authentication mode for the LLM.",
+        json_schema_extra=field_meta(
+            SettingProminence.CRITICAL,
+            label="Authentication",
+        ),
+    )
+    subscription_vendor: Literal["openai"] | None = Field(
+        default=None,
+        description="Subscription provider for subscription-backed LLM access.",
+        json_schema_extra=field_meta(
+            SettingProminence.CRITICAL,
+            label="Subscription provider",
+            depends_on=("auth_type",),
+        ),
+    )
     base_url: str | None = Field(
         default=None,
         description="Custom base URL.",
@@ -521,6 +538,8 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     _chat_template_tokenizer: Any = PrivateAttr(default=None)
     _telemetry: Telemetry | None = PrivateAttr(default=None)
     _is_subscription: bool = PrivateAttr(default=False)
+    _subscription_credential_store: Any = PrivateAttr(default=None)
+    _subscription_credentials: Any = PrivateAttr(default=None)
     _litellm_provider: str | None = PrivateAttr(default=None)
     _prompt_cache_key: str | None = PrivateAttr(default=None)
     _effective_max_input_tokens: int | None = PrivateAttr(default=None)
@@ -848,17 +867,29 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         instructions: str | None,
         resp_tools: list[Any] | None,
         final_kwargs: dict[str, Any],
+        auth_values: tuple[str | None, dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Build the shared kwargs dict for litellm_responses / litellm_aresponses."""
         typed_input: ResponseInputParam | str = (
             cast(ResponseInputParam, input_items) if input_items else ""
         )
+        api_key_value, subscription_headers = (
+            auth_values if auth_values is not None else self._get_litellm_auth_values()
+        )
+        if subscription_headers:
+            final_kwargs = {
+                **final_kwargs,
+                "extra_headers": {
+                    **(final_kwargs.get("extra_headers") or {}),
+                    **subscription_headers,
+                },
+            }
         return {
             **self._litellm_call_kwargs(),
             "input": typed_input,
             "instructions": instructions,
             "tools": resp_tools,
-            "api_key": self._get_litellm_api_key_value(),
+            "api_key": api_key_value,
             "api_version": self.api_version,
             "timeout": self.timeout,
             "drop_params": self.drop_params,
@@ -1659,8 +1690,13 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             with self._litellm_modify_params_ctx(self.modify_params):
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=DeprecationWarning)
+                    auth_values = await self._aget_litellm_auth_values()
                     litellm_kwargs = self._build_responses_call_kwargs(
-                        input_items, instructions, resp_tools, final_kwargs
+                        input_items,
+                        instructions,
+                        resp_tools,
+                        final_kwargs,
+                        auth_values=auth_values,
                     )
                     ret = await litellm_aresponses(**litellm_kwargs)
 
@@ -1772,19 +1808,79 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
 
         return self._infer_litellm_provider()
 
-    def _get_litellm_api_key_value(self) -> str | None:
-        api_key_value: str | None = None
-        if self.api_key:
-            assert isinstance(self.api_key, SecretStr)
-            api_key_value = self.api_key.get_secret_value()
+    def _subscription_headers_from_credentials(
+        self, auth: Any, credentials: Any
+    ) -> dict[str, str]:
+        account_id = auth.extract_chatgpt_account_id(credentials)
+        if not account_id:
+            return {}
+        return {"chatgpt-account-id": account_id}
 
+    def _subscription_api_key_from_credentials(self, credentials: Any) -> str:
+        return credentials.access_token
+
+    def _normalize_litellm_api_key_value(self, api_key_value: str | None) -> str | None:
         # LiteLLM treats api_key for Bedrock as an AWS bearer token.
         # Passing a non-Bedrock key (e.g. OpenAI/Anthropic) can cause Bedrock
         # to reject the request with an "Invalid API Key format" error.
         # For IAM/SigV4 auth (the default Bedrock path), do not forward api_key.
         if api_key_value is not None and self._infer_litellm_provider() == "bedrock":
             return None
+        return api_key_value
 
+    def _get_litellm_auth_values(self) -> tuple[str | None, dict[str, str]]:
+        api_key_value: str | None = None
+        extra_headers: dict[str, str] = {}
+        if self.is_subscription:
+            from openhands.sdk.llm.auth.openai import OpenAISubscriptionAuth
+
+            auth = OpenAISubscriptionAuth(
+                credential_store=self._subscription_credential_store
+            )
+            credentials = self._subscription_credentials
+            if credentials is None or credentials.is_expired():
+                credentials = auth.refresh_if_needed_sync()
+            if credentials is None:
+                credentials = self._subscription_credentials
+            if credentials is None:
+                raise ValueError("OpenAI subscription login is required")
+            api_key_value = self._subscription_api_key_from_credentials(credentials)
+            extra_headers = self._subscription_headers_from_credentials(
+                auth, credentials
+            )
+        elif self.api_key:
+            assert isinstance(self.api_key, SecretStr)
+            api_key_value = self.api_key.get_secret_value()
+
+        return self._normalize_litellm_api_key_value(api_key_value), extra_headers
+
+    def _get_litellm_api_key_value(self) -> str | None:
+        api_key_value, _ = self._get_litellm_auth_values()
+        return api_key_value
+
+    async def _aget_litellm_auth_values(self) -> tuple[str | None, dict[str, str]]:
+        if not self.is_subscription:
+            return self._get_litellm_auth_values()
+
+        from openhands.sdk.llm.auth.openai import OpenAISubscriptionAuth
+
+        auth = OpenAISubscriptionAuth(
+            credential_store=self._subscription_credential_store
+        )
+        credentials = await auth.refresh_if_needed()
+        if credentials is None:
+            credentials = self._subscription_credentials
+        if credentials is None:
+            raise ValueError("OpenAI subscription login is required")
+        api_key_value = self._normalize_litellm_api_key_value(
+            self._subscription_api_key_from_credentials(credentials)
+        )
+        return api_key_value, self._subscription_headers_from_credentials(
+            auth, credentials
+        )
+
+    async def _aget_litellm_api_key_value(self) -> str | None:
+        api_key_value, _ = await self._aget_litellm_auth_values()
         return api_key_value
 
     @contextmanager
@@ -1822,6 +1918,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         *,
         messages: list[dict[str, Any]],
         enable_streaming: bool,
+        auth_values: tuple[str | None, dict[str, str]] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """Build the keyword arguments for a litellm (a)completion call."""
@@ -1830,9 +1927,17 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         # not silently discarded by litellm's streaming handler.
         if enable_streaming:
             kwargs.setdefault("stream_options", {"include_usage": True})
+        api_key_value, subscription_headers = (
+            auth_values if auth_values is not None else self._get_litellm_auth_values()
+        )
+        if subscription_headers:
+            kwargs["extra_headers"] = {
+                **(kwargs.get("extra_headers") or {}),
+                **subscription_headers,
+            }
         return {
             **self._litellm_call_kwargs(),
-            "api_key": self._get_litellm_api_key_value(),
+            "api_key": api_key_value,
             "api_version": self.api_version,
             "timeout": self.timeout,
             "drop_params": self.drop_params,
@@ -1878,10 +1983,14 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         **kwargs,
     ) -> ModelResponse:
         """Async variant of :meth:`_transport_call`."""
+        auth_values = await self._aget_litellm_auth_values()
         with self._transport_ctx():
             ret = await litellm_acompletion(
                 **self._prepare_transport_kwargs(
-                    messages=messages, enable_streaming=enable_streaming, **kwargs
+                    messages=messages,
+                    enable_streaming=enable_streaming,
+                    auth_values=auth_values,
+                    **kwargs,
                 )
             )
             if enable_streaming and on_token is not None:
@@ -2591,11 +2700,22 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
 
         payload.pop("schema_version", None)
         payload = canonicalize_openhands_llm_payload(payload)
-        return cls.model_validate(payload, context=context)
+        llm = cls.model_validate(payload, context=context)
+        if llm.auth_type == "subscription":
+            from openhands.sdk.llm.auth.openai import (
+                create_subscription_llm_from_config,
+            )
+
+            return create_subscription_llm_from_config(llm)
+        return llm
 
     def to_persisted(self, *, context: dict[str, Any] | None = None) -> dict[str, Any]:
         """Serialize this LLM for profile persistence."""
         data = self.model_dump(mode="json", exclude_none=True, context=context)
+        if data.get("auth_type") == "subscription":
+            data.pop("api_key", None)
+            data.pop("base_url", None)
+            data.pop("extra_headers", None)
         data["schema_version"] = LLM_PROFILE_SCHEMA_VERSION
         return data
 
@@ -2673,7 +2793,14 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             v = _cast_value(value, fields[field_name])
             if v is not None:
                 data[field_name] = v
-        return cls(**data)
+        llm = cls(**data)
+        if llm.auth_type == "subscription":
+            from openhands.sdk.llm.auth.openai import (
+                create_subscription_llm_from_config,
+            )
+
+            return create_subscription_llm_from_config(llm)
+        return llm
 
     @classmethod
     def subscription_login(
