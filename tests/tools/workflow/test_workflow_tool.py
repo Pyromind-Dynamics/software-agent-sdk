@@ -402,3 +402,87 @@ async def main(wf):
 """
     execute_workflow_script(script, context)
     assert manager.peak_active <= context_cap
+
+
+def test_pipeline_returns_results_in_item_order() -> None:
+    ctx = _context(_FakeTaskManager())
+
+    async def stage(value: str) -> str:
+        return value + "!"
+
+    result = asyncio.run(ctx.pipeline(["a", "b", "c"], stage))
+    assert result == ["a!", "b!", "c!"]
+
+
+def test_pipeline_has_no_barrier_between_stages() -> None:
+    """A fast item reaches a later stage while a slow item is still in stage 1."""
+    ctx = _context(_FakeTaskManager())
+    order: list[str] = []
+
+    async def stage1(item: str) -> str:
+        if item == "slow":
+            await asyncio.sleep(0.05)
+            order.append("slow:s1:end")
+        else:
+            order.append(f"{item}:s1")
+        return item
+
+    async def stage2(item: str) -> str:
+        order.append(f"{item}:s2")
+        return item
+
+    result = asyncio.run(ctx.pipeline(["slow", "fast"], stage1, stage2))
+    assert result == ["slow", "fast"]  # order preserved despite race
+    # fast reached stage 2 before slow finished stage 1 -> no barrier
+    assert order.index("fast:s2") < order.index("slow:s1:end")
+
+
+def test_pipeline_stage_failure_drops_item_to_none() -> None:
+    ctx = _context(_FakeTaskManager())
+
+    async def stage(item: str) -> str:
+        if item == "bad":
+            raise RuntimeError("boom")
+        return item.upper()
+
+    result = asyncio.run(ctx.pipeline(["ok", "bad", "ok2"], stage))
+    assert result == ["OK", None, "OK2"]
+
+
+def test_pipeline_supports_sync_and_async_stages() -> None:
+    ctx = _context(_FakeTaskManager())
+
+    def sync_stage(value: str) -> str:
+        return value + "!"
+
+    async def async_stage(value: str) -> str:
+        return value.upper()
+
+    result = asyncio.run(ctx.pipeline(["a"], sync_stage, async_stage))
+    assert result == ["A!"]
+
+
+def test_pipeline_requires_at_least_one_stage() -> None:
+    ctx = _context(_FakeTaskManager())
+    with pytest.raises(ValueError, match="at least one stage"):
+        asyncio.run(ctx.pipeline(["a"]))
+
+
+def test_pipeline_reachable_from_generated_script() -> None:
+    manager = _FakeTaskManager()
+    ctx = _context(manager)
+    script = """
+async def main(wf):
+    async def review(item):
+        return await wf.run_agent(f"review {item}")
+
+    async def verify(prev):
+        return await wf.run_agent(f"verify {prev}")
+
+    return await wf.pipeline(["x", "y"], review, verify)
+"""
+    result = execute_workflow_script(script, ctx)
+    assert result == [
+        "result:verify result:review x",
+        "result:verify result:review y",
+    ]

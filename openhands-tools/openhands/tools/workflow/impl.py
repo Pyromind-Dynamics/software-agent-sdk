@@ -187,6 +187,40 @@ class WorkflowContext:
             )
         return [str(result) for result in results]
 
+    async def pipeline(
+        self,
+        items: Sequence[Any],
+        *stages: Callable[[Any], Any],
+    ) -> list[Any]:
+        """Run each item through all stages independently, with no barrier between
+        stages: a fast item can reach a later stage while a slow item is still in an
+        earlier one. The first stage receives the original item; each later stage
+        receives the previous stage's result. Stages may be sync or async. A stage
+        that raises drops that item to ``None`` and skips its remaining stages; other
+        items are unaffected.
+
+        Concurrency is bounded by the agent calls inside stages (which acquire the
+        shared semaphore), so pipeline adds no barrier of its own. Do not have a
+        stage re-acquire the semaphore directly; call ``run_agent``/``map_agents``.
+        """
+        if not stages:
+            raise ValueError("pipeline requires at least one stage")
+
+        async def run_chain(index: int, item: Any) -> Any:
+            value: Any = item
+            try:
+                for stage in stages:
+                    result = stage(value)
+                    value = await result if inspect.isawaitable(result) else result
+                return value
+            except Exception as exc:
+                logger.warning("pipeline: item %d failed: %s", index + 1, exc)
+                return None
+
+        return list(
+            await asyncio.gather(*(run_chain(i, item) for i, item in enumerate(items)))
+        )
+
     async def reduce_agent(
         self,
         items: Any,
