@@ -2725,6 +2725,20 @@ class ACPAgent(AgentBase):
         self.init_state(state, on_event=on_event)
         self._restart_session_on_next_turn = False
 
+    async def _arestart_session_after_drain_timeout(
+        self,
+        state: ConversationState,
+        on_event: ConversationCallbackType,
+    ) -> None:
+        """Restart ACP without blocking the async conversation loop."""
+        # Restart calls init_state(), which may synchronously resolve LookupSecret
+        # values through HTTP loopback to this same agent server. Keep it off the
+        # server loop for the same reason LocalConversation.arun() offloads the
+        # initial _ensure_agent_ready() path.
+        await asyncio.to_thread(
+            self._restart_session_after_drain_timeout, state, on_event
+        )
+
     def _request_session_cancel(self) -> None:
         """Ask the ACP server to cancel the active session prompt."""
         if self._conn is None or self._executor is None or self._session_id is None:
@@ -3230,7 +3244,7 @@ class ACPAgent(AgentBase):
         if self._restart_session_on_next_turn:
             # If restart initialization fails, let the conversation transition
             # to ERROR rather than reusing an ambiguous ACP session.
-            self._restart_session_after_drain_timeout(state, on_event)
+            await self._arestart_session_after_drain_timeout(state, on_event)
 
         prompt_blocks: list[Any] | None = None
         if prompt_message is not None:

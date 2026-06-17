@@ -2065,6 +2065,73 @@ class TestACPAgentAstep:
             conversation.state.execution_status == ConversationExecutionStatus.FINISHED
         )
 
+    def test_astep_restarts_session_off_caller_loop(self, tmp_path):
+        """Restart init can synchronously resolve loopback LookupSecret values.
+
+        ``astep`` must keep that restart work off the caller loop so the
+        agent-server can serve those loopback HTTP requests instead of waiting
+        for each secret lookup to time out.
+        """
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        emitted: list = []
+
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+        agent._restart_session_on_next_turn = True
+
+        async def _fake_prompt(prompt_blocks, session_id):  # noqa: ARG001
+            mock_client.accumulated_text.append("answer")
+            return None
+
+        agent._conn.prompt = _fake_prompt
+
+        executor = AsyncExecutor()
+
+        async def _run_restart() -> None:
+            caller_loop = asyncio.get_running_loop()
+            caller_thread_id = threading.get_ident()
+            restart_entered = asyncio.Event()
+            release_restart = threading.Event()
+            restart_thread_ids: list[int] = []
+
+            def _blocking_restart(self, state, on_event):  # noqa: ARG001
+                assert self is agent
+                restart_thread_ids.append(threading.get_ident())
+                caller_loop.call_soon_threadsafe(restart_entered.set)
+                assert release_restart.wait(5.0)
+                agent._restart_session_on_next_turn = False
+
+            with patch.object(
+                ACPAgent,
+                "_restart_session_after_drain_timeout",
+                new=_blocking_restart,
+            ):
+                task = asyncio.create_task(
+                    agent.astep(conversation, on_event=emitted.append)
+                )
+                await asyncio.wait_for(restart_entered.wait(), timeout=5.0)
+                assert len(restart_thread_ids) == 1
+                assert restart_thread_ids[0] != caller_thread_id
+                release_restart.set()
+                await asyncio.wait_for(task, timeout=5.0)
+
+        try:
+            agent._executor = executor
+            asyncio.run(_run_restart())
+        finally:
+            executor.close()
+
+        assert (
+            conversation.state.execution_status == ConversationExecutionStatus.FINISHED
+        )
+        assert emitted
+
     def test_astep_active_prompt_survives_idle_window(self, tmp_path):
         """End-to-end via the real portal: an actively-streaming prompt that
         runs well past ``acp_prompt_timeout`` finalizes normally.
