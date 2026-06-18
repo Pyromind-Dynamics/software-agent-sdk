@@ -28,7 +28,9 @@ from openhands.sdk.llm.message import (  # re-export
     TextContent as TextContent,
 )
 from openhands.sdk.llm.utils.metrics import MetricsSnapshot
-from openhands.sdk.profiles.agent_profile import LaunchedProfile as LaunchedProfile
+from openhands.sdk.profiles.agent_profile import (
+    LaunchedAgentProfile as LaunchedAgentProfile,
+)
 from openhands.sdk.secret import SecretSource
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import (
@@ -79,7 +81,7 @@ class StoredConversation(StartConversationRequest):
     Extends StartConversationRequest with server-assigned fields.
     """
 
-    # agent_profile_id is resolved into launched_profile at creation; exclude from
+    # agent_profile_id is resolved into launched_agent_profile at creation; exclude from
     # the persistence payload so it does not re-appear in meta.json.
     agent_profile_id: UUID | None = Field(default=None, exclude=True)
 
@@ -90,7 +92,7 @@ class StoredConversation(StartConversationRequest):
     metrics: MetricsSnapshot | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
-    launched_profile: LaunchedProfile | None = Field(
+    launched_agent_profile: LaunchedAgentProfile | None = Field(
         default=None,
         description=(
             "Provenance snapshot of the agent profile that launched this "
@@ -248,14 +250,14 @@ class _ConversationInfoBase(BaseModel):
             "and before the conversation has started a session."
         ),
     )
-    launched_profile: LaunchedProfile | None = Field(
+    launched_agent_profile: LaunchedAgentProfile | None = Field(
         default=None,
         description=(
             "Provenance snapshot of the agent profile that launched this "
             "conversation. Set at creation when the conversation was started via "
             "``agent_profile_id``; ``None`` for conversations started directly "
             "with ``agent`` or ``agent_settings``. Clients use this to identify "
-            "which profile is current without fragile settings-comparison."
+            "which agent profile is current without fragile settings-comparison."
         ),
     )
 
