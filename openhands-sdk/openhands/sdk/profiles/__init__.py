@@ -20,6 +20,13 @@ from openhands.sdk.profiles.profile_refs import (
     find_referrers,
     rename_llm_profile,
 )
+from openhands.sdk.profiles.resolver import (
+    AgentProfileDiagnostics,
+    DanglingMcpServerRef,
+    ProfileNotFound,
+    resolve_agent_profile,
+    resolve_agent_profile_dry_run,
+)
 
 
 __all__ = [
@@ -27,14 +34,19 @@ __all__ = [
     "ACPAgentProfile",
     "AgentProfile",
     "AgentProfileBase",
+    "AgentProfileDiagnostics",
     "AgentProfileStore",
+    "DanglingMcpServerRef",
     "OpenHandsAgentProfile",
     "ProfileLimitExceeded",
+    "ProfileNotFound",
     "ProfileReferenced",
     "ProfileVerificationSettings",
     "cascade_rename",
     "delete_llm_profile",
     "find_referrers",
     "rename_llm_profile",
+    "resolve_agent_profile",
+    "resolve_agent_profile_dry_run",
     "validate_agent_profile",
 ]
