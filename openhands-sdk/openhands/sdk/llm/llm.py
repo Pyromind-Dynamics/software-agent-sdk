@@ -120,6 +120,7 @@ from openhands.sdk.llm.utils.openhands_provider import (
 )
 from openhands.sdk.llm.utils.retry_mixin import RetryMixin
 from openhands.sdk.llm.utils.telemetry import Telemetry
+from openhands.sdk.llm.utils.vertex_preflight import assert_vertex_sdk_available
 from openhands.sdk.logger import ENV_LOG_DIR, get_logger
 
 
@@ -1890,6 +1891,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         **kwargs,
     ) -> dict[str, Any]:
         """Build the keyword arguments for a litellm (a)completion call."""
+        provider = self._infer_litellm_provider()
+        assert_vertex_sdk_available(provider)
+
         # When streaming, request usage in the final chunk so that detailed
         # token breakdowns (prompt_tokens_details with cached_tokens, etc.) are
         # not silently discarded by litellm's streaming handler.
