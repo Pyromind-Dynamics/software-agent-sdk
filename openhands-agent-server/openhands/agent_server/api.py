@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 
+from openhands.agent_server.agent_profiles_router import agent_profiles_router
 from openhands.agent_server.auth_router import auth_router
 from openhands.agent_server.bash_router import bash_router
 from openhands.agent_server.bash_service import get_default_bash_event_service
@@ -352,6 +353,7 @@ def _add_api_routes(app: FastAPI, config: Config) -> None:
     api_router.include_router(settings_router)
     api_router.include_router(workspaces_router)
     api_router.include_router(profiles_router)
+    api_router.include_router(agent_profiles_router)
     # /api/auth/* mints workspace cookies and requires the header to bootstrap,
     # so it lives under the header-only auth group.
     api_router.include_router(auth_router)
