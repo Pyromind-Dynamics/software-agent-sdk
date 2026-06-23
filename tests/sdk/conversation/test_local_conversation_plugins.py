@@ -1,18 +1,21 @@
 """Tests for plugin loading via LocalConversation and Conversation factory."""
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import SecretStr
 
+import openhands.sdk.conversation.impl.local_conversation as local_conversation_impl
 from openhands.sdk import LLM, Agent, AgentContext, Conversation
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.hooks import HookConfig
 from openhands.sdk.hooks.config import HookDefinition, HookMatcher
 from openhands.sdk.marketplace import MarketplaceRegistration
 from openhands.sdk.plugin import PluginSource
+from openhands.sdk.tool.builtins import ThinkTool
 
 
 @pytest.fixture
@@ -88,13 +91,16 @@ def create_test_marketplace(
             mcp_config=plugin.get("mcp_config"),
             hooks=plugin.get("hooks"),
         )
-        entries.append(
-            {
-                "name": plugin_name,
-                "source": f"./plugins/{plugin_name}",
-                "description": f"Test plugin {plugin_name}",
-            }
-        )
+        entry = {
+            "name": plugin_name,
+            "source": plugin.get("source", f"./plugins/{plugin_name}"),
+            "description": f"Test plugin {plugin_name}",
+        }
+        if "ref" in plugin:
+            entry["ref"] = plugin["ref"]
+        if "repo_path" in plugin:
+            entry["repo_path"] = plugin["repo_path"]
+        entries.append(entry)
 
     manifest = {
         "name": name,
@@ -437,6 +443,273 @@ class TestLocalConversationPlugins:
         assert conversation.resolved_plugins is not None
         assert len(conversation.resolved_plugins) == 1
         assert conversation.resolved_plugins[0].source == str(plugin_dir)
+
+        conversation.close()
+
+    def test_load_plugin_from_registered_marketplace(self, tmp_path: Path, mock_llm):
+        """Test runtime plugin loading from a registered marketplace."""
+        marketplace_dir = create_test_marketplace(
+            tmp_path / "marketplace",
+            plugins=[
+                {
+                    "name": "manual-plugin",
+                    "skills": [{"name": "manual-skill", "content": "Manual skill"}],
+                }
+            ],
+        )
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        agent = Agent(
+            llm=mock_llm,
+            tools=[],
+            agent_context=AgentContext(
+                registered_marketplaces=[
+                    MarketplaceRegistration(name="manual", source=str(marketplace_dir))
+                ]
+            ),
+        )
+        conversation = LocalConversation(
+            agent=agent, workspace=workspace, visualizer=None
+        )
+
+        conversation.load_plugin("manual-plugin@manual")
+
+        assert conversation.agent.agent_context is not None
+        skills = {
+            skill.name: skill for skill in conversation.agent.agent_context.skills
+        }
+        assert skills["manual-skill"].content == "Manual skill"
+        assert conversation.resolved_plugins is not None
+        assert len(conversation.resolved_plugins) == 1
+
+        conversation.close()
+
+    def test_load_plugin_expands_resolved_plugin_source_secret_refs(
+        self,
+        tmp_path: Path,
+        mock_llm,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        marketplace_dir = create_test_marketplace(
+            tmp_path / "marketplace",
+            plugins=[
+                {
+                    "name": "private-plugin",
+                    "source": {
+                        "source": "url",
+                        "url": "https://${PLUGIN_TOKEN}@example.com/private.git",
+                        "ref": "${PLUGIN_REF}",
+                        "path": "plugins/private-plugin",
+                    },
+                    "skills": [{"name": "private-skill", "content": "Private skill"}],
+                }
+            ],
+        )
+        plugin_dir = marketplace_dir / "plugins" / "private-plugin"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        agent = Agent(
+            llm=mock_llm,
+            tools=[],
+            agent_context=AgentContext(
+                registered_marketplaces=[
+                    MarketplaceRegistration(name="manual", source=str(marketplace_dir))
+                ]
+            ),
+        )
+        conversation = LocalConversation(
+            agent=agent, workspace=workspace, visualizer=None
+        )
+        conversation.update_secrets(
+            {"PLUGIN_TOKEN": "token-value", "PLUGIN_REF": "release-branch"}
+        )
+
+        with (
+            caplog.at_level(logging.INFO),
+            patch(
+                "openhands.sdk.conversation.impl.local_conversation."
+                "fetch_plugin_with_resolution",
+                return_value=(plugin_dir, "abc123"),
+            ) as mock_fetch,
+        ):
+            conversation.load_plugin("private-plugin")
+
+        assert "token-value" not in caplog.text
+        assert "https://" not in caplog.text
+        mock_fetch.assert_called_once_with(
+            source="https://token-value@example.com/private.git",
+            ref="release-branch",
+            repo_path="plugins/private-plugin",
+        )
+        assert conversation.agent.agent_context is not None
+        assert [skill.name for skill in conversation.agent.agent_context.skills] == [
+            "private-skill"
+        ]
+        assert conversation.resolved_plugins is not None
+        assert len(conversation.resolved_plugins) == 1
+
+        conversation.close()
+
+    def test_load_plugin_adds_runtime_tools_without_reinitializing_existing_tools(
+        self, tmp_path: Path, mock_llm, monkeypatch
+    ):
+        mcp_tools_created = []
+
+        class RuntimeOnlyTool(ThinkTool):
+            name = "runtime_only"
+
+        runtime_tool = RuntimeOnlyTool.create()[0]
+
+        class RuntimeMCPClient:
+            def __init__(self):
+                self.tools = [runtime_tool]
+
+        marketplace_dir = create_test_marketplace(
+            tmp_path / "marketplace",
+            plugins=[
+                {
+                    "name": "mcp-plugin",
+                    "mcp_config": {
+                        "mcpServers": {"runtime-server": {"command": "runtime"}}
+                    },
+                }
+            ],
+        )
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        agent = Agent(
+            llm=mock_llm,
+            tools=[],
+            agent_context=AgentContext(
+                registered_marketplaces=[
+                    MarketplaceRegistration(name="manual", source=str(marketplace_dir))
+                ]
+            ),
+        )
+        conversation = LocalConversation(
+            agent=agent, workspace=workspace, visualizer=None
+        )
+        conversation._ensure_agent_ready()
+        existing_tools = dict(conversation.agent.tools_map)
+
+        def mock_create_mcp_tools(config, timeout):
+            mcp_tools_created.append((config, conversation.state.locked()))
+            return RuntimeMCPClient()
+
+        monkeypatch.setattr(
+            local_conversation_impl, "create_mcp_tools", mock_create_mcp_tools
+        )
+
+        conversation.load_plugin("mcp-plugin")
+
+        for name, tool in existing_tools.items():
+            assert conversation.agent.tools_map[name] is tool
+        assert conversation.agent.tools_map[runtime_tool.name] is runtime_tool
+        assert conversation.agent.mcp_config is not None
+        assert "runtime-server" in conversation.agent.mcp_config["mcpServers"]
+        assert len(mcp_tools_created) == 1
+        created_config, state_locked = mcp_tools_created[0]
+        assert not state_locked
+        assert "runtime-server" in created_config["mcpServers"]
+
+        conversation.close()
+
+    def test_load_plugin_merges_runtime_hooks_and_restarts_processor(
+        self, tmp_path: Path, mock_llm
+    ):
+        marketplace_dir = create_test_marketplace(
+            tmp_path / "marketplace",
+            plugins=[
+                {
+                    "name": "hook-plugin",
+                    "hooks": {
+                        "hooks": {
+                            "PreToolUse": [
+                                {
+                                    "matcher": "runtime-*",
+                                    "hooks": [{"command": "runtime-cmd"}],
+                                }
+                            ]
+                        }
+                    },
+                }
+            ],
+        )
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        agent = Agent(
+            llm=mock_llm,
+            tools=[],
+            agent_context=AgentContext(
+                registered_marketplaces=[
+                    MarketplaceRegistration(name="manual", source=str(marketplace_dir))
+                ]
+            ),
+        )
+        explicit_hooks = HookConfig(
+            pre_tool_use=[
+                HookMatcher(
+                    matcher="explicit-*", hooks=[HookDefinition(command="explicit-cmd")]
+                )
+            ]
+        )
+        conversation = LocalConversation(
+            agent=agent,
+            workspace=workspace,
+            hook_config=explicit_hooks,
+            visualizer=None,
+        )
+        initial_processor = MagicMock()
+        initial_processor.on_event = MagicMock()
+        runtime_processor = MagicMock()
+        runtime_processor.on_event = MagicMock()
+
+        callback_lock_owned: list[bool] = []
+
+        def mock_create_hook_callback(*args, **kwargs):
+            callback_lock_owned.append(conversation.state._lock.owned())
+            if len(callback_lock_owned) == 1:
+                return initial_processor, initial_processor.on_event
+            return runtime_processor, runtime_processor.on_event
+
+        with patch(
+            "openhands.sdk.conversation.impl.local_conversation.create_hook_callback",
+            side_effect=mock_create_hook_callback,
+        ) as mock_create_hook_callback:
+            conversation.load_plugin("hook-plugin")
+
+        assert conversation.state.hook_config is not None
+        assert [
+            matcher.matcher for matcher in conversation.state.hook_config.pre_tool_use
+        ] == ["explicit-*", "runtime-*"]
+        assert mock_create_hook_callback.call_count == 2
+        assert callback_lock_owned[1]
+        initial_processor.set_conversation_state.assert_called_once_with(
+            conversation.state
+        )
+        initial_processor.run_session_start.assert_called_once()
+        initial_processor.run_session_end.assert_called_once()
+        runtime_processor.set_conversation_state.assert_called_once_with(
+            conversation.state
+        )
+        runtime_processor.run_session_start.assert_called_once()
+
+        conversation.close()
+
+    def test_load_plugin_requires_registered_marketplaces(
+        self, tmp_path: Path, basic_agent
+    ):
+        """Test runtime plugin loading requires registered marketplaces."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        conversation = LocalConversation(
+            agent=basic_agent,
+            workspace=workspace,
+            visualizer=None,
+        )
+
+        with pytest.raises(ValueError, match="registered_marketplaces"):
+            conversation.load_plugin("missing-plugin")
 
         conversation.close()
 
