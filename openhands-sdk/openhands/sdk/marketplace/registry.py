@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from openhands.sdk.logger import get_logger
-from openhands.sdk.marketplace.types import Marketplace, MarketplaceRegistration
+from openhands.sdk.marketplace.registration import MarketplaceRegistration
+from openhands.sdk.marketplace.types import Marketplace
 from openhands.sdk.plugin.fetch import fetch_plugin_with_resolution
 from openhands.sdk.plugin.types import PluginSource
 from openhands.sdk.utils.redact import redact_url_credentials
@@ -96,7 +97,7 @@ class MarketplaceRegistry:
         return [
             registration
             for registration in self._registrations.values()
-            if registration.auto_load == "all"
+            if registration.auto_load
         ]
 
     def get_marketplace(self, name: str) -> tuple[Marketplace, Path]:
