@@ -206,9 +206,15 @@ consult each relevant package-level AGENTS.md.
 </DEV_SETUP>
 
 <PR_ARTIFACTS>
-# PR-Specific Documents
+# PR-Specific Evidence Documents
+
+The `.pr/` directory is intentionally temporary by repository policy: the
+`PR Artifacts` workflow (`.github/workflows/pr-artifacts.yml`) treats it as
+PR-only reviewer context and automatically removes it after PR approval.
 
 When working on a PR that requires design documents, scripts meant for development-only, or other temporary artifacts that should NOT be merged to main, store them in a `.pr/` directory at the repository root.
+
+You can also use the `.pr/` directory for evidence, such as logs, live-tests, live-test summary files.
 
 ## Usage
 
