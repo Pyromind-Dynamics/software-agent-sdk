@@ -193,6 +193,7 @@ class LocalConversation(BaseConversation):
         # Appended at the end (not grouped with max_iteration_per_run) to avoid
         # shifting the position of any existing positional argument.
         max_budget_per_run: float | None = None,
+        observability_span_name: str = "conversation",
         **_: object,
     ):
         """Initialize the conversation.
@@ -242,6 +243,8 @@ class LocalConversation(BaseConversation):
                   (e.g. a frontend) observing the emitted ActionEvent.
             observability_metadata: Optional trace metadata for observability backends.
             observability_tags: Optional root span tags for observability backends.
+            observability_span_name: Optional child span name for observability
+                  backends. The root span remains named "conversation".
         """
         super().__init__()  # Initialize with span tracking
         # Mark cleanup as initiated as early as possible to avoid races or partially
@@ -422,6 +425,7 @@ class LocalConversation(BaseConversation):
         atexit.register(self.close)
         self._start_observability_span(
             str(desired_id),
+            span_name=observability_span_name,
             user_id=user_id,
             metadata=observability_metadata,
             tags=observability_tags,

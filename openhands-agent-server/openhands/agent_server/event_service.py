@@ -825,6 +825,7 @@ class EventService:
             user_id=self.stored.user_id,
             observability_metadata=self.stored.observability_metadata,
             observability_tags=self.stored.observability_tags,
+            observability_span_name=self.stored.observability_span_name,
         )
 
         conversation.set_confirmation_policy(self.stored.confirmation_policy)
