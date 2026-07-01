@@ -1,0 +1,127 @@
+---
+title: Sandbox
+description: Create and manage Sandbox instances in the PyroMind Console, and access a full desktop OS environment remotely through Web VNC.
+---
+
+## Prerequisites
+
+- You have a valid PyroMind account and have [signed in to the Console](https://console.pyromind.ai/dashboard)
+- You understand your [account quotas](/docs/basic/user_profile)
+- (Optional) You have uploaded a custom system image (in `qcow2` format) to [distributed Storage](/docs/basic/storage)
+
+## Typical workflow
+
+1. **Create an instance** — Choose sandbox type, configure resources and screen resolution
+2. **View information** — Get the Sandbox ID and Web VNC URL
+3. **Remote access** — Operate the sandbox desktop in the browser via the Web VNC URL
+4. **Modify configuration** — Adjust title, resources, screen resolution, and other settings
+5. **Pause / resume / delete** — Manage the instance lifecycle as needed
+
+## Sandbox types
+
+Sandbox supports multiple system types, covering desktop operating systems, mobile emulators, and other scenarios:
+
+| Type | Description |
+|------|------|
+| OSWorld | General-purpose desktop OS sandbox. Uses the default Ubuntu image and supports custom `qcow2` system images |
+| Windows | Windows desktop environment sandbox |
+| Code | Lightweight development environment without a Web VNC entry |
+| macOS | macOS desktop environment sandbox |
+| Android | Android emulator sandbox |
+| Search | Browser-based search environment sandbox |
+
+<Note>
+The exact list of available types depends on what the Console exposes. Desktop-style sandboxes such as OSWorld provide Web VNC by default, and you can interact with them directly in the browser.
+</Note>
+
+## Step 1: Open Sandbox
+
+1. Sign in to the [PyroMind Console](https://console.pyromind.ai/dashboard).
+2. In the navigation bar or product list, find **Sandbox** and open the instance management page.
+
+## Step 2: Create a Sandbox instance
+
+1. On the instance list page, click **Create** and switch to the **Sandbox** tab in the dialog.
+2. Fill in the form:
+
+   | Field | Description |
+   |------|------|
+   | Title | Instance name, up to 100 characters |
+   | Type | Sandbox type, such as OSWorld, Windows, or Android |
+   | Screen resolution | Screen resolution, defaults to `1920 x 1080` |
+   | System image path | (Optional) Path in Storage to a custom system image. Leave blank to use the default Ubuntu image |
+   | CPU | Number of CPU cores, minimum 4 |
+   | Memory (Gi) | Memory size in GiB, minimum 8 |
+
+3. After confirming the settings, click **Create** to launch the instance.
+
+![Sandbox - Create](/resource/sandbox/create.png)
+
+<Note>
+**Resource ratio**: CPU and memory must follow a **1 : 2** ratio (for example, 4 cores with 8 Gi, or 8 cores with 16 Gi). Configurations that do not match this ratio are rejected.
+
+**Custom system image**: `System image path` must point to an existing `qcow2` image file in Storage, for example `/workspace/images/Windows-10-x64.qcow2`. The sandbox boots from this image as its system disk.
+</Note>
+
+## Step 3: View instance information
+
+After an instance is created, the list page shows the name, status, and resource configuration. Click an instance to view its details:
+
+| Field | Description |
+|------|------|
+| Name | The instance name set during creation |
+| Sandbox ID | Unique identifier of the sandbox, formatted like `sb-acd1f23fd4e9` |
+| Web VNC URL | Remote desktop URL accessible in the browser, with a one-click copy button |
+
+Click the Web VNC URL to open the remote desktop in a new tab and start interacting with the sandbox.
+
+![Sandbox - Instance info](/resource/sandbox/sandbox_info.png)
+
+<Note>
+Code-type sandboxes do not expose a Web VNC URL. Desktop-style sandboxes such as OSWorld attach `autoconnect=true&resize=scale` parameters by default, so the session adapts to the browser window automatically once connected.
+</Note>
+
+## Step 4: Modify instance configuration
+
+On the instance list or details page, click **Settings / Edit** to edit an existing instance:
+
+- Change Title (display name)
+- Change Type (sandbox type)
+- Change Screen resolution
+- Change System image path (custom system image)
+- Adjust CPU / Memory resources
+
+Click **Update** to apply the changes.
+
+![Sandbox - Edit](/resource/sandbox/sandbox_edit.png)
+
+<Note>
+When changing CPU / memory, the 1 : 2 ratio constraint still applies. Resource or system image changes usually take effect only after the instance restarts.
+</Note>
+
+## Step 5: Pause, resume, and delete
+
+| Action | Description |
+|------|------|
+| Pause | Temporarily stop the sandbox while keeping its configuration. No compute usage is billed while paused |
+| Resume | Restore the sandbox from the paused state and continue the previous session |
+| Delete | Permanently remove the instance and release the occupied compute quota |
+
+Use the corresponding action buttons in the instance list.
+
+## FAQ
+
+**Q: Why does the Console reject my resource configuration when creating an instance?**
+A: Make sure CPU and memory follow the 1 : 2 ratio, that CPU is at least 4 cores and memory is at least 8 Gi, and that you have enough remaining quota.
+
+**Q: The Web VNC URL fails to connect. What should I do?**
+A: First confirm the instance is in the `running` state. If it was just created, wait until the system image has finished loading before trying again.
+
+**Q: Can I use my own Windows / macOS image?**
+A: Yes. Upload the `qcow2` image to [distributed Storage](/docs/basic/storage) first, then reference its path in `System image path` when creating or editing an instance.
+
+## Next steps
+
+- [Distributed storage usage](/docs/basic/storage) — Upload and manage custom system images
+- [User profile](/docs/basic/user_profile) — View and manage account quotas
+- [Inference](/docs/basic/inference) — Create and manage model inference tasks

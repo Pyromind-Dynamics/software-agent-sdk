@@ -1,0 +1,60 @@
+---
+title: Preview dataset
+description: Preview loaded dataset samples in Training Studio to confirm format and content quality.
+---
+
+import { DatasetPreview } from "/snippets/dataset-preview.jsx";
+
+## Prerequisites
+
+- You have completed [Load and preprocess datasets](/docs/studio/load-preprocess-dataset)
+
+## Preview with Dataset Validator
+
+The **Dataset Processing** workflow includes a built-in **Dataset Validator** node to validate data and generate a visual preview before training:
+
+1. Confirm that **Dataset Kind Config Builder** and **Dataset Config Builder** are correctly configured for field mapping and data paths.
+2. Connect the `dataset_config` output to **Dataset Validator**.
+3. Run the workflow and check node outputs:
+   - `metrics_yaml` - Dataset statistics (sample count, field completeness, and more)
+   - `output_preview_path` - HTML preview file path (default: `/workspace/datasets/preview.html`)
+
+![Dataset processing workflow](/resource/studio/imgs/Dataset-Processing.png)
+
+## Preview example
+
+After running **Dataset Validator**, an HTML preview is generated. The sample list is shown on the left, and conversation content (system/user/assistant) is shown on the right. You can switch between samples interactively:
+
+<DatasetPreview />
+
+<Note>
+The example above is based on the preprocessed `openai/gsm8k` dataset. Actual preview content depends on your dataset and your **Dataset Kind Config Builder**/**Dataset Config Builder** settings.
+</Note>
+
+## Validator configuration
+
+| Parameter | Description |
+|------|------|
+| `limit` | Maximum number of preview samples; `0` means no limit |
+| `check_reasoning` | Whether to validate reasoning-chain format (for example, `<<...>>` tags) |
+| `verbose` | Whether to output detailed validation logs |
+| `preview_html_path` | Save path for the preview HTML file |
+
+## Checklist
+
+| Check item | Expected result |
+|--------|----------|
+| Sample count | Matches expectations with no abnormal drop |
+| Label format | Matches downstream SFT/DPO/GRPO node requirements |
+| Outliers | No empty labels, excessive blank text, or corrupted files |
+| Data split | Train/validation split aligns with experiment design |
+
+## Common issues
+
+- **Path error**: Confirm Storage is mounted correctly and paths match those in [distributed storage](/docs/basic/storage).
+- **Field mismatch**: Return to **Dataset Kind Config Builder** to adjust mappings, or fix source data format.
+- **Empty preview**: Check whether filtering rules are too strict and remove all samples.
+
+## Next steps
+
+- [Train with SFT](/docs/studio/sft-training) - Start training once data checks pass

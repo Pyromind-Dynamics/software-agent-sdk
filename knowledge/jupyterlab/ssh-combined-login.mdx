@@ -1,0 +1,73 @@
+---
+title: SSH combined username login
+description: Configure independent system accounts and SSH login for multiple users on a shared JupyterLab instance.
+---
+
+## Background
+
+When multiple users share the same JupyterLab instance, the system signs in as `root` by default. If everyone operates as `root`, their environments can interfere with each other. This guide explains how to configure independent system users on one instance and connect through SSH with individual usernames.
+
+## Prerequisites
+
+- JupyterLab image version **v0.0.6** or later (supports startup hook script `start-hook.sh`)
+- Storage is mounted and `/workspace` is readable and writable
+
+## Configuration steps
+
+### Step 1: Configure the multi-user initialization script
+
+When a JupyterLab instance starts, it runs the hook script `start-hook.sh`. In this script, you can create system users and bind each user to the platform-provided SSH public key.
+
+| Description | Details |
+|------|------|
+| Hook script | `start-hook.sh` (if it does not exist, sign in to the instance as `root`, create it, and set executable permission with `chmod +x`) |
+| Official reference implementation | <a href="/docs/jupyterlab/start-hook-init-user.sh" target="_blank" rel="noreferrer">start-hook-init-user.sh</a> (all configuration below is based on this script) |
+| Storage location | Place `start-hook-init-user.sh` under any path in `/workspace` on Storage, then call this script from `start-hook.sh` |
+
+### Step 2: Create user directories
+
+Under `/workspace` in Storage, set up the following directory structure:
+
+1. Create the `.users` directory (full path: `/workspace/.users`)
+2. Under `.users`, create an **empty directory with the same name** for each user to be created (for example, user `myuser` corresponds to `/workspace/.users/myuser`)
+
+The script scans subdirectory names under `.users` and creates system users with matching names. Directory contents can remain empty; no files are required in advance.
+
+After completing these two steps, configuration is complete.
+
+## Usage
+
+### Automatic execution
+
+After the instance starts, `start-hook-init-user.sh` runs automatically and creates users configured in `.users`.
+
+### Manual execution
+
+If the instance is already running before configuration is completed, sign in as `root` and run `start-hook-init-user.sh` manually. The effect is the same as automatic execution at startup.
+
+## SSH login
+
+### Get the login command
+
+The SSH command provided by the Console targets the `root` user by default, for example:
+
+```text
+ssh jp-***********@ssh-us-west-2.pyromind.ai -p 2222
+```
+
+### Sign in with a custom username
+
+Add the target username as a `+username` suffix after the instance identifier (the matching system user must already exist):
+
+```text
+ssh jp-***********+myuser@ssh-us-west-2.pyromind.ai -p 2222
+```
+
+| Login method | Command example |
+|----------|----------|
+| `root` | `ssh jp-***********@ssh-us-west-2.pyromind.ai -p 2222` |
+| Custom user `myuser` | `ssh jp-***********+myuser@ssh-us-west-2.pyromind.ai -p 2222` |
+
+## Further customization
+
+After this setup, you can enable independent multi-user login on a shared JupyterLab instance. If you have additional requirements (such as permissions or environment variables), modify the logic in `start-hook-init-user.sh` as needed.

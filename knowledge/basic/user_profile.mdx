@@ -1,0 +1,68 @@
+---
+title: User profile
+description: Manage your account, SSH public keys, API key, and resource quotas in the PyroMind Console.
+---
+
+## Prerequisites
+
+- You have already [registered and signed in to the Console](/docs/basic/signup_login)
+
+## Step 1: Open your profile
+
+1. Open the user menu or settings entry and go to the profile page.
+
+![Go to profile - Step 1](/resource/jupyterlab/imgs/goto_profile0.png)
+
+2. Enter the profile settings page.
+
+![Go to profile - Step 2](/resource/jupyterlab/imgs/goto_profile1.png)
+
+## Step 2: Manage SSH public keys
+
+SSH public keys are required to connect to JupyterLab instances through a terminal. If you plan to use SSH, add your public key first.
+
+1. Find the SSH key section and click edit SSH keys.
+
+![Edit SSH key - Open SSH key settings](/resource/jupyterlab/imgs/edit_ssh_key_0.png)
+
+2. Click **Add key**.
+
+![Add SSH key - Click add button](/resource/jupyterlab/imgs/add-key0.png)
+
+3. Paste your SSH public key into the input box and save.
+
+![Add SSH key - Enter public key](/resource/jupyterlab/imgs/add-key1.png)
+
+> **Note:** If you have not generated a key pair yet, run `ssh-keygen -t ed25519` in your local terminal. The public key is usually located at `~/.ssh/id_ed25519.pub`.
+
+On the same page, you can view all added public keys and remove keys you no longer use.
+
+## Step 3: View your API key
+
+In profile or security settings, you can view or copy your API key (Access Key). The API key is used to call platform APIs programmatically through the [PyroMind SDK](/docs/sdk/installation).
+
+> **Note:** Keep your API key secure. Do not commit it to public repositories or share it with others.
+
+<Note>
+Screenshots for the API key entry in the Console will be added later. If the UI changes, refer to what is currently shown in the Console.
+</Note>
+
+## Step 4: View quotas and resource limits
+
+In your profile or resource management page, you can check your current account quotas, typically including:
+
+- **Compute resources**: Total and used CPU, memory, and GPU
+- **Storage capacity**: Total and used distributed Storage capacity
+- **Instance limits**: Maximum number of JupyterLab, Studio, EchoMind, and other instances that can run at the same time
+
+When creating instances, make sure your selected configuration does not exceed remaining quotas, or creation may fail.
+
+<Note>
+Screenshots for the quota details page will be added later. Before creating instances, check your remaining GPU and storage capacity in the Console.
+</Note>
+
+## Next steps
+
+- [Create JupyterLab and connect via SSH](/docs/jupyterlab/how-to-use) — SSH public keys are required for SSH connections
+- [Distributed storage usage](/docs/basic/storage) — View and manage storage usage
+- [SDK - View user profile](/docs/sdk/user-profile) — Query account details and SSH keys via API

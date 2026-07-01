@@ -1,0 +1,137 @@
+---
+title: JupyterLab
+description: Create JupyterLab instances in the PyroMind Console and connect through Web or SSH.
+---
+
+JupyterLab is the interactive development environment provided in the PyroMind Console. You can create GPU instances for code development, debugging, and SDK integration through a browser or SSH, and use them alongside Storage, Studio, and other workflow capabilities.
+
+## Prerequisites
+
+- You hold a valid PyroMind account and can access the [PyroMind Console](https://console.pyromind.ai/dashboard)
+- You have reviewed [account quotas](/docs/basic/user_profile#step-4-view-quotas-and-resource-limits) and confirmed sufficient compute resources to create instances
+- If you plan to connect through SSH, first add your SSH public key in [User profile](/docs/basic/user_profile)
+
+## Step 1: Open JupyterLab instance management
+
+1. Sign in to the [PyroMind Console](https://console.pyromind.ai/dashboard).
+2. Go to the [JupyterLab instance list](https://console.pyromind.ai/instance) page to view and manage your instances.
+
+## Step 2: Create a JupyterLab instance
+
+1. On the instance management page, click **Create instance**.
+
+![Create instance - Step 1](/resource/jupyterlab/imgs/create_instance0.png)
+
+2. Configure instance parameters (such as instance name, GPU type and count, CPU/memory, and Storage mount), then confirm and submit.
+
+![Create instance - Step 2](/resource/jupyterlab/imgs/create_instance1.png)
+
+When creating an instance, confirm that the selected resources do not exceed your [account quotas](/docs/basic/user_profile#step-4-view-quotas-and-resource-limits). For persistent data, we recommend mounting [distributed Storage](/docs/basic/storage).
+
+## Step 3: Manage instances
+
+After creation, the instance appears in the instance list. The following table summarizes each entry point in the list:
+
+![Connect to instance - View connection details](/resource/jupyterlab/imgs/connect_to_instance0.png)
+
+| Feature | Description |
+|---------|-------------|
+| ① Instance status | View the current runtime status and billing-related information |
+| ② Settings | Modify instance name, GPU type, GPU count, CPU, and memory |
+| ③ Connect to instance | Connect through a JupyterLab URL or SSH |
+| ④ Start / pause | Control instance runtime state; billing stops after pausing |
+| ⑤ Resource monitor | View CPU, memory, GPU utilization, and GPU memory usage |
+| ⑥ Restart count | View cumulative restart count and restart history |
+| ⑦ Instance IP | View the internal IP for SSH or inter-instance communication |
+
+### ① Instance status
+
+Instance status values and their meanings are as follows:
+
+| Status | Description |
+|--------|-------------|
+| **Running** | The instance is running; billing continues |
+| **Pending** | Awaiting scheduling or resource allocation |
+| **Failed** | The instance encountered an error; troubleshoot, recreate, or contact support |
+| **Stopped** | The instance is stopped; billing stops immediately |
+
+### ② Settings
+
+Modify JupyterLab instance parameters, including instance name, requested GPU type, GPU count, and CPU/memory size.
+
+> **Note:** Renaming alone does not restart the instance. Any other resource adjustment triggers a restart. Before submitting changes, confirm that required files have been saved.
+
+### ③ Connect to instance
+
+After instance creation, you can connect in either of the following ways:
+
+#### Method 1: Connect through JupyterLab URL
+
+1. Find the target instance in the list and review the connection details.
+2. Click the provided URL to open JupyterLab directly in your browser.
+
+#### Method 2: Connect through SSH
+
+1. Obtain the SSH command or connection details from the instance information page.
+
+![Connect to instance - SSH connection](/resource/jupyterlab/imgs/connect_to_instance1.png)
+
+2. Run the SSH command in your local terminal to establish a connection to the JupyterLab instance.
+
+### ④ Start / pause instance
+
+Control the instance runtime state:
+
+| Current status | Action |
+|----------------|--------|
+| **Running** | The button shows a pause icon; click to pause the instance; billing stops after pausing |
+| **Stopped** | The button shows a start icon; click to restart the instance |
+
+> **Note:** Before pausing or stopping an instance, confirm that important files are saved to `/workspace/` or `/root/` to avoid data loss.
+
+### ⑤ Resource monitor
+
+Click **Resource Monitor** to expand or collapse the monitoring panel and view CPU, memory, GPU utilization, and GPU memory usage.
+
+Supported time ranges are as follows:
+
+| Preset ranges | Custom range |
+|---------------|--------------|
+| 5m, 15m, 30m, 1h, 6h, 1d, 7d, 14d, 30d | Use **Start date** / **End date** to specify a time window and view historical monitoring data |
+
+### ⑥ Restart count
+
+Displays the cumulative number of instance restarts. Hover over the information icon to view detailed restart history (such as restart time and reason) to help troubleshoot anomalies.
+
+### ⑦ Instance IP
+
+Displays the internal IP address assigned to the instance, used for SSH connections or internal communication between instances.
+
+## Data persistence
+
+After you pause, stop, or restart a JupyterLab instance, data is preserved only in certain directories. Please review the following rules:
+
+| Type | Description |
+|------|-------------|
+| **Not preserved** | System packages installed with `apt install`; system-level configuration; other software installed outside persistent directories |
+| **Preserved** | `/workspace/` (workspace directory), `/root/` (root home directory) |
+
+> **Note:** After you pause, stop, or restart an instance, changes in the **Not preserved** category are overwritten.
+
+**Recommendations:**
+
+- Store all important files and projects in `/workspace/` or `/root/`
+- If you need to install dependencies, prefer `pip` or `conda` in user space or workspace directories
+- For system-level packages used repeatedly, create an install script to run after each instance restart
+
+## Usage recommendations
+
+- Before connecting, confirm the instance is in **Running** status
+- Keep SSH credentials secure and do not share them with others
+- If you encounter connection issues, verify instance status, network settings, and SSH public key configuration
+
+## Next steps
+
+- [SSH combined username login](/docs/jupyterlab/ssh-combined-login) — Configure multi-user SSH login on shared instances
+- [Distributed storage usage](/docs/basic/storage) — Mount Storage for cross-instance data persistence
+- [SDK — Create JupyterLab](/docs/sdk/jupyterlab) — Manage instances programmatically through the Python SDK

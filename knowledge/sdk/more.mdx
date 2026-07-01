@@ -1,0 +1,169 @@
+---
+title: More SDK information
+description: PyroMind SDK appendix reference - project structure, async clients, error handling, response models, inference APIs, examples, and development/debugging.
+---
+
+## Project structure
+
+```
+pyromind_sdk/
+├── client/                          # API 客户端
+│   ├── base.py                      # 基础 HTTP 客户端
+│   ├── client.py                    # PyroMindAPIClient（统一入口）
+│   ├── async_client.py              # PyroMindAsyncAPIClient（异步入口）
+│   ├── studio.py / async_studio.py  # Studio / 训练任务
+│   ├── jupyterLab.py / async_jupyterlab.py  # Jupyter 实例
+│   ├── inference.py / async_inference.py    # 推理实例
+│   ├── echomind.py / async_echomind.py      # EchoMind 实例
+│   ├── storage.py                   # 文件存储
+│   ├── profile.py                   # 用户信息与 SSH 密钥
+│   ├── models.py                    # Pydantic 模型
+│   └── workflow/                    # Workflow 校验与转换
+├── nodes/                           # 自定义节点 SDK
+├── common/                          # 共享工具
+├── cli.py                           # CLI 入口
+├── python_function_to_yaml_cli.py   # Python → YAML CLI
+├── examples/                        # 使用示例
+└── tests/                           # 测试套件
+```
+
+## Async support
+
+All services provide async clients through `PyroMindAsyncAPIClient`:
+
+```python
+from pyromind_sdk import PyroMindAsyncAPIClient
+
+async with PyroMindAsyncAPIClient(api_key="your-api-key") as client:
+    tasks = await client.studio.list()
+    task = await client.studio.create(request)
+```
+
+Async client mapping:
+
+| Synchronous | Asynchronous |
+|------|------|
+| `client.studio` | `AsyncStudioClient` |
+| `client.instances` | `AsyncJupyterLabClient` |
+| `client.inference` | `AsyncInferenceClient` |
+| `client.echomind` | `AsyncEchoMindClient` |
+
+## Error handling
+
+When an API call fails, the SDK raises `PyroMindAPIError` (sync) or `PyroMindAsyncAPIError` (async):
+
+```python
+from pyromind_sdk.client.base import PyroMindAPIError
+
+try:
+    task = client.studio.get_task("invalid-id")
+except PyroMindAPIError as e:
+    print(f"Error {e.status_code}: {e.message}")
+    if e.response:
+        print(f"Response: {e.response}")
+```
+
+| Property | Type | Description |
+|------|------|------|
+| `message` | `str` | Error description |
+| `status_code` | `Optional[int]` | HTTP status code |
+| `response` | `Optional[Dict]` | API error response body |
+
+## Key response models
+
+### `TrainingTaskResponse` (Studio)
+
+| Field | Type | Description |
+|------|------|------|
+| `task_id` | `str` | Unique task ID |
+| `name` | `str` | Task name |
+| `status` | `str` | Current status |
+| `workflow` | `Dict` | Workflow configuration |
+| `nodes` | `List[TrainingTaskNodeInfo]` | Node execution details |
+| `error_message` | `Optional[str]` | Error message when the task fails |
+| `created_at` | `datetime` | Created time |
+
+### `JupyterResponse` (Jupyter)
+
+| Field | Type | Description |
+|------|------|------|
+| `id` | `str` | Instance ID |
+| `name` | `str` | Instance name |
+| `status` | `str` | Current status |
+| `url` | `Optional[str]` | Jupyter URL |
+| `password` | `Optional[str]` | Access password |
+
+### `InferenceJobResponse` (Inference)
+
+| Field | Type | Description |
+|------|------|------|
+| `id` | `str` | Job ID |
+| `name` | `str` | Job name |
+| `model_path` | `str` | Model path |
+| `status` | `str` | Current status |
+| `endpoint_url` | `Optional[str]` | Inference endpoint |
+| `resources` | `Optional[ResourceConfig]` | Allocated resources |
+
+### `EchoMindJobResponse` (EchoMind)
+
+| Field | Type | Description |
+|------|------|------|
+| `id` | `str` | Instance ID |
+| `name` | `str` | Instance name |
+| `status` | `str` | Current status |
+
+## Inference
+
+For inference APIs, see the [Create inference instances](/docs/sdk/inference) guide.
+
+## Workflow validation and conversion
+
+The `client/workflow/` module provides workflow validation and format conversion:
+
+| Tool | Description |
+|------|------|
+| `validate_workflow(workflow)` | Validate workflow JSON structure |
+| `ValidationError` | Raised when the workflow is invalid |
+| `converter.py` | Convert between workflow formats |
+
+## CLI tools
+
+| Command | Description |
+|------|------|
+| `python -m pyromind_sdk.cli` | SDK CLI (multiple utilities) |
+| `python -m pyromind_sdk.python_function_to_yaml_cli` | Convert Python functions to YAML node definitions |
+
+## Example index
+
+| Example file | Description |
+|----------|------|
+| `api_client_basic.py` | Basic client configuration |
+| `studio_example.py` | Studio task CRUD + node outputs |
+| `studio_monitor.py` | Looping task status monitor |
+| `workflow_cli.py` | Workflow management CLI |
+| `complete_workflow_example.py` | End-to-end workflow demonstration |
+| `jupyter_instance_example.py` | Jupyter instance CRUD |
+| `inference_example.py` | Inference instance management |
+| `echomind_example.py` | EchoMind lifecycle |
+| `storage_example.py` | File upload/download |
+| `release_all_instance.py` | Bulk resource release |
+| `async_training_example.py` | Async Studio training |
+| `async_inference_example.py` | Async inference |
+| `async_echomind_example.py` | Async EchoMind |
+| `async_jupyter_instance_example.py` | Async Jupyter |
+
+## Development and testing
+
+### Install from source
+
+```bash
+git clone https://github.com/pyromind/pyromind-sdk.git
+cd pyromind-sdk
+pip install -e .
+```
+
+### Run tests
+
+```bash
+pytest
+```

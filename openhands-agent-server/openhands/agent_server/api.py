@@ -52,6 +52,7 @@ from openhands.agent_server.openai.router import (
 )
 from openhands.agent_server.plugins_router import plugins_router
 from openhands.agent_server.profiles_router import profiles_router
+from openhands.agent_server.pyromind_router import pyromind_router
 from openhands.agent_server.server_details_router import (
     get_server_info,
     mark_initialization_complete,
@@ -357,6 +358,7 @@ def _add_api_routes(app: FastAPI) -> None:
     api_router.include_router(workspaces_router)
     api_router.include_router(profiles_router)
     api_router.include_router(agent_profiles_router)
+    api_router.include_router(pyromind_router)
     # /api/auth/* mints workspace cookies and requires the header to bootstrap,
     # so it lives under the header-only auth group.
     api_router.include_router(auth_router)

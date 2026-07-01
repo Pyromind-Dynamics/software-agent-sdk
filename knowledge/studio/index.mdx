@@ -1,0 +1,31 @@
+---
+title: Quick start
+description: End-to-end guide to prepare datasets, run SFT/GRPO training, validate models, and deploy inference services in Training Studio.
+---
+
+Follow the recommended sequence below to complete the full Studio workflow from data preparation to production deployment.
+
+## Recommended reading order
+
+1. [Load and preprocess datasets](/docs/studio/load-preprocess-dataset) - Load raw data and complete format conversion and preprocessing
+2. [Preview dataset](/docs/studio/preview-dataset) - Verify sample format and content
+3. [Train with SFT](/docs/studio/sft-training) - Fine-tune a model and produce a baseline checkpoint
+4. [Train with DPO](/docs/studio/dpo-training) - Align the model with preference pairs (optional)
+5. [Write reward functions](/docs/studio/reward-function) - Define objective scoring logic for GRPO
+6. [Train with GRPO](/docs/studio/grpo-training) - Further optimize the policy on top of SFT
+7. [Model validation](/docs/studio/model-validation) - Batch benchmark evaluation, quick checks, and additional validation methods
+8. [Model inference and serving](/docs/studio/model-inference-deployment) - Run inference workflows and deploy online services
+
+## Node reference
+
+9. [System nodes](/docs/studio/system-nodes) - Understand built-in node types, connection patterns, and example workflows
+10. [Custom nodes](/docs/studio/custom-nodes) - Register Python functions as Studio nodes
+
+## Prerequisite reading
+
+- [Studio](/docs/studio/how-to-use) - Understand the workflow canvas and task execution
+- [Distributed storage](/docs/basic/storage) - Upload and manage training datasets
+
+## Additional reading
+
+- [Blog - Training a Compute-Use VLM](/blog/compute-use/windows-computer-use) - Full SFT + GRPO case study for GUI Agent scenarios

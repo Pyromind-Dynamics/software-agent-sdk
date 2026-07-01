@@ -1,0 +1,124 @@
+---
+title: System nodes
+description: Understand built-in Training Studio system nodes, connection patterns, and workflow examples.
+---
+
+## Prerequisites
+
+- You are familiar with basic canvas operations in [Studio](/docs/studio/how-to-use)
+
+## What are system nodes
+
+**System nodes** are built-in standard nodes in Studio. They encapsulate core capabilities such as data loading, model management, training configuration, training execution, and inference. By connecting system nodes in a data flow, you can build complete training and inference workflows without writing low-level scripts.
+
+Each node includes:
+
+- **Input/output ports** - Transfer datasets, model paths, config objects, and more between nodes
+- **Property panel** - Configure paths, hyperparameters, resources, and other settings on the right panel
+- **nodeType** - Node type identifier (visible when importing workflow JSON)
+
+<Note>
+In addition to system nodes, you can extend the node library with [Custom nodes](/docs/studio/custom-nodes). Config Builder nodes are usually pre-registered by the platform and can be used directly like system nodes.
+</Note>
+
+## Node categories
+
+### Data and resources
+
+| Node | nodeType | Description |
+|------|----------|------|
+| Clone Dataset | `CloneAndCacheDataset` | Pull and cache datasets from HuggingFace and similar sources to a local path |
+| Clone Model | `CloneAndCacheModel` | Pull and cache pretrained models to a local path |
+| Join Path | `PathJoinNode` | Join a base path and subpath |
+| Dataset to JSONL | `DatasetToJsonlNode` | Convert formats such as Parquet to JSONL |
+| Dataset Validator | `DatasetValidatorNode` | Validate dataset format and generate an HTML preview |
+| Load Image | `LoadImage` | Load a single image for VLM/GUI inference |
+| Load LoRA Adapter | `LoadLoRAAdapter` | Load LoRA adapters for LoRA-enabled inference |
+
+### Config builders
+
+| Node | nodeType | Description |
+|------|----------|------|
+| Dataset Config Builder | `DatasetConfigBuilderNode` | Build dataset YAML config (data path, `dataset_kind_config`, `dataset_extra_config`) |
+| Dataset Kind Config Builder (Text Only) | `DatasetConfigBuilderTextNode` | Text-task field mapping; outputs `dataset_kind_config` |
+| Dataset Kind Config Builder (Vision) | `DatasetConfigBuilderVisionNode` | Multimodal field mapping (includes `image_field`); outputs `dataset_kind_config` |
+| Dataset Extra Config Builder | `DatasetExtraConfigBuilderNode` | Sequence length, sample caps, collator entry, and more |
+| Model Config Builder | `ModelConfigBuilderNode` | Model path (`model_path`) and model type (`model_type`) |
+| Lora Config Builder | `LoraConfigBuilderNode` | LoRA rank, dropout, target modules, excluded modules |
+| Merge LoRA | `ModelMergeLoraNode` | Merge LoRA adapters into base model weights and output a standalone model directory |
+| Training Config Builder | `TrainingConfigBuilderNode` | Learning rate, batch size, epochs, save/eval steps, and more |
+| Accelerate Config Builder | `AccelerateConfigBuilderNode` | Distributed training and ZeRO stage settings |
+| Wandb Config Builder | `WandbConfigBuilderNode` | WandB experiment tracking configuration |
+| Reward Item Builder | `RewardItemBuilderNode` | Single reward entry function, name, and weight |
+| Reward Config Builder | `RewardConfigBuilderNode` | Combine multiple reward items |
+| GRPO Training Extra Config Builder | `GRPOTrainingExtraConfigBuilderNode` | Group size, temperature, generation length, and more |
+| Metrics Config Builder | `MetricsConfigBuilderNode` | Metric entry and name for Benchmark workflows |
+
+### Training execution
+
+| Node | nodeType | Description |
+|------|----------|------|
+| SFT Training | `ModelTrainSFTNode` | Supervised fine-tuning |
+| DPO Training | `ModelTrainDPONode` | Direct preference optimization |
+| GRPO Training | `ModelTrainGRPONode` | GRPO reinforcement learning |
+
+### Inference and evaluation
+
+| Node | nodeType | Description |
+|------|----------|------|
+| Inference (VLLM) | `VLLMInference` | Start a vLLM inference service for Benchmark or business calls |
+| Benchmark By Api | `ModelEvalApiNode` | Batch-evaluate models via inference APIs and output metric reports |
+| Validate Reward | `ModelValidateRewardNode` | Validate reward configuration and scoring logic |
+| LLM Test | `TestLLMNode` | Send test prompts to inference endpoints and return outputs |
+| Content Preview | `ContentPreview` | Preview text content, useful for reviewing **LLM Test** output |
+
+### Utilities
+
+| Node | nodeType | Description |
+|------|----------|------|
+| Anything to String | `AnythingToString` | Convert any output type into a string |
+| Show Result | `ShowResultNode` | Display upstream node outputs |
+| Preview Image | `PreviewImageEx` | Preview images to debug VLM/GUI workflows |
+
+## Typical connection patterns
+
+For node wiring, port mappings, and workflow screenshots by scenario, see:
+
+| Scenario | Guide |
+|------|------|
+| Dataset processing | [Load and preprocess datasets](/docs/studio/load-preprocess-dataset) |
+| SFT training | [Train with SFT - Typical connection pattern](/docs/studio/sft-training#typical-connection-pattern) |
+| DPO training | [Train with DPO - Typical connection pattern](/docs/studio/dpo-training#typical-connection-pattern) |
+| GRPO training | [Train with GRPO - Typical connection pattern](/docs/studio/grpo-training#typical-connection-pattern) |
+| Reward validation | [Write reward functions - Validate reward functions](/docs/studio/reward-function#validate-reward-functions) |
+| Model evaluation | [Model validation - Evaluate with the Benchmark workflow](/docs/studio/model-validation#evaluate-with-the-benchmark-workflow) |
+
+Workflows use the **Config Builder** pattern: each Builder outputs YAML strings that are fed into training or evaluation nodes. **Dataset Kind Config Builder** handles field mapping, and its `dataset_kind_config` output connects to the same-named input on **Dataset Config Builder**.
+
+## Example workflows
+
+Import the JSON files below into the Studio canvas to inspect real node wiring and default parameters. For configuration and connection details, follow the corresponding guide in the table.
+
+| Scenario | Workflow JSON | Guide |
+|------|-------------|------|
+| Dataset processing | <a href="/resource/studio/jsons/dataset-processing.json" target="_blank" rel="noreferrer">dataset-processing</a> | [Load and preprocess datasets](/docs/studio/load-preprocess-dataset) |
+| SFT training | <a href="/resource/studio/jsons/SFT.json" target="_blank" rel="noreferrer">SFT</a> | [Train with SFT](/docs/studio/sft-training) |
+| DPO training | <a href="/resource/studio/jsons/DPO.json" target="_blank" rel="noreferrer">DPO</a> | [Train with DPO](/docs/studio/dpo-training) |
+| GRPO training | <a href="/resource/studio/jsons/GRPO.json" target="_blank" rel="noreferrer">GRPO</a> | [Train with GRPO](/docs/studio/grpo-training) |
+| Reward validation | <a href="/resource/studio/jsons/Validate-Reward.json" target="_blank" rel="noreferrer">Validate-Reward</a> | [Write reward functions](/docs/studio/reward-function) |
+| Model evaluation | <a href="/resource/studio/jsons/Benchmark.json" target="_blank" rel="noreferrer">Benchmark</a> | [Model validation](/docs/studio/model-validation) |
+
+## Best practices
+
+1. **Import examples first**: Start from official JSON and adjust paths/hyperparameters in the property panel. This is faster than wiring from scratch.
+2. **Match port types**: Connect Config Builder string outputs to the corresponding config inputs on training nodes.
+3. **Connect model path directly**: Connect `model_path` from **Clone Model** directly into `model_path` on **Model Config Builder**.
+4. **Separate model and LoRA config**: Set `model_path` in **Model Config Builder** and LoRA params in **Lora Config Builder**. After training, merge with **Merge LoRA**.
+5. **Run single-node smoke tests**: In complex workflows, validate data-loading or Dataset Validator outputs before launching training.
+6. **Track training logs**: After configuring Wandb Config Builder, monitor loss and reward curves in WandB.
+
+## Related guides
+
+- [Custom nodes](/docs/studio/custom-nodes) - Extend the node library
+- [Model validation](/docs/studio/model-validation) - Benchmark workflows and validation methods
+- [Quick start](/docs/studio/index) - End-to-end training and inference flow

@@ -1,0 +1,84 @@
+---
+title: Upload, view, and download files
+description: Use pyromind-sdk StorageClient to upload, list, inspect, and download object storage files.
+---
+
+Install the `minio` package first:
+
+```bash
+pip install minio
+```
+
+## Prerequisites
+
+- Complete [SDK installation and configuration](/docs/sdk/installation)
+- We recommend configuring `PYROMIND_STORAGE_ENDPOINT`, `PYROMIND_STORAGE_SECRET_KEY`, and `PYROMIND_STORAGE_BUCKET`
+
+## Initialize `StorageClient`
+
+```python
+from pyromind_sdk import StorageClient
+
+storage = StorageClient()
+```
+
+### Initialization parameters
+
+| Parameter | Required | Type | Description |
+|------|------|------|------|
+| `endpoint` | No | `str` | Storage endpoint (`PYROMIND_STORAGE_ENDPOINT`, default `https://storage.pyromind.ai`) |
+| `access_key` | No | `str` | Access key (`PYROMIND_API_KEY`) |
+| `secret_key` | No | `str` | Secret key (`PYROMIND_STORAGE_SECRET_KEY`) |
+| `bucket_name` | No | `str` | Default bucket (`PYROMIND_STORAGE_BUCKET`) |
+| `secure` | No | `bool` | Whether to use HTTPS (auto-detected from the endpoint URL) |
+| `region` | No | `str` | Storage region (default `us-east-1`) |
+
+## View file list
+
+Each item returned by `list_files` includes a `type` field (`"file"` or `"folder"`):
+
+```python
+items = storage.list_files(folder_path="documents/", recursive=True, max_depth=2)
+for item in items:
+    if item["type"] == "folder":
+        print(f"[DIR] {item['object_name']}")
+    else:
+        print(f"{item['object_name']} ({item['size']} bytes)")
+```
+
+## Upload a file
+
+```python
+storage.upload_file("local/file.txt", "remote/file.txt")
+```
+
+## Download a file
+
+```python
+storage.download_file("remote/file.txt", "downloaded/file.txt")
+```
+
+## Check whether a file exists
+
+```python
+if storage.file_exists("remote/file.txt"):
+    print("File exists")
+```
+
+## API quick reference
+
+| Method | Description |
+|------|------|
+| `list_files(folder_path, ...)` | List files in a folder |
+| `file_exists(file_path)` | Check whether a file exists |
+| `upload_file(file_path, object_name, ...)` | Upload a file (supports multipart upload) |
+| `upload_folder(folder_path, ...)` | Upload an entire folder |
+| `download_file(object_name, ...)` | Download a file |
+| `download_folder(folder_path, local_path)` | Download a folder |
+| `delete_file(object_name)` | Delete a file |
+| `delete_folder(folder_path)` | Delete a folder |
+
+## Next steps
+
+- [View user information](/docs/sdk/user-profile) - Check storage usage
+- For more examples, see `storage_example.py` in the [example index](/docs/sdk/more#examples)

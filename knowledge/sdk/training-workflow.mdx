@@ -1,0 +1,98 @@
+---
+title: Run training workflows
+description: Use pyromind-sdk to create, run, and wait for training workflow jobs to finish.
+---
+
+## Prerequisites
+
+- Complete [SDK installation and configuration](/docs/sdk/installation)
+
+## Create a training task
+
+```python
+from pyromind_sdk import PyroMindAPIClient
+from pyromind_sdk.client.models import TrainingTaskCreateRequest, WorkflowRunRequest
+
+client = PyroMindAPIClient(api_key="your-api-key")
+
+task = client.studio.create(
+    TrainingTaskCreateRequest(
+        name="my-workflow",
+        workflow={"nodes": [...]}
+    )
+)
+print(f"Task ID: {task.task_id}")
+```
+
+## List tasks and run with injected parameters
+
+```python
+tasks = client.studio.list()
+
+result = client.studio.run_with_params(
+    WorkflowRunRequest(workflow_name="my-workflow", primitive_node_map={"key": "value"})
+)
+
+status = client.studio.wait_for_task_completion(task.task_id, timeout=600)
+print(f"Final status: {status}")
+```
+
+## Validate your workflow before submission
+
+```python
+from pyromind_sdk.client import validate_workflow, ValidationError
+
+try:
+    validate_workflow(workflow_dict)
+    print("Workflow is valid")
+except ValidationError as e:
+    print(f"Invalid workflow: {e}")
+```
+
+## Request parameters
+
+### `TrainingTaskCreateRequest`
+
+| Parameter | Required | Type | Description |
+|------|------|------|------|
+| `name` | Yes | `str` | Task name |
+| `workflow` | Yes | `Dict[str, Any]` | Workflow JSON containing node definitions |
+
+### `WorkflowRunRequest`
+
+| Parameter | Required | Type | Description |
+|------|------|------|------|
+| `workflow_name` | Yes | `str` | Name of the stored workflow |
+| `primitive_node_map` | No | `Dict[str, Any]` | Injected primitive node values (default `{}`) |
+
+## API quick reference
+
+| Method | Description |
+|------|------|
+| `list()` | List all Studio tasks |
+| `create(request)` | Create a new training task |
+| `get_job(task_id)` / `get_task(task_id)` | Get task details |
+| `delete(task_id, force=False)` | Delete a task |
+| `stop(task_id)` | Stop a running task |
+| `get_node_output(task_id, node_id)` | Get node-level output |
+| `run_with_params(request)` | Run a stored workflow with parameters |
+| `wait_for_task_completion(task_id, ...)` | Poll until terminal status |
+| `create_and_wait(request, ...)` | Create + poll + optional output export |
+
+## Response fields (`TrainingTaskResponse`)
+
+| Field | Type | Description |
+|------|------|------|
+| `task_id` | `str` | Unique task ID |
+| `name` | `str` | Task name |
+| `status` | `str` | Current status (`running`, `completed`, `failed`, etc.) |
+| `workflow` | `Dict` | Workflow configuration |
+| `nodes` | `List[TrainingTaskNodeInfo]` | Node execution details |
+| `error_message` | `Optional[str]` | Error message when the task fails |
+| `created_at` | `datetime` | Created time |
+
+## Next steps
+
+- [Create and validate custom nodes](/docs/sdk/custom-nodes)
+- [Upload, view, and download files](/docs/sdk/storage)
+- For more examples, see `studio_example.py` and `complete_workflow_example.py` in the [example index](/docs/sdk/more#examples)

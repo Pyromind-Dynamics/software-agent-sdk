@@ -1,0 +1,378 @@
+---
+title: Studio
+description: Use Training Studio in the PyroMind Console to create, edit, save, and run visual workflows.
+---
+
+Training Studio is the visual workflow editor provided in the PyroMind Console. You can orchestrate data, model, configuration, training, evaluation, and inference nodes on the canvas, and save workflows as reusable JSON files.
+
+## Prerequisites
+
+- You hold a valid PyroMind account and have completed [console sign-in](https://console.pyromind.ai/dashboard)
+- **Studio Service** is enabled
+- You have reviewed [account quotas](/docs/basic/user_profile#step-4-view-quotas-and-resource-limits) and confirmed sufficient compute resources to run tasks
+- We recommend accessing Studio from a desktop browser; mobile access will prompt you to return to the home page
+
+## Step 1: Open Training Studio
+
+1. Sign in to the [PyroMind Console](https://console.pyromind.ai/dashboard).
+2. Click **Studio** in the left navigation bar.
+
+![Studio entry](/resource/studio/imgs/studio_entry.png)
+
+After entering Studio, the page typically includes the following functional areas:
+
+| Area | Description |
+|------|-------------|
+| Top workflow tabs | Switch between multiple open workflows; unsaved workflows display status markers; task result workflows open in read-only tabs. |
+| Top toolbar | Provides common actions such as create, import, save, export, run, stop, and open node library. |
+| Workflow list | Search, open, pin, clone, rename, or delete server-side saved workflows. |
+| Node library | Search system nodes, shared nodes, or custom nodes; create custom nodes; and add nodes to the canvas. |
+| Canvas | Drag nodes, create connections, select nodes, create groups, auto-layout, and refresh workflows. |
+| Right configuration panel | View and modify node parameters, required inputs, default values, and output information. |
+| Task management | View submitted tasks, task details, node execution records, node charges, and open task result workflows. |
+
+## End-to-end workflow
+
+If you need to build a complete workflow based on custom logic, we recommend following this sequence:
+
+1. **Prepare the runtime environment**: Create and access a [JupyterLab instance](/docs/jupyterlab/how-to-use), install `pyromind-sdk`, and configure `PYROMIND_API_KEY`.
+2. **Create custom nodes**: Create nodes through the Studio wizard, or register nodes in JupyterLab via the SDK. See [Custom nodes](/docs/studio/custom-nodes) for details.
+3. **Open the Studio canvas**: Enter **Studio**, create a blank workflow, or import an existing JSON workflow as a starting point.
+4. **Add system nodes**: Add data, model, configuration, training, inference, or utility nodes from the node library.
+5. **Add custom nodes**: Search for registered nodes in the node library, drag them onto the canvas, and connect upstream and downstream nodes.
+6. **Connect data flows**: Connect upstream node outputs to downstream node inputs. For example, connect a preprocessing node output to a dataset configuration node, then to a training node.
+7. **Configure parameters**: Specify data paths, model paths, output paths, GPU count, GPU type, and training hyperparameters.
+8. **Save the workflow**: Click **Save** to store on the server, or click **Export Json** to export a local backup.
+9. **Run and monitor**: Click **Run** to submit the task, then review task status, task details, node charges, logs, and outputs in **Task management**.
+10. **Reuse results**: After task completion, open the result workflow to review node outputs; clone the workflow to continue iteration, or export JSON for team sharing.
+
+Common use cases are summarized below:
+
+| Objective | Recommended flow |
+|-----------|------------------|
+| Complete training with system nodes | Import sample JSON → modify data and model parameters → save → run |
+| Add custom preprocessing before training | Create custom preprocessing node → add in Studio → connect upstream of data config node → run |
+| Add custom post-processing after inference | Create custom post-processing node → connect downstream of inference output → save and run |
+| Reuse team workflows | Import JSON or open server-side workflow → modify parameters → **Save As** to store as a new workflow |
+
+### Basic workflow operations demo
+
+The following video demonstrates basic workflow operations:
+
+<video controls width="100%">
+  <source src="https://raw.githubusercontent.com/PyroMind-Dynamics/Markdown-Resource-Pub/refs/heads/main/videos/tutorials/studio/BaseOperator.mp4" type="video/mp4" />
+  Your browser does not support the video tag.
+</video>
+
+## Step 2: Create or open a workflow
+
+### Example Workflows
+
+Studio provides a set of official example workflows. We recommend importing an example first, then adjusting parameters based on your data, models, and resource configuration.
+
+| Example workflow | Use case | Download | Details |
+|------------------|----------|----------|---------|
+| Dataset Processing | Load, transform, and preprocess datasets to generate training-ready data configuration. | <a href="/resource/studio/jsons/dataset-processing.json" target="_blank" rel="noreferrer">dataset-processing</a> | [Load and preprocess datasets](/docs/studio/load-preprocess-dataset) |
+| SFT | Train a baseline model with supervised fine-tuning and perform quick validation after training. | <a href="/resource/studio/jsons/SFT.json" target="_blank" rel="noreferrer">SFT</a> | [SFT supervised fine-tuning](/docs/studio/sft-training) |
+| DPO | Apply direct preference optimization on top of an SFT model using preference-pair data. | <a href="/resource/studio/jsons/DPO.json" target="_blank" rel="noreferrer">DPO</a> | [DPO preference alignment](/docs/studio/dpo-training) |
+| GRPO | Connect reward configuration on top of an SFT model and run GRPO reinforcement learning training. | <a href="/resource/studio/jsons/GRPO.json" target="_blank" rel="noreferrer">GRPO</a> | [GRPO reinforcement learning training](/docs/studio/grpo-training) |
+| Validate-Reward | Validate reward function scoring with a small sample set before launching GRPO. | <a href="/resource/studio/jsons/Validate-Reward.json" target="_blank" rel="noreferrer">Validate-Reward</a> | [Write reward functions](/docs/studio/reward-function#validate-reward-functions) |
+| Benchmark | Run batch evaluation on trained models and output metric results. | <a href="/resource/studio/jsons/Benchmark.json" target="_blank" rel="noreferrer">Benchmark</a> | [Model validation](/docs/studio/model-validation) |
+
+After importing an example, verify data paths, model paths, output paths, GPU type, GPU count, and training hyperparameters. **Do not submit production tasks using example parameters directly.**
+
+### Create a blank workflow
+
+1. Click **+** next to the top tab bar, or click **New** in the workflow menu.
+2. Search for target nodes in the node library.
+3. Add nodes to the canvas.
+4. Configure node parameters and connect input/output ports.
+
+### Import workflow JSON
+
+You may import a local JSON file, or drag a JSON file onto the canvas.
+
+1. Download an example workflow JSON file from [Example Workflows](#example-workflows).
+2. Open the workflow menu in Studio.
+3. Click **Import from json** and select the target JSON file.
+
+![Studio import workflow](/resource/studio/imgs/studio_import.png)
+
+### Import workflow from image
+
+If a workflow image contains parseable workflow data, click **Import from Image**, select the image, and restore the corresponding canvas.
+
+### Manage saved workflows
+
+After clicking **Import from json** or the workflow list entry, you can search server-side saved workflows.
+
+![Studio workflow list](/resource/studio/imgs/studio_workflow_list.png)
+
+| Action | Description |
+|--------|-------------|
+| Search | Enter keywords in **Search Workflows** to filter target workflows. |
+| Open | Click a workflow row to load it into a new tab or the current tab. |
+| Pin | Click the pin icon to fix frequently used workflows at the top of the list. |
+| Clone | Click **Clone** in the workflow context menu to copy as a new workflow. |
+| Rename | Click **Rename** in the workflow context menu. |
+| Delete | Click **Delete** in the workflow context menu and confirm to remove the server-side workflow. |
+
+## Step 3: Edit the canvas
+
+### Add nodes
+
+1. Click the node library button in the upper-right area.
+2. Search by node name or category.
+3. Click a node, or drag it onto the canvas.
+
+![Studio node library](/resource/studio/imgs/studio_nodes_list.png)
+
+Nodes are typically categorized as follows:
+
+| Type | Description |
+|------|-------------|
+| Data nodes | Clone, load, transform, or preprocess datasets. |
+| Model nodes | Clone, load, merge, or export models. |
+| Configuration nodes | Generate dataset, model, training, LoRA, Accelerate, W&B, and related configuration. |
+| Training nodes | Submit SFT, DPO, GRPO, and other training tasks. |
+| Inference nodes | Start inference services or invoke models for testing. |
+| Utility nodes | Concatenate paths, process files, or execute auxiliary logic. |
+| Custom nodes | Extend canvas capabilities with registered Python functions. |
+
+Right-click a custom node or category in the node library to manage categories, reload node definitions, view node details, or delete nodes.
+
+![Studio node library context menu](/resource/studio/imgs/studio_node_right_click.png)
+
+| Action | Description |
+|--------|-------------|
+| **Add Category** | Create a new node category. |
+| **Reload** | Reload node definitions. |
+| **Details** | View node details. |
+| **Delete** | Delete the node. |
+
+### Use custom nodes
+
+You may create custom nodes on the Studio page, or through JupyterLab and the SDK. Page-based creation is suitable when you already have a Python source file and want the wizard to generate node configuration. SDK-based creation is suitable for version control, bulk registration, or automated publishing.
+
+#### Create custom nodes on the Studio page
+
+1. Open **Node Library**.
+2. Click the plus icon in the upper-right corner of the node library.
+
+![Studio custom node entry](/resource/studio/imgs/studio_node_create1.png)
+
+3. In the **Create Custom Node** dialog, select a creation method. Typically choose **Create via Python script** or **Create via YAML config file**. If **Create via WebUI** is unavailable, it cannot be selected.
+4. Click **Create**.
+
+![Choose custom node creation method](/resource/studio/imgs/studio_node_create2.png)
+
+5. In **Step 1**, select the source file path. You may choose a file from the **Storage Path** tree, or search by path.
+6. Select the Python function to wrap as a node.
+7. Review the function signature. The page will indicate unsupported parameter types or missing type annotations.
+8. In **Select Node Properties**, choose **GPU Node** or **CPU Node**.
+9. Click **Next**.
+
+![Select custom node function](/resource/studio/imgs/studio_node_create3.png)
+
+10. In **Step 2**, review or edit the generated **Node manifest (YAML)**.
+11. Set **Category** so the node appears under the appropriate node library category.
+
+![Edit custom node YAML](/resource/studio/imgs/studio_node_create4.png)
+
+12. Click **Create**. After successful creation, the node appears in **Node Library**.
+13. Search for the node and drag it onto the canvas.
+14. Connect upstream and downstream nodes, configure parameters, save, and run the workflow.
+
+When creating nodes on the Studio page, Studio validates the source file, function, node type, YAML, and category information. Function parameters should use basic types such as `str`, `int`, `float`, and `bool`. If creation fails, complete required fields or adjust function type annotations according to on-page prompts.
+
+#### Create custom nodes through JupyterLab and the SDK
+
+1. Write a Python function in JupyterLab.
+2. Use the SDK CLI to convert the function to YAML.
+3. Validate the YAML and call `client.studio.create_node()` to register the node.
+4. Return to Studio and search for the node name in the node library.
+5. Drag the node onto the canvas and connect upstream and downstream nodes.
+6. Fill in node parameters, save, and run the workflow.
+
+For complete code examples, see [Custom nodes](/docs/studio/custom-nodes).
+
+### Connect nodes
+
+Drag from one node's output port to another node's input port to create a connection. Studio validates port types and connection direction.
+
+If an input requires only a fixed value, use a basic value node or enter the parameter directly in the node configuration panel.
+
+### Configure nodes
+
+After clicking a node, modify parameters in the right configuration panel.
+
+| Configuration item | Description |
+|--------------------|-------------|
+| Required inputs | Must be filled or connected before running; the workflow cannot be submitted if missing. |
+| Optional inputs | May be filled as needed; defaults apply or fields remain empty if not provided. |
+| Enum values | Must be selected from dropdown options, such as GPU type or scheduling policy. |
+| File/directory paths | Point to Storage, instance directories, or node output paths. |
+| Output fields | Results available for downstream connection, such as `model_output_path`, `dataset_path`, or `endpoint`. |
+
+### Custom node operations demo
+
+The following video demonstrates custom node operations:
+
+<video controls width="100%">
+  <source src="https://raw.githubusercontent.com/PyroMind-Dynamics/Markdown-Resource-Pub/refs/heads/main/videos/tutorials/studio/CustomsNode.mp4" type="video/mp4" />
+  Your browser does not support the video tag.
+</video>
+
+## Step 4: Use canvas tools
+
+| Feature | How to use |
+|---------|------------|
+| Undo/redo | Use the top toolbar or keyboard shortcuts to restore edits. |
+| Auto layout | Click **Auto Layout** to rearrange canvas nodes. |
+| Refresh | Click **Refresh** to reload the current workflow and node definitions. |
+| Select multiple nodes | Box-select an area on the canvas, or use select-all. |
+| Copy/paste | Use **Copy** and **Paste** in the canvas context menu. |
+| Enable/disable | Select a node and use **Enable** or **Disable**; disabled nodes do not participate in execution. |
+| Delete | Select a node or connection, then click **Delete**. |
+| Create group | Right-click blank canvas area and click **Add group** to organize related nodes. |
+| Export image | Click **Export Image** in the workflow menu to save a canvas screenshot. |
+| Export node images | Click **Export All Node Images** in the workflow menu to export node images in batch. |
+
+## Step 5: Save and export workflows
+
+Studio supports saving workflows to the server, as well as exporting them as local files or images. Click the top workflow menu to view the full set of actions.
+
+![Studio top toolbar](/resource/studio/imgs/studio_top_toolbar.png)
+
+| Action | Description |
+|--------|-------------|
+| **New** | Create a blank workflow tab. |
+| **Import from json** | Import a complete workflow from a local JSON file; you may also drag a JSON file onto the canvas. |
+| **Import from Image** | Restore the canvas from an image containing workflow data. |
+| **Import workflow data** | Paste workflow JSON data in `nodes` and `edges` format and import. |
+| **Save** | Save the current workflow; a file name is required for first-time save. |
+| **Save As** | Save the current workflow as a new server-side JSON file. |
+| **Export Json** | Export the current workflow as a local JSON file; re-import later via **Import from json**. |
+| **Export Image** | Export the current canvas as a PNG image for documentation, sharing, or connection troubleshooting. |
+| **Export Core Node** | Export core node information for reusing node configuration or troubleshooting node definitions. |
+| **Export All Node Images** | Export images of all nodes on the current canvas in batch. |
+
+We recommend clicking **Save** before running. Studio will also attempt to save the current workflow before task submission.
+
+Right-click a workflow tab to manage currently open tabs:
+
+![Studio tab context menu](/resource/studio/imgs/studio_tag_right_click_the_tab.png)
+
+| Action | Description |
+|--------|-------------|
+| **Close** | Close the current workflow tab. |
+| **Close Others** | Close all tabs except the current tab. |
+| **Close All to the Left** | Close all tabs to the left of the current tab. |
+| **Close All to the Right** | Close all tabs to the right of the current tab. |
+| **Clone** | Clone the current workflow. |
+| **Rename** | Rename the current workflow tab; task result or read-only tabs cannot be renamed. |
+
+### Workflow template management demo
+
+The following video demonstrates workflow template management:
+
+<video controls width="100%">
+  <source src="https://raw.githubusercontent.com/PyroMind-Dynamics/Markdown-Resource-Pub/refs/heads/main/videos/tutorials/studio/WorkflowTemplates.mp4" type="video/mp4" />
+  Your browser does not support the video tag.
+</video>
+
+## Step 6: Run workflows
+
+1. Confirm all required inputs are filled.
+2. Confirm node connections are correct.
+3. Confirm resource settings such as GPU type, GPU count, and output paths do not exceed account quotas.
+4. Click **Run**.
+
+After submission, the button state changes to **Pending** or **Running**.
+
+| Status | Description |
+|--------|-------------|
+| **Pending** | The task has been submitted and is awaiting resource allocation or scheduling. |
+| **Running** | The task is running. |
+| **Completed** | The task has completed. |
+| **Failed** | Task execution failed; review logs to identify the cause. |
+| **Cancelled** | The task has been cancelled. |
+
+To stop a task, click the stop control on the run button; Studio will submit a stop request to the backend.
+
+## Step 7: View tasks and results
+
+Click **Task management** to open the task list. You can browse historical tasks by page, open task details, and open result workflows for specific tasks.
+
+![Studio task list](/resource/studio/imgs/studio_task_list.png)
+
+The task list is primarily used for quick status review. In task details, you can view per-node execution records, including node status, start time, end time, runtime, and node charges. Node charges help identify high-cost nodes and support optimization of GPU type, GPU count, data scale, and training parameters.
+
+Common task list fields are as follows:
+
+| Field | Description |
+|-------|-------------|
+| **ID** | Task ID. |
+| **Name** | Task name, typically derived from the workflow name. |
+| **Created At** | Task creation time. |
+| **Status** | Task status, such as **Succeeded**, **Error**, or **Failed**. |
+| **Progress** | Completed node count versus total node count. |
+| **Execution Time** | Total task runtime. |
+| **Amount** | Total charges for the current task. |
+| **Actions** | Click **Details** to view task details, or **Delete** to remove the task record. |
+
+Task result workflows typically open in read-only tabs with task IDs in the tab name. Read-only workflows are used to review post-execution node status, logs, and outputs, but connections cannot be modified directly and the original workflow cannot be overwritten through save.
+
+After clicking a node in a task, you can review:
+
+| Content | Description |
+|---------|-------------|
+| Node details | Node-level status, runtime, duration, and charges. |
+| Node logs | Node execution logs for troubleshooting failures. |
+| Node outputs | Output values, paths, model directories, dataset directories, or inference endpoints. |
+| Run status | Whether the node is waiting, running, completed, or failed. |
+
+Output files are typically stored in Storage or instance-mounted directories and can be downloaded through the [Storage console](/docs/basic/storage).
+
+### Workflow task management demo
+
+The following video demonstrates workflow task management:
+
+<video controls width="100%">
+  <source src="https://raw.githubusercontent.com/PyroMind-Dynamics/Markdown-Resource-Pub/refs/heads/main/videos/tutorials/studio/TaskManagement.mp4" type="video/mp4" />
+  Your browser does not support the video tag.
+</video>
+
+## FAQ
+
+### Why can't I run the workflow?
+
+Please verify the following first:
+
+- The current canvas is not empty.
+- Required parameters are not missing.
+- Required inputs are connected.
+- Node port types are compatible.
+- GPU type and GPU count are within account quota limits.
+- The workflow was saved successfully.
+
+### Why can't I edit a workflow?
+
+Task result workflows and workflows marked as read-only cannot be edited directly. Clone the workflow, or export JSON and re-import it as a new workflow.
+
+### Why can't nodes be connected?
+
+Studio validates connection direction and data types. Confirm you are connecting from an output port to an input port, and that both port data types are compatible.
+
+### Why is a node unavailable?
+
+If a node is reported as inactive, first confirm availability in the node library. Custom nodes must be registered and loaded before use.
+
+## Next steps
+
+- [System nodes overview and examples](/docs/studio/system-nodes) — Built-in node types and example workflows
+- [Custom nodes](/docs/studio/custom-nodes) — Register Python functions as Studio nodes
+- [Quick start](/docs/studio/index) — End-to-end guide from data preparation and SFT / GRPO training to validation and inference services
+- [Inference](/docs/basic/inference) — Deploy trained models as inference services
+- [SDK — Run training workflows](/docs/sdk/training-workflow) — Create and run workflows programmatically through the Python SDK
+- [Distributed storage usage](/docs/basic/storage) — Upload and manage training datasets

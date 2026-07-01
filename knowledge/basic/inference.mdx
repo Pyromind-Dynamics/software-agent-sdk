@@ -1,0 +1,73 @@
+---
+title: Inference
+description: Create and manage model inference jobs in the PyroMind Console.
+---
+
+## Prerequisites
+
+- You have a valid PyroMind account and have [signed in to the Console](https://console.pyromind.ai/dashboard)
+- Your model files are uploaded to [distributed storage](/docs/basic/storage) or available by path
+- You understand your [account quotas](/docs/basic/user_profile)
+
+## Typical workflow
+
+1. **Select framework and image** — Confirm supported inference frameworks and runtime images
+2. **Create a job** — Configure model path, resources, and job name
+3. **Monitor status** — Track deployment and runtime status in the job list
+4. **Access endpoint** — Get the inference endpoint URL after the job is ready
+5. **Pause / delete** — Pause, resume, or delete jobs as needed to release resources
+
+## Step 1: Open Inference
+
+1. Sign in to the [PyroMind Console](https://console.pyromind.ai/dashboard).
+2. In the navigation bar or product list, find **Inference** and open the job management page.
+
+![EchoMind - Inference entry](/resource/inference/imgs/inference_entry.png)
+
+## Step 2: Create an inference instance
+
+1. Click **Create job** or the equivalent button.
+2. Enter a job name.
+3. Specify the **model path** (model directory or file path in Storage).
+4. Select the **inference framework** and **inference image** (if dropdown options are available in the Console).
+5. Configure compute resources (CPU, memory, GPU, and so on), making sure they do not exceed your remaining account quota.
+6. Confirm creation and wait until the job reaches the `running` state.
+
+![EchoMind - Create instance](/resource/inference/imgs/create_inference_instance.png)
+
+## Step 3: Check job status and endpoint
+
+After job creation, you can view the following in the job list:
+
+| Item | Description |
+|------|------|
+| Job ID and name | Unique identifier and display name |
+| Status | For example `pending`, `running`, `paused`, `failed` |
+| Model path | Location of the model in use |
+| Inference endpoint | Ready `endpoint_url` for sending inference requests |
+
+Open job details to view resource usage, logs, and full configuration details.
+
+![EchoMind - Instance information](/resource/inference/imgs/inference_info.png)
+
+
+## Step 4: Pause, resume, and delete
+
+| Action | Description |
+|------|------|
+| Pause | Temporarily stop the inference service while keeping job configuration |
+| Resume | Restart the service from paused state |
+| Delete | Permanently remove the job and release occupied compute quota |
+
+![EchoMind - Instance operations](/resource/inference/imgs/inference_operate.png)
+
+## Relationship with Studio
+
+- After training in [Studio](/docs/studio/how-to-use), you can use the output model for Inference deployment.
+- You can also import the inference workflow JSON from [Model inference and serving](/docs/studio/model-inference-deployment) and run LLM / VLM inference in Studio.
+
+## Next steps
+
+- [SDK - Inference instances](/docs/sdk/inference) — Manage inference instances programmatically through the Python SDK
+- [Distributed storage](/docs/basic/storage) — Upload and manage model files
+- [Model inference and serving](/docs/studio/model-inference-deployment) — Studio inference and deployment examples
