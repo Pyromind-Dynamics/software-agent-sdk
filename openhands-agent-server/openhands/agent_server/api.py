@@ -74,6 +74,53 @@ from openhands.tools.terminal.constants import TMUX_SOCKET_NAME
 
 logger = get_logger(__name__)
 
+_PYROMIND_PORTAL_CORS_ORIGINS = (
+    "https://pyromind.ai",
+    "https://www.pyromind.ai",
+    "https://pre.pyromind.ai",
+    "https://pre2.pyromind.ai",
+    "https://api.pyromind.ai",
+    "https://pre-api.pyromind.ai",
+    "https://pre2-api.pyromind.ai",
+    "https://pre2-studio.pyromind.ai",
+    "https://pre-studio.pyromind.ai",
+    "https://studio.pyromind.ai",
+    "https://console.pyromind.ai",
+    "https://pre-console.pyromind.ai",
+    "https://pre2-console.pyromind.ai",
+    "https://api-aws-west-2.pyromind.ai",
+    "https://pre-api-aws-west-2.pyromind.ai",
+    "https://pre2-api-aws-west-2.pyromind.ai",
+    "https://console-aws-west-2.pyromind.ai",
+    "https://pre-console-aws-west-2.pyromind.ai",
+    "https://pre2-console-aws-west-2.pyromind.ai",
+    "https://console-us-west-2.pyromind.ai",
+    "https://console-us-west-1.pyromind.ai",
+    "https://pre-console-us-west-2.pyromind.ai",
+    "https://pre-console-us-west-1.pyromind.ai",
+    "https://pre2-console-us-west-2.pyromind.ai",
+    "https://pre2-console-us-west-1.pyromind.ai",
+    "https://api-us-west-1.pyromind.ai",
+    "https://api-us-west-2.pyromind.ai",
+    "https://pre-api-us-west-1.pyromind.ai",
+    "https://pre-api-us-west-2.pyromind.ai",
+    "https://pre2-api-us-west-1.pyromind.ai",
+    "https://pre2-api-us-west-2.pyromind.ai",
+    "https://api-portal.pyromind.ai",
+    "https://pre-api-portal.pyromind.ai",
+    "https://pre2-api-portal.pyromind.ai",
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:5275",
+    "http://localhost:8000",
+)
+
+
+def _cors_allow_origins(config: Config) -> list[str]:
+    return list(
+        dict.fromkeys((*_PYROMIND_PORTAL_CORS_ORIGINS, *config.allow_cors_origins))
+    )
+
 
 def _default_server_tmux_tmpdir() -> Path:
     return Path(tempfile.gettempdir()) / f"openhands-agent-server-{os.getpid()}"
@@ -595,7 +642,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     _setup_static_files(app, config)
     app.add_middleware(
         CORSDispatcher,
-        allow_origins=config.allow_cors_origins,
+        allow_origins=_cors_allow_origins(config),
         allow_origin_regex=config.allow_cors_origin_regex,
     )
     _add_exception_handlers(app)
