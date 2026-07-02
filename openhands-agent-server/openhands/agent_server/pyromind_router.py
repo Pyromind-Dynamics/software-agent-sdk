@@ -24,6 +24,7 @@ from openhands.sdk.conversation.request import (
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.default import register_default_tools
 
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -59,7 +60,7 @@ PYROMIND_SYSTEM_PROMPT = """\
 4. 如果知识库中没有找到相关信息，如实告知用户
 
 注意：搜索时请使用中文和英文关键词都尝试，以获得更全面的结果。\
-"""
+"""  # noqa: E501
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +119,7 @@ def _build_skills_prompt(skills: list[dict[str, str]]) -> str:
 
     return "\n".join(sections)
 
+
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
@@ -126,9 +128,15 @@ def _build_skills_prompt(skills: list[dict[str, str]]) -> str:
 class PyromindLLMConfig(BaseModel):
     """LLM configuration passed from the frontend."""
 
-    model: str = "gpt-4o"
-    api_key: str | None = None
-    base_url: str | None = None
+    model: str = Field(
+        default_factory=lambda: os.environ.get("LLM_MODEL", "gpt-4o"),
+    )
+    api_key: str | None = Field(
+        default_factory=lambda: os.environ.get("OPENAI_API_KEY"),
+    )
+    base_url: str | None = Field(
+        default_factory=lambda: os.environ.get("LLM_BASE_URL"),
+    )
 
 
 class PyromindCreateConversationRequest(BaseModel):
@@ -216,6 +224,7 @@ async def create_pyromind_conversation(
         model=request.llm.model,
         api_key=request.llm.api_key,
         base_url=request.llm.base_url,
+        native_tool_calling=False,
     )
 
     # 5. Build Agent with tools and system prompt
@@ -249,7 +258,5 @@ async def create_pyromind_conversation(
 
     # 8. Delegate to conversation service
     info, is_new = await conversation_service.start_conversation(start_request)
-    response.status_code = (
-        status.HTTP_201_CREATED if is_new else status.HTTP_200_OK
-    )
+    response.status_code = status.HTTP_201_CREATED if is_new else status.HTTP_200_OK
     return info
