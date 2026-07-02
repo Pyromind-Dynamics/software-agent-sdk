@@ -44,6 +44,7 @@ dev = [
     "streamlit>=1.49.1",
     "pytest-timeout>=2.4.0",
     "griffe[pypi]>=2.0.0",
+    "pyromind-sdk>=0.1.5",
 ]
 
 # Ruff configuration
