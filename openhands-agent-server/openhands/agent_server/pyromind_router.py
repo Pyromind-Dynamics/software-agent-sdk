@@ -5,6 +5,7 @@ system prompt, tools, and workspace on the server side so that the
 frontend only needs to pass minimal configuration fields.
 """
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from openhands.sdk.conversation.request import (
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.default import register_default_tools
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -32,8 +34,17 @@ from openhands.tools.preset.default import register_default_tools
 # can be overridden via the PYROMIND_KNOWLEDGE_BASE_PATH environment variable.
 _DEFAULT_KNOWLEDGE_BASE_PATH = os.environ.get(
     "PYROMIND_KNOWLEDGE_BASE_PATH",
-    str(Path(__file__).resolve().parents[4] / "knowledge"),
+    str(Path(__file__).resolve().parents[3] / "knowledge"),
 )
+
+# Default skills path — .agents/skills/ at the repo root
+_DEFAULT_SKILLS_PATH = os.environ.get(
+    "PYROMIND_SKILLS_PATH",
+    str(Path(__file__).resolve().parents[3] / ".agents" / "skills"),
+)
+
+# Only load these skills for Pyromind (avoids loading unrelated SDK skills)
+_PYROMIND_SKILL_NAMES = ["generate-workflow-dsl"]
 
 PYROMIND_SYSTEM_PROMPT = """\
 你是 Pyromind 平台的知识库助手。当用户询问关于 pyromind 平台的使用方法、节点概念或相关功能时，\
@@ -49,6 +60,63 @@ PYROMIND_SYSTEM_PROMPT = """\
 
 注意：搜索时请使用中文和英文关键词都尝试，以获得更全面的结果。\
 """
+
+
+# ---------------------------------------------------------------------------
+# Skill loading utilities
+# ---------------------------------------------------------------------------
+
+
+def _load_skills(
+    skills_path: str, allow_list: list[str] | None = None
+) -> list[dict[str, str]]:
+    """Load SKILL.md files from the skills directory.
+
+    Scans for both top-level markdown files and SKILL.md inside subdirectories.
+    When *allow_list* is provided, only skills whose name is in the list are loaded.
+    Returns a list of dicts with 'name' and 'content' keys.
+    """
+    skills: list[dict[str, str]] = []
+    skills_dir = Path(skills_path)
+    if not skills_dir.is_dir():
+        logger.warning(f"Skills directory not found: {skills_path}")
+        return skills
+
+    for entry in sorted(skills_dir.iterdir()):
+        name = entry.stem if entry.is_file() else entry.name
+        # Filter by allow list if specified
+        if allow_list and name not in allow_list:
+            continue
+
+        skill_file: Path | None = None
+        if entry.is_dir():
+            candidate = entry / "SKILL.md"
+            if candidate.is_file():
+                skill_file = candidate
+        elif entry.is_file() and entry.suffix == ".md":
+            skill_file = entry
+
+        if skill_file:
+            content = skill_file.read_text(encoding="utf-8")
+            skills.append({"name": name, "content": content})
+            logger.info(f"Loaded skill: {name}")
+
+    return skills
+
+
+def _build_skills_prompt(skills: list[dict[str, str]]) -> str:
+    """Build the skills section to append to the system prompt."""
+    if not skills:
+        return ""
+
+    sections = []
+    sections.append("\n\n# 可用技能 (Available Skills)")
+    sections.append("以下技能已加载，当用户需求匹配时请按照技能说明执行：\n")
+
+    for skill in skills:
+        sections.append(f"---\n{skill['content']}\n")
+
+    return "\n".join(sections)
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -130,12 +198,19 @@ async def create_pyromind_conversation(
         knowledge_base_path=knowledge_base_path
     )
 
+    # 3. Load and append available skills
+    skills_path = request.extra.get("skills_path", _DEFAULT_SKILLS_PATH)
+    skills = _load_skills(skills_path, allow_list=_PYROMIND_SKILL_NAMES)
+    skills_prompt = _build_skills_prompt(skills)
+    if skills_prompt:
+        system_prompt += skills_prompt
+
     # Append custom instructions from extra if provided
     custom_instructions = request.extra.get("custom_instructions")
     if custom_instructions:
         system_prompt += f"\n\n补充说明：{custom_instructions}"
 
-    # 3. Build LLM config
+    # 4. Build LLM config
     llm = LLM(
         usage_id="pyromind-agent",
         model=request.llm.model,
@@ -143,7 +218,7 @@ async def create_pyromind_conversation(
         base_url=request.llm.base_url,
     )
 
-    # 4. Build Agent with tools and system prompt
+    # 5. Build Agent with tools and system prompt
     agent = Agent(
         llm=llm,
         tools=[
@@ -154,10 +229,10 @@ async def create_pyromind_conversation(
         system_prompt=system_prompt,
     )
 
-    # 5. Build workspace pointing to knowledge base
+    # 6. Build workspace pointing to knowledge base
     workspace = LocalWorkspace(working_dir=knowledge_base_path)
 
-    # 6. Assemble StartConversationRequest
+    # 7. Assemble StartConversationRequest
     initial_message: SendMessageRequest | None = None
     if request.message:
         initial_message = SendMessageRequest(
@@ -172,7 +247,7 @@ async def create_pyromind_conversation(
         initial_message=initial_message,
     )
 
-    # 7. Delegate to conversation service
+    # 8. Delegate to conversation service
     info, is_new = await conversation_service.start_conversation(start_request)
     response.status_code = (
         status.HTTP_201_CREATED if is_new else status.HTTP_200_OK
