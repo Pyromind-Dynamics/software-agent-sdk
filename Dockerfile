@@ -37,13 +37,14 @@ WORKDIR /agent-server
 
 # Copy workspace source
 # Before docker build, run:
-#   git submodule update --init --recursive knowledge/docs-mintlify knowledge/pyromind-sdk-example
+#   git submodule update --init --recursive docs-mintlify
 COPY --chown=${USERNAME}:${USERNAME} pyproject.toml uv.lock ./
 COPY --chown=${USERNAME}:${USERNAME} openhands-sdk ./openhands-sdk
 COPY --chown=${USERNAME}:${USERNAME} openhands-tools ./openhands-tools
 COPY --chown=${USERNAME}:${USERNAME} openhands-workspace ./openhands-workspace
 COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server ./openhands-agent-server
 COPY --chown=${USERNAME}:${USERNAME} knowledge ./knowledge
+COPY --chown=${USERNAME}:${USERNAME} docs-mintlify ./docs-mintlify
 
 # Install dependencies and workspace packages
 RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \

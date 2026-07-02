@@ -36,23 +36,11 @@ export OH_ALLOW_CORS_ORIGIN_REGEX="https?://.+"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYROMIND_KNOWLEDGE_BASE_PATH="${SCRIPT_DIR}/knowledge"
 
-PYROMIND_SUBMODULES=(
-  "knowledge/docs-mintlify/zh/docs"
-  "knowledge/pyromind-sdk-example/docs"
-)
-missing=()
-for path in "${PYROMIND_SUBMODULES[@]}"; do
-  if [[ ! -d "${SCRIPT_DIR}/${path}" ]]; then
-    missing+=("${path}")
-  fi
-done
-if ((${#missing[@]} > 0)); then
-  echo "WARNING: knowledge submodule content is missing:"
-  for path in "${missing[@]}"; do
-    echo "  - ${SCRIPT_DIR}/${path}"
-  done
+if [[ ! -d "${SCRIPT_DIR}/docs-mintlify/zh/docs" ]]; then
+  echo "WARNING: docs-mintlify submodule content is missing:"
+  echo "  - ${SCRIPT_DIR}/docs-mintlify/zh/docs"
   echo "Initialize submodules before starting:"
-  echo "  git submodule update --init --recursive knowledge/docs-mintlify knowledge/pyromind-sdk-example"
+  echo "  git submodule update --init --recursive docs-mintlify"
   echo ""
 fi
 
@@ -64,8 +52,7 @@ echo " Pyromind Agent Server"
 echo "============================================"
 echo " LLM Base URL:      ${LLM_BASE_URL}"
 echo " Knowledge Base:    ${PYROMIND_KNOWLEDGE_BASE_PATH}"
-echo " Mintlify docs:     ${PYROMIND_KNOWLEDGE_BASE_PATH}/docs-mintlify/zh/docs"
-echo " Node docs:         ${PYROMIND_KNOWLEDGE_BASE_PATH}/pyromind-sdk-example/docs"
+echo " Mintlify docs:     ${SCRIPT_DIR}/docs-mintlify/zh/docs"
 echo " Host:              127.0.0.1"
 echo " Port:              8000"
 echo " Auto-reload:       enabled"
