@@ -145,10 +145,12 @@ RUN set -eux; \
     # Best-effort: add user to a sudo group when one exists (Debian-style
     # `sudo` group). On Alpine/RHEL/SUSE there is no `sudo` group by default,
     # and the NOPASSWD sudoers line below grants sudo regardless of group.
+    # usermod -aG sudo "${USERNAME}" 2>/dev/null || true; \
+    # echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers; \
+    # mkdir -p /appworkspace/project; \
+    # chown -R "${USERNAME}:${USERNAME}" /appworkspace
     usermod -aG sudo "${USERNAME}" 2>/dev/null || true; \
-    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers; \
-    mkdir -p /workspace/project; \
-    chown -R "${USERNAME}:${USERNAME}" /workspace
+    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers; 
 
 # Pre-install ACP servers for ACPAgent support (Claude Code, Codex, Gemini CLI)
 # Install Node.js 22 to a dedicated prefix so ACP packages get a modern runtime
