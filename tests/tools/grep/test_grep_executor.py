@@ -2,7 +2,7 @@
 
 These tests verify that grep behaves like OpenHands:
 - Case-insensitive search (rg -i)
-- Returns file paths only (rg -l)
+- Returns matching lines with 1-based line numbers (rg -n)
 - Sorted by modification time (--sortr=modified)
 """
 
@@ -69,15 +69,16 @@ def test_grep_executor_basic_search():
         observation = executor(action)
 
         assert observation.is_error is False
-        assert len(observation.matches) == 2  # Two files containing "print"
+        assert len(observation.matches) == 2  # Two matching lines containing "print"
         assert observation.pattern == "print"
         assert observation.search_path == str(Path(temp_dir).resolve())
 
-        # Check that matches are file paths
-        for file_path in observation.matches:
-            assert isinstance(file_path, str)
-            assert file_path.endswith(".py")
-            assert Path(file_path).exists()
+        # Check that matches carry file path, line number, and line text
+        for match in observation.matches:
+            assert match.file_path.endswith(".py")
+            assert Path(match.file_path).exists()
+            assert match.line_number >= 1
+            assert "print" in match.line.lower()
 
 
 def test_grep_executor_case_insensitive():
@@ -91,8 +92,9 @@ def test_grep_executor_case_insensitive():
         observation = executor(action)
 
         assert observation.is_error is False
-        assert len(observation.matches) == 1  # File contains pattern (case-insensitive)
-        assert "case_test.py" in observation.matches[0]
+        # Three lines match the pattern (case-insensitive)
+        assert len(observation.matches) == 3
+        assert all("case_test.py" in m.file_path for m in observation.matches)
 
 
 def test_grep_executor_include_filter():
@@ -108,7 +110,7 @@ def test_grep_executor_include_filter():
 
         assert observation.is_error is False
         assert len(observation.matches) == 1
-        assert observation.matches[0].endswith(".py")
+        assert observation.matches[0].file_path.endswith(".py")
 
 
 def test_grep_executor_custom_path():
@@ -126,7 +128,7 @@ def test_grep_executor_custom_path():
         assert observation.is_error is False
         assert len(observation.matches) == 1
         assert observation.search_path == str(sub_dir.resolve())
-        assert str(sub_dir.resolve()) in str(observation.matches[0])
+        assert str(sub_dir.resolve()) in observation.matches[0].file_path
 
 
 def test_grep_executor_invalid_path():
@@ -165,7 +167,7 @@ def test_grep_executor_hidden_files_excluded():
 
         assert observation.is_error is False
         assert len(observation.matches) == 1
-        assert ".hidden" not in observation.matches[0]
+        assert ".hidden" not in observation.matches[0].file_path
 
 
 def test_grep_executor_include_filter_still_skips_hidden_directories():
@@ -182,7 +184,7 @@ def test_grep_executor_include_filter_still_skips_hidden_directories():
         observation = executor._execute_with_python_search(action, Path(temp_dir))
 
         assert observation.is_error is False
-        assert observation.matches == [str(visible.resolve())]
+        assert [m.file_path for m in observation.matches] == [str(visible.resolve())]
 
 
 @pytest.mark.skipif(not _check_grep_available(), reason="grep not available")
@@ -206,7 +208,9 @@ def test_grep_executor_system_grep_matches_python_fallback_for_hidden_include():
         )
 
         assert grep_observation.matches == python_observation.matches
-        assert grep_observation.matches == [str(hidden_file.resolve())]
+        assert [m.file_path for m in grep_observation.matches] == [
+            str(hidden_file.resolve())
+        ]
 
 
 def test_grep_executor_sorting():
@@ -226,8 +230,8 @@ def test_grep_executor_sorting():
         assert observation.is_error is False
         assert len(observation.matches) == 2
         # Newest file should be first
-        assert "new.py" in observation.matches[0]
-        assert "old.py" in observation.matches[1]
+        assert "new.py" in observation.matches[0].file_path
+        assert "old.py" in observation.matches[1].file_path
 
 
 def test_grep_executor_truncation():
@@ -315,8 +319,10 @@ def test_grep_executor_concurrent():
         assert all(len(matches) == 5 for matches in results_a)
         assert all(len(matches) == 5 for matches in results_b)
         assert all(
-            all("alpha_" in Path(f).name for f in matches) for matches in results_a
+            all("alpha_" in Path(m.file_path).name for m in matches)
+            for matches in results_a
         )
         assert all(
-            all("beta_" in Path(f).name for f in matches) for matches in results_b
+            all("beta_" in Path(m.file_path).name for m in matches)
+            for matches in results_b
         )

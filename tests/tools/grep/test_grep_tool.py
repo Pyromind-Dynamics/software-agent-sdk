@@ -71,11 +71,11 @@ def test_grep_tool_basic_search():
         assert observation.search_path == str(Path(temp_dir).resolve())
         assert not observation.truncated
 
-        # Check that matches are file paths
-        for file_path in observation.matches:
-            assert isinstance(file_path, str)
-            assert file_path.endswith(".py")
-            assert os.path.exists(file_path)
+        # Check that matches carry file path, line number and line text
+        for match in observation.matches:
+            assert match.file_path.endswith(".py")
+            assert os.path.exists(match.file_path)
+            assert match.line_number >= 1
 
 
 def test_grep_tool_case_insensitive():
@@ -111,7 +111,7 @@ def test_grep_tool_include_filter():
 
         assert observation.is_error is False
         assert len(observation.matches) == 1
-        assert observation.matches[0].endswith(".py")
+        assert observation.matches[0].file_path.endswith(".py")
 
 
 def test_grep_tool_specific_directory():
@@ -133,7 +133,7 @@ def test_grep_tool_specific_directory():
         assert observation.is_error is False
         assert len(observation.matches) == 1
         assert observation.search_path == str(src_dir.resolve())
-        assert str(src_dir.resolve()) in observation.matches[0]
+        assert str(src_dir.resolve()) in observation.matches[0].file_path
 
 
 def test_grep_tool_no_matches():
@@ -200,7 +200,7 @@ def test_grep_tool_hidden_files_excluded():
 
         assert observation.is_error is False
         assert len(observation.matches) == 1
-        assert ".hidden" not in observation.matches[0]
+        assert ".hidden" not in observation.matches[0].file_path
 
 
 def test_grep_tool_to_llm_content():
@@ -219,7 +219,7 @@ def test_grep_tool_to_llm_content():
         content = observation.to_llm_content
         assert len(content) == 1
         text = content[0].text
-        assert "Found 1 file(s) containing pattern" in text
+        assert "Found 1 match(es) for pattern" in text
         assert "test.py" in text
 
 
@@ -256,7 +256,7 @@ def test_grep_tool_to_llm_content_no_matches():
 
         content = observation.to_llm_content
         text = content[0].text
-        assert "No files found containing pattern" in text
+        assert "No matches found for pattern" in text
 
 
 def test_grep_tool_to_llm_content_error():

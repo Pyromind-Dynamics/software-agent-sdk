@@ -267,7 +267,11 @@ class TaskTrackerExecutor(ToolExecutor[TaskTrackerAction, TaskTrackerObservation
 
 
 # Tool definition with detailed description
-TASK_TRACKER_DESCRIPTION = """This tool provides structured task management capabilities for development workflows.
+TASK_TRACKER_DESCRIPTION = """Updates the task plan.
+Provide an optional explanation and a list of plan items, each with a step and status.
+At most one step can be in_progress at a time.
+
+This tool provides structured task management capabilities for development workflows.
 It enables systematic tracking of work items, progress monitoring, and efficient
 organization of complex development activities.
 

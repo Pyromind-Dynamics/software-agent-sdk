@@ -4,7 +4,7 @@ import os
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from pydantic import Field
+from pydantic import BaseModel, Field, field_validator
 
 from openhands.sdk.tool import (
     Action,
@@ -40,27 +40,65 @@ class GrepAction(Action):
     )
 
 
+class GrepMatch(BaseModel):
+    """A single matching line found by grep."""
+
+    file_path: str = Field(
+        description="Absolute path of the file containing the match"
+    )
+    line_number: int = Field(
+        description="1-based line number of the matching line within the file"
+    )
+    line: str = Field(description="The full text of the matching line")
+
+
 class GrepObservation(Observation):
     """Observation from grep content search operations."""
 
-    matches: list[str] = Field(description="List of file paths containing the pattern")
+    matches: list[GrepMatch] = Field(
+        default_factory=list,
+        description=(
+            "Matching lines, each with its file path, 1-based line number, "
+            "and line text"
+        ),
+    )
     pattern: str = Field(description="The regex pattern that was used")
     search_path: str = Field(description="The directory that was searched")
     include_pattern: str | None = Field(
         default=None, description="The file pattern filter that was used"
     )
     truncated: bool = Field(
-        default=False, description="Whether results were truncated to 100 files"
+        default=False,
+        description="Whether results were truncated to the first 100 matches",
     )
+
+    @field_validator("matches", mode="before")
+    @classmethod
+    def _coerce_legacy_matches(cls, value: object) -> object:
+        """Coerce legacy string matches into GrepMatch objects.
+
+        Older persisted observations stored ``matches`` as a list of file-path
+        strings (before per-line matches were introduced). Map each such string
+        to a GrepMatch so historical conversations remain loadable.
+        """
+        if not isinstance(value, list):
+            return value
+        coerced: list[object] = []
+        for item in value:
+            if isinstance(item, str):
+                coerced.append({"file_path": item, "line_number": 0, "line": ""})
+            else:
+                coerced.append(item)
+        return coerced
 
 
 TOOL_DESCRIPTION = """Fast content search tool.
 * Searches file contents using regular expressions
 * Supports full regex syntax (eg. "log.*Error", "function\\s+\\w+", etc.)
 * Filter files by pattern with the include parameter (eg. "*.js", "*.{ts,tsx}")
-* Returns matching file paths sorted by modification time.
-* Only the first 100 results are returned. Consider narrowing your search with stricter regex patterns or provide path parameter if you need more results.
-* Use this tool when you need to find files containing specific patterns.
+* Returns each matching line with its file path and 1-based line number.
+* Only the first 100 matches are returned. Narrow your search with a stricter regex pattern or the include/path parameters if you need more results.
+* Use this tool when you need to find where specific patterns occur in files.
 """  # noqa
 
 

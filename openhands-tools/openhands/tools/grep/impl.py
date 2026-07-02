@@ -14,7 +14,7 @@ from openhands.sdk.utils import sanitized_env
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
-from openhands.tools.grep.definition import GrepAction, GrepObservation
+from openhands.tools.grep.definition import GrepAction, GrepMatch, GrepObservation
 from openhands.tools.utils import (
     _check_grep_available,
     _check_ripgrep_available,
@@ -115,31 +115,32 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
 
     def _format_output(
         self,
-        matches: list[str],
+        matches: list[GrepMatch],
         pattern: str,
         search_path: str,
         include_pattern: str | None,
         truncated: bool,
     ) -> str:
         """Format the grep observation output message."""
+        include_info = (
+            f" (filtered by '{include_pattern}')" if include_pattern else ""
+        )
         if not matches:
-            include_info = (
-                f" (filtered by '{include_pattern}')" if include_pattern else ""
-            )
             return (
-                f"No files found containing pattern '{pattern}' "
+                f"No matches found for pattern '{pattern}' "
                 f"in directory '{search_path}'{include_info}"
             )
 
-        include_info = f" (filtered by '{include_pattern}')" if include_pattern else ""
-        file_list = "\n".join(matches)
+        match_lines = "\n".join(
+            f"{m.file_path}:{m.line_number}: {m.line}" for m in matches
+        )
         output = (
-            f"Found {len(matches)} file(s) containing pattern "
-            f"'{pattern}' in '{search_path}'{include_info}:\n{file_list}"
+            f"Found {len(matches)} match(es) for pattern "
+            f"'{pattern}' in '{search_path}'{include_info}:\n{match_lines}"
         )
         if truncated:
             output += (
-                "\n\n[Results truncated to first 100 files. "
+                "\n\n[Results truncated to the first 100 matches. "
                 "Consider using a more specific pattern.]"
             )
         return output
@@ -173,42 +174,49 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
 
     def _finalize_matches(
         self,
-        matches: list[Path],
+        matches: list[GrepMatch],
         search_path: Path,
         include_pattern: str | None,
-    ) -> tuple[list[str], bool]:
-        """Filter, sort, and truncate raw match paths."""
-        unique_matches: dict[str, Path] = {}
+    ) -> tuple[list[GrepMatch], bool]:
+        """Filter, deduplicate, sort, and truncate raw line matches."""
+        unique_matches: dict[tuple[str, int], GrepMatch] = {}
         for match in matches:
             try:
-                resolved = match.resolve()
+                resolved = Path(match.file_path).resolve()
             except OSError:
                 continue
             if not self._path_matches_filters(resolved, search_path, include_pattern):
                 continue
-            unique_matches[str(resolved)] = resolved
+            key = (str(resolved), match.line_number)
+            if key in unique_matches:
+                continue
+            unique_matches[key] = GrepMatch(
+                file_path=str(resolved),
+                line_number=match.line_number,
+                line=match.line,
+            )
 
+        # Sort by file modification time (newest first), then line number ascending.
         sorted_matches = sorted(
             unique_matches.values(),
-            key=self._match_mtime,
-            reverse=True,
+            key=lambda m: (-self._match_mtime(Path(m.file_path)), m.line_number),
         )
         truncated = len(sorted_matches) > self._MAX_MATCHES
-        return [str(path) for path in sorted_matches[: self._MAX_MATCHES]], truncated
+        return sorted_matches[: self._MAX_MATCHES], truncated
 
     def _build_observation(
         self,
         action: GrepAction,
         search_path: Path,
-        matches: list[Path],
+        matches: list[GrepMatch],
     ) -> GrepObservation:
-        formatted_matches, truncated = self._finalize_matches(
+        finalized_matches, truncated = self._finalize_matches(
             matches,
             search_path,
             action.include,
         )
         output = self._format_output(
-            matches=formatted_matches,
+            matches=finalized_matches,
             pattern=action.pattern,
             search_path=str(search_path),
             include_pattern=action.include,
@@ -216,12 +224,37 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
         )
         return GrepObservation.from_text(
             text=output,
-            matches=formatted_matches,
+            matches=finalized_matches,
             pattern=action.pattern,
             search_path=str(search_path),
             include_pattern=action.include,
             truncated=truncated,
         )
+
+    def _parse_grep_lines(self, stdout: str) -> list[GrepMatch]:
+        """Parse ``path:line_number:content`` output into GrepMatch entries."""
+        matches: list[GrepMatch] = []
+        if not stdout:
+            return matches
+        for raw_line in stdout.splitlines():
+            if not raw_line:
+                continue
+            parts = raw_line.split(":", 2)
+            if len(parts) < 3:
+                continue
+            file_path, line_no_str, content = parts
+            try:
+                line_number = int(line_no_str)
+            except ValueError:
+                continue
+            matches.append(
+                GrepMatch(
+                    file_path=file_path,
+                    line_number=line_number,
+                    line=content,
+                )
+            )
+        return matches
 
     def _execute_with_ripgrep(
         self, action: GrepAction, search_path: Path
@@ -229,7 +262,10 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
         """Execute grep content search using ripgrep."""
         cmd = [
             "rg",
-            "-l",
+            "--line-number",
+            "--no-heading",
+            "--with-filename",
+            "--color=never",
             "-i",
             action.pattern,
             str(search_path),
@@ -247,10 +283,7 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
             env=sanitized_env(),
         )
 
-        matches = []
-        if result.stdout:
-            matches = [Path(line) for line in result.stdout.splitlines() if line]
-
+        matches = self._parse_grep_lines(result.stdout)
         return self._build_observation(action, search_path, matches)
 
     def _execute_with_system_grep(
@@ -258,7 +291,7 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
     ) -> GrepObservation:
         """Execute grep content search using the system grep binary."""
         result = subprocess.run(
-            ["grep", "-R", "-I", "-l", "-i", action.pattern, str(search_path)],
+            ["grep", "-R", "-I", "-n", "-i", action.pattern, str(search_path)],
             capture_output=True,
             text=True,
             timeout=30,
@@ -272,10 +305,7 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
             )
             return self._execute_with_python_search(action, search_path)
 
-        matches = []
-        if result.stdout:
-            matches = [Path(line) for line in result.stdout.splitlines() if line]
-
+        matches = self._parse_grep_lines(result.stdout)
         return self._build_observation(action, search_path, matches)
 
     def _execute_with_python_search(
@@ -286,7 +316,7 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
     ) -> GrepObservation:
         """Execute grep content search using Python file walking."""
         compiled_regex = regex or re.compile(action.pattern, re.IGNORECASE)
-        matches: list[Path] = []
+        matches: list[GrepMatch] = []
         for root, dirs, files in os.walk(search_path):
             dirs[:] = [name for name in dirs if not name.startswith(".")]
             for filename in files:
@@ -300,7 +330,14 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
                     content = file_path.read_text(encoding="utf-8", errors="ignore")
                 except OSError:
                     continue
-                if compiled_regex.search(content):
-                    matches.append(file_path)
+                for line_number, line in enumerate(content.splitlines(), start=1):
+                    if compiled_regex.search(line):
+                        matches.append(
+                            GrepMatch(
+                                file_path=str(file_path),
+                                line_number=line_number,
+                                line=line,
+                            )
+                        )
 
         return self._build_observation(action, search_path, matches)
