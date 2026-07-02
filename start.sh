@@ -30,19 +30,24 @@ export OH_SECRET_KEY=""
 export OH_ALLOW_CORS_ORIGIN_REGEX="https?://.+"
 
 # ----------------------------------------------------------
-# Pyromind Knowledge Base Path
+# Pyromind Knowledge Base (sync docs-mintlify → knowledge/)
 # ----------------------------------------------------------
 # Points to the knowledge/ folder in this repository by default
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYROMIND_KNOWLEDGE_BASE_PATH="${SCRIPT_DIR}/knowledge"
 
-if [[ ! -d "${SCRIPT_DIR}/docs-mintlify/zh/docs" ]]; then
-  echo "WARNING: docs-mintlify submodule content is missing:"
-  echo "  - ${SCRIPT_DIR}/docs-mintlify/zh/docs"
-  echo "Initialize submodules before starting:"
-  echo "  git submodule update --init --recursive docs-mintlify"
-  echo ""
+echo "Initializing docs-mintlify submodule..."
+git -C "${SCRIPT_DIR}" submodule update --init --recursive docs-mintlify
+
+DOCS_SRC="${SCRIPT_DIR}/docs-mintlify/zh/docs"
+KNOWLEDGE_DIR="${SCRIPT_DIR}/knowledge"
+if [[ ! -d "${DOCS_SRC}" ]]; then
+  echo "ERROR: docs source directory not found: ${DOCS_SRC}" >&2
+  exit 1
 fi
+
+echo "Syncing ${DOCS_SRC} → ${KNOWLEDGE_DIR}/"
+cp -a "${DOCS_SRC}/." "${KNOWLEDGE_DIR}/"
 
 # ----------------------------------------------------------
 # Start Agent Server
@@ -52,7 +57,7 @@ echo " Pyromind Agent Server"
 echo "============================================"
 echo " LLM Base URL:      ${LLM_BASE_URL}"
 echo " Knowledge Base:    ${PYROMIND_KNOWLEDGE_BASE_PATH}"
-echo " Mintlify docs:     ${SCRIPT_DIR}/docs-mintlify/zh/docs"
+echo " Docs source:       ${DOCS_SRC}"
 echo " Host:              127.0.0.1"
 echo " Port:              8000"
 echo " Auto-reload:       enabled"

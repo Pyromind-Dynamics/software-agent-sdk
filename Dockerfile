@@ -7,7 +7,7 @@ ARG BASE_IMAGE=nikolaik/python-nodejs:python3.13-nodejs22-slim
 ARG USERNAME=openhands
 ARG UID=10001
 ARG GID=10001
-ARG PORT=8000
+ARG PORT=80
 # Opt-in build flag for the Vertex AI extra (`openhands-sdk[vertex]`). Off by
 # default to keep the published image lean. Pass `--build-arg ENABLE_VERTEX=1`
 # to bundle google-cloud-aiplatform so the resulting binary supports
@@ -77,6 +77,24 @@ RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
     uv run pyinstaller openhands-agent-server/openhands/agent_server/agent-server.spec
 # Fail fast if the expected binary is missing
 RUN test -x /agent-server/dist/openhands-agent-server
+
+####################################################################################
+# Pyromind knowledge base
+# Before docker build:
+#   git submodule update --init --recursive docs-mintlify
+####################################################################################
+FROM debian:bookworm-slim AS knowledge-sync
+ARG USERNAME UID GID
+RUN groupadd -g ${GID} ${USERNAME} \
+ && useradd -m -u ${UID} -g ${GID} -s /usr/sbin/nologin ${USERNAME}
+WORKDIR /sync
+COPY knowledge ./knowledge
+COPY docs-mintlify ./docs-mintlify
+RUN test -d docs-mintlify/zh/docs \
+ || (echo "ERROR: docs-mintlify submodule not initialized. Run: git submodule update --init --recursive docs-mintlify" >&2 && exit 1) \
+ && cp -a docs-mintlify/zh/docs/. knowledge/ \
+ && rm -rf docs-mintlify \
+ && chown -R ${USERNAME}:${USERNAME} knowledge
 
 ####################################################################################
 # Base image (minimal)
@@ -352,11 +370,15 @@ EXPOSE ${PORT} ${NOVNC_PORT}
 FROM base-image AS source
 ARG USERNAME
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server /agent-server
+COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
+ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
 ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "openhands.agent_server"]
 
 FROM base-image-minimal AS source-minimal
 ARG USERNAME
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server /agent-server
+COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
+ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
 ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "openhands.agent_server"]
 
 ############################
@@ -368,15 +390,19 @@ FROM base-image AS binary
 ARG USERNAME
 
 COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/openhands-agent-server /usr/local/bin/openhands-agent-server
+COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
 RUN chmod +x /usr/local/bin/openhands-agent-server
 # Fix library path to use system GCC libraries instead of bundled ones
 ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
 ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]
 
 FROM base-image-minimal AS binary-minimal
 ARG USERNAME
 COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/openhands-agent-server /usr/local/bin/openhands-agent-server
+COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
 RUN chmod +x /usr/local/bin/openhands-agent-server
 # Fix library path to use system GCC libraries instead of bundled ones
 ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
 ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]
