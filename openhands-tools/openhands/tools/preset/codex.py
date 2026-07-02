@@ -10,6 +10,7 @@ inject the ``<SKILLS>`` block so ``invoke_skill(...)`` keeps working.
 """
 
 from openhands.sdk import Agent
+from openhands.sdk.context import AgentContext
 from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.context.condenser.base import CondenserBase
 from openhands.sdk.llm.llm import LLM
@@ -26,6 +27,7 @@ _CODEX_SYSTEM_PROMPT_FILENAME = "system_prompt_codex.j2"
 def register_codex_tools(enable_browser: bool = True) -> None:
     """Register the codex tool set (terminal, apply_patch, task_tracker, browser)."""
     from openhands.tools.apply_patch import ApplyPatchTool
+
     # from openhands.tools.task_tracker import TaskTrackerTool
     from openhands.tools.terminal import TerminalTool
 
@@ -48,6 +50,7 @@ def get_codex_tools(enable_browser: bool = True) -> list[Tool]:
     register_codex_tools(enable_browser=enable_browser)
 
     from openhands.tools.apply_patch import ApplyPatchTool
+
     # from openhands.tools.task_tracker import TaskTrackerTool
     from openhands.tools.terminal import TerminalTool
 
@@ -74,6 +77,7 @@ def get_codex_agent(
     available_skills_prompt: str | None = None,
     custom_instructions: str | None = None,
     extra_tools: list[Tool] | None = None,
+    agent_context: AgentContext | None = None,
 ) -> Agent:
     """Get an agent aligned with Codex (gpt-5.2-codex) prompt + tools.
 
@@ -86,6 +90,10 @@ def get_codex_agent(
             codex base prompt (rendered into the ``# Custom instructions`` block).
         extra_tools: Optional extra tools appended to the codex tool set (e.g.
             ``Tool(name="grep")`` for knowledge-base search).
+        agent_context: Optional :class:`AgentContext`. When it carries
+            AgentSkills-format skills, the SDK auto-attaches ``InvokeSkillTool``
+            so the model can actually call ``invoke_skill(...)`` (the prompt text
+            alone does not attach the tool).
     """
     tools = get_codex_tools(enable_browser=not cli_mode)
     if extra_tools:
@@ -93,6 +101,7 @@ def get_codex_agent(
     agent = Agent(
         llm=llm,
         tools=tools,
+        agent_context=agent_context,
         system_prompt_filename=_CODEX_SYSTEM_PROMPT_FILENAME,
         system_prompt_kwargs={
             "cli_mode": cli_mode,

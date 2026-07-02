@@ -16,11 +16,12 @@ from pydantic import BaseModel, Field
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import get_conversation_service
 from openhands.agent_server.models import ConversationInfo
-from openhands.sdk import LLM, TextContent, Tool
+from openhands.sdk import LLM, AgentContext, TextContent, Tool
 from openhands.sdk.conversation.request import (
     SendMessageRequest,
     StartConversationRequest,
 )
+from openhands.sdk.skills import Skill, load_skills_from_dir
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
@@ -60,8 +61,7 @@ The Pyromind platform knowledge base is at your working directory: \
 invoke that skill via `invoke_skill` first, before searching the knowledge base.
 - Otherwise, for Pyromind questions, `grep` this directory for the relevant \
 keywords, then open the matched files with `file_editor` to read their full \
-content before answering. Do not restrict the search to a single file \
-extension (such as .mdx/.md); the knowledge base contains various file types.\
+content before answering.
 """
 
 
@@ -70,59 +70,37 @@ extension (such as .mdx/.md); the knowledge base contains various file types.\
 # ---------------------------------------------------------------------------
 
 
-def _load_skills(
+def _load_agent_skills(
     skills_path: str, allow_list: list[str] | None = None
-) -> list[dict[str, str]]:
-    """Load SKILL.md files from the skills directory.
+) -> list[Skill]:
+    """Load AgentSkills-format skills as :class:`Skill` objects.
 
-    Scans for both top-level markdown files and SKILL.md inside subdirectories.
-    When *allow_list* is provided, only skills whose name is in the list are loaded.
-    Returns a list of dicts with 'name' and 'content' keys.
+    Returns real ``Skill`` objects (not prompt text) so they can be placed on
+    an :class:`AgentContext`. This is what makes the SDK auto-attach
+    ``InvokeSkillTool`` — passing skills as prompt text alone advertises
+    ``invoke_skill(...)`` without ever attaching the tool, so the model cannot
+    call it and falls back to grep.
+
+    When *allow_list* is provided, only skills whose name is in the list are
+    returned.
     """
-    skills: list[dict[str, str]] = []
     skills_dir = Path(skills_path)
     if not skills_dir.is_dir():
         logger.warning(f"Skills directory not found: {skills_path}")
-        return skills
+        return []
 
-    for entry in sorted(skills_dir.iterdir()):
-        name = entry.stem if entry.is_file() else entry.name
-        # Filter by allow list if specified
+    # load_skills_from_dir returns (repo_skills, knowledge_skills, agent_skills);
+    # AgentSkills-format SKILL.md directories land in the third dict.
+    _, _, agent_skills = load_skills_from_dir(skills_dir)
+
+    selected: list[Skill] = []
+    for name, skill in sorted(agent_skills.items()):
         if allow_list and name not in allow_list:
             continue
+        selected.append(skill)
+        logger.info(f"Loaded skill: {name}")
 
-        skill_file: Path | None = None
-        if entry.is_dir():
-            candidate = entry / "SKILL.md"
-            if candidate.is_file():
-                skill_file = candidate
-        elif entry.is_file() and entry.suffix == ".md":
-            skill_file = entry
-
-        if skill_file:
-            content = skill_file.read_text(encoding="utf-8")
-            skills.append({"name": name, "content": content})
-            logger.info(f"Loaded skill: {name}")
-
-    return skills
-
-
-def _build_skills_prompt(skills: list[dict[str, str]]) -> str:
-    """Build the inner body for the codex ``<SKILLS>`` block.
-
-    The codex template (`system_prompt_codex.j2`) already renders the
-    ``<SKILLS>`` envelope and the ``invoke_skill(...)`` instructions, so this
-    only returns the per-skill listing that goes inside it. Returns an empty
-    string when there are no skills (the block is then omitted).
-    """
-    if not skills:
-        return ""
-
-    sections = []
-    for skill in skills:
-        sections.append(f"---\n{skill['content']}")
-
-    return "\n\n".join(sections)
+    return selected
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -132,9 +110,15 @@ def _build_skills_prompt(skills: list[dict[str, str]]) -> str:
 class PyromindLLMConfig(BaseModel):
     """LLM configuration passed from the frontend."""
 
-    model: str = "gpt-4o"
-    api_key: str | None = None
-    base_url: str | None = None
+    model: str = Field(
+        default_factory=lambda: os.environ.get("LLM_MODEL", "gpt-4o"),
+    )
+    api_key: str | None = Field(
+        default_factory=lambda: os.environ.get("OPENAI_API_KEY"),
+    )
+    base_url: str | None = Field(
+        default_factory=lambda: os.environ.get("LLM_BASE_URL"),
+    )
 
 
 class PyromindCreateConversationRequest(BaseModel):
@@ -211,10 +195,12 @@ async def create_pyromind_conversation(
     if extra_instructions:
         custom_instructions += f"\n\n补充说明：{extra_instructions}"
 
-    # 3. Load available skills and render them into the codex <SKILLS> block
+    # 3. Load available skills as real Skill objects. Placing them on an
+    #    AgentContext makes the SDK auto-attach InvokeSkillTool so the model can
+    #    actually call invoke_skill(...) (prompt text alone does not attach it).
     skills_path = request.extra.get("skills_path", _DEFAULT_SKILLS_PATH)
-    skills = _load_skills(skills_path, allow_list=_PYROMIND_SKILL_NAMES)
-    skills_prompt = _build_skills_prompt(skills) or None
+    skills = _load_agent_skills(skills_path, allow_list=_PYROMIND_SKILL_NAMES)
+    agent_context = AgentContext(skills=skills) if skills else None
 
     # 4. Build LLM config
     llm = LLM(
@@ -229,7 +215,7 @@ async def create_pyromind_conversation(
     agent = get_codex_agent(
         llm=llm,
         cli_mode=True,
-        available_skills_prompt=skills_prompt,
+        agent_context=agent_context,
         custom_instructions=custom_instructions,
         extra_tools=[Tool(name="grep"), Tool(name="file_editor")],
     )
@@ -254,7 +240,5 @@ async def create_pyromind_conversation(
 
     # 8. Delegate to conversation service
     info, is_new = await conversation_service.start_conversation(start_request)
-    response.status_code = (
-        status.HTTP_201_CREATED if is_new else status.HTTP_200_OK
-    )
+    response.status_code = status.HTTP_201_CREATED if is_new else status.HTTP_200_OK
     return info
