@@ -16,13 +16,15 @@ from pydantic import BaseModel, Field
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import get_conversation_service
 from openhands.agent_server.models import ConversationInfo
-from openhands.sdk import LLM, Agent, TextContent, Tool
+from openhands.sdk import LLM, TextContent, Tool
 from openhands.sdk.conversation.request import (
     SendMessageRequest,
     StartConversationRequest,
 )
 from openhands.sdk.workspace import LocalWorkspace
+from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
+
 
 logger = logging.getLogger(__name__)
 
@@ -46,19 +48,20 @@ _DEFAULT_SKILLS_PATH = os.environ.get(
 # Only load these skills for Pyromind (avoids loading unrelated SDK skills)
 _PYROMIND_SKILL_NAMES = ["generate-workflow-dsl"]
 
-PYROMIND_SYSTEM_PROMPT = """\
-你是 Pyromind 平台的知识库助手。当用户询问关于 pyromind 平台的使用方法、节点概念或相关功能时，\
-请使用 grep 工具在知识库目录中搜索相关关键信息，然后基于搜索结果回答用户的问题。
+# Knowledge-base retrieval guidance layered on top of the codex base prompt via
+# get_codex_agent(custom_instructions=...). Kept lightweight: prefer invoking a
+# matching skill first, and only fall back to grep + file_editor for free-form
+# knowledge-base lookups.
+PYROMIND_KB_INSTRUCTIONS = """\
+The Pyromind platform knowledge base is at your working directory: \
+{knowledge_base_path}
 
-知识库目录路径: {knowledge_base_path}
-
-工作流程：
-1. 分析用户问题，提取关键词
-2. 使用 grep 工具在知识库目录中搜索相关内容（可多次搜索不同关键词）
-3. 综合搜索结果，用清晰易懂的语言回答用户问题
-4. 如果知识库中没有找到相关信息，如实告知用户
-
-注意：搜索时请使用中文和英文关键词都尝试，以获得更全面的结果。\
+- If a listed skill fits the request (for example, generating a workflow), \
+invoke that skill via `invoke_skill` first, before searching the knowledge base.
+- Otherwise, for Pyromind questions, `grep` this directory for the relevant \
+keywords, then open the matched files with `file_editor` to read their full \
+content before answering. Do not restrict the search to a single file \
+extension (such as .mdx/.md); the knowledge base contains various file types.\
 """
 
 
@@ -105,18 +108,21 @@ def _load_skills(
 
 
 def _build_skills_prompt(skills: list[dict[str, str]]) -> str:
-    """Build the skills section to append to the system prompt."""
+    """Build the inner body for the codex ``<SKILLS>`` block.
+
+    The codex template (`system_prompt_codex.j2`) already renders the
+    ``<SKILLS>`` envelope and the ``invoke_skill(...)`` instructions, so this
+    only returns the per-skill listing that goes inside it. Returns an empty
+    string when there are no skills (the block is then omitted).
+    """
     if not skills:
         return ""
 
     sections = []
-    sections.append("\n\n# 可用技能 (Available Skills)")
-    sections.append("以下技能已加载，当用户需求匹配时请按照技能说明执行：\n")
-
     for skill in skills:
-        sections.append(f"---\n{skill['content']}\n")
+        sections.append(f"---\n{skill['content']}")
 
-    return "\n".join(sections)
+    return "\n\n".join(sections)
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -174,11 +180,13 @@ async def create_pyromind_conversation(
     """Create a new conversation configured for Pyromind knowledge-base retrieval.
 
     The server assembles:
-    - A system prompt instructing the agent to use grep for KB search
-    - Tools: terminal, file_editor, grep
+    - A codex-style base agent (prompt + tools) via ``get_codex_agent``
+    - Pyromind KB-retrieval instructions layered on top via ``custom_instructions``
+    - Tools: codex set (terminal + apply_patch + task_tracker) + grep and
+      file_editor for KB search (grep finds files, file_editor views them)
     - Workspace pointing to the knowledge base directory
     """
-    # Ensure grep tool is registered
+    # Ensure the grep tool is registered (codex tools are registered by the preset).
     register_default_tools(enable_browser=False)
 
     # 1. Resolve knowledge base path (extra can override the default)
@@ -193,22 +201,20 @@ async def create_pyromind_conversation(
             detail=f"Knowledge base path does not exist: {knowledge_base_path}",
         )
 
-    # 2. Assemble system prompt
-    system_prompt = PYROMIND_SYSTEM_PROMPT.format(
+    # 2. Assemble the pyromind KB instructions (layered on the codex base prompt)
+    custom_instructions = PYROMIND_KB_INSTRUCTIONS.format(
         knowledge_base_path=knowledge_base_path
     )
 
-    # 3. Load and append available skills
+    # Append extra custom instructions from the request if provided
+    extra_instructions = request.extra.get("custom_instructions")
+    if extra_instructions:
+        custom_instructions += f"\n\n补充说明：{extra_instructions}"
+
+    # 3. Load available skills and render them into the codex <SKILLS> block
     skills_path = request.extra.get("skills_path", _DEFAULT_SKILLS_PATH)
     skills = _load_skills(skills_path, allow_list=_PYROMIND_SKILL_NAMES)
-    skills_prompt = _build_skills_prompt(skills)
-    if skills_prompt:
-        system_prompt += skills_prompt
-
-    # Append custom instructions from extra if provided
-    custom_instructions = request.extra.get("custom_instructions")
-    if custom_instructions:
-        system_prompt += f"\n\n补充说明：{custom_instructions}"
+    skills_prompt = _build_skills_prompt(skills) or None
 
     # 4. Build LLM config
     llm = LLM(
@@ -218,15 +224,14 @@ async def create_pyromind_conversation(
         base_url=request.llm.base_url,
     )
 
-    # 5. Build Agent with tools and system prompt
-    agent = Agent(
+    # 5. Build the codex-style agent with the KB instructions + KB retrieval
+    #    tools (grep to find files, file_editor to view their content).
+    agent = get_codex_agent(
         llm=llm,
-        tools=[
-            Tool(name="terminal"),
-            Tool(name="file_editor"),
-            Tool(name="grep"),
-        ],
-        system_prompt=system_prompt,
+        cli_mode=True,
+        available_skills_prompt=skills_prompt,
+        custom_instructions=custom_instructions,
+        extra_tools=[Tool(name="grep"), Tool(name="file_editor")],
     )
 
     # 6. Build workspace pointing to knowledge base
