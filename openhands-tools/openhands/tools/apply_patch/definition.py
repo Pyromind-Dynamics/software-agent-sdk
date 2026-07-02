@@ -35,8 +35,11 @@ class ApplyPatchAction(Action):
 
     patch: str = Field(
         description=(
-            "Patch content following the '*** Begin Patch' ... '*** End Patch' "
-            "format as described in OpenAI GPT-5.1 prompting guide."
+            "The patch to apply, wrapped in the '*** Begin Patch' ... "
+            "'*** End Patch' envelope. Each file section starts with an "
+            "'*** Add File:', '*** Delete File:', or '*** Update File:' header. "
+            "Prefix new content lines with '+'. This is a FREEFORM tool, so do "
+            "not wrap the patch in JSON."
         ),
     )
 
@@ -121,8 +124,8 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
 
 
 _DESCRIPTION = (
-    "Apply unified text patches to files in the workspace. "
-    "Input must start with '*** Begin Patch' and end with '*** End Patch'."
+    "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do "
+    "not wrap the patch in JSON."
 )
 
 

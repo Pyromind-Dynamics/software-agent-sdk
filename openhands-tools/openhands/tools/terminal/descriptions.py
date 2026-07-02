@@ -2,6 +2,7 @@
 
 UNIX_TOOL_DESCRIPTION = "\n".join(
     [
+        "Runs a shell command and returns its output.",
         "Execute a shell command in the terminal within a persistent shell session.",
         "",
         "",
@@ -45,6 +46,7 @@ UNIX_TOOL_DESCRIPTION = "\n".join(
 
 WINDOWS_TOOL_DESCRIPTION = "\n".join(
     [
+        "Runs a shell command and returns its output.",
         (
             "Execute a shell command in the terminal within a persistent "
             "PowerShell session."

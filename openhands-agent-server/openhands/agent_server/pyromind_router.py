@@ -16,12 +16,14 @@ from pydantic import BaseModel, Field
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import get_conversation_service
 from openhands.agent_server.models import ConversationInfo
-from openhands.sdk import LLM, Agent, TextContent, Tool
+from openhands.sdk import LLM, AgentContext, TextContent, Tool
 from openhands.sdk.conversation.request import (
     SendMessageRequest,
     StartConversationRequest,
 )
+from openhands.sdk.skills import Skill, load_skills_from_dir
 from openhands.sdk.workspace import LocalWorkspace
+from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
 
 
@@ -47,20 +49,20 @@ _DEFAULT_SKILLS_PATH = os.environ.get(
 # Only load these skills for Pyromind (avoids loading unrelated SDK skills)
 _PYROMIND_SKILL_NAMES = ["generate-workflow-dsl"]
 
-PYROMIND_SYSTEM_PROMPT = """\
-你是 Pyromind 平台的知识库助手。当用户询问关于 pyromind 平台的使用方法、节点概念或相关功能时，\
-请使用 grep 工具在知识库目录中搜索相关关键信息，然后基于搜索结果回答用户的问题。
+# Knowledge-base retrieval guidance layered on top of the codex base prompt via
+# get_codex_agent(custom_instructions=...). Kept lightweight: prefer invoking a
+# matching skill first, and only fall back to grep + file_editor for free-form
+# knowledge-base lookups.
+PYROMIND_KB_INSTRUCTIONS = """\
+The Pyromind platform knowledge base is at your working directory: \
+{knowledge_base_path}
 
-知识库目录路径: {knowledge_base_path}
-
-工作流程：
-1. 分析用户问题，提取关键词
-2. 使用 grep 工具在知识库目录中搜索相关内容（可多次搜索不同关键词）
-3. 综合搜索结果，用清晰易懂的语言回答用户问题
-4. 如果知识库中没有找到相关信息，如实告知用户
-
-注意：搜索时请使用中文和英文关键词都尝试，以获得更全面的结果。\
-"""  # noqa: E501
+- If a listed skill fits the request (for example, generating a workflow), \
+invoke that skill via `invoke_skill` first, before searching the knowledge base.
+- Otherwise, for Pyromind questions, `grep` this directory for the relevant \
+keywords, then open the matched files with `file_editor` to read their full \
+content before answering.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -68,57 +70,37 @@ PYROMIND_SYSTEM_PROMPT = """\
 # ---------------------------------------------------------------------------
 
 
-def _load_skills(
+def _load_agent_skills(
     skills_path: str, allow_list: list[str] | None = None
-) -> list[dict[str, str]]:
-    """Load SKILL.md files from the skills directory.
+) -> list[Skill]:
+    """Load AgentSkills-format skills as :class:`Skill` objects.
 
-    Scans for both top-level markdown files and SKILL.md inside subdirectories.
-    When *allow_list* is provided, only skills whose name is in the list are loaded.
-    Returns a list of dicts with 'name' and 'content' keys.
+    Returns real ``Skill`` objects (not prompt text) so they can be placed on
+    an :class:`AgentContext`. This is what makes the SDK auto-attach
+    ``InvokeSkillTool`` — passing skills as prompt text alone advertises
+    ``invoke_skill(...)`` without ever attaching the tool, so the model cannot
+    call it and falls back to grep.
+
+    When *allow_list* is provided, only skills whose name is in the list are
+    returned.
     """
-    skills: list[dict[str, str]] = []
     skills_dir = Path(skills_path)
     if not skills_dir.is_dir():
         logger.warning(f"Skills directory not found: {skills_path}")
-        return skills
+        return []
 
-    for entry in sorted(skills_dir.iterdir()):
-        name = entry.stem if entry.is_file() else entry.name
-        # Filter by allow list if specified
+    # load_skills_from_dir returns (repo_skills, knowledge_skills, agent_skills);
+    # AgentSkills-format SKILL.md directories land in the third dict.
+    _, _, agent_skills = load_skills_from_dir(skills_dir)
+
+    selected: list[Skill] = []
+    for name, skill in sorted(agent_skills.items()):
         if allow_list and name not in allow_list:
             continue
+        selected.append(skill)
+        logger.info(f"Loaded skill: {name}")
 
-        skill_file: Path | None = None
-        if entry.is_dir():
-            candidate = entry / "SKILL.md"
-            if candidate.is_file():
-                skill_file = candidate
-        elif entry.is_file() and entry.suffix == ".md":
-            skill_file = entry
-
-        if skill_file:
-            content = skill_file.read_text(encoding="utf-8")
-            skills.append({"name": name, "content": content})
-            logger.info(f"Loaded skill: {name}")
-
-    return skills
-
-
-def _build_skills_prompt(skills: list[dict[str, str]]) -> str:
-    """Build the skills section to append to the system prompt."""
-    if not skills:
-        return ""
-
-    sections = []
-    sections.append("\n\n# 可用技能 (Available Skills)")
-    sections.append("以下技能已加载，当用户需求匹配时请按照技能说明执行：\n")
-
-    for skill in skills:
-        sections.append(f"---\n{skill['content']}\n")
-
-    return "\n".join(sections)
-
+    return selected
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -182,11 +164,13 @@ async def create_pyromind_conversation(
     """Create a new conversation configured for Pyromind knowledge-base retrieval.
 
     The server assembles:
-    - A system prompt instructing the agent to use grep for KB search
-    - Tools: terminal, file_editor, grep
+    - A codex-style base agent (prompt + tools) via ``get_codex_agent``
+    - Pyromind KB-retrieval instructions layered on top via ``custom_instructions``
+    - Tools: codex set (terminal + apply_patch + task_tracker) + grep and
+      file_editor for KB search (grep finds files, file_editor views them)
     - Workspace pointing to the knowledge base directory
     """
-    # Ensure grep tool is registered
+    # Ensure the grep tool is registered (codex tools are registered by the preset).
     register_default_tools(enable_browser=False)
 
     # 1. Resolve knowledge base path (extra can override the default)
@@ -201,22 +185,22 @@ async def create_pyromind_conversation(
             detail=f"Knowledge base path does not exist: {knowledge_base_path}",
         )
 
-    # 2. Assemble system prompt
-    system_prompt = PYROMIND_SYSTEM_PROMPT.format(
+    # 2. Assemble the pyromind KB instructions (layered on the codex base prompt)
+    custom_instructions = PYROMIND_KB_INSTRUCTIONS.format(
         knowledge_base_path=knowledge_base_path
     )
 
-    # 3. Load and append available skills
-    skills_path = request.extra.get("skills_path", _DEFAULT_SKILLS_PATH)
-    skills = _load_skills(skills_path, allow_list=_PYROMIND_SKILL_NAMES)
-    skills_prompt = _build_skills_prompt(skills)
-    if skills_prompt:
-        system_prompt += skills_prompt
+    # Append extra custom instructions from the request if provided
+    extra_instructions = request.extra.get("custom_instructions")
+    if extra_instructions:
+        custom_instructions += f"\n\n补充说明：{extra_instructions}"
 
-    # Append custom instructions from extra if provided
-    custom_instructions = request.extra.get("custom_instructions")
-    if custom_instructions:
-        system_prompt += f"\n\n补充说明：{custom_instructions}"
+    # 3. Load available skills as real Skill objects. Placing them on an
+    #    AgentContext makes the SDK auto-attach InvokeSkillTool so the model can
+    #    actually call invoke_skill(...) (prompt text alone does not attach it).
+    skills_path = request.extra.get("skills_path", _DEFAULT_SKILLS_PATH)
+    skills = _load_agent_skills(skills_path, allow_list=_PYROMIND_SKILL_NAMES)
+    agent_context = AgentContext(skills=skills) if skills else None
 
     # 4. Build LLM config
     llm = LLM(
@@ -224,18 +208,16 @@ async def create_pyromind_conversation(
         model=request.llm.model,
         api_key=request.llm.api_key,
         base_url=request.llm.base_url,
-        native_tool_calling=False,
     )
 
-    # 5. Build Agent with tools and system prompt
-    agent = Agent(
+    # 5. Build the codex-style agent with the KB instructions + KB retrieval
+    #    tools (grep to find files, file_editor to view their content).
+    agent = get_codex_agent(
         llm=llm,
-        tools=[
-            Tool(name="terminal"),
-            Tool(name="file_editor"),
-            Tool(name="grep"),
-        ],
-        system_prompt=system_prompt,
+        cli_mode=True,
+        agent_context=agent_context,
+        custom_instructions=custom_instructions,
+        extra_tools=[Tool(name="grep"), Tool(name="file_editor")],
     )
 
     # 6. Build workspace pointing to knowledge base

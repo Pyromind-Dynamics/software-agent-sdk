@@ -80,6 +80,31 @@ print("All done!")
 For installation instructions and detailed setup, see the [Getting Started Guide](https://docs.openhands.dev/sdk/getting-started).
 For local development from this repository, run `make build` to install the workspace dependencies and pre-commit hooks.
 
+## PyroMind Agent & Knowledge Base
+
+This fork includes a PyroMind knowledge-base agent. The `knowledge/` directory is the
+runtime document root (`PYROMIND_KNOWLEDGE_BASE_PATH`).
+
+| Path | Purpose |
+|------|---------|
+| [`knowledge/`](knowledge/) | Runtime document root for the PyroMind agent |
+| [`knowledge/docs-mintlify/`](knowledge/docs-mintlify/) | **git submodule** — official Mintlify docs ([upstream](https://github.com/PyroMind-Dynamics/docs-mintlify)) |
+| [`knowledge/pyromind-sdk-example/`](knowledge/pyromind-sdk-example/) | **git submodule** — node I/O specs and workflow JSON samples ([upstream](https://github.com/PyroMind-Dynamics/pyromind-sdk-example)) |
+
+The [PyroMind Python SDK](https://pypi.org/project/pyromind-sdk/) is installed from PyPI via `make build` / `uv sync --dev`.
+
+After cloning, initialize knowledge submodules:
+
+```bash
+git submodule update --init --recursive \
+  knowledge/docs-mintlify \
+  knowledge/pyromind-sdk-example
+make build
+./start.sh
+```
+
+See [`knowledge/README.md`](knowledge/README.md) for updating the submodule pointer and Docker build notes.
+
 ## Documentation
 
 For detailed documentation, tutorials, and API reference, visit:

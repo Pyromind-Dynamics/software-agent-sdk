@@ -16,9 +16,14 @@ triggers:
 ## 概述
 
 当用户要求生成模型训练工作流时，你需要：
-1. 先用 grep 检索知识库，了解可用的节点类型、参数和连接模式
+1. 先用 grep 检索知识库（`knowledge/`），了解可用的节点类型、参数和连接模式
 2. 根据用户需求选择合适的节点组合
 3. 按照 DSL 语法格式输出工作流代码
+
+知识库检索路径（均在 `knowledge/` 下）：
+- 平台用法：`knowledge/docs-mintlify/zh/docs/`、`knowledge/docs-mintlify/en/docs/`
+- 节点 I/O 与端口定义：`knowledge/pyromind-sdk-example/docs/`、`knowledge/pyromind-sdk-example/docs_zh/`
+- workflow JSON 样例：`knowledge/pyromind-sdk-example/workflow/`
 
 ## DSL 语法格式
 
@@ -410,7 +415,7 @@ grpo_train = ModelTrainGRPONode(
 ## 生成工作流的步骤
 
 1. **理解用户需求**：确定训练类型（SFT/DPO/GRPO）、数据集、模型
-2. **检索知识库**：用 grep 搜索相关节点文档和连接模式
+2. **检索知识库**：用 grep 在 `knowledge/` 下搜索；平台文档查 `knowledge/docs-mintlify/zh/docs/`，节点契约查 `knowledge/pyromind-sdk-example/docs/`，样例连接查 `knowledge/pyromind-sdk-example/workflow/`
 3. **选择节点组合**：
    - 数据加载：CloneAndCacheDataset → PathJoinNode → DatasetToJsonlNode（如需转换）
    - 字段映射：DatasetConfigBuilderTextNode 或 DatasetConfigBuilderVisionNode
