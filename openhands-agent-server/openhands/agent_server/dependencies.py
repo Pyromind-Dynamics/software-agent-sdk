@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from uuid import UUID
 
 from fastapi import Depends, HTTPException, Request, status
@@ -7,6 +8,12 @@ from openhands.agent_server.bash_service import BashEventService
 from openhands.agent_server.config import Config
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.event_service import EventService
+from openhands.agent_server.pyromind_auth import (
+    LOGIN_REQUIRED_DETAIL,
+    PYROMIND_AUTH_COOKIE_NAME,
+    CurrentLoginUser,
+    get_current_login_user_from_token,
+)
 
 
 # Cookie name used to authenticate the workspace static-file routes.
@@ -21,19 +28,73 @@ _WORKSPACE_SESSION_COOKIE = APIKeyCookie(
 )
 
 
+def is_session_api_key_valid(config: Config, session_api_key: str | None) -> bool:
+    if not config.enable_session_api_key_auth:
+        return False
+    return bool(config.session_api_keys and session_api_key in config.session_api_keys)
+
+
+def is_pyromind_jwt_auth_configured(config: Config) -> bool:
+    return config.enable_pyromind_jwt_auth is True
+
+
+def is_auth_configured(config: Config) -> bool:
+    return bool(config.session_api_keys) or is_pyromind_jwt_auth_configured(config)
+
+
+def get_pyromind_jwt_token(
+    *,
+    cookies: Mapping[str, str],
+) -> str | None:
+    return cookies.get(PYROMIND_AUTH_COOKIE_NAME)
+
+
+def get_pyromind_jwt_token_from_request(request: Request) -> str | None:
+    return get_pyromind_jwt_token(
+        cookies=request.cookies,
+    )
+
+
+def verify_pyromind_jwt_token(
+    config: Config,
+    token: str | None,
+) -> CurrentLoginUser | None:
+    if config.enable_pyromind_jwt_auth is not True:
+        return None
+    return get_current_login_user_from_token(token)
+
+
+def authenticate_request(request: Request, session_api_key: str | None) -> None:
+    config: Config = request.app.state.config
+
+    if is_session_api_key_valid(config, session_api_key):
+        request.state.auth_method = "session_api_key"
+        return
+
+    pyromind_token = get_pyromind_jwt_token_from_request(request)
+    pyromind_user = verify_pyromind_jwt_token(config, pyromind_token)
+    if pyromind_user is not None:
+        request.state.auth_method = "pyromind_jwt"
+        request.state.current_user = pyromind_user
+        return
+
+    if not is_auth_configured(config):
+        return
+
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=LOGIN_REQUIRED_DETAIL)
+
+
 def check_session_api_key(
     request: Request,
     session_api_key: str | None = Depends(_SESSION_API_KEY_HEADER),
 ) -> None:
-    """Reject the request if the supplied key is not in the current session keys.
+    """Reject the request unless it matches one configured auth mechanism.
 
-    Reads ``session_api_keys`` from ``request.app.state.config`` at request time
-    so that keys delivered via ``POST /api/init`` take effect immediately without
-    restarting the server or re-registering routes.
+    Reads config from ``request.app.state.config`` at request time so that keys
+    or JWT settings delivered via ``POST /api/init`` take effect immediately
+    without restarting the server or re-registering routes.
     """
-    config: Config = request.app.state.config
-    if config.session_api_keys and session_api_key not in config.session_api_keys:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED)
+    authenticate_request(request, session_api_key)
 
 
 def check_workspace_session(
@@ -52,12 +113,36 @@ def check_workspace_session(
     to this router only; no other endpoint honors it.
     """
     config: Config = request.app.state.config
-    if not config.session_api_keys:
-        return
     for candidate in (header_key, cookie_key):
-        if candidate and candidate in config.session_api_keys:
+        if is_session_api_key_valid(config, candidate):
             return
-    raise HTTPException(status.HTTP_401_UNAUTHORIZED)
+
+    for candidate in (
+        request.cookies.get(PYROMIND_AUTH_COOKIE_NAME),
+        cookie_key,
+    ):
+        pyromind_user = verify_pyromind_jwt_token(config, candidate)
+        if pyromind_user is not None:
+            request.state.auth_method = "pyromind_jwt"
+            request.state.current_user = pyromind_user
+            return
+
+    if not is_auth_configured(config):
+        return
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=LOGIN_REQUIRED_DETAIL)
+
+
+def get_workspace_session_cookie_value(request: Request) -> str:
+    config: Config = request.app.state.config
+    session_api_key = request.headers.get("x-session-api-key")
+    if is_session_api_key_valid(config, session_api_key):
+        return session_api_key or ""
+
+    token = get_pyromind_jwt_token_from_request(request)
+    if verify_pyromind_jwt_token(config, token) is not None:
+        return token or ""
+
+    return ""
 
 
 def get_conversation_service(request: Request) -> ConversationService:

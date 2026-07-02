@@ -10,15 +10,17 @@ exchange it for a short-lived cookie which the browser will automatically
 attach to every workspace request — including cross-site iframes, thanks
 to ``SameSite=None; Secure; Partitioned``.
 
-The cookie is honored by ``workspace_router`` ONLY. Every other API route
-continues to require the ``X-Session-API-Key`` header. This is deliberate:
-keeping cookies off the rest of the API removes the CSRF surface that
-cookie auth would otherwise add.
+The workspace session cookie is honored by ``workspace_router`` ONLY. Regular
+API routes do not accept this cookie; they use the configured general API auth
+mechanisms instead.
 """
 
 from fastapi import APIRouter, Request, Response, status
 
-from openhands.agent_server.dependencies import WORKSPACE_SESSION_COOKIE_NAME
+from openhands.agent_server.dependencies import (
+    WORKSPACE_SESSION_COOKIE_NAME,
+    get_workspace_session_cookie_value,
+)
 
 
 auth_router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -128,15 +130,14 @@ def _append_partitioned_to_last_set_cookie(response: Response) -> None:
 async def create_workspace_session(request: Request, response: Response) -> Response:
     """Mint a workspace-scoped session cookie.
 
-    Caller must already be authenticated by the ``X-Session-API-Key``
-    header (enforced by the parent router's dependency). The cookie value
-    is the validated session API key itself; it is HttpOnly so JS in
+    Caller must already be authenticated by the parent router's dependency.
+    The cookie value is the validated session API key, or the validated
+    PyroMind JWT when API-key auth is disabled; it is HttpOnly so JS in
     workspace HTML cannot read it back.
     """
-    session_api_key = request.headers.get("x-session-api-key", "")
     _set_workspace_cookie(
         response,
-        value=session_api_key,
+        value=get_workspace_session_cookie_value(request),
         secure=_request_is_secure_context(request),
         max_age=_COOKIE_MAX_AGE_SECONDS,
     )
