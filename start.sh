@@ -13,17 +13,18 @@ set -euo pipefail
 # LLM Configuration
 # ----------------------------------------------------------
 export LLM_BASE_URL="https://openrouter.ai/api/v1/"
-export OPENAI_API_KEY="your-secret-key-here"
+export OPENAI_API_KEY=""
+export LLM_MODEL="openai/gpt-5.5"
 
 # ----------------------------------------------------------
 # Agent Server Configuration
 # ----------------------------------------------------------
 # Session API key for authenticating requests (leave empty for unsecured dev mode)
-export SESSION_API_KEY="pyromind_agent"
+export SESSION_API_KEY=""
 
 # Secret key for encrypting LLM API keys in stored conversations
 # Generate with: openssl rand -hex 32
-export OH_SECRET_KEY="pyromind_agent"
+export OH_SECRET_KEY=""
 
 # Allow all CORS origins in development
 export OH_ALLOW_CORS_ORIGIN_REGEX="https?://.+"
