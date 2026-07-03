@@ -20,7 +20,10 @@ from openhands.agent_server._secrets_exposure import (
     get_cipher,
 )
 from openhands.agent_server.conversation_service import ConversationService
-from openhands.agent_server.dependencies import get_conversation_service
+from openhands.agent_server.dependencies import (
+    get_conversation_service,
+    get_current_user_id,
+)
 from openhands.agent_server.models import (
     INCLUDE_SKILLS_PARAM_TITLE,
     AgentResponseResult,
@@ -76,11 +79,17 @@ START_CONVERSATION_EXAMPLES = [
 ]
 
 
+def _user_scope_kwargs(request: Request) -> dict[str, str]:
+    user_id = get_current_user_id(request)
+    return {"user_id": user_id} if user_id is not None else {}
+
+
 # Read methods
 
 
 @conversation_router.get("/search")
 async def search_conversations(
+    request: Request,
     page_id: Annotated[
         str | None,
         Query(title="Optional next_page_id from the previously returned page"),
@@ -104,7 +113,11 @@ async def search_conversations(
     assert limit > 0
     assert limit <= 100
     page = await conversation_service.search_conversations(
-        page_id, limit, status, sort_order
+        page_id,
+        limit,
+        status,
+        sort_order,
+        **_user_scope_kwargs(request),
     )
     if not include_skills:
         # ``model_copy`` rather than in-place mutation so we never
@@ -123,6 +136,7 @@ async def search_conversations(
 
 @conversation_router.get("/count")
 async def count_conversations(
+    request: Request,
     status: Annotated[
         ConversationExecutionStatus | None,
         Query(title="Optional filter by conversation execution status"),
@@ -130,7 +144,9 @@ async def count_conversations(
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> int:
     """Count conversations matching the given filters"""
-    count = await conversation_service.count_conversations(status)
+    count = await conversation_service.count_conversations(
+        status, **_user_scope_kwargs(request)
+    )
     return count
 
 
@@ -138,12 +154,16 @@ async def count_conversations(
     "/{conversation_id}", responses={404: {"description": "Item not found"}}
 )
 async def get_conversation(
+    request: Request,
     conversation_id: UUID,
     include_skills: Annotated[bool, Query(title=INCLUDE_SKILLS_PARAM_TITLE)] = False,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> ConversationInfo:
     """Given an id, get a conversation"""
-    conversation = await conversation_service.get_conversation(conversation_id)
+    conversation = await conversation_service.get_conversation(
+        conversation_id,
+        **_user_scope_kwargs(request),
+    )
     if conversation is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
     if not include_skills:
@@ -156,6 +176,7 @@ async def get_conversation(
     responses={404: {"description": "Conversation not found"}},
 )
 async def get_conversation_agent_final_response(
+    request: Request,
     conversation_id: UUID,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> AgentResponseResult:
@@ -165,7 +186,10 @@ async def get_conversation_agent_final_response(
     the last agent text response (MessageEvent). Returns an empty string
     if the agent has not produced a final response yet.
     """
-    event_service = await conversation_service.get_event_service(conversation_id)
+    event_service = await conversation_service.get_event_service(
+        conversation_id,
+        **_user_scope_kwargs(request),
+    )
     if event_service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
     response = await event_service.get_agent_final_response()
@@ -174,6 +198,7 @@ async def get_conversation_agent_final_response(
 
 @conversation_router.get("")
 async def batch_get_conversations(
+    request: Request,
     ids: Annotated[list[UUID], Query()],
     include_skills: Annotated[bool, Query(title=INCLUDE_SKILLS_PARAM_TITLE)] = False,
     conversation_service: ConversationService = Depends(get_conversation_service),
@@ -181,7 +206,10 @@ async def batch_get_conversations(
     """Get a batch of conversations given their ids, returning null for
     any missing item"""
     assert len(ids) < 100
-    conversations = await conversation_service.batch_get_conversations(ids)
+    conversations = await conversation_service.batch_get_conversations(
+        ids,
+        **_user_scope_kwargs(request),
+    )
     if not include_skills:
         return [
             trim_conversation_response_skills(c) if c is not None else None
@@ -195,6 +223,7 @@ async def batch_get_conversations(
 
 @conversation_router.post("")
 async def start_conversation(
+    http_request: Request,
     request: Annotated[
         StartConversationRequest, Body(examples=START_CONVERSATION_EXAMPLES)
     ],
@@ -203,8 +232,13 @@ async def start_conversation(
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> ConversationInfo:
     """Start a conversation in the local environment."""
+    user_id = get_current_user_id(http_request)
+    if user_id is not None:
+        request = request.model_copy(update={"user_id": user_id})
     try:
         info, is_new = await conversation_service.start_conversation(request)
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except ProfileNotFound as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except DanglingMcpServerRef as e:
@@ -226,11 +260,15 @@ async def start_conversation(
     "/{conversation_id}/pause", responses={404: {"description": "Item not found"}}
 )
 async def pause_conversation(
+    request: Request,
     conversation_id: UUID,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> Success:
     """Pause a conversation, allowing it to be resumed later."""
-    paused = await conversation_service.pause_conversation(conversation_id)
+    paused = await conversation_service.pause_conversation(
+        conversation_id,
+        **_user_scope_kwargs(request),
+    )
     if not paused:
         raise HTTPException(status.HTTP_400_BAD_REQUEST)
     return Success()
@@ -241,6 +279,7 @@ async def pause_conversation(
     responses={404: {"description": "Item not found"}},
 )
 async def interrupt_conversation(
+    request: Request,
     conversation_id: UUID,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> Success:
@@ -250,7 +289,10 @@ async def interrupt_conversation(
     ``/interrupt`` cancels the in-flight request so the effect is instant.
     The conversation transitions to *paused* and can be resumed later.
     """
-    interrupted = await conversation_service.interrupt_conversation(conversation_id)
+    interrupted = await conversation_service.interrupt_conversation(
+        conversation_id,
+        **_user_scope_kwargs(request),
+    )
     if not interrupted:
         raise HTTPException(status.HTTP_400_BAD_REQUEST)
     return Success()
@@ -260,11 +302,15 @@ async def interrupt_conversation(
     "/{conversation_id}", responses={404: {"description": "Item not found"}}
 )
 async def delete_conversation(
+    request: Request,
     conversation_id: UUID,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> Success:
     """Permanently delete a conversation."""
-    deleted = await conversation_service.delete_conversation(conversation_id)
+    deleted = await conversation_service.delete_conversation(
+        conversation_id,
+        **_user_scope_kwargs(request),
+    )
     if not deleted:
         raise HTTPException(status.HTTP_400_BAD_REQUEST)
     return Success()
@@ -278,11 +324,15 @@ async def delete_conversation(
     },
 )
 async def run_conversation(
+    request: Request,
     conversation_id: UUID,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> Success:
     """Start running the conversation in the background."""
-    event_service = await conversation_service.get_event_service(conversation_id)
+    event_service = await conversation_service.get_event_service(
+        conversation_id,
+        **_user_scope_kwargs(request),
+    )
     if event_service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
 
@@ -309,6 +359,7 @@ async def run_conversation(
     },
 )
 async def start_goal_in_conversation(
+    http_request: Request,
     conversation_id: UUID,
     request: StartGoalRequest,
     conversation_service: ConversationService = Depends(get_conversation_service),
@@ -319,7 +370,10 @@ async def start_goal_in_conversation(
     history and event stream as the main chat. It does not create a separate
     conversation for the goal or fork the existing one.
     """
-    event_service = await conversation_service.get_event_service(conversation_id)
+    event_service = await conversation_service.get_event_service(
+        conversation_id,
+        **_user_scope_kwargs(http_request),
+    )
     if event_service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
 
@@ -344,6 +398,7 @@ async def start_goal_in_conversation(
     responses={404: {"description": "Item not found"}},
 )
 async def stop_goal_in_conversation(
+    request: Request,
     conversation_id: UUID,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> Success:
@@ -352,7 +407,10 @@ async def stop_goal_in_conversation(
     This cancels only the background goal loop, not the conversation itself, and
     records an ``interrupted`` goal status so ``/goal/resume`` can continue it.
     """
-    event_service = await conversation_service.get_event_service(conversation_id)
+    event_service = await conversation_service.get_event_service(
+        conversation_id,
+        **_user_scope_kwargs(request),
+    )
     if event_service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
     await event_service.stop_goal_loop()
@@ -367,11 +425,15 @@ async def stop_goal_in_conversation(
     },
 )
 async def resume_goal_in_conversation(
+    request: Request,
     conversation_id: UUID,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> Success:
     """Resume the last interrupted ``/goal`` loop inside this conversation."""
-    event_service = await conversation_service.get_event_service(conversation_id)
+    event_service = await conversation_service.get_event_service(
+        conversation_id,
+        **_user_scope_kwargs(request),
+    )
     if event_service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
 
@@ -393,12 +455,16 @@ async def resume_goal_in_conversation(
     "/{conversation_id}/secrets", responses={404: {"description": "Item not found"}}
 )
 async def update_conversation_secrets(
+    http_request: Request,
     conversation_id: UUID,
     request: UpdateSecretsRequest,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> Success:
     """Update secrets for a conversation."""
-    event_service = await conversation_service.get_event_service(conversation_id)
+    event_service = await conversation_service.get_event_service(
+        conversation_id,
+        **_user_scope_kwargs(http_request),
+    )
     if event_service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
     # Strings are valid SecretValue (SecretValue = str | SecretProvider)
@@ -416,12 +482,16 @@ async def update_conversation_secrets(
     responses={404: {"description": "Item not found"}},
 )
 async def set_conversation_confirmation_policy(
+    http_request: Request,
     conversation_id: UUID,
     request: SetConfirmationPolicyRequest,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> Success:
     """Set the confirmation policy for a conversation."""
-    event_service = await conversation_service.get_event_service(conversation_id)
+    event_service = await conversation_service.get_event_service(
+        conversation_id,
+        **_user_scope_kwargs(http_request),
+    )
     if event_service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
     await event_service.set_confirmation_policy(request.policy)
@@ -433,12 +503,16 @@ async def set_conversation_confirmation_policy(
     responses={404: {"description": "Item not found"}},
 )
 async def set_conversation_security_analyzer(
+    http_request: Request,
     conversation_id: UUID,
     request: SetSecurityAnalyzerRequest,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> Success:
     """Set the security analyzer for a conversation."""
-    event_service = await conversation_service.get_event_service(conversation_id)
+    event_service = await conversation_service.get_event_service(
+        conversation_id,
+        **_user_scope_kwargs(http_request),
+    )
     if event_service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
     await event_service.set_security_analyzer(request.security_analyzer)
@@ -453,12 +527,16 @@ async def set_conversation_security_analyzer(
     },
 )
 async def switch_conversation_profile(
+    request: Request,
     conversation_id: UUID,
     profile_name: str = Body(..., embed=True),
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> Success:
     """Switch the conversation's LLM profile to a named profile."""
-    event_service = await conversation_service.get_event_service(conversation_id)
+    event_service = await conversation_service.get_event_service(
+        conversation_id,
+        **_user_scope_kwargs(request),
+    )
     if event_service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
     conversation = event_service.get_conversation()
@@ -492,7 +570,10 @@ async def switch_conversation_llm(
     Used by app-servers that own the LLM directly and don't push profiles
     to the agent-server's filesystem (see #3017).
     """
-    event_service = await conversation_service.get_event_service(conversation_id)
+    event_service = await conversation_service.get_event_service(
+        conversation_id,
+        **_user_scope_kwargs(request),
+    )
     if event_service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
     conversation = event_service.get_conversation()
@@ -511,12 +592,16 @@ async def switch_conversation_llm(
     },
 )
 async def load_conversation_plugin(
+    request: Request,
     conversation_id: UUID,
     plugin_ref: str = Body(..., embed=True),
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> Success:
     """Load a plugin from the conversation's registered marketplaces."""
-    event_service = await conversation_service.get_event_service(conversation_id)
+    event_service = await conversation_service.get_event_service(
+        conversation_id,
+        **_user_scope_kwargs(request),
+    )
     if event_service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
     try:
@@ -548,6 +633,7 @@ async def load_conversation_plugin(
     },
 )
 async def switch_conversation_acp_model(
+    request: Request,
     conversation_id: UUID,
     model: str = Body(..., embed=True),
     conversation_service: ConversationService = Depends(get_conversation_service),
@@ -561,7 +647,10 @@ async def switch_conversation_acp_model(
     ``200`` either way). Only valid for ACP conversations whose provider
     supports model switching.
     """
-    event_service = await conversation_service.get_event_service(conversation_id)
+    event_service = await conversation_service.get_event_service(
+        conversation_id,
+        **_user_scope_kwargs(request),
+    )
     if event_service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
     try:
@@ -586,6 +675,7 @@ async def switch_conversation_acp_model(
     "/{conversation_id}", responses={404: {"description": "Item not found"}}
 )
 async def update_conversation(
+    http_request: Request,
     conversation_id: UUID,
     request: UpdateConversationRequest,
     conversation_service: ConversationService = Depends(get_conversation_service),
@@ -594,7 +684,11 @@ async def update_conversation(
 
     This endpoint allows updating conversation details like title.
     """
-    updated = await conversation_service.update_conversation(conversation_id, request)
+    updated = await conversation_service.update_conversation(
+        conversation_id,
+        request,
+        **_user_scope_kwargs(http_request),
+    )
     if not updated:
         return Success(success=False)
     return Success()
@@ -605,12 +699,17 @@ async def update_conversation(
     responses={404: {"description": "Item not found"}},
 )
 async def ask_agent(
+    http_request: Request,
     conversation_id: UUID,
     request: AskAgentRequest,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> AskAgentResponse:
     """Ask the agent a simple question without affecting conversation state."""
-    response = await conversation_service.ask_agent(conversation_id, request.question)
+    response = await conversation_service.ask_agent(
+        conversation_id,
+        request.question,
+        **_user_scope_kwargs(http_request),
+    )
     if response is None:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR)
     return AskAgentResponse(response=response)
@@ -621,11 +720,15 @@ async def ask_agent(
     responses={404: {"description": "Item not found"}},
 )
 async def condense_conversation(
+    request: Request,
     conversation_id: UUID,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> Success:
     """Force condensation of the conversation history."""
-    success = await conversation_service.condense(conversation_id)
+    success = await conversation_service.condense(
+        conversation_id,
+        **_user_scope_kwargs(request),
+    )
     if not success:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Conversation not found")
     return Success()
@@ -641,6 +744,7 @@ async def condense_conversation(
     status_code=status.HTTP_201_CREATED,
 )
 async def fork_conversation(
+    http_request: Request,
     conversation_id: UUID,
     request: Annotated[ForkConversationRequest, Body()] = ForkConversationRequest(),  # noqa: B008
     include_skills: Annotated[bool, Query(title=INCLUDE_SKILLS_PARAM_TITLE)] = False,
@@ -659,6 +763,7 @@ async def fork_conversation(
             title=request.title,
             tags=request.tags if request.tags is not None else None,
             reset_metrics=request.reset_metrics,
+            **_user_scope_kwargs(http_request),
         )
     except ValueError as exc:
         if "already exists" in str(exc):

@@ -398,6 +398,7 @@ async def run_chat_completion(
     config: Config,
     conversation_service: ConversationService,
     reusable_conversation_id: UUID | None,
+    user_id: str | None = None,
     observability_overrides: dict[str, object] | None = None,
 ) -> OpenAIChatCompletionResult:
     if request.stream:
@@ -414,14 +415,28 @@ async def run_chat_completion(
     )
     if observability_overrides:
         start_request = start_request.model_copy(update=observability_overrides)
+    if user_id is not None:
+        start_request = start_request.model_copy(update={"user_id": user_id})
     event_service = None
     conversation_id = reusable_conversation_id
     min_event_count: int | None = None
 
     if reusable_conversation_id is not None:
-        event_service = await conversation_service.get_event_service(
-            reusable_conversation_id
+        existing_event_service = await conversation_service.get_event_service(
+            reusable_conversation_id,
         )
+        if user_id is None:
+            event_service = existing_event_service
+        else:
+            event_service = await conversation_service.get_event_service(
+                reusable_conversation_id,
+                user_id=user_id,
+            )
+        if existing_event_service is not None and event_service is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Conversation not found",
+            )
         if event_service is not None:
             min_event_count = len((await event_service.get_state()).events) + 1
             user_message = _latest_user_message(request.messages)
@@ -436,9 +451,15 @@ async def run_chat_completion(
             start_request
         )
         conversation_id = conversation_info.id
-        event_service = await conversation_service.get_event_service(
-            conversation_info.id
-        )
+        if user_id is None:
+            event_service = await conversation_service.get_event_service(
+                conversation_info.id
+            )
+        else:
+            event_service = await conversation_service.get_event_service(
+                conversation_info.id,
+                user_id=user_id,
+            )
         if event_service is None:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -84,6 +84,13 @@ def authenticate_request(request: Request, session_api_key: str | None) -> None:
     raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=LOGIN_REQUIRED_DETAIL)
 
 
+def get_current_user_id(request: Request) -> str | None:
+    current_user = getattr(request.state, "current_user", None)
+    if isinstance(current_user, CurrentLoginUser):
+        return str(current_user.user_id)
+    return None
+
+
 def check_session_api_key(
     request: Request,
     session_api_key: str | None = Depends(_SESSION_API_KEY_HEADER),
@@ -167,9 +174,17 @@ def get_bash_event_service(request: Request) -> BashEventService:
 
 async def get_event_service(
     conversation_id: UUID,
+    request: Request,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> EventService:
-    event_service = await conversation_service.get_event_service(conversation_id)
+    user_id = get_current_user_id(request)
+    if user_id is None:
+        event_service = await conversation_service.get_event_service(conversation_id)
+    else:
+        event_service = await conversation_service.get_event_service(
+            conversation_id,
+            user_id=user_id,
+        )
     if event_service is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

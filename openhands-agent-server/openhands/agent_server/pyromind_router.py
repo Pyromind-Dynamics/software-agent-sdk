@@ -11,11 +11,14 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
 from openhands.agent_server.conversation_service import ConversationService
-from openhands.agent_server.dependencies import get_conversation_service
+from openhands.agent_server.dependencies import (
+    get_conversation_service,
+    get_current_user_id,
+)
 from openhands.agent_server.models import ConversationInfo
 from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
@@ -129,6 +132,7 @@ def _load_agent_skills(
     return selected
 
 
+
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
@@ -184,6 +188,7 @@ pyromind_router = APIRouter(prefix="/pyromind", tags=["Pyromind"])
 
 @pyromind_router.post("/conversations", response_model=ConversationInfo)
 async def create_pyromind_conversation(
+    http_request: Request,
     request: PyromindCreateConversationRequest,
     response: Response,
     conversation_service: ConversationService = Depends(get_conversation_service),
@@ -276,9 +281,13 @@ async def create_pyromind_conversation(
         conversation_id=conversation_id,
         initial_message=initial_message,
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
+        user_id=get_current_user_id(http_request),
     )
 
     # 8. Delegate to conversation service
-    info, is_new = await conversation_service.start_conversation(start_request)
+    try:
+        info, is_new = await conversation_service.start_conversation(start_request)
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     response.status_code = status.HTTP_201_CREATED if is_new else status.HTTP_200_OK
     return info
