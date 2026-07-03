@@ -7,6 +7,7 @@ frontend only needs to pass minimal configuration fields.
 
 import logging
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from openhands.sdk.skills import Skill, load_skills_from_dir
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
+from openhands.tools.workflow import PublishWorkflowTool
 
 
 logger = logging.getLogger(__name__)
@@ -54,14 +56,27 @@ _PYROMIND_SKILL_NAMES = ["generate-workflow-dsl"]
 # matching skill first, and only fall back to grep + file_editor for free-form
 # knowledge-base lookups.
 PYROMIND_KB_INSTRUCTIONS = """\
-The Pyromind platform knowledge base is at your working directory: \
+The Pyromind platform knowledge base is available at this absolute path:
 {knowledge_base_path}
+
+Your current working directory is this conversation's private workspace:
+{working_dir}
+
+Create and edit the workflow DSL at the relative path `workflow.py` from the
+current working directory. Prefer `apply_patch` with `workflow.py` for workflow
+changes. If you use `file_editor` for this file, set its `path` to `workflow.py`;
+the runtime resolves workspace-relative paths to host-absolute paths. Do not
+hand-author long absolute paths, and do not use `/workspace/...` or
+`workspace/conversations/...` as a `file_editor.path` for `workflow.py`.
+After creating or modifying `workflow.py`, call `publish_workflow`. Do not say
+the workflow has been generated unless a tool call actually created or modified
+`workflow.py`.
 
 - If a listed skill fits the request (for example, generating a workflow), \
 invoke that skill via `invoke_skill` first, before searching the knowledge base.
-- Otherwise, for Pyromind questions, `grep` this directory for the relevant \
-keywords, then open the matched files with `file_editor` to read their full \
-content before answering.
+- For Pyromind knowledge-base lookups, use `grep` with the absolute path above,
+then open matched files with `file_editor` to read their full content before
+answering or editing `workflow.py`.
 """
 
 
@@ -101,6 +116,7 @@ def _load_agent_skills(
         logger.info(f"Loaded skill: {name}")
 
     return selected
+
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -168,7 +184,7 @@ async def create_pyromind_conversation(
     - Pyromind KB-retrieval instructions layered on top via ``custom_instructions``
     - Tools: codex set (terminal + apply_patch + task_tracker) + grep and
       file_editor for KB search (grep finds files, file_editor views them)
-    - Workspace pointing to the knowledge base directory
+    - Workspace pointing to a conversation-private directory
     """
     # Ensure the grep tool is registered (codex tools are registered by the preset).
     register_default_tools(enable_browser=False)
@@ -185,9 +201,16 @@ async def create_pyromind_conversation(
             detail=f"Knowledge base path does not exist: {knowledge_base_path}",
         )
 
+    # Generate the conversation id here so the workspace directory and persisted
+    # conversation id stay aligned.
+    conversation_id = uuid.uuid4()
+    conversation_dir = conversation_service.conversations_dir / conversation_id.hex
+    conversation_dir.mkdir(parents=True, exist_ok=True)
+
     # 2. Assemble the pyromind KB instructions (layered on the codex base prompt)
     custom_instructions = PYROMIND_KB_INSTRUCTIONS.format(
-        knowledge_base_path=knowledge_base_path
+        knowledge_base_path=knowledge_base_path,
+        working_dir=str(conversation_dir),
     )
 
     # Append extra custom instructions from the request if provided
@@ -217,11 +240,16 @@ async def create_pyromind_conversation(
         cli_mode=True,
         agent_context=agent_context,
         custom_instructions=custom_instructions,
-        extra_tools=[Tool(name="grep"), Tool(name="file_editor")],
+        extra_tools=[
+            Tool(name="grep"),
+            Tool(name="file_editor"),
+            Tool(name=PublishWorkflowTool.name),
+        ],
     )
 
-    # 6. Build workspace pointing to knowledge base
-    workspace = LocalWorkspace(working_dir=knowledge_base_path)
+    # 6. Build a conversation-private workspace. The knowledge base is accessed
+    #    separately via its absolute path in the prompt.
+    workspace = LocalWorkspace(working_dir=str(conversation_dir))
 
     # 7. Assemble StartConversationRequest
     initial_message: SendMessageRequest | None = None
@@ -235,6 +263,7 @@ async def create_pyromind_conversation(
     start_request = StartConversationRequest(
         agent=agent,
         workspace=workspace,
+        conversation_id=conversation_id,
         initial_message=initial_message,
     )
 

@@ -16,14 +16,15 @@ triggers:
 ## 概述
 
 当用户要求生成模型训练工作流时，你需要：
-1. 先用 grep 检索知识库（`knowledge/`），了解可用的节点类型、参数和连接模式
+1. 先用 grep 检索路由提示中给出的知识库绝对路径，了解可用的节点类型、参数和连接模式
 2. 根据用户需求选择合适的节点组合
-3. 按照 DSL 语法格式输出工作流代码
+3. 按照 DSL 语法格式创建或修改当前工作目录下的 `workflow.py`
+4. 创建或修改后调用 `publish_workflow` 将当前文件推送给前端
 
-知识库检索路径（均在 `knowledge/` 下）：
-- 平台用法：`knowledge/docs-mintlify/zh/docs/`、`knowledge/docs-mintlify/en/docs/`
-- 节点 I/O 与端口定义：`knowledge/pyromind-sdk-example/docs/`、`knowledge/pyromind-sdk-example/docs_zh/`
-- workflow JSON 样例：`knowledge/pyromind-sdk-example/workflow/`
+知识库检索路径均位于路由提示中的绝对知识库目录下。使用 `grep` 时传入该绝对路径或其子目录路径：
+- 平台用法：`<知识库绝对路径>/docs-mintlify/zh/docs/`、`<知识库绝对路径>/docs-mintlify/en/docs/`
+- 节点 I/O 与端口定义：`<知识库绝对路径>/pyromind-sdk-example/docs/`、`<知识库绝对路径>/pyromind-sdk-example/docs_zh/`
+- workflow JSON 样例：`<知识库绝对路径>/pyromind-sdk-example/workflow/`
 
 ## DSL 语法格式
 
@@ -415,7 +416,7 @@ grpo_train = ModelTrainGRPONode(
 ## 生成工作流的步骤
 
 1. **理解用户需求**：确定训练类型（SFT/DPO/GRPO）、数据集、模型
-2. **检索知识库**：用 grep 在 `knowledge/` 下搜索；平台文档查 `knowledge/docs-mintlify/zh/docs/`，节点契约查 `knowledge/pyromind-sdk-example/docs/`，样例连接查 `knowledge/pyromind-sdk-example/workflow/`
+2. **检索知识库**：用 grep 在路由提示中的知识库绝对路径下搜索；平台文档查 `<知识库绝对路径>/docs-mintlify/zh/docs/`，节点契约查 `<知识库绝对路径>/pyromind-sdk-example/docs/`，样例连接查 `<知识库绝对路径>/pyromind-sdk-example/workflow/`
 3. **选择节点组合**：
    - 数据加载：CloneAndCacheDataset → PathJoinNode → DatasetToJsonlNode（如需转换）
    - 字段映射：DatasetConfigBuilderTextNode 或 DatasetConfigBuilderVisionNode
@@ -425,4 +426,5 @@ grpo_train = ModelTrainGRPONode(
    - 训练执行：ModelTrainSFTNode / ModelTrainDPONode / ModelTrainGRPONode
    - 后处理：ModelMergeLoraNode → VLLMInference → TestLLMNode（可选）
 4. **组装 DSL**：按依赖顺序排列节点，确保被引用节点在前
-5. **输出结果**：返回完整的 DSL 代码块
+5. **写入文件**：使用 `apply_patch` 将 DSL 写入当前工作目录根路径 `workflow.py`；如果是在修改已有工作流，也只编辑这个固定相对路径。不要手写会话目录的长绝对路径；如必须使用 `file_editor`，也传入 `workflow.py`，由运行时解析到实际文件。不要只说明已经生成，必须实际调用工具创建或修改文件
+6. **发布结果**：如果 `workflow.py` 被创建或修改，调用 `publish_workflow`，可在 `summary` 中简述本次创建或修改内容

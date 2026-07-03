@@ -22,9 +22,7 @@ def test_load_agent_skills_returns_skill_objects(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    skills = _load_agent_skills(
-        str(tmp_path), allow_list=["generate-workflow-dsl"]
-    )
+    skills = _load_agent_skills(str(tmp_path), allow_list=["generate-workflow-dsl"])
 
     assert len(skills) == 1
     skill = skills[0]
@@ -43,16 +41,19 @@ def test_load_agent_skills_respects_allow_list(tmp_path) -> None:
             encoding="utf-8",
         )
 
-    skills = _load_agent_skills(
-        str(tmp_path), allow_list=["generate-workflow-dsl"]
-    )
+    skills = _load_agent_skills(str(tmp_path), allow_list=["generate-workflow-dsl"])
 
     assert [s.name for s in skills] == ["generate-workflow-dsl"]
 
 
 def test_kb_instructions_format_injects_path() -> None:
-    rendered = PYROMIND_KB_INSTRUCTIONS.format(knowledge_base_path="/kb/root")
+    rendered = PYROMIND_KB_INSTRUCTIONS.format(
+        knowledge_base_path="/kb/root",
+        working_dir="workspace/conversations/abc123",
+    )
     assert "/kb/root" in rendered
+    assert "workspace/conversations/abc123" in rendered
+    assert "workflow.py" in rendered
     assert "Pyromind" in rendered
     # Skill-first guidance must be present.
     assert "invoke_skill" in rendered

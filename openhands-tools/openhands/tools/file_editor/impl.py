@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from openhands.sdk.tool import ToolExecutor
+from openhands.sdk.utils.path import is_host_absolute_path
 
 
 if TYPE_CHECKING:
@@ -13,6 +14,11 @@ from openhands.tools.file_editor.definition import (
 )
 from openhands.tools.file_editor.editor import FileEditor
 from openhands.tools.file_editor.exceptions import ToolError
+from openhands.tools.workflow.definition import (
+    PublishedWorkflowObservation,
+    PublishWorkflowAction,
+)
+from openhands.tools.workflow.impl import PublishWorkflowExecutor
 
 
 # Module-global editor instance (lazily initialized in file_editor)
@@ -27,21 +33,54 @@ class FileEditorExecutor(ToolExecutor):
         workspace_root: str | None = None,
         allowed_edits_files: list[str] | None = None,
     ):
-        self.editor: FileEditor = FileEditor(workspace_root=workspace_root)
+        self.workspace_root = (
+            Path(workspace_root).resolve() if workspace_root else Path.cwd().resolve()
+        )
+        self.editor: FileEditor = FileEditor(workspace_root=str(self.workspace_root))
         self.allowed_edits_files: set[Path] | None = (
-            {Path(f).resolve() for f in allowed_edits_files}
+            {Path(self.normalize_path(f)).resolve() for f in allowed_edits_files}
             if allowed_edits_files
             else None
         )
+
+    def normalize_path(self, path: str) -> str:
+        """Return a host-absolute path for editor operations.
+
+        The underlying FileEditor validates host-absolute paths only. The model
+        should be able to pass short workspace-relative paths such as
+        ``workflow.py``; this adapter resolves those paths in code before the
+        validation layer runs.
+        """
+        action_path = Path(path)
+
+        if is_host_absolute_path(action_path):
+            if str(action_path).startswith("/workspace/"):
+                cwd_candidate = (Path.cwd() / str(action_path).lstrip("/")).resolve()
+                if cwd_candidate.exists() or cwd_candidate.parent.exists():
+                    return str(cwd_candidate)
+            return str(action_path.resolve())
+
+        workspace_candidate = (self.workspace_root / action_path).resolve()
+        if workspace_candidate.exists():
+            return str(workspace_candidate)
+
+        if str(action_path).startswith("workspace/"):
+            cwd_candidate = (Path.cwd() / action_path).resolve()
+            if cwd_candidate.exists() or cwd_candidate.parent.exists():
+                return str(cwd_candidate)
+
+        return str(workspace_candidate)
 
     def __call__(
         self,
         action: FileEditorAction,
         conversation: "LocalConversation | None" = None,  # noqa: ARG002
     ) -> FileEditorObservation:
+        normalized_path = self.normalize_path(action.path)
+
         # Enforce allowed_edits_files restrictions
         if self.allowed_edits_files is not None and action.command != "view":
-            action_path = Path(action.path).resolve()
+            action_path = Path(normalized_path).resolve()
             if action_path not in self.allowed_edits_files:
                 return FileEditorObservation.from_text(
                     text=(
@@ -58,7 +97,7 @@ class FileEditorExecutor(ToolExecutor):
         try:
             result = self.editor(
                 command=action.command,
-                path=action.path,
+                path=normalized_path,
                 file_text=action.file_text,
                 view_range=action.view_range,
                 old_str=action.old_str,
@@ -70,7 +109,33 @@ class FileEditorExecutor(ToolExecutor):
                 text=e.message, command=action.command, is_error=True
             )
         assert result is not None, "file_editor should always return a result"
+        if not result.is_error and action.command != "view":
+            published_workflow = self._publish_workflow_if_target(
+                normalized_path,
+                summary=(
+                    "Created workflow.py"
+                    if action.command == "create"
+                    else "Updated workflow.py"
+                ),
+            )
+            if published_workflow is not None:
+                result = result.model_copy(
+                    update={"published_workflow": published_workflow}
+                )
         return result
+
+    def _publish_workflow_if_target(
+        self,
+        path: str,
+        summary: str,
+    ) -> PublishedWorkflowObservation | None:
+        target_path = Path(path).resolve()
+        workflow_path = (self.workspace_root / "workflow.py").resolve()
+        if target_path != workflow_path:
+            return None
+        return PublishWorkflowExecutor(str(self.workspace_root))(
+            PublishWorkflowAction(summary=summary)
+        )
 
 
 def file_editor(

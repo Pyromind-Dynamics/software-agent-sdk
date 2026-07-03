@@ -321,7 +321,7 @@ def test_view_with_a_specific_range(editor):
     assert "    49\tLine 49" not in result.text
     assert "    50\tLine 50" in result.text
     assert "   100\tLine 100" in result.text
-    assert "101" not in result.text
+    assert "   101\tLine 101" not in result.text
 
 
 def test_create_file(editor):

@@ -13,7 +13,11 @@ set -euo pipefail
 # LLM Configuration
 # ----------------------------------------------------------
 export LLM_BASE_URL="https://openrouter.ai/api/v1/"
-export OPENAI_API_KEY=""
+if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+  echo "ERROR: OPENAI_API_KEY is required. Export it before running start.sh." >&2
+  exit 1
+fi
+export OPENAI_API_KEY
 export LLM_MODEL="openai/gpt-5.5"
 
 # ----------------------------------------------------------

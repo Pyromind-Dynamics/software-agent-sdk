@@ -51,6 +51,25 @@ def test_create_modify_delete(tmp_ws: Path):
     assert not fp.exists()
 
 
+def test_apply_patch_publishes_workflow_update(tmp_ws: Path):
+    patch = (
+        "*** Begin Patch\n"
+        "*** Add File: workflow.py\n"
+        "+# workflow: Patch Demo\n"
+        "+limit = 20\n"
+        "*** End Patch"
+    )
+
+    obs = run_exec(tmp_ws, patch)
+
+    assert not obs.is_error
+    assert obs.published_workflow is not None
+    assert obs.published_workflow.path == str(tmp_ws / "workflow.py")
+    assert obs.published_workflow.name == "Patch Demo"
+    assert obs.published_workflow.workflow == "# workflow: Patch Demo\nlimit = 20"
+    assert obs.published_workflow.summary == "Updated workflow.py"
+
+
 def test_reject_absolute_path(tmp_ws: Path):
     # refuse escape/absolute paths
     patch = (

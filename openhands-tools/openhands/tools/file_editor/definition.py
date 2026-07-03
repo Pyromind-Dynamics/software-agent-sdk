@@ -21,6 +21,7 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.file_editor.utils.diff import visualize_diff
+from openhands.tools.workflow.definition import PublishedWorkflowObservation
 
 
 CommandLiteral = Literal["view", "create", "str_replace", "insert", "undo_edit"]
@@ -33,7 +34,9 @@ class FileEditorAction(Action):
         description="The commands to run. Allowed options are: `view`, `create`, "
         "`str_replace`, `insert`, `undo_edit`."
     )
-    path: str = Field(description="Absolute path to file or directory.")
+    path: str = Field(
+        description="Host-absolute path, or path relative to the current workspace."
+    )
     file_text: str | None = Field(
         default=None,
         description="Required parameter of `create` command, with the content of "
@@ -86,6 +89,13 @@ class FileEditorObservation(Observation):
     )
     new_content: str | None = Field(
         default=None, description="The content of the file after the edit."
+    )
+    published_workflow: PublishedWorkflowObservation | None = Field(
+        default=None,
+        description=(
+            "Latest workflow.py publication when this edit updated the current "
+            "workspace workflow file."
+        ),
     )
 
     _diff_cache: Text | None = PrivateAttr(default=None)
@@ -174,7 +184,7 @@ Before using this tool:
 When making edits:
    - Ensure the edit results in idiomatic, correct code
    - Do not leave the code in a broken state
-   - Always use absolute file paths (starting with /)
+   - Prefer paths relative to the current workspace when editing workspace files
 
 CRITICAL REQUIREMENTS FOR USING THIS TOOL:
 
@@ -202,7 +212,11 @@ class FileEditorTool(ToolDefinition[FileEditorAction, FileEditorObservation]):
         *different* files run in parallel.
         """
         assert isinstance(action, FileEditorAction)
-        normalized_path = Path(action.path).resolve()
+        normalize_path = getattr(self.executor, "normalize_path", None)
+        if callable(normalize_path):
+            normalized_path = Path(normalize_path(action.path)).resolve()
+        else:
+            normalized_path = Path(action.path).resolve()
         return DeclaredResources(keys=(f"file:{normalized_path}",), declared=True)
 
     @classmethod
@@ -242,7 +256,7 @@ class FileEditorTool(ToolDefinition[FileEditorAction, FileEditorObservation]):
 
         # Add working directory information to the tool description
         # to guide the agent to use the correct directory instead of root
-        working_dir = conv_state.workspace.working_dir
+        working_dir = str(conv_state.workspace.working_dir)
         enhanced_description = (
             f"{tool_description}\n\n"
             f"Your current working directory is: {working_dir}\n"

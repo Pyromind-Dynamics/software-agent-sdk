@@ -15,6 +15,7 @@ from openhands.sdk.tool import DeclaredResources
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.file_editor import (
     FileEditorAction,
+    FileEditorExecutor,
     FileEditorObservation,
     FileEditorTool,
 )
@@ -101,6 +102,69 @@ def test_file_editor_tool_view_file():
         assert "Line 1" in result.text
         assert "Line 2" in result.text
         assert "Line 3" in result.text
+
+
+def test_file_editor_executor_resolves_workspace_relative_path(tmp_path):
+    """Executor accepts short workspace-relative paths and normalizes them."""
+    workflow = tmp_path / "workflow.py"
+    workflow.write_text("# workflow: Demo\nlimit = 10\n", encoding="utf-8")
+
+    executor = FileEditorExecutor(workspace_root=str(tmp_path))
+
+    view_result = executor(FileEditorAction(command="view", path="workflow.py"))
+    assert not view_result.is_error
+    assert view_result.path == str(workflow.resolve())
+    assert "limit = 10" in view_result.text
+
+    edit_result = executor(
+        FileEditorAction(
+            command="str_replace",
+            path="workflow.py",
+            old_str="limit = 10",
+            new_str="limit = 20",
+        )
+    )
+    assert not edit_result.is_error
+    assert edit_result.path == str(workflow.resolve())
+    assert edit_result.published_workflow is not None
+    assert edit_result.published_workflow.workflow == "# workflow: Demo\nlimit = 20\n"
+    assert edit_result.published_workflow.name == "Demo"
+    assert edit_result.published_workflow.summary == "Updated workflow.py"
+    assert workflow.read_text(encoding="utf-8") == "# workflow: Demo\nlimit = 20\n"
+
+
+def test_file_editor_executor_resolves_cwd_relative_conversation_path(
+    tmp_path, monkeypatch
+):
+    """Executor also handles legacy paths copied from a relative conversations dir."""
+    repo = tmp_path / "software-agent-sdk"
+    conversation_dir = repo / "workspace" / "conversations" / "abc123"
+    conversation_dir.mkdir(parents=True)
+    workflow = conversation_dir / "workflow.py"
+    workflow.write_text("# workflow: Demo\nlimit = 10\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    executor = FileEditorExecutor(workspace_root=str(conversation_dir))
+
+    result = executor(
+        FileEditorAction(
+            command="view",
+            path="workspace/conversations/abc123/workflow.py",
+        )
+    )
+
+    assert not result.is_error
+    assert result.path == str(workflow.resolve())
+    assert "limit = 10" in result.text
+
+    absolute_alias_result = executor(
+        FileEditorAction(
+            command="view",
+            path="/workspace/conversations/abc123/workflow.py",
+        )
+    )
+    assert not absolute_alias_result.is_error
+    assert absolute_alias_result.path == str(workflow.resolve())
 
 
 def test_file_editor_tool_str_replace():
@@ -284,11 +348,11 @@ def test_declared_resources_normalizes_dot_paths():
 
 
 def test_declared_resources_normalizes_relative_paths():
-    """Relative paths are resolved to absolute path."""
+    """Relative paths are resolved against the workspace root."""
     with tempfile.TemporaryDirectory() as temp_dir:
         tool = FileEditorTool.create(_create_test_conv_state(temp_dir))[0]
         r1 = tool.declared_resources(FileEditorAction(command="view", path="a.py"))
-        expected_path = Path("a.py").resolve()
+        expected_path = (Path(temp_dir) / "a.py").resolve()
         assert r1.keys == (f"file:{expected_path}",)
 
 

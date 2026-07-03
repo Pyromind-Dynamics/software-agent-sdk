@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
 
 from pydantic import Field
 
+from openhands.sdk.llm import ImageContent, TextContent
 from openhands.sdk.tool import (
     Action,
     Observation,
@@ -49,6 +51,43 @@ class WorkflowObservation(Observation):
     status: Literal["completed", "error"] = Field(
         description="The workflow execution status."
     )
+
+
+class PublishWorkflowAction(Action):
+    """Schema for publishing the current conversation workflow DSL."""
+
+    summary: str | None = Field(
+        default=None,
+        description="Short note describing the workflow change being published.",
+    )
+
+
+class PublishedWorkflowObservation(Observation):
+    """Observation containing the current workflow.py content."""
+
+    workflow: str = Field(description="Complete workflow.py source.")
+    path: str = Field(description="Absolute path to the published workflow file.")
+    name: str | None = Field(
+        default=None,
+        description="Workflow name parsed from a leading '# workflow:' header.",
+    )
+    summary: str | None = Field(
+        default=None,
+        description="Short note supplied by the publish action.",
+    )
+    exists: bool = Field(
+        description="Whether workflow.py existed when publish_workflow ran."
+    )
+
+    @property
+    def to_llm_content(self) -> list[TextContent | ImageContent]:
+        if self.is_error:
+            return list(super().to_llm_content)
+        if not self.exists:
+            return [TextContent(text=f"No workflow.py found at {self.path}")]
+        line_count = len(self.workflow.splitlines())
+        label = self.name or Path(self.path).name
+        return [TextContent(text=f"Published {label} ({line_count} lines).")]
 
 
 _WORKFLOW_DESCRIPTION: Final[
@@ -181,5 +220,46 @@ class WorkflowToolSet(ToolDefinition[WorkflowAction, WorkflowObservation]):
         return WorkflowTool.create(executor=WorkflowExecutor())
 
 
+_PUBLISH_WORKFLOW_DESCRIPTION: Final[
+    str
+] = """Publish the current Pyromind workflow file to the frontend.
+
+Use this after creating or modifying `workflow.py` in the current working
+directory. The tool reads `workflow.py` and streams its full contents to the
+frontend as a workflow observation. It does not modify files.
+"""
+
+
+class PublishWorkflowTool(
+    ToolDefinition[PublishWorkflowAction, PublishedWorkflowObservation]
+):
+    """Tool that publishes the current conversation's workflow.py file."""
+
+    @classmethod
+    def create(
+        cls,
+        conv_state: ConversationState,
+    ) -> Sequence[PublishWorkflowTool]:
+        from openhands.tools.workflow.impl import PublishWorkflowExecutor
+
+        working_dir = conv_state.workspace.working_dir
+        return [
+            cls(
+                description=_PUBLISH_WORKFLOW_DESCRIPTION,
+                action_type=PublishWorkflowAction,
+                observation_type=PublishedWorkflowObservation,
+                annotations=ToolAnnotations(
+                    title="publish_workflow",
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=False,
+                ),
+                executor=PublishWorkflowExecutor(working_dir=working_dir),
+            )
+        ]
+
+
 register_tool(WorkflowToolSet.name, WorkflowToolSet)
 register_tool(WorkflowTool.name, WorkflowTool)
+register_tool(PublishWorkflowTool.name, PublishWorkflowTool)
