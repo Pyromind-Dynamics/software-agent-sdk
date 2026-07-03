@@ -39,7 +39,7 @@ fi
 
 # Local start.sh runs without Pyromind portal cookies by default. Deployments
 # that require portal login should set OH_ENABLE_PYROMIND_JWT_AUTH=true.
-export OH_ENABLE_PYROMIND_JWT_AUTH="${OH_ENABLE_PYROMIND_JWT_AUTH:-false}"
+export OH_ENABLE_PYROMIND_JWT_AUTH="${OH_ENABLE_PYROMIND_JWT_AUTH:-true}"
 
 # Allow all CORS origins in development
 export OH_ALLOW_CORS_ORIGIN_REGEX="${OH_ALLOW_CORS_ORIGIN_REGEX:-https?://.+}"
