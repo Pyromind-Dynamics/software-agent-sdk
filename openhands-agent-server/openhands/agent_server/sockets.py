@@ -37,6 +37,12 @@ from openhands.agent_server.conversation_service import (
     ConversationService,
     get_default_conversation_service,
 )
+from openhands.agent_server.dependencies import (
+    get_pyromind_jwt_token,
+    is_auth_configured,
+    is_session_api_key_valid,
+    verify_pyromind_jwt_token,
+)
 from openhands.agent_server.event_router import normalize_datetime_to_server_timezone
 from openhands.agent_server.models import (
     BashError,
@@ -122,6 +128,14 @@ def _resolve_websocket_session_api_key(
     return None
 
 
+def _resolve_websocket_pyromind_jwt_token(
+    websocket: WebSocket,
+) -> str | None:
+    return get_pyromind_jwt_token(
+        cookies=websocket.cookies,
+    )
+
+
 # Give clients 10 seconds to send auth frame after connection opens.
 # This balances security (don't hold connections indefinitely) with
 # accommodating slow networks and client startup time.
@@ -147,22 +161,28 @@ async def _accept_authenticated_websocket(
     resolved_key = _resolve_websocket_session_api_key(websocket, session_api_key)
 
     # No auth configured — accept unconditionally.
-    if not config.session_api_keys:
+    if not is_auth_configured(config):
         await websocket.accept()
         return True
 
     # Legacy path: key supplied via query param or header.
     if resolved_key is not None:
-        if resolved_key in config.session_api_keys:
+        if is_session_api_key_valid(config, resolved_key):
             logger.warning(
                 "session_api_key passed via query param or header is deprecated. "
                 "Use first-message auth instead."
             )
             await websocket.accept()
             return True
-        logger.warning("WebSocket authentication failed: invalid API key")
-        await websocket.close(code=4001, reason="Authentication failed")
-        return False
+        if config.enable_session_api_key_auth:
+            logger.warning("WebSocket authentication failed: invalid API key")
+            await websocket.close(code=4001, reason="Authentication failed")
+            return False
+
+    pyromind_token = _resolve_websocket_pyromind_jwt_token(websocket)
+    if verify_pyromind_jwt_token(config, pyromind_token) is not None:
+        await websocket.accept()
+        return True
 
     # First-message auth: we must accept() before reading frames because the
     # WebSocket protocol requires the handshake to complete first.  The legacy
@@ -210,15 +230,16 @@ async def _accept_authenticated_websocket(
             websocket, code=4001, reason="Authentication failed"
         )
         return False
-    if data.get("session_api_key") not in config.session_api_keys:
-        logger.warning("WebSocket first-message auth failed: invalid API key")
-        await _safe_close_websocket(
-            websocket, code=4001, reason="Authentication failed"
-        )
-        return False
+    message_session_api_key = data.get("session_api_key")
+    if isinstance(message_session_api_key, str) and is_session_api_key_valid(
+        config, message_session_api_key
+    ):
+        logger.info("WebSocket authenticated via first-message auth")
+        return True
 
-    logger.info("WebSocket authenticated via first-message auth")
-    return True
+    logger.warning("WebSocket first-message auth failed: invalid credentials")
+    await _safe_close_websocket(websocket, code=4001, reason="Authentication failed")
+    return False
 
 
 @sockets_router.websocket("/events/{conversation_id}")

@@ -416,7 +416,11 @@ grpo_train = ModelTrainGRPONode(
 ## 生成工作流的步骤
 
 1. **理解用户需求**：确定训练类型（SFT/DPO/GRPO）、数据集、模型
+<<<<<<< HEAD
 2. **检索知识库**：用 grep 在路由提示中的知识库绝对路径下搜索；平台文档查 `<知识库绝对路径>/docs-mintlify/zh/docs/`，节点契约查 `<知识库绝对路径>/pyromind-sdk-example/docs/`，样例连接查 `<知识库绝对路径>/pyromind-sdk-example/workflow/`
+=======
+2. **检索知识库**：用 grep 在 `knowledge/` 下搜索平台文档；节点与工作流参考查 `knowledge/sdk/` 与 `docs-mintlify/zh/docs/`
+>>>>>>> ec5e2328811c57624e0c770a0f559e1bb8ef9360
 3. **选择节点组合**：
    - 数据加载：CloneAndCacheDataset → PathJoinNode → DatasetToJsonlNode（如需转换）
    - 字段映射：DatasetConfigBuilderTextNode 或 DatasetConfigBuilderVisionNode

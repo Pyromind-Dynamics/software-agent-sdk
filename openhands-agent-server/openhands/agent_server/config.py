@@ -128,6 +128,24 @@ class Config(BaseModel):
             "old key is removed from the list. "
         ),
     )
+    enable_session_api_key_auth: bool = Field(
+        default=True,
+        description=(
+            "Whether incoming requests may authenticate with a configured session "
+            "API key via X-Session-API-Key or compatible bearer/query forms. "
+            "Disable this only when another authentication mechanism, such as "
+            "PyroMind JWT authentication, is configured."
+        ),
+    )
+    enable_pyromind_jwt_auth: bool = Field(
+        default=True,
+        description=(
+            "Whether incoming requests may authenticate with the PyroMind portal "
+            "auth_token cookie. The JWT secret is resolved exactly like the portal: "
+            "APP_ENV=dev uses the dev secret; other environments read "
+            "/etc/secrets/web_secret_key."
+        ),
+    )
     allow_cors_origins: list[str] = Field(
         default_factory=list,
         description=(

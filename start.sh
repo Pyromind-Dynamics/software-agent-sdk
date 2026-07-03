@@ -34,31 +34,24 @@ export OH_SECRET_KEY=""
 export OH_ALLOW_CORS_ORIGIN_REGEX="https?://.+"
 
 # ----------------------------------------------------------
-# Pyromind Knowledge Base Path
+# Pyromind Knowledge Base (sync docs-mintlify → knowledge/)
 # ----------------------------------------------------------
 # Points to the knowledge/ folder in this repository by default
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYROMIND_KNOWLEDGE_BASE_PATH="${SCRIPT_DIR}/knowledge"
 
-PYROMIND_SUBMODULES=(
-  "knowledge/docs-mintlify/zh/docs"
-  "knowledge/pyromind-sdk-example/docs"
-)
-missing=()
-for path in "${PYROMIND_SUBMODULES[@]}"; do
-  if [[ ! -d "${SCRIPT_DIR}/${path}" ]]; then
-    missing+=("${path}")
-  fi
-done
-if ((${#missing[@]} > 0)); then
-  echo "WARNING: knowledge submodule content is missing:"
-  for path in "${missing[@]}"; do
-    echo "  - ${SCRIPT_DIR}/${path}"
-  done
-  echo "Initialize submodules before starting:"
-  echo "  git submodule update --init --recursive knowledge/docs-mintlify knowledge/pyromind-sdk-example"
-  echo ""
+echo "Initializing docs-mintlify submodule..."
+git -C "${SCRIPT_DIR}" submodule update --init --recursive docs-mintlify
+
+DOCS_SRC="${SCRIPT_DIR}/docs-mintlify/zh/docs"
+KNOWLEDGE_DIR="${SCRIPT_DIR}/knowledge"
+if [[ ! -d "${DOCS_SRC}" ]]; then
+  echo "ERROR: docs source directory not found: ${DOCS_SRC}" >&2
+  exit 1
 fi
+
+echo "Syncing ${DOCS_SRC} → ${KNOWLEDGE_DIR}/"
+cp -a "${DOCS_SRC}/." "${KNOWLEDGE_DIR}/"
 
 # ----------------------------------------------------------
 # Start Agent Server
@@ -68,8 +61,7 @@ echo " Pyromind Agent Server"
 echo "============================================"
 echo " LLM Base URL:      ${LLM_BASE_URL}"
 echo " Knowledge Base:    ${PYROMIND_KNOWLEDGE_BASE_PATH}"
-echo " Mintlify docs:     ${PYROMIND_KNOWLEDGE_BASE_PATH}/docs-mintlify/zh/docs"
-echo " Node docs:         ${PYROMIND_KNOWLEDGE_BASE_PATH}/pyromind-sdk-example/docs"
+echo " Docs source:       ${DOCS_SRC}"
 echo " Host:              127.0.0.1"
 echo " Port:              8000"
 echo " Auto-reload:       enabled"

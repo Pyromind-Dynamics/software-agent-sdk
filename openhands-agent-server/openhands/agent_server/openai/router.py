@@ -11,7 +11,13 @@ from pydantic import TypeAdapter, ValidationError
 
 from openhands.agent_server.config import Config
 from openhands.agent_server.conversation_service import ConversationService
-from openhands.agent_server.dependencies import get_conversation_service
+from openhands.agent_server.dependencies import (
+    get_conversation_service,
+    get_pyromind_jwt_token_from_request,
+    is_auth_configured,
+    is_session_api_key_valid,
+    verify_pyromind_jwt_token,
+)
 from openhands.agent_server.openai.models import (
     OpenAIChatCompletionRequest,
     OpenAIChatCompletionResponse,
@@ -48,20 +54,24 @@ def check_openai_api_key(
     ``X-Session-API-Key`` preserves compatibility with existing agent-server
     clients, while ``Authorization: Bearer`` lets OpenAI-compatible clients use
     their standard API-key header. Both forms validate against
-    ``config.session_api_keys``; this does not introduce a second credential
-    system. When no session keys are configured, the local server remains
-    unauthenticated like the existing agent-server API.
+    ``config.session_api_keys`` when session API-key auth is enabled. PyroMind
+    JWT cookie authentication is also accepted when configured. When no auth
+    mechanism is configured, the local server remains unauthenticated like the
+    existing agent-server API.
 
     Reads config from ``request.app.state`` at request time so that keys
     delivered via ``POST /api/init`` take effect immediately.
     """
     config: Config = request.app.state.config
-    if not config.session_api_keys:
-        return
     bearer_token = authorization.credentials if authorization else None
-    if session_api_key in config.session_api_keys:
+    if is_session_api_key_valid(config, session_api_key):
         return
-    if bearer_token in config.session_api_keys:
+    if is_session_api_key_valid(config, bearer_token):
+        return
+    pyromind_token = get_pyromind_jwt_token_from_request(request)
+    if verify_pyromind_jwt_token(config, pyromind_token) is not None:
+        return
+    if not is_auth_configured(config):
         return
     raise HTTPException(status.HTTP_401_UNAUTHORIZED)
 

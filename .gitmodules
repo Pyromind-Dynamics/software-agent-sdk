@@ -1,6 +1,3 @@
-[submodule "knowledge/pyromind-sdk-example"]
-	path = knowledge/pyromind-sdk-example
-	url = https://github.com/PyroMind-Dynamics/pyromind-sdk-example.git
-[submodule "knowledge/docs-mintlify"]
-	path = knowledge/docs-mintlify
-	url = https://github.com/PyroMind-Dynamics/docs-mintlify.git
+[submodule "docs-mintlify"]
+	path = docs-mintlify
+	url = ../docs-mintlify.git
