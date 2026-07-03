@@ -22,9 +22,9 @@ triggers:
 4. 创建或修改后调用 `publish_workflow` 将当前文件推送给前端
 
 知识库检索路径均位于路由提示中的绝对知识库目录下。使用 `grep` 时传入该绝对路径或其子目录路径：
-- 平台用法：`<知识库绝对路径>/docs-mintlify/zh/docs/`、`<知识库绝对路径>/docs-mintlify/en/docs/`
-- 节点 I/O 与端口定义：`<知识库绝对路径>/pyromind-sdk-example/docs/`、`<知识库绝对路径>/pyromind-sdk-example/docs_zh/`
-- workflow JSON 样例：`<知识库绝对路径>/pyromind-sdk-example/workflow/`
+TODO 
+- 平台用法英文版：`<知识库绝对路径>/basic/`、`<知识库绝对路径>/jupyterlab`(通过撰写python脚本完成模型训练)、`<知识库绝对路径>/sdk`（实现模型训练python脚本所需的sdk）、`<知识库绝对路径>/studio`（拖拽工作流来搭建模型训练的链路）
+- 节点 I/O 与端口定义：`<知识库绝对路径>/nodes`
 
 ## DSL 语法格式
 
