@@ -7,15 +7,36 @@ from openhands.tools.workflow.definition import (
     WorkflowTool,
     WorkflowToolSet,
 )
+from openhands.tools.workflow.dsl_to_xyflow import (
+    DslToXyflowAction,
+    DslToXyflowExecutor,
+    DslToXyflowObservation,
+    DslToXyflowTool,
+)
 from openhands.tools.workflow.impl import (
     WorkflowContext,
     WorkflowExecutor,
     WorkflowScriptError,
     read_workflow_file,
 )
+from openhands.tools.workflow.validate_workflow_dsl import (
+    ValidateWorkflowDslAction,
+    ValidateWorkflowDslExecutor,
+    ValidateWorkflowDslObservation,
+    ValidateWorkflowDslTool,
+    WorkflowValidationIssue,
+)
 
 
 __all__ = [
+    "DslToXyflowAction",
+    "DslToXyflowExecutor",
+    "DslToXyflowObservation",
+    "DslToXyflowTool",
+    "ValidateWorkflowDslAction",
+    "ValidateWorkflowDslExecutor",
+    "ValidateWorkflowDslObservation",
+    "ValidateWorkflowDslTool",
     "WorkflowAction",
     "WorkflowContext",
     "WorkflowExecutor",
@@ -24,5 +45,6 @@ __all__ = [
     "WorkflowScriptError",
     "WorkflowTool",
     "WorkflowToolSet",
+    "WorkflowValidationIssue",
     "read_workflow_file",
 ]

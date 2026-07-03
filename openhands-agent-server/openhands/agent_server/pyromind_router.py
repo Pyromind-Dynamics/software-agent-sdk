@@ -12,14 +12,16 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import (
     get_conversation_service,
     get_current_user_id,
+    get_pyromind_jwt_token_from_request,
 )
 from openhands.agent_server.models import ConversationInfo
+from openhands.agent_server.pyromind_auth import PYROMIND_AUTH_COOKIE_NAME
 from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
     PYROMIND_APP_TAG_VALUE,
@@ -29,10 +31,12 @@ from openhands.sdk.conversation.request import (
     SendMessageRequest,
     StartConversationRequest,
 )
+from openhands.sdk.secret import SecretSource, StaticSecret
 from openhands.sdk.skills import Skill, load_skills_from_dir
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
+from openhands.tools.workflow import DslToXyflowTool, ValidateWorkflowDslTool
 
 
 logger = logging.getLogger(__name__)
@@ -56,6 +60,9 @@ _DEFAULT_SKILLS_PATH = os.environ.get(
 
 # Only load these skills for Pyromind (avoids loading unrelated SDK skills)
 _PYROMIND_SKILL_NAMES = ["generate-workflow-dsl"]
+_PYROMIND_VALIDATE_AUTH_COOKIE_SECRET = "PYROMIND_VALIDATE_AUTH_COOKIE"
+_PYROMIND_VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
+_PYROMIND_VALIDATE_FORWARD_HEADERS = ("x-cluster", "accept-language")
 
 # Knowledge-base retrieval guidance layered on top of the codex base prompt via
 # get_codex_agent(custom_instructions=...). Kept lightweight: prefer invoking a
@@ -131,6 +138,52 @@ def _load_agent_skills(
 
     return selected
 
+
+# ---------------------------------------------------------------------------
+# Tool loading utilities
+# ---------------------------------------------------------------------------
+
+
+def _build_workflow_validation_tool(
+    http_request: Request,
+    extra: dict[str, Any],
+) -> tuple[Tool, dict[str, SecretSource]]:
+    headers = {
+        name: value
+        for name in _PYROMIND_VALIDATE_FORWARD_HEADERS
+        if (value := http_request.headers.get(name))
+    }
+    cluster = extra.get("x_cluster", extra.get("x-cluster"))
+    if isinstance(cluster, str) and cluster:
+        headers["x-cluster"] = cluster
+
+    params: dict[str, Any] = {}
+    endpoint_url = extra.get("workflow_validation_endpoint_url")
+    if isinstance(endpoint_url, str) and endpoint_url:
+        params["endpoint_url"] = endpoint_url
+    if headers:
+        params["headers"] = headers
+
+    secrets: dict[str, SecretSource] = {}
+    secret_headers: dict[str, str] = {}
+    auth_token = get_pyromind_jwt_token_from_request(http_request)
+    if auth_token:
+        secret_headers["cookie"] = _PYROMIND_VALIDATE_AUTH_COOKIE_SECRET
+        secrets[_PYROMIND_VALIDATE_AUTH_COOKIE_SECRET] = StaticSecret(
+            value=SecretStr(f"{PYROMIND_AUTH_COOKIE_NAME}={auth_token}")
+        )
+
+    authorization = http_request.headers.get("authorization")
+    if authorization:
+        secret_headers["authorization"] = _PYROMIND_VALIDATE_AUTHORIZATION_SECRET
+        secrets[_PYROMIND_VALIDATE_AUTHORIZATION_SECRET] = StaticSecret(
+            value=SecretStr(authorization)
+        )
+
+    if secret_headers:
+        params["secret_headers"] = secret_headers
+
+    return Tool(name=ValidateWorkflowDslTool.name, params=params), secrets
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +293,9 @@ async def create_pyromind_conversation(
     skills_path = request.extra.get("skills_path", _DEFAULT_SKILLS_PATH)
     skills = _load_agent_skills(skills_path, allow_list=_PYROMIND_SKILL_NAMES)
     agent_context = AgentContext(skills=skills) if skills else None
+    validation_tool, validation_secrets = _build_workflow_validation_tool(
+        http_request, request.extra
+    )
 
     # 4. Build LLM config
     llm = LLM(
@@ -259,6 +315,8 @@ async def create_pyromind_conversation(
         extra_tools=[
             Tool(name="grep"),
             Tool(name="file_editor"),
+            Tool(name=DslToXyflowTool.name),
+            validation_tool,
         ],
     )
 
@@ -280,6 +338,7 @@ async def create_pyromind_conversation(
         workspace=workspace,
         conversation_id=conversation_id,
         initial_message=initial_message,
+        secrets=validation_secrets,
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
         user_id=get_current_user_id(http_request),
     )
