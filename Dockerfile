@@ -7,7 +7,7 @@ ARG BASE_IMAGE=nikolaik/python-nodejs:python3.13-nodejs22-slim
 ARG USERNAME=openhands
 ARG UID=10001
 ARG GID=10001
-ARG PORT=80
+ARG PORT=8000
 # Opt-in build flag for the Vertex AI extra (`openhands-sdk[vertex]`). Off by
 # default to keep the published image lean. Pass `--build-arg ENABLE_VERTEX=1`
 # to bundle google-cloud-aiplatform so the resulting binary supports
