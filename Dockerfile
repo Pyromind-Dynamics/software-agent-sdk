@@ -52,6 +52,7 @@ COPY --chown=${USERNAME}:${USERNAME} openhands-sdk ./openhands-sdk
 COPY --chown=${USERNAME}:${USERNAME} openhands-tools ./openhands-tools
 COPY --chown=${USERNAME}:${USERNAME} openhands-workspace ./openhands-workspace
 COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server ./openhands-agent-server
+COPY --chown=${USERNAME}:${USERNAME} .agents ./.agents
 RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
     EXTRA_FLAGS=""; \
     if [ "$ENABLE_VERTEX" = "1" ]; then EXTRA_FLAGS="--extra vertex"; fi; \
@@ -80,8 +81,6 @@ RUN test -x /agent-server/dist/openhands-agent-server
 
 ####################################################################################
 # Pyromind knowledge base
-# Before docker build:
-#   git submodule update --init --recursive docs-mintlify
 ####################################################################################
 FROM debian:bookworm-slim AS knowledge-sync
 ARG USERNAME UID GID
@@ -89,11 +88,12 @@ RUN groupadd -g ${GID} ${USERNAME} \
  && useradd -m -u ${UID} -g ${GID} -s /usr/sbin/nologin ${USERNAME}
 WORKDIR /sync
 COPY knowledge ./knowledge
-COPY docs-mintlify ./docs-mintlify
-RUN test -d docs-mintlify/zh/docs \
- || (echo "ERROR: docs-mintlify submodule not initialized. Run: git submodule update --init --recursive docs-mintlify" >&2 && exit 1) \
- && cp -a docs-mintlify/zh/docs/. knowledge/ \
- && rm -rf docs-mintlify \
+RUN test -d knowledge/basic \
+ && test -d knowledge/jupyterlab \
+ && test -d knowledge/nodes \
+ && test -d knowledge/sdk \
+ && test -d knowledge/studio \
+ && test -f knowledge/dataset_processing_workflow.py \
  && chown -R ${USERNAME}:${USERNAME} knowledge
 
 ####################################################################################
@@ -242,6 +242,8 @@ ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
 ENV OH_ENABLE_VNC=false
 ENV LOG_JSON=true
+ENV workspace_dir=/workspace
+ENV WORKSPACE_DIR=/workspace
 EXPOSE ${PORT}
 
 ####################################################################################
@@ -372,6 +374,7 @@ ARG USERNAME
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server /agent-server
 COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
+ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
 ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "openhands.agent_server"]
 
 FROM base-image-minimal AS source-minimal
@@ -379,6 +382,7 @@ ARG USERNAME
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server /agent-server
 COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
+ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
 ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "openhands.agent_server"]
 
 ############################
@@ -390,19 +394,23 @@ FROM base-image AS binary
 ARG USERNAME
 
 COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/openhands-agent-server /usr/local/bin/openhands-agent-server
+COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/.agents /agent-server/.agents
 COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
 RUN chmod +x /usr/local/bin/openhands-agent-server
 # Fix library path to use system GCC libraries instead of bundled ones
 ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
+ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
 ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]
 
 FROM base-image-minimal AS binary-minimal
 ARG USERNAME
 COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/openhands-agent-server /usr/local/bin/openhands-agent-server
+COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/.agents /agent-server/.agents
 COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
 RUN chmod +x /usr/local/bin/openhands-agent-server
 # Fix library path to use system GCC libraries instead of bundled ones
 ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
+ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
 ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]

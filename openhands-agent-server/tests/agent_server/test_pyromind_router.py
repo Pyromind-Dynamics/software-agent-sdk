@@ -55,5 +55,8 @@ def test_kb_instructions_format_injects_path() -> None:
     assert "workspace/conversations/abc123" in rendered
     assert "workflow.py" in rendered
     assert "Pyromind" in rendered
+    assert "nodes/<NodeType>/<NodeType>.md" in rendered
+    assert "dataset_processing_workflow.py" in rendered
+    assert "docs-mintlify/zh/docs" not in rendered
     # Skill-first guidance must be present.
     assert "invoke_skill" in rendered

@@ -88,19 +88,34 @@ runtime document root (`PYROMIND_KNOWLEDGE_BASE_PATH`).
 | Path | Purpose |
 |------|---------|
 | [`knowledge/`](knowledge/) | Runtime document root for the PyroMind agent |
-| [`docs-mintlify/`](docs-mintlify/) | **git submodule** — official Mintlify docs ([upstream](https://github.com/PyroMind-Dynamics/docs-mintlify)) |
 
 The [PyroMind Python SDK](https://pypi.org/project/pyromind-sdk/) is installed from PyPI via `make build` / `uv sync --dev`.
 
-After cloning, initialize the docs submodule:
+After cloning:
 
 ```bash
-git submodule update --init --recursive docs-mintlify
 make build
 ./start.sh
 ```
 
-See [`knowledge/README.md`](knowledge/README.md) for updating the submodule pointer and Docker build notes.
+Set `workspace_dir` before startup to place conversations, project files, and bash
+events under a deployment-specific workspace root.
+
+Directory-related startup variables:
+
+| Variable | Default |
+|----------|---------|
+| `SOFTWARE_AGENT_SDK_DIR` | directory containing `start.sh` |
+| `workspace_dir` / `WORKSPACE_DIR` | `${SOFTWARE_AGENT_SDK_DIR}/workspace` |
+| `OPENHANDS_CONFIG_DIR` | `${WORKSPACE_DIR}` |
+| `OPENHANDS_AGENT_SERVER_CONFIG_PATH` | `${OPENHANDS_CONFIG_DIR}/openhands_agent_server_config.json` |
+| `OH_CONVERSATIONS_PATH` | `${WORKSPACE_DIR}/conversations` |
+| `OH_WORKSPACE_PATH` | `${WORKSPACE_DIR}/project` |
+| `OH_BASH_EVENTS_DIR` | `${WORKSPACE_DIR}/bash_events` |
+| `PYROMIND_KNOWLEDGE_BASE_PATH` | `${SOFTWARE_AGENT_SDK_DIR}/knowledge` |
+| `PYROMIND_SKILLS_PATH` | `${SOFTWARE_AGENT_SDK_DIR}/.agents/skills` |
+
+See [`knowledge/README.md`](knowledge/README.md) for knowledge layout and Docker build notes.
 
 ## Documentation
 

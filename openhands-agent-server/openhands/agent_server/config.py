@@ -23,6 +23,8 @@ V0_SESSION_API_KEY_ENV = "SESSION_API_KEY"
 V1_SESSION_API_KEY_ENV = "OH_SESSION_API_KEYS_0"
 ENVIRONMENT_VARIABLE_PREFIX = "OH"
 CONFIG_PATH_ENV = "OPENHANDS_AGENT_SERVER_CONFIG_PATH"
+WORKSPACE_DIR_ENV = "workspace_dir"
+WORKSPACE_DIR_ENV_UPPER = "WORKSPACE_DIR"
 DEFAULT_CONFIG_PATH = Path("workspace/openhands_agent_server_config.json")
 _logger = logging.getLogger(__name__)
 
@@ -63,6 +65,29 @@ def _default_web_url() -> str | None:
         return web_url
 
     return None
+
+
+def _default_workspace_root() -> Path:
+    configured = os.getenv(WORKSPACE_DIR_ENV) or os.getenv(WORKSPACE_DIR_ENV_UPPER)
+    if configured:
+        return Path(configured)
+    return Path("workspace")
+
+
+def _default_conversations_path() -> Path:
+    return _default_workspace_root() / "conversations"
+
+
+def _default_workspace_path() -> Path:
+    return _default_workspace_root() / "project"
+
+
+def _default_bash_events_dir() -> Path:
+    return _default_workspace_root() / "bash_events"
+
+
+def _default_config_path() -> Path:
+    return _default_workspace_root() / DEFAULT_CONFIG_PATH.name
 
 
 class WebhookSpec(BaseModel):
@@ -165,22 +190,22 @@ class Config(BaseModel):
         ),
     )
     conversations_path: Path = Field(
-        default=Path("workspace/conversations"),
+        default_factory=_default_conversations_path,
         description=(
             "The location of the directory where conversations and events are stored."
         ),
     )
     workspace_path: Path = Field(
-        default=Path("workspace/project"),
+        default_factory=_default_workspace_path,
         description=(
             "Default workspace directory for conversations created by the server."
         ),
     )
     bash_events_dir: Path = Field(
-        default=Path("workspace/bash_events"),
+        default_factory=_default_bash_events_dir,
         description=(
             "The location of the directory where bash events are stored as files. "
-            "Defaults to 'workspace/bash_events'."
+            "Defaults to '<workspace_dir>/bash_events'."
         ),
     )
     bash_events_retention_seconds: int | None = Field(
@@ -326,7 +351,10 @@ def load_config(config_path: Path | None = None) -> Config:
     """
     resolved_path = config_path
     if resolved_path is None:
-        resolved_path = Path(os.getenv(CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH))
+        env_config_path = os.getenv(CONFIG_PATH_ENV)
+        resolved_path = (
+            Path(env_config_path) if env_config_path else _default_config_path()
+        )
 
     file_data = _read_config_file(resolved_path)
     parser = get_env_parser(Config, _get_default_parsers())

@@ -59,6 +59,14 @@ PYROMIND_KB_INSTRUCTIONS = """\
 The Pyromind platform knowledge base is available at this absolute path:
 {knowledge_base_path}
 
+Knowledge base layout:
+- basic/: platform basics
+- jupyterlab/: JupyterLab and script-based training
+- sdk/: Python SDK and script-based workflow APIs
+- studio/: Studio workflow documentation
+- nodes/<NodeType>/<NodeType>.md: node parameters, I/O, and ports
+- dataset_processing_workflow.py: workflow DSL example
+
 Your current working directory is this conversation's private workspace:
 {working_dir}
 

@@ -33,6 +33,8 @@ spec:
       - env:
         - name: RunMode
           value: agent-server
+        - name: workspace_dir
+          value: /workspace
         - name: SESSION_API_KEY
           valueFrom:
             secretKeyRef:
@@ -71,6 +73,7 @@ spec:
         - |
           mkdir -p /workspace/conversations
           mkdir -p /workspace/project
+          mkdir -p /workspace/bash_events
           chown -R 10001:10001 /workspace
           echo "Workspace initialized successfully"
         volumeMounts:
@@ -110,4 +113,4 @@ spec:
     port: 80
     targetPort: 8000
     protocol: TCP
-  type: ClusterIP  
+  type: ClusterIP

@@ -457,6 +457,44 @@ def test_config_class_parsing(clean_env):
     assert config.enable_vscode is False
 
 
+def test_config_workspace_dir_env_sets_default_paths(clean_env):
+    """workspace_dir provides the default workspace root for server paths."""
+    os.environ["workspace_dir"] = "/runtime/workspace"
+
+    config = Config()
+
+    assert config.conversations_path == Path("/runtime/workspace/conversations")
+    assert config.workspace_path == Path("/runtime/workspace/project")
+    assert config.bash_events_dir == Path("/runtime/workspace/bash_events")
+
+
+def test_config_oh_paths_override_workspace_dir_defaults(clean_env):
+    """Explicit OH_* path settings keep precedence over workspace_dir defaults."""
+    os.environ["workspace_dir"] = "/runtime/workspace"
+    os.environ["OH_CONVERSATIONS_PATH"] = "/custom/conversations"
+    os.environ["OH_WORKSPACE_PATH"] = "/custom/project"
+    os.environ["OH_BASH_EVENTS_DIR"] = "/custom/bash_events"
+
+    config = load_config()
+
+    assert config.conversations_path == Path("/custom/conversations")
+    assert config.workspace_path == Path("/custom/project")
+    assert config.bash_events_dir == Path("/custom/bash_events")
+
+
+def test_load_config_default_path_follows_workspace_dir(tmp_path, clean_env):
+    """The default config file path is derived from workspace_dir."""
+    os.environ["workspace_dir"] = str(tmp_path)
+    config_path = tmp_path / "openhands_agent_server_config.json"
+    config_path.write_text(
+        json.dumps({"allow_cors_origins": ["https://workspace.example.com"]})
+    )
+
+    config = load_config()
+
+    assert config.allow_cors_origins == ["https://workspace.example.com"]
+
+
 def test_config_file_parsing(tmp_path, clean_env):
     """JSON config files should populate the same Config fields as env vars."""
     config_path = tmp_path / "config.json"

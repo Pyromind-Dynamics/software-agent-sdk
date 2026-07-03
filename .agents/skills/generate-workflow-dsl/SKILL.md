@@ -2,7 +2,7 @@
 name: generate-workflow-dsl
 description: >-
   当用户需要生成 Pyromind 平台上的模型训练工作流时使用此技能。
-  先检索知识库了解可用节点和连接模式，然后生成符合 DSL 格式的工作流代码。
+  优先复用技能内置模板，并按需读取相关节点文档，生成符合 DSL 格式的工作流代码。
 triggers:
 - 生成工作流
 - generate workflow
@@ -16,15 +16,36 @@ triggers:
 ## 概述
 
 当用户要求生成模型训练工作流时，你需要：
-1. 先用 grep 检索路由提示中给出的知识库绝对路径，了解可用的节点类型、参数和连接模式
-2. 根据用户需求选择合适的节点组合
+1. 先从本技能内置的示例工作流中选择最接近的模板，不要从零开始搜索
+2. 根据用户需求选择合适的节点组合，并按需读取相关节点文档确认参数
 3. 按照 DSL 语法格式创建或修改当前工作目录下的 `workflow.py`
 4. 创建或修改后调用 `publish_workflow` 将当前文件推送给前端
 
-知识库检索路径均位于路由提示中的绝对知识库目录下。使用 `grep` 时传入该绝对路径或其子目录路径：
-TODO 
-- 平台用法英文版：`<知识库绝对路径>/basic/`、`<知识库绝对路径>/jupyterlab`(通过撰写python脚本完成模型训练)、`<知识库绝对路径>/sdk`（实现模型训练python脚本所需的sdk）、`<知识库绝对路径>/studio`（拖拽工作流来搭建模型训练的链路）
-- 节点 I/O 与端口定义：`<知识库绝对路径>/nodes`
+可读取的知识库路径均位于路由提示中的绝对知识库目录下。需要补充检索时，使用 `grep` 传入该绝对路径或其子目录路径：
+- 平台基础用法：`<知识库绝对路径>/basic/`
+- JupyterLab 与脚本训练：`<知识库绝对路径>/jupyterlab/`
+- Python SDK 与脚本训练 API：`<知识库绝对路径>/sdk/`
+- Studio 拖拽工作流：`<知识库绝对路径>/studio/`
+- 节点 I/O、参数与端口定义：`<知识库绝对路径>/nodes/<NodeType>/<NodeType>.md`
+- 外部数据处理样例：`<知识库绝对路径>/dataset_processing_workflow.py`
+
+## 检索与读取策略
+
+优先级：**内置示例模板 → 直接读取相关节点文档 → 必要时宽泛 grep**。
+
+1. 本技能已经包含数据处理、SFT、GRPO 示例。用户要生成 SFT 时，直接以“示例2：SFT 训练工作流”为模板调整数据集、模型和训练参数；用户要生成 GRPO 时，直接以“示例3：GRPO 训练工作流”为模板调整。不要为了确认示例存在而先 grep 完整的 `# workflow: ...` 标题或注释。
+2. 节点文档路径是确定的：`<知识库绝对路径>/nodes/<NodeType>/<NodeType>.md`。当已经知道要用哪些节点时，直接用 `file_editor` 查看对应文件，不要先在整个知识库里 grep 节点名来“发现”文件。
+3. grep 只用于补充检索，并使用宽泛关键词：`SFT`、`DPO`、`GRPO`、`training`、`dataset`、`reward`，或精确的 `NodeType`。避免使用依赖格式的 pattern，例如完整工作流标题、Markdown 标题锚点、`^###`、`# workflow: ...`。
+4. 如果只是生成常见训练工作流，通常只需要读取被选中节点的契约文档；只有用户问平台概念、Studio 操作、SDK 脚本写法，或节点参数仍不明确时，才检索 `basic/`、`studio/`、`sdk/`、`jupyterlab/`。
+
+常见工作流需要优先读取的节点文档：
+
+| 场景 | 相关节点 |
+|------|----------|
+| 数据处理/验证 | CloneAndCacheDataset、PathJoinNode、DatasetToJsonlNode、DatasetConfigBuilderTextNode、DatasetConfigBuilderVisionNode、DatasetConfigBuilderNode、DatasetValidatorNode |
+| SFT | CloneAndCacheDataset、CloneAndCacheModel、PathJoinNode、DatasetConfigBuilderTextNode、DatasetConfigBuilderMessageNode、DatasetConfigBuilderVisionNode、DatasetConfigBuilderNode、ModelConfigBuilderNode、LoraConfigBuilderNode、TrainingConfigBuilderNode、AccelerateConfigBuilderNode、ModelTrainSFTNode、ModelMergeLoraNode |
+| DPO | CloneAndCacheDataset、CloneAndCacheModel、PathJoinNode、DatasetConfigBuilderTextNode、DatasetConfigBuilderMessageNode、DatasetConfigBuilderNode、ModelConfigBuilderNode、LoraConfigBuilderNode、TrainingConfigBuilderNode、AccelerateConfigBuilderNode、ModelTrainDPONode |
+| GRPO | CloneAndCacheDataset、CloneAndCacheModel、PathJoinNode、DatasetConfigBuilderTextNode、DatasetConfigBuilderVisionNode、DatasetConfigBuilderNode、ModelConfigBuilderNode、LoraConfigBuilderNode、TrainingConfigBuilderNode、AccelerateConfigBuilderNode、RewardItemBuilderNode、RewardConfigBuilderNode、GRPOTrainingExtraConfigBuilderNode、ModelTrainGRPONode |
 
 ## DSL 语法格式
 
@@ -416,12 +437,9 @@ grpo_train = ModelTrainGRPONode(
 ## 生成工作流的步骤
 
 1. **理解用户需求**：确定训练类型（SFT/DPO/GRPO）、数据集、模型
-<<<<<<< HEAD
-2. **检索知识库**：用 grep 在路由提示中的知识库绝对路径下搜索；平台文档查 `<知识库绝对路径>/docs-mintlify/zh/docs/`，节点契约查 `<知识库绝对路径>/pyromind-sdk-example/docs/`，样例连接查 `<知识库绝对路径>/pyromind-sdk-example/workflow/`
-=======
-2. **检索知识库**：用 grep 在 `knowledge/` 下搜索平台文档；节点与工作流参考查 `knowledge/sdk/` 与 `docs-mintlify/zh/docs/`
->>>>>>> ec5e2328811c57624e0c770a0f559e1bb8ef9360
-3. **选择节点组合**：
+2. **选择模板**：优先复用本技能内置示例。SFT 用示例2，GRPO 用示例3，数据处理/验证用示例1；DPO 可在 SFT 骨架上替换为 DPO 数据字段与 `ModelTrainDPONode`
+3. **读取必要节点契约**：根据已选模板和用户需求，直接查看 `<知识库绝对路径>/nodes/<NodeType>/<NodeType>.md`。只读取会实际使用或参数不确定的节点文档，不要用高精度标题 pattern 搜索示例
+4. **选择节点组合**：
    - 数据加载：CloneAndCacheDataset → PathJoinNode → DatasetToJsonlNode（如需转换）
    - 字段映射：DatasetConfigBuilderTextNode 或 DatasetConfigBuilderVisionNode
    - 数据集配置：DatasetConfigBuilderNode
@@ -429,6 +447,6 @@ grpo_train = ModelTrainGRPONode(
    - 训练配置：LoraConfigBuilderNode + TrainingConfigBuilderNode + AccelerateConfigBuilderNode
    - 训练执行：ModelTrainSFTNode / ModelTrainDPONode / ModelTrainGRPONode
    - 后处理：ModelMergeLoraNode → VLLMInference → TestLLMNode（可选）
-4. **组装 DSL**：按依赖顺序排列节点，确保被引用节点在前
-5. **写入文件**：使用 `apply_patch` 将 DSL 写入当前工作目录根路径 `workflow.py`；如果是在修改已有工作流，也只编辑这个固定相对路径。不要手写会话目录的长绝对路径；如必须使用 `file_editor`，也传入 `workflow.py`，由运行时解析到实际文件。不要只说明已经生成，必须实际调用工具创建或修改文件
-6. **发布结果**：如果 `workflow.py` 被创建或修改，调用 `publish_workflow`，可在 `summary` 中简述本次创建或修改内容
+5. **组装 DSL**：按依赖顺序排列节点，确保被引用节点在前
+6. **写入文件**：使用 `apply_patch` 将 DSL 写入当前工作目录根路径 `workflow.py`；如果是在修改已有工作流，也只编辑这个固定相对路径。不要手写会话目录的长绝对路径；如必须使用 `file_editor`，也传入 `workflow.py`，由运行时解析到实际文件。不要只说明已经生成，必须实际调用工具创建或修改文件
+7. **发布结果**：如果 `workflow.py` 被创建或修改，调用 `publish_workflow`，可在 `summary` 中简述本次创建或修改内容
