@@ -88,17 +88,14 @@ runtime document root (`PYROMIND_KNOWLEDGE_BASE_PATH`).
 | Path | Purpose |
 |------|---------|
 | [`knowledge/`](knowledge/) | Runtime document root for the PyroMind agent |
-| [`knowledge/docs-mintlify/`](knowledge/docs-mintlify/) | **git submodule** — official Mintlify docs ([upstream](https://github.com/PyroMind-Dynamics/docs-mintlify)) |
-| [`knowledge/pyromind-sdk-example/`](knowledge/pyromind-sdk-example/) | **git submodule** — node I/O specs and workflow JSON samples ([upstream](https://github.com/PyroMind-Dynamics/pyromind-sdk-example)) |
+| [`docs-mintlify/`](docs-mintlify/) | **git submodule** — official Mintlify docs ([upstream](https://github.com/PyroMind-Dynamics/docs-mintlify)) |
 
 The [PyroMind Python SDK](https://pypi.org/project/pyromind-sdk/) is installed from PyPI via `make build` / `uv sync --dev`.
 
-After cloning, initialize knowledge submodules:
+After cloning, initialize the docs submodule:
 
 ```bash
-git submodule update --init --recursive \
-  knowledge/docs-mintlify \
-  knowledge/pyromind-sdk-example
+git submodule update --init --recursive docs-mintlify
 make build
 ./start.sh
 ```
