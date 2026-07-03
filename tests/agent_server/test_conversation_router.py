@@ -21,6 +21,7 @@ from openhands.agent_server.models import (
     SendMessageRequest,
     StartConversationRequest,
 )
+from openhands.agent_server.pyromind_auth import CurrentLoginUser
 from openhands.agent_server.utils import utc_now
 from openhands.sdk import LLM, Agent, TextContent, Tool
 from openhands.sdk.agent.acp_agent import ACPAgent
@@ -527,6 +528,53 @@ def test_start_conversation_new(
         mock_conversation_service.start_conversation.assert_called_once()
     finally:
         client.app.dependency_overrides.clear()
+
+
+def test_start_conversation_uses_authenticated_user_id(
+    mock_conversation_service, sample_conversation_info
+):
+    """JWT-authenticated requests are scoped to the login user's id."""
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def set_current_user(request, call_next):
+        request.state.current_user = CurrentLoginUser(
+            username="test-user",
+            email="test@example.com",
+            user_id=42,
+        )
+        return await call_next(request)
+
+    app.include_router(conversation_router, prefix="/api")
+    app.state.config = Config(static_files_path=None, session_api_keys=[])
+    client = TestClient(app)
+    app.dependency_overrides[get_conversation_service] = lambda: (
+        mock_conversation_service
+    )
+    mock_conversation_service.start_conversation.return_value = (
+        sample_conversation_info,
+        True,
+    )
+
+    try:
+        response = client.post(
+            "/api/conversations",
+            json={
+                "agent": {
+                    "kind": "Agent",
+                    "llm": {"model": "gpt-4o", "usage_id": "test-llm"},
+                    "tools": [],
+                },
+                "workspace": {"working_dir": "/tmp/test"},
+                "user_id": "client-supplied",
+            },
+        )
+
+        assert response.status_code == 201
+        request = mock_conversation_service.start_conversation.call_args.args[0]
+        assert request.user_id == "42"
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_start_conversation_existing(

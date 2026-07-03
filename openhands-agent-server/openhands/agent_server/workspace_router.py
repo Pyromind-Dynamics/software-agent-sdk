@@ -15,11 +15,14 @@ Behaves like a plain static file server:
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import FileResponse
 
 from openhands.agent_server.conversation_service import ConversationService
-from openhands.agent_server.dependencies import get_conversation_service
+from openhands.agent_server.dependencies import (
+    get_conversation_service,
+    get_current_user_id,
+)
 from openhands.sdk.logger import get_logger
 from openhands.sdk.workspace import LocalWorkspace
 
@@ -41,8 +44,16 @@ def conversation_workspace_url_path(conversation_id: UUID | str) -> str:
 async def _resolve_workspace_dir(
     conversation_id: UUID,
     conversation_service: ConversationService,
+    request: Request,
 ) -> Path:
-    event_service = await conversation_service.get_event_service(conversation_id)
+    user_id = get_current_user_id(request)
+    if user_id is None:
+        event_service = await conversation_service.get_event_service(conversation_id)
+    else:
+        event_service = await conversation_service.get_event_service(
+            conversation_id,
+            user_id=user_id,
+        )
     if event_service is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -102,11 +113,16 @@ def _serve_path(workspace_dir: Path, file_path: str) -> FileResponse:
     responses={404: {"description": "File or conversation not found"}},
 )
 async def serve_workspace_root(
+    request: Request,
     conversation_id: UUID,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> FileResponse:
     """Serve ``index.html`` from the conversation's workspace root."""
-    workspace_dir = await _resolve_workspace_dir(conversation_id, conversation_service)
+    workspace_dir = await _resolve_workspace_dir(
+        conversation_id,
+        conversation_service,
+        request,
+    )
     return _serve_path(workspace_dir, "")
 
 
@@ -115,10 +131,15 @@ async def serve_workspace_root(
     responses={404: {"description": "File or conversation not found"}},
 )
 async def serve_workspace_file(
+    request: Request,
     conversation_id: UUID,
     file_path: str,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> FileResponse:
     """Serve a file (or directory ``index.html``) from the workspace."""
-    workspace_dir = await _resolve_workspace_dir(conversation_id, conversation_service)
+    workspace_dir = await _resolve_workspace_dir(
+        conversation_id,
+        conversation_service,
+        request,
+    )
     return _serve_path(workspace_dir, file_path)

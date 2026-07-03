@@ -38,6 +38,7 @@ from openhands.agent_server.conversation_service import (
     get_default_conversation_service,
 )
 from openhands.agent_server.dependencies import (
+    CurrentLoginUser,
     get_pyromind_jwt_token,
     is_auth_configured,
     is_session_api_key_valid,
@@ -180,7 +181,9 @@ async def _accept_authenticated_websocket(
             return False
 
     pyromind_token = _resolve_websocket_pyromind_jwt_token(websocket)
-    if verify_pyromind_jwt_token(config, pyromind_token) is not None:
+    pyromind_user = verify_pyromind_jwt_token(config, pyromind_token)
+    if pyromind_user is not None:
+        websocket.state.current_user = pyromind_user
         await websocket.accept()
         return True
 
@@ -300,7 +303,19 @@ async def events_socket(
 
     logger.info(f"Event Websocket Connected: {conversation_id}")
     conv_service = _get_conversation_service(websocket)
-    event_service = await conv_service.get_event_service(conversation_id)
+    current_user = getattr(websocket.state, "current_user", None)
+    user_id = (
+        str(current_user.user_id)
+        if isinstance(current_user, CurrentLoginUser)
+        else None
+    )
+    if user_id is None:
+        event_service = await conv_service.get_event_service(conversation_id)
+    else:
+        event_service = await conv_service.get_event_service(
+            conversation_id,
+            user_id=user_id,
+        )
     if event_service is None:
         logger.warning(f"Converation not found: {conversation_id}")
         await websocket.close(code=4004, reason="Conversation not found")

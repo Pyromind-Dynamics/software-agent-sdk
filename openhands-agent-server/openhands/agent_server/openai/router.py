@@ -13,6 +13,7 @@ from openhands.agent_server.config import Config
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import (
     get_conversation_service,
+    get_current_user_id,
     get_pyromind_jwt_token_from_request,
     is_auth_configured,
     is_session_api_key_valid,
@@ -65,11 +66,16 @@ def check_openai_api_key(
     config: Config = request.app.state.config
     bearer_token = authorization.credentials if authorization else None
     if is_session_api_key_valid(config, session_api_key):
+        request.state.auth_method = "session_api_key"
         return
     if is_session_api_key_valid(config, bearer_token):
+        request.state.auth_method = "session_api_key"
         return
     pyromind_token = get_pyromind_jwt_token_from_request(request)
-    if verify_pyromind_jwt_token(config, pyromind_token) is not None:
+    pyromind_user = verify_pyromind_jwt_token(config, pyromind_token)
+    if pyromind_user is not None:
+        request.state.auth_method = "pyromind_jwt"
+        request.state.current_user = pyromind_user
         return
     if not is_auth_configured(config):
         return
@@ -155,6 +161,7 @@ async def create_chat_completion(
         config=_get_config(request),
         conversation_service=conversation_service,
         reusable_conversation_id=x_openhands_server_conversation_id,
+        user_id=get_current_user_id(request),
         observability_overrides=_parse_observability_overrides(
             span_name=x_openhands_observability_span_name,
             tags=x_openhands_observability_tags,

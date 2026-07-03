@@ -75,6 +75,36 @@ def sample_stored_conversation():
     )
 
 
+def _stored_conversation_for_user(user_id: str | None) -> StoredConversation:
+    return StoredConversation(
+        id=uuid4(),
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=LocalWorkspace(working_dir="workspace/project"),
+        confirmation_policy=NeverConfirm(),
+        initial_message=None,
+        metrics=None,
+        created_at=datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC),
+        updated_at=datetime(2025, 1, 1, 12, 30, 0, tzinfo=UTC),
+        user_id=user_id,
+    )
+
+
+def _mock_event_service_for_stored(
+    stored: StoredConversation,
+    status: ConversationExecutionStatus = ConversationExecutionStatus.IDLE,
+) -> AsyncMock:
+    service = AsyncMock(spec=EventService)
+    service.stored = stored
+    service.get_state.return_value = ConversationState(
+        id=stored.id,
+        agent=stored.agent,
+        workspace=stored.workspace,
+        execution_status=status,
+        confirmation_policy=stored.confirmation_policy,
+    )
+    return service
+
+
 def _create_running_terminal_action(tool_call_id: str = "call_1") -> ActionEvent:
     tool_call = MessageToolCall.from_chat_tool_call(
         ChatCompletionMessageToolCall(
@@ -1046,6 +1076,78 @@ class TestConversationServiceCountConversations:
             conversation_service._event_services[stored_conv.id] = mock_service
 
         assert await conversation_service.count_conversations() == 2
+
+
+class TestConversationServiceUserScoping:
+    @pytest.mark.asyncio
+    async def test_search_conversations_filters_by_user_id(self, conversation_service):
+        user_conversation = _stored_conversation_for_user("42")
+        other_conversation = _stored_conversation_for_user("7")
+        legacy_conversation = _stored_conversation_for_user(None)
+
+        for stored in (user_conversation, other_conversation, legacy_conversation):
+            conversation_service._event_services[stored.id] = (
+                _mock_event_service_for_stored(stored)
+            )
+
+        result = await conversation_service.search_conversations(user_id="42")
+
+        assert [item.id for item in result.items] == [user_conversation.id]
+        assert result.next_page_id is None
+
+    @pytest.mark.asyncio
+    async def test_count_conversations_filters_by_user_id(self, conversation_service):
+        user_conversation = _stored_conversation_for_user("42")
+        other_conversation = _stored_conversation_for_user("7")
+
+        for stored in (user_conversation, other_conversation):
+            conversation_service._event_services[stored.id] = (
+                _mock_event_service_for_stored(stored)
+            )
+
+        assert await conversation_service.count_conversations(user_id="42") == 1
+        assert await conversation_service.count_conversations(user_id="missing") == 0
+
+    @pytest.mark.asyncio
+    async def test_get_conversation_filters_by_user_id(self, conversation_service):
+        stored = _stored_conversation_for_user("42")
+        event_service = _mock_event_service_for_stored(stored)
+        conversation_service._event_services[stored.id] = event_service
+
+        assert (
+            await conversation_service.get_conversation(stored.id, user_id="7") is None
+        )
+        assert (
+            await conversation_service.get_event_service(stored.id, user_id="7") is None
+        )
+
+        result = await conversation_service.get_conversation(stored.id, user_id="42")
+        assert result is not None
+        assert result.id == stored.id
+        assert (
+            await conversation_service.get_event_service(stored.id, user_id="42")
+            is event_service
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_conversation_rejects_existing_other_user(
+        self, conversation_service
+    ):
+        stored = _stored_conversation_for_user("42")
+        event_service = _mock_event_service_for_stored(stored)
+        event_service.is_open.return_value = True
+        conversation_service._event_services[stored.id] = event_service
+
+        request = StartConversationRequest(
+            conversation_id=stored.id,
+            agent=stored.agent,
+            workspace=stored.workspace,
+            confirmation_policy=stored.confirmation_policy,
+            user_id="7",
+        )
+
+        with pytest.raises(PermissionError, match="Conversation not found"):
+            await conversation_service.start_conversation(request)
 
 
 class TestConversationServiceStartConversation:
@@ -2525,7 +2627,7 @@ class TestAutoTitle:
         with patch(self._GENERATE_TITLE_PATH, return_value="✨ Generated Title"):
             subscriber = AutoTitleSubscriber(service=service)
             await subscriber(self._user_message_event())
-            await asyncio.sleep(0)
+            await self._drain_title_task(lambda: service.stored.title is not None)
 
         assert service.stored.title == "✨ Generated Title"
         service.save_meta.assert_called_once()

@@ -382,6 +382,12 @@ def _compose_webhook_conversation_info(
     return _compose_conversation_info(stored, state)
 
 
+def _event_service_matches_user(
+    event_service: EventService, user_id: str | None
+) -> bool:
+    return user_id is None or event_service.stored.user_id == user_id
+
+
 def _update_state_tags_sync(
     state: ConversationState, tags: dict[str, str]
 ) -> ConversationState:
@@ -453,22 +459,28 @@ class ConversationService:
     _lease_renewal_task: asyncio.Task | None = field(default=None, init=False)
     _run_executor: ThreadPoolExecutor | None = field(default=None, init=False)
 
-    async def get_conversation(self, conversation_id: UUID) -> ConversationInfo | None:
+    async def get_conversation(
+        self, conversation_id: UUID, user_id: str | None = None
+    ) -> ConversationInfo | None:
         if self._event_services is None:
             raise ValueError("inactive_service")
         event_service = self._event_services.get(conversation_id)
-        if event_service is None:
+        if event_service is None or not _event_service_matches_user(
+            event_service, user_id
+        ):
             return None
         state = await event_service.get_state()
         return _compose_conversation_info(event_service.stored, state)
 
     async def get_acp_conversation(
-        self, conversation_id: UUID
+        self, conversation_id: UUID, user_id: str | None = None
     ) -> ConversationInfo | None:
         if self._event_services is None:
             raise ValueError("inactive_service")
         event_service = self._event_services.get(conversation_id)
-        if event_service is None:
+        if event_service is None or not _event_service_matches_user(
+            event_service, user_id
+        ):
             return None
         state = await event_service.get_state()
         return _compose_conversation_info(event_service.stored, state)
@@ -479,12 +491,14 @@ class ConversationService:
         limit: int = 100,
         execution_status: ConversationExecutionStatus | None = None,
         sort_order: ConversationSortOrder = ConversationSortOrder.CREATED_AT_DESC,
+        user_id: str | None = None,
     ) -> ConversationPage:
         items, next_page_id = await self._search_conversations(
             page_id=page_id,
             limit=limit,
             execution_status=execution_status,
             sort_order=sort_order,
+            user_id=user_id,
         )
         return ConversationPage(
             items=items,
@@ -497,12 +511,14 @@ class ConversationService:
         limit: int = 100,
         execution_status: ConversationExecutionStatus | None = None,
         sort_order: ConversationSortOrder = ConversationSortOrder.CREATED_AT_DESC,
+        user_id: str | None = None,
     ) -> ConversationPage:
         items, next_page_id = await self._search_conversations(
             page_id=page_id,
             limit=limit,
             execution_status=execution_status,
             sort_order=sort_order,
+            user_id=user_id,
         )
         return ConversationPage(
             items=items,
@@ -515,6 +531,7 @@ class ConversationService:
         limit: int,
         execution_status: ConversationExecutionStatus | None,
         sort_order: ConversationSortOrder,
+        user_id: str | None,
     ) -> tuple[list[ConversationInfo], str | None]:
         if self._event_services is None:
             raise ValueError("inactive_service")
@@ -522,6 +539,8 @@ class ConversationService:
         # Collect all conversations with their info
         all_conversations = []
         for id, event_service in self._event_services.items():
+            if not _event_service_matches_user(event_service, user_id):
+                continue
             state = await event_service.get_state()
             conversation_info = _compose_conversation_info(event_service.stored, state)
             # Apply status filter if provided
@@ -569,12 +588,17 @@ class ConversationService:
     async def count_conversations(
         self,
         execution_status: ConversationExecutionStatus | None = None,
+        user_id: str | None = None,
     ) -> int:
-        return await self._count_conversations(execution_status=execution_status)
+        return await self._count_conversations(
+            execution_status=execution_status,
+            user_id=user_id,
+        )
 
     async def _count_conversations(
         self,
         execution_status: ConversationExecutionStatus | None,
+        user_id: str | None,
     ) -> int:
         """Count conversations matching the given filters."""
         if self._event_services is None:
@@ -582,6 +606,8 @@ class ConversationService:
 
         count = 0
         for event_service in self._event_services.values():
+            if not _event_service_matches_user(event_service, user_id):
+                continue
             state = await event_service.get_state()
 
             # Apply status filter if provided
@@ -596,24 +622,24 @@ class ConversationService:
         return count
 
     async def batch_get_conversations(
-        self, conversation_ids: list[UUID]
+        self, conversation_ids: list[UUID], user_id: str | None = None
     ) -> list[ConversationInfo | None]:
         """Given a list of ids, get a batch of conversation info, returning
         None for any that were not found."""
         results = await asyncio.gather(
             *[
-                self.get_conversation(conversation_id)
+                self.get_conversation(conversation_id, user_id=user_id)
                 for conversation_id in conversation_ids
             ]
         )
         return results
 
     async def batch_get_acp_conversations(
-        self, conversation_ids: list[UUID]
+        self, conversation_ids: list[UUID], user_id: str | None = None
     ) -> list[ConversationInfo | None]:
         results = await asyncio.gather(
             *[
-                self.get_conversation(conversation_id)
+                self.get_conversation(conversation_id, user_id=user_id)
                 for conversation_id in conversation_ids
             ]
         )
@@ -670,12 +696,15 @@ class ConversationService:
             raise ValueError("inactive_service")
         conversation_id = request.conversation_id or uuid4()
         existing_event_service = self._event_services.get(conversation_id)
-        if existing_event_service and existing_event_service.is_open():
-            state = await existing_event_service.get_state()
-            conversation_info = _compose_conversation_info(
-                existing_event_service.stored, state
-            )
-            return conversation_info, False
+        if existing_event_service:
+            if not _event_service_matches_user(existing_event_service, request.user_id):
+                raise PermissionError(f"Conversation not found: {conversation_id}")
+            if existing_event_service.is_open():
+                state = await existing_event_service.get_state()
+                conversation_info = _compose_conversation_info(
+                    existing_event_service.stored, state
+                )
+                return conversation_info, False
 
         # Profile resolution must happen before _prepare_request_workspace (which
         # asserts request.agent is not None) and before model_dump so the resolved
@@ -814,10 +843,12 @@ class ConversationService:
 
         return conversation_info, True
 
-    async def pause_conversation(self, conversation_id: UUID) -> bool:
+    async def pause_conversation(
+        self, conversation_id: UUID, user_id: str | None = None
+    ) -> bool:
         if self._event_services is None:
             raise ValueError("inactive_service")
-        event_service = self._event_services.get(conversation_id)
+        event_service = await self.get_event_service(conversation_id, user_id=user_id)
         if event_service:
             await event_service.pause()
             # Notify conversation webhooks about the paused conversation
@@ -828,7 +859,9 @@ class ConversationService:
             await self._notify_conversation_webhooks(conversation_info)
         return bool(event_service)
 
-    async def interrupt_conversation(self, conversation_id: UUID) -> bool:
+    async def interrupt_conversation(
+        self, conversation_id: UUID, user_id: str | None = None
+    ) -> bool:
         """Immediately cancel an in-flight LLM call for a conversation.
 
         Unlike :meth:`pause_conversation`, which waits for the current
@@ -837,7 +870,7 @@ class ConversationService:
         """
         if self._event_services is None:
             raise ValueError("inactive_service")
-        event_service = self._event_services.get(conversation_id)
+        event_service = await self.get_event_service(conversation_id, user_id=user_id)
         if event_service:
             await event_service.interrupt()
             state = await event_service.get_state()
@@ -847,18 +880,28 @@ class ConversationService:
             await self._notify_conversation_webhooks(conversation_info)
         return bool(event_service)
 
-    async def resume_conversation(self, conversation_id: UUID) -> bool:
+    async def resume_conversation(
+        self, conversation_id: UUID, user_id: str | None = None
+    ) -> bool:
         if self._event_services is None:
             raise ValueError("inactive_service")
-        event_service = self._event_services.get(conversation_id)
+        event_service = await self.get_event_service(conversation_id, user_id=user_id)
         if event_service:
             await event_service.start()
         return bool(event_service)
 
-    async def delete_conversation(self, conversation_id: UUID) -> bool:
+    async def delete_conversation(
+        self, conversation_id: UUID, user_id: str | None = None
+    ) -> bool:
         if self._event_services is None:
             raise ValueError("inactive_service")
-        event_service = self._event_services.pop(conversation_id, None)
+        event_service = self._event_services.get(conversation_id)
+        if event_service is not None and not _event_service_matches_user(
+            event_service, user_id
+        ):
+            event_service = None
+        if event_service is not None:
+            self._event_services.pop(conversation_id, None)
         if event_service:
             # Notify conversation webhooks about the stopped conversation before closing
             try:
@@ -897,7 +940,10 @@ class ConversationService:
         return False
 
     async def update_conversation(
-        self, conversation_id: UUID, request: UpdateConversationRequest
+        self,
+        conversation_id: UUID,
+        request: UpdateConversationRequest,
+        user_id: str | None = None,
     ) -> bool:
         """Update conversation metadata.
 
@@ -910,7 +956,7 @@ class ConversationService:
         """
         if self._event_services is None:
             raise ValueError("inactive_service")
-        event_service = self._event_services.get(conversation_id)
+        event_service = await self.get_event_service(conversation_id, user_id=user_id)
         if event_service is None:
             return False
 
@@ -949,18 +995,29 @@ class ConversationService:
         )
         return True
 
-    async def get_event_service(self, conversation_id: UUID) -> EventService | None:
+    async def get_event_service(
+        self, conversation_id: UUID, user_id: str | None = None
+    ) -> EventService | None:
         if self._event_services is None:
             raise ValueError("inactive_service")
-        return self._event_services.get(conversation_id)
+        event_service = self._event_services.get(conversation_id)
+        if event_service is None or not _event_service_matches_user(
+            event_service, user_id
+        ):
+            return None
+        return event_service
 
     async def generate_conversation_title(
-        self, conversation_id: UUID, max_length: int = 50, llm: LLM | None = None
+        self,
+        conversation_id: UUID,
+        max_length: int = 50,
+        llm: LLM | None = None,
+        user_id: str | None = None,
     ) -> str | None:
         """Generate a title for the conversation using LLM."""
         if self._event_services is None:
             raise ValueError("inactive_service")
-        event_service = self._event_services.get(conversation_id)
+        event_service = await self.get_event_service(conversation_id, user_id=user_id)
         if event_service is None:
             return None
 
@@ -968,11 +1025,13 @@ class ConversationService:
         title = await event_service.generate_title(llm=llm, max_length=max_length)
         return title
 
-    async def ask_agent(self, conversation_id: UUID, question: str) -> str | None:
+    async def ask_agent(
+        self, conversation_id: UUID, question: str, user_id: str | None = None
+    ) -> str | None:
         """Ask the agent a simple question without affecting conversation state."""
         if self._event_services is None:
             raise ValueError("inactive_service")
-        event_service = self._event_services.get(conversation_id)
+        event_service = await self.get_event_service(conversation_id, user_id=user_id)
         if event_service is None:
             return None
 
@@ -980,11 +1039,11 @@ class ConversationService:
         response = await event_service.ask_agent(question)
         return response
 
-    async def condense(self, conversation_id: UUID) -> bool:
+    async def condense(self, conversation_id: UUID, user_id: str | None = None) -> bool:
         """Force condensation of the conversation history."""
         if self._event_services is None:
             raise ValueError("inactive_service")
-        event_service = self._event_services.get(conversation_id)
+        event_service = await self.get_event_service(conversation_id, user_id=user_id)
         if event_service is None:
             return False
 
@@ -1000,6 +1059,7 @@ class ConversationService:
         title: str | None = None,
         tags: dict[str, str] | None = None,
         reset_metrics: bool = True,
+        user_id: str | None = None,
     ) -> ConversationInfo | None:
         """Fork an existing conversation, deep-copying its event history.
 
@@ -1020,7 +1080,7 @@ class ConversationService:
         if fork_id is not None and fork_id in self._event_services:
             raise ValueError(f"Conversation with id {fork_id} already exists")
 
-        source_service = self._event_services.get(source_id)
+        source_service = await self.get_event_service(source_id, user_id=user_id)
         if source_service is None:
             return None
 
@@ -1060,6 +1120,8 @@ class ConversationService:
             fork_overrides["metrics"] = None
         if tags is not None:
             fork_overrides["tags"] = tags
+        if user_id is not None:
+            fork_overrides["user_id"] = user_id
         fork_stored = source_service.stored.model_copy(update=fork_overrides)
         # If the service fails to start, clean up the orphaned persistence
         # directory so we don't leave stale state on disk.
