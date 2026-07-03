@@ -20,6 +20,11 @@ from openhands.agent_server.models import (
     StoredConversation,
 )
 from openhands.agent_server.pub_sub import PubSub, Subscriber
+from openhands.agent_server.pyromind_constants import (
+    PYROMIND_APP_TAG_KEY,
+    PYROMIND_APP_TAG_VALUE,
+    PYROMIND_WORKFLOW_EVENT_KEY,
+)
 from openhands.sdk import LLM, AgentBase, Event, Message, TextContent, get_logger
 from openhands.sdk.agent import ACPAgent
 from openhands.sdk.conversation.base import BaseConversation
@@ -60,6 +65,11 @@ from openhands.sdk.security.confirmation_policy import ConfirmationPolicyBase
 from openhands.sdk.utils.async_utils import AsyncCallbackWrapper
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
+from openhands.tools.workflow.definition import (
+    PYROMIND_WORKFLOW_DIRTY_KEY,
+    PYROMIND_WORKFLOW_EMITTED_KEY,
+)
+from openhands.tools.workflow.impl import read_workflow_file
 
 
 LEASE_RENEW_INTERVAL_SECONDS = 15.0
@@ -438,6 +448,61 @@ class EventService:
         with self._conversation._state as state:
             if state.execution_status != ConversationExecutionStatus.ERROR:
                 state.execution_status = ConversationExecutionStatus.ERROR
+
+    def _is_pyromind_conversation(self) -> bool:
+        return (
+            self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE
+        )
+
+    def _clear_pyromind_workflow_dirty_sync(self) -> None:
+        if not self._conversation:
+            return
+        with self._conversation._state as state:
+            if state.agent_state.get(PYROMIND_WORKFLOW_DIRTY_KEY) is True:
+                state.agent_state = {
+                    **state.agent_state,
+                    PYROMIND_WORKFLOW_DIRTY_KEY: False,
+                }
+
+    def _emit_pyromind_workflow_if_dirty_sync(self) -> bool:
+        """Emit workflow.py once after a Pyromind run edited it."""
+        conversation = self._conversation
+        if not conversation or not self._is_pyromind_conversation():
+            return False
+
+        with conversation._state as state:
+            if state.agent_state.get(PYROMIND_WORKFLOW_DIRTY_KEY) is not True:
+                return False
+            already_emitted = bool(
+                state.agent_state.get(PYROMIND_WORKFLOW_EMITTED_KEY)
+            )
+
+        working_dir = Path(conversation.workspace.working_dir)
+        workflow_path = working_dir / "workflow.py"
+        if not workflow_path.is_file():
+            self._clear_pyromind_workflow_dirty_sync()
+            return False
+
+        summary = "Updated workflow.py" if already_emitted else "Created workflow.py"
+        observation = read_workflow_file(working_dir, summary=summary)
+        if not observation.exists:
+            self._clear_pyromind_workflow_dirty_sync()
+            return False
+
+        event = ConversationStateUpdateEvent(
+            key=PYROMIND_WORKFLOW_EVENT_KEY,
+            value=observation.model_dump(mode="json"),
+        )
+        with conversation._state as state:
+            if state.agent_state.get(PYROMIND_WORKFLOW_DIRTY_KEY) is not True:
+                return False
+            conversation._on_event(event)
+            state.agent_state = {
+                **state.agent_state,
+                PYROMIND_WORKFLOW_DIRTY_KEY: False,
+                PYROMIND_WORKFLOW_EMITTED_KEY: True,
+            }
+        return True
 
     def _create_state_update_event_sync(self) -> ConversationStateUpdateEvent:
         if not self._conversation:
@@ -978,6 +1043,15 @@ class EventService:
                         await loop.run_in_executor(
                             None, self._callback_wrapper.wait_for_pending, 30.0
                         )
+
+                    if not self._rerun_requested:
+                        workflow_emitted = await loop.run_in_executor(
+                            None, self._emit_pyromind_workflow_if_dirty_sync
+                        )
+                        if workflow_emitted and self._callback_wrapper:
+                            await loop.run_in_executor(
+                                None, self._callback_wrapper.wait_for_pending, 30.0
+                            )
 
                     # Clear task reference and publish state update
                     self._run_task = None

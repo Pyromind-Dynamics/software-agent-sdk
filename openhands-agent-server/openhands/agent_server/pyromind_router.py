@@ -17,6 +17,10 @@ from pydantic import BaseModel, Field
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import get_conversation_service
 from openhands.agent_server.models import ConversationInfo
+from openhands.agent_server.pyromind_constants import (
+    PYROMIND_APP_TAG_KEY,
+    PYROMIND_APP_TAG_VALUE,
+)
 from openhands.sdk import LLM, AgentContext, TextContent, Tool
 from openhands.sdk.conversation.request import (
     SendMessageRequest,
@@ -26,7 +30,6 @@ from openhands.sdk.skills import Skill, load_skills_from_dir
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
-from openhands.tools.workflow import PublishWorkflowTool
 
 
 logger = logging.getLogger(__name__)
@@ -76,9 +79,9 @@ changes. If you use `file_editor` for this file, set its `path` to `workflow.py`
 the runtime resolves workspace-relative paths to host-absolute paths. Do not
 hand-author long absolute paths, and do not use `/workspace/...` or
 `workspace/conversations/...` as a `file_editor.path` for `workflow.py`.
-After creating or modifying `workflow.py`, call `publish_workflow`. Do not say
-the workflow has been generated unless a tool call actually created or modified
-`workflow.py`.
+After creating or modifying `workflow.py`, stop normally; the server sends
+the workflow to the frontend once the run finishes. Do not say the workflow has
+been generated unless a tool call actually created or modified `workflow.py`.
 
 - If a listed skill fits the request (for example, generating a workflow), \
 invoke that skill via `invoke_skill` first, before searching the knowledge base.
@@ -251,7 +254,6 @@ async def create_pyromind_conversation(
         extra_tools=[
             Tool(name="grep"),
             Tool(name="file_editor"),
-            Tool(name=PublishWorkflowTool.name),
         ],
     )
 
@@ -273,6 +275,7 @@ async def create_pyromind_conversation(
         workspace=workspace,
         conversation_id=conversation_id,
         initial_message=initial_message,
+        tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
     )
 
     # 8. Delegate to conversation service

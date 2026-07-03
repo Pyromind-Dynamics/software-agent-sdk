@@ -4,6 +4,10 @@ import pytest
 from fastapi import Response, status
 
 from openhands.agent_server.models import ConversationInfo
+from openhands.agent_server.pyromind_constants import (
+    PYROMIND_APP_TAG_KEY,
+    PYROMIND_APP_TAG_VALUE,
+)
 from openhands.agent_server.pyromind_router import (
     PyromindCreateConversationRequest,
     PyromindLLMConfig,
@@ -11,6 +15,9 @@ from openhands.agent_server.pyromind_router import (
 )
 from openhands.sdk.conversation.request import StartConversationRequest
 from openhands.sdk.conversation.state import ConversationExecutionStatus
+
+
+_REMOVED_WORKFLOW_TOOL = "publish" + "_workflow"
 
 
 class _FakeConversationService:
@@ -63,4 +70,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     tool_names = {tool.name for tool in service.start_request.agent.tools}
     assert "grep" in tool_names
     assert "file_editor" in tool_names
-    assert "publish_workflow" in tool_names
+    assert _REMOVED_WORKFLOW_TOOL not in tool_names
+    assert service.start_request.tags == {
+        PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE
+    }

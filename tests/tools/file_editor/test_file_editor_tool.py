@@ -19,6 +19,27 @@ from openhands.tools.file_editor import (
     FileEditorObservation,
     FileEditorTool,
 )
+from openhands.tools.workflow.definition import PYROMIND_WORKFLOW_DIRTY_KEY
+
+
+class _DirtyState:
+    def __init__(self) -> None:
+        self.agent_state: dict[str, object] = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def owned(self) -> bool:
+        return True
+
+
+class _DirtyConversation:
+    def __init__(self) -> None:
+        self._state = _DirtyState()
+        self._step_holds_state_lock = False
 
 
 def _create_test_conv_state(temp_dir: str) -> ConversationState:
@@ -110,11 +131,13 @@ def test_file_editor_executor_resolves_workspace_relative_path(tmp_path):
     workflow.write_text("# workflow: Demo\nlimit = 10\n", encoding="utf-8")
 
     executor = FileEditorExecutor(workspace_root=str(tmp_path))
+    conversation = _DirtyConversation()
 
     view_result = executor(FileEditorAction(command="view", path="workflow.py"))
     assert not view_result.is_error
     assert view_result.path == str(workflow.resolve())
     assert "limit = 10" in view_result.text
+    assert PYROMIND_WORKFLOW_DIRTY_KEY not in conversation._state.agent_state
 
     edit_result = executor(
         FileEditorAction(
@@ -122,15 +145,33 @@ def test_file_editor_executor_resolves_workspace_relative_path(tmp_path):
             path="workflow.py",
             old_str="limit = 10",
             new_str="limit = 20",
-        )
+        ),
+        conversation=conversation,
     )
     assert not edit_result.is_error
     assert edit_result.path == str(workflow.resolve())
-    assert edit_result.published_workflow is not None
-    assert edit_result.published_workflow.workflow == "# workflow: Demo\nlimit = 20\n"
-    assert edit_result.published_workflow.name == "Demo"
-    assert edit_result.published_workflow.summary == "Updated workflow.py"
+    assert conversation._state.agent_state[PYROMIND_WORKFLOW_DIRTY_KEY] is True
     assert workflow.read_text(encoding="utf-8") == "# workflow: Demo\nlimit = 20\n"
+
+
+def test_file_editor_executor_non_workflow_edit_does_not_mark_dirty(tmp_path):
+    target = tmp_path / "notes.py"
+    target.write_text("value = 10\n", encoding="utf-8")
+    executor = FileEditorExecutor(workspace_root=str(tmp_path))
+    conversation = _DirtyConversation()
+
+    result = executor(
+        FileEditorAction(
+            command="str_replace",
+            path="notes.py",
+            old_str="10",
+            new_str="20",
+        ),
+        conversation=conversation,
+    )
+
+    assert not result.is_error
+    assert PYROMIND_WORKFLOW_DIRTY_KEY not in conversation._state.agent_state
 
 
 def test_file_editor_executor_resolves_cwd_relative_conversation_path(

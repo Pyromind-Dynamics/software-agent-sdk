@@ -14,17 +14,14 @@ from openhands.sdk.logger import get_logger
 from openhands.sdk.tool import ToolExecutor
 from openhands.tools.task.manager import TaskManager
 from openhands.tools.workflow.definition import (
-    PublishedWorkflowObservation,
+    WorkflowFileObservation,
     WorkflowObservation,
 )
 
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation.impl.local_conversation import LocalConversation
-    from openhands.tools.workflow.definition import (
-        PublishWorkflowAction,
-        WorkflowAction,
-    )
+    from openhands.tools.workflow.definition import WorkflowAction
 
 logger = get_logger(__name__)
 
@@ -545,55 +542,47 @@ class WorkflowExecutor(ToolExecutor["WorkflowAction", WorkflowObservation]):
             context.close()
 
 
-class PublishWorkflowExecutor(
-    ToolExecutor["PublishWorkflowAction", PublishedWorkflowObservation]
-):
-    """Executor that reads and publishes the conversation's workflow.py file."""
-
-    def __init__(self, working_dir: str):
-        self.working_dir = Path(working_dir).resolve()
-        self.workflow_path = self.working_dir / "workflow.py"
-
-    def __call__(
-        self,
-        action: PublishWorkflowAction,
-        conversation: LocalConversation | None = None,  # noqa: ARG002
-    ) -> PublishedWorkflowObservation:
-        path = str(self.workflow_path)
-        if not self.workflow_path.is_file():
-            return PublishedWorkflowObservation.from_text(
-                text=f"No workflow.py found at {path}",
-                workflow="",
-                path=path,
-                name=None,
-                summary=action.summary,
-                exists=False,
-            )
-
-        try:
-            workflow = self.workflow_path.read_text(encoding="utf-8")
-        except OSError as e:
-            return PublishedWorkflowObservation.from_text(
-                text=f"Failed to read workflow.py: {e}",
-                workflow="",
-                path=path,
-                name=None,
-                summary=action.summary,
-                exists=False,
-                is_error=True,
-            )
-
-        name = _parse_workflow_name(workflow)
-        line_count = len(workflow.splitlines())
-        label = name or self.workflow_path.name
-        return PublishedWorkflowObservation.from_text(
-            text=f"Published {label} ({line_count} lines).",
-            workflow=workflow,
+def read_workflow_file(
+    working_dir: str | Path,
+    summary: str | None = None,
+) -> WorkflowFileObservation:
+    """Read workflow.py from a workspace and return a UI payload."""
+    workflow_path = Path(working_dir).resolve() / "workflow.py"
+    path = str(workflow_path)
+    if not workflow_path.is_file():
+        return WorkflowFileObservation.from_text(
+            text=f"No workflow.py found at {path}",
+            workflow="",
             path=path,
-            name=name,
-            summary=action.summary,
-            exists=True,
+            name=None,
+            summary=summary,
+            exists=False,
         )
+
+    try:
+        workflow = workflow_path.read_text(encoding="utf-8")
+    except OSError as e:
+        return WorkflowFileObservation.from_text(
+            text=f"Failed to read workflow.py: {e}",
+            workflow="",
+            path=path,
+            name=None,
+            summary=summary,
+            exists=False,
+            is_error=True,
+        )
+
+    name = _parse_workflow_name(workflow)
+    line_count = len(workflow.splitlines())
+    label = name or workflow_path.name
+    return WorkflowFileObservation.from_text(
+        text=f"Workflow {label} ({line_count} lines).",
+        workflow=workflow,
+        path=path,
+        name=name,
+        summary=summary,
+        exists=True,
+    )
 
 
 def _parse_workflow_name(workflow: str) -> str | None:

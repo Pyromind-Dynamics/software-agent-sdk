@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import nullcontext
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from pydantic import Field
 
@@ -21,6 +22,30 @@ from openhands.sdk.tool import (
 if TYPE_CHECKING:
     from openhands.sdk.conversation.state import ConversationState
     from openhands.tools.workflow.impl import WorkflowExecutor
+
+
+PYROMIND_WORKFLOW_DIRTY_KEY: Final[str] = "pyromind_workflow_dirty"
+PYROMIND_WORKFLOW_EMITTED_KEY: Final[str] = "pyromind_workflow_emitted"
+
+
+def mark_pyromind_workflow_dirty(conversation: Any | None) -> None:
+    """Record that workflow.py changed during this run."""
+    if conversation is None:
+        return
+
+    state = getattr(conversation, "_state", None)
+    if state is None:
+        return
+
+    skip_lock = bool(getattr(conversation, "_step_holds_state_lock", False))
+    if skip_lock and hasattr(state, "owned"):
+        skip_lock = not state.owned()
+    lock = nullcontext() if skip_lock else state
+    with lock:
+        state.agent_state = {
+            **state.agent_state,
+            PYROMIND_WORKFLOW_DIRTY_KEY: True,
+        }
 
 
 class WorkflowAction(Action):
@@ -53,31 +78,20 @@ class WorkflowObservation(Observation):
     )
 
 
-class PublishWorkflowAction(Action):
-    """Schema for publishing the current conversation workflow DSL."""
-
-    summary: str | None = Field(
-        default=None,
-        description="Short note describing the workflow change being published.",
-    )
-
-
-class PublishedWorkflowObservation(Observation):
+class WorkflowFileObservation(Observation):
     """Observation containing the current workflow.py content."""
 
     workflow: str = Field(description="Complete workflow.py source.")
-    path: str = Field(description="Absolute path to the published workflow file.")
+    path: str = Field(description="Absolute path to the workflow file.")
     name: str | None = Field(
         default=None,
         description="Workflow name parsed from a leading '# workflow:' header.",
     )
     summary: str | None = Field(
         default=None,
-        description="Short note supplied by the publish action.",
+        description="Short note describing the workflow change.",
     )
-    exists: bool = Field(
-        description="Whether workflow.py existed when publish_workflow ran."
-    )
+    exists: bool = Field(description="Whether workflow.py existed.")
 
     @property
     def to_llm_content(self) -> list[TextContent | ImageContent]:
@@ -87,7 +101,7 @@ class PublishedWorkflowObservation(Observation):
             return [TextContent(text=f"No workflow.py found at {self.path}")]
         line_count = len(self.workflow.splitlines())
         label = self.name or Path(self.path).name
-        return [TextContent(text=f"Published {label} ({line_count} lines).")]
+        return [TextContent(text=f"Workflow {label} ({line_count} lines).")]
 
 
 _WORKFLOW_DESCRIPTION: Final[
@@ -220,46 +234,5 @@ class WorkflowToolSet(ToolDefinition[WorkflowAction, WorkflowObservation]):
         return WorkflowTool.create(executor=WorkflowExecutor())
 
 
-_PUBLISH_WORKFLOW_DESCRIPTION: Final[
-    str
-] = """Publish the current Pyromind workflow file to the frontend.
-
-Use this after creating or modifying `workflow.py` in the current working
-directory. The tool reads `workflow.py` and streams its full contents to the
-frontend as a workflow observation. It does not modify files.
-"""
-
-
-class PublishWorkflowTool(
-    ToolDefinition[PublishWorkflowAction, PublishedWorkflowObservation]
-):
-    """Tool that publishes the current conversation's workflow.py file."""
-
-    @classmethod
-    def create(
-        cls,
-        conv_state: ConversationState,
-    ) -> Sequence[PublishWorkflowTool]:
-        from openhands.tools.workflow.impl import PublishWorkflowExecutor
-
-        working_dir = conv_state.workspace.working_dir
-        return [
-            cls(
-                description=_PUBLISH_WORKFLOW_DESCRIPTION,
-                action_type=PublishWorkflowAction,
-                observation_type=PublishedWorkflowObservation,
-                annotations=ToolAnnotations(
-                    title="publish_workflow",
-                    readOnlyHint=True,
-                    destructiveHint=False,
-                    idempotentHint=True,
-                    openWorldHint=False,
-                ),
-                executor=PublishWorkflowExecutor(working_dir=working_dir),
-            )
-        ]
-
-
 register_tool(WorkflowToolSet.name, WorkflowToolSet)
 register_tool(WorkflowTool.name, WorkflowTool)
-register_tool(PublishWorkflowTool.name, PublishWorkflowTool)

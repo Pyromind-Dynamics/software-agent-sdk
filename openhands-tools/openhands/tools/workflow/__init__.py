@@ -1,19 +1,17 @@
 """Dynamic workflow tool for sub-agent orchestration."""
 
 from openhands.tools.workflow.definition import (
-    PublishedWorkflowObservation,
-    PublishWorkflowAction,
-    PublishWorkflowTool,
     WorkflowAction,
+    WorkflowFileObservation,
     WorkflowObservation,
     WorkflowTool,
     WorkflowToolSet,
 )
 from openhands.tools.workflow.impl import (
-    PublishWorkflowExecutor,
     WorkflowContext,
     WorkflowExecutor,
     WorkflowScriptError,
+    read_workflow_file,
 )
 
 
@@ -21,12 +19,10 @@ __all__ = [
     "WorkflowAction",
     "WorkflowContext",
     "WorkflowExecutor",
+    "WorkflowFileObservation",
     "WorkflowObservation",
     "WorkflowScriptError",
     "WorkflowTool",
     "WorkflowToolSet",
-    "PublishedWorkflowObservation",
-    "PublishWorkflowAction",
-    "PublishWorkflowExecutor",
-    "PublishWorkflowTool",
+    "read_workflow_file",
 ]

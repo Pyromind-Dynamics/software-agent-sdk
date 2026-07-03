@@ -8,6 +8,9 @@ from openhands.agent_server.pyromind_router import (
 )
 
 
+_REMOVED_WORKFLOW_TOOL = "publish" + "_workflow"
+
+
 def test_load_agent_skills_missing_dir_returns_empty() -> None:
     assert _load_agent_skills("/nonexistent/skills/path") == []
 
@@ -58,5 +61,7 @@ def test_kb_instructions_format_injects_path() -> None:
     assert "nodes/<NodeType>/<NodeType>.md" in rendered
     assert "dataset_processing_workflow.py" in rendered
     assert "docs-mintlify/zh/docs" not in rendered
+    assert _REMOVED_WORKFLOW_TOOL not in rendered
+    assert "server sends" in rendered
     # Skill-first guidance must be present.
     assert "invoke_skill" in rendered

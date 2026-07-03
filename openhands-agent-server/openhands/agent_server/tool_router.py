@@ -10,7 +10,6 @@ from openhands.tools.preset.default import (
 )
 from openhands.tools.preset.gemini import register_gemini_tools
 from openhands.tools.preset.planning import register_planning_tools
-from openhands.tools.workflow import PublishWorkflowTool
 
 
 tool_router = APIRouter(prefix="/tools", tags=["Tools"])
@@ -22,9 +21,6 @@ register_planning_tools()
 # conversations can be deserialized on resume; otherwise the ApplyPatchTool
 # kind is unknown to the ToolDefinition discriminated union.
 register_codex_tools(enable_browser=True)
-# Register Pyromind workflow publishing at startup so persisted
-# PublishWorkflowAction / PublishedWorkflowObservation events can be restored.
-_ = PublishWorkflowTool
 
 
 # Tool listing

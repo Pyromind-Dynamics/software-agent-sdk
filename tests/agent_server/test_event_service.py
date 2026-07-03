@@ -23,6 +23,11 @@ from openhands.agent_server.models import (
     StoredConversation,
 )
 from openhands.agent_server.pub_sub import Subscriber
+from openhands.agent_server.pyromind_constants import (
+    PYROMIND_APP_TAG_KEY,
+    PYROMIND_APP_TAG_VALUE,
+    PYROMIND_WORKFLOW_EVENT_KEY,
+)
 from openhands.sdk import LLM, Agent, AgentBase, Conversation, Message
 from openhands.sdk.agent import ACPAgent
 from openhands.sdk.conversation.event_store import EventLog
@@ -37,6 +42,7 @@ from openhands.sdk.conversation.state import (
     ConversationState,
 )
 from openhands.sdk.event import AgentErrorEvent, Event
+from openhands.sdk.event.base import LLMConvertibleEvent
 from openhands.sdk.event.conversation_state import ConversationStateUpdateEvent
 from openhands.sdk.event.llm_convertible import (
     ActionEvent,
@@ -49,6 +55,11 @@ from openhands.sdk.llm import MessageToolCall, TextContent
 from openhands.sdk.security.confirmation_policy import NeverConfirm
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.terminal import TerminalAction, TerminalObservation
+from openhands.tools.workflow.definition import (
+    PYROMIND_WORKFLOW_DIRTY_KEY,
+    PYROMIND_WORKFLOW_EMITTED_KEY,
+    WorkflowFileObservation,
+)
 from tests.agent_server.stress.scripts import (
     SlowTestLLM,
     start_conversation_with_test_llm,
@@ -179,6 +190,127 @@ def _attach_event_log(event_service, event_log: EventLog) -> None:
     state.events = event_log
     conversation._state = state
     event_service._conversation = conversation
+
+
+class _WorkflowEmitState:
+    def __init__(self, agent_state: dict[str, object]) -> None:
+        self.agent_state = agent_state
+        self.events: list[Event] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+class _WorkflowEmitConversation:
+    def __init__(self, working_dir: Path, agent_state: dict[str, object]) -> None:
+        self.workspace = LocalWorkspace(working_dir=str(working_dir))
+        self._state = _WorkflowEmitState(agent_state)
+
+    def _on_event(self, event: Event) -> None:
+        self._state.events.append(event)
+
+
+def _workflow_event_service(
+    tmp_path: Path,
+    *,
+    pyromind: bool,
+    agent_state: dict[str, object],
+) -> EventService:
+    tags = {PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE} if pyromind else {}
+    stored = StoredConversation(
+        id=uuid4(),
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=LocalWorkspace(working_dir=str(tmp_path)),
+        tags=tags,
+    )
+    service = EventService(stored=stored, conversations_dir=tmp_path / "conversations")
+    service._conversation = _WorkflowEmitConversation(tmp_path, agent_state)
+    return service
+
+
+def test_emit_pyromind_workflow_if_dirty_emits_event_and_clears_flag(tmp_path):
+    workflow = tmp_path / "workflow.py"
+    workflow.write_text("# workflow: Demo\nlimit = 20\n", encoding="utf-8")
+    agent_state: dict[str, object] = {PYROMIND_WORKFLOW_DIRTY_KEY: True}
+    service = _workflow_event_service(
+        tmp_path,
+        pyromind=True,
+        agent_state=agent_state,
+    )
+
+    emitted = service._emit_pyromind_workflow_if_dirty_sync()
+
+    assert emitted is True
+    assert service._conversation is not None
+    events = service._conversation._state.events
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, ConversationStateUpdateEvent)
+    assert not isinstance(event, LLMConvertibleEvent)
+    assert event.key == PYROMIND_WORKFLOW_EVENT_KEY
+    observation = WorkflowFileObservation.model_validate(event.value)
+    assert observation.workflow == "# workflow: Demo\nlimit = 20\n"
+    assert observation.name == "Demo"
+    assert observation.summary == "Created workflow.py"
+    assert (
+        service._conversation._state.agent_state[PYROMIND_WORKFLOW_DIRTY_KEY]
+        is False
+    )
+    assert (
+        service._conversation._state.agent_state[PYROMIND_WORKFLOW_EMITTED_KEY]
+        is True
+    )
+
+
+def test_emit_pyromind_workflow_if_not_dirty_does_nothing(tmp_path):
+    (tmp_path / "workflow.py").write_text("# workflow: Demo\n", encoding="utf-8")
+    service = _workflow_event_service(tmp_path, pyromind=True, agent_state={})
+
+    emitted = service._emit_pyromind_workflow_if_dirty_sync()
+
+    assert emitted is False
+    assert service._conversation is not None
+    assert service._conversation._state.events == []
+    assert PYROMIND_WORKFLOW_DIRTY_KEY not in service._conversation._state.agent_state
+
+
+def test_emit_pyromind_workflow_if_missing_file_clears_dirty(tmp_path):
+    agent_state: dict[str, object] = {PYROMIND_WORKFLOW_DIRTY_KEY: True}
+    service = _workflow_event_service(
+        tmp_path,
+        pyromind=True,
+        agent_state=agent_state,
+    )
+
+    emitted = service._emit_pyromind_workflow_if_dirty_sync()
+
+    assert emitted is False
+    assert service._conversation is not None
+    assert service._conversation._state.events == []
+    assert (
+        service._conversation._state.agent_state[PYROMIND_WORKFLOW_DIRTY_KEY]
+        is False
+    )
+
+
+def test_emit_pyromind_workflow_ignores_non_pyromind_conversations(tmp_path):
+    (tmp_path / "workflow.py").write_text("# workflow: Demo\n", encoding="utf-8")
+    agent_state: dict[str, object] = {PYROMIND_WORKFLOW_DIRTY_KEY: True}
+    service = _workflow_event_service(
+        tmp_path,
+        pyromind=False,
+        agent_state=agent_state,
+    )
+
+    emitted = service._emit_pyromind_workflow_if_dirty_sync()
+
+    assert emitted is False
+    assert service._conversation is not None
+    assert service._conversation._state.events == []
+    assert service._conversation._state.agent_state[PYROMIND_WORKFLOW_DIRTY_KEY] is True
 
 
 class TestEventServiceSearchEvents:

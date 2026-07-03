@@ -14,11 +14,7 @@ from openhands.tools.file_editor.definition import (
 )
 from openhands.tools.file_editor.editor import FileEditor
 from openhands.tools.file_editor.exceptions import ToolError
-from openhands.tools.workflow.definition import (
-    PublishedWorkflowObservation,
-    PublishWorkflowAction,
-)
-from openhands.tools.workflow.impl import PublishWorkflowExecutor
+from openhands.tools.workflow.definition import mark_pyromind_workflow_dirty
 
 
 # Module-global editor instance (lazily initialized in file_editor)
@@ -74,7 +70,7 @@ class FileEditorExecutor(ToolExecutor):
     def __call__(
         self,
         action: FileEditorAction,
-        conversation: "LocalConversation | None" = None,  # noqa: ARG002
+        conversation: "LocalConversation | None" = None,
     ) -> FileEditorObservation:
         normalized_path = self.normalize_path(action.path)
 
@@ -110,32 +106,19 @@ class FileEditorExecutor(ToolExecutor):
             )
         assert result is not None, "file_editor should always return a result"
         if not result.is_error and action.command != "view":
-            published_workflow = self._publish_workflow_if_target(
-                normalized_path,
-                summary=(
-                    "Created workflow.py"
-                    if action.command == "create"
-                    else "Updated workflow.py"
-                ),
-            )
-            if published_workflow is not None:
-                result = result.model_copy(
-                    update={"published_workflow": published_workflow}
-                )
+            self._mark_workflow_dirty_if_target(normalized_path, conversation)
         return result
 
-    def _publish_workflow_if_target(
+    def _mark_workflow_dirty_if_target(
         self,
         path: str,
-        summary: str,
-    ) -> PublishedWorkflowObservation | None:
+        conversation: "LocalConversation | None",
+    ) -> None:
         target_path = Path(path).resolve()
         workflow_path = (self.workspace_root / "workflow.py").resolve()
         if target_path != workflow_path:
-            return None
-        return PublishWorkflowExecutor(str(self.workspace_root))(
-            PublishWorkflowAction(summary=summary)
-        )
+            return
+        mark_pyromind_workflow_dirty(conversation)
 
 
 def file_editor(

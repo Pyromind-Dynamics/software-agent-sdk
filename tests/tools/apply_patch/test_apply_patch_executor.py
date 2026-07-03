@@ -4,6 +4,27 @@ from pathlib import Path
 import pytest
 
 from openhands.tools.apply_patch.definition import ApplyPatchAction, ApplyPatchExecutor
+from openhands.tools.workflow.definition import PYROMIND_WORKFLOW_DIRTY_KEY
+
+
+class _DirtyState:
+    def __init__(self) -> None:
+        self.agent_state: dict[str, object] = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def owned(self) -> bool:
+        return True
+
+
+class _DirtyConversation:
+    def __init__(self) -> None:
+        self._state = _DirtyState()
+        self._step_holds_state_lock = False
 
 
 @pytest.fixture()
@@ -12,9 +33,9 @@ def tmp_ws(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def run_exec(ws: Path, patch: str):
+def run_exec(ws: Path, patch: str, conversation=None):
     ex = ApplyPatchExecutor(workspace_root=str(ws))
-    return ex(ApplyPatchAction(patch=patch))
+    return ex(ApplyPatchAction(patch=patch), conversation=conversation)
 
 
 def test_create_modify_delete(tmp_ws: Path):
@@ -51,7 +72,7 @@ def test_create_modify_delete(tmp_ws: Path):
     assert not fp.exists()
 
 
-def test_apply_patch_publishes_workflow_update(tmp_ws: Path):
+def test_apply_patch_marks_workflow_dirty(tmp_ws: Path):
     patch = (
         "*** Begin Patch\n"
         "*** Add File: workflow.py\n"
@@ -59,15 +80,27 @@ def test_apply_patch_publishes_workflow_update(tmp_ws: Path):
         "+limit = 20\n"
         "*** End Patch"
     )
+    conversation = _DirtyConversation()
 
-    obs = run_exec(tmp_ws, patch)
+    obs = run_exec(tmp_ws, patch, conversation=conversation)
 
     assert not obs.is_error
-    assert obs.published_workflow is not None
-    assert obs.published_workflow.path == str(tmp_ws / "workflow.py")
-    assert obs.published_workflow.name == "Patch Demo"
-    assert obs.published_workflow.workflow == "# workflow: Patch Demo\nlimit = 20"
-    assert obs.published_workflow.summary == "Updated workflow.py"
+    assert conversation._state.agent_state[PYROMIND_WORKFLOW_DIRTY_KEY] is True
+
+
+def test_apply_patch_non_workflow_file_does_not_mark_dirty(tmp_ws: Path):
+    patch = (
+        "*** Begin Patch\n"
+        "*** Add File: notes.py\n"
+        "+print('not workflow')\n"
+        "*** End Patch"
+    )
+    conversation = _DirtyConversation()
+
+    obs = run_exec(tmp_ws, patch, conversation=conversation)
+
+    assert not obs.is_error
+    assert PYROMIND_WORKFLOW_DIRTY_KEY not in conversation._state.agent_state
 
 
 def test_reject_absolute_path(tmp_ws: Path):

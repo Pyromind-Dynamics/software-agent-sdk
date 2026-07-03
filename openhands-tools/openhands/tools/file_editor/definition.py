@@ -21,7 +21,6 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.file_editor.utils.diff import visualize_diff
-from openhands.tools.workflow.definition import PublishedWorkflowObservation
 
 
 CommandLiteral = Literal["view", "create", "str_replace", "insert", "undo_edit"]
@@ -89,13 +88,6 @@ class FileEditorObservation(Observation):
     )
     new_content: str | None = Field(
         default=None, description="The content of the file after the edit."
-    )
-    published_workflow: PublishedWorkflowObservation | None = Field(
-        default=None,
-        description=(
-            "Latest workflow.py publication when this edit updated the current "
-            "workspace workflow file."
-        ),
     )
 
     _diff_cache: Text | None = PrivateAttr(default=None)

@@ -17,11 +17,7 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.sdk.tool.tool import FunctionToolParam
-from openhands.tools.workflow.definition import (
-    PublishedWorkflowObservation,
-    PublishWorkflowAction,
-)
-from openhands.tools.workflow.impl import PublishWorkflowExecutor
+from openhands.tools.workflow.definition import mark_pyromind_workflow_dirty
 
 from .core import Commit, DiffError, process_patch
 
@@ -60,13 +56,6 @@ class ApplyPatchObservation(Observation):
     message: str = ""
     fuzz: int = 0
     commit: Commit | None = None
-    published_workflow: PublishedWorkflowObservation | None = Field(
-        default=None,
-        description=(
-            "Latest workflow.py publication when this patch updated the current "
-            "workspace workflow file."
-        ),
-    )
 
 
 class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
@@ -99,7 +88,7 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
     def __call__(
         self,
         action: ApplyPatchAction,
-        conversation=None,  # noqa: ARG002 - signature match
+        conversation=None,
     ) -> ApplyPatchObservation:
         """Execute the patch application and return an observation."""
 
@@ -122,14 +111,13 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
             msg, fuzz, commit = process_patch(
                 action.patch, open_file, write_file, remove_file
             )
-            published_workflow = self._publish_workflow_if_changed(commit)
+            self._mark_workflow_dirty_if_changed(commit, conversation)
             # Include a human-readable summary in content so Responses API sees
             # a function_call_output payload paired with the function_call.
             obs = ApplyPatchObservation(
                 message=msg,
                 fuzz=fuzz,
                 commit=commit,
-                published_workflow=published_workflow,
             )
             if msg:
                 # Use Observation.from_text to populate content field correctly
@@ -138,24 +126,22 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
                     message=msg,
                     fuzz=fuzz,
                     commit=commit,
-                    published_workflow=published_workflow,
                     is_error=False,
                 )
             return obs
         except DiffError as e:
             return ApplyPatchObservation.from_text(text=str(e), is_error=True)
 
-    def _publish_workflow_if_changed(
+    def _mark_workflow_dirty_if_changed(
         self,
         commit: Commit,
-    ) -> PublishedWorkflowObservation | None:
+        conversation,
+    ) -> None:
         workflow_path = (self.workspace_root / "workflow.py").resolve()
         for path in commit.changes:
             if self._resolve_path(path) == workflow_path:
-                return PublishWorkflowExecutor(str(self.workspace_root))(
-                    PublishWorkflowAction(summary="Updated workflow.py")
-                )
-        return None
+                mark_pyromind_workflow_dirty(conversation)
+                return
 
 
 _DESCRIPTION = (
