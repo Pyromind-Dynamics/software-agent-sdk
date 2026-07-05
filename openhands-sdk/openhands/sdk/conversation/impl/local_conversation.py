@@ -1415,7 +1415,12 @@ class LocalConversation(BaseConversation):
             }
 
     @observe(name="conversation.send_message")
-    def send_message(self, message: str | Message, sender: str | None = None) -> None:
+    def send_message(
+        self,
+        message: str | Message,
+        sender: str | None = None,
+        extended_content: list[TextContent] | None = None,
+    ) -> None:
         """Send a message to the agent.
 
         Args:
@@ -1425,6 +1430,11 @@ class LocalConversation(BaseConversation):
                    message origin in multi-agent scenarios. For example, when
                    one agent delegates to another, the sender can be set to
                    identify which agent is sending the message.
+            extended_content: Optional extra content appended to the user
+                    message for the LLM only (e.g. a server-generated
+                    reminder). It is merged with any content produced by
+                    ``agent_context`` (skill/microagent triggers) and does
+                    not appear in the user's original message text.
         """
         # ACPAgent startup can take much longer than a normal send_message()
         # round-trip because it launches and initializes a subprocess-backed
@@ -1450,7 +1460,7 @@ class LocalConversation(BaseConversation):
 
             # TODO: We should add test cases for all these scenarios
             activated_skill_names: list[str] = []
-            extended_content: list[TextContent] = []
+            merged_extended_content: list[TextContent] = list(extended_content or [])
 
             # Handle per-turn user message (i.e., knowledge agent trigger)
             if self.agent.agent_context:
@@ -1468,14 +1478,14 @@ class LocalConversation(BaseConversation):
                         f"Got augmented user message content: {content}, "
                         f"activated skills: {activated_skill_names}"
                     )
-                    extended_content.append(content)
+                    merged_extended_content.append(content)
                     self._state.activated_knowledge_skills.extend(activated_skill_names)
 
             user_msg_event = MessageEvent(
                 source="user",
                 llm_message=message,
                 activated_skills=activated_skill_names,
-                extended_content=extended_content,
+                extended_content=merged_extended_content,
                 sender=sender,
             )
             self._on_event(user_msg_event)
