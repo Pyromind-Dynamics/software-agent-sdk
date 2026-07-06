@@ -23,6 +23,9 @@ from openhands.agent_server.dependencies import (
 )
 from openhands.agent_server.event_service import EventService
 from openhands.agent_server.models import ConversationInfo, Success
+from openhands.agent_server.dependencies import (
+    get_conversation_service,
+    get_current_user_id,
     get_pyromind_jwt_token_from_request,
 )
 from openhands.agent_server.pyromind_auth import (
