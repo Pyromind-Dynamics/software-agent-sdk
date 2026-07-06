@@ -1,4 +1,5 @@
 import os
+from collections.abc import Mapping
 from datetime import datetime
 from functools import lru_cache
 
@@ -13,6 +14,8 @@ logger = get_logger(__name__)
 
 ALGORITHM = "HS256"
 PYROMIND_AUTH_COOKIE_NAME = "auth_token"
+PYROMIND_DEV_USER_ID_HEADER = "x-pyromind-debug-user-id"
+PYROMIND_DEV_USER_NAME_HEADER = "x-pyromind-debug-user-name"
 LOGIN_REQUIRED_DETAIL = (
     "Sorry, you need to log in first—or your session ended. Re-login to access this."
 )
@@ -39,6 +42,8 @@ class CurrentLoginUser(BaseModel):
     uid: int | None = None
     avatar_url: str | None = None
     avatar_info: AvatarInfo | None = None
+    cookie: str | None = None
+    x_cluster: str | None = None
 
 
 def get_env_value() -> str:
@@ -114,6 +119,48 @@ def get_current_login_user_from_token(
     if not auth_token:
         return None
     return v_jwt_token(auth_token)
+
+
+def add_request_context_to_user(
+    current_user: CurrentLoginUser,
+    headers: Mapping[str, str],
+) -> CurrentLoginUser:
+    return current_user.model_copy(
+        update={
+            "cookie": headers.get("cookie"),
+            "x_cluster": headers.get("x-cluster"),
+        }
+    )
+
+
+def get_dev_login_user_from_headers(
+    headers: Mapping[str, str],
+) -> CurrentLoginUser | None:
+    if not is_dev():
+        return None
+
+    raw_user_id = headers.get(PYROMIND_DEV_USER_ID_HEADER, "").strip()
+    if not raw_user_id:
+        return None
+
+    try:
+        user_id = int(raw_user_id)
+    except ValueError:
+        logger.warning("Invalid dev Pyromind user id: %s", raw_user_id)
+        return None
+
+    username = headers.get(PYROMIND_DEV_USER_NAME_HEADER, "").strip()
+    if not username:
+        username = f"debug-user-{user_id}"
+
+    current_user = CurrentLoginUser(
+        username=username,
+        email=f"{username}@example.test",
+        user_id=user_id,
+        group_id=0,
+        full_phone_num="",
+    )
+    return add_request_context_to_user(current_user, headers)
 
 
 def require_login_from_cookie(

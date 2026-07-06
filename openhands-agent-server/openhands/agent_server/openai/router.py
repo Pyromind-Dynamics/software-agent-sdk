@@ -29,6 +29,10 @@ from openhands.agent_server.openai.service import (
     list_openai_models,
     run_chat_completion,
 )
+from openhands.agent_server.pyromind_auth import (
+    add_request_context_to_user,
+    get_dev_login_user_from_headers,
+)
 from openhands.sdk.conversation.types import (
     ConversationObservabilityMetadata,
     ConversationObservabilitySpanName,
@@ -71,11 +75,18 @@ def check_openai_api_key(
     if is_session_api_key_valid(config, bearer_token):
         request.state.auth_method = "session_api_key"
         return
+    dev_user = get_dev_login_user_from_headers(request.headers)
+    if dev_user is not None:
+        request.state.auth_method = "pyromind_dev"
+        request.state.current_user = dev_user
+        return
     pyromind_token = get_pyromind_jwt_token_from_request(request)
     pyromind_user = verify_pyromind_jwt_token(config, pyromind_token)
     if pyromind_user is not None:
         request.state.auth_method = "pyromind_jwt"
-        request.state.current_user = pyromind_user
+        request.state.current_user = add_request_context_to_user(
+            pyromind_user, request.headers
+        )
         return
     if not is_auth_configured(config):
         return
