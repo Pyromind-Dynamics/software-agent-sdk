@@ -9,7 +9,7 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import httpx
@@ -20,9 +20,11 @@ from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import (
     get_conversation_service,
     get_current_user_id,
+    get_event_service,
     get_pyromind_jwt_token_from_request,
 )
-from openhands.agent_server.models import ConversationInfo
+from openhands.agent_server.event_service import EventService
+from openhands.agent_server.models import ConversationInfo, Success
 from openhands.agent_server.pyromind_auth import (
     PYROMIND_AUTH_COOKIE_NAME,
     CurrentLoginUser,
@@ -39,11 +41,13 @@ from openhands.sdk.conversation.request import (
     SendMessageRequest,
     StartConversationRequest,
 )
+from openhands.sdk.llm.message import Message
 from openhands.sdk.secret import SecretSource, StaticSecret
 from openhands.sdk.skills import Skill, load_skills_from_dir
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
+from openhands.tools.pyromind_debug import get_debug_result_broker
 from openhands.tools.workflow import DslToXyflowTool, ValidateWorkflowDslTool
 
 
@@ -67,7 +71,7 @@ _DEFAULT_SKILLS_PATH = os.environ.get(
 )
 
 # Only load these skills for Pyromind (avoids loading unrelated SDK skills)
-_PYROMIND_SKILL_NAMES = ["generate-workflow-dsl"]
+_PYROMIND_SKILL_NAMES = ["generate-workflow-dsl", "debug-workflow"]
 _PYROMIND_VALIDATE_AUTH_COOKIE_SECRET = "PYROMIND_VALIDATE_AUTH_COOKIE"
 _PYROMIND_VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
 _PYROMIND_VALIDATE_FORWARD_HEADERS = ("x-cluster", "accept-language")
@@ -258,6 +262,15 @@ class PyromindCreateConversationRequest(BaseModel):
         default=None,
         description="Optional initial user message to start the conversation.",
     )
+    workflow_dsl: str | None = Field(
+        default=None,
+        description=(
+            "Optional DSL of a workflow the user already had on the canvas "
+            "before starting this conversation. If provided, it seeds "
+            "workflow.py before the initial message is processed. `null` "
+            "(the default) means no canvas state to seed from."
+        ),
+    )
     extra: dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -268,6 +281,115 @@ class PyromindCreateConversationRequest(BaseModel):
             "'custom_instructions' (str) - extra instructions appended to prompt."
         ),
     )
+
+
+class PyromindSendMessageRequest(BaseModel):
+    """Request body for sending a message in a Pyromind conversation.
+
+    Unlike the generic ``POST /api/conversations/{id}/events`` endpoint, this
+    also accepts the DSL of the workflow currently shown on the canvas, so
+    that workflow.py is synced to what the user actually sees *before* the
+    agent acts on this message. See "工作流同步链路" in the debug-loop plan.
+    """
+
+    text: str = Field(description="The user's message text.")
+    workflow_dsl: str | None = Field(
+        default=None,
+        description=(
+            "DSL of the workflow currently on the canvas. `null` means the "
+            "frontend did not attach canvas state, so no sync is performed "
+            "(workflow.py is left untouched). An empty string means the "
+            "canvas is genuinely empty (the user cleared it)."
+        ),
+    )
+    run: bool = Field(
+        default=True,
+        description="Whether the agent loop should run after this message.",
+    )
+
+
+class PyromindDebugCallbackRequest(BaseModel):
+    """Webhook payload the debug platform posts when an async run finishes."""
+
+    task_id: str = Field(description="The task id returned when the run was submitted.")
+    status: Literal["passed", "failed"] = Field(description="Outcome of the run.")
+    error_log: str | None = Field(
+        default=None, description="Runtime error output when status='failed'."
+    )
+
+
+def _normalize_dsl(text: str) -> str:
+    return text.strip()
+
+
+def _sync_workflow_with_canvas(
+    working_dir: Path, workflow_dsl: str | None
+) -> TextContent | None:
+    """Reconcile workflow.py with the DSL currently shown on the canvas.
+
+    The user can edit the canvas between agent turns, so workflow.py must be
+    re-synced from the canvas before each new user message is processed --
+    otherwise the agent would keep editing a stale version. Returns a
+    ``<system_reminder>`` TextContent to inject into the LLM's context (via
+    ``extended_content``) when workflow.py actually changed as a result, or
+    None when nothing needed to change.
+
+    `workflow_dsl=None` means the caller attached no canvas state at all
+    (e.g. a plain follow-up message) and is a deliberate no-op, distinct
+    from `workflow_dsl=""` which means the canvas is genuinely empty.
+    """
+    if workflow_dsl is None:
+        return None
+
+    workflow_path = working_dir / "workflow.py"
+    existed = workflow_path.is_file()
+    current = workflow_path.read_text(encoding="utf-8") if existed else ""
+
+    normalized_canvas = _normalize_dsl(workflow_dsl)
+    normalized_current = _normalize_dsl(current)
+    if normalized_canvas == normalized_current:
+        return None  # Already in sync -- also covers the from-scratch case
+        # where the canvas and workflow.py are both empty/missing.
+
+    working_dir.mkdir(parents=True, exist_ok=True)
+
+    if not normalized_canvas:
+        # The user cleared the canvas. Remove workflow.py entirely (rather
+        # than writing an empty file) so downstream logic -- the debug tool,
+        # the generate-workflow-dsl skill's "does workflow.py exist?" check,
+        # etc. -- treats this identically to "never created".
+        workflow_path.unlink(missing_ok=True)
+        return TextContent(
+            text=(
+                "<system_reminder>\n"
+                "The user has cleared the workflow on the canvas. workflow.py "
+                "has been removed to match. If asked to continue building a "
+                "workflow, start fresh rather than assuming the previous "
+                "workflow still exists.\n"
+                "</system_reminder>"
+            )
+        )
+
+    workflow_path.write_text(workflow_dsl, encoding="utf-8")
+    if existed:
+        reminder_text = (
+            "<system_reminder>\n"
+            "The user has modified the workflow on the canvas since your last "
+            "turn. workflow.py has been overwritten to match the canvas "
+            "exactly. Treat the current file content as the source of truth "
+            "-- do not rely on your memory of a previous version when reading "
+            "or editing it.\n"
+            "</system_reminder>"
+        )
+    else:
+        reminder_text = (
+            "<system_reminder>\n"
+            "The user already had a workflow on the canvas from before this "
+            "message. It has been loaded into workflow.py as the current "
+            "state -- read it before making further changes.\n"
+            "</system_reminder>"
+        )
+    return TextContent(text=reminder_text)
 
 
 class PyromindDebugUrlRequest(BaseModel):
@@ -454,6 +576,7 @@ async def create_pyromind_conversation(
         extra_tools=[
             Tool(name="grep"),
             Tool(name="file_editor"),
+            Tool(name="debug_workflow"),
             Tool(name=DslToXyflowTool.name),
             validation_tool,
         ],
@@ -462,6 +585,15 @@ async def create_pyromind_conversation(
     # 6. Build a conversation-private workspace. The knowledge base is accessed
     #    separately via its absolute path in the prompt.
     workspace = LocalWorkspace(working_dir=str(conversation_dir))
+
+    # Seed workflow.py from a canvas the user already had before starting this
+    # conversation (e.g. they sketched something, then opened chat). No
+    # system_reminder is needed here -- this is turn 1, so there is no
+    # prior-turn workflow.py content for the agent to contrast against.
+    if request.workflow_dsl:
+        (conversation_dir / "workflow.py").write_text(
+            request.workflow_dsl, encoding="utf-8"
+        )
 
     # 7. Assemble StartConversationRequest
     initial_message: SendMessageRequest | None = None
@@ -492,3 +624,75 @@ async def create_pyromind_conversation(
         bind_debug_current_login_user_to_conversation(info.id, current_user)
     response.status_code = status.HTTP_201_CREATED if is_new else status.HTTP_200_OK
     return info
+
+
+@pyromind_router.post(
+    "/conversations/{conversation_id}/messages",
+    response_model=Success,
+    responses={404: {"description": "Conversation not found"}},
+)
+async def send_pyromind_message(
+    request: PyromindSendMessageRequest,
+    event_service: EventService = Depends(get_event_service),
+) -> Success:
+    """Send a user message, first syncing workflow.py to the canvas if needed.
+
+    The frontend attaches the DSL currently shown on the canvas via
+    ``workflow_dsl`` on every message. If it disagrees with workflow.py (the
+    user edited the canvas, or cleared it), workflow.py is overwritten/
+    removed to match and a ``<system_reminder>`` is injected into this
+    turn's LLM context (not into the user's visible message) so the agent
+    knows to treat the current file as authoritative.
+    """
+    conversation = event_service.get_conversation()
+    working_dir = Path(conversation.workspace.working_dir)
+    reminder = _sync_workflow_with_canvas(working_dir, request.workflow_dsl)
+
+    message = Message(role="user", content=[TextContent(text=request.text)])
+    await event_service.send_message(
+        message,
+        run=request.run,
+        extended_content=[reminder] if reminder else None,
+    )
+    return Success()
+
+
+# ---------------------------------------------------------------------------
+# Debug webhook router
+#
+# Deliberately a *separate* router from ``pyromind_router`` above and mounted
+# directly on the app in api.py, bypassing the global
+# ``Depends(check_session_api_key)`` applied to every other /api/* route.
+# The caller here is the external debug platform (or, today, the in-process
+# MockDebugPlatform's timer thread making a real HTTP call), not a logged-in
+# user -- it has no session key and no Pyromind login cookie to present.
+#
+# Known trade-off (accepted for now): this endpoint has NO authentication.
+# It is only safe to expose this server on a trusted/internal network. If
+# the debug platform is ever reachable from a less trusted network, add a
+# shared-secret header check here before going further.
+# ---------------------------------------------------------------------------
+
+pyromind_debug_webhook_router = APIRouter(prefix="/api/pyromind", tags=["Pyromind"])
+
+
+@pyromind_debug_webhook_router.post("/debug/callback", response_model=Success)
+async def pyromind_debug_callback(request: PyromindDebugCallbackRequest) -> Success:
+    """Webhook the debug platform calls when an async debug run finishes.
+
+    Resolves the in-process :class:`DebugResultBroker`, waking the
+    ``debug_workflow`` tool-executor thread that is blocked waiting for this
+    task's result. See ``openhands.tools.pyromind_debug`` for the tool side
+    and ``MockDebugPlatform`` for the local stand-in used until the real
+    platform integration is wired up.
+    """
+    broker = get_debug_result_broker()
+    resolved = broker.resolve(
+        request.task_id, status=request.status, error_log=request.error_log
+    )
+    if not resolved:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown or already-resolved debug task: {request.task_id}",
+        )
+    return Success()

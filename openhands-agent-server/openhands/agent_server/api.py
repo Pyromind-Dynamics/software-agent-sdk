@@ -52,7 +52,10 @@ from openhands.agent_server.openai.router import (
 )
 from openhands.agent_server.plugins_router import plugins_router
 from openhands.agent_server.profiles_router import profiles_router
-from openhands.agent_server.pyromind_router import pyromind_router
+from openhands.agent_server.pyromind_router import (
+    pyromind_debug_webhook_router,
+    pyromind_router,
+)
 from openhands.agent_server.server_details_router import (
     get_server_info,
     mark_initialization_complete,
@@ -412,6 +415,12 @@ def _add_api_routes(app: FastAPI) -> None:
     app.include_router(api_router)
 
     app.include_router(openai_router, dependencies=[Depends(check_openai_api_key)])
+
+    # Debug-platform webhook: intentionally NOT behind check_session_api_key
+    # (see pyromind_debug_webhook_router's docstring for why) or the dormant
+    # gate -- a callback for a run that was submitted before a restart should
+    # still be able to land.
+    app.include_router(pyromind_debug_webhook_router)
 
     # Workspace static-file routes get their own auth group that accepts
     # EITHER the X-Session-API-Key header OR the workspace session cookie.

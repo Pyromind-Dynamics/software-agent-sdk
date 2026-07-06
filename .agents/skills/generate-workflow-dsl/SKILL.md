@@ -49,6 +49,11 @@ triggers:
 
 ## DSL 语法格式
 
+`workflow.py` 是**声明式 DSL**，只是借用 Python 语法描述节点及连线，并不是可以在本地直接
+运行的 Python 脚本；不要尝试执行它或按 Python 运行时语义推理其行为。测试/验证工作流是否能
+真正跑通，需要使用 `debug-workflow` 技能里的 `debug_workflow` 工具（用户说"测试”“test”“调试”
+“debug”“试跑”均指此意）。
+
 ```python
 # workflow: <工作流名称>
 
