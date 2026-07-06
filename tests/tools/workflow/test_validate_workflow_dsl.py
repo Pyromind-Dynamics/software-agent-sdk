@@ -13,6 +13,11 @@ from openhands.tools.workflow import (
     ValidateWorkflowDslExecutor,
     ValidateWorkflowDslObservation,
     ValidateWorkflowDslTool,
+    WorkflowValidationIssue,
+)
+from openhands.tools.workflow.validate_workflow_dsl import (
+    PRE_VALIDATE_URL,
+    PROD_VALIDATE_URL,
 )
 
 
@@ -26,6 +31,68 @@ class _Response:
         if isinstance(self._payload, Exception):
             raise self._payload
         return self._payload
+
+
+def _valid_response() -> _Response:
+    return _Response(
+        200,
+        {
+            "success": True,
+            "data": {
+                "valid": True,
+                "workflow_id": "workflow-1",
+                "errors": [],
+                "warnings": [],
+            },
+            "message": None,
+            "error_code": None,
+        },
+    )
+
+
+def test_validate_workflow_dsl_defaults_to_pre_endpoint_for_local_and_pre(
+    monkeypatch,
+):
+    urls: list[str] = []
+
+    def fake_post(url, *, headers, json, timeout):
+        urls.append(url)
+        return _valid_response()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.delenv("APP_ENV", raising=False)
+    observation = ValidateWorkflowDslExecutor()(
+        ValidateWorkflowDslAction(dsl="# workflow: demo\n")
+    )
+    assert not observation.is_error
+    assert urls[-1] == PRE_VALIDATE_URL
+
+    for app_env in ("dev", "pre", "local"):
+        monkeypatch.setenv("APP_ENV", app_env)
+        observation = ValidateWorkflowDslExecutor()(
+            ValidateWorkflowDslAction(dsl="# workflow: demo\n")
+        )
+        assert not observation.is_error
+        assert urls[-1] == PRE_VALIDATE_URL
+
+
+def test_validate_workflow_dsl_defaults_to_prod_endpoint_for_online_envs(
+    monkeypatch,
+):
+    urls: list[str] = []
+
+    def fake_post(url, *, headers, json, timeout):
+        urls.append(url)
+        return _valid_response()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    for app_env in ("prod", "production", "online"):
+        monkeypatch.setenv("APP_ENV", app_env)
+        observation = ValidateWorkflowDslExecutor()(
+            ValidateWorkflowDslAction(dsl="# workflow: demo\n")
+        )
+        assert not observation.is_error
+        assert urls[-1] == PROD_VALIDATE_URL
 
 
 def test_validate_workflow_dsl_posts_payload_and_preserves_issue_fields(monkeypatch):
@@ -54,12 +121,21 @@ def test_validate_workflow_dsl_posts_payload_and_preserves_issue_fields(monkeypa
                             "workflow_id": ("8ca009ae-d7c9-4a5a-ae51-6faee07eded4"),
                             "node_id": "1",
                             "node_type": "CloneAndCacheModel1",
+                            "node_name": "Clone model",
                             "field": "nodes[1]",
                             "message": "Node not found",
                             "source": "k8s",
                             "detail": {
                                 "location": "nodes[1]",
                                 "target_node_line": 4,
+                                "node_code": (
+                                    "n6a71806 = CloneAndCacheModel1"
+                                    "(id=1, model=nfbc9d56.value)"
+                                ),
+                                "target_node_code": (
+                                    "n6a71806 = CloneAndCacheModel1"
+                                    "(id=1, model=nfbc9d56.value)"
+                                ),
                             },
                         }
                     ],
@@ -91,8 +167,12 @@ def test_validate_workflow_dsl_posts_payload_and_preserves_issue_fields(monkeypa
     assert observation.workflow_id == "8ca009ae-d7c9-4a5a-ae51-6faee07eded4"
     assert observation.errors[0].code == "NODE_NOT_FOUND"
     assert observation.errors[0].node_id == "1"
+    assert observation.errors[0].node_name == "Clone model"
     assert observation.errors[0].detail["target_node_line"] == 4
+    assert observation.errors[0].detail["node_code"].startswith("n6a71806")
+    assert observation.errors[0].detail["target_node_code"].startswith("n6a71806")
     assert "line=4" in observation.text
+    assert "dsl_code: n6a71806 = CloneAndCacheModel1" in observation.text
     assert calls == {
         "url": "https://validator.test/validate",
         "headers": {
@@ -230,3 +310,29 @@ def test_validate_workflow_dsl_tool_is_explicitly_available() -> None:
         cast(Any, None),
     )
     assert isinstance(resolved[0], ValidateWorkflowDslTool)
+
+
+def test_validate_workflow_dsl_output_schema_describes_api_fields() -> None:
+    success_description = ValidateWorkflowDslObservation.model_fields[
+        "success"
+    ].description
+    valid_description = ValidateWorkflowDslObservation.model_fields["valid"].description
+    detail_description = WorkflowValidationIssue.model_fields["detail"].description
+    source_description = WorkflowValidationIssue.model_fields["source"].description
+
+    assert success_description is not None
+    assert "BizResponse.success" in success_description
+    assert valid_description is not None
+    assert "WorkflowValidationResult" in valid_description
+    assert detail_description is not None
+    assert "1-based line numbers" in detail_description
+    assert "node_code is the DSL statement for issue.node_id" in detail_description
+    assert "target_node_line" in detail_description
+    assert "target_node_code" in detail_description
+    assert "source_node_code" in detail_description
+    assert "source_node_id" in detail_description
+    assert "available_inputs" in detail_description
+    assert source_description is not None
+    assert "dsl" in source_description
+    assert "xyflow" in source_description
+    assert "k8s" in source_description
