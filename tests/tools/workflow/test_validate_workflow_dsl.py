@@ -1,4 +1,5 @@
 import json as jsonlib
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -18,7 +19,14 @@ from openhands.tools.workflow import (
 from openhands.tools.workflow.validate_workflow_dsl import (
     PRE_VALIDATE_URL,
     PROD_VALIDATE_URL,
+    PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
+    PYROMIND_VALIDATE_HEADERS_STATE_KEY,
 )
+
+
+class _FakeWorkspace:
+    def __init__(self, working_dir: Path) -> None:
+        self.working_dir = str(working_dir)
 
 
 class _Response:
@@ -48,6 +56,29 @@ def _valid_response() -> _Response:
             "error_code": None,
         },
     )
+
+
+def _fake_conversation(
+    tmp_path: Path,
+    *,
+    secret_registry: SecretRegistry | None = None,
+    agent_state: dict[str, Any] | None = None,
+):
+    return type(
+        "FakeConversation",
+        (),
+        {
+            "workspace": _FakeWorkspace(tmp_path),
+            "state": type(
+                "FakeState",
+                (),
+                {
+                    "secret_registry": secret_registry or SecretRegistry(),
+                    "agent_state": agent_state or {},
+                },
+            )(),
+        },
+    )()
 
 
 def test_validate_workflow_dsl_defaults_to_pre_endpoint_for_local_and_pre(
@@ -188,6 +219,46 @@ def test_validate_workflow_dsl_posts_payload_and_preserves_issue_fields(monkeypa
     }
 
 
+def test_validate_workflow_dsl_reads_workflow_file_when_dsl_omitted(
+    monkeypatch, tmp_path
+):
+    calls: dict[str, Any] = {}
+
+    def fake_post(url, *, headers, json, timeout):
+        calls["json"] = json
+        return _valid_response()
+
+    (tmp_path / "workflow.py").write_text("# workflow: from-file\n", encoding="utf-8")
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    observation = ValidateWorkflowDslExecutor()(
+        ValidateWorkflowDslAction(),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert not observation.is_error
+    assert calls["json"] == {
+        "name": "workflow",
+        "dsl": "# workflow: from-file\n",
+    }
+
+
+def test_validate_workflow_dsl_reports_missing_workflow_file(monkeypatch, tmp_path):
+    def fake_post(url, *, headers, json, timeout):
+        raise AssertionError("validation API should not be called")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    observation = ValidateWorkflowDslExecutor()(
+        ValidateWorkflowDslAction(),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert observation.is_error
+    assert "workflow.py" in observation.text
+    assert "does not exist" in observation.text
+
+
 def test_validate_workflow_dsl_resolves_headers_from_conversation_secrets(
     monkeypatch,
 ):
@@ -219,11 +290,7 @@ def test_validate_workflow_dsl_resolves_headers_from_conversation_secrets(
             )
         }
     )
-    conversation = type(
-        "FakeConversation",
-        (),
-        {"state": type("FakeState", (), {"secret_registry": secret_registry})()},
-    )()
+    conversation = _fake_conversation(Path("/tmp"), secret_registry=secret_registry)
     executor = ValidateWorkflowDslExecutor(
         secret_headers={"cookie": "PYROMIND_VALIDATE_AUTH_COOKIE"}
     )
@@ -235,6 +302,41 @@ def test_validate_workflow_dsl_resolves_headers_from_conversation_secrets(
 
     assert not observation.is_error
     assert calls["headers"]["cookie"] == "auth_token=session-token"
+
+
+def test_validate_workflow_dsl_uses_websocket_validation_context(monkeypatch):
+    calls: dict[str, Any] = {}
+
+    def fake_post(url, *, headers, json, timeout):
+        calls["headers"] = headers
+        return _valid_response()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    secret_registry = SecretRegistry()
+    secret_registry.update_secrets(
+        {
+            PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: StaticSecret(
+                value=SecretStr("auth_token=websocket-token")
+            )
+        }
+    )
+    conversation = _fake_conversation(
+        Path("/tmp"),
+        secret_registry=secret_registry,
+        agent_state={
+            PYROMIND_VALIDATE_HEADERS_STATE_KEY: {"x-cluster": "websocket-cluster"}
+        },
+    )
+    executor = ValidateWorkflowDslExecutor(headers={"x-cluster": "request-cluster"})
+
+    observation = executor(
+        ValidateWorkflowDslAction(dsl="# workflow: demo\n"),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert calls["headers"]["cookie"] == "auth_token=websocket-token"
+    assert calls["headers"]["x-cluster"] == "websocket-cluster"
 
 
 def test_validate_workflow_dsl_marks_api_failure_as_tool_error(monkeypatch):

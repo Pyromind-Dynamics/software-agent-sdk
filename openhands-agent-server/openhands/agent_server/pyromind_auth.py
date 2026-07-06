@@ -142,11 +142,12 @@ def get_current_login_user_from_token(
 def add_request_context_to_user(
     current_user: CurrentLoginUser,
     headers: Mapping[str, str],
+    x_cluster: str | None = None,
 ) -> CurrentLoginUser:
     return current_user.model_copy(
         update={
             "cookie": headers.get("cookie"),
-            "x_cluster": headers.get("x-cluster"),
+            "x_cluster": x_cluster or headers.get("x-cluster"),
         }
     )
 

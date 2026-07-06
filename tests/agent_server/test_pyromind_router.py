@@ -6,6 +6,7 @@ from fastapi import Response, status
 from starlette.requests import Request
 
 from openhands.agent_server.conversation_service import ConversationService
+from openhands.agent_server.event_service import EventService
 from openhands.agent_server.models import ConversationInfo
 from openhands.agent_server.pyromind_auth import (
     PYROMIND_AUTH_COOKIE_NAME,
@@ -22,11 +23,16 @@ from openhands.agent_server.pyromind_router import (
     _build_debug_context_headers,
     _build_workflow_validation_tool,
     _get_validation_cookie_header,
+    apply_pyromind_validation_context,
     create_pyromind_conversation,
 )
 from openhands.sdk.conversation.request import StartConversationRequest
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.tools.workflow import DslToXyflowTool, ValidateWorkflowDslTool
+from openhands.tools.workflow.validate_workflow_dsl import (
+    PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
+    PYROMIND_VALIDATE_HEADERS_STATE_KEY,
+)
 
 
 _REMOVED_WORKFLOW_TOOL = "publish" + "_workflow"
@@ -51,6 +57,19 @@ class _FakeConversationService:
             ),
             True,
         )
+
+
+class _FakeEventService:
+    def __init__(self, tags: dict[str, str]) -> None:
+        self.stored = type("FakeStoredConversation", (), {"tags": tags})()
+        self.secrets: dict[str, str] = {}
+        self.agent_state: dict[str, object] = {}
+
+    async def update_secrets(self, secrets: dict[str, str]) -> None:
+        self.secrets.update(secrets)
+
+    async def update_agent_state(self, values: dict[str, object]) -> None:
+        self.agent_state.update(values)
 
 
 def _make_request(headers: dict[str, str] | None = None) -> Request:
@@ -207,3 +226,41 @@ def test_build_debug_context_headers_uses_current_user_context():
         "cookie": "auth_token=session-token; other=value",
         "x-cluster": "us-west-1#pre",
     }
+
+
+@pytest.mark.asyncio
+async def test_pyromind_validation_context_uses_websocket_user_headers():
+    service = _FakeEventService({PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE})
+    current_user = CurrentLoginUser(
+        username="debug-user-42",
+        email="debug-user-42@example.test",
+        user_id=42,
+        cookie="auth_token=websocket-token; other=value",
+        x_cluster="websocket-cluster",
+    )
+
+    await apply_pyromind_validation_context(cast(EventService, service), current_user)
+
+    assert service.secrets == {
+        PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: "auth_token=websocket-token; other=value"
+    }
+    assert service.agent_state == {
+        PYROMIND_VALIDATE_HEADERS_STATE_KEY: {"x-cluster": "websocket-cluster"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_pyromind_validation_context_ignores_non_pyromind_conversations():
+    service = _FakeEventService({})
+    current_user = CurrentLoginUser(
+        username="debug-user-42",
+        email="debug-user-42@example.test",
+        user_id=42,
+        cookie="auth_token=websocket-token",
+        x_cluster="websocket-cluster",
+    )
+
+    await apply_pyromind_validation_context(cast(EventService, service), current_user)
+
+    assert service.secrets == {}
+    assert service.agent_state == {}

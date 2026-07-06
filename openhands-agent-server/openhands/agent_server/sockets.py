@@ -56,6 +56,7 @@ from openhands.agent_server.pyromind_auth import (
     add_request_context_to_user,
     get_dev_login_user_from_headers,
 )
+from openhands.agent_server.pyromind_router import apply_pyromind_validation_context
 from openhands.sdk import Event, Message
 from openhands.sdk.utils.paging import page_iterator
 
@@ -141,6 +142,25 @@ def _resolve_websocket_pyromind_jwt_token(
     )
 
 
+def _resolve_websocket_x_cluster(websocket: WebSocket) -> str | None:
+    return (
+        websocket.headers.get("x-cluster")
+        or websocket.query_params.get("x-cluster")
+        or websocket.query_params.get("x_cluster")
+    )
+
+
+def _add_websocket_context_to_user(
+    current_user: CurrentLoginUser,
+    websocket: WebSocket,
+) -> CurrentLoginUser:
+    return add_request_context_to_user(
+        current_user,
+        websocket.headers,
+        x_cluster=_resolve_websocket_x_cluster(websocket),
+    )
+
+
 # Give clients 10 seconds to send auth frame after connection opens.
 # This balances security (don't hold connections indefinitely) with
 # accommodating slow networks and client startup time.
@@ -186,15 +206,17 @@ async def _accept_authenticated_websocket(
 
     dev_user = get_dev_login_user_from_headers(websocket.headers)
     if dev_user is not None:
-        websocket.state.current_user = dev_user
+        websocket.state.current_user = _add_websocket_context_to_user(
+            dev_user, websocket
+        )
         await websocket.accept()
         return True
 
     pyromind_token = _resolve_websocket_pyromind_jwt_token(websocket)
     pyromind_user = verify_pyromind_jwt_token(config, pyromind_token)
     if pyromind_user is not None:
-        websocket.state.current_user = add_request_context_to_user(
-            pyromind_user, websocket.headers
+        websocket.state.current_user = _add_websocket_context_to_user(
+            pyromind_user, websocket
         )
         await websocket.accept()
         return True
@@ -332,6 +354,8 @@ async def events_socket(
         logger.warning(f"Converation not found: {conversation_id}")
         await websocket.close(code=4004, reason="Conversation not found")
         return
+    if isinstance(current_user, CurrentLoginUser):
+        await apply_pyromind_validation_context(event_service, current_user)
 
     try:
         subscriber_id = await event_service.subscribe_to_events(

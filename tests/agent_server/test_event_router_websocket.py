@@ -10,7 +10,11 @@ from fastapi import WebSocketDisconnect
 
 from openhands.agent_server.event_service import EventService
 from openhands.agent_server.models import EventPage
-from openhands.agent_server.sockets import _WebSocketSubscriber
+from openhands.agent_server.pyromind_auth import CurrentLoginUser
+from openhands.agent_server.sockets import (
+    _add_websocket_context_to_user,
+    _WebSocketSubscriber,
+)
 from openhands.sdk import Message
 from openhands.sdk.event import Event
 from openhands.sdk.event.llm_convertible import MessageEvent
@@ -27,6 +31,40 @@ def mock_websocket():
     websocket.close = AsyncMock()
     websocket.application_state = MagicMock()
     return websocket
+
+
+def test_websocket_context_uses_cluster_query_param_when_header_absent(
+    mock_websocket,
+):
+    mock_websocket.headers = {"cookie": "auth_token=session-token; other=value"}
+    mock_websocket.query_params = {"x-cluster": "query-cluster"}
+    current_user = CurrentLoginUser(
+        username="portal-user",
+        email="portal-user@example.test",
+        user_id=42,
+    )
+
+    updated = _add_websocket_context_to_user(current_user, mock_websocket)
+
+    assert updated.cookie == "auth_token=session-token; other=value"
+    assert updated.x_cluster == "query-cluster"
+
+
+def test_websocket_context_prefers_cluster_header_over_query_param(mock_websocket):
+    mock_websocket.headers = {
+        "cookie": "auth_token=session-token; other=value",
+        "x-cluster": "header-cluster",
+    }
+    mock_websocket.query_params = {"x-cluster": "query-cluster"}
+    current_user = CurrentLoginUser(
+        username="portal-user",
+        email="portal-user@example.test",
+        user_id=42,
+    )
+
+    updated = _add_websocket_context_to_user(current_user, mock_websocket)
+
+    assert updated.x_cluster == "header-cluster"
 
 
 @pytest.fixture

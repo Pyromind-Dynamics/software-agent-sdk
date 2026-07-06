@@ -4,6 +4,7 @@ from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
@@ -450,9 +451,7 @@ class EventService:
                 state.execution_status = ConversationExecutionStatus.ERROR
 
     def _is_pyromind_conversation(self) -> bool:
-        return (
-            self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE
-        )
+        return self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE
 
     def _clear_pyromind_workflow_dirty_sync(self) -> None:
         if not self._conversation:
@@ -473,9 +472,7 @@ class EventService:
         with conversation._state as state:
             if state.agent_state.get(PYROMIND_WORKFLOW_DIRTY_KEY) is not True:
                 return False
-            already_emitted = bool(
-                state.agent_state.get(PYROMIND_WORKFLOW_EMITTED_KEY)
-            )
+            already_emitted = bool(state.agent_state.get(PYROMIND_WORKFLOW_EMITTED_KEY))
 
         working_dir = Path(conversation.workspace.working_dir)
         workflow_path = working_dir / "workflow.py"
@@ -555,7 +552,8 @@ class EventService:
         _from_goal_loop: bool = False,
         extended_content: list[TextContent] | None = None,
     ):
-        if not self._conversation:
+        conversation = self._conversation
+        if not conversation:
             raise ValueError("inactive_service")
         # A normal user message supersedes any active /goal loop in this
         # conversation. The goal loop's own messages pass _from_goal_loop=True.
@@ -565,7 +563,7 @@ class EventService:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None,
-            lambda: self._conversation.send_message(
+            lambda: conversation.send_message(
                 message, extended_content=extended_content
             ),
         )
@@ -1431,6 +1429,19 @@ class EventService:
             raise ValueError("inactive_service")
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._conversation.update_secrets, secrets)
+
+    async def update_agent_state(self, values: dict[str, Any]) -> None:
+        """Merge values into the active conversation agent state."""
+        if not self._conversation:
+            raise ValueError("inactive_service")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._update_agent_state_sync, values)
+
+    def _update_agent_state_sync(self, values: dict[str, Any]) -> None:
+        if self._conversation is None:
+            raise ValueError("inactive_service")
+        with self._conversation._state as state:
+            state.agent_state = {**state.agent_state, **values}
 
     async def set_confirmation_policy(self, policy: ConfirmationPolicyBase):
         """Set the confirmation policy for the conversation."""

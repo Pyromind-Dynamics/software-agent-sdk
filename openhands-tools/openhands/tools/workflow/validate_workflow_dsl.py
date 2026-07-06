@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, cast
 
 import httpx
@@ -31,6 +32,8 @@ PRE_VALIDATE_URL = (
 PROD_VALIDATE_URL = (
     "https://api-portal.pyromind.ai/std2/studio_api/api/agent/workflows/dsl/validate"
 )
+PYROMIND_VALIDATE_AUTH_COOKIE_SECRET = "PYROMIND_VALIDATE_AUTH_COOKIE"
+PYROMIND_VALIDATE_HEADERS_STATE_KEY = "pyromind_validate_workflow_dsl_headers"
 _PROD_APP_ENVS = {"prod", "production", "online"}
 
 
@@ -119,7 +122,13 @@ class WorkflowValidationIssue(BaseModel):
 
 
 class ValidateWorkflowDslAction(Action):
-    dsl: str = Field(description="Pyromind workflow DSL source to validate.")
+    dsl: str | None = Field(
+        default=None,
+        description=(
+            "Pyromind workflow DSL source to validate. If omitted, the tool reads "
+            "`workflow.py` from the active conversation workspace."
+        ),
+    )
     name: str = Field(default="workflow", description="Workflow name.")
 
     @property
@@ -252,12 +261,21 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
         action: ValidateWorkflowDslAction,
         conversation: BaseConversation | None = None,
     ) -> ValidateWorkflowDslObservation:
+        try:
+            dsl = self._resolve_dsl(action, conversation)
+        except ValueError as exc:
+            return ValidateWorkflowDslObservation.from_text(
+                text=str(exc),
+                is_error=True,
+            )
+
         headers = {
             "accept": "*/*",
             "content-type": "application/json",
             **self._headers,
         }
         try:
+            headers.update(self._resolve_conversation_headers(conversation))
             headers.update(self._resolve_secret_headers(conversation))
         except ValueError as exc:
             return ValidateWorkflowDslObservation.from_text(
@@ -268,7 +286,7 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
             response = httpx.post(
                 self._endpoint_url,
                 headers=headers,
-                json={"name": action.name, "dsl": action.dsl},
+                json={"name": action.name, "dsl": dsl},
                 timeout=self._timeout,
             )
         except httpx.RequestError as exc:
@@ -305,11 +323,40 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
 
         return _observation_from_payload(payload)
 
+    def _resolve_dsl(
+        self,
+        action: ValidateWorkflowDslAction,
+        conversation: BaseConversation | None,
+    ) -> str:
+        if action.dsl is not None:
+            return action.dsl
+        if conversation is None:
+            raise ValueError(
+                "Cannot read workflow.py without an active conversation. "
+                "Pass `dsl` explicitly or call this tool from a conversation."
+            )
+
+        workspace = cast(Any, conversation).workspace
+        workflow_path = Path(workspace.working_dir) / "workflow.py"
+        if not workflow_path.is_file():
+            raise ValueError(
+                f"Cannot validate workflow DSL: {workflow_path} does not exist."
+            )
+        return workflow_path.read_text(encoding="utf-8")
+
     def _resolve_secret_headers(
         self,
         conversation: BaseConversation | None,
     ) -> dict[str, str]:
-        if not self._secret_headers:
+        secret_headers = dict(self._secret_headers)
+        if conversation is not None:
+            state = cast("ConversationState", conversation.state)
+            secret_registry = state.secret_registry
+            if secret_registry.get_secret_value(PYROMIND_VALIDATE_AUTH_COOKIE_SECRET):
+                secret_headers.setdefault(
+                    "cookie", PYROMIND_VALIDATE_AUTH_COOKIE_SECRET
+                )
+        if not secret_headers:
             return {}
         if conversation is None:
             raise ValueError(
@@ -320,7 +367,7 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
         resolved: dict[str, str] = {}
         state = cast("ConversationState", conversation.state)
         secret_registry = state.secret_registry
-        for header_name, secret_name in self._secret_headers.items():
+        for header_name, secret_name in secret_headers.items():
             value = secret_registry.get_secret_value(secret_name)
             if not value:
                 raise ValueError(
@@ -329,6 +376,23 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
                 )
             resolved[header_name] = value
         return resolved
+
+    def _resolve_conversation_headers(
+        self,
+        conversation: BaseConversation | None,
+    ) -> dict[str, str]:
+        if conversation is None:
+            return {}
+
+        state = cast("ConversationState", conversation.state)
+        headers = state.agent_state.get(PYROMIND_VALIDATE_HEADERS_STATE_KEY)
+        if not isinstance(headers, dict):
+            return {}
+        return {
+            str(name): str(value)
+            for name, value in headers.items()
+            if value is not None
+        }
 
 
 class ValidateWorkflowDslTool(

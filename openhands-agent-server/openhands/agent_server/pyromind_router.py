@@ -49,6 +49,10 @@ from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
 from openhands.tools.pyromind_debug import get_debug_result_broker
 from openhands.tools.workflow import DslToXyflowTool, ValidateWorkflowDslTool
+from openhands.tools.workflow.validate_workflow_dsl import (
+    PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
+    PYROMIND_VALIDATE_HEADERS_STATE_KEY,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -72,7 +76,6 @@ _DEFAULT_SKILLS_PATH = os.environ.get(
 
 # Only load these skills for Pyromind (avoids loading unrelated SDK skills)
 _PYROMIND_SKILL_NAMES = ["generate-workflow-dsl", "debug-workflow"]
-_PYROMIND_VALIDATE_AUTH_COOKIE_SECRET = "PYROMIND_VALIDATE_AUTH_COOKIE"
 _PYROMIND_VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
 _PYROMIND_VALIDATE_FORWARD_HEADERS = ("x-cluster", "accept-language")
 _PYROMIND_DEBUG_URL_TIMEOUT_SECONDS = 30.0
@@ -181,8 +184,8 @@ def _build_workflow_validation_tool(
     secret_headers: dict[str, str] = {}
     cookie_header = _get_validation_cookie_header(http_request)
     if cookie_header:
-        secret_headers["cookie"] = _PYROMIND_VALIDATE_AUTH_COOKIE_SECRET
-        secrets[_PYROMIND_VALIDATE_AUTH_COOKIE_SECRET] = StaticSecret(
+        secret_headers["cookie"] = PYROMIND_VALIDATE_AUTH_COOKIE_SECRET
+        secrets[PYROMIND_VALIDATE_AUTH_COOKIE_SECRET] = StaticSecret(
             value=SecretStr(cookie_header)
         )
 
@@ -197,6 +200,25 @@ def _build_workflow_validation_tool(
         params["secret_headers"] = secret_headers
 
     return Tool(name=ValidateWorkflowDslTool.name, params=params), secrets
+
+
+async def apply_pyromind_validation_context(
+    event_service: EventService,
+    current_user: CurrentLoginUser | None,
+) -> None:
+    if current_user is None:
+        return
+    if event_service.stored.tags.get(PYROMIND_APP_TAG_KEY) != PYROMIND_APP_TAG_VALUE:
+        return
+
+    if current_user.cookie:
+        await event_service.update_secrets(
+            {PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: current_user.cookie}
+        )
+    if current_user.x_cluster:
+        await event_service.update_agent_state(
+            {PYROMIND_VALIDATE_HEADERS_STATE_KEY: {"x-cluster": current_user.x_cluster}}
+        )
 
 
 def _get_validation_cookie_header(http_request: Request) -> str | None:
