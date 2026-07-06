@@ -52,6 +52,10 @@ from openhands.agent_server.models import (
     ServerErrorEvent,
 )
 from openhands.agent_server.pub_sub import MaxSubscribersError, Subscriber
+from openhands.agent_server.pyromind_auth import (
+    add_request_context_to_user,
+    get_dev_login_user_from_headers,
+)
 from openhands.sdk import Event, Message
 from openhands.sdk.utils.paging import page_iterator
 
@@ -180,10 +184,18 @@ async def _accept_authenticated_websocket(
             await websocket.close(code=4001, reason="Authentication failed")
             return False
 
+    dev_user = get_dev_login_user_from_headers(websocket.headers)
+    if dev_user is not None:
+        websocket.state.current_user = dev_user
+        await websocket.accept()
+        return True
+
     pyromind_token = _resolve_websocket_pyromind_jwt_token(websocket)
     pyromind_user = verify_pyromind_jwt_token(config, pyromind_token)
     if pyromind_user is not None:
-        websocket.state.current_user = pyromind_user
+        websocket.state.current_user = add_request_context_to_user(
+            pyromind_user, websocket.headers
+        )
         await websocket.accept()
         return True
 

@@ -12,7 +12,9 @@ from openhands.agent_server.pyromind_auth import (
     LOGIN_REQUIRED_DETAIL,
     PYROMIND_AUTH_COOKIE_NAME,
     CurrentLoginUser,
+    add_request_context_to_user,
     get_current_login_user_from_token,
+    get_dev_login_user_from_headers,
 )
 
 
@@ -67,6 +69,12 @@ def verify_pyromind_jwt_token(
 def authenticate_request(request: Request, session_api_key: str | None) -> None:
     config: Config = request.app.state.config
 
+    dev_user = get_dev_login_user_from_headers(request.headers)
+    if dev_user is not None:
+        request.state.auth_method = "pyromind_dev"
+        request.state.current_user = dev_user
+        return
+
     if is_session_api_key_valid(config, session_api_key):
         request.state.auth_method = "session_api_key"
         return
@@ -75,7 +83,9 @@ def authenticate_request(request: Request, session_api_key: str | None) -> None:
     pyromind_user = verify_pyromind_jwt_token(config, pyromind_token)
     if pyromind_user is not None:
         request.state.auth_method = "pyromind_jwt"
-        request.state.current_user = pyromind_user
+        request.state.current_user = add_request_context_to_user(
+            pyromind_user, request.headers
+        )
         return
 
     if not is_auth_configured(config):
@@ -120,6 +130,12 @@ def check_workspace_session(
     to this router only; no other endpoint honors it.
     """
     config: Config = request.app.state.config
+    dev_user = get_dev_login_user_from_headers(request.headers)
+    if dev_user is not None:
+        request.state.auth_method = "pyromind_dev"
+        request.state.current_user = dev_user
+        return
+
     for candidate in (header_key, cookie_key):
         if is_session_api_key_valid(config, candidate):
             return
@@ -131,7 +147,9 @@ def check_workspace_session(
         pyromind_user = verify_pyromind_jwt_token(config, candidate)
         if pyromind_user is not None:
             request.state.auth_method = "pyromind_jwt"
-            request.state.current_user = pyromind_user
+            request.state.current_user = add_request_context_to_user(
+                pyromind_user, request.headers
+            )
             return
 
     if not is_auth_configured(config):
