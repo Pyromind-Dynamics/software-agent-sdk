@@ -10,6 +10,7 @@ from openhands.agent_server.models import ConversationInfo
 from openhands.agent_server.pyromind_auth import (
     PYROMIND_AUTH_COOKIE_NAME,
     CurrentLoginUser,
+    get_debug_current_login_user_by_conversation,
 )
 from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
@@ -121,6 +122,40 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         == cookie_header
     )
     assert service.start_request.tags == {PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE}
+
+
+@pytest.mark.asyncio
+async def test_pyromind_conversation_binds_login_context(tmp_path):
+    knowledge_base = tmp_path / "knowledge"
+    knowledge_base.mkdir()
+    service = _FakeConversationService(tmp_path / "conversations")
+    response = Response()
+    request = _make_request()
+    request.state.current_user = CurrentLoginUser(
+        username="debug-user-42",
+        email="debug-user-42@example.test",
+        user_id=42,
+        cookie="auth_token=context-token",
+        x_cluster="context-cluster",
+    )
+
+    info = await create_pyromind_conversation(
+        request,
+        PyromindCreateConversationRequest(
+            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            extra={
+                "knowledge_base_path": str(knowledge_base),
+                "skills_path": str(tmp_path / "missing-skills"),
+            },
+        ),
+        response,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert service.start_request is not None
+    assert service.start_request.user_id == "42"
+    bound_user = get_debug_current_login_user_by_conversation(info.id)
+    assert bound_user == request.state.current_user
 
 
 def test_validation_cookie_header_keeps_full_cookie_in_prod(monkeypatch):

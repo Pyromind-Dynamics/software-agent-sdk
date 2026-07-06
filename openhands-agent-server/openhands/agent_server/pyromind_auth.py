@@ -2,6 +2,7 @@ import os
 from collections.abc import Mapping
 from datetime import datetime
 from functools import lru_cache
+from uuid import UUID
 
 import jwt
 from fastapi import Cookie, HTTPException, WebSocketException, status
@@ -20,6 +21,7 @@ LOGIN_REQUIRED_DETAIL = (
     "Sorry, you need to log in first—or your session ended. Re-login to access this."
 )
 _DEV_SECRET_KEY = "Kij823420JITRE21i21248cbsxhuexvS"
+_DEBUG_CONVERSATION_LOGIN_USERS: dict[UUID, "CurrentLoginUser"] = {}
 
 
 class AvatarInfo(BaseModel):
@@ -44,6 +46,22 @@ class CurrentLoginUser(BaseModel):
     avatar_info: AvatarInfo | None = None
     cookie: str | None = None
     x_cluster: str | None = None
+
+
+def bind_debug_current_login_user_to_conversation(
+    conversation_id: UUID,
+    current_user: CurrentLoginUser,
+) -> None:
+    _DEBUG_CONVERSATION_LOGIN_USERS[conversation_id] = current_user.model_copy()
+
+
+def get_debug_current_login_user_by_conversation(
+    conversation_id: UUID,
+) -> CurrentLoginUser | None:
+    current_user = _DEBUG_CONVERSATION_LOGIN_USERS.get(conversation_id)
+    if current_user is None:
+        return None
+    return current_user.model_copy()
 
 
 def get_env_value() -> str:

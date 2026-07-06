@@ -10,6 +10,7 @@ import os
 import uuid
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -25,6 +26,8 @@ from openhands.agent_server.models import ConversationInfo
 from openhands.agent_server.pyromind_auth import (
     PYROMIND_AUTH_COOKIE_NAME,
     CurrentLoginUser,
+    bind_debug_current_login_user_to_conversation,
+    get_debug_current_login_user_by_conversation,
     is_dev,
 )
 from openhands.agent_server.pyromind_constants import (
@@ -269,10 +272,19 @@ class PyromindCreateConversationRequest(BaseModel):
 
 class PyromindDebugUrlRequest(BaseModel):
     url: str = Field(description="HTTP or HTTPS URL to call with dev auth context.")
+    conversation_id: UUID = Field(
+        description=(
+            "Conversation to scope the debug request to. The server verifies the "
+            "conversation belongs to the current user before forwarding the "
+            "current request's login context."
+        ),
+    )
 
 
 class PyromindDebugUrlResponse(BaseModel):
     url: str
+    context_source: str
+    conversation_id: UUID | None = None
     status_code: int
     forwarded_headers: dict[str, str]
     response_headers: dict[str, str]
@@ -327,15 +339,22 @@ def _build_debug_context_headers(current_user: CurrentLoginUser) -> dict[str, st
     response_model=PyromindDebugUrlResponse,
 )
 async def request_debug_url(
-    http_request: Request,
     request: PyromindDebugUrlRequest,
 ) -> PyromindDebugUrlResponse:
     if not is_dev():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
-    current_user = _get_current_login_user(http_request)
     url = _validate_debug_url(request.url)
-    headers = _build_debug_context_headers(current_user)
+    conversation_user = get_debug_current_login_user_by_conversation(
+        request.conversation_id
+    )
+    if conversation_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pyromind conversation login context is not available.",
+        )
+    headers = _build_debug_context_headers(conversation_user)
+
     try:
         async with httpx.AsyncClient(
             timeout=_PYROMIND_DEBUG_URL_TIMEOUT_SECONDS,
@@ -350,6 +369,8 @@ async def request_debug_url(
 
     return PyromindDebugUrlResponse(
         url=url,
+        context_source="conversation",
+        conversation_id=request.conversation_id,
         status_code=response.status_code,
         forwarded_headers=headers,
         response_headers=dict(response.headers),
@@ -466,5 +487,8 @@ async def create_pyromind_conversation(
         info, is_new = await conversation_service.start_conversation(start_request)
     except PermissionError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    current_user = getattr(http_request.state, "current_user", None)
+    if is_dev() and isinstance(current_user, CurrentLoginUser):
+        bind_debug_current_login_user_to_conversation(info.id, current_user)
     response.status_code = status.HTTP_201_CREATED if is_new else status.HTTP_200_OK
     return info
