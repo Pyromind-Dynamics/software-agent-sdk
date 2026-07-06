@@ -8,11 +8,12 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
+exclude-newer = "2026-06-26T09:51:13.028719Z"
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
 litellm = "2026-05-22T00:00:00Z"
+pyromind-sdk = "2026-07-03T10:00:00Z"
 
 [manifest]
 members = [
@@ -43,7 +44,7 @@ dev = [
     { name = "pycodestyle", specifier = ">=2.12.0" },
     { name = "pyinstaller", specifier = ">=6.16.0" },
     { name = "pyright", extras = ["nodejs"], specifier = ">=1.1.405" },
-    { name = "pyromind-sdk", specifier = ">=0.1.5" },
+    { name = "pyromind-sdk", marker = "python_full_version < '3.14'", specifier = "==0.1.6rc1", index = "https://test.pypi.org/simple/" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest-asyncio", specifier = ">=1.1.0" },
     { name = "pytest-cov", specifier = ">=5.0.0" },
@@ -302,7 +303,7 @@ name = "argon2-cffi"
 version = "25.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "argon2-cffi-bindings" },
+    { name = "argon2-cffi-bindings", marker = "python_full_version < '3.14'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/0e/89/ce5af8a7d472a67cc819d5d998aa8c82c5d860608c4db9f46f1162d7dab9/argon2_cffi-25.1.0.tar.gz", hash = "sha256:694ae5cc8a42f4c4e2bf2ca0e64e51e23a040c6a517a85074683d3959e1346c1", size = 45706, upload-time = "2025-06-03T06:55:32.073Z" }
 wheels = [
@@ -314,7 +315,7 @@ name = "argon2-cffi-bindings"
 version = "25.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi" },
+    { name = "cffi", marker = "python_full_version < '3.14'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/5c/2d/db8af0df73c1cf454f71b2bbe5e356b8c1f8041c979f505b3d3186e520a9/argon2_cffi_bindings-25.1.0.tar.gz", hash = "sha256:b957f3e6ea4d55d820e40ff76f450952807013d361a65d7f28acc0acbf29229d", size = 1783441, upload-time = "2025-07-30T10:02:05.147Z" }
 wheels = [
@@ -2442,11 +2443,11 @@ name = "minio"
 version = "7.2.20"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "argon2-cffi" },
-    { name = "certifi" },
-    { name = "pycryptodome" },
-    { name = "typing-extensions" },
-    { name = "urllib3" },
+    { name = "argon2-cffi", marker = "python_full_version < '3.14'" },
+    { name = "certifi", marker = "python_full_version < '3.14'" },
+    { name = "pycryptodome", marker = "python_full_version < '3.14'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.14'" },
+    { name = "urllib3", marker = "python_full_version < '3.14'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/40/df/6dfc6540f96a74125a11653cce717603fd5b7d0001a8e847b3e54e72d238/minio-7.2.20.tar.gz", hash = "sha256:95898b7a023fbbfde375985aa77e2cd6a0762268db79cf886f002a9ea8e68598", size = 136113, upload-time = "2025-11-27T00:37:15.569Z" }
 wheels = [
@@ -6426,19 +6427,19 @@ nodejs = [
 
 [[package]]
 name = "pyromind-sdk"
-version = "0.1.5"
-source = { registry = "https://pypi.org/simple" }
+version = "0.1.6rc1"
+source = { registry = "https://test.pypi.org/simple/" }
 dependencies = [
-    { name = "aiohttp" },
-    { name = "minio" },
-    { name = "pydantic" },
-    { name = "pyyaml" },
-    { name = "requests" },
-    { name = "urllib3" },
+    { name = "aiohttp", marker = "python_full_version < '3.14'" },
+    { name = "minio", marker = "python_full_version < '3.14'" },
+    { name = "pydantic", marker = "python_full_version < '3.14'" },
+    { name = "pyyaml", marker = "python_full_version < '3.14'" },
+    { name = "requests", marker = "python_full_version < '3.14'" },
+    { name = "urllib3", marker = "python_full_version < '3.14'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ea/6e/2e3a284f4c2694c764c506424c8840b30ae0acbafad0448ac85ad93b5737/pyromind_sdk-0.1.5.tar.gz", hash = "sha256:7a6f167ed917676ffe7fbca3f622c27aee1d357cb03a1ffc1a619cc699284eca", size = 117186, upload-time = "2026-06-22T12:49:44.806Z" }
+sdist = { url = "https://test-files.pythonhosted.org/packages/d3/f6/67eb214ec242329aac5b1f8f0f28cc37bb56dbe31709d6f1a6828ad24597/pyromind_sdk-0.1.6rc1.tar.gz", hash = "sha256:b1ff6ffc0fcbfe5e649fd26801440293cfcf8fc525167f43fad5a9a55e4e1b01", size = 122047, upload-time = "2026-07-03T09:42:40.481Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/57/b0/322459f5ba046c4e1e5170c8c20061d648222b524a571c274fdd526cd184/pyromind_sdk-0.1.5-py3-none-any.whl", hash = "sha256:0c0b4b3e17372d4f8206ea7837d3f650675d1c8ce19d0e8bef9904e45c4e7f77", size = 129214, upload-time = "2026-06-22T12:49:43.428Z" },
+    { url = "https://test-files.pythonhosted.org/packages/87/a7/21fae3bfd6751e91df40e4a3c3e351bc109fb6aa0f98ac5ecd35bd80f8f4/pyromind_sdk-0.1.6rc1-py3-none-any.whl", hash = "sha256:851e9c85d62aa4c589cfa392ffef9f8c77b1f0d8332217659b4117a9828d901a", size = 136072, upload-time = "2026-07-03T09:42:39.019Z" },
 ]
 
 [[package]]

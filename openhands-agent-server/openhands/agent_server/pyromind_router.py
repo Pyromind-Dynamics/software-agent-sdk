@@ -11,8 +11,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import (
@@ -22,6 +23,13 @@ from openhands.agent_server.dependencies import (
 )
 from openhands.agent_server.event_service import EventService
 from openhands.agent_server.models import ConversationInfo, Success
+    get_pyromind_jwt_token_from_request,
+)
+from openhands.agent_server.pyromind_auth import (
+    PYROMIND_AUTH_COOKIE_NAME,
+    CurrentLoginUser,
+    is_dev,
+)
 from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
     PYROMIND_APP_TAG_VALUE,
@@ -32,11 +40,13 @@ from openhands.sdk.conversation.request import (
     StartConversationRequest,
 )
 from openhands.sdk.llm.message import Message
+from openhands.sdk.secret import SecretSource, StaticSecret
 from openhands.sdk.skills import Skill, load_skills_from_dir
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
 from openhands.tools.pyromind_debug import get_debug_result_broker
+from openhands.tools.workflow import DslToXyflowTool, ValidateWorkflowDslTool
 
 
 logger = logging.getLogger(__name__)
@@ -60,6 +70,11 @@ _DEFAULT_SKILLS_PATH = os.environ.get(
 
 # Only load these skills for Pyromind (avoids loading unrelated SDK skills)
 _PYROMIND_SKILL_NAMES = ["generate-workflow-dsl", "debug-workflow"]
+_PYROMIND_VALIDATE_AUTH_COOKIE_SECRET = "PYROMIND_VALIDATE_AUTH_COOKIE"
+_PYROMIND_VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
+_PYROMIND_VALIDATE_FORWARD_HEADERS = ("x-cluster", "accept-language")
+_PYROMIND_DEBUG_URL_TIMEOUT_SECONDS = 30.0
+_PYROMIND_DEBUG_RESPONSE_BODY_LIMIT = 20000
 
 # Knowledge-base retrieval guidance layered on top of the codex base prompt via
 # get_codex_agent(custom_instructions=...). Kept lightweight: prefer invoking a
@@ -135,6 +150,80 @@ def _load_agent_skills(
 
     return selected
 
+
+# ---------------------------------------------------------------------------
+# Tool loading utilities
+# ---------------------------------------------------------------------------
+
+
+def _build_workflow_validation_tool(
+    http_request: Request,
+    extra: dict[str, Any],
+) -> tuple[Tool, dict[str, SecretSource]]:
+    headers = {
+        name: value
+        for name in _PYROMIND_VALIDATE_FORWARD_HEADERS
+        if name != "x-cluster" and (value := http_request.headers.get(name))
+    }
+    if cluster := _get_validation_cluster_header(http_request, extra):
+        headers["x-cluster"] = cluster
+
+    params: dict[str, Any] = {}
+    endpoint_url = extra.get("workflow_validation_endpoint_url")
+    if isinstance(endpoint_url, str) and endpoint_url:
+        params["endpoint_url"] = endpoint_url
+    if headers:
+        params["headers"] = headers
+
+    secrets: dict[str, SecretSource] = {}
+    secret_headers: dict[str, str] = {}
+    cookie_header = _get_validation_cookie_header(http_request)
+    if cookie_header:
+        secret_headers["cookie"] = _PYROMIND_VALIDATE_AUTH_COOKIE_SECRET
+        secrets[_PYROMIND_VALIDATE_AUTH_COOKIE_SECRET] = StaticSecret(
+            value=SecretStr(cookie_header)
+        )
+
+    authorization = http_request.headers.get("authorization")
+    if authorization:
+        secret_headers["authorization"] = _PYROMIND_VALIDATE_AUTHORIZATION_SECRET
+        secrets[_PYROMIND_VALIDATE_AUTHORIZATION_SECRET] = StaticSecret(
+            value=SecretStr(authorization)
+        )
+
+    if secret_headers:
+        params["secret_headers"] = secret_headers
+
+    return Tool(name=ValidateWorkflowDslTool.name, params=params), secrets
+
+
+def _get_validation_cookie_header(http_request: Request) -> str | None:
+    current_user = getattr(http_request.state, "current_user", None)
+    if isinstance(current_user, CurrentLoginUser) and current_user.cookie:
+        return current_user.cookie
+
+    raw_cookie = http_request.headers.get("cookie")
+    if raw_cookie:
+        return raw_cookie
+
+    auth_token = get_pyromind_jwt_token_from_request(http_request)
+    if auth_token:
+        return f"{PYROMIND_AUTH_COOKIE_NAME}={auth_token}"
+    return None
+
+
+def _get_validation_cluster_header(
+    http_request: Request,
+    extra: dict[str, Any],
+) -> str | None:
+    current_user = getattr(http_request.state, "current_user", None)
+    if isinstance(current_user, CurrentLoginUser) and current_user.x_cluster:
+        return current_user.x_cluster
+
+    cluster = extra.get("x_cluster", extra.get("x-cluster"))
+    if isinstance(cluster, str) and cluster:
+        return cluster
+    return http_request.headers.get("x-cluster")
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +388,16 @@ def _sync_workflow_with_canvas(
             "</system_reminder>"
         )
     return TextContent(text=reminder_text)
+class PyromindDebugUrlRequest(BaseModel):
+    url: str = Field(description="HTTP or HTTPS URL to call with dev auth context.")
+
+
+class PyromindDebugUrlResponse(BaseModel):
+    url: str
+    status_code: int
+    forwarded_headers: dict[str, str]
+    response_headers: dict[str, str]
+    body: str
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +405,77 @@ def _sync_workflow_with_canvas(
 # ---------------------------------------------------------------------------
 
 pyromind_router = APIRouter(prefix="/pyromind", tags=["Pyromind"])
+
+
+def _get_current_login_user(http_request: Request) -> CurrentLoginUser:
+    current_user = getattr(http_request.state, "current_user", None)
+    if not isinstance(current_user, CurrentLoginUser):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Pyromind user context is not available.",
+        )
+    return current_user
+
+
+def _validate_debug_url(url: str) -> str:
+    try:
+        parsed = httpx.URL(url)
+    except httpx.InvalidURL as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid URL: {exc}",
+        ) from exc
+
+    if parsed.scheme not in {"http", "https"} or not parsed.host:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="URL must be an absolute HTTP or HTTPS URL.",
+        )
+    return str(parsed)
+
+
+def _build_debug_context_headers(current_user: CurrentLoginUser) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if current_user.cookie:
+        headers["cookie"] = current_user.cookie
+    if current_user.x_cluster:
+        headers["x-cluster"] = current_user.x_cluster
+    return headers
+
+
+@pyromind_router.post(
+    "/debug/request-url",
+    response_model=PyromindDebugUrlResponse,
+)
+async def request_debug_url(
+    http_request: Request,
+    request: PyromindDebugUrlRequest,
+) -> PyromindDebugUrlResponse:
+    if not is_dev():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+
+    current_user = _get_current_login_user(http_request)
+    url = _validate_debug_url(request.url)
+    headers = _build_debug_context_headers(current_user)
+    try:
+        async with httpx.AsyncClient(
+            timeout=_PYROMIND_DEBUG_URL_TIMEOUT_SECONDS,
+            follow_redirects=False,
+        ) as client:
+            response = await client.get(url, headers=headers)
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to request debug URL: {type(exc).__name__}: {exc}",
+        ) from exc
+
+    return PyromindDebugUrlResponse(
+        url=url,
+        status_code=response.status_code,
+        forwarded_headers=headers,
+        response_headers=dict(response.headers),
+        body=response.text[:_PYROMIND_DEBUG_RESPONSE_BODY_LIMIT],
+    )
 
 
 @pyromind_router.post("/conversations", response_model=ConversationInfo)
@@ -362,6 +532,9 @@ async def create_pyromind_conversation(
     skills_path = request.extra.get("skills_path", _DEFAULT_SKILLS_PATH)
     skills = _load_agent_skills(skills_path, allow_list=_PYROMIND_SKILL_NAMES)
     agent_context = AgentContext(skills=skills) if skills else None
+    validation_tool, validation_secrets = _build_workflow_validation_tool(
+        http_request, request.extra
+    )
 
     # 4. Build LLM config
     llm = LLM(
@@ -382,6 +555,8 @@ async def create_pyromind_conversation(
             Tool(name="grep"),
             Tool(name="file_editor"),
             Tool(name="debug_workflow"),
+            Tool(name=DslToXyflowTool.name),
+            validation_tool,
         ],
     )
 
@@ -412,6 +587,7 @@ async def create_pyromind_conversation(
         workspace=workspace,
         conversation_id=conversation_id,
         initial_message=initial_message,
+        secrets=validation_secrets,
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
         user_id=get_current_user_id(http_request),
     )
