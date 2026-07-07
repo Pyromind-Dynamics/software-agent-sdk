@@ -33,8 +33,21 @@ from openhands.agent_server.models import (
 from openhands.agent_server.pub_sub import Subscriber
 from openhands.agent_server.server_details_router import update_last_execution_time
 from openhands.agent_server.utils import safe_rmtree, utc_now
+from openhands.agent_server.workflow_canvas_models import (
+    SaveWorkflowCanvasEventSnapshotRequest,
+)
+from openhands.agent_server.workflow_canvas_store import (
+    FileWorkflowCanvasStore,
+    WorkflowCanvasEventSnapshotNotFoundError,
+    WorkflowCanvasVersionNotFoundError,
+)
 from openhands.sdk import LLM, AgentContext, Event, Message
 from openhands.sdk.agent.base import AgentBase
+from openhands.sdk.conversation.event_store import EventLog
+from openhands.sdk.conversation.persistence_const import (
+    EVENT_NAME_RE,
+    EVENTS_DIR,
+)
 from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
     ConversationState,
@@ -50,12 +63,32 @@ from openhands.sdk.git.utils import run_git_command, validate_git_repository
 from openhands.sdk.tool.client_tool import register_client_tools
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
+from openhands.tools.workflow.definition import (
+    PYROMIND_WORKFLOW_DIRTY_KEY,
+    PYROMIND_WORKFLOW_EMITTED_KEY,
+)
 
 
 if TYPE_CHECKING:
     from openhands.sdk.subagent.schema import AgentDefinition
 
 CONVERSATION_WORKTREE_ROOT = Path("/tmp/conversation-worktrees")
+
+
+class ConversationForkAtEventError(RuntimeError):
+    pass
+
+
+class ConversationForkAtEventSourceNotFoundError(ConversationForkAtEventError):
+    pass
+
+
+class ConversationForkAtEventTargetNotFoundError(ConversationForkAtEventError):
+    pass
+
+
+class ConversationForkAtEventConflictError(ConversationForkAtEventError):
+    pass
 
 
 def _build_worktree_guidance(
@@ -96,6 +129,27 @@ def _append_worktree_guidance(
     suffix = f"{existing_suffix}\n\n{guidance}" if existing_suffix else guidance
     updated_context = context.model_copy(update={"system_message_suffix": suffix})
     return agent.model_copy(update={"agent_context": updated_context})
+
+
+def _last_user_message_id(events: list[Event]) -> str | None:
+    for event in reversed(events):
+        if isinstance(event, MessageEvent) and event.source == "user":
+            return event.id
+    return None
+
+
+def _delete_event_files_after(conversation_dir: Path, keep_index: int) -> None:
+    events_dir = conversation_dir / EVENTS_DIR
+    if not events_dir.exists():
+        return
+    for path in events_dir.iterdir():
+        if not path.is_file():
+            continue
+        match = EVENT_NAME_RE.match(path.name)
+        if match is None:
+            continue
+        if int(match.group("idx")) > keep_index:
+            path.unlink()
 
 
 def _has_git_remote(repo_root: Path, remote: str = "origin") -> bool:
@@ -1051,11 +1105,191 @@ class ConversationService:
         await event_service.condense()
         return True
 
+    async def fork_conversation_at_event(
+        self,
+        source_id: UUID,
+        *,
+        event_id: str,
+        title: str | None = None,
+        tags: dict[str, str] | None = None,
+        user_id: str | None = None,
+    ) -> tuple[ConversationInfo, str]:
+        """Fork a Pyromind conversation branch at a workflow event checkpoint."""
+        if self._event_services is None:
+            raise ValueError("inactive_service")
+
+        source_service = await self.get_event_service(source_id, user_id=user_id)
+        if source_service is None:
+            raise ConversationForkAtEventSourceNotFoundError(
+                f"Source conversation not found: {source_id}"
+            )
+
+        source_state = await source_service.get_state()
+        if source_state.execution_status == ConversationExecutionStatus.RUNNING:
+            raise ConversationForkAtEventConflictError(
+                "Cannot fork a conversation while it is running"
+            )
+
+        source_store = FileWorkflowCanvasStore(
+            conversation_dir=source_service.conversation_dir,
+            session_id=source_service.stored.id.hex,
+        )
+        try:
+            target_snapshot = source_store.get_event_snapshot(event_id)
+        except (
+            WorkflowCanvasEventSnapshotNotFoundError,
+            WorkflowCanvasVersionNotFoundError,
+        ) as exc:
+            raise ConversationForkAtEventTargetNotFoundError(
+                f"Workflow snapshot not found for event: {event_id}"
+            ) from exc
+        if target_snapshot.snapshot_role != "out":
+            raise ConversationForkAtEventConflictError(
+                "Only workflow output events can be used as fork checkpoints"
+            )
+
+        fork_id = uuid4()
+        fork_workspace = LocalWorkspace(
+            working_dir=str(self.conversations_dir / fork_id.hex)
+        )
+        fork_info = await self.fork_conversation(
+            source_id,
+            fork_id=fork_id,
+            workspace=fork_workspace,
+            title=title,
+            tags=tags,
+            reset_metrics=True,
+            user_id=user_id,
+        )
+        if fork_info is None:
+            raise ConversationForkAtEventSourceNotFoundError(
+                f"Source conversation not found: {source_id}"
+            )
+
+        try:
+            fork_service = await self.get_event_service(fork_info.id, user_id=user_id)
+            if fork_service is None:
+                raise ConversationForkAtEventSourceNotFoundError(
+                    f"Forked conversation not found: {fork_info.id}"
+                )
+            loop = asyncio.get_running_loop()
+            retained_event_ids = await loop.run_in_executor(
+                None,
+                self._prepare_pyromind_fork_at_event_sync,
+                fork_service,
+                event_id,
+                target_snapshot.workflow_dsl_data,
+            )
+            await loop.run_in_executor(
+                None,
+                self._copy_workflow_canvas_snapshots_sync,
+                source_store,
+                fork_service,
+                retained_event_ids,
+            )
+            fork_store = FileWorkflowCanvasStore(
+                conversation_dir=fork_service.conversation_dir,
+                session_id=fork_service.stored.id.hex,
+            )
+            fork_target_snapshot = await loop.run_in_executor(
+                None, fork_store.get_event_snapshot, event_id
+            )
+            fork_state = await fork_service.get_state()
+            return (
+                _compose_conversation_info(fork_service.stored, fork_state),
+                fork_target_snapshot.version_id,
+            )
+        except Exception:
+            await self._discard_forked_conversation(fork_id)
+            raise
+
+    def _prepare_pyromind_fork_at_event_sync(
+        self,
+        fork_service: EventService,
+        event_id: str,
+        workflow_dsl: str,
+    ) -> list[str]:
+        conversation = fork_service.get_conversation()
+        state = conversation._state
+        callback = state._on_state_change
+        state._on_state_change = None
+        try:
+            with state:
+                try:
+                    keep_index = state.events.get_index(event_id)
+                except KeyError as exc:
+                    raise ConversationForkAtEventTargetNotFoundError(
+                        f"Event not found in forked conversation: {event_id}"
+                    ) from exc
+                retained_events = [
+                    state.events[index] for index in range(keep_index + 1)
+                ]
+                _delete_event_files_after(fork_service.conversation_dir, keep_index)
+                state._events = EventLog(state._fs, dir_path=EVENTS_DIR)
+                state._events.set_write_guard(state._write_guard)
+                state.rebuild_view()
+                state.execution_status = ConversationExecutionStatus.IDLE
+                state.last_user_message_id = _last_user_message_id(retained_events)
+                state.blocked_actions = {}
+                state.blocked_messages = {}
+                state.agent_state = {
+                    **state.agent_state,
+                    PYROMIND_WORKFLOW_DIRTY_KEY: False,
+                    PYROMIND_WORKFLOW_EMITTED_KEY: True,
+                }
+        finally:
+            state._on_state_change = callback
+
+        working_dir = Path(conversation.workspace.working_dir)
+        working_dir.mkdir(parents=True, exist_ok=True)
+        workflow_path = working_dir / "workflow.py"
+        if workflow_dsl.strip():
+            workflow_path.write_text(workflow_dsl, encoding="utf-8")
+        else:
+            workflow_path.unlink(missing_ok=True)
+        return [event.id for event in retained_events]
+
+    def _copy_workflow_canvas_snapshots_sync(
+        self,
+        source_store: FileWorkflowCanvasStore,
+        fork_service: EventService,
+        retained_event_ids: list[str],
+    ) -> None:
+        snapshots = source_store.batch_get_event_snapshots(retained_event_ids)
+        fork_store = FileWorkflowCanvasStore(
+            conversation_dir=fork_service.conversation_dir,
+            session_id=fork_service.stored.id.hex,
+        )
+        for event_id in retained_event_ids:
+            snapshot = snapshots.get(event_id)
+            if snapshot is None:
+                continue
+            fork_store.save_event_snapshot(
+                SaveWorkflowCanvasEventSnapshotRequest(
+                    eventId=snapshot.event_id,
+                    snapshotRole=snapshot.snapshot_role,
+                    workflowDslData=snapshot.workflow_dsl_data,
+                    parentUserMessageEventId=(snapshot.parent_user_message_event_id),
+                    eventType=snapshot.event_type,
+                    summary=snapshot.summary,
+                    feature=snapshot.feature,
+                    createdBy="pyromind_fork_at_event",
+                )
+            )
+
+    async def _discard_forked_conversation(self, fork_id: UUID) -> None:
+        if self._event_services is not None:
+            fork_service = self._event_services.pop(fork_id, None)
+            if fork_service is not None:
+                await fork_service.close()
+        safe_rmtree(self.conversations_dir / fork_id.hex)
+
     async def fork_conversation(
         self,
         source_id: UUID,
         *,
         fork_id: UUID | None = None,
+        workspace: LocalWorkspace | None = None,
         title: str | None = None,
         tags: dict[str, str] | None = None,
         reset_metrics: bool = True,
@@ -1097,7 +1331,10 @@ class ConversationService:
         # Extract the persisted data, then discard the temporary conversation.
         fork_conv_id = fork_conv.id
         fork_agent = cast(AgentBase, fork_conv.agent)
-        fork_workspace = fork_conv.workspace
+        if workspace is not None:
+            fork_conv.workspace = workspace
+            fork_conv._state.workspace = workspace
+        fork_workspace = workspace or fork_conv.workspace
         fork_conv.delete_on_close = False
         fork_conv.close()
 
