@@ -675,6 +675,7 @@ async def send_pyromind_message(
         message,
         run=request.run,
         extended_content=[reminder] if reminder else None,
+        workflow_dsl_snapshot=request.workflow_dsl,
     )
     return Success()
 

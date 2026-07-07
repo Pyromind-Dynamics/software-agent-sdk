@@ -68,6 +68,7 @@ from openhands.agent_server.tool_preload_service import get_tool_preload_service
 from openhands.agent_server.tool_router import tool_router
 from openhands.agent_server.vscode_router import vscode_router
 from openhands.agent_server.vscode_service import get_vscode_service
+from openhands.agent_server.workflow_canvas_router import workflow_canvas_router
 from openhands.agent_server.workspace_router import workspace_router
 from openhands.agent_server.workspaces_router import workspaces_router
 from openhands.sdk.logger import DEBUG, get_logger
@@ -406,6 +407,7 @@ def _add_api_routes(app: FastAPI) -> None:
     api_router.include_router(mcp_router)
     api_router.include_router(settings_router)
     api_router.include_router(workspaces_router)
+    api_router.include_router(workflow_canvas_router)
     api_router.include_router(profiles_router)
     api_router.include_router(agent_profiles_router)
     api_router.include_router(pyromind_router)

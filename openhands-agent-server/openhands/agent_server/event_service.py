@@ -26,6 +26,9 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_VALUE,
     PYROMIND_WORKFLOW_EVENT_KEY,
 )
+from openhands.agent_server.workflow_canvas_snapshot_hook import (
+    WorkflowCanvasSnapshotHook,
+)
 from openhands.sdk import LLM, AgentBase, Event, Message, TextContent, get_logger
 from openhands.sdk.agent import ACPAgent
 from openhands.sdk.conversation.base import BaseConversation
@@ -453,6 +456,27 @@ class EventService:
     def _is_pyromind_conversation(self) -> bool:
         return self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE
 
+    def _workflow_canvas_snapshot_hook(self) -> WorkflowCanvasSnapshotHook:
+        return WorkflowCanvasSnapshotHook(
+            conversation_dir=self.conversation_dir,
+            session_id=self.stored.id.hex,
+        )
+
+    def _save_pyromind_workflow_input_snapshot_sync(
+        self,
+        workflow_dsl: str | None,
+    ) -> None:
+        if workflow_dsl is None or not self._conversation:
+            return
+        if not self._is_pyromind_conversation():
+            return
+        with self._conversation._state as state:
+            user_message_event_id = state.last_user_message_id
+        self._workflow_canvas_snapshot_hook().save_in_snapshot(
+            event_id=user_message_event_id,
+            workflow_dsl_data=workflow_dsl,
+        )
+
     def _clear_pyromind_workflow_dirty_sync(self) -> None:
         if not self._conversation:
             return
@@ -490,15 +514,23 @@ class EventService:
             key=PYROMIND_WORKFLOW_EVENT_KEY,
             value=observation.model_dump(mode="json"),
         )
+        parent_user_message_event_id: str | None = None
         with conversation._state as state:
             if state.agent_state.get(PYROMIND_WORKFLOW_DIRTY_KEY) is not True:
                 return False
+            parent_user_message_event_id = state.last_user_message_id
             conversation._on_event(event)
             state.agent_state = {
                 **state.agent_state,
                 PYROMIND_WORKFLOW_DIRTY_KEY: False,
                 PYROMIND_WORKFLOW_EMITTED_KEY: True,
             }
+        self._workflow_canvas_snapshot_hook().save_out_snapshot(
+            event_id=event.id,
+            workflow_dsl_data=observation.workflow,
+            parent_user_message_event_id=parent_user_message_event_id,
+            summary=observation.summary,
+        )
         return True
 
     def _create_state_update_event_sync(self) -> ConversationStateUpdateEvent:
@@ -551,6 +583,7 @@ class EventService:
         run: bool = False,
         _from_goal_loop: bool = False,
         extended_content: list[TextContent] | None = None,
+        workflow_dsl_snapshot: str | None = None,
     ):
         conversation = self._conversation
         if not conversation:
@@ -561,12 +594,21 @@ class EventService:
             await self.stop_goal_loop()
         explicit_interrupt_generation = self._explicit_interrupt_generation
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: conversation.send_message(
-                message, extended_content=extended_content
-            ),
-        )
+        if extended_content is None:
+            await loop.run_in_executor(None, conversation.send_message, message)
+        else:
+            await loop.run_in_executor(
+                None,
+                lambda: conversation.send_message(
+                    message, extended_content=extended_content
+                ),
+            )
+        if workflow_dsl_snapshot is not None:
+            await loop.run_in_executor(
+                None,
+                self._save_pyromind_workflow_input_snapshot_sync,
+                workflow_dsl_snapshot,
+            )
         if run:
             if self._explicit_interrupt_generation != explicit_interrupt_generation:
                 return

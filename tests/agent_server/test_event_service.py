@@ -28,6 +28,7 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_VALUE,
     PYROMIND_WORKFLOW_EVENT_KEY,
 )
+from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
 from openhands.sdk import LLM, Agent, AgentBase, Conversation, Message
 from openhands.sdk.agent import ACPAgent
 from openhands.sdk.conversation.event_store import EventLog
@@ -193,9 +194,14 @@ def _attach_event_log(event_service, event_log: EventLog) -> None:
 
 
 class _WorkflowEmitState:
-    def __init__(self, agent_state: dict[str, object]) -> None:
+    def __init__(
+        self,
+        agent_state: dict[str, object],
+        last_user_message_id: str | None = "user-event-1",
+    ) -> None:
         self.agent_state = agent_state
         self.events: list[Event] = []
+        self.last_user_message_id = last_user_message_id
 
     def __enter__(self):
         return self
@@ -205,9 +211,14 @@ class _WorkflowEmitState:
 
 
 class _WorkflowEmitConversation:
-    def __init__(self, working_dir: Path, agent_state: dict[str, object]) -> None:
+    def __init__(
+        self,
+        working_dir: Path,
+        agent_state: dict[str, object],
+        last_user_message_id: str | None = "user-event-1",
+    ) -> None:
         self.workspace = LocalWorkspace(working_dir=str(working_dir))
-        self._state = _WorkflowEmitState(agent_state)
+        self._state = _WorkflowEmitState(agent_state, last_user_message_id)
 
     def _on_event(self, event: Event) -> None:
         self._state.events.append(event)
@@ -227,7 +238,10 @@ def _workflow_event_service(
         tags=tags,
     )
     service = EventService(stored=stored, conversations_dir=tmp_path / "conversations")
-    service._conversation = _WorkflowEmitConversation(tmp_path, agent_state)
+    service._conversation = cast(
+        LocalConversation,
+        _WorkflowEmitConversation(tmp_path, agent_state),
+    )
     return service
 
 
@@ -256,13 +270,44 @@ def test_emit_pyromind_workflow_if_dirty_emits_event_and_clears_flag(tmp_path):
     assert observation.name == "Demo"
     assert observation.summary == "Created workflow.py"
     assert (
-        service._conversation._state.agent_state[PYROMIND_WORKFLOW_DIRTY_KEY]
-        is False
+        service._conversation._state.agent_state[PYROMIND_WORKFLOW_DIRTY_KEY] is False
     )
     assert (
-        service._conversation._state.agent_state[PYROMIND_WORKFLOW_EMITTED_KEY]
-        is True
+        service._conversation._state.agent_state[PYROMIND_WORKFLOW_EMITTED_KEY] is True
     )
+    snapshot = FileWorkflowCanvasStore(
+        service.conversation_dir,
+        service.stored.id.hex,
+    ).get_event_snapshot(event.id)
+    assert snapshot.snapshot_role == "out"
+    assert snapshot.workflow_dsl_data == "# workflow: Demo\nlimit = 20\n"
+    assert snapshot.parent_user_message_event_id == "user-event-1"
+    assert snapshot.event_type == PYROMIND_WORKFLOW_EVENT_KEY
+
+
+def test_save_pyromind_workflow_input_snapshot_sync_saves_in_snapshot(tmp_path):
+    service = _workflow_event_service(tmp_path, pyromind=True, agent_state={})
+
+    service._save_pyromind_workflow_input_snapshot_sync("# workflow: Input\n")
+
+    snapshot = FileWorkflowCanvasStore(
+        service.conversation_dir,
+        service.stored.id.hex,
+    ).get_event_snapshot("user-event-1")
+    assert snapshot.snapshot_role == "in"
+    assert snapshot.workflow_dsl_data == "# workflow: Input\n"
+
+
+def test_save_pyromind_workflow_input_snapshot_ignores_non_pyromind(tmp_path):
+    service = _workflow_event_service(tmp_path, pyromind=False, agent_state={})
+
+    service._save_pyromind_workflow_input_snapshot_sync("# workflow: Input\n")
+
+    snapshots = FileWorkflowCanvasStore(
+        service.conversation_dir,
+        service.stored.id.hex,
+    ).batch_get_event_snapshots(["user-event-1"])
+    assert snapshots == {}
 
 
 def test_emit_pyromind_workflow_if_not_dirty_does_nothing(tmp_path):
@@ -291,8 +336,7 @@ def test_emit_pyromind_workflow_if_missing_file_clears_dirty(tmp_path):
     assert service._conversation is not None
     assert service._conversation._state.events == []
     assert (
-        service._conversation._state.agent_state[PYROMIND_WORKFLOW_DIRTY_KEY]
-        is False
+        service._conversation._state.agent_state[PYROMIND_WORKFLOW_DIRTY_KEY] is False
     )
 
 
