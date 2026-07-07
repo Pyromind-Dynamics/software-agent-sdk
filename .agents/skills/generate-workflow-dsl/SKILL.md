@@ -1,17 +1,25 @@
 ---
 name: generate-workflow-dsl
 description: >-
-  当用户需要生成或修改 Pyromind 平台上的模型训练工作流时使用此技能，也适用于用户单独要求
-  校验/检查当前工作流 DSL 是否合法。优先复用技能内置模板，并按需读取相关节点文档，生成符合
-  DSL 格式的工作流代码，写入后必须通过 `validate_workflow_dsl` 校验，报错则修复后重新校验。
+  当用户想在 Pyromind 平台上用自己的数据训练/微调模型（典型形式是贴一个 storage 数据集
+  相对路径说"帮我用这些数据训练一个模型"）、要求生成或修改训练工作流、跑基线评测
+  （benchmark），或单独要求校验当前工作流 DSL 时使用此技能。流程：先用 preview_dataset
+  了解数据 → 引导先跑基模 bench 基线（用户可跳过）→ 默认生成 SFT 工作流并按决策链自动
+  配参 → 写入 workflow.py 后必须通过 validate_workflow_dsl 校验，报错则修复后重新校验。
 triggers:
+- 训练一个模型
+- 训练模型
+- 微调
+- fine-tune
+- train a model
 - 生成工作流
 - generate workflow
 - 训练工作流
 - training workflow
 - workflow DSL
+- benchmark
+- 基线评测
 - 校验工作流
-- 校验一下工作流
 - 检查工作流
 - validate workflow
 ---
@@ -20,482 +28,164 @@ triggers:
 
 ## 概述
 
-当用户要求生成/修改模型训练工作流，或单独要求校验当前工作流时，你需要：
-1. 先从本技能内置的示例工作流中选择最接近的模板，不要从零开始搜索（如果只是校验现有
-   `workflow.py`、并未要求生成或修改，跳过这一步）
-2. 根据用户需求选择合适的节点组合，并按需读取相关节点文档确认参数
-3. 按照 DSL 语法格式创建或修改当前工作目录下的 `workflow.py`
-4. 写入/修改后，调用 `validate_workflow_dsl` 校验，报错则按返回的结构化信息修复后再次
-   校验，直到通过或达到重试上限（见下方"生成后校验循环"）
-5. 校验通过（或用户只是要求校验、本来就通过）后正常结束；后端会在本轮 run 结束后自动将
-   当前文件同步给前端
+典型用户不会说"给我一个 SFT 工作流"。他们通常是把一批（格式往往比较乱的）训练数据传到
+storage，把相对路径贴进对话框，说"帮我用这些数据训练一个模型"；也可能顺带描述自己的行业
+背景和想落地的业务场景。你的职责是把这类模糊需求落成可运行的工作流 DSL。
 
-可读取的知识库路径均位于路由提示中的绝对知识库目录下。需要补充检索时，使用 `grep` 传入该绝对路径或其子目录路径：
-- 平台基础用法：`<知识库绝对路径>/basic/`
-- JupyterLab 与脚本训练：`<知识库绝对路径>/jupyterlab/`
-- Python SDK 与脚本训练 API：`<知识库绝对路径>/sdk/`
-- Studio 拖拽工作流：`<知识库绝对路径>/studio/`
-- 节点 I/O、参数与端口定义：`<知识库绝对路径>/nodes/<NodeType>/<NodeType>.md`
-- 外部数据处理样例：`<知识库绝对路径>/dataset_processing_workflow.py`
+SFT/DPO/GRPO 等后训练方法的原理你已经掌握，不要向用户科普，也不要依赖用户说出这些术语。
+注意力放在四件事上：数据格式判断、节点选型、参数决策、DSL 正确性。
 
-## 检索与读取策略
+如果用户只是要求校验现有 workflow.py（没有生成/修改诉求），直接跳到"校验循环"。
 
-优先级：**内置示例模板 → 直接读取相关节点文档 → 必要时宽泛 grep**。
+## 工作流程
 
-1. 本技能已经包含数据处理、SFT、GRPO 示例。用户要生成 SFT 时，直接以“示例2：SFT 训练工作流”为模板调整数据集、模型和训练参数；用户要生成 GRPO 时，直接以“示例3：GRPO 训练工作流”为模板调整。不要为了确认示例存在而先 grep 完整的 `# workflow: ...` 标题或注释。
-2. 节点文档路径是确定的：`<知识库绝对路径>/nodes/<NodeType>/<NodeType>.md`。当已经知道要用哪些节点时，直接用 `file_editor` 查看对应文件，不要先在整个知识库里 grep 节点名来“发现”文件。
-3. grep 只用于补充检索，并使用宽泛关键词：`SFT`、`DPO`、`GRPO`、`training`、`dataset`、`reward`，或精确的 `NodeType`。避免使用依赖格式的 pattern，例如完整工作流标题、Markdown 标题锚点、`^###`、`# workflow: ...`。
-4. 如果只是生成常见训练工作流，通常只需要读取被选中节点的契约文档；只有用户问平台概念、Studio 操作、SDK 脚本写法，或节点参数仍不明确时，才检索 `basic/`、`studio/`、`sdk/`、`jupyterlab/`。
+```
+1. 数据理解      preview_dataset 看清格式/条数/长度/是否多模态
+2. 基线评测引导  建议先用基模跑 bench（用户可明确跳过）
+3. 生成训练工作流 默认 SFT；数据明摆着是偏好对/仅 prompt 才用 DPO/GRPO
+4. 自动配参      数据(N,L) → 模型类型 → 规模 → LoRA/Full → GPU
+5. 写入与校验    写 workflow.py → validate_workflow_dsl 循环直到通过
+```
 
-常见工作流需要优先读取的节点文档：
+### 第 1 步：数据理解
 
-| 场景 | 相关节点 |
-|------|----------|
-| 数据处理/验证 | CloneAndCacheDataset、PathJoinNode、DatasetToJsonlNode、DatasetConfigBuilderTextNode、DatasetConfigBuilderVisionNode、DatasetConfigBuilderNode、DatasetValidatorNode |
-| SFT | CloneAndCacheDataset、CloneAndCacheModel、PathJoinNode、DatasetConfigBuilderTextNode、DatasetConfigBuilderMessageNode、DatasetConfigBuilderVisionNode、DatasetConfigBuilderNode、ModelConfigBuilderNode、LoraConfigBuilderNode、TrainingConfigBuilderNode、AccelerateConfigBuilderNode、ModelTrainSFTNode、ModelMergeLoraNode |
-| DPO | CloneAndCacheDataset、CloneAndCacheModel、PathJoinNode、DatasetConfigBuilderTextNode、DatasetConfigBuilderMessageNode、DatasetConfigBuilderNode、ModelConfigBuilderNode、LoraConfigBuilderNode、TrainingConfigBuilderNode、AccelerateConfigBuilderNode、ModelTrainDPONode |
-| GRPO | CloneAndCacheDataset、CloneAndCacheModel、PathJoinNode、DatasetConfigBuilderTextNode、DatasetConfigBuilderVisionNode、DatasetConfigBuilderNode、ModelConfigBuilderNode、LoraConfigBuilderNode、TrainingConfigBuilderNode、AccelerateConfigBuilderNode、RewardItemBuilderNode、RewardConfigBuilderNode、GRPOTrainingExtraConfigBuilderNode、ModelTrainGRPONode |
+用户贴了 storage 数据路径时，先调用 `preview_dataset` 工具查看真实数据，再决定节点和
+字段映射参数，不要凭路径名猜格式。需要记下三个配参输入：条数 N、P95 序列长度 L、是否
+含图片/视频。
 
-## DSL 语法格式
+根据样本行判断字段映射节点：
 
-`workflow.py` 是**声明式 DSL**，只是借用 Python 语法描述节点及连线，并不是可以在本地直接
-运行的 Python 脚本；不要尝试执行它或按 Python 运行时语义推理其行为。它的正确性由两个不同
-的工具分别负责，不要混淆：
+| 数据形态 | 节点 |
+|----------|------|
+| `messages` 数组（多轮对话，可含 tool_calls） | DatasetConfigBuilderMessageNode |
+| 独立的 prompt / response 字段 | DatasetConfigBuilderTextNode |
+| 含图片/视频字段 | DatasetConfigBuilderVisionNode |
+| chosen/rejected 偏好对 | DPO 数据（字段映射同上，加 rejected_field） |
 
-- **`validate_workflow_dsl`**：调用平台的静态校验接口，检查 DSL 语法、节点/端口是否存在、
-  类型是否匹配等**结构性**问题，几秒内返回，不会真正执行工作流。**每次你创建或修改
-  `workflow.py` 之后都必须调用它**，是本技能"生成后校验循环"的一部分
-- **`debug_workflow`**（属于 `debug-workflow` 技能）：把 DSL 提交到平台**真实执行**一次，
-  用于验证工作流能不能真正跑通（通常 30 秒到 2 分钟）。只有当用户明确要求"测试”“test”
-  “调试”“debug”“试跑”时才触发这个更重的动作，不要在本技能里主动调用它
+用户描述了行业背景和业务场景时，把这些信息用于指标推荐和基模选择，不要只依赖数据集
+反推。信息不足时针对性地问一两个问题，不要发问卷。
 
-两者返回的报错含义不同：`validate_workflow_dsl` 的 `errors` 是结构性问题（节点/端口/类型/
-DAG），`debug_workflow` 的 `error_log` 是真实执行时的运行时报错；修复前先看清楚报错来自
-哪个工具。
+### 第 2 步：基线评测引导（生成训练工作流之前）
+
+在生成训练工作流之前，先建议用户用基模（主要是 Qwen 系列）跑一个 bench 基线：部署基模
+推理服务，按业务场景推荐指标，从用户数据里采样一部分跑出基线分数，训练后用同一套评测
+对比才能说明训练效果。用户明确说不需要/跳过时，直接进入第 3 步，不要反复推销。
+
+bench 工作流结构（完整模板见 [references/example-workflows.md](references/example-workflows.md) 示例5）：
+
+```
+基模(CloneAndCacheModel) → VLLMInference 部署
+用户数据(PathJoinNode → DatasetToJsonlNode 如需) → DatasetConfigBuilderNode
+两路汇入 ModelEvalApiNode（max_samples 控制采样条数）+ 指标配置
+```
+
+指标选择，按业务场景推荐：
+
+| 场景 | entry |
+|------|-------|
+| 数学/数值答案 | `compute_gsm8k`（默认） |
+| 分类/精确匹配 | `compute_accuracy` |
+| 翻译/受约束生成 | `compute_bleu` |
+| 摘要/长文本生成 | `compute_rouge_l` |
+
+- 现成指标用 `MetricsConfigBuilderNode`，entry 必须填完整枚举值
+  `examples/eval_metrics_common.py:<上表函数名>`，如
+  `examples/eval_metrics_common.py:compute_gsm8k`
+- 现成指标都不合适时（如工具调用正确率、业务自定义打分），用 `MetricsConfigBuilderCustomNode`：
+  1. 在工作区写好指标 py 文件，函数签名
+     `fn(gt_text, pred_text, sample, *, metrics_name=None) -> dict | None`，
+     返回 dict 中含与指标同名的键、值为 0~1 分数
+  2. 调用 `upload_file_to_pyromind` 工具上传，拿到形如 `/workspace/script/agent/acc.py`
+     的 storage 路径
+  3. entry 填 `<storage路径>:<函数名>`，例如 `/workspace/script/agent/acc.py:acc_func`
+
+### 第 3 步：生成训练工作流
+
+- **默认生成 SFT 工作流**。只有数据明摆着是 DPO 格式（chosen/rejected 偏好对）或 GRPO
+  格式（仅 prompt + 可程序化验证的答案/reward），才生成对应类型；拿不准时选 SFT，并向
+  用户说明一句判断依据。
+- 基模用 `CloneAndCacheModel`，可选值只有：
+  - 纯文本：`Qwen/Qwen3-0.6B`、`Qwen/Qwen3-1.7B`、`Qwen/Qwen3-4B`
+  - 多模态：`Qwen/Qwen3-VL-2B-Instruct`、`Qwen/Qwen3-VL-4B-Instruct`
+- 用户要用列表之外的开源模型时，改用 `DownloadAndCacheModel`（Download Model 节点）从
+  huggingface/modelscope 下载。
+- 以 [references/example-workflows.md](references/example-workflows.md) 里最接近的示例为
+  模板改参数，不要从零拼节点。用户 storage 数据 + messages 格式的 SFT（最常见场景）直接
+  用示例6。
+
+### 第 4 步：自动配参
+
+决策链：**数据集(N, L) → 模型类型(LLM/VL) → 模型规模 → LoRA/Full → GPU 资源**。
+
+生成训练工作流前先读 [references/parameter-decision.md](references/parameter-decision.md)，
+按表填 lora_rank、batch_size、learning_rate、epoch 等参数。速记原则：
+
+- LoRA 是默认，Full 只在数据量大且有深度对齐需求且资源够时用
+- VL 模型：batch 和 lr 在 LLM 基础上减半，显存需求升一档
+- DPO lr ≈ SFT 的 5%~10%；GRPO lr ≈ SFT 的 10%~20%
+- 资源不够时依次：Full→LoRA、降 rank、batch 减半 accum 翻倍，**不要先降 lr**
+
+### 第 5 步：写入与校验
+
+1. 用 `apply_patch` 把 DSL 写入当前工作目录的相对路径 `workflow.py`（修改已有工作流也
+   只编辑这个路径）。不要手写会话目录的长绝对路径；如用 `file_editor` 也传 `workflow.py`。
+   不要只口头说已生成——必须实际调用工具创建或修改文件。
+2. 每次写入/修改后立即进入下方"校验循环"。
+3. 校验通过后正常结束：不要调用额外发布工具，也不要主动调用 `debug_workflow`（那是用户
+   明确要求"测试/调试/试跑"时才做的事）。后端会在本轮结束后自动把 workflow.py 同步给前端。
+
+## DSL 语法
+
+`workflow.py` 是**声明式 DSL**，只是借用 Python 语法描述节点及连线，不能本地执行，也不要
+按 Python 运行时语义推理它的行为。
 
 ```python
 # workflow: <工作流名称>
 
 variable_name = NodeType(
     id="<唯一节点ID>",
-    param1=value1,
-    param2=another_variable.output_port,
+    param1="静态值",
+    param2=another_variable.output_port,  # 引用上游节点输出端口
 )
 ```
 
-### 语法规则
+规则：文件开头 `# workflow: <name>` 注释；每个节点一个变量赋值；`id` 必须唯一（数字
+字符串）；被引用的节点必须先定义；静态值支持字符串/数字/浮点（如 `1e-4`）/布尔。
 
-1. 文件开头用注释标明工作流名称：`# workflow: <name>`
-2. 每个节点是一个变量赋值：`var = NodeType(id="...", ...)`
-3. `id` 参数必须唯一（使用数字字符串）
-4. 静态值：字符串 `"value"`、数字 `42`、浮点数 `1e-4`、布尔值 `True`/`False`
-5. 节点连接：引用 `变量名.输出端口名` 来连接上游节点的输出
-6. 节点定义顺序：被引用的节点必须先定义
+## 节点与知识库检索
 
-## 可用节点速查
+检索优先级：**内置示例模板 → 直接读相关节点文档 → 必要时宽泛 grep**。
 
-### 数据与资源节点
+- 节点速查表和常用参数见 [references/node-reference.md](references/node-reference.md)
+- 节点契约文档路径固定：`<知识库绝对路径>/nodes/<NodeType>/<NodeType>.md`（知识库绝对
+  路径见路由提示）。已确定要用的节点直接读其文档，只读会实际用到或参数不确定的
+- grep 只用于补充检索，用宽泛关键词（`SFT`、`DPO`、`GRPO`、`dataset`、`reward` 或精确
+  NodeType），不要用完整标题、`^###`、`# workflow: ...` 这类依赖格式的 pattern
+- 只有用户问平台概念、Studio 操作、SDK 脚本写法时，才检索知识库的 `basic/`、`studio/`、
+  `sdk/`、`jupyterlab/` 子目录
 
-| NodeType | 描述 | 主要输出端口 |
-|----------|------|-------------|
-| CloneAndCacheDataset | 拉取缓存数据集 | dataset_path |
-| CloneAndCacheModel | 拉取缓存模型 | model_path |
-| PathJoinNode | 拼接路径 | joined_path |
-| DatasetToJsonlNode | 格式转换为JSONL | jsonl_path |
-| DatasetValidatorNode | 验证数据集格式 | validation_result |
+## 校验循环
 
-### 配置构建节点
+`workflow.py` 每次被创建或修改后，立即用 `validate_workflow_dsl` 校验（不传 `dsl` 参数，
+工具自己读当前工作目录的 `workflow.py`），不要在未校验的情况下结束：
 
-| NodeType | 描述 | 主要输出端口 |
-|----------|------|-------------|
-| DatasetConfigBuilderTextNode | 文本任务字段映射 | dataset_kind_config |
-| DatasetConfigBuilderVisionNode | 多模态字段映射 | dataset_kind_config |
-| DatasetConfigBuilderNode | 构建完整数据集配置 | dataset_config |
-| DatasetExtraConfigBuilderNode | 序列长度、采样上限等 | dataset_extra_config |
-| ModelConfigBuilderNode | 模型路径和类型 | model_config |
-| LoraConfigBuilderNode | LoRA配置 | lora_config |
-| TrainingConfigBuilderNode | 训练超参数 | training_config |
-| AccelerateConfigBuilderNode | 分布式训练配置 | accelerate_config |
-| WandbConfigBuilderNode | WandB实验追踪 | wandb_config |
-| RewardItemBuilderNode | 单个奖励项 | reward_item |
-| RewardConfigBuilderNode | 组合多个奖励项 | reward_config |
-| GRPOTrainingExtraConfigBuilderNode | GRPO额外配置 | grpo_extra_config |
+1. `valid == true`：通过。`warnings` 非空也算通过，结束语里提一句即可，不要为消除警告
+   继续改
+2. `valid == false`：`errors` 是结构化列表，含 `code`、`message`、`node_id`/`node_type`/
+   `edge_id`/`field` 定位信息，`detail` 里的 `node_code`/`target_node_code`/
+   `source_node_code` 是对应的原始 DSL 语句。用这些字段直接定位，用 `apply_patch` 只修改
+   报错指向的那几处，不要因为一条报错重写整个文件；改完回到步骤 1
+3. 调用本身失败（网络错误、非 2xx、JSON 解析失败）不代表工作流有问题：如实告知用户校验
+   服务暂时不可用，不要当成 DSL 错误去"修复"
+4. **最多重试 5 轮**（自己计数）。5 轮后仍不通过，或同一 `code`/`node_id` 连续两轮没消失，
+   停止重试并如实说明剩余错误
 
-### 训练执行节点
+`validate_workflow_dsl`（静态结构校验，秒级返回）和 `debug_workflow`（提交平台真实执行，
+30 秒~2 分钟，属于 debug-workflow 技能）职责不同：前者每次写入后必须调；后者只在用户明确
+要求"测试/调试/试跑"时用，报错来源要分清再修。
 
-| NodeType | 描述 | 主要输出端口 |
-|----------|------|-------------|
-| ModelTrainSFTNode | SFT监督微调 | model_output_path |
-| ModelTrainDPONode | DPO偏好优化 | model_output_path |
-| ModelTrainGRPONode | GRPO强化学习 | model_output_path |
+## 参考文件
 
-### 推理与评估节点
-
-| NodeType | 描述 | 主要输出端口 |
-|----------|------|-------------|
-| ModelMergeLoraNode | 合并LoRA到基础模型 | merged_model_path |
-| VLLMInference | 启动vLLM推理服务 | endpoint |
-| TestLLMNode | 测试推理端点 | result |
-| ContentPreview | 预览文本内容 | — |
-
-## 常用节点参数详情
-
-### CloneAndCacheDataset
-```python
-dataset = CloneAndCacheDataset(
-    id="1",
-    dataset="openai/gsm8k",           # HuggingFace数据集标识
-    target_path="/workspace/datasets/", # 本地缓存目录
-)
-# 输出: dataset.dataset_path
-```
-
-### CloneAndCacheModel
-```python
-model = CloneAndCacheModel(
-    id="2",
-    model="Qwen/Qwen3-0.6B",          # 模型标识
-    target_path="/workspace/models/",   # 本地缓存目录
-)
-# 输出: model.model_path
-```
-
-### DatasetConfigBuilderTextNode
-```python
-dataset_kind = DatasetConfigBuilderTextNode(
-    id="3",
-    user_prompt_field="question",           # 用户输入字段
-    assistant_response_field="answer",      # 模型响应字段
-    # system_prompt_field="system",         # 可选：系统提示字段
-    # rejected_field="rejected_answer",     # 可选：DPO拒绝回答字段
-)
-# 输出: dataset_kind.dataset_kind_config
-```
-
-### DatasetConfigBuilderNode
-```python
-dataset_config = DatasetConfigBuilderNode(
-    id="4",
-    train_data_path=train_jsonl.jsonl_path,              # 训练数据路径
-    dataset_kind_config=dataset_kind.dataset_kind_config, # 字段映射配置
-    # val_data_path=val_jsonl.jsonl_path,                 # 可选：验证集路径
-    # dataset_extra_config=extra.dataset_extra_config,    # 可选：额外配置
-)
-# 输出: dataset_config.dataset_config
-```
-
-### ModelConfigBuilderNode
-```python
-model_config = ModelConfigBuilderNode(
-    id="5",
-    model_path=model.model_path,  # 模型路径（通常引用CloneAndCacheModel输出）
-    model_type="auto",            # 模型类型: "auto", "qwen3vl", "qwen3.5"
-)
-# 输出: model_config.model_config
-```
-
-### LoraConfigBuilderNode
-```python
-lora_config = LoraConfigBuilderNode(
-    id="6",
-    lora_rank=8,           # LoRA秩
-    lora_dropout=0.05,     # Dropout比率
-    target_modules="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
-)
-# 输出: lora_config.lora_config
-```
-
-### TrainingConfigBuilderNode
-```python
-training_config = TrainingConfigBuilderNode(
-    id="7",
-    learning_rate=1e-4,      # 学习率（GRPO/DPO通常用1e-6）
-    batch_size=2,            # 批次大小
-    grad_accum_steps=2,      # 梯度累积步数
-    num_epochs=1,            # 训练轮次
-    save_steps=500,          # 保存间隔
-    save_total_limit=3,      # 最大保存数量
-)
-# 输出: training_config.training_config
-```
-
-### ModelTrainSFTNode
-```python
-sft_train = ModelTrainSFTNode(
-    id="8",
-    dataset_config=dataset_config.dataset_config,
-    model_config=model_config.model_config,
-    lora_config=lora_config.lora_config,
-    training_config=training_config.training_config,
-    accelerate_config=accelerate_config.accelerate_config,
-    # wandb_config=wandb.wandb_config,  # 可选
-    output_path="/workspace/output/sft/",
-)
-# 输出: sft_train.model_output_path
-```
-
-## 示例工作流
-
-### 示例1：数据集预处理工作流
-
-```python
-# workflow: Dataset Processing
-
-dataset = CloneAndCacheDataset(
-    id="10",
-    dataset="openai/gsm8k",
-    target_path="/workspace/datasets/",
-)
-
-dataset_kind = DatasetConfigBuilderTextNode(
-    id="16",
-    user_prompt_field="question",
-    assistant_response_field="answer",
-)
-
-train_file = PathJoinNode(
-    id="11",
-    base_path=dataset.dataset_path,
-    subpath="main/train-00000-of-00001.parquet",
-)
-
-train_jsonl = DatasetToJsonlNode(
-    id="13",
-    dataset_path=train_file.joined_path,
-)
-
-dataset_config = DatasetConfigBuilderNode(
-    id="9",
-    train_data_path=train_jsonl.jsonl_path,
-    dataset_kind_config=dataset_kind.dataset_kind_config,
-)
-
-dataset_validation = DatasetValidatorNode(
-    id="15",
-    dataset_config=dataset_config.dataset_config,
-    check_reasoning=False,
-    limit=0,
-    verbose=False,
-    preview_html_path="/workspace/datasets/preview.html",
-)
-```
-
-### 示例2：SFT 训练工作流
-
-```python
-# workflow: SFT Training
-
-dataset = CloneAndCacheDataset(
-    id="1",
-    dataset="pyromind/self-cognition",
-    target_path="/workspace/datasets/",
-)
-
-model = CloneAndCacheModel(
-    id="2",
-    model="Qwen/Qwen3-0.6B",
-    target_path="/workspace/models/",
-)
-
-train_file = PathJoinNode(
-    id="3",
-    base_path=dataset.dataset_path,
-    subpath="self-cognition.jsonl",
-)
-
-dataset_kind = DatasetConfigBuilderTextNode(
-    id="4",
-    user_prompt_field="user_prompt",
-    assistant_response_field="gt",
-)
-
-dataset_config = DatasetConfigBuilderNode(
-    id="5",
-    train_data_path=train_file.joined_path,
-    dataset_kind_config=dataset_kind.dataset_kind_config,
-)
-
-model_config = ModelConfigBuilderNode(
-    id="6",
-    model_path=model.model_path,
-    model_type="auto",
-)
-
-lora_config = LoraConfigBuilderNode(
-    id="7",
-    lora_rank=8,
-    lora_dropout=0.05,
-    target_modules="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
-)
-
-training_config = TrainingConfigBuilderNode(
-    id="8",
-    learning_rate=1e-4,
-    batch_size=2,
-    grad_accum_steps=2,
-    num_epochs=1,
-    save_steps=500,
-    save_total_limit=3,
-)
-
-accelerate_config = AccelerateConfigBuilderNode(
-    id="9",
-    zero_stage=0,
-)
-
-sft_train = ModelTrainSFTNode(
-    id="10",
-    dataset_config=dataset_config.dataset_config,
-    model_config=model_config.model_config,
-    lora_config=lora_config.lora_config,
-    training_config=training_config.training_config,
-    accelerate_config=accelerate_config.accelerate_config,
-    output_path="/workspace/output/sft/",
-)
-
-merge = ModelMergeLoraNode(
-    id="11",
-    model_path=model.model_path,
-    lora_path=sft_train.model_output_path,
-    output_path="/workspace/output/merged/",
-)
-```
-
-### 示例3：GRPO 训练工作流
-
-```python
-# workflow: GRPO Training
-
-dataset = CloneAndCacheDataset(
-    id="1",
-    dataset="pyromind/geometry-vqa-vlm-demo",
-    target_path="/workspace/datasets/",
-)
-
-model = CloneAndCacheModel(
-    id="2",
-    model="Qwen/Qwen3-VL-4B-Instruct",
-    target_path="/workspace/models/",
-)
-
-train_file = PathJoinNode(
-    id="3",
-    base_path=dataset.dataset_path,
-    subpath="multimodal-open-r1-test.jsonl",
-)
-
-dataset_kind = DatasetConfigBuilderVisionNode(
-    id="4",
-    user_prompt_field="question",
-    assistant_response_field="answer",
-    image_field="image_path",
-)
-
-dataset_config = DatasetConfigBuilderNode(
-    id="5",
-    train_data_path=train_file.joined_path,
-    dataset_kind_config=dataset_kind.dataset_kind_config,
-)
-
-model_config = ModelConfigBuilderNode(
-    id="6",
-    model_path=model.model_path,
-    model_type="qwen3vl",
-)
-
-lora_config = LoraConfigBuilderNode(
-    id="7",
-    lora_rank=8,
-    lora_dropout=0.05,
-    target_modules="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
-)
-
-training_config = TrainingConfigBuilderNode(
-    id="8",
-    learning_rate=1e-6,
-    batch_size=2,
-    grad_accum_steps=2,
-    num_epochs=1,
-    save_steps=500,
-    save_total_limit=3,
-)
-
-reward_item_1 = RewardItemBuilderNode(
-    id="9",
-    entry_function="reward_functions.accuracy_reward",
-    name="accuracy",
-    weight=1.0,
-)
-
-reward_config = RewardConfigBuilderNode(
-    id="10",
-    reward_item_1=reward_item_1.reward_item,
-)
-
-grpo_extra = GRPOTrainingExtraConfigBuilderNode(
-    id="11",
-    num_generations=4,
-    temperature=0.7,
-    max_completion_length=200,
-    max_prompt_length=20000,
-)
-
-accelerate_config = AccelerateConfigBuilderNode(
-    id="12",
-    zero_stage=0,
-)
-
-grpo_train = ModelTrainGRPONode(
-    id="13",
-    dataset_config=dataset_config.dataset_config,
-    model_config=model_config.model_config,
-    lora_config=lora_config.lora_config,
-    training_config=training_config.training_config,
-    accelerate_config=accelerate_config.accelerate_config,
-    reward_config=reward_config.reward_config,
-    grpo_extra_config=grpo_extra.grpo_extra_config,
-    output_path="/workspace/output/grpo/",
-)
-```
-
-## 生成工作流的步骤
-
-1. **理解用户需求**：确定训练类型（SFT/DPO/GRPO）、数据集、模型
-2. **选择模板**：优先复用本技能内置示例。SFT 用示例2，GRPO 用示例3，数据处理/验证用示例1；DPO 可在 SFT 骨架上替换为 DPO 数据字段与 `ModelTrainDPONode`
-3. **读取必要节点契约**：根据已选模板和用户需求，直接查看 `<知识库绝对路径>/nodes/<NodeType>/<NodeType>.md`。只读取会实际使用或参数不确定的节点文档，不要用高精度标题 pattern 搜索示例
-4. **选择节点组合**：
-   - 数据加载：CloneAndCacheDataset → PathJoinNode → DatasetToJsonlNode（如需转换）
-   - 字段映射：DatasetConfigBuilderTextNode 或 DatasetConfigBuilderVisionNode
-   - 数据集配置：DatasetConfigBuilderNode
-   - 模型加载：CloneAndCacheModel → ModelConfigBuilderNode
-   - 训练配置：LoraConfigBuilderNode + TrainingConfigBuilderNode + AccelerateConfigBuilderNode
-   - 训练执行：ModelTrainSFTNode / ModelTrainDPONode / ModelTrainGRPONode
-   - 后处理：ModelMergeLoraNode → VLLMInference → TestLLMNode（可选）
-5. **组装 DSL**：按依赖顺序排列节点，确保被引用节点在前
-6. **写入文件**：使用 `apply_patch` 将 DSL 写入当前工作目录根路径 `workflow.py`；如果是在修改已有工作流，也只编辑这个固定相对路径。不要手写会话目录的长绝对路径；如必须使用 `file_editor`，也传入 `workflow.py`，由运行时解析到实际文件。不要只说明已经生成，必须实际调用工具创建或修改文件
-7. **校验并修复**：见下方"生成后校验循环"，写入/修改后必须校验，报错则修复后再次校验
-8. **结束处理**：校验通过后正常结束；不要调用额外发布工具，也不要主动调用 `debug_workflow`
-   （那是用户明确要求"测试/调试"时才做的事），后端会自动把当前 `workflow.py` 同步给前端
-
-## 生成后校验循环
-
-`workflow.py` 每次被创建或修改后，都要立即用 `validate_workflow_dsl` 校验一次，不要在没有
-校验的情况下直接结束：
-
-1. 调用 `validate_workflow_dsl`（不需要传 `dsl` 参数，工具会自己读取当前工作目录的
-   `workflow.py`）
-2. 查看返回的 `valid` 字段：
-   - **`valid == true`**：校验通过，进入步骤 8 正常结束
-   - **`valid == false`**：`errors` 是结构化问题列表，每一项包含 `code`、`message`，以及
-     `node_id`/`node_type`/`edge_id`/`field` 等定位信息，`detail` 里的 `node_code`/
-     `target_node_code`/`source_node_code` 是对应的原始 DSL 语句。优先用这些字段定位到
-     `workflow.py` 里具体的节点/连线，而不是通读全文猜测
-   - 调用本身失败（网络错误、平台返回非 2xx、JSON 解析失败等）：这不代表工作流有问题，
-     如实告知用户校验服务暂时不可用，不要当成 DSL 错误去"修复"
-3. 如果 `valid == false`：用 `apply_patch` 只修改 `errors` 指向的那几处（对应节点参数、
-   端口引用或连线），不要因为一条报错就重写整个工作流；改完后回到步骤 1 重新校验
-4. **最多重试 5 轮**（`validate_workflow_dsl` 本身没有内置的重试上限，由你自己计数）。如果
-   5 轮之后仍然 `valid == false`，或者同一个 `code`/`node_id` 连续两轮都没有消失，停止重试，
-   如实向用户说明当前还存在哪些校验错误，不要无限循环
-5. `warnings` 非空但 `valid == true` 时视为通过，可以在结束语里简单提一句有哪些警告，不需要
-   为了消除警告继续修改
+- [references/parameter-decision.md](references/parameter-decision.md)：配参决策链的档位表与推荐超参
+- [references/node-reference.md](references/node-reference.md)：节点速查表与常用节点参数
+- [references/example-workflows.md](references/example-workflows.md)：6 个示例工作流模板

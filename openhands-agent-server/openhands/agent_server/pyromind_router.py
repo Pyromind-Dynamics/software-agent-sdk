@@ -47,6 +47,10 @@ from openhands.sdk.skills import Skill, load_skills_from_dir
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
+from openhands.tools.pyromind_dataset import (
+    PreviewDatasetTool,
+    UploadFileToPyromindTool,
+)
 from openhands.tools.pyromind_debug import get_debug_result_broker
 from openhands.tools.workflow import DslToXyflowTool, ValidateWorkflowDslTool
 from openhands.tools.workflow.validate_workflow_dsl import (
@@ -600,6 +604,8 @@ async def create_pyromind_conversation(
             Tool(name="file_editor"),
             Tool(name="debug_workflow"),
             Tool(name=DslToXyflowTool.name),
+            Tool(name=PreviewDatasetTool.name),
+            Tool(name=UploadFileToPyromindTool.name),
             validation_tool,
         ],
     )
