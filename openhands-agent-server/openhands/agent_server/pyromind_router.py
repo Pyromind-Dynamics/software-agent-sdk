@@ -603,7 +603,6 @@ async def create_pyromind_conversation(
             Tool(name="grep"),
             Tool(name="file_editor"),
             Tool(name="debug_workflow"),
-            Tool(name=DslToXyflowTool.name),
             Tool(name=PreviewDatasetTool.name),
             Tool(name=UploadFileToPyromindTool.name),
             validation_tool,

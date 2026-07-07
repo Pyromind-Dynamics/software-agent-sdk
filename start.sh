@@ -15,7 +15,7 @@ export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 # ----------------------------------------------------------
 # LLM Configuration
 # ----------------------------------------------------------
-export LLM_BASE_URL="${LLM_BASE_URL:-https://openrouter.ai/api/v1/}"
+export LLM_BASE_URL="${LLM_BASE_URL:-https://aihubmix.com/v1/}"
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
   echo "ERROR: OPENAI_API_KEY is required. Export it before running start.sh." >&2
   exit 1
