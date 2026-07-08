@@ -82,6 +82,10 @@ class WorkflowFileObservation(Observation):
     """Observation containing the current workflow.py content."""
 
     workflow: str = Field(description="Complete workflow.py source.")
+    xyflow: dict[str, Any] | None = Field(
+        default=None,
+        description="Converted xyflow JSON workflow for frontend rendering.",
+    )
     path: str = Field(description="Absolute path to the workflow file.")
     name: str | None = Field(
         default=None,

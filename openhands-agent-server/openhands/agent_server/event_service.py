@@ -73,6 +73,7 @@ from openhands.tools.workflow.definition import (
     PYROMIND_WORKFLOW_DIRTY_KEY,
     PYROMIND_WORKFLOW_EMITTED_KEY,
 )
+from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
 from openhands.tools.workflow.impl import read_workflow_file
 
 
@@ -465,6 +466,7 @@ class EventService:
     def _save_pyromind_workflow_input_snapshot_sync(
         self,
         workflow_dsl: str | None,
+        workflow_xyflow: dict[str, Any] | None,
     ) -> None:
         if workflow_dsl is None or not self._conversation:
             return
@@ -475,6 +477,7 @@ class EventService:
         self._workflow_canvas_snapshot_hook().save_in_snapshot(
             event_id=user_message_event_id,
             workflow_dsl_data=workflow_dsl,
+            workflow_xyflow_data=workflow_xyflow,
         )
 
     def _clear_pyromind_workflow_dirty_sync(self) -> None:
@@ -509,6 +512,18 @@ class EventService:
         if not observation.exists:
             self._clear_pyromind_workflow_dirty_sync()
             return False
+        workflow_xyflow: dict[str, Any] | None = None
+        try:
+            workflow_xyflow = convert_dsl_to_xyflow(
+                observation.workflow,
+                name=observation.name or "workflow",
+            )
+            observation = observation.model_copy(update={"xyflow": workflow_xyflow})
+        except Exception:
+            logger.warning(
+                "Failed to convert workflow DSL to xyflow for event emission",
+                exc_info=True,
+            )
 
         event = ConversationStateUpdateEvent(
             key=PYROMIND_WORKFLOW_EVENT_KEY,
@@ -528,6 +543,7 @@ class EventService:
         self._workflow_canvas_snapshot_hook().save_out_snapshot(
             event_id=event.id,
             workflow_dsl_data=observation.workflow,
+            workflow_xyflow_data=workflow_xyflow,
             parent_user_message_event_id=parent_user_message_event_id,
             summary=observation.summary,
         )
@@ -584,6 +600,7 @@ class EventService:
         _from_goal_loop: bool = False,
         extended_content: list[TextContent] | None = None,
         workflow_dsl_snapshot: str | None = None,
+        workflow_xyflow_snapshot: dict[str, Any] | None = None,
     ):
         conversation = self._conversation
         if not conversation:
@@ -608,6 +625,7 @@ class EventService:
                 None,
                 self._save_pyromind_workflow_input_snapshot_sync,
                 workflow_dsl_snapshot,
+                workflow_xyflow_snapshot,
             )
         if run:
             if self._explicit_interrupt_generation != explicit_interrupt_generation:

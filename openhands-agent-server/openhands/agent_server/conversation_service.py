@@ -1269,6 +1269,7 @@ class ConversationService:
                     eventId=snapshot.event_id,
                     snapshotRole=snapshot.snapshot_role,
                     workflowDslData=snapshot.workflow_dsl_data,
+                    workflowXyflowData=snapshot.workflow_xyflow_data,
                     parentUserMessageEventId=(snapshot.parent_user_message_event_id),
                     eventType=snapshot.event_type,
                     summary=snapshot.summary,

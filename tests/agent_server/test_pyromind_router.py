@@ -1,8 +1,10 @@
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
+from uuid import UUID
 
 import pytest
 from fastapi import Response, status
+from pydantic import ValidationError
 from starlette.requests import Request
 
 from openhands.agent_server.conversation_service import ConversationService
@@ -20,14 +22,17 @@ from openhands.agent_server.pyromind_constants import (
 from openhands.agent_server.pyromind_router import (
     PyromindCreateConversationRequest,
     PyromindLLMConfig,
+    PyromindSendMessageRequest,
     _build_debug_context_headers,
     _build_workflow_validation_tool,
     _get_validation_cookie_header,
+    _workflow_dsl_from_xyflow,
     apply_pyromind_validation_context,
     create_pyromind_conversation,
 )
 from openhands.sdk.conversation.request import StartConversationRequest
 from openhands.sdk.conversation.state import ConversationExecutionStatus
+from openhands.sdk.llm.message import Message
 from openhands.tools.workflow import DslToXyflowTool, ValidateWorkflowDslTool
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
@@ -42,21 +47,61 @@ class _FakeConversationService:
     def __init__(self, conversations_dir: Path) -> None:
         self.conversations_dir = conversations_dir
         self.start_request: StartConversationRequest | None = None
+        self.event_service = _FakeInitialMessageEventService()
+        self.info: ConversationInfo | None = None
 
     async def start_conversation(
         self, request: StartConversationRequest
     ) -> tuple[ConversationInfo, bool]:
         self.start_request = request
         assert request.conversation_id is not None
-        return (
-            ConversationInfo(
-                id=request.conversation_id,
-                agent=request.agent,
-                workspace=request.workspace,
-                execution_status=ConversationExecutionStatus.IDLE,
-            ),
-            True,
+        self.info = ConversationInfo(
+            id=request.conversation_id,
+            agent=request.agent,
+            workspace=request.workspace,
+            execution_status=ConversationExecutionStatus.IDLE,
         )
+        return (self.info, True)
+
+    async def get_event_service(
+        self,
+        conversation_id: UUID,
+        user_id: str | None = None,
+    ) -> EventService | None:
+        assert self.info is not None
+        assert conversation_id == self.info.id
+        return cast(EventService, self.event_service)
+
+    async def get_conversation(
+        self,
+        conversation_id: UUID,
+        user_id: str | None = None,
+    ) -> ConversationInfo | None:
+        assert self.info is not None
+        assert conversation_id == self.info.id
+        return self.info
+
+
+class _FakeInitialMessageEventService:
+    def __init__(self) -> None:
+        self.sent_message: Message | None = None
+        self.run: bool | None = None
+        self.workflow_dsl_snapshot: str | None = None
+        self.workflow_xyflow_snapshot: dict[str, Any] | None = None
+
+    async def send_message(
+        self,
+        message: Message,
+        run: bool = False,
+        _from_goal_loop: bool = False,
+        extended_content: list[Any] | None = None,
+        workflow_dsl_snapshot: str | None = None,
+        workflow_xyflow_snapshot: dict[str, Any] | None = None,
+    ) -> None:
+        self.sent_message = message
+        self.run = run
+        self.workflow_dsl_snapshot = workflow_dsl_snapshot
+        self.workflow_xyflow_snapshot = workflow_xyflow_snapshot
 
 
 class _FakeEventService:
@@ -175,6 +220,102 @@ async def test_pyromind_conversation_binds_login_context(tmp_path):
     assert service.start_request.user_id == "42"
     bound_user = get_debug_current_login_user_by_conversation(info.id)
     assert bound_user == request.state.current_user
+
+
+@pytest.mark.asyncio
+async def test_pyromind_conversation_converts_xyflow_before_seeding_workflow(
+    tmp_path, monkeypatch
+):
+    knowledge_base = tmp_path / "knowledge"
+    knowledge_base.mkdir()
+    service = _FakeConversationService(tmp_path / "conversations")
+    response = Response()
+    xyflow = {"name": "Canvas", "nodes": [{"id": "n1"}], "edges": []}
+    monkeypatch.setattr(
+        "openhands.agent_server.pyromind_router.convert_xyflow_to_dsl",
+        lambda workflow: "# workflow: Canvas\nnode = Example()\n",
+    )
+
+    info = await create_pyromind_conversation(
+        _make_request(),
+        PyromindCreateConversationRequest(
+            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            workflow_xyflow=xyflow,
+            extra={
+                "knowledge_base_path": str(knowledge_base),
+                "skills_path": str(tmp_path / "missing-skills"),
+            },
+        ),
+        response,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    workflow_path = service.conversations_dir / info.id.hex / "workflow.py"
+    assert workflow_path.read_text(encoding="utf-8") == (
+        "# workflow: Canvas\nnode = Example()\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pyromind_conversation_initial_message_saves_workflow_snapshot(
+    tmp_path, monkeypatch
+):
+    knowledge_base = tmp_path / "knowledge"
+    knowledge_base.mkdir()
+    service = _FakeConversationService(tmp_path / "conversations")
+    response = Response()
+    xyflow = {"name": "Canvas", "nodes": [{"id": "n1"}], "edges": []}
+    monkeypatch.setattr(
+        "openhands.agent_server.pyromind_router.convert_xyflow_to_dsl",
+        lambda workflow: "# workflow: Canvas\nnode = Example()\n",
+    )
+
+    await create_pyromind_conversation(
+        _make_request(),
+        PyromindCreateConversationRequest(
+            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            message="帮我继续改工作流",
+            workflow_xyflow=xyflow,
+            extra={
+                "knowledge_base_path": str(knowledge_base),
+                "skills_path": str(tmp_path / "missing-skills"),
+            },
+        ),
+        response,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert service.start_request is not None
+    assert service.start_request.initial_message is None
+    assert service.event_service.sent_message is not None
+    assert service.event_service.sent_message.role == "user"
+    assert service.event_service.run is True
+    assert service.event_service.workflow_dsl_snapshot == (
+        "# workflow: Canvas\nnode = Example()\n"
+    )
+    assert service.event_service.workflow_xyflow_snapshot == xyflow
+
+
+def test_workflow_dsl_from_xyflow_treats_empty_xyflow_as_empty_canvas():
+    assert _workflow_dsl_from_xyflow({"name": "Empty", "nodes": [], "edges": []}) == ""
+
+
+def test_pyromind_requests_reject_workflow_dsl_field():
+    with pytest.raises(ValidationError):
+        PyromindCreateConversationRequest.model_validate(
+            {
+                "llm": {"model": "gpt-4o", "api_key": "test-key"},
+                "workflow_dsl": "# workflow: old\n",
+            }
+        )
+
+    with pytest.raises(ValidationError):
+        PyromindSendMessageRequest.model_validate(
+            {
+                "text": "继续",
+                "workflow_dsl": "# workflow: old\n",
+            }
+        )
 
 
 def test_validation_cookie_header_keeps_full_cookie_in_prod(monkeypatch):

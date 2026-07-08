@@ -26,12 +26,14 @@ def _request(
     *,
     role: str = "in",
     dsl: str = "# workflow: demo\n",
+    xyflow: dict[str, object] | None = None,
     **overrides,
 ) -> SaveWorkflowCanvasEventSnapshotRequest:
     payload = {
         "eventId": event_id,
         "snapshotRole": role,
         "workflowDslData": dsl,
+        "workflowXyflowData": xyflow or {"name": "demo", "nodes": [], "edges": []},
         "summary": "snapshot",
         "createdBy": "test",
     }
@@ -50,6 +52,7 @@ def test_save_event_snapshot_is_idempotent_for_same_event_and_dsl(tmp_path):
     assert first.snapshot_role == "in"
     assert first.version_id == "v000001"
     assert first.workflow_dsl_data == "# workflow: demo\n"
+    assert first.workflow_xyflow_data == {"name": "demo", "nodes": [], "edges": []}
     assert retry.version_id == first.version_id
     assert [item.version_id for item in store.list_versions()] == ["v000001"]
 
@@ -60,6 +63,16 @@ def test_save_event_snapshot_rejects_same_event_with_different_dsl(tmp_path):
 
     with pytest.raises(DuplicateWorkflowCanvasEventSnapshotError):
         store.save_event_snapshot(_request(dsl="# workflow: changed\n"))
+
+
+def test_save_event_snapshot_rejects_same_event_with_different_xyflow(tmp_path):
+    store = FileWorkflowCanvasStore(tmp_path, session_id="s1")
+    store.save_event_snapshot(_request())
+
+    with pytest.raises(DuplicateWorkflowCanvasEventSnapshotError):
+        store.save_event_snapshot(
+            _request(xyflow={"name": "demo", "nodes": [{"id": "n1"}], "edges": []})
+        )
 
 
 def test_save_event_snapshot_rejects_same_event_with_different_role(tmp_path):
@@ -89,6 +102,7 @@ def test_get_version_returns_dsl_snapshot(tmp_path):
     version = store.get_version(snapshot.version_id)
 
     assert version.workflow_dsl_data == "# workflow: demo\n"
+    assert version.workflow_xyflow_data == {"name": "demo", "nodes": [], "edges": []}
 
 
 @dataclass
