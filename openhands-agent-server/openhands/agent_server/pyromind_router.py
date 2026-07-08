@@ -16,7 +16,12 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field, SecretStr
 
-from openhands.agent_server.conversation_service import ConversationService
+from openhands.agent_server.conversation_service import (
+    ConversationForkAtEventConflictError,
+    ConversationForkAtEventSourceNotFoundError,
+    ConversationForkAtEventTargetNotFoundError,
+    ConversationService,
+)
 from openhands.agent_server.dependencies import (
     get_conversation_service,
     get_current_user_id,
@@ -332,6 +337,31 @@ class PyromindSendMessageRequest(BaseModel):
         default=True,
         description="Whether the agent loop should run after this message.",
     )
+
+
+class PyromindForkAtEventRequest(BaseModel):
+    event_id: str = Field(
+        alias="eventId",
+        min_length=1,
+        description="Workflow output event id to branch from.",
+    )
+    title: str | None = Field(
+        default=None,
+        max_length=200,
+        description="Optional title for the forked conversation.",
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class PyromindForkAtEventResponse(BaseModel):
+    conversation_id: UUID = Field(alias="conversationId")
+    source_conversation_id: UUID = Field(alias="sourceConversationId")
+    forked_at_event_id: str = Field(alias="forkedAtEventId")
+    workflow_version_id: str = Field(alias="workflowVersionId")
+    conversation: ConversationInfo
+
+    model_config = {"populate_by_name": True}
 
 
 class PyromindDebugCallbackRequest(BaseModel):
@@ -680,8 +710,56 @@ async def send_pyromind_message(
         message,
         run=request.run,
         extended_content=[reminder] if reminder else None,
+        workflow_dsl_snapshot=request.workflow_dsl,
     )
     return Success()
+
+
+@pyromind_router.post(
+    "/conversations/{conversation_id}/fork-at-event",
+    response_model=PyromindForkAtEventResponse,
+    response_model_by_alias=True,
+    responses={
+        404: {"description": "Source conversation or workflow event not found"},
+        409: {"description": "Conversation cannot be forked at this event"},
+    },
+)
+async def fork_pyromind_conversation_at_event(
+    http_request: Request,
+    conversation_id: UUID,
+    request: PyromindForkAtEventRequest,
+    conversation_service: ConversationService = Depends(get_conversation_service),
+) -> PyromindForkAtEventResponse:
+    """Create a new Pyromind conversation branch at a workflow checkpoint."""
+    try:
+        (
+            conversation,
+            workflow_version_id,
+        ) = await conversation_service.fork_conversation_at_event(
+            conversation_id,
+            event_id=request.event_id,
+            title=request.title,
+            tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
+            user_id=get_current_user_id(http_request),
+        )
+    except ConversationForkAtEventSourceNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ConversationForkAtEventTargetNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ConversationForkAtEventConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    current_user = get_debug_current_login_user_by_conversation(conversation_id)
+    if current_user is not None:
+        bind_debug_current_login_user_to_conversation(conversation.id, current_user)
+
+    return PyromindForkAtEventResponse(
+        conversationId=conversation.id,
+        sourceConversationId=conversation_id,
+        forkedAtEventId=request.event_id,
+        workflowVersionId=workflow_version_id,
+        conversation=conversation,
+    )
 
 
 # ---------------------------------------------------------------------------

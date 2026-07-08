@@ -32,7 +32,16 @@ from openhands.agent_server.models import (
     StoredConversation,
     UpdateConversationRequest,
 )
+from openhands.agent_server.pyromind_constants import (
+    PYROMIND_APP_TAG_KEY,
+    PYROMIND_APP_TAG_VALUE,
+    PYROMIND_WORKFLOW_EVENT_KEY,
+)
 from openhands.agent_server.utils import safe_rmtree as _safe_rmtree
+from openhands.agent_server.workflow_canvas_models import (
+    SaveWorkflowCanvasEventSnapshotRequest,
+)
+from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
 from openhands.sdk import LLM, Agent, Message
 from openhands.sdk.agent.acp_agent import ACPAgent
 from openhands.sdk.conversation.state import (
@@ -51,6 +60,7 @@ from openhands.sdk.security.risk import SecurityRisk
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.terminal.definition import TerminalAction, TerminalObservation
+from openhands.tools.workflow.definition import WorkflowFileObservation
 
 
 @pytest.fixture
@@ -165,6 +175,144 @@ def conversation_service():
         # Initialize the _event_services dict to simulate an active service
         service._event_services = {}
         yield service
+
+
+def _test_message_event(event_id: str, text: str) -> MessageEvent:
+    return MessageEvent(
+        id=event_id,
+        source="user",
+        llm_message=Message(role="user", content=[TextContent(text=text)]),
+    )
+
+
+def _test_workflow_event(
+    event_id: str,
+    workflow: str,
+    workflow_path: Path,
+) -> ConversationStateUpdateEvent:
+    observation = WorkflowFileObservation(
+        workflow=workflow,
+        path=str(workflow_path),
+        name="demo",
+        summary="workflow snapshot",
+        exists=True,
+    )
+    return ConversationStateUpdateEvent(
+        id=event_id,
+        key=PYROMIND_WORKFLOW_EVENT_KEY,
+        value=observation.model_dump(mode="json"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_conversation_at_event_creates_rollback_branch(
+    conversation_service,
+    tmp_path,
+):
+    source_id = uuid4()
+    source_workspace = tmp_path / "source-workspace"
+    source_workspace.mkdir()
+    request = StartConversationRequest(
+        conversation_id=source_id,
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=LocalWorkspace(working_dir=str(source_workspace)),
+        confirmation_policy=NeverConfirm(),
+        tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
+    )
+    source_info, _ = await conversation_service.start_conversation(request)
+    source_service = await conversation_service.get_event_service(source_info.id)
+    assert source_service is not None
+
+    workflow_path = source_workspace / "workflow.py"
+    workflow_v1 = "# workflow: demo\nstep = 1\n"
+    workflow_v2 = "# workflow: demo\nstep = 2\n"
+    workflow_path.write_text("# workflow: future\nstep = 3\n", encoding="utf-8")
+
+    events = [
+        _test_message_event("00000000-0000-0000-0000-000000000101", "first"),
+        _test_workflow_event(
+            "00000000-0000-0000-0000-000000000102",
+            workflow_v1,
+            workflow_path,
+        ),
+        _test_message_event("00000000-0000-0000-0000-000000000103", "second"),
+        _test_workflow_event(
+            "00000000-0000-0000-0000-000000000104",
+            workflow_v2,
+            workflow_path,
+        ),
+        _test_message_event("00000000-0000-0000-0000-000000000105", "future"),
+    ]
+    state = await source_service.get_state()
+    callback = state._on_state_change
+    state._on_state_change = None
+    try:
+        with state:
+            for event in events:
+                state.events.append(event)
+            state.last_user_message_id = events[-1].id
+            state.rebuild_view()
+    finally:
+        state._on_state_change = callback
+
+    source_store = FileWorkflowCanvasStore(
+        conversation_dir=source_service.conversation_dir,
+        session_id=source_info.id.hex,
+    )
+    source_store.save_event_snapshot(
+        SaveWorkflowCanvasEventSnapshotRequest(
+            eventId=events[1].id,
+            snapshotRole="out",
+            workflowDslData=workflow_v1,
+            eventType=PYROMIND_WORKFLOW_EVENT_KEY,
+            createdBy="test",
+        )
+    )
+    source_store.save_event_snapshot(
+        SaveWorkflowCanvasEventSnapshotRequest(
+            eventId=events[3].id,
+            snapshotRole="out",
+            workflowDslData=workflow_v2,
+            eventType=PYROMIND_WORKFLOW_EVENT_KEY,
+            createdBy="test",
+        )
+    )
+
+    (
+        fork_info,
+        workflow_version_id,
+    ) = await conversation_service.fork_conversation_at_event(
+        source_info.id,
+        event_id=events[3].id,
+        title="rollback branch",
+    )
+
+    assert fork_info.id != source_info.id
+    assert workflow_version_id == "v000002"
+    fork_service = await conversation_service.get_event_service(fork_info.id)
+    assert fork_service is not None
+    fork_events = (await fork_service.search_events(limit=10)).items
+    assert [event.id for event in fork_events] == [event.id for event in events[:4]]
+    fork_state = await fork_service.get_state()
+    assert fork_state.execution_status == ConversationExecutionStatus.IDLE
+    assert fork_state.last_user_message_id == events[2].id
+    assert fork_info.workspace.working_dir == str(
+        conversation_service.conversations_dir / fork_info.id.hex
+    )
+    fork_workflow_path = Path(fork_info.workspace.working_dir) / "workflow.py"
+    assert fork_workflow_path.read_text(encoding="utf-8") == workflow_v2
+    assert workflow_path.read_text(encoding="utf-8") == "# workflow: future\nstep = 3\n"
+
+    fork_store = FileWorkflowCanvasStore(
+        conversation_dir=fork_service.conversation_dir,
+        session_id=fork_info.id.hex,
+    )
+    fork_snapshot = fork_store.get_event_snapshot(events[3].id)
+    assert fork_snapshot.session_id == fork_info.id.hex
+    assert fork_snapshot.workflow_dsl_data == workflow_v2
+
+    source_events = (await source_service.search_events(limit=10)).items
+    assert [event.id for event in source_events] == [event.id for event in events]
 
 
 @pytest.mark.asyncio
