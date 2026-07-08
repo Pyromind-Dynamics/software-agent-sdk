@@ -115,6 +115,19 @@ def _mock_event_service_for_stored(
     return service
 
 
+def _add_mock_event_service_for_stored(
+    conversation_service: ConversationService,
+    stored: StoredConversation,
+    status: ConversationExecutionStatus = ConversationExecutionStatus.IDLE,
+) -> AsyncMock:
+    service = _mock_event_service_for_stored(stored, status)
+    event_services = conversation_service._event_services
+    assert event_services is not None
+    event_services[stored.id] = service
+    conversation_service._index_event_service(service)
+    return service
+
+
 def _create_running_terminal_action(tool_call_id: str = "call_1") -> ActionEvent:
     tool_call = MessageToolCall.from_chat_tool_call(
         ChatCompletionMessageToolCall(
@@ -1240,34 +1253,45 @@ class TestConversationServiceUserScoping:
         other_conversation = _stored_conversation_for_user("7")
         legacy_conversation = _stored_conversation_for_user(None)
 
-        for stored in (user_conversation, other_conversation, legacy_conversation):
-            conversation_service._event_services[stored.id] = (
-                _mock_event_service_for_stored(stored)
-            )
+        user_service = _add_mock_event_service_for_stored(
+            conversation_service, user_conversation
+        )
+        other_service = _add_mock_event_service_for_stored(
+            conversation_service, other_conversation
+        )
+        legacy_service = _add_mock_event_service_for_stored(
+            conversation_service, legacy_conversation
+        )
 
         result = await conversation_service.search_conversations(user_id="42")
 
         assert [item.id for item in result.items] == [user_conversation.id]
         assert result.next_page_id is None
+        user_service.get_state.assert_awaited_once()
+        other_service.get_state.assert_not_awaited()
+        legacy_service.get_state.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_count_conversations_filters_by_user_id(self, conversation_service):
         user_conversation = _stored_conversation_for_user("42")
         other_conversation = _stored_conversation_for_user("7")
 
-        for stored in (user_conversation, other_conversation):
-            conversation_service._event_services[stored.id] = (
-                _mock_event_service_for_stored(stored)
-            )
+        user_service = _add_mock_event_service_for_stored(
+            conversation_service, user_conversation
+        )
+        other_service = _add_mock_event_service_for_stored(
+            conversation_service, other_conversation
+        )
 
         assert await conversation_service.count_conversations(user_id="42") == 1
         assert await conversation_service.count_conversations(user_id="missing") == 0
+        user_service.get_state.assert_not_awaited()
+        other_service.get_state.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_get_conversation_filters_by_user_id(self, conversation_service):
         stored = _stored_conversation_for_user("42")
-        event_service = _mock_event_service_for_stored(stored)
-        conversation_service._event_services[stored.id] = event_service
+        event_service = _add_mock_event_service_for_stored(conversation_service, stored)
 
         assert (
             await conversation_service.get_conversation(stored.id, user_id="7") is None
@@ -1285,13 +1309,33 @@ class TestConversationServiceUserScoping:
         )
 
     @pytest.mark.asyncio
+    async def test_delete_conversation_removes_user_index(self, conversation_service):
+        stored = _stored_conversation_for_user("42")
+        event_service = _add_mock_event_service_for_stored(conversation_service, stored)
+        event_service.conversation_dir = "/tmp/test_conversation"
+
+        assert await conversation_service.count_conversations(user_id="42") == 1
+
+        with patch(
+            "openhands.agent_server.conversation_service.safe_rmtree"
+        ) as mock_rmtree:
+            result = await conversation_service.delete_conversation(
+                stored.id,
+                user_id="42",
+            )
+
+        assert result is True
+        assert await conversation_service.count_conversations(user_id="42") == 0
+        assert "42" not in conversation_service._conversation_ids_by_user
+        mock_rmtree.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_start_conversation_rejects_existing_other_user(
         self, conversation_service
     ):
         stored = _stored_conversation_for_user("42")
-        event_service = _mock_event_service_for_stored(stored)
+        event_service = _add_mock_event_service_for_stored(conversation_service, stored)
         event_service.is_open.return_value = True
-        conversation_service._event_services[stored.id] = event_service
 
         request = StartConversationRequest(
             conversation_id=stored.id,

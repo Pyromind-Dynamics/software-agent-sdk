@@ -507,11 +507,48 @@ class ConversationService:
     max_concurrent_runs: int = 10
     lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS
     _event_services: dict[UUID, EventService] | None = field(default=None, init=False)
+    _conversation_ids_by_user: dict[str, set[UUID]] = field(
+        default_factory=dict, init=False
+    )
     _conversation_webhook_subscribers: list["ConversationWebhookSubscriber"] = field(
         default_factory=list, init=False
     )
     _lease_renewal_task: asyncio.Task | None = field(default=None, init=False)
     _run_executor: ThreadPoolExecutor | None = field(default=None, init=False)
+
+    def _index_event_service(self, event_service: EventService) -> None:
+        user_id = event_service.stored.user_id
+        if user_id is None:
+            return
+        self._conversation_ids_by_user.setdefault(user_id, set()).add(
+            event_service.stored.id
+        )
+
+    def _unindex_event_service(self, event_service: EventService) -> None:
+        user_id = event_service.stored.user_id
+        if user_id is None:
+            return
+        conversation_ids = self._conversation_ids_by_user.get(user_id)
+        if conversation_ids is None:
+            return
+        conversation_ids.discard(event_service.stored.id)
+        if not conversation_ids:
+            self._conversation_ids_by_user.pop(user_id, None)
+
+    def _candidate_event_services(
+        self, user_id: str | None
+    ) -> dict[UUID, EventService]:
+        if self._event_services is None:
+            raise ValueError("inactive_service")
+        if user_id is None:
+            return self._event_services
+
+        candidate_services: dict[UUID, EventService] = {}
+        for conversation_id in self._conversation_ids_by_user.get(user_id, set()):
+            event_service = self._event_services.get(conversation_id)
+            if event_service is not None:
+                candidate_services[conversation_id] = event_service
+        return candidate_services
 
     async def get_conversation(
         self, conversation_id: UUID, user_id: str | None = None
@@ -592,9 +629,7 @@ class ConversationService:
 
         # Collect all conversations with their info
         all_conversations = []
-        for id, event_service in self._event_services.items():
-            if not _event_service_matches_user(event_service, user_id):
-                continue
+        for id, event_service in self._candidate_event_services(user_id).items():
             state = await event_service.get_state()
             conversation_info = _compose_conversation_info(event_service.stored, state)
             # Apply status filter if provided
@@ -658,10 +693,12 @@ class ConversationService:
         if self._event_services is None:
             raise ValueError("inactive_service")
 
+        candidate_services = self._candidate_event_services(user_id)
+        if execution_status is None:
+            return len(candidate_services)
+
         count = 0
-        for event_service in self._event_services.values():
-            if not _event_service_matches_user(event_service, user_id):
-                continue
+        for event_service in candidate_services.values():
             state = await event_service.get_state()
 
             # Apply status filter if provided
@@ -956,6 +993,7 @@ class ConversationService:
             event_service = None
         if event_service is not None:
             self._event_services.pop(conversation_id, None)
+            self._unindex_event_service(event_service)
         if event_service:
             # Notify conversation webhooks about the stopped conversation before closing
             try:
@@ -1282,6 +1320,7 @@ class ConversationService:
         if self._event_services is not None:
             fork_service = self._event_services.pop(fork_id, None)
             if fork_service is not None:
+                self._unindex_event_service(fork_service)
                 await fork_service.close()
         safe_rmtree(self.conversations_dir / fork_id.hex)
 
@@ -1380,6 +1419,7 @@ class ConversationService:
             thread_name_prefix="conversation-run",
         )
         self._event_services = {}
+        self._conversation_ids_by_user = {}
         for conversation_dir in self.conversations_dir.iterdir():
             stored: StoredConversation | None = None
             try:
@@ -1491,6 +1531,7 @@ class ConversationService:
         if event_services is None:
             return
         self._event_services = None
+        self._conversation_ids_by_user = {}
         # This stops conversations and saves meta
         await asyncio.gather(
             *[
@@ -1571,6 +1612,7 @@ class ConversationService:
             raise
 
         event_services[stored.id] = event_service
+        self._index_event_service(event_service)
         return event_service
 
 
