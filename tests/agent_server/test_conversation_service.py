@@ -226,6 +226,11 @@ async def test_fork_conversation_at_event_creates_rollback_branch(
     workflow_path = source_workspace / "workflow.py"
     workflow_v1 = "# workflow: demo\nstep = 1\n"
     workflow_v2 = "# workflow: demo\nstep = 2\n"
+    workflow_v2_xyflow = {
+        "name": "demo",
+        "nodes": [{"id": "step", "data": {"label": "step"}}],
+        "edges": [],
+    }
     workflow_path.write_text("# workflow: future\nstep = 3\n", encoding="utf-8")
 
     events = [
@@ -273,6 +278,7 @@ async def test_fork_conversation_at_event_creates_rollback_branch(
             eventId=events[3].id,
             snapshotRole="out",
             workflowDslData=workflow_v2,
+            workflowXyflowData=workflow_v2_xyflow,
             eventType=PYROMIND_WORKFLOW_EVENT_KEY,
             createdBy="test",
         )
@@ -310,6 +316,7 @@ async def test_fork_conversation_at_event_creates_rollback_branch(
     fork_snapshot = fork_store.get_event_snapshot(events[3].id)
     assert fork_snapshot.session_id == fork_info.id.hex
     assert fork_snapshot.workflow_dsl_data == workflow_v2
+    assert fork_snapshot.workflow_xyflow_data == workflow_v2_xyflow
 
     source_events = (await source_service.search_events(limit=10)).items
     assert [event.id for event in source_events] == [event.id for event in events]

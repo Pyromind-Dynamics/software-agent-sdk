@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from openhands.agent_server.pyromind_constants import PYROMIND_WORKFLOW_EVENT_KEY
 from openhands.agent_server.workflow_canvas_models import (
@@ -25,6 +26,7 @@ class WorkflowCanvasSnapshotHook:
         *,
         event_id: str | None,
         workflow_dsl_data: str | None,
+        workflow_xyflow_data: dict[str, Any] | None = None,
     ) -> None:
         if event_id is None or workflow_dsl_data is None:
             return
@@ -33,7 +35,8 @@ class WorkflowCanvasSnapshotHook:
                 eventId=event_id,
                 snapshotRole="in",
                 workflowDslData=workflow_dsl_data,
-                summary="用户输入时的 workflow DSL 快照",
+                workflowXyflowData=workflow_xyflow_data,
+                summary="用户输入时的 workflow 快照",
                 createdBy="workflow_canvas_snapshot_hook",
             )
         )
@@ -43,6 +46,7 @@ class WorkflowCanvasSnapshotHook:
         *,
         event_id: str,
         workflow_dsl_data: str,
+        workflow_xyflow_data: dict[str, Any] | None,
         parent_user_message_event_id: str | None,
         summary: str | None,
     ) -> None:
@@ -51,6 +55,7 @@ class WorkflowCanvasSnapshotHook:
                 eventId=event_id,
                 snapshotRole="out",
                 workflowDslData=workflow_dsl_data,
+                workflowXyflowData=workflow_xyflow_data,
                 parentUserMessageEventId=parent_user_message_event_id,
                 eventType=PYROMIND_WORKFLOW_EVENT_KEY,
                 summary=summary or "Agent workflow 输出快照",

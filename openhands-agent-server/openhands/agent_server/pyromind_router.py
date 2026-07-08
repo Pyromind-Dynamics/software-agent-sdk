@@ -14,7 +14,7 @@ from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import AliasChoices, BaseModel, Field, SecretStr
 
 from openhands.agent_server.conversation_service import (
     ConversationForkAtEventConflictError,
@@ -43,7 +43,6 @@ from openhands.agent_server.pyromind_constants import (
 )
 from openhands.sdk import LLM, AgentContext, TextContent, Tool
 from openhands.sdk.conversation.request import (
-    SendMessageRequest,
     StartConversationRequest,
 )
 from openhands.sdk.llm.message import Message
@@ -54,6 +53,7 @@ from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
 from openhands.tools.pyromind_debug import get_debug_result_broker
 from openhands.tools.workflow import DslToXyflowTool, ValidateWorkflowDslTool
+from openhands.tools.workflow.dsl_to_xyflow import convert_xyflow_to_dsl
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
@@ -289,13 +289,13 @@ class PyromindCreateConversationRequest(BaseModel):
         default=None,
         description="Optional initial user message to start the conversation.",
     )
-    workflow_dsl: str | None = Field(
+    workflow_xyflow: dict[str, Any] | None = Field(
         default=None,
+        validation_alias=AliasChoices("workflow_xyflow", "workflowXyflow"),
         description=(
-            "Optional DSL of a workflow the user already had on the canvas "
-            "before starting this conversation. If provided, it seeds "
-            "workflow.py before the initial message is processed. `null` "
-            "(the default) means no canvas state to seed from."
+            "Optional xyflow JSON of the workflow currently on the canvas. "
+            "When provided, the server converts it to workflow DSL before "
+            "seeding workflow.py."
         ),
     )
     extra: dict[str, Any] = Field(
@@ -309,30 +309,34 @@ class PyromindCreateConversationRequest(BaseModel):
         ),
     )
 
+    model_config = {"populate_by_name": True, "extra": "forbid"}
+
 
 class PyromindSendMessageRequest(BaseModel):
     """Request body for sending a message in a Pyromind conversation.
 
     Unlike the generic ``POST /api/conversations/{id}/events`` endpoint, this
-    also accepts the DSL of the workflow currently shown on the canvas, so
-    that workflow.py is synced to what the user actually sees *before* the
-    agent acts on this message. See "工作流同步链路" in the debug-loop plan.
+    also accepts the workflow currently shown on the canvas, so that workflow.py
+    is synced to what the user actually sees *before* the agent acts on this
+    message.
     """
 
     text: str = Field(description="The user's message text.")
-    workflow_dsl: str | None = Field(
+    workflow_xyflow: dict[str, Any] | None = Field(
         default=None,
+        validation_alias=AliasChoices("workflow_xyflow", "workflowXyflow"),
         description=(
-            "DSL of the workflow currently on the canvas. `null` means the "
-            "frontend did not attach canvas state, so no sync is performed "
-            "(workflow.py is left untouched). An empty string means the "
-            "canvas is genuinely empty (the user cleared it)."
+            "xyflow JSON of the workflow currently on the canvas. When "
+            "provided, the server converts it to workflow DSL before syncing "
+            "workflow.py and saving the input snapshot."
         ),
     )
     run: bool = Field(
         default=True,
         description="Whether the agent loop should run after this message.",
     )
+
+    model_config = {"populate_by_name": True, "extra": "forbid"}
 
 
 class PyromindForkAtEventRequest(BaseModel):
@@ -374,21 +378,42 @@ def _normalize_dsl(text: str) -> str:
     return text.strip()
 
 
+def _is_empty_xyflow(workflow_xyflow: dict[str, Any]) -> bool:
+    return workflow_xyflow.get("nodes") == [] and workflow_xyflow.get("edges") == []
+
+
+def _workflow_dsl_from_xyflow(workflow_xyflow: dict[str, Any] | None) -> str | None:
+    if workflow_xyflow is None:
+        return None
+    if _is_empty_xyflow(workflow_xyflow):
+        return ""
+    try:
+        return convert_xyflow_to_dsl(workflow_xyflow)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Failed to convert workflow_xyflow to workflow DSL: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        ) from exc
+
+
 def _sync_workflow_with_canvas(
     working_dir: Path, workflow_dsl: str | None
 ) -> TextContent | None:
-    """Reconcile workflow.py with the DSL currently shown on the canvas.
+    """Reconcile workflow.py with the DSL converted from the canvas xyflow.
 
     The user can edit the canvas between agent turns, so workflow.py must be
-    re-synced from the canvas before each new user message is processed --
-    otherwise the agent would keep editing a stale version. Returns a
+    re-synced from the converted canvas state before each new user message is
+    processed -- otherwise the agent would keep editing a stale version. Returns a
     ``<system_reminder>`` TextContent to inject into the LLM's context (via
     ``extended_content``) when workflow.py actually changed as a result, or
     None when nothing needed to change.
 
-    `workflow_dsl=None` means the caller attached no canvas state at all
-    (e.g. a plain follow-up message) and is a deliberate no-op, distinct
-    from `workflow_dsl=""` which means the canvas is genuinely empty.
+    `workflow_dsl=None` means the caller attached no xyflow canvas state at all
+    and is a deliberate no-op, distinct from `workflow_dsl=""` which means the
+    canvas is genuinely empty.
     """
     if workflow_dsl is None:
         return None
@@ -642,28 +667,22 @@ async def create_pyromind_conversation(
     # conversation (e.g. they sketched something, then opened chat). No
     # system_reminder is needed here -- this is turn 1, so there is no
     # prior-turn workflow.py content for the agent to contrast against.
-    if request.workflow_dsl:
-        (conversation_dir / "workflow.py").write_text(
-            request.workflow_dsl, encoding="utf-8"
-        )
+    workflow_dsl = _workflow_dsl_from_xyflow(request.workflow_xyflow)
+    if workflow_dsl:
+        (conversation_dir / "workflow.py").write_text(workflow_dsl, encoding="utf-8")
 
-    # 7. Assemble StartConversationRequest
-    initial_message: SendMessageRequest | None = None
-    if request.message:
-        initial_message = SendMessageRequest(
-            role="user",
-            content=[TextContent(text=request.message)],
-            run=True,
-        )
-
+    # 7. Assemble StartConversationRequest. Pyromind sends the initial message
+    # after startup through EventService so the workflow snapshot hook can bind
+    # the input snapshot to the generated user MessageEvent.id.
+    user_id = get_current_user_id(http_request)
     start_request = StartConversationRequest(
         agent=agent,
         workspace=workspace,
         conversation_id=conversation_id,
-        initial_message=initial_message,
+        initial_message=None,
         secrets=validation_secrets,
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
-        user_id=get_current_user_id(http_request),
+        user_id=user_id,
     )
 
     # 8. Delegate to conversation service
@@ -674,6 +693,28 @@ async def create_pyromind_conversation(
     current_user = getattr(http_request.state, "current_user", None)
     if is_dev() and isinstance(current_user, CurrentLoginUser):
         bind_debug_current_login_user_to_conversation(info.id, current_user)
+    if is_new and request.message:
+        event_service = await conversation_service.get_event_service(
+            info.id,
+            user_id=user_id,
+        )
+        if event_service is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Conversation event service not found: {info.id}",
+            )
+        await event_service.send_message(
+            Message(role="user", content=[TextContent(text=request.message)]),
+            run=True,
+            workflow_dsl_snapshot=workflow_dsl,
+            workflow_xyflow_snapshot=request.workflow_xyflow,
+        )
+        refreshed_info = await conversation_service.get_conversation(
+            info.id,
+            user_id=user_id,
+        )
+        if refreshed_info is not None:
+            info = refreshed_info
     response.status_code = status.HTTP_201_CREATED if is_new else status.HTTP_200_OK
     return info
 
@@ -689,23 +730,26 @@ async def send_pyromind_message(
 ) -> Success:
     """Send a user message, first syncing workflow.py to the canvas if needed.
 
-    The frontend attaches the DSL currently shown on the canvas via
-    ``workflow_dsl`` on every message. If it disagrees with workflow.py (the
-    user edited the canvas, or cleared it), workflow.py is overwritten/
-    removed to match and a ``<system_reminder>`` is injected into this
-    turn's LLM context (not into the user's visible message) so the agent
-    knows to treat the current file as authoritative.
+    The frontend attaches the xyflow JSON currently shown on the canvas via
+    ``workflow_xyflow``. The server converts it to DSL before syncing
+    workflow.py. If the converted DSL disagrees with workflow.py (the user
+    edited the canvas, or cleared it), workflow.py is overwritten/removed to
+    match and a ``<system_reminder>`` is injected into this turn's LLM context
+    (not into the user's visible message) so the agent knows to treat the
+    current file as authoritative.
     """
     conversation = event_service.get_conversation()
     working_dir = Path(conversation.workspace.working_dir)
-    reminder = _sync_workflow_with_canvas(working_dir, request.workflow_dsl)
+    workflow_dsl = _workflow_dsl_from_xyflow(request.workflow_xyflow)
+    reminder = _sync_workflow_with_canvas(working_dir, workflow_dsl)
 
     message = Message(role="user", content=[TextContent(text=request.text)])
     await event_service.send_message(
         message,
         run=request.run,
         extended_content=[reminder] if reminder else None,
-        workflow_dsl_snapshot=request.workflow_dsl,
+        workflow_dsl_snapshot=workflow_dsl,
+        workflow_xyflow_snapshot=request.workflow_xyflow,
     )
     return Success()
 

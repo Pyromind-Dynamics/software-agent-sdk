@@ -17,6 +17,10 @@ class WorkflowCanvasVersion(BaseModel):
     version_id: str = Field(alias="versionId")
     version_no: int = Field(alias="versionNo", ge=1)
     workflow_dsl_data: str = Field(alias="workflowDslData")
+    workflow_xyflow_data: dict[str, Any] | None = Field(
+        default=None,
+        alias="workflowXyflowData",
+    )
     summary: str | None = None
     feature: Any | None = None
     created_by: str | None = Field(default=None, alias="createdBy")
@@ -67,6 +71,10 @@ class WorkflowCanvasEventSnapshot(BaseModel):
     version_id: str = Field(alias="versionId")
     version_no: int = Field(alias="versionNo")
     workflow_dsl_data: str = Field(alias="workflowDslData")
+    workflow_xyflow_data: dict[str, Any] | None = Field(
+        default=None,
+        alias="workflowXyflowData",
+    )
     summary: str | None = None
     parent_user_message_event_id: str | None = Field(
         default=None,
@@ -84,6 +92,10 @@ class SaveWorkflowCanvasEventSnapshotRequest(BaseModel):
     event_id: str = Field(alias="eventId", min_length=1)
     snapshot_role: WorkflowCanvasSnapshotRole = Field(alias="snapshotRole")
     workflow_dsl_data: str = Field(alias="workflowDslData")
+    workflow_xyflow_data: dict[str, Any] | None = Field(
+        default=None,
+        alias="workflowXyflowData",
+    )
     parent_user_message_event_id: str | None = Field(
         default=None,
         alias="parentUserMessageEventId",
