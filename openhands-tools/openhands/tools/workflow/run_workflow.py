@@ -17,7 +17,6 @@ callback 异步回传。平台 HTTP 集成在 :class:`RunWorkflowExecutor` 中�
 
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
@@ -46,6 +45,7 @@ from openhands.tools.workflow.dsl_to_xyflow import (
     DslToXyflowObservation,
 )
 
+
 if TYPE_CHECKING:
     from openhands.sdk.conversation.base import BaseConversation
     from openhands.sdk.conversation.state import ConversationState
@@ -65,9 +65,6 @@ class WorkflowRunError(RuntimeError):
     当 Pyromind 平台创建或运行工作流失败时抛出。属于运行时/平台错误，而非输入值
     不合法，因此继承 ``RuntimeError``。Executor 会捕获它并转为 error observation。
     """
-
-
-
 
 
 class RunWorkflowAction(Action):
@@ -97,7 +94,11 @@ class RunWorkflowAction(Action):
     )
     test_mode: bool = Field(
         default=False,
-        description="Whether to run the workflow in test mode.",
+        description=(
+            "When true, submit a platform test/debug run (execution_mode=test). "
+            "Use for 测试/调试/试跑 requests; the tool returns after submission and "
+            "delivers pass/fail via callback."
+        ),
     )
 
 
@@ -140,9 +141,17 @@ class RunWorkflowObservation(Observation):
 
 TOOL_DESCRIPTION = """Submit the current Pyromind workflow to the platform for asynchronous execution.
 
-Use this tool when the user asks to run, test, debug, or 试跑 a workflow. Pass the
-required workflow Python DSL source code in `dsl` (not a file path). Do not execute
-the workflow locally with bash or Python.
+Use this tool when the user asks to run, publish, or execute a workflow in production mode
+(`test_mode=false`, the default).
+
+Use `test_mode=true` when the user asks to test, debug, 测试, 调试, or 试跑 a workflow.
+That is the replacement for the legacy `debug_workflow` tool: it submits a real platform
+test run with `execution_mode=test` and returns a task ID after submission. Final pass/fail
+status and runtime errors are delivered later via a platform callback (system reminder).
+
+Pass the required workflow Python DSL source code in `dsl` (not a file path). Read
+`workflow.py` from the workspace and pass its contents as `dsl`. Do not execute the
+workflow locally with bash or Python.
 
 Platform execution is asynchronous: this tool returns a workflow task ID after
 submission. Final run status and runtime errors will be delivered later via a
@@ -193,8 +202,8 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
         self.cluster = cluster
         self.env = env
         self.current_user = current_user
-        self._max_attempts = DEFAULT_MAX_ATTEMPTS     # 最大尝试次数
-        self._attempt = 0                             # 当前尝试次数
+        self._max_attempts = DEFAULT_MAX_ATTEMPTS  # 最大尝试次数
+        self._attempt = 0  # 当前尝试次数
         self.headers = headers or {}
 
     def __call__(
@@ -373,13 +382,17 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
 
             # 3. 调用平台运行接口
             request = TrainingTaskCreateRequest(
-                name=_workflow_name, workflow=workflow_xyflow, out_id=f"agent1#{conversation_id}"
+                name=_workflow_name,
+                workflow=workflow_xyflow,
+                out_id=f"agent1#{conversation_id}",
             )
 
             # 4. 创建工作流
-            is_mock = True
+            is_mock = False
             if is_mock:
-                response: TrainingTaskCreateResponse = self._mock_submit_workflow(request)
+                response: TrainingTaskCreateResponse = self._mock_submit_workflow(
+                    request
+                )
             else:
                 response: TrainingTaskCreateResponse = client.studio.create(request)
 
@@ -390,13 +403,11 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
 
             if test_mode:
                 user_text = (
-                    "The test workflow task has been submitted. "
-                    "Please wait patiently."
+                    "The test workflow task has been submitted. Please wait patiently."
                 )
             else:
                 user_text = (
-                    "The workflow task has been submitted. "
-                    "Please wait patiently."
+                    "The workflow task has been submitted. Please wait patiently."
                 )
 
             # 成功提交工作流，返回提交结果
@@ -534,12 +545,13 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
             raise ValueError("Workflow DSL conversion did not return xyflow JSON.")
         return conversion.xyflow
 
-
-    def _mock_submit_workflow(self, request: TrainingTaskCreateRequest) -> TrainingTaskCreateResponse:
-        resp = TrainingTaskCreateResponse(task_id="1999", name=request.name, status="Running")
+    def _mock_submit_workflow(
+        self, request: TrainingTaskCreateRequest
+    ) -> TrainingTaskCreateResponse:
+        resp = TrainingTaskCreateResponse(
+            task_id="1999", name=request.name, status="Running"
+        )
         return resp
-
-
 
 
 class RunWorkflowTool(ToolDefinition[RunWorkflowAction, RunWorkflowObservation]):

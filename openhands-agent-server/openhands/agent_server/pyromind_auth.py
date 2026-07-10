@@ -167,13 +167,14 @@ def add_request_context_to_user(
     )
 
 
+
+
+
 def get_dev_login_user_from_headers(
     headers: Mapping[str, str],
 ) -> CurrentLoginUser | None:
-
     if not is_dev():
         return None
-
     raw_user_id = headers.get(PYROMIND_DEV_USER_ID_HEADER, "").strip()
     if not raw_user_id:
         return None

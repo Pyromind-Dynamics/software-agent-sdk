@@ -124,6 +124,53 @@ def test_check_session_api_key_accepts_dev_pyromind_headers(monkeypatch):
     }
 
 
+def test_check_session_api_key_accepts_dev_pyromind_query_params(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "dev")
+    client = TestClient(_make_user_app(["test-key"]), raise_server_exceptions=False)
+
+    response = client.get(
+        "/test",
+        params={
+            "pyromind-debug-user-id": "42",
+            "pyromind-debug-user-name": "debug-user-42",
+        },
+        headers={
+            "Cookie": "auth_token=session-token; other=value",
+            "X-Cluster": "us-west-1#pre",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "auth_method": "pyromind_dev",
+        "user_id": "42",
+        "username": "debug-user-42",
+        "cookie": "auth_token=session-token; other=value",
+        "x_cluster": "us-west-1#pre",
+    }
+
+
+def test_check_session_api_key_prefers_dev_pyromind_headers_over_query(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "dev")
+    client = TestClient(_make_user_app(["test-key"]), raise_server_exceptions=False)
+
+    response = client.get(
+        "/test",
+        params={
+            "pyromind-debug-user-id": "99",
+            "pyromind-debug-user-name": "query-user",
+        },
+        headers={
+            "X-Pyromind-Debug-User-Id": "42",
+            "X-Pyromind-Debug-User-Name": "header-user",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["user_id"] == "42"
+    assert response.json()["username"] == "header-user"
+
+
 def test_check_session_api_key_rejects_dev_headers_outside_dev(monkeypatch):
     monkeypatch.setenv("APP_ENV", "prod")
     client = TestClient(_make_app(["test-key"]), raise_server_exceptions=False)

@@ -66,11 +66,10 @@ from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
 )
 from openhands.tools.pyromind_debug import get_debug_result_broker
-
 from openhands.tools.workflow import (
     DslToXyflowTool,
     RunWorkflowTool,
-    ValidateWorkflowDslTool
+    ValidateWorkflowDslTool,
 )
 from openhands.tools.workflow.dsl_to_xyflow import (
     DslToXyflowTool,
@@ -232,7 +231,6 @@ def _build_workflow_validation_tool(
     return Tool(name=ValidateWorkflowDslTool.name, params=params), secrets
 
 
-
 def _load_env_to_tools(
     http_request: Request, params: dict[str, Any], secrets: dict[str, SecretSource]
 ) -> tuple[dict[str, Any], dict[str, SecretSource]]:
@@ -333,7 +331,6 @@ def _build_pyromind_storage_tools(
     )
 
 
-
 async def apply_pyromind_validation_context(
     event_service: EventService,
     current_user: CurrentLoginUser | None,
@@ -356,9 +353,6 @@ async def apply_pyromind_validation_context(
         secrets_update[PYROMIND_AUTH_TOKEN_SECRET] = auth_token
     if secrets_update:
         await event_service.update_secrets(secrets_update)
-
-
-
 
     if current_user.x_cluster:
         await event_service.update_agent_state(
@@ -807,7 +801,6 @@ async def create_pyromind_conversation(
         http_request, request.extra
     )
 
-
     # 4. Build LLM config
     llm = LLM(
         usage_id="pyromind-agent",
@@ -826,7 +819,6 @@ async def create_pyromind_conversation(
         extra_tools=[
             Tool(name="grep"),
             Tool(name="file_editor"),
-            Tool(name="debug_workflow"),
             Tool(name=RunWorkflowTool.name, params=run_tool.params),
             *storage_tools,
             Tool(name=DslToXyflowTool.name),

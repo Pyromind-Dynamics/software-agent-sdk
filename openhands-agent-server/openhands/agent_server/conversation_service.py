@@ -1093,6 +1093,13 @@ class ConversationService:
         if self._event_services is None:
             raise ValueError("inactive_service")
         event_service = self._event_services.get(conversation_id)
+        # 如果event_service为空直接返回
+        if event_service is None:
+            return None
+
+        if not user_id:
+            return event_service
+
         if event_service is None or not _event_service_matches_user(
             event_service, user_id
         ):

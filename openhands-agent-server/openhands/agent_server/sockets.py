@@ -345,18 +345,24 @@ async def events_socket(
     logger.info(f"Event Websocket Connected: {conversation_id}")
     conv_service = _get_conversation_service(websocket)
     current_user = getattr(websocket.state, "current_user", None)
+
     user_id = (
         str(current_user.user_id)
         if isinstance(current_user, CurrentLoginUser)
         else None
     )
-    if user_id is None:
-        event_service = await conv_service.get_event_service(conversation_id)
-    else:
-        event_service = await conv_service.get_event_service(
-            conversation_id,
-            user_id=user_id,
-        )
+
+    event_service = await conv_service.get_event_service(conversation_id, user_id=user_id)
+
+    # # get_event_service兼容user_id 是否为空的处理
+    # if user_id is None:
+    #     event_service = await conv_service.get_event_service(conversation_id)
+    # else:
+    #     event_service = await conv_service.get_event_service(
+    #         conversation_id,
+    #         user_id=user_id,
+    #     )
+
     if event_service is None:
         logger.warning(f"Converation not found: {conversation_id}")
         await websocket.close(code=4004, reason="Conversation not found")
