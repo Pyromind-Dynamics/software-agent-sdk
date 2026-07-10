@@ -1,8 +1,4 @@
-"""Pyromind dataset tools: preview storage datasets and upload local files.
-
-Both tools are currently MOCKED (return fixed values) until the real
-platform APIs are available. See definition.py for the TODO markers.
-"""
+"""Pyromind dataset tools: preview storage datasets and upload local files."""
 
 from openhands.tools.pyromind_dataset.definition import (
     PreviewDatasetAction,

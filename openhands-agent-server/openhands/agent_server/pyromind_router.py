@@ -55,9 +55,16 @@ from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
     UploadFileToPyromindTool,
 )
+from openhands.tools.pyromind_dataset.definition import (
+    PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
+    PYROMIND_STORAGE_HEADERS_STATE_KEY,
+)
 from openhands.tools.pyromind_debug import get_debug_result_broker
-from openhands.tools.workflow import DslToXyflowTool, ValidateWorkflowDslTool
-from openhands.tools.workflow.dsl_to_xyflow import convert_xyflow_to_dsl
+from openhands.tools.workflow import ValidateWorkflowDslTool
+from openhands.tools.workflow.dsl_to_xyflow import (
+    DslToXyflowTool,
+    convert_xyflow_to_dsl,
+)
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
@@ -211,6 +218,45 @@ def _build_workflow_validation_tool(
     return Tool(name=ValidateWorkflowDslTool.name, params=params), secrets
 
 
+def _build_pyromind_storage_tools(
+    http_request: Request,
+    extra: dict[str, Any],
+) -> tuple[list[Tool], dict[str, SecretSource]]:
+    headers = {
+        name: value
+        for name in _PYROMIND_VALIDATE_FORWARD_HEADERS
+        if name != "x-cluster" and (value := http_request.headers.get(name))
+    }
+    if cluster := _get_validation_cluster_header(http_request, extra):
+        headers["x-cluster"] = cluster
+
+    params: dict[str, Any] = {}
+    storage_base_url = extra.get("storage_base_url", extra.get("storage_api_base_url"))
+    if isinstance(storage_base_url, str) and storage_base_url:
+        params["storage_base_url"] = storage_base_url
+    if headers:
+        params["headers"] = headers
+
+    secrets: dict[str, SecretSource] = {}
+    secret_headers: dict[str, str] = {}
+    cookie_header = _get_validation_cookie_header(http_request)
+    if cookie_header:
+        secret_headers["cookie"] = PYROMIND_STORAGE_AUTH_COOKIE_SECRET
+        secrets[PYROMIND_STORAGE_AUTH_COOKIE_SECRET] = StaticSecret(
+            value=SecretStr(cookie_header)
+        )
+    if secret_headers:
+        params["secret_headers"] = secret_headers
+
+    return (
+        [
+            Tool(name=PreviewDatasetTool.name, params=dict(params)),
+            Tool(name=UploadFileToPyromindTool.name, params=dict(params)),
+        ],
+        secrets,
+    )
+
+
 async def apply_pyromind_validation_context(
     event_service: EventService,
     current_user: CurrentLoginUser | None,
@@ -222,11 +268,21 @@ async def apply_pyromind_validation_context(
 
     if current_user.cookie:
         await event_service.update_secrets(
-            {PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: current_user.cookie}
+            {
+                PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: current_user.cookie,
+                PYROMIND_STORAGE_AUTH_COOKIE_SECRET: current_user.cookie,
+            }
         )
     if current_user.x_cluster:
         await event_service.update_agent_state(
-            {PYROMIND_VALIDATE_HEADERS_STATE_KEY: {"x-cluster": current_user.x_cluster}}
+            {
+                PYROMIND_VALIDATE_HEADERS_STATE_KEY: {
+                    "x-cluster": current_user.x_cluster
+                },
+                PYROMIND_STORAGE_HEADERS_STATE_KEY: {
+                    "x-cluster": current_user.x_cluster
+                },
+            }
         )
 
 
@@ -638,6 +694,9 @@ async def create_pyromind_conversation(
     validation_tool, validation_secrets = _build_workflow_validation_tool(
         http_request, request.extra
     )
+    storage_tools, storage_secrets = _build_pyromind_storage_tools(
+        http_request, request.extra
+    )
 
     # 4. Build LLM config
     llm = LLM(
@@ -658,8 +717,8 @@ async def create_pyromind_conversation(
             Tool(name="grep"),
             Tool(name="file_editor"),
             Tool(name="debug_workflow"),
-            Tool(name=PreviewDatasetTool.name),
-            Tool(name=UploadFileToPyromindTool.name),
+            *storage_tools,
+            Tool(name=DslToXyflowTool.name),
             validation_tool,
         ],
     )
@@ -685,7 +744,7 @@ async def create_pyromind_conversation(
         workspace=workspace,
         conversation_id=conversation_id,
         initial_message=None,
-        secrets=validation_secrets,
+        secrets={**validation_secrets, **storage_secrets},
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
         user_id=user_id,
     )
@@ -730,6 +789,7 @@ async def create_pyromind_conversation(
     responses={404: {"description": "Conversation not found"}},
 )
 async def send_pyromind_message(
+    http_request: Request,
     request: PyromindSendMessageRequest,
     event_service: EventService = Depends(get_event_service),
 ) -> Success:
@@ -743,6 +803,10 @@ async def send_pyromind_message(
     (not into the user's visible message) so the agent knows to treat the
     current file as authoritative.
     """
+    current_user = getattr(http_request.state, "current_user", None)
+    if isinstance(current_user, CurrentLoginUser):
+        await apply_pyromind_validation_context(event_service, current_user)
+
     conversation = event_service.get_conversation()
     working_dir = Path(conversation.workspace.working_dir)
     workflow_dsl = _workflow_dsl_from_xyflow(request.workflow_xyflow)
