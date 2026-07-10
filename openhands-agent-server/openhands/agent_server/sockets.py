@@ -53,6 +53,7 @@ from openhands.agent_server.models import (
 )
 from openhands.agent_server.pub_sub import MaxSubscribersError, Subscriber
 from openhands.agent_server.pyromind_auth import (
+    PYROMIND_AUTH_COOKIE_NAME,
     add_request_context_to_user,
     get_dev_login_user_from_headers,
 )
@@ -154,9 +155,15 @@ def _add_websocket_context_to_user(
     current_user: CurrentLoginUser,
     websocket: WebSocket,
 ) -> CurrentLoginUser:
+    headers = dict(websocket.headers)
+    cookie_header = headers.get("cookie")
+    if not cookie_header:
+        if token := _resolve_websocket_pyromind_jwt_token(websocket):
+            cookie_header = f"{PYROMIND_AUTH_COOKIE_NAME}={token}"
+            headers["cookie"] = cookie_header
     return add_request_context_to_user(
         current_user,
-        websocket.headers,
+        headers,
         x_cluster=_resolve_websocket_x_cluster(websocket),
     )
 
