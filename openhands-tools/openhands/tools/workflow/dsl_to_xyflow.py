@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import json
 from collections.abc import Callable, Sequence
+from copy import deepcopy
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, Self
 
@@ -24,6 +26,167 @@ if TYPE_CHECKING:
 
 
 DslConverterFactory = Callable[[], Any]
+
+
+def create_dsl_converter() -> Any:
+    try:
+        workflow_module = import_module("pyromind_sdk.client.workflow")
+        converter_type = getattr(workflow_module, "DslConverter")
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "pyromind-sdk with pyromind_sdk.client.workflow.DslConverter is "
+            "required for workflow DSL/xyflow conversion."
+        ) from exc
+    return converter_type()
+
+
+def convert_dsl_to_xyflow(
+    dsl: str,
+    *,
+    name: str = "workflow",
+    converter_factory: DslConverterFactory | None = None,
+) -> dict[str, Any]:
+    converter = (converter_factory or create_dsl_converter)()
+    xyflow = converter.from_python(dsl, name=name)
+    if not isinstance(xyflow, dict):
+        raise TypeError(
+            f"Workflow DSL converter returned {type(xyflow).__name__}; expected dict."
+        )
+    return _normalize_xyflow(xyflow)
+
+
+def convert_xyflow_to_dsl(
+    xyflow: dict[str, Any],
+    *,
+    converter_factory: DslConverterFactory | None = None,
+) -> str:
+    converter = (converter_factory or create_dsl_converter)()
+    dsl = converter.to_python(_normalize_xyflow(xyflow))
+    if not isinstance(dsl, str):
+        raise TypeError(
+            f"Workflow xyflow converter returned {type(dsl).__name__}; expected str."
+        )
+    ast.parse(dsl)
+    return dsl
+
+
+def _normalize_xyflow(xyflow: dict[str, Any]) -> dict[str, Any]:
+    normalized = deepcopy(xyflow)
+    nodes = normalized.get("nodes")
+    if not isinstance(nodes, list):
+        return normalized
+
+    edges = normalized.get("edges")
+    if not isinstance(edges, list):
+        edges = []
+
+    incoming_handles = _edge_handles_by_node(edges, "target", "targetHandle")
+    outgoing_handles = _edge_handles_by_node(edges, "source", "sourceHandle")
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        data = node.get("data")
+        if not isinstance(data, dict):
+            continue
+        if data.get("nodeType") and not node.get("type"):
+            node["type"] = "default"
+        node_id = str(node.get("id"))
+        _ensure_minimal_node_definition(
+            data,
+            incoming_handles.get(node_id, []),
+            outgoing_handles.get(node_id, []),
+        )
+    return normalized
+
+
+def _edge_handles_by_node(
+    edges: list[Any],
+    node_key: str,
+    handle_key: str,
+) -> dict[str, list[str]]:
+    handles_by_node: dict[str, list[str]] = {}
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        node_id = edge.get(node_key)
+        handle = edge.get(handle_key)
+        if node_id is None or not isinstance(handle, str) or not handle:
+            continue
+        handles_by_node.setdefault(str(node_id), []).append(handle)
+    return handles_by_node
+
+
+def _ensure_minimal_node_definition(
+    data: dict[str, Any],
+    incoming_handles: list[str],
+    outgoing_handles: list[str],
+) -> None:
+    input_names = _ordered_unique(
+        [
+            *incoming_handles,
+            *_node_config_keys(data.get("config")),
+        ]
+    )
+    output_names = _ordered_unique(outgoing_handles)
+    if not input_names and not output_names:
+        return
+
+    node_definition = data.get("nodeDefinition")
+    if not isinstance(node_definition, dict):
+        node_definition = {}
+        data["nodeDefinition"] = node_definition
+
+    input_definition = node_definition.get("input")
+    if not isinstance(input_definition, dict):
+        input_definition = {}
+        node_definition["input"] = input_definition
+
+    required = input_definition.get("required")
+    if not isinstance(required, dict):
+        required = {}
+        input_definition["required"] = required
+    optional = input_definition.get("optional")
+    if not isinstance(optional, dict):
+        optional = {}
+        input_definition["optional"] = optional
+
+    known_inputs = set(required) | set(optional)
+    for name in input_names:
+        if name not in known_inputs:
+            optional[name] = {}
+            known_inputs.add(name)
+
+    existing_outputs = node_definition.get("output_name")
+    if not isinstance(existing_outputs, list):
+        existing_outputs = []
+        node_definition["output_name"] = existing_outputs
+
+    known_outputs = {name for name in existing_outputs if isinstance(name, str)}
+    for name in output_names:
+        if name not in known_outputs:
+            existing_outputs.append(name)
+            known_outputs.add(name)
+
+
+def _node_config_keys(config: Any) -> list[str]:
+    if not isinstance(config, dict):
+        return []
+    return [
+        key
+        for key, value in config.items()
+        if isinstance(key, str) and key != "controlMode" and value not in ("", None)
+    ]
+
+
+def _ordered_unique(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 class DslToXyflowAction(Action):
@@ -82,7 +245,7 @@ class DslToXyflowExecutor(ToolExecutor):
         self,
         converter_factory: DslConverterFactory | None = None,
     ) -> None:
-        self._converter_factory = converter_factory or _create_dsl_converter
+        self._converter_factory = converter_factory or create_dsl_converter
 
     def __call__(
         self,
@@ -101,22 +264,16 @@ class DslToXyflowExecutor(ToolExecutor):
             )
 
         try:
-            converter = self._converter_factory()
-            xyflow = converter.from_python(action.dsl, name=action.name)
+            xyflow = convert_dsl_to_xyflow(
+                action.dsl,
+                name=action.name,
+                converter_factory=self._converter_factory,
+            )
         except Exception as exc:
             return DslToXyflowObservation.from_text(
                 text=(
                     "Failed to convert workflow DSL to xyflow: "
                     f"{type(exc).__name__}: {exc}"
-                ),
-                is_error=True,
-            )
-
-        if not isinstance(xyflow, dict):
-            return DslToXyflowObservation.from_text(
-                text=(
-                    "Workflow DSL converter returned "
-                    f"{type(xyflow).__name__}; expected dict."
                 ),
                 is_error=True,
             )
@@ -171,18 +328,6 @@ class DslToXyflowTool(ToolDefinition[DslToXyflowAction, DslToXyflowObservation])
                 ),
             )
         ]
-
-
-def _create_dsl_converter() -> Any:
-    try:
-        workflow_module = import_module("pyromind_sdk.client.workflow")
-        converter_type = getattr(workflow_module, "DslConverter")
-    except (ImportError, AttributeError) as exc:
-        raise RuntimeError(
-            "pyromind-sdk with pyromind_sdk.client.workflow.DslConverter is "
-            "required for DSL to xyflow conversion."
-        ) from exc
-    return converter_type()
 
 
 def _count_list(value: Any) -> int | None:

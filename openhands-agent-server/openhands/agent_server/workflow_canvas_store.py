@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from pydantic import ValidationError
 
@@ -58,6 +59,7 @@ class FileWorkflowCanvasStore:
             version = self._create_version(
                 state,
                 workflow_dsl_data=request.workflow_dsl_data,
+                workflow_xyflow_data=request.workflow_xyflow_data,
                 summary=request.summary,
                 feature=request.feature,
                 created_by=request.created_by,
@@ -143,6 +145,7 @@ class FileWorkflowCanvasStore:
         state: WorkflowCanvasState,
         *,
         workflow_dsl_data: str,
+        workflow_xyflow_data: dict[str, Any] | None,
         summary: str | None,
         feature: object | None,
         created_by: str | None,
@@ -157,6 +160,7 @@ class FileWorkflowCanvasStore:
             versionId=version_id,
             versionNo=version_no,
             workflowDslData=workflow_dsl_data,
+            workflowXyflowData=workflow_xyflow_data,
             summary=summary,
             feature=feature,
             createdBy=created_by,
@@ -188,6 +192,7 @@ class FileWorkflowCanvasStore:
         if (
             record.snapshot_role != request.snapshot_role
             or version.workflow_dsl_data != request.workflow_dsl_data
+            or version.workflow_xyflow_data != request.workflow_xyflow_data
         ):
             raise DuplicateWorkflowCanvasEventSnapshotError(
                 "Workflow canvas event snapshot already exists for "
@@ -207,6 +212,7 @@ class FileWorkflowCanvasStore:
             versionId=record.version_id,
             versionNo=version.version_no,
             workflowDslData=version.workflow_dsl_data,
+            workflowXyflowData=version.workflow_xyflow_data,
             summary=version.summary,
             parentUserMessageEventId=record.parent_user_message_event_id,
             eventType=record.event_type,

@@ -33,15 +33,26 @@ triggers:
 
 - 不要尝试用 `execute_bash` 运行 `python workflow.py`，也不要给它添加 `import` 语句
 - 不要凭 Python 语法/解释器语义去"推演"它会怎么跑、会不会报错——它不是那样被执行的
-- **验证/执行它的唯一方式就是调用 `debug_workflow`**；测试通过与否、报错信息都以这个工具的
-  返回为准。报错来自平台侧节点的真实执行，定位方式是对照 `error_log` 与相关节点文档
+- **真正让它跑起来的唯一方式就是调用 `debug_workflow`**；测试通过与否、报错信息都以这个
+  工具的返回为准。报错来自平台侧节点的真实执行，定位方式是对照 `error_log` 与相关节点文档
   （`<知识库绝对路径>/nodes/<NodeType>/<NodeType>.md`），而不是分析 Python 调用栈
+
+**`debug_workflow` 和 `validate_workflow_dsl` 是两个不同的工具，报错含义不要混淆：**
+`validate_workflow_dsl`（`generate-workflow-dsl` 技能里生成/修改后会自动调用）做的是几秒
+内返回的静态结构校验（节点/端口/类型/DAG），不会真正执行；`debug_workflow` 才是提交到平台
+**真实执行**一次。`debug_workflow` 返回 `failed` 时的 `error_log` 是运行时报错，通常是
+`validate_workflow_dsl` 覆盖不到的问题（例如数据集/模型不可达、显存不足、训练脚本报错等）。
 
 ## 前置条件
 
 调用 `debug_workflow` 前，确认当前工作目录下已经存在 `workflow.py`（例如刚通过
 `generate-workflow-dsl` 技能生成，或用户已有工作流）。如果不存在，先生成工作流，不要直接
 调用 `debug_workflow`。
+
+如果 `workflow.py` 是本轮刚生成/修改、还没有经过 `validate_workflow_dsl` 校验，先调用一次
+`validate_workflow_dsl`：结构性问题几秒内就能发现并修复，没必要每次都用一次 30 秒到 2 分钟
+的真实执行去发现同样的问题。`validate_workflow_dsl` 通过之后，再调用 `debug_workflow` 进入
+下面的真实测试循环。
 
 ## 循环步骤
 

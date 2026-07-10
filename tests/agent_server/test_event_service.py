@@ -245,9 +245,16 @@ def _workflow_event_service(
     return service
 
 
-def test_emit_pyromind_workflow_if_dirty_emits_event_and_clears_flag(tmp_path):
+def test_emit_pyromind_workflow_if_dirty_emits_event_and_clears_flag(
+    tmp_path, monkeypatch
+):
     workflow = tmp_path / "workflow.py"
     workflow.write_text("# workflow: Demo\nlimit = 20\n", encoding="utf-8")
+    xyflow = {"name": "Demo", "nodes": [{"id": "limit"}], "edges": []}
+    monkeypatch.setattr(
+        "openhands.agent_server.event_service.convert_dsl_to_xyflow",
+        lambda dsl, *, name: xyflow,
+    )
     agent_state: dict[str, object] = {PYROMIND_WORKFLOW_DIRTY_KEY: True}
     service = _workflow_event_service(
         tmp_path,
@@ -267,8 +274,13 @@ def test_emit_pyromind_workflow_if_dirty_emits_event_and_clears_flag(tmp_path):
     assert event.key == PYROMIND_WORKFLOW_EVENT_KEY
     observation = WorkflowFileObservation.model_validate(event.value)
     assert observation.workflow == "# workflow: Demo\nlimit = 20\n"
+    assert observation.xyflow == xyflow
     assert observation.name == "Demo"
     assert observation.summary == "Created workflow.py"
+    llm_content = observation.to_llm_content
+    assert len(llm_content) == 1
+    assert isinstance(llm_content[0], TextContent)
+    assert llm_content[0].text == "Workflow Demo (2 lines)."
     assert (
         service._conversation._state.agent_state[PYROMIND_WORKFLOW_DIRTY_KEY] is False
     )
@@ -281,14 +293,19 @@ def test_emit_pyromind_workflow_if_dirty_emits_event_and_clears_flag(tmp_path):
     ).get_event_snapshot(event.id)
     assert snapshot.snapshot_role == "out"
     assert snapshot.workflow_dsl_data == "# workflow: Demo\nlimit = 20\n"
+    assert snapshot.workflow_xyflow_data == xyflow
     assert snapshot.parent_user_message_event_id == "user-event-1"
     assert snapshot.event_type == PYROMIND_WORKFLOW_EVENT_KEY
 
 
 def test_save_pyromind_workflow_input_snapshot_sync_saves_in_snapshot(tmp_path):
     service = _workflow_event_service(tmp_path, pyromind=True, agent_state={})
+    xyflow = {"name": "Input", "nodes": [], "edges": []}
 
-    service._save_pyromind_workflow_input_snapshot_sync("# workflow: Input\n")
+    service._save_pyromind_workflow_input_snapshot_sync(
+        "# workflow: Input\n",
+        xyflow,
+    )
 
     snapshot = FileWorkflowCanvasStore(
         service.conversation_dir,
@@ -296,12 +313,16 @@ def test_save_pyromind_workflow_input_snapshot_sync_saves_in_snapshot(tmp_path):
     ).get_event_snapshot("user-event-1")
     assert snapshot.snapshot_role == "in"
     assert snapshot.workflow_dsl_data == "# workflow: Input\n"
+    assert snapshot.workflow_xyflow_data == xyflow
 
 
 def test_save_pyromind_workflow_input_snapshot_ignores_non_pyromind(tmp_path):
     service = _workflow_event_service(tmp_path, pyromind=False, agent_state={})
 
-    service._save_pyromind_workflow_input_snapshot_sync("# workflow: Input\n")
+    service._save_pyromind_workflow_input_snapshot_sync(
+        "# workflow: Input\n",
+        {"name": "Input", "nodes": [], "edges": []},
+    )
 
     snapshots = FileWorkflowCanvasStore(
         service.conversation_dir,

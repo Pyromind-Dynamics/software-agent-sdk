@@ -12,6 +12,8 @@ from openhands.tools.workflow.dsl_to_xyflow import (
     DslToXyflowExecutor,
     DslToXyflowObservation,
     DslToXyflowTool,
+    convert_dsl_to_xyflow,
+    convert_xyflow_to_dsl,
 )
 from openhands.tools.workflow.impl import (
     WorkflowContext,
@@ -43,6 +45,8 @@ __all__ = [
     "RunWorkflowExecutor",
     "RunWorkflowObservation",
     "RunWorkflowTool",
+    "convert_dsl_to_xyflow",
+    "convert_xyflow_to_dsl",
     "ValidateWorkflowDslAction",
     "ValidateWorkflowDslExecutor",
     "ValidateWorkflowDslObservation",
