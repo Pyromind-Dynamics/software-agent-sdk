@@ -1,0 +1,145 @@
+---
+title: EchoMind
+description: 在 PyroMind 控制台创建和管理 EchoMind 全自动模型训练实例。
+---
+
+EchoMind 是 PyroMind 控制台提供的全自动数据抓取与模型训练服务。您可配置上游模型 API、采集策略及自动训练参数，由平台完成数据采集，并在满足条件时触发后续训练流程。
+
+## 前置条件
+
+- 持有有效的 PyroMind 账户，且已完成 [控制台登录](https://console.pyromind.ai/dashboard)
+- 已了解 [账户配额](/zh/docs/basic/user_profile#第四步：查看配额与资源限制)，并确认具备创建实例所需的计算资源
+
+## 典型流程
+
+| 阶段 | 说明 |
+|------|------|
+| 创建实例 | 在控制台配置名称、模型 API、执行模式、训练参数及计算资源并提交 |
+| 查看状态 | 在实例列表中监控运行状态与资源占用 |
+| 暂停 / 恢复 | 按需暂停或恢复采集与训练任务 |
+| 清理资源 | 任务完成后删除实例，释放占用的配额 |
+
+## 第一步：进入 EchoMind
+
+1. 登录 [PyroMind 控制台](https://console.pyromind.ai/dashboard)。
+2. 在导航栏或产品列表中找到 **EchoMind** 入口，进入实例管理页面。
+
+![EchoMind - 入口](/resource/echomind/imgs/echomind_entry.png)
+
+## 第二步：创建 EchoMind 实例
+
+1. 在实例列表页面单击 **创建实例**。
+2. 按以下说明完成各项配置，确认后提交创建。
+
+### 基础信息
+
+| 配置项 | 说明 |
+|--------|------|
+| 实例名称 | 用于标识当前 EchoMind 实例的显示名称 |
+
+### 模型 API 配置
+
+| 配置项 | 说明 |
+|--------|------|
+| **API Mode** | 上游模型 API 的调用模式 |
+| **API URL** | 上游模型 API 的服务地址 |
+| **Model Name** | 用于数据抓取的原始模型名称 |
+| **AccessKey** | 调用上游 API 所需的访问密钥 |
+
+### 执行模式（Execution Mode）
+
+| 模式 | 状态 | 说明 |
+|------|------|------|
+| **Manual**（手动干预模式） | 当前可用 | 需预先在 [Storage](/zh/docs/basic/storage) 中上传可执行的 Shell 脚本；当数据采集满足触发条件后，系统将自动执行该脚本，衔接后续自定义训练流程（详见下方说明） |
+| **Automatic**（自动模式） | 敬请期待 | 功能完善后逐步上线 |
+
+<Note>
+自定义运行脚本须为 Shell 脚本（`.sh`），且已上传至 Storage 中配置的路径。创建实例前，请确认该路径下文件存在且具备执行权限。
+</Note>
+
+### 手动干预模式下的 Shell 脚本与工作流
+
+在手动干预模式下，您自行编写的 Shell 脚本可在其中调用 Python，并通过 [PyroMind SDK](/zh/docs/sdk/training-workflow) 提交并运行 Studio 工作流。
+
+建议将工作流设计为「先数据清理，再训练」的两阶段流程：
+
+| 阶段 | 说明 |
+|------|------|
+| 数据清理 | 处理本轮采集数据，例如去除无效样本、格式化字段、划分训练集等 |
+| 训练 | 基于清理后的数据执行模型训练，并输出 checkpoint 或指标结果 |
+
+由于每次采集数据达到 **Training Batch Size** 后都会触发一次脚本执行，**同一工作流将被反复调用**。请在工作流中做好重复执行时的清理与隔离设计，例如：
+
+| 建议 | 说明 |
+|------|------|
+| 清理中间产物 | 在每轮训练开始前，清理上一轮产生的临时文件或过时中间结果 |
+| 隔离输出路径 | 为每轮运行使用独立输出目录，建议在路径中包含轮次编号或时间戳 |
+| 避免覆盖在用资源 | 勿直接覆盖仍被下游节点引用的数据集、模型 checkpoint 或日志文件 |
+
+工作流设计与节点编排可参考 [Studio 使用方式](/zh/docs/studio/how-to-use) 及 [加载和预处理数据集](/zh/docs/studio/load-preprocess-dataset)。
+
+### 自动训练参数
+
+| 配置项 | 说明 |
+|--------|------|
+| **Training Batch Size** | 每批次训练所需采集的样本数量；达到该数量后将触发 Shell 脚本及后续训练流程 |
+| **Trajectory Buffer Size** | 轨迹数据缓存上限，用于限制样本总量、避免数据无限增长；达到上限后，系统将按生成时间自动清理最早的数据 |
+| **Training Rounds** | 计划执行的自动训练总轮次 |
+| **Save Path** | 数据存储路径；路径中须包含 `{{instanceId}}`，以确保不同实例间的数据隔离 |
+
+### 计算资源
+
+| 配置项 | 说明 |
+|--------|------|
+| **CPU** | 实例运行所需的 CPU 资源 |
+| **内存** | 实例运行所需的内存资源 |
+
+创建时请确认所选资源配置不超过 [账户配额](/zh/docs/basic/user_profile#第四步：查看配额与资源限制)。
+
+![EchoMind - 创建](/resource/echomind/imgs/create_echomind.png)
+
+## 第三步：查看运行状态
+
+实例创建后，您可在实例列表中查看以下信息：
+
+| 信息 | 说明 |
+|------|------|
+| 实例 ID 与名称 | 实例的唯一标识与显示名称 |
+| 当前状态 | 如 **pending**、**running**、**paused**、**stopped** |
+| 资源使用情况 | 实例占用的 CPU、内存等资源 |
+
+单击实例详情，可查看更完整的运行日志与采集进度。
+
+![EchoMind - 实例状态](/resource/echomind/imgs/echomind_list.png)
+
+## 第四步：暂停、恢复与删除
+
+| 操作 | 说明 |
+|------|------|
+| 暂停 | 临时停止采集与训练任务，保留实例配置与已采集数据 |
+| 恢复 | 从暂停状态继续运行 |
+| 删除 | 永久移除实例并释放占用的计算配额 |
+
+在实例列表或详情页中找到对应操作按钮即可执行。
+
+![EchoMind - 实例操作](/resource/echomind/imgs/echomind_instance_operate.png)
+
+## 第五步：查看采集结果
+
+采集完成后，结果文件通常保存在实例挂载的 Storage 或配置的输出目录中。您可通过 [分布式 Storage 控制台](/zh/docs/basic/storage) 浏览并下载采集数据。
+
+![EchoMind - 抓取结果](/resource/echomind/imgs/echomind_crawling_results.png)
+
+## 第六步：查看自动训练进度
+
+当采集数据达到预设的 **Training Batch Size** 时，EchoMind 将触发 Shell 脚本执行，并启动对应的训练流程。
+
+![EchoMind - 自动训练](/resource/echomind/imgs/echomind_auto_train.png)
+
+在此页面，您可查看当前数据采集进度、已采集数据详情，以及各轮训练的进度信息。
+
+## 下一步
+
+- [SDK — EchoMind 自动化训练](/zh/docs/sdk/echo-mind) — 通过 Python SDK 以编程方式管理 EchoMind 实例
+- [分布式存储使用方式](/zh/docs/basic/storage) — 管理采集结果的存储与下载
+- [用户配置](/zh/docs/basic/user_profile) — 查看与管理账户配额

@@ -1,0 +1,73 @@
+---
+title: SSH 组合用户名登录
+description: 在共享 JupyterLab 实例上为多名用户配置独立系统账户与 SSH 登录。
+---
+
+## 背景
+
+当同一 JupyterLab 实例由多名用户共同使用时，系统默认以 `root` 账户登录。若多人均以 `root` 身份操作，彼此的工作环境可能相互干扰。本文说明如何为同一实例配置独立系统用户，并通过 SSH 以各自的用户名登录。
+
+## 前置条件
+
+- JupyterLab 镜像版本为 **v0.0.6** 及以上（支持启动回调脚本 `start-hook.sh`）
+- 已挂载 Storage，且可读写 `/workspace` 目录
+
+## 配置步骤
+
+### 第一步：配置多用户初始化脚本
+
+JupyterLab 实例启动时会执行回调脚本 `start-hook.sh`。您可在此脚本中创建系统用户，并为各用户绑定平台指定的 SSH 公钥。
+
+| 说明 | 内容 |
+|------|------|
+| 回调脚本 | `start-hook.sh`（若不存在，请以 `root` 登录实例后自行创建，并赋予可执行权限 `chmod +x`） |
+| 官方参考实现 | <a href="/zh/docs/jupyterlab/start-hook-init-user.sh" target="_blank" rel="noreferrer">start-hook-init-user.sh</a>（下文配置均基于该脚本） |
+| 存放位置 | 将 `start-hook-init-user.sh` 置于 Storage 的 `/workspace` 下任意路径；在 `start-hook.sh` 中调用该脚本 |
+
+### 第二步：创建用户目录
+
+在 Storage 的 `/workspace` 下完成以下目录结构：
+
+1. 创建目录 `.users`（完整路径：`/workspace/.users`）
+2. 在 `.users` 下为每位待创建用户新建**同名空目录**（例如 `myuser` 对应目录 `/workspace/.users/myuser`）
+
+脚本会扫描 `.users` 下的子目录名称，并在系统中创建同名用户。目录内容可为空，无需预先放置文件。
+
+完成以上两步后，配置即告完成。
+
+## 使用说明
+
+### 自动执行
+
+实例启动后，将自动执行 `start-hook-init-user.sh`，在系统内创建 `.users` 中配置的用户。
+
+### 手动执行
+
+若在完成配置前实例已处于运行状态，可使用 `root` 登录后手动执行 `start-hook-init-user.sh`，效果与启动时自动执行相同。
+
+## SSH 登录
+
+### 获取登录命令
+
+控制台提供的 SSH 登录命令默认对应 `root` 用户，格式示例如下：
+
+```text
+ssh jp-***********@ssh-us-west-2.pyromind.ai -p 2222
+```
+
+### 使用自定义用户名登录
+
+在实例标识与用户名的连接处，使用 `+用户名` 后缀指定目标用户（须已通过上述步骤创建同名系统用户）：
+
+```text
+ssh jp-***********+myuser@ssh-us-west-2.pyromind.ai -p 2222
+```
+
+| 登录方式 | 命令示例 |
+|----------|----------|
+| `root` | `ssh jp-***********@ssh-us-west-2.pyromind.ai -p 2222` |
+| 自定义用户 `myuser` | `ssh jp-***********+myuser@ssh-us-west-2.pyromind.ai -p 2222` |
+
+## 进一步定制
+
+完成上述配置后，即可在同一 JupyterLab 实例上实现多用户独立登录。若有额外需求（如用户权限、环境变量等），可酌情修改 `start-hook-init-user.sh` 中的逻辑。

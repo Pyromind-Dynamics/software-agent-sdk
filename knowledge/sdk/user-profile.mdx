@@ -1,0 +1,117 @@
+---
+title: 查看用户信息
+description: 使用 pyromind-sdk 查询账户信息、存储凭证并管理 SSH 公钥。
+---
+
+## 前置条件
+
+- 已完成 [SDK 安装与配置](/zh/docs/sdk/installation)
+
+## 查看用户信息
+
+```python
+from pyromind_sdk import PyroMindAPIClient
+
+client = PyroMindAPIClient(api_key="your-api-key")
+
+resp = client.profile.get_user_info()
+print(f"Logged in: {resp.is_logged_in}")
+print(f"Username: {resp.user.username}")
+print(f"Email: {resp.user.email}")
+```
+
+如需查询积分余额：
+
+```python
+resp = client.profile.get_user_info(credit_info=True)
+print(f"Credit: {resp.user.available_credit} {resp.user.currency}")
+```
+
+## 获取 Access Key
+
+```python
+access_key = client.profile.get_access_key()
+print(f"Access Key: {access_key}")
+```
+
+## 查看存储凭证
+
+```python
+storage_info = client.profile.get_storage_info()
+print(f"Endpoint: {storage_info.url}")
+print(f"Access Key: {storage_info.access_key}")
+```
+
+<Note>
+若需查看存储用量（已用 / 总量），请使用 `pyromind_sdk.client.storage.get_storage_info()` 模块级函数，它返回 `dict`，包含 `used_size`、`human_used_size`、`total_size`、`human_total_size` 等字段。
+</Note>
+
+```python
+from pyromind_sdk.client.storage import get_storage_info
+
+info = get_storage_info()
+print(f"Used: {info['human_used_size']} / Total: {info['human_total_size']}")
+```
+
+## 管理 SSH 公钥
+
+```python
+from pyromind_sdk.client.models import UserPubKeyRequest
+
+client.profile.add_key(UserPubKeyRequest(name="my-laptop", key="ssh-ed25519 AAAA..."))
+keys = client.profile.list_keys()
+for k in keys:
+    print(f"{k.id} - {k.name}: {k.pub_key}")
+```
+
+## API 速查
+
+| 方法 | 输入 | 输出 | 说明 |
+|------|------|------|------|
+| `get_user_info(credit_info=False)` | `bool` | `ProfileUserInfoResponse` | 获取用户信息（`credit_info=True` 时返回积分字段） |
+| `get_access_key()` | — | `str` | 获取 Access Key |
+| `get_storage_info()` | — | `ProfileStorageInfoResponse` | 获取存储凭证 |
+| `add_key(request)` | `UserPubKeyRequest` | `bool` | 添加 SSH 公钥 |
+| `list_keys()` | — | `List[UserPubKey]` | 列出 SSH 公钥 |
+
+## 响应字段
+
+### `ProfileUserInfoResponse`
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `is_logged_in` | `bool` | 是否已登录（JSON 字段名 `isLoggedIn`） |
+| `user` | `ProfileUserInfo` | 用户详情（嵌套对象，访问字段需 `resp.user.xxx`） |
+
+### `ProfileUserInfo`
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `username` | `Optional[str]` | 用户名 |
+| `email` | `Optional[str]` | 邮箱 |
+| `full_phone_num` | `Optional[str]` | 手机号 |
+| `uid` | `Optional[str \| int]` | 用户 ID |
+| `group_id` | `Optional[int]` | 用户组 ID |
+| `user_tier` | `Optional[str]` | 用户等级 |
+| `avatar_url` | `Optional[str]` | 头像 URL |
+| `avatar_info` | `Optional[AvatarInfo]` | 头像详情 |
+| `credit_amount` | `Optional[int \| float \| str]` | 积分总量 |
+| `available_credit` | `Optional[str]` | 可用积分 |
+| `cash_balance` | `Optional[str]` | 现金余额 |
+| `currency` | `Optional[str]` | 币种 |
+| `account_restricted` | `Optional[bool]` | 账户是否受限 |
+
+### `ProfileStorageInfoResponse`
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `access_key` | `str` | 存储 Access Key |
+| `secret_key` | `Optional[str]` | 存储 Secret Key |
+| `url` | `Optional[str]` | 存储 Endpoint URL |
+| `uid` | `Optional[str]` | 用户 ID |
+
+## 下一步
+
+- [上传、查看和下载文件](/zh/docs/sdk/storage)
+- [创建开发环境](/zh/docs/sdk/jupyterlab) — SSH 密钥常用于连接实例
+- 更多参考见 [更多 SDK 信息](/zh/docs/sdk/more)

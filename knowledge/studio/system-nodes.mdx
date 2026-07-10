@@ -1,0 +1,124 @@
+---
+title: 系统节点介绍和示例
+description: 了解 Training Studio 内置系统节点的功能、连接方式与示例工作流。
+---
+
+## 前置条件
+
+- 已了解 [Studio 使用方式](/zh/docs/studio/how-to-use) 中的画布基本操作
+
+## 什么是系统节点
+
+**系统节点**是 Studio 内置的标准节点，封装了数据加载、模型管理、训练配置、训练执行与推理等核心能力。将多个系统节点按数据流连线，即可搭建完整的训练或推理工作流，无需编写底层脚本。
+
+每个节点包含：
+
+- **输入/输出端口** — 与其他节点传递数据集、模型路径、配置对象等
+- **属性面板** — 在右侧配置路径、超参数、资源等
+- **nodeType** — 节点类型标识（导入工作流 JSON 时可见）
+
+<Note>
+除系统节点外，您还可以通过 [添加自定义节点](/zh/docs/studio/custom-nodes) 扩展节点库。Config Builder 类节点通常由平台预注册，与系统节点一样可直接使用。
+</Note>
+
+## 节点分类
+
+### 数据与资源
+
+| 节点 | nodeType | 说明 |
+|------|----------|------|
+| Clone Dataset | `CloneAndCacheDataset` | 拉取并缓存 HuggingFace 等来源的数据集到本地路径 |
+| Clone Model | `CloneAndCacheModel` | 拉取并缓存预训练模型到本地路径 |
+| Join Path | `PathJoinNode` | 拼接基础路径与子路径 |
+| Dataset to JSONL | `DatasetToJsonlNode` | 将 Parquet 等格式转换为 JSONL |
+| Dataset Validator | `DatasetValidatorNode` | 校验数据集格式并生成 HTML 预览 |
+| Load Image | `LoadImage` | 加载单张图片，供 VLM / GUI 推理使用 |
+| Load LoRA Adapter | `LoadLoRAAdapter` | 加载 LoRA 适配器，用于带 LoRA 的推理 |
+
+### 配置 Builder
+
+| 节点 | nodeType | 说明 |
+|------|----------|------|
+| Dataset Config Builder | `DatasetConfigBuilderNode` | 构建数据集 YAML 配置（数据路径、`dataset_kind_config`、`dataset_extra_config`） |
+| Dataset Kind Config Builder (Text Only) | `DatasetConfigBuilderTextNode` | 纯文本任务的字段映射，输出 `dataset_kind_config` |
+| Dataset Kind Config Builder (Vision) | `DatasetConfigBuilderVisionNode` | 图文任务的字段映射（含 `image_field`），输出 `dataset_kind_config` |
+| Dataset Extra Config Builder | `DatasetExtraConfigBuilderNode` | 序列长度、采样上限、collator 入口等 |
+| Model Config Builder | `ModelConfigBuilderNode` | 模型路径（`model_path`）与类型（`model_type`） |
+| Lora Config Builder | `LoraConfigBuilderNode` | LoRA rank、dropout、目标模块、排除模块 |
+| Merge LoRA | `ModelMergeLoraNode` | 将 LoRA 适配器合并到基座权重，输出独立模型目录 |
+| Training Config Builder | `TrainingConfigBuilderNode` | 学习率、batch size、epoch、保存/评估步数等 |
+| Accelerate Config Builder | `AccelerateConfigBuilderNode` | 分布式训练与 ZeRO stage 配置 |
+| Wandb Config Builder | `WandbConfigBuilderNode` | WandB 实验追踪配置 |
+| Reward Item Builder | `RewardItemBuilderNode` | 单个 reward 函数入口、名称与权重 |
+| Reward Config Builder | `RewardConfigBuilderNode` | 组合多个 reward 项 |
+| GRPO Training Extra Config Builder | `GRPOTrainingExtraConfigBuilderNode` | 组采样数、温度、生成长度等 |
+| Metrics Config Builder | `MetricsConfigBuilderNode` | 评估指标入口与名称，供 Benchmark 工作流使用 |
+
+### 训练执行
+
+| 节点 | nodeType | 说明 |
+|------|----------|------|
+| SFT Training | `ModelTrainSFTNode` | 监督微调训练 |
+| DPO Training | `ModelTrainDPONode` | 直接偏好优化训练 |
+| GRPO Training | `ModelTrainGRPONode` | GRPO 强化学习训练 |
+
+### 推理与评估
+
+| 节点 | nodeType | 说明 |
+|------|----------|------|
+| Inference (VLLM) | `VLLMInference` | 启动 vLLM 推理服务，供 Benchmark 或业务调用 |
+| Benchmark By Api | `ModelEvalApiNode` | 通过推理 API 批量评估模型，输出指标报告 |
+| Validate Reward | `ModelValidateRewardNode` | 验证 reward 配置与打分逻辑 |
+| LLM Test | `TestLLMNode` | 向推理端点发送测试 prompt，返回生成结果 |
+| Content Preview | `ContentPreview` | 预览文本内容，便于查看 **LLM Test** 输出 |
+
+### 工具
+
+| 节点 | nodeType | 说明 |
+|------|----------|------|
+| Anything to String | `AnythingToString` | 将任意类型输出转为字符串 |
+| Show Result | `ShowResultNode` | 展示上游节点的输出结果 |
+| Preview Image | `PreviewImageEx` | 预览图片，便于调试 VLM / GUI 工作流 |
+
+## 典型连接方式
+
+各场景的节点连线、端口对照与工作流截图详见对应教程：
+
+| 场景 | 教程 |
+|------|------|
+| 数据集处理 | [加载和预处理数据集](/zh/docs/studio/load-preprocess-dataset) |
+| SFT 训练 | [SFT 监督微调 — 典型连接方式](/zh/docs/studio/sft-training#典型连接方式) |
+| DPO 训练 | [DPO 偏好对齐 — 典型连接方式](/zh/docs/studio/dpo-training#典型连接方式) |
+| GRPO 训练 | [GRPO 强化学习训练 — 典型连接方式](/zh/docs/studio/grpo-training#典型连接方式) |
+| Reward 验证 | [编写 reward 函数 — 验证 reward 函数](/zh/docs/studio/reward-function#验证-reward-函数) |
+| 模型评估 | [模型的验证 — Benchmark 工作流](/zh/docs/studio/model-validation#使用-benchmark-工作流评估) |
+
+工作流采用 **Config Builder** 模式：各 Builder 输出 YAML 字符串，再汇入训练或评估节点。**Dataset Kind Config Builder** 负责字段映射，其 `dataset_kind_config` 输出连接到 **Dataset Config Builder** 的同名输入。
+
+## 示例工作流
+
+导入以下 JSON 到 Studio 画布，即可查看各节点的实际连线与默认参数。配置步骤与连接说明见上表对应教程。
+
+| 场景 | 工作流 JSON | 教程 |
+|------|-------------|------|
+| 数据集处理 | <a href="/resource/studio/jsons/dataset-processing.json" target="_blank" rel="noreferrer">dataset-processing</a> | [加载和预处理数据集](/zh/docs/studio/load-preprocess-dataset) |
+| SFT 训练 | <a href="/resource/studio/jsons/SFT.json" target="_blank" rel="noreferrer">SFT</a> | [SFT 监督微调](/zh/docs/studio/sft-training) |
+| DPO 训练 | <a href="/resource/studio/jsons/DPO.json" target="_blank" rel="noreferrer">DPO</a> | [DPO 偏好对齐](/zh/docs/studio/dpo-training) |
+| GRPO 训练 | <a href="/resource/studio/jsons/GRPO.json" target="_blank" rel="noreferrer">GRPO</a> | [GRPO 强化学习训练](/zh/docs/studio/grpo-training) |
+| Reward 验证 | <a href="/resource/studio/jsons/Validate-Reward.json" target="_blank" rel="noreferrer">Validate-Reward</a> | [编写 reward 函数](/zh/docs/studio/reward-function) |
+| 模型评估 | <a href="/resource/studio/jsons/Benchmark.json" target="_blank" rel="noreferrer">Benchmark</a> | [模型的验证](/zh/docs/studio/model-validation) |
+
+## 使用建议
+
+1. **先导入示例再修改**：从官方 JSON 入手，在属性面板中调整路径与超参，比从零连线更高效。
+2. **确认端口类型匹配**：Config Builder 的字符串输出应连接到训练节点的对应 config 输入。
+3. **模型路径直接连线**：**Clone Model** 的 `model_path` 可直接连接到 **Model Config Builder** 的 `model_path`，无需中间转换节点。
+4. **模型与 LoRA 分开配置**：`model_path` 在 **Model Config Builder** 中设置，LoRA 参数在 **Lora Config Builder** 中设置；训练完成后可用 **Merge LoRA** 合并权重。
+5. **单节点试跑**：复杂工作流可先运行数据加载或 Dataset Validator 节点，确认输出正确后再启动训练。
+6. **查看训练日志**：配置 Wandb Config Builder 后，可在 WandB 面板追踪 loss 与 reward 曲线。
+
+## 相关教程
+
+- [添加自定义节点](/zh/docs/studio/custom-nodes) — 扩展节点库
+- [模型的验证](/zh/docs/studio/model-validation) — 了解 Benchmark 工作流与验证方式
+- [快速开始](/zh/docs/studio/index) — 端到端训练与推理流程

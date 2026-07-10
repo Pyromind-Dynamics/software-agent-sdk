@@ -217,7 +217,7 @@ tests/integration/api_compliance/outputs/
 .agent_tmp/
 
 
-knowledge/basic/
-knowledge/jupyterlab/
-knowledge/sdk/
-knowledge/studio/
+#knowledge/basic/
+#knowledge/jupyterlab/
+#knowledge/sdk/
+#knowledge/studio/

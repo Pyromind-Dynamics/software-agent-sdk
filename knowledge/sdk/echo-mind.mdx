@@ -1,0 +1,121 @@
+---
+title: EchoMind 自动化训练
+description: 使用 pyromind-sdk 创建并管理 EchoMind 实例，实现全自动数据抓取与训练。
+---
+
+## 前置条件
+
+- 已完成 [SDK 安装与配置](/zh/docs/sdk/installation)
+
+## 典型流程
+
+1. **创建实例** — 调用 `client.echomind.create()` 启动抓取任务
+2. **查看状态** — 通过 `get_job()` 或 `list()` 监控运行状态
+3. **暂停 / 恢复** — 按需调用 `pause()` / `resume()`
+4. **清理资源** — 完成后调用 `delete()`
+
+## 创建 EchoMind 实例
+
+```python
+from pyromind_sdk import PyroMindAPIClient
+from pyromind_sdk.client.models import EchoMindJobRequest, ResourceConfig
+
+client = PyroMindAPIClient(api_key="your-api-key")
+
+job_id = client.echomind.create(
+    EchoMindJobRequest(
+        name="my-echomind",
+        api_url="https://generativelanguage.googleapis.com",
+        api_mode="gemini",
+        origin_model="gemini-1.5-flash",
+        access_key="your-access-key",
+        training_model="my-training-model",
+        training_batch_size=32,
+        trajectory_buffer_size=1000,
+        time_per_round=60,
+        training_round=100,
+        training_save_path="/data/training/echomind",
+        resources=ResourceConfig(cpu="4", memory="16Gi"),
+        execution_mode="manual",
+        custom_runtime_script_path="/workspace/trigger/say_hello.sh",
+    )
+)
+print(f"EchoMind Job ID: {job_id}")
+```
+
+## 列出实例并查看状态
+
+```python
+instances = client.echomind.list()
+for job in instances:
+    print(f"{job.job_id} - {job.name} - {job.status}")
+
+job = client.echomind.get_job(job_id)
+print(f"Status: {job.status}")
+```
+
+## 暂停、恢复与删除
+
+```python
+client.echomind.pause(job_id)
+client.echomind.resume(job_id)
+client.echomind.delete(job_id)
+```
+
+## `EchoMindJobRequest` 参数
+
+| 参数 | 必填 | 类型 | 说明 |
+|------|------|------|------|
+| `name` | 是 | `str` | 实例显示名称 |
+| `api_url` | 是 | `str` | 上游模型 API 地址 |
+| `api_mode` | 是 | `str` | API 模式，可选 `openai` / `gemini` / `anthropic`（默认 `openai`） |
+| `origin_model` | 是 | `str` | 原始模型名称（如 `gemini-1.5-flash`） |
+| `access_key` | 是 | `str` | 调用上游 API 使用的 access key |
+| `training_model` | 是 | `str` | 训练模型名称 |
+| `training_batch_size` | 是 | `int` | 训练 batch 大小 |
+| `trajectory_buffer_size` | 是 | `int` | 轨迹缓存大小 |
+| `time_per_round` | 是 | `float` | 每轮耗时（秒） |
+| `training_round` | 是 | `int` | 训练轮数 |
+| `training_save_path` | 是 | `str` | 训练结果保存路径 |
+| `resources` | 是 | `ResourceConfig` | CPU / 内存 / GPU 配置 |
+| `execution_mode` | 是 | `str` | 执行模式，可选 `manual` / `automatic`（默认 `manual`） |
+| `custom_runtime_script_path` | 是 | `str` | 自定义运行脚本路径(shell 脚本, 需要storage中有该脚本) |
+
+## API 速查
+
+| 方法 | 输入 | 输出 | 说明 |
+|------|------|------|------|
+| `list()` | — | `List[EchoMindJobResponse]` | 列出所有 EchoMind 实例 |
+| `create(request)` | `EchoMindJobRequest` | `str` (job_id) | 创建 EchoMind 实例 |
+| `get_job(job_id)` | `str` | `EchoMindJobResponse` | 获取实例详情 |
+| `update(job_id, request)` | `str`, `EchoMindJobRequest` | `EchoMindJobResponse` | 更新实例配置 |
+| `delete(job_id)` | `str` | `None` | 删除实例 |
+| `pause(job_id)` / `resume(job_id)` | `str` | `EchoMindJobResponse` | 暂停 / 恢复 |
+
+## 响应字段（`EchoMindJobResponse`）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `job_id` | `str` | 实例 ID |
+| `name` | `Optional[str]` | 实例名称 |
+| `status` | `str` | 当前状态 |
+| `api_url` | `Optional[str]` | 上游 API 地址 |
+| `api_mode` | `Optional[str]` | API 模式 |
+| `origin_model` | `Optional[str]` | 原始模型 |
+| `access_key` | `Optional[str]` | 上游 API access key |
+| `training_model` | `Optional[str]` | 训练模型 |
+| `training_batch_size` | `Optional[str]` | 训练 batch 大小 |
+| `trajectory_buffer_size` | `Optional[str]` | 轨迹缓存大小 |
+| `time_per_round` | `Optional[str]` | 每轮耗时 |
+| `training_round` | `Optional[str]` | 训练轮数 |
+| `training_save_path` | `Optional[str]` | 训练结果保存路径 |
+| `secret_key` | `Optional[str]` | 平台生成的 secret key |
+| `resources` | `Optional[ResourceConfig]` | 分配资源 |
+| `created_at` | `Optional[str \| datetime]` | 创建时间 |
+| `execution_mode` | `str` | 执行模式 |
+| `custom_runtime_script_path` | `Optional[str]` | 自定义运行脚本路径(shell 脚本, 需要storage中有该脚本) |
+
+## 下一步
+
+- [查看用户信息](/zh/docs/sdk/user-profile)
+- 异步用法见 [更多 SDK 信息 — 异步支持](/zh/docs/sdk/more#async-support)（`async_echomind_example.py`）

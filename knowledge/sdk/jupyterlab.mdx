@@ -1,0 +1,62 @@
+---
+title: 创建开发环境
+description: 使用 pyromind-sdk 创建 JupyterLab 实例并获取访问地址。
+---
+
+## 前置条件
+
+- 已完成 [SDK 安装与配置](/zh/docs/sdk/installation)
+- 拥有有效的 PyroMind API Key
+
+## 创建实例
+
+```python
+from pyromind_sdk import PyroMindAPIClient
+from pyromind_sdk.client.models import JupyterRequest, ResourceConfig
+
+client = PyroMindAPIClient(api_key="your-api-key")
+
+jupyter = client.jupyter.create(
+    JupyterRequest(
+        name="my-notebook",
+        resources=ResourceConfig(cpu="4", memory="16Gi", gpu="1", gpu_card="L40S")
+    )
+)
+print(f"Jupyter ID: {jupyter.id}, URL: {jupyter.url}")
+```
+
+## `JupyterRequest` 参数
+
+| 参数 | 必填 | 类型 | 说明 |
+|------|------|------|------|
+| `name` | 是 | `str` | 实例显示名称 |
+| `resources` | 是 | `ResourceConfig` | CPU / 内存 / GPU 配置 |
+
+## API 速查
+
+| 方法 | 输入 | 输出 | 说明 |
+|------|------|------|------|
+| `list()` | — | `List[JupyterResponse]` | 列出所有 Jupyter 实例 |
+| `create(request)` | `JupyterRequest` | `JupyterResponse` | 创建新实例 |
+| `get_instance(jupyter_id)` | `str` | `JupyterResponse` | 获取实例详情 |
+| `update(jupyter_id, request)` | `str`, `JupyterRequest` | `JupyterResponse` | 更新实例配置 |
+| `delete(jupyter_id)` | `str` | `None` | 删除实例 |
+| `pause(jupyter_id)` / `resume(jupyter_id)` | `str` | `JupyterResponse` | 暂停 / 恢复 |
+
+## 响应字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | `str` | 实例 ID |
+| `name` | `str` | 实例名称 |
+| `status` | `str` | 当前状态 |
+| `password` | `Optional[str]` | 访问密码 |
+| `resources` | `Optional[ResourceConfig]` | 分配的资源 |
+| `url` | `Optional[str]` | Jupyter 访问 URL |
+| `created_at` | `Optional[datetime]` | 创建时间 |
+| `updated_at` | `Optional[datetime]` | 更新时间 |
+
+## 下一步
+
+- [执行训练工作流](/zh/docs/sdk/training-workflow)
+- 更多示例见 [更多 SDK 信息 — 示例索引](/zh/docs/sdk/more#examples)（`jupyter_instance_example.py`）

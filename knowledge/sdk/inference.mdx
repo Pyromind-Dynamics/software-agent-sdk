@@ -1,0 +1,110 @@
+---
+title: 创建推理实例
+description: 使用 pyromind-sdk 创建并管理 Inference 推理实例。
+---
+
+## 前置条件
+
+- 已完成 [SDK 安装与配置](/zh/docs/sdk/installation)
+- 模型已上传至 Storage 或可通过 `model_path` 访问
+
+## 查询可用框架与镜像
+
+```python
+from pyromind_sdk import PyroMindAPIClient
+
+client = PyroMindAPIClient(api_key="your-api-key")
+
+frameworks = client.inference.get_framework()
+images = client.inference.get_inf_image(frameworks[0])
+print(f"Frameworks: {frameworks}")
+print(f"Images: {images}")
+```
+
+## 创建推理实例
+
+```python
+from pyromind_sdk.client.models import InferenceJobRequest, ResourceConfig
+
+job_id = client.inference.create(
+    InferenceJobRequest(
+        model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+        model_name="glm-5",
+        inference_framework=frameworks[0],
+        inf_image=images[0],
+        resources=ResourceConfig(cpu="4", memory="32Gi", gpu=1, gpu_card="L40S"),
+        name="my-inference",
+    )
+)
+print(f"Job ID: {job_id}")
+```
+
+## 查看实例状态
+
+```python
+job = client.inference.get_job(job_id)
+print(f"Status: {job.status}")
+print(f"Endpoint: {job.endpoint_url}")
+```
+
+## 列出、更新与删除
+
+```python
+jobs = client.inference.list()
+for j in jobs:
+    print(f"{j.id} - {j.name} - {j.status}")
+
+client.inference.pause(job_id)
+client.inference.resume(job_id)
+client.inference.delete(job_id)
+```
+
+## `InferenceJobRequest` 参数
+
+| 参数 | 必填 | 类型 | 说明 |
+|------|------|------|------|
+| `model_path` | 是 | `str` | 模型路径 |
+| `inference_framework` | 否 | `str` | 框架名称（通过 `get_framework()` 获取） |
+| `resources` | 是 | `ResourceConfig` | CPU / 内存 / GPU 配置 |
+| `name` | 是 | `str` | 任务显示名称 |
+| `inf_image` | 是 | `str` | 推理镜像（通过 `get_inf_image()` 获取） |
+| `model_name` | 是 | `str` | 模型名称覆盖 |
+| `model_length` | 否 | `int` | 模型上下文长度 |
+
+## API 速查
+
+| 方法 | 说明 |
+|------|------|
+| `list()` | 列出所有推理实例 |
+| `create(request)` | 创建推理实例，返回 `job_id` |
+| `get_job(job_id)` | 获取任务详情 |
+| `update(job_id, request)` | 更新任务配置 |
+| `delete(job_id)` | 删除任务 |
+| `pause(job_id)` / `resume(job_id)` | 暂停 / 恢复任务 |
+| `get_framework()` | 列出可用推理框架 |
+| `get_inf_image(framework)` | 列出推理镜像 |
+
+## 响应字段（`InferenceJobResponse`）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | `str` | 任务 ID（响应中字段名为 `job_id`，通过 alias 暴露为 `id`） |
+| `name` | `str` | 任务名称 |
+| `model_path` | `str` | 模型路径 |
+| `inference_framework` | `Optional[str]` | 推理框架 |
+| `image` | `Optional[str]` | 镜像 |
+| `status` | `str` | 当前状态 |
+| `uid` | `Optional[str]` | 用户 ID |
+| `resources` | `Optional[ResourceConfig]` | 分配的资源 |
+| `endpoint_url` | `Optional[str]` | 推理端点 |
+| `created_at` | `Optional[datetime]` | 创建时间 |
+| `updated_at` | `Optional[datetime]` | 更新时间 |
+| `model_name` | `Optional[str]` | 模型名称 |
+| `model_length` | `Optional[int]` | 模型上下文长度 |
+| `inf_image` | `Optional[str]` | 推理镜像 |
+
+## 下一步
+
+- [控制台 — Inference](/zh/docs/basic/inference) — Web UI 操作指南
+- [上传、查看和下载文件](/zh/docs/sdk/storage) — 管理模型文件
+- 异步用法见 [更多 SDK 信息](/zh/docs/sdk/more#异步支持)（`async_inference_example.py`）

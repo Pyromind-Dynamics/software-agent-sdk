@@ -1,0 +1,169 @@
+---
+title: 更多 SDK 信息
+description: PyroMind SDK 附录参考 — 项目结构、异步客户端、错误处理、响应模型、Inference API、示例与开发调试。
+---
+
+## 项目结构
+
+```
+pyromind_sdk/
+├── client/                          # API 客户端
+│   ├── base.py                      # 基础 HTTP 客户端
+│   ├── client.py                    # PyroMindAPIClient（统一入口）
+│   ├── async_client.py              # PyroMindAsyncAPIClient（异步入口）
+│   ├── studio.py / async_studio.py  # Studio / 训练任务
+│   ├── jupyterLab.py / async_jupyterlab.py  # Jupyter 实例
+│   ├── inference.py / async_inference.py    # 推理实例
+│   ├── echomind.py / async_echomind.py      # EchoMind 实例
+│   ├── storage.py                   # 文件存储
+│   ├── profile.py                   # 用户信息与 SSH 密钥
+│   ├── models.py                    # Pydantic 模型
+│   └── workflow/                    # Workflow 校验与转换
+├── nodes/                           # 自定义节点 SDK
+├── common/                          # 共享工具
+├── cli.py                           # CLI 入口
+├── python_function_to_yaml_cli.py   # Python → YAML CLI
+├── examples/                        # 使用示例
+└── tests/                           # 测试套件
+```
+
+## 异步支持
+
+所有服务均提供异步客户端，通过 `PyroMindAsyncAPIClient` 访问：
+
+```python
+from pyromind_sdk import PyroMindAsyncAPIClient
+
+async with PyroMindAsyncAPIClient(api_key="your-api-key") as client:
+    tasks = await client.studio.list()
+    task = await client.studio.create(request)
+```
+
+异步客户端对照：
+
+| 同步 | 异步 |
+|------|------|
+| `client.studio` | `AsyncStudioClient` |
+| `client.instances` | `AsyncJupyterLabClient` |
+| `client.inference` | `AsyncInferenceClient` |
+| `client.echomind` | `AsyncEchoMindClient` |
+
+## 错误处理
+
+所有 API 调用失败时抛出 `PyroMindAPIError`（同步）或 `PyroMindAsyncAPIError`（异步）：
+
+```python
+from pyromind_sdk.client.base import PyroMindAPIError
+
+try:
+    task = client.studio.get_task("invalid-id")
+except PyroMindAPIError as e:
+    print(f"Error {e.status_code}: {e.message}")
+    if e.response:
+        print(f"Response: {e.response}")
+```
+
+| 属性 | 类型 | 说明 |
+|------|------|------|
+| `message` | `str` | 错误描述 |
+| `status_code` | `Optional[int]` | HTTP 状态码 |
+| `response` | `Optional[Dict]` | API 错误响应体 |
+
+## 关键响应模型
+
+### `TrainingTaskResponse`（Studio）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `task_id` | `str` | 任务唯一 ID |
+| `name` | `str` | 任务名称 |
+| `status` | `str` | 当前状态 |
+| `workflow` | `Dict` | Workflow 配置 |
+| `nodes` | `List[TrainingTaskNodeInfo]` | 节点执行详情 |
+| `error_message` | `Optional[str]` | 失败时的错误信息 |
+| `created_at` | `datetime` | 创建时间 |
+
+### `JupyterResponse`（Jupyter）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | `str` | 实例 ID |
+| `name` | `str` | 实例名称 |
+| `status` | `str` | 当前状态 |
+| `url` | `Optional[str]` | Jupyter URL |
+| `password` | `Optional[str]` | 访问密码 |
+
+### `InferenceJobResponse`（Inference）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | `str` | 任务 ID |
+| `name` | `str` | 任务名称 |
+| `model_path` | `str` | 模型路径 |
+| `status` | `str` | 当前状态 |
+| `endpoint_url` | `Optional[str]` | 推理端点 |
+| `resources` | `Optional[ResourceConfig]` | 分配的资源 |
+
+### `EchoMindJobResponse`（EchoMind）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | `str` | 实例 ID |
+| `name` | `str` | 实例名称 |
+| `status` | `str` | 当前状态 |
+
+## Inference
+
+推理实例 API 详见 [推理实例](/zh/docs/sdk/inference) 指南。
+
+## Workflow 校验与转换
+
+`client/workflow/` 模块提供 workflow 校验与格式转换：
+
+| 工具 | 说明 |
+|------|------|
+| `validate_workflow(workflow)` | 校验 workflow JSON 结构 |
+| `ValidationError` | 无效 workflow 时抛出 |
+| `converter.py` | 在不同 workflow 格式间转换 |
+
+## CLI 工具
+
+| 命令 | 说明 |
+|------|------|
+| `python -m pyromind_sdk.cli` | SDK CLI（多种工具） |
+| `python -m pyromind_sdk.python_function_to_yaml_cli` | 将 Python 函数转为 YAML 节点定义 |
+
+## 示例索引
+
+| 示例文件 | 说明 |
+|----------|------|
+| `api_client_basic.py` | 基础客户端配置 |
+| `studio_example.py` | Studio 任务 CRUD + 节点输出 |
+| `studio_monitor.py` | 循环监控任务状态 |
+| `workflow_cli.py` | Workflow 管理 CLI |
+| `complete_workflow_example.py` | 端到端 workflow 演示 |
+| `jupyter_instance_example.py` | Jupyter 实例 CRUD |
+| `inference_example.py` | 推理实例管理 |
+| `echomind_example.py` | EchoMind 生命周期 |
+| `storage_example.py` | 文件上传/下载 |
+| `release_all_instance.py` | 批量释放资源 |
+| `async_training_example.py` | 异步 Studio 训练 |
+| `async_inference_example.py` | 异步推理 |
+| `async_echomind_example.py` | 异步 EchoMind |
+| `async_jupyter_instance_example.py` | 异步 Jupyter |
+
+## 开发与测试
+
+### 从源码安装
+
+```bash
+git clone https://github.com/pyromind/pyromind-sdk.git
+cd pyromind-sdk
+pip install -e .
+```
+
+### 运行测试
+
+```bash
+pytest
+```

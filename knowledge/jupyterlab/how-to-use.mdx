@@ -1,0 +1,137 @@
+---
+title: JupyterLab
+description: 在 PyroMind 控制台创建 JupyterLab 实例，通过 Web 或 SSH 连接。
+---
+
+JupyterLab 是 PyroMind 控制台提供的交互式开发环境。您可在此创建 GPU 实例，通过浏览器或 SSH 进行代码开发、调试及 SDK 集成，并与 Storage、Studio 等工作流能力协同使用。
+
+## 前置条件
+
+- 持有有效的 PyroMind 账户，且可访问 [PyroMind 控制台](https://console.pyromind.ai/dashboard)
+- 已了解 [账户配额](/zh/docs/basic/user_profile#第四步：查看配额与资源限制)，并确认具备创建实例所需的计算资源
+- 若计划通过 SSH 连接，请先在 [用户配置](/zh/docs/basic/user_profile) 中添加 SSH 公钥
+
+## 第一步：进入 JupyterLab 实例管理
+
+1. 登录 [PyroMind 控制台](https://console.pyromind.ai/dashboard)。
+2. 前往 [JupyterLab 实例列表](https://console.pyromind.ai/instance) 页面，查看并管理您的实例。
+
+## 第二步：创建 JupyterLab 实例
+
+1. 在实例管理页面单击 **创建实例**。
+
+![创建实例 - 步骤 1](/resource/jupyterlab/imgs/create_instance0.png)
+
+2. 配置实例参数（如实例名称、GPU 类型与数量、CPU/内存、Storage 挂载等），确认后提交创建。
+
+![创建实例 - 步骤 2](/resource/jupyterlab/imgs/create_instance1.png)
+
+创建时请确认所选资源配置不超过 [账户配额](/zh/docs/basic/user_profile#第四步：查看配额与资源限制)。如需持久化数据，建议挂载 [分布式 Storage](/zh/docs/basic/storage)。
+
+## 第三步：管理实例
+
+实例创建完成后，将在实例列表中显示对应记录。列表中的各功能入口说明如下：
+
+![连接到实例 - 查看连接信息](/resource/jupyterlab/imgs/connect_to_instance0.png)
+
+| 功能 | 说明 |
+|------|------|
+| ① 实例状态 | 查看实例当前运行状态及计费相关说明 |
+| ② 设置 | 修改实例名称、GPU 类型、GPU 数量、CPU 与内存等配置 |
+| ③ 连接实例 | 通过 JupyterLab URL 或 SSH 连接至实例 |
+| ④ 启动 / 暂停 | 控制实例运行状态，暂停后停止计费 |
+| ⑤ 资源监控 | 查看 CPU、内存、GPU 利用率及显存使用情况 |
+| ⑥ 重启次数 | 查看实例累计重启次数及历史重启记录 |
+| ⑦ 实例 IP | 查看实例内网 IP，用于 SSH 或实例间内部通信 |
+
+### ① 实例状态
+
+实例状态枚举及含义如下：
+
+| 状态 | 说明 |
+|------|------|
+| **Running** | 实例运行中，将持续计费 |
+| **Pending** | 等待调度或资源分配 |
+| **Failed** | 实例异常，需排查后重新创建或联系支持 |
+| **Stopped** | 实例已停止，停止后立即停止计费 |
+
+### ② 设置
+
+用于修改 JupyterLab 实例参数，包括实例名称、申请的 GPU 卡类型、GPU 卡数量，以及 CPU 与内存大小。
+
+> **注意：** 仅修改实例名称不会触发实例重启；其余涉及资源调整的变更均会重启实例。提交变更前，请确认已保存必要文件。
+
+### ③ 连接实例
+
+实例创建完成后，可通过以下两种方式连接：
+
+#### 方式一：通过 JupyterLab URL 连接
+
+1. 在实例列表中找到目标实例，查看连接信息。
+2. 单击提供的 URL，在浏览器中直接打开 JupyterLab。
+
+#### 方式二：通过 SSH 连接
+
+1. 在实例信息页面获取 SSH 命令或连接详情。
+
+![连接到实例 - SSH 连接](/resource/jupyterlab/imgs/connect_to_instance1.png)
+
+2. 在本地终端执行 SSH 命令，建立与 JupyterLab 实例的连接。
+
+### ④ 启动 / 暂停实例
+
+用于控制实例运行状态：
+
+| 当前状态 | 操作说明 |
+|----------|----------|
+| **Running** | 按钮显示为暂停图标；单击可暂停实例，暂停后停止计费 |
+| **Stopped** | 按钮显示为启动图标；单击可重新启动实例 |
+
+> **注意：** 暂停或停止实例前，请确认重要文件已保存至 `/workspace/` 或 `/root/` 目录，避免数据丢失。
+
+### ⑤ 资源监控
+
+单击 **Resource Monitor** 可展开或折叠资源监控面板，查看实例的 CPU、内存、GPU 利用率及 GPU 显存使用情况。
+
+支持的时间范围如下：
+
+| 预设范围 | 自定义范围 |
+|----------|------------|
+| 5m、15m、30m、1h、6h、1d、7d、14d、30d | 通过 **Start date** / **End date** 指定起止时间，查看历史监控数据 |
+
+### ⑥ 重启次数
+
+显示实例累计重启次数。将鼠标悬停于信息图标，可查看历史重启记录的详细信息（如重启时间、原因等），便于排查异常。
+
+### ⑦ 实例 IP
+
+显示实例分配的内网 IP 地址，用于 SSH 连接，或在多个实例之间进行内部通信。
+
+## 数据持久性说明
+
+JupyterLab 实例在暂停、停止或重启后，仅部分目录中的数据会被保留。请务必了解以下规则：
+
+| 类型 | 说明 |
+|------|------|
+| **不保留** | 通过 `apt install` 安装的系统软件包；系统级配置；持久目录外安装的其他软件 |
+| **保留** | `/workspace/`（工作空间目录）、`/root/`（root 主目录） |
+
+> **注意：** 暂停、停止或重启实例后，「不保留」范围内的变更将被覆盖。
+
+**建议：**
+
+- 将所有重要文件与项目存储在 `/workspace/` 或 `/root/` 中
+- 如需安装依赖，优先使用 `pip` 或 `conda`，安装至用户空间或工作空间目录
+- 对于需反复使用的系统级软件包，建议编写安装脚本，在每次实例重启后执行
+
+## 使用建议
+
+- 连接实例前，请确认实例处于 **Running** 状态
+- 妥善保管 SSH 凭据，勿与他人共享
+- 若遇到连接问题，请检查实例状态、网络设置及 SSH 公钥配置是否正确
+
+## 下一步
+
+- [SSH 组合用户名登录](/zh/docs/jupyterlab/ssh-combined-login) — 在共享实例上配置多用户 SSH 登录
+- [分布式存储使用方式](/zh/docs/basic/storage) — 挂载 Storage，实现跨实例数据持久化
+- [SDK — 创建 JupyterLab](/zh/docs/sdk/jupyterlab) — 通过 Python SDK 以编程方式管理实例

@@ -1,0 +1,68 @@
+---
+title: 用户配置
+description: 在 PyroMind 控制台管理账户、SSH 公钥、API Key 与资源配额。
+---
+
+## 前置条件
+
+- 已 [注册并登录控制台](/zh/docs/basic/signup_login)
+
+## 第一步：进入个人资料
+
+1. 打开用户菜单或设置入口，进入个人资料页面。
+
+![进入个人资料 - 步骤 1](/resource/jupyterlab/imgs/goto_profile0.png)
+
+2. 进入个人资料设置页面。
+
+![进入个人资料 - 步骤 2](/resource/jupyterlab/imgs/goto_profile1.png)
+
+## 第二步：管理 SSH 公钥
+
+SSH 公钥用于通过终端连接 JupyterLab 实例。若您计划使用 SSH 连接，请先添加公钥。
+
+1. 找到 SSH 密钥部分，点击编辑 SSH 密钥。
+
+![编辑 SSH 密钥 - 进入 SSH 密钥设置](/resource/jupyterlab/imgs/edit_ssh_key_0.png)
+
+2. 点击「添加密钥」按钮。
+
+![添加 SSH 密钥 - 点击添加按钮](/resource/jupyterlab/imgs/add-key0.png)
+
+3. 将 SSH 公钥粘贴到输入框中并保存。
+
+![添加 SSH 密钥 - 输入公钥](/resource/jupyterlab/imgs/add-key1.png)
+
+> **注意：** 若尚未生成密钥对，可在本地终端运行 `ssh-keygen -t ed25519` 生成。公钥通常位于 `~/.ssh/id_ed25519.pub`。
+
+您可以在同一页面查看已添加的公钥列表，并按需删除不再使用的密钥。
+
+## 第三步：查看 API Key
+
+在个人资料或安全设置中，您可以查看或复制 API Key（Access Key）。API Key 用于通过 [PyroMind SDK](/zh/docs/sdk/installation) 以编程方式调用平台 API。
+
+> **注意：** 请妥善保管 API Key，不要将其提交到公开代码仓库或与他人共享。
+
+<Note>
+控制台中 API Key 的具体入口位置截图待补充。若界面有变动，请以控制台实际显示为准。
+</Note>
+
+## 第四步：查看配额与资源限制
+
+在个人资料或资源管理页面，您可以查看当前账户的资源配额，通常包括：
+
+- **计算资源**：可用的 CPU、内存、GPU 总量及已用量
+- **存储空间**：分布式 Storage 的总容量与已用容量
+- **实例数量**：可同时运行的 JupyterLab、Studio、EchoMind 等实例上限
+
+创建实例时，请确保所选资源配置不超过账户剩余配额，否则创建可能失败。
+
+<Note>
+配额详情页面截图待补充。创建实例前，建议在控制台确认剩余 GPU 与存储容量。
+</Note>
+
+## 下一步
+
+- [创建 JupyterLab 并通过 SSH 连接](/zh/docs/jupyterlab/how-to-use) — SSH 公钥是 SSH 连接的前置条件
+- [分布式存储使用方式](/zh/docs/basic/storage) — 查看与管理存储用量
+- [SDK — 查看用户信息](/zh/docs/sdk/user-profile) — 通过 API 查询账户信息与 SSH 密钥

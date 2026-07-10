@@ -1,0 +1,73 @@
+---
+title: Inference
+description: 在 PyroMind 控制台创建和管理模型推理任务。
+---
+
+## 前置条件
+
+- 拥有有效的 PyroMind 账户并已 [登录控制台](https://console.pyromind.ai/dashboard)
+- 模型文件已上传至 [分布式存储](/zh/docs/basic/storage) 或可通过路径访问
+- 了解 [账户配额](/zh/docs/basic/user_profile#第四步：查看配额与资源限制)
+
+## 典型流程
+
+1. **选择框架与镜像** — 确认平台支持的推理框架与运行镜像
+2. **创建任务** — 配置模型路径、资源与任务名称
+3. **查看状态** — 在任务列表中监控部署与运行状态
+4. **访问端点** — 任务就绪后获取推理端点 URL
+5. **暂停 / 删除** — 按需暂停、恢复或删除任务释放资源
+
+## 第一步：进入 Inference
+
+1. 登录 [PyroMind 控制台](https://console.pyromind.ai/dashboard)。
+2. 在导航栏或产品列表中找到 **Inference**（推理）入口并点击进入任务管理页面。
+
+![EchoMind - 推理入口](/resource/inference/imgs/inference_entry.png)
+
+## 第二步：创建推理实例
+
+1. 点击「创建任务」或等效按钮。
+2. 填写任务名称。
+3. 指定 **模型路径**（Storage 中的模型目录或文件路径）。
+4. 选择 **推理框架** 与 **推理镜像**（若控制台提供下拉选项）。
+5. 配置计算资源（CPU、内存、GPU 等），确保不超过账户剩余配额。
+6. 确认创建并等待任务进入 running 状态。
+
+![EchoMind - 创建实例](/resource/inference/imgs/create_inference_instance.png)
+
+## 第三步：查看任务状态与端点
+
+任务创建后，您可以在任务列表中查看：
+
+| 信息 | 说明 |
+|------|------|
+| 任务 ID 与名称 | 唯一标识与显示名称 |
+| 状态 | 如 pending、running、paused、failed |
+| 模型路径 | 使用的模型位置 |
+| 推理端点 | 就绪后的 `endpoint_url`，用于发送推理请求 |
+
+点击任务详情可查看资源占用、日志与更完整的配置信息。
+
+![EchoMind - 实例信息](/resource/inference/imgs/inference_info.png)
+
+
+## 第四步：暂停、恢复与删除
+
+| 操作 | 说明 |
+|------|------|
+| 暂停 | 临时停止推理服务，保留任务配置 |
+| 恢复 | 从暂停状态重新启动服务 |
+| 删除 | 永久移除任务并释放占用的计算配额 |
+
+![EchoMind - 实例操作](/resource/inference/imgs/inference_operate.png)
+
+## 与 Studio 的关系
+
+- 在 [Studio](/zh/docs/studio/how-to-use) 中完成训练后，可将产出模型用于 Inference 部署。
+- 也可直接导入 [模型的推理和服务](/zh/docs/studio/model-inference-deployment) 中的推理工作流 JSON，在 Studio 中运行 LLM / VLM 推理。
+
+## 下一步
+
+- [SDK — 推理实例](/zh/docs/sdk/inference) — 通过 Python SDK 以编程方式管理推理实例
+- [分布式存储](/zh/docs/basic/storage) — 上传与管理模型文件
+- [模型的推理和服务](/zh/docs/studio/model-inference-deployment) — Studio 推理与部署示例
