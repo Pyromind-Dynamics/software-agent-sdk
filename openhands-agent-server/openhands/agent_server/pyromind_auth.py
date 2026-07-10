@@ -65,7 +65,7 @@ def get_debug_current_login_user_by_conversation(
 
 
 def get_env_value() -> str:
-    app_env: str = os.getenv("APP_ENV", "pre")
+    app_env: str = os.getenv("APP_ENV", "dev")
     return app_env
 
 
