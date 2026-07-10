@@ -1,0 +1,174 @@
+---
+title: 添加自定义节点
+description: 在 Studio 中创建、注册并使用自定义节点扩展工作流。
+---
+
+## 前置条件
+
+- 已 [创建 JupyterLab 实例](/zh/docs/jupyterlab/how-to-use) 并 [进入 JupyterLab](/zh/docs/jupyterlab/how-to-use#第三步：连接到实例)
+- 在 JupyterLab 终端中已完成 [SDK 安装](/zh/docs/sdk/installation)：
+
+  ```bash
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip install pyromind-sdk
+  ```
+- 已了解 [系统节点介绍和示例](/zh/docs/studio/system-nodes)
+- 已设置 `PYROMIND_API_KEY` 环境变量
+ ```bash
+  export PYROMIND_API_KEY="your-api-key"
+  ```
+
+## 为什么需要自定义节点
+
+**系统节点**覆盖常见的数据、训练与推理场景。当业务逻辑更特殊时——例如自定义数据预处理、结果后处理——可通过 **自定义节点** 将 Python 函数封装为 Studio 节点，与系统节点一样拖拽连线使用。
+
+典型场景：
+
+| 场景 | 示例 |
+|------|------|
+| 数据预处理 | 按业务规则过滤、转换或增强样本 |
+| 结果处理 | 对模型输出做格式化、校验或写入 Storage |
+
+## 整体流程
+
+以下所有操作均在 JupyterLab 中完成：
+
+```
+在 JupyterLab 中编写 Python 函数 → CLI 生成 YAML → SDK 校验并注册 → 在 Studio 画布中使用
+```
+
+---
+
+## 第一步：在 JupyterLab 中编写节点函数
+
+打开 JupyterLab，在左侧文件面板中创建 `/workspace/nodes/` 目录，新建 `greet.py`：
+
+```python
+# /workspace/nodes/greet.py
+def greet(name: str = "World") -> dict:
+    """返回一个问候消息。"""
+    return {"message": f"Hello, {name}!"}
+```
+
+<Note>
+  - 打开 JupyterLab 终端：顶部菜单 **File → New → Terminal**
+  - 使用内置编辑器或终端中的 `vim` / `nano` 创建 Python 文件
+  - 函数参数与返回值类型需明确，便于自动生成输入/输出端口
+</Note>
+
+---
+
+## 第二步：CLI 生成 YAML
+
+在 JupyterLab 终端中执行：
+
+```bash
+python -m pyromind_sdk.python_function_to_yaml_cli \
+  /workspace/nodes/greet.py greet \
+  --node-name GreetNode \
+  --output /workspace/nodes/greet.yaml
+```
+
+<Note>
+  YAML 文件需放在 `/workspace/nodes/` 目录下，否则注册时服务端无法读取。YAML 中的 `python_code` 需指向 `.py` 文件的实际路径。
+</Note>
+
+执行后 `/workspace/nodes/` 目录下会生成 `greet.yaml`：
+
+```yaml
+name: GreetNode
+description: 返回一个问候消息。
+display_name: GreetNode
+base_class: PodExecutionNode
+python_code: /workspace/nodes/greet.py
+function_name: greet
+python_command: python3
+parameters:
+  - name: name
+    dtype: STRING
+    type: input
+    required_type: optional
+  - name: message
+    dtype: STRING
+    type: output
+```
+
+---
+
+## 第三步：校验 YAML
+
+在 JupyterLab 终端中校验生成的 YAML 是否合法：
+
+```bash
+python -m pyromind_sdk.tests.test_yaml_nodes /workspace/nodes/greet.yaml --verbose
+```
+
+校验通过后输出节点类名、输入输出端口等信息。
+
+---
+
+## 第四步：注册到 Studio
+
+在 JupyterLab 终端中创建 `register.py` 并执行：
+
+```python
+# /workspace/nodes/register.py
+from pyromind_sdk.nodes.yaml_loader import load_nodes_from_yaml
+from pyromind_sdk.nodes.node_validator import validate_node_class
+from pyromind_sdk import PyroMindAPIClient
+
+# 1. 校验
+nodes = load_nodes_from_yaml("/workspace/nodes/greet.yaml")
+node_class = nodes["GreetNode"]
+validate_node_class(node_class, "GreetNode")
+
+# 2. 注册
+client = PyroMindAPIClient()
+client.studio.create_node(yaml_path="/workspace/nodes/greet.yaml")
+print("节点注册成功")
+```
+
+在终端运行：
+
+```bash
+python /workspace/nodes/register.py
+```
+
+成功后返回 `节点注册成功`，即可在 Studio 节点库中搜索到 `GreetNode`。
+
+---
+
+## 第五步：在 Studio 画布中使用
+
+1. 打开 [Training Studio](https://console.pyromind.ai/studio)，新建或打开已有工作流
+2. 在节点库中搜索 `GreetNode`
+
+![搜索 GreetNode](/resource/studio/imgs/studio-custom-nodes-search.png)
+
+3. 拖拽到画布，连接上下游节点的输入/输出端口
+
+![拖拽到画布](/resource/studio/imgs/studio-custom-nodes-workflow.png)
+
+4. 填写 `name` 参数，保存并运行工作流
+
+---
+
+## YAML 节点定义参考
+
+> 详见 [YAML 节点定义参考](/zh/docs/sdk/custom-nodes)
+
+
+---
+
+## 常见问题
+
+- **节点库中找不到自定义节点**：确认 `create_node` 成功执行
+- **运行时报参数错误**：检查 YAML 端口类型是否与上游节点输出匹配
+- **需要更新节点逻辑**：修改 `.py` 函数或 `.yaml` 文件后，执行 `client.studio.reload_nodes(node_name="YourNode")` 即可生效
+
+## 相关教程
+
+- [编写 reward 函数](/zh/docs/studio/reward-function) — 为 GRPO 编写评分节点
+- [系统节点介绍和示例](/zh/docs/studio/system-nodes) — 内置节点参考
+- [SDK — 创建/校验自定义节点](/zh/docs/sdk/custom-nodes) — 完整 API 与 CLI 参考

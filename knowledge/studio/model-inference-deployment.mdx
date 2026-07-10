@@ -1,0 +1,54 @@
+---
+title: 模型的推理和服务
+description: 将训练后的模型部署为在线推理服务，供业务系统调用。
+---
+
+## 前置条件
+
+- 已完成 [模型的验证](/zh/docs/studio/model-validation)，选定上线 checkpoint
+- 了解 [Inference](/zh/docs/basic/inference) 控制台或 [SDK 推理任务](/zh/docs/sdk/inference)
+
+## 部署方式概览
+
+| 方式 | 适用场景 |
+|------|----------|
+| Inference 服务 | 持续在线 API，供业务系统调用（推荐） |
+| SDK | 程序化创建推理任务、自动化流水线 |
+
+训练完成后，模型 checkpoint 通常保存在 Storage 或工作流 `output_path` 指定目录。验证通过后，可直接部署为 Inference 服务。
+
+## 部署到 Inference
+
+1. 确认模型文件已在 Storage 中就绪。
+2. 在控制台 [Inference](/zh/docs/basic/inference) 页面创建推理任务，或使用 SDK：
+
+```python
+job_id = client.inference.create(
+    InferenceJobRequest(
+        model_path="/path/to/checkpoint",
+        inference_framework=frameworks[0],
+        resources=ResourceConfig(cpu="8", memory="32Gi", gpu="1"),
+        name="my-deployed-model"
+    )
+)
+```
+
+3. 等待任务状态变为 running，获取 `endpoint_url`。
+4. 通过端点发送请求，完成上线验证。
+
+## 上线检查清单
+
+- [ ] 推理延迟与吞吐量满足业务要求
+- [ ] 输入输出格式与 API 文档一致
+- [ ] 监控与日志已接入
+- [ ] 回滚方案（保留上一版 checkpoint）已准备
+
+## 下一步
+
+- [系统节点介绍和示例](/zh/docs/studio/system-nodes) — 了解工作流中的内置节点
+- [添加自定义节点](/zh/docs/studio/custom-nodes) — 扩展工作流能力
+
+## 相关资源
+
+- [Inference 控制台指南](/zh/docs/basic/inference)
+- [SDK — 推理任务](/zh/docs/sdk/inference)

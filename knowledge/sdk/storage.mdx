@@ -1,0 +1,84 @@
+---
+title: 上传、查看和下载文件
+description: 使用 pyromind-sdk StorageClient 上传、列出、检查与下载对象存储文件。
+---
+
+需要额外安装 `minio` 包：
+
+```bash
+pip install minio
+```
+
+## 前置条件
+
+- 已完成 [SDK 安装与配置](/zh/docs/sdk/installation)
+- 建议配置 `PYROMIND_STORAGE_ENDPOINT`、`PYROMIND_STORAGE_SECRET_KEY`、`PYROMIND_STORAGE_BUCKET` 环境变量
+
+## 初始化 StorageClient
+
+```python
+from pyromind_sdk import StorageClient
+
+storage = StorageClient()
+```
+
+### 初始化参数
+
+| 参数 | 必填 | 类型 | 说明 |
+|------|------|------|------|
+| `endpoint` | 否 | `str` | 存储端点（环境变量 `PYROMIND_STORAGE_ENDPOINT`，默认 `https://storage.pyromind.ai`） |
+| `access_key` | 否 | `str` | 访问密钥（环境变量 `PYROMIND_API_KEY`） |
+| `secret_key` | 否 | `str` | Secret Key（环境变量 `PYROMIND_STORAGE_SECRET_KEY`） |
+| `bucket_name` | 否 | `str` | 默认存储桶（环境变量 `PYROMIND_STORAGE_BUCKET`） |
+| `secure` | 否 | `bool` | 是否使用 HTTPS（根据端点 URL 自动检测） |
+| `region` | 否 | `str` | 存储区域（默认 `us-east-1`） |
+
+## 查看文件列表
+
+`list_files` 返回的每一项都包含 `type` 字段（`"file"` 或 `"folder"`）：
+
+```python
+items = storage.list_files(folder_path="documents/", recursive=True, max_depth=2)
+for item in items:
+    if item["type"] == "folder":
+        print(f"[DIR] {item['object_name']}")
+    else:
+        print(f"{item['object_name']} ({item['size']} bytes)")
+```
+
+## 上传文件
+
+```python
+storage.upload_file("local/file.txt", "remote/file.txt")
+```
+
+## 下载文件
+
+```python
+storage.download_file("remote/file.txt", "downloaded/file.txt")
+```
+
+## 检查文件是否存在
+
+```python
+if storage.file_exists("remote/file.txt"):
+    print("File exists")
+```
+
+## API 速查
+
+| 方法 | 说明 |
+|------|------|
+| `list_files(folder_path, ...)` | 列出目录中的文件 |
+| `file_exists(file_path)` | 检查文件是否存在 |
+| `upload_file(file_path, object_name, ...)` | 上传文件（支持分片） |
+| `upload_folder(folder_path, ...)` | 上传整个文件夹 |
+| `download_file(object_name, ...)` | 下载文件 |
+| `download_folder(folder_path, local_path)` | 下载文件夹 |
+| `delete_file(object_name)` | 删除文件 |
+| `delete_folder(folder_path)` | 删除文件夹 |
+
+## 下一步
+
+- [查看用户信息](/zh/docs/sdk/user-profile) — 查询存储用量
+- 更多示例见 `storage_example.py`（[示例索引](/zh/docs/sdk/more#examples)）

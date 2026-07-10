@@ -1,0 +1,81 @@
+---
+title: 创建/校验自定义节点
+description: 使用 pyromind-sdk 将 Python 函数转为自定义节点、校验 YAML 并注册到 Studio。
+---
+
+## 前置条件
+
+- 已完成 [SDK 安装与配置](/zh/docs/sdk/installation)
+- 建议先了解 [执行训练工作流](/zh/docs/sdk/training-workflow)
+
+## 将 Python 函数封装为节点
+
+```python
+from pyromind_sdk.nodes.function_call_wrapper import create_node_from_function
+
+@create_node_from_function(
+    name="my_custom_node",
+    description="Processes input data",
+    category="data-processing"
+)
+def process_data(input_text: str, threshold: float = 0.5) -> dict:
+    return {"result": "processed", "value": len(input_text)}
+```
+
+## 运行时执行 Python 节点
+
+```python
+from pyromind_sdk.nodes.python_function_executor import execute_python_node
+
+result = execute_python_node(
+    source_code="print('hello')",
+    node_type="python"
+)
+```
+
+## 将 Python 函数转为 YAML 配置
+
+```python
+from pyromind_sdk.nodes.python_to_yaml import python_function_to_yaml_config
+
+def my_func(input: str) -> str:
+    return input.upper()
+
+yaml_config = python_function_to_yaml_config(my_func)
+# yaml_config 可保存为 .yaml 文件，并通过 studio.create_node() 注册
+```
+
+## 校验并加载 YAML 节点定义
+
+```python
+from pyromind_sdk.nodes.yaml_loader import load_yaml_node
+from pyromind_sdk.nodes.node_validator import validate_node_config
+
+node_config = load_yaml_node("path/to/node.yaml")
+validate_node_config(node_config)
+```
+
+## 注册到 Studio
+
+通过 `client.studio` 将节点注册到平台：
+
+| 方法 | 说明 |
+|------|------|
+| `create_node(...)` | 注册自定义节点（`yaml_path` / `yaml_content` + 选项） |
+| `reload_nodes(node_name=None)` | 重新加载节点 YAML 定义 |
+| `delete_node_by_name(node_name)` | 按名称删除自定义节点 |
+| `move_node(node_name, source_file_path)` | 移动节点源文件 |
+| `get_node_info(names=None)` | 获取节点定义信息 |
+
+## CLI 工具
+
+```bash
+python -m pyromind_sdk.python_function_to_yaml_cli
+```
+
+将 Python 函数转换为 YAML 节点定义。更多 CLI 见 [更多 SDK 信息](/zh/docs/sdk/more#cli-tools)。
+
+## 下一步
+
+- [执行训练工作流](/zh/docs/sdk/training-workflow) — 在 workflow 中使用自定义节点
+- Workflow 校验详见 [training-workflow](/zh/docs/sdk/training-workflow) 中的 `validate_workflow`

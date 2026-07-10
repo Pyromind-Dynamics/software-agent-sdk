@@ -1,0 +1,31 @@
+---
+title: 快速开始
+description: 在 Training Studio 中完成数据集准备、SFT / GRPO 训练、验证与推理服务的端到端指南。
+---
+
+按推荐顺序完成以下步骤，即可在 Studio 中走完从数据到上线的完整流程。
+
+## 推荐阅读顺序
+
+1. [加载和预处理数据集](/zh/docs/studio/load-preprocess-dataset) — 加载原始数据并完成格式转换与预处理
+2. [预览数据集](/zh/docs/studio/preview-dataset) — 检查样本格式与内容是否正确
+3. [SFT 监督微调](/zh/docs/studio/sft-training) — 使用数据集微调模型，获得基线 checkpoint
+4. [DPO 偏好对齐](/zh/docs/studio/dpo-training) — 基于偏好对数据对齐模型（可选）
+5. [编写 reward 函数](/zh/docs/studio/reward-function) — 为 GRPO 强化学习定义客观评分逻辑
+6. [GRPO 强化学习训练](/zh/docs/studio/grpo-training) — 在 SFT 基础上进一步优化策略
+7. [模型的验证](/zh/docs/studio/model-validation) — Benchmark 批量评估、快速验证与其他验证方式
+8. [模型的推理和服务](/zh/docs/studio/model-inference-deployment) — 运行推理工作流并部署在线服务
+
+## 节点参考
+
+9. [系统节点介绍和示例](/zh/docs/studio/system-nodes) — 了解内置节点类型、连接方式与示例工作流
+10. [添加自定义节点](/zh/docs/studio/custom-nodes) — 将 Python 函数注册为 Studio 节点
+
+## 前置阅读
+
+- [Studio 使用方式](/zh/docs/studio/how-to-use) — 了解工作流画布与任务运行
+- [分布式存储](/zh/docs/basic/storage) — 上传与管理训练数据集
+
+## 延伸阅读
+
+- [博客 — 训练 Compute-Use VLM](/zh/blog/compute-use/windows-computer-use) — GUI Agent 场景的 SFT + GRPO 完整案例

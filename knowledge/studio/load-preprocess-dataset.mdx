@@ -1,0 +1,76 @@
+---
+title: 加载和预处理数据集
+description: 在 Training Studio 中加载原始数据并完成格式转换与预处理。
+---
+
+## 前置条件
+
+- 已 [注册并登录控制台](/zh/docs/basic/signup_login) 并了解 [Studio](/zh/docs/studio/how-to-use)
+- 数据集已上传至 [分布式存储](/zh/docs/basic/storage)
+
+## 导入数据集处理工作流
+
+推荐使用官方 **Dataset Processing** 工作流完成数据加载、格式转换与校验：
+
+1. 下载工作流：<a href="/resource/studio/jsons/dataset-processing.json" target="_blank" rel="noreferrer">dataset-processing</a>
+2. 将 JSON 文件拖入 Studio 画布。
+3. 按下方说明配置各节点参数。
+
+![数据集处理工作流](/resource/studio/imgs/Dataset-Processing.png)
+
+## 工作流节点说明
+
+| 节点 | 说明 |
+|------|------|
+| Clone Dataset | 从 HuggingFace 等平台拉取数据集到本地缓存路径 |
+| Join Path | 拼接数据集根目录与具体文件子路径 |
+| Dataset to JSONL | 将 Parquet 等格式转换为 JSONL |
+| Dataset Kind Config Builder (Text Only) | 配置字段映射，输出 `dataset_kind_config` |
+| Dataset Config Builder | 汇总数据路径与 `dataset_kind_config`，生成完整 `dataset_config` |
+| Dataset Validator | 校验数据集格式并生成预览报告 |
+
+## 准备数据格式
+
+训练前请确认数据集符合目标任务格式。以 LLM 监督微调为例，单条样本通常包含 **问题** 与 **答案** 字段：
+
+- **问题**：`"Natalia 在四月份向她的 48 位朋友出售了夹子，然后在五月份出售了其一半。Natalia 在四月和五月共出售了多少个夹子？"`
+- **答案**：包含推理链与最终结果的完整回复文本
+
+DPO 任务需额外提供 **rejected** 字段（被拒绝的回答）。VLM / GUI Agent 任务请使用 **Dataset Kind Config Builder (Vision)** 节点，并配置 `image_field` 等字段。
+
+## 配置数据集节点
+
+字段映射与数据路径分属两个节点：
+
+**Dataset Kind Config Builder (Text Only)** — 配置字段映射，输出连接到 **Dataset Config Builder** 的 `dataset_kind_config`：
+
+| 配置项 | 说明 |
+|--------|------|
+| `user_prompt_field` | 用户输入字段（示例工作流默认 `question`） |
+| `assistant_response_field` | 模型回复字段（示例工作流默认 `answer`） |
+| `system_prompt_field` | 系统提示字段（可选） |
+| `rejected_field` | DPO 任务中被拒绝回答的字段名（Dataset Processing 工作流默认为空，DPO 训练时再配置） |
+
+**Dataset Config Builder** — 配置数据路径：
+
+| 配置项 | 说明 |
+|--------|------|
+| `train_data_path` / `val_data_path` | 训练集与验证集 JSONL 路径 |
+| `dataset_kind_config` | 由 Dataset Kind Config Builder 节点连线传入 |
+| `dataset_extra_config` | 由 Dataset Extra Config Builder 节点连线传入（训练工作流中使用） |
+
+## 预处理与格式转换
+
+1. 在 **Clone Dataset** 中选择数据集（如 `openai/gsm8k`），指定缓存目录（默认 `/workspace/datasets/`）。
+2. 在 **Join Path** 中填写数据文件子路径（如 `main/train-00000-of-00001.parquet`）。
+3. 若源数据非 JSONL，通过 **Dataset to JSONL** 节点完成格式转换。
+4. 将拼接后的路径连接到 **Dataset Config Builder** 的 `train_data_path`。
+
+<Note>
+具体预处理节点名称与参数因任务类型而异。导入官方示例工作流后，请参考节点属性面板中的说明。
+</Note>
+
+## 下一步
+
+- [预览数据集](/zh/docs/studio/preview-dataset) — 校验加载与预处理结果
+- [SFT 监督微调](/zh/docs/studio/sft-training) — 进入监督微调阶段

@@ -1,0 +1,98 @@
+---
+title: 执行训练工作流
+description: 使用 pyromind-sdk 创建、运行并等待训练 workflow 任务完成。
+---
+
+## 前置条件
+
+- 已完成 [SDK 安装与配置](/zh/docs/sdk/installation)
+
+## 创建训练任务
+
+```python
+from pyromind_sdk import PyroMindAPIClient
+from pyromind_sdk.client.models import TrainingTaskCreateRequest, WorkflowRunRequest
+
+client = PyroMindAPIClient(api_key="your-api-key")
+
+task = client.studio.create(
+    TrainingTaskCreateRequest(
+        name="my-workflow",
+        workflow={"nodes": [...]}
+    )
+)
+print(f"Task ID: {task.task_id}")
+```
+
+## 列出任务并注入参数运行
+
+```python
+tasks = client.studio.list()
+
+result = client.studio.run_with_params(
+    WorkflowRunRequest(workflow_name="my-workflow", primitive_node_map={"key": "value"})
+)
+
+status = client.studio.wait_for_task_completion(task.task_id, timeout=600)
+print(f"Final status: {status}")
+```
+
+## 提交前校验 workflow
+
+```python
+from pyromind_sdk.client import validate_workflow, ValidationError
+
+try:
+    validate_workflow(workflow_dict)
+    print("Workflow is valid")
+except ValidationError as e:
+    print(f"Invalid workflow: {e}")
+```
+
+## 请求参数
+
+### `TrainingTaskCreateRequest`
+
+| 参数 | 必填 | 类型 | 说明 |
+|------|------|------|------|
+| `name` | 是 | `str` | 任务名称 |
+| `workflow` | 是 | `Dict[str, Any]` | 包含节点定义的 workflow JSON |
+
+### `WorkflowRunRequest`
+
+| 参数 | 必填 | 类型 | 说明 |
+|------|------|------|------|
+| `workflow_name` | 是 | `str` | 已存储的 workflow 名称 |
+| `primitive_node_map` | 否 | `Dict[str, Any]` | 注入的原始节点值（默认 `{}`） |
+
+## API 速查
+
+| 方法 | 说明 |
+|------|------|
+| `list()` | 列出所有 Studio 任务 |
+| `create(request)` | 创建新训练任务 |
+| `get_job(task_id)` / `get_task(task_id)` | 获取任务详情 |
+| `delete(task_id, force=False)` | 删除任务 |
+| `stop(task_id)` | 停止运行中的任务 |
+| `get_node_output(task_id, node_id)` | 获取节点级输出 |
+| `run_with_params(request)` | 以参数运行已存储的 workflow |
+| `wait_for_task_completion(task_id, ...)` | 轮询直至终态 |
+| `create_and_wait(request, ...)` | 创建 + 轮询 + 可选导出输出 |
+
+## 响应字段（`TrainingTaskResponse`）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `task_id` | `str` | 任务唯一 ID |
+| `name` | `str` | 任务名称 |
+| `status` | `str` | 当前状态（`running`、`completed`、`failed` 等） |
+| `workflow` | `Dict` | Workflow 配置 |
+| `nodes` | `List[TrainingTaskNodeInfo]` | 节点执行详情 |
+| `error_message` | `Optional[str]` | 失败时的错误信息 |
+| `created_at` | `datetime` | 创建时间 |
+
+## 下一步
+
+- [创建/校验自定义节点](/zh/docs/sdk/custom-nodes)
+- [上传、查看和下载文件](/zh/docs/sdk/storage)
+- 更多示例见 `studio_example.py`、`complete_workflow_example.py`（[示例索引](/zh/docs/sdk/more#examples)）

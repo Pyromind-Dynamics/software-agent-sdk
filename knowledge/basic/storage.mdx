@@ -1,0 +1,90 @@
+---
+title: 分布式存储
+description: 在 PyroMind 控制台管理分布式 Storage — 上传、浏览、下载文件，并挂载到 JupyterLab 实例。
+---
+
+## 什么是分布式 Storage
+
+分布式 Storage 是 PyroMind 平台提供的 S3/MinIO 兼容对象存储服务，主要用途包括：
+
+- **跨实例共享数据**：在不同 JupyterLab 或 Studio 任务之间共享数据集、模型权重和输出文件
+- **持久化保存**：挂载到实例的 `/workspace` 目录，实例暂停或重启后数据仍然保留
+- **配合高级功能**：如 [SSH 组合用户名登录](/zh/docs/jupyterlab/ssh-combined-login) 需要在 Storage 的 `/workspace` 下放置初始化脚本
+
+## 前置条件
+
+- 拥有有效的 PyroMind 账户并已 [登录控制台](https://console.pyromind.ai/dashboard)
+- 了解 [存储配额](/zh/docs/basic/user_profile#第四步：查看配额与资源限制)
+
+## 第一步：查看存储用量
+
+1. 登录 [PyroMind 控制台](https://console.pyromind.ai/dashboard)。
+2. 进入 Storage 管理页面或 [用户配置](/zh/docs/basic/user_profile) 中的存储用量区域。
+3. 查看已用容量、总容量及剩余空间。
+
+![EchoMind - 存储管理](/resource/storage/imgs/storage_management.png)
+
+## 第二步：上传文件
+
+1. 在 Storage 管理页面中，选择目标目录或存储桶。
+2. 点击「上传」按钮，选择本地文件或文件夹。
+3. 等待上传完成，确认文件出现在文件列表中。
+
+您也可以通过拖拽方式将文件直接拖入 Storage 文件浏览器。
+
+![EchoMind - 上传文件](/resource/storage/imgs/upload_file.png)
+
+## 第三步：浏览与下载文件
+
+1. 在 Storage 文件浏览器中导航到目标目录。
+2. 点击文件名可预览或查看文件详情（如支持）。
+3. 选择文件后点击「下载」按钮，将文件保存到本地。
+
+![EchoMind - 文件管理](/resource/storage/imgs/file_management.png)
+
+## 第四步：删除文件
+
+1. 在文件列表中选中不再需要的文件或文件夹。
+2. 点击「删除」并确认操作。
+
+> **注意：** 删除操作不可恢复，请谨慎操作。
+
+![EchoMind - 文件管理](/resource/storage/imgs/file_delete.png)
+
+## 第五步：挂载 Storage 到 JupyterLab 实例
+
+创建或编辑 JupyterLab 实例时，可以将 Storage 挂载到实例的 `/workspace` 目录：
+
+1. 在 [JupyterLab 实例创建页面](/zh/docs/jupyterlab/how-to-use) 的配置项中，选择要挂载的 Storage。
+2. 确认挂载路径（通常为 `/workspace`）。
+3. 实例启动后，通过 JupyterLab 或 SSH 访问 `/workspace` 即可读写 Storage 中的文件。
+
+挂载 Storage 后，您在 `/workspace` 中保存的所有文件都会持久化到分布式存储，不会因实例重启而丢失。
+
+
+
+
+## 第六步：通过本地终端访问
+
+您可以通过本地终端访问Storage的内容
+![Storage - Storage](/resource/storage/imgs/local-access1.png)
+1. 通过①号链接安装本地访问Storage的客户端软件
+2. 点击②号链接，查看Storage的访问信息
+
+![Storage - StorageInfo](/resource/storage/imgs/local-access2.png)
+
+
+
+
+
+
+
+## 与 SSH 组合登录的关系
+
+[SSH 组合用户名登录](/zh/docs/jupyterlab/ssh-combined-login) 功能要求实例已挂载 Storage 且可读写 `/workspace` 目录。多用户初始化脚本需放置在 Storage 的 `/workspace` 下，实例启动时自动执行。
+
+## 下一步
+
+- [创建 JupyterLab 并通过 SSH 连接](/zh/docs/jupyterlab/how-to-use) — 创建实例并挂载 Storage
+- [用户配置 — 查看存储配额](/zh/docs/basic/user_profile#第四步：查看配额与资源限制)
+- [SDK — 上传、查看和下载文件](/zh/docs/sdk/storage) — 通过 Python SDK 以编程方式操作 Storage

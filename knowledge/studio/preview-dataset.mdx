@@ -1,0 +1,60 @@
+---
+title: 预览数据集
+description: 在 Training Studio 中预览加载后的数据集样本，确认格式与内容正确。
+---
+
+import { DatasetPreview } from "/snippets/dataset-preview.jsx";
+
+## 前置条件
+
+- 已完成 [加载和预处理数据集](/zh/docs/studio/load-preprocess-dataset)
+
+## 使用 Dataset Validator 预览
+
+**Dataset Processing** 工作流内置 **Dataset Validator** 节点，可在训练前校验数据并生成可视化预览：
+
+1. 确认 **Dataset Kind Config Builder** 与 **Dataset Config Builder** 已正确配置字段映射与数据路径。
+2. 将 `dataset_config` 输出连接到 **Dataset Validator** 节点。
+3. 运行工作流，查看节点输出：
+   - `metrics_yaml` — 数据集统计指标（样本数、字段完整性等）
+   - `output_preview_path` — HTML 预览文件路径（默认 `/workspace/datasets/preview.html`）
+
+![数据集处理工作流](/resource/studio/imgs/Dataset-Processing.png)
+
+## 预览效果示例
+
+运行 **Dataset Validator** 后生成的 HTML 预览如下。左侧为样本列表，右侧为对话内容（system / user / assistant），可点击切换不同样本：
+
+<DatasetPreview />
+
+<Note>
+以上为 `openai/gsm8k` 数据集经预处理后的预览示例。实际预览内容取决于您的数据集与 **Dataset Kind Config Builder** / **Dataset Config Builder** 配置。
+</Note>
+
+## Validator 配置项
+
+| 参数 | 说明 |
+|------|------|
+| `limit` | 预览样本数量上限，`0` 表示不限制 |
+| `check_reasoning` | 是否校验推理链格式（如 `<<...>>` 标记） |
+| `verbose` | 是否输出详细校验日志 |
+| `preview_html_path` | 预览 HTML 文件的保存路径 |
+
+## 检查清单
+
+| 检查项 | 期望结果 |
+|--------|----------|
+| 样本数量 | 与预期一致，无异常过少 |
+| 标签格式 | 与下游 SFT / DPO / GRPO 节点要求匹配 |
+| 异常值 | 无空标签、超长空白或损坏文件 |
+| 划分方式 | 训练 / 验证集划分符合实验设计 |
+
+## 常见问题
+
+- **路径错误**：确认 Storage 挂载正常，路径与 [分布式存储](/zh/docs/basic/storage) 中一致。
+- **字段不匹配**：回到 **Dataset Kind Config Builder** 调整映射，或修正源数据格式。
+- **预览为空**：检查过滤规则是否过于严格，导致样本被全部剔除。
+
+## 下一步
+
+- [SFT 监督微调](/zh/docs/studio/sft-training) — 数据确认无误后开始训练

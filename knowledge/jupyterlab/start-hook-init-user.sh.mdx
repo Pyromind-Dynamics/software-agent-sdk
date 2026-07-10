@@ -1,0 +1,475 @@
+---
+title: 启动钩子初始化用户脚本
+---
+
+```sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Base directory containing user home data copied from other Linux systems.
+# Only immediate subdirectories are treated as users; regular files are skipped.
+AUTO_USER_BASE_DIR="/workspace/.users"
+WORKSPACE_ROOT="/workspace"
+
+BASHRC_SNIPPET_CONTENT=$(cat <<'EOF'
+# Source CUDA/vGPU environment variables
+if [ -f /tmp/.pyro.env ]; then
+    source /tmp/.pyro.env
+fi
+EOF
+)
+
+# Minimum UID for auto-created users; lower UIDs are shifted by adding BASE_UID.
+BASE_UID=10000
+USER_META_FILENAME=".pyro-user.meta"
+
+# Populates USERNAMES[] and USER_DATA_DIRS[] (parallel arrays).
+# Regular files under AUTO_USER_BASE_DIR are skipped; only subdirectories are users.
+discover_users_from_base_dir() {
+  USERNAMES=()
+  USER_DATA_DIRS=()
+
+  if [[ ! -d "${AUTO_USER_BASE_DIR}" ]]; then
+    echo "AUTO_USER_BASE_DIR does not exist: ${AUTO_USER_BASE_DIR}. Nothing to do."
+    return 0
+  fi
+
+  local entry name
+  for entry in "${AUTO_USER_BASE_DIR}"/*; do
+    [[ -e "${entry}" ]] || continue
+    name="$(basename "${entry}")"
+
+    if [[ -f "${entry}" ]]; then
+      echo "Skipping file under ${AUTO_USER_BASE_DIR}: ${name}"
+      continue
+    fi
+
+    if [[ ! -d "${entry}" ]]; then
+      echo "Skipping non-directory entry under ${AUTO_USER_BASE_DIR}: ${name}"
+      continue
+    fi
+
+    USERNAMES+=("${name}")
+    USER_DATA_DIRS+=("${AUTO_USER_BASE_DIR}/${name}")
+  done
+
+  if [[ ${#USERNAMES[@]} -eq 0 ]]; then
+    echo "No user subdirectories found under ${AUTO_USER_BASE_DIR}. Nothing to do."
+    return 0
+  fi
+
+  echo "Discovered ${#USERNAMES[@]} user(s) from subdirectories under ${AUTO_USER_BASE_DIR}"
+}
+
+user_meta_file() {
+  echo "${1}/${USER_META_FILENAME}"
+}
+
+has_user_meta() {
+  local user_data_dir="$1"
+  local meta_file uid gid
+
+  meta_file="$(user_meta_file "${user_data_dir}")"
+  [[ -f "${meta_file}" ]] || return 1
+
+  uid="$(grep -E '^uid=' "${meta_file}" | tail -n1 | cut -d= -f2- | tr -d '[:space:]')"
+  gid="$(grep -E '^gid=' "${meta_file}" | tail -n1 | cut -d= -f2- | tr -d '[:space:]')"
+  [[ "${uid}" =~ ^[0-9]+$ && "${gid}" =~ ^[0-9]+$ ]]
+}
+
+read_user_meta() {
+  local user_data_dir="$1"
+  local meta_file
+
+  meta_file="$(user_meta_file "${user_data_dir}")"
+  USER_META_UID="$(grep -E '^uid=' "${meta_file}" | tail -n1 | cut -d= -f2- | tr -d '[:space:]')"
+  USER_META_GID="$(grep -E '^gid=' "${meta_file}" | tail -n1 | cut -d= -f2- | tr -d '[:space:]')"
+}
+
+write_user_meta() {
+  local user_data_dir="$1"
+  local uid="$2"
+  local gid="$3"
+  local username="$4"
+  local meta_file
+
+  meta_file="$(user_meta_file "${user_data_dir}")"
+  cat > "${meta_file}" <<EOF
+uid=${uid}
+gid=${gid}
+EOF
+  chmod 600 "${meta_file}"
+  chown "${username}:${username}" "${meta_file}" 2>/dev/null || chown root:root "${meta_file}"
+}
+
+ensure_uid_available() {
+  local uid="$1"
+  local username="$2"
+  local existing
+
+  existing="$(getent passwd "${uid}" | cut -d: -f1 || true)"
+  if [[ -n "${existing}" && "${existing}" != "${username}" ]]; then
+    echo "Error: UID ${uid} is already used by ${existing}, cannot configure ${username}."
+    return 1
+  fi
+}
+
+ensure_group_for_gid() {
+  local gid="$1"
+  local username="$2"
+
+  if getent group "${gid}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! groupadd -g "${gid}" "${username}" 2>/dev/null; then
+    groupadd -g "${gid}" "grp_${username}" 2>/dev/null || \
+      echo "Warning: failed to create group with gid ${gid} for ${username}."
+  fi
+}
+
+apply_base_uid_offset() {
+  local username="$1"
+  local uid
+
+  uid="$(id -u "${username}")"
+  if (( uid < BASE_UID )); then
+    local new_uid=$((uid + BASE_UID))
+    ensure_uid_available "${new_uid}" "${username}" || return 1
+    usermod -u "${new_uid}" "${username}"
+    echo "Adjusted UID for ${username} to ${new_uid} (BASE_UID=${BASE_UID})."
+    uid="${new_uid}"
+  fi
+  echo "${uid}"
+}
+
+sync_system_user_to_meta() {
+  local username="$1"
+  local target_uid="$2"
+  local target_gid="$3"
+  local current_uid current_gid
+
+  current_uid="$(id -u "${username}")"
+  current_gid="$(id -g "${username}")"
+
+  if [[ "${current_uid}" != "${target_uid}" ]]; then
+    ensure_uid_available "${target_uid}" "${username}" || return 1
+    usermod -u "${target_uid}" "${username}"
+    echo "Updated UID for ${username}: ${current_uid} -> ${target_uid}"
+  fi
+
+  if [[ "${current_gid}" != "${target_gid}" ]]; then
+    ensure_group_for_gid "${target_gid}" "${username}"
+    usermod -g "${target_gid}" "${username}"
+    echo "Updated GID for ${username}: ${current_gid} -> ${target_gid}"
+  fi
+}
+
+ensure_user_data_dir() {
+  local user_data_dir="$1"
+
+  mkdir -p "${user_data_dir}"
+}
+
+# .users: listable by managed users; each user's own subdir is 700 owned by that user.
+ensure_auto_user_base_dir_layout() {
+  mkdir -p "${AUTO_USER_BASE_DIR}"
+  chown root:root "${AUTO_USER_BASE_DIR}"
+  chmod 755 "${AUTO_USER_BASE_DIR}"
+}
+
+set_user_acl() {
+  local username="$1"
+  local path="$2"
+  local perms="$3"
+
+  if ! command -v setfacl >/dev/null 2>&1; then
+    return 1
+  fi
+
+  setfacl -m "u:${username}:${perms}" "${path}"
+}
+
+set_user_default_acl() {
+  local username="$1"
+  local path="$2"
+  local perms="$3"
+
+  if ! command -v setfacl >/dev/null 2>&1; then
+    return 1
+  fi
+
+  setfacl -d -m "u:${username}:${perms}" "${path}"
+}
+
+# Fallback when setfacl is unavailable.
+configure_workspace_shared_access_fallback() {
+  local username="$1"
+  local group_name="workspace-shared"
+  local users_dir_name
+  local entry name
+
+  users_dir_name="$(basename "${AUTO_USER_BASE_DIR}")"
+
+  if ! getent group "${group_name}" >/dev/null 2>&1; then
+    groupadd "${group_name}"
+  fi
+  usermod -aG "${group_name}" "${username}" 2>/dev/null || true
+
+  chgrp "${group_name}" "${WORKSPACE_ROOT}" 2>/dev/null || true
+  chmod g+rwx "${WORKSPACE_ROOT}" 2>/dev/null || true
+
+  for entry in "${WORKSPACE_ROOT}"/*; do
+    [[ -e "${entry}" ]] || continue
+    name="$(basename "${entry}")"
+    [[ "${name}" == "${users_dir_name}" ]] && continue
+    chgrp "${group_name}" "${entry}" 2>/dev/null || true
+    if [[ -d "${entry}" ]]; then
+      chmod g+rwx "${entry}" 2>/dev/null || true
+    else
+      chmod g+rw "${entry}" 2>/dev/null || true
+    fi
+  done
+}
+
+# 1) /workspace (except .users tree): read/write/execute/create files and directories.
+# 2) /workspace/.users: list and traverse only; full control only in /workspace/.users/{username}.
+# 3) /workspace/.users/{other}: no access (700, owned by other user or root).
+configure_user_workspace_permissions() {
+  local username="$1"
+  local user_data_dir="$2"
+  local users_dir_name
+  local entry other_name name
+
+  users_dir_name="$(basename "${AUTO_USER_BASE_DIR}")"
+  ensure_auto_user_base_dir_layout
+
+  mkdir -p "${user_data_dir}"
+  chown "${username}:${username}" "${user_data_dir}"
+  chmod 700 "${user_data_dir}"
+
+  for entry in "${AUTO_USER_BASE_DIR}"/*; do
+    [[ -d "${entry}" ]] || continue
+    other_name="$(basename "${entry}")"
+    [[ "${other_name}" == "${username}" ]] && continue
+    if id -u "${other_name}" >/dev/null 2>&1; then
+      chown "${other_name}:${other_name}" "${entry}"
+    else
+      chown root:root "${entry}"
+    fi
+    chmod 700 "${entry}"
+  done
+
+  if [[ ! -d "${WORKSPACE_ROOT}" ]]; then
+    echo "Workspace root not found: ${WORKSPACE_ROOT}. Skip workspace permission setup for ${username}."
+    return 0
+  fi
+
+  if command -v setfacl >/dev/null 2>&1; then
+    # Full workspace access on /workspace itself (create files/dirs at workspace root).
+    set_user_acl "${username}" "${WORKSPACE_ROOT}" "rwx" || true
+    set_user_default_acl "${username}" "${WORKSPACE_ROOT}" "rwx" || true
+
+    # .users: can list entries, but cannot create/modify inside .users itself.
+    set_user_acl "${username}" "${AUTO_USER_BASE_DIR}" "r-x" || true
+
+    for entry in "${WORKSPACE_ROOT}"/*; do
+      [[ -e "${entry}" ]] || continue
+      name="$(basename "${entry}")"
+      [[ "${name}" == "${users_dir_name}" ]] && continue
+      set_user_acl "${username}" "${entry}" "rwx" || \
+        echo "Warning: failed to set ACL on ${entry} for ${username}"
+      if [[ -d "${entry}" ]]; then
+        set_user_default_acl "${username}" "${entry}" "rwx" || true
+      fi
+    done
+    echo "Workspace permissions configured for ${username} (ACL)."
+  else
+    configure_workspace_shared_access_fallback "${username}"
+    echo "Workspace permissions configured for ${username} (shared group fallback)."
+  fi
+}
+
+# /home/{user} -> AUTO_USER_BASE_DIR/{user} (or base dir in single-user mode).
+ensure_home_symlink() {
+  local username="$1"
+  local user_data_dir="$2"
+  local home_link="/home/${username}"
+
+  mkdir -p "${user_data_dir}"
+
+  if [[ -L "${home_link}" ]]; then
+    local current_target
+    current_target="$(readlink -f "${home_link}")"
+    local expected_target
+    expected_target="$(readlink -f "${user_data_dir}")"
+    if [[ "${current_target}" == "${expected_target}" ]]; then
+      echo "Home symlink already correct for ${username}: ${home_link} -> ${user_data_dir}"
+      return 0
+    fi
+    echo "Updating home symlink for ${username} ..."
+    rm -f "${home_link}"
+  elif [[ -e "${home_link}" ]]; then
+    if [[ -d "${home_link}" ]] && [[ -z "$(ls -A "${home_link}" 2>/dev/null || true)" ]]; then
+      rmdir "${home_link}" 2>/dev/null || rm -rf "${home_link}"
+    else
+      echo "Warning: ${home_link} exists and is not an empty directory; skip symlink replacement."
+      return 0
+    fi
+  fi
+
+  ln -sfn "${user_data_dir}" "${home_link}"
+  chown -h "${username}:${username}" "${home_link}" 2>/dev/null || true
+  chown -R "${username}:${username}" "${user_data_dir}"
+  echo "Linked ${home_link} -> ${user_data_dir}"
+}
+
+ensure_user_exists() {
+  local username="$1"
+  local user_data_dir="$2"
+  local home_link="/home/${username}"
+  local user_bashrc="${home_link}/.bashrc"
+  local has_meta=false
+  local system_exists=false
+  local uid gid
+
+  ensure_user_data_dir "${user_data_dir}"
+
+  if has_user_meta "${user_data_dir}"; then
+    has_meta=true
+    read_user_meta "${user_data_dir}"
+  fi
+
+  if id -u "${username}" >/dev/null 2>&1; then
+    system_exists=true
+  fi
+
+  if [[ "${has_meta}" == "false" && "${system_exists}" == "false" ]]; then
+    # Case 1: new directory, no registered uid/gid — create user and persist meta.
+    echo "Creating new user ${username} (no ${USER_META_FILENAME}) ..."
+    useradd -M -d "${home_link}" -s /bin/bash "${username}"
+    passwd -d "${username}" >/dev/null 2>&1 || true
+    uid="$(apply_base_uid_offset "${username}")" || return 1
+    gid="$(id -g "${username}")"
+    write_user_meta "${user_data_dir}" "${uid}" "${gid}" "${username}"
+    echo "User ${username} created with uid=${uid}, gid=${gid}; meta saved."
+  elif [[ "${has_meta}" == "true" && "${system_exists}" == "false" ]]; then
+    # Case 2: restore user from persisted uid/gid.
+    echo "Creating user ${username} from ${USER_META_FILENAME} (uid=${USER_META_UID}, gid=${USER_META_GID}) ..."
+    ensure_uid_available "${USER_META_UID}" "${username}" || return 1
+    ensure_group_for_gid "${USER_META_GID}" "${username}"
+    useradd -M -u "${USER_META_UID}" -g "${USER_META_GID}" -d "${home_link}" -s /bin/bash "${username}"
+    passwd -d "${username}" >/dev/null 2>&1 || true
+    write_user_meta "${user_data_dir}" "${USER_META_UID}" "${USER_META_GID}" "${username}"
+    echo "User ${username} created from meta."
+  elif [[ "${has_meta}" == "true" && "${system_exists}" == "true" ]]; then
+    # Case 3: system user exists — align uid/gid with meta if different.
+    echo "User ${username} exists; syncing uid/gid with ${USER_META_FILENAME} ..."
+    sync_system_user_to_meta "${username}" "${USER_META_UID}" "${USER_META_GID}" || return 1
+    write_user_meta "${user_data_dir}" "${USER_META_UID}" "${USER_META_GID}" "${username}"
+  else
+    # System user exists but no meta — persist current ids for multi-host sharing.
+    uid="$(id -u "${username}")"
+    gid="$(id -g "${username}")"
+    echo "User ${username} exists without meta; saving uid=${uid}, gid=${gid}."
+    write_user_meta "${user_data_dir}" "${uid}" "${gid}" "${username}"
+  fi
+
+  ensure_home_symlink "${username}" "${user_data_dir}"
+
+  touch "${user_bashrc}"
+  if ! grep -Fq "${BASHRC_SNIPPET_CONTENT}" "${user_bashrc}"; then
+    printf "\n%s\n" "${BASHRC_SNIPPET_CONTENT}" >> "${user_bashrc}"
+  fi
+  chown "${username}:${username}" "${user_bashrc}"
+}
+
+ensure_ssh_access_enabled() {
+  local username="$1"
+  local user_ssh_dir="$2"
+  local user_authorized_keys="$3"
+
+  local enabled="true"
+  if [[ ! -d "${user_ssh_dir}" || ! -f "${user_authorized_keys}" ]]; then
+    enabled="false"
+  elif [[ "$(stat -c '%a' "${user_ssh_dir}")" != "700" ]]; then
+    enabled="false"
+  elif [[ "$(stat -c '%a' "${user_authorized_keys}")" != "600" ]]; then
+    enabled="false"
+  fi
+
+  if [[ "${enabled}" == "true" ]]; then
+    echo "SSH access already enabled for ${username}."
+    return 0
+  fi
+
+  echo "Enabling SSH access for ${username} ..."
+  mkdir -p "${user_ssh_dir}"
+  touch "${user_authorized_keys}"
+  chmod 700 "${user_ssh_dir}"
+  chmod 600 "${user_authorized_keys}"
+  chown -R "${username}:${username}" "${user_ssh_dir}"
+}
+
+ensure_public_key_configured() {
+  local username="$1"
+  local user_authorized_keys="$2"
+  local root_authorized_keys="/root/.ssh/authorized_keys"
+
+  if [[ ! -f "${root_authorized_keys}" ]]; then
+    echo "Root authorized_keys not found: ${root_authorized_keys}. Skip key sync for ${username}."
+    return 0
+  fi
+
+  local added=0
+  while IFS= read -r root_key_line; do
+    if [[ -z "${root_key_line}" || "${root_key_line}" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+
+    if grep -Fxq "${root_key_line}" "${user_authorized_keys}"; then
+      continue
+    fi
+
+    echo "${root_key_line}" >> "${user_authorized_keys}"
+    added=1
+  done < "${root_authorized_keys}"
+
+  if [[ "${added}" -eq 1 ]]; then
+    echo "Synced root public key(s) to ${username}."
+  else
+    echo "Root public key(s) already present for ${username}, skip."
+  fi
+}
+
+discover_users_from_base_dir
+ensure_auto_user_base_dir_layout
+
+for i in "${!USERNAMES[@]}"; do
+  username="${USERNAMES[$i]}"
+  user_data_dir="${USER_DATA_DIRS[$i]}"
+
+  if [[ -z "${username}" ]]; then
+    echo "Invalid entry: username is empty."
+    continue
+  fi
+
+  user_home="/home/${username}"
+  user_bashrc="${user_home}/.bashrc"
+  user_ssh_dir="${user_home}/.ssh"
+  user_authorized_keys="${user_ssh_dir}/authorized_keys"
+
+  # 1) Ensure user exists (uid/gid per meta) and /home/{user} points to user data dir.
+  if ! ensure_user_exists "${username}" "${user_data_dir}"; then
+    echo "Skip remaining setup for ${username} due to user creation/sync failure."
+    continue
+  fi
+  # 2) Configure /workspace and /workspace/.users permissions for this user.
+  configure_user_workspace_permissions "${username}" "${user_data_dir}"
+  # 3) Ensure SSH access is enabled.
+  ensure_ssh_access_enabled "${username}" "${user_ssh_dir}" "${user_authorized_keys}"
+  # 4) Sync root public key(s) to this user.
+  ensure_public_key_configured "${username}" "${user_authorized_keys}"
+done
+
+```

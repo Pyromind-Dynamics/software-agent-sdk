@@ -1,0 +1,378 @@
+---
+title: Studio
+description: 在 PyroMind 控制台使用 Training Studio 创建、编辑、保存和运行可视化工作流。
+---
+
+Training Studio 是 PyroMind 控制台提供的可视化工作流编辑器。您可在画布中编排数据、模型、配置、训练、评估及推理节点，并将工作流保存为可复用的 JSON 文件。
+
+## 前置条件
+
+- 持有有效的 PyroMind 账户，且已完成 [控制台登录](https://console.pyromind.ai/dashboard)
+- 已开通 **Studio Service**
+- 已了解 [账户配额](/zh/docs/basic/user_profile#第四步：查看配额与资源限制)，并确认具备运行任务所需的计算资源
+- 建议使用 PC 端浏览器访问 Studio；移动端访问时将提示返回首页
+
+## 第一步：进入 Training Studio
+
+1. 登录 [PyroMind 控制台](https://console.pyromind.ai/dashboard)。
+2. 在左侧导航栏中单击 **Studio**。
+
+![Studio 入口](/resource/studio/imgs/studio_entry.png)
+
+进入 Studio 后，页面通常包含以下功能区域：
+
+| 区域 | 说明 |
+|------|------|
+| 顶部工作流标签页 | 用于切换多个已打开的工作流；未保存的工作流将显示状态标记；任务结果工作流以只读标签页形式打开。 |
+| 顶部工具栏 | 提供新建、导入、保存、导出、运行、停止、打开节点库等常用操作入口。 |
+| 工作流列表 | 支持检索、打开、置顶、克隆、重命名或删除服务端已保存的工作流。 |
+| 节点库 | 支持检索系统节点、共享节点或自定义节点，创建自定义节点，并将节点添加至画布。 |
+| 画布 | 支持拖拽节点、建立连线、选择节点、创建分组、自动布局及刷新工作流。 |
+| 右侧配置面板 | 用于查看并修改节点参数、必填输入、默认值及输出信息。 |
+| 任务管理 | 用于查看已提交任务、任务详情、节点运行明细、节点费用，并打开任务结果工作流。 |
+
+## 端到端流程
+
+若需基于自定义逻辑构建完整工作流，建议按以下顺序执行：
+
+1. **准备运行环境**：创建并进入 [JupyterLab 实例](/zh/docs/jupyterlab/how-to-use)，安装 `pyromind-sdk`，并配置 `PYROMIND_API_KEY`。
+2. **创建自定义节点**：可在 Studio 页面通过向导创建节点，亦可在 JupyterLab 中通过 SDK 注册节点。详见 [添加自定义节点](/zh/docs/studio/custom-nodes)。
+3. **打开 Studio 画布**：进入 **Studio**，新建空白工作流，或导入既有 JSON 工作流作为起点。
+4. **添加系统节点**：自节点库添加数据、模型、配置、训练、推理或工具类节点。
+5. **添加自定义节点**：在节点库中检索已注册节点，将其拖入画布，并接入上下游节点。
+6. **连接数据流**：将上游节点输出连接至下游节点输入。例如，将数据预处理节点输出连接至数据集配置节点，再连接至训练节点。
+7. **配置参数**：填写数据路径、模型路径、输出路径、GPU 数量、GPU 型号及训练超参数。
+8. **保存工作流**：单击 **Save** 保存至服务端，或单击 **Export Json** 导出本地备份。
+9. **运行与监控**：单击 **Run** 提交任务，在 **Task management** 中查看任务状态、任务详情、节点费用、日志及输出。
+10. **复用结果**：任务完成后，打开结果工作流查看节点输出；可克隆工作流继续迭代，或导出 JSON 供团队共享。
+
+常见应用场景如下：
+
+| 目标 | 推荐流程 |
+|------|----------|
+| 使用系统节点完成训练 | 导入示例 JSON → 修改数据与模型参数 → 保存 → 运行 |
+| 在训练前加入自定义预处理 | 创建自定义预处理节点 → 在 Studio 中添加节点 → 接入数据配置节点上游 → 运行 |
+| 在推理后加入自定义后处理 | 创建自定义后处理节点 → 接入推理节点输出下游 → 保存并运行 |
+| 复用团队工作流 | 导入 JSON 或打开服务端工作流 → 修改参数 → 通过 **Save As** 另存为新工作流 |
+
+### 工作流基本操作演示
+
+以下视频演示工作流的基本操作方法：
+
+<video controls width="100%">
+  <source src="https://raw.githubusercontent.com/PyroMind-Dynamics/Markdown-Resource-Pub/refs/heads/main/videos/tutorials/studio/BaseOperator.mp4" type="video/mp4" />
+  您的浏览器不支持视频标签。
+</video>
+
+## 第二步：创建或打开工作流
+
+### Example Workflows
+
+Studio 提供一组官方示例工作流。建议先导入示例，再依据实际数据、模型及资源配置调整相关参数。
+
+| 示例工作流 | 适用场景 | 下载 | 详细说明 |
+|------------|----------|------|----------|
+| Dataset Processing | 加载、转换和预处理数据集，生成可用于训练的数据配置。 | <a href="/resource/studio/jsons/dataset-processing.json" target="_blank" rel="noreferrer">dataset-processing</a> | [加载和预处理数据集](/zh/docs/studio/load-preprocess-dataset) |
+| SFT | 通过监督微调训练基线模型，并在训练完成后执行快速验证。 | <a href="/resource/studio/jsons/SFT.json" target="_blank" rel="noreferrer">SFT</a> | [SFT 监督微调](/zh/docs/studio/sft-training) |
+| DPO | 在 SFT 模型基础上，基于偏好对数据执行直接偏好优化。 | <a href="/resource/studio/jsons/DPO.json" target="_blank" rel="noreferrer">DPO</a> | [DPO 偏好对齐](/zh/docs/studio/dpo-training) |
+| GRPO | 在 SFT 模型基础上接入 reward 配置，执行 GRPO 强化学习训练。 | <a href="/resource/studio/jsons/GRPO.json" target="_blank" rel="noreferrer">GRPO</a> | [GRPO 强化学习训练](/zh/docs/studio/grpo-training) |
+| Validate-Reward | 在启动 GRPO 前，使用少量样本验证 reward 函数评分是否符合预期。 | <a href="/resource/studio/jsons/Validate-Reward.json" target="_blank" rel="noreferrer">Validate-Reward</a> | [编写 reward 函数](/zh/docs/studio/reward-function#验证-reward-函数) |
+| Benchmark | 对训练后的模型执行批量评估，并输出指标结果。 | <a href="/resource/studio/jsons/Benchmark.json" target="_blank" rel="noreferrer">Benchmark</a> | [模型的验证](/zh/docs/studio/model-validation) |
+
+导入示例后，请重点核对数据路径、模型路径、输出路径、GPU 型号、GPU 数量及训练超参数。**请勿直接使用示例参数提交生产任务。**
+
+### 新建空白工作流
+
+1. 单击顶部标签栏旁的 **+**，或在工作流菜单中单击 **New**。
+2. 在节点库中检索目标节点。
+3. 将节点添加至画布。
+4. 配置节点参数，并连接输入/输出端口。
+
+### 导入工作流 JSON
+
+您可导入本地 JSON 文件，或将 JSON 文件拖拽至画布。
+
+1. 自 [Example Workflows](#example-workflows) 下载示例工作流 JSON 文件。
+2. 在 Studio 中打开工作流菜单。
+3. 单击 **Import from json**，并选择目标 JSON 文件。
+
+![Studio 导入工作流](/resource/studio/imgs/studio_import.png)
+
+### 从图片导入工作流
+
+若工作流图片中包含可解析的工作流数据，可单击 **Import from Image**，选择图片并恢复对应画布。
+
+### 管理已保存工作流
+
+单击 **Import from json** 或工作流列表入口后，可检索服务端已保存的工作流。
+
+![Studio 工作流列表](/resource/studio/imgs/studio_workflow_list.png)
+
+| 操作 | 说明 |
+|------|------|
+| 搜索 | 在 **Search Workflows** 中输入关键字，筛选目标工作流。 |
+| 打开 | 单击工作流行，将其加载至新标签页或当前标签页。 |
+| 置顶 | 单击置顶图标，将常用工作流固定于列表顶部。 |
+| 克隆 | 在工作流右键菜单中单击 **Clone**，复制为新工作流。 |
+| 重命名 | 在工作流右键菜单中单击 **Rename**。 |
+| 删除 | 在工作流右键菜单中单击 **Delete**，确认后删除服务端工作流。 |
+
+## 第三步：编辑画布
+
+### 添加节点
+
+1. 单击右上角节点库按钮。
+2. 按节点名称或类别检索。
+3. 单击节点，或将其拖拽至画布。
+
+![Studio 节点库](/resource/studio/imgs/studio_nodes_list.png)
+
+节点通常分为以下类型：
+
+| 类型 | 说明 |
+|------|------|
+| 数据节点 | 用于克隆、加载、转换或预处理数据集。 |
+| 模型节点 | 用于克隆、加载、合并或导出模型。 |
+| 配置节点 | 用于生成数据集、模型、训练、LoRA、Accelerate、W&B 等配置。 |
+| 训练节点 | 用于提交 SFT、DPO、GRPO 等训练任务。 |
+| 推理节点 | 用于启动推理服务，或调用模型完成测试。 |
+| 工具节点 | 用于拼接路径、处理文件或执行辅助逻辑。 |
+| 自定义节点 | 用于扩展已注册的 Python 函数能力。 |
+
+在节点库中右键单击自定义节点或分类，可执行分类管理、刷新节点定义、查看节点详情或删除节点等操作。
+
+![Studio 节点库右键菜单](/resource/studio/imgs/studio_node_right_click.png)
+
+| 操作 | 说明 |
+|------|------|
+| **Add Category** | 新建节点分类。 |
+| **Reload** | 重新加载节点定义。 |
+| **Details** | 查看节点详情。 |
+| **Delete** | 删除节点。 |
+
+### 使用自定义节点
+
+您可在 Studio 页面创建自定义节点，亦可通过 JupyterLab 与 SDK 创建。页面创建适用于已具备 Python 源文件、且希望通过向导生成节点配置的场景；SDK 创建适用于版本化管理、批量注册或自动化发布场景。
+
+#### 在 Studio 页面创建自定义节点
+
+1. 打开 **Node Library**。
+2. 单击节点库右上角的加号入口。
+
+![Studio 自定义节点入口](/resource/studio/imgs/studio_node_create1.png)
+
+3. 在 **Create Custom Node** 对话框中选择创建方式。通常选择 **Create via Python script** 或 **Create via YAML config file**；若 **Create via WebUI** 不可用，则暂不可选。
+4. 单击 **Create**。
+
+![Studio 选择自定义节点创建方式](/resource/studio/imgs/studio_node_create2.png)
+
+5. 在 **Step 1** 中选择源文件路径。可从 **Storage Path** 文件树中选择文件，或按路径检索。
+6. 选择拟封装为节点的 Python 函数。
+7. 检查函数签名。页面将提示不支持的参数类型或缺失的类型标注。
+8. 在 **Select Node Properties** 中选择 **GPU Node** 或 **CPU Node**。
+9. 单击 **Next**。
+
+![Studio 选择自定义节点函数](/resource/studio/imgs/studio_node_create3.png)
+
+10. 在 **Step 2** 中检查或编辑生成的 **Node manifest (YAML)**。
+11. 设置 **Category**，使节点显示于相应节点库分类下。
+
+![Studio 编辑自定义节点 YAML](/resource/studio/imgs/studio_node_create4.png)
+
+12. 单击 **Create**。创建成功后，节点将显示于 **Node Library** 中。
+13. 检索该节点，并将其拖入画布。
+14. 连接上下游节点，配置参数，保存并运行工作流。
+
+页面创建节点时，Studio 将校验源文件、函数、节点类型、YAML 及分类信息。函数参数建议使用 `str`、`int`、`float`、`bool` 等基础类型。若创建失败，请依据页面提示补全必填项或调整函数类型标注。
+
+#### 通过 JupyterLab 和 SDK 创建自定义节点
+
+1. 在 JupyterLab 中编写 Python 函数。
+2. 使用 SDK CLI 将函数转换为 YAML。
+3. 校验 YAML，并调用 `client.studio.create_node()` 注册节点。
+4. 返回 Studio，在节点库中检索节点名称。
+5. 将节点拖入画布，并连接上下游节点。
+6. 填写节点参数，保存并运行工作流。
+
+完整代码示例请参阅 [添加自定义节点](/zh/docs/studio/custom-nodes)。
+
+### 连接节点
+
+将某一节点的输出端口拖拽至另一节点的输入端口，即可建立连线。Studio 将校验端口类型及连接方向。
+
+若某一输入仅需固定值，可使用基础值节点，或在节点配置面板中直接填写参数。
+
+### 配置节点
+
+单击节点后，可在右侧配置面板中修改参数。
+
+| 配置项 | 说明 |
+|--------|------|
+| 必填输入 | 运行前须填写或建立连接；缺失时将无法提交工作流。 |
+| 可选输入 | 可按需填写；未填写时采用默认值或留空。 |
+| 枚举值 | 须从下拉选项中选择，例如 GPU 型号或调度策略。 |
+| 文件/目录路径 | 指向 Storage、实例目录或节点输出路径。 |
+| 输出字段 | 可供下游节点连接的结果，例如 `model_output_path`、`dataset_path` 或 `endpoint`。 |
+
+### 自定义节点操作演示
+
+以下视频演示自定义节点的操作方法：
+
+<video controls width="100%">
+  <source src="https://raw.githubusercontent.com/PyroMind-Dynamics/Markdown-Resource-Pub/refs/heads/main/videos/tutorials/studio/CustomsNode.mp4" type="video/mp4" />
+  您的浏览器不支持视频标签。
+</video>
+
+## 第四步：使用画布工具
+
+| 功能 | 使用方式 |
+|------|----------|
+| 撤销/重做 | 通过顶部工具栏或快捷键恢复编辑操作。 |
+| 自动布局 | 单击 **Auto Layout**，重新排列画布节点。 |
+| 刷新 | 单击 **Refresh**，重新加载当前工作流及节点定义。 |
+| 选择多个节点 | 框选画布区域，或执行全选操作。 |
+| 复制/粘贴 | 在画布右键菜单中使用 **Copy**、**Paste**。 |
+| 启用/禁用 | 选中节点后使用 **Enable** 或 **Disable**；禁用节点不参与运行。 |
+| 删除 | 选中节点或连线后单击 **Delete**。 |
+| 创建分组 | 在画布空白处右键单击 **Add group**，用于组织相关节点。 |
+| 导出图片 | 在工作流菜单中单击 **Export Image**，保存当前画布截图。 |
+| 导出节点图片 | 在工作流菜单中单击 **Export All Node Images**，批量导出节点图片。 |
+
+## 第五步：保存和导出工作流
+
+Studio 支持将工作流保存至服务端，亦支持导出为本地文件或图片。单击顶部工作流菜单可查看完整操作项。
+
+![Studio 顶部工具栏](/resource/studio/imgs/studio_top_toolbar.png)
+
+| 操作 | 说明 |
+|------|------|
+| **New** | 新建空白工作流标签页。 |
+| **Import from json** | 自本地 JSON 文件导入完整工作流；亦可将 JSON 文件拖拽至画布。 |
+| **Import from Image** | 自包含工作流数据的图片中恢复画布。 |
+| **Import workflow data** | 粘贴 `nodes` 与 `edges` 格式的工作流 JSON 数据并导入。 |
+| **Save** | 保存当前工作流；若为首次保存，须输入文件名。 |
+| **Save As** | 将当前工作流另存为新的服务端 JSON 文件。 |
+| **Export Json** | 将当前工作流导出为本地 JSON 文件；后续可通过 **Import from json** 再次导入。 |
+| **Export Image** | 将当前画布导出为 PNG 图片，适用于文档记录、共享或连线排查。 |
+| **Export Core Node** | 导出核心节点相关信息，用于复用节点配置或排查节点定义问题。 |
+| **Export All Node Images** | 批量导出当前画布中全部节点的图片。 |
+
+建议在运行前先执行 **Save** 操作。Studio 在提交任务前亦将尝试保存当前工作流。
+
+右键单击工作流标签页，可管理当前已打开的标签：
+
+![Studio 标签页右键菜单](/resource/studio/imgs/studio_tag_right_click_the_tab.png)
+
+| 操作 | 说明 |
+|------|------|
+| **Close** | 关闭当前工作流标签。 |
+| **Close Others** | 关闭除当前标签外的其他标签。 |
+| **Close All to the Left** | 关闭当前标签左侧的全部标签。 |
+| **Close All to the Right** | 关闭当前标签右侧的全部标签。 |
+| **Clone** | 克隆当前工作流。 |
+| **Rename** | 重命名当前工作流标签；任务结果或只读标签不可重命名。 |
+
+### 工作流模板管理演示
+
+以下视频演示工作流模板的管理方法：
+
+<video controls width="100%">
+  <source src="https://raw.githubusercontent.com/PyroMind-Dynamics/Markdown-Resource-Pub/refs/heads/main/videos/tutorials/studio/WorkflowTemplates.mp4" type="video/mp4" />
+  您的浏览器不支持视频标签。
+</video>
+
+## 第六步：运行工作流
+
+1. 确认全部必填输入已填写。
+2. 确认节点间连接正确。
+3. 确认 GPU 型号、GPU 数量、输出路径等资源配置未超出账户配额。
+4. 单击 **Run**。
+
+提交后，按钮状态将变更为 **Pending** 或 **Running**。
+
+| 状态 | 说明 |
+|------|------|
+| **Pending** | 任务已提交，正在等待资源分配或调度。 |
+| **Running** | 任务正在运行。 |
+| **Completed** | 任务已完成。 |
+| **Failed** | 任务执行失败，须查看日志定位原因。 |
+| **Cancelled** | 任务已取消。 |
+
+如需停止任务，可单击运行按钮上的停止入口；Studio 将向后端提交停止请求。
+
+## 第七步：查看任务和结果
+
+单击 **Task management** 打开任务列表。您可按页浏览历史任务，进入任务详情，并打开指定任务的结果工作流。
+
+![Studio 任务列表](/resource/studio/imgs/studio_task_list.png)
+
+任务列表主要用于快速查看任务状态。进入任务详情后，可查看该任务下各节点的执行明细，包括节点状态、开始时间、结束时间、运行耗时及节点费用。节点费用可用于识别高成本节点，并辅助优化 GPU 型号、GPU 数量、数据规模及训练参数。
+
+任务列表常见字段如下：
+
+| 字段 | 说明 |
+|------|------|
+| **ID** | 任务 ID。 |
+| **Name** | 任务名称，通常来源于工作流名称。 |
+| **Created At** | 任务创建时间。 |
+| **Status** | 任务状态，例如 **Succeeded**、**Error** 或 **Failed**。 |
+| **Progress** | 已完成节点数与总节点数。 |
+| **Execution Time** | 任务总运行时长。 |
+| **Amount** | 当前任务的总费用。 |
+| **Actions** | 单击 **Details** 查看任务详情，或单击 **Delete** 删除任务记录。 |
+
+任务结果工作流通常以只读标签页形式打开，标签名称包含任务 ID。只读工作流用于查看实际执行后的节点状态、日志及输出，但不可直接修改连线或保存并覆盖原始工作流。
+
+单击任务中的节点后，可查看以下内容：
+
+| 内容 | 说明 |
+|------|------|
+| 节点明细 | 查看节点级状态、运行时间、耗时及费用。 |
+| 节点日志 | 读取节点运行日志，用于排查失败原因。 |
+| 节点输出 | 查看节点输出值、路径、模型目录、数据集目录或推理端点。 |
+| 运行状态 | 查看节点是否处于等待、运行、完成或失败状态。 |
+
+输出文件通常保存于 Storage 或实例挂载目录中，可通过 [Storage 控制台](/zh/docs/basic/storage) 下载。
+
+### 工作流任务管理演示
+
+以下视频演示工作流任务的管理方法：
+
+<video controls width="100%">
+  <source src="https://raw.githubusercontent.com/PyroMind-Dynamics/Markdown-Resource-Pub/refs/heads/main/videos/tutorials/studio/TaskManagement.mp4" type="video/mp4" />
+  您的浏览器不支持视频标签。
+</video>
+
+## 常见问题
+
+### 为什么无法运行工作流？
+
+请优先检查以下事项：
+
+- 当前画布是否为空。
+- 必填参数是否缺失。
+- 必填输入是否已建立连接。
+- 节点端口类型是否匹配。
+- GPU 型号及 GPU 数量是否在账户配额范围内。
+- 工作流是否已成功保存。
+
+### 为什么无法修改某个工作流？
+
+任务结果工作流及标记为只读的工作流不可直接编辑。您可克隆该工作流，或导出 JSON 后重新导入为新工作流。
+
+### 为什么节点无法连接？
+
+Studio 将校验连接方向及数据类型。请确认自输出端口连接至输入端口，并确认两端数据类型兼容。
+
+### 为什么节点不可用？
+
+若提示节点未激活，请先在节点库中确认该节点是否可用。自定义节点须先完成注册与加载。
+
+## 下一步
+
+- [系统节点介绍和示例](/zh/docs/studio/system-nodes) — 内置节点类型与示例工作流
+- [添加自定义节点](/zh/docs/studio/custom-nodes) — 将 Python 函数注册为 Studio 节点
+- [快速开始](/zh/docs/studio/index) — 从数据准备、SFT / GRPO 训练到验证与推理服务的端到端指南
+- [Inference](/zh/docs/basic/inference) — 将训练完成的模型部署为推理服务
+- [SDK — 执行训练工作流](/zh/docs/sdk/training-workflow) — 通过 Python SDK 以编程方式创建并运行工作流
+- [分布式存储使用方式](/zh/docs/basic/storage) — 上传与管理训练数据集

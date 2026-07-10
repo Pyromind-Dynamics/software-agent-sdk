@@ -1,0 +1,254 @@
+---
+title: Slurm
+description: 在 JupyterLab 实例上搭建Slurm集群。
+---
+
+# Slurm集群部署文档
+
+## 背景说明
+在JupyterLab搭建Slurm平台。
+
+**注意**：
+    在Pod环境下运行Slurm时，Controller节点或Worker节点可能会发生重启。若出现此类情况，某些节点重启后，Slurm应用有可能无法正常启动，需要手动执行启动脚本：
+```bash
+sh /root/slurm_data/${HOSTNAME}/start.sh
+```
+
+---
+
+## 一、Slurm Controller节点部署
+
+### 1.1 购买Controller节点
+
+创建一台Instance实例作为Slurm Controller节点，**配置不需要显卡**。
+
+- 实例创建成功后，记录Controller实例ID
+- **本次Controller实例ID**：`jp-ee3a4ed8314f`（后续安装Worker会用到）
+
+![Slurm 创建实例](/resource/slurm/imgs/instance.png )
+
+### 1.2 部署Slurm Controller节点
+
+#### 1.2.1 下载部署包
+
+从GitHub下载部署包到持久化目录(不知道持久化哪个目录，默认选择/root即可)，防止Pod重启造成数据丢失：
+
+```bash
+cd /root && git clone git@github.com:PyroMind-Dynamics/pyromind-slurm.git
+```
+
+#### 1.2.2 修改Controller配置
+
+本次操作路径：
+- 安装包目录：`/root/pyromind-slurm`
+- 数据持久化目录：`/root/slurm_data`
+
+修改安装脚本 `/root/pyromind-slurm/slurm-master.sh`：
+
+```bash
+PKG_ROOT_PATH="/root/pyromind-slurm"        # 修改为安装包实际目录，默认使用这个目录就可以
+SLURM_DATA_STORE_BASE="/root/slurm_data"    # 修改为数据持久化实际目录，默认使用这个目录就可以
+```
+
+#### 1.2.3 安装Controller
+
+执行安装命令：
+
+```bash
+sh /root/pyromind-slurm/slurm-master.sh
+```
+
+等待自动部署完成后，验证安装：
+
+```bash
+sinfo
+sacct
+```
+
+![Slurm controller](/resource/slurm/imgs/install-control.png )
+
+
+如果没有报错，Controller安装完成。
+
+#### 1.2.4 备份Munge密钥
+
+**重要**：备份 `munge.key`，后续安装Worker会使用到。
+
+密钥存储路径：
+```
+${SLURM_DATA_STORE_BASE}/$(hostname)/munge/munge.key
+```
+
+备份该文件到安全位置。
+
+#### 1.2.5 开机自启动配置
+
+在Slurm集群第一次部署时，需处理 `/workspace/start-hook.sh`：
+
+- **若文件已存在**：检查内容是否已包含 `/root/pyromind-slurm/start-hook.sh`，若未包含则追加后者内容，若已包含则跳过
+- **若文件不存在**：直接将 `/root/pyromind-slurm/start-hook.sh` 覆盖到 `/workspace/start-hook.sh`
+
+---
+
+## 二、申请Controller唯一地址
+
+### 2.1 提交工单申请
+
+提交工单申请Controller实例地址，**务必在工单中提供步骤1.1获得的Controller实例ID**：
+```
+实例ID：jp-ee3a4ed8314f
+```
+
+### 2.2 等待回执
+
+等待后台完成Controller实例地址的创建，后台将返回该Controller实例的唯一访问地址，**请妥善保存**。
+
+---
+
+## 三、部署Worker节点
+
+### 3.1 购买Worker节点
+
+创建Instance实例作为Slurm Worker节点（Worker节点是真正运行算法任务的节点，**建议选择带显卡配置**）。
+
+
+### 3.2 安装Worker节点
+
+#### 3.2.1 下载部署包
+
+```bash
+cd /root && git clone git@github.com:PyroMind-Dynamics/pyromind-slurm.git
+```
+
+#### 3.2.2 修改Worker配置
+
+修改安装脚本 `/root/pyromind-slurm/slurm-node.sh`：
+
+```bash
+PKG_ROOT_PATH="/root/pyromind-slurm"        # 修改为安装包实际目录，，默认使用这个目录就可以
+SLURM_DATA_STORE_BASE="/root/slurm_data"    # 修改为数据持久化实际目录，，默认使用这个目录就可以
+MASTER_POD_ID="ee3a4ed8314f"                # Controller实例ID（去掉"jp-"前缀）
+CONTROL_MACHINE="jupyter-headless-ee3a4ed8314f.custom-user-1000056326"  # 步骤2.2返回的唯一域名地址
+```
+
+#### 3.2.3 拷贝Munge密钥
+
+将步骤1.2.4备份的 `munge.key` 拷贝到Worker节点：
+
+```bash
+# 创建目录（注意：$(hostname)是worker节点的主机名）
+mkdir -p ${SLURM_DATA_STORE_BASE}/$(hostname)/munge
+
+# 拷贝munge.key到目标位置
+cp /path/to/backup/munge.key ${SLURM_DATA_STORE_BASE}/$(hostname)/munge/munge.key
+```
+
+#### 3.2.4 执行安装命令
+
+```bash
+sh /root/pyromind-slurm/slurm-node.sh
+```
+
+等待自动部署完成后，验证Worker节点是否安装成功：
+
+在Worker节点执行：
+```bash
+sinfo
+```
+![Slurm worker](/resource/slurm/imgs/install-worker.png )
+
+
+如果集群能看到Worker节点，说明安装成功。
+
+#### 3.2.5 开机自启动配置
+
+将代码仓库中的启动脚本拷贝到 `/workspace/` 目录并添加执行权限：
+
+```bash
+cp /root/pyromind-slurm/start-hook.sh /workspace/
+chmod +x /workspace/start-hook.sh
+```
+
+---
+
+## 四、验证
+
+### 4.1 运行CPU任务
+
+在任意Worker节点或Controller执行：
+
+```bash
+srun echo "Hello World"
+```
+
+**预期输出**：
+```
+Hello World
+```
+
+![Slurm worker](/resource/slurm/imgs/task-1.png )
+
+
+### 4.2 运行GPU任务
+
+在任意Worker节点或Controller执行：
+
+```bash
+srun --gres=gpu:1 python3 -c "import torch; print(torch.cuda.is_available())"
+```
+
+**预期输出**：
+```
+True
+```
+
+![Slurm worker](/resource/slurm/imgs/task-2.png )
+
+
+---
+
+## 附录：常用命令
+
+| 命令 | 用途 |
+|------|------|
+| `sinfo` | 查看集群节点状态 |
+| `sacct` | 查看作业历史记录 |
+| `squeue` | 查看当前作业队列 |
+| `srun <command>` | 提交作业到集群 |
+
+---
+
+## 故障排查
+
+### 节点重启后Slurm无法启动
+
+手动执行启动脚本：
+```bash
+sh /root/slurm_data/${HOSTNAME}/start.sh
+```
+
+### 检查Munge密钥是否一致
+
+确保所有节点的 `munge.key` 内容一致：
+```bash
+md5sum ${SLURM_DATA_STORE_BASE}/$(hostname)/munge/munge.key
+```
+
+### 检查Slurm服务状态
+
+```bash
+sinfo
+scontrol show node
+```
+
+
+### Worker节点重启成功，显示状态DOWN
+![Slurm 创建实例](/resource/slurm/imgs/node-rr.png )
+
+手动执行启动脚本：
+```bash
+当worker节点重启成功，slurmd也启动成功，但是sinfo显示down,执行如下命令
+scontrol update nodename=jupyter-deployment-f3518c9f0425-0 state=resume
+其中 nodename 是节点名称，根据自己实际调整。
+执行完成，worker节点恢复正常
+```
