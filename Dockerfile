@@ -59,6 +59,10 @@ RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
     uv python install 3.13 && \
     uv venv --python-preference only-managed --python 3.13 .venv && \
     uv sync --frozen --no-editable --managed-python --extra boto3 $EXTRA_FLAGS && \
+    .venv/bin/python -m pip install \
+        --index-url https://test.pypi.org/simple/ \
+        --extra-index-url https://pypi.org/simple \
+        pyromind-sdk && \
     readlink -f .venv/bin/python | grep -q '^/agent-server/uv-managed-python/'
 
 ####################################################################################
