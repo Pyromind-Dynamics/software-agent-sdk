@@ -9,12 +9,11 @@
 
 | NodeType | 描述 | 主要输出端口 |
 |----------|------|-------------|
-| CloneAndCacheDataset | 拉取平台预置数据集 | dataset_path |
+| CloneAndCacheDataset | 克隆平台自带测试数据集 | dataset_path |
+| DownloadAndCacheDataset | 下载已清洗的数据集 | dataset_path |
 | CloneAndCacheModel | 克隆平台预置基模（枚举见 SKILL.md 第 3 步） | model_path |
 | DownloadAndCacheModel | 从 huggingface/modelscope 下载任意开源模型 | model_path |
-| PathJoinNode | 拼接路径（接入用户 storage 数据的入口） | joined_path |
-| DatasetToJsonlNode | HF 数据集目录/parquet 转 JSONL | jsonl_path |
-| DatasetValidatorNode | 验证数据集格式 | validation_result |
+| PathJoinNode | 拼接 Clone 数据目录，或接入用户上传的 Storage 相对路径 | joined_path |
 
 ### 配置构建
 
@@ -54,22 +53,34 @@
 ### 数据接入
 
 ```python
-# 平台预置数据集
-dataset = CloneAndCacheDataset(
+# 用户上传的已清洗数据：先 preview，再接入其 Storage 相对文件路径
+uploaded_dataset = PathJoinNode(
     id="1",
-    dataset="openai/gsm8k",             # 数据集标识
+    base_path="/workspace/",
+    subpath="datasets/my_data/train.jsonl",
+)
+
+# Clone Dataset：三个值是平台测试集，不是唯一允许的数据入口
+dataset = CloneAndCacheDataset(
+    id="2",
+    dataset="pyromind/self-cognition",
     target_path="/workspace/datasets/",
 )
 
-# 用户 storage 数据：直接用 PathJoinNode 指向用户贴的相对路径
+# Clone 后按该数据集的已知文件结构取训练文件
 train_file = PathJoinNode(
-    id="2",
-    base_path="/workspace/",
-    subpath="datasets/my_data/train.jsonl",  # 用户贴的相对路径 + preview 看到的文件名
+    id="3",
+    base_path=dataset.dataset_path,
+    subpath="self-cognition.jsonl",
 )
 
-# parquet / HF 目录需先转 JSONL
-train_jsonl = DatasetToJsonlNode(id="3", dataset_path=train_file.joined_path)
+# Download Dataset：可下载用户指定的远程数据集；这里是已知可直接使用的示例
+downloaded_dataset = DownloadAndCacheDataset(
+    id="4",
+    dataset_name="pyromind/easyhard-24k",
+    cache_dir="/workspace/datasets/pyromind/easyhard-24k",
+    download_source="huggingface",
+)
 ```
 
 ### 字段映射（三选一）
@@ -105,7 +116,7 @@ dataset_kind = DatasetConfigBuilderVisionNode(
 ```python
 dataset_config = DatasetConfigBuilderNode(
     id="5",
-    train_data_path=train_jsonl.jsonl_path,
+    train_data_path=train_file.joined_path,
     dataset_kind_config=dataset_kind.dataset_kind_config,
     # val_data_path=...,          # 可选：验证集
     # dataset_extra_config=...,   # 可选：max_seq_length 等
@@ -132,7 +143,7 @@ training_config = TrainingConfigBuilderNode(
     id="8",
     learning_rate=1e-4,           # 按 parameter-decision.md 决策
     batch_size=2,
-    grad_accum_steps=2,
+    grad_accum=2,
     num_epochs=1,
     save_steps=500,
     save_total_limit=3,
@@ -156,6 +167,8 @@ sft_train = ModelTrainSFTNode(
     accelerate_config=accelerate_config.accelerate_config,
     # wandb_config=...,           # 可选
     output_path="/workspace/output/sft/",
+    gpu_count=1,
+    gpu_product="NVIDIA-H100-NVL",
 )
 
 merge = ModelMergeLoraNode(
@@ -163,13 +176,21 @@ merge = ModelMergeLoraNode(
     model_path=model.model_path,
     lora_path=sft_train.model_output_path,
     output_path="/workspace/output/merged/",
+    gpu_count=1,
+    gpu_product="NVIDIA-H100-NVL",
 )
 ```
 
 ### 评测（bench）
 
 ```python
-infer = VLLMInference(id="12", model_path=model.model_path)
+infer = VLLMInference(
+    id="12",
+    model_path=model.model_path,
+    port=3000,
+    gpu_count=1,
+    gpu_product="NVIDIA-H100-NVL",
+)
 
 metrics = MetricsConfigBuilderNode(
     id="13",
@@ -182,6 +203,8 @@ metrics = MetricsConfigBuilderNode(
 evaluate = ModelEvalApiNode(
     id="14",
     endpoint=infer.endpoint,
+    endpoint_api_key="empty",
+    endpoint_model="default",
     output_path="/workspace/outputs/bench",
     dataset_config=dataset_config.dataset_config,
     metrics_config=metrics.metrics_config,

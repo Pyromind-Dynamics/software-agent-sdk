@@ -8,13 +8,32 @@ from pydantic import SecretStr
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.secret import StaticSecret
 from openhands.tools.pyromind_dataset.definition import (
+    _PREVIEW_DATASET_DESCRIPTION,
     PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
     PreviewDatasetAction,
     PreviewDatasetExecutor,
     UploadFileToPyromindAction,
     UploadFileToPyromindExecutor,
+    _with_cleaned_dataset_hint,
 )
+
+
+def test_preview_description_excludes_cleaned_dataset_identifiers() -> None:
+    assert "Do not" in _PREVIEW_DATASET_DESCRIPTION
+    assert "pyromind/self-cognition" in _PREVIEW_DATASET_DESCRIPTION
+    assert "must not be retried" in _PREVIEW_DATASET_DESCRIPTION
+    assert "uploaded the data" in _PREVIEW_DATASET_DESCRIPTION
+    assert "storage-relative path" in _PREVIEW_DATASET_DESCRIPTION
+
+
+def test_preview_404_hints_when_path_is_cleaned_dataset_identifier() -> None:
+    message = _with_cleaned_dataset_hint(
+        "Pyromind storage get_file_metadata API returned HTTP 404",
+        "pyromind/self-cognition",
+    )
+    assert "cleaned dataset identifier" in message
+    assert "do not retry" in message
 
 
 class _FakeWorkspace:
