@@ -19,8 +19,6 @@ from openhands.tools.utils import (
     _check_grep_available,
     _check_ripgrep_available,
     _log_ripgrep_fallback_warning,
-)
-from openhands.tools.utils.public_read_paths import (
     configured_public_read_roots,
     logical_public_read_path,
     resolve_public_read_alias,
