@@ -131,9 +131,6 @@ Knowledge base layout:
 - nodes/<NodeType>/<NodeType>.md: node parameters, I/O, and ports
 - dataset_processing_workflow.py: workflow DSL example
 
-The public examples directory is available through the read-only logical path
-`examples/`. Do not use `terminal` to discover or access either public path.
-
 Your current working directory is this conversation's private workspace:
 {working_dir}
 

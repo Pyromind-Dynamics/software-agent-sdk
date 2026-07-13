@@ -626,7 +626,7 @@ def _make_build_context(
             "Expected single folder in sdist"
         )
         tmp_root = entries[0].resolve()
-        for asset_name in ("knowledge", "examples"):
+        for asset_name in ("knowledge",):
             asset_source = sdk_project_root / asset_name
             if not asset_source.is_dir():
                 raise FileNotFoundError(
