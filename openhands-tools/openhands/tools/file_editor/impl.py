@@ -28,11 +28,16 @@ class FileEditorExecutor(ToolExecutor):
         self,
         workspace_root: str | None = None,
         allowed_edits_files: list[str] | None = None,
+        read_only_roots: list[str] | None = None,
     ):
         self.workspace_root = (
             Path(workspace_root).resolve() if workspace_root else Path.cwd().resolve()
         )
         self.editor: FileEditor = FileEditor(workspace_root=str(self.workspace_root))
+        self.read_only_editors = {
+            Path(root).resolve(): FileEditor(workspace_root=root)
+            for root in (read_only_roots or [])
+        }
         self.allowed_edits_files: set[Path] | None = (
             {Path(self.normalize_path(f)).resolve() for f in allowed_edits_files}
             if allowed_edits_files
@@ -91,7 +96,8 @@ class FileEditorExecutor(ToolExecutor):
 
         result: FileEditorObservation | None = None
         try:
-            result = self.editor(
+            editor = self._editor_for_view(normalized_path, action.command)
+            result = editor(
                 command=action.command,
                 path=normalized_path,
                 file_text=action.file_text,
@@ -108,6 +114,14 @@ class FileEditorExecutor(ToolExecutor):
         if not result.is_error and action.command != "view":
             self._mark_workflow_dirty_if_target(normalized_path, conversation)
         return result
+
+    def _editor_for_view(self, path: str, command: CommandLiteral) -> FileEditor:
+        if command == "view":
+            resolved = Path(path).resolve()
+            for root, editor in self.read_only_editors.items():
+                if resolved.is_relative_to(root):
+                    return editor
+        return self.editor
 
     def _mark_workflow_dirty_if_target(
         self,
