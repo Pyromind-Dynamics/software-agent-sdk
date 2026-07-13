@@ -626,6 +626,17 @@ def _make_build_context(
             "Expected single folder in sdist"
         )
         tmp_root = entries[0].resolve()
+        for asset_name in ("knowledge", "examples"):
+            asset_source = sdk_project_root / asset_name
+            if not asset_source.is_dir():
+                raise FileNotFoundError(
+                    f"Required Docker build asset directory not found: {asset_source}"
+                )
+            shutil.copytree(
+                asset_source,
+                tmp_root / asset_name,
+                dirs_exist_ok=True,
+            )
         # copy Dockerfile into place
         shutil.copy2(dockerfile_path, tmp_root / "Dockerfile")
         logger.debug(f"[build] Clean context ready at {tmp_root}")
