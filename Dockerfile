@@ -92,13 +92,16 @@ RUN groupadd -g ${GID} ${USERNAME} \
  && useradd -m -u ${UID} -g ${GID} -s /usr/sbin/nologin ${USERNAME}
 WORKDIR /sync
 COPY knowledge ./knowledge
+COPY examples ./examples
 RUN test -d knowledge/basic \
  && test -d knowledge/jupyterlab \
  && test -d knowledge/nodes \
  && test -d knowledge/sdk \
  && test -d knowledge/studio \
  && test -f knowledge/dataset_processing_workflow.py \
+ && test -d examples \
  && chown -R ${USERNAME}:${USERNAME} knowledge
+RUN chown -R ${USERNAME}:${USERNAME} examples
 
 ####################################################################################
 # Base image (minimal)
@@ -377,7 +380,9 @@ FROM base-image AS source
 ARG USERNAME
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server /agent-server
 COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
+COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/examples /agent-server/examples
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
+ENV PYROMIND_PUBLIC_READ_PATHS=/agent-server/examples
 ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
 ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "openhands.agent_server"]
 
@@ -385,7 +390,9 @@ FROM base-image-minimal AS source-minimal
 ARG USERNAME
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server /agent-server
 COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
+COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/examples /agent-server/examples
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
+ENV PYROMIND_PUBLIC_READ_PATHS=/agent-server/examples
 ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
 ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "openhands.agent_server"]
 
@@ -400,10 +407,12 @@ ARG USERNAME
 COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/openhands-agent-server /usr/local/bin/openhands-agent-server
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/.agents /agent-server/.agents
 COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
+COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/examples /agent-server/examples
 RUN chmod +x /usr/local/bin/openhands-agent-server
 # Fix library path to use system GCC libraries instead of bundled ones
 ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
+ENV PYROMIND_PUBLIC_READ_PATHS=/agent-server/examples
 ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
 ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]
 
@@ -412,9 +421,11 @@ ARG USERNAME
 COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/openhands-agent-server /usr/local/bin/openhands-agent-server
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/.agents /agent-server/.agents
 COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
+COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/examples /agent-server/examples
 RUN chmod +x /usr/local/bin/openhands-agent-server
 # Fix library path to use system GCC libraries instead of bundled ones
 ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
+ENV PYROMIND_PUBLIC_READ_PATHS=/agent-server/examples
 ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
 ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]
