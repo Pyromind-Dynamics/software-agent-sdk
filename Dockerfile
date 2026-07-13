@@ -91,17 +91,25 @@ ARG USERNAME UID GID
 RUN groupadd -g ${GID} ${USERNAME} \
  && useradd -m -u ${UID} -g ${GID} -s /usr/sbin/nologin ${USERNAME}
 WORKDIR /sync
-COPY knowledge ./knowledge
-COPY examples ./examples
-RUN test -d knowledge/basic \
- && test -d knowledge/jupyterlab \
- && test -d knowledge/nodes \
- && test -d knowledge/sdk \
- && test -d knowledge/studio \
- && test -f knowledge/dataset_processing_workflow.py \
- && test -d examples \
- && chown -R ${USERNAME}:${USERNAME} knowledge
-RUN chown -R ${USERNAME}:${USERNAME} examples
+COPY --chown=${USERNAME}:${USERNAME} knowledge ./knowledge
+COPY --chown=${USERNAME}:${USERNAME} examples ./examples
+RUN set -eux; \
+    for path in \
+        knowledge/basic \
+        knowledge/jupyterlab \
+        knowledge/nodes \
+        knowledge/sdk \
+        knowledge/studio \
+        examples; do \
+        test -d "$path" || { \
+            echo "Missing required build asset directory: $path" >&2; \
+            exit 1; \
+        }; \
+    done; \
+    test -f knowledge/dataset_processing_workflow.py || { \
+        echo "Missing required build asset file: knowledge/dataset_processing_workflow.py" >&2; \
+        exit 1; \
+    }
 
 ####################################################################################
 # Base image (minimal)
