@@ -23,6 +23,7 @@ from openhands.agent_server.pyromind_router import (
     PyromindCreateConversationRequest,
     PyromindLLMConfig,
     PyromindSendMessageRequest,
+    PyromindWorkflowRollbackRequest,
     _build_debug_context_headers,
     _build_pyromind_storage_tools,
     _build_workflow_validation_tool,
@@ -30,11 +31,16 @@ from openhands.agent_server.pyromind_router import (
     _workflow_dsl_from_xyflow,
     apply_pyromind_validation_context,
     create_pyromind_conversation,
+    rollback_pyromind_workflow_at_event,
     send_pyromind_message,
 )
+from openhands.agent_server.workflow_canvas_models import (
+    SaveWorkflowCanvasEventSnapshotRequest,
+)
+from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
 from openhands.sdk.conversation.request import StartConversationRequest
 from openhands.sdk.conversation.state import ConversationExecutionStatus
-from openhands.sdk.llm.message import Message
+from openhands.sdk.llm.message import Message, TextContent
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
     UploadFileToPyromindTool,
@@ -115,8 +121,19 @@ class _FakeInitialMessageEventService:
 
 
 class _FakeEventService:
-    def __init__(self, tags: dict[str, str]) -> None:
-        self.stored = type("FakeStoredConversation", (), {"tags": tags})()
+    def __init__(
+        self,
+        tags: dict[str, str],
+        conversation_id: UUID | None = None,
+    ) -> None:
+        self.stored = type(
+            "FakeStoredConversation",
+            (),
+            {
+                "id": conversation_id or UUID("00000000-0000-0000-0000-000000000001"),
+                "tags": tags,
+            },
+        )()
         self.secrets: dict[str, str] = {}
         self.agent_state: dict[str, object] = {}
 
@@ -128,8 +145,15 @@ class _FakeEventService:
 
 
 class _FakePyromindMessageEventService(_FakeEventService):
-    def __init__(self, tags: dict[str, str], working_dir: Path) -> None:
-        super().__init__(tags)
+    def __init__(
+        self,
+        tags: dict[str, str],
+        working_dir: Path,
+        conversation_id: UUID | None = None,
+        conversation_dir: Path | None = None,
+    ) -> None:
+        super().__init__(tags, conversation_id)
+        self.conversation_dir = conversation_dir or working_dir / "conversation"
         self.sent_message: Message | None = None
         self.run: bool | None = None
         self.workflow_dsl_snapshot: str | None = None
@@ -416,6 +440,98 @@ async def test_pyromind_message_refreshes_storage_auth_context(tmp_path):
     }
     assert service.sent_message is not None
     assert service.run is True
+
+
+@pytest.mark.asyncio
+async def test_pyromind_workflow_rollback_restores_snapshot_and_sends_correction(
+    tmp_path,
+):
+    conversation_id = UUID("00000000-0000-0000-0000-000000000123")
+    conversation_dir = tmp_path / "conversation"
+    working_dir = tmp_path / "workspace"
+    working_dir.mkdir()
+    workflow_path = working_dir / "workflow.py"
+    workflow_path.write_text("# workflow: current\nstep = 2\n", encoding="utf-8")
+    service = _FakePyromindMessageEventService(
+        {PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
+        working_dir,
+        conversation_id=conversation_id,
+        conversation_dir=conversation_dir,
+    )
+    xyflow = {"name": "Rollback", "nodes": [{"id": "n1"}], "edges": []}
+    FileWorkflowCanvasStore(conversation_dir, conversation_id.hex).save_event_snapshot(
+        SaveWorkflowCanvasEventSnapshotRequest(
+            eventId="event-rollback",
+            snapshotRole="out",
+            workflowDslData="# workflow: rollback\nstep = 1\n",
+            workflowXyflowData=xyflow,
+            summary="rollback target",
+            createdBy="test",
+        )
+    )
+
+    result = await rollback_pyromind_workflow_at_event(
+        _make_request(),
+        conversation_id,
+        PyromindWorkflowRollbackRequest(eventId="event-rollback"),
+        event_service=cast(EventService, service),
+    )
+
+    assert workflow_path.read_text(encoding="utf-8") == (
+        "# workflow: rollback\nstep = 1\n"
+    )
+    assert service.sent_message is not None
+    assert service.sent_message.role == "user"
+    assert service.sent_message.content == []
+    assert service.extended_content is not None
+    first_content = service.extended_content[0]
+    assert isinstance(first_content, TextContent)
+    correction_text = first_content.text
+    assert "Workflow rollback applied by the user" in correction_text
+    assert "event-rollback" in correction_text
+    assert service.run is False
+    assert service.workflow_dsl_snapshot == "# workflow: rollback\nstep = 1\n"
+    assert service.workflow_xyflow_snapshot == xyflow
+    assert result.conversation_id == conversation_id
+    assert result.rolled_back_to_event_id == "event-rollback"
+    assert result.workflow_version_id == "v000001"
+    assert result.snapshot_role == "out"
+    assert result.workflow_file_action == "updated"
+    assert result.snapshot is not None
+    assert result.snapshot.workflow_dsl_data == "# workflow: rollback\nstep = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_pyromind_workflow_rollback_returns_null_when_snapshot_is_missing(
+    tmp_path,
+):
+    conversation_id = UUID("00000000-0000-0000-0000-000000000123")
+    working_dir = tmp_path / "workspace"
+    working_dir.mkdir()
+    workflow_path = working_dir / "workflow.py"
+    current_workflow = "# workflow: current\nstep = 2\n"
+    workflow_path.write_text(current_workflow, encoding="utf-8")
+    service = _FakePyromindMessageEventService(
+        {PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
+        working_dir,
+        conversation_id=conversation_id,
+        conversation_dir=tmp_path / "conversation",
+    )
+
+    result = await rollback_pyromind_workflow_at_event(
+        _make_request(),
+        conversation_id,
+        PyromindWorkflowRollbackRequest(eventId="event-without-snapshot"),
+        event_service=cast(EventService, service),
+    )
+
+    assert result.snapshot is None
+    assert result.rolled_back_to_event_id is None
+    assert result.workflow_version_id is None
+    assert result.workflow_file_action is None
+    assert result.model_dump(mode="json", by_alias=True)["snapshot"] is None
+    assert workflow_path.read_text(encoding="utf-8") == current_workflow
+    assert service.sent_message is None
 
 
 def test_validation_cookie_header_keeps_full_cookie_in_prod(monkeypatch):

@@ -336,6 +336,90 @@ async def test_fork_conversation_at_event_creates_rollback_branch(
 
 
 @pytest.mark.asyncio
+async def test_fork_conversation_at_event_accepts_input_snapshot(
+    conversation_service,
+    tmp_path,
+):
+    source_id = uuid4()
+    source_workspace = tmp_path / "source-workspace"
+    source_workspace.mkdir()
+    request = StartConversationRequest(
+        conversation_id=source_id,
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=LocalWorkspace(working_dir=str(source_workspace)),
+        confirmation_policy=NeverConfirm(),
+        tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
+    )
+    source_info, _ = await conversation_service.start_conversation(request)
+    source_service = await conversation_service.get_event_service(source_info.id)
+    assert source_service is not None
+
+    workflow_path = source_workspace / "workflow.py"
+    input_workflow = "# workflow: user-input\nstep = 1\n"
+    output_workflow = "# workflow: agent-output\nstep = 2\n"
+    workflow_path.write_text(output_workflow, encoding="utf-8")
+    events = [
+        _test_message_event("00000000-0000-0000-0000-000000000201", "change it"),
+        _test_workflow_event(
+            "00000000-0000-0000-0000-000000000202",
+            output_workflow,
+            workflow_path,
+        ),
+    ]
+    state = await source_service.get_state()
+    callback = state._on_state_change
+    state._on_state_change = None
+    try:
+        with state:
+            for event in events:
+                state.events.append(event)
+            state.last_user_message_id = events[0].id
+            state.rebuild_view()
+    finally:
+        state._on_state_change = callback
+
+    source_store = FileWorkflowCanvasStore(
+        conversation_dir=source_service.conversation_dir,
+        session_id=source_info.id.hex,
+    )
+    source_store.save_event_snapshot(
+        SaveWorkflowCanvasEventSnapshotRequest(
+            eventId=events[0].id,
+            snapshotRole="in",
+            workflowDslData=input_workflow,
+            createdBy="test",
+        )
+    )
+
+    (
+        fork_info,
+        workflow_version_id,
+    ) = await conversation_service.fork_conversation_at_event(
+        source_info.id,
+        event_id=events[0].id,
+        title="input branch",
+    )
+
+    assert workflow_version_id == "v000001"
+    fork_service = await conversation_service.get_event_service(fork_info.id)
+    assert fork_service is not None
+    fork_events = (await fork_service.search_events(limit=10)).items
+    assert [event.id for event in fork_events] == [events[0].id]
+    fork_state = await fork_service.get_state()
+    assert fork_state.last_user_message_id == events[0].id
+    fork_workflow_path = Path(fork_info.workspace.working_dir) / "workflow.py"
+    assert fork_workflow_path.read_text(encoding="utf-8") == input_workflow
+
+    fork_store = FileWorkflowCanvasStore(
+        conversation_dir=fork_service.conversation_dir,
+        session_id=fork_info.id.hex,
+    )
+    fork_snapshot = fork_store.get_event_snapshot(events[0].id)
+    assert fork_snapshot.snapshot_role == "in"
+    assert fork_snapshot.workflow_dsl_data == input_workflow
+
+
+@pytest.mark.asyncio
 async def test_start_conversation_registers_and_injects_client_tools(
     conversation_service, tmp_path
 ):

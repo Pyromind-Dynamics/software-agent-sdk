@@ -41,6 +41,13 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
     PYROMIND_APP_TAG_VALUE,
 )
+from openhands.agent_server.workflow_canvas_models import WorkflowCanvasEventSnapshot
+from openhands.agent_server.workflow_canvas_store import (
+    FileWorkflowCanvasStore,
+    WorkflowCanvasEventSnapshotNotFoundError,
+    WorkflowCanvasStoreError,
+    WorkflowCanvasVersionNotFoundError,
+)
 from openhands.sdk import LLM, AgentContext, TextContent, Tool
 from openhands.sdk.conversation.request import (
     StartConversationRequest,
@@ -403,7 +410,7 @@ class PyromindForkAtEventRequest(BaseModel):
     event_id: str = Field(
         alias="eventId",
         min_length=1,
-        description="Workflow output event id to branch from.",
+        description="Workflow snapshot event id to branch from.",
     )
     title: str | None = Field(
         default=None,
@@ -420,6 +427,45 @@ class PyromindForkAtEventResponse(BaseModel):
     forked_at_event_id: str = Field(alias="forkedAtEventId")
     workflow_version_id: str = Field(alias="workflowVersionId")
     conversation: ConversationInfo
+
+    model_config = {"populate_by_name": True}
+
+
+class PyromindWorkflowRollbackRequest(BaseModel):
+    event_id: str = Field(
+        alias="eventId",
+        min_length=1,
+        description="Workflow snapshot event id to restore.",
+    )
+    run: bool = Field(
+        default=False,
+        description="Whether the agent loop should run after the correction context.",
+    )
+    message: str | None = Field(
+        default=None,
+        max_length=2000,
+        description=(
+            "Optional correction message to append after applying the snapshot."
+        ),
+    )
+
+    model_config = {"populate_by_name": True, "extra": "forbid"}
+
+
+class PyromindWorkflowRollbackResponse(BaseModel):
+    conversation_id: UUID = Field(alias="conversationId")
+    rolled_back_to_event_id: str | None = Field(
+        default=None, alias="rolledBackToEventId"
+    )
+    workflow_version_id: str | None = Field(default=None, alias="workflowVersionId")
+    snapshot_role: Literal["in", "out"] | None = Field(
+        default=None, alias="snapshotRole"
+    )
+    workflow_file_action: Literal["updated", "removed"] | None = Field(
+        default=None, alias="workflowFileAction"
+    )
+    correction_message: str | None = Field(default=None, alias="correctionMessage")
+    snapshot: WorkflowCanvasEventSnapshot | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -527,6 +573,45 @@ def _sync_workflow_with_canvas(
             "</system_reminder>"
         )
     return TextContent(text=reminder_text)
+
+
+def _workflow_canvas_store(event_service: EventService) -> FileWorkflowCanvasStore:
+    return FileWorkflowCanvasStore(
+        conversation_dir=event_service.conversation_dir,
+        session_id=event_service.stored.id.hex,
+    )
+
+
+def _apply_workflow_snapshot_to_workspace(
+    working_dir: Path,
+    workflow_dsl: str,
+) -> Literal["updated", "removed"]:
+    workflow_path = working_dir / "workflow.py"
+    if not _normalize_dsl(workflow_dsl):
+        workflow_path.unlink(missing_ok=True)
+        return "removed"
+
+    working_dir.mkdir(parents=True, exist_ok=True)
+    workflow_path.write_text(workflow_dsl, encoding="utf-8")
+    return "updated"
+
+
+def _workflow_rollback_correction_message(
+    snapshot: WorkflowCanvasEventSnapshot,
+    workflow_file_action: Literal["updated", "removed"],
+) -> str:
+    workflow_state = (
+        "workflow.py has been removed because the restored snapshot is empty"
+        if workflow_file_action == "removed"
+        else "workflow.py has been overwritten with the restored snapshot"
+    )
+    return (
+        "Workflow rollback applied by the user. "
+        f"Restored event {snapshot.event_id} "
+        f"({snapshot.snapshot_role} snapshot, version {snapshot.version_id}). "
+        f"{workflow_state}. Treat the current workflow.py state as authoritative "
+        "and ignore workflow state from before this correction."
+    )
 
 
 class PyromindDebugUrlRequest(BaseModel):
@@ -821,6 +906,67 @@ async def send_pyromind_message(
         workflow_xyflow_snapshot=request.workflow_xyflow,
     )
     return Success()
+
+
+@pyromind_router.post(
+    "/conversations/{conversation_id}/rollback-workflow-at-event",
+    response_model=PyromindWorkflowRollbackResponse,
+    response_model_by_alias=True,
+    responses={409: {"description": "Workflow snapshot state is inconsistent"}},
+)
+async def rollback_pyromind_workflow_at_event(
+    http_request: Request,
+    conversation_id: UUID,
+    request: PyromindWorkflowRollbackRequest,
+    event_service: EventService = Depends(get_event_service),
+) -> PyromindWorkflowRollbackResponse:
+    """Restore a workflow snapshot when the event has one."""
+    current_user = getattr(http_request.state, "current_user", None)
+    if isinstance(current_user, CurrentLoginUser):
+        await apply_pyromind_validation_context(event_service, current_user)
+
+    try:
+        snapshot = _workflow_canvas_store(event_service).get_event_snapshot(
+            request.event_id
+        )
+    except WorkflowCanvasEventSnapshotNotFoundError:
+        return PyromindWorkflowRollbackResponse(
+            conversationId=conversation_id,
+            snapshot=None,
+        )
+    except WorkflowCanvasVersionNotFoundError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except WorkflowCanvasStoreError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    conversation = event_service.get_conversation()
+    working_dir = Path(conversation.workspace.working_dir)
+    workflow_file_action = _apply_workflow_snapshot_to_workspace(
+        working_dir,
+        snapshot.workflow_dsl_data,
+    )
+    correction_message = request.message or _workflow_rollback_correction_message(
+        snapshot,
+        workflow_file_action,
+    )
+
+    await event_service.send_message(
+        Message(role="user", content=[]),
+        run=request.run,
+        extended_content=[TextContent(text=correction_message)],
+        workflow_dsl_snapshot=snapshot.workflow_dsl_data,
+        workflow_xyflow_snapshot=snapshot.workflow_xyflow_data,
+    )
+
+    return PyromindWorkflowRollbackResponse(
+        conversationId=conversation_id,
+        rolledBackToEventId=snapshot.event_id,
+        workflowVersionId=snapshot.version_id,
+        snapshotRole=snapshot.snapshot_role,
+        workflowFileAction=workflow_file_action,
+        correctionMessage=correction_message,
+        snapshot=snapshot,
+    )
 
 
 @pyromind_router.post(

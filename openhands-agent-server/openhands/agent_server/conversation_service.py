@@ -1181,10 +1181,6 @@ class ConversationService:
             raise ConversationForkAtEventTargetNotFoundError(
                 f"Workflow snapshot not found for event: {event_id}"
             ) from exc
-        if target_snapshot.snapshot_role != "out":
-            raise ConversationForkAtEventConflictError(
-                "Only workflow output events can be used as fork checkpoints"
-            )
 
         fork_id = uuid4()
         fork_workspace = LocalWorkspace(
