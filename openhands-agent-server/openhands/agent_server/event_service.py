@@ -76,6 +76,10 @@ from openhands.sdk.security.confirmation_policy import ConfirmationPolicyBase
 from openhands.sdk.utils.async_utils import AsyncCallbackWrapper
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
+from openhands.sdk.workspace.base import (
+    PERSIST_WORKSPACE_PATH_CONTEXT,
+    REDACTED_WORKSPACE_PATH,
+)
 from openhands.tools.workflow.definition import (
     PYROMIND_WORKFLOW_DIRTY_KEY,
     PYROMIND_WORKFLOW_EMITTED_KEY,
@@ -196,6 +200,7 @@ class EventService:
                     self.stored.model_dump_json(
                         context={
                             "cipher": self.cipher,
+                            PERSIST_WORKSPACE_PATH_CONTEXT: True,
                         }
                     )
                 ),
@@ -931,6 +936,11 @@ class EventService:
         workspace = self.stored.workspace
         assert isinstance(workspace, LocalWorkspace)
         working_dir = Path(workspace.working_dir)
+        if workspace.working_dir == REDACTED_WORKSPACE_PATH:
+            working_dir = self.conversation_dir
+            workspace = workspace.model_copy(update={"working_dir": str(working_dir)})
+            self.stored = self.stored.model_copy(update={"workspace": workspace})
+            await self.save_meta()
         working_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_workspace_is_git_repo(working_dir)
         if self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE:

@@ -13,7 +13,8 @@ from openhands.sdk.workspace.models import CommandResult, FileOperationResult
 logger = get_logger(__name__)
 
 
-_REDACTED_WORKSPACE_PATH = "<REDACTED_WORKSPACE_PATH>"
+REDACTED_WORKSPACE_PATH = "<REDACTED_WORKSPACE_PATH>"
+PERSIST_WORKSPACE_PATH_CONTEXT = "persist_workspace_path"
 
 
 def _convert_path_to_str(v: str | Path) -> str:
@@ -51,9 +52,11 @@ class BaseWorkspace(DiscriminatedUnionMixin, ABC):
     ]
 
     @field_serializer("working_dir")
-    def _serialize_working_dir(self, _value: str, _info: Any) -> str:
-        """Redact the host-absolute working directory from persisted state."""
-        return _REDACTED_WORKSPACE_PATH
+    def _serialize_working_dir(self, value: str, info: Any) -> str:
+        """Redact host paths unless serializing internal runtime state."""
+        if info.context and info.context.get(PERSIST_WORKSPACE_PATH_CONTEXT):
+            return value
+        return REDACTED_WORKSPACE_PATH
 
     def __enter__(self) -> "BaseWorkspace":
         """Enter the workspace context.

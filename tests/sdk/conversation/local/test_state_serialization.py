@@ -147,6 +147,12 @@ def test_persisted_state_redacts_local_project_paths():
     # Single-segment relative paths should survive redaction.
     assert "/basic/" in serialized
 
+    persisted = state.model_dump_json(
+        exclude_none=True,
+        context={"persist_workspace_path": True},
+    )
+    assert sensitive_path in persisted
+
 
 def test_conversation_state_persistence_save_load():
     """Test ConversationState persistence with FileStore."""
