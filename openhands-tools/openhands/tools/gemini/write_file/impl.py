@@ -1,10 +1,10 @@
 """Write file tool executor implementation."""
 
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from openhands.sdk.tool import ToolExecutor
+from openhands.sdk.utils.path import resolve_workspace_path
 from openhands.tools.gemini.write_file.definition import (
     WriteFileAction,
     WriteFileObservation,
@@ -44,11 +44,14 @@ class WriteFileExecutor(ToolExecutor[WriteFileAction, WriteFileObservation]):
         file_path = action.file_path
         content = action.content
 
-        # Resolve path relative to workspace
-        if not os.path.isabs(file_path):
-            resolved_path = self.workspace_root / file_path
-        else:
-            resolved_path = Path(file_path)
+        try:
+            resolved_path = resolve_workspace_path(file_path, self.workspace_root)
+        except ValueError as exc:
+            return WriteFileObservation.from_text(
+                text=f"Error: {exc}",
+                is_error=True,
+                file_path=file_path,
+            )
 
         # Check if path is a directory
         if resolved_path.exists() and resolved_path.is_dir():

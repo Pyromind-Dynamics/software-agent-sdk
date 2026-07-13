@@ -49,6 +49,9 @@ from openhands.sdk.utils.path import to_posix_path
 logger = get_logger(__name__)
 
 
+_REDACTED_SKILL_PATH = "<REDACTED_SKILL_PATH>"
+
+
 class SkillInfo(BaseModel):
     """Lightweight representation of a skill's essential information.
 
@@ -107,6 +110,11 @@ class SkillResources(BaseModel):
         """Get the assets directory path if it exists."""
         assets_dir = Path(self.skill_root) / "assets"
         return assets_dir if assets_dir.is_dir() else None
+
+    @field_serializer("skill_root")
+    def _serialize_skill_root(self, _value: str, _info: SerializationInfo) -> str:
+        """Redact the host-absolute skill root from persisted state."""
+        return _REDACTED_SKILL_PATH
 
 
 # Union type for all trigger types
@@ -294,6 +302,20 @@ class Skill(BaseModel):
         from openhands.sdk.settings.model import serialize_mcp_config
 
         return serialize_mcp_config(MCPConfig.model_validate(value), info)
+
+    @field_serializer("source")
+    def _serialize_source(
+        self, value: str | None, _info: SerializationInfo
+    ) -> str | None:
+        """Redact host-absolute source paths from persisted state.
+
+        Relative source paths (e.g. test fixtures) are preserved.
+        """
+        if value is None:
+            return None
+        if Path(value).is_absolute():
+            return _REDACTED_SKILL_PATH
+        return value
 
     PATH_TO_THIRD_PARTY_SKILL_NAME: ClassVar[dict[str, str]] = {
         ".cursorrules": "cursorrules",

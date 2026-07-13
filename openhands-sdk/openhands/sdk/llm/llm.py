@@ -17,9 +17,11 @@ from pydantic import (
     Field,
     PrivateAttr,
     SecretStr,
+    SerializationInfo,
     computed_field,
     field_serializer,
     field_validator,
+    model_serializer,
     model_validator,
 )
 from pydantic.json_schema import SkipJsonSchema
@@ -271,6 +273,13 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         default=None,
         description="Custom base URL.",
         json_schema_extra=field_meta(SettingProminence.MAJOR),
+    )
+    persist_runtime_config: SkipJsonSchema[bool] = Field(
+        default=True,
+        exclude=True,
+        description=(
+            "Whether runtime connection fields should be serialized with this LLM."
+        ),
     )
     api_version: str | None = Field(
         default=None,
@@ -706,6 +715,20 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     @field_serializer(*LLM_SECRET_FIELDS, when_used="always")
     def _serialize_secrets(self, v: SecretStr | None, info):
         return serialize_secret(v, info)
+
+    @model_serializer(mode="wrap")
+    def _serialize_with_runtime_config_policy(self, handler, info: SerializationInfo):
+        result = handler(self)
+        if self.persist_runtime_config:
+            return result
+        expose_secrets = info.context.get("expose_secrets") if info.context else None
+        if expose_secrets is True or expose_secrets == "plaintext":
+            return result
+
+        result.pop("api_key", None)
+        result.pop("base_url", None)
+        result.pop("extra_headers", None)
+        return result
 
     # =========================================================================
     # Public API

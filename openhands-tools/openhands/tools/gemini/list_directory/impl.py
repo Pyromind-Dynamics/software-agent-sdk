@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from openhands.sdk.tool import ToolExecutor
+from openhands.sdk.utils.path import resolve_workspace_path
 from openhands.tools.gemini.list_directory.definition import (
     MAX_ENTRIES,
     FileEntry,
@@ -29,7 +30,7 @@ class ListDirectoryExecutor(
         Args:
             workspace_root: Root directory for file operations
         """
-        self.workspace_root = Path(workspace_root)
+        self.workspace_root = Path(workspace_root).resolve()
 
     def __call__(
         self,
@@ -49,11 +50,13 @@ class ListDirectoryExecutor(
         dir_path = action.dir_path
         recursive = action.recursive
 
-        # Resolve path relative to workspace
-        if not os.path.isabs(dir_path):
-            resolved_path = self.workspace_root / dir_path
-        else:
-            resolved_path = Path(dir_path)
+        try:
+            resolved_path = resolve_workspace_path(dir_path, self.workspace_root)
+        except ValueError as exc:
+            return ListDirectoryObservation.from_text(
+                is_error=True,
+                text=f"Error: {exc}",
+            )
 
         # Check if directory exists
         if not resolved_path.exists():

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from openhands.sdk.logger import get_logger
 from openhands.sdk.tool import ToolExecutor
 from openhands.sdk.utils import sanitized_env
+from openhands.sdk.utils.path import resolve_workspace_path
 
 
 if TYPE_CHECKING:
@@ -64,7 +65,7 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
         """Execute grep content search using the best available backend."""
         try:
             if action.path:
-                search_path = Path(action.path).resolve()
+                search_path = resolve_workspace_path(action.path, self.working_dir)
                 if not search_path.is_dir():
                     return GrepObservation.from_text(
                         text=f"Search path '{action.path}' is not a valid directory",
@@ -122,9 +123,7 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
         truncated: bool,
     ) -> str:
         """Format the grep observation output message."""
-        include_info = (
-            f" (filtered by '{include_pattern}')" if include_pattern else ""
-        )
+        include_info = f" (filtered by '{include_pattern}')" if include_pattern else ""
         if not matches:
             return (
                 f"No matches found for pattern '{pattern}' "

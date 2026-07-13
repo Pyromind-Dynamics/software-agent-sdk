@@ -1417,6 +1417,7 @@ class ConversationService:
 
     async def __aenter__(self):
         self.conversations_dir.mkdir(parents=True, exist_ok=True)
+        self.conversations_dir.chmod(0o700)
         self._run_executor = ThreadPoolExecutor(
             max_workers=self.max_concurrent_runs,
             thread_name_prefix="conversation-run",
