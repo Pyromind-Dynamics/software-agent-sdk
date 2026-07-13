@@ -236,11 +236,12 @@ storage API and returns:
 - configurable sampling with `sample_strategy`: `head`, `tail`, `random`, or
   `stratified`
 
-Call this BEFORE generating any training workflow that uses a user-provided
-dataset, so you can determine the data format (SFT messages / prompt-response
-/ DPO chosen-rejected / GRPO prompt-only), pick the right dataset config
-builder node, and fill in field-mapping parameters from real field names
-instead of guessing.
+Use this only to inspect an actual file or directory uploaded to Pyromind
+storage. A slash in the value is not enough to classify it: when the user says
+they uploaded the data and pasted a storage-relative path, preview that exact
+path. Do not use this tool for values identified as Clone Dataset or Download
+Dataset IDs, such as `pyromind/self-cognition` or `pyromind/easyhard-24k`; those
+are not storage paths, so a storage 404 must not be retried with path variants.
 
 Sample content is saved under the current conversation directory's
 `preview_dataset/` folder, next to `workflow_canvas/`. Large files are sampled
@@ -411,7 +412,7 @@ class PreviewDatasetExecutor(
         payload_result = self._post_json("get_file_metadata", {"path": path}, headers)
         if isinstance(payload_result, str):
             return PreviewDatasetObservation.from_text(
-                text=payload_result,
+                text=_with_cleaned_dataset_hint(payload_result, path),
                 is_error=True,
                 dataset_path=path,
             )
@@ -995,6 +996,16 @@ def _decode_json_response(
     if not isinstance(payload, dict):
         return f"{api_name} returned a non-object JSON payload."
     return payload
+
+
+def _with_cleaned_dataset_hint(message: str, dataset_path: str) -> str:
+    if "HTTP 404" not in message or not dataset_path.startswith("pyromind/"):
+        return message
+    return (
+        f"{message} This looks like a cleaned dataset identifier for Clone Dataset "
+        "or Download Dataset, not a Pyromind storage path; use it directly in the "
+        "workflow and do not retry preview_dataset with path variants."
+    )
 
 
 def _extract_api_data(api_name: str, payload: dict[str, Any]) -> dict[str, Any] | str:
