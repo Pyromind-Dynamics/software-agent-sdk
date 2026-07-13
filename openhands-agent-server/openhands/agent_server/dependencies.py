@@ -1,4 +1,5 @@
 from collections.abc import Mapping
+from typing import Any
 from uuid import UUID
 
 from fastapi import Depends, HTTPException, Request, status
@@ -15,6 +16,7 @@ from openhands.agent_server.pyromind_auth import (
     add_request_context_to_user,
     get_current_login_user_from_token,
     get_dev_login_user_from_headers,
+    parse_auth_token_from_cookie_header,
 )
 
 
@@ -52,9 +54,22 @@ def get_pyromind_jwt_token(
 
 
 def get_pyromind_jwt_token_from_request(request: Request) -> str | None:
-    return get_pyromind_jwt_token(
+    return resolve_pyromind_auth_token(
         cookies=request.cookies,
+        cookie_header=request.headers.get("cookie"),
     )
+
+
+def resolve_pyromind_auth_token(
+    *,
+    cookies: Mapping[str, str] | None = None,
+    cookie_header: str | None = None,
+) -> str | None:
+    """Resolve the Pyromind JWT from parsed cookies or a raw Cookie header."""
+    if cookies:
+        if token := get_pyromind_jwt_token(cookies=cookies):
+            return token
+    return parse_auth_token_from_cookie_header(cookie_header)
 
 
 def verify_pyromind_jwt_token(
@@ -70,6 +85,7 @@ def authenticate_request(request: Request, session_api_key: str | None) -> None:
     config: Config = request.app.state.config
 
     dev_user = get_dev_login_user_from_headers(request.headers)
+
     if dev_user is not None:
         request.state.auth_method = "pyromind_dev"
         request.state.current_user = dev_user
@@ -90,8 +106,50 @@ def authenticate_request(request: Request, session_api_key: str | None) -> None:
 
     if not is_auth_configured(config):
         return
-
     raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=LOGIN_REQUIRED_DETAIL)
+
+
+def load_base_env(request: Request):
+    def _parse_env_from_x_cluster(_x_cluster: str | None) -> str | None:
+        _DEFAULT_ENV = "prod"
+        if not _x_cluster:
+            return _DEFAULT_ENV
+        if "#" not in _x_cluster:
+            return _DEFAULT_ENV
+        env = _x_cluster.rsplit("#", 1)[-1].strip().lower()
+        ## 这里返回的env 可能是pre 也可能是pre2
+        return env or _DEFAULT_ENV
+
+    def _resolve_cluster_from_conversation(_x_cluster: str | None) -> str:
+        """
+        根据 x-cluster 头解析集群信息
+        x_cluster 可能的值： us-west-1 us-west-2 us-west-1#pre us-west-1#pre2 us-west-2#pre us-west-2#pre2
+        """
+        if _x_cluster and "#" in _x_cluster:
+            region = _x_cluster.split("#", 1)[0].strip()
+            if region:
+                return region
+        if _x_cluster:
+            return _x_cluster
+        raise ValueError(f"Can't resolve cluster from x-cluster: {_x_cluster}.")
+
+    if x_cluster := _get_validation_cluster_header(request):
+        request.state.env = _parse_env_from_x_cluster(x_cluster)
+        request.state.cluster = _resolve_cluster_from_conversation(x_cluster)
+
+
+def _get_validation_cluster_header(
+    http_request: Request,
+    extra: dict[str, Any] = {},
+) -> str | None:
+    current_user = getattr(http_request.state, "current_user", None)
+    if isinstance(current_user, CurrentLoginUser) and current_user.x_cluster:
+        return current_user.x_cluster
+    if extra:
+        cluster = extra.get("x_cluster", extra.get("x-cluster"))
+        if cluster and isinstance(cluster, str):
+            return cluster
+    return http_request.headers.get("x-cluster")
 
 
 def get_current_user_id(request: Request) -> str | None:
@@ -112,6 +170,8 @@ def check_session_api_key(
     without restarting the server or re-registering routes.
     """
     authenticate_request(request, session_api_key)
+    ## 加载环境信息
+    load_base_env(request)
 
 
 def check_workspace_session(

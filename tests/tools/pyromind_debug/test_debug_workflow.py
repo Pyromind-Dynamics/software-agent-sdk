@@ -13,8 +13,6 @@ from typing import cast
 import pytest
 
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
-from openhands.sdk.tool.registry import resolve_tool
-from openhands.sdk.tool.spec import Tool
 from openhands.tools.pyromind_debug.broker import (
     DebugResultBroker,
     get_debug_result_broker,
@@ -184,21 +182,12 @@ def test_passes_immediately_when_no_failures_configured(
     assert obs.status == "passed"
 
 
-def test_registered_tool_resolves_and_runs_fail_fail_pass_loop(
-    tmp_path, monkeypatch, webhook_base_url
-):
-    """Full wiring check: registry.resolve_tool(Tool(name="debug_workflow")) ->
-    ToolDefinition.create() -> real executor -> real MockDebugPlatform timer
-    thread -> a genuine HTTP callback into the live webhook route ->
-    DebugResultBroker. This is what the agent loop actually does when the
-    LLM calls the debug_workflow tool; everything above this test drives
-    DebugWorkflowExecutor directly and skips the registry/tool layer (and/or
-    the real HTTP hop).
+def test_tool_create_runs_fail_fail_pass_loop(tmp_path, monkeypatch, webhook_base_url):
+    """DebugWorkflowTool.create() -> executor -> MockDebugPlatform -> webhook.
+
+    Exercises the legacy debug_workflow implementation directly (registry
+    registration is disabled; production uses run_workflow(test_mode=True)).
     """
-    # MockDebugPlatform() (created inside DebugWorkflowTool.create with no
-    # platform override) falls back to these module-level defaults, which
-    # are read from env vars once at import time -- so patch the already
-    # imported constants directly rather than the env vars.
     import openhands.tools.pyromind_debug.mock_platform as mock_platform_module
 
     monkeypatch.setattr(mock_platform_module, "DEFAULT_DELAY_SECONDS", 0.05)
@@ -209,7 +198,7 @@ def test_registered_tool_resolves_and_runs_fail_fail_pass_loop(
     _write_workflow(tmp_path)
     conversation = _fake_conversation(tmp_path)
 
-    tools = resolve_tool(Tool(name=DebugWorkflowTool.name), conv_state=None)
+    tools = DebugWorkflowTool.create(callback_base_url=webhook_base_url)
     assert len(tools) == 1
     tool = tools[0]
     assert tool.executor is not None

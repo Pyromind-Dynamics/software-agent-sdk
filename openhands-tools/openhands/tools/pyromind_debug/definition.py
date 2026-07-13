@@ -109,7 +109,7 @@ class DebugWorkflowTool(ToolDefinition[DebugWorkflowAction, DebugWorkflowObserva
     @classmethod
     def create(
         cls,
-        conv_state: "ConversationState | None" = None,
+        conv_state: ConversationState | None = None,
         **params,
     ) -> Sequence[ToolDefinition]:
         from openhands.tools.pyromind_debug.impl import DebugWorkflowExecutor
@@ -144,4 +144,9 @@ class DebugWorkflowTool(ToolDefinition[DebugWorkflowAction, DebugWorkflowObserva
         ]
 
 
-register_tool(DebugWorkflowTool.name, DebugWorkflowTool)
+# Disabled by default — workflow test/debug uses run_workflow(test_mode=True).
+# Set OH_ENABLE_DEBUG_WORKFLOW_TOOL=1 to re-enable legacy registration.
+_DEBUG_WORKFLOW_TOOL_ENABLED = False
+
+if _DEBUG_WORKFLOW_TOOL_ENABLED:
+    register_tool(DebugWorkflowTool.name, DebugWorkflowTool)

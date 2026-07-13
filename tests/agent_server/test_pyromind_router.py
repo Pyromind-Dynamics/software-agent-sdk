@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from starlette.requests import Request
 
 from openhands.agent_server.conversation_service import ConversationService
+from openhands.agent_server.dependencies import load_base_env
 from openhands.agent_server.event_service import EventService
 from openhands.agent_server.models import ConversationInfo
 from openhands.agent_server.pyromind_auth import (
@@ -20,12 +21,14 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_VALUE,
 )
 from openhands.agent_server.pyromind_router import (
+    PYROMIND_AUTH_TOKEN_SECRET,
     PyromindCreateConversationRequest,
     PyromindLLMConfig,
     PyromindSendMessageRequest,
     PyromindWorkflowRollbackRequest,
     _build_debug_context_headers,
     _build_pyromind_storage_tools,
+    _build_workflow_run_tool,
     _build_workflow_validation_tool,
     _get_validation_cookie_header,
     _workflow_dsl_from_xyflow,
@@ -49,7 +52,11 @@ from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
 )
-from openhands.tools.workflow import DslToXyflowTool, ValidateWorkflowDslTool
+from openhands.tools.workflow import (
+    DslToXyflowTool,
+    RunWorkflowTool,
+    ValidateWorkflowDslTool,
+)
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
@@ -204,13 +211,16 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     response = Response()
     cookie_header = f"{PYROMIND_AUTH_COOKIE_NAME}=session-token; other=value"
 
+    request = _make_request(
+        {
+            "cookie": cookie_header,
+            "x-cluster": "us-west-1#pre",
+        }
+    )
+    load_base_env(request)
+
     info = await create_pyromind_conversation(
-        _make_request(
-            {
-                "cookie": cookie_header,
-                "x-cluster": "us-west-1#pre",
-            }
-        ),
+        request,
         PyromindCreateConversationRequest(
             llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
             extra={
@@ -233,6 +243,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert "grep" in tool_names
     assert "file_editor" in tool_names
     assert DslToXyflowTool.name in tool_names
+    assert RunWorkflowTool.name in tool_names
     assert ValidateWorkflowDslTool.name in tool_names
     assert PreviewDatasetTool.name in tool_names
     assert UploadFileToPyromindTool.name in tool_names
@@ -242,15 +253,31 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         for tool in service.start_request.agent.tools
         if tool.name == ValidateWorkflowDslTool.name
     )
+    run_tool = next(
+        tool
+        for tool in service.start_request.agent.tools
+        if tool.name == RunWorkflowTool.name
+    )
     assert validation_tool.params == {
         "headers": {"x-cluster": "us-west-1#pre"},
         "secret_headers": {"cookie": "PYROMIND_VALIDATE_AUTH_COOKIE"},
     }
+    assert run_tool.params == {
+        "current_user": None,
+        "env": "pre",
+        "cluster": "us-west-1",
+        "headers": {
+            "x-cluster": "us-west-1#pre",
+            "request-app": "openhands",
+        },
+    }
     assert "session-token" not in str(validation_tool.params)
+    assert "secret_headers" not in run_tool.params
     assert (
         service.start_request.secrets["PYROMIND_VALIDATE_AUTH_COOKIE"].get_value()
         == cookie_header
     )
+
     preview_tool = next(
         tool
         for tool in service.start_request.agent.tools
@@ -271,6 +298,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         service.start_request.secrets["PYROMIND_STORAGE_AUTH_COOKIE"].get_value()
         == cookie_header
     )
+    assert service.start_request.secrets["auth_token"].get_value() == "session-token"
     assert service.start_request.tags == {PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE}
 
 
@@ -432,6 +460,7 @@ async def test_pyromind_message_refreshes_storage_auth_context(tmp_path):
 
     assert service.secrets == {
         PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: "auth_token=context-token; other=value",
+        PYROMIND_AUTH_TOKEN_SECRET: "context-token",
         PYROMIND_STORAGE_AUTH_COOKIE_SECRET: "auth_token=context-token; other=value",
     }
     assert service.agent_state == {
@@ -632,12 +661,49 @@ async def test_pyromind_validation_context_uses_websocket_user_headers():
 
     assert service.secrets == {
         PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: "auth_token=websocket-token; other=value",
+        PYROMIND_AUTH_TOKEN_SECRET: "websocket-token",
         PYROMIND_STORAGE_AUTH_COOKIE_SECRET: "auth_token=websocket-token; other=value",
     }
     assert service.agent_state == {
         PYROMIND_VALIDATE_HEADERS_STATE_KEY: {"x-cluster": "websocket-cluster"},
         PYROMIND_STORAGE_HEADERS_STATE_KEY: {"x-cluster": "websocket-cluster"},
     }
+
+
+def test_build_workflow_run_tool_wires_env_headers_and_auth_token():
+    request = _make_request(
+        {
+            "cookie": f"{PYROMIND_AUTH_COOKIE_NAME}=jwt-token",
+            "x-cluster": "us-west-1#pre",
+            "accept-language": "en-US",
+        }
+    )
+    load_base_env(request)
+
+    tool, secrets = _build_workflow_run_tool(request, {})
+
+    assert tool.name == RunWorkflowTool.name
+    assert tool.params == {
+        "current_user": None,
+        "env": "pre",
+        "cluster": "us-west-1",
+        "headers": {
+            "x-cluster": "us-west-1#pre",
+            "accept-language": "en-US",
+            "request-app": "openhands",
+        },
+    }
+    assert secrets["auth_token"].get_value() == "jwt-token"
+
+
+def test_parse_auth_token_from_cookie_header_extracts_jwt():
+    from openhands.agent_server.pyromind_auth import parse_auth_token_from_cookie_header
+
+    assert (
+        parse_auth_token_from_cookie_header("auth_token=jwt-token; other=value")
+        == "jwt-token"
+    )
+    assert parse_auth_token_from_cookie_header(None) is None
 
 
 @pytest.mark.asyncio
