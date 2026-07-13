@@ -14,6 +14,11 @@ from openhands.tools.file_editor.definition import (
 )
 from openhands.tools.file_editor.editor import FileEditor
 from openhands.tools.file_editor.exceptions import ToolError
+from openhands.tools.utils.public_read_paths import (
+    configured_public_read_roots,
+    logical_public_read_path,
+    resolve_public_read_alias,
+)
 from openhands.tools.workflow.definition import mark_pyromind_workflow_dirty
 
 
@@ -34,9 +39,9 @@ class FileEditorExecutor(ToolExecutor):
             Path(workspace_root).resolve() if workspace_root else Path.cwd().resolve()
         )
         self.editor: FileEditor = FileEditor(workspace_root=str(self.workspace_root))
+        self.read_only_roots = configured_public_read_roots(read_only_roots)
         self.read_only_editors = {
-            Path(root).resolve(): FileEditor(workspace_root=root)
-            for root in (read_only_roots or [])
+            root: FileEditor(workspace_root=str(root)) for root in self.read_only_roots
         }
         self.allowed_edits_files: set[Path] | None = (
             {Path(self.normalize_path(f)).resolve() for f in allowed_edits_files}
@@ -53,6 +58,10 @@ class FileEditorExecutor(ToolExecutor):
         validation layer runs.
         """
         action_path = Path(path)
+
+        aliased = resolve_public_read_alias(path, self.read_only_roots)
+        if aliased is not None:
+            return str(aliased)
 
         if is_host_absolute_path(action_path):
             if str(action_path).startswith("/workspace/"):
@@ -111,6 +120,12 @@ class FileEditorExecutor(ToolExecutor):
                 text=e.message, command=action.command, is_error=True
             )
         assert result is not None, "file_editor should always return a result"
+        if not result.is_error:
+            public_path = logical_public_read_path(
+                Path(normalized_path), self.read_only_roots
+            )
+            if public_path != normalized_path:
+                result = result.model_copy(update={"path": public_path})
         if not result.is_error and action.command != "view":
             self._mark_workflow_dirty_if_target(normalized_path, conversation)
         return result
