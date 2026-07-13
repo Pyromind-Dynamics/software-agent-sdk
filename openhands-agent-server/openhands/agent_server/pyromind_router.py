@@ -120,8 +120,8 @@ _PYROMIND_DEBUG_RESPONSE_BODY_LIMIT = 20000
 # matching skill first, and only fall back to grep + file_editor for free-form
 # knowledge-base lookups.
 PYROMIND_KB_INSTRUCTIONS = """\
-The Pyromind platform knowledge base is available at this absolute path:
-{knowledge_base_path}
+The Pyromind platform knowledge base is available through the read-only logical
+path `knowledge/`. Do not use or request its host filesystem path.
 
 Knowledge base layout:
 - basic/: platform basics
@@ -130,6 +130,9 @@ Knowledge base layout:
 - studio/: Studio workflow documentation
 - nodes/<NodeType>/<NodeType>.md: node parameters, I/O, and ports
 - dataset_processing_workflow.py: workflow DSL example
+
+The public examples directory is available through the read-only logical path
+`examples/`. Do not use `terminal` to discover or access either public path.
 
 Your current working directory is this conversation's private workspace:
 {working_dir}
@@ -146,9 +149,12 @@ been generated unless a tool call actually created or modified `workflow.py`.
 
 - If a listed skill fits the request (for example, generating a workflow), \
 invoke that skill via `invoke_skill` first, before searching the knowledge base.
-- For Pyromind knowledge-base lookups, use `grep` with the absolute path above,
-then open matched files with `file_editor` to read their full content before
-answering or editing `workflow.py`.
+- For requests to output, summarize, or explain knowledge-base articles, use
+`grep` with `knowledge/<subdirectory>` and then open matched files with
+`file_editor` using the same logical path. Do not invoke a workflow-generation
+skill for an article lookup alone.
+- For workflow generation, use the matching skill and consult `knowledge/` only
+when needed for platform details.
 """
 
 
@@ -881,7 +887,6 @@ async def create_pyromind_conversation(
 
     # 2. Assemble the pyromind KB instructions (layered on the codex base prompt)
     custom_instructions = PYROMIND_KB_INSTRUCTIONS.format(
-        knowledge_base_path=knowledge_base_path,
         working_dir=str(conversation_dir),
     )
 

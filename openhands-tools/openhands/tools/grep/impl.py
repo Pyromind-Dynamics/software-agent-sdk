@@ -20,6 +20,11 @@ from openhands.tools.utils import (
     _check_ripgrep_available,
     _log_ripgrep_fallback_warning,
 )
+from openhands.tools.utils.public_read_paths import (
+    configured_public_read_roots,
+    logical_public_read_path,
+    resolve_public_read_alias,
+)
 
 
 logger = get_logger(__name__)
@@ -42,9 +47,7 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
             working_dir: The working directory to use as the base for searches
         """
         self.working_dir: Path = Path(working_dir).resolve()
-        self.read_only_roots = tuple(
-            Path(root).resolve() for root in (read_only_roots or [])
-        )
+        self.read_only_roots = configured_public_read_roots(read_only_roots)
         self._search_backend = self._select_search_backend()
 
         if self._search_backend == "grep":
@@ -118,11 +121,15 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
 
     def _resolve_search_path(self, path: str) -> Path:
         candidate = Path(path)
-        resolved = (
-            candidate.resolve()
-            if candidate.is_absolute()
-            else (self.working_dir / candidate).resolve()
-        )
+        aliased = resolve_public_read_alias(path, self.read_only_roots)
+        if aliased is not None:
+            resolved = aliased
+        else:
+            resolved = (
+                candidate.resolve()
+                if candidate.is_absolute()
+                else (self.working_dir / candidate).resolve()
+            )
         if resolved.is_relative_to(self.working_dir) or any(
             resolved.is_relative_to(root) for root in self.read_only_roots
         ):
@@ -208,7 +215,7 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
             if key in unique_matches:
                 continue
             unique_matches[key] = GrepMatch(
-                file_path=str(resolved),
+                file_path=logical_public_read_path(resolved, self.read_only_roots),
                 line_number=match.line_number,
                 line=match.line,
             )
