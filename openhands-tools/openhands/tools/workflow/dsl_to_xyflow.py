@@ -190,7 +190,11 @@ def _ordered_unique(values: list[str]) -> list[str]:
 
 
 class DslToXyflowAction(Action):
-    dsl: str = Field(description="Pyromind workflow Python DSL source to convert.")
+    dsl: str = Field(
+        description=(
+            "Pyromind workflow Python DSL source code to convert (not a file path)."
+        ),
+    )
     name: str = Field(default="workflow", description="Workflow name.")
 
     @property

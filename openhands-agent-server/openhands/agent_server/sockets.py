@@ -53,6 +53,7 @@ from openhands.agent_server.models import (
 )
 from openhands.agent_server.pub_sub import MaxSubscribersError, Subscriber
 from openhands.agent_server.pyromind_auth import (
+    PYROMIND_AUTH_COOKIE_NAME,
     add_request_context_to_user,
     get_dev_login_user_from_headers,
 )
@@ -154,9 +155,15 @@ def _add_websocket_context_to_user(
     current_user: CurrentLoginUser,
     websocket: WebSocket,
 ) -> CurrentLoginUser:
+    headers = dict(websocket.headers)
+    cookie_header = headers.get("cookie")
+    if not cookie_header:
+        if token := _resolve_websocket_pyromind_jwt_token(websocket):
+            cookie_header = f"{PYROMIND_AUTH_COOKIE_NAME}={token}"
+            headers["cookie"] = cookie_header
     return add_request_context_to_user(
         current_user,
-        websocket.headers,
+        headers,
         x_cluster=_resolve_websocket_x_cluster(websocket),
     )
 
@@ -338,18 +345,24 @@ async def events_socket(
     logger.info(f"Event Websocket Connected: {conversation_id}")
     conv_service = _get_conversation_service(websocket)
     current_user = getattr(websocket.state, "current_user", None)
+
     user_id = (
         str(current_user.user_id)
         if isinstance(current_user, CurrentLoginUser)
         else None
     )
-    if user_id is None:
-        event_service = await conv_service.get_event_service(conversation_id)
-    else:
-        event_service = await conv_service.get_event_service(
-            conversation_id,
-            user_id=user_id,
-        )
+
+    event_service = await conv_service.get_event_service(conversation_id, user_id=user_id)
+
+    # # get_event_service兼容user_id 是否为空的处理
+    # if user_id is None:
+    #     event_service = await conv_service.get_event_service(conversation_id)
+    # else:
+    #     event_service = await conv_service.get_event_service(
+    #         conversation_id,
+    #         user_id=user_id,
+    #     )
+
     if event_service is None:
         logger.warning(f"Converation not found: {conversation_id}")
         await websocket.close(code=4004, reason="Conversation not found")

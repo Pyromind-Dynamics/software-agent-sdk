@@ -21,6 +21,12 @@ from openhands.tools.workflow.impl import (
     WorkflowScriptError,
     read_workflow_file,
 )
+from openhands.tools.workflow.run_workflow import (
+    RunWorkflowAction,
+    RunWorkflowExecutor,
+    RunWorkflowObservation,
+    RunWorkflowTool,
+)
 from openhands.tools.workflow.validate_workflow_dsl import (
     ValidateWorkflowDslAction,
     ValidateWorkflowDslExecutor,
@@ -35,6 +41,10 @@ __all__ = [
     "DslToXyflowExecutor",
     "DslToXyflowObservation",
     "DslToXyflowTool",
+    "RunWorkflowAction",
+    "RunWorkflowExecutor",
+    "RunWorkflowObservation",
+    "RunWorkflowTool",
     "convert_dsl_to_xyflow",
     "convert_xyflow_to_dsl",
     "ValidateWorkflowDslAction",

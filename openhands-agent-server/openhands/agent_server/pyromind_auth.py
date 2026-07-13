@@ -139,6 +139,21 @@ def get_current_login_user_from_token(
     return v_jwt_token(auth_token)
 
 
+def parse_auth_token_from_cookie_header(cookie_header: str | None) -> str | None:
+    """Extract the Pyromind JWT value from a raw ``Cookie`` header string."""
+    if not cookie_header:
+        return None
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        if name.strip() == PYROMIND_AUTH_COOKIE_NAME:
+            token = value.strip()
+            return token or None
+    return None
+
+
 def add_request_context_to_user(
     current_user: CurrentLoginUser,
     headers: Mapping[str, str],
@@ -152,12 +167,14 @@ def add_request_context_to_user(
     )
 
 
+
+
+
 def get_dev_login_user_from_headers(
     headers: Mapping[str, str],
 ) -> CurrentLoginUser | None:
     if not is_dev():
         return None
-
     raw_user_id = headers.get(PYROMIND_DEV_USER_ID_HEADER, "").strip()
     if not raw_user_id:
         return None

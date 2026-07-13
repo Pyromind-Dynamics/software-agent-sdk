@@ -125,8 +125,10 @@ class ValidateWorkflowDslAction(Action):
     dsl: str | None = Field(
         default=None,
         description=(
-            "Pyromind workflow DSL source to validate. If omitted, the tool reads "
-            "`workflow.py` from the active conversation workspace."
+            "Pyromind workflow Python DSL source code to validate (not a file path). "
+            "Pass the declarative workflow script text the agent generated or "
+            "edited. If omitted, the tool reads the saved `workflow.py` contents "
+            "from the active conversation workspace."
         ),
     )
     name: str = Field(default="workflow", description="Workflow name.")

@@ -5,6 +5,8 @@ from typing import Any, cast
 import httpx
 from pydantic import SecretStr
 
+from openhands.agent_server.pyromind_router import PYROMIND_VALIDATE_HEADERS_STATE_KEY, \
+    PYROMIND_VALIDATE_AUTH_COOKIE_SECRET
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.secret import StaticSecret
 from openhands.sdk.tool import Tool
@@ -19,8 +21,6 @@ from openhands.tools.workflow import (
 from openhands.tools.workflow.validate_workflow_dsl import (
     PRE_VALIDATE_URL,
     PROD_VALIDATE_URL,
-    PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
-    PYROMIND_VALIDATE_HEADERS_STATE_KEY,
 )
 
 
