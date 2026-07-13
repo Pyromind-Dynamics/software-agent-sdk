@@ -16,6 +16,9 @@ export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 # LLM Configuration
 # ----------------------------------------------------------
 export LLM_BASE_URL="${LLM_BASE_URL:-http://208.64.254.187:8000/v1}"
+if [[ -z "${OPENAI_API_KEY:-}" && -n "${LLM_API_KEY:-}" ]]; then
+  export OPENAI_API_KEY="${LLM_API_KEY}"
+fi
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
   echo "ERROR: OPENAI_API_KEY is required. Export it before running start.sh." >&2
   exit 1
