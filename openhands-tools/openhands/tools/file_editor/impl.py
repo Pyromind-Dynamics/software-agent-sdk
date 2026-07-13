@@ -14,7 +14,7 @@ from openhands.tools.file_editor.definition import (
 )
 from openhands.tools.file_editor.editor import FileEditor
 from openhands.tools.file_editor.exceptions import ToolError
-from openhands.tools.utils.public_read_paths import (
+from openhands.tools.utils import (
     configured_public_read_roots,
     logical_public_read_path,
     resolve_public_read_alias,
