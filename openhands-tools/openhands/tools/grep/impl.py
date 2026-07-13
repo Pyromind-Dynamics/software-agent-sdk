@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 from openhands.sdk.logger import get_logger
 from openhands.sdk.tool import ToolExecutor
 from openhands.sdk.utils import sanitized_env
-from openhands.sdk.utils.path import resolve_workspace_path
 
 
 if TYPE_CHECKING:
@@ -36,13 +35,16 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
 
     _MAX_MATCHES = 100
 
-    def __init__(self, working_dir: str):
+    def __init__(self, working_dir: str, read_only_roots: list[str] | None = None):
         """Initialize the grep executor.
 
         Args:
             working_dir: The working directory to use as the base for searches
         """
         self.working_dir: Path = Path(working_dir).resolve()
+        self.read_only_roots = tuple(
+            Path(root).resolve() for root in (read_only_roots or [])
+        )
         self._search_backend = self._select_search_backend()
 
         if self._search_backend == "grep":
@@ -65,7 +67,7 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
         """Execute grep content search using the best available backend."""
         try:
             if action.path:
-                search_path = resolve_workspace_path(action.path, self.working_dir)
+                search_path = self._resolve_search_path(action.path)
                 if not search_path.is_dir():
                     return GrepObservation.from_text(
                         text=f"Search path '{action.path}' is not a valid directory",
@@ -113,6 +115,22 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
                 include_pattern=action.include,
                 is_error=True,
             )
+
+    def _resolve_search_path(self, path: str) -> Path:
+        candidate = Path(path)
+        resolved = (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (self.working_dir / candidate).resolve()
+        )
+        if resolved.is_relative_to(self.working_dir) or any(
+            resolved.is_relative_to(root) for root in self.read_only_roots
+        ):
+            return resolved
+        raise ValueError(
+            "Path is outside the workspace and configured read-only roots; "
+            f"it is not a valid directory: {path}"
+        )
 
     def _format_output(
         self,
