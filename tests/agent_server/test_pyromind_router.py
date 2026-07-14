@@ -177,6 +177,7 @@ class _FakePyromindMessageEventService(_FakeEventService):
         self.workflow_dsl_snapshot: str | None = None
         self.workflow_xyflow_snapshot: dict[str, Any] | None = None
         self.extended_content: list[Any] | None = None
+        self.internal_context: list[TextContent] | None = None
         workspace = type("FakeWorkspace", (), {"working_dir": str(working_dir)})()
         self._conversation = type("FakeConversation", (), {"workspace": workspace})()
 
@@ -197,6 +198,19 @@ class _FakePyromindMessageEventService(_FakeEventService):
         self.extended_content = extended_content
         self.workflow_dsl_snapshot = workflow_dsl_snapshot
         self.workflow_xyflow_snapshot = workflow_xyflow_snapshot
+
+    async def send_internal_context(
+        self,
+        content: list[TextContent],
+        run: bool = False,
+        workflow_dsl_snapshot: str | None = None,
+        workflow_xyflow_snapshot: dict[str, Any] | None = None,
+    ) -> str:
+        self.internal_context = content
+        self.run = run
+        self.workflow_dsl_snapshot = workflow_dsl_snapshot
+        self.workflow_xyflow_snapshot = workflow_xyflow_snapshot
+        return "internal-event"
 
 
 def _make_request(headers: dict[str, str] | None = None) -> Request:
@@ -563,11 +577,9 @@ async def test_pyromind_workflow_rollback_restores_snapshot_and_sends_correction
     assert workflow_path.read_text(encoding="utf-8") == (
         "# workflow: rollback\nstep = 1\n"
     )
-    assert service.sent_message is not None
-    assert service.sent_message.role == "user"
-    assert service.sent_message.content == []
-    assert service.extended_content is not None
-    first_content = service.extended_content[0]
+    assert service.sent_message is None
+    assert service.internal_context is not None
+    first_content = service.internal_context[0]
     assert isinstance(first_content, TextContent)
     correction_text = first_content.text
     assert "Workflow rollback applied by the user" in correction_text
@@ -615,6 +627,7 @@ async def test_pyromind_workflow_rollback_returns_null_when_snapshot_is_missing(
     assert result.model_dump(mode="json", by_alias=True)["snapshot"] is None
     assert workflow_path.read_text(encoding="utf-8") == current_workflow
     assert service.sent_message is None
+    assert service.internal_context is None
 
 
 def test_validation_cookie_header_keeps_full_cookie_in_prod(monkeypatch):

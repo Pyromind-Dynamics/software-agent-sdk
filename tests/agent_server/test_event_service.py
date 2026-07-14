@@ -1038,6 +1038,52 @@ class TestEventServiceSendMessage:
             await event_service.send_message(message)
 
     @pytest.mark.asyncio
+    async def test_send_internal_context_preserves_real_user_message(
+        self, event_service, tmp_path
+    ):
+        conversation = LocalConversation(
+            agent=Agent(
+                llm=LLM(model="gpt-4o", usage_id="internal-context-test"),
+                tools=[],
+            ),
+            workspace=str(tmp_path / "workspace"),
+            stuck_detection=False,
+        )
+        conversation.send_message("original user message")
+        original_user_message_id = conversation.state.last_user_message_id
+        conversation.state.execution_status = ConversationExecutionStatus.FINISHED
+        event_service.stored = event_service.stored.model_copy(
+            update={
+                "tags": {PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
+            }
+        )
+        event_service.conversations_dir = tmp_path / "conversations"
+        event_service._conversation = conversation
+
+        event_id = await event_service.send_internal_context(
+            [TextContent(text="internal workflow result")],
+            workflow_dsl_snapshot="# restored workflow\n",
+            workflow_xyflow_snapshot={"nodes": [], "edges": []},
+        )
+
+        event = conversation.state.events[-1]
+        assert isinstance(event, MessageEvent)
+        assert event.id == event_id
+        assert event.source == "environment"
+        assert event.llm_message.role == "user"
+        assert event.llm_message.content == []
+        assert event.extended_content == [TextContent(text="internal workflow result")]
+        assert conversation.state.last_user_message_id == original_user_message_id
+        assert conversation.state.execution_status == ConversationExecutionStatus.IDLE
+
+        snapshot = FileWorkflowCanvasStore(
+            event_service.conversation_dir,
+            event_service.stored.id.hex,
+        ).get_event_snapshot(event_id)
+        assert snapshot.workflow_dsl_data == "# restored workflow\n"
+        assert snapshot.workflow_xyflow_data == {"nodes": [], "edges": []}
+
+    @pytest.mark.asyncio
     async def test_send_message_with_run_false_default(self, event_service):
         """Test send_message with default run=True."""
         # Mock conversation and its methods

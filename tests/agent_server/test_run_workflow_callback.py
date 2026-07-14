@@ -6,24 +6,22 @@ import pytest
 
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.run_workflow_callback import deliver_run_workflow_status
-from openhands.sdk.llm import Message, TextContent
+from openhands.sdk.llm import TextContent
 
 
 class _FakeEventService:
     def __init__(self) -> None:
-        self.message: Message | None = None
         self.run: bool | None = None
-        self.extended_content: list[TextContent] | None = None
+        self.internal_context: list[TextContent] | None = None
 
-    async def send_message(
+    async def send_internal_context(
         self,
-        message: Message,
+        content: list[TextContent],
         run: bool = False,
-        extended_content: list[TextContent] | None = None,
-    ) -> None:
-        self.message = message
+    ) -> str:
         self.run = run
-        self.extended_content = extended_content
+        self.internal_context = content
+        return "internal-event"
 
 
 class _FakeConversationService:
@@ -56,13 +54,12 @@ async def test_generic_callback_silently_resumes_conversation(tmp_path):
     assert result.conversation_id == str(conversation_id)
     assert service.requested_conversation_id == conversation_id
     assert service.event_service.run is False
-    assert service.event_service.message is not None
-    assert service.event_service.message.content == []
-    assert service.event_service.extended_content is not None
-    reminder = service.event_service.extended_content[0].text
+    assert service.event_service.internal_context is not None
+    reminder = service.event_service.internal_context[0].text
     assert task_id in reminder
-    assert "tool invocation associated with this task" in reminder
+    assert "Resume the tool invocation associated with this task" in reminder
     assert "most recent non-empty visible message" in reminder
+    assert "Review the outcome and continue helping the user" not in reminder
     assert "stats.json" not in reminder
 
     duplicate = await deliver_run_workflow_status(
@@ -88,4 +85,4 @@ async def test_generic_callback_without_conversation_is_unknown_task(tmp_path):
 
     assert result.outcome == "unknown_task"
     assert service.requested_conversation_id is None
-    assert service.event_service.message is None
+    assert service.event_service.internal_context is None
