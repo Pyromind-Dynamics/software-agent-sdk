@@ -66,6 +66,7 @@ from openhands.sdk.skills import Skill, load_skills_from_dir
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
+from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
     UploadFileToPyromindTool,
@@ -366,10 +367,21 @@ def _build_pyromind_storage_tools(
     if secret_headers:
         params["secret_headers"] = secret_headers
 
+    cleaning_params, secrets = _load_env_to_tools(
+        http_request=http_request,
+        params={},
+        secrets=secrets,
+    )
+    secrets = _load_auth_token(http_request=http_request, secrets=secrets)
+    cleaning_output_root = extra.get("dataset_cleaning_output_root")
+    if isinstance(cleaning_output_root, str) and cleaning_output_root:
+        cleaning_params["output_root"] = cleaning_output_root
+
     return (
         [
             Tool(name=PreviewDatasetTool.name, params=dict(params)),
             Tool(name=UploadFileToPyromindTool.name, params=dict(params)),
+            Tool(name=RunDatasetCleaningTool.name, params=cleaning_params),
         ],
         secrets,
     )
@@ -608,8 +620,12 @@ class PyromindWorkflowCallbackRequest(BaseModel):
     status: str = Field(
         description="Raw workflow status from the platform or Kafka message."
     )
-    conversation_id: str = Field(
-        description="Conversation to resume; usually from task out_id / Kafka."
+    conversation_id: str | None = Field(
+        default=None,
+        description=(
+            "Conversation to resume. Dataset cleaning callbacks may omit this "
+            "because task association is persisted at submission time."
+        ),
     )
     error_log: str | None = Field(
         default=None,
@@ -1112,10 +1128,9 @@ async def rollback_pyromind_workflow_at_event(
         workflow_file_action,
     )
 
-    await event_service.send_message(
-        Message(role="user", content=[]),
+    await event_service.send_internal_context(
+        [TextContent(text=correction_message)],
         run=request.run,
-        extended_content=[TextContent(text=correction_message)],
         workflow_dsl_snapshot=snapshot.workflow_dsl_data,
         workflow_xyflow_snapshot=snapshot.workflow_xyflow_data,
     )

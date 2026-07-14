@@ -44,6 +44,7 @@ from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
 from openhands.sdk.conversation.request import StartConversationRequest
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.llm.message import Message, TextContent
+from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
     UploadFileToPyromindTool,
@@ -176,6 +177,7 @@ class _FakePyromindMessageEventService(_FakeEventService):
         self.workflow_dsl_snapshot: str | None = None
         self.workflow_xyflow_snapshot: dict[str, Any] | None = None
         self.extended_content: list[Any] | None = None
+        self.internal_context: list[TextContent] | None = None
         workspace = type("FakeWorkspace", (), {"working_dir": str(working_dir)})()
         self._conversation = type("FakeConversation", (), {"workspace": workspace})()
 
@@ -196,6 +198,19 @@ class _FakePyromindMessageEventService(_FakeEventService):
         self.extended_content = extended_content
         self.workflow_dsl_snapshot = workflow_dsl_snapshot
         self.workflow_xyflow_snapshot = workflow_xyflow_snapshot
+
+    async def send_internal_context(
+        self,
+        content: list[TextContent],
+        run: bool = False,
+        workflow_dsl_snapshot: str | None = None,
+        workflow_xyflow_snapshot: dict[str, Any] | None = None,
+    ) -> str:
+        self.internal_context = content
+        self.run = run
+        self.workflow_dsl_snapshot = workflow_dsl_snapshot
+        self.workflow_xyflow_snapshot = workflow_xyflow_snapshot
+        return "internal-event"
 
 
 def _make_request(headers: dict[str, str] | None = None) -> Request:
@@ -257,6 +272,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert ValidateWorkflowDslTool.name in tool_names
     assert PreviewDatasetTool.name in tool_names
     assert UploadFileToPyromindTool.name in tool_names
+    assert RunDatasetCleaningTool.name in tool_names
     assert _REMOVED_WORKFLOW_TOOL not in tool_names
     validation_tool = next(
         tool
@@ -298,11 +314,17 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         for tool in service.start_request.agent.tools
         if tool.name == UploadFileToPyromindTool.name
     )
+    cleaning_tool = next(
+        tool
+        for tool in service.start_request.agent.tools
+        if tool.name == RunDatasetCleaningTool.name
+    )
     assert preview_tool.params == {
         "headers": {"x-cluster": "us-west-1#pre"},
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
     assert upload_tool.params == preview_tool.params
+    assert cleaning_tool.params == run_tool.params
     assert "session-token" not in str(preview_tool.params)
     assert (
         service.start_request.secrets["PYROMIND_STORAGE_AUTH_COOKIE"].get_value()
@@ -555,11 +577,9 @@ async def test_pyromind_workflow_rollback_restores_snapshot_and_sends_correction
     assert workflow_path.read_text(encoding="utf-8") == (
         "# workflow: rollback\nstep = 1\n"
     )
-    assert service.sent_message is not None
-    assert service.sent_message.role == "user"
-    assert service.sent_message.content == []
-    assert service.extended_content is not None
-    first_content = service.extended_content[0]
+    assert service.sent_message is None
+    assert service.internal_context is not None
+    first_content = service.internal_context[0]
     assert isinstance(first_content, TextContent)
     correction_text = first_content.text
     assert "Workflow rollback applied by the user" in correction_text
@@ -607,6 +627,7 @@ async def test_pyromind_workflow_rollback_returns_null_when_snapshot_is_missing(
     assert result.model_dump(mode="json", by_alias=True)["snapshot"] is None
     assert workflow_path.read_text(encoding="utf-8") == current_workflow
     assert service.sent_message is None
+    assert service.internal_context is None
 
 
 def test_validation_cookie_header_keeps_full_cookie_in_prod(monkeypatch):
@@ -659,22 +680,49 @@ def test_pyromind_storage_tools_use_user_context_headers():
         cookie=f"{PYROMIND_AUTH_COOKIE_NAME}=context-token; other=value",
         x_cluster="context-cluster",
     )
+    load_base_env(request)
 
-    tools, secrets = _build_pyromind_storage_tools(request, {})
+    tools, secrets = _build_pyromind_storage_tools(
+        request,
+        {
+            "storage_base_url": "https://storage.test/api",
+            "dataset_cleaning_output_root": "/agentTest/clean-results",
+        },
+    )
 
     assert [tool.name for tool in tools] == [
         PreviewDatasetTool.name,
         UploadFileToPyromindTool.name,
+        RunDatasetCleaningTool.name,
     ]
     assert tools[0].params == {
+        "storage_base_url": "https://storage.test/api",
         "headers": {"x-cluster": "context-cluster"},
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
     assert tools[1].params == tools[0].params
+    cleaning_params = tools[2].params
+    assert cleaning_params == {
+        "current_user": CurrentLoginUser(
+            username="debug-user-42",
+            email="debug-user-42@example.test",
+            user_id=42,
+            cookie=None,
+            x_cluster="context-cluster",
+        ),
+        "env": "prod",
+        "cluster": "context-cluster",
+        "headers": {
+            "x-cluster": "context-cluster",
+            "request-app": "openhands",
+        },
+        "output_root": "/agentTest/clean-results",
+    }
     assert (
         secrets["PYROMIND_STORAGE_AUTH_COOKIE"].get_value()
         == f"{PYROMIND_AUTH_COOKIE_NAME}=context-token; other=value"
     )
+    assert secrets["auth_token"].get_value() == "request-token"
 
 
 def test_build_debug_context_headers_uses_current_user_context():

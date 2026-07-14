@@ -24,6 +24,7 @@ Kafka Topic 枚举 — 统一管理所有 Kafka Topic。
   topic = KafkaTopic.TRAINING_BILLING.resolve()  # → "training_billing_topic_us-west-1"
   KafkaTopic.TRAINING_BILLING.cluster_scoped      # → True
 """
+
 from enum import Enum
 
 from openhands.sdk.utils import env_util
@@ -39,8 +40,8 @@ class KafkaTopic(Enum):
       - concurrency:    消费并发数（默认 3）
     """
 
-    WORKFLOW_MONITOR     = ("workflow_monitor_topic", False, 3)    # 工作流监控
-    DLQ                  = ("dead_letter_queue_topic", False, 3)   # 死信队列（所有消费失败消息的中转站）
+    WORKFLOW_MONITOR = ("workflow_monitor_topic", False, 3)  # 工作流监控
+    DLQ = ("dead_letter_queue_topic", False, 3)  # 死信队列（所有消费失败消息的中转站）
 
     def __init__(self, base_name: str, cluster_scoped: bool, concurrency: int = 3):
         self._base_name = base_name
@@ -74,16 +75,16 @@ class KafkaTopic(Enum):
           prod → "training_billing_topic_us-west-1"
           pre  → "training_billing_topic_pre_us-west-1"
         """
-        env = env_util.get_env_value()
+        env = env_util.get_kafka_env_value()
         cluster_region = env_util.get_cluster_region()
 
         if self.cluster_scoped:
             # 集群隔离: {base_name}[_{env}]_{cluster_region}
-            if env_util.is_pre():
+            if env_util.is_kafka_pre():
                 return f"{self.base_name}_{env}_{cluster_region}"
             return f"{self.base_name}_{cluster_region}"
         else:
             # 集群共享: {base_name}[_{env}]
-            if env_util.is_pre():
+            if env_util.is_kafka_pre():
                 return f"{self.base_name}_{env}"
             return self.base_name

@@ -559,6 +559,55 @@ async def test_acp_arun_sends_stop_hook_feedback_to_acp(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_acp_arun_sends_environment_user_context_to_acp(tmp_path):
+    agent = ACPAgent(acp_command=["echo", "test"])
+    conversation = LocalConversation(
+        agent=agent,
+        workspace=str(tmp_path),
+        max_iteration_per_run=3,
+        stuck_detection=False,
+    )
+    conversation.send_message("already processed")
+    original_user_message_id = conversation.state.last_user_message_id
+    conversation.state.agent_state = {
+        ACP_LAST_PROMPT_USER_MESSAGE_ID: original_user_message_id
+    }
+    internal_event = MessageEvent(
+        source="environment",
+        llm_message=Message(role="user", content=[]),
+        extended_content=[TextContent(text="workflow completed")],
+    )
+    conversation._on_event_with_state_lock(internal_event)
+    prompts_seen: list[str] = []
+
+    async def record_astep(
+        self,  # noqa: ARG001
+        conv: LocalConversation,
+        on_event: ConversationCallbackType,  # noqa: ARG001
+        on_token: ConversationTokenCallbackType | None = None,  # noqa: ARG001
+        prompt_message: MessageEvent | None = None,
+    ) -> None:
+        assert prompt_message is not None
+        content = prompt_message.to_llm_message().content[0]
+        assert isinstance(content, TextContent)
+        prompts_seen.append(content.text)
+        conv.state.execution_status = ConversationExecutionStatus.FINISHED
+
+    with (
+        patch.object(ACPAgent, "init_state", autospec=True),
+        patch.object(ACPAgent, "astep", new=record_astep),
+    ):
+        await asyncio.wait_for(conversation.arun(), timeout=1.0)
+
+    assert prompts_seen == ["workflow completed"]
+    assert conversation.state.last_user_message_id == original_user_message_id
+    assert (
+        conversation.state.agent_state.get(ACP_LAST_PROMPT_USER_MESSAGE_ID)
+        == internal_event.id
+    )
+
+
+@pytest.mark.asyncio
 async def test_acp_arun_rechecks_messages_before_finishing(tmp_path):
     """A user message appended in the finish gap should be sent in the same run."""
 
