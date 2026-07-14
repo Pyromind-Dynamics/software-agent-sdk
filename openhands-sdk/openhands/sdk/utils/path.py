@@ -49,6 +49,25 @@ def is_host_absolute_path(path: str | os.PathLike[str]) -> bool:
     return Path(value).expanduser().is_absolute()
 
 
+def resolve_workspace_path(
+    path: str | os.PathLike[str], workspace_root: str | os.PathLike[str]
+) -> Path:
+    """Resolve a local path and reject paths outside ``workspace_root``."""
+
+    root = Path(workspace_root).resolve()
+    candidate = Path(path)
+    resolved = (
+        (root / candidate).resolve()
+        if not candidate.is_absolute()
+        else candidate.resolve()
+    )
+    if not resolved.is_relative_to(root):
+        raise ValueError(
+            f"Path is outside the workspace root and is not a valid directory: {path}"
+        )
+    return resolved
+
+
 def is_local_path_source(source: str) -> bool:
     """Return whether a plugin/skill source should be treated as local.
 

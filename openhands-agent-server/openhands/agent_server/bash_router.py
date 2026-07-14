@@ -10,10 +10,12 @@ from fastapi import (
     Depends,
     HTTPException,
     Query,
+    Request,
     status,
 )
 
 from openhands.agent_server.bash_service import BashEventService
+from openhands.agent_server.config import Config
 from openhands.agent_server.dependencies import get_bash_event_service
 from openhands.agent_server.models import (
     BashCommand,
@@ -28,6 +30,22 @@ from openhands.agent_server.server_details_router import update_last_execution_t
 
 bash_router = APIRouter(prefix="/bash", tags=["Bash"])
 logger = logging.getLogger(__name__)
+
+
+def _reject_global_bash_in_multi_tenant(request: Request) -> None:
+    config: Config = request.app.state.config
+    if config.command_policy_mode != "multi_tenant_strict":
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "code": "direct_bash_api_disabled",
+            "message": (
+                "Global bash command execution is disabled in multi-tenant mode. "
+                "Use a conversation-scoped tool or API instead."
+            ),
+        },
+    )
 
 
 # bash event routes
@@ -99,10 +117,12 @@ async def batch_get_bash_events(
 
 @bash_router.post("/start_bash_command")
 async def start_bash_command(
+    request_context: Request,
     request: ExecuteBashRequest,
     bash_event_service: BashEventService = Depends(get_bash_event_service),
 ) -> BashCommand:
     """Execute a bash command in the background"""
+    _reject_global_bash_in_multi_tenant(request_context)
     update_last_execution_time()
     command, _ = await bash_event_service.start_bash_command(request)
     return command
@@ -110,10 +130,12 @@ async def start_bash_command(
 
 @bash_router.post("/execute_bash_command")
 async def execute_bash_command(
+    request_context: Request,
     request: ExecuteBashRequest,
     bash_event_service: BashEventService = Depends(get_bash_event_service),
 ) -> BashOutput:
     """Execute a bash command and wait for a result"""
+    _reject_global_bash_in_multi_tenant(request_context)
     update_last_execution_time()
     command, task = await bash_event_service.start_bash_command(request)
     await task

@@ -8,6 +8,7 @@ import signal
 import subprocess
 import time
 from collections.abc import Callable
+from pathlib import Path, UnsupportedOperation
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
@@ -16,6 +17,13 @@ from openhands.sdk.conversation.visualizer import ConversationVisualizerBase
 from openhands.sdk.hooks.config import HookDefinition, HookType
 from openhands.sdk.hooks.types import HookDecision, HookEvent
 from openhands.sdk.observability.laminar import observe
+from openhands.sdk.security.command_policy import (
+    CommandExecutionContext,
+    CommandExecutionSource,
+    CommandPolicyAction,
+    CommandPolicyConfig,
+    evaluate_command,
+)
 from openhands.sdk.utils import sanitized_env
 
 
@@ -199,6 +207,41 @@ class HookExecutor:
             decision=HookDecision.ALLOW,
             reason=reason,
             error=error or reason,
+        )
+
+    def _evaluate_command_policy(self, command: str) -> HookResult | None:
+        try:
+            workspace_dir = Path(self.working_dir)
+        except UnsupportedOperation:
+            return None
+        try:
+            decision = evaluate_command(
+                command,
+                CommandExecutionContext(
+                    source=CommandExecutionSource.HOOK,
+                    workspace_dir=workspace_dir,
+                    cwd=workspace_dir,
+                ),
+                CommandPolicyConfig(allowed_roots=[workspace_dir]),
+            )
+        except UnsupportedOperation:
+            return None
+        if decision.action != CommandPolicyAction.DENY:
+            return None
+
+        logger.warning(
+            "Hook command blocked by command policy rule=%s command=%r",
+            decision.rule_id,
+            decision.redacted_command,
+        )
+        return HookResult(
+            success=False,
+            blocked=True,
+            exit_code=2,
+            stderr=decision.reason,
+            decision=HookDecision.DENY,
+            reason=decision.reason,
+            error=decision.reason,
         )
 
     @observe(
@@ -411,6 +454,10 @@ class HookExecutor:
                 exit_code=-1,
                 error="'command' is required when type is 'command'",
             )
+
+        policy_result = self._evaluate_command_policy(command)
+        if policy_result is not None:
+            return policy_result
 
         # Handle async hooks: fire and forget
         if hook.async_:

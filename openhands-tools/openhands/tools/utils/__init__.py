@@ -1,13 +1,50 @@
 """Shared utilities."""
 
+import os
 import shutil
 import subprocess
 from collections.abc import Sequence
+from pathlib import Path
 
 from openhands.sdk.logger import get_logger
 
 
 logger = get_logger(__name__)
+
+
+def configured_public_read_roots(
+    read_only_roots: list[str] | None = None,
+) -> tuple[Path, ...]:
+    """Return configured read-only roots without exposing them to the model."""
+    if read_only_roots is not None:
+        roots = read_only_roots
+    else:
+        roots = [
+            os.environ.get("PYROMIND_KNOWLEDGE_BASE_PATH", ""),
+            *os.environ.get("PYROMIND_PUBLIC_READ_PATHS", "").split(os.pathsep),
+        ]
+    return tuple(Path(root).resolve() for root in roots if root)
+
+
+def resolve_public_read_alias(
+    path: str,
+    roots: tuple[Path, ...],
+) -> Path | None:
+    """Resolve the ``knowledge/`` alias to the configured root."""
+    candidate = Path(path)
+    if candidate.is_absolute() or not candidate.parts:
+        return None
+    if candidate.parts[0] != "knowledge" or not roots:
+        return None
+    return (roots[0] / Path(*candidate.parts[1:])).resolve()
+
+
+def logical_public_read_path(path: Path, roots: tuple[Path, ...]) -> str:
+    """Return a model-safe alias for a path under a configured public root."""
+    resolved = path.resolve()
+    if roots and resolved.is_relative_to(roots[0]):
+        return str(Path("knowledge") / resolved.relative_to(roots[0]))
+    return str(resolved)
 
 
 def _check_command_available(

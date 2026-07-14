@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from openhands.sdk.tool import ToolExecutor
 from openhands.sdk.utils import sanitized_env
+from openhands.sdk.utils.path import resolve_workspace_path
 
 
 if TYPE_CHECKING:
@@ -65,7 +66,7 @@ class GlobExecutor(ToolExecutor[GlobAction, GlobObservation]):
             original_pattern = action.pattern  # Store original pattern for observation
 
             if action.path:
-                search_path = Path(action.path).resolve()
+                search_path = resolve_workspace_path(action.path, self.working_dir)
                 pattern = action.pattern
             else:
                 extracted_path, pattern = self._extract_search_path_from_pattern(
@@ -74,6 +75,7 @@ class GlobExecutor(ToolExecutor[GlobAction, GlobObservation]):
                 search_path = (
                     extracted_path if extracted_path is not None else self.working_dir
                 )
+                search_path = resolve_workspace_path(search_path, self.working_dir)
 
             if not search_path.is_dir():
                 return GlobObservation.from_text(

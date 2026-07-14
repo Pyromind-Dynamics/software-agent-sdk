@@ -424,11 +424,16 @@ async def deliver_run_workflow_status(
             conversation_id=resolved_conversation_id,
         )
 
-    # Step 5: Conversation must be loaded on this agent-server instance.
+    # Step 6: Conversation must be loaded on this agent-server instance.
+    # Under Kafka broadcast (per-pod consumer group), other pods normally miss
+    # the conversation — return unknown_conversation without raising so the
+    # consumer skips (no retry/DLQ). Only the pod that holds the session delivers.
+    service = conversation_service or get_default_conversation_service()
     event_service = await service.get_event_service(conversation_uuid)
     if event_service is None:
-        logger.warning(
-            "Conversation %s not active on this agent-server (task_id=%s)",
+        logger.info(
+            "Skip run_workflow callback: conversation %s not on this pod "
+            "(expected under Kafka broadcast). task_id=%s",
             conversation_uuid,
             task_id,
         )
