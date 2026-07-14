@@ -48,6 +48,9 @@
 | TestLLMNode | 测试推理端点 | result |
 | ContentPreview | 预览文本内容 | — |
 
+组合映射：用户要求“发送测试请求并展示结果”时，使用
+`VLLMInference → TestLLMNode → ContentPreview`，由 `ContentPreview` 消费 `result`。
+
 ## 常用节点参数
 
 ### 数据接入
@@ -168,7 +171,7 @@ sft_train = ModelTrainSFTNode(
     # wandb_config=...,           # 可选
     output_path="/workspace/output/sft/",
     gpu_count=1,
-    gpu_product="NVIDIA-H100-NVL",
+    gpu_product="NVIDIA-H100-80GB-HBM3",
 )
 
 merge = ModelMergeLoraNode(
@@ -177,7 +180,7 @@ merge = ModelMergeLoraNode(
     lora_path=sft_train.model_output_path,
     output_path="/workspace/output/merged/",
     gpu_count=1,
-    gpu_product="NVIDIA-H100-NVL",
+    gpu_product="NVIDIA-H100-80GB-HBM3",
 )
 ```
 
@@ -189,12 +192,12 @@ infer = VLLMInference(
     model_path=model.model_path,
     port=3000,
     gpu_count=1,
-    gpu_product="NVIDIA-H100-NVL",
+    gpu_product="NVIDIA-H100-80GB-HBM3",
 )
 
 metrics = MetricsConfigBuilderNode(
     id="13",
-    entry="examples/eval_metrics_common.py:compute_gsm8k",  # 枚举见 SKILL.md 第 2 步
+    entry="compute_gsm8k",  # 内置指标使用裸函数名枚举
     name="gsm8k",
 )
 # 自定义指标：先 upload_file_to_pyromind 上传 py 文件，再用

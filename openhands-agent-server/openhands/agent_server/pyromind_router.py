@@ -148,10 +148,15 @@ invoke that skill via `invoke_skill` first, before searching the knowledge base.
 - For Pyromind knowledge-base lookups, use `grep` with the absolute path above,
 then open matched files with `file_editor` to read their full content before
 answering or editing `workflow.py`.
-- For a knowledge-base answer, extract only facts relevant to the user's question
-from files you actually opened. Before answering, verify that every relevant fact
-is covered; omit tangential search results. Never give specific APIs, class names,
-or code based only on filenames or directory listings.
+- For a Pyromind knowledge-base answer:
+  1. Split the user's request into explicit subquestions.
+  2. From files you actually opened, make a short checklist of directly relevant
+     headings, tables, warnings, alternatives, and ordered steps for each subquestion.
+  3. Before answering, mark every checklist item as covered or intentionally omitted.
+     Omit an item only when it is tangential, and do not omit a peer item from the
+     same list or table without a reason.
+  4. Never infer APIs or operational facts from filenames or directory listings.
+  Do not show this internal checklist unless the user asks for sources.
 """
 
 

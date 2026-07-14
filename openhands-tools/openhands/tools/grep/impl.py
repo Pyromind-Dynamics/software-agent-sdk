@@ -4,6 +4,7 @@ import fnmatch
 import os
 import re
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -64,10 +65,18 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
         """Execute grep content search using the best available backend."""
         try:
             if action.path:
-                search_path = Path(action.path).resolve()
-                if not search_path.is_dir():
+                requested_path = Path(action.path).expanduser()
+                if not requested_path.is_absolute():
+                    requested_path = self.working_dir / requested_path
+                search_path = requested_path.resolve()
+                if not search_path.exists() or not (
+                    search_path.is_dir() or search_path.is_file()
+                ):
                     return GrepObservation.from_text(
-                        text=f"Search path '{action.path}' is not a valid directory",
+                        text=(
+                            f"Search path '{action.path}' is not a valid directory "
+                            "or file"
+                        ),
                         matches=[],
                         pattern=action.pattern,
                         search_path=str(search_path),
@@ -120,15 +129,20 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
         search_path: str,
         include_pattern: str | None,
         truncated: bool,
+        searched_files: int | None,
     ) -> str:
         """Format the grep observation output message."""
-        include_info = (
-            f" (filtered by '{include_pattern}')" if include_pattern else ""
-        )
+        include_info = f" (filtered by '{include_pattern}')" if include_pattern else ""
         if not matches:
-            return (
+            output = (
                 f"No matches found for pattern '{pattern}' "
-                f"in directory '{search_path}'{include_info}"
+                f"in '{search_path}'{include_info}."
+            )
+            if searched_files is not None:
+                output += f" Searched {searched_files} candidate file(s)."
+            return output + (
+                " This result does not prove the topic is absent; broaden the "
+                "regex or include filter if needed."
             )
 
         match_lines = "\n".join(
@@ -215,12 +229,18 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
             search_path,
             action.include,
         )
+        searched_files = (
+            self._count_candidate_files(search_path, action.include)
+            if not finalized_matches and action.include
+            else None
+        )
         output = self._format_output(
             matches=finalized_matches,
             pattern=action.pattern,
             search_path=str(search_path),
             include_pattern=action.include,
             truncated=truncated,
+            searched_files=searched_files,
         )
         return GrepObservation.from_text(
             text=output,
@@ -229,7 +249,33 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
             search_path=str(search_path),
             include_pattern=action.include,
             truncated=truncated,
+            searched_files=searched_files,
         )
+
+    def _candidate_files(
+        self,
+        search_path: Path,
+        include_pattern: str | None,
+    ) -> Iterator[Path]:
+        """Yield non-hidden files that the configured search may inspect."""
+        if search_path.is_file():
+            if self._path_matches_filters(search_path, search_path, include_pattern):
+                yield search_path
+            return
+
+        for root, dirs, files in os.walk(search_path):
+            dirs[:] = [name for name in dirs if not name.startswith(".")]
+            for filename in files:
+                file_path = Path(root) / filename
+                if self._path_matches_filters(file_path, search_path, include_pattern):
+                    yield file_path
+
+    def _count_candidate_files(
+        self,
+        search_path: Path,
+        include_pattern: str | None,
+    ) -> int:
+        return sum(1 for _ in self._candidate_files(search_path, include_pattern))
 
     def _parse_grep_lines(self, stdout: str) -> list[GrepMatch]:
         """Parse ``path:line_number:content`` output into GrepMatch entries."""
@@ -267,12 +313,11 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
             "--with-filename",
             "--color=never",
             "-i",
-            action.pattern,
-            str(search_path),
             "--sortr=modified",
         ]
         if action.include:
             cmd.extend(["-g", action.include])
+        cmd.extend([action.pattern, str(search_path)])
 
         result = subprocess.run(
             cmd,
@@ -282,6 +327,13 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
             check=False,
             env=sanitized_env(),
         )
+        if result.returncode not in (0, 1):
+            logger.warning(
+                "ripgrep backend failed with exit code %s; falling back to "
+                "Python search",
+                result.returncode,
+            )
+            return self._execute_with_python_search(action, search_path)
 
         matches = self._parse_grep_lines(result.stdout)
         return self._build_observation(action, search_path, matches)
@@ -290,8 +342,12 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
         self, action: GrepAction, search_path: Path
     ) -> GrepObservation:
         """Execute grep content search using the system grep binary."""
+        cmd = ["grep", "-H", "-I", "-n", "-i", "-E"]
+        if search_path.is_dir():
+            cmd.append("-R")
+        cmd.extend([action.pattern, str(search_path)])
         result = subprocess.run(
-            ["grep", "-R", "-I", "-n", "-i", action.pattern, str(search_path)],
+            cmd,
             capture_output=True,
             text=True,
             timeout=30,
@@ -317,27 +373,19 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
         """Execute grep content search using Python file walking."""
         compiled_regex = regex or re.compile(action.pattern, re.IGNORECASE)
         matches: list[GrepMatch] = []
-        for root, dirs, files in os.walk(search_path):
-            dirs[:] = [name for name in dirs if not name.startswith(".")]
-            for filename in files:
-                file_path = Path(root) / filename
-                if not self._path_matches_filters(
-                    file_path, search_path, action.include
-                ):
-                    continue
-
-                try:
-                    content = file_path.read_text(encoding="utf-8", errors="ignore")
-                except OSError:
-                    continue
-                for line_number, line in enumerate(content.splitlines(), start=1):
-                    if compiled_regex.search(line):
-                        matches.append(
-                            GrepMatch(
-                                file_path=str(file_path),
-                                line_number=line_number,
-                                line=line,
-                            )
+        for file_path in self._candidate_files(search_path, action.include):
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for line_number, line in enumerate(content.splitlines(), start=1):
+                if compiled_regex.search(line):
+                    matches.append(
+                        GrepMatch(
+                            file_path=str(file_path),
+                            line_number=line_number,
+                            line=line,
                         )
+                    )
 
         return self._build_observation(action, search_path, matches)

@@ -15,7 +15,7 @@ import pytest
 import openhands.tools.grep.impl as grep_impl
 from openhands.tools.grep import GrepAction
 from openhands.tools.grep.impl import GrepExecutor
-from openhands.tools.utils import _check_grep_available
+from openhands.tools.utils import _check_grep_available, _check_ripgrep_available
 
 
 def test_grep_executor_initialization():
@@ -129,6 +129,75 @@ def test_grep_executor_custom_path():
         assert len(observation.matches) == 1
         assert observation.search_path == str(sub_dir.resolve())
         assert str(sub_dir.resolve()) in observation.matches[0].file_path
+
+
+def test_grep_executor_accepts_exact_file_path():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        target = Path(temp_dir) / "guide.mdx"
+        target.write_text("SFT 训练 workflow", encoding="utf-8")
+        executor = GrepExecutor(working_dir=temp_dir)
+
+        observation = executor(
+            GrepAction(pattern="训练|workflow", path=str(target.resolve()))
+        )
+
+        assert not observation.is_error
+        assert [match.file_path for match in observation.matches] == [
+            str(target.resolve())
+        ]
+
+
+@pytest.mark.parametrize("backend", ["ripgrep", "grep", "python"])
+def test_grep_backends_match_for_absolute_mdx_mixed_regex(backend: str):
+    if backend == "ripgrep" and not _check_ripgrep_available():
+        pytest.skip("ripgrep not available")
+    if backend == "grep" and not _check_grep_available():
+        pytest.skip("grep not available")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        docs = Path(temp_dir) / "docs"
+        docs.mkdir()
+        first = docs / "training.mdx"
+        second = docs / "studio.mdx"
+        ignored = docs / "notes.md"
+        first.write_text("SFT 训练说明", encoding="utf-8")
+        second.write_text("DPO workflow guide", encoding="utf-8")
+        ignored.write_text("训练 workflow", encoding="utf-8")
+        executor = GrepExecutor(working_dir=temp_dir)
+        executor._search_backend = backend
+
+        observation = executor(
+            GrepAction(
+                pattern="训练|workflow",
+                path=str(docs.resolve()),
+                include="*.mdx",
+            )
+        )
+
+        assert not observation.is_error
+        assert {Path(match.file_path).name for match in observation.matches} == {
+            first.name,
+            second.name,
+        }
+
+
+def test_grep_zero_match_reports_scanned_file_count():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        (root / "guide.mdx").write_text("SFT", encoding="utf-8")
+        (root / "guide.md").write_text("SFT", encoding="utf-8")
+        hidden = root / ".hidden"
+        hidden.mkdir()
+        (hidden / "secret.mdx").write_text("target", encoding="utf-8")
+
+        observation = GrepExecutor(working_dir=temp_dir)(
+            GrepAction(pattern="missing", include="*.mdx")
+        )
+
+        assert not observation.is_error
+        assert observation.searched_files == 1
+        assert "Searched 1 candidate file(s)" in observation.text
+        assert "does not prove the topic is absent" in observation.text
 
 
 def test_grep_executor_invalid_path():

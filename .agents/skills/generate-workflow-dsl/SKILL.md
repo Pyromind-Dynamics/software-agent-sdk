@@ -109,9 +109,8 @@ bench 工作流结构（完整模板见 [references/example-workflows.md](refere
 | 翻译/受约束生成 | `compute_bleu` |
 | 摘要/长文本生成 | `compute_rouge_l` |
 
-- 现成指标用 `MetricsConfigBuilderNode`，entry 必须填完整枚举值
-  `examples/eval_metrics_common.py:<上表函数名>`，如
-  `examples/eval_metrics_common.py:compute_gsm8k`
+- 现成指标用 `MetricsConfigBuilderNode`，entry 必须填裸函数名枚举值，如
+  `compute_gsm8k`；不要加 `examples/eval_metrics_common.py:` 前缀
 - 现成指标都不合适时（如工具调用正确率、业务自定义打分），用 `MetricsConfigBuilderCustomNode`：
   1. 在工作区写好指标 py 文件，函数签名
      `fn(gt_text, pred_text, sample, *, metrics_name=None) -> dict | None`，
@@ -149,14 +148,16 @@ bench 工作流结构（完整模板见 [references/example-workflows.md](refere
 - VL 模型：batch 和 lr 在 LLM 基础上减半，显存需求升一档
 - DPO lr ≈ SFT 的 5%~10%；GRPO lr ≈ SFT 的 10%~20%
 - 资源不够时依次：Full→LoRA、降 rank、batch 减半 accum 翻倍，**不要先降 lr**
+- 按优先级链选出第一个满足模态、效果、资源和用户约束的方案后停止扩展候选；只记录最终
+  选择与一个被排除方案的关键理由
 
 ### 第 5 步：写入与校验
 
-1. 用 `apply_patch` 把 DSL 写入当前工作目录的相对路径 `workflow.py`（修改已有工作流也
-   只编辑这个路径）。不要手写会话目录的长绝对路径；如用 `file_editor` 也传 `workflow.py`。
-   不要只口头说已生成——必须实际调用工具创建或修改文件。
-   Patch 必须用 `*** Begin Patch` / `*** End Patch` 包裹；Add File 的内容行写成 `+content`，
-   不要写成 `+ content`，因为加号后的空格会成为文件内容。
+1. 新建 `workflow.py` 或整体重写全文件时用 `apply_patch`，路径只传当前工作目录下的相对
+   路径 `workflow.py`。修改已有文件（追加/替换节点块）时，先用 `file_editor` 读取当前内容，
+   默认用 `str_replace` 做唯一匹配的最小替换。不要手写会话目录的长绝对路径，也不要只口头
+   说已生成。Patch 必须用 `*** Begin Patch` / `*** End Patch` 包裹；Add File 内容行写成
+   `+content`。若 patch 失败一次，不再重试；重新读取文件确认实际状态后切换到 `str_replace`。
 2. 每次写入/修改后立即进入下方"校验循环"。
 3. 校验通过后正常结束：不要调用额外发布工具，也不要主动调用 `run_workflow(test_mode=true)`
    （那是用户明确要求"测试/调试/试跑"时由 **debug-workflow** 技能通过 `run_workflow` test
@@ -183,13 +184,18 @@ variable_name = NodeType(
 
 ## 节点与知识库检索
 
-检索优先级：**内置示例模板 → 直接读相关节点文档 → 必要时宽泛 grep**。
+检索优先级：**运行时校验结果 → [平台契约覆盖层](references/platform-contract-overrides.md)
+→ 内置示例模板 → 直接读相关节点文档 → 必要时宽泛 grep**。使用 GPU、Metrics、Reward 或
+WandB 时必须先读覆盖层；它专门修正可能被上游同步覆盖的知识库契约。
 
 - 节点速查表和常用参数见 [references/node-reference.md](references/node-reference.md)
 - 节点契约文档路径固定：`<知识库绝对路径>/nodes/<NodeType>/<NodeType>.md`（知识库绝对
   路径见路由提示）。已确定要用的节点直接读其文档，只读会实际用到或参数不确定的
-- 修改已有架构前先列出“必须保留 / 必须新增 / 必须删除”三组节点；写入后逐组核对，避免
-  改训练类型时残留旧节点，或追加推理/评测时漏掉用户要求的结果输出节点
+- 修改已有 `workflow.py` 前做两张内部清单：①需求验收项，把每个明确动作映射为可观察
+  结果（“展示/预览返回内容”必须有 Preview 类节点消费结果端口；“评测”必须有指标、样本
+  上限和结果输出）；②图差分，列出必须保留/新增/删除的节点与连线。修改后先核对验收项，
+  再核对图差分，最后校验完整 DSL。静态校验通过不等于需求验收通过；未要求改变的有效模型、
+  参数、节点和连线保持原样
 - grep 只用于补充检索，用宽泛关键词（`SFT`、`DPO`、`GRPO`、`dataset`、`reward` 或精确
   NodeType），不要用完整标题、`^###`、`# workflow: ...` 这类依赖格式的 pattern
 - 只有用户问平台概念、Studio 操作、SDK 脚本写法时，才检索知识库的 `basic/`、`studio/`、
@@ -204,10 +210,12 @@ variable_name = NodeType(
    继续改
 2. `valid == false`：`errors` 是结构化列表，含 `code`、`message`、`node_id`/`node_type`/
    `edge_id`/`field` 定位信息，`detail` 里的 `node_code`/`target_node_code`/
-   `source_node_code` 是对应的原始 DSL 语句。用这些字段直接定位，用 `apply_patch` 只修改
-   报错指向的那几处，不要因为一条报错重写整个文件；改完回到步骤 1
-3. 调用本身失败（网络错误、非 2xx、JSON 解析失败）不代表工作流有问题：如实告知用户校验
-   服务暂时不可用，不要当成 DSL 错误去"修复"
+   `source_node_code` 是对应的原始 DSL 语句。用这些字段直接定位，优先用 `str_replace` 只
+   修改报错指向的唯一片段，不要因为一条报错重写整个文件；改完回到步骤 1
+3. 调用本身失败不代表工作流有问题。若 `retryable == true`（SSL、timeout、429/5xx 等传输
+   失败），短暂退避后最多重试 2 次；仍失败则调用 `dsl_to_xyflow` 做本地语法、引用和建图
+   检查。转换成功不等于平台完整校验通过，最终回复必须同时说明主校验不可用和降级结果。
+   `retryable == false` 时不重试，也不要把传输/服务错误当成 DSL 错误去修改文件
 4. **最多重试 5 轮**（自己计数）。5 轮后仍不通过，或同一 `code`/`node_id` 连续两轮没消失，
    停止重试并如实说明剩余错误
 
@@ -226,5 +234,6 @@ variable_name = NodeType(
 ## 参考文件
 
 - [references/parameter-decision.md](references/parameter-decision.md)：配参决策链的档位表与推荐超参
+- [references/platform-contract-overrides.md](references/platform-contract-overrides.md)：易漂移的平台枚举与 Secret 约定
 - [references/node-reference.md](references/node-reference.md)：节点速查表与常用节点参数
 - [references/example-workflows.md](references/example-workflows.md)：6 个示例工作流模板

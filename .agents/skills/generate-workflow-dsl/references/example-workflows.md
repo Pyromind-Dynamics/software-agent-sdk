@@ -65,7 +65,7 @@ sft_train = ModelTrainSFTNode(
     accelerate_config=accelerate_config.accelerate_config,
     output_path="/workspace/output/sft/",
     gpu_count=1,
-    gpu_product="NVIDIA-H100-NVL",
+    gpu_product="NVIDIA-H100-80GB-HBM3",
 )
 merge = ModelMergeLoraNode(
     id="11",
@@ -73,7 +73,7 @@ merge = ModelMergeLoraNode(
     lora_path=sft_train.model_output_path,
     output_path="/workspace/output/merged/",
     gpu_count=1,
-    gpu_product="NVIDIA-H100-NVL",
+    gpu_product="NVIDIA-H100-80GB-HBM3",
 )
 ```
 
@@ -132,7 +132,7 @@ dpo_train = ModelTrainDPONode(
     accelerate_config=accelerate_config.accelerate_config,
     output_path="/workspace/output/dpo/",
     gpu_count=1,
-    gpu_product="NVIDIA-H100-NVL",
+    gpu_product="NVIDIA-H100-80GB-HBM3",
 )
 ```
 
@@ -187,13 +187,13 @@ training_config = TrainingConfigBuilderNode(
 )
 reward_item_1 = RewardItemBuilderNode(
     id="9",
-    entry="examples/geometry_vqa/reward.py:geometry_vqa_thinking_reward",
+    entry="geometry_vqa_thinking_reward",
     name="thinking_tags",
     weight=1.0,
 )
 reward_item_2 = RewardItemBuilderNode(
     id="10",
-    entry="examples/geometry_vqa/reward.py:geometry_vqa_answer_reward",
+    entry="geometry_vqa_answer_reward",
     name="answer_acc",
     weight=1.0,
 )
@@ -221,7 +221,7 @@ grpo_train = ModelTrainGRPONode(
     grpo_extra_config=grpo_extra.grpo_extra_config,
     output_path="/workspace/output/grpo/",
     gpu_count=1,
-    gpu_product="NVIDIA-H100-NVL",
+    gpu_product="NVIDIA-H100-80GB-HBM3",
 )
 ```
 
@@ -274,7 +274,7 @@ sft_train = ModelTrainSFTNode(
     accelerate_config=accelerate_config.accelerate_config,
     output_path="/workspace/output/sft/",
     gpu_count=1,
-    gpu_product="NVIDIA-H100-NVL",
+    gpu_product="NVIDIA-H100-80GB-HBM3",
 )
 ```
 
@@ -323,7 +323,7 @@ sft_train = ModelTrainSFTNode(
     accelerate_config=accelerate_config.accelerate_config,
     output_path="/workspace/output/sft/",
     gpu_count=1,
-    gpu_product="NVIDIA-H100-NVL",
+    gpu_product="NVIDIA-H100-80GB-HBM3",
 )
 ```
 
@@ -355,7 +355,7 @@ dataset_config = DatasetConfigBuilderNode(
 )
 metrics = MetricsConfigBuilderNode(
     id="5",
-    entry="examples/eval_metrics_common.py:compute_gsm8k",
+    entry="compute_gsm8k",
     name="gsm8k",
 )
 vllm = VLLMInference(
@@ -363,7 +363,7 @@ vllm = VLLMInference(
     model_path=model.model_path,
     port=3000,
     gpu_count=1,
-    gpu_product="NVIDIA-H100-NVL",
+    gpu_product="NVIDIA-H100-80GB-HBM3",
 )
 bench = ModelEvalApiNode(
     id="7",
