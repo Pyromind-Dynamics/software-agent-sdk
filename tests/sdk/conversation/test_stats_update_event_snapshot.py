@@ -98,6 +98,8 @@ def test_stats_update_event_uses_snapshot_not_full_metrics(state):
     assert "accumulated_token_usage" in metrics_data
     assert metrics_data["accumulated_token_usage"]["prompt_tokens"] == 1000
     assert metrics_data["accumulated_token_usage"]["completion_tokens"] == 500
+    assert metrics_data["model_name"] == "<redacted>"
+    assert metrics_data["accumulated_token_usage"]["model"] == "<redacted>"
 
 
 def test_stats_model_dump_preserves_full_history():
@@ -146,6 +148,7 @@ def test_stats_model_dump_preserves_full_history():
     # Verify accumulated values are also present
     assert "accumulated_cost" in metrics_data
     assert metrics_data["accumulated_cost"] == pytest.approx(0.05)
+    assert metrics_data["model_name"] == "gpt-4"
 
 
 def test_stats_model_dump_with_snapshot_context_excludes_history():
@@ -192,3 +195,13 @@ def test_stats_model_dump_with_snapshot_context_excludes_history():
     assert "accumulated_token_usage" in metrics_data
     assert metrics_data["accumulated_token_usage"]["prompt_tokens"] == 500
     assert metrics_data["accumulated_token_usage"]["completion_tokens"] == 250
+
+
+def test_full_state_event_redacts_model_names(state):
+    """Full state events must not expose model names through conversation stats."""
+    state.stats.usage_to_metrics["default"] = Metrics(model_name="private-model")
+
+    event = ConversationStateUpdateEvent.from_conversation_state(state)
+    metrics_data = event.value["stats"]["usage_to_metrics"]["default"]
+
+    assert metrics_data["model_name"] == "<redacted>"

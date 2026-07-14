@@ -9,6 +9,23 @@ from openhands.sdk.logger import get_logger
 
 logger = get_logger(__name__)
 
+_REDACTED_MODEL_NAME = "<redacted>"
+
+
+def _redact_model_names(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: (
+                _REDACTED_MODEL_NAME
+                if key in {"model", "model_name"}
+                else _redact_model_names(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_model_names(item) for item in value]
+    return value
+
 
 class ConversationStats(BaseModel):
     """Track per-LLM usage metrics observed during conversations."""
@@ -43,15 +60,26 @@ class ConversationStats(BaseModel):
         # Check if we should use snapshot serialization
         context = info.context if info else None
         use_snapshot = context.get("use_snapshot", False) if context else False
+        redact_model_names = (
+            context.get("redact_model_names", False) if context else False
+        )
 
         if use_snapshot and "usage_to_metrics" in data:
             # Replace each Metrics with its snapshot
             usage_to_snapshots = {}
             for usage_id, metrics in self.usage_to_metrics.items():
                 snapshot = metrics.get_snapshot()
-                usage_to_snapshots[usage_id] = snapshot.model_dump()
+                snapshot_data = snapshot.model_dump()
+                usage_to_snapshots[usage_id] = (
+                    _redact_model_names(snapshot_data)
+                    if redact_model_names
+                    else snapshot_data
+                )
 
             data["usage_to_metrics"] = usage_to_snapshots
+
+        if redact_model_names and "usage_to_metrics" in data:
+            data["usage_to_metrics"] = _redact_model_names(data["usage_to_metrics"])
 
         return data
 
