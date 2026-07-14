@@ -15,6 +15,7 @@ import asyncio
 import json
 import uuid
 from datetime import datetime
+
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 from openhands.agent_server.kafka_bus.kafka_handler import MessageHandler
@@ -59,7 +60,7 @@ class KafkaMessageBus:
                     "[MessageBus] KAFKA_BROKERS 未配置，无法创建 Producer"
                 )
             self._producer = AIOKafkaProducer(
-                bootstrap_servers=brokers.split(","),
+                bootstrap_servers=brokers,
                 request_timeout_ms=40000,
             )
             await self._producer.start()
@@ -85,7 +86,7 @@ class KafkaMessageBus:
 
         # 自动填充集群标识，用于消息追踪和日志
         message.cluster = env_util.get_cluster_region()
-        message.env = env_util.get_env_value()
+        message.env = env_util.get_kafka_env_value()
         message.topic = topic.resolve()
         message.timestamp = str(_current_timestamp())
 
@@ -104,7 +105,10 @@ class KafkaMessageBus:
             return True
         except Exception as e:
             logger.error(
-                f"[MessageBus] 发送失败: message_id={message.message_id}, biz_code={message.biz_code}, error={e}"
+                "[MessageBus] 发送失败: message_id=%s, biz_code=%s, error=%s",
+                message.message_id,
+                message.biz_code,
+                e,
             )
             return False
 
@@ -162,7 +166,11 @@ class KafkaMessageBus:
                 )
                 if ok:
                     logger.info(
-                        f"[MessageBus] Consumer 已启动: topic={resolved_topic}, group={group_id}, concurrency={handler.concurrency()}"
+                        "[MessageBus] Consumer 已启动: topic=%s, group=%s, "
+                        "concurrency=%s",
+                        resolved_topic,
+                        group_id,
+                        handler.concurrency(),
                     )
                 else:
                     failed.append((resolved_topic, handler))
@@ -173,7 +181,10 @@ class KafkaMessageBus:
 
             pending = failed
             logger.error(
-                f"[MessageBus] {len(failed)} 个 Consumer 启动失败，{RETRY_INTERVAL}s 后重试（第 {attempt} 轮）"
+                "[MessageBus] %s 个 Consumer 启动失败，%ss 后重试（第 %s 轮）",
+                len(failed),
+                RETRY_INTERVAL,
+                attempt,
             )
             await asyncio.sleep(RETRY_INTERVAL)
 
@@ -182,9 +193,12 @@ class KafkaMessageBus:
     ) -> bool:
         """创建并启动一个 AIOKafkaConsumer，返回是否成功"""
         brokers = env_util.get_kafka_brokers()
+        if not brokers:
+            logger.error("[MessageBus] KAFKA_BROKERS 未配置，无法创建 Consumer")
+            return False
         consumer = AIOKafkaConsumer(
             topic,
-            bootstrap_servers=brokers.split(","),
+            bootstrap_servers=brokers,
             group_id=group_id,
             auto_offset_reset="latest",
             enable_auto_commit=True,
@@ -204,7 +218,10 @@ class KafkaMessageBus:
             return True
         except Exception as e:
             logger.error(
-                f"[MessageBus] Consumer 启动失败: topic={topic}, group={group_id}, error={e}"
+                "[MessageBus] Consumer 启动失败: topic=%s, group=%s, error=%s",
+                topic,
+                group_id,
+                e,
             )
             try:
                 await consumer.stop()
@@ -262,7 +279,7 @@ class KafkaMessageBus:
             logger.info(f"[MessageBus] 消费循环结束: topic={topic}")
 
     def _is_dev(self) -> bool:
-        return env_util.is_dev()
+        return env_util.is_kafka_dev()
 
     async def _restart_consumer(
         self,
@@ -308,9 +325,13 @@ class KafkaMessageBus:
             f"[MessageBus] 收到消息: message_id={message_id}, attempt={attempt}"
         )
 
-        handler: MessageHandler = self._handlers.get(event.topic)
+        topic = event.topic
+        if not topic:
+            logger.warning("[MessageBus] 消息缺少 topic")
+            return
+        handler = self._handlers.get(topic)
         if not handler:
-            logger.warning(f"[MessageBus] 无 handler 处理: topic={event.topic}")
+            logger.warning("[MessageBus] 无 handler 处理: topic=%s", topic)
             return
 
         group_id = handler.group_id()
@@ -322,7 +343,10 @@ class KafkaMessageBus:
                 error_msg = f"消费重试 {attempt} 次仍失败: {e}"
                 event.error_message = error_msg
                 logger.error(
-                    f"[MessageBus] 重试耗尽: message_id={message_id}, topic={event.topic}, attempt={attempt}"
+                    "[MessageBus] 重试耗尽: message_id=%s, topic=%s, attempt=%s",
+                    message_id,
+                    event.topic,
+                    attempt,
                 )
                 await self._send_to_dlq(event, group_id)
             else:
@@ -330,7 +354,8 @@ class KafkaMessageBus:
                 event.error_message = str(e)
                 logger.warning(
                     f"[MessageBus] 消费失败，发回原 topic 重试: topic={event.topic}, "
-                    f"message_id={message_id}, biz_code={event.biz_code},attempt={attempt}, warning={e}"
+                    f"message_id={message_id}, biz_code={event.biz_code}, "
+                    f"attempt={attempt}, warning={e}"
                 )
                 try:
                     producer = await self._get_or_create_producer()

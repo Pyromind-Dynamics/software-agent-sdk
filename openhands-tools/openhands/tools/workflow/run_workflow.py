@@ -22,11 +22,8 @@ from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
 from pydantic import Field
 from pyromind_sdk import PyroMindAPIClient
-from pyromind_sdk.client.models import (
-    TrainingTaskCreateRequest,
-    TrainingTaskCreateResponse,
-)
 
+from openhands.sdk.logger import get_logger
 from openhands.sdk.tool.registry import register_tool
 from openhands.sdk.tool.tool import (
     Action,
@@ -35,17 +32,16 @@ from openhands.sdk.tool.tool import (
     ToolDefinition,
     ToolExecutor,
 )
-from openhands.tools.utils.pyromind_api_client import (
-    get_api_key,
-    get_pyromind_api_client,
-)
 from openhands.tools.workflow.dsl_to_xyflow import (
     DslToXyflowAction,
     DslToXyflowExecutor,
     DslToXyflowObservation,
 )
-from openhands.sdk.logger import get_logger
-
+from openhands.tools.workflow.task_submission import (
+    PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
+    create_workflow_api_client,
+    submit_workflow_task,
+)
 
 
 logger = get_logger(__name__)
@@ -57,18 +53,6 @@ if TYPE_CHECKING:
 
 # Default retry budget per executor instance / 每个 Executor 实例的默认最大尝试次数
 DEFAULT_MAX_ATTEMPTS = 10
-
-
-class WorkflowRunError(RuntimeError):
-    """Raised when the Pyromind platform fails to create or run a workflow.
-
-    This is a runtime/platform error rather than an invalid input value, so it
-    inherits from ``RuntimeError``. The executor catches it and turns it into an
-    error observation for the agent loop.
-
-    当 Pyromind 平台创建或运行工作流失败时抛出。属于运行时/平台错误，而非输入值
-    不合法，因此继承 ``RuntimeError``。Executor 会捕获它并转为 error observation。
-    """
 
 
 class RunWorkflowAction(Action):
@@ -275,12 +259,15 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
             # 2. Resolve DSL format to xyflow
             workflow_json = self._resolve_dsl(action)
 
-            # 3. 获取用户的AccessKey
-            access_key = self._resolve_access_key(conversation)
-
-            # 4. 获取client
-            client = self._get_client(
-                api_key=access_key, env=self.env, cluster=self.cluster
+            state = cast("ConversationState", conversation.state)
+            auth_token = state.secret_registry.get_secret_value(
+                PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET
+            )
+            client = create_workflow_api_client(
+                env=self.env,
+                cluster=self.cluster,
+                auth_token=auth_token,
+                headers=self.headers,
             )
 
             # 5. 运行工作流
@@ -384,41 +371,29 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
             # 获取工作流名称
             _workflow_name = str(workflow_xyflow.get("name", workflow_name))
 
-            # 3. 调用平台运行接口
-            request = TrainingTaskCreateRequest(
-                name=_workflow_name,
+            response = submit_workflow_task(
+                client=client,
                 workflow=workflow_xyflow,
-                out_id=f"agent1#{conversation_id}",
+                name=_workflow_name,
+                conversation_id=conversation_id,
             )
-            
-            # 4. 创建工作流
-            is_mock = False
-            response: TrainingTaskCreateResponse | None = None
-            if is_mock:
-                response = self._mock_submit_workflow(
-                    request
-                )
-            else:
-                response = client.studio.create(request)
-
-            # 5. 检查任务是否创建成功
-            if response is None:
-                # 校验失败，工作流没有创建成功
-                raise WorkflowRunError("Workflow create failed, response is None")
-            if not response.task_id:
-                # 校验失败，工作流没有创建成功
-                raise WorkflowRunError("Workflow create failed, task_id is None")
 
             if test_mode:
                 user_text = (
-                    f"The test workflow task has been submitted. Please wait patiently. task id: {response.task_id}"
+                    "The test workflow task has been submitted. Please wait "
+                    f"patiently. task id: {response.task_id}"
                 )
             else:
                 user_text = (
-                    f"The workflow task has been submitted. Please wait patiently. task id: {response.task_id}"
+                    "The workflow task has been submitted. Please wait patiently. "
+                    f"task id: {response.task_id}"
                 )
 
-            logger.info(f"Run workflow successfully, msg = {user_text}, mode = {"test" if test_mode else "Normal"}")
+            logger.info(
+                "Run workflow successfully, msg = %s, mode = %s",
+                user_text,
+                "test" if test_mode else "Normal",
+            )
 
             # 成功提交工作流，返回提交结果
             return RunWorkflowObservation.from_text(
@@ -459,32 +434,6 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
         return DslToXyflowExecutor(converter_factory=None)(
             DslToXyflowAction(dsl=dsl, name=name)
         )
-
-    def _resolve_access_key(
-        self,
-        conversation: BaseConversation | None,
-    ) -> str | None:
-        if conversation:
-            state = cast("ConversationState", conversation.state)
-            if auth_token := state.secret_registry.get_secret_value("auth_token"):
-                return get_api_key(
-                    env=self.env, auth_token=auth_token, origin_headers=self.headers
-                )
-        return None
-
-    def _get_client(
-        self,
-        env: str | None,
-        cluster: str | None,
-        api_key: str | None,
-    ) -> PyroMindAPIClient:
-        if not api_key:
-            raise ValueError("API key is required.")
-        if not env:
-            raise ValueError("env is required.")
-        if not cluster:
-            raise ValueError("cluster is required.")
-        return get_pyromind_api_client(env=env, cluster=cluster, api_key=api_key)
 
     def _resolve_add_test_mode(self, workflow_json: dict, test_mode: bool) -> dict:
         """Parse workflow JSON string into a dictionary.
@@ -554,14 +503,6 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
         if conversion.xyflow is None:
             raise ValueError("Workflow DSL conversion did not return xyflow JSON.")
         return conversion.xyflow
-
-    def _mock_submit_workflow(
-        self, request: TrainingTaskCreateRequest
-    ) -> TrainingTaskCreateResponse:
-        resp = TrainingTaskCreateResponse(
-            task_id="1999", name=request.name, status="Running"
-        )
-        return resp
 
 
 class RunWorkflowTool(ToolDefinition[RunWorkflowAction, RunWorkflowObservation]):

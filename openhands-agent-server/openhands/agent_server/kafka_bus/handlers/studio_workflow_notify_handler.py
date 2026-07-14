@@ -27,6 +27,14 @@ _BROADCAST_SKIP_OUTCOMES = frozenset(
         "resolved_blocked",
     }
 )
+_TERMINAL_STUDIO_STATUSES = frozenset(
+    {
+        StudioTaskStatus.FAILED,
+        StudioTaskStatus.SUCCEEDED,
+        StudioTaskStatus.ERROR,
+        StudioTaskStatus.TERMINATED,
+    }
+)
 
 
 class TrainingTaskEventType(str, Enum):
@@ -67,7 +75,7 @@ class StudioWorkflowNotifyHandler(MessageHandler):
 
         message_data = event.data
         status = _get_task_status(message_data.get("status"))
-        if status is None or not status.is_end:
+        if status is None or status not in _TERMINAL_STUDIO_STATUSES:
             return
 
         raw_task_id = message_data.get("task_id")
@@ -81,13 +89,12 @@ class StudioWorkflowNotifyHandler(MessageHandler):
 
         conversation_id = _parse_conversation_id_from_out_id(message_data.get("out_id"))
         if not conversation_id:
-            logger.warning(
-                "Skip workflow notify: missing out_id/conversation_id "
+            logger.info(
+                "Workflow notify has no out_id; trying generic task correlation "
                 "task_id=%s message_id=%s",
                 task_id,
                 event.message_id,
             )
-            return
 
         error_log = (
             str(message_data["error_msg"])

@@ -1,6 +1,6 @@
-"""Deliver Pyromind run_workflow terminal status updates back to conversations.
+"""Deliver Pyromind workflow terminal status updates back to conversations.
 
-Agent-server callback layer for the async run_workflow pipeline. An external
+Agent-server callback layer for asynchronous Studio workflows. An external
 Kafka consumer (or HTTP webhook) calls :func:`deliver_run_workflow_status`
 when the platform reports a workflow status change. The callback uses the
 ``conversation_id`` written to the task at submission time
@@ -23,7 +23,7 @@ Module layout / 模块结构
 4. **Broker bridge (optional)** — lazy import of ``run_workflow_broker`` for
    Debug ``wait_mode=block`` and in-process registry fallback
 5. **Idempotency** — process-wide dedup of terminal deliveries per ``task_id``
-6. **Conversation delivery** — inject MessageEvent + ``extended_content``
+6. **Conversation delivery** — inject hidden environment context
 7. **Main entry** — :func:`deliver_run_workflow_status` orchestrates the above
 """
 
@@ -40,7 +40,7 @@ from openhands.agent_server.conversation_service import (
     get_default_conversation_service,
 )
 from openhands.agent_server.event_service import EventService
-from openhands.sdk.llm import Message, TextContent
+from openhands.sdk.llm import TextContent
 from openhands.sdk.logger import get_logger
 
 
@@ -56,11 +56,11 @@ RunWorkflowStatus = Literal[
 """Normalized workflow status aligned with RunWorkflowObservation."""
 
 CallbackOutcome = Literal[
-    "resolved_blocked",      # Debug path: broker.wait was woken
-    "delivered_async",       # Async path: conversation updated + auto_run
-    "unknown_task",          # No conversation_id and no broker registration
+    "resolved_blocked",  # Debug path: broker.wait was woken
+    "delivered_async",  # Async path: conversation updated + auto_run
+    "unknown_task",  # No conversation_id and no broker registration
     "unknown_conversation",  # Invalid id or conversation not on this server
-    "duplicate_terminal",    # Terminal status already delivered for task_id
+    "duplicate_terminal",  # Terminal status already delivered for task_id
     "ignored_non_terminal",  # Pending/Running — no agent restart
 ]
 
@@ -137,11 +137,15 @@ def build_run_workflow_terminal_reminder(
     """
     lines = [
         "<system_reminder>",
+        f"Pyromind workflow task {task_id} completed with status {status}.",
         (
-            f"Pyromind workflow run_workflow task {task_id} reached terminal "
-            f"status {status}."
+            "Resume the tool invocation associated with this task and follow "
+            "that tool's result contract when inspecting outputs or errors."
         ),
-        "Review the outcome and continue helping the user.",
+        (
+            "Respond in the language of the user's most recent non-empty "
+            "visible message."
+        ),
     ]
     if error_log:
         lines.append("Runtime error log:")
@@ -255,6 +259,12 @@ def _mark_terminal_delivered(task_id: str) -> bool:
         return True
 
 
+def _release_terminal_delivery(task_id: str) -> None:
+    """Allow a failed delivery attempt to be retried."""
+    with _delivered_terminal_lock:
+        _delivered_terminal_task_ids.discard(task_id)
+
+
 # ---------------------------------------------------------------------------
 # 6. Conversation delivery / 会话投递
 # ---------------------------------------------------------------------------
@@ -270,33 +280,19 @@ async def resume_conversation_after_workflow(
 ) -> None:
     """Inject terminal status into a conversation and optionally start the agent.
 
-    Uses the same extended_content pattern as pyromind canvas sync: a visible
-    user Message plus a ``<system_reminder>`` block the LLM sees but the user
-    does not need to type.
+    Uses hidden environment context so the LLM receives the workflow status
+    without creating a user-authored chat event.
 
-    向会话注入终态并可选启动 Agent。与 canvas sync 相同：用户可见 Message +
-    LLM 可见的 ``<system_reminder>``（extended_content）。
+    通过隐藏的 environment 上下文注入终态并可选启动 Agent，不会伪造用户消息。
     """
     reminder = build_run_workflow_terminal_reminder(
         task_id=task_id,
         status=status,
         error_log=error_log,
     )
-    message = Message(
-        role="user",
-        content=[
-            TextContent(
-                text=(
-                    f"Pyromind workflow run finished "
-                    f"(task_id={task_id}, status={status})."
-                )
-            )
-        ],
-    )
-    await event_service.send_message(
-        message,
+    await event_service.send_internal_context(
+        [TextContent(text=reminder)],
         run=auto_run,
-        extended_content=[TextContent(text=reminder)],
     )
 
 
@@ -321,9 +317,9 @@ async def deliver_run_workflow_status(
     1. Normalize status
     2. Try Debug broker resolve → ``resolved_blocked``
     3. Skip non-terminal → ``ignored_non_terminal``
-    4. Dedup terminal → ``duplicate_terminal``
-    5. Resolve conversation_id (Kafka > broker fallback)
-    6. Locate EventService on this agent-server
+    4. Resolve conversation_id (Kafka > broker fallback)
+    5. Locate EventService on this agent-server
+    6. Dedup terminal → ``duplicate_terminal``
     7. Inject reminder + auto_run → ``delivered_async``
 
     Args:
@@ -338,6 +334,7 @@ async def deliver_run_workflow_status(
     del updated_at  # reserved for future idempotency / ordering
 
     normalized_status = normalize_platform_status(status)
+    service = conversation_service or get_default_conversation_service()
 
     # Step 2: Debug block path — wake broker.wait(), skip async delivery.
     if _try_resolve_blocked_waiter(
@@ -371,21 +368,7 @@ async def deliver_run_workflow_status(
             conversation_id=conversation_id,
         )
 
-    # Step 4: Ignore duplicate terminal Kafka messages.
-    if not _mark_terminal_delivered(task_id):
-        logger.info(
-            "Ignoring duplicate terminal run_workflow status task_id=%s status=%s",
-            task_id,
-            normalized_status,
-        )
-        return RunWorkflowCallbackResult(
-            outcome="duplicate_terminal",
-            task_id=task_id,
-            normalized_status=normalized_status,
-            conversation_id=conversation_id,
-        )
-
-    # Step 5: conversation_id from Kafka (primary) or broker registry (fallback).
+    # Step 4: conversation_id from the callback or broker registry.
     resolved_conversation_id = conversation_id
     if resolved_conversation_id is None:
         resolved_conversation_id = _lookup_conversation_id_from_broker(task_id)
@@ -415,11 +398,10 @@ async def deliver_run_workflow_status(
             conversation_id=resolved_conversation_id,
         )
 
-    # Step 6: Conversation must be loaded on this agent-server instance.
+    # Step 5: Conversation must be loaded on this agent-server instance.
     # Under Kafka broadcast (per-pod consumer group), other pods normally miss
     # the conversation — return unknown_conversation without raising so the
     # consumer skips (no retry/DLQ). Only the pod that holds the session delivers.
-    service = conversation_service or get_default_conversation_service()
     event_service = await service.get_event_service(conversation_uuid)
     if event_service is None:
         logger.info(
@@ -435,14 +417,32 @@ async def deliver_run_workflow_status(
             conversation_id=str(conversation_uuid),
         )
 
+    # Step 6: Reserve this terminal delivery after all routing data is available.
+    if not _mark_terminal_delivered(task_id):
+        logger.info(
+            "Ignoring duplicate terminal run_workflow status task_id=%s status=%s",
+            task_id,
+            normalized_status,
+        )
+        return RunWorkflowCallbackResult(
+            outcome="duplicate_terminal",
+            task_id=task_id,
+            normalized_status=normalized_status,
+            conversation_id=str(conversation_uuid),
+        )
+
     # Step 7: Deliver to conversation and auto_run.
-    await resume_conversation_after_workflow(
-        event_service=event_service,
-        task_id=task_id,
-        status=normalized_status,
-        error_log=error_log,
-        auto_run=auto_run,
-    )
+    try:
+        await resume_conversation_after_workflow(
+            event_service=event_service,
+            task_id=task_id,
+            status=normalized_status,
+            error_log=error_log,
+            auto_run=auto_run,
+        )
+    except Exception:
+        _release_terminal_delivery(task_id)
+        raise
     logger.info(
         "Delivered run_workflow terminal status task_id=%s status=%s "
         "conversation_id=%s auto_run=%s",
