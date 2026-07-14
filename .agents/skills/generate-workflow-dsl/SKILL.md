@@ -153,11 +153,11 @@ bench 工作流结构（完整模板见 [references/example-workflows.md](refere
 
 ### 第 5 步：写入与校验
 
-1. 新建 `workflow.py` 或整体重写全文件时用 `apply_patch`，路径只传当前工作目录下的相对
-   路径 `workflow.py`。修改已有文件（追加/替换节点块）时，先用 `file_editor` 读取当前内容，
-   默认用 `str_replace` 做唯一匹配的最小替换。不要手写会话目录的长绝对路径，也不要只口头
-   说已生成。Patch 必须用 `*** Begin Patch` / `*** End Patch` 包裹；Add File 内容行写成
-   `+content`。若 patch 失败一次，不再重试；重新读取文件确认实际状态后切换到 `str_replace`。
+1. 新建 `workflow.py` 或整体重写全文件时用 `apply_patch`（patch 格式以工具描述为准），
+   路径只传当前工作目录下的相对路径 `workflow.py`。修改已有文件（追加/替换节点块）时，
+   先用 `file_editor` 读取当前内容，默认用 `str_replace` 做唯一匹配的最小替换。不要手写
+   会话目录的长绝对路径，也不要只口头说已生成。若 patch 失败一次，不再重试；重新读取
+   文件确认实际状态后切换到 `str_replace`。
 2. 每次写入/修改后立即进入下方"校验循环"。
 3. 校验通过后正常结束：不要调用额外发布工具，也不要主动调用 `run_workflow(test_mode=true)`
    （那是用户明确要求"测试/调试/试跑"时由 **debug-workflow** 技能通过 `run_workflow` test

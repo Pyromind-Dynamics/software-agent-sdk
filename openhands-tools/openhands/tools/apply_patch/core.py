@@ -346,17 +346,84 @@ def peek_next_section(
     return old, chunks, index, False
 
 
-def text_to_patch(text: str, orig: dict[str, str]) -> tuple[Patch, int]:
+_HEREDOC_MARKERS = ("<<EOF", "<<'EOF'", '<<"EOF"')
+
+
+def _is_end_marker(line: str) -> bool:
+    """Match the closing envelope marker, tolerating a spurious '+' prefix.
+
+    Models sometimes over-apply the "prefix content lines with +" rule to the
+    closing marker itself and emit "+*** End Patch". That line means the model
+    finished the patch (no truncation risk), so we accept it as the envelope
+    end. A file whose content legitimately ends with the literal line
+    "*** End Patch" would need a bare marker after it anyway, and that bare
+    marker wins because we search from the end.
+    """
+    stripped = line.strip()
+    return stripped == "*** End Patch" or stripped == "+*** End Patch"
+
+
+def extract_patch_lines(text: str) -> list[str]:
+    """Extract patch lines with lenient boundary handling (mirrors codex).
+
+    codex-rs (apply-patch/src/parser.rs) parses patches in lenient mode:
+    envelope markers are compared after trimming whitespace and common
+    wrappers emitted by LLMs (shell heredocs) are stripped. We additionally
+    unwrap markdown code fences and tolerate trailing prose after
+    "*** End Patch", since these are frequent failure modes when the patch
+    travels through a JSON string argument.
+
+    Interior lines are never trimmed; only the envelope is normalized so the
+    strict line-oriented Parser below keeps working unchanged.
+    """
     stripped = text.strip()
     lines = stripped.splitlines() if stripped else []
-    if not lines or lines[0] != "*** Begin Patch":
+
+    # Unwrap a markdown code fence around the whole patch.
+    if (
+        len(lines) >= 2
+        and lines[0].lstrip().startswith("```")
+        and lines[-1].strip() == "```"
+    ):
+        lines = lines[1:-1]
+
+    # Unwrap a shell heredoc (codex lenient mode: <<'EOF' ... EOF).
+    if (
+        len(lines) >= 4
+        and lines[0].strip() in _HEREDOC_MARKERS
+        and lines[-1].strip().endswith("EOF")
+    ):
+        lines = lines[1:-1]
+
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    if not lines or lines[0].strip() != "*** Begin Patch":
         raise DiffError(
             'PATCH_BEGIN_MISSING: first non-empty line must be "*** Begin Patch"'
         )
-    if len(lines) < 2 or lines[-1] != "*** End Patch":
-        raise DiffError(
-            'PATCH_END_MISSING: last non-empty line must be "*** End Patch"'
-        )
+    lines[0] = "*** Begin Patch"
+
+    if _is_end_marker(lines[-1]):
+        lines[-1] = "*** End Patch"
+        return lines
+
+    # Tolerate trailing prose after the closing marker: truncate at the last
+    # line that is the closing marker (modulo whitespace / spurious '+').
+    # A patch with no closing marker at all is still rejected, because that
+    # usually means the patch content itself was truncated.
+    for i in range(len(lines) - 1, 0, -1):
+        if _is_end_marker(lines[i]):
+            lines = lines[: i + 1]
+            lines[-1] = "*** End Patch"
+            return lines
+    raise DiffError('PATCH_END_MISSING: last non-empty line must be "*** End Patch"')
+
+
+def text_to_patch(text: str, orig: dict[str, str]) -> tuple[Patch, int]:
+    lines = extract_patch_lines(text)
 
     parser = Parser(
         current_files=orig,
@@ -504,12 +571,8 @@ def process_patch(
 
     Returns (message, fuzz, commit)
     """
-    stripped = text.strip()
-    first_line = stripped.splitlines()[0] if stripped else ""
-    if first_line != "*** Begin Patch":
-        raise DiffError(
-            'PATCH_BEGIN_MISSING: first non-empty line must be "*** Begin Patch"'
-        )
+    # Normalize the envelope once so downstream helpers see canonical markers.
+    text = "\n".join(extract_patch_lines(text))
     paths = identify_files_needed(text)
     orig = load_files(paths, open_fn)
     patch, fuzz = text_to_patch(text, orig)

@@ -16,7 +16,6 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
-from openhands.sdk.tool.tool import FunctionToolParam
 from openhands.tools.workflow.definition import mark_pyromind_workflow_dirty
 
 from .core import Commit, DiffError, process_patch
@@ -36,11 +35,9 @@ class ApplyPatchAction(Action):
 
     patch: str = Field(
         description=(
-            "The patch to apply, wrapped in the '*** Begin Patch' ... "
-            "'*** End Patch' envelope. Each file section starts with an "
-            "'*** Add File:', '*** Delete File:', or '*** Update File:' header. "
-            "Prefix new content lines with '+'. This is a FREEFORM tool, so do "
-            "not wrap the patch in JSON."
+            "The full patch text, starting with '*** Begin Patch' and ending "
+            "with '*** End Patch'. Pass it as a plain string (newlines escaped "
+            "as \\n inside the JSON argument); do not wrap it in a code fence."
         ),
     )
 
@@ -144,18 +141,66 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
                 return
 
 
-_DESCRIPTION = (
-    "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do "
-    "not wrap the patch in JSON."
-)
+# Adapted from codex's apply_patch tool instructions
+# (codex-rs/prompts/templates/apply_patch_tool_instructions.md), reworked for
+# a JSON function tool that takes the patch text in a single `patch` argument.
+_DESCRIPTION = """Use the `apply_patch` tool to create, delete, or edit files.
+
+The `patch` argument is a stripped-down, file-oriented diff format:
+
+*** Begin Patch
+[ one or more file sections ]
+*** End Patch
+
+Each file section starts with exactly one of three headers:
+
+*** Add File: <path> - create a new file. Every following line is a + line (the initial contents).
+*** Delete File: <path> - remove an existing file. Nothing follows.
+*** Update File: <path> - patch an existing file in place. May be immediately followed by *** Move to: <new path> to rename the file. Then one or more hunks, each introduced by @@ (optionally followed by a class/function header). Within a hunk each line starts with ' ' (context), '-' (remove), or '+' (add).
+
+For Update File hunks:
+- Show 3 lines of context immediately above and below each change. If a change is within 3 lines of a previous change, do NOT duplicate context lines between hunks.
+- If 3 lines of context is insufficient to uniquely locate the snippet, use the @@ operator to name the enclosing class or function, e.g. `@@ class BaseClass` or `@@ def method():`. Multiple @@ statements may be stacked to narrow down further.
+
+Full grammar:
+Patch := Begin { FileOp } End
+Begin := "*** Begin Patch" NEWLINE
+End := "*** End Patch" NEWLINE
+FileOp := AddFile | DeleteFile | UpdateFile
+AddFile := "*** Add File: " path NEWLINE { "+" line NEWLINE }
+DeleteFile := "*** Delete File: " path NEWLINE
+UpdateFile := "*** Update File: " path NEWLINE [ MoveTo ] { Hunk }
+MoveTo := "*** Move to: " newPath NEWLINE
+Hunk := "@@" [ header ] NEWLINE { HunkLine } [ "*** End of File" NEWLINE ]
+HunkLine := (" " | "-" | "+") text NEWLINE
+
+Example combining several operations:
+
+*** Begin Patch
+*** Add File: hello.txt
++Hello world
+*** Update File: src/app.py
+*** Move to: src/main.py
+@@ def greet():
+-print("Hi")
++print("Hello, world!")
+*** Delete File: obsolete.txt
+*** End Patch
+
+Remember:
+- Every file section must have an Add/Delete/Update header.
+- Prefix every new content line with `+`, even when creating a new file.
+- The `+` prefix applies ONLY to file content lines. Never prefix `***` marker lines: the patch must end with the bare line `*** End Patch`, not `+*** End Patch`.
+- File paths must be relative, NEVER ABSOLUTE."""
 
 
 class ApplyPatchTool(ToolDefinition[ApplyPatchAction, ApplyPatchObservation]):
     """ToolDefinition for applying unified text patches.
 
-    Creates an ApplyPatchExecutor bound to the current workspace and supplies a
-    concise description. The Responses tool schema is minimized to rely on
-    provider-known behavior for GPT-5.1 models.
+    Creates an ApplyPatchExecutor bound to the current workspace and supplies
+    the full patch-format instructions (adapted from codex) as the tool
+    description, so models that don't natively know this format can still
+    produce valid patches.
     """
 
     @classmethod
@@ -177,29 +222,6 @@ class ApplyPatchTool(ToolDefinition[ApplyPatchAction, ApplyPatchObservation]):
                 executor=executor,
             )
         ]
-
-    # For OpenAI Responses API with GPT-5.1 models, the tool is server-known.
-    # Return a minimal function spec so the provider wires its own definition.
-    def to_responses_tool(
-        self,
-        add_security_risk_prediction: bool = False,  # noqa: ARG002 - signature match
-        action_type: type | None = None,  # noqa: ARG002 - signature match
-    ) -> FunctionToolParam:  # type: ignore[override]
-        """Serialize to OpenAI Responses function tool spec.
-
-        GPT-5.1 tools are known server-side. We return a minimal schema to ensure
-        the model includes the canonical 'patch' argument when calling this tool.
-        """
-        return {
-            "type": "function",
-            "name": self.name,
-            "parameters": {
-                "type": "object",
-                "properties": {"patch": {"type": "string"}},
-                "required": ["patch"],
-            },
-            "strict": False,
-        }  # type: ignore[return-value]
 
 
 register_tool(ApplyPatchTool.name, ApplyPatchTool)
