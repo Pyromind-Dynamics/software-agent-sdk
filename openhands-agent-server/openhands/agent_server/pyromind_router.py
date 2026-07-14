@@ -75,6 +75,7 @@ from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
 )
 from openhands.tools.pyromind_debug import get_debug_result_broker
+from openhands.tools.utils import PUBLIC_READ_ALIASES
 from openhands.tools.workflow import (
     DslToXyflowTool,
     RunWorkflowTool,
@@ -92,6 +93,10 @@ _OPENAI_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 
 
 logger = logging.getLogger(__name__)
+
+_PUBLIC_READ_ALIAS_NAMES = {alias: alias for alias, _, _, _ in PUBLIC_READ_ALIASES}
+_KNOWLEDGE_ALIAS = _PUBLIC_READ_ALIAS_NAMES["knowledge"]
+_SKILLS_ALIAS = _PUBLIC_READ_ALIAS_NAMES[".agents/skills"]
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -123,7 +128,7 @@ _PYROMIND_DEBUG_RESPONSE_BODY_LIMIT = 20000
 # knowledge-base lookups.
 PYROMIND_KB_INSTRUCTIONS = """\
 The Pyromind platform knowledge base is available through the read-only logical
-path `knowledge/`. Do not use or request its host filesystem path.
+path `{knowledge_alias}/`. Do not use or request its host filesystem path.
 
 Knowledge base layout:
 - basic/: platform basics
@@ -132,6 +137,9 @@ Knowledge base layout:
 - studio/: Studio workflow documentation
 - nodes/<NodeType>/<NodeType>.md: node parameters, I/O, and ports
 - dataset_processing_workflow.py: workflow DSL example
+
+The shared skill documents are available through the read-only logical path
+`{skills_alias}/`. Do not use or request their host filesystem path.
 
 Your current working directory is this conversation's private workspace:
 {working_dir}
@@ -149,9 +157,10 @@ been generated unless a tool call actually created or modified `workflow.py`.
 - If a listed skill fits the request (for example, generating a workflow), \
 invoke it via `invoke_skill` before searching the knowledge base. Do not invoke
 a workflow-generation skill for an article lookup alone.
-- For every knowledge-base request, use only `grep` and `file_editor` with the
-logical `knowledge/` path. Do not call `terminal` or `apply_patch`, and never
-pass a host filesystem path. Open matched files with `file_editor` before
+- For every knowledge-base or skill-document request, use only `grep` and
+  `file_editor` with the logical `{knowledge_alias}/` or `{skills_alias}/` path. Do not
+  call `terminal` or `apply_patch`, and never pass a host filesystem path. Open
+  matched files with `file_editor` before
 answering or editing `workflow.py`; never infer APIs or operational facts from
 filenames or directory listings.
 - For "查看知识库有哪些信息" or similar inventory requests, use one `grep`
@@ -905,6 +914,8 @@ async def create_pyromind_conversation(
     # 2. Assemble the pyromind KB instructions (layered on the codex base prompt)
     custom_instructions = PYROMIND_KB_INSTRUCTIONS.format(
         working_dir=str(conversation_dir),
+        knowledge_alias=_KNOWLEDGE_ALIAS,
+        skills_alias=_SKILLS_ALIAS,
     )
 
     # Append extra custom instructions from the request if provided

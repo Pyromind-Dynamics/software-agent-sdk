@@ -14,6 +14,7 @@ from openhands.sdk.tool import (
     ToolDefinition,
     register_tool,
 )
+from openhands.tools.utils import configured_public_read_roots
 
 
 if TYPE_CHECKING:
@@ -152,15 +153,7 @@ class GrepTool(ToolDefinition[GrepAction, GrepObservation]):
         # Initialize the executor
         configured_roots = read_only_roots
         if configured_roots is None:
-            knowledge_root = os.environ.get("PYROMIND_KNOWLEDGE_BASE_PATH")
-            configured_roots = [
-                root
-                for root in [
-                    knowledge_root,
-                    *os.environ.get("PYROMIND_PUBLIC_READ_PATHS", "").split(os.pathsep),
-                ]
-                if root
-            ]
+            configured_roots = [str(root) for root in configured_public_read_roots()]
         executor = GrepExecutor(
             working_dir=working_dir, read_only_roots=configured_roots
         )

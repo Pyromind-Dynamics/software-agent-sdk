@@ -71,8 +71,8 @@ mkdir -p \
 # ----------------------------------------------------------
 # Points to the knowledge/ folder in this repository by default.
 export PYROMIND_KNOWLEDGE_BASE_PATH="${PYROMIND_KNOWLEDGE_BASE_PATH:-${SOFTWARE_AGENT_SDK_DIR}/knowledge}"
-export PYROMIND_PUBLIC_READ_PATHS="${PYROMIND_PUBLIC_READ_PATHS:-${SOFTWARE_AGENT_SDK_DIR}/examples}"
 export PYROMIND_SKILLS_PATH="${PYROMIND_SKILLS_PATH:-${SOFTWARE_AGENT_SDK_DIR}/.agents/skills}"
+export PYROMIND_PUBLIC_READ_PATHS="${PYROMIND_PUBLIC_READ_PATHS:-${PYROMIND_SKILLS_PATH}}"
 
 for required_dir in basic jupyterlab nodes sdk studio; do
   if [[ ! -d "${PYROMIND_KNOWLEDGE_BASE_PATH}/${required_dir}" ]]; then
@@ -86,8 +86,8 @@ if [[ ! -f "${PYROMIND_KNOWLEDGE_BASE_PATH}/dataset_processing_workflow.py" ]]; 
   exit 1
 fi
 
-if [[ ! -d "${SOFTWARE_AGENT_SDK_DIR}/examples" ]]; then
-  echo "ERROR: public examples directory missing: ${SOFTWARE_AGENT_SDK_DIR}/examples" >&2
+if [[ ! -d "${PYROMIND_SKILLS_PATH}" ]]; then
+  echo "ERROR: skills directory missing: ${PYROMIND_SKILLS_PATH}" >&2
   exit 1
 fi
 

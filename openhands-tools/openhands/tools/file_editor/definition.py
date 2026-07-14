@@ -1,6 +1,5 @@
 """String replace editor tool implementation."""
 
-import os
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -23,6 +22,7 @@ from openhands.sdk.tool import (
 )
 from openhands.sdk.utils.redact import redact_text_secrets
 from openhands.tools.file_editor.utils.diff import visualize_diff
+from openhands.tools.utils import configured_public_read_roots
 
 
 CommandLiteral = Literal["view", "create", "str_replace", "insert", "undo_edit"]
@@ -237,15 +237,7 @@ class FileEditorTool(ToolDefinition[FileEditorAction, FileEditorObservation]):
         # Initialize the executor
         configured_roots = read_only_roots
         if configured_roots is None:
-            knowledge_root = os.environ.get("PYROMIND_KNOWLEDGE_BASE_PATH")
-            configured_roots = [
-                root
-                for root in [
-                    knowledge_root,
-                    *os.environ.get("PYROMIND_PUBLIC_READ_PATHS", "").split(os.pathsep),
-                ]
-                if root
-            ]
+            configured_roots = [str(root) for root in configured_public_read_roots()]
         executor = FileEditorExecutor(
             workspace_root=conv_state.workspace.working_dir,
             read_only_roots=configured_roots,
