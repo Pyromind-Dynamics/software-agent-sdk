@@ -43,6 +43,7 @@ from openhands.agent_server.init_router import (
     init_router,
     require_initialized,
 )
+from openhands.agent_server.kafka_bus.kafka_bus import kafka_message_bus
 from openhands.agent_server.llm_router import llm_router
 from openhands.agent_server.mcp_router import mcp_router
 from openhands.agent_server.middleware import CORSDispatcher
@@ -244,6 +245,15 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
                 f"Server initialization failed with {len(exceptions)} exception(s)"
             ) from exceptions[0]
 
+        # Kafka consumer starts in the background and must not block server boot.
+        try:
+            await kafka_message_bus.start_consumer()
+            logger.info("Kafka message bus consumer start requested")
+        except Exception:
+            logger.exception(
+                "Kafka message bus consumer failed to start; continuing without Kafka"
+            )
+
         async def stop_stateless_services():
             async def stop_vscode_service():
                 if vscode_service is not None:
@@ -257,10 +267,17 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
                 if tool_preload_service is not None:
                     await tool_preload_service.stop()
 
+            async def stop_kafka_message_bus():
+                try:
+                    await kafka_message_bus.stop()
+                except Exception:
+                    logger.exception("Kafka message bus stop failed")
+
             await asyncio.gather(
                 stop_vscode_service(),
                 stop_desktop_service(),
                 stop_tool_preload_service(),
+                stop_kafka_message_bus(),
                 return_exceptions=True,
             )
 
