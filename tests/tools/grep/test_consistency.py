@@ -189,7 +189,9 @@ class TestGrepConsistency:
 
         # Verify all matches are Python files
         for match in ripgrep_matches:
-            assert match.endswith(".py"), f"Non-Python file found: {match}"
+            assert match.file_path.endswith(".py"), (
+                f"Non-Python file found: {match.file_path}"
+            )
 
     def test_no_matches_consistency(self, temp_dir_with_content):
         """Test that ripgrep and the Python fallback handle no matches consistently."""

@@ -36,6 +36,28 @@ def test_preview_404_hints_when_path_is_cleaned_dataset_identifier() -> None:
     assert "do not retry" in message
 
 
+def test_preview_rejects_known_dataset_ids_without_storage_request(monkeypatch):
+    def unexpected_post(*args, **kwargs):
+        raise AssertionError("storage API must not be called for dataset IDs")
+
+    monkeypatch.setattr(httpx, "post", unexpected_post)
+    expected_nodes = {
+        "pyromind/self-cognition": "CloneAndCacheDataset",
+        "pyromind/geometry-vqa-vlm-demo": "CloneAndCacheDataset",
+        "pyromind/easyhard-24k": "DownloadAndCacheDataset",
+    }
+
+    for dataset_id, expected_node in expected_nodes.items():
+        observation = PreviewDatasetExecutor()(
+            PreviewDatasetAction(dataset_path=dataset_id)
+        )
+
+        assert observation.is_error
+        assert observation.error_code == "NOT_A_STORAGE_PATH"
+        assert observation.suggested_node == expected_node
+        assert "do not retry" in observation.text
+
+
 class _FakeWorkspace:
     def __init__(self, working_dir: Path) -> None:
         self.working_dir = str(working_dir)

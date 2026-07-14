@@ -4,7 +4,7 @@ import json
 import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
 import httpx
 from pydantic import BaseModel, Field
@@ -189,6 +189,23 @@ class ValidateWorkflowDslObservation(Observation):
             "success, data, message, and error_code."
         ),
     )
+    retryable: bool = Field(
+        default=False,
+        description=(
+            "Whether retrying the same validation request may recover from a "
+            "transient transport failure. True for request errors and 408/429/5xx."
+        ),
+    )
+    failure_stage: (
+        Literal["transport", "dsl_parse", "sdk_schema", "platform_schema"] | None
+    ) = Field(
+        default=None,
+        description=(
+            "Stage that failed: transport, DSL parsing, SDK workflow schema, or "
+            "platform workflow schema. None when validation passes or no stage "
+            "can be determined."
+        ),
+    )
 
     @property
     def visualize(self) -> Text:
@@ -238,6 +255,9 @@ source_node_code is the DSL statement for the source node in edge/type errors.
 When fixing invalid DSL, prefer detail.node_code, detail.target_node_code, and
 detail.source_node_code over xyflow-only fields because they point back to the
 original DSL statements.
+
+The observation also returns retryable and failure_stage. Retry only when
+retryable=true; deterministic DSL/schema errors must be fixed instead of retried.
 
 Note: a successful tool call can still return valid=false. In that case, use
 the returned node_id, node_type, edge_id, field, and detail line information to
@@ -298,6 +318,8 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
                     f"{type(exc).__name__}: {exc}"
                 ),
                 is_error=True,
+                retryable=True,
+                failure_stage="transport",
             )
 
         if response.status_code >= 400:
@@ -307,6 +329,8 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
                     f"{response.status_code}: {_truncate_response_text(response.text)}"
                 ),
                 is_error=True,
+                retryable=_is_retryable_http_status(response.status_code),
+                failure_stage="transport",
             )
 
         try:
@@ -315,12 +339,14 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
             return ValidateWorkflowDslObservation.from_text(
                 text=(f"Workflow DSL validation API returned invalid JSON: {exc.msg}"),
                 is_error=True,
+                failure_stage="transport",
             )
 
         if not isinstance(payload, dict):
             return ValidateWorkflowDslObservation.from_text(
                 text="Workflow DSL validation API returned a non-object JSON payload.",
                 is_error=True,
+                failure_stage="transport",
             )
 
         return _observation_from_payload(payload)
@@ -468,6 +494,7 @@ def _observation_from_payload(
             message=_optional_str(payload.get("message")),
             error_code=_optional_str(payload.get("error_code")),
             raw_response=payload,
+            failure_stage="transport",
         )
     if not isinstance(data, dict):
         return ValidateWorkflowDslObservation.from_text(
@@ -475,6 +502,7 @@ def _observation_from_payload(
             is_error=True,
             success=True,
             raw_response=payload,
+            failure_stage="transport",
         )
 
     valid = data.get("valid")
@@ -493,7 +521,27 @@ def _observation_from_payload(
         message=_optional_str(payload.get("message")),
         error_code=_optional_str(payload.get("error_code")),
         raw_response=payload,
+        failure_stage=(_infer_failure_stage(errors) if valid is not True else None),
     )
+
+
+def _is_retryable_http_status(status_code: int) -> bool:
+    return status_code in {408, 429} or status_code >= 500
+
+
+def _infer_failure_stage(
+    errors: list[WorkflowValidationIssue],
+) -> Literal["dsl_parse", "sdk_schema", "platform_schema"]:
+    if any(
+        issue.code == "DSL_PARSE_FAILED" or issue.source == "dsl" for issue in errors
+    ):
+        return "dsl_parse"
+    if any(
+        issue.code in {"SDK_NOT_AVAILABLE", "WORKFLOW_SCHEMA_INVALID"}
+        for issue in errors
+    ):
+        return "sdk_schema"
+    return "platform_schema"
 
 
 def _format_api_failure(payload: dict[str, Any]) -> str:

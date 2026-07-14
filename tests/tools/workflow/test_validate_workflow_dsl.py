@@ -5,8 +5,10 @@ from typing import Any, cast
 import httpx
 from pydantic import SecretStr
 
-from openhands.agent_server.pyromind_router import PYROMIND_VALIDATE_HEADERS_STATE_KEY, \
-    PYROMIND_VALIDATE_AUTH_COOKIE_SECRET
+from openhands.agent_server.pyromind_router import (
+    PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
+    PYROMIND_VALIDATE_HEADERS_STATE_KEY,
+)
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.secret import StaticSecret
 from openhands.sdk.tool import Tool
@@ -202,6 +204,8 @@ def test_validate_workflow_dsl_posts_payload_and_preserves_issue_fields(monkeypa
     assert observation.errors[0].detail["target_node_line"] == 4
     assert observation.errors[0].detail["node_code"].startswith("n6a71806")
     assert observation.errors[0].detail["target_node_code"].startswith("n6a71806")
+    assert observation.retryable is False
+    assert observation.failure_stage == "platform_schema"
     assert "line=4" in observation.text
     assert "dsl_code: n6a71806 = CloneAndCacheModel1" in observation.text
     assert calls == {
@@ -361,6 +365,8 @@ def test_validate_workflow_dsl_marks_api_failure_as_tool_error(monkeypatch):
     assert observation.success is False
     assert observation.message == "login required"
     assert observation.error_code == "AUTH_REQUIRED"
+    assert observation.retryable is False
+    assert observation.failure_stage == "transport"
     assert "AUTH_REQUIRED" in observation.text
 
 
@@ -376,6 +382,8 @@ def test_validate_workflow_dsl_reports_transport_and_json_errors(monkeypatch):
     )
     assert observation.is_error
     assert "ConnectError" in observation.text
+    assert observation.retryable is True
+    assert observation.failure_stage == "transport"
 
     def return_invalid_json(url, *, headers, json, timeout):
         return _Response(
@@ -389,6 +397,62 @@ def test_validate_workflow_dsl_reports_transport_and_json_errors(monkeypatch):
     )
     assert observation.is_error
     assert "invalid JSON" in observation.text
+    assert observation.retryable is False
+    assert observation.failure_stage == "transport"
+
+    def return_service_unavailable(url, *, headers, json, timeout):
+        return _Response(503, {}, text="temporarily unavailable")
+
+    monkeypatch.setattr(httpx, "post", return_service_unavailable)
+    observation = ValidateWorkflowDslExecutor()(
+        ValidateWorkflowDslAction(dsl="# workflow: demo\n")
+    )
+    assert observation.is_error
+    assert observation.retryable is True
+    assert observation.failure_stage == "transport"
+
+
+def test_validate_workflow_dsl_classifies_deterministic_failure_stages(monkeypatch):
+    issue: dict[str, Any] = {}
+
+    def fake_post(url, *, headers, json, timeout):
+        return _Response(
+            200,
+            {
+                "success": True,
+                "data": {
+                    "valid": False,
+                    "workflow_id": "workflow-1",
+                    "errors": [issue],
+                    "warnings": [],
+                },
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    executor = ValidateWorkflowDslExecutor()
+    action = ValidateWorkflowDslAction(dsl="# workflow: demo\n")
+
+    issue.update(
+        code="DSL_PARSE_FAILED",
+        level="error",
+        source="dsl",
+        message="invalid syntax",
+    )
+    observation = executor(action)
+    assert observation.failure_stage == "dsl_parse"
+    assert observation.retryable is False
+
+    issue.clear()
+    issue.update(
+        code="WORKFLOW_SCHEMA_INVALID",
+        level="error",
+        source="xyflow",
+        message="invalid workflow schema",
+    )
+    observation = executor(action)
+    assert observation.failure_stage == "sdk_schema"
+    assert observation.retryable is False
 
 
 def test_validate_workflow_dsl_tool_is_explicitly_available() -> None:
@@ -421,6 +485,12 @@ def test_validate_workflow_dsl_output_schema_describes_api_fields() -> None:
     valid_description = ValidateWorkflowDslObservation.model_fields["valid"].description
     detail_description = WorkflowValidationIssue.model_fields["detail"].description
     source_description = WorkflowValidationIssue.model_fields["source"].description
+    retryable_description = ValidateWorkflowDslObservation.model_fields[
+        "retryable"
+    ].description
+    failure_stage_description = ValidateWorkflowDslObservation.model_fields[
+        "failure_stage"
+    ].description
 
     assert success_description is not None
     assert "BizResponse.success" in success_description
@@ -438,3 +508,7 @@ def test_validate_workflow_dsl_output_schema_describes_api_fields() -> None:
     assert "dsl" in source_description
     assert "xyflow" in source_description
     assert "k8s" in source_description
+    assert retryable_description is not None
+    assert "408/429/5xx" in retryable_description
+    assert failure_stage_description is not None
+    assert "SDK workflow schema" in failure_stage_description

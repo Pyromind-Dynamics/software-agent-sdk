@@ -148,7 +148,11 @@ class Parser(BaseModel):
                     raise DiffError(f"Add File Error: Duplicate Path: {path}")
                 self.patch.actions[path] = self.parse_add_file()
                 continue
-            raise DiffError(f"Unknown Line: {self.lines[self.index]}")
+            raise DiffError(
+                "PATCH_SECTION_INVALID at line "
+                f"{self.index + 1}: expected Add/Update/Delete File header; "
+                f"got {self.lines[self.index]!r}"
+            )
         if not self.startswith(("*** End Patch",)):
             raise DiffError("Missing End Patch")
         self.index += 1
@@ -217,9 +221,14 @@ class Parser(BaseModel):
         while not self.is_done(
             ("*** End Patch", "*** Update File:", "*** Delete File:", "*** Add File:")
         ):
+            line_number = self.index + 1
             s = self.read_str()
             if not s.startswith("+"):
-                raise DiffError(f"Invalid Add File Line: {s}")
+                raise DiffError(
+                    "PATCH_ADD_LINE_INVALID at line "
+                    f'{line_number}: Add File content must start with "+"; '
+                    f"got {s!r}"
+                )
             s = s[1:]
             lines.append(s)
         return PatchAction(
@@ -338,13 +347,16 @@ def peek_next_section(
 
 
 def text_to_patch(text: str, orig: dict[str, str]) -> tuple[Patch, int]:
-    lines = text.strip().split("\n")
-    if (
-        len(lines) < 2
-        or not lines[0].startswith("*** Begin Patch")
-        or lines[-1] != "*** End Patch"
-    ):
-        raise DiffError("Invalid patch text")
+    stripped = text.strip()
+    lines = stripped.splitlines() if stripped else []
+    if not lines or lines[0] != "*** Begin Patch":
+        raise DiffError(
+            'PATCH_BEGIN_MISSING: first non-empty line must be "*** Begin Patch"'
+        )
+    if len(lines) < 2 or lines[-1] != "*** End Patch":
+        raise DiffError(
+            'PATCH_END_MISSING: last non-empty line must be "*** End Patch"'
+        )
 
     parser = Parser(
         current_files=orig,
@@ -492,8 +504,12 @@ def process_patch(
 
     Returns (message, fuzz, commit)
     """
-    if not text.startswith("*** Begin Patch"):
-        raise DiffError("Invalid patch: must start with '*** Begin Patch'")
+    stripped = text.strip()
+    first_line = stripped.splitlines()[0] if stripped else ""
+    if first_line != "*** Begin Patch":
+        raise DiffError(
+            'PATCH_BEGIN_MISSING: first non-empty line must be "*** Begin Patch"'
+        )
     paths = identify_files_needed(text)
     orig = load_files(paths, open_fn)
     patch, fuzz = text_to_patch(text, orig)

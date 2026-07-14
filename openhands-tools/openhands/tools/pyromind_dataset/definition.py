@@ -69,6 +69,14 @@ _VISION_SUFFIXES = {
 }
 _VISION_FIELD_MARKERS = ("image", "video", "vision")
 SampleStrategy = Literal["head", "tail", "random", "stratified"]
+SuggestedDatasetNode = Literal["CloneAndCacheDataset", "DownloadAndCacheDataset"]
+_KNOWN_DATASET_NODES: dict[str, SuggestedDatasetNode] = {
+    "pyromind/alpaca-gpt4-llm-demo": "CloneAndCacheDataset",
+    "pyromind/geometry-vqa-vlm-demo": "CloneAndCacheDataset",
+    "pyromind/self-cognition": "CloneAndCacheDataset",
+    "pyromind/easyhard-24k": "DownloadAndCacheDataset",
+    "pyromind/agentic-tool-call-dataset-12k": "DownloadAndCacheDataset",
+}
 
 
 @dataclass(frozen=True)
@@ -209,6 +217,17 @@ class PreviewDatasetObservation(Observation):
         default=None,
         description="Non-fatal content parsing issue, when metadata lookup succeeded.",
     )
+    error_code: str | None = Field(
+        default=None,
+        description="Machine-readable input or preview error code.",
+    )
+    suggested_node: SuggestedDatasetNode | None = Field(
+        default=None,
+        description=(
+            "Workflow node to use when dataset_path is a known dataset identifier "
+            "rather than a storage path."
+        ),
+    )
 
     @property
     def visualize(self) -> Text:
@@ -241,7 +260,8 @@ storage. A slash in the value is not enough to classify it: when the user says
 they uploaded the data and pasted a storage-relative path, preview that exact
 path. Do not use this tool for values identified as Clone Dataset or Download
 Dataset IDs, such as `pyromind/self-cognition` or `pyromind/easyhard-24k`; those
-are not storage paths, so a storage 404 must not be retried with path variants.
+are not storage paths. Known IDs fail locally with `NOT_A_STORAGE_PATH` and a
+`suggested_node`; no storage request is sent and path variants must not be retried.
 
 Sample content is saved under the current conversation directory's
 `preview_dataset/` folder, next to `workflow_canvas/`. Large files are sampled
@@ -276,17 +296,35 @@ class PreviewDatasetExecutor(
         action: PreviewDatasetAction,
         conversation: BaseConversation | None = None,
     ) -> PreviewDatasetObservation:
-        try:
-            headers = self._resolve_headers(conversation, json_content=True)
-        except ValueError as exc:
-            return PreviewDatasetObservation.from_text(text=str(exc), is_error=True)
-
         dataset_path = action.dataset_path.strip()
         if not dataset_path:
             return PreviewDatasetObservation.from_text(
                 text="dataset_path must be a non-empty storage path.",
                 is_error=True,
                 dataset_path=action.dataset_path,
+            )
+
+        suggested_node = _KNOWN_DATASET_NODES.get(dataset_path.rstrip("/"))
+        if suggested_node is not None:
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    f"NOT_A_STORAGE_PATH: {dataset_path!r} is a known dataset "
+                    f"identifier, not a Pyromind storage path. Use {suggested_node} "
+                    "and do not retry preview_dataset with path variants."
+                ),
+                is_error=True,
+                dataset_path=dataset_path,
+                error_code="NOT_A_STORAGE_PATH",
+                suggested_node=suggested_node,
+            )
+
+        try:
+            headers = self._resolve_headers(conversation, json_content=True)
+        except ValueError as exc:
+            return PreviewDatasetObservation.from_text(
+                text=str(exc),
+                is_error=True,
+                dataset_path=dataset_path,
             )
 
         files: list[str] = []
