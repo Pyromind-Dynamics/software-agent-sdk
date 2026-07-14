@@ -90,10 +90,7 @@ def test_apply_patch_marks_workflow_dirty(tmp_ws: Path):
 
 def test_apply_patch_non_workflow_file_does_not_mark_dirty(tmp_ws: Path):
     patch = (
-        "*** Begin Patch\n"
-        "*** Add File: notes.py\n"
-        "+print('not workflow')\n"
-        "*** End Patch"
+        "*** Begin Patch\n*** Add File: notes.py\n+print('not workflow')\n*** End Patch"
     )
     conversation = _DirtyConversation()
 
@@ -114,6 +111,99 @@ def test_reject_absolute_path(tmp_ws: Path):
     obs = run_exec(tmp_ws, patch)
     assert obs.is_error
     assert "Absolute or escaping paths" in obs.text
+
+
+@pytest.mark.parametrize(
+    ("patch", "expected_error"),
+    [
+        (
+            "*** Add File: FACTS.txt\n+x\n*** End Patch",
+            "PATCH_BEGIN_MISSING",
+        ),
+        (
+            "*** Begin Patch\n*** Add File: FACTS.txt\n+x",
+            "PATCH_END_MISSING",
+        ),
+        (
+            "*** Begin Patch\n*** Bogus File: FACTS.txt\n*** End Patch",
+            "PATCH_SECTION_INVALID at line 2",
+        ),
+        (
+            "*** Begin Patch\n*** Add File: FACTS.txt\nx\n*** End Patch",
+            "PATCH_ADD_LINE_INVALID at line 3",
+        ),
+    ],
+)
+def test_patch_parse_errors_are_actionable(
+    tmp_ws: Path,
+    patch: str,
+    expected_error: str,
+):
+    observation = run_exec(tmp_ws, patch)
+
+    assert observation.is_error
+    assert expected_error in observation.text
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        # Whitespace around the envelope markers (codex trims boundary lines).
+        (
+            "*** Begin Patch \n"
+            "*** Add File: lenient.txt\n"
+            "+content\n"
+            "  *** End Patch  "
+        ),
+        # Whole patch wrapped in a markdown code fence.
+        (
+            "```\n"
+            "*** Begin Patch\n"
+            "*** Add File: lenient.txt\n"
+            "+content\n"
+            "*** End Patch\n"
+            "```"
+        ),
+        # Shell heredoc wrapper (codex lenient mode).
+        (
+            "<<'EOF'\n"
+            "*** Begin Patch\n"
+            "*** Add File: lenient.txt\n"
+            "+content\n"
+            "*** End Patch\n"
+            "EOF"
+        ),
+        # Trailing prose after the closing marker.
+        (
+            "*** Begin Patch\n"
+            "*** Add File: lenient.txt\n"
+            "+content\n"
+            "*** End Patch\n"
+            "Done! The file has been created."
+        ),
+        # Spurious '+' prefix on the closing marker (over-applied content rule).
+        (
+            "*** Begin Patch\n"
+            "*** Add File: lenient.txt\n"
+            "+content\n"
+            "+*** End Patch"
+        ),
+    ],
+)
+def test_lenient_envelope_parsing(tmp_ws: Path, patch: str):
+    obs = run_exec(tmp_ws, patch)
+    assert not obs.is_error
+    assert (tmp_ws / "lenient.txt").read_text() == "content"
+
+
+def test_missing_end_marker_still_rejected(tmp_ws: Path):
+    # A patch without any closing marker is likely truncated output and must
+    # not be silently applied.
+    patch = "*** Begin Patch\n*** Add File: trunc.txt\n+partial content"
+    obs = run_exec(tmp_ws, patch)
+    assert obs.is_error
+    assert "PATCH_END_MISSING" in obs.text
+    assert not (tmp_ws / "trunc.txt").exists()
 
 
 def test_multi_hunk_success_single_file(tmp_ws: Path):

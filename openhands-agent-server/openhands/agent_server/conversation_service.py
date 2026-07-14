@@ -30,6 +30,7 @@ from openhands.agent_server.models import (
     StoredConversation,
     UpdateConversationRequest,
 )
+from openhands.agent_server.persistence.store import _ensure_secure_directory
 from openhands.agent_server.pub_sub import Subscriber
 from openhands.agent_server.server_details_router import update_last_execution_time
 from openhands.agent_server.utils import safe_rmtree, utc_now
@@ -417,7 +418,7 @@ def _compose_conversation_info(
         agent_state.get("acp_supports_runtime_model_switch", False)
     )
     return ConversationInfo(
-        **state.model_dump(mode="json"),
+        **state.model_dump(mode="json", context={"redact_model_names": True}),
         title=stored.title,
         metrics=stored.metrics,
         created_at=stored.created_at,
@@ -1425,6 +1426,8 @@ class ConversationService:
         self._event_services = {}
         self._conversation_ids_by_user = {}
         for conversation_dir in self.conversations_dir.iterdir():
+            if conversation_dir.is_dir():
+                _ensure_secure_directory(conversation_dir)
             stored: StoredConversation | None = None
             try:
                 meta_file = conversation_dir / "meta.json"

@@ -65,3 +65,9 @@ def test_kb_instructions_format_injects_path() -> None:
     assert "server sends" in rendered
     # Skill-first guidance must be present.
     assert "invoke_skill" in rendered
+    assert "article lookup alone" in rendered
+    assert "do not call `terminal`" in rendered
+    assert 'include="*.mdx"' in rendered
+    assert "`.` or `^`" in rendered
+    assert "every relevant fact" in rendered
+    assert "files you actually opened" in rendered

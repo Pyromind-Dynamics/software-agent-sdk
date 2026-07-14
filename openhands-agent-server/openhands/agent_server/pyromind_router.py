@@ -60,6 +60,8 @@ from openhands.sdk.conversation.request import (
 )
 from openhands.sdk.llm.message import Message
 from openhands.sdk.secret import SecretSource, SecretValue, StaticSecret
+from openhands.sdk.security.confirmation_policy import ConfirmRisky
+from openhands.sdk.security.defense_in_depth import PatternSecurityAnalyzer
 from openhands.sdk.skills import Skill, load_skills_from_dir
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.codex import get_codex_agent
@@ -146,9 +148,13 @@ the workflow to the frontend once the run finishes. Do not say the workflow has
 been generated unless a tool call actually created or modified `workflow.py`.
 
 - If a listed skill fits the request (for example, generating a workflow), \
-invoke that skill via `invoke_skill` first, before searching the knowledge base.
-- For every knowledge-base request, do not call `terminal`, `apply_patch`, or
-`grep` with a host filesystem path. Use only the logical `knowledge/` path.
+invoke it via `invoke_skill` before searching the knowledge base. Do not invoke
+a workflow-generation skill for an article lookup alone.
+- For every knowledge-base request, use only `grep` and `file_editor` with the
+logical `knowledge/` path. Do not call `terminal` or `apply_patch`, and never
+pass a host filesystem path. Open matched files with `file_editor` before
+answering or editing `workflow.py`; never infer APIs or operational facts from
+filenames or directory listings.
 - For "查看知识库有哪些信息" or similar inventory requests, use one `grep`
 call per top-level directory (`basic`, `jupyterlab`, `sdk`, `studio`, and
 `nodes`) with `include="*.mdx"` and pattern `^title:|^# `; do not use pattern
@@ -157,7 +163,14 @@ call per top-level directory (`basic`, `jupyterlab`, `sdk`, `studio`, and
 articles, first search with `grep` under `knowledge/<subdirectory>` using
 `include="*.mdx"`, then open only the matched files with `file_editor` using
 the same logical path. Use `*.md` only when an `.mdx` search has no matches.
-Do not invoke a workflow-generation skill for an article lookup alone.
+- For a Pyromind knowledge-base answer:
+  1. Split the user's request into explicit subquestions.
+  2. From files you actually opened, make a short checklist of directly relevant
+     headings, tables, warnings, alternatives, and ordered steps for each subquestion.
+  3. Before answering, mark every checklist item as covered or intentionally omitted.
+     Omit an item only when it is tangential, and do not omit a peer item from the
+     same list or table without a reason.
+  Do not show this internal checklist unless the user asks for sources.
 - For workflow generation, use the matching skill and consult `knowledge/` only
 when needed for platform details.
 """
@@ -982,6 +995,10 @@ async def create_pyromind_conversation(
         secrets={**validation_secrets, **run_secrets, **storage_secrets},
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
         user_id=user_id,
+        # Pyromind exposes terminal, patch, and workflow execution tools. Treat
+        # unknown-risk actions as requiring user confirmation by default.
+        confirmation_policy=ConfirmRisky(),
+        security_analyzer=PatternSecurityAnalyzer(),
     )
 
     # 8. Delegate to conversation service

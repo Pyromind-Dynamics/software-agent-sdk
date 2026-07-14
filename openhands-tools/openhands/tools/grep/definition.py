@@ -4,7 +4,7 @@ import os
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from openhands.sdk.tool import (
     Action,
@@ -27,8 +27,9 @@ class GrepAction(Action):
     path: str | None = Field(
         default=None,
         description=(
-            "The directory (absolute path) to search in. "
-            "Defaults to the current working directory."
+            "The directory or exact file to search. Absolute paths are accepted; "
+            "relative paths resolve from the current working directory. Defaults "
+            "to the current working directory."
         ),
     )
     include: str | None = Field(
@@ -42,6 +43,8 @@ class GrepAction(Action):
 
 class GrepMatch(BaseModel):
     """A single matching line found by grep."""
+
+    model_config = ConfigDict(frozen=True)
 
     file_path: str = Field(description="Absolute path of the file containing the match")
     line_number: int = Field(
@@ -61,13 +64,20 @@ class GrepObservation(Observation):
         ),
     )
     pattern: str = Field(description="The regex pattern that was used")
-    search_path: str = Field(description="The directory that was searched")
+    search_path: str = Field(description="The file or directory that was searched")
     include_pattern: str | None = Field(
         default=None, description="The file pattern filter that was used"
     )
     truncated: bool = Field(
         default=False,
         description="Whether results were truncated to the first 100 matches",
+    )
+    searched_files: int | None = Field(
+        default=None,
+        description=(
+            "Number of candidate files searched. Populated for zero-match searches "
+            "that use include, so an overly narrow glob is visible."
+        ),
     )
 
     @field_validator("matches", mode="before")
@@ -93,9 +103,14 @@ class GrepObservation(Observation):
 TOOL_DESCRIPTION = """Fast content search tool.
 * Searches file contents using regular expressions
 * Supports full regex syntax (eg. "log.*Error", "function\\s+\\w+", etc.)
-* Filter files by pattern with the include parameter (eg. "*.js", "*.{ts,tsx}")
+* `path` accepts a directory or an exact file. Pyromind documentation uses both
+  `.md` and `.mdx`; use `include="*.mdx"` for Studio/basic/sdk pages, or omit
+  `include` when uncertain.
+* Filter files by pattern with the include parameter (eg. "*.mdx", "*.js")
 * Returns each matching line with its file path and 1-based line number.
 * Only the first 100 matches are returned. Narrow your search with a stricter regex pattern or the include/path parameters if you need more results.
+* A no-match result means only that this query found no lines; it does not prove
+  the topic is absent.
 * Use this tool when you need to find where specific patterns occur in files.
 """  # noqa
 

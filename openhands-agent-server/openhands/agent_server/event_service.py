@@ -72,7 +72,12 @@ from openhands.sdk.git.exceptions import GitCommandError, GitRepositoryError
 from openhands.sdk.git.utils import run_git_command, validate_git_repository
 from openhands.sdk.llm.streaming import LLMStreamChunk
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
-from openhands.sdk.security.confirmation_policy import ConfirmationPolicyBase
+from openhands.sdk.security.confirmation_policy import (
+    ConfirmationPolicyBase,
+    ConfirmRisky,
+    NeverConfirm,
+)
+from openhands.sdk.security.defense_in_depth import PatternSecurityAnalyzer
 from openhands.sdk.utils.async_utils import AsyncCallbackWrapper
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
@@ -1031,7 +1036,24 @@ class EventService:
             observability_span_name=self.stored.observability_span_name,
         )
 
-        conversation.set_confirmation_policy(self.stored.confirmation_policy)
+        confirmation_policy = self.stored.confirmation_policy
+        if self.stored.tags.get(
+            PYROMIND_APP_TAG_KEY
+        ) == PYROMIND_APP_TAG_VALUE and isinstance(confirmation_policy, NeverConfirm):
+            confirmation_policy = ConfirmRisky()
+            self.stored = self.stored.model_copy(
+                update={"confirmation_policy": confirmation_policy}
+            )
+            await self.save_meta()
+        conversation.set_confirmation_policy(confirmation_policy)
+        if (
+            self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE
+            and self.stored.security_analyzer is None
+        ):
+            self.stored = self.stored.model_copy(
+                update={"security_analyzer": PatternSecurityAnalyzer()}
+            )
+            await self.save_meta()
         conversation.set_security_analyzer(self.stored.security_analyzer)
         self._conversation = conversation
         self._conversation._state.set_write_guard(self._write_guard)
