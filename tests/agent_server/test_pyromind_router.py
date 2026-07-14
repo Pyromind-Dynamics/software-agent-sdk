@@ -44,6 +44,7 @@ from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
 from openhands.sdk.conversation.request import StartConversationRequest
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.llm.message import Message, TextContent
+from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
     UploadFileToPyromindTool,
@@ -247,6 +248,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert ValidateWorkflowDslTool.name in tool_names
     assert PreviewDatasetTool.name in tool_names
     assert UploadFileToPyromindTool.name in tool_names
+    assert RunDatasetCleaningTool.name in tool_names
     assert _REMOVED_WORKFLOW_TOOL not in tool_names
     validation_tool = next(
         tool
@@ -288,11 +290,17 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         for tool in service.start_request.agent.tools
         if tool.name == UploadFileToPyromindTool.name
     )
+    cleaning_tool = next(
+        tool
+        for tool in service.start_request.agent.tools
+        if tool.name == RunDatasetCleaningTool.name
+    )
     assert preview_tool.params == {
         "headers": {"x-cluster": "us-west-1#pre"},
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
     assert upload_tool.params == preview_tool.params
+    assert cleaning_tool.params == preview_tool.params
     assert "session-token" not in str(preview_tool.params)
     assert (
         service.start_request.secrets["PYROMIND_STORAGE_AUTH_COOKIE"].get_value()
@@ -614,17 +622,32 @@ def test_pyromind_storage_tools_use_user_context_headers():
         x_cluster="context-cluster",
     )
 
-    tools, secrets = _build_pyromind_storage_tools(request, {})
+    tools, secrets = _build_pyromind_storage_tools(
+        request,
+        {
+            "storage_base_url": "https://storage.test/api",
+            "dataset_cleaning_endpoint_url": "https://studio.test/api/prompt",
+            "dataset_cleaning_output_root": "/agentTest/clean-results",
+        },
+    )
 
     assert [tool.name for tool in tools] == [
         PreviewDatasetTool.name,
         UploadFileToPyromindTool.name,
+        RunDatasetCleaningTool.name,
     ]
     assert tools[0].params == {
+        "storage_base_url": "https://storage.test/api",
         "headers": {"x-cluster": "context-cluster"},
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
     assert tools[1].params == tools[0].params
+    assert tools[2].params == {
+        "headers": {"x-cluster": "context-cluster"},
+        "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
+        "endpoint_url": "https://studio.test/api/prompt",
+        "output_root": "/agentTest/clean-results",
+    }
     assert (
         secrets["PYROMIND_STORAGE_AUTH_COOKIE"].get_value()
         == f"{PYROMIND_AUTH_COOKIE_NAME}=context-token; other=value"

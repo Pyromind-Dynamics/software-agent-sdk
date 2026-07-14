@@ -137,7 +137,7 @@ async def test_workflow_callback_delegates_to_deliver(
         )
 
     monkeypatch.setattr(
-        "openhands.agent_server.pyromind_router.deliver_run_workflow_status",
+        "openhands.agent_server.pyromind_router.dispatch_run_workflow_status",
         fake_deliver,
     )
 
@@ -162,6 +162,37 @@ async def test_workflow_callback_delegates_to_deliver(
 
 
 @pytest.mark.asyncio
+async def test_workflow_callback_allows_omitted_conversation_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_deliver(**kwargs: object) -> RunWorkflowCallbackResult:
+        captured.update(kwargs)
+        return RunWorkflowCallbackResult(
+            outcome="delivered_async",
+            task_id="clean-task-1",
+            normalized_status="Succeeded",
+            conversation_id="550e8400-e29b-41d4-a716-446655440000",
+        )
+
+    monkeypatch.setattr(
+        "openhands.agent_server.pyromind_router.dispatch_run_workflow_status",
+        fake_deliver,
+    )
+
+    response = await pyromind_workflow_callback(
+        PyromindWorkflowCallbackRequest(
+            task_id="clean-task-1",
+            status="Succeeded",
+        )
+    )
+
+    assert response.success is True
+    assert captured["conversation_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_workflow_callback_unknown_conversation_returns_404(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -174,7 +205,7 @@ async def test_workflow_callback_unknown_conversation_returns_404(
         )
 
     monkeypatch.setattr(
-        "openhands.agent_server.pyromind_router.deliver_run_workflow_status",
+        "openhands.agent_server.pyromind_router.dispatch_run_workflow_status",
         fake_deliver,
     )
 

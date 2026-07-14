@@ -32,7 +32,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Protocol
 from uuid import UUID
 
 from openhands.agent_server.conversation_service import (
@@ -56,11 +56,11 @@ RunWorkflowStatus = Literal[
 """Normalized workflow status aligned with RunWorkflowObservation."""
 
 CallbackOutcome = Literal[
-    "resolved_blocked",      # Debug path: broker.wait was woken
-    "delivered_async",       # Async path: conversation updated + auto_run
-    "unknown_task",          # No conversation_id and no broker registration
+    "resolved_blocked",  # Debug path: broker.wait was woken
+    "delivered_async",  # Async path: conversation updated + auto_run
+    "unknown_task",  # No conversation_id and no broker registration
     "unknown_conversation",  # Invalid id or conversation not on this server
-    "duplicate_terminal",    # Terminal status already delivered for task_id
+    "duplicate_terminal",  # Terminal status already delivered for task_id
     "ignored_non_terminal",  # Pending/Running — no agent restart
 ]
 
@@ -97,6 +97,20 @@ class RunWorkflowCallbackResult:
     task_id: str
     normalized_status: RunWorkflowStatus | None
     conversation_id: str | None
+
+
+class TerminalStatusDelivery(Protocol):
+    """Deliver one terminal workflow status to an already resolved conversation."""
+
+    async def __call__(
+        self,
+        *,
+        event_service: EventService,
+        task_id: str,
+        status: RunWorkflowStatus,
+        error_log: str | None = None,
+        auto_run: bool = True,
+    ) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +269,12 @@ def _mark_terminal_delivered(task_id: str) -> bool:
         return True
 
 
+def _release_terminal_delivery(task_id: str) -> None:
+    """Allow a failed delivery attempt to be retried."""
+    with _delivered_terminal_lock:
+        _delivered_terminal_task_ids.discard(task_id)
+
+
 # ---------------------------------------------------------------------------
 # 6. Conversation delivery / 会话投递
 # ---------------------------------------------------------------------------
@@ -314,6 +334,7 @@ async def deliver_run_workflow_status(
     updated_at: datetime | None = None,
     auto_run: bool = True,
     conversation_service: ConversationService | None = None,
+    terminal_delivery: TerminalStatusDelivery | None = None,
 ) -> RunWorkflowCallbackResult:
     """Handle one workflow status update from Kafka or HTTP webhook.
 
@@ -321,9 +342,9 @@ async def deliver_run_workflow_status(
     1. Normalize status
     2. Try Debug broker resolve → ``resolved_blocked``
     3. Skip non-terminal → ``ignored_non_terminal``
-    4. Dedup terminal → ``duplicate_terminal``
-    5. Resolve conversation_id (Kafka > broker fallback)
-    6. Locate EventService on this agent-server
+    4. Resolve conversation_id (Kafka > broker fallback)
+    5. Locate EventService on this agent-server
+    6. Dedup terminal → ``duplicate_terminal``
     7. Inject reminder + auto_run → ``delivered_async``
 
     Args:
@@ -334,10 +355,12 @@ async def deliver_run_workflow_status(
         updated_at: Reserved for future ordering / idempotency.
         auto_run: Restart agent after injecting terminal reminder (default True).
         conversation_service: Override for tests; else process singleton.
+        terminal_delivery: Optional domain-specific terminal message delivery.
     """
     del updated_at  # reserved for future idempotency / ordering
 
     normalized_status = normalize_platform_status(status)
+    service = conversation_service or get_default_conversation_service()
 
     # Step 2: Debug block path — wake broker.wait(), skip async delivery.
     if _try_resolve_blocked_waiter(
@@ -371,21 +394,7 @@ async def deliver_run_workflow_status(
             conversation_id=conversation_id,
         )
 
-    # Step 4: Ignore duplicate terminal Kafka messages.
-    if not _mark_terminal_delivered(task_id):
-        logger.info(
-            "Ignoring duplicate terminal run_workflow status task_id=%s status=%s",
-            task_id,
-            normalized_status,
-        )
-        return RunWorkflowCallbackResult(
-            outcome="duplicate_terminal",
-            task_id=task_id,
-            normalized_status=normalized_status,
-            conversation_id=conversation_id,
-        )
-
-    # Step 5: conversation_id from Kafka (primary) or broker registry (fallback).
+    # Step 4: conversation_id from the callback or broker registry.
     resolved_conversation_id = conversation_id
     if resolved_conversation_id is None:
         resolved_conversation_id = _lookup_conversation_id_from_broker(task_id)
@@ -415,8 +424,7 @@ async def deliver_run_workflow_status(
             conversation_id=resolved_conversation_id,
         )
 
-    # Step 6: Conversation must be loaded on this agent-server instance.
-    service = conversation_service or get_default_conversation_service()
+    # Step 5: Conversation must be loaded on this agent-server instance.
     event_service = await service.get_event_service(conversation_uuid)
     if event_service is None:
         logger.warning(
@@ -431,14 +439,33 @@ async def deliver_run_workflow_status(
             conversation_id=str(conversation_uuid),
         )
 
+    # Step 6: Reserve this terminal delivery after all routing data is available.
+    if not _mark_terminal_delivered(task_id):
+        logger.info(
+            "Ignoring duplicate terminal run_workflow status task_id=%s status=%s",
+            task_id,
+            normalized_status,
+        )
+        return RunWorkflowCallbackResult(
+            outcome="duplicate_terminal",
+            task_id=task_id,
+            normalized_status=normalized_status,
+            conversation_id=str(conversation_uuid),
+        )
+
     # Step 7: Deliver to conversation and auto_run.
-    await resume_conversation_after_workflow(
-        event_service=event_service,
-        task_id=task_id,
-        status=normalized_status,
-        error_log=error_log,
-        auto_run=auto_run,
-    )
+    try:
+        delivery = terminal_delivery or resume_conversation_after_workflow
+        await delivery(
+            event_service=event_service,
+            task_id=task_id,
+            status=normalized_status,
+            error_log=error_log,
+            auto_run=auto_run,
+        )
+    except Exception:
+        _release_terminal_delivery(task_id)
+        raise
     logger.info(
         "Delivered run_workflow terminal status task_id=%s status=%s "
         "conversation_id=%s auto_run=%s",
