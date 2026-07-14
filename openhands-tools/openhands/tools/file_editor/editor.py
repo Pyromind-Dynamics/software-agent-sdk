@@ -70,6 +70,7 @@ class FileEditor:
     _max_file_size: int
     _encoding_manager: EncodingManager
     _cwd: str
+    _workspace_root: Path | None
 
     def __init__(
         self,
@@ -100,8 +101,10 @@ class FileEditor:
             if not workspace_path.is_absolute():
                 workspace_path = workspace_path.resolve()
             self._cwd = str(workspace_path)
+            self._workspace_root = workspace_path.resolve()
         else:
             self._cwd = os.path.abspath(os.getcwd())
+            self._workspace_root = None
         logger.info(f"FileEditor initialized with cwd: {self._cwd}")
 
     def __call__(
@@ -646,6 +649,18 @@ class FileEditor:
                 str(path),
                 suggestion_message,
             )
+
+        resolved_path = path.resolve()
+        if self._workspace_root is not None:
+            try:
+                resolved_path.relative_to(self._workspace_root)
+            except ValueError:
+                raise EditorToolParameterInvalidError(
+                    "path",
+                    str(path),
+                    f"The path must be inside the workspace root: "
+                    f"{self._workspace_root}",
+                ) from None
 
         # Check if path and command are compatible
         if command == "create" and path.exists():

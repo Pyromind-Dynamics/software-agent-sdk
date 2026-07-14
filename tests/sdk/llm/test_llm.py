@@ -44,6 +44,36 @@ def test_llm_init_with_default_config(default_llm):
     assert default_llm.metrics.model_name == "gpt-4o"
 
 
+def test_llm_can_omit_runtime_connection_config_from_serialization():
+    llm = LLM(
+        model="openai/glm-5.2-fp8",
+        api_key=SecretStr("test-key"),
+        base_url="https://llm.example.test/v1",
+        extra_headers={"x-test": "value"},
+        persist_runtime_config=False,
+    )
+
+    redacted = llm.model_dump(mode="json")
+    assert redacted["model"] == "openai/glm-5.2-fp8"
+    assert "api_key" not in redacted
+    assert "base_url" not in redacted
+    assert "extra_headers" not in redacted
+
+    exposed = llm.model_dump(mode="json", context={"expose_secrets": True})
+    assert exposed["model"] == "openai/glm-5.2-fp8"
+    assert exposed["api_key"] == "test-key"
+    assert exposed["base_url"] == "https://llm.example.test/v1"
+    assert exposed["extra_headers"] == {"x-test": "value"}
+
+    encrypted = llm.model_dump(
+        mode="json", context={"cipher": Mock(encrypt=lambda s: "encrypted")}
+    )
+    assert encrypted["model"] == "openai/glm-5.2-fp8"
+    assert "api_key" not in encrypted
+    assert "base_url" not in encrypted
+    assert "extra_headers" not in encrypted
+
+
 @patch("openhands.sdk.llm.utils.model_info.httpx.get")
 def test_base_url_for_openhands_provider(mock_get):
     """Test that openhands/ remains public while transport uses the proxy."""

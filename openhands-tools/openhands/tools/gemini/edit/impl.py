@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from openhands.sdk.tool import ToolExecutor
+from openhands.sdk.utils.path import resolve_workspace_path
 from openhands.tools.gemini.edit.definition import EditAction, EditObservation
 
 
@@ -42,7 +43,13 @@ class EditExecutor(ToolExecutor[EditAction, EditObservation]):
         new_string = action.new_string
         expected_replacements = action.expected_replacements
 
-        resolved_path = (self.workspace_root / file_path).resolve()
+        try:
+            resolved_path = resolve_workspace_path(file_path, self.workspace_root)
+        except ValueError as exc:
+            return EditObservation.from_text(
+                text=f"Error: {exc}",
+                is_error=True,
+            )
 
         # Handle file creation (old_string is empty)
         if old_string == "":

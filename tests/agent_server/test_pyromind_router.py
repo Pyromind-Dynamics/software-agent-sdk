@@ -25,26 +25,25 @@ from openhands.agent_server.pyromind_router import (
     PyromindCreateConversationRequest,
     PyromindLLMConfig,
     PyromindSendMessageRequest,
+    PyromindWorkflowRollbackRequest,
     _build_debug_context_headers,
-    _build_workflow_run_tool,
     _build_pyromind_storage_tools,
+    _build_workflow_run_tool,
     _build_workflow_validation_tool,
     _get_validation_cookie_header,
     _workflow_dsl_from_xyflow,
     apply_pyromind_validation_context,
     create_pyromind_conversation,
+    rollback_pyromind_workflow_at_event,
     send_pyromind_message,
 )
+from openhands.agent_server.workflow_canvas_models import (
+    SaveWorkflowCanvasEventSnapshotRequest,
+)
+from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
 from openhands.sdk.conversation.request import StartConversationRequest
 from openhands.sdk.conversation.state import ConversationExecutionStatus
-
-from openhands.tools.workflow import (
-    DslToXyflowTool,
-    RunWorkflowTool,
-    ValidateWorkflowDslTool,
-)
-
-from openhands.sdk.llm.message import Message
+from openhands.sdk.llm.message import Message, TextContent
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
     UploadFileToPyromindTool,
@@ -53,7 +52,11 @@ from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
 )
-from openhands.tools.workflow import DslToXyflowTool, ValidateWorkflowDslTool
+from openhands.tools.workflow import (
+    DslToXyflowTool,
+    RunWorkflowTool,
+    ValidateWorkflowDslTool,
+)
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
@@ -61,6 +64,16 @@ from openhands.tools.workflow.validate_workflow_dsl import (
 
 
 _REMOVED_WORKFLOW_TOOL = "publish" + "_workflow"
+
+
+def test_pyromind_llm_config_normalizes_chat_completions_base_url() -> None:
+    config = PyromindLLMConfig(
+        model="openai/glm-5.2-fp8",
+        api_key="test-key",
+        base_url=" http://208.64.254.187:8000/v1/chat/completions/ ",
+    )
+
+    assert config.base_url == "http://208.64.254.187:8000/v1"
 
 
 class _FakeConversationService:
@@ -125,8 +138,19 @@ class _FakeInitialMessageEventService:
 
 
 class _FakeEventService:
-    def __init__(self, tags: dict[str, str]) -> None:
-        self.stored = type("FakeStoredConversation", (), {"tags": tags})()
+    def __init__(
+        self,
+        tags: dict[str, str],
+        conversation_id: UUID | None = None,
+    ) -> None:
+        self.stored = type(
+            "FakeStoredConversation",
+            (),
+            {
+                "id": conversation_id or UUID("00000000-0000-0000-0000-000000000001"),
+                "tags": tags,
+            },
+        )()
         self.secrets: dict[str, str] = {}
         self.agent_state: dict[str, object] = {}
 
@@ -138,8 +162,15 @@ class _FakeEventService:
 
 
 class _FakePyromindMessageEventService(_FakeEventService):
-    def __init__(self, tags: dict[str, str], working_dir: Path) -> None:
-        super().__init__(tags)
+    def __init__(
+        self,
+        tags: dict[str, str],
+        working_dir: Path,
+        conversation_id: UUID | None = None,
+        conversation_dir: Path | None = None,
+    ) -> None:
+        super().__init__(tags, conversation_id)
+        self.conversation_dir = conversation_dir or working_dir / "conversation"
         self.sent_message: Message | None = None
         self.run: bool | None = None
         self.workflow_dsl_snapshot: str | None = None
@@ -279,6 +310,42 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     )
     assert service.start_request.secrets["auth_token"].get_value() == "session-token"
     assert service.start_request.tags == {PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE}
+    dumped_agent = service.start_request.agent.model_dump(mode="json")
+    assert "api_key" not in dumped_agent["llm"]
+    assert "base_url" not in dumped_agent["llm"]
+    assert "api_key" not in dumped_agent["condenser"]["llm"]
+    assert "base_url" not in dumped_agent["condenser"]["llm"]
+
+
+@pytest.mark.asyncio
+async def test_pyromind_conversation_request_serializes_without_local_paths(tmp_path):
+    """Persisted request JSON (meta.json) must not contain host-absolute paths."""
+    knowledge_base = tmp_path / "knowledge"
+    knowledge_base.mkdir()
+    service = _FakeConversationService(tmp_path / "conversations")
+    response = Response()
+
+    info = await create_pyromind_conversation(
+        _make_request(),
+        PyromindCreateConversationRequest(
+            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            extra={
+                "knowledge_base_path": str(knowledge_base),
+                "skills_path": str(tmp_path / "missing-skills"),
+            },
+        ),
+        response,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert service.start_request is not None
+    request_json = service.start_request.model_dump_json(exclude_none=True)
+
+    assert str(knowledge_base) not in request_json
+    assert str(service.conversations_dir / info.id.hex) not in request_json
+    assert "<REDACTED_WORKSPACE_PATH>" in request_json
+    assert "<REDACTED_PATH>" in request_json
 
 
 @pytest.mark.asyncio
@@ -439,6 +506,7 @@ async def test_pyromind_message_refreshes_storage_auth_context(tmp_path):
 
     assert service.secrets == {
         PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: "auth_token=context-token; other=value",
+        PYROMIND_AUTH_TOKEN_SECRET: "context-token",
         PYROMIND_STORAGE_AUTH_COOKIE_SECRET: "auth_token=context-token; other=value",
     }
     assert service.agent_state == {
@@ -447,6 +515,98 @@ async def test_pyromind_message_refreshes_storage_auth_context(tmp_path):
     }
     assert service.sent_message is not None
     assert service.run is True
+
+
+@pytest.mark.asyncio
+async def test_pyromind_workflow_rollback_restores_snapshot_and_sends_correction(
+    tmp_path,
+):
+    conversation_id = UUID("00000000-0000-0000-0000-000000000123")
+    conversation_dir = tmp_path / "conversation"
+    working_dir = tmp_path / "workspace"
+    working_dir.mkdir()
+    workflow_path = working_dir / "workflow.py"
+    workflow_path.write_text("# workflow: current\nstep = 2\n", encoding="utf-8")
+    service = _FakePyromindMessageEventService(
+        {PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
+        working_dir,
+        conversation_id=conversation_id,
+        conversation_dir=conversation_dir,
+    )
+    xyflow = {"name": "Rollback", "nodes": [{"id": "n1"}], "edges": []}
+    FileWorkflowCanvasStore(conversation_dir, conversation_id.hex).save_event_snapshot(
+        SaveWorkflowCanvasEventSnapshotRequest(
+            eventId="event-rollback",
+            snapshotRole="out",
+            workflowDslData="# workflow: rollback\nstep = 1\n",
+            workflowXyflowData=xyflow,
+            summary="rollback target",
+            createdBy="test",
+        )
+    )
+
+    result = await rollback_pyromind_workflow_at_event(
+        _make_request(),
+        conversation_id,
+        PyromindWorkflowRollbackRequest(eventId="event-rollback"),
+        event_service=cast(EventService, service),
+    )
+
+    assert workflow_path.read_text(encoding="utf-8") == (
+        "# workflow: rollback\nstep = 1\n"
+    )
+    assert service.sent_message is not None
+    assert service.sent_message.role == "user"
+    assert service.sent_message.content == []
+    assert service.extended_content is not None
+    first_content = service.extended_content[0]
+    assert isinstance(first_content, TextContent)
+    correction_text = first_content.text
+    assert "Workflow rollback applied by the user" in correction_text
+    assert "event-rollback" in correction_text
+    assert service.run is False
+    assert service.workflow_dsl_snapshot == "# workflow: rollback\nstep = 1\n"
+    assert service.workflow_xyflow_snapshot == xyflow
+    assert result.conversation_id == conversation_id
+    assert result.rolled_back_to_event_id == "event-rollback"
+    assert result.workflow_version_id == "v000001"
+    assert result.snapshot_role == "out"
+    assert result.workflow_file_action == "updated"
+    assert result.snapshot is not None
+    assert result.snapshot.workflow_dsl_data == "# workflow: rollback\nstep = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_pyromind_workflow_rollback_returns_null_when_snapshot_is_missing(
+    tmp_path,
+):
+    conversation_id = UUID("00000000-0000-0000-0000-000000000123")
+    working_dir = tmp_path / "workspace"
+    working_dir.mkdir()
+    workflow_path = working_dir / "workflow.py"
+    current_workflow = "# workflow: current\nstep = 2\n"
+    workflow_path.write_text(current_workflow, encoding="utf-8")
+    service = _FakePyromindMessageEventService(
+        {PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
+        working_dir,
+        conversation_id=conversation_id,
+        conversation_dir=tmp_path / "conversation",
+    )
+
+    result = await rollback_pyromind_workflow_at_event(
+        _make_request(),
+        conversation_id,
+        PyromindWorkflowRollbackRequest(eventId="event-without-snapshot"),
+        event_service=cast(EventService, service),
+    )
+
+    assert result.snapshot is None
+    assert result.rolled_back_to_event_id is None
+    assert result.workflow_version_id is None
+    assert result.workflow_file_action is None
+    assert result.model_dump(mode="json", by_alias=True)["snapshot"] is None
+    assert workflow_path.read_text(encoding="utf-8") == current_workflow
+    assert service.sent_message is None
 
 
 def test_validation_cookie_header_keeps_full_cookie_in_prod(monkeypatch):
@@ -556,15 +716,6 @@ async def test_pyromind_validation_context_uses_websocket_user_headers():
     }
 
 
-
-
-
-
-
-
-
-
-
 def test_build_workflow_run_tool_wires_env_headers_and_auth_token():
     request = _make_request(
         {
@@ -575,7 +726,7 @@ def test_build_workflow_run_tool_wires_env_headers_and_auth_token():
     )
     load_base_env(request)
 
-    tool, secrets = _build_workflow_run_tool(request, {})
+    tool, secrets = _build_workflow_run_tool(request)
 
     assert tool.name == RunWorkflowTool.name
     assert tool.params == {
@@ -588,6 +739,30 @@ def test_build_workflow_run_tool_wires_env_headers_and_auth_token():
             "request-app": "openhands",
         },
     }
+    assert secrets["auth_token"].get_value() == "jwt-token"
+
+
+def test_build_workflow_run_tool_does_not_persist_current_user_cookie():
+    request = _make_request(
+        {
+            "cookie": f"{PYROMIND_AUTH_COOKIE_NAME}=jwt-token",
+            "x-cluster": "us-west-1#pre",
+        }
+    )
+    request.state.current_user = CurrentLoginUser(
+        username="debug-user",
+        email="debug-user@example.test",
+        user_id=100,
+        cookie="auth_token=jwt-token; other=value",
+        x_cluster="us-west-1#pre",
+    )
+    load_base_env(request)
+
+    tool, secrets = _build_workflow_run_tool(request)
+
+    current_user = tool.params["current_user"]
+    assert isinstance(current_user, CurrentLoginUser)
+    assert current_user.cookie is None
     assert secrets["auth_token"].get_value() == "jwt-token"
 
 

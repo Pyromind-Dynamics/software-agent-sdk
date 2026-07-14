@@ -78,6 +78,25 @@ def test_edit_create_new_file(tmp_path):
     assert test_file.read_text() == "print('hello')\n"
 
 
+def test_edit_rejects_path_outside_workspace(tmp_path):
+    outside_file = tmp_path.parent / "outside.txt"
+    outside_file.write_text("private")
+    try:
+        executor = EditExecutor(workspace_root=str(tmp_path))
+        obs = executor(
+            EditAction(
+                file_path=str(outside_file),
+                old_string="private",
+                new_string="changed",
+            )
+        )
+        assert obs.is_error
+        assert "outside the workspace root" in obs.text
+        assert outside_file.read_text() == "private"
+    finally:
+        outside_file.unlink()
+
+
 def test_edit_create_existing_file_error(tmp_path):
     """Test error when trying to create file that already exists."""
     # Create existing file

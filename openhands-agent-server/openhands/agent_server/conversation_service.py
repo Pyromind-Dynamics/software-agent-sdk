@@ -1188,10 +1188,6 @@ class ConversationService:
             raise ConversationForkAtEventTargetNotFoundError(
                 f"Workflow snapshot not found for event: {event_id}"
             ) from exc
-        if target_snapshot.snapshot_role != "out":
-            raise ConversationForkAtEventConflictError(
-                "Only workflow output events can be used as fork checkpoints"
-            )
 
         fork_id = uuid4()
         fork_workspace = LocalWorkspace(
@@ -1421,6 +1417,7 @@ class ConversationService:
 
     async def __aenter__(self):
         self.conversations_dir.mkdir(parents=True, exist_ok=True)
+        self.conversations_dir.chmod(0o700)
         self._run_executor = ThreadPoolExecutor(
             max_workers=self.max_concurrent_runs,
             thread_name_prefix="conversation-run",

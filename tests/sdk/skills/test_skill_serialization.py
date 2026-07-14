@@ -374,3 +374,31 @@ def test_mcp_tools_none_round_trips_unchanged():
     dumped = skill.model_dump(mode="json")
     assert dumped["mcp_tools"] is None
     assert Skill.model_validate(dumped) == skill
+
+
+def test_absolute_skill_paths_are_redacted_in_serialization():
+    """Host-absolute skill source/skill_root must not leak into JSON."""
+    from openhands.sdk.skills.skill import SkillResources
+
+    sensitive_path = "/Users/test/project/agent/software-agent-sdk/skills/test"
+    skill = Skill(
+        name="leaky-paths",
+        content="content",
+        source=f"{sensitive_path}/SKILL.md",
+        resources=SkillResources(skill_root=sensitive_path),
+    )
+
+    dumped = skill.model_dump(mode="json")
+    assert dumped["source"] == "<REDACTED_SKILL_PATH>"
+    assert dumped["resources"]["skill_root"] == "<REDACTED_SKILL_PATH>"
+
+    json_str = skill.model_dump_json()
+    assert sensitive_path not in json_str
+    assert "<REDACTED_SKILL_PATH>" in json_str
+
+
+def test_relative_skill_source_is_preserved_in_serialization():
+    """Relative source paths should serialize unchanged."""
+    skill = Skill(name="relative", content="content", source="test-repo.md")
+    dumped = skill.model_dump(mode="json")
+    assert dumped["source"] == "test-repo.md"

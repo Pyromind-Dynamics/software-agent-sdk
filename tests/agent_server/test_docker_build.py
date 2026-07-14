@@ -564,6 +564,7 @@ def test_make_build_context_reuses_prebuilt_sdist_without_running_uv_build(
     try:
         mock_run.assert_not_called()
         assert (ctx / "README.md").read_text(encoding="utf-8") == "fixture"
+        assert (ctx / "knowledge" / "dataset_processing_workflow.py").exists()
         assert (ctx / "Dockerfile").exists()
     finally:
         if ctx.exists():

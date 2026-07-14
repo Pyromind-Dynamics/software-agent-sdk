@@ -14,7 +14,7 @@ from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import AliasChoices, BaseModel, Field, SecretStr
+from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator
 
 from openhands.agent_server.conversation_service import (
     ConversationForkAtEventConflictError,
@@ -47,6 +47,13 @@ from openhands.agent_server.run_workflow_callback import (
     RunWorkflowCallbackResult,
     deliver_run_workflow_status,
 )
+from openhands.agent_server.workflow_canvas_models import WorkflowCanvasEventSnapshot
+from openhands.agent_server.workflow_canvas_store import (
+    FileWorkflowCanvasStore,
+    WorkflowCanvasEventSnapshotNotFoundError,
+    WorkflowCanvasStoreError,
+    WorkflowCanvasVersionNotFoundError,
+)
 from openhands.sdk import LLM, AgentContext, TextContent, Tool
 from openhands.sdk.conversation.request import (
     StartConversationRequest,
@@ -71,10 +78,7 @@ from openhands.tools.workflow import (
     RunWorkflowTool,
     ValidateWorkflowDslTool,
 )
-from openhands.tools.workflow.dsl_to_xyflow import (
-    DslToXyflowTool,
-    convert_xyflow_to_dsl,
-)
+from openhands.tools.workflow.dsl_to_xyflow import convert_xyflow_to_dsl
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
@@ -82,6 +86,7 @@ from openhands.tools.workflow.validate_workflow_dsl import (
 
 
 PYROMIND_AUTH_TOKEN_SECRET = "auth_token"
+_OPENAI_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 
 
 logger = logging.getLogger(__name__)
@@ -115,8 +120,8 @@ _PYROMIND_DEBUG_RESPONSE_BODY_LIMIT = 20000
 # matching skill first, and only fall back to grep + file_editor for free-form
 # knowledge-base lookups.
 PYROMIND_KB_INSTRUCTIONS = """\
-The Pyromind platform knowledge base is available at this absolute path:
-{knowledge_base_path}
+The Pyromind platform knowledge base is available through the read-only logical
+path `knowledge/`. Do not use or request its host filesystem path.
 
 Knowledge base layout:
 - basic/: platform basics
@@ -141,9 +146,19 @@ been generated unless a tool call actually created or modified `workflow.py`.
 
 - If a listed skill fits the request (for example, generating a workflow), \
 invoke that skill via `invoke_skill` first, before searching the knowledge base.
-- For Pyromind knowledge-base lookups, use `grep` with the absolute path above,
-then open matched files with `file_editor` to read their full content before
-answering or editing `workflow.py`.
+- For every knowledge-base request, do not call `terminal`, `apply_patch`, or
+`grep` with a host filesystem path. Use only the logical `knowledge/` path.
+- For "查看知识库有哪些信息" or similar inventory requests, use one `grep`
+call per top-level directory (`basic`, `jupyterlab`, `sdk`, `studio`, and
+`nodes`) with `include="*.mdx"` and pattern `^title:|^# `; do not use pattern
+`.` or `^` because those return document bodies instead of an index.
+- For requests to output, summarize, or explain specific knowledge-base
+articles, first search with `grep` under `knowledge/<subdirectory>` using
+`include="*.mdx"`, then open only the matched files with `file_editor` using
+the same logical path. Use `*.md` only when an `.mdx` search has no matches.
+Do not invoke a workflow-generation skill for an article lookup alone.
+- For workflow generation, use the matching skill and consult `knowledge/` only
+when needed for platform details.
 """
 
 
@@ -240,11 +255,13 @@ def _load_env_to_tools(
     params = params if params else {}
     secrets = secrets if secrets else {}
 
-    params["current_user"] = getattr(http_request.state, "current_user", None)
+    params["current_user"] = _current_user_without_cookie(
+        getattr(http_request.state, "current_user", None)
+    )
     params["env"] = getattr(http_request.state, "env", None)
     params["cluster"] = getattr(http_request.state, "cluster", None)
 
-    ## 拷贝请求头 不包含认证信息，一般的环境信息拷贝
+    # 拷贝请求头，不包含认证信息，仅复制一般环境信息。
     headers = {
         name: _value
         for name in _PYROMIND_VALIDATE_FORWARD_HEADERS
@@ -256,6 +273,12 @@ def _load_env_to_tools(
     params["headers"] = headers
 
     return params, secrets
+
+
+def _current_user_without_cookie(current_user: Any) -> Any:
+    if not isinstance(current_user, CurrentLoginUser):
+        return current_user
+    return current_user.model_copy(update={"cookie": None})
 
 
 def _load_auth_token(
@@ -275,20 +298,19 @@ def _load_auth_token(
 
 def _build_workflow_run_tool(
     http_request: Request,
-    extra: dict[str, Any],
 ) -> tuple[Tool, dict[str, SecretSource]]:
     params: dict[str, Any] = {}
     secrets: dict[str, SecretSource] = {}
 
-    ## 加载通用属性
+    # 加载通用属性。
     params, secrets = _load_env_to_tools(
         http_request=http_request, params=params, secrets=secrets
     )
 
-    ## 加载用户认证token
+    # 加载用户认证 token。
     secrets = _load_auth_token(http_request=http_request, secrets=secrets)
 
-    ## 返回工具参数，会话级别
+    # 返回会话级工具参数。
     return Tool(name=RunWorkflowTool.name, params=params), secrets
 
 
@@ -402,6 +424,21 @@ class PyromindLLMConfig(BaseModel):
         default_factory=lambda: os.environ.get("LLM_BASE_URL"),
     )
 
+    @field_validator("base_url", mode="before")
+    @classmethod
+    def normalize_base_url(cls, value: Any) -> str | None:
+        if not isinstance(value, str):
+            return value
+
+        base_url = value.strip().rstrip("/")
+        if not base_url:
+            return None
+
+        if base_url.endswith(_OPENAI_CHAT_COMPLETIONS_SUFFIX):
+            return base_url[: -len(_OPENAI_CHAT_COMPLETIONS_SUFFIX)]
+
+        return base_url
+
 
 class PyromindCreateConversationRequest(BaseModel):
     """Request body for creating a Pyromind knowledge-base conversation.
@@ -472,7 +509,7 @@ class PyromindForkAtEventRequest(BaseModel):
     event_id: str = Field(
         alias="eventId",
         min_length=1,
-        description="Workflow output event id to branch from.",
+        description="Workflow snapshot event id to branch from.",
     )
     title: str | None = Field(
         default=None,
@@ -489,6 +526,45 @@ class PyromindForkAtEventResponse(BaseModel):
     forked_at_event_id: str = Field(alias="forkedAtEventId")
     workflow_version_id: str = Field(alias="workflowVersionId")
     conversation: ConversationInfo
+
+    model_config = {"populate_by_name": True}
+
+
+class PyromindWorkflowRollbackRequest(BaseModel):
+    event_id: str = Field(
+        alias="eventId",
+        min_length=1,
+        description="Workflow snapshot event id to restore.",
+    )
+    run: bool = Field(
+        default=False,
+        description="Whether the agent loop should run after the correction context.",
+    )
+    message: str | None = Field(
+        default=None,
+        max_length=2000,
+        description=(
+            "Optional correction message to append after applying the snapshot."
+        ),
+    )
+
+    model_config = {"populate_by_name": True, "extra": "forbid"}
+
+
+class PyromindWorkflowRollbackResponse(BaseModel):
+    conversation_id: UUID = Field(alias="conversationId")
+    rolled_back_to_event_id: str | None = Field(
+        default=None, alias="rolledBackToEventId"
+    )
+    workflow_version_id: str | None = Field(default=None, alias="workflowVersionId")
+    snapshot_role: Literal["in", "out"] | None = Field(
+        default=None, alias="snapshotRole"
+    )
+    workflow_file_action: Literal["updated", "removed"] | None = Field(
+        default=None, alias="workflowFileAction"
+    )
+    correction_message: str | None = Field(default=None, alias="correctionMessage")
+    snapshot: WorkflowCanvasEventSnapshot | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -626,6 +702,45 @@ def _sync_workflow_with_canvas(
             "</system_reminder>"
         )
     return TextContent(text=reminder_text)
+
+
+def _workflow_canvas_store(event_service: EventService) -> FileWorkflowCanvasStore:
+    return FileWorkflowCanvasStore(
+        conversation_dir=event_service.conversation_dir,
+        session_id=event_service.stored.id.hex,
+    )
+
+
+def _apply_workflow_snapshot_to_workspace(
+    working_dir: Path,
+    workflow_dsl: str,
+) -> Literal["updated", "removed"]:
+    workflow_path = working_dir / "workflow.py"
+    if not _normalize_dsl(workflow_dsl):
+        workflow_path.unlink(missing_ok=True)
+        return "removed"
+
+    working_dir.mkdir(parents=True, exist_ok=True)
+    workflow_path.write_text(workflow_dsl, encoding="utf-8")
+    return "updated"
+
+
+def _workflow_rollback_correction_message(
+    snapshot: WorkflowCanvasEventSnapshot,
+    workflow_file_action: Literal["updated", "removed"],
+) -> str:
+    workflow_state = (
+        "workflow.py has been removed because the restored snapshot is empty"
+        if workflow_file_action == "removed"
+        else "workflow.py has been overwritten with the restored snapshot"
+    )
+    return (
+        "Workflow rollback applied by the user. "
+        f"Restored event {snapshot.event_id} "
+        f"({snapshot.snapshot_role} snapshot, version {snapshot.version_id}). "
+        f"{workflow_state}. Treat the current workflow.py state as authoritative "
+        "and ignore workflow state from before this correction."
+    )
 
 
 class PyromindDebugUrlRequest(BaseModel):
@@ -772,10 +887,10 @@ async def create_pyromind_conversation(
     conversation_id = uuid.uuid4()
     conversation_dir = conversation_service.conversations_dir / conversation_id.hex
     conversation_dir.mkdir(parents=True, exist_ok=True)
+    conversation_dir.chmod(0o700)
 
     # 2. Assemble the pyromind KB instructions (layered on the codex base prompt)
     custom_instructions = PYROMIND_KB_INSTRUCTIONS.format(
-        knowledge_base_path=knowledge_base_path,
         working_dir=str(conversation_dir),
     )
 
@@ -795,7 +910,7 @@ async def create_pyromind_conversation(
     )
 
     # run_workflow reuses validate auth/header wiring / 运行工具复用校验鉴权配置
-    run_tool, run_secrets = _build_workflow_run_tool(http_request, request.extra)
+    run_tool, run_secrets = _build_workflow_run_tool(http_request)
     # storage
     storage_tools, storage_secrets = _build_pyromind_storage_tools(
         http_request, request.extra
@@ -807,6 +922,7 @@ async def create_pyromind_conversation(
         model=request.llm.model,
         api_key=request.llm.api_key,
         base_url=request.llm.base_url,
+        persist_runtime_config=False,
     )
 
     # 5. Build the codex-style agent with the KB instructions + KB retrieval
@@ -847,7 +963,7 @@ async def create_pyromind_conversation(
         workspace=workspace,
         conversation_id=conversation_id,
         initial_message=None,
-        secrets={**validation_secrets, **storage_secrets},
+        secrets={**validation_secrets, **run_secrets, **storage_secrets},
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
         user_id=user_id,
     )
@@ -924,6 +1040,67 @@ async def send_pyromind_message(
         workflow_xyflow_snapshot=request.workflow_xyflow,
     )
     return Success()
+
+
+@pyromind_router.post(
+    "/conversations/{conversation_id}/rollback-workflow-at-event",
+    response_model=PyromindWorkflowRollbackResponse,
+    response_model_by_alias=True,
+    responses={409: {"description": "Workflow snapshot state is inconsistent"}},
+)
+async def rollback_pyromind_workflow_at_event(
+    http_request: Request,
+    conversation_id: UUID,
+    request: PyromindWorkflowRollbackRequest,
+    event_service: EventService = Depends(get_event_service),
+) -> PyromindWorkflowRollbackResponse:
+    """Restore a workflow snapshot when the event has one."""
+    current_user = getattr(http_request.state, "current_user", None)
+    if isinstance(current_user, CurrentLoginUser):
+        await apply_pyromind_validation_context(event_service, current_user)
+
+    try:
+        snapshot = _workflow_canvas_store(event_service).get_event_snapshot(
+            request.event_id
+        )
+    except WorkflowCanvasEventSnapshotNotFoundError:
+        return PyromindWorkflowRollbackResponse(
+            conversationId=conversation_id,
+            snapshot=None,
+        )
+    except WorkflowCanvasVersionNotFoundError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except WorkflowCanvasStoreError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    conversation = event_service.get_conversation()
+    working_dir = Path(conversation.workspace.working_dir)
+    workflow_file_action = _apply_workflow_snapshot_to_workspace(
+        working_dir,
+        snapshot.workflow_dsl_data,
+    )
+    correction_message = request.message or _workflow_rollback_correction_message(
+        snapshot,
+        workflow_file_action,
+    )
+
+    await event_service.send_message(
+        Message(role="user", content=[]),
+        run=request.run,
+        extended_content=[TextContent(text=correction_message)],
+        workflow_dsl_snapshot=snapshot.workflow_dsl_data,
+        workflow_xyflow_snapshot=snapshot.workflow_xyflow_data,
+    )
+
+    return PyromindWorkflowRollbackResponse(
+        conversationId=conversation_id,
+        rolledBackToEventId=snapshot.event_id,
+        workflowVersionId=snapshot.version_id,
+        snapshotRole=snapshot.snapshot_role,
+        workflowFileAction=workflow_file_action,
+        correctionMessage=correction_message,
+        snapshot=snapshot,
+    )
 
 
 @pyromind_router.post(

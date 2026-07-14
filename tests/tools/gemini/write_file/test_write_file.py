@@ -83,6 +83,17 @@ def test_write_file_absolute_path(tmp_path):
     assert test_file.read_text() == "content\n"
 
 
+def test_write_file_rejects_path_outside_workspace(tmp_path):
+    outside_file = tmp_path.parent / "outside.txt"
+    executor = WriteFileExecutor(workspace_root=str(tmp_path))
+
+    obs = executor(WriteFileAction(file_path=str(outside_file), content="private"))
+
+    assert obs.is_error
+    assert "outside the workspace root" in obs.text
+    assert not outside_file.exists()
+
+
 def test_write_file_empty_content(tmp_path):
     """Test writing empty content."""
     executor = WriteFileExecutor(workspace_root=str(tmp_path))
