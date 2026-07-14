@@ -1,10 +1,10 @@
 """Read file tool executor implementation."""
 
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from openhands.sdk.tool import ToolExecutor
+from openhands.sdk.utils.path import resolve_workspace_path
 from openhands.tools.gemini.read_file.definition import (
     MAX_LINES_PER_READ,
     ReadFileAction,
@@ -46,11 +46,15 @@ class ReadFileExecutor(ToolExecutor[ReadFileAction, ReadFileObservation]):
         offset = action.offset or 0
         limit = action.limit
 
-        # Resolve path relative to workspace
-        if not os.path.isabs(file_path):
-            resolved_path = self.workspace_root / file_path
-        else:
-            resolved_path = Path(file_path)
+        try:
+            resolved_path = resolve_workspace_path(file_path, self.workspace_root)
+        except ValueError as exc:
+            return ReadFileObservation.from_text(
+                text=f"Error: {exc}",
+                is_error=True,
+                file_path=file_path,
+                file_content="",
+            )
 
         # Check if file exists
         if not resolved_path.exists():

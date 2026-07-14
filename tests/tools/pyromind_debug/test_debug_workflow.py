@@ -13,6 +13,7 @@ from typing import cast
 import pytest
 
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
+from openhands.sdk.tool.registry import list_registered_tools
 from openhands.tools.pyromind_debug.broker import (
     DebugResultBroker,
     get_debug_result_broker,
@@ -25,9 +26,14 @@ from openhands.tools.pyromind_debug.impl import DebugWorkflowExecutor
 from openhands.tools.pyromind_debug.mock_platform import MockDebugPlatform
 
 
+def test_legacy_debug_workflow_tool_remains_registered():
+    assert DebugWorkflowTool.name in list_registered_tools()
+
+
 def _fake_conversation(working_dir) -> LocalConversation:
     return cast(
-        LocalConversation, SimpleNamespace(workspace=SimpleNamespace(working_dir=str(working_dir)))
+        LocalConversation,
+        SimpleNamespace(workspace=SimpleNamespace(working_dir=str(working_dir))),
     )
 
 
@@ -90,7 +96,9 @@ def test_mock_platform_end_to_end(tmp_path, webhook_base_url):
     platform = MockDebugPlatform(
         delay_seconds=0.05, fail_attempts=2, callback_base_url=webhook_base_url
     )
-    executor = DebugWorkflowExecutor(max_attempts=10, timeout_seconds=5, platform=platform)
+    executor = DebugWorkflowExecutor(
+        max_attempts=10, timeout_seconds=5, platform=platform
+    )
 
     statuses = []
     for _ in range(3):

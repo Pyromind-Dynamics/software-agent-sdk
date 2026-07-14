@@ -99,6 +99,18 @@ def test_read_file_absolute_path(tmp_path):
     assert "content" in obs.file_content
 
 
+def test_read_file_rejects_path_outside_workspace(tmp_path):
+    outside_file = tmp_path.parent / "outside.txt"
+    outside_file.write_text("private")
+    try:
+        executor = ReadFileExecutor(workspace_root=str(tmp_path))
+        obs = executor(ReadFileAction(file_path=str(outside_file)))
+        assert obs.is_error
+        assert "outside the workspace root" in obs.text
+    finally:
+        outside_file.unlink()
+
+
 def test_read_file_offset_beyond_length(tmp_path):
     """Test reading with offset beyond file length."""
     test_file = tmp_path / "test.txt"
