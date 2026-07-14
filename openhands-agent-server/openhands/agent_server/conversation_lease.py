@@ -10,6 +10,10 @@ from typing import NotRequired, TypedDict
 
 from filelock import FileLock
 
+from openhands.agent_server.persistence.store import (
+    _atomic_write_json,
+    _ensure_secure_directory,
+)
 from openhands.sdk import get_logger
 
 
@@ -121,7 +125,7 @@ class ConversationLease:
 
     def claim(self) -> LeaseClaim:
         """Claim or renew ownership of the conversation directory."""
-        self._conversation_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_secure_directory(self._conversation_dir)
         with FileLock(str(self._lock_path)):
             now = time.time()
             payload = self._read_payload()
@@ -276,6 +280,4 @@ class ConversationLease:
             "owner_host": _current_host(),
             "owner_pid": os.getpid(),
         }
-        tmp_path = self._lease_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(payload))
-        tmp_path.replace(self._lease_path)
+        _atomic_write_json(self._lease_path, payload)

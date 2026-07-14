@@ -46,6 +46,30 @@ def test_workspace_root_as_cwd(tmp_path):
     assert "Maybe you meant" not in error_message
 
 
+def test_workspace_root_rejects_outside_paths(tmp_path):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    outside_file = tmp_path / "outside.txt"
+    outside_file.write_text("private")
+
+    editor = FileEditor(workspace_root=str(workspace_root))
+
+    with pytest.raises(EditorToolParameterInvalidError, match="inside the workspace"):
+        editor(command="view", path=str(outside_file))
+
+
+def test_workspace_root_rejects_directory_traversal(tmp_path):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    outside_file = tmp_path / "outside.txt"
+    outside_file.write_text("private")
+
+    editor = FileEditor(workspace_root=str(workspace_root))
+
+    with pytest.raises(EditorToolParameterInvalidError, match="inside the workspace"):
+        editor(command="view", path=str(workspace_root / ".." / outside_file.name))
+
+
 def test_relative_workspace_root_do_not_raises_error(tmp_path, monkeypatch):
     """Test that a relative workspace_root raises a ValueError."""
     # Set up a directory structure

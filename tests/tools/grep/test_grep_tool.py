@@ -184,6 +184,20 @@ def test_grep_tool_invalid_directory():
         assert "not a valid directory" in observation.text
 
 
+def test_grep_tool_rejects_path_outside_workspace(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    conv_state = _create_test_conv_state(str(tmp_path / "workspace"))
+    Path(conv_state.workspace.working_dir).mkdir()
+    tool = GrepTool.create(conv_state)[0]
+    assert tool.executor is not None
+
+    observation = tool.executor(GrepAction(pattern="secret", path=str(outside)))
+
+    assert observation.is_error
+    assert "outside the workspace root" in observation.text
+
+
 def test_grep_tool_hidden_files_excluded():
     """Test that hidden files are excluded from results."""
     with tempfile.TemporaryDirectory() as temp_dir:

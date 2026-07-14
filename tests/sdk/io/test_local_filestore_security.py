@@ -121,3 +121,17 @@ def test_file_operations_with_security():
         # Test that we can't read outside the root
         with pytest.raises(ValueError, match="path escapes filestore root"):
             store.read("../outside.txt")
+
+
+def test_local_filestore_uses_private_permissions():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root_dir = os.path.join(temp_dir, "filestore_root")
+        store = LocalFileStore(root_dir)
+        store.write("events/event.json", "{}")
+
+        assert os.stat(root_dir).st_mode & 0o777 == 0o700
+        assert os.stat(os.path.join(root_dir, "events")).st_mode & 0o777 == 0o700
+        assert (
+            os.stat(os.path.join(root_dir, "events/event.json")).st_mode & 0o777
+            == 0o600
+        )

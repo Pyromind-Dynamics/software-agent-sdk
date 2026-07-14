@@ -67,6 +67,16 @@ from openhands.tools.workflow.validate_workflow_dsl import (
 _REMOVED_WORKFLOW_TOOL = "publish" + "_workflow"
 
 
+def test_pyromind_llm_config_normalizes_chat_completions_base_url() -> None:
+    config = PyromindLLMConfig(
+        model="openai/glm-5.2-fp8",
+        api_key="test-key",
+        base_url=" http://208.64.254.187:8000/v1/chat/completions/ ",
+    )
+
+    assert config.base_url == "http://208.64.254.187:8000/v1"
+
+
 class _FakeConversationService:
     def __init__(self, conversations_dir: Path) -> None:
         self.conversations_dir = conversations_dir
@@ -308,6 +318,42 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     )
     assert service.start_request.secrets["auth_token"].get_value() == "session-token"
     assert service.start_request.tags == {PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE}
+    dumped_agent = service.start_request.agent.model_dump(mode="json")
+    assert "api_key" not in dumped_agent["llm"]
+    assert "base_url" not in dumped_agent["llm"]
+    assert "api_key" not in dumped_agent["condenser"]["llm"]
+    assert "base_url" not in dumped_agent["condenser"]["llm"]
+
+
+@pytest.mark.asyncio
+async def test_pyromind_conversation_request_serializes_without_local_paths(tmp_path):
+    """Persisted request JSON (meta.json) must not contain host-absolute paths."""
+    knowledge_base = tmp_path / "knowledge"
+    knowledge_base.mkdir()
+    service = _FakeConversationService(tmp_path / "conversations")
+    response = Response()
+
+    info = await create_pyromind_conversation(
+        _make_request(),
+        PyromindCreateConversationRequest(
+            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            extra={
+                "knowledge_base_path": str(knowledge_base),
+                "skills_path": str(tmp_path / "missing-skills"),
+            },
+        ),
+        response,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert service.start_request is not None
+    request_json = service.start_request.model_dump_json(exclude_none=True)
+
+    assert str(knowledge_base) not in request_json
+    assert str(service.conversations_dir / info.id.hex) not in request_json
+    assert "<REDACTED_WORKSPACE_PATH>" in request_json
+    assert "<REDACTED_PATH>" in request_json
 
 
 @pytest.mark.asyncio
@@ -703,7 +749,7 @@ def test_build_workflow_run_tool_wires_env_headers_and_auth_token():
     )
     load_base_env(request)
 
-    tool, secrets = _build_workflow_run_tool(request, {})
+    tool, secrets = _build_workflow_run_tool(request)
 
     assert tool.name == RunWorkflowTool.name
     assert tool.params == {
@@ -716,6 +762,30 @@ def test_build_workflow_run_tool_wires_env_headers_and_auth_token():
             "request-app": "openhands",
         },
     }
+    assert secrets["auth_token"].get_value() == "jwt-token"
+
+
+def test_build_workflow_run_tool_does_not_persist_current_user_cookie():
+    request = _make_request(
+        {
+            "cookie": f"{PYROMIND_AUTH_COOKIE_NAME}=jwt-token",
+            "x-cluster": "us-west-1#pre",
+        }
+    )
+    request.state.current_user = CurrentLoginUser(
+        username="debug-user",
+        email="debug-user@example.test",
+        user_id=100,
+        cookie="auth_token=jwt-token; other=value",
+        x_cluster="us-west-1#pre",
+    )
+    load_base_env(request)
+
+    tool, secrets = _build_workflow_run_tool(request)
+
+    current_user = tool.params["current_user"]
+    assert isinstance(current_user, CurrentLoginUser)
+    assert current_user.cookie is None
     assert secrets["auth_token"].get_value() == "jwt-token"
 
 

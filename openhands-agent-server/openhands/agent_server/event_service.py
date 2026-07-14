@@ -1,4 +1,6 @@
 import asyncio
+import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
@@ -7,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from openhands.agent_server.conversation_lease import (
     DEFAULT_LEASE_TTL_SECONDS,
@@ -20,6 +22,10 @@ from openhands.agent_server.models import (
     EventSortOrder,
     StoredConversation,
 )
+from openhands.agent_server.persistence.store import (
+    _atomic_write_json,
+    _ensure_secure_directory,
+)
 from openhands.agent_server.pub_sub import PubSub, Subscriber
 from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
@@ -31,6 +37,7 @@ from openhands.agent_server.workflow_canvas_snapshot_hook import (
 )
 from openhands.sdk import LLM, AgentBase, Event, Message, TextContent, get_logger
 from openhands.sdk.agent import ACPAgent
+from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.conversation.base import BaseConversation
 from openhands.sdk.conversation.events_list_base import EventsListBase
 from openhands.sdk.conversation.goal import (
@@ -69,6 +76,10 @@ from openhands.sdk.security.confirmation_policy import ConfirmationPolicyBase
 from openhands.sdk.utils.async_utils import AsyncCallbackWrapper
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
+from openhands.sdk.workspace.base import (
+    PERSIST_WORKSPACE_PATH_CONTEXT,
+    REDACTED_WORKSPACE_PATH,
+)
 from openhands.tools.workflow.definition import (
     PYROMIND_WORKFLOW_DIRTY_KEY,
     PYROMIND_WORKFLOW_EMITTED_KEY,
@@ -81,6 +92,46 @@ LEASE_RENEW_INTERVAL_SECONDS = 15.0
 # Bounds initial-state push so subscribe_to_events does not stall on a
 # subscriber whose __call__ blocks (e.g. WS with a full TCP send buffer).
 INITIAL_STATE_PUSH_TIMEOUT_SECONDS = 0.5
+_OPENAI_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
+
+
+def _normalize_openai_base_url(base_url: str | None) -> str | None:
+    if base_url is None:
+        return None
+    normalized = base_url.strip().rstrip("/")
+    if not normalized:
+        return None
+    if normalized.endswith(_OPENAI_CHAT_COMPLETIONS_SUFFIX):
+        return normalized[: -len(_OPENAI_CHAT_COMPLETIONS_SUFFIX)]
+    return normalized
+
+
+def _pyromind_runtime_llm(existing: LLM) -> LLM:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    return existing.model_copy(
+        update={
+            "model": os.environ.get("LLM_MODEL") or existing.model,
+            "api_key": SecretStr(api_key) if api_key is not None else existing.api_key,
+            "base_url": _normalize_openai_base_url(
+                os.environ.get("LLM_BASE_URL") or existing.base_url
+            ),
+            "persist_runtime_config": False,
+        }
+    )
+
+
+def _with_pyromind_runtime_llm(agent: AgentBase) -> AgentBase:
+    runtime_llm = _pyromind_runtime_llm(agent.llm)
+    condenser = agent.condenser
+    if isinstance(condenser, LLMSummarizingCondenser):
+        condenser = condenser.model_copy(
+            update={
+                "llm": runtime_llm.model_copy(
+                    update={"usage_id": condenser.llm.usage_id}
+                )
+            }
+        )
+    return agent.model_copy(update={"llm": runtime_llm, "condenser": condenser})
 
 
 logger = get_logger(__name__)
@@ -142,12 +193,17 @@ class EventService:
     async def save_meta(self):
         with self._write_guard():
             meta_file = self.conversation_dir / "meta.json"
-            meta_file.write_text(
-                self.stored.model_dump_json(
-                    context={
-                        "cipher": self.cipher,
-                    }
-                )
+            _ensure_secure_directory(self.conversation_dir)
+            _atomic_write_json(
+                meta_file,
+                json.loads(
+                    self.stored.model_dump_json(
+                        context={
+                            "cipher": self.cipher,
+                            PERSIST_WORKSPACE_PATH_CONTEXT: True,
+                        }
+                    )
+                ),
             )
 
     def _write_guard(self):
@@ -866,7 +922,7 @@ class EventService:
         self._main_loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
 
         # self.stored contains an Agent configuration we can instantiate
-        self.conversation_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_secure_directory(self.conversation_dir)
         # lease_ttl_seconds=0 disables leasing for single-instance deployments
         # where shared-storage stale leases would otherwise block pod restarts.
         if self.lease_ttl_seconds > 0:
@@ -880,8 +936,17 @@ class EventService:
         workspace = self.stored.workspace
         assert isinstance(workspace, LocalWorkspace)
         working_dir = Path(workspace.working_dir)
+        if workspace.working_dir == REDACTED_WORKSPACE_PATH:
+            working_dir = self.conversation_dir
+            workspace = workspace.model_copy(update={"working_dir": str(working_dir)})
+            self.stored = self.stored.model_copy(update={"workspace": workspace})
+            await self.save_meta()
         working_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_workspace_is_git_repo(working_dir)
+        if self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE:
+            self.stored = self.stored.model_copy(
+                update={"agent": _with_pyromind_runtime_llm(self.stored.agent)}
+            )
         agent_cls = type(self.stored.agent)
         agent = agent_cls.model_validate(
             self.stored.agent.model_dump(context={"expose_secrets": True}),

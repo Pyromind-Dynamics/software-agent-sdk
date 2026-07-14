@@ -14,7 +14,7 @@ from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import AliasChoices, BaseModel, Field, SecretStr
+from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator
 
 from openhands.agent_server.conversation_service import (
     ConversationForkAtEventConflictError,
@@ -87,6 +87,7 @@ from openhands.tools.workflow.validate_workflow_dsl import (
 
 
 PYROMIND_AUTH_TOKEN_SECRET = "auth_token"
+_OPENAI_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 
 
 logger = logging.getLogger(__name__)
@@ -120,8 +121,8 @@ _PYROMIND_DEBUG_RESPONSE_BODY_LIMIT = 20000
 # matching skill first, and only fall back to grep + file_editor for free-form
 # knowledge-base lookups.
 PYROMIND_KB_INSTRUCTIONS = """\
-The Pyromind platform knowledge base is available at this absolute path:
-{knowledge_base_path}
+The Pyromind platform knowledge base is available through the read-only logical
+path `knowledge/`. Do not use or request its host filesystem path.
 
 Knowledge base layout:
 - basic/: platform basics
@@ -146,9 +147,19 @@ been generated unless a tool call actually created or modified `workflow.py`.
 
 - If a listed skill fits the request (for example, generating a workflow), \
 invoke that skill via `invoke_skill` first, before searching the knowledge base.
-- For Pyromind knowledge-base lookups, use `grep` with the absolute path above,
-then open matched files with `file_editor` to read their full content before
-answering or editing `workflow.py`.
+- For every knowledge-base request, do not call `terminal`, `apply_patch`, or
+`grep` with a host filesystem path. Use only the logical `knowledge/` path.
+- For "查看知识库有哪些信息" or similar inventory requests, use one `grep`
+call per top-level directory (`basic`, `jupyterlab`, `sdk`, `studio`, and
+`nodes`) with `include="*.mdx"` and pattern `^title:|^# `; do not use pattern
+`.` or `^` because those return document bodies instead of an index.
+- For requests to output, summarize, or explain specific knowledge-base
+articles, first search with `grep` under `knowledge/<subdirectory>` using
+`include="*.mdx"`, then open only the matched files with `file_editor` using
+the same logical path. Use `*.md` only when an `.mdx` search has no matches.
+Do not invoke a workflow-generation skill for an article lookup alone.
+- For workflow generation, use the matching skill and consult `knowledge/` only
+when needed for platform details.
 """
 
 
@@ -245,7 +256,9 @@ def _load_env_to_tools(
     params = params if params else {}
     secrets = secrets if secrets else {}
 
-    params["current_user"] = getattr(http_request.state, "current_user", None)
+    params["current_user"] = _current_user_without_cookie(
+        getattr(http_request.state, "current_user", None)
+    )
     params["env"] = getattr(http_request.state, "env", None)
     params["cluster"] = getattr(http_request.state, "cluster", None)
 
@@ -261,6 +274,12 @@ def _load_env_to_tools(
     params["headers"] = headers
 
     return params, secrets
+
+
+def _current_user_without_cookie(current_user: Any) -> Any:
+    if not isinstance(current_user, CurrentLoginUser):
+        return current_user
+    return current_user.model_copy(update={"cookie": None})
 
 
 def _load_auth_token(
@@ -280,7 +299,6 @@ def _load_auth_token(
 
 def _build_workflow_run_tool(
     http_request: Request,
-    _extra: dict[str, Any],
 ) -> tuple[Tool, dict[str, SecretSource]]:
     params: dict[str, Any] = {}
     secrets: dict[str, SecretSource] = {}
@@ -419,6 +437,21 @@ class PyromindLLMConfig(BaseModel):
     base_url: str | None = Field(
         default_factory=lambda: os.environ.get("LLM_BASE_URL"),
     )
+
+    @field_validator("base_url", mode="before")
+    @classmethod
+    def normalize_base_url(cls, value: Any) -> str | None:
+        if not isinstance(value, str):
+            return value
+
+        base_url = value.strip().rstrip("/")
+        if not base_url:
+            return None
+
+        if base_url.endswith(_OPENAI_CHAT_COMPLETIONS_SUFFIX):
+            return base_url[: -len(_OPENAI_CHAT_COMPLETIONS_SUFFIX)]
+
+        return base_url
 
 
 class PyromindCreateConversationRequest(BaseModel):
@@ -872,10 +905,10 @@ async def create_pyromind_conversation(
     conversation_id = uuid.uuid4()
     conversation_dir = conversation_service.conversations_dir / conversation_id.hex
     conversation_dir.mkdir(parents=True, exist_ok=True)
+    conversation_dir.chmod(0o700)
 
     # 2. Assemble the pyromind KB instructions (layered on the codex base prompt)
     custom_instructions = PYROMIND_KB_INSTRUCTIONS.format(
-        knowledge_base_path=knowledge_base_path,
         working_dir=str(conversation_dir),
     )
 
@@ -895,7 +928,7 @@ async def create_pyromind_conversation(
     )
 
     # run_workflow reuses validate auth/header wiring / 运行工具复用校验鉴权配置
-    run_tool, run_secrets = _build_workflow_run_tool(http_request, request.extra)
+    run_tool, run_secrets = _build_workflow_run_tool(http_request)
     # storage
     storage_tools, storage_secrets = _build_pyromind_storage_tools(
         http_request, request.extra
@@ -907,6 +940,7 @@ async def create_pyromind_conversation(
         model=request.llm.model,
         api_key=request.llm.api_key,
         base_url=request.llm.base_url,
+        persist_runtime_config=False,
     )
 
     # 5. Build the codex-style agent with the KB instructions + KB retrieval

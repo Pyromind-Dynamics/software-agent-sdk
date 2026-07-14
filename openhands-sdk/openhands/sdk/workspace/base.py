@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Annotated, Any
 
-from pydantic import BeforeValidator, Field
+from pydantic import BeforeValidator, Field, field_serializer
 
 from openhands.sdk.git.models import GitChange, GitDiff
 from openhands.sdk.logger import get_logger
@@ -11,6 +11,10 @@ from openhands.sdk.workspace.models import CommandResult, FileOperationResult
 
 
 logger = get_logger(__name__)
+
+
+REDACTED_WORKSPACE_PATH = "<REDACTED_WORKSPACE_PATH>"
+PERSIST_WORKSPACE_PATH_CONTEXT = "persist_workspace_path"
 
 
 def _convert_path_to_str(v: str | Path) -> str:
@@ -46,6 +50,13 @@ class BaseWorkspace(DiscriminatedUnionMixin, ABC):
             )
         ),
     ]
+
+    @field_serializer("working_dir")
+    def _serialize_working_dir(self, value: str, info: Any) -> str:
+        """Redact host paths unless serializing internal runtime state."""
+        if info.context and info.context.get(PERSIST_WORKSPACE_PATH_CONTEXT):
+            return value
+        return REDACTED_WORKSPACE_PATH
 
     def __enter__(self) -> "BaseWorkspace":
         """Enter the workspace context.

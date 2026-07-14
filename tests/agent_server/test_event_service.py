@@ -12,10 +12,14 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from pydantic import SecretStr
 
 from openhands.agent_server.conversation_lease import LEASE_FILE_NAME
 from openhands.agent_server.conversation_service import ConversationService
-from openhands.agent_server.event_service import EventService
+from openhands.agent_server.event_service import (
+    EventService,
+    _with_pyromind_runtime_llm,
+)
 from openhands.agent_server.models import (
     ConfirmationResponseRequest,
     EventPage,
@@ -31,6 +35,7 @@ from openhands.agent_server.pyromind_constants import (
 from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
 from openhands.sdk import LLM, Agent, AgentBase, Conversation, Message
 from openhands.sdk.agent import ACPAgent
+from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.conversation.event_store import EventLog
 from openhands.sdk.conversation.fifo_lock import FIFOLock
 from openhands.sdk.conversation.impl.local_conversation import (
@@ -243,6 +248,37 @@ def _workflow_event_service(
         _WorkflowEmitConversation(tmp_path, agent_state),
     )
     return service
+
+
+def test_pyromind_runtime_llm_is_rehydrated_from_server_env(monkeypatch):
+    monkeypatch.setenv("LLM_MODEL", "openai/glm-5.2-fp8")
+    monkeypatch.setenv("OPENAI_API_KEY", "runtime-key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://llm.example.test/v1/chat/completions")
+    agent = Agent(
+        llm=LLM(model="openai/glm-5.2-fp8", usage_id="pyromind-agent"),
+        tools=[],
+        condenser=LLMSummarizingCondenser(
+            llm=LLM(model="openai/glm-5.2-fp8", usage_id="condenser"),
+            max_size=80,
+            keep_first=4,
+        ),
+    )
+
+    updated = _with_pyromind_runtime_llm(agent)
+
+    assert updated.llm.base_url == "https://llm.example.test/v1"
+    assert updated.llm.api_key is not None
+    assert isinstance(updated.llm.api_key, SecretStr)
+    assert updated.llm.api_key.get_secret_value() == "runtime-key"
+    assert updated.llm.persist_runtime_config is False
+    assert isinstance(updated.condenser, LLMSummarizingCondenser)
+    assert updated.condenser.llm.base_url == "https://llm.example.test/v1"
+    assert updated.condenser.llm.usage_id == "condenser"
+    dumped = updated.model_dump(mode="json", context={"expose_secrets": True})
+    assert "api_key" not in dumped["llm"]
+    assert "base_url" not in dumped["llm"]
+    assert "api_key" not in dumped["condenser"]["llm"]
+    assert "base_url" not in dumped["condenser"]["llm"]
 
 
 def test_emit_pyromind_workflow_if_dirty_emits_event_and_clears_flag(
