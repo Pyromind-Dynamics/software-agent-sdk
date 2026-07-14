@@ -22,6 +22,9 @@ from openhands.agent_server.conversation_service import (
     ConversationForkAtEventTargetNotFoundError,
     ConversationService,
 )
+from openhands.agent_server.dataset_cleaning_callback import (
+    dispatch_run_workflow_status,
+)
 from openhands.agent_server.dependencies import (
     _get_validation_cluster_header,
     get_conversation_service,
@@ -43,10 +46,7 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
     PYROMIND_APP_TAG_VALUE,
 )
-from openhands.agent_server.run_workflow_callback import (
-    RunWorkflowCallbackResult,
-    deliver_run_workflow_status,
-)
+from openhands.agent_server.run_workflow_callback import RunWorkflowCallbackResult
 from openhands.agent_server.workflow_canvas_models import WorkflowCanvasEventSnapshot
 from openhands.agent_server.workflow_canvas_store import (
     FileWorkflowCanvasStore,
@@ -64,6 +64,7 @@ from openhands.sdk.skills import Skill, load_skills_from_dir
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
+from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
     UploadFileToPyromindTool,
@@ -326,10 +327,23 @@ def _build_pyromind_storage_tools(
     if secret_headers:
         params["secret_headers"] = secret_headers
 
+    cleaning_params = {
+        name: params[name] for name in ("headers", "secret_headers") if name in params
+    }
+    cleaning_endpoint_url = extra.get(
+        "dataset_cleaning_endpoint_url", extra.get("studio_prompt_endpoint_url")
+    )
+    if isinstance(cleaning_endpoint_url, str) and cleaning_endpoint_url:
+        cleaning_params["endpoint_url"] = cleaning_endpoint_url
+    cleaning_output_root = extra.get("dataset_cleaning_output_root")
+    if isinstance(cleaning_output_root, str) and cleaning_output_root:
+        cleaning_params["output_root"] = cleaning_output_root
+
     return (
         [
             Tool(name=PreviewDatasetTool.name, params=dict(params)),
             Tool(name=UploadFileToPyromindTool.name, params=dict(params)),
+            Tool(name=RunDatasetCleaningTool.name, params=cleaning_params),
         ],
         secrets,
     )
@@ -553,8 +567,12 @@ class PyromindWorkflowCallbackRequest(BaseModel):
     status: str = Field(
         description="Raw workflow status from the platform or Kafka message."
     )
-    conversation_id: str = Field(
-        description="Conversation to resume; usually from task out_id / Kafka."
+    conversation_id: str | None = Field(
+        default=None,
+        description=(
+            "Conversation to resume. Dataset cleaning callbacks may omit this "
+            "because task association is persisted at submission time."
+        ),
     )
     error_log: str | None = Field(
         default=None,
@@ -1166,11 +1184,11 @@ async def pyromind_workflow_callback(
 ) -> PyromindWorkflowCallbackResponse:
     """Temporary webhook to simulate Kafka run_workflow terminal status delivery.
 
-    Calls :func:`deliver_run_workflow_status` so manual HTTP clients can test the
+    Calls :func:`dispatch_run_workflow_status` so manual HTTP clients can test the
     async resume path without a Kafka consumer. Mounted on the same unauthenticated
     webhook router as ``/debug/callback`` — internal/trusted network only.
     """
-    result: RunWorkflowCallbackResult = await deliver_run_workflow_status(
+    result: RunWorkflowCallbackResult = await dispatch_run_workflow_status(
         task_id=request.task_id,
         status=request.status,
         error_log=request.error_log,
