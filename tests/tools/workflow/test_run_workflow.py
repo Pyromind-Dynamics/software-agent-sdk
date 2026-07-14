@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock
+from uuid import UUID
 
 import pytest
 from pyromind_sdk.client.models import TrainingTaskCreateResponse
@@ -17,6 +18,9 @@ from openhands.tools.workflow import (
     RunWorkflowTool,
 )
 from openhands.tools.workflow.run_workflow import DEFAULT_MAX_ATTEMPTS
+
+
+_CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000123")
 
 
 def _executor_kwargs(**overrides: Any) -> dict[str, Any]:
@@ -38,6 +42,7 @@ def _fake_conversation(
     return cast(
         LocalConversation,
         SimpleNamespace(
+            id=_CONVERSATION_ID,
             workspace=SimpleNamespace(working_dir=str(tmp_path)),
             state=SimpleNamespace(
                 secret_registry=secret_registry or SecretRegistry(),
@@ -150,11 +155,11 @@ def test_run_workflow_submits_task_successfully(
     )
 
     monkeypatch.setattr(
-        "openhands.tools.workflow.run_workflow.get_api_key",
+        "openhands.tools.workflow.task_submission.get_api_key",
         lambda **kwargs: "access-key-1",
     )
     monkeypatch.setattr(
-        "openhands.tools.workflow.run_workflow.get_pyromind_api_client",
+        "openhands.tools.workflow.task_submission.get_pyromind_api_client",
         lambda **kwargs: mock_client,
     )
     monkeypatch.setattr(
@@ -178,6 +183,9 @@ def test_run_workflow_submits_task_successfully(
     assert observation.attempt == 1
     assert "task-123" in observation.text
     mock_client.studio.create.assert_called_once()
+    request = mock_client.studio.create.call_args.args[0]
+    assert request.out_id == f"agent1#{_CONVERSATION_ID}"
+    assert request.workflow == {"name": "demo", "nodes": [], "edges": []}
 
 
 def test_run_workflow_applies_test_mode_to_xyflow() -> None:

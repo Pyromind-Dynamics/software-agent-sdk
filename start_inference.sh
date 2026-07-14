@@ -16,13 +16,11 @@ export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 # LLM Configuration
 # ----------------------------------------------------------
 # LiteLLM requires a provider prefix (e.g. openai/) for custom OpenAI-compatible endpoints.
-export LLM_MODEL="${LLM_MODEL:-openai/glm-5.2-fp8}"
-export LLM_BASE_URL="${LLM_BASE_URL:-http://208.64.254.187:8000/v1}"
-if [[ -z "${OPENAI_API_KEY:-}" && -n "${LLM_API_KEY:-}" ]]; then
-  export OPENAI_API_KEY="${LLM_API_KEY}"
-fi
+export LLM_MODEL="openai/glm-5.2-fp8"
+export LLM_BASE_URL="http://208.64.254.187:8000/v1"
+export OPENAI_API_KEY="${OPENROUTER_API_KEY:-}"
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-  echo "ERROR: OPENAI_API_KEY is required. Export it before running start_inference.sh." >&2
+  echo "ERROR: OPENAI_API_KEY is required. Set it in start_inference.sh." >&2
   exit 1
 fi
 export OPENAI_API_KEY
@@ -42,6 +40,11 @@ elif [[ -n "${SESSION_API_KEY}" ]]; then
 fi
 
 export OH_ENABLE_PYROMIND_JWT_AUTH="${OH_ENABLE_PYROMIND_JWT_AUTH:-true}"
+
+# Keep the server in local development mode while consuming pre workflow events.
+export KAFKA_ENV="${KAFKA_ENV:-pre}"
+export POD_NAME="${POD_NAME:-local-agent-server-${USER:-unknown}}"
+export KAFKA_URL="${KAFKA_URL:-kafka-portal.pyromind.ai:31011,kafka-portal.pyromind.ai:31012,kafka-portal.pyromind.ai:31013}"
 
 # Allow all CORS origins in development
 export OH_ALLOW_CORS_ORIGIN_REGEX="${OH_ALLOW_CORS_ORIGIN_REGEX:-https?://.+}"
@@ -69,7 +72,6 @@ mkdir -p \
 # ----------------------------------------------------------
 # Points to the knowledge/ folder in this repository by default.
 export PYROMIND_KNOWLEDGE_BASE_PATH="${PYROMIND_KNOWLEDGE_BASE_PATH:-${SOFTWARE_AGENT_SDK_DIR}/knowledge}"
-export PYROMIND_PUBLIC_READ_PATHS="${PYROMIND_PUBLIC_READ_PATHS:-${SOFTWARE_AGENT_SDK_DIR}/examples}"
 export PYROMIND_SKILLS_PATH="${PYROMIND_SKILLS_PATH:-${SOFTWARE_AGENT_SDK_DIR}/.agents/skills}"
 
 for required_dir in basic jupyterlab nodes sdk studio; do
@@ -81,11 +83,6 @@ done
 
 if [[ ! -f "${PYROMIND_KNOWLEDGE_BASE_PATH}/dataset_processing_workflow.py" ]]; then
   echo "ERROR: knowledge workflow example missing: ${PYROMIND_KNOWLEDGE_BASE_PATH}/dataset_processing_workflow.py" >&2
-  exit 1
-fi
-
-if [[ ! -d "${SOFTWARE_AGENT_SDK_DIR}/examples" ]]; then
-  echo "ERROR: public examples directory missing: ${SOFTWARE_AGENT_SDK_DIR}/examples" >&2
   exit 1
 fi
 
@@ -115,7 +112,6 @@ echo "============================================"
 echo " LLM Base URL:      ${LLM_BASE_URL}"
 echo " Server root:       ${SOFTWARE_AGENT_SDK_DIR}"
 echo " Knowledge Base:    ${PYROMIND_KNOWLEDGE_BASE_PATH}"
-echo " Public read paths: ${PYROMIND_PUBLIC_READ_PATHS}"
 echo " Skills:            ${PYROMIND_SKILLS_PATH}"
 echo " Workspace root:    ${WORKSPACE_DIR}"
 echo " Conversations:     ${OH_CONVERSATIONS_PATH}"
@@ -123,6 +119,10 @@ echo " Project workspace: ${OH_WORKSPACE_PATH}"
 echo " Bash events:       ${OH_BASH_EVENTS_DIR}"
 echo " Config path:       ${OPENHANDS_AGENT_SERVER_CONFIG_PATH}"
 echo " Pyromind JWT auth: ${OH_ENABLE_PYROMIND_JWT_AUTH}"
+echo " Server env:        ${APP_ENV:-dev}"
+echo " Kafka env:         ${KAFKA_ENV}"
+echo " Kafka brokers:     ${KAFKA_URL:-cluster-internal default}"
+echo " Kafka group:       ${POD_NAME}"
 echo " Session API key:   $([[ -n "${SESSION_API_KEY}" ]] && echo configured || echo disabled)"
 echo " Host:              127.0.0.1"
 echo " Port:              8000"

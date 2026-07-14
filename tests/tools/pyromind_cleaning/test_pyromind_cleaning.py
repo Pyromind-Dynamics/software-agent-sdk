@@ -1,47 +1,27 @@
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import MagicMock
 from uuid import UUID
 
-import httpx
 import pytest
-from pydantic import SecretStr
+from pyromind_sdk.client.models import TrainingTaskCreateResponse
 
 from openhands.sdk.conversation.secret_registry import SecretRegistry
-from openhands.sdk.secret import StaticSecret
 from openhands.tools.pyromind_cleaning import (
     DatasetCleaningTaskAssociation,
     DatasetCleaningTaskStore,
     RunDatasetCleaningAction,
     RunDatasetCleaningExecutor,
-)
-from openhands.tools.pyromind_dataset.definition import (
-    PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
-    PYROMIND_STORAGE_HEADERS_STATE_KEY,
+    RunDatasetCleaningTool,
 )
 
 
 _CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000123")
 
 
-class _Response:
-    def __init__(self, status_code: int, payload: Any, text: str = "") -> None:
-        self.status_code = status_code
-        self._payload = payload
-        self.text = text
-
-    def json(self) -> Any:
-        return self._payload
-
-
 def _secret_registry() -> SecretRegistry:
     registry = SecretRegistry()
-    registry.update_secrets(
-        {
-            PYROMIND_STORAGE_AUTH_COOKIE_SECRET: StaticSecret(
-                value=SecretStr("auth_token=session-token")
-            )
-        }
-    )
+    registry.update_secrets({"auth_token": "session-token"})
     return registry
 
 
@@ -56,9 +36,6 @@ def _fake_conversation(tmp_path: Path):
         (),
         {
             "secret_registry": _secret_registry(),
-            "agent_state": {
-                PYROMIND_STORAGE_HEADERS_STATE_KEY: {"x-cluster": "us-west-1#pre"}
-            },
         },
     )()
     return type(
@@ -68,22 +45,41 @@ def _fake_conversation(tmp_path: Path):
     )()
 
 
+def test_cleaning_tool_derives_execution_target_from_legacy_headers():
+    tool = RunDatasetCleaningTool.create(
+        headers={"x-cluster": "us-west-1#pre"},
+        secret_headers={"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
+        endpoint_url="https://legacy.test/std2/studio_api/api/prompt",
+    )[0]
+
+    executor = tool.executor
+    assert isinstance(executor, RunDatasetCleaningExecutor)
+    assert executor._env == "pre"
+    assert executor._cluster == "us-west-1"
+
+
 def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
     monkeypatch,
     tmp_path,
 ):
-    calls: list[dict[str, Any]] = []
-
-    def fake_post(url, *, headers, json, timeout):
-        calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
-        return _Response(200, {"success": True, "data": {"task_id": 9876}})
-
-    monkeypatch.setattr(httpx, "post", fake_post)
+    mock_client = MagicMock()
+    mock_client.studio.create.return_value = TrainingTaskCreateResponse(
+        task_id="9876",
+        name="agent-data-clean",
+        status="Pending",
+    )
+    client_factory = MagicMock(return_value=mock_client)
+    monkeypatch.setattr(
+        "openhands.tools.pyromind_cleaning.definition.create_workflow_api_client",
+        client_factory,
+    )
     task_store_dir = tmp_path / "tasks"
     conversation = _fake_conversation(tmp_path)
 
     observation = RunDatasetCleaningExecutor(
-        endpoint_url="https://portal.test/std2/studio_api/api/prompt",
+        env="pre",
+        cluster="us-west-1",
+        headers={"x-cluster": "us-west-1#pre", "request-app": "openhands"},
         task_store_dir=str(task_store_dir),
         timeout=5,
     )(
@@ -100,12 +96,19 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
     assert observation.run_id is not None
     assert observation.output_dir == (f"/agentTest/data_cleaning/{observation.run_id}")
     assert observation.resumed is False
-    assert calls[0]["url"] == "https://portal.test/std2/studio_api/api/prompt"
-    assert calls[0]["timeout"] == 5
-    assert calls[0]["headers"]["cookie"] == "auth_token=session-token"
-    assert calls[0]["headers"]["x-cluster"] == "us-west-1#pre"
+    assert f"{observation.output_dir}/stats.json" in observation.text
+    assert "checkpoint.json and errors.jsonl" in observation.text
+    client_factory.assert_called_once_with(
+        env="pre",
+        cluster="us-west-1",
+        auth_token="session-token",
+        headers={"x-cluster": "us-west-1#pre", "request-app": "openhands"},
+        timeout=5,
+    )
 
-    workflow = calls[0]["json"]
+    request = mock_client.studio.create.call_args.args[0]
+    assert request.out_id == f"agent1#{_CONVERSATION_ID}"
+    workflow = request.workflow
     assert workflow["id"] == observation.run_id
     assert workflow["edges"] == []
     assert len(workflow["nodes"]) == 1
@@ -137,13 +140,16 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
 
 
 def test_run_dataset_cleaning_resume_uses_frozen_script(monkeypatch, tmp_path):
-    calls: list[dict[str, Any]] = []
-
-    def fake_post(url, *, headers, json, timeout):
-        calls.append({"json": json})
-        return _Response(200, {"success": True, "data": {"task_id": "task-2"}})
-
-    monkeypatch.setattr(httpx, "post", fake_post)
+    mock_client = MagicMock()
+    mock_client.studio.create.return_value = TrainingTaskCreateResponse(
+        task_id="task-2",
+        name="agent-data-clean",
+        status="Pending",
+    )
+    monkeypatch.setattr(
+        "openhands.tools.pyromind_cleaning.definition.create_workflow_api_client",
+        MagicMock(return_value=mock_client),
+    )
     run_id = UUID("10000000-0000-0000-0000-000000000001")
     task_store_dir = tmp_path / "tasks"
     task_store = DatasetCleaningTaskStore(task_store_dir)
@@ -159,7 +165,8 @@ def test_run_dataset_cleaning_resume_uses_frozen_script(monkeypatch, tmp_path):
     )
 
     observation = RunDatasetCleaningExecutor(
-        endpoint_url="https://portal.test/std2/studio_api/api/prompt",
+        env="pre",
+        cluster="us-west-1",
         task_store_dir=str(task_store_dir),
     )(
         RunDatasetCleaningAction(
@@ -172,7 +179,9 @@ def test_run_dataset_cleaning_resume_uses_frozen_script(monkeypatch, tmp_path):
     assert not observation.is_error
     assert observation.run_id == str(run_id)
     assert observation.resumed is True
-    command = calls[0]["json"]["nodes"][0]["data"]["config"]["command"]
+    request = mock_client.studio.create.call_args.args[0]
+    assert request.out_id == f"agent1#{_CONVERSATION_ID}"
+    command = request.workflow["nodes"][0]["data"]["config"]["command"]
     frozen_script = (
         f"/target-workspace/agentTest/data_cleaning/{run_id}/clean_script.py"
     )
@@ -188,7 +197,8 @@ def test_run_dataset_cleaning_rejects_unknown_resume(tmp_path):
     run_id = UUID("20000000-0000-0000-0000-000000000001")
 
     observation = RunDatasetCleaningExecutor(
-        endpoint_url="https://portal.test/std2/studio_api/api/prompt",
+        env="pre",
+        cluster="us-west-1",
         task_store_dir=str(tmp_path / "tasks"),
     )(
         RunDatasetCleaningAction(
@@ -216,7 +226,8 @@ def test_run_dataset_cleaning_rejects_invalid_paths(
     tmp_path,
 ):
     observation = RunDatasetCleaningExecutor(
-        endpoint_url="https://portal.test/std2/studio_api/api/prompt",
+        env="pre",
+        cluster="us-west-1",
         task_store_dir=str(tmp_path / "tasks"),
     )(
         RunDatasetCleaningAction(

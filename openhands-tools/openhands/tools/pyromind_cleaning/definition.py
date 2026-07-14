@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import shlex
 import uuid
 from collections.abc import Sequence
@@ -10,7 +9,6 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
-import httpx
 from pydantic import Field
 from rich.text import Text
 
@@ -27,9 +25,10 @@ from openhands.tools.pyromind_cleaning.task_store import (
     DatasetCleaningTaskAssociation,
     DatasetCleaningTaskStore,
 )
-from openhands.tools.pyromind_dataset.definition import (
-    PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
-    PYROMIND_STORAGE_HEADERS_STATE_KEY,
+from openhands.tools.workflow.task_submission import (
+    PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
+    create_workflow_api_client,
+    submit_workflow_task,
 )
 
 
@@ -38,19 +37,8 @@ if TYPE_CHECKING:
     from openhands.sdk.conversation.state import ConversationState
 
 
-PRE_STUDIO_PROMPT_URL = "https://pre-api-portal.pyromind.ai/std2/studio_api/api/prompt"
-PROD_STUDIO_PROMPT_URL = "https://api-portal.pyromind.ai/std2/studio_api/api/prompt"
 DEFAULT_CLEANING_OUTPUT_ROOT = "/agentTest/data_cleaning"
 DEFAULT_GPU_PRODUCT = "NVIDIA-H100-NVL"
-
-_PROD_APP_ENVS = {"prod", "production", "online"}
-
-
-def _default_studio_prompt_url() -> str:
-    app_env = os.getenv("APP_ENV", "dev").strip().lower()
-    if app_env in _PROD_APP_ENVS:
-        return PROD_STUDIO_PROMPT_URL
-    return PRE_STUDIO_PROMPT_URL
 
 
 class RunDatasetCleaningAction(Action):
@@ -132,6 +120,11 @@ The submission is asynchronous. A new run gets a unique result directory under
 `output.jsonl`, and state files. Use `limit` for a bounded sample run. To continue
 an interrupted run, call this tool again with `resume_run_id`; the platform
 executes the frozen script copy and passes `--resume`.
+
+When the terminal workflow callback resumes the conversation, use the
+`output_dir` returned by this tool. Preview its `stats.json` before reporting
+success, and treat a missing `stats.json` as an incomplete run. For failed runs,
+inspect `checkpoint.json` and `errors.jsonl` before deciding whether to resume.
 """
 
 
@@ -143,17 +136,17 @@ class RunDatasetCleaningExecutor(
     def __init__(
         self,
         *,
-        endpoint_url: str | None = None,
+        env: str | None = None,
+        cluster: str | None = None,
         output_root: str = DEFAULT_CLEANING_OUTPUT_ROOT,
         headers: dict[str, str] | None = None,
-        secret_headers: dict[str, str] | None = None,
         task_store_dir: str | None = None,
-        timeout: float = 30.0,
+        timeout: int = 30,
     ) -> None:
-        self._endpoint_url = (endpoint_url or _default_studio_prompt_url()).rstrip("/")
+        self._env = env
+        self._cluster = cluster
         self._output_root = _normalize_storage_path(output_root, "output_root")
         self._headers = dict(headers or {})
-        self._secret_headers = dict(secret_headers or {})
         self._task_store_dir = Path(task_store_dir) if task_store_dir else None
         self._timeout = timeout
 
@@ -175,7 +168,6 @@ class RunDatasetCleaningExecutor(
                 )
                 if PurePosixPath(uploaded_script_path).suffix.lower() != ".py":
                     raise ValueError("script_path must point to a Python .py file.")
-            headers = self._resolve_headers(conversation)
             task_store = self._task_store(conversation)
             run_id = action.resume_run_id or uuid.uuid4()
             resumed = action.resume_run_id is not None
@@ -220,14 +212,25 @@ class RunDatasetCleaningExecutor(
             )
 
         try:
-            response = httpx.post(
-                self._endpoint_url,
-                headers=headers,
-                json=workflow,
+            state = cast("ConversationState", conversation.state)
+            auth_token = state.secret_registry.get_secret_value(
+                PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET
+            )
+            client = create_workflow_api_client(
+                env=self._env,
+                cluster=self._cluster,
+                auth_token=auth_token,
+                headers=self._headers,
                 timeout=self._timeout,
             )
-            task_id = _extract_task_id(response)
-        except (httpx.RequestError, ValueError) as exc:
+            response = submit_workflow_task(
+                client=client,
+                workflow=workflow,
+                name=str(workflow["name"]),
+                conversation_id=str(conversation.id),
+            )
+            task_id = response.task_id
+        except Exception as exc:
             return RunDatasetCleaningObservation.from_text(
                 text=f"Failed to submit dataset cleaning workflow: {exc}",
                 status="Failed",
@@ -246,6 +249,7 @@ class RunDatasetCleaningExecutor(
             script_path=effective_script_path,
             limit=action.limit,
             resumed=resumed,
+            status=response.status,
         )
         try:
             task_store.save(association)
@@ -255,7 +259,7 @@ class RunDatasetCleaningExecutor(
                     f"Studio accepted dataset cleaning task {task_id}, but task "
                     f"association persistence failed: {exc}"
                 ),
-                status="Pending",
+                status=response.status,
                 task_id=task_id,
                 run_id=str(run_id),
                 output_dir=output_dir,
@@ -266,44 +270,17 @@ class RunDatasetCleaningExecutor(
         return RunDatasetCleaningObservation.from_text(
             text=(
                 "Dataset cleaning workflow submitted. "
-                f"task_id={task_id}, run_id={run_id}, output_dir={output_dir}"
+                f"task_id={task_id}, run_id={run_id}, output_dir={output_dir}. "
+                "After the terminal callback, inspect "
+                f"{output_dir}/stats.json before reporting success; on failure, "
+                "inspect checkpoint.json and errors.jsonl."
             ),
-            status="Pending",
+            status=response.status,
             task_id=task_id,
             run_id=str(run_id),
             output_dir=output_dir,
             resumed=resumed,
         )
-
-    def _resolve_headers(self, conversation: BaseConversation) -> dict[str, str]:
-        headers = {
-            "accept": "*/*",
-            "content-type": "application/json",
-            **self._headers,
-        }
-        state = cast("ConversationState", conversation.state)
-        state_headers = state.agent_state.get(PYROMIND_STORAGE_HEADERS_STATE_KEY)
-        if isinstance(state_headers, dict):
-            headers.update(
-                {
-                    str(name): str(value)
-                    for name, value in state_headers.items()
-                    if value is not None
-                }
-            )
-
-        secret_headers = dict(self._secret_headers)
-        if state.secret_registry.get_secret_value(PYROMIND_STORAGE_AUTH_COOKIE_SECRET):
-            secret_headers.setdefault("cookie", PYROMIND_STORAGE_AUTH_COOKIE_SECRET)
-        for header_name, secret_name in secret_headers.items():
-            value = state.secret_registry.get_secret_value(secret_name)
-            if not value:
-                raise ValueError(
-                    f"Secret '{secret_name}' required for Studio header "
-                    f"'{header_name}' was not found."
-                )
-            headers[header_name] = value
-        return headers
 
     def _task_store(self, conversation: BaseConversation) -> DatasetCleaningTaskStore:
         if self._task_store_dir is not None:
@@ -324,20 +301,24 @@ class RunDatasetCleaningTool(
         conv_state: ConversationState | None = None,  # noqa: ARG003
         **params: Any,
     ) -> Sequence[Self]:
-        endpoint_url = str(params.pop("endpoint_url", _default_studio_prompt_url()))
+        env_value = params.pop("env", None)
+        env = str(env_value) if env_value is not None else None
+        cluster_value = params.pop("cluster", None)
+        cluster = str(cluster_value) if cluster_value is not None else None
+        params.pop("current_user", None)
         output_root = str(params.pop("output_root", DEFAULT_CLEANING_OUTPUT_ROOT))
         headers = _normalize_headers(params.pop("headers", None))
-        secret_headers = _normalize_headers(params.pop("secret_headers", None))
+        env, cluster = _resolve_execution_target(env, cluster, headers)
+        params.pop("endpoint_url", None)
+        params.pop("secret_headers", None)
         task_store_dir_value = params.pop("task_store_dir", None)
         task_store_dir = (
             str(task_store_dir_value) if task_store_dir_value is not None else None
         )
-        timeout = float(params.pop("timeout", 30.0))
+        timeout = int(params.pop("timeout", 30))
         if params:
             names = ", ".join(sorted(params))
             raise ValueError(f"RunDatasetCleaningTool got unknown params: {names}")
-        if not endpoint_url.strip():
-            raise ValueError("endpoint_url must be a non-empty string")
         if timeout <= 0:
             raise ValueError("timeout must be greater than 0")
         _normalize_storage_path(output_root, "output_root")
@@ -347,10 +328,10 @@ class RunDatasetCleaningTool(
                 action_type=RunDatasetCleaningAction,
                 observation_type=RunDatasetCleaningObservation,
                 executor=RunDatasetCleaningExecutor(
-                    endpoint_url=endpoint_url,
+                    env=env,
+                    cluster=cluster,
                     output_root=output_root,
                     headers=headers,
-                    secret_headers=secret_headers,
                     task_store_dir=task_store_dir,
                     timeout=timeout,
                 ),
@@ -371,6 +352,28 @@ def _normalize_headers(value: Any) -> dict[str, str] | None:
     if not isinstance(value, dict):
         raise ValueError("headers must be a dictionary when provided")
     return {str(name): str(header_value) for name, header_value in value.items()}
+
+
+def _resolve_execution_target(
+    env: str | None,
+    cluster: str | None,
+    headers: dict[str, str] | None,
+) -> tuple[str | None, str | None]:
+    routed_cluster = next(
+        (
+            value
+            for name, value in (headers or {}).items()
+            if name.lower() == "x-cluster"
+        ),
+        None,
+    )
+    if not routed_cluster:
+        return env, cluster
+
+    cluster_part, separator, env_part = routed_cluster.partition("#")
+    resolved_cluster = cluster or cluster_part.strip() or None
+    resolved_env = env or (env_part.strip().lower() if separator else "prod")
+    return resolved_env, resolved_cluster
 
 
 def _normalize_storage_path(value: str, field_name: str) -> str:
@@ -463,30 +466,6 @@ def _build_cleaning_workflow(
         "viewport": {"x": 0, "y": 0, "zoom": 1},
         "timestamp": datetime.now(UTC).isoformat(),
     }
-
-
-def _extract_task_id(response: httpx.Response) -> str:
-    if response.status_code >= 400:
-        raise ValueError(
-            f"Studio prompt API returned HTTP {response.status_code}: "
-            f"{response.text[:1000]}"
-        )
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise ValueError("Studio prompt API returned invalid JSON.") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("Studio prompt API returned a non-object JSON payload.")
-    if payload.get("success") is not True:
-        message = payload.get("message") or payload.get("detail") or "unknown error"
-        raise ValueError(f"Studio prompt API failed: {message}")
-    data = payload.get("data")
-    if not isinstance(data, dict) or data.get("task_id") is None:
-        raise ValueError("Studio prompt API response is missing data.task_id.")
-    task_id = str(data["task_id"]).strip()
-    if not task_id:
-        raise ValueError("Studio prompt API returned an empty task ID.")
-    return task_id
 
 
 register_tool(RunDatasetCleaningTool.name, RunDatasetCleaningTool)
