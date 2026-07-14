@@ -169,6 +169,21 @@ def test_glob_tool_invalid_directory():
         assert len(observation.files) == 0
 
 
+def test_glob_tool_rejects_path_outside_workspace(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    conv_state = _create_test_conv_state(str(workspace))
+    tool = GlobTool.create(conv_state)[0]
+    assert tool.executor is not None
+
+    observation = tool.executor(GlobAction(pattern="*", path=str(outside)))
+
+    assert observation.is_error
+    assert "outside the workspace root" in observation.text
+
+
 def test_glob_tool_complex_patterns():
     """Test that GlobTool handles complex glob patterns."""
     with tempfile.TemporaryDirectory() as temp_dir:

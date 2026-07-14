@@ -5,7 +5,7 @@ members = ["openhands-sdk", "openhands-tools", "openhands-workspace", "openhands
 # Security: Apply workspace-wide dependency guardrails.
 [tool.uv]
 exclude-newer = "7 days"  # Avoid packages uploaded in the last 7 days.
-exclude-newer-package = { litellm = "2026-05-22T00:00:00Z", "pyromind-sdk" = "2026-07-11T00:00:00Z" }  # Bump or remove when upgrading litellm past 1.84.1
+exclude-newer-package = { litellm = "2026-05-22T00:00:00Z", "pyromind-sdk" = "2026-07-15T00:00:00Z" }  # Bump or remove when upgrading litellm past 1.84.1
 constraint-dependencies = [
     "starlette>=0.49.1",  # CVE-2025-62727
     "aiohttp>=3.13.3",  # CVE-2025-69223 + 7 others
@@ -24,7 +24,7 @@ openhands-sdk = { workspace = true }
 openhands-tools = { workspace = true }
 openhands-workspace = { workspace = true }
 openhands-agent-server = { workspace = true }
-pyromind-sdk = { index = "testpypi" }
+#pyromind-sdk = { index = "testpypi" }
 
 [dependency-groups]
 dev = [
@@ -45,7 +45,7 @@ dev = [
     "streamlit>=1.49.1",
     "pytest-timeout>=2.4.0",
     "griffe[pypi]>=2.0.0",
-    "pyromind-sdk==0.1.7.dev3; python_full_version < '3.14'",
+    "pyromind-sdk==0.1.7rc1; python_full_version < '3.14'",
 ]
 
 # Ruff configuration

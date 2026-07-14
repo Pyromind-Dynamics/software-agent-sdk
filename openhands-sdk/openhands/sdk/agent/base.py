@@ -20,6 +20,7 @@ from pydantic import (
     SecretStr,
     SerializationInfo,
     ValidationInfo,
+    field_serializer,
     model_serializer,
     model_validator,
 )
@@ -99,6 +100,22 @@ def _decrypt_mcp_secret_values(
                 for name, value in mapping.items()
             }
     return config
+
+
+# Matches host-absolute paths well enough to scrub them from persisted text.
+# Unix paths require at least two segments after root so single-level tokens
+# like "/basic/" are preserved; Windows absolute paths are matched broadly.
+_ABSOLUTE_PATH_RE = re.compile(
+    r"(?:/[A-Za-z0-9_.~+-]+){2,}[A-Za-z0-9_.~+-/]*"
+    r"|[A-Za-z]:[\\/](?:[A-Za-z0-9_.~+-]+[\\/])*[A-Za-z0-9_.~+-/]+"
+)
+
+_REDACTED_PATH = "<REDACTED_PATH>"
+
+
+def _redact_absolute_paths(text: str) -> str:
+    """Replace host-absolute paths in *text* with a placeholder."""
+    return _ABSOLUTE_PATH_RE.sub(_REDACTED_PATH, text)
 
 
 # -- SOUL.md loader -------------------------------------------------------
@@ -265,6 +282,18 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
         description="Optional kwargs to pass to the system prompt Jinja2 template.",
         examples=[{"cli_mode": True}],
     )
+
+    @field_serializer("system_prompt_kwargs")
+    def _serialize_system_prompt_kwargs(
+        self, value: dict[str, object], _info: SerializationInfo
+    ) -> dict[str, object]:
+        """Redact host-absolute paths inside custom_instructions on serialization."""
+        if not value or "custom_instructions" not in value:
+            return value
+        custom = value["custom_instructions"]
+        if not isinstance(custom, str):
+            return value
+        return {**value, "custom_instructions": _redact_absolute_paths(custom)}
 
     @model_validator(mode="before")
     @classmethod
