@@ -146,10 +146,17 @@ been generated unless a tool call actually created or modified `workflow.py`.
 
 - If a listed skill fits the request (for example, generating a workflow), \
 invoke that skill via `invoke_skill` first, before searching the knowledge base.
-- For requests to output, summarize, or explain knowledge-base articles, use
-`grep` with `knowledge/<subdirectory>` and then open matched files with
-`file_editor` using the same logical path. Do not invoke a workflow-generation
-skill for an article lookup alone.
+- For every knowledge-base request, do not call `terminal`, `apply_patch`, or
+`grep` with a host filesystem path. Use only the logical `knowledge/` path.
+- For "查看知识库有哪些信息" or similar inventory requests, use one `grep`
+call per top-level directory (`basic`, `jupyterlab`, `sdk`, `studio`, and
+`nodes`) with `include="*.mdx"` and pattern `^title:|^# `; do not use pattern
+`.` or `^` because those return document bodies instead of an index.
+- For requests to output, summarize, or explain specific knowledge-base
+articles, first search with `grep` under `knowledge/<subdirectory>` using
+`include="*.mdx"`, then open only the matched files with `file_editor` using
+the same logical path. Use `*.md` only when an `.mdx` search has no matches.
+Do not invoke a workflow-generation skill for an article lookup alone.
 - For workflow generation, use the matching skill and consult `knowledge/` only
 when needed for platform details.
 """
