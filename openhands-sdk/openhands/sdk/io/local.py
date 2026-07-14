@@ -14,6 +14,9 @@ from .base import FileStore
 
 logger = get_logger(__name__)
 
+_DIRECTORY_MODE = 0o700
+_FILE_MODE = 0o600
+
 
 class LocalFileStore(FileStore):
     root: str
@@ -41,6 +44,7 @@ class LocalFileStore(FileStore):
         root = os.path.abspath(os.path.normpath(root))
         self.root = root
         os.makedirs(self.root, exist_ok=True)
+        os.chmod(self.root, _DIRECTORY_MODE)
         self.cache = MemoryLRUCache(cache_memory_size, cache_limit_size)
 
     def get_full_path(self, path: str) -> str:
@@ -61,13 +65,16 @@ class LocalFileStore(FileStore):
     def write(self, path: str, contents: str | bytes) -> None:
         full_path = self.get_full_path(path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        os.chmod(os.path.dirname(full_path), _DIRECTORY_MODE)
         if isinstance(contents, str):
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(contents)
+            os.chmod(full_path, _FILE_MODE)
             self.cache[full_path] = contents
         else:
             with open(full_path, "wb") as f:
                 f.write(contents)
+            os.chmod(full_path, _FILE_MODE)
             # Don't cache binary content - LocalFileStore is meant for JSON data
             # If binary data is written and then read, it will error on read
 
@@ -132,9 +139,13 @@ class LocalFileStore(FileStore):
         """Acquire file-based lock using flock."""
         lock_path = self.get_full_path(path)
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        os.chmod(os.path.dirname(lock_path), _DIRECTORY_MODE)
         file_lock = FileLock(lock_path)
         try:
             with file_lock.acquire(timeout=timeout):
+                # FileLock creates the lock file itself, so enforce its mode
+                # after acquisition as well as for pre-existing lock files.
+                os.chmod(lock_path, _FILE_MODE)
                 yield
         except Timeout:
             logger.error(f"Failed to acquire lock within {timeout}s: {lock_path}")

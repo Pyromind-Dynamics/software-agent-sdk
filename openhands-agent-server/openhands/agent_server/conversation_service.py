@@ -30,6 +30,7 @@ from openhands.agent_server.models import (
     StoredConversation,
     UpdateConversationRequest,
 )
+from openhands.agent_server.persistence.store import _ensure_secure_directory
 from openhands.agent_server.pub_sub import Subscriber
 from openhands.agent_server.server_details_router import update_last_execution_time
 from openhands.agent_server.utils import safe_rmtree, utc_now
@@ -1417,6 +1418,7 @@ class ConversationService:
 
     async def __aenter__(self):
         self.conversations_dir.mkdir(parents=True, exist_ok=True)
+        self.conversations_dir.chmod(0o700)
         self._run_executor = ThreadPoolExecutor(
             max_workers=self.max_concurrent_runs,
             thread_name_prefix="conversation-run",
@@ -1424,6 +1426,8 @@ class ConversationService:
         self._event_services = {}
         self._conversation_ids_by_user = {}
         for conversation_dir in self.conversations_dir.iterdir():
+            if conversation_dir.is_dir():
+                _ensure_secure_directory(conversation_dir)
             stored: StoredConversation | None = None
             try:
                 meta_file = conversation_dir / "meta.json"

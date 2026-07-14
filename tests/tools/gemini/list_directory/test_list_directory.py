@@ -137,6 +137,19 @@ def test_list_directory_absolute_path(tmp_path):
     assert obs.entries[0].name == "file.txt"
 
 
+def test_list_directory_rejects_path_outside_workspace(tmp_path):
+    outside = tmp_path.parent / "outside"
+    outside.mkdir()
+    try:
+        executor = ListDirectoryExecutor(workspace_root=str(tmp_path))
+        obs = executor(ListDirectoryAction(dir_path=str(outside)))
+
+        assert obs.is_error
+        assert "outside the workspace root" in obs.text
+    finally:
+        outside.rmdir()
+
+
 @pytest.mark.parametrize(
     "dir_path, recursive",
     [

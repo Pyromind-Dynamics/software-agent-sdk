@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
@@ -219,6 +219,14 @@ class Config(BaseModel):
             "a command whose BashCommand file is purged mid-execution will "
             "complete normally, but its on-disk event history will be "
             "incomplete. A value >= 2x max command timeout avoids this."
+        ),
+    )
+    command_policy_mode: Literal["local", "multi_tenant_strict"] = Field(
+        default="local",
+        description=(
+            "Command execution policy mode. In multi_tenant_strict mode, global "
+            "bash command execution endpoints are disabled and command execution "
+            "must be scoped through tenant, user, conversation, and workspace."
         ),
     )
     static_files_path: Path | None = Field(

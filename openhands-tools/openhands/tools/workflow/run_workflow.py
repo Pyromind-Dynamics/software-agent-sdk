@@ -44,7 +44,11 @@ from openhands.tools.workflow.dsl_to_xyflow import (
     DslToXyflowExecutor,
     DslToXyflowObservation,
 )
+from openhands.sdk.logger import get_logger
 
+
+
+logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation.base import BaseConversation
@@ -386,29 +390,35 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
                 workflow=workflow_xyflow,
                 out_id=f"agent1#{conversation_id}",
             )
-
+            
             # 4. 创建工作流
             is_mock = False
+            response: TrainingTaskCreateResponse | None = None
             if is_mock:
-                response: TrainingTaskCreateResponse = self._mock_submit_workflow(
+                response = self._mock_submit_workflow(
                     request
                 )
             else:
-                response: TrainingTaskCreateResponse = client.studio.create(request)
+                response = client.studio.create(request)
 
             # 5. 检查任务是否创建成功
+            if response is None:
+                # 校验失败，工作流没有创建成功
+                raise WorkflowRunError("Workflow create failed, response is None")
             if not response.task_id:
                 # 校验失败，工作流没有创建成功
-                raise WorkflowRunError("Workflow create failed")
+                raise WorkflowRunError("Workflow create failed, task_id is None")
 
             if test_mode:
                 user_text = (
-                    "The test workflow task has been submitted. Please wait patiently."
+                    f"The test workflow task has been submitted. Please wait patiently. task id: {response.task_id}"
                 )
             else:
                 user_text = (
-                    "The workflow task has been submitted. Please wait patiently."
+                    f"The workflow task has been submitted. Please wait patiently. task id: {response.task_id}"
                 )
+
+            logger.info(f"Run workflow successfully, msg = {user_text}, mode = {"test" if test_mode else "Normal"}")
 
             # 成功提交工作流，返回提交结果
             return RunWorkflowObservation.from_text(

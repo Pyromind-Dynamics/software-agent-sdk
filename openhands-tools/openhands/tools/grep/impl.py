@@ -20,6 +20,9 @@ from openhands.tools.utils import (
     _check_grep_available,
     _check_ripgrep_available,
     _log_ripgrep_fallback_warning,
+    configured_public_read_roots,
+    logical_public_read_path,
+    resolve_public_read_alias,
 )
 
 
@@ -36,13 +39,14 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
 
     _MAX_MATCHES = 100
 
-    def __init__(self, working_dir: str):
+    def __init__(self, working_dir: str, read_only_roots: list[str] | None = None):
         """Initialize the grep executor.
 
         Args:
             working_dir: The working directory to use as the base for searches
         """
         self.working_dir: Path = Path(working_dir).resolve()
+        self.read_only_roots = configured_public_read_roots(read_only_roots)
         self._search_backend = self._select_search_backend()
 
         if self._search_backend == "grep":
@@ -65,13 +69,13 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
         """Execute grep content search using the best available backend."""
         try:
             if action.path:
+                # Use the path resolution logic for action.path
                 requested_path = Path(action.path).expanduser()
                 if not requested_path.is_absolute():
                     requested_path = self.working_dir / requested_path
                 search_path = requested_path.resolve()
-                if not search_path.exists() or not (
-                    search_path.is_dir() or search_path.is_file()
-                ):
+                # Validate: path must exist AND be a directory or file
+                if not search_path.exists() or not (search_path.is_dir() or search_path.is_file()):
                     return GrepObservation.from_text(
                         text=(
                             f"Search path '{action.path}' is not a valid directory "
@@ -121,6 +125,26 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
                 include_pattern=action.include,
                 is_error=True,
             )
+
+    def _resolve_search_path(self, path: str) -> Path:
+        candidate = Path(path)
+        aliased = resolve_public_read_alias(path, self.read_only_roots)
+        if aliased is not None:
+            resolved = aliased
+        else:
+            resolved = (
+                candidate.resolve()
+                if candidate.is_absolute()
+                else (self.working_dir / candidate).resolve()
+            )
+        if resolved.is_relative_to(self.working_dir) or any(
+            resolved.is_relative_to(root) for root in self.read_only_roots
+        ):
+            return resolved
+        raise ValueError(
+            "Path is outside the workspace and configured read-only roots; "
+            f"it is not a valid directory: {path}"
+        )
 
     def _format_output(
         self,
@@ -205,7 +229,7 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
             if key in unique_matches:
                 continue
             unique_matches[key] = GrepMatch(
-                file_path=str(resolved),
+                file_path=logical_public_read_path(resolved, self.read_only_roots),
                 line_number=match.line_number,
                 line=match.line,
             )

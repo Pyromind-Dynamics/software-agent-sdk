@@ -1,10 +1,11 @@
 """String replace editor tool implementation."""
 
+import os
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import Field, PrivateAttr
+from pydantic import Field, PrivateAttr, field_validator
 
 
 if TYPE_CHECKING:
@@ -20,6 +21,7 @@ from openhands.sdk.tool import (
     ToolDefinition,
     register_tool,
 )
+from openhands.sdk.utils.redact import redact_text_secrets
 from openhands.tools.file_editor.utils.diff import visualize_diff
 
 
@@ -91,6 +93,11 @@ class FileEditorObservation(Observation):
     )
 
     _diff_cache: Text | None = PrivateAttr(default=None)
+
+    @field_validator("old_content", "new_content")
+    @classmethod
+    def _redact_sensitive_content(cls, value: str | None) -> str | None:
+        return redact_text_secrets(value) if value is not None else None
 
     @property
     def visualize(self) -> Text:
@@ -206,15 +213,16 @@ class FileEditorTool(ToolDefinition[FileEditorAction, FileEditorObservation]):
         assert isinstance(action, FileEditorAction)
         normalize_path = getattr(self.executor, "normalize_path", None)
         if callable(normalize_path):
-            normalized_path = Path(normalize_path(action.path)).resolve()
+            normalized_path = Path(str(normalize_path(action.path))).resolve()
         else:
-            normalized_path = Path(action.path).resolve()
+            normalized_path = Path(str(action.path)).resolve()
         return DeclaredResources(keys=(f"file:{normalized_path}",), declared=True)
 
     @classmethod
     def create(
         cls,
         conv_state: "ConversationState",
+        read_only_roots: list[str] | None = None,
     ) -> Sequence["FileEditorTool"]:
         """Initialize FileEditorTool with a FileEditorExecutor.
 
@@ -227,7 +235,21 @@ class FileEditorTool(ToolDefinition[FileEditorAction, FileEditorObservation]):
         from openhands.tools.file_editor.impl import FileEditorExecutor
 
         # Initialize the executor
-        executor = FileEditorExecutor(workspace_root=conv_state.workspace.working_dir)
+        configured_roots = read_only_roots
+        if configured_roots is None:
+            knowledge_root = os.environ.get("PYROMIND_KNOWLEDGE_BASE_PATH")
+            configured_roots = [
+                root
+                for root in [
+                    knowledge_root,
+                    *os.environ.get("PYROMIND_PUBLIC_READ_PATHS", "").split(os.pathsep),
+                ]
+                if root
+            ]
+        executor = FileEditorExecutor(
+            workspace_root=conv_state.workspace.working_dir,
+            read_only_roots=configured_roots,
+        )
 
         # Build the tool description with conditional image viewing support
         # Split TOOL_DESCRIPTION to insert image viewing line after the second bullet

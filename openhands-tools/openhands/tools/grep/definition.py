@@ -133,6 +133,7 @@ class GrepTool(ToolDefinition[GrepAction, GrepObservation]):
     def create(
         cls,
         conv_state: "ConversationState",
+        read_only_roots: list[str] | None = None,
     ) -> Sequence["GrepTool"]:
         """Initialize GrepTool with a GrepExecutor.
 
@@ -149,7 +150,20 @@ class GrepTool(ToolDefinition[GrepAction, GrepObservation]):
             raise ValueError(f"working_dir '{working_dir}' is not a valid directory")
 
         # Initialize the executor
-        executor = GrepExecutor(working_dir=working_dir)
+        configured_roots = read_only_roots
+        if configured_roots is None:
+            knowledge_root = os.environ.get("PYROMIND_KNOWLEDGE_BASE_PATH")
+            configured_roots = [
+                root
+                for root in [
+                    knowledge_root,
+                    *os.environ.get("PYROMIND_PUBLIC_READ_PATHS", "").split(os.pathsep),
+                ]
+                if root
+            ]
+        executor = GrepExecutor(
+            working_dir=working_dir, read_only_roots=configured_roots
+        )
 
         # Add working directory information to the tool description
         enhanced_description = (

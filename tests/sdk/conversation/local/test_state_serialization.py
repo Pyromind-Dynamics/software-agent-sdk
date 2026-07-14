@@ -10,6 +10,7 @@ from pydantic import SecretStr, ValidationError
 
 from openhands.sdk import Agent, Conversation
 from openhands.sdk.agent.base import AgentBase
+from openhands.sdk.context.agent_context import AgentContext
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
@@ -24,6 +25,7 @@ from openhands.sdk.io import InMemoryFileStore
 from openhands.sdk.llm import LLM, Message, TextContent
 from openhands.sdk.llm.llm_registry import RegistryEvent
 from openhands.sdk.security.confirmation_policy import AlwaysConfirm
+from openhands.sdk.skills.skill import Skill, SkillResources
 from openhands.sdk.workspace import LocalWorkspace
 
 
@@ -103,6 +105,53 @@ def test_conversation_state_basic_serialization():
     # Verify agent properties
     assert deserialized.agent.llm.model == agent.llm.model
     assert deserialized.agent.__class__ == agent.__class__
+
+
+def test_persisted_state_redacts_local_project_paths():
+    """Host-absolute paths must not leak into base_state.json."""
+    sensitive_path = "/Users/test/project/agent/software-agent-sdk"
+    custom_instructions = (
+        f"The knowledge base is at {sensitive_path}/knowledge.\n"
+        "Relative references like /basic/ should be preserved.\n"
+        f"Workspace: {sensitive_path}/workspace/conv-123"
+    )
+
+    llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test-key"), usage_id="test-llm")
+    skills = [
+        Skill(
+            name="test-skill",
+            content="test content",
+            source=f"{sensitive_path}/skills/test/SKILL.md",
+            resources=SkillResources(skill_root=f"{sensitive_path}/skills/test"),
+        )
+    ]
+    agent = Agent(
+        llm=llm,
+        tools=[],
+        agent_context=AgentContext(skills=skills),
+        system_prompt_kwargs={"custom_instructions": custom_instructions},
+    )
+
+    state = ConversationState.create(
+        agent=agent,
+        id=uuid.UUID("12345678-1234-5678-9abc-123456789010"),
+        workspace=LocalWorkspace(working_dir=sensitive_path),
+    )
+
+    serialized = state.model_dump_json(exclude_none=True)
+
+    assert sensitive_path not in serialized
+    assert "<REDACTED_WORKSPACE_PATH>" in serialized
+    assert "<REDACTED_SKILL_PATH>" in serialized
+    assert "<REDACTED_PATH>" in serialized
+    # Single-segment relative paths should survive redaction.
+    assert "/basic/" in serialized
+
+    persisted = state.model_dump_json(
+        exclude_none=True,
+        context={"persist_workspace_path": True},
+    )
+    assert sensitive_path in persisted
 
 
 def test_conversation_state_persistence_save_load():
