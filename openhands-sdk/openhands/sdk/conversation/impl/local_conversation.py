@@ -48,7 +48,7 @@ from openhands.sdk.event import (
 from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.hooks import HookConfig, HookEventProcessor, create_hook_callback
 from openhands.sdk.io import LocalFileStore
-from openhands.sdk.llm import LLM, Message, TextContent, content_to_str
+from openhands.sdk.llm import LLM, Message, TextContent
 from openhands.sdk.llm.auth.openai import create_subscription_llm_from_config
 from openhands.sdk.llm.llm import LLMCallContext
 from openhands.sdk.llm.llm_profile_store import LLMProfileStore
@@ -123,13 +123,8 @@ def _agent_already_surfaced_error(events: Sequence[Event], since: int = 0) -> bo
 def _is_acp_prompt_message(event: Event) -> TypeGuard[MessageEvent]:
     if not isinstance(event, MessageEvent):
         return False
-    if event.source == "user":
-        return True
-    if event.source != "environment" or event.llm_message.role != "user":
-        return False
-    return any(
-        part.startswith(ACP_STOP_HOOK_FEEDBACK_PREFIX)
-        for part in content_to_str(event.llm_message.content)
+    return event.source == "user" or (
+        event.source == "environment" and event.llm_message.role == "user"
     )
 
 

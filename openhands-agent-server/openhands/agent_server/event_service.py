@@ -63,6 +63,7 @@ from openhands.sdk.conversation.state import (
 )
 from openhands.sdk.event import (
     AgentErrorEvent,
+    MessageEvent,
     ObservationBaseEvent,
     StreamingDeltaEvent,
 )
@@ -529,14 +530,26 @@ class EventService:
         workflow_dsl: str | None,
         workflow_xyflow: dict[str, Any] | None,
     ) -> None:
-        if workflow_dsl is None or not self._conversation:
-            return
-        if not self._is_pyromind_conversation():
+        if not self._conversation:
             return
         with self._conversation._state as state:
             user_message_event_id = state.last_user_message_id
+        self._save_pyromind_workflow_input_snapshot_for_event_sync(
+            user_message_event_id,
+            workflow_dsl,
+            workflow_xyflow,
+        )
+
+    def _save_pyromind_workflow_input_snapshot_for_event_sync(
+        self,
+        event_id: str | None,
+        workflow_dsl: str | None,
+        workflow_xyflow: dict[str, Any] | None,
+    ) -> None:
+        if workflow_dsl is None or not self._is_pyromind_conversation():
+            return
         self._workflow_canvas_snapshot_hook().save_in_snapshot(
-            event_id=user_message_event_id,
+            event_id=event_id,
             workflow_dsl_data=workflow_dsl,
             workflow_xyflow_data=workflow_xyflow,
         )
@@ -688,48 +701,117 @@ class EventService:
                 workflow_dsl_snapshot,
                 workflow_xyflow_snapshot,
             )
-        if run:
+        await self._run_after_prompt_enqueued(
+            run=run,
+            explicit_interrupt_generation=explicit_interrupt_generation,
+        )
+
+    async def send_internal_context(
+        self,
+        content: list[TextContent],
+        run: bool = False,
+        workflow_dsl_snapshot: str | None = None,
+        workflow_xyflow_snapshot: dict[str, Any] | None = None,
+    ) -> str:
+        """Persist hidden context and optionally continue the agent.
+
+        The LLM message remains a ``user`` turn so it can prompt continuation,
+        while the event source is ``environment`` so it is not user-authored and
+        does not update ``last_user_message_id``.
+        """
+        if not self._conversation:
+            raise ValueError("inactive_service")
+        await self.stop_goal_loop()
+        explicit_interrupt_generation = self._explicit_interrupt_generation
+        loop = asyncio.get_running_loop()
+        event_id = await loop.run_in_executor(
+            None,
+            self._append_internal_context_sync,
+            content,
+        )
+        if workflow_dsl_snapshot is not None:
+            await loop.run_in_executor(
+                None,
+                self._save_pyromind_workflow_input_snapshot_for_event_sync,
+                event_id,
+                workflow_dsl_snapshot,
+                workflow_xyflow_snapshot,
+            )
+        await self._run_after_prompt_enqueued(
+            run=run,
+            explicit_interrupt_generation=explicit_interrupt_generation,
+            latest_prompt_message_id=event_id,
+        )
+        return event_id
+
+    def _append_internal_context_sync(self, content: list[TextContent]) -> str:
+        conversation = self._conversation
+        if not conversation:
+            raise ValueError("inactive_service")
+        event = MessageEvent(
+            source="environment",
+            llm_message=Message(role="user", content=[]),
+            extended_content=list(content),
+        )
+        with conversation._state as state:
+            if state.execution_status in (
+                ConversationExecutionStatus.FINISHED,
+                ConversationExecutionStatus.STUCK,
+            ):
+                state.execution_status = ConversationExecutionStatus.IDLE
+            conversation._on_event(event)
+        return event.id
+
+    async def _run_after_prompt_enqueued(
+        self,
+        *,
+        run: bool,
+        explicit_interrupt_generation: int,
+        latest_prompt_message_id: str | None = None,
+    ) -> None:
+        if not run:
+            return
+        if self._explicit_interrupt_generation != explicit_interrupt_generation:
+            return
+        (
+            did_mark_acp_prompt_superseded,
+            active_acp_prompt_has_latest_message,
+        ) = await self._mark_running_acp_prompt_superseded(latest_prompt_message_id)
+        interrupted_acp = False
+        if did_mark_acp_prompt_superseded:
+            self._acp_internal_rerun_requested = True
+            interrupted_acp = True
+            await self.interrupt(internal_acp_rerun=True)
             if self._explicit_interrupt_generation != explicit_interrupt_generation:
                 return
-            (
-                did_mark_acp_prompt_superseded,
-                active_acp_prompt_has_latest_message,
-            ) = await self._mark_running_acp_prompt_superseded()
-            interrupted_acp = False
-            if did_mark_acp_prompt_superseded:
-                self._acp_internal_rerun_requested = True
-                interrupted_acp = True
-                await self.interrupt(internal_acp_rerun=True)
-                if self._explicit_interrupt_generation != explicit_interrupt_generation:
-                    return
-            try:
-                await self.run(
-                    acp_internal_rerun_generation=explicit_interrupt_generation
-                )
-                self._acp_internal_rerun_requested = False
-            except ValueError as e:
-                # run() refused. If a run is still wrapping up (its
-                # wait_for_pending tail), the message we just appended won't be
-                # picked up by it, so record explicit run intent for
-                # _run_and_publish to honor once that task clears. Tracking the
-                # request — rather than inferring it later from an IDLE status —
-                # is what keeps a deliberate run=False append, or an IDLE reached
-                # via another path, from triggering an unwanted run.
-                # "inactive_service" is terminal and must not re-arm.
-                if (
-                    str(e) == "conversation_already_running"
-                    and not active_acp_prompt_has_latest_message
-                ):
-                    self._rerun_requested = True
-                    if interrupted_acp:
-                        self._acp_internal_rerun_requested = True
+        try:
+            await self.run(acp_internal_rerun_generation=explicit_interrupt_generation)
+            self._acp_internal_rerun_requested = False
+        except ValueError as e:
+            # run() refused. If a run is still wrapping up (its
+            # wait_for_pending tail), the message we just appended won't be
+            # picked up by it, so record explicit run intent for
+            # _run_and_publish to honor once that task clears. Tracking the
+            # request — rather than inferring it later from an IDLE status —
+            # is what keeps a deliberate run=False append, or an IDLE reached
+            # via another path, from triggering an unwanted run.
+            # "inactive_service" is terminal and must not re-arm.
+            if (
+                str(e) == "conversation_already_running"
+                and not active_acp_prompt_has_latest_message
+            ):
+                self._rerun_requested = True
+                if interrupted_acp:
+                    self._acp_internal_rerun_requested = True
 
-    def _mark_running_acp_prompt_superseded_sync(self) -> tuple[bool, bool]:
+    def _mark_running_acp_prompt_superseded_sync(
+        self, latest_prompt_message_id: str | None = None
+    ) -> tuple[bool, bool]:
         """Mark the currently running ACP prompt superseded if needed.
 
         The tuple is ``(did_mark_superseded, active_prompt_has_latest_message)``.
         If the running ACP prompt has already advanced to the newly appended
-        user message, interrupting it would cancel the replacement prompt and
+        prompt message, interrupting it would cancel the replacement prompt and
         strand that message behind the persisted cursor.
         """
         if not self._conversation:
@@ -744,11 +826,15 @@ class EventService:
             inflight_prompt_user_message_id = state.agent_state.get(
                 ACP_INFLIGHT_PROMPT_USER_MESSAGE_ID
             )
-            last_user_message_id = state.last_user_message_id
-            if inflight_prompt_user_message_id is None or last_user_message_id is None:
+            if latest_prompt_message_id is None:
+                latest_prompt_message_id = state.last_user_message_id
+            if (
+                inflight_prompt_user_message_id is None
+                or latest_prompt_message_id is None
+            ):
                 return (False, False)
             active_prompt_has_latest_message = (
-                inflight_prompt_user_message_id == last_user_message_id
+                inflight_prompt_user_message_id == latest_prompt_message_id
             )
             if active_prompt_has_latest_message:
                 return (False, True)
@@ -758,10 +844,14 @@ class EventService:
             }
             return (True, False)
 
-    async def _mark_running_acp_prompt_superseded(self) -> tuple[bool, bool]:
+    async def _mark_running_acp_prompt_superseded(
+        self, latest_prompt_message_id: str | None = None
+    ) -> tuple[bool, bool]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None, self._mark_running_acp_prompt_superseded_sync
+            None,
+            self._mark_running_acp_prompt_superseded_sync,
+            latest_prompt_message_id,
         )
 
     async def subscribe_to_events(self, subscriber: Subscriber[Event]) -> UUID:

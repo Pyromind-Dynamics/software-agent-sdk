@@ -1117,10 +1117,9 @@ async def rollback_pyromind_workflow_at_event(
         workflow_file_action,
     )
 
-    await event_service.send_message(
-        Message(role="user", content=[]),
+    await event_service.send_internal_context(
+        [TextContent(text=correction_message)],
         run=request.run,
-        extended_content=[TextContent(text=correction_message)],
         workflow_dsl_snapshot=snapshot.workflow_dsl_data,
         workflow_xyflow_snapshot=snapshot.workflow_xyflow_data,
     )

@@ -23,7 +23,7 @@ Module layout / 模块结构
 4. **Broker bridge (optional)** — lazy import of ``run_workflow_broker`` for
    Debug ``wait_mode=block`` and in-process registry fallback
 5. **Idempotency** — process-wide dedup of terminal deliveries per ``task_id``
-6. **Conversation delivery** — inject MessageEvent + ``extended_content``
+6. **Conversation delivery** — inject hidden environment context
 7. **Main entry** — :func:`deliver_run_workflow_status` orchestrates the above
 """
 
@@ -40,7 +40,7 @@ from openhands.agent_server.conversation_service import (
     get_default_conversation_service,
 )
 from openhands.agent_server.event_service import EventService
-from openhands.sdk.llm import Message, TextContent
+from openhands.sdk.llm import TextContent
 from openhands.sdk.logger import get_logger
 
 
@@ -137,16 +137,14 @@ def build_run_workflow_terminal_reminder(
     """
     lines = [
         "<system_reminder>",
-        (f"Pyromind workflow task {task_id} reached terminal status {status}."),
+        f"Pyromind workflow task {task_id} completed with status {status}.",
         (
-            "Continue from the tool invocation associated with this task. Use "
-            "that tool's prior observation and contract to inspect any "
-            "domain-specific outputs and continue helping the user."
+            "Resume the tool invocation associated with this task and follow "
+            "that tool's result contract when inspecting outputs or errors."
         ),
         (
-            "Reply in the language of the user's most recent non-empty visible "
-            "message; the language of this internal reminder must not affect "
-            "the reply language."
+            "Respond in the language of the user's most recent non-empty "
+            "visible message."
         ),
     ]
     if error_log:
@@ -282,22 +280,19 @@ async def resume_conversation_after_workflow(
 ) -> None:
     """Inject terminal status into a conversation and optionally start the agent.
 
-    Uses an empty user message plus ``extended_content`` so the LLM receives the
-    workflow status without exposing an internal callback message in chat.
+    Uses hidden environment context so the LLM receives the workflow status
+    without creating a user-authored chat event.
 
-    通过空消息和 ``extended_content`` 注入终态并可选启动 Agent，内部回调消息
-    不会展示在聊天记录中。
+    通过隐藏的 environment 上下文注入终态并可选启动 Agent，不会伪造用户消息。
     """
     reminder = build_run_workflow_terminal_reminder(
         task_id=task_id,
         status=status,
         error_log=error_log,
     )
-    message = Message(role="user", content=[])
-    await event_service.send_message(
-        message,
+    await event_service.send_internal_context(
+        [TextContent(text=reminder)],
         run=auto_run,
-        extended_content=[TextContent(text=reminder)],
     )
 
 
