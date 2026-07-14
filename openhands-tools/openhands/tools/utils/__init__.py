@@ -1,6 +1,7 @@
 """Shared utilities."""
 
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Sequence
@@ -11,6 +12,36 @@ from openhands.sdk.logger import get_logger
 
 logger = get_logger(__name__)
 
+PUBLIC_READ_ALIASES: tuple[tuple[str, str, str, str | None], ...] = (
+    ("knowledge", "PYROMIND_KNOWLEDGE_BASE_PATH", "knowledge", None),
+    (".agents/skills", "PYROMIND_SKILLS_PATH", "skills", ".agents"),
+)
+
+_PUBLIC_READ_ALIAS_PATTERN = re.compile(
+    r"(?<![\w.-])(?:knowledge|\.agents/skills)(?=(?:/|\b))"
+)
+
+
+def terminal_public_read_block_reason(command: str) -> str | None:
+    """Return a safe redirect when terminal targets a public read-only root."""
+    normalized_command = command.replace("\\", "/")
+    if _PUBLIC_READ_ALIAS_PATTERN.search(normalized_command):
+        return (
+            "Public knowledge and skill documents are read-only. Use `grep` "
+            "with the logical `knowledge/` or `.agents/skills/` path, then "
+            'use `file_editor` with `command="view"`. Do not use terminal '
+            "or a host filesystem path."
+        )
+
+    for root in configured_public_read_roots():
+        if str(root).replace("\\", "/") in normalized_command:
+            return (
+                "Public knowledge and skill documents must be accessed through "
+                "the logical `knowledge/` or `.agents/skills/` path with `grep` "
+                "or `file_editor.view`; host filesystem paths are not exposed."
+            )
+    return None
+
 
 def configured_public_read_roots(
     read_only_roots: list[str] | None = None,
@@ -20,30 +51,54 @@ def configured_public_read_roots(
         roots = read_only_roots
     else:
         roots = [
-            os.environ.get("PYROMIND_KNOWLEDGE_BASE_PATH", ""),
+            *(
+                os.environ.get(environment_variable, "")
+                for _, environment_variable, _, _ in PUBLIC_READ_ALIASES
+            ),
             *os.environ.get("PYROMIND_PUBLIC_READ_PATHS", "").split(os.pathsep),
         ]
-    return tuple(Path(root).resolve() for root in roots if root)
+    resolved_roots = (Path(root).resolve() for root in roots if root)
+    return tuple(dict.fromkeys(resolved_roots))
+
+
+def _public_alias_root(alias: str, roots: tuple[Path, ...]) -> Path | None:
+    for configured_alias, _, root_name, parent_name in PUBLIC_READ_ALIASES:
+        if alias != configured_alias:
+            continue
+        for root in roots:
+            if root.name == root_name and (
+                parent_name is None or root.parent.name == parent_name
+            ):
+                return root
+    return None
 
 
 def resolve_public_read_alias(
     path: str,
     roots: tuple[Path, ...],
 ) -> Path | None:
-    """Resolve the ``knowledge/`` alias to the configured root."""
+    """Resolve a logical public-read alias to its configured root."""
     candidate = Path(path)
     if candidate.is_absolute() or not candidate.parts:
         return None
-    if candidate.parts[0] != "knowledge" or not roots:
-        return None
-    return (roots[0] / Path(*candidate.parts[1:])).resolve()
+
+    for alias, _, _, _ in PUBLIC_READ_ALIASES:
+        alias_parts = Path(alias).parts
+        if candidate.parts[: len(alias_parts)] != alias_parts:
+            continue
+        root = _public_alias_root(alias, roots)
+        if root is not None:
+            return (root / Path(*candidate.parts[len(alias_parts) :])).resolve()
+    return None
 
 
 def logical_public_read_path(path: Path, roots: tuple[Path, ...]) -> str:
     """Return a model-safe alias for a path under a configured public root."""
     resolved = path.resolve()
-    if roots and resolved.is_relative_to(roots[0]):
-        return str(Path("knowledge") / resolved.relative_to(roots[0]))
+    for alias, _, _, _ in PUBLIC_READ_ALIASES:
+        root = _public_alias_root(alias, roots)
+        if root is not None and resolved.is_relative_to(root):
+            return str(Path(alias) / resolved.relative_to(root))
     return str(resolved)
 
 

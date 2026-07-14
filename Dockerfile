@@ -387,6 +387,7 @@ ARG USERNAME
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server /agent-server
 COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
+ENV PYROMIND_PUBLIC_READ_PATHS=/agent-server/.agents/skills
 ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
 ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "openhands.agent_server"]
 
@@ -395,6 +396,7 @@ ARG USERNAME
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server /agent-server
 COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
+ENV PYROMIND_PUBLIC_READ_PATHS=/agent-server/.agents/skills
 ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
 ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "openhands.agent_server"]
 
@@ -413,6 +415,7 @@ RUN chmod +x /usr/local/bin/openhands-agent-server
 # Fix library path to use system GCC libraries instead of bundled ones
 ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
+ENV PYROMIND_PUBLIC_READ_PATHS=/agent-server/.agents/skills
 ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
 ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]
 
@@ -425,5 +428,6 @@ RUN chmod +x /usr/local/bin/openhands-agent-server
 # Fix library path to use system GCC libraries instead of bundled ones
 ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
+ENV PYROMIND_PUBLIC_READ_PATHS=/agent-server/.agents/skills
 ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
 ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]

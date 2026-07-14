@@ -69,13 +69,11 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
         """Execute grep content search using the best available backend."""
         try:
             if action.path:
-                # Use the path resolution logic for action.path
-                requested_path = Path(action.path).expanduser()
-                if not requested_path.is_absolute():
-                    requested_path = self.working_dir / requested_path
-                search_path = requested_path.resolve()
+                search_path = self._resolve_search_path(action.path)
                 # Validate: path must exist AND be a directory or file
-                if not search_path.exists() or not (search_path.is_dir() or search_path.is_file()):
+                if not search_path.exists() or not (
+                    search_path.is_dir() or search_path.is_file()
+                ):
                     return GrepObservation.from_text(
                         text=(
                             f"Search path '{action.path}' is not a valid directory "
