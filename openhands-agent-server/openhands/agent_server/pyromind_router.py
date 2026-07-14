@@ -22,9 +22,6 @@ from openhands.agent_server.conversation_service import (
     ConversationForkAtEventTargetNotFoundError,
     ConversationService,
 )
-from openhands.agent_server.dataset_cleaning_callback import (
-    dispatch_run_workflow_status,
-)
 from openhands.agent_server.dependencies import (
     _get_validation_cluster_header,
     get_conversation_service,
@@ -46,7 +43,10 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
     PYROMIND_APP_TAG_VALUE,
 )
-from openhands.agent_server.run_workflow_callback import RunWorkflowCallbackResult
+from openhands.agent_server.run_workflow_callback import (
+    RunWorkflowCallbackResult,
+    deliver_run_workflow_status,
+)
 from openhands.agent_server.workflow_canvas_models import WorkflowCanvasEventSnapshot
 from openhands.agent_server.workflow_canvas_store import (
     FileWorkflowCanvasStore,
@@ -345,14 +345,12 @@ def _build_pyromind_storage_tools(
     if secret_headers:
         params["secret_headers"] = secret_headers
 
-    cleaning_params = {
-        name: params[name] for name in ("headers", "secret_headers") if name in params
-    }
-    cleaning_endpoint_url = extra.get(
-        "dataset_cleaning_endpoint_url", extra.get("studio_prompt_endpoint_url")
+    cleaning_params, secrets = _load_env_to_tools(
+        http_request=http_request,
+        params={},
+        secrets=secrets,
     )
-    if isinstance(cleaning_endpoint_url, str) and cleaning_endpoint_url:
-        cleaning_params["endpoint_url"] = cleaning_endpoint_url
+    secrets = _load_auth_token(http_request=http_request, secrets=secrets)
     cleaning_output_root = extra.get("dataset_cleaning_output_root")
     if isinstance(cleaning_output_root, str) and cleaning_output_root:
         cleaning_params["output_root"] = cleaning_output_root
@@ -1218,11 +1216,11 @@ async def pyromind_workflow_callback(
 ) -> PyromindWorkflowCallbackResponse:
     """Temporary webhook to simulate Kafka run_workflow terminal status delivery.
 
-    Calls :func:`dispatch_run_workflow_status` so manual HTTP clients can test the
+    Calls :func:`deliver_run_workflow_status` so manual HTTP clients can test the
     async resume path without a Kafka consumer. Mounted on the same unauthenticated
     webhook router as ``/debug/callback`` — internal/trusted network only.
     """
-    result: RunWorkflowCallbackResult = await dispatch_run_workflow_status(
+    result: RunWorkflowCallbackResult = await deliver_run_workflow_status(
         task_id=request.task_id,
         status=request.status,
         error_log=request.error_log,

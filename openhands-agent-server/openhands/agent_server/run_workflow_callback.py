@@ -1,6 +1,6 @@
-"""Deliver Pyromind run_workflow terminal status updates back to conversations.
+"""Deliver Pyromind workflow terminal status updates back to conversations.
 
-Agent-server callback layer for the async run_workflow pipeline. An external
+Agent-server callback layer for asynchronous Studio workflows. An external
 Kafka consumer (or HTTP webhook) calls :func:`deliver_run_workflow_status`
 when the platform reports a workflow status change. The callback uses the
 ``conversation_id`` written to the task at submission time
@@ -32,7 +32,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, Protocol
+from typing import Literal
 from uuid import UUID
 
 from openhands.agent_server.conversation_service import (
@@ -99,20 +99,6 @@ class RunWorkflowCallbackResult:
     conversation_id: str | None
 
 
-class TerminalStatusDelivery(Protocol):
-    """Deliver one terminal workflow status to an already resolved conversation."""
-
-    async def __call__(
-        self,
-        *,
-        event_service: EventService,
-        task_id: str,
-        status: RunWorkflowStatus,
-        error_log: str | None = None,
-        auto_run: bool = True,
-    ) -> None: ...
-
-
 # ---------------------------------------------------------------------------
 # 2. Text builders / 文案构造
 # ---------------------------------------------------------------------------
@@ -151,11 +137,17 @@ def build_run_workflow_terminal_reminder(
     """
     lines = [
         "<system_reminder>",
+        (f"Pyromind workflow task {task_id} reached terminal status {status}."),
         (
-            f"Pyromind workflow run_workflow task {task_id} reached terminal "
-            f"status {status}."
+            "Continue from the tool invocation associated with this task. Use "
+            "that tool's prior observation and contract to inspect any "
+            "domain-specific outputs and continue helping the user."
         ),
-        "Review the outcome and continue helping the user.",
+        (
+            "Reply in the language of the user's most recent non-empty visible "
+            "message; the language of this internal reminder must not affect "
+            "the reply language."
+        ),
     ]
     if error_log:
         lines.append("Runtime error log:")
@@ -290,29 +282,18 @@ async def resume_conversation_after_workflow(
 ) -> None:
     """Inject terminal status into a conversation and optionally start the agent.
 
-    Uses the same extended_content pattern as pyromind canvas sync: a visible
-    user Message plus a ``<system_reminder>`` block the LLM sees but the user
-    does not need to type.
+    Uses an empty user message plus ``extended_content`` so the LLM receives the
+    workflow status without exposing an internal callback message in chat.
 
-    向会话注入终态并可选启动 Agent。与 canvas sync 相同：用户可见 Message +
-    LLM 可见的 ``<system_reminder>``（extended_content）。
+    通过空消息和 ``extended_content`` 注入终态并可选启动 Agent，内部回调消息
+    不会展示在聊天记录中。
     """
     reminder = build_run_workflow_terminal_reminder(
         task_id=task_id,
         status=status,
         error_log=error_log,
     )
-    message = Message(
-        role="user",
-        content=[
-            TextContent(
-                text=(
-                    f"Pyromind workflow run finished "
-                    f"(task_id={task_id}, status={status})."
-                )
-            )
-        ],
-    )
+    message = Message(role="user", content=[])
     await event_service.send_message(
         message,
         run=auto_run,
@@ -334,7 +315,6 @@ async def deliver_run_workflow_status(
     updated_at: datetime | None = None,
     auto_run: bool = True,
     conversation_service: ConversationService | None = None,
-    terminal_delivery: TerminalStatusDelivery | None = None,
 ) -> RunWorkflowCallbackResult:
     """Handle one workflow status update from Kafka or HTTP webhook.
 
@@ -355,7 +335,6 @@ async def deliver_run_workflow_status(
         updated_at: Reserved for future ordering / idempotency.
         auto_run: Restart agent after injecting terminal reminder (default True).
         conversation_service: Override for tests; else process singleton.
-        terminal_delivery: Optional domain-specific terminal message delivery.
     """
     del updated_at  # reserved for future idempotency / ordering
 
@@ -424,11 +403,10 @@ async def deliver_run_workflow_status(
             conversation_id=resolved_conversation_id,
         )
 
-    # Step 6: Conversation must be loaded on this agent-server instance.
+    # Step 5: Conversation must be loaded on this agent-server instance.
     # Under Kafka broadcast (per-pod consumer group), other pods normally miss
     # the conversation — return unknown_conversation without raising so the
     # consumer skips (no retry/DLQ). Only the pod that holds the session delivers.
-    service = conversation_service or get_default_conversation_service()
     event_service = await service.get_event_service(conversation_uuid)
     if event_service is None:
         logger.info(
@@ -460,8 +438,7 @@ async def deliver_run_workflow_status(
 
     # Step 7: Deliver to conversation and auto_run.
     try:
-        delivery = terminal_delivery or resume_conversation_after_workflow
-        await delivery(
+        await resume_conversation_after_workflow(
             event_service=event_service,
             task_id=task_id,
             status=normalized_status,

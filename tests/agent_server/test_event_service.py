@@ -274,7 +274,7 @@ def test_pyromind_runtime_llm_is_rehydrated_from_server_env(monkeypatch):
     assert isinstance(updated.condenser, LLMSummarizingCondenser)
     assert updated.condenser.llm.base_url == "https://llm.example.test/v1"
     assert updated.condenser.llm.usage_id == "condenser"
-    dumped = updated.model_dump(mode="json", context={"expose_secrets": True})
+    dumped = updated.model_dump(mode="json")
     assert "api_key" not in dumped["llm"]
     assert "base_url" not in dumped["llm"]
     assert "api_key" not in dumped["condenser"]["llm"]

@@ -137,7 +137,7 @@ async def test_workflow_callback_delegates_to_deliver(
         )
 
     monkeypatch.setattr(
-        "openhands.agent_server.pyromind_router.dispatch_run_workflow_status",
+        "openhands.agent_server.pyromind_router.deliver_run_workflow_status",
         fake_deliver,
     )
 
@@ -177,7 +177,7 @@ async def test_workflow_callback_allows_omitted_conversation_id(
         )
 
     monkeypatch.setattr(
-        "openhands.agent_server.pyromind_router.dispatch_run_workflow_status",
+        "openhands.agent_server.pyromind_router.deliver_run_workflow_status",
         fake_deliver,
     )
 
@@ -205,7 +205,7 @@ async def test_workflow_callback_unknown_conversation_returns_404(
         )
 
     monkeypatch.setattr(
-        "openhands.agent_server.pyromind_router.dispatch_run_workflow_status",
+        "openhands.agent_server.pyromind_router.deliver_run_workflow_status",
         fake_deliver,
     )
 

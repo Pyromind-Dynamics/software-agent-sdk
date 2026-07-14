@@ -310,7 +310,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
     assert upload_tool.params == preview_tool.params
-    assert cleaning_tool.params == preview_tool.params
+    assert cleaning_tool.params == run_tool.params
     assert "session-token" not in str(preview_tool.params)
     assert (
         service.start_request.secrets["PYROMIND_STORAGE_AUTH_COOKIE"].get_value()
@@ -667,12 +667,12 @@ def test_pyromind_storage_tools_use_user_context_headers():
         cookie=f"{PYROMIND_AUTH_COOKIE_NAME}=context-token; other=value",
         x_cluster="context-cluster",
     )
+    load_base_env(request)
 
     tools, secrets = _build_pyromind_storage_tools(
         request,
         {
             "storage_base_url": "https://storage.test/api",
-            "dataset_cleaning_endpoint_url": "https://studio.test/api/prompt",
             "dataset_cleaning_output_root": "/agentTest/clean-results",
         },
     )
@@ -688,16 +688,28 @@ def test_pyromind_storage_tools_use_user_context_headers():
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
     assert tools[1].params == tools[0].params
-    assert tools[2].params == {
-        "headers": {"x-cluster": "context-cluster"},
-        "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
-        "endpoint_url": "https://studio.test/api/prompt",
+    cleaning_params = tools[2].params
+    assert cleaning_params == {
+        "current_user": CurrentLoginUser(
+            username="debug-user-42",
+            email="debug-user-42@example.test",
+            user_id=42,
+            cookie=None,
+            x_cluster="context-cluster",
+        ),
+        "env": "prod",
+        "cluster": "context-cluster",
+        "headers": {
+            "x-cluster": "context-cluster",
+            "request-app": "openhands",
+        },
         "output_root": "/agentTest/clean-results",
     }
     assert (
         secrets["PYROMIND_STORAGE_AUTH_COOKIE"].get_value()
         == f"{PYROMIND_AUTH_COOKIE_NAME}=context-token; other=value"
     )
+    assert secrets["auth_token"].get_value() == "request-token"
 
 
 def test_build_debug_context_headers_uses_current_user_context():
