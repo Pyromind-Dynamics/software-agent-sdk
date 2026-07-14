@@ -60,6 +60,8 @@ from openhands.sdk.conversation.request import (
 )
 from openhands.sdk.llm.message import Message
 from openhands.sdk.secret import SecretSource, SecretValue, StaticSecret
+from openhands.sdk.security.confirmation_policy import ConfirmRisky
+from openhands.sdk.security.defense_in_depth import PatternSecurityAnalyzer
 from openhands.sdk.skills import Skill, load_skills_from_dir
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.codex import get_codex_agent
@@ -966,6 +968,10 @@ async def create_pyromind_conversation(
         secrets={**validation_secrets, **run_secrets, **storage_secrets},
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
         user_id=user_id,
+        # Pyromind exposes terminal, patch, and workflow execution tools. Treat
+        # unknown-risk actions as requiring user confirmation by default.
+        confirmation_policy=ConfirmRisky(),
+        security_analyzer=PatternSecurityAnalyzer(),
     )
 
     # 8. Delegate to conversation service
