@@ -145,6 +145,67 @@ def test_patch_parse_errors_are_actionable(
     assert expected_error in observation.text
 
 
+@pytest.mark.parametrize(
+    "patch",
+    [
+        # Whitespace around the envelope markers (codex trims boundary lines).
+        (
+            "*** Begin Patch \n"
+            "*** Add File: lenient.txt\n"
+            "+content\n"
+            "  *** End Patch  "
+        ),
+        # Whole patch wrapped in a markdown code fence.
+        (
+            "```\n"
+            "*** Begin Patch\n"
+            "*** Add File: lenient.txt\n"
+            "+content\n"
+            "*** End Patch\n"
+            "```"
+        ),
+        # Shell heredoc wrapper (codex lenient mode).
+        (
+            "<<'EOF'\n"
+            "*** Begin Patch\n"
+            "*** Add File: lenient.txt\n"
+            "+content\n"
+            "*** End Patch\n"
+            "EOF"
+        ),
+        # Trailing prose after the closing marker.
+        (
+            "*** Begin Patch\n"
+            "*** Add File: lenient.txt\n"
+            "+content\n"
+            "*** End Patch\n"
+            "Done! The file has been created."
+        ),
+        # Spurious '+' prefix on the closing marker (over-applied content rule).
+        (
+            "*** Begin Patch\n"
+            "*** Add File: lenient.txt\n"
+            "+content\n"
+            "+*** End Patch"
+        ),
+    ],
+)
+def test_lenient_envelope_parsing(tmp_ws: Path, patch: str):
+    obs = run_exec(tmp_ws, patch)
+    assert not obs.is_error
+    assert (tmp_ws / "lenient.txt").read_text() == "content"
+
+
+def test_missing_end_marker_still_rejected(tmp_ws: Path):
+    # A patch without any closing marker is likely truncated output and must
+    # not be silently applied.
+    patch = "*** Begin Patch\n*** Add File: trunc.txt\n+partial content"
+    obs = run_exec(tmp_ws, patch)
+    assert obs.is_error
+    assert "PATCH_END_MISSING" in obs.text
+    assert not (tmp_ws / "trunc.txt").exists()
+
+
 def test_multi_hunk_success_single_file(tmp_ws: Path):
     fp = tmp_ws / "multi_success.txt"
     fp.write_text("a1\na2\na3\na4\na5\n")
