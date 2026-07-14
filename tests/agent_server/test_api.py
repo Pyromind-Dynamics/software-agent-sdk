@@ -311,6 +311,10 @@ class TestServiceParallelization:
                 "openhands.agent_server.api.get_tool_preload_service",
                 return_value=mock_tool_preload_service,
             ),
+            patch(
+                "openhands.agent_server.api.kafka_message_bus",
+                AsyncMock(),
+            ),
         ):
             # Create a mock FastAPI app
             mock_app = AsyncMock()
@@ -363,6 +367,10 @@ class TestServiceParallelization:
                 "openhands.agent_server.api.get_tool_preload_service",
                 return_value=mock_tool_preload_service,
             ),
+            patch(
+                "openhands.agent_server.api.kafka_message_bus",
+                AsyncMock(),
+            ),
         ):
             # Create a mock FastAPI app
             mock_app = AsyncMock()
@@ -391,6 +399,10 @@ class TestServiceParallelization:
             patch("openhands.agent_server.api.get_desktop_service", return_value=None),
             patch(
                 "openhands.agent_server.api.get_tool_preload_service", return_value=None
+            ),
+            patch(
+                "openhands.agent_server.api.kafka_message_bus",
+                AsyncMock(),
             ),
         ):
             # Create a mock FastAPI app
@@ -422,6 +434,10 @@ class TestServiceParallelization:
             patch("openhands.agent_server.api.get_desktop_service", return_value=None),
             patch(
                 "openhands.agent_server.api.get_tool_preload_service", return_value=None
+            ),
+            patch(
+                "openhands.agent_server.api.kafka_message_bus",
+                AsyncMock(),
             ),
         ):
             mock_app = AsyncMock()
