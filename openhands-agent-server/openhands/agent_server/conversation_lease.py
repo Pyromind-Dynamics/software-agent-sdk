@@ -127,6 +127,7 @@ class ConversationLease:
         """Claim or renew ownership of the conversation directory."""
         _ensure_secure_directory(self._conversation_dir)
         with FileLock(str(self._lock_path)):
+            self._lock_path.chmod(0o600)
             now = time.time()
             payload = self._read_payload()
             if payload is not None:

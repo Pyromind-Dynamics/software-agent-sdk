@@ -69,6 +69,14 @@ _VISION_SUFFIXES = {
 }
 _VISION_FIELD_MARKERS = ("image", "video", "vision")
 SampleStrategy = Literal["head", "tail", "random", "stratified"]
+SuggestedDatasetNode = Literal["CloneAndCacheDataset", "DownloadAndCacheDataset"]
+_KNOWN_DATASET_NODES: dict[str, SuggestedDatasetNode] = {
+    "pyromind/alpaca-gpt4-llm-demo": "CloneAndCacheDataset",
+    "pyromind/geometry-vqa-vlm-demo": "CloneAndCacheDataset",
+    "pyromind/self-cognition": "CloneAndCacheDataset",
+    "pyromind/easyhard-24k": "DownloadAndCacheDataset",
+    "pyromind/agentic-tool-call-dataset-12k": "DownloadAndCacheDataset",
+}
 
 
 @dataclass(frozen=True)
@@ -209,6 +217,17 @@ class PreviewDatasetObservation(Observation):
         default=None,
         description="Non-fatal content parsing issue, when metadata lookup succeeded.",
     )
+    error_code: str | None = Field(
+        default=None,
+        description="Machine-readable input or preview error code.",
+    )
+    suggested_node: SuggestedDatasetNode | None = Field(
+        default=None,
+        description=(
+            "Workflow node to use when dataset_path is a known dataset identifier "
+            "rather than a storage path."
+        ),
+    )
 
     @property
     def visualize(self) -> Text:
@@ -236,11 +255,13 @@ storage API and returns:
 - configurable sampling with `sample_strategy`: `head`, `tail`, `random`, or
   `stratified`
 
-Call this BEFORE generating any training workflow that uses a user-provided
-dataset, so you can determine the data format (SFT messages / prompt-response
-/ DPO chosen-rejected / GRPO prompt-only), pick the right dataset config
-builder node, and fill in field-mapping parameters from real field names
-instead of guessing.
+Use this only to inspect an actual file or directory uploaded to Pyromind
+storage. A slash in the value is not enough to classify it: when the user says
+they uploaded the data and pasted a storage-relative path, preview that exact
+path. Do not use this tool for values identified as Clone Dataset or Download
+Dataset IDs, such as `pyromind/self-cognition` or `pyromind/easyhard-24k`; those
+are not storage paths. Known IDs fail locally with `NOT_A_STORAGE_PATH` and a
+`suggested_node`; no storage request is sent and path variants must not be retried.
 
 Sample content is saved under the current conversation directory's
 `preview_dataset/` folder, next to `workflow_canvas/`. Large files are sampled
@@ -275,17 +296,35 @@ class PreviewDatasetExecutor(
         action: PreviewDatasetAction,
         conversation: BaseConversation | None = None,
     ) -> PreviewDatasetObservation:
-        try:
-            headers = self._resolve_headers(conversation, json_content=True)
-        except ValueError as exc:
-            return PreviewDatasetObservation.from_text(text=str(exc), is_error=True)
-
         dataset_path = action.dataset_path.strip()
         if not dataset_path:
             return PreviewDatasetObservation.from_text(
                 text="dataset_path must be a non-empty storage path.",
                 is_error=True,
                 dataset_path=action.dataset_path,
+            )
+
+        suggested_node = _KNOWN_DATASET_NODES.get(dataset_path.rstrip("/"))
+        if suggested_node is not None:
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    f"NOT_A_STORAGE_PATH: {dataset_path!r} is a known dataset "
+                    f"identifier, not a Pyromind storage path. Use {suggested_node} "
+                    "and do not retry preview_dataset with path variants."
+                ),
+                is_error=True,
+                dataset_path=dataset_path,
+                error_code="NOT_A_STORAGE_PATH",
+                suggested_node=suggested_node,
+            )
+
+        try:
+            headers = self._resolve_headers(conversation, json_content=True)
+        except ValueError as exc:
+            return PreviewDatasetObservation.from_text(
+                text=str(exc),
+                is_error=True,
+                dataset_path=dataset_path,
             )
 
         files: list[str] = []
@@ -411,7 +450,7 @@ class PreviewDatasetExecutor(
         payload_result = self._post_json("get_file_metadata", {"path": path}, headers)
         if isinstance(payload_result, str):
             return PreviewDatasetObservation.from_text(
-                text=payload_result,
+                text=_with_cleaned_dataset_hint(payload_result, path),
                 is_error=True,
                 dataset_path=path,
             )
@@ -995,6 +1034,16 @@ def _decode_json_response(
     if not isinstance(payload, dict):
         return f"{api_name} returned a non-object JSON payload."
     return payload
+
+
+def _with_cleaned_dataset_hint(message: str, dataset_path: str) -> str:
+    if "HTTP 404" not in message or not dataset_path.startswith("pyromind/"):
+        return message
+    return (
+        f"{message} This looks like a cleaned dataset identifier for Clone Dataset "
+        "or Download Dataset, not a Pyromind storage path; use it directly in the "
+        "workflow and do not retry preview_dataset with path variants."
+    )
 
 
 def _extract_api_data(api_name: str, payload: dict[str, Any]) -> dict[str, Any] | str:

@@ -55,7 +55,10 @@ class ConversationStateUpdateEvent(Event):
         # For ConversationStats, use snapshot serialization to avoid
         # sending lengthy lists over WebSocket
         if isinstance(value, ConversationStats):
-            return value.model_dump(mode="json", context={"use_snapshot": True})
+            return value.model_dump(
+                mode="json",
+                context={"use_snapshot": True, "redact_model_names": True},
+            )
 
         key = info.data.get("key")
         if key is None:
@@ -95,7 +98,11 @@ class ConversationStateUpdateEvent(Event):
         """
         # Create a snapshot with all important state fields
         # Use mode='json' to ensure proper serialization including SecretStr
-        state_snapshot = state.model_dump(mode="json", exclude_none=True)
+        state_snapshot = state.model_dump(
+            mode="json",
+            exclude_none=True,
+            context={"redact_model_names": True},
+        )
 
         # Use a special key "full_state" to indicate this is a full snapshot
         return cls(key=FULL_STATE_KEY, value=state_snapshot)

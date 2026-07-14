@@ -2,7 +2,7 @@ from abc import ABC
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
-from pydantic import ConfigDict, Field, create_model
+from pydantic import ConfigDict, Field, create_model, field_validator
 from rich.text import Text
 
 from openhands.sdk.llm import ImageContent, TextContent
@@ -11,6 +11,7 @@ from openhands.sdk.logger import get_logger
 from openhands.sdk.utils.models import (
     DiscriminatedUnionMixin,
 )
+from openhands.sdk.utils.redact import redact_text_secrets
 from openhands.sdk.utils.visualize import display_json
 
 
@@ -278,6 +279,19 @@ class Observation(Schema, ABC):
             "When there is an error, it should be written in this field."
         ),
     )
+
+    @field_validator("content")
+    @classmethod
+    def _redact_sensitive_text_content(
+        cls, value: list[TextContent | ImageContent]
+    ) -> list[TextContent | ImageContent]:
+        return [
+            item.model_copy(update={"text": redact_text_secrets(item.text)})
+            if isinstance(item, TextContent)
+            else item
+            for item in value
+        ]
+
     is_error: bool = Field(
         default=False, description="Whether the observation indicates an error"
     )

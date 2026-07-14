@@ -139,9 +139,13 @@ class LocalFileStore(FileStore):
         """Acquire file-based lock using flock."""
         lock_path = self.get_full_path(path)
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        os.chmod(os.path.dirname(lock_path), _DIRECTORY_MODE)
         file_lock = FileLock(lock_path)
         try:
             with file_lock.acquire(timeout=timeout):
+                # FileLock creates the lock file itself, so enforce its mode
+                # after acquisition as well as for pre-existing lock files.
+                os.chmod(lock_path, _FILE_MODE)
                 yield
         except Timeout:
             logger.error(f"Failed to acquire lock within {timeout}s: {lock_path}")

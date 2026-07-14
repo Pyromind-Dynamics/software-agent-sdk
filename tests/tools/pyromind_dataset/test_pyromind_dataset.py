@@ -8,13 +8,54 @@ from pydantic import SecretStr
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.secret import StaticSecret
 from openhands.tools.pyromind_dataset.definition import (
+    _PREVIEW_DATASET_DESCRIPTION,
     PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
     PreviewDatasetAction,
     PreviewDatasetExecutor,
     UploadFileToPyromindAction,
     UploadFileToPyromindExecutor,
+    _with_cleaned_dataset_hint,
 )
+
+
+def test_preview_description_excludes_cleaned_dataset_identifiers() -> None:
+    assert "Do not" in _PREVIEW_DATASET_DESCRIPTION
+    assert "pyromind/self-cognition" in _PREVIEW_DATASET_DESCRIPTION
+    assert "must not be retried" in _PREVIEW_DATASET_DESCRIPTION
+    assert "uploaded the data" in _PREVIEW_DATASET_DESCRIPTION
+    assert "storage-relative path" in _PREVIEW_DATASET_DESCRIPTION
+
+
+def test_preview_404_hints_when_path_is_cleaned_dataset_identifier() -> None:
+    message = _with_cleaned_dataset_hint(
+        "Pyromind storage get_file_metadata API returned HTTP 404",
+        "pyromind/self-cognition",
+    )
+    assert "cleaned dataset identifier" in message
+    assert "do not retry" in message
+
+
+def test_preview_rejects_known_dataset_ids_without_storage_request(monkeypatch):
+    def unexpected_post(*args, **kwargs):
+        raise AssertionError("storage API must not be called for dataset IDs")
+
+    monkeypatch.setattr(httpx, "post", unexpected_post)
+    expected_nodes = {
+        "pyromind/self-cognition": "CloneAndCacheDataset",
+        "pyromind/geometry-vqa-vlm-demo": "CloneAndCacheDataset",
+        "pyromind/easyhard-24k": "DownloadAndCacheDataset",
+    }
+
+    for dataset_id, expected_node in expected_nodes.items():
+        observation = PreviewDatasetExecutor()(
+            PreviewDatasetAction(dataset_path=dataset_id)
+        )
+
+        assert observation.is_error
+        assert observation.error_code == "NOT_A_STORAGE_PATH"
+        assert observation.suggested_node == expected_node
+        assert "do not retry" in observation.text
 
 
 class _FakeWorkspace:

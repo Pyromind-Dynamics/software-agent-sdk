@@ -135,3 +135,12 @@ def test_local_filestore_uses_private_permissions():
             os.stat(os.path.join(root_dir, "events/event.json")).st_mode & 0o777
             == 0o600
         )
+
+
+def test_local_filestore_lock_uses_private_permissions():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = LocalFileStore(os.path.join(temp_dir, "filestore_root"))
+
+        with store.lock("events/.eventlog.lock"):
+            lock_path = os.path.join(store.root, "events/.eventlog.lock")
+            assert os.stat(lock_path).st_mode & 0o777 == 0o600
