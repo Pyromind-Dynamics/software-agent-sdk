@@ -9,7 +9,7 @@
 
 | NodeType | 描述 | 主要输出端口 |
 |----------|------|-------------|
-| CloneAndCacheDataset | 克隆平台自带测试数据集 | dataset_path |
+| CloneAndCacheDataset | 克隆平台预置数据集 | dataset_path |
 | DownloadAndCacheDataset | 下载已清洗的数据集 | dataset_path |
 | CloneAndCacheModel | 克隆平台预置基模（枚举见 SKILL.md 第 3 步） | model_path |
 | DownloadAndCacheModel | 从 huggingface/modelscope 下载任意开源模型 | model_path |
@@ -46,7 +46,7 @@
 | VLLMInference | 启动 vLLM 推理服务（OpenAI 兼容） | endpoint |
 | ModelEvalApiNode | 调推理端点跑离线 benchmark | benchmark_output_path |
 | TestLLMNode | 测试推理端点 | result |
-| ContentPreview | 预览文本内容 | — |
+| ContentPreview | 预览文本内容 | content |
 
 组合映射：用户要求“发送测试请求并展示结果”时，使用
 `VLLMInference → TestLLMNode → ContentPreview`，由 `ContentPreview` 消费 `result`。
@@ -54,6 +54,13 @@
 ## 常用节点参数
 
 ### 数据接入
+
+`CloneAndCacheDataset.dataset` 当前枚举：`Writer/omniact`、`openai/gsm8k`、
+`pyromind/alpaca-gpt4-llm-demo`、`pyromind/geometry-vqa-vlm-demo`、
+`pyromind/self-cognition`；`target_path` 默认 `/workspace/datasets/`。
+
+`CloneAndCacheModel.model` 当前枚举：`Qwen/Qwen3-0.6B`、`Qwen/Qwen3-1.7B`、
+`Qwen/Qwen3-4B`、`Qwen/Qwen3-VL-2B-Instruct`、`Qwen/Qwen3-VL-4B-Instruct`。
 
 ```python
 # 用户上传的已清洗数据：先 preview，再接入其 Storage 相对文件路径
@@ -63,7 +70,7 @@ uploaded_dataset = PathJoinNode(
     subpath="datasets/my_data/train.jsonl",
 )
 
-# Clone Dataset：三个值是平台测试集，不是唯一允许的数据入口
+# Clone Dataset：使用上面的平台枚举；其他远程数据集用 DownloadAndCacheDataset
 dataset = CloneAndCacheDataset(
     id="2",
     dataset="pyromind/self-cognition",
@@ -117,18 +124,28 @@ dataset_kind = DatasetConfigBuilderVisionNode(
 ### 数据集与模型配置
 
 ```python
-dataset_config = DatasetConfigBuilderNode(
+dataset_extra = DatasetExtraConfigBuilderNode(
     id="5",
+    train_max_samples=0,
+    val_max_samples=0,
+    sft_collator_entry="train.sft_collator:make_collate_fn",
+    dpo_collator_entry="train.dpo_collator:make_collate_fn",
+    grpo_collator_entry="train.data.default_vision_grpo_collate:create_grpo_collate_fn",
+    max_seq_length=4096,
+)
+
+dataset_config = DatasetConfigBuilderNode(
+    id="6",
     train_data_path=train_file.joined_path,
     dataset_kind_config=dataset_kind.dataset_kind_config,
+    dataset_extra_config=dataset_extra.dataset_extra_config,
     # val_data_path=...,          # 可选：验证集
-    # dataset_extra_config=...,   # 可选：max_seq_length 等
 )
 
 model_config = ModelConfigBuilderNode(
-    id="6",
+    id="7",
     model_path=model.model_path,
-    model_type="auto",            # "auto" | "qwen3vl" | "qwen3.5"，VL 模型必须显式指定
+    model_type="auto",            # 默认 auto；也可用 qwen3vl、qwen3.5
 )
 ```
 
@@ -156,31 +173,75 @@ accelerate_config = AccelerateConfigBuilderNode(
     id="9",
     zero_stage=0,                 # 单卡 LoRA 固定为 0
 )
+
+# 仅启用 WandB 时创建；wandb_api_key 填 Secret 名，不填明文密钥
+wandb_config = WandbConfigBuilderNode(
+    id="10",
+    wandb_api_key="MY_WANDB_KEY",
+    wandb_project="studio_training",
+    # wandb_name="sft-run",       # 可选
+)
 ```
 
 ### 训练执行与后处理
 
+`ModelTrainSFTNode` 必填 `output_path`、`dataset_config`、`training_config`、
+`model_config`、`accelerate_config`、`gpu_count`、`gpu_product`；可选 `lora_config`、
+`wandb_config`、`thinking_as_input_ratio`。训练和 LoRA 合并节点的 `gpu_product` 只允许
+`NVIDIA-H200`、`NVIDIA-H100-80GB-HBM3`。
+
 ```python
 sft_train = ModelTrainSFTNode(
-    id="10",
+    id="11",
     dataset_config=dataset_config.dataset_config,
     model_config=model_config.model_config,
     lora_config=lora_config.lora_config,
     training_config=training_config.training_config,
     accelerate_config=accelerate_config.accelerate_config,
-    # wandb_config=...,           # 可选
+    # wandb_config=wandb_config.wandb_config,  # 可选
+    thinking_as_input_ratio=0,    # 可选，默认 0
     output_path="/workspace/output/sft/",
     gpu_count=1,
     gpu_product="NVIDIA-H100-80GB-HBM3",
 )
 
 merge = ModelMergeLoraNode(
-    id="11",
+    id="12",
     model_path=model.model_path,
     lora_path=sft_train.model_output_path,
     output_path="/workspace/output/merged/",
     gpu_count=1,
     gpu_product="NVIDIA-H100-80GB-HBM3",
+    model_type="auto",            # 默认 auto；也可用 qwen3vl、qwen3.5
+)
+```
+
+### 推理测试与预览
+
+`VLLMInference.gpu_product` 可用 `NVIDIA-H200`、`NVIDIA-H100-80GB-HBM3`、
+`NVIDIA-L40S`。用户要求发送测试请求并展示结果时，连接完整链路：
+
+```python
+infer = VLLMInference(
+    id="13",
+    model_path=merge.merged_model_path,
+    port=3000,
+    gpu_count=1,
+    gpu_product="NVIDIA-H100-80GB-HBM3",
+)
+
+test = TestLLMNode(
+    id="14",
+    endpoint=infer.endpoint,
+    prompt="Hello, how are you?",
+    max_tokens=100,
+    temperature=0.7,
+)
+
+preview = ContentPreview(
+    id="15",
+    content=test.result,
+    file_format="txt",
 )
 ```
 
@@ -192,7 +253,7 @@ infer = VLLMInference(
     model_path=model.model_path,
     port=3000,
     gpu_count=1,
-    gpu_product="NVIDIA-H100-80GB-HBM3",
+    gpu_product="NVIDIA-H100-80GB-HBM3",  # 也可用 NVIDIA-H200、NVIDIA-L40S
 )
 
 metrics = MetricsConfigBuilderNode(

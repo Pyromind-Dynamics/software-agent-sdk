@@ -31,7 +31,7 @@ N = 已清洗数据集条数，L = P95 序列长度（token）。用户上传 St
 - `batch_size` = 同规模 LLM 的 1/2
 - `learning_rate` = 同规模 LLM 的 1/2（更保守）
 - 显存需求约为同规模 LLM 的 1.5~2 倍（GPU 档位升一档）
-- `max_seq_length` 默认取 min(P95, 8192)，确有需要才升到 32K
+- `max_seq_length` 默认取 min(P95, 4096)，确有需要才升到 32K
 
 ## Step 3：模型规模分档
 
