@@ -16,6 +16,7 @@ from openhands.tools.file_editor.editor import FileEditor
 from openhands.tools.file_editor.exceptions import ToolError
 from openhands.tools.utils import (
     configured_public_read_roots,
+    default_path_access_policy,
     logical_public_read_path,
     resolve_public_read_alias,
 )
@@ -40,6 +41,9 @@ class FileEditorExecutor(ToolExecutor):
         )
         self.editor: FileEditor = FileEditor(workspace_root=str(self.workspace_root))
         self.read_only_roots = configured_public_read_roots(read_only_roots)
+        self.path_policy = default_path_access_policy(
+            self.workspace_root, self.read_only_roots
+        )
         self.read_only_editors = {
             root: FileEditor(workspace_root=str(root)) for root in self.read_only_roots
         }
@@ -87,6 +91,14 @@ class FileEditorExecutor(ToolExecutor):
         conversation: "LocalConversation | None" = None,
     ) -> FileEditorObservation:
         normalized_path = self.normalize_path(action.path)
+
+        operation = "read" if action.command == "view" else "write"
+        try:
+            self.path_policy.require(normalized_path, operation)
+        except PermissionError as error:
+            return FileEditorObservation.from_text(
+                text=str(error), command=action.command, is_error=True
+            )
 
         # Enforce allowed_edits_files restrictions
         if self.allowed_edits_files is not None and action.command != "view":

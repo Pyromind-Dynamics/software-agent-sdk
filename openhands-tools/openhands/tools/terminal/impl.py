@@ -41,7 +41,6 @@ from openhands.tools.terminal.terminal.tmux_pane_pool import (
     PooledTmuxTerminal,
     TmuxPanePool,
 )
-from openhands.tools.utils import terminal_public_read_block_reason
 
 
 _TMUX_POOL_RECOVERY_MESSAGE = (
@@ -605,15 +604,6 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                         literal_kind=literal_kind,
                         head=head,
                     ),
-                    is_error=True,
-                    command=action.command,
-                    exit_code=None,
-                )
-
-            public_read_reason = terminal_public_read_block_reason(action.command)
-            if public_read_reason is not None:
-                return TerminalObservation.from_text(
-                    text=f"Blocked by public-read policy: {public_read_reason}",
                     is_error=True,
                     command=action.command,
                     exit_code=None,

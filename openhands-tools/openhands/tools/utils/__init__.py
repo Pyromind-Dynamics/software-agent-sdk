@@ -1,11 +1,12 @@
 """Shared utilities."""
 
 import os
-import re
 import shutil
 import subprocess
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from openhands.sdk.logger import get_logger
 
@@ -17,30 +18,75 @@ PUBLIC_READ_ALIASES: tuple[tuple[str, str, str, str | None], ...] = (
     (".agents/skills", "PYROMIND_SKILLS_PATH", "skills", ".agents"),
 )
 
-_PUBLIC_READ_ALIAS_PATTERN = re.compile(
-    r"(?<![\w.-])(?:knowledge|\.agents/skills)(?=(?:/|\b))"
-)
+PathOperation = Literal["read", "write", "execute"]
 
 
-def terminal_public_read_block_reason(command: str) -> str | None:
-    """Return a safe redirect when terminal targets a public read-only root."""
-    normalized_command = command.replace("\\", "/")
-    if _PUBLIC_READ_ALIAS_PATTERN.search(normalized_command):
-        return (
-            "Public knowledge and skill documents are read-only. Use `grep` "
-            "with the logical `knowledge/` or `.agents/skills/` path, then "
-            'use `file_editor` with `command="view"`. Do not use terminal '
-            "or a host filesystem path."
+@dataclass(frozen=True)
+class PathRule:
+    """A filesystem root and the operations permitted below it."""
+
+    path: Path
+    perm: frozenset[PathOperation]
+    recursive: bool = True
+
+    @classmethod
+    def create(
+        cls,
+        path: str | Path,
+        perm: str,
+        recursive: bool = True,
+    ) -> "PathRule":
+        invalid = set(perm) - {"r", "w", "x"}
+        if invalid:
+            raise ValueError(f"Unsupported path permissions: {sorted(invalid)}")
+        allowed: set[PathOperation] = set()
+        permission_markers: tuple[tuple[PathOperation, str], ...] = (
+            ("read", "r"),
+            ("write", "w"),
+            ("execute", "x"),
+        )
+        for operation, marker in permission_markers:
+            if marker in perm:
+                allowed.add(operation)
+        return cls(
+            path=Path(path).expanduser().resolve(),
+            perm=frozenset(allowed),
+            recursive=recursive,
         )
 
-    for root in configured_public_read_roots():
-        if str(root).replace("\\", "/") in normalized_command:
-            return (
-                "Public knowledge and skill documents must be accessed through "
-                "the logical `knowledge/` or `.agents/skills/` path with `grep` "
-                "or `file_editor.view`; host filesystem paths are not exposed."
-            )
-    return None
+
+class PathAccessPolicy:
+    """Resolve and authorize filesystem paths against ordered allow rules."""
+
+    def __init__(self, rules: Sequence[PathRule]):
+        self.rules = tuple(rules)
+
+    def check(self, target_path: str | Path, operation: PathOperation) -> bool:
+        target = Path(target_path).expanduser().resolve()
+        for rule in self.rules:
+            if rule.recursive:
+                in_rule = target == rule.path or target.is_relative_to(rule.path)
+            else:
+                in_rule = target == rule.path or target.parent == rule.path
+            if in_rule:
+                return operation in rule.perm
+        return False
+
+    def require(self, target_path: str | Path, operation: PathOperation) -> Path:
+        target = Path(target_path).expanduser().resolve()
+        if not self.check(target, operation):
+            raise PermissionError(f"Path is not allowed for {operation}: {target}")
+        return target
+
+
+def default_path_access_policy(
+    workspace_dir: str | Path,
+    read_only_roots: Sequence[str | Path] = (),
+) -> PathAccessPolicy:
+    """Build the standard workspace plus public-read path policy."""
+    rules = [PathRule.create(root, "r") for root in read_only_roots]
+    rules.append(PathRule.create(workspace_dir, "rwx"))
+    return PathAccessPolicy(rules)
 
 
 def configured_public_read_roots(
