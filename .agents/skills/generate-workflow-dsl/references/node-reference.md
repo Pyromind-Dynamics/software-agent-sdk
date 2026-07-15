@@ -65,28 +65,28 @@
 ```python
 # 用户上传的已清洗数据：先 preview，再接入其 Storage 相对文件路径
 uploaded_dataset = PathJoinNode(
-    id="1",
+    id=1,
     base_path="/workspace/",
     subpath="datasets/my_data/train.jsonl",
 )
 
 # Clone Dataset：使用上面的平台枚举；其他远程数据集用 DownloadAndCacheDataset
 dataset = CloneAndCacheDataset(
-    id="2",
+    id=2,
     dataset="pyromind/self-cognition",
     target_path="/workspace/datasets/",
 )
 
 # Clone 后按该数据集的已知文件结构取训练文件
 train_file = PathJoinNode(
-    id="3",
+    id=3,
     base_path=dataset.dataset_path,
     subpath="self-cognition.jsonl",
 )
 
 # Download Dataset：可下载用户指定的远程数据集；这里是已知可直接使用的示例
 downloaded_dataset = DownloadAndCacheDataset(
-    id="4",
+    id=4,
     dataset_name="pyromind/easyhard-24k",
     cache_dir="/workspace/datasets/pyromind/easyhard-24k",
     download_source="huggingface",
@@ -98,7 +98,7 @@ downloaded_dataset = DownloadAndCacheDataset(
 ```python
 # prompt/response 独立字段
 dataset_kind = DatasetConfigBuilderTextNode(
-    id="4",
+    id=4,
     user_prompt_field="question",
     assistant_response_field="answer",
     # system_prompt_field="system",     # 可选
@@ -107,14 +107,14 @@ dataset_kind = DatasetConfigBuilderTextNode(
 
 # messages 对话格式
 dataset_kind = DatasetConfigBuilderMessageNode(
-    id="4",
+    id=4,
     messages_field="messages",
     # rejected_field="rejected_messages",  # DPO 时必填
 )
 
 # 多模态
 dataset_kind = DatasetConfigBuilderVisionNode(
-    id="4",
+    id=4,
     user_prompt_field="question",
     assistant_response_field="answer",
     image_field="image_path",
@@ -125,7 +125,7 @@ dataset_kind = DatasetConfigBuilderVisionNode(
 
 ```python
 dataset_extra = DatasetExtraConfigBuilderNode(
-    id="5",
+    id=5,
     train_max_samples=0,
     val_max_samples=0,
     sft_collator_entry="train.sft_collator:make_collate_fn",
@@ -135,7 +135,7 @@ dataset_extra = DatasetExtraConfigBuilderNode(
 )
 
 dataset_config = DatasetConfigBuilderNode(
-    id="6",
+    id=6,
     train_data_path=train_file.joined_path,
     dataset_kind_config=dataset_kind.dataset_kind_config,
     dataset_extra_config=dataset_extra.dataset_extra_config,
@@ -143,7 +143,7 @@ dataset_config = DatasetConfigBuilderNode(
 )
 
 model_config = ModelConfigBuilderNode(
-    id="7",
+    id=7,
     model_path=model.model_path,
     model_type="auto",            # 默认 auto；也可用 qwen3vl、qwen3.5
 )
@@ -153,14 +153,14 @@ model_config = ModelConfigBuilderNode(
 
 ```python
 lora_config = LoraConfigBuilderNode(
-    id="7",
+    id=7,
     lora_rank=8,                  # 按 parameter-decision.md 决策
     lora_dropout=0.05,
     target_modules="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
 )
 
 training_config = TrainingConfigBuilderNode(
-    id="8",
+    id=8,
     learning_rate=1e-4,           # 按 parameter-decision.md 决策
     batch_size=2,
     grad_accum=2,
@@ -170,13 +170,13 @@ training_config = TrainingConfigBuilderNode(
 )
 
 accelerate_config = AccelerateConfigBuilderNode(
-    id="9",
+    id=9,
     zero_stage=0,                 # 单卡 LoRA 固定为 0
 )
 
 # 仅启用 WandB 时创建；wandb_api_key 填 Secret 名，不填明文密钥
 wandb_config = WandbConfigBuilderNode(
-    id="10",
+    id=10,
     wandb_api_key="MY_WANDB_KEY",
     wandb_project="studio_training",
     # wandb_name="sft-run",       # 可选
@@ -192,7 +192,7 @@ wandb_config = WandbConfigBuilderNode(
 
 ```python
 sft_train = ModelTrainSFTNode(
-    id="11",
+    id=11,
     dataset_config=dataset_config.dataset_config,
     model_config=model_config.model_config,
     lora_config=lora_config.lora_config,
@@ -206,7 +206,7 @@ sft_train = ModelTrainSFTNode(
 )
 
 merge = ModelMergeLoraNode(
-    id="12",
+    id=12,
     model_path=model.model_path,
     lora_path=sft_train.model_output_path,
     output_path="/workspace/output/merged/",
@@ -223,7 +223,7 @@ merge = ModelMergeLoraNode(
 
 ```python
 infer = VLLMInference(
-    id="13",
+    id=13,
     model_path=merge.merged_model_path,
     port=3000,
     gpu_count=1,
@@ -231,7 +231,7 @@ infer = VLLMInference(
 )
 
 test = TestLLMNode(
-    id="14",
+    id=14,
     endpoint=infer.endpoint,
     prompt="Hello, how are you?",
     max_tokens=100,
@@ -239,7 +239,7 @@ test = TestLLMNode(
 )
 
 preview = ContentPreview(
-    id="15",
+    id=15,
     content=test.result,
     file_format="txt",
 )
@@ -249,7 +249,7 @@ preview = ContentPreview(
 
 ```python
 infer = VLLMInference(
-    id="12",
+    id=12,
     model_path=model.model_path,
     port=3000,
     gpu_count=1,
@@ -257,7 +257,7 @@ infer = VLLMInference(
 )
 
 metrics = MetricsConfigBuilderNode(
-    id="13",
+    id=13,
     entry="compute_gsm8k",  # 内置指标使用裸函数名枚举
     name="gsm8k",
 )
@@ -265,7 +265,7 @@ metrics = MetricsConfigBuilderNode(
 # MetricsConfigBuilderCustomNode(entry="/workspace/script/agent/acc.py:acc_func", name="acc")
 
 evaluate = ModelEvalApiNode(
-    id="14",
+    id=14,
     endpoint=infer.endpoint,
     endpoint_api_key="empty",
     endpoint_model="default",

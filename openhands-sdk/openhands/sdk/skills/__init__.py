@@ -55,6 +55,15 @@ from openhands.sdk.skills.installed import (
 )
 
 # Core skill model and loading
+from openhands.sdk.skills.catalog import (
+    SkillCatalog,
+    SkillCatalogEntry,
+    SkillCatalogError,
+    SkillResourceHandle,
+    build_skill_catalog,
+)
+from openhands.sdk.skills.resource_router import SkillResourceRouter
+from openhands.sdk.skills.selector import DeterministicSkillSelector, SkillSelection
 from openhands.sdk.skills.skill import (
     Skill,
     SkillInfo,
@@ -82,6 +91,9 @@ from openhands.sdk.skills.types import (
     SkillKnowledge,
     SkillResponse,
 )
+
+# Runtime / catalog / resources
+from openhands.sdk.skills.runtime import SkillReadResult, SkillRuntime
 
 # Utilities
 from openhands.sdk.skills.utils import (
@@ -121,6 +133,18 @@ __all__ = [
     "load_available_skills",
     "merge_skills_by_name",
     "to_prompt",
+    # Catalog / selection / resources
+    "SkillCatalog",
+    "SkillCatalogEntry",
+    "SkillCatalogError",
+    "SkillResourceHandle",
+    "build_skill_catalog",
+    "DeterministicSkillSelector",
+    "SkillSelection",
+    "SkillResourceRouter",
+    # Runtime
+    "SkillReadResult",
+    "SkillRuntime",
     # Triggers
     "BaseTrigger",
     "KeywordTrigger",

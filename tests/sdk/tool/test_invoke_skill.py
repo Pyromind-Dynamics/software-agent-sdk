@@ -12,7 +12,12 @@ from pydantic import SecretStr
 from openhands.sdk import LLM, Agent, AgentContext
 from openhands.sdk.context import KeywordTrigger
 from openhands.sdk.conversation.state import ConversationState
-from openhands.sdk.skills import Skill
+from openhands.sdk.skills import (
+    DeterministicSkillSelector,
+    Skill,
+    SkillResources,
+    build_skill_catalog,
+)
 from openhands.sdk.tool.builtins import (
     BUILT_IN_TOOL_CLASSES,
     BUILT_IN_TOOLS,
@@ -239,6 +244,40 @@ def test_footer_omitted_when_source_is_not_a_real_path():
     assert "located at" not in obs.text
 
 
+def test_resource_index_is_appended_when_skill_has_resources(tmp_path):
+    workspace = tmp_path / "ws"
+    skill_dir = workspace / "skills" / "reader"
+    (skill_dir / "references").mkdir(parents=True)
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "assets").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("body")
+    (skill_dir / "references" / "guide.md").write_text("guide")
+    (skill_dir / "scripts" / "run.py").write_text("print('ok')")
+    (skill_dir / "assets" / "logo.txt").write_text("asset")
+    skill = Skill(
+        name="reader",
+        content="body",
+        description="desc",
+        source=str(skill_dir / "SKILL.md"),
+        is_agentskills_format=True,
+        resources=SkillResources(
+            skill_root=str(skill_dir),
+            references=["guide.md"],
+            scripts=["run.py"],
+            assets=["logo.txt"],
+        ),
+    )
+    conv = _make_conv([skill], working_dir=str(workspace))
+
+    obs = _run("reader", conv)
+
+    assert obs.is_error is False
+    assert "Skill resources:" in obs.text
+    assert "references/guide.md" in obs.text
+    assert "scripts/run.py" in obs.text
+    assert "assets/logo.txt" in obs.text
+
+
 def test_invoked_skills_dedupes():
     conv = _make_conv([_make_skill("x")])
 
@@ -246,6 +285,21 @@ def test_invoked_skills_dedupes():
     _run("x", conv)
 
     assert conv.state.invoked_skills == ["x"]
+
+
+def test_catalog_and_selector_work_together():
+    skills = [
+        _make_skill("alpha", content="# alpha\n\nfirst"),
+        _make_skill("beta", content="# beta\n\nsecond"),
+    ]
+    catalog = build_skill_catalog(skills)
+    selector = DeterministicSkillSelector()
+
+    exact = selector.select("beta", catalog)
+    assert [entry.name for entry in exact.candidate_entries] == ["beta"]
+
+    fuzzy = selector.select("second", catalog)
+    assert [entry.name for entry in fuzzy.candidate_entries] == ["beta"]
 
 
 def test_legacy_triggered_skill_is_invocable():

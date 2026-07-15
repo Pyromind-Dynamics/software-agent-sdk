@@ -17,6 +17,21 @@ from openhands.sdk.tool.builtins.invoke_skill import (
     InvokeSkillObservation,
     InvokeSkillTool,
 )
+from openhands.sdk.tool.builtins.skills import (
+    SkillsBuiltinFacade,
+    SkillsListObservation,
+    SkillsReadObservation,
+)
+from openhands.sdk.tool.builtins.skills_tool import (
+    SkillsListAction,
+    SkillsListExecutor,
+    SkillsListObservation,
+    SkillsListTool,
+    SkillsReadAction,
+    SkillsReadExecutor,
+    SkillsReadObservation,
+    SkillsReadTool,
+)
 from openhands.sdk.tool.builtins.switch_llm import (
     SwitchLLMAction,
     SwitchLLMExecutor,
@@ -42,6 +57,8 @@ BUILT_IN_TOOLS = [FinishTool, ThinkTool]
 BUILT_IN_TOOL_CLASSES = {
     **{tool.__name__: tool for tool in BUILT_IN_TOOLS},
     InvokeSkillTool.__name__: InvokeSkillTool,
+    SkillsListTool.__name__: SkillsListTool,
+    SkillsReadTool.__name__: SkillsReadTool,
     SwitchLLMTool.__name__: SwitchLLMTool,
 }
 
@@ -56,6 +73,17 @@ __all__ = [
     "InvokeSkillAction",
     "InvokeSkillObservation",
     "InvokeSkillExecutor",
+    "SkillsListTool",
+    "SkillsListAction",
+    "SkillsListObservation",
+    "SkillsListExecutor",
+    "SkillsReadTool",
+    "SkillsReadAction",
+    "SkillsReadObservation",
+    "SkillsReadExecutor",
+    "SkillsBuiltinFacade",
+    "SkillsListObservation",
+    "SkillsReadObservation",
     "SwitchLLMTool",
     "SwitchLLMAction",
     "SwitchLLMObservation",
