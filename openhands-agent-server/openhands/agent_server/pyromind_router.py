@@ -977,7 +977,6 @@ async def create_pyromind_conversation(
             Tool(name="file_editor"),
             Tool(name=RunWorkflowTool.name, params=run_tool.params),
             *storage_tools,
-            Tool(name=DslToXyflowTool.name),
             validation_tool,
         ],
     )
