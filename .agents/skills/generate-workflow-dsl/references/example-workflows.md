@@ -30,10 +30,15 @@ dataset_kind = DatasetConfigBuilderTextNode(
     user_prompt_field="user_prompt",
     assistant_response_field="gt",
 )
+dataset_extra = DatasetExtraConfigBuilderNode(
+    id="12",
+    max_seq_length=4096,
+)
 dataset_config = DatasetConfigBuilderNode(
     id="5",
     train_data_path=train_file.joined_path,
     dataset_kind_config=dataset_kind.dataset_kind_config,
+    dataset_extra_config=dataset_extra.dataset_extra_config,
 )
 model_config = ModelConfigBuilderNode(
     id="6",
@@ -66,6 +71,7 @@ sft_train = ModelTrainSFTNode(
     output_path="/workspace/output/sft/",
     gpu_count=1,
     gpu_product="NVIDIA-H100-80GB-HBM3",
+    thinking_as_input_ratio=0,
 )
 merge = ModelMergeLoraNode(
     id="11",
@@ -74,6 +80,26 @@ merge = ModelMergeLoraNode(
     output_path="/workspace/output/merged/",
     gpu_count=1,
     gpu_product="NVIDIA-H100-80GB-HBM3",
+    model_type="auto",
+)
+infer = VLLMInference(
+    id="13",
+    model_path=merge.merged_model_path,
+    port=3000,
+    gpu_count=1,
+    gpu_product="NVIDIA-H100-80GB-HBM3",
+)
+test = TestLLMNode(
+    id="14",
+    endpoint=infer.endpoint,
+    prompt="Hello, how are you?",
+    max_tokens=100,
+    temperature=0.7,
+)
+preview = ContentPreview(
+    id="15",
+    content=test.result,
+    file_format="txt",
 )
 ```
 
@@ -104,10 +130,15 @@ dataset_kind = DatasetConfigBuilderTextNode(
     assistant_response_field="gt",
     rejected_field="rejected_answer",
 )
+dataset_extra = DatasetExtraConfigBuilderNode(
+    id="11",
+    max_seq_length=4096,
+)
 dataset_config = DatasetConfigBuilderNode(
     id="5",
     train_data_path=train_file.joined_path,
     dataset_kind_config=dataset_kind.dataset_kind_config,
+    dataset_extra_config=dataset_extra.dataset_extra_config,
 )
 model_config = ModelConfigBuilderNode(
     id="6",
@@ -133,6 +164,7 @@ dpo_train = ModelTrainDPONode(
     output_path="/workspace/output/dpo/",
     gpu_count=1,
     gpu_product="NVIDIA-H100-80GB-HBM3",
+    thinking_as_input_ratio=0,
 )
 ```
 
@@ -158,14 +190,21 @@ train_file = PathJoinNode(
 )
 dataset_kind = DatasetConfigBuilderVisionNode(
     id="4",
-    user_prompt_field="question",
-    assistant_response_field="answer",
+    system_prompt_field="system_prompt",
+    user_prompt_field="user_prompt",
+    assistant_response_field="gt",
     image_field="image_path",
+)
+dataset_extra = DatasetExtraConfigBuilderNode(
+    id="15",
+    grpo_collator_entry="train.data.default_vision_grpo_collate:create_grpo_collate_fn",
+    max_seq_length=4096,
 )
 dataset_config = DatasetConfigBuilderNode(
     id="5",
     train_data_path=train_file.joined_path,
     dataset_kind_config=dataset_kind.dataset_kind_config,
+    dataset_extra_config=dataset_extra.dataset_extra_config,
 )
 model_config = ModelConfigBuilderNode(
     id="6",
@@ -222,6 +261,7 @@ grpo_train = ModelTrainGRPONode(
     output_path="/workspace/output/grpo/",
     gpu_count=1,
     gpu_product="NVIDIA-H100-80GB-HBM3",
+    thinking_as_input_ratio=0,
 )
 ```
 
