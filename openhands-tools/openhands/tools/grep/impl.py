@@ -21,6 +21,7 @@ from openhands.tools.utils import (
     _check_ripgrep_available,
     _log_ripgrep_fallback_warning,
     configured_public_read_roots,
+    default_path_access_policy,
     logical_public_read_path,
     resolve_public_read_alias,
 )
@@ -47,6 +48,9 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
         """
         self.working_dir: Path = Path(working_dir).resolve()
         self.read_only_roots = configured_public_read_roots(read_only_roots)
+        self.path_policy = default_path_access_policy(
+            self.working_dir, self.read_only_roots
+        )
         self._search_backend = self._select_search_backend()
 
         if self._search_backend == "grep":
@@ -135,9 +139,7 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
                 if candidate.is_absolute()
                 else (self.working_dir / candidate).resolve()
             )
-        if resolved.is_relative_to(self.working_dir) or any(
-            resolved.is_relative_to(root) for root in self.read_only_roots
-        ):
+        if self.path_policy.check(resolved, "read"):
             return resolved
         raise ValueError(
             "Path is outside the workspace and configured read-only roots; "

@@ -16,6 +16,7 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
+from openhands.tools.utils import default_path_access_policy
 from openhands.tools.workflow.definition import mark_pyromind_workflow_dirty
 
 from .core import Commit, DiffError, process_patch
@@ -70,6 +71,7 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
                 resolved. Absolute or path-escaping references are rejected.
         """
         self.workspace_root = Path(workspace_root).resolve()
+        self.path_policy = default_path_access_policy(self.workspace_root)
 
     def _resolve_path(self, p: str) -> Path:
         """Resolve a file path into the workspace, disallowing escapes."""
@@ -91,17 +93,20 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
 
         def open_file(path: str) -> str:
             fp = self._resolve_path(path)
+            self.path_policy.require(fp, "read")
             with open(fp, encoding="utf-8") as f:
                 return f.read()
 
         def write_file(path: str, content: str) -> None:
             fp = self._resolve_path(path)
+            self.path_policy.require(fp, "write")
             fp.parent.mkdir(parents=True, exist_ok=True)
             with open(fp, "w", encoding="utf-8") as f:
                 f.write(content)
 
         def remove_file(path: str) -> None:
             fp = self._resolve_path(path)
+            self.path_policy.require(fp, "write")
             fp.unlink(missing_ok=False)
 
         try:
@@ -154,13 +159,22 @@ The `patch` argument is a stripped-down, file-oriented diff format:
 
 Each file section starts with exactly one of three headers:
 
-*** Add File: <path> - create a new file. Every following line is a + line (the initial contents).
+*** Add File: <path> - create a new file. Every following line is a + line
+(the initial contents).
 *** Delete File: <path> - remove an existing file. Nothing follows.
-*** Update File: <path> - patch an existing file in place. May be immediately followed by *** Move to: <new path> to rename the file. Then one or more hunks, each introduced by @@ (optionally followed by a class/function header). Within a hunk each line starts with ' ' (context), '-' (remove), or '+' (add).
+*** Update File: <path> - patch an existing file in place. May be immediately
+followed by *** Move to: <new path> to rename the file. Then one or more hunks,
+each introduced by @@ (optionally followed by a class/function header). Within
+a hunk each line starts with ' ' (context), '-' (remove), or '+' (add).
 
 For Update File hunks:
-- Show 3 lines of context immediately above and below each change. If a change is within 3 lines of a previous change, do NOT duplicate context lines between hunks.
-- If 3 lines of context is insufficient to uniquely locate the snippet, use the @@ operator to name the enclosing class or function, e.g. `@@ class BaseClass` or `@@ def method():`. Multiple @@ statements may be stacked to narrow down further.
+- Show 3 lines of context immediately above and below each change. If a change
+  is within 3 lines of a previous change, do NOT duplicate context lines
+  between hunks.
+- If 3 lines of context is insufficient to uniquely locate the snippet, use
+  the @@ operator to name the enclosing class or function, e.g.
+  `@@ class BaseClass` or `@@ def method():`. Multiple @@ statements may be
+  stacked to narrow down further.
 
 Full grammar:
 Patch := Begin { FileOp } End
@@ -190,7 +204,9 @@ Example combining several operations:
 Remember:
 - Every file section must have an Add/Delete/Update header.
 - Prefix every new content line with `+`, even when creating a new file.
-- The `+` prefix applies ONLY to file content lines. Never prefix `***` marker lines: the patch must end with the bare line `*** End Patch`, not `+*** End Patch`.
+- The `+` prefix applies ONLY to file content lines. Never prefix `***` marker
+  lines: the patch must end with the bare line `*** End Patch`, not `+*** End
+  Patch`.
 - File paths must be relative, NEVER ABSOLUTE."""
 
 

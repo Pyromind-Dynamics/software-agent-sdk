@@ -66,9 +66,12 @@ class RunDatasetCleaningAction(Action):
     cpu: int = Field(default=4, ge=1, le=64)
     memory: int = Field(default=32, ge=1, le=256)
     gpu_count: int = Field(default=0, ge=0, le=8)
-    gpu_product: Literal["NVIDIA-H100-NVL", "NVIDIA-L40S"] = Field(
-        default=DEFAULT_GPU_PRODUCT
-    )
+    gpu_product: Literal[
+        "NVIDIA-H100-NVL",
+        "NVIDIA-L40S",
+        "NVIDIA-H200",
+        "NVIDIA-H100-80GB-HBM3",
+    ] = Field(default=DEFAULT_GPU_PRODUCT)
 
     @property
     def visualize(self) -> Text:

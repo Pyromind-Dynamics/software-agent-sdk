@@ -49,12 +49,15 @@ def test_load_agent_skills_respects_allow_list(tmp_path) -> None:
     assert [s.name for s in skills] == ["generate-workflow-dsl"]
 
 
-def test_kb_instructions_format_injects_path() -> None:
+def test_kb_instructions_use_logical_read_only_paths() -> None:
     rendered = PYROMIND_KB_INSTRUCTIONS.format(
         knowledge_base_path="/kb/root",
         working_dir="workspace/conversations/abc123",
+        knowledge_alias="knowledge",
+        skills_alias=".agents/skills",
     )
-    assert "/kb/root" in rendered
+    assert "/kb/root" not in rendered
+    assert "knowledge/<subdirectory>" in rendered
     assert "workspace/conversations/abc123" in rendered
     assert "workflow.py" in rendered
     assert "Pyromind" in rendered
@@ -66,8 +69,8 @@ def test_kb_instructions_format_injects_path() -> None:
     # Skill-first guidance must be present.
     assert "invoke_skill" in rendered
     assert "article lookup alone" in rendered
-    assert "do not call `terminal`" in rendered
+    assert "`terminal` is also available" in rendered
     assert 'include="*.mdx"' in rendered
     assert "`.` or `^`" in rendered
-    assert "every relevant fact" in rendered
+    assert "every checklist item" in rendered
     assert "files you actually opened" in rendered
