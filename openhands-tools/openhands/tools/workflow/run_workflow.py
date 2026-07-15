@@ -399,7 +399,9 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
                 conversation_id=conversation_id,
             )
 
+            keep_ui_lock = False
             if test_mode:
+                keep_ui_lock = True
                 user_text = (
                     "The test workflow task has been submitted. Please wait "
                     f"patiently. task id: {response.task_id}"
@@ -424,7 +426,7 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
                 attempt=attempt,
                 max_attempts=self._max_attempts,
                 is_error=False,
-                keep_ui_lock=True,
+                keep_ui_lock=keep_ui_lock,
             )
         except Exception as exc:
             return RunWorkflowObservation.from_text(
