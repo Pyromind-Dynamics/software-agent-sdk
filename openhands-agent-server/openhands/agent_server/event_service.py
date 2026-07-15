@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
@@ -1241,6 +1242,9 @@ class EventService:
             loop = asyncio.get_running_loop()
 
             async def _run_and_publish():
+                run_t0 = time.monotonic()
+                arun_ms = 0.0
+                wait_pending_ms = 0.0
                 try:
                     # Prefer the native async path when available so the event
                     # loop is free during LLM I/O.  Fall back to thread-pool
@@ -1264,10 +1268,12 @@ class EventService:
                         and type(conversation).arun is not BaseConversation.arun
                         and type(conversation.agent).astep is not AgentBase.astep
                     )
+                    arun_t0 = time.monotonic()
                     if has_native_arun:
                         await conversation.arun()
                     else:
                         await loop.run_in_executor(self._run_executor, conversation.run)
+                    arun_ms = (time.monotonic() - arun_t0) * 1000
                 except Exception:
                     logger.exception("Error during conversation run")
                     # Backstop: a run that raised before reaching its own error
@@ -1284,9 +1290,11 @@ class EventService:
                     # becomes FINISHED before agent events (MessageEvent, ActionEvent,
                     # etc.) are published to WebSocket subscribers.
                     if self._callback_wrapper:
+                        wait_t0 = time.monotonic()
                         await loop.run_in_executor(
                             None, self._callback_wrapper.wait_for_pending, 30.0
                         )
+                        wait_pending_ms = (time.monotonic() - wait_t0) * 1000
 
                     if not self._rerun_requested:
                         workflow_emitted = await loop.run_in_executor(
@@ -1299,7 +1307,19 @@ class EventService:
 
                     # Clear task reference and publish state update
                     self._run_task = None
+                    publish_t0 = time.monotonic()
                     await self._publish_state_update()
+                    publish_ms = (time.monotonic() - publish_t0) * 1000
+                    logger.info(
+                        "[perf] event_service.run conversation_id=%s "
+                        "arun_ms=%.1f wait_pending_ms=%.1f publish_ms=%.1f "
+                        "total_ms=%.1f",
+                        self.stored.id,
+                        arun_ms,
+                        wait_pending_ms,
+                        publish_ms,
+                        (time.monotonic() - run_t0) * 1000,
+                    )
 
                     # Re-arm a run for input stranded while this task was
                     # wrapping up. A send_message(run=True) that arrived during
