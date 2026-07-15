@@ -158,9 +158,10 @@ been generated unless a tool call actually created or modified `workflow.py`.
 - If a listed skill fits the request (for example, generating a workflow), \
 invoke it via `invoke_skill` before searching the knowledge base. Do not invoke
 a workflow-generation skill for an article lookup alone.
-- For every knowledge-base or skill-document request, use only `grep` and
-  `file_editor` with the logical `{knowledge_alias}/` or `{skills_alias}/` path. Do not
-  call `terminal` or `apply_patch`, and never pass a host filesystem path. Open
+- For knowledge-base or skill-document requests, prefer `grep` and
+  `file_editor` with the logical `{knowledge_alias}/` or `{skills_alias}/` path.
+  `terminal` is also available when direct filesystem inspection is needed.
+  Do not use `apply_patch` to modify public knowledge or skill documents. Open
   matched files with `file_editor` before
 answering or editing `workflow.py`; never infer APIs or operational facts from
 filenames or directory listings.
