@@ -158,7 +158,43 @@ async def test_workflow_callback_delegates_to_deliver(
         "error_log": None,
         "conversation_id": "550e8400-e29b-41d4-a716-446655440000",
         "auto_run": False,
+        "from_workflow_debug": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_workflow_callback_passes_from_workflow_debug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_deliver(**kwargs: object) -> RunWorkflowCallbackResult:
+        captured.update(kwargs)
+        return RunWorkflowCallbackResult(
+            outcome="delivered_async",
+            task_id="task-debug-1",
+            normalized_status="Succeeded",
+            conversation_id="conv-1",
+        )
+
+    monkeypatch.setattr(
+        "openhands.agent_server.pyromind_router.deliver_run_workflow_status",
+        fake_deliver,
+    )
+
+    response = await pyromind_workflow_callback(
+        PyromindWorkflowCallbackRequest(
+            task_id="task-debug-1",
+            status="Succeeded",
+            conversation_id="550e8400-e29b-41d4-a716-446655440000",
+            auto_run=True,
+            from_workflow_debug=True,
+        )
+    )
+
+    assert response.success is True
+    assert captured["from_workflow_debug"] is True
+    assert captured["auto_run"] is True
 
 
 @pytest.mark.asyncio

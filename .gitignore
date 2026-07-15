@@ -215,6 +215,9 @@ tests/integration/api_compliance/outputs/
 
 # Agent-generated temp
 .agent_tmp/
+/openhands-tools/openhands/tools/workflow/skills/*.md
+/openhands-tools/openhands/tools/workflow_debug/*.md
+/tests/wangting/
 
 
 #knowledge/basic/

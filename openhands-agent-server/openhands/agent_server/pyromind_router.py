@@ -87,6 +87,7 @@ from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
 )
+from openhands.tools.workflow_debug import WorkflowDebugTool
 
 
 PYROMIND_AUTH_TOKEN_SECRET = "auth_token"
@@ -336,6 +337,19 @@ def _build_workflow_run_tool(
 
     # 返回会话级工具参数。
     return Tool(name=RunWorkflowTool.name, params=params), secrets
+
+
+def _build_workflow_debug_tool(
+    http_request: Request,
+) -> tuple[Tool, dict[str, SecretSource]]:
+    """Build ``workflow_debug`` with the same env/auth params as ``run_workflow``."""
+    params: dict[str, Any] = {}
+    secrets: dict[str, SecretSource] = {}
+    params, secrets = _load_env_to_tools(
+        http_request=http_request, params=params, secrets=secrets
+    )
+    secrets = _load_auth_token(http_request=http_request, secrets=secrets)
+    return Tool(name=WorkflowDebugTool.name, params=params), secrets
 
 
 def _build_pyromind_storage_tools(
@@ -635,6 +649,13 @@ class PyromindWorkflowCallbackRequest(BaseModel):
     auto_run: bool = Field(
         default=True,
         description="Restart the agent on the target conversation after delivery.",
+    )
+    from_workflow_debug: bool = Field(
+        default=False,
+        description=(
+            "True when simulating a workflow_debug (test) terminal callback. "
+            "Kafka derives this from out_id agent1#debug#..."
+        ),
     )
 
 
@@ -950,8 +971,9 @@ async def create_pyromind_conversation(
         http_request, request.extra
     )
 
-    # run_workflow reuses validate auth/header wiring / 运行工具复用校验鉴权配置
+    # run_workflow / workflow_debug reuse validate auth/header wiring
     run_tool, run_secrets = _build_workflow_run_tool(http_request)
+    debug_tool, debug_secrets = _build_workflow_debug_tool(http_request)
     # storage
     storage_tools, storage_secrets = _build_pyromind_storage_tools(
         http_request, request.extra
@@ -977,6 +999,7 @@ async def create_pyromind_conversation(
             Tool(name="grep"),
             Tool(name="file_editor"),
             Tool(name=RunWorkflowTool.name, params=run_tool.params),
+            Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
             *storage_tools,
             Tool(name=DslToXyflowTool.name),
             validation_tool,
@@ -1004,7 +1027,12 @@ async def create_pyromind_conversation(
         workspace=workspace,
         conversation_id=conversation_id,
         initial_message=None,
-        secrets={**validation_secrets, **run_secrets, **storage_secrets},
+        secrets={
+            **validation_secrets,
+            **run_secrets,
+            **debug_secrets,
+            **storage_secrets,
+        },
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
         user_id=user_id,
         # Pyromind exposes terminal, patch, and workflow execution tools. Treat
@@ -1254,6 +1282,7 @@ async def pyromind_workflow_callback(
         error_log=request.error_log,
         conversation_id=request.conversation_id,
         auto_run=request.auto_run,
+        from_workflow_debug=request.from_workflow_debug,
     )
     if result.outcome in {"unknown_task", "unknown_conversation"}:
         raise HTTPException(
