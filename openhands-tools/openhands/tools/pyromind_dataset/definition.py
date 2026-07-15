@@ -25,6 +25,7 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
+from openhands.tools.utils import default_path_access_policy
 
 
 if TYPE_CHECKING:
@@ -1000,6 +1001,7 @@ def _resolve_workspace_file(
 
     workspace = cast(Any, conversation).workspace
     workspace_dir = Path(workspace.working_dir).resolve()
+    path_policy = default_path_access_policy(workspace_dir)
     candidate = Path(file_path)
     resolved = (
         candidate.resolve()
@@ -1012,7 +1014,7 @@ def _resolve_workspace_file(
         raise ValueError(
             f"Cannot upload file outside the conversation workspace: {file_path}"
         ) from exc
-    if not resolved.is_file():
+    if not path_policy.check(resolved, "read") or not resolved.is_file():
         raise ValueError(f"Cannot upload missing workspace file: {file_path}")
     return resolved
 
@@ -1518,6 +1520,7 @@ def _write_preview_sample(
     workspace = cast(Any, conversation).workspace
     workspace_dir = Path(workspace.working_dir).resolve()
     sample_dir = workspace_dir / "preview_dataset"
+    path_policy = default_path_access_policy(workspace_dir)
 
     sample_content, suffix, limited_rows = _render_sample_file_content(
         preview_path,
@@ -1533,6 +1536,7 @@ def _write_preview_sample(
         / f"{_safe_sample_file_stem(preview_path)}-sample-{uuid.uuid4().hex[:8]}"
         f"{suffix}"
     )
+    path_policy.require(sample_file, "write")
     try:
         sample_dir.mkdir(parents=True, exist_ok=True)
         sample_file.write_text(sample_content, encoding="utf-8")

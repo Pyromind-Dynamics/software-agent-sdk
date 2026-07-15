@@ -18,6 +18,7 @@ from openhands.tools.glob.definition import GlobAction, GlobObservation
 from openhands.tools.utils import (
     _check_ripgrep_available,
     _log_ripgrep_fallback_warning,
+    default_path_access_policy,
 )
 
 
@@ -37,6 +38,7 @@ class GlobExecutor(ToolExecutor[GlobAction, GlobObservation]):
             working_dir: The working directory to use as the base for searches
         """
         self.working_dir: Path = Path(working_dir).resolve()
+        self.path_policy = default_path_access_policy(self.working_dir)
         self._ripgrep_available: bool = _check_ripgrep_available()
         if not self._ripgrep_available:
             _log_ripgrep_fallback_warning("glob", "Python glob module")
@@ -76,6 +78,15 @@ class GlobExecutor(ToolExecutor[GlobAction, GlobObservation]):
                     extracted_path if extracted_path is not None else self.working_dir
                 )
                 search_path = resolve_workspace_path(search_path, self.working_dir)
+
+            if not self.path_policy.check(search_path, "read"):
+                return GlobObservation.from_text(
+                    text=f"Path is not allowed for read: {search_path}",
+                    files=[],
+                    pattern=original_pattern,
+                    search_path=str(search_path),
+                    is_error=True,
+                )
 
             if not search_path.is_dir():
                 return GlobObservation.from_text(

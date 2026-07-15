@@ -2,20 +2,12 @@ import re
 import threading
 import time
 from contextlib import suppress
-from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from libtmux.exc import LibTmuxException, TmuxObjectDoesNotExist
 
 from openhands.sdk.llm import TextContent
 from openhands.sdk.logger import get_logger
-from openhands.sdk.security.command_policy import (
-    CommandExecutionContext,
-    CommandExecutionSource,
-    CommandPolicyAction,
-    CommandPolicyConfig,
-    evaluate_command,
-)
 from openhands.sdk.tool import ToolExecutor
 
 
@@ -41,7 +33,6 @@ from openhands.tools.terminal.terminal.tmux_pane_pool import (
     PooledTmuxTerminal,
     TmuxPanePool,
 )
-from openhands.tools.utils import terminal_public_read_block_reason
 
 
 _TMUX_POOL_RECOVERY_MESSAGE = (
@@ -434,40 +425,6 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
     # Execution paths
     # ------------------------------------------------------------------
 
-    def _evaluate_command_policy(
-        self,
-        action: TerminalAction,
-        conversation: "LocalConversation | None" = None,
-    ) -> TerminalObservation | None:
-        workspace_dir = Path(self._working_dir)
-        if conversation is not None:
-            workspace_dir = Path(conversation.workspace.working_dir)
-
-        decision = evaluate_command(
-            action.command,
-            CommandExecutionContext(
-                source=CommandExecutionSource.AGENT_TERMINAL,
-                conversation_id=getattr(conversation, "id", None),
-                workspace_dir=workspace_dir,
-                cwd=Path(self._working_dir),
-            ),
-            CommandPolicyConfig(allowed_roots=[workspace_dir]),
-        )
-        if decision.action != CommandPolicyAction.DENY:
-            return None
-
-        logger.warning(
-            "Terminal command blocked by command policy rule=%s command=%r",
-            decision.rule_id,
-            decision.redacted_command,
-        )
-        return TerminalObservation.from_text(
-            text=f"Blocked by command policy: {decision.reason}",
-            is_error=True,
-            command=decision.redacted_command,
-            exit_code=None,
-        )
-
     def _execute_single_session(
         self,
         action: TerminalAction,
@@ -609,19 +566,6 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                     command=action.command,
                     exit_code=None,
                 )
-
-            public_read_reason = terminal_public_read_block_reason(action.command)
-            if public_read_reason is not None:
-                return TerminalObservation.from_text(
-                    text=f"Blocked by public-read policy: {public_read_reason}",
-                    is_error=True,
-                    command=action.command,
-                    exit_code=None,
-                )
-
-            policy_observation = self._evaluate_command_policy(action, conversation)
-            if policy_observation is not None:
-                return policy_observation
 
         if self._pool is not None:
             return self._execute_pooled(action, conversation)
