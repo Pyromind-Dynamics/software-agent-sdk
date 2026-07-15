@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -719,6 +720,12 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         loop responsive during blocking tool I/O.
         """
         state = conversation.state
+        step_t0 = time.monotonic()
+        prepare_ms = 0.0
+        llm_ms = 0.0
+        tools_ms = 0.0
+        outcome = "ok"
+
         # Check for pending actions (implicit confirmation)
         pending_actions = ConversationState.get_unmatched_actions(state.events)
         if pending_actions:
@@ -726,7 +733,16 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                 "Confirmation mode: Executing %d pending action(s)",
                 len(pending_actions),
             )
+            tools_t0 = time.monotonic()
             await self._aexecute_actions(conversation, pending_actions, on_event)
+            tools_ms = (time.monotonic() - tools_t0) * 1000
+            logger.info(
+                "[perf] agent.astep conversation_id=%s outcome=pending_actions "
+                "prepare_ms=0.0 llm_ms=0.0 tools_ms=%.1f total_ms=%.1f",
+                state.id,
+                tools_ms,
+                (time.monotonic() - step_t0) * 1000,
+            )
             return
 
         if state.last_user_message_id is not None:
@@ -745,12 +761,21 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
 
         # Prepare LLM messages from the cached, incrementally-maintained view.
         # See https://github.com/OpenHands/software-agent-sdk/issues/3053.
+        prepare_t0 = time.monotonic()
         _messages_or_condensation = await aprepare_llm_messages(
             state.view, condenser=self.condenser, llm=self.llm
         )
+        prepare_ms = (time.monotonic() - prepare_t0) * 1000
 
         if isinstance(_messages_or_condensation, Condensation):
             on_event(_messages_or_condensation)
+            logger.info(
+                "[perf] agent.astep conversation_id=%s outcome=condensation "
+                "prepare_ms=%.1f llm_ms=0.0 tools_ms=0.0 total_ms=%.1f",
+                state.id,
+                prepare_ms,
+                (time.monotonic() - step_t0) * 1000,
+            )
             return
 
         _messages = _messages_or_condensation
@@ -761,13 +786,17 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         )
 
         try:
-            llm_response = await amake_llm_completion(
-                self.llm,
-                _messages,
-                tools=list(self.tools_map.values()),
-                on_token=on_token,
-                call_context=call_context,
-            )
+            llm_t0 = time.monotonic()
+            try:
+                llm_response = await amake_llm_completion(
+                    self.llm,
+                    _messages,
+                    tools=list(self.tools_map.values()),
+                    on_token=on_token,
+                    call_context=call_context,
+                )
+            finally:
+                llm_ms = (time.monotonic() - llm_t0) * 1000
         except FunctionCallValidationError as e:
             logger.warning(f"LLM generated malformed function call: {e}")
             error_message = MessageEvent(
@@ -778,6 +807,15 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                 ),
             )
             on_event(error_message)
+            logger.info(
+                "[perf] agent.astep conversation_id=%s "
+                "outcome=malformed_tool_call "
+                "prepare_ms=%.1f llm_ms=%.1f tools_ms=0.0 total_ms=%.1f",
+                state.id,
+                prepare_ms,
+                llm_ms,
+                (time.monotonic() - step_t0) * 1000,
+            )
             return
         except LLMContentPolicyViolationError as e:
             # Content-policy blocks are deterministic; nudge the model and let the
@@ -799,6 +837,15 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                         ],
                     ),
                 )
+            )
+            logger.info(
+                "[perf] agent.astep conversation_id=%s "
+                "outcome=content_policy "
+                "prepare_ms=%.1f llm_ms=%.1f tools_ms=0.0 total_ms=%.1f",
+                state.id,
+                prepare_ms,
+                llm_ms,
+                (time.monotonic() - step_t0) * 1000,
             )
             return
         except LLMMalformedConversationHistoryError as e:
@@ -822,6 +869,15 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                 # enforcement before the condensation retry.
                 state.rebuild_view()
                 on_event(CondensationRequest())
+                logger.info(
+                    "[perf] agent.astep conversation_id=%s "
+                    "outcome=malformed_history_condensation "
+                    "prepare_ms=%.1f llm_ms=%.1f tools_ms=0.0 total_ms=%.1f",
+                    state.id,
+                    prepare_ms,
+                    llm_ms,
+                    (time.monotonic() - step_t0) * 1000,
+                )
                 return
             logger.warning(
                 "LLM raised malformed conversation history error but "
@@ -842,6 +898,15 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                     "LLM raised context window exceeded error, triggering condensation"
                 )
                 on_event(CondensationRequest())
+                logger.info(
+                    "[perf] agent.astep conversation_id=%s "
+                    "outcome=context_window_condensation "
+                    "prepare_ms=%.1f llm_ms=%.1f tools_ms=0.0 total_ms=%.1f",
+                    state.id,
+                    prepare_ms,
+                    llm_ms,
+                    (time.monotonic() - step_t0) * 1000,
+                )
                 return
             # No condenser available; log helpful warning
             self._log_context_window_exceeded_warning()
@@ -852,14 +917,19 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
 
         match response_type:
             case LLMResponseType.TOOL_CALLS:
+                outcome = "tool_calls"
+                tools_t0 = time.monotonic()
                 await self._ahandle_tool_calls(
                     message, llm_response, conversation, state, on_event
                 )
+                tools_ms = (time.monotonic() - tools_t0) * 1000
             case LLMResponseType.CONTENT:
+                outcome = "content"
                 self._handle_content_response(
                     message, llm_response, conversation, state, on_event
                 )
             case LLMResponseType.REASONING_ONLY | LLMResponseType.EMPTY:
+                outcome = response_type.value
                 self._handle_no_content_response(
                     message,
                     llm_response,
@@ -868,6 +938,19 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                     on_event,
                     response_type=response_type,
                 )
+
+        logger.info(
+            "[perf] agent.astep conversation_id=%s outcome=%s "
+            "prepare_ms=%.1f llm_ms=%.1f tools_ms=%.1f total_ms=%.1f "
+            "n_messages=%d",
+            state.id,
+            outcome,
+            prepare_ms,
+            llm_ms,
+            tools_ms,
+            (time.monotonic() - step_t0) * 1000,
+            len(_messages),
+        )
 
     def _requires_user_confirmation(
         self, state: ConversationState, action_events: list[ActionEvent]
