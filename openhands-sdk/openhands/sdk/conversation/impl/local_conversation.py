@@ -3,6 +3,7 @@ import atexit
 import contextlib
 import copy
 import json
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -1684,6 +1685,8 @@ class LocalConversation(BaseConversation):
         """
         self._arun_task = asyncio.current_task()
         self._cancel_token = CancellationToken()
+        arun_t0 = time.monotonic()
+        iteration = 0
         # Off-load lazy init to a worker thread: init_state may block the loop
         # (an ACP agent resolves credentials via a synchronous LookupSecret
         # httpx.get). When the agent-server runs arun() on its event loop and
@@ -1691,7 +1694,13 @@ class LocalConversation(BaseConversation):
         # inline freezes the loop so the lookup can never be served — a
         # self-deadlock that ReadTimeouts after 30s (agent-canvas#1072).
         # _ensure_agent_ready is thread-safe and already runs off-loop in run().
+        init_t0 = time.monotonic()
         await asyncio.to_thread(self._ensure_agent_ready)
+        logger.info(
+            "[perf] conversation.arun init_ms=%.1f conversation_id=%s",
+            (time.monotonic() - init_t0) * 1000,
+            self._state.id,
+        )
 
         with self._state:
             if isinstance(self.agent, ACPAgent) and self._state.execution_status in (
@@ -1720,7 +1729,6 @@ class LocalConversation(BaseConversation):
                 ACP_LAST_PROMPT_USER_MESSAGE_ID
             )
 
-        iteration = 0
         _run_start_event_count = len(self._state.events)
         try:
             while True:
@@ -1842,6 +1850,7 @@ class LocalConversation(BaseConversation):
                         # worker threads skip re-acquiring it instead of
                         # deadlocking while this await holds it (#3485).
                         self._step_holds_state_lock = True
+                        step_t0 = time.monotonic()
                         try:
                             await self.agent.astep(
                                 self,
@@ -1851,6 +1860,14 @@ class LocalConversation(BaseConversation):
                         finally:
                             self._step_holds_state_lock = False
                         iteration += 1
+                        logger.info(
+                            "[perf] conversation.arun iteration=%d "
+                            "step_ms=%.1f status=%s conversation_id=%s",
+                            iteration,
+                            (time.monotonic() - step_t0) * 1000,
+                            self._state.execution_status,
+                            self._state.id,
+                        )
 
                         if (
                             self.state.execution_status
@@ -2123,6 +2140,14 @@ class LocalConversation(BaseConversation):
                 self._state.id, e, persistence_dir=self._state.persistence_dir
             ) from e
         finally:
+            logger.info(
+                "[perf] conversation.arun total_ms=%.1f iterations=%d "
+                "status=%s conversation_id=%s",
+                (time.monotonic() - arun_t0) * 1000,
+                iteration,
+                self._state.execution_status,
+                self._state.id,
+            )
             # A cancelled token must stay observable: interrupted tool calls run
             # in worker threads that can outlive arun() and still poll it. A
             # fresh token is created on the next run().

@@ -11,21 +11,19 @@ GRPO training aligned with SFT-style YAML: dataset_config, training_config (shar
 | 参数 | 数据类型 | 必填 | 描述 |
 |------|---------|------|------|
 | output_path | STRING | 是 | 输出目录或文件路径 |
-| dataset_config | STRING | 是 | 已组装的数据集配置 YAML 字符串 |
-| training_config | STRING | 是 | 训练配置 YAML 字符串（`BaseTrainingConfig` 字段） |
-| grpo_extra_config | STRING | 否 | GRPO 专用额外训练配置 YAML。默认值：空字符串 |
-| model_config | STRING | 是 | 模型配置 YAML 字符串 |
-| lora_config | STRING | 否 | 来自 Lora Config Builder 的 LoRA 配置 YAML |
-| reward_config | STRING | 是 | 来自 Reward Config Builder 的奖励配置 YAML |
+| dataset_config | STRING\|DATASET_CONFIG | 是 | 已组装的数据集配置 YAML 字符串 |
+| training_config | STRING\|TRAINING_CONFIG | 是 | 训练配置 YAML 字符串（`BaseTrainingConfig` 字段） |
+| grpo_extra_config | STRING\|GRPO_EXTRA_CONFIG | 否 | GRPO 专用额外训练配置 YAML。默认值：空字符串 |
+| model_config | STRING\|MODEL_CONFIG | 是 | 模型配置 YAML 字符串 |
+| lora_config | STRING\|LORA_CONFIG | 否 | 来自 Lora Config Builder 的 LoRA 配置 YAML |
+| reward_config | STRING\|REWARD_CONFIG | 是 | 来自 Reward Config Builder 的奖励配置 YAML |
 | wandb_config | WANDB_CONFIG | 否 | W&B 配置对象 |
 | thinking_as_input_ratio | FLOAT | 否 | 将思维链内容作为输入的比例。默认值：`0.0` |
-
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
 | model_output_path | STRING | 训练输出模型目录 |
-
 ## 1.4 Workflow JSON 定义
 
 完整 workflow 定义见 [`workflow/ModelTrainGRPONode/ModelTrainGRPONode.json`](../../workflow/ModelTrainGRPONode/ModelTrainGRPONode.json)。

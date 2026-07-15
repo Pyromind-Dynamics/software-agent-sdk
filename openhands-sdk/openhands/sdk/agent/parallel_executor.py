@@ -19,6 +19,7 @@ while tools touching *different* resources can run concurrently.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
@@ -129,35 +130,46 @@ class ParallelToolExecutor:
         if not action_events:
             return []
 
+        batch_t0 = time.monotonic()
+        tool_names = ",".join(ae.tool_name for ae in action_events)
+
         def _resolve(ae: ActionEvent) -> ToolDefinition | None:
             return tools.get(ae.tool_name) if tools else None
 
         if len(action_events) == 1 or self._max_workers == 1:
-            return [
+            results = [
                 await self._arun_safe(
                     action, tool_runner, _resolve(action), cancel_token
                 )
                 for action in action_events
             ]
-
-        with ThreadPoolExecutor(
-            max_workers=self._max_workers,
-            thread_name_prefix="aexecute_batch",
-        ) as pool:
-            return list(
-                await asyncio.gather(
-                    *[
-                        self._arun_safe(
-                            action,
-                            tool_runner,
-                            _resolve(action),
-                            cancel_token,
-                            pool,
-                        )
-                        for action in action_events
-                    ]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=self._max_workers,
+                thread_name_prefix="aexecute_batch",
+            ) as pool:
+                results = list(
+                    await asyncio.gather(
+                        *[
+                            self._arun_safe(
+                                action,
+                                tool_runner,
+                                _resolve(action),
+                                cancel_token,
+                                pool,
+                            )
+                            for action in action_events
+                        ]
+                    )
                 )
-            )
+
+        logger.info(
+            "[perf] tools.aexecute_batch batch_ms=%.1f n_tools=%d tools=%s",
+            (time.monotonic() - batch_t0) * 1000,
+            len(action_events),
+            tool_names,
+        )
+        return results
 
     async def _arun_safe(
         self,
@@ -189,11 +201,18 @@ class ParallelToolExecutor:
         timeout.
         """
         loop = asyncio.get_running_loop()
+        tool_t0 = time.monotonic()
         fut = loop.run_in_executor(
             executor, self._run_safe, action, tool_runner, tool, cancel_token
         )
         try:
-            return await fut
+            result = await fut
+            logger.info(
+                "[perf] tools.arun_safe tool=%s tool_ms=%.1f",
+                action.tool_name,
+                (time.monotonic() - tool_t0) * 1000,
+            )
+            return result
         except asyncio.CancelledError:
             # The asyncio task was cancelled (interrupt), but the
             # thread-pool worker is still running.  Signal the tool
@@ -207,6 +226,11 @@ class ParallelToolExecutor:
                         action.tool_name,
                         exc_info=True,
                     )
+            logger.info(
+                "[perf] tools.arun_safe tool=%s tool_ms=%.1f outcome=cancelled",
+                action.tool_name,
+                (time.monotonic() - tool_t0) * 1000,
+            )
             raise
 
     @staticmethod

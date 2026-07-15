@@ -1,6 +1,6 @@
 # 节点速查与常用参数
 
-节点完整契约（必填项、默认值、枚举）以 `<知识库绝对路径>/nodes/<NodeType>/<NodeType>.md`
+节点完整契约（必填项、默认值、枚举）以 `knowledge/nodes/<NodeType>/<NodeType>.md`
 为准，本文件只是速查。
 
 ## 节点速查表
