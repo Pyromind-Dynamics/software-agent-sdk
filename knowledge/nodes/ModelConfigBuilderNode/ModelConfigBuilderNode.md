@@ -12,13 +12,11 @@
 |------|---------|------|------|
 | model_path | STRING | 否 | HuggingFace 模型名或本地路径。默认值：`Qwen/Qwen3-VL-2B-Instruct` |
 | model_type | STRING | 否 | 模型架构类型（`auto`、`qwen3vl`、`qwen3.5`）。选项：`auto`, `qwen3vl`, `qwen3.5` |
-
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
-| model_config | STRING | 模型配置 YAML 字符串 |
-
+| model_config | STRING\|MODEL_CONFIG | 模型配置 YAML 字符串 |
 ## 1.4 Workflow JSON 定义
 
 完整 workflow 定义见 [`workflow/ModelConfigBuilderNode/ModelConfigBuilderNode.json`](../../workflow/ModelConfigBuilderNode/ModelConfigBuilderNode.json)。

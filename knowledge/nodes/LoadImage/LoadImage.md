@@ -12,14 +12,12 @@
 
 | 参数  | 数据类型      | 必填 | 描述 |
 |-------|---------------|----|------|
-| image | STRING (枚举) | 是 | 从 `/workspace/image_cache/` 中动态读取的图片文件列表。用户通过下拉菜单选择所需图片。支持 `image_upload` 扩展（允许用户上传新图片）。默认值：列表中第一个图片路径。 |
-
+| image | STRING | 是 | 从 `/workspace/image_cache/` 中动态读取的图片文件列表。用户通过下拉菜单选择所需图片。支持 `image_upload` 扩展（允许用户上传新图片）。默认值：列表中第一个图片路径。 |
 ## 1.3 输出类型
 
 | 参数            | 数据类型 | 描述 |
 |-----------------|----------|------|
-| image_file_path | STRING   | 图片在工作区中的完整路径，格式为 `/workspace/{所选图片路径}`。供下游节点（如 RL 训练、Rollout 等）读取图片内容使用。当前无路径存在性校验。 |
-
+| image_file_path | STRING | 图片在工作区中的完整路径，格式为 `/workspace/{所选图片路径}`。供下游节点（如 RL 训练、Rollout 等）读取图片内容使用。当前无路径存在性校验。 |
 ## 1.4 Workflow JSON 定义
 
 完整 workflow 定义见 [`workflow/LoadImage/LoadImage.json`](../../workflow/LoadImage/LoadImage.json)。

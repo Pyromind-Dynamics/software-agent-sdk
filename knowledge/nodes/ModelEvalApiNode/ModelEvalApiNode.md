@@ -14,18 +14,16 @@
 | endpoint_api_key | STRING | 否 | 推理 API Key。默认值：`empty` |
 | endpoint_model | STRING | 否 | 推理端点提供的模型名称。默认值：`default` |
 | output_path | STRING | 是 | 输出目录或文件路径 |
-| dataset_config | STRING | 是 | 已组装的数据集配置 YAML 字符串 |
-| metrics_config | STRING | 是 | Metrics config |
+| dataset_config | STRING\|DATASET_CONFIG | 是 | 已组装的数据集配置 YAML 字符串 |
+| metrics_config | STRING\|METRICS_CONFIG | 是 | Metrics config |
 | max_samples | INT | 否 | 最大评测样本数（0 表示全部）。默认值：`0` |
 | max_tokens | INT | 否 | 每次 API 调用的最大 token 数。默认值：`256` |
 | temperature | FLOAT | 否 | 采样温度。默认值：`0.01` |
-
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
 | benchmark_output_path | STRING | 基准评测报告输出路径 |
-
 ## 1.4 Workflow JSON 定义
 
 完整 workflow 定义见 [`workflow/ModelEvalApiNode/ModelEvalApiNode.json`](../../workflow/ModelEvalApiNode/ModelEvalApiNode.json)。

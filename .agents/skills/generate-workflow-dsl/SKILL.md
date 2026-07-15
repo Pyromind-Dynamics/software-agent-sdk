@@ -25,6 +25,15 @@ triggers:
 
 # 生成 Pyromind 工作流 DSL
 
+## 知识库访问限制
+
+- 知识库和共享技能文档只能通过 `grep` 和 `file_editor` 访问。
+- 查询知识库使用逻辑路径 `knowledge/...`；查询共享技能使用逻辑路径
+  `.agents/skills/...`。
+- 禁止使用 `terminal`、`find`、`ls`、`cat` 或 `apply_patch` 扫描、读取或修改知识库和技能目录。
+- 禁止请求、拼接或传递知识库和技能目录的宿主机绝对路径。
+- 节点文档直接用 `file_editor(command="view")` 打开已确定的逻辑路径；不要先扫描整个目录。
+
 ## 概述
 
 数据准备和清洗发生在生成训练工作流之前，当前能力不负责清洗或格式转换。数据入口可以是
@@ -197,15 +206,15 @@ variable_name = NodeType(
 它专门修正可能被上游同步覆盖的知识库契约。
 
 - 节点速查表和常用参数见 [references/node-reference.md](references/node-reference.md)
-- 节点契约文档路径固定：`<知识库绝对路径>/nodes/<NodeType>/<NodeType>.md`（知识库绝对
-  路径见路由提示）。已确定要用的节点直接读其文档，只读会实际用到或参数不确定的
+- 节点契约文档路径固定：`knowledge/nodes/<NodeType>/<NodeType>.md`。已确定要用的节点直接
+  读其文档，只读会实际用到或参数不确定的
 - 修改已有 `workflow.py` 前做两张内部清单：①需求验收项，把每个明确动作映射为可观察
   结果（“展示/预览返回内容”必须有 Preview 类节点消费结果端口；“评测”必须有指标、样本
   上限和结果输出）；②图差分，列出必须保留/新增/删除的节点与连线。修改后先核对验收项，
   再核对图差分，最后校验完整 DSL。静态校验通过不等于需求验收通过；未要求改变的有效模型、
   参数、节点和连线保持原样
 - grep 只用于补充检索，用宽泛关键词（`SFT`、`DPO`、`GRPO`、`dataset`、`reward` 或精确
-  NodeType），不要用完整标题、`^###`、`# workflow: ...` 这类依赖格式的 pattern
+  NodeType），不要使用 `.`、`^` 或其他会返回整个目录内容的 pattern，也不要扫描整个目录。
 - 只有用户问平台概念、Studio 操作、SDK 脚本写法时，才检索知识库的 `basic/`、`studio/`、
   `sdk/`、`jupyterlab/` 子目录
 

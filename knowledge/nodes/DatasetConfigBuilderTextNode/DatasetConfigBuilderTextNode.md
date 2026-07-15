@@ -14,13 +14,11 @@
 | user_prompt_field | STRING | 否 | user prompt 字段名。默认值：空字符串 |
 | assistant_response_field | STRING | 否 | 助手回复 / ground-truth 字段名。默认值：`gt` |
 | rejected_field | STRING | 否 | 拒绝回复 / rejected messages 字段名。默认值：`rejected_answer` |
-
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
-| dataset_kind_config | STRING | 来自 Kind Config Builder 节点的 dataset kind 配置 YAML |
-
+| dataset_kind_config | STRING\|DATASET_KIND_CONFIG | 来自 Kind Config Builder 节点的 dataset kind 配置 YAML |
 ## 1.4 Workflow JSON 定义
 
 完整 workflow 定义见 [`workflow/DatasetConfigBuilderTextNode/DatasetConfigBuilderTextNode.json`](../../workflow/DatasetConfigBuilderTextNode/DatasetConfigBuilderTextNode.json)。
