@@ -17,13 +17,11 @@ Build grpo_extra_config YAML (GRPO-only training fields; use with shared trainin
 | temperature | FLOAT | 否 | 采样温度。默认值：`0.7` |
 | enable_chord | BOOLEAN | 否 | 是否启用 CHORD 算法（GRPO extra）。默认值：false |
 | enable_hint | BOOLEAN | 否 | 是否启用 hint 模式（GRPO extra）。默认值：false |
-
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
-| grpo_extra_config | STRING | GRPO 专用额外训练配置 YAML |
-
+| grpo_extra_config | STRING\|GRPO_EXTRA_CONFIG | GRPO 专用额外训练配置 YAML |
 ## 1.4 Workflow JSON 定义
 
 完整 workflow 定义见 [`workflow/GRPOTrainingExtraConfigBuilderNode/GRPOTrainingExtraConfigBuilderNode.json`](../../workflow/GRPOTrainingExtraConfigBuilderNode/GRPOTrainingExtraConfigBuilderNode.json)。

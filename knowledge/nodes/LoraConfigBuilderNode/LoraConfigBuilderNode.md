@@ -14,13 +14,11 @@
 | lora_dropout | FLOAT | 否 | LoRA dropout。默认值：`0.05` |
 | target_modules | STRING | 否 | LoRA 目标模块（逗号分隔）。默认值：`q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj` |
 | exclude_modules | STRING | 否 | LoRA 排除模块（逗号分隔）。默认值：空字符串 |
-
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
-| lora_config | STRING | 来自 Lora Config Builder 的 LoRA 配置 YAML |
-
+| lora_config | STRING\|LORA_CONFIG | 来自 Lora Config Builder 的 LoRA 配置 YAML |
 ## 1.4 Workflow JSON 定义
 
 完整 workflow 定义见 [`workflow/LoraConfigBuilderNode/LoraConfigBuilderNode.json`](../../workflow/LoraConfigBuilderNode/LoraConfigBuilderNode.json)。

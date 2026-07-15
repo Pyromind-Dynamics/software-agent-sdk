@@ -62,7 +62,7 @@ run_workflow(
 - **真正让它跑起来的方式是 `run_workflow(test_mode=true)`**；测试通过与否、报错信息以
   callback 终态和 observation 中的 `error_log` 为准。报错来自平台侧节点的真实执行，定位方式
   是对照 `error_log` 与相关节点文档
-  （`<知识库绝对路径>/nodes/<NodeType>/<NodeType>.md`），而不是分析 Python 调用栈
+  （`knowledge/nodes/<NodeType>/<NodeType>.md`），而不是分析 Python 调用栈
 
 ## 与 `validate_workflow_dsl` 的区别
 
@@ -119,7 +119,7 @@ run_workflow(
 - 不要因为一次报错就大幅改变工作流结构（例如更换节点类型），除非 `error_log` 明确指出
   当前节点类型/组合不支持
 - 如果同一个报错连续出现两次以上，说明上一次的修改没有真正解决问题，重新读一遍
-  `error_log` 和相关节点文档（`<知识库绝对路径>/nodes/<NodeType>/<NodeType>.md`），
+  `error_log` 和相关节点文档（`knowledge/nodes/<NodeType>/<NodeType>.md`），
   不要重复同样的修改
 
 ## 与用户的沟通
