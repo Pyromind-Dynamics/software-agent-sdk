@@ -22,13 +22,11 @@
 | seed | INT | 否 | 随机种子。默认值：`42` |
 | resume_from_checkpoint | STRING | 否 | 恢复训练的 checkpoint 路径。默认值：空字符串 |
 | max_grad_norm | FLOAT | 否 | 梯度裁剪最大范数。默认值：`2` |
-
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
-| training_config | STRING | 训练配置 YAML 字符串（`BaseTrainingConfig` 字段） |
-
+| training_config | STRING\|TRAINING_CONFIG | 训练配置 YAML 字符串（`BaseTrainingConfig` 字段） |
 ## 1.4 Workflow JSON 定义
 
 完整 workflow 定义见 [`workflow/TrainingConfigBuilderNode/TrainingConfigBuilderNode.json`](../../workflow/TrainingConfigBuilderNode/TrainingConfigBuilderNode.json)。

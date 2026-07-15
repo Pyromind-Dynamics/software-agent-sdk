@@ -10,11 +10,11 @@
 
 | 参数          | 数据类型 | 必填 | 描述                                                                                                                |
 |-------------|---------|----|-------------------------------------------------------------------------------------------------------------------|
-| model_path  | STRING | 是  | 模型引用。默认值：-                                                                                                        |
-| environment | ENV | 否  | 环境变量名。默认值：-                                                                                                       |
-| port        | INT | 是  | 推理服务端口号                                                                                                           |
-| gpu_count   | INT | 是  | 推理服务使用的显卡个数                                                                                                       |
-| gpu_product | STRING | 是  | 显卡类型。默认值：`NVIDIA-H100-NVL` Options: NVIDIA-H100-NVL, NVIDIA-L40S, NVIDIA-H200, NVIDIA-B200, NVIDIA-H100-80GB-HBM3 |
+| model_path | STRING | 是 | 模型引用。默认值：- |
+| environment | ENV | 否 | 环境变量名。默认值：- |
+| port | INT | 是 | 推理服务端口号 |
+| gpu_count | INT | 是 | 推理服务使用的显卡个数 |
+| gpu_product | STRING | 是 | 显卡类型。枚举：NVIDIA-H200、NVIDIA-H100-80GB-HBM3、NVIDIA-L40S |
 
 
 

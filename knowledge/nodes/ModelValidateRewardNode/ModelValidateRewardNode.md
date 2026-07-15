@@ -10,16 +10,14 @@ Validate reward composition and score aggregation.
 
 | 参数 | 数据类型 | 必填 | 描述 |
 |------|---------|------|------|
-| reward_config | STRING | 是 | 来自 Reward Config Builder 的奖励配置 YAML |
+| reward_config | STRING\|REWARD_CONFIG | 是 | 来自 Reward Config Builder 的奖励配置 YAML |
 | completions | STRING | 否 | 用于奖励校验的可选 completions JSON。默认值：空字符串 |
-
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
 | status | STRING | 校验状态字符串 |
 | scores | STRING | 校验得分的 YAML/JSON 字符串 |
-
 ## 1.4 Workflow JSON 定义
 
 完整 workflow 定义见 [`workflow/ModelValidateRewardNode/ModelValidateRewardNode.json`](../../workflow/ModelValidateRewardNode/ModelValidateRewardNode.json)。

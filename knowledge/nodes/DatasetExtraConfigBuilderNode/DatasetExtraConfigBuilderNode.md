@@ -16,13 +16,11 @@
 | dpo_collator_entry | STRING | 否 | DPO collator 入口（`module:function`）。默认值：`train.dpo_collator:make_collate_fn` |
 | grpo_collator_entry | STRING | 否 | GRPO collator 入口（`module:function`）。默认值：`train.data.default_vision_grpo_collate:create_grpo_collate_fn` |
 | max_seq_length | INT | 否 | 最大序列长度。默认值：`4096` |
-
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
-| dataset_extra_config | STRING | 来自 Dataset Extra Config Builder 节点的额外配置 YAML |
-
+| dataset_extra_config | STRING\|DATASET_EXTRA_CONFIG | 来自 Dataset Extra Config Builder 节点的额外配置 YAML |
 ## 1.4 Workflow JSON 定义
 
 完整 workflow 定义见 [`workflow/DatasetExtraConfigBuilderNode/DatasetExtraConfigBuilderNode.json`](../../workflow/DatasetExtraConfigBuilderNode/DatasetExtraConfigBuilderNode.json)。

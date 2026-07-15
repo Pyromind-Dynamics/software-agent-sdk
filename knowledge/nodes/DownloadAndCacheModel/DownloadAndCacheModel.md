@@ -10,8 +10,8 @@
 
 | 参数 | 数据类型 | 必填 | 描述                                                    |
 |------|---------|------|-------------------------------------------------------|
-| modelname | STRING | 是 | 模型资源路径  默认值 : `Qwen/Qwen2.5-1.5B-Instruct`                           |
-| cache_dir | STRING | 是 | 目标文件夹。  默认值 : `/workspace/models/Qwen/Qwen2.5-1.5B-Instruct`                                                |
+| modelname | STRING | 是 | 模型资源路径  默认值 : `Qwen/Qwen2.5-1.5B-Instruct` |
+| cache_dir | STRING | 是 | 目标文件夹。  默认值 : `/workspace/models/Qwen/Qwen2.5-1.5B-Instruct` |
 | download_source | STRING | 是 | 下载源。默认值：`huggingface` Options: huggingface, modelscope |
 ## 1.3 输出类型
 

@@ -12,15 +12,13 @@
 |------|---------|------|------|
 | train_data_path | STRING | 是 | 训练数据路径 |
 | val_data_path | STRING | 否 | 验证数据路径。默认值：空字符串 |
-| dataset_kind_config | STRING | 否 | 来自 Kind Config Builder 节点的 dataset kind 配置 YAML。默认值：空字符串 |
-| dataset_extra_config | STRING | 否 | 来自 Dataset Extra Config Builder 节点的额外配置 YAML。默认值：空字符串 |
-
+| dataset_kind_config | STRING\|DATASET_KIND_CONFIG | 否 | 来自 Kind Config Builder 节点的 dataset kind 配置 YAML。默认值：空字符串 |
+| dataset_extra_config | STRING\|DATASET_EXTRA_CONFIG | 否 | 来自 Dataset Extra Config Builder 节点的额外配置 YAML。默认值：空字符串 |
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
-| dataset_config | STRING | 已组装的数据集配置 YAML 字符串 |
-
+| dataset_config | STRING\|DATASET_CONFIG | 已组装的数据集配置 YAML 字符串 |
 ## 1.4 Workflow JSON 定义
 
 完整 workflow 定义见 [`workflow/DatasetConfigBuilderNode/DatasetConfigBuilderNode.json`](../../workflow/DatasetConfigBuilderNode/DatasetConfigBuilderNode.json)。
