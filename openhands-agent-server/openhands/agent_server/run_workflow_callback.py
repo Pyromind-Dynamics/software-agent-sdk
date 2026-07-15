@@ -30,6 +30,7 @@ Module layout / 模块结构
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -333,6 +334,7 @@ async def deliver_run_workflow_status(
     """
     del updated_at  # reserved for future idempotency / ordering
 
+    deliver_t0 = time.monotonic()
     normalized_status = normalize_platform_status(status)
     service = conversation_service or get_default_conversation_service()
 
@@ -433,6 +435,7 @@ async def deliver_run_workflow_status(
 
     # Step 7: Deliver to conversation and auto_run.
     try:
+        resume_t0 = time.monotonic()
         await resume_conversation_after_workflow(
             event_service=event_service,
             task_id=task_id,
@@ -440,6 +443,7 @@ async def deliver_run_workflow_status(
             error_log=error_log,
             auto_run=auto_run,
         )
+        resume_ms = (time.monotonic() - resume_t0) * 1000
     except Exception:
         _release_terminal_delivery(task_id)
         raise
@@ -450,6 +454,16 @@ async def deliver_run_workflow_status(
         normalized_status,
         conversation_uuid,
         auto_run,
+    )
+    logger.info(
+        "[perf] run_workflow_callback task_id=%s conversation_id=%s "
+        "resume_ms=%.1f total_ms=%.1f auto_run=%s status=%s",
+        task_id,
+        conversation_uuid,
+        resume_ms,
+        (time.monotonic() - deliver_t0) * 1000,
+        auto_run,
+        normalized_status,
     )
     return RunWorkflowCallbackResult(
         outcome="delivered_async",

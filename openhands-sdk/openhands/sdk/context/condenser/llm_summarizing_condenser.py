@@ -1,4 +1,5 @@
 import os
+import time
 from collections.abc import Sequence
 from enum import Enum
 from typing import Final
@@ -201,8 +202,14 @@ class LLMSummarizingCondenser(RollingCondenser):
         # Do not pass extra_body explicitly. The LLM handles forwarding
         # litellm_extra_body only when it is non-empty.
         try:
+            llm_t0 = time.monotonic()
             llm_response = self.llm.completion(
                 messages=messages,
+            )
+            logger.info(
+                "[perf] condenser.summarize llm_ms=%.1f n_forgotten=%d",
+                (time.monotonic() - llm_t0) * 1000,
+                len(forgotten_events),
             )
         except Exception as e:
             raise NoCondensationAvailableException(
@@ -395,7 +402,13 @@ class LLMSummarizingCondenser(RollingCondenser):
 
         messages = [Message(role="user", content=[TextContent(text=prompt)])]
         try:
+            llm_t0 = time.monotonic()
             llm_response = await self.llm.acompletion(messages=messages)
+            logger.info(
+                "[perf] condenser.asummarize llm_ms=%.1f n_forgotten=%d",
+                (time.monotonic() - llm_t0) * 1000,
+                len(forgotten_events),
+            )
         except Exception as e:
             raise NoCondensationAvailableException(
                 f"Summarization LLM call failed: {e}"
