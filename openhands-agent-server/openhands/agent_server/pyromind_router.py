@@ -58,6 +58,7 @@ from openhands.sdk import LLM, AgentContext, TextContent, Tool
 from openhands.sdk.conversation.request import (
     StartConversationRequest,
 )
+from openhands.sdk.skills import SkillRuntime
 from openhands.sdk.llm.message import Message
 from openhands.sdk.secret import SecretSource, SecretValue, StaticSecret
 from openhands.sdk.security.confirmation_policy import ConfirmRisky
@@ -124,9 +125,9 @@ _PYROMIND_DEBUG_URL_TIMEOUT_SECONDS = 30.0
 _PYROMIND_DEBUG_RESPONSE_BODY_LIMIT = 20000
 
 # Knowledge-base retrieval guidance layered on top of the codex base prompt via
-# get_codex_agent(custom_instructions=...). Kept lightweight: prefer invoking a
-# matching skill first, and only fall back to grep + file_editor for free-form
-# knowledge-base lookups.
+# get_codex_agent(custom_instructions=...). Match the Codex flow: prefer the
+# matching skill first; then use skill/runtime reads for skill docs; only fall
+# back to grep + file_editor for free-form knowledge-base lookups.
 PYROMIND_KB_INSTRUCTIONS = """\
 The Pyromind platform knowledge base is available through the read-only logical
 path `{knowledge_alias}/`. Do not use or request its host filesystem path.
@@ -142,6 +143,15 @@ Knowledge base layout:
 The shared skill documents are available through the read-only logical path
 `{skills_alias}/`. Do not use or request their host filesystem path.
 
+Skill usage rules:
+- If the user request matches a listed skill, invoke that skill first.
+- For skill document lookup, use `skills_list` / `skills_read` style access,
+  not grep or directory scanning.
+- For skill-linked resources, read the exact relative path from the skill root;
+  do not manually search `references/`, `scripts/`, or `assets/` with grep.
+- Use `grep` and `file_editor` only as a fallback when the request is not skill-
+  addressed or when you need a free-form knowledge-base article.
+
 Your current working directory is this conversation's private workspace:
 {working_dir}
 
@@ -155,24 +165,21 @@ After creating or modifying `workflow.py`, stop normally; the server sends
 the workflow to the frontend once the run finishes. Do not say the workflow has
 been generated unless a tool call actually created or modified `workflow.py`.
 
-- If a listed skill fits the request (for example, generating a workflow), \
-invoke it via `invoke_skill` before searching the knowledge base. Do not invoke
-a workflow-generation skill for an article lookup alone.
-- For knowledge-base or skill-document requests, prefer `grep` and
-  `file_editor` with the logical `{knowledge_alias}/` or `{skills_alias}/` path.
-  `terminal` is also available when direct filesystem inspection is needed.
-  Do not use `apply_patch` to modify public knowledge or skill documents. Open
-  matched files with `file_editor` before
-answering or editing `workflow.py`; never infer APIs or operational facts from
-filenames or directory listings.
+- For knowledge-base or skill-document requests that are not skill-linked,
+  prefer `grep` and `file_editor` with the logical `{knowledge_alias}/` or
+  `{skills_alias}/` path. `terminal` is also available when direct filesystem
+  inspection is needed. Do not use `apply_patch` to modify public knowledge or
+  skill documents. Open matched files with `file_editor` before answering or
+  editing `workflow.py`; never infer APIs or operational facts from filenames or
+  directory listings.
 - For "查看知识库有哪些信息" or similar inventory requests, use one `grep`
-call per top-level directory (`basic`, `jupyterlab`, `sdk`, `studio`, and
-`nodes`) with `include="*.mdx"` and pattern `^title:|^# `; do not use pattern
-`.` or `^` because those return document bodies instead of an index.
+  call per top-level directory (`basic`, `jupyterlab`, `sdk`, `studio`, and
+  `nodes`) with `include="*.mdx"` and pattern `^title:|^# `; do not use pattern
+  `.` or `^` because those return document bodies instead of an index.
 - For requests to output, summarize, or explain specific knowledge-base
-articles, first search with `grep` under `knowledge/<subdirectory>` using
-`include="*.mdx"`, then open only the matched files with `file_editor` using
-the same logical path. Use `*.md` only when an `.mdx` search has no matches.
+  articles, first search with `grep` under `knowledge/<subdirectory>` using
+  `include="*.mdx"`, then open only the matched files with `file_editor` using
+  the same logical path. Use `*.md` only when an `.mdx` search has no matches.
 - For a Pyromind knowledge-base answer:
   1. Split the user's request into explicit subquestions.
   2. From files you actually opened, make a short checklist of directly relevant
@@ -182,7 +189,7 @@ the same logical path. Use `*.md` only when an `.mdx` search has no matches.
      same list or table without a reason.
   Do not show this internal checklist unless the user asks for sources.
 - For workflow generation, use the matching skill and consult `knowledge/` only
-when needed for platform details.
+  when needed for platform details.
 """
 
 
@@ -945,6 +952,7 @@ async def create_pyromind_conversation(
     #    actually call invoke_skill(...) (prompt text alone does not attach it).
     skills_path = request.extra.get("skills_path", _DEFAULT_SKILLS_PATH)
     skills = _load_agent_skills(skills_path, allow_list=_PYROMIND_SKILL_NAMES)
+    skill_runtime = SkillRuntime(skills) if skills else None
     agent_context = AgentContext(skills=skills) if skills else None
     validation_tool, validation_secrets = _build_workflow_validation_tool(
         http_request, request.extra
