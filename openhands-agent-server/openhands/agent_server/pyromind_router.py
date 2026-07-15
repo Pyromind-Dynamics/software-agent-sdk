@@ -54,11 +54,11 @@ from openhands.agent_server.workflow_canvas_store import (
     WorkflowCanvasStoreError,
     WorkflowCanvasVersionNotFoundError,
 )
-from openhands.sdk import LLM, AgentContext, TextContent, Tool
+from openhands.sdk import LLM, AgentContext, TextContent, Tool, register_tool
 from openhands.sdk.conversation.request import (
     StartConversationRequest,
 )
-from openhands.sdk.skills import SkillRuntime
+from openhands.sdk.tool.builtins import SkillsListTool, SkillsReadTool
 from openhands.sdk.llm.message import Message
 from openhands.sdk.secret import SecretSource, SecretValue, StaticSecret
 from openhands.sdk.security.confirmation_policy import ConfirmRisky
@@ -913,8 +913,10 @@ async def create_pyromind_conversation(
       file_editor for KB search (grep finds files, file_editor views them)
     - Workspace pointing to a conversation-private directory
     """
-    # Ensure the grep tool is registered (codex tools are registered by the preset).
+    # Register default and optional skill-runtime tools before agent resolution.
     register_default_tools(enable_browser=False)
+    register_tool(SkillsListTool.__name__, SkillsListTool)
+    register_tool(SkillsReadTool.__name__, SkillsReadTool)
 
     # 1. Resolve knowledge base path (extra can override the default)
     knowledge_base_path = request.extra.get(
@@ -952,7 +954,6 @@ async def create_pyromind_conversation(
     #    actually call invoke_skill(...) (prompt text alone does not attach it).
     skills_path = request.extra.get("skills_path", _DEFAULT_SKILLS_PATH)
     skills = _load_agent_skills(skills_path, allow_list=_PYROMIND_SKILL_NAMES)
-    skill_runtime = SkillRuntime(skills) if skills else None
     agent_context = AgentContext(skills=skills) if skills else None
     validation_tool, validation_secrets = _build_workflow_validation_tool(
         http_request, request.extra
@@ -982,6 +983,14 @@ async def create_pyromind_conversation(
         agent_context=agent_context,
         custom_instructions=custom_instructions,
         extra_tools=[
+            *(
+                [
+                    Tool(name=SkillsListTool.__name__),
+                    Tool(name=SkillsReadTool.__name__),
+                ]
+                if skills
+                else []
+            ),
             Tool(name="grep"),
             Tool(name="file_editor"),
             Tool(name=RunWorkflowTool.name, params=run_tool.params),

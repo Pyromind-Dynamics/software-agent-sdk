@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Self
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from openhands.sdk.skills import SkillRuntime
 from openhands.sdk.tool.tool import (
@@ -36,25 +36,28 @@ class SkillsReadObservation(Observation):
     contents: str = Field()
 
 
-class SkillsListExecutor(ToolExecutor):
-    def __init__(self, runtime: SkillRuntime) -> None:
-        self.runtime = runtime
+def _runtime_from_conversation(conversation) -> SkillRuntime:
+    if conversation is None:
+        return SkillRuntime([])
+    context = conversation.state.agent.agent_context
+    return SkillRuntime(list(context.skills) if context else [])
 
+
+class SkillsListExecutor(ToolExecutor):
     def __call__(self, action: SkillsListAction, conversation=None) -> SkillsListObservation:
+        runtime = _runtime_from_conversation(conversation)
         if action.query:
-            selection = self.runtime.select(action.query, limit=action.limit)
+            selection = runtime.select(action.query, limit=action.limit)
             return SkillsListObservation(
                 skills=[entry.name for entry in selection.candidate_entries]
             )
-        return SkillsListObservation(skills=[entry.name for entry in self.runtime.list()])
+        return SkillsListObservation(skills=[entry.name for entry in runtime.list()])
 
 
 class SkillsReadExecutor(ToolExecutor):
-    def __init__(self, runtime: SkillRuntime) -> None:
-        self.runtime = runtime
-
     def __call__(self, action: SkillsReadAction, conversation=None) -> SkillsReadObservation:
-        result = self.runtime.read(action.skill_name, action.path)
+        runtime = _runtime_from_conversation(conversation)
+        result = runtime.read(action.skill_name, action.path)
         return SkillsReadObservation(
             skill_name=result.entry.name,
             path=result.handle.relative_path,
@@ -63,19 +66,19 @@ class SkillsReadExecutor(ToolExecutor):
 
 
 class SkillsListTool(ToolDefinition[SkillsListAction, SkillsListObservation]):
+    def declared_resources(self, action: Action) -> DeclaredResources:
+        return DeclaredResources(keys=(), declared=True)
+
     @classmethod
     def create(cls, conv_state=None, **params) -> Sequence[Self]:
-        runtime = params.pop("runtime", None)
         if params:
             raise ValueError("SkillsListTool doesn't accept parameters")
-        if runtime is None:
-            raise ValueError("SkillsListTool requires runtime")
         return [
             cls(
                 action_type=SkillsListAction,
                 observation_type=SkillsListObservation,
                 description="List available skills, optionally filtering by query.",
-                executor=SkillsListExecutor(runtime),
+                executor=SkillsListExecutor(),
                 annotations=ToolAnnotations(
                     title="skills_list",
                     readOnlyHint=True,
@@ -88,19 +91,24 @@ class SkillsListTool(ToolDefinition[SkillsListAction, SkillsListObservation]):
 
 
 class SkillsReadTool(ToolDefinition[SkillsReadAction, SkillsReadObservation]):
+    def declared_resources(self, action: Action) -> DeclaredResources:
+        path = getattr(action, "path", "SKILL.md")
+        skill_name = getattr(action, "skill_name", "")
+        return DeclaredResources(
+            keys=(f"skill:{skill_name}:{path}",),
+            declared=True,
+        )
+
     @classmethod
     def create(cls, conv_state=None, **params) -> Sequence[Self]:
-        runtime = params.pop("runtime", None)
         if params:
             raise ValueError("SkillsReadTool doesn't accept parameters")
-        if runtime is None:
-            raise ValueError("SkillsReadTool requires runtime")
         return [
             cls(
                 action_type=SkillsReadAction,
                 observation_type=SkillsReadObservation,
                 description="Read a skill document or bundled resource by skill name and relative path.",
-                executor=SkillsReadExecutor(runtime),
+                executor=SkillsReadExecutor(),
                 annotations=ToolAnnotations(
                     title="skills_read",
                     readOnlyHint=True,

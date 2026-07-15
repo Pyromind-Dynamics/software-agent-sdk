@@ -17,11 +17,6 @@ from openhands.sdk.tool.builtins.invoke_skill import (
     InvokeSkillObservation,
     InvokeSkillTool,
 )
-from openhands.sdk.tool.builtins.skills import (
-    SkillsBuiltinFacade,
-    SkillsListObservation,
-    SkillsReadObservation,
-)
 from openhands.sdk.tool.builtins.skills_tool import (
     SkillsListAction,
     SkillsListExecutor,
@@ -81,9 +76,6 @@ __all__ = [
     "SkillsReadAction",
     "SkillsReadObservation",
     "SkillsReadExecutor",
-    "SkillsBuiltinFacade",
-    "SkillsListObservation",
-    "SkillsReadObservation",
     "SwitchLLMTool",
     "SwitchLLMAction",
     "SwitchLLMObservation",
