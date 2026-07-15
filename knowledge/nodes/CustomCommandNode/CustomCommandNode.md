@@ -14,7 +14,7 @@
 | cpu | INT | 是 | CPU 核数限制（1–64）。默认值：4 |
 | memory | INT | 是 | 内存限制，单位 GiB（1–256）。默认值：32 |
 | gpu_count | INT | 是 | 要申请的 GPU 数量（0–8）。默认值：0 |
-| gpu_product | STRING | 是 | gpu_count 大于零时要申请的 GPU 产品型号。枚举：NVIDIA-H200、NVIDIA-H100-80GB-HBM3、NVIDIA-L40S。 |
+| gpu_product | STRING | 是 | gpu_count 大于零时要申请的 GPU 产品型号，必须与集群匹配：`us-west-1` 支持 `NVIDIA-H100-NVL`、`NVIDIA-L40S`；`us-west-2` 支持 `NVIDIA-H200`、`NVIDIA-H100-80GB-HBM3`。 |
 
 ## 1.3 输出类型
 

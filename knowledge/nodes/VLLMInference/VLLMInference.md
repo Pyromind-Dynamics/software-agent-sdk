@@ -13,7 +13,7 @@
 | model_path | STRING | 是 | 模型路径引用 |
 | port | INT | 是 | 推理服务端口号。默认值：`3000` |
 | gpu_count | INT | 是 | 推理服务使用的显卡数量。默认值：`1` |
-| gpu_product | STRING | 是 | 显卡类型。枚举：NVIDIA-H200、NVIDIA-H100-80GB-HBM3、NVIDIA-L40S |
+| gpu_product | STRING | 是 | 显卡类型，必须与集群匹配：`us-west-1` 支持 `NVIDIA-H100-NVL`、`NVIDIA-L40S`；`us-west-2` 支持 `NVIDIA-H200`、`NVIDIA-H100-80GB-HBM3` |
 | environment | ENV | 否 | 环境变量 |
 | max_model_len | INT | 否 | 最大模型上下文长度 |
 
