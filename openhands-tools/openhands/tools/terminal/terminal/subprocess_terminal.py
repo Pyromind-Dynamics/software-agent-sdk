@@ -29,6 +29,7 @@ from openhands.tools.terminal.constants import (
     HISTORY_LIMIT,
 )
 from openhands.tools.terminal.metadata import CmdOutputMetadata
+from openhands.tools.terminal.sandbox import TerminalSandbox, TerminalSandboxMode
 from openhands.tools.terminal.terminal import TerminalInterface
 from openhands.tools.terminal.terminal.interface import parse_ctrl_key
 
@@ -84,6 +85,7 @@ class SubprocessTerminal(TerminalInterface):
         work_dir: str,
         username: str | None = None,
         shell_path: str | None = None,
+        sandbox_mode: TerminalSandboxMode = "off",
     ):
         super().__init__(work_dir, username)
         self.PS1 = CmdOutputMetadata.to_ps1_prompt()
@@ -96,6 +98,7 @@ class SubprocessTerminal(TerminalInterface):
         self.reader_thread = None
         self._current_command_running = False
         self.shell_path = shell_path
+        self.sandbox = TerminalSandbox(work_dir, sandbox_mode)
 
     # ------------------------- Lifecycle -------------------------
 
@@ -145,12 +148,18 @@ class SubprocessTerminal(TerminalInterface):
         env["PS2"] = ""
         env["TERM"] = "xterm-256color"
 
-        bash_cmd = [resolved_shell_path, "-i"]
+        self.sandbox.prepare()
+        bash_cmd = self.sandbox.wrap_command([resolved_shell_path, "-i"])
 
         # Create a PTY; give the slave to the child, keep the master
         master_fd, slave_fd = pty.openpty()
 
         logger.debug("Initializing PTY terminal with: %s", " ".join(bash_cmd))
+
+        def setup_child() -> None:
+            os.setsid()
+            self.sandbox.apply()
+
         try:
             self.process = subprocess.Popen(
                 bash_cmd,
@@ -161,7 +170,7 @@ class SubprocessTerminal(TerminalInterface):
                 env=env,
                 text=False,  # bytes I/O
                 bufsize=0,
-                preexec_fn=os.setsid,  # new process group for signal handling
+                preexec_fn=setup_child,
                 close_fds=True,
             )
         finally:
@@ -232,6 +241,7 @@ class SubprocessTerminal(TerminalInterface):
                 self.reader_thread.join(timeout=1)
 
             self.process = None
+            self.sandbox.cleanup()
             self._closed: bool = True
 
     # ------------------------- I/O Core -------------------------

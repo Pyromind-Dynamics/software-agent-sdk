@@ -44,6 +44,7 @@ from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
 from openhands.sdk.conversation.request import StartConversationRequest
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.llm.message import Message, TextContent
+from openhands.sdk.tool.builtins import SkillsListTool, SkillsReadTool
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
@@ -267,6 +268,8 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     tool_names = {tool.name for tool in service.start_request.agent.tools}
     assert "grep" in tool_names
     assert "file_editor" in tool_names
+    assert SkillsListTool.name not in tool_names
+    assert SkillsReadTool.name not in tool_names
     assert DslToXyflowTool.name in tool_names
     assert RunWorkflowTool.name in tool_names
     assert ValidateWorkflowDslTool.name in tool_names
@@ -337,6 +340,41 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert "base_url" not in dumped_agent["llm"]
     assert "api_key" not in dumped_agent["condenser"]["llm"]
     assert "base_url" not in dumped_agent["condenser"]["llm"]
+
+
+@pytest.mark.asyncio
+async def test_pyromind_conversation_registers_skill_runtime_tools(tmp_path):
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "generate-workflow-dsl"
+    (skill_dir / "references").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: generate-workflow-dsl\n"
+        "description: Generate workflow DSL\n---\n# Generate",
+        encoding="utf-8",
+    )
+    (skill_dir / "references" / "guide.md").write_text("guide", encoding="utf-8")
+    service = _FakeConversationService(tmp_path / "conversations")
+    response = Response()
+    request = _make_request({})
+    load_base_env(request)
+
+    await create_pyromind_conversation(
+        request,
+        PyromindCreateConversationRequest(
+            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            extra={"skills_path": str(skills_dir)},
+        ),
+        response,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert service.start_request is not None
+    tools = {tool.name: tool for tool in service.start_request.agent.tools}
+    assert SkillsListTool.name in tools
+    assert SkillsReadTool.name in tools
+    assert tools[SkillsListTool.name].params == {}
+    assert tools[SkillsReadTool.name].params == {}
+    service.start_request.model_dump(mode="json")
 
 
 @pytest.mark.asyncio

@@ -156,3 +156,9 @@ chmod +x /path/to/bash  # If needed
 - The `shell_path` configuration only affects the subprocess terminal type; tmux terminals will use whatever shell tmux is configured to use
 - The shell must be bash-compatible for proper operation
 - On reset, the terminal session will preserve the originally configured shell path
+- On Linux and macOS, terminal sessions require a kernel-backed filesystem
+  sandbox by default: Landlock on Linux and Seatbelt via `sandbox-exec` on
+  macOS. The shell can write only to the current working directory plus a
+  private temporary directory. Set `OH_TERMINAL_SANDBOX=off` for trusted local
+  development or `auto` for a best-effort fallback. Sandboxed sessions use an
+  isolated subprocess instead of the shared tmux pool.
