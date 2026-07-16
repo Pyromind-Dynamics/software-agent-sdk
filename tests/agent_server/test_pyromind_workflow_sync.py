@@ -23,36 +23,36 @@ from openhands.tools.pyromind_debug.broker import get_debug_result_broker
 
 def test_no_workflow_dsl_is_a_noop(tmp_path):
     assert _sync_workflow_with_canvas(tmp_path, None) is None
-    assert not (tmp_path / "workflow.py").exists()
+    assert not (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").exists()
 
 
 def test_from_scratch_both_empty_is_a_noop(tmp_path):
     assert _sync_workflow_with_canvas(tmp_path, "") is None
-    assert not (tmp_path / "workflow.py").exists()
+    assert not (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").exists()
 
 
 def test_already_in_sync_is_a_noop(tmp_path):
-    (tmp_path / "workflow.py").write_text("# workflow: demo\nx = 1\n", encoding="utf-8")
+    wf = tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
+    wf.parent.mkdir(parents=True, exist_ok=True)
+    wf.write_text("# workflow: demo\nx = 1\n", encoding="utf-8")
 
     reminder = _sync_workflow_with_canvas(tmp_path, "# workflow: demo\nx = 1\n")
 
     assert reminder is None
-    assert (tmp_path / "workflow.py").read_text(encoding="utf-8") == (
-        "# workflow: demo\nx = 1\n"
-    )
+    assert wf.read_text(encoding="utf-8") == ("# workflow: demo\nx = 1\n")
 
 
 def test_canvas_edited_overwrites_and_reminds(tmp_path):
-    (tmp_path / "workflow.py").write_text("# workflow: old\nx = 1\n", encoding="utf-8")
+    wf = tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
+    wf.parent.mkdir(parents=True, exist_ok=True)
+    wf.write_text("# workflow: old\nx = 1\n", encoding="utf-8")
 
     reminder = _sync_workflow_with_canvas(tmp_path, "# workflow: new\nx = 2\n")
 
     assert reminder is not None
     assert "system_reminder" in reminder.text
     assert "modified the workflow on the canvas" in reminder.text
-    assert (tmp_path / "workflow.py").read_text(encoding="utf-8") == (
-        "# workflow: new\nx = 2\n"
-    )
+    assert wf.read_text(encoding="utf-8") == ("# workflow: new\nx = 2\n")
 
 
 def test_canvas_seeds_missing_workflow_file(tmp_path):
@@ -60,23 +60,27 @@ def test_canvas_seeds_missing_workflow_file(tmp_path):
 
     assert reminder is not None
     assert "already had a workflow on the canvas" in reminder.text
-    assert (tmp_path / "workflow.py").read_text(encoding="utf-8") == (
-        "# workflow: from-canvas\n"
-    )
+    assert (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").read_text(
+        encoding="utf-8"
+    ) == ("# workflow: from-canvas\n")
 
 
 def test_canvas_cleared_removes_file_and_reminds(tmp_path):
-    (tmp_path / "workflow.py").write_text("# workflow: old\nx = 1\n", encoding="utf-8")
+    wf = tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
+    wf.parent.mkdir(parents=True, exist_ok=True)
+    wf.write_text("# workflow: old\nx = 1\n", encoding="utf-8")
 
     reminder = _sync_workflow_with_canvas(tmp_path, "")
 
     assert reminder is not None
     assert "cleared the workflow on the canvas" in reminder.text
-    assert not (tmp_path / "workflow.py").exists()
+    assert not wf.exists()
 
 
 def test_whitespace_only_diff_is_a_noop(tmp_path):
-    (tmp_path / "workflow.py").write_text("# workflow: demo\nx = 1\n", encoding="utf-8")
+    wf = tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
+    wf.parent.mkdir(parents=True, exist_ok=True)
+    wf.write_text("# workflow: demo\nx = 1\n", encoding="utf-8")
 
     reminder = _sync_workflow_with_canvas(tmp_path, "# workflow: demo\nx = 1\n\n\n  ")
 

@@ -284,7 +284,8 @@ def test_pyromind_runtime_llm_is_rehydrated_from_server_env(monkeypatch):
 def test_emit_pyromind_workflow_if_dirty_emits_event_and_clears_flag(
     tmp_path, monkeypatch
 ):
-    workflow = tmp_path / "workflow.py"
+    workflow = tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
+    workflow.parent.mkdir(parents=True, exist_ok=True)
     workflow.write_text("# workflow: Demo\nlimit = 20\n", encoding="utf-8")
     xyflow = {"name": "Demo", "nodes": [{"id": "limit"}], "edges": []}
     monkeypatch.setattr(
@@ -368,7 +369,10 @@ def test_save_pyromind_workflow_input_snapshot_ignores_non_pyromind(tmp_path):
 
 
 def test_emit_pyromind_workflow_if_not_dirty_does_nothing(tmp_path):
-    (tmp_path / "workflow.py").write_text("# workflow: Demo\n", encoding="utf-8")
+    (tmp_path / "public_data" / "workflow_canvas").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").write_text(
+        "# workflow: Demo\n", encoding="utf-8"
+    )
     service = _workflow_event_service(tmp_path, pyromind=True, agent_state={})
 
     emitted = service._emit_pyromind_workflow_if_dirty_sync()
@@ -398,7 +402,10 @@ def test_emit_pyromind_workflow_if_missing_file_clears_dirty(tmp_path):
 
 
 def test_emit_pyromind_workflow_ignores_non_pyromind_conversations(tmp_path):
-    (tmp_path / "workflow.py").write_text("# workflow: Demo\n", encoding="utf-8")
+    (tmp_path / "public_data" / "workflow_canvas").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").write_text(
+        "# workflow: Demo\n", encoding="utf-8"
+    )
     agent_state: dict[str, object] = {PYROMIND_WORKFLOW_DIRTY_KEY: True}
     service = _workflow_event_service(
         tmp_path,

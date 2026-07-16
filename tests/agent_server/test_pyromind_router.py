@@ -432,7 +432,13 @@ async def test_pyromind_conversation_converts_xyflow_before_seeding_workflow(
         conversation_service=cast(ConversationService, service),
     )
 
-    workflow_path = service.conversations_dir / info.id.hex / "workflow.py"
+    workflow_path = (
+        service.conversations_dir
+        / info.id.hex
+        / "public_data"
+        / "workflow_canvas"
+        / "workflow.py"
+    )
     assert workflow_path.read_text(encoding="utf-8") == (
         "# workflow: Canvas\nnode = Example()\n"
     )
@@ -547,7 +553,8 @@ async def test_pyromind_workflow_rollback_restores_snapshot_and_sends_correction
     conversation_dir = tmp_path / "conversation"
     working_dir = tmp_path / "workspace"
     working_dir.mkdir()
-    workflow_path = working_dir / "workflow.py"
+    workflow_path = working_dir / "public_data" / "workflow_canvas" / "workflow.py"
+    workflow_path.parent.mkdir(parents=True, exist_ok=True)
     workflow_path.write_text("# workflow: current\nstep = 2\n", encoding="utf-8")
     service = _FakePyromindMessageEventService(
         {PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
@@ -603,8 +610,9 @@ async def test_pyromind_workflow_rollback_returns_null_when_snapshot_is_missing(
     conversation_id = UUID("00000000-0000-0000-0000-000000000123")
     working_dir = tmp_path / "workspace"
     working_dir.mkdir()
-    workflow_path = working_dir / "workflow.py"
+    workflow_path = working_dir / "public_data" / "workflow_canvas" / "workflow.py"
     current_workflow = "# workflow: current\nstep = 2\n"
+    workflow_path.parent.mkdir(parents=True, exist_ok=True)
     workflow_path.write_text(current_workflow, encoding="utf-8")
     service = _FakePyromindMessageEventService(
         {PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},

@@ -157,7 +157,8 @@ def build_run_workflow_terminal_reminder(
         lines.append(
             "This terminal status is from a workflow_debug (test) run that "
             "failed. The workflow DSL may be wrong. Read the runtime error "
-            "below, regenerate or fix workflow.py accordingly (validate if "
+            "below, regenerate or fix "
+            "public_data/workflow_canvas/workflow.py accordingly (validate if "
             "needed), then call workflow_debug again to continue testing."
         )
     elif from_workflow_debug and status == "Terminated":

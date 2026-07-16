@@ -82,6 +82,7 @@ from openhands.tools.workflow import (
     RunWorkflowTool,
     ValidateWorkflowDslTool,
 )
+from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 from openhands.tools.workflow.dsl_to_xyflow import convert_xyflow_to_dsl
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
@@ -146,15 +147,20 @@ The shared skill documents are available through the read-only logical path
 Your current working directory is this conversation's private workspace:
 {working_dir}
 
-Create and edit the workflow DSL at the relative path `workflow.py` from the
-current working directory. Prefer `apply_patch` with `workflow.py` for workflow
-changes. If you use `file_editor` for this file, set its `path` to `workflow.py`;
-the runtime resolves workspace-relative paths to host-absolute paths. Do not
-hand-author long absolute paths, and do not use `/workspace/...` or
-`workspace/conversations/...` as a `file_editor.path` for `workflow.py`.
-After creating or modifying `workflow.py`, stop normally; the server sends
+Create and edit the workflow DSL at the relative path
+`public_data/workflow_canvas/workflow.py` from the current working directory.
+Prefer `apply_patch` for workflow changes. When using `apply_patch`, always
+use the full relative path in the patch header, e.g.
+`*** Add File: public_data/workflow_canvas/workflow.py` or
+`*** Update File: public_data/workflow_canvas/workflow.py` — never use the
+bare name `workflow.py`. If you use `file_editor` for this file, set its
+`path` to `public_data/workflow_canvas/workflow.py`; the runtime resolves
+workspace-relative paths to host-absolute paths. Do not hand-author long
+absolute paths, and do not use `/workspace/...` or
+`workspace/conversations/...` as a `file_editor.path` for the workflow file.
+After creating or modifying the workflow file, stop normally; the server sends
 the workflow to the frontend once the run finishes. Do not say the workflow has
-been generated unless a tool call actually created or modified `workflow.py`.
+been generated unless a tool call actually created or modified the workflow file.
 
 - If a listed skill fits the request (for example, generating a workflow), \
 invoke it via `invoke_skill` before searching the knowledge base. Do not invoke
@@ -164,7 +170,7 @@ a workflow-generation skill for an article lookup alone.
   `terminal` is also available when direct filesystem inspection is needed.
   Do not use `apply_patch` to modify public knowledge or skill documents. Open
   matched files with `file_editor` before
-answering or editing `workflow.py`; never infer APIs or operational facts from
+answering or editing the workflow file; never infer APIs or operational facts from
 filenames or directory listings.
 - For "查看知识库有哪些信息" or similar inventory requests, use one `grep`
 call per top-level directory (`basic`, `jupyterlab`, `sdk`, `studio`, and
@@ -510,7 +516,7 @@ class PyromindCreateConversationRequest(BaseModel):
         description=(
             "Optional xyflow JSON of the workflow currently on the canvas. "
             "When provided, the server converts it to workflow DSL before "
-            "seeding workflow.py."
+            "seeding the workflow file."
         ),
     )
     extra: dict[str, Any] = Field(
@@ -531,7 +537,7 @@ class PyromindSendMessageRequest(BaseModel):
     """Request body for sending a message in a Pyromind conversation.
 
     Unlike the generic ``POST /api/conversations/{id}/events`` endpoint, this
-    also accepts the workflow currently shown on the canvas, so that workflow.py
+    also accepts the workflow currently shown on the canvas, so that the workflow file
     is synced to what the user actually sees *before* the agent acts on this
     message.
     """
@@ -543,7 +549,7 @@ class PyromindSendMessageRequest(BaseModel):
         description=(
             "xyflow JSON of the workflow currently on the canvas. When "
             "provided, the server converts it to workflow DSL before syncing "
-            "workflow.py and saving the input snapshot."
+            "the workflow file and saving the input snapshot."
         ),
     )
     run: bool = Field(
@@ -713,7 +719,7 @@ def _sync_workflow_with_canvas(
     if workflow_dsl is None:
         return None
 
-    workflow_path = working_dir / "workflow.py"
+    workflow_path = working_dir / WORKFLOW_RELATIVE_PATH
     existed = workflow_path.is_file()
     current = workflow_path.read_text(encoding="utf-8") if existed else ""
 
@@ -723,7 +729,7 @@ def _sync_workflow_with_canvas(
         return None  # Already in sync -- also covers the from-scratch case
         # where the canvas and workflow.py are both empty/missing.
 
-    working_dir.mkdir(parents=True, exist_ok=True)
+    workflow_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not normalized_canvas:
         # The user cleared the canvas. Remove workflow.py entirely (rather
@@ -775,12 +781,12 @@ def _apply_workflow_snapshot_to_workspace(
     working_dir: Path,
     workflow_dsl: str,
 ) -> Literal["updated", "removed"]:
-    workflow_path = working_dir / "workflow.py"
+    workflow_path = working_dir / WORKFLOW_RELATIVE_PATH
     if not _normalize_dsl(workflow_dsl):
         workflow_path.unlink(missing_ok=True)
         return "removed"
 
-    working_dir.mkdir(parents=True, exist_ok=True)
+    workflow_path.parent.mkdir(parents=True, exist_ok=True)
     workflow_path.write_text(workflow_dsl, encoding="utf-8")
     return "updated"
 
@@ -1016,7 +1022,9 @@ async def create_pyromind_conversation(
     # prior-turn workflow.py content for the agent to contrast against.
     workflow_dsl = _workflow_dsl_from_xyflow(request.workflow_xyflow)
     if workflow_dsl:
-        (conversation_dir / "workflow.py").write_text(workflow_dsl, encoding="utf-8")
+        workflow_file = conversation_dir / WORKFLOW_RELATIVE_PATH
+        workflow_file.parent.mkdir(parents=True, exist_ok=True)
+        workflow_file.write_text(workflow_dsl, encoding="utf-8")
 
     # 7. Assemble StartConversationRequest. Pyromind sends the initial message
     # after startup through EventService so the workflow snapshot hook can bind

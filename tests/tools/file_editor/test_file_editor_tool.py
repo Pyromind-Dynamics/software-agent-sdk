@@ -3,12 +3,14 @@
 import os
 import tempfile
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 import pytest
 from pydantic import SecretStr
 
 from openhands.sdk.agent import Agent
+from openhands.sdk.conversation import LocalConversation
 from openhands.sdk.conversation.state import ConversationState
 from openhands.sdk.llm import LLM
 from openhands.sdk.tool import DeclaredResources
@@ -127,13 +129,17 @@ def test_file_editor_tool_view_file():
 
 def test_file_editor_executor_resolves_workspace_relative_path(tmp_path):
     """Executor accepts short workspace-relative paths and normalizes them."""
-    workflow = tmp_path / "workflow.py"
+    workflow_dir = tmp_path / "public_data" / "workflow_canvas"
+    workflow_dir.mkdir(parents=True)
+    workflow = workflow_dir / "workflow.py"
     workflow.write_text("# workflow: Demo\nlimit = 10\n", encoding="utf-8")
 
     executor = FileEditorExecutor(workspace_root=str(tmp_path))
     conversation = _DirtyConversation()
 
-    view_result = executor(FileEditorAction(command="view", path="workflow.py"))
+    view_result = executor(
+        FileEditorAction(command="view", path="public_data/workflow_canvas/workflow.py")
+    )
     assert not view_result.is_error
     assert view_result.path == str(workflow.resolve())
     assert "limit = 10" in view_result.text
@@ -142,11 +148,11 @@ def test_file_editor_executor_resolves_workspace_relative_path(tmp_path):
     edit_result = executor(
         FileEditorAction(
             command="str_replace",
-            path="workflow.py",
+            path="public_data/workflow_canvas/workflow.py",
             old_str="limit = 10",
             new_str="limit = 20",
         ),
-        conversation=conversation,
+        conversation=cast(LocalConversation, conversation),
     )
     assert not edit_result.is_error
     assert edit_result.path == str(workflow.resolve())
@@ -167,7 +173,7 @@ def test_file_editor_executor_non_workflow_edit_does_not_mark_dirty(tmp_path):
             old_str="10",
             new_str="20",
         ),
-        conversation=conversation,
+        conversation=cast(LocalConversation, conversation),
     )
 
     assert not result.is_error
@@ -181,7 +187,9 @@ def test_file_editor_executor_resolves_cwd_relative_conversation_path(
     repo = tmp_path / "software-agent-sdk"
     conversation_dir = repo / "workspace" / "conversations" / "abc123"
     conversation_dir.mkdir(parents=True)
-    workflow = conversation_dir / "workflow.py"
+    workflow_dir = conversation_dir / "public_data" / "workflow_canvas"
+    workflow_dir.mkdir(parents=True)
+    workflow = workflow_dir / "workflow.py"
     workflow.write_text("# workflow: Demo\nlimit = 10\n", encoding="utf-8")
     monkeypatch.chdir(repo)
 
@@ -190,7 +198,7 @@ def test_file_editor_executor_resolves_cwd_relative_conversation_path(
     result = executor(
         FileEditorAction(
             command="view",
-            path="workspace/conversations/abc123/workflow.py",
+            path="workspace/conversations/abc123/public_data/workflow_canvas/workflow.py",
         )
     )
 
@@ -201,7 +209,7 @@ def test_file_editor_executor_resolves_cwd_relative_conversation_path(
     absolute_alias_result = executor(
         FileEditorAction(
             command="view",
-            path="/workspace/conversations/abc123/workflow.py",
+            path="/workspace/conversations/abc123/public_data/workflow_canvas/workflow.py",
         )
     )
     assert not absolute_alias_result.is_error

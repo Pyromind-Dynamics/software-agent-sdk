@@ -232,7 +232,10 @@ def test_validate_workflow_dsl_reads_workflow_file_when_dsl_omitted(
         calls["json"] = json
         return _valid_response()
 
-    (tmp_path / "workflow.py").write_text("# workflow: from-file\n", encoding="utf-8")
+    (tmp_path / "public_data" / "workflow_canvas").mkdir(parents=True)
+    (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").write_text(
+        "# workflow: from-file\n", encoding="utf-8"
+    )
     monkeypatch.setattr(httpx, "post", fake_post)
 
     observation = ValidateWorkflowDslExecutor()(
