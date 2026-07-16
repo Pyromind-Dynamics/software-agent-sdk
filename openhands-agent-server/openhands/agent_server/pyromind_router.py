@@ -146,6 +146,13 @@ The shared skill documents are available through the read-only logical path
 
 Skill usage rules:
 - If the user request matches a listed skill, invoke that skill first.
+- A conversation may already contain a workflow at
+  `public_data/workflow_canvas/workflow.py`. Before asking for information or
+  answering any request that may inspect, modify, validate, test, or run the
+  current workflow, read that file in full with `file_editor`. Apply this rule
+  especially to short contextual requests such as "看数据", "改一下", or
+  "换个模型". Reuse dataset/model identifiers and topology already present in
+  the file instead of asking the user to provide them again.
 - For skill document lookup, use `skills_list` / `skills_read` style access,
   not grep or directory scanning.
 - For skill-linked resources, read the exact relative path from the skill root;
@@ -1023,7 +1030,6 @@ async def create_pyromind_conversation(
             ),
             Tool(name="grep"),
             Tool(name="file_editor"),
-            Tool(name=RunWorkflowTool.name, params=run_tool.params),
             Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
             *storage_tools,
             validation_tool,
@@ -1035,9 +1041,7 @@ async def create_pyromind_conversation(
     workspace = LocalWorkspace(working_dir=str(conversation_dir))
 
     # Seed workflow.py from a canvas the user already had before starting this
-    # conversation (e.g. they sketched something, then opened chat). No
-    # system_reminder is needed here -- this is turn 1, so there is no
-    # prior-turn workflow.py content for the agent to contrast against.
+    # conversation (e.g. they sketched something, then opened chat).
     workflow_dsl = _workflow_dsl_from_xyflow(request.workflow_xyflow)
     if workflow_dsl:
         workflow_file = conversation_dir / WORKFLOW_RELATIVE_PATH
@@ -1088,6 +1092,23 @@ async def create_pyromind_conversation(
         await event_service.send_message(
             Message(role="user", content=[TextContent(text=request.message)]),
             run=True,
+            extended_content=(
+                [
+                    TextContent(
+                        text=(
+                            "<system_reminder>\n"
+                            "A workflow from the current canvas is already loaded at "
+                            "public_data/workflow_canvas/workflow.py. Treat it as "
+                            "authoritative context. Read the full file with file_editor "
+                            "before interpreting this request or asking for dataset, "
+                            "model, or topology details already present there.\n"
+                            "</system_reminder>"
+                        )
+                    )
+                ]
+                if workflow_dsl
+                else None
+            ),
             workflow_dsl_snapshot=workflow_dsl,
             workflow_xyflow_snapshot=request.workflow_xyflow,
         )

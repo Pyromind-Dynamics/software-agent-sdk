@@ -55,7 +55,6 @@ from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
 )
 from openhands.tools.workflow import (
-    DslToXyflowTool,
     RunWorkflowTool,
     ValidateWorkflowDslTool,
 )
@@ -72,16 +71,32 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     repo_root = Path(__file__).parents[2]
     skill_root = repo_root / ".agents" / "skills" / "generate-workflow-dsl"
     skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
-    node_reference = (skill_root / "references" / "node-reference.md").read_text(
-        encoding="utf-8"
-    )
+    references = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in (skill_root / "references").glob("*.md")
+    }
 
-    assert "references/` 列表是索引，不是必读清单" in skill_text
-    assert "不要用它们读取\n  `.agents/skills/...`" in skill_text
-    assert "首次校验前不要逐个确认节点" in skill_text
-    assert "生成训练工作流前先读" not in skill_text
-    assert "已确定要用的节点直接" not in skill_text
-    assert "足以生成第一版 DSL，不要再逐个读取节点文档" in node_reference
+    frontmatter = skill_text.split("---", 2)[1]
+    assert set(
+        line.split(":", 1)[0]
+        for line in frontmatter.splitlines()
+        if line and not line.startswith(" ")
+    ) == {"name", "description"}
+    assert len(skill_text.splitlines()) <= 120
+    assert "只读取当前步骤需要的一份 reference" in skill_text
+    assert "ModelTrainSFTNode(" not in skill_text
+    assert set(references) == {
+        "custom-python-assets.md",
+        "data-routing.md",
+        "node-reference.md",
+        "parameter-decision.md",
+        "platform-contract-overrides.md",
+        "stage-templates.md",
+    }
+    assert not (skill_root / "references" / "example-workflows.md").exists()
+    assert "PathJoinNode → LoadDataset" in references["data-routing.md"]
+    assert "sample_file_path" in references["data-routing.md"]
+    assert "禁止调用 `run_dataset_cleaning`" in skill_text
 
 
 def test_pyromind_llm_config_normalizes_chat_completions_base_url() -> None:
@@ -139,6 +154,7 @@ class _FakeInitialMessageEventService:
         self.run: bool | None = None
         self.workflow_dsl_snapshot: str | None = None
         self.workflow_xyflow_snapshot: dict[str, Any] | None = None
+        self.extended_content: list[Any] | None = None
 
     async def send_message(
         self,
@@ -151,6 +167,7 @@ class _FakeInitialMessageEventService:
     ) -> None:
         self.sent_message = message
         self.run = run
+        self.extended_content = extended_content
         self.workflow_dsl_snapshot = workflow_dsl_snapshot
         self.workflow_xyflow_snapshot = workflow_xyflow_snapshot
 
@@ -284,10 +301,9 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     tool_names = {tool.name for tool in service.start_request.agent.tools}
     assert "grep" in tool_names
     assert "file_editor" in tool_names
-    assert SkillsListTool.name not in tool_names
-    assert SkillsReadTool.name not in tool_names
-    assert DslToXyflowTool.name in tool_names
-    assert RunWorkflowTool.name in tool_names
+    assert SkillsListTool.__name__ not in tool_names
+    assert SkillsReadTool.__name__ not in tool_names
+    assert RunWorkflowTool.name not in tool_names
     assert ValidateWorkflowDslTool.name in tool_names
     assert PreviewDatasetTool.name in tool_names
     assert UploadFileToPyromindTool.name in tool_names
@@ -298,16 +314,11 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         for tool in service.start_request.agent.tools
         if tool.name == ValidateWorkflowDslTool.name
     )
-    run_tool = next(
-        tool
-        for tool in service.start_request.agent.tools
-        if tool.name == RunWorkflowTool.name
-    )
     assert validation_tool.params == {
         "headers": {"x-cluster": "us-west-1#pre"},
         "secret_headers": {"cookie": "PYROMIND_VALIDATE_AUTH_COOKIE"},
     }
-    assert run_tool.params == {
+    expected_execution_params = {
         "current_user": None,
         "env": "pre",
         "cluster": "us-west-1",
@@ -317,7 +328,6 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         },
     }
     assert "session-token" not in str(validation_tool.params)
-    assert "secret_headers" not in run_tool.params
     assert (
         service.start_request.secrets["PYROMIND_VALIDATE_AUTH_COOKIE"].get_value()
         == cookie_header
@@ -343,7 +353,8 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
     assert upload_tool.params == preview_tool.params
-    assert cleaning_tool.params == run_tool.params
+    assert cleaning_tool.params == expected_execution_params
+    assert "secret_headers" not in cleaning_tool.params
     assert "session-token" not in str(preview_tool.params)
     assert (
         service.start_request.secrets["PYROMIND_STORAGE_AUTH_COOKIE"].get_value()
@@ -386,10 +397,10 @@ async def test_pyromind_conversation_registers_skill_runtime_tools(tmp_path):
 
     assert service.start_request is not None
     tools = {tool.name: tool for tool in service.start_request.agent.tools}
-    assert SkillsListTool.name in tools
-    assert SkillsReadTool.name in tools
-    assert tools[SkillsListTool.name].params == {}
-    assert tools[SkillsReadTool.name].params == {}
+    assert SkillsListTool.__name__ in tools
+    assert SkillsReadTool.__name__ in tools
+    assert tools[SkillsListTool.__name__].params == {}
+    assert tools[SkillsReadTool.__name__].params == {}
     service.start_request.model_dump(mode="json")
 
 
@@ -536,6 +547,11 @@ async def test_pyromind_conversation_initial_message_saves_workflow_snapshot(
         "# workflow: Canvas\nnode = Example()\n"
     )
     assert service.event_service.workflow_xyflow_snapshot == xyflow
+    assert service.event_service.extended_content is not None
+    reminder = service.event_service.extended_content[0]
+    assert isinstance(reminder, TextContent)
+    assert "workflow.py" in reminder.text
+    assert "Read the full file with file_editor" in reminder.text
 
 
 def test_workflow_dsl_from_xyflow_treats_empty_xyflow_as_empty_canvas():
