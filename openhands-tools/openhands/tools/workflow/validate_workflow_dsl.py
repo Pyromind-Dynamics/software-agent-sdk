@@ -18,6 +18,7 @@ from openhands.sdk.tool.tool import (
     ToolDefinition,
     ToolExecutor,
 )
+from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 
 
 if TYPE_CHECKING:
@@ -127,7 +128,8 @@ class ValidateWorkflowDslAction(Action):
         description=(
             "Pyromind workflow Python DSL source code to validate (not a file path). "
             "Pass the declarative workflow script text the agent generated or "
-            "edited. If omitted, the tool reads the saved `workflow.py` contents "
+            "edited. If omitted, the tool reads the saved "
+            "`public_data/workflow_canvas/workflow.py` contents "
             "from the active conversation workspace."
         ),
     )
@@ -365,7 +367,7 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
             )
 
         workspace = cast(Any, conversation).workspace
-        workflow_path = Path(workspace.working_dir) / "workflow.py"
+        workflow_path = Path(workspace.working_dir) / WORKFLOW_RELATIVE_PATH
         if not workflow_path.is_file():
             raise ValueError(
                 f"Cannot validate workflow DSL: {workflow_path} does not exist."

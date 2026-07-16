@@ -20,7 +20,10 @@ from openhands.tools.utils import (
     logical_public_read_path,
     resolve_public_read_alias,
 )
-from openhands.tools.workflow.definition import mark_pyromind_workflow_dirty
+from openhands.tools.workflow.definition import (
+    WORKFLOW_RELATIVE_PATH,
+    mark_pyromind_workflow_dirty,
+)
 
 
 # Module-global editor instance (lazily initialized in file_editor)
@@ -156,7 +159,7 @@ class FileEditorExecutor(ToolExecutor):
         conversation: "LocalConversation | None",
     ) -> None:
         target_path = Path(path).resolve()
-        workflow_path = (self.workspace_root / "workflow.py").resolve()
+        workflow_path = (self.workspace_root / WORKFLOW_RELATIVE_PATH).resolve()
         if target_path != workflow_path:
             return
         mark_pyromind_workflow_dirty(conversation)

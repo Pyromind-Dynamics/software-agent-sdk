@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 PYROMIND_WORKFLOW_DIRTY_KEY: Final[str] = "pyromind_workflow_dirty"
 PYROMIND_WORKFLOW_EMITTED_KEY: Final[str] = "pyromind_workflow_emitted"
 
+WORKFLOW_RELATIVE_PATH: Final[str] = "public_data/workflow_canvas/workflow.py"
+
 
 def mark_pyromind_workflow_dirty(conversation: Any | None) -> None:
     """Record that workflow.py changed during this run."""

@@ -124,7 +124,7 @@ Call the dedicated `workflow_debug` tool instead (it wraps this implementation w
 platform `execution_mode=test` and returns `keep_ui_lock`).
 
 Pass the required workflow Python DSL source code in `dsl` (not a file path). Read
-`workflow.py` from the workspace and pass its contents as `dsl`. Do not execute the
+`public_data/workflow_canvas/workflow.py` from the workspace and pass its contents as `dsl`. Do not execute the
 workflow locally with bash or Python.
 
 Platform execution is asynchronous: this tool returns a workflow task ID after

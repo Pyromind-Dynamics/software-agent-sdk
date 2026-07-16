@@ -110,8 +110,8 @@ Use this tool whenever the user asks to test, debug, 测试, 调试, or 试跑 a
 This is the only tool for debug/test runs — do **not** use `run_workflow` for
 测试/调试/试跑 (`run_workflow` has no agent-facing `test_mode` parameter).
 
-`workflow.py` is a declarative DSL, not a runnable Python script. Read
-`workflow.py` from the workspace and pass its contents as `dsl`. Do not execute
+`public_data/workflow_canvas/workflow.py` is a declarative DSL, not a runnable Python script. Read
+`public_data/workflow_canvas/workflow.py` from the workspace and pass its contents as `dsl`. Do not execute
 it locally with bash or Python.
 
 This tool delegates to `run_workflow`'s executor with internal `test_mode=true`
@@ -133,7 +133,7 @@ How to use the result:
   test workflow succeeded, then **wait for their next input**. Do not call
   workflow_debug again unless they ask.
 - Terminal Failed/Error (debug-tagged): the DSL may be wrong. Read `error_log`,
-  regenerate or fix `workflow.py` from the error, validate if needed, then call
+  regenerate or fix `public_data/workflow_canvas/workflow.py` from the error, validate if needed, then call
   `workflow_debug` again to continue testing.
 - Do not use this tool for production run/publish — use `run_workflow` instead.
   Production `run_workflow` does not return `keep_ui_lock`.

@@ -17,7 +17,10 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.utils import default_path_access_policy
-from openhands.tools.workflow.definition import mark_pyromind_workflow_dirty
+from openhands.tools.workflow.definition import (
+    WORKFLOW_RELATIVE_PATH,
+    mark_pyromind_workflow_dirty,
+)
 
 from .core import Commit, DiffError, process_patch
 
@@ -139,7 +142,7 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
         commit: Commit,
         conversation,
     ) -> None:
-        workflow_path = (self.workspace_root / "workflow.py").resolve()
+        workflow_path = (self.workspace_root / WORKFLOW_RELATIVE_PATH).resolve()
         for path in commit.changes:
             if self._resolve_path(path) == workflow_path:
                 mark_pyromind_workflow_dirty(conversation)

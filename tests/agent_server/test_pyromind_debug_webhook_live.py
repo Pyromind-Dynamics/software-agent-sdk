@@ -43,7 +43,9 @@ def _live_webhook_server() -> Generator[str]:
     app = create_app(config)
 
     port = find_available_tcp_port()
-    server_config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server_config = uvicorn.Config(
+        app, host="127.0.0.1", port=port, log_level="warning"
+    )
     server = uvicorn.Server(server_config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -98,7 +100,10 @@ def test_mock_platform_fail_fail_pass_over_real_http(tmp_path):
     """The core debug-loop scenario, driven end-to-end through a real HTTP
     callback into the live webhook route rather than an in-process shortcut.
     """
-    (tmp_path / "workflow.py").write_text("# workflow: demo\n", encoding="utf-8")
+    (tmp_path / "public_data" / "workflow_canvas").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").write_text(
+        "# workflow: demo\n", encoding="utf-8"
+    )
     conversation = _fake_conversation(tmp_path)
 
     with _live_webhook_server() as base_url:

@@ -38,7 +38,9 @@ def _fake_conversation(working_dir) -> LocalConversation:
 
 
 def _write_workflow(tmp_path) -> None:
-    (tmp_path / "workflow.py").write_text("# workflow: demo\n", encoding="utf-8")
+    workflow_dir = tmp_path / "public_data" / "workflow_canvas"
+    workflow_dir.mkdir(parents=True, exist_ok=True)
+    (workflow_dir / "workflow.py").write_text("# workflow: demo\n", encoding="utf-8")
 
 
 class _StubPlatform:

@@ -1,9 +1,12 @@
 from openhands.sdk.event.conversation_state import ConversationStateUpdateEvent
+from openhands.sdk.llm import TextContent
 from openhands.tools.workflow import WorkflowFileObservation, read_workflow_file
 
 
 def test_read_workflow_file_reads_workflow_py(tmp_path):
-    workflow_path = tmp_path / "workflow.py"
+    workflow_dir = tmp_path / "public_data" / "workflow_canvas"
+    workflow_dir.mkdir(parents=True)
+    workflow_path = workflow_dir / "workflow.py"
     workflow_path.write_text(
         "# workflow: Train demo\n"
         "\n"
@@ -19,7 +22,9 @@ def test_read_workflow_file_reads_workflow_py(tmp_path):
     assert observation.summary == "created demo workflow"
     assert "CloneAndCacheDataset" in observation.workflow
     assert observation.kind == "WorkflowFileObservation"
-    assert observation.to_llm_content[0].text == "Workflow Train demo (3 lines)."
+    content = observation.to_llm_content[0]
+    assert isinstance(content, TextContent)
+    assert content.text == "Workflow Train demo (3 lines)."
 
 
 def test_read_workflow_file_missing_file(tmp_path):
@@ -28,8 +33,12 @@ def test_read_workflow_file_missing_file(tmp_path):
     assert observation.exists is False
     assert observation.workflow == ""
     assert observation.name is None
-    assert observation.path == str(tmp_path / "workflow.py")
-    assert "No workflow.py found" in observation.to_llm_content[0].text
+    assert observation.path == str(
+        tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
+    )
+    content = observation.to_llm_content[0]
+    assert isinstance(content, TextContent)
+    assert "No workflow.py found" in content.text
 
 
 def test_workflow_file_observation_round_trips_in_state_event():

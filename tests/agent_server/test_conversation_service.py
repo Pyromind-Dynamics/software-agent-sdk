@@ -236,7 +236,8 @@ async def test_fork_conversation_at_event_creates_rollback_branch(
     source_service = await conversation_service.get_event_service(source_info.id)
     assert source_service is not None
 
-    workflow_path = source_workspace / "workflow.py"
+    workflow_path = source_workspace / "public_data" / "workflow_canvas" / "workflow.py"
+    workflow_path.parent.mkdir(parents=True, exist_ok=True)
     workflow_v1 = "# workflow: demo\nstep = 1\n"
     workflow_v2 = "# workflow: demo\nstep = 2\n"
     workflow_v2_xyflow = {
@@ -318,7 +319,12 @@ async def test_fork_conversation_at_event_creates_rollback_branch(
     assert fork_info.workspace.working_dir == str(
         conversation_service.conversations_dir / fork_info.id.hex
     )
-    fork_workflow_path = Path(fork_info.workspace.working_dir) / "workflow.py"
+    fork_workflow_path = (
+        Path(fork_info.workspace.working_dir)
+        / "public_data"
+        / "workflow_canvas"
+        / "workflow.py"
+    )
     assert fork_workflow_path.read_text(encoding="utf-8") == workflow_v2
     assert workflow_path.read_text(encoding="utf-8") == "# workflow: future\nstep = 3\n"
 
@@ -354,7 +360,8 @@ async def test_fork_conversation_at_event_accepts_input_snapshot(
     source_service = await conversation_service.get_event_service(source_info.id)
     assert source_service is not None
 
-    workflow_path = source_workspace / "workflow.py"
+    workflow_path = source_workspace / "public_data" / "workflow_canvas" / "workflow.py"
+    workflow_path.parent.mkdir(parents=True, exist_ok=True)
     input_workflow = "# workflow: user-input\nstep = 1\n"
     output_workflow = "# workflow: agent-output\nstep = 2\n"
     workflow_path.write_text(output_workflow, encoding="utf-8")
@@ -407,7 +414,12 @@ async def test_fork_conversation_at_event_accepts_input_snapshot(
     assert [event.id for event in fork_events] == [events[0].id]
     fork_state = await fork_service.get_state()
     assert fork_state.last_user_message_id == events[0].id
-    fork_workflow_path = Path(fork_info.workspace.working_dir) / "workflow.py"
+    fork_workflow_path = (
+        Path(fork_info.workspace.working_dir)
+        / "public_data"
+        / "workflow_canvas"
+        / "workflow.py"
+    )
     assert fork_workflow_path.read_text(encoding="utf-8") == input_workflow
 
     fork_store = FileWorkflowCanvasStore(
