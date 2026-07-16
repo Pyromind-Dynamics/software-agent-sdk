@@ -78,6 +78,8 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         full_output_save_dir: str | None = None,
         max_panes: int = DEFAULT_MAX_PANES,
         sandbox_mode: TerminalSandboxMode | None = None,
+        sandbox_read_only_paths: tuple[str, ...] = (),
+        sandbox_read_write_paths: tuple[str, ...] | None = None,
     ):
         """Initialize TerminalExecutor with auto-detected or specified session type.
 
@@ -99,11 +101,15 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         self._working_dir = working_dir
         self._username = username
         self._no_change_timeout_seconds = no_change_timeout_seconds
-        self._terminal_type = terminal_type
+        self._terminal_type: Literal["tmux", "subprocess", "powershell"] | None = (
+            terminal_type
+        )
         self._max_panes = max_panes
         self._sandbox_mode: TerminalSandboxMode = (
             sandbox_mode or terminal_sandbox_mode()
         )
+        self._sandbox_read_only_paths = sandbox_read_only_paths
+        self._sandbox_read_write_paths = sandbox_read_write_paths
         self.full_output_save_dir: str | None = full_output_save_dir
 
         # Pool mode: use TmuxPanePool for parallel execution
@@ -129,6 +135,8 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 terminal_type=terminal_type,
                 shell_path=shell_path,
                 sandbox_mode=self._sandbox_mode,
+                read_only_paths=self._sandbox_read_only_paths,
+                read_write_paths=self._sandbox_read_write_paths,
             )
             self._session.initialize()
             logger.info(
@@ -403,18 +411,20 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
     def _reset_single_session(self) -> TerminalObservation:
         """Reset the single-session terminal."""
         assert self._session is not None
-        original_work_dir = self._session.work_dir
-        original_username = self._session.username
-        original_no_change_timeout = self._session.no_change_timeout_seconds
+        saved_work_dir = self._session.work_dir
+        saved_username = self._session.username
+        saved_timeout = self._session.no_change_timeout_seconds
 
         self._session.close()
         self._session = create_terminal_session(
-            work_dir=original_work_dir,
-            username=original_username,
-            no_change_timeout_seconds=original_no_change_timeout,
-            terminal_type=None,
+            work_dir=saved_work_dir,
+            username=saved_username,
+            no_change_timeout_seconds=saved_timeout,
+            terminal_type=self._terminal_type,
             shell_path=self.shell_path,
             sandbox_mode=self._sandbox_mode,
+            read_only_paths=self._sandbox_read_only_paths,
+            read_write_paths=self._sandbox_read_write_paths,
         )
         self._session.initialize()
 
@@ -423,10 +433,7 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         )
 
         return TerminalObservation.from_text(
-            text=(
-                "Terminal session has been reset. All previous environment "
-                "variables and session state have been cleared."
-            ),
+            text=self._RESET_TEXT,
             command="[RESET]",
             exit_code=0,
         )

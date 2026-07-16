@@ -148,3 +148,54 @@ def test_seatbelt_profile_denies_sibling_directory(
         "-f",
         str(sandbox._seatbelt_profile),
     ]
+
+
+def test_seatbelt_profile_blocks_meta_json_in_conversation_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Darwin"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.shutil.which",
+        lambda _: "/usr/bin/sandbox-exec",
+    )
+    conv_dir = tmp_path / "conversations" / "abc123"
+    conv_dir.mkdir(parents=True)
+    (conv_dir / "events").mkdir()
+    (conv_dir / "public_data").mkdir()
+    (conv_dir / "meta.json").write_text("{}")
+
+    sandbox = TerminalSandbox(
+        str(conv_dir),
+        "required",
+        read_only_paths=("events",),
+        read_write_paths=("public_data",),
+    )
+    sandbox.prepare()
+
+    assert sandbox._seatbelt_profile is not None
+    profile = sandbox._seatbelt_profile.read_text()
+    events_path = str(conv_dir / "events")
+    public_data_path = str(conv_dir / "public_data")
+    assert f'(deny file-read* (subpath "{tmp_path / "conversations"}"))' in profile
+    assert f'(allow file-read* (subpath "{events_path}"))' in profile
+    assert f'(allow file-read* (subpath "{public_data_path}"))' in profile
+    meta_path = str(conv_dir / "meta.json")
+    assert f'(allow file-read* (subpath "{meta_path}"))' not in profile
+    assert f'(allow file-read* (subpath "{conv_dir}"))' not in profile
+
+
+def test_sandbox_resolves_relative_subpaths_against_work_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conv_dir = tmp_path / "workspace"
+    conv_dir.mkdir()
+    sandbox = TerminalSandbox(
+        str(conv_dir),
+        "auto",
+        read_only_paths=("events",),
+        read_write_paths=("public_data",),
+    )
+    assert sandbox.read_only_paths == (conv_dir / "events",)
+    assert sandbox.read_write_paths == (conv_dir / "public_data",)

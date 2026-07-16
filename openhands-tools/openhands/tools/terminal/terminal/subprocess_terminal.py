@@ -86,6 +86,8 @@ class SubprocessTerminal(TerminalInterface):
         username: str | None = None,
         shell_path: str | None = None,
         sandbox_mode: TerminalSandboxMode = "off",
+        read_only_paths: tuple[str, ...] = (),
+        read_write_paths: tuple[str, ...] | None = None,
     ):
         super().__init__(work_dir, username)
         self.PS1 = CmdOutputMetadata.to_ps1_prompt()
@@ -98,7 +100,12 @@ class SubprocessTerminal(TerminalInterface):
         self.reader_thread = None
         self._current_command_running = False
         self.shell_path = shell_path
-        self.sandbox = TerminalSandbox(work_dir, sandbox_mode)
+        self.sandbox = TerminalSandbox(
+            work_dir,
+            sandbox_mode,
+            read_only_paths=read_only_paths,
+            read_write_paths=read_write_paths,
+        )
 
     # ------------------------- Lifecycle -------------------------
 
@@ -111,7 +118,7 @@ class SubprocessTerminal(TerminalInterface):
         # 1. Explicit shell_path argument
         # 2. Auto-detection via shutil.which("bash") (searches PATH like `env bash`)
         resolved_shell_path: str | None
-        if self.shell_path:
+        if self.shell_path is not None:
             resolved_shell_path = self.shell_path
         else:
             resolved_shell_path = shutil.which("bash")
