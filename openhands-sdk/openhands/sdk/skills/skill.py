@@ -50,6 +50,7 @@ logger = get_logger(__name__)
 
 
 _REDACTED_SKILL_PATH = "<REDACTED_SKILL_PATH>"
+PRESERVE_SKILL_PATH_CONTEXT = "preserve_skill_path"
 
 
 class SkillInfo(BaseModel):
@@ -112,8 +113,10 @@ class SkillResources(BaseModel):
         return assets_dir if assets_dir.is_dir() else None
 
     @field_serializer("skill_root")
-    def _serialize_skill_root(self, _value: str, _info: SerializationInfo) -> str:
+    def _serialize_skill_root(self, value: str, info: SerializationInfo) -> str:
         """Redact the host-absolute skill root from persisted state."""
+        if info.context and info.context.get(PRESERVE_SKILL_PATH_CONTEXT):
+            return value
         return _REDACTED_SKILL_PATH
 
 
@@ -305,7 +308,7 @@ class Skill(BaseModel):
 
     @field_serializer("source")
     def _serialize_source(
-        self, value: str | None, _info: SerializationInfo
+        self, value: str | None, info: SerializationInfo
     ) -> str | None:
         """Redact host-absolute source paths from persisted state.
 
@@ -313,6 +316,8 @@ class Skill(BaseModel):
         """
         if value is None:
             return None
+        if info.context and info.context.get(PRESERVE_SKILL_PATH_CONTEXT):
+            return value
         if Path(value).is_absolute():
             return _REDACTED_SKILL_PATH
         return value

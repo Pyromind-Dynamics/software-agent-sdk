@@ -80,6 +80,8 @@ from openhands.sdk.security.confirmation_policy import (
     NeverConfirm,
 )
 from openhands.sdk.security.defense_in_depth import PatternSecurityAnalyzer
+from openhands.sdk.skills import load_skills_from_dir
+from openhands.sdk.skills.skill import PRESERVE_SKILL_PATH_CONTEXT
 from openhands.sdk.utils.async_utils import AsyncCallbackWrapper
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
@@ -139,6 +141,26 @@ def _with_pyromind_runtime_llm(agent: AgentBase) -> AgentBase:
             }
         )
     return agent.model_copy(update={"llm": runtime_llm, "condenser": condenser})
+
+
+def _with_pyromind_runtime_skills(agent: AgentBase) -> AgentBase:
+    context = agent.agent_context
+    if context is None or not any(
+        skill.resources is not None and not Path(skill.resources.skill_root).is_dir()
+        for skill in context.skills
+    ):
+        return agent
+
+    default_path = Path(__file__).resolve().parents[3] / ".agents" / "skills"
+    skills_path = Path(os.environ.get("PYROMIND_SKILLS_PATH", str(default_path)))
+    if not skills_path.is_dir():
+        return agent
+
+    _, _, available = load_skills_from_dir(skills_path)
+    skills = [available.get(skill.name, skill) for skill in context.skills]
+    return agent.model_copy(
+        update={"agent_context": context.model_copy(update={"skills": skills})}
+    )
 
 
 logger = get_logger(__name__)
@@ -1040,12 +1062,18 @@ class EventService:
         working_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_workspace_is_git_repo(working_dir)
         if self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE:
+            runtime_agent = _with_pyromind_runtime_skills(self.stored.agent)
             self.stored = self.stored.model_copy(
-                update={"agent": _with_pyromind_runtime_llm(self.stored.agent)}
+                update={"agent": _with_pyromind_runtime_llm(runtime_agent)}
             )
         agent_cls = type(self.stored.agent)
         agent = agent_cls.model_validate(
-            self.stored.agent.model_dump(context={"expose_secrets": True}),
+            self.stored.agent.model_dump(
+                context={
+                    "expose_secrets": True,
+                    PRESERVE_SKILL_PATH_CONTEXT: True,
+                }
+            ),
         )
 
         # Create LocalConversation with plugins and hook_config.

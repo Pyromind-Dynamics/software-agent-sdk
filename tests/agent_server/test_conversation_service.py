@@ -42,7 +42,7 @@ from openhands.agent_server.workflow_canvas_models import (
     SaveWorkflowCanvasEventSnapshotRequest,
 )
 from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
-from openhands.sdk import LLM, Agent, Message
+from openhands.sdk import LLM, Agent, AgentContext, Message
 from openhands.sdk.agent.acp_agent import ACPAgent
 from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
@@ -57,6 +57,11 @@ from openhands.sdk.llm import MessageToolCall, TextContent
 from openhands.sdk.secret import SecretSource, StaticSecret
 from openhands.sdk.security.confirmation_policy import NeverConfirm
 from openhands.sdk.security.risk import SecurityRisk
+from openhands.sdk.skills import Skill
+from openhands.sdk.tool.builtins.skills_tool import (
+    SkillsReadAction,
+    SkillsReadExecutor,
+)
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.terminal.definition import TerminalAction, TerminalObservation
@@ -215,6 +220,75 @@ def _test_workflow_event(
         key=PYROMIND_WORKFLOW_EVENT_KEY,
         value=observation.model_dump(mode="json"),
     )
+
+
+@pytest.mark.asyncio
+async def test_pyromind_skill_read_survives_persistence_round_trip(
+    conversation_service, tmp_path, monkeypatch
+):
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "generate-workflow-dsl"
+    references_dir = skill_dir / "references"
+    references_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: generate-workflow-dsl\n"
+        "description: Generate workflow DSL\n"
+        "---\n"
+        "# Generate",
+        encoding="utf-8",
+    )
+    (references_dir / "example-workflows.md").write_text(
+        "example workflow",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PYROMIND_SKILLS_PATH", str(skills_dir))
+    skill = Skill.load(skill_dir / "SKILL.md")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    request = StartConversationRequest(
+        agent=Agent(
+            llm=LLM(model="gpt-4o", usage_id="pyromind-agent"),
+            tools=[],
+            agent_context=AgentContext(skills=[skill]),
+        ),
+        workspace=LocalWorkspace(working_dir=str(workspace)),
+        tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
+    )
+
+    info, _ = await conversation_service.start_conversation(request)
+    service = await conversation_service.get_event_service(info.id)
+    assert service is not None
+    action = SkillsReadAction(
+        skill_name="generate-workflow-dsl",
+        path="references/example-workflows.md",
+    )
+    assert SkillsReadExecutor()(action, service.get_conversation()).contents == (
+        "example workflow"
+    )
+
+    meta_path = service.conversation_dir / "meta.json"
+    base_state_path = service.conversation_dir / "base_state.json"
+    meta_text = meta_path.read_text(encoding="utf-8")
+    base_state_text = base_state_path.read_text(encoding="utf-8")
+    assert str(skills_dir) not in meta_text
+    assert str(skills_dir) not in base_state_text
+    assert "<REDACTED_SKILL_PATH>" in meta_text
+    assert "<REDACTED_SKILL_PATH>" in base_state_text
+
+    await service.close()
+    conversation_service._event_services.pop(info.id)
+    resumed = EventService(
+        stored=StoredConversation.model_validate_json(meta_text),
+        conversations_dir=conversation_service.conversations_dir,
+        lease_ttl_seconds=0,
+    )
+    await resumed.start()
+    try:
+        observation = SkillsReadExecutor()(action, resumed.get_conversation())
+        assert observation.contents == "example workflow"
+    finally:
+        await resumed.close()
 
 
 @pytest.mark.asyncio

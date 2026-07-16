@@ -9,6 +9,7 @@ from openhands.sdk.skills import (
     Skill,
     TaskTrigger,
 )
+from openhands.sdk.skills.skill import PRESERVE_SKILL_PATH_CONTEXT
 from openhands.sdk.skills.types import InputMetadata
 from openhands.sdk.utils.models import OpenHandsModel
 
@@ -395,6 +396,27 @@ def test_absolute_skill_paths_are_redacted_in_serialization():
     json_str = skill.model_dump_json()
     assert sensitive_path not in json_str
     assert "<REDACTED_SKILL_PATH>" in json_str
+
+
+def test_absolute_skill_paths_can_be_preserved_for_runtime_round_trips():
+    """Trusted in-process round-trips can retain paths without changing defaults."""
+    from openhands.sdk.skills.skill import SkillResources
+
+    sensitive_path = "/Users/test/project/agent/software-agent-sdk/skills/test"
+    skill = Skill(
+        name="runtime-paths",
+        content="content",
+        source=f"{sensitive_path}/SKILL.md",
+        resources=SkillResources(skill_root=sensitive_path),
+    )
+
+    dumped = skill.model_dump(
+        mode="json",
+        context={PRESERVE_SKILL_PATH_CONTEXT: True},
+    )
+
+    assert dumped["source"] == f"{sensitive_path}/SKILL.md"
+    assert dumped["resources"]["skill_root"] == sensitive_path
 
 
 def test_relative_skill_source_is_preserved_in_serialization():

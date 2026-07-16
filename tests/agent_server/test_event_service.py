@@ -19,6 +19,7 @@ from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.event_service import (
     EventService,
     _with_pyromind_runtime_llm,
+    _with_pyromind_runtime_skills,
 )
 from openhands.agent_server.models import (
     ConfirmationResponseRequest,
@@ -33,7 +34,7 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_WORKFLOW_EVENT_KEY,
 )
 from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
-from openhands.sdk import LLM, Agent, AgentBase, Conversation, Message
+from openhands.sdk import LLM, Agent, AgentBase, AgentContext, Conversation, Message
 from openhands.sdk.agent import ACPAgent
 from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.conversation.event_store import EventLog
@@ -59,6 +60,7 @@ from openhands.sdk.io.local import LocalFileStore
 from openhands.sdk.io.memory import InMemoryFileStore
 from openhands.sdk.llm import MessageToolCall, TextContent
 from openhands.sdk.security.confirmation_policy import NeverConfirm
+from openhands.sdk.skills import Skill, SkillResources, SkillRuntime
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.terminal import TerminalAction, TerminalObservation
 from openhands.tools.workflow.definition import (
@@ -279,6 +281,49 @@ def test_pyromind_runtime_llm_is_rehydrated_from_server_env(monkeypatch):
     assert "base_url" not in dumped["llm"]
     assert "api_key" not in dumped["condenser"]["llm"]
     assert "base_url" not in dumped["condenser"]["llm"]
+
+
+def test_pyromind_runtime_skills_are_rehydrated_from_server_path(tmp_path, monkeypatch):
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "generate-workflow-dsl"
+    references_dir = skill_dir / "references"
+    references_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: generate-workflow-dsl\n"
+        "description: Generate workflow DSL\n"
+        "---\n"
+        "# Generate",
+        encoding="utf-8",
+    )
+    (references_dir / "example-workflows.md").write_text(
+        "example workflow",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PYROMIND_SKILLS_PATH", str(skills_dir))
+    persisted_skill = Skill(
+        name="generate-workflow-dsl",
+        content="# Generate",
+        source="<REDACTED_SKILL_PATH>",
+        is_agentskills_format=True,
+        resources=SkillResources(
+            skill_root="<REDACTED_SKILL_PATH>",
+            references=["example-workflows.md"],
+        ),
+    )
+    agent = Agent(
+        llm=LLM(model="gpt-4o", usage_id="pyromind-agent"),
+        tools=[],
+        agent_context=AgentContext(skills=[persisted_skill]),
+    )
+
+    updated = _with_pyromind_runtime_skills(agent)
+
+    assert updated.agent_context is not None
+    runtime = SkillRuntime(updated.agent_context.skills)
+    result = runtime.read("generate-workflow-dsl", "references/example-workflows.md")
+    assert result.handle.contents == "example workflow"
+    assert result.entry.resource_root == str(skill_dir.resolve())
 
 
 def test_emit_pyromind_workflow_if_dirty_emits_event_and_clears_flag(
