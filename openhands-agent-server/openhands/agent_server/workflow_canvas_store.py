@@ -42,7 +42,7 @@ class FileWorkflowCanvasStore:
     def __init__(self, conversation_dir: Path | str, session_id: str) -> None:
         self.conversation_dir = Path(conversation_dir)
         self.session_id = session_id
-        self._dir = self.conversation_dir / "workflow_canvas"
+        self._dir = self.conversation_dir / "public_data"
         self._path = self._dir / "state.json"
         self._lock_path = self._dir / ".workflow_canvas.lock"
 

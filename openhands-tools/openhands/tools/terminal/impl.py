@@ -20,6 +20,11 @@ from openhands.tools.terminal.definition import (
     TerminalObservation,
     looks_like_python_literal_argument,
 )
+from openhands.tools.terminal.sandbox import (
+    TerminalSandboxMode,
+    terminal_sandbox_enabled,
+    terminal_sandbox_mode,
+)
 from openhands.tools.terminal.terminal.factory import (
     _is_tmux_available,
     create_terminal_session,
@@ -72,6 +77,7 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         shell_path: str | None = None,
         full_output_save_dir: str | None = None,
         max_panes: int = DEFAULT_MAX_PANES,
+        sandbox_mode: TerminalSandboxMode | None = None,
     ):
         """Initialize TerminalExecutor with auto-detected or specified session type.
 
@@ -95,6 +101,9 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         self._no_change_timeout_seconds = no_change_timeout_seconds
         self._terminal_type = terminal_type
         self._max_panes = max_panes
+        self._sandbox_mode: TerminalSandboxMode = (
+            sandbox_mode or terminal_sandbox_mode()
+        )
         self.full_output_save_dir: str | None = full_output_save_dir
 
         # Pool mode: use TmuxPanePool for parallel execution
@@ -104,7 +113,11 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         self._sessions_lock = threading.Lock()
         self._pool_recovery_lock = threading.Lock()
 
-        use_pool = terminal_type in (None, "tmux") and _is_tmux_available()
+        use_pool = (
+            terminal_type in (None, "tmux")
+            and _is_tmux_available()
+            and not terminal_sandbox_enabled(self._sandbox_mode)
+        )
 
         if use_pool:
             self._initialize_pool()
@@ -115,6 +128,7 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 no_change_timeout_seconds=no_change_timeout_seconds,
                 terminal_type=terminal_type,
                 shell_path=shell_path,
+                sandbox_mode=self._sandbox_mode,
             )
             self._session.initialize()
             logger.info(
@@ -400,6 +414,7 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
             no_change_timeout_seconds=original_no_change_timeout,
             terminal_type=None,
             shell_path=self.shell_path,
+            sandbox_mode=self._sandbox_mode,
         )
         self._session.initialize()
 

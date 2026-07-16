@@ -1,0 +1,150 @@
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from openhands.tools.terminal.sandbox import (
+    TerminalSandbox,
+    terminal_sandbox_enabled,
+    terminal_sandbox_mode,
+)
+
+
+def test_terminal_sandbox_mode_rejects_unknown_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OH_TERMINAL_SANDBOX", "invalid")
+
+    with pytest.raises(ValueError, match="must be one of"):
+        terminal_sandbox_mode()
+
+
+def test_terminal_sandbox_prepare_creates_private_tmp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    sandbox = TerminalSandbox(str(tmp_path), "auto")
+
+    sandbox.prepare()
+
+    assert (tmp_path / ".openhands-tmp").is_dir()
+    assert (tmp_path / ".openhands-tmp").stat().st_mode & 0o777 == 0o700
+
+
+def test_terminal_sandbox_applies_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    class FakeLandlock:
+        def __init__(self, *, strict: bool):
+            assert strict
+
+        def __getattr__(self, name: str):
+            def record(*paths: str):
+                calls.append((name, paths))
+                return self
+
+            return record
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "py_landlock",
+        SimpleNamespace(Landlock=FakeLandlock),
+    )
+    sandbox = TerminalSandbox(str(tmp_path), "required")
+    sandbox.prepare()
+
+    sandbox.apply()
+
+    assert any(
+        name == "allow_read_write" and str(tmp_path) in paths for name, paths in calls
+    )
+    assert any(name == "allow_execute" for name, _ in calls)
+
+
+def test_terminal_sandbox_uses_explicit_read_and_write_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    class FakeLandlock:
+        def __init__(self, *, strict: bool):
+            assert strict
+
+        def __getattr__(self, name: str):
+            def record(*paths: str):
+                calls.append((name, paths))
+                return self
+
+            return record
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "py_landlock",
+        SimpleNamespace(Landlock=FakeLandlock),
+    )
+    workflow_dir = tmp_path / "workflow"
+    events_dir = tmp_path / "events"
+    workflow_dir.mkdir()
+    events_dir.mkdir()
+    sandbox = TerminalSandbox(
+        str(workflow_dir),
+        "required",
+        read_only_paths=(str(events_dir),),
+        read_write_paths=(str(workflow_dir),),
+    )
+    sandbox.prepare()
+    sandbox.apply()
+
+    read_write_calls = [paths for name, paths in calls if name == "allow_read_write"]
+    read_calls = [paths for name, paths in calls if name == "allow_read"]
+    assert any(str(workflow_dir) in paths for paths in read_write_calls)
+    assert any(str(events_dir) in paths for paths in read_calls)
+
+
+def test_terminal_sandbox_off_does_not_enable_on_linux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+
+    assert not terminal_sandbox_enabled("off")
+
+
+def test_seatbelt_profile_denies_sibling_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Darwin"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.shutil.which",
+        lambda _: "/usr/bin/sandbox-exec",
+    )
+    current = tmp_path / "current"
+    current.mkdir()
+    sandbox = TerminalSandbox(str(current), "required")
+
+    sandbox.prepare()
+
+    assert sandbox._seatbelt_profile is not None
+    profile = sandbox._seatbelt_profile.read_text()
+    assert f'(deny file-read* (subpath "{tmp_path}"))' in profile
+    assert f'(allow file-read* (subpath "{current}"))' in profile
+    assert '(allow file-read* (subpath "/agent-server/knowledge"))' in profile
+    assert '(allow file-read* (subpath "/agent-server/.agents/skills"))' in profile
+    assert sandbox.wrap_command(["/bin/bash", "-i"])[:3] == [
+        "/usr/bin/sandbox-exec",
+        "-f",
+        str(sandbox._seatbelt_profile),
+    ]
