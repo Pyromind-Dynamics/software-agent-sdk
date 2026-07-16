@@ -14,6 +14,7 @@ from openhands.sdk.logger import get_logger
 from openhands.sdk.tool import ToolExecutor
 from openhands.tools.task.manager import TaskManager
 from openhands.tools.workflow.definition import (
+    WORKFLOW_RELATIVE_PATH,
     WorkflowFileObservation,
     WorkflowObservation,
 )
@@ -547,7 +548,7 @@ def read_workflow_file(
     summary: str | None = None,
 ) -> WorkflowFileObservation:
     """Read workflow.py from a workspace and return a UI payload."""
-    workflow_path = Path(working_dir).resolve() / "workflow.py"
+    workflow_path = Path(working_dir).resolve() / WORKFLOW_RELATIVE_PATH
     path = str(workflow_path)
     if not workflow_path.is_file():
         return WorkflowFileObservation.from_text(

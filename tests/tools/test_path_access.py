@@ -5,6 +5,37 @@ import pytest
 from openhands.tools.utils import PathAccessPolicy, PathRule
 
 
+def assert_conversation_policy_shape(
+    policy: PathAccessPolicy, conversation_dir: Path
+) -> None:
+    """Assert the conversation-workspace permission matrix.
+
+    Single source of truth for tool-integration tests. Keep this in sync with
+    :data:`openhands.tools.utils.CONVERSATION_READ_WRITE_SUBPATHS` /
+    :data:`openhands.tools.utils.CONVERSATION_READ_ONLY_SUBPATHS` and the
+    ``exclude_workspace_fallback=True`` semantics.
+    """
+    workflow_file = conversation_dir / "workflow" / "workflow.py"
+    events_file = conversation_dir / "events" / "0001.json"
+    canvas_file = conversation_dir / "public_data" / "state.json"
+    meta_file = conversation_dir / "meta.json"
+    base_state = conversation_dir / "base_state.json"
+
+    assert not policy.check(workflow_file, "read")
+    assert not policy.check(workflow_file, "write")
+
+    assert policy.check(events_file, "read")
+    assert not policy.check(events_file, "write")
+
+    assert policy.check(canvas_file, "read")
+    assert policy.check(canvas_file, "write")
+
+    assert not policy.check(meta_file, "read")
+    assert not policy.check(meta_file, "write")
+    assert not policy.check(base_state, "read")
+    assert not policy.check(base_state, "write")
+
+
 def test_policy_resolves_relative_paths_and_checks_permissions(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -41,3 +72,21 @@ def test_require_raises_for_denied_operation(tmp_path: Path) -> None:
 
     with pytest.raises(PermissionError, match="write"):
         policy.require(tmp_path / "file.txt", "write")
+
+
+def test_conversation_workspace_restricts_to_subpaths(tmp_path: Path) -> None:
+    from openhands.tools.utils import (
+        CONVERSATION_READ_ONLY_SUBPATHS,
+        CONVERSATION_READ_WRITE_SUBPATHS,
+        default_path_access_policy,
+    )
+
+    conversation_dir = tmp_path / "conversation"
+    conversation_dir.mkdir()
+    policy = default_path_access_policy(
+        conversation_dir,
+        workspace_read_only_subpaths=CONVERSATION_READ_ONLY_SUBPATHS,
+        workspace_read_write_subpaths=CONVERSATION_READ_WRITE_SUBPATHS,
+        exclude_workspace_fallback=True,
+    )
+    assert_conversation_policy_shape(policy, conversation_dir)

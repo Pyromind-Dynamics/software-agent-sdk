@@ -92,6 +92,7 @@ from openhands.sdk.workspace.base import (
 from openhands.tools.workflow.definition import (
     PYROMIND_WORKFLOW_DIRTY_KEY,
     PYROMIND_WORKFLOW_EMITTED_KEY,
+    WORKFLOW_RELATIVE_PATH,
 )
 from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
 from openhands.tools.workflow.impl import read_workflow_file
@@ -599,7 +600,7 @@ class EventService:
             already_emitted = bool(state.agent_state.get(PYROMIND_WORKFLOW_EMITTED_KEY))
 
         working_dir = Path(conversation.workspace.working_dir)
-        workflow_path = working_dir / "workflow.py"
+        workflow_path = working_dir / WORKFLOW_RELATIVE_PATH
         if not workflow_path.is_file():
             self._clear_pyromind_workflow_dirty_sync()
             return False

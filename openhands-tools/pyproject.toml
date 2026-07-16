@@ -16,6 +16,7 @@ dependencies = [
     "func-timeout>=4.3.5",
     "tom-swe>=1.0.3",
     "httpx>=0.27",
+    "py-landlock>=0.1.1; sys_platform == 'linux'",
 ]
 
 [project.urls]

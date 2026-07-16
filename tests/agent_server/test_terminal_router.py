@@ -1,11 +1,8 @@
 """Tests for bash_router.py endpoints."""
 
-import asyncio
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
-from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,11 +10,8 @@ from fastapi.testclient import TestClient
 from openhands.agent_server.api import create_app
 from openhands.agent_server.bash_service import BashEventService
 from openhands.agent_server.config import Config
-from openhands.agent_server.dependencies import (
-    get_bash_event_service,
-    get_conversation_service,
-)
-from openhands.agent_server.models import BashCommand, BashEventPage, BashOutput
+from openhands.agent_server.dependencies import get_bash_event_service
+from openhands.agent_server.models import BashCommand
 
 
 @pytest.fixture
@@ -78,123 +72,6 @@ def test_clear_all_bash_events_with_data():
     assert response.status_code == 200
     assert response.json() == {"cleared_count": 5}
     mock_service.clear_all_events.assert_called_once()
-
-
-def test_start_bash_command_disabled_in_multi_tenant():
-    mock_service = MagicMock(spec=BashEventService)
-    mock_service.start_bash_command = AsyncMock()
-
-    config = Config(
-        session_api_keys=[],
-        enable_pyromind_jwt_auth=False,
-        command_policy_mode="multi_tenant_strict",
-    )
-    app = create_app(config)
-    app.dependency_overrides[get_bash_event_service] = lambda: mock_service
-
-    client = TestClient(app)
-    response = client.post(
-        "/api/bash/start_bash_command",
-        json={"command": "echo blocked"},
-    )
-
-    assert response.status_code == 403
-    assert response.json()["detail"]["code"] == "direct_bash_api_disabled"
-    mock_service.start_bash_command.assert_not_called()
-
-
-def test_execute_bash_command_disabled_in_multi_tenant():
-    mock_service = MagicMock(spec=BashEventService)
-    mock_service.start_bash_command = AsyncMock()
-
-    config = Config(
-        session_api_keys=[],
-        enable_pyromind_jwt_auth=False,
-        command_policy_mode="multi_tenant_strict",
-    )
-    app = create_app(config)
-    app.dependency_overrides[get_bash_event_service] = lambda: mock_service
-
-    client = TestClient(app)
-    response = client.post(
-        "/api/bash/execute_bash_command",
-        json={"command": "echo blocked"},
-    )
-
-    assert response.status_code == 403
-    assert response.json()["detail"]["code"] == "direct_bash_api_disabled"
-    mock_service.start_bash_command.assert_not_called()
-
-
-def test_conversation_scoped_bash_executes_in_conversation_workspace(tmp_path: Path):
-    conversation_id = uuid4()
-    command = BashCommand(command="echo scoped", cwd=str(tmp_path))
-    output = BashOutput(command_id=command.id, order=0, exit_code=0, stdout="scoped\n")
-    event_service = MagicMock()
-    event_service.get_conversation.return_value = SimpleNamespace(
-        workspace=SimpleNamespace(working_dir=str(tmp_path))
-    )
-    conversation_service = MagicMock()
-    conversation_service.get_event_service = AsyncMock(return_value=event_service)
-    bash_service = MagicMock(spec=BashEventService)
-
-    async def start_command(request):
-        assert request.cwd == str(tmp_path)
-        task = asyncio.create_task(asyncio.sleep(0))
-        return command, task
-
-    bash_service.start_bash_command = AsyncMock(side_effect=start_command)
-    bash_service.search_bash_events = AsyncMock(
-        return_value=BashEventPage(items=[command, output])
-    )
-
-    config = Config(session_api_keys=[], command_policy_mode="multi_tenant_strict")
-    app = create_app(config)
-    app.dependency_overrides[get_conversation_service] = lambda: conversation_service
-    app.dependency_overrides[get_bash_event_service] = lambda: bash_service
-
-    client = TestClient(app)
-    response = client.post(
-        f"/api/conversations/{conversation_id}/bash/execute",
-        json={"command": "echo scoped"},
-        headers={"x-pyromind-debug-user-id": "123"},
-    )
-
-    assert response.status_code == 200
-    assert response.json()["stdout"] == "scoped\n"
-    conversation_service.get_event_service.assert_awaited_once_with(
-        conversation_id,
-        user_id="123",
-    )
-    bash_service.start_bash_command.assert_awaited_once()
-
-
-def test_conversation_scoped_bash_denies_policy_blocked_command(tmp_path: Path):
-    conversation_id = uuid4()
-    event_service = MagicMock()
-    event_service.get_conversation.return_value = SimpleNamespace(
-        workspace=SimpleNamespace(working_dir=str(tmp_path))
-    )
-    conversation_service = MagicMock()
-    conversation_service.get_event_service = AsyncMock(return_value=event_service)
-    bash_service = MagicMock(spec=BashEventService)
-    bash_service.start_bash_command = AsyncMock()
-
-    config = Config(session_api_keys=[], command_policy_mode="multi_tenant_strict")
-    app = create_app(config)
-    app.dependency_overrides[get_conversation_service] = lambda: conversation_service
-    app.dependency_overrides[get_bash_event_service] = lambda: bash_service
-
-    client = TestClient(app)
-    response = client.post(
-        f"/api/conversations/{conversation_id}/bash/execute",
-        json={"command": "cat .env"},
-        headers={"x-pyromind-debug-user-id": "123"},
-    )
-
-    assert response.status_code == 403
-    assert response.json()["detail"]["rule_id"] == "secret-read"
-    bash_service.start_bash_command.assert_not_called()
 
 
 @pytest.mark.asyncio

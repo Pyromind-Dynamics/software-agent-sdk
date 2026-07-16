@@ -16,8 +16,16 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
-from openhands.tools.utils import default_path_access_policy
-from openhands.tools.workflow.definition import mark_pyromind_workflow_dirty
+from openhands.tools.utils import (
+    CONVERSATION_READ_ONLY_SUBPATHS,
+    CONVERSATION_READ_WRITE_SUBPATHS,
+    default_path_access_policy,
+    is_conversation_workspace,
+)
+from openhands.tools.workflow.definition import (
+    WORKFLOW_RELATIVE_PATH,
+    mark_pyromind_workflow_dirty,
+)
 
 from .core import Commit, DiffError, process_patch
 
@@ -63,15 +71,35 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
     filesystem access is constrained to the agent's workspace_root.
     """
 
-    def __init__(self, workspace_root: str):
+    def __init__(
+        self,
+        workspace_root: str,
+        conversation_mode: bool | None = None,
+    ):
         """Initialize executor with a workspace root.
 
         Args:
             workspace_root: Base directory relative to which all patch paths are
                 resolved. Absolute or path-escaping references are rejected.
+            conversation_mode: When True, restrict the agent to conversation
+                subpaths (``public_data/`` is rw; ``events/`` is read-only).
+                When None (default), the executor auto-detects based on
+                :func:`is_conversation_workspace`.
         """
         self.workspace_root = Path(workspace_root).resolve()
-        self.path_policy = default_path_access_policy(self.workspace_root)
+        if conversation_mode is None:
+            conversation_mode = is_conversation_workspace(self.workspace_root)
+        self.conversation_mode = conversation_mode
+        self.path_policy = default_path_access_policy(
+            self.workspace_root,
+            workspace_read_only_subpaths=(
+                CONVERSATION_READ_ONLY_SUBPATHS if conversation_mode else ()
+            ),
+            workspace_read_write_subpaths=(
+                CONVERSATION_READ_WRITE_SUBPATHS if conversation_mode else ()
+            ),
+            exclude_workspace_fallback=conversation_mode,
+        )
 
     def _resolve_path(self, p: str) -> Path:
         """Resolve a file path into the workspace, disallowing escapes."""
@@ -131,7 +159,7 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
                     is_error=False,
                 )
             return obs
-        except DiffError as e:
+        except (DiffError, PermissionError) as e:
             return ApplyPatchObservation.from_text(text=str(e), is_error=True)
 
     def _mark_workflow_dirty_if_changed(
@@ -139,7 +167,7 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
         commit: Commit,
         conversation,
     ) -> None:
-        workflow_path = (self.workspace_root / "workflow.py").resolve()
+        workflow_path = (self.workspace_root / WORKFLOW_RELATIVE_PATH).resolve()
         for path in commit.changes:
             if self._resolve_path(path) == workflow_path:
                 mark_pyromind_workflow_dirty(conversation)

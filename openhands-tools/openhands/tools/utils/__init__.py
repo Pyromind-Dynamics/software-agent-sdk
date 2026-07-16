@@ -6,7 +6,7 @@ import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 from openhands.sdk.logger import get_logger
 
@@ -82,10 +82,45 @@ class PathAccessPolicy:
 def default_path_access_policy(
     workspace_dir: str | Path,
     read_only_roots: Sequence[str | Path] = (),
+    workspace_read_only_subpaths: Sequence[str | Path] = (),
+    workspace_read_write_subpaths: Sequence[str | Path] = (),
+    exclude_workspace_fallback: bool = False,
 ) -> PathAccessPolicy:
-    """Build the standard workspace plus public-read path policy."""
-    rules = [PathRule.create(root, "r") for root in read_only_roots]
-    rules.append(PathRule.create(workspace_dir, "rwx"))
+    """Build the standard workspace plus public-read path policy.
+
+    ``read_only_roots`` are absolute roots outside the workspace that the agent
+    may read (knowledge base, skills, etc.).
+
+    ``workspace_read_only_subpaths`` / ``workspace_read_write_subpaths`` are
+    paths relative to ``workspace_dir`` registered with ``r`` / ``rw``
+    permissions before the workspace ``rwx`` fallback rule. Use these together
+    with ``exclude_workspace_fallback=True`` to model a conversation workspace
+    where only a handful of subdirectories are exposed to the agent (for
+    example, ``public_data/`` is read-write and ``events/`` is read-only,
+    while ``meta.json`` / ``base_state.json`` are off-limits).
+
+    When ``exclude_workspace_fallback`` is True, the workspace ``rwx`` rule is
+    omitted entirely; paths outside any declared subpath will be denied by
+    :class:`PathAccessPolicy` (first-match, no-match = deny).
+    """
+    rules: list[PathRule] = [PathRule.create(root, "r") for root in read_only_roots]
+    workspace_root = Path(workspace_dir).expanduser().resolve()
+    for subpath in workspace_read_only_subpaths:
+        target = (
+            Path(subpath).resolve()
+            if Path(subpath).is_absolute()
+            else (workspace_root / subpath).resolve()
+        )
+        rules.append(PathRule.create(target, "r"))
+    for subpath in workspace_read_write_subpaths:
+        target = (
+            Path(subpath).resolve()
+            if Path(subpath).is_absolute()
+            else (workspace_root / subpath).resolve()
+        )
+        rules.append(PathRule.create(target, "rw"))
+    if not exclude_workspace_fallback:
+        rules.append(PathRule.create(workspace_root, "rwx"))
     return PathAccessPolicy(rules)
 
 
@@ -105,6 +140,23 @@ def configured_public_read_roots(
         ]
     resolved_roots = (Path(root).resolve() for root in roots if root)
     return tuple(dict.fromkeys(resolved_roots))
+
+
+WORKFLOW_SUBPATH: Final[str] = "workflow"
+EVENTS_SUBPATH: Final[str] = "events"
+PUBLIC_DATA_SUBPATH: Final[str] = "public_data"
+
+CONVERSATION_READ_WRITE_SUBPATHS: tuple[str, ...] = (PUBLIC_DATA_SUBPATH,)
+CONVERSATION_READ_ONLY_SUBPATHS: tuple[str, ...] = (EVENTS_SUBPATH,)
+
+
+def is_conversation_workspace(workspace_dir: str | Path) -> bool:
+    """Return True when ``workspace_dir`` looks like a conversation workspace.
+
+    Detection is based on the presence of an ``events/`` subdirectory, which
+    the event log creates when a conversation is started.
+    """
+    return (Path(workspace_dir) / EVENTS_SUBPATH).is_dir()
 
 
 def _public_alias_root(alias: str, roots: tuple[Path, ...]) -> Path | None:

@@ -92,6 +92,8 @@ ARG OPENHANDS_BUILD_GIT_SHA=unknown
 ARG OPENHANDS_BUILD_GIT_REF=unknown
 ENV OPENHANDS_BUILD_GIT_SHA=${OPENHANDS_BUILD_GIT_SHA}
 ENV OPENHANDS_BUILD_GIT_REF=${OPENHANDS_BUILD_GIT_REF}
+# Terminal shells are restricted to their conversation workspace on Linux.
+ENV OH_TERMINAL_SANDBOX=required
 
 # Install base packages and create user
 RUN set -eux; \

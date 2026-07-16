@@ -68,12 +68,12 @@ class DebugWorkflowObservation(Observation):
     )
 
 
-_DEBUG_WORKFLOW_DESCRIPTION = """Test-run (debug) the current workflow.py: submit it to the
+_DEBUG_WORKFLOW_DESCRIPTION = """Test-run (debug) the current public_data/workflow_canvas/workflow.py: submit it to the
 Pyromind training platform for a real execution and block until the result is known.
 Whether the user says "test", "测试", "debug", "调试", or "试跑", they all mean this same
 action -- there is no separate "test" vs "debug" tool.
 
-`workflow.py` is a declarative DSL (it borrows Python syntax to describe nodes and their
+`public_data/workflow_canvas/workflow.py` is a declarative DSL (it borrows Python syntax to describe nodes and their
 connections), not a runnable Python script. There is no local interpreter for it and no
 other way to execute or validate it -- this tool call is the *only* way to actually run it.
 Do not try to run it with a shell/Python interpreter or reason about it using Python
@@ -91,9 +91,9 @@ How to use the result:
   to fix only the specific lines responsible for the error -- do not rewrite
   the whole file -- and then call `debug_workflow` again.
 - status="timeout": the platform did not respond in time. You may call
-  `debug_workflow` again to retry the same workflow.py.
+  `debug_workflow` again to retry the same workflow.
 - status="error": the run could not even be submitted (for example,
-  workflow.py does not exist yet, or you already used all allowed attempts).
+  public_data/workflow_canvas/workflow.py does not exist yet, or you already used all allowed attempts).
   Do not call `debug_workflow` again in this case.
 
 Each conversation allows a limited number of debug attempts, enforced by the
