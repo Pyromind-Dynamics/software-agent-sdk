@@ -64,7 +64,8 @@ def test_run_workflow_tool_create_and_resolve() -> None:
     assert tool.annotations is not None
     assert tool.annotations.readOnlyHint is False
     assert tool.annotations.openWorldHint is True
-    assert {"note", "dsl", "name", "test_mode"} <= set(tool.action_type.model_fields)
+    assert {"note", "dsl", "name"} <= set(tool.action_type.model_fields)
+    assert "test_mode" not in tool.action_type.model_fields
 
     resolved = resolve_tool(
         Tool(name="run_workflow", params=params),
@@ -186,6 +187,50 @@ def test_run_workflow_submits_task_successfully(
     request = mock_client.studio.create.call_args.args[0]
     assert request.out_id == f"agent1#{_CONVERSATION_ID}"
     assert request.workflow == {"name": "demo", "nodes": [], "edges": []}
+
+
+def test_run_workflow_executor_test_mode_uses_debug_out_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Internal test_mode kwarg (not action field) tags debug out_id."""
+    registry = SecretRegistry()
+    registry.update_secrets({"auth_token": "jwt-token"})
+
+    mock_client = MagicMock()
+    mock_client.studio.create.return_value = TrainingTaskCreateResponse(
+        task_id="task-debug",
+        name="demo",
+        status="Pending",
+    )
+
+    monkeypatch.setattr(
+        "openhands.tools.workflow.task_submission.get_api_key",
+        lambda **kwargs: "access-key-1",
+    )
+    monkeypatch.setattr(
+        "openhands.tools.workflow.task_submission.get_pyromind_api_client",
+        lambda **kwargs: mock_client,
+    )
+    monkeypatch.setattr(
+        RunWorkflowExecutor,
+        "_convert_dsl_to_xyflow",
+        lambda self, *, dsl, name: SimpleNamespace(
+            is_error=False,
+            xyflow={"name": name, "nodes": [], "edges": []},
+            text="",
+        ),
+    )
+
+    observation = RunWorkflowExecutor(**_executor_kwargs())(
+        RunWorkflowAction(dsl="# workflow: demo", name="demo"),
+        conversation=_fake_conversation(tmp_path, secret_registry=registry),
+        test_mode=True,
+    )
+
+    assert not observation.is_error
+    request = mock_client.studio.create.call_args.args[0]
+    assert request.out_id == f"agent1#debug#{_CONVERSATION_ID}"
+    assert request.workflow["execution_argos"] == [{"execution_mode": "test"}]
 
 
 def test_run_workflow_applies_test_mode_to_xyflow() -> None:
