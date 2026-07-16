@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING, Self
 from pydantic import Field
 from rich.text import Text
 
+from openhands.sdk.skills.catalog import SkillCatalog, SkillCatalogEntry
 from openhands.sdk.skills.execute import render_content_with_commands
+from openhands.sdk.skills.resource_router import SkillResourceRouter
 from openhands.sdk.tool.tool import (
     Action,
     DeclaredResources,
@@ -59,22 +61,30 @@ returned as the tool result.
 
 class InvokeSkillExecutor(ToolExecutor):
     @staticmethod
-    def _get_skills_and_working_dir(
+    def _get_catalog_and_working_dir(
         conversation: BaseConversation | None,
-    ) -> tuple[list, Path | None]:
-        """Extract the skill catalog and working dir from the conversation state."""
+    ) -> tuple[SkillCatalog, Path | None]:
         if conversation is None:
-            return [], None
+            return SkillCatalog(), None
 
         state = conversation.state
         ctx = state.agent.agent_context
         skills = list(ctx.skills) if ctx else []
+        catalog = SkillCatalog()
+        for skill in skills:
+            catalog.add(
+                SkillCatalogEntry(
+                    name=skill.name,
+                    skill=skill,
+                    display_path=skill.source,
+                    prompt_visible=not skill.disable_model_invocation,
+                )
+            )
         working_dir = state.workspace.working_dir
-        return skills, Path(working_dir) if working_dir else None
+        return catalog, Path(working_dir) if working_dir else None
 
     @staticmethod
     def _record_invocation(conversation: BaseConversation | None, name: str) -> None:
-        """Append `name` to the conversation's invoked-skills list (deduped)."""
         if conversation is None:
             return
         invoked = conversation.state.invoked_skills
@@ -83,30 +93,21 @@ class InvokeSkillExecutor(ToolExecutor):
 
     @staticmethod
     def _error(name: str, text: str) -> InvokeSkillObservation:
-        return InvokeSkillObservation.from_text(
-            text=text, is_error=True, skill_name=name
-        )
+        return InvokeSkillObservation.from_text(text=text, is_error=True, skill_name=name)
 
     def __call__(
         self,
         action: InvokeSkillAction,
         conversation: BaseConversation | None = None,
     ) -> InvokeSkillObservation:
-        skills, working_dir = self._get_skills_and_working_dir(conversation)
+        catalog, working_dir = self._get_catalog_and_working_dir(conversation)
         name = action.name.strip()
 
-        match = next((s for s in skills if s.name == name), None)
+        match = catalog.get(name)
         if match is None:
-            available = (
-                ", ".join(
-                    sorted(s.name for s in skills if not s.disable_model_invocation)
-                )
-                or "<none>"
-            )
-            return self._error(
-                name, f"Unknown skill '{name}'. Available skills: {available}."
-            )
-        if match.disable_model_invocation:
+            available = ", ".join(sorted(s.name for s in catalog.enabled())) or "<none>"
+            return self._error(name, f"Unknown skill '{name}'. Available skills: {available}.")
+        if not match.prompt_visible:
             return self._error(
                 name,
                 (
@@ -115,10 +116,9 @@ class InvokeSkillExecutor(ToolExecutor):
                 ),
             )
 
-        rendered = render_content_with_commands(match.content, working_dir=working_dir)
-        rendered = self._append_skill_location_footer(
-            rendered, match.source, working_dir
-        )
+        rendered = render_content_with_commands(match.main_prompt, working_dir=working_dir)
+        rendered = self._append_skill_location_footer(rendered, match.source, working_dir)
+        rendered = self._append_resource_index(rendered, match)
         self._record_invocation(conversation, name)
         return InvokeSkillObservation.from_text(text=rendered, skill_name=name)
 
@@ -126,16 +126,6 @@ class InvokeSkillExecutor(ToolExecutor):
     def _append_skill_location_footer(
         rendered: str, source: str | None, working_dir: Path | None
     ) -> str:
-        """Append a trailing note pointing the LLM at the skill's on-disk directory.
-
-        The AgentSkills spec allows skills to bundle `scripts/`, `references/`, and
-        `assets/` alongside `SKILL.md`. Skill authors reference those by relative
-        path, so the model needs to know where the skill lives to reach them.
-
-        When the skill lives under the conversation's `working_dir`, the path is
-        rendered relative to it to avoid leaking absolute home-directory paths
-        into the LLM context.
-        """
         if not source:
             return rendered
         try:
@@ -150,7 +140,7 @@ class InvokeSkillExecutor(ToolExecutor):
             try:
                 display = skill_dir.relative_to(working_dir.resolve())
             except (ValueError, OSError):
-                pass  # skill lives outside working_dir, keep absolute
+                pass
         footer = (
             f"\n\n---\n"
             f"This skill is located at `{to_posix_path(display)}`. "
@@ -159,15 +149,40 @@ class InvokeSkillExecutor(ToolExecutor):
         )
         return rendered + footer
 
+    @staticmethod
+    def _append_resource_index(rendered: str, entry: SkillCatalogEntry) -> str:
+        router = SkillResourceRouter()
+        root = entry.resource_root
+        if not root:
+            return rendered
+        skill_root = Path(root)
+        sections: list[str] = []
+        for rel in ("references", "scripts", "assets"):
+            subdir = skill_root / rel
+            if not subdir.is_dir():
+                continue
+            files = sorted(p for p in subdir.rglob("*") if p.is_file())
+            if not files:
+                continue
+            handles = []
+            for file_path in files:
+                relative_path = file_path.relative_to(skill_root).as_posix()
+                try:
+                    handle = router.read(entry, relative_path)
+                except Exception:
+                    continue
+                handles.append(f"- {handle.relative_path}")
+            if handles:
+                sections.append(f"{rel}:\n" + "\n".join(handles))
+        if not sections:
+            return rendered
+        return rendered + "\n\n---\nSkill resources:\n" + "\n\n".join(sections)
+
 
 class InvokeSkillTool(ToolDefinition[InvokeSkillAction, InvokeSkillObservation]):
     """Built-in tool for explicit invocation of progressive-disclosure skills."""
 
     def declared_resources(self, action: Action) -> DeclaredResources:
-        # Rendering a skill may execute inline `!`cmd`` tokens, which can
-        # touch arbitrary on-disk state. Keying on the skill name serializes
-        # concurrent invocations of the same skill while still allowing
-        # distinct skills to render in parallel.
         name = getattr(action, "name", "") or ""
         return DeclaredResources(keys=(f"skill:{name.strip()}",), declared=True)
 

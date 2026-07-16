@@ -160,6 +160,64 @@ def test_file_editor_executor_resolves_workspace_relative_path(tmp_path):
     assert workflow.read_text(encoding="utf-8") == "# workflow: Demo\nlimit = 20\n"
 
 
+def test_file_editor_executor_views_knowledge_alias_but_cannot_edit(tmp_path):
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    article = knowledge / "article.md"
+    article.write_text("workflow article\n", encoding="utf-8")
+    executor = FileEditorExecutor(
+        workspace_root=str(tmp_path / "conversation"),
+        read_only_roots=[str(knowledge)],
+    )
+
+    view_result = executor(
+        FileEditorAction(command="view", path="knowledge/article.md")
+    )
+    edit_result = executor(
+        FileEditorAction(
+            command="str_replace",
+            path="knowledge/article.md",
+            old_str="workflow",
+            new_str="changed",
+        )
+    )
+
+    assert not view_result.is_error
+    assert view_result.path == "knowledge/article.md"
+    assert "workflow article" in view_result.text
+    assert edit_result.is_error
+    assert article.read_text(encoding="utf-8") == "workflow article\n"
+
+
+def test_file_editor_executor_views_skills_alias_but_cannot_edit(tmp_path):
+    skills = tmp_path / ".agents" / "skills"
+    skills.mkdir(parents=True)
+    skill = skills / "SKILL.md"
+    skill.write_text("workflow skill\n", encoding="utf-8")
+    executor = FileEditorExecutor(
+        workspace_root=str(tmp_path / "conversation"),
+        read_only_roots=[str(skills)],
+    )
+
+    view_result = executor(
+        FileEditorAction(command="view", path=".agents/skills/SKILL.md")
+    )
+    edit_result = executor(
+        FileEditorAction(
+            command="str_replace",
+            path=".agents/skills/SKILL.md",
+            old_str="workflow",
+            new_str="changed",
+        )
+    )
+
+    assert not view_result.is_error
+    assert view_result.path == ".agents/skills/SKILL.md"
+    assert "workflow skill" in view_result.text
+    assert edit_result.is_error
+    assert skill.read_text(encoding="utf-8") == "workflow skill\n"
+
+
 def test_file_editor_executor_non_workflow_edit_does_not_mark_dirty(tmp_path):
     target = tmp_path / "notes.py"
     target.write_text("value = 10\n", encoding="utf-8")
@@ -509,3 +567,70 @@ def test_str_replace_exact_match_preserves_new_str_whitespace():
         with open(test_file) as f:
             content = f.read()
         assert content == "HELLO WORLD  \nsecond line\n"
+
+
+def test_file_editor_executor_conversation_mode_restricts_subpaths(tmp_path):
+    from openhands.tools.utils import (
+        CONVERSATION_READ_ONLY_SUBPATHS,
+        CONVERSATION_READ_WRITE_SUBPATHS,
+    )
+
+    conversation_dir = tmp_path / "conversation"
+    conversation_dir.mkdir()
+    (conversation_dir / "events").mkdir()
+    public_data_dir = conversation_dir / "public_data"
+    public_data_dir.mkdir()
+    (conversation_dir / "workflow").mkdir()
+    workflow_file = conversation_dir / "workflow" / "workflow.py"
+    workflow_file.write_text("# original\nlimit = 1\n", encoding="utf-8")
+    canvas_file = public_data_dir / "state.json"
+    canvas_file.write_text('{"layout": "A"}\n', encoding="utf-8")
+    events_file = conversation_dir / "events" / "0001.json"
+    events_file.write_text('{"kind": "message"}\n', encoding="utf-8")
+    meta_file = conversation_dir / "meta.json"
+    meta_file.write_text("{}", encoding="utf-8")
+
+    executor = FileEditorExecutor(
+        workspace_root=str(conversation_dir),
+        workspace_read_only_subpaths=list(CONVERSATION_READ_ONLY_SUBPATHS),
+        workspace_read_write_subpaths=list(CONVERSATION_READ_WRITE_SUBPATHS),
+        exclude_workspace_fallback=True,
+    )
+
+    workflow_view = executor(
+        FileEditorAction(command="view", path="workflow/workflow.py")
+    )
+    assert workflow_view.is_error
+
+    canvas_view = executor(
+        FileEditorAction(command="view", path="public_data/state.json")
+    )
+    assert not canvas_view.is_error
+
+    canvas_edit = executor(
+        FileEditorAction(
+            command="str_replace",
+            path="public_data/state.json",
+            old_str='"layout": "A"',
+            new_str='"layout": "B"',
+        )
+    )
+    assert not canvas_edit.is_error
+    assert canvas_file.read_text(encoding="utf-8") == '{"layout": "B"}\n'
+
+    events_view = executor(FileEditorAction(command="view", path="events/0001.json"))
+    assert not events_view.is_error
+
+    events_edit = executor(
+        FileEditorAction(
+            command="str_replace",
+            path="events/0001.json",
+            old_str='"kind": "message"',
+            new_str='"kind": "tampered"',
+        )
+    )
+    assert events_edit.is_error
+    assert events_file.read_text(encoding="utf-8") == '{"kind": "message"}\n'
+
+    meta_view = executor(FileEditorAction(command="view", path="meta.json"))
+    assert meta_view.is_error

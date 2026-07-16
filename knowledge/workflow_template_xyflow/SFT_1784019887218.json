@@ -1,0 +1,1561 @@
+{
+  "id": "6735391d-63a4-4bd0-a8d1-5e19948b3075",
+  "name": "SFT",
+  "nodes": [
+    {
+      "id": "1",
+      "type": "default",
+      "position": {
+        "x": 2045.2965007664493,
+        "y": -86.95639834862325
+      },
+      "data": {
+        "nodeType": "ModelTrainSFTNode",
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "output_path": [
+                "STRING"
+              ],
+              "dataset_config": [
+                "STRING"
+              ],
+              "training_config": [
+                "STRING"
+              ],
+              "model_config": [
+                "STRING"
+              ],
+              "accelerate_config": [
+                "ACCELERATE_CONFIG"
+              ],
+              "gpu_count": [
+                "INT",
+                {
+                  "default": 1,
+                  "min": 1,
+                  "max": 8
+                }
+              ],
+              "gpu_product": [
+                "STRING",
+                {
+                  "default": "NVIDIA-H200",
+                  "enum": [
+                    "NVIDIA-H200",
+                    "NVIDIA-H100-80GB-HBM3"
+                  ]
+                }
+              ]
+            },
+            "optional": {
+              "lora_config": [
+                "STRING"
+              ],
+              "wandb_config": [
+                "WANDB_CONFIG"
+              ],
+              "thinking_as_input_ratio": [
+                "FLOAT",
+                {
+                  "default": 0
+                }
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "model_output_path"
+          ],
+          "category": "train",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 495,
+          "node_type": "share",
+          "created_at": null,
+          "updated_at": null,
+          "version": 1,
+          "description": "Run SFT training and return output directory.",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "output_path": "/workspace/models/checkpoints/sft0617",
+          "dataset_config": "",
+          "training_config": "",
+          "model_config": "",
+          "accelerate_config": "",
+          "gpu_count": 1,
+          "gpu_product": "NVIDIA-H100-80GB-HBM3",
+          "wandb_config": "",
+          "thinking_as_input_ratio": 0
+        },
+        "definitionMissing": false,
+        "display_name": "SFT Training",
+        "libraryNodeId": "321",
+        "width": 300
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "2",
+      "type": "default",
+      "position": {
+        "x": 908.1562980739312,
+        "y": -325.95531303098625
+      },
+      "data": {
+        "nodeType": "AccelerateConfigBuilderNode",
+        "nodeDefinition": {
+          "input": {
+            "required": {},
+            "optional": {
+              "zero_stage": [
+                "INT",
+                {
+                  "default": 2
+                }
+              ]
+            }
+          },
+          "output": [
+            "ACCELERATE_CONFIG"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "accelerate_config"
+          ],
+          "category": "TrainConfig",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 472,
+          "node_type": "share",
+          "created_at": null,
+          "updated_at": null,
+          "version": 1,
+          "description": "Build accelerate_config YAML string for accelerate launch.",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "zero_stage": 1
+        },
+        "definitionMissing": false,
+        "display_name": "Accelerate Config Builder",
+        "libraryNodeId": "322",
+        "width": 300
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "8",
+      "type": "default",
+      "position": {
+        "x": 1349.9181946536166,
+        "y": -363.68593034519256
+      },
+      "data": {
+        "nodeType": "WandbConfigBuilderNode",
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "wandb_api_key": [
+                "STRING",
+                {
+                  "default": ""
+                }
+              ],
+              "wandb_project": [
+                "STRING",
+                {
+                  "default": ""
+                }
+              ]
+            },
+            "optional": {
+              "wandb_name": [
+                "STRING",
+                {
+                  "default": ""
+                }
+              ]
+            }
+          },
+          "output": [
+            "WANDB_CONFIG"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "wandb_config"
+          ],
+          "category": "TrainConfig",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 503,
+          "node_type": "share",
+          "created_at": null,
+          "updated_at": null,
+          "version": 1,
+          "description": "Build wandb_config YAML string for W&B training runtime env.",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "wandb_api_key": "7c7f22bc2f23cda64c29fd2d78e4112890cee22f",
+          "wandb_project": "studio_training",
+          "wandb_name": ""
+        },
+        "definitionMissing": false,
+        "display_name": "Wandb Config Builder",
+        "libraryNodeId": "327",
+        "width": 300
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "9",
+      "type": "default",
+      "position": {
+        "x": 953.3997310395149,
+        "y": -136.6047811959877
+      },
+      "data": {
+        "nodeType": "DatasetConfigBuilderNode",
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "train_data_path": [
+                "STRING"
+              ]
+            },
+            "optional": {
+              "val_data_path": [
+                "STRING",
+                {
+                  "default": ""
+                }
+              ],
+              "dataset_kind_config": [
+                "STRING",
+                {
+                  "default": ""
+                }
+              ],
+              "dataset_extra_config": [
+                "STRING",
+                {
+                  "default": ""
+                }
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "dataset_config"
+          ],
+          "category": "TrainConfig",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 481,
+          "node_type": "share",
+          "created_at": null,
+          "updated_at": null,
+          "version": 1,
+          "description": "Build dataset config YAML string for SFT/GRPO.",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "train_data_path": "",
+          "val_data_path": "",
+          "dataset_kind_config": "",
+          "dataset_extra_config": ""
+        },
+        "definitionMissing": false,
+        "display_name": "Dataset Config Builder",
+        "libraryNodeId": "352",
+        "width": 300
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "10",
+      "type": "default",
+      "position": {
+        "x": 526.839925831962,
+        "y": -368.2151099191982
+      },
+      "data": {
+        "display_name": "Clone Dataset",
+        "nodeType": "CloneAndCacheDataset",
+        "libraryNodeId": "188",
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "dataset": [
+                "STRING",
+                {
+                  "skip_enum": true,
+                  "enum": [
+                    "Writer/omniact",
+                    "openai/gsm8k",
+                    "pyromind/alpaca-gpt4-llm-demo",
+                    "pyromind/geometry-vqa-vlm-demo",
+                    "pyromind/self-cognition"
+                  ]
+                }
+              ],
+              "target_path": [
+                "STRING",
+                {
+                  "default": "/workspace/datasets/",
+                  "input_components": {
+                    "type": "folder_select"
+                  }
+                }
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "dataset_path"
+          ],
+          "category": "datasets",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 381,
+          "node_type": "system",
+          "created_at": "2026-06-13T14:26:18.509346+00:00",
+          "updated_at": "2026-06-13T14:26:18.509346+00:00",
+          "version": 1,
+          "description": "Clone datasets for training and evaluation. The dataset is stored in the pyromind environment, so you can clone it very fast.",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "dataset": "pyromind/self-cognition",
+          "target_path": "/workspace/datasets/"
+        },
+        "definitionMissing": false,
+        "width": 300
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "11",
+      "type": "default",
+      "position": {
+        "x": 544.1960547340717,
+        "y": -155.05556835349591
+      },
+      "data": {
+        "display_name": "Join Path",
+        "nodeType": "PathJoinNode",
+        "libraryNodeId": "203",
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "base_path": [
+                "STRING",
+                {
+                  "default": ""
+                }
+              ],
+              "subpath": [
+                "STRING",
+                {
+                  "default": ""
+                }
+              ]
+            },
+            "optional": {
+              "environment": [
+                "ENV"
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "joined_path"
+          ],
+          "category": "utils",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 394,
+          "node_type": "system",
+          "created_at": "2026-06-13T14:26:18.658328+00:00",
+          "updated_at": "2026-06-13T14:26:18.658328+00:00",
+          "version": 1,
+          "description": "Join a base path with a subpath",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "base_path": "",
+          "subpath": "self-cognition.jsonl",
+          "environment": ""
+        },
+        "definitionMissing": false,
+        "width": 300
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "12",
+      "type": "default",
+      "position": {
+        "x": 804.5380001870276,
+        "y": 484.7590683973937
+      },
+      "data": {
+        "display_name": "Clone Model",
+        "nodeType": "CloneAndCacheModel",
+        "libraryNodeId": "195",
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "model": [
+                "STRING",
+                {
+                  "skip_enum": true,
+                  "enum": [
+                    "Qwen/Qwen3-0.6B",
+                    "Qwen/Qwen3-1.7B",
+                    "Qwen/Qwen3-4B",
+                    "Qwen/Qwen3-VL-2B-Instruct",
+                    "Qwen/Qwen3-VL-4B-Instruct"
+                  ]
+                }
+              ],
+              "target_path": [
+                "STRING",
+                {
+                  "default": "/workspace/models/",
+                  "input_components": {
+                    "type": "folder_select"
+                  }
+                }
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "model_path"
+          ],
+          "category": "models",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 383,
+          "node_type": "system",
+          "created_at": "2026-06-13T14:26:18.548887+00:00",
+          "updated_at": "2026-06-13T14:26:18.548887+00:00",
+          "version": 1,
+          "description": "Clone models for training and evaluation. The model is stored in the pyromind environment, so you can clone it very fast.",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "model": "Qwen/Qwen3-0.6B",
+          "target_path": "/workspace/models/"
+        },
+        "definitionMissing": false,
+        "width": 300
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "14",
+      "type": "default",
+      "position": {
+        "x": 457.7320605945225,
+        "y": 336.7158597638499
+      },
+      "data": {
+        "display_name": "Dataset Extra Config Builder",
+        "nodeType": "DatasetExtraConfigBuilderNode",
+        "libraryNodeId": "1947",
+        "nodeDefinition": {
+          "input": {
+            "required": {},
+            "optional": {
+              "train_max_samples": [
+                "INT",
+                {
+                  "default": 0
+                }
+              ],
+              "val_max_samples": [
+                "INT",
+                {
+                  "default": 0
+                }
+              ],
+              "sft_collator_entry": [
+                "STRING",
+                {
+                  "default": "train.sft_collator:make_collate_fn"
+                }
+              ],
+              "dpo_collator_entry": [
+                "STRING",
+                {
+                  "default": "train.dpo_collator:make_collate_fn"
+                }
+              ],
+              "grpo_collator_entry": [
+                "STRING",
+                {
+                  "default": "train.data.default_vision_grpo_collate:create_grpo_collate_fn"
+                }
+              ],
+              "max_seq_length": [
+                "INT",
+                {
+                  "default": 4096
+                }
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "dataset_extra_config"
+          ],
+          "category": "TrainConfig",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 484,
+          "node_type": "share",
+          "created_at": null,
+          "updated_at": null,
+          "version": 1,
+          "description": "Build dataset extra config YAML string for SFT/GRPO.",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "train_max_samples": 0,
+          "val_max_samples": 0,
+          "sft_collator_entry": "train.sft_collator:make_collate_fn",
+          "dpo_collator_entry": "train.dpo_collator:make_collate_fn",
+          "grpo_collator_entry": "train.data.default_vision_grpo_collate:create_grpo_collate_fn",
+          "max_seq_length": 4096
+        },
+        "width": 300,
+        "definitionMissing": false
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "15",
+      "type": "default",
+      "position": {
+        "x": 1340.0022195995623,
+        "y": 504.7156818182797
+      },
+      "data": {
+        "display_name": "Model Config Builder",
+        "nodeType": "ModelConfigBuilderNode",
+        "libraryNodeId": "2035",
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "model_path": [
+                "STRING",
+                {
+                  "default": ""
+                }
+              ]
+            },
+            "optional": {
+              "model_type": [
+                "STRING",
+                {
+                  "default": "auto",
+                  "enum": [
+                    "auto",
+                    "qwen3vl",
+                    "qwen3.5"
+                  ]
+                }
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "model_config"
+          ],
+          "category": "TrainConfig",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 491,
+          "node_type": "share",
+          "created_at": null,
+          "updated_at": null,
+          "version": 1,
+          "description": "Build model config YAML string.",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "model_path": "",
+          "model_type": "auto"
+        },
+        "definitionMissing": false,
+        "width": 300
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "16",
+      "type": "default",
+      "position": {
+        "x": 1599.6908529348054,
+        "y": 221.37686386456238
+      },
+      "data": {
+        "display_name": "Lora Config Builder",
+        "nodeType": "LoraConfigBuilderNode",
+        "libraryNodeId": "2133",
+        "nodeDefinition": {
+          "input": {
+            "required": {},
+            "optional": {
+              "lora_rank": [
+                "INT",
+                {
+                  "default": 8
+                }
+              ],
+              "lora_dropout": [
+                "FLOAT",
+                {
+                  "default": 0.05
+                }
+              ],
+              "target_modules": [
+                "STRING",
+                {
+                  "default": "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+                }
+              ],
+              "exclude_modules": [
+                "STRING",
+                {
+                  "default": ""
+                }
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "lora_config"
+          ],
+          "category": "TrainConfig",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 486,
+          "node_type": "share",
+          "created_at": null,
+          "updated_at": null,
+          "version": 1,
+          "description": "Build lora config YAML string.",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "lora_rank": 8,
+          "lora_dropout": 0.05,
+          "target_modules": "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+          "exclude_modules": ""
+        },
+        "definitionMissing": false,
+        "width": 300
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "17",
+      "type": "default",
+      "position": {
+        "x": 1251.000552365164,
+        "y": -19.22257406668646
+      },
+      "data": {
+        "display_name": "Training Config Builder",
+        "nodeType": "TrainingConfigBuilderNode",
+        "libraryNodeId": "2156",
+        "nodeDefinition": {
+          "input": {
+            "required": {},
+            "optional": {
+              "num_epochs": [
+                "FLOAT",
+                {
+                  "default": 2
+                }
+              ],
+              "batch_size": [
+                "INT",
+                {
+                  "default": 2
+                }
+              ],
+              "grad_accum": [
+                "INT",
+                {
+                  "default": 2
+                }
+              ],
+              "learning_rate": [
+                "FLOAT",
+                {
+                  "default": 0.0001
+                }
+              ],
+              "lr_scheduler_type": [
+                "STRING",
+                {
+                  "default": "constant",
+                  "enum": [
+                    "linear",
+                    "cosine",
+                    "cosine_with_restarts",
+                    "polynomial",
+                    "constant",
+                    "constant_with_warmup"
+                  ]
+                }
+              ],
+              "logging_steps": [
+                "INT",
+                {
+                  "default": 5
+                }
+              ],
+              "save_steps": [
+                "INT",
+                {
+                  "default": 500
+                }
+              ],
+              "save_total_limit": [
+                "INT",
+                {
+                  "default": 3
+                }
+              ],
+              "eval_steps": [
+                "INT",
+                {
+                  "default": 500
+                }
+              ],
+              "seed": [
+                "INT",
+                {
+                  "default": 42
+                }
+              ],
+              "resume_from_checkpoint": [
+                "STRING",
+                {
+                  "default": ""
+                }
+              ],
+              "max_grad_norm": [
+                "FLOAT",
+                {
+                  "default": 2
+                }
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "training_config"
+          ],
+          "category": "TrainConfig",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 504,
+          "node_type": "share",
+          "created_at": null,
+          "updated_at": null,
+          "version": 1,
+          "description": "Build shared training_config YAML (BaseTrainingConfig fields) for SFT and GRPO training_config inputs.",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "num_epochs": 2,
+          "batch_size": 2,
+          "grad_accum": 2,
+          "learning_rate": 0.0001,
+          "lr_scheduler_type": "constant",
+          "logging_steps": 5,
+          "save_steps": 500,
+          "save_total_limit": 3,
+          "eval_steps": 500,
+          "seed": 42,
+          "resume_from_checkpoint": "",
+          "max_grad_norm": 2
+        },
+        "definitionMissing": false,
+        "width": 300
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "18",
+      "type": "default",
+      "position": {
+        "x": 534.8818614775755,
+        "y": 43.150228164622234
+      },
+      "data": {
+        "display_name": "Dataset Kind Config Builder(Text Only)",
+        "nodeType": "DatasetConfigBuilderTextNode",
+        "libraryNodeId": "2965",
+        "nodeDefinition": {
+          "input": {
+            "required": {},
+            "optional": {
+              "system_prompt_field": [
+                "STRING",
+                {
+                  "default": ""
+                }
+              ],
+              "user_prompt_field": [
+                "STRING",
+                {
+                  "default": ""
+                }
+              ],
+              "assistant_response_field": [
+                "STRING",
+                {
+                  "default": "gt"
+                }
+              ],
+              "rejected_field": [
+                "STRING",
+                {
+                  "default": "rejected_answer"
+                }
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "dataset_kind_config"
+          ],
+          "category": "TrainConfig",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 479,
+          "node_type": "share",
+          "created_at": null,
+          "updated_at": null,
+          "version": 1,
+          "description": "Build text only dataset config YAML string for SFT/GRPO.",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "system_prompt_field": "",
+          "user_prompt_field": "user_prompt",
+          "assistant_response_field": "gt",
+          "rejected_field": ""
+        },
+        "width": 300,
+        "definitionMissing": false
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "19",
+      "type": "default",
+      "position": {
+        "x": 2431.3577186706307,
+        "y": -296.75231288595796
+      },
+      "data": {
+        "display_name": "Merge LoRA",
+        "nodeType": "ModelMergeLoraNode",
+        "libraryNodeId": "356",
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "lora_path": [
+                "STRING"
+              ],
+              "output_path": [
+                "STRING"
+              ],
+              "model_path": [
+                "STRING",
+                {
+                  "default": ""
+                }
+              ],
+              "gpu_count": [
+                "INT",
+                {
+                  "default": 1,
+                  "min": 1,
+                  "max": 1
+                }
+              ],
+              "gpu_product": [
+                "STRING",
+                {
+                  "default": "NVIDIA-H200",
+                  "enum": [
+                    "NVIDIA-H200",
+                    "NVIDIA-H100-80GB-HBM3"
+                  ]
+                }
+              ]
+            },
+            "optional": {
+              "model_type": [
+                "STRING",
+                {
+                  "default": "auto",
+                  "enum": [
+                    "auto",
+                    "qwen3vl",
+                    "qwen3.5"
+                  ]
+                }
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "merged_model_path"
+          ],
+          "category": "ModelEval",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 493,
+          "node_type": "share",
+          "created_at": null,
+          "updated_at": null,
+          "version": 1,
+          "description": "Merge LoRA adapter into base weights (PEFT merge_and_unload) and save model + processor\nto a standalone directory. Base model id/path may be omitted if adapter_config.json\ncontains base_model_name_or_path.\n",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "lora_path": "",
+          "output_path": "/workspace/models/checkpoints/sft0617_merge",
+          "model_path": "",
+          "gpu_count": 1,
+          "gpu_product": "NVIDIA-H100-80GB-HBM3",
+          "model_type": "auto"
+        },
+        "definitionMissing": false,
+        "width": 300
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "20",
+      "type": "default",
+      "position": {
+        "x": 2427.0016927644583,
+        "y": 153.71070681504722
+      },
+      "data": {
+        "display_name": "Inference (VLLM)",
+        "nodeType": "VLLMInference",
+        "libraryNodeId": "1816",
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "model_path": [
+                "STRING"
+              ],
+              "port": [
+                "INT",
+                {
+                  "default": 3000,
+                  "min": 1,
+                  "max": 8000
+                }
+              ],
+              "gpu_count": [
+                "INT",
+                {
+                  "default": 1,
+                  "min": 1,
+                  "max": 8
+                }
+              ],
+              "gpu_product": [
+                "STRING",
+                {
+                  "default": "NVIDIA-H200",
+                  "enum": [
+                    "NVIDIA-H200",
+                    "NVIDIA-H100-80GB-HBM3",
+                    "NVIDIA-L40S"
+                  ]
+                }
+              ]
+            },
+            "optional": {
+              "environment": [
+                "ENV"
+              ],
+              "max_model_len": [
+                "INT"
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "endpoint"
+          ],
+          "category": "inference",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 386,
+          "node_type": "system",
+          "created_at": "2026-06-13T14:26:18.577048+00:00",
+          "updated_at": "2026-06-13T14:26:18.577048+00:00",
+          "version": 1,
+          "description": "Run inference using vLLM, serving OpenAI-compatible API endpoint.",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "model_path": "",
+          "port": 3000,
+          "gpu_count": 1,
+          "gpu_product": "NVIDIA-H100-80GB-HBM3",
+          "environment": "",
+          "max_model_len": ""
+        },
+        "width": 300,
+        "definitionMissing": false
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "21",
+      "type": "default",
+      "position": {
+        "x": 2810.961816554993,
+        "y": -180.2914058168396
+      },
+      "data": {
+        "display_name": "LLM Test",
+        "nodeType": "TestLLMNode",
+        "libraryNodeId": "107",
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "endpoint": [
+                "STRING",
+                {
+                  "default": "http://localhost:30000"
+                }
+              ],
+              "prompt": [
+                "STRING",
+                {
+                  "default": "Hello, how are you?"
+                }
+              ],
+              "max_tokens": [
+                "INT",
+                {
+                  "default": 100,
+                  "min": 1,
+                  "max": 4096
+                }
+              ],
+              "temperature": [
+                "FLOAT",
+                {
+                  "default": 0.7,
+                  "min": 0,
+                  "max": 2
+                }
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "result"
+          ],
+          "category": "utils",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 389,
+          "node_type": "system",
+          "created_at": "2026-06-13T14:26:18.606987+00:00",
+          "updated_at": "2026-06-13T14:26:18.606987+00:00",
+          "version": 1,
+          "description": "Test sglang endpoint by sending a prompt and returning the result",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "endpoint": "http://localhost:30000",
+          "prompt": "Hello, how are you?",
+          "max_tokens": 100,
+          "temperature": 0.7
+        },
+        "width": 300,
+        "definitionMissing": false
+      },
+      "style": {
+        "width": 300
+      }
+    },
+    {
+      "id": "22",
+      "type": "default",
+      "position": {
+        "x": 3173.768274578294,
+        "y": -30.034828874185955
+      },
+      "data": {
+        "display_name": "Content Preview",
+        "nodeType": "ContentPreview",
+        "libraryNodeId": "469",
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "content": [
+                "*"
+              ],
+              "file_format": [
+                "STRING",
+                {
+                  "default": "txt",
+                  "enum": [
+                    "txt",
+                    "json",
+                    "xml",
+                    "python"
+                  ]
+                }
+              ]
+            }
+          },
+          "output": [
+            "*"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "content"
+          ],
+          "category": "utils",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false,
+          "python_module": "test_nodes",
+          "id": 9653,
+          "node_type": "system",
+          "created_at": "2026-07-03T08:08:37.950651+00:00",
+          "updated_at": "2026-07-03T08:08:37.950651+00:00",
+          "version": 1,
+          "description": "Display the input [content] in the specified file format.",
+          "is_enabled": true,
+          "metanode_deleted": false
+        },
+        "config": {
+          "content": "",
+          "file_format": "txt"
+        },
+        "definitionMissing": false,
+        "width": 300,
+        "height": 320
+      },
+      "style": {
+        "width": 300,
+        "height": 320
+      }
+    }
+  ],
+  "edges": [
+    {
+      "animated": false,
+      "style": {
+        "stroke": "hsl(65, 70%, 55%)",
+        "strokeWidth": 2,
+        "color": "hsl(65, 70%, 55%)"
+      },
+      "type": "default",
+      "source": "2",
+      "sourceHandle": "accelerate_config",
+      "target": "1",
+      "targetHandle": "accelerate_config",
+      "data": {
+        "connectionType": "ACCELERATE_CONFIG"
+      },
+      "id": "xy-edge__2accelerate_config-1accelerate_config"
+    },
+    {
+      "animated": false,
+      "style": {
+        "stroke": "hsl(165, 70%, 55%)",
+        "strokeWidth": 2,
+        "color": "hsl(165, 70%, 55%)"
+      },
+      "type": "default",
+      "source": "8",
+      "sourceHandle": "wandb_config",
+      "target": "1",
+      "targetHandle": "wandb_config",
+      "data": {
+        "connectionType": "WANDB_CONFIG"
+      },
+      "id": "xy-edge__8wandb_config-1wandb_config"
+    },
+    {
+      "animated": false,
+      "style": {
+        "stroke": "#22c55e",
+        "strokeWidth": 2,
+        "color": "#22c55e"
+      },
+      "type": "default",
+      "source": "9",
+      "sourceHandle": "dataset_config",
+      "target": "1",
+      "targetHandle": "dataset_config",
+      "data": {
+        "connectionType": "STRING"
+      },
+      "id": "xy-edge__9dataset_config-1dataset_config"
+    },
+    {
+      "animated": false,
+      "style": {
+        "stroke": "#22c55e",
+        "strokeWidth": 2,
+        "color": "#22c55e"
+      },
+      "type": "default",
+      "source": "10",
+      "sourceHandle": "dataset_path",
+      "target": "11",
+      "targetHandle": "base_path",
+      "data": {
+        "connectionType": "STRING"
+      },
+      "id": "xy-edge__10dataset_path-11base_path"
+    },
+    {
+      "animated": false,
+      "style": {
+        "stroke": "#22c55e",
+        "strokeWidth": 2,
+        "color": "#22c55e"
+      },
+      "type": "default",
+      "source": "11",
+      "sourceHandle": "joined_path",
+      "target": "9",
+      "targetHandle": "train_data_path",
+      "data": {
+        "connectionType": "STRING"
+      },
+      "id": "xy-edge__11joined_path-9train_data_path"
+    },
+    {
+      "animated": false,
+      "style": {
+        "stroke": "#22c55e",
+        "strokeWidth": 2,
+        "color": "#22c55e"
+      },
+      "type": "default",
+      "source": "14",
+      "sourceHandle": "dataset_extra_config",
+      "target": "9",
+      "targetHandle": "dataset_extra_config",
+      "data": {
+        "connectionType": "STRING"
+      },
+      "id": "xy-edge__14dataset_extra_config-9dataset_extra_config"
+    },
+    {
+      "animated": false,
+      "style": {
+        "stroke": "#22c55e",
+        "strokeWidth": 2,
+        "color": "#22c55e"
+      },
+      "type": "default",
+      "source": "16",
+      "sourceHandle": "lora_config",
+      "target": "1",
+      "targetHandle": "lora_config",
+      "data": {
+        "connectionType": "STRING"
+      },
+      "id": "xy-edge__16lora_config-1lora_config"
+    },
+    {
+      "animated": false,
+      "style": {
+        "stroke": "#22c55e",
+        "strokeWidth": 2,
+        "color": "#22c55e"
+      },
+      "type": "default",
+      "source": "15",
+      "sourceHandle": "model_config",
+      "target": "1",
+      "targetHandle": "model_config",
+      "data": {
+        "connectionType": "STRING"
+      },
+      "id": "xy-edge__15model_config-1model_config"
+    },
+    {
+      "animated": false,
+      "style": {
+        "stroke": "#22c55e",
+        "strokeWidth": 2,
+        "color": "#22c55e"
+      },
+      "type": "default",
+      "source": "17",
+      "sourceHandle": "training_config",
+      "target": "1",
+      "targetHandle": "training_config",
+      "data": {
+        "connectionType": "STRING"
+      },
+      "id": "xy-edge__17training_config-1training_config"
+    },
+    {
+      "animated": false,
+      "style": {
+        "stroke": "#22c55e",
+        "strokeWidth": 2,
+        "color": "#22c55e"
+      },
+      "type": "default",
+      "source": "18",
+      "sourceHandle": "dataset_kind_config",
+      "target": "9",
+      "targetHandle": "dataset_kind_config",
+      "data": {
+        "connectionType": "STRING"
+      },
+      "id": "xy-edge__18dataset_kind_config-9dataset_kind_config"
+    },
+    {
+      "animated": false,
+      "style": {
+        "stroke": "#22c55e",
+        "strokeWidth": 2,
+        "color": "#22c55e"
+      },
+      "type": "default",
+      "source": "1",
+      "sourceHandle": "model_output_path",
+      "target": "19",
+      "targetHandle": "lora_path",
+      "data": {
+        "connectionType": "STRING"
+      },
+      "id": "xy-edge__1model_output_path-19lora_path"
+    },
+    {
+      "animated": false,
+      "style": {
+        "stroke": "#22c55e",
+        "strokeWidth": 2,
+        "color": "#22c55e"
+      },
+      "type": "default",
+      "source": "12",
+      "sourceHandle": "model_path",
+      "target": "15",
+      "targetHandle": "model_path",
+      "data": {
+        "connectionType": "STRING"
+      },
+      "id": "xy-edge__12model_path-15model_path"
+    },
+    {
+      "animated": false,
+      "style": {
+        "stroke": "#22c55e",
+        "strokeWidth": 2,
+        "color": "#22c55e"
+      },
+      "type": "default",
+      "source": "12",
+      "sourceHandle": "model_path",
+      "target": "19",
+      "targetHandle": "model_path",
+      "data": {
+        "connectionType": "STRING"
+      },
+      "id": "xy-edge__12model_path-19model_path"
+    },
+    {
+      "animated": false,
+      "style": {
+        "stroke": "#22c55e",
+        "strokeWidth": 2,
+        "color": "#22c55e"
+      },
+      "type": "default",
+      "source": "19",
+      "sourceHandle": "merged_model_path",
+      "target": "20",
+      "targetHandle": "model_path",
+      "data": {
+        "connectionType": "STRING"
+      },
+      "id": "xy-edge__19merged_model_path-20model_path"
+    }
+  ],
+  "viewport": {
+    "x": -43.71202096066975,
+    "y": 293.4697976680223,
+    "zoom": 0.34018159173387186
+  },
+  "timestamp": "2026-07-14T09:04:47.217Z"
+}

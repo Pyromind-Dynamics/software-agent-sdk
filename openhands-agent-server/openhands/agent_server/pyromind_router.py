@@ -54,7 +54,7 @@ from openhands.agent_server.workflow_canvas_store import (
     WorkflowCanvasStoreError,
     WorkflowCanvasVersionNotFoundError,
 )
-from openhands.sdk import LLM, AgentContext, TextContent, Tool
+from openhands.sdk import LLM, AgentContext, TextContent, Tool, register_tool
 from openhands.sdk.conversation.request import (
     StartConversationRequest,
 )
@@ -63,6 +63,7 @@ from openhands.sdk.secret import SecretSource, SecretValue, StaticSecret
 from openhands.sdk.security.confirmation_policy import ConfirmRisky
 from openhands.sdk.security.defense_in_depth import PatternSecurityAnalyzer
 from openhands.sdk.skills import Skill, load_skills_from_dir
+from openhands.sdk.tool.builtins import SkillsListTool, SkillsReadTool
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
@@ -78,7 +79,6 @@ from openhands.tools.pyromind_dataset.definition import (
 from openhands.tools.pyromind_debug import get_debug_result_broker
 from openhands.tools.utils import PUBLIC_READ_ALIASES
 from openhands.tools.workflow import (
-    DslToXyflowTool,
     RunWorkflowTool,
     ValidateWorkflowDslTool,
 )
@@ -126,9 +126,9 @@ _PYROMIND_DEBUG_URL_TIMEOUT_SECONDS = 30.0
 _PYROMIND_DEBUG_RESPONSE_BODY_LIMIT = 20000
 
 # Knowledge-base retrieval guidance layered on top of the codex base prompt via
-# get_codex_agent(custom_instructions=...). Kept lightweight: prefer invoking a
-# matching skill first, and only fall back to grep + file_editor for free-form
-# knowledge-base lookups.
+# get_codex_agent(custom_instructions=...). Match the Codex flow: prefer the
+# matching skill first; then use skill/runtime reads for skill docs; only fall
+# back to grep + file_editor for free-form knowledge-base lookups.
 PYROMIND_KB_INSTRUCTIONS = """\
 The Pyromind platform knowledge base is available through the read-only logical
 path `{knowledge_alias}/`. Do not use or request its host filesystem path.
@@ -143,6 +143,15 @@ Knowledge base layout:
 
 The shared skill documents are available through the read-only logical path
 `{skills_alias}/`. Do not use or request their host filesystem path.
+
+Skill usage rules:
+- If the user request matches a listed skill, invoke that skill first.
+- For skill document lookup, use `skills_list` / `skills_read` style access,
+  not grep or directory scanning.
+- For skill-linked resources, read the exact relative path from the skill root;
+  do not manually search `references/`, `scripts/`, or `assets/` with grep.
+- Use `grep` and `file_editor` only as a fallback when the request is not skill-
+  addressed or when you need a free-form knowledge-base article.
 
 Your current working directory is this conversation's private workspace:
 {working_dir}
@@ -165,21 +174,21 @@ been generated unless a tool call actually created or modified the workflow file
 - If a listed skill fits the request (for example, generating a workflow), \
 invoke it via `invoke_skill` before searching the knowledge base. Do not invoke
 a workflow-generation skill for an article lookup alone.
-- For knowledge-base or skill-document requests, prefer `grep` and
-  `file_editor` with the logical `{knowledge_alias}/` or `{skills_alias}/` path.
-  `terminal` is also available when direct filesystem inspection is needed.
-  Do not use `apply_patch` to modify public knowledge or skill documents. Open
-  matched files with `file_editor` before
+- For knowledge-base or skill-document requests that are not skill-linked,
+  prefer `grep` and `file_editor` with the logical `{knowledge_alias}/` or
+  `{skills_alias}/` path. `terminal` is also available when direct filesystem
+  inspection is needed. Do not use `apply_patch` to modify public knowledge or
+  skill documents. Open matched files with `file_editor` before
 answering or editing the workflow file; never infer APIs or operational facts from
 filenames or directory listings.
 - For "查看知识库有哪些信息" or similar inventory requests, use one `grep`
-call per top-level directory (`basic`, `jupyterlab`, `sdk`, `studio`, and
-`nodes`) with `include="*.mdx"` and pattern `^title:|^# `; do not use pattern
-`.` or `^` because those return document bodies instead of an index.
+  call per top-level directory (`basic`, `jupyterlab`, `sdk`, `studio`, and
+  `nodes`) with `include="*.mdx"` and pattern `^title:|^# `; do not use pattern
+  `.` or `^` because those return document bodies instead of an index.
 - For requests to output, summarize, or explain specific knowledge-base
-articles, first search with `grep` under `knowledge/<subdirectory>` using
-`include="*.mdx"`, then open only the matched files with `file_editor` using
-the same logical path. Use `*.md` only when an `.mdx` search has no matches.
+  articles, first search with `grep` under `knowledge/<subdirectory>` using
+  `include="*.mdx"`, then open only the matched files with `file_editor` using
+  the same logical path. Use `*.md` only when an `.mdx` search has no matches.
 - For a Pyromind knowledge-base answer:
   1. Split the user's request into explicit subquestions.
   2. From files you actually opened, make a short checklist of directly relevant
@@ -189,7 +198,7 @@ the same logical path. Use `*.md` only when an `.mdx` search has no matches.
      same list or table without a reason.
   Do not show this internal checklist unless the user asks for sources.
 - For workflow generation, use the matching skill and consult `knowledge/` only
-when needed for platform details.
+  when needed for platform details.
 """
 
 
@@ -933,8 +942,10 @@ async def create_pyromind_conversation(
       file_editor for KB search (grep finds files, file_editor views them)
     - Workspace pointing to a conversation-private directory
     """
-    # Ensure the grep tool is registered (codex tools are registered by the preset).
+    # Register default and optional skill-runtime tools before agent resolution.
     register_default_tools(enable_browser=False)
+    register_tool(SkillsListTool.__name__, SkillsListTool)
+    register_tool(SkillsReadTool.__name__, SkillsReadTool)
 
     # 1. Resolve knowledge base path (extra can override the default)
     knowledge_base_path = request.extra.get(
@@ -1002,12 +1013,19 @@ async def create_pyromind_conversation(
         agent_context=agent_context,
         custom_instructions=custom_instructions,
         extra_tools=[
+            *(
+                [
+                    Tool(name=SkillsListTool.__name__),
+                    Tool(name=SkillsReadTool.__name__),
+                ]
+                if skills
+                else []
+            ),
             Tool(name="grep"),
             Tool(name="file_editor"),
             Tool(name=RunWorkflowTool.name, params=run_tool.params),
             Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
             *storage_tools,
-            Tool(name=DslToXyflowTool.name),
             validation_tool,
         ],
     )

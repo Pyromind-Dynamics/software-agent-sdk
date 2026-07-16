@@ -38,14 +38,32 @@ class FileEditorExecutor(ToolExecutor):
         workspace_root: str | None = None,
         allowed_edits_files: list[str] | None = None,
         read_only_roots: list[str] | None = None,
+        workspace_read_only_subpaths: list[str] | None = None,
+        workspace_read_write_subpaths: list[str] | None = None,
+        exclude_workspace_fallback: bool = False,
     ):
         self.workspace_root = (
             Path(workspace_root).resolve() if workspace_root else Path.cwd().resolve()
         )
         self.editor: FileEditor = FileEditor(workspace_root=str(self.workspace_root))
         self.read_only_roots = configured_public_read_roots(read_only_roots)
+        self.workspace_read_only_subpaths: tuple[str, ...] = (
+            tuple(workspace_read_only_subpaths)
+            if workspace_read_only_subpaths is not None
+            else ()
+        )
+        self.workspace_read_write_subpaths: tuple[str, ...] = (
+            tuple(workspace_read_write_subpaths)
+            if workspace_read_write_subpaths is not None
+            else ()
+        )
+        self.exclude_workspace_fallback = exclude_workspace_fallback
         self.path_policy = default_path_access_policy(
-            self.workspace_root, self.read_only_roots
+            self.workspace_root,
+            self.read_only_roots,
+            workspace_read_only_subpaths=self.workspace_read_only_subpaths,
+            workspace_read_write_subpaths=self.workspace_read_write_subpaths,
+            exclude_workspace_fallback=self.exclude_workspace_fallback,
         )
         self.read_only_editors = {
             root: FileEditor(workspace_root=str(root)) for root in self.read_only_roots

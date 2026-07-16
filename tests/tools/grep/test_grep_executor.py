@@ -14,6 +14,7 @@ import pytest
 
 import openhands.tools.grep.impl as grep_impl
 from openhands.tools.grep import GrepAction
+from openhands.tools.grep.definition import GrepMatch
 from openhands.tools.grep.impl import GrepExecutor
 from openhands.tools.utils import _check_grep_available, _check_ripgrep_available
 
@@ -23,6 +24,51 @@ def test_grep_executor_initialization():
     with tempfile.TemporaryDirectory() as temp_dir:
         executor = GrepExecutor(working_dir=temp_dir)
         assert executor.working_dir == Path(temp_dir).resolve()
+
+
+def test_grep_executor_resolves_knowledge_alias(tmp_path):
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    (knowledge / "article.md").write_text("workflow article\n", encoding="utf-8")
+
+    executor = GrepExecutor(
+        working_dir=str(tmp_path / "conversation"),
+        read_only_roots=[str(knowledge)],
+    )
+    observation = executor(GrepAction(pattern="workflow", path="knowledge"))
+
+    assert not observation.is_error
+    assert len(observation.matches) == 1
+    assert observation.matches[0].file_path == "knowledge/article.md"
+
+
+def test_grep_executor_resolves_skills_alias(tmp_path):
+    skills = tmp_path / ".agents" / "skills"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").write_text("workflow skill\n", encoding="utf-8")
+
+    executor = GrepExecutor(
+        working_dir=str(tmp_path / "conversation"),
+        read_only_roots=[str(skills)],
+    )
+    observation = executor(GrepAction(pattern="workflow", path=".agents/skills"))
+
+    assert not observation.is_error
+    assert len(observation.matches) == 1
+    assert observation.matches[0].file_path == ".agents/skills/SKILL.md"
+
+
+def test_grep_executor_rejects_unknown_public_alias(tmp_path):
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    executor = GrepExecutor(
+        working_dir=str(tmp_path / "conversation"),
+        read_only_roots=[str(knowledge)],
+    )
+
+    observation = executor(GrepAction(pattern="workflow", path="secrets"))
+
+    assert observation.is_error
 
 
 def test_grep_executor_prefers_ripgrep_backend(monkeypatch):
@@ -351,7 +397,7 @@ def test_grep_executor_concurrent():
 
         executor = GrepExecutor(working_dir=temp_dir)
 
-        results: list[tuple[str, list[str]]] = []
+        results: list[tuple[str, list[GrepMatch]]] = []
         results_lock = threading.Lock()
         errors: list[Exception] = []
 

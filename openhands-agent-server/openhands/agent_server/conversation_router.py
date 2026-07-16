@@ -1,7 +1,6 @@
 """Conversation router for OpenHands SDK."""
 
-from pathlib import Path
-from typing import Annotated, cast
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import (
@@ -20,10 +19,8 @@ from openhands.agent_server._secrets_exposure import (
     decrypt_incoming_llm_secrets,
     get_cipher,
 )
-from openhands.agent_server.bash_service import BashEventService
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import (
-    get_bash_event_service,
     get_conversation_service,
     get_current_user_id,
 )
@@ -32,11 +29,9 @@ from openhands.agent_server.models import (
     AgentResponseResult,
     AskAgentRequest,
     AskAgentResponse,
-    BashOutput,
     ConversationInfo,
     ConversationPage,
     ConversationSortOrder,
-    ExecuteBashRequest,
     ForkConversationRequest,
     SendMessageRequest,
     SetConfirmationPolicyRequest,
@@ -48,7 +43,6 @@ from openhands.agent_server.models import (
     UpdateSecretsRequest,
     trim_conversation_response_skills,
 )
-from openhands.agent_server.pyromind_auth import CurrentLoginUser
 from openhands.sdk import LLM, Agent, TextContent
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.marketplace.registry import (
@@ -58,13 +52,6 @@ from openhands.sdk.marketplace.registry import (
 )
 from openhands.sdk.plugin import PluginFetchError
 from openhands.sdk.profiles.resolver import DanglingMcpServerRef, ProfileNotFound
-from openhands.sdk.security.command_policy import (
-    CommandExecutionContext,
-    CommandExecutionSource,
-    CommandPolicyAction,
-    CommandPolicyConfig,
-    evaluate_command,
-)
 from openhands.sdk.tool.client_tool import ClientToolRegistrationError
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.default import get_default_tools
@@ -95,27 +82,6 @@ START_CONVERSATION_EXAMPLES = [
 def _user_scope_kwargs(request: Request) -> dict[str, str]:
     user_id = get_current_user_id(request)
     return {"user_id": user_id} if user_id is not None else {}
-
-
-def _tenant_id_from_request(request: Request) -> str | None:
-    current_user = getattr(request.state, "current_user", None)
-    if not isinstance(current_user, CurrentLoginUser):
-        return None
-    if current_user.group_id is not None:
-        return str(current_user.group_id)
-    return str(current_user.user_id)
-
-
-def _resolve_conversation_bash_cwd(
-    workspace_dir: Path,
-    requested_cwd: str | None,
-) -> Path:
-    if requested_cwd is None:
-        return workspace_dir.resolve()
-    cwd = Path(requested_cwd)
-    if not cwd.is_absolute():
-        cwd = workspace_dir / cwd
-    return cwd.resolve()
 
 
 # Read methods
@@ -383,77 +349,6 @@ async def run_conversation(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     return Success()
-
-
-@conversation_router.post(
-    "/{conversation_id}/bash/execute",
-    responses={
-        403: {"description": "Command blocked by command policy"},
-        404: {"description": "Conversation not found"},
-        409: {"description": "Command requires confirmation"},
-    },
-)
-async def execute_conversation_bash_command(
-    http_request: Request,
-    conversation_id: UUID,
-    request: ExecuteBashRequest,
-    conversation_service: ConversationService = Depends(get_conversation_service),
-    bash_event_service: BashEventService = Depends(get_bash_event_service),
-) -> BashOutput:
-    """Execute a bash command scoped to a conversation workspace."""
-    event_service = await conversation_service.get_event_service(
-        conversation_id,
-        **_user_scope_kwargs(http_request),
-    )
-    if event_service is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND)
-
-    conversation = event_service.get_conversation()
-    workspace_dir = Path(conversation.workspace.working_dir).resolve()
-    cwd = _resolve_conversation_bash_cwd(workspace_dir, request.cwd)
-    config = http_request.app.state.config
-    user_id = get_current_user_id(http_request)
-    decision = evaluate_command(
-        request.command,
-        CommandExecutionContext(
-            source=CommandExecutionSource.DIRECT_BASH_API,
-            user_id=user_id,
-            tenant_id=_tenant_id_from_request(http_request),
-            conversation_id=conversation_id,
-            workspace_dir=workspace_dir,
-            cwd=cwd,
-        ),
-        CommandPolicyConfig(
-            allowed_roots=[workspace_dir],
-            require_tenant_scope=config.command_policy_mode == "multi_tenant_strict",
-        ),
-    )
-    if decision.action == CommandPolicyAction.DENY:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "code": "command_policy_denied",
-                "rule_id": decision.rule_id,
-                "reason": decision.reason,
-                "command": decision.redacted_command,
-            },
-        )
-    if decision.action == CommandPolicyAction.CONFIRM:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "confirmation_required",
-                "rule_id": decision.rule_id,
-                "reason": decision.reason,
-                "command": decision.redacted_command,
-            },
-        )
-
-    scoped_request = request.model_copy(update={"cwd": str(cwd)})
-    command, task = await bash_event_service.start_bash_command(scoped_request)
-    await task
-    page = await bash_event_service.search_bash_events(command_id__eq=command.id)
-    return cast(BashOutput, page.items[-1])
 
 
 @conversation_router.post(

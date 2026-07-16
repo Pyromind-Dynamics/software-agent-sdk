@@ -2857,6 +2857,7 @@ dependencies = [
     { name = "httpx" },
     { name = "libtmux" },
     { name = "openhands-sdk" },
+    { name = "py-landlock", marker = "sys_platform == 'linux'" },
     { name = "pydantic" },
     { name = "tom-swe" },
     { name = "tree-sitter" },
@@ -2872,6 +2873,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "libtmux", specifier = ">=0.53.0" },
     { name = "openhands-sdk", editable = "openhands-sdk" },
+    { name = "py-landlock", marker = "sys_platform == 'linux'", specifier = ">=0.1.1" },
     { name = "pydantic", specifier = ">=2.11.7" },
     { name = "tom-swe", specifier = ">=1.0.3" },
     { name = "tree-sitter", specifier = ">=0.24" },
@@ -3468,6 +3470,15 @@ keyring = [
 ]
 memory = [
     { name = "cachetools" },
+]
+
+[[package]]
+name = "py-landlock"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/83/aa/6dc19aa2393cf4d2288fe3647ade6308d66c2deb233e40e592ddce7c6330/py_landlock-0.1.1.tar.gz", hash = "sha256:917e83917ea8932c1f106b62e82874542094738143600b77dbccd88deabc5656", size = 16210, upload-time = "2026-01-11T15:10:16.372Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/25/f5/53515e4b743ee4d07e37aedfb4bc30c2185b48bd96df44a9fbbef3f3c610/py_landlock-0.1.1-py3-none-any.whl", hash = "sha256:a4dd8dad2032edeb6974031d10be8758acf6c9747ab18616921a03779d97e404", size = 16602, upload-time = "2026-01-11T15:10:17.056Z" },
 ]
 
 [[package]]
