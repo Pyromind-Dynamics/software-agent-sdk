@@ -79,6 +79,16 @@ class PathAccessPolicy:
         return target
 
 
+def resolve_workspace_subpath(subpath: str | Path, workspace_root: Path) -> Path:
+    """Resolve *subpath* against *workspace_root*.
+
+    Absolute paths are resolved directly. Relative paths are joined with
+    *workspace_root* before resolving.
+    """
+    p = Path(subpath)
+    return (p if p.is_absolute() else workspace_root / p).resolve()
+
+
 def default_path_access_policy(
     workspace_dir: str | Path,
     read_only_roots: Sequence[str | Path] = (),
@@ -97,28 +107,36 @@ def default_path_access_policy(
     with ``exclude_workspace_fallback=True`` to model a conversation workspace
     where only a handful of subdirectories are exposed to the agent (for
     example, ``public_data/`` is read-write and ``events/`` is read-only,
-    while ``meta.json`` / ``base_state.json`` are off-limits).
+    while ``meta.json`` / ``base_state.json` are off-limits).
 
     When ``exclude_workspace_fallback`` is True, the workspace ``rwx`` rule is
     omitted entirely; paths outside any declared subpath will be denied by
     :class:`PathAccessPolicy` (first-match, no-match = deny).
+
+    When the caller does not pass explicit subpaths or ``exclude_workspace_fallback``,
+    the function auto-detects conversation workspaces (via
+    :func:`is_conversation_workspace`) and applies the standard conversation
+    permission matrix automatically. This ensures all tools get correct
+    path restrictions without per-tool conversation detection.
     """
+    caller_specified = (
+        workspace_read_only_subpaths
+        or workspace_read_write_subpaths
+        or exclude_workspace_fallback
+    )
+    if not caller_specified and is_conversation_workspace(workspace_dir):
+        workspace_read_only_subpaths = CONVERSATION_READ_ONLY_SUBPATHS
+        workspace_read_write_subpaths = CONVERSATION_READ_WRITE_SUBPATHS
+        exclude_workspace_fallback = True
+
     rules: list[PathRule] = [PathRule.create(root, "r") for root in read_only_roots]
     workspace_root = Path(workspace_dir).expanduser().resolve()
-    for subpath in workspace_read_only_subpaths:
-        target = (
-            Path(subpath).resolve()
-            if Path(subpath).is_absolute()
-            else (workspace_root / subpath).resolve()
-        )
-        rules.append(PathRule.create(target, "r"))
-    for subpath in workspace_read_write_subpaths:
-        target = (
-            Path(subpath).resolve()
-            if Path(subpath).is_absolute()
-            else (workspace_root / subpath).resolve()
-        )
-        rules.append(PathRule.create(target, "rw"))
+    for subpath, perm in (
+        *((s, "r") for s in workspace_read_only_subpaths),
+        *((s, "rw") for s in workspace_read_write_subpaths),
+    ):
+        target = resolve_workspace_subpath(subpath, workspace_root)
+        rules.append(PathRule.create(target, perm))
     if not exclude_workspace_fallback:
         rules.append(PathRule.create(workspace_root, "rwx"))
     return PathAccessPolicy(rules)
@@ -153,10 +171,16 @@ CONVERSATION_READ_ONLY_SUBPATHS: tuple[str, ...] = (EVENTS_SUBPATH,)
 def is_conversation_workspace(workspace_dir: str | Path) -> bool:
     """Return True when ``workspace_dir`` looks like a conversation workspace.
 
-    Detection is based on the presence of an ``events/`` subdirectory, which
-    the event log creates when a conversation is started.
+    Detection uses two heuristics (either is sufficient):
+    1. The directory path matches ``…/workspace/conversations/<id>`` — this
+       works even before the conversation starts and ``events/`` is created.
+    2. An ``events/`` subdirectory exists — this works for already-running
+       conversations regardless of path layout.
     """
-    return (Path(workspace_dir) / EVENTS_SUBPATH).is_dir()
+    resolved = Path(workspace_dir).resolve()
+    if (resolved / EVENTS_SUBPATH).is_dir():
+        return True
+    return resolved.parent.name == "conversations" and bool(resolved.name)
 
 
 def _public_alias_root(alias: str, roots: tuple[Path, ...]) -> Path | None:

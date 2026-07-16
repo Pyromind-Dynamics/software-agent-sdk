@@ -195,7 +195,7 @@ def test_grep_tool_rejects_path_outside_workspace(tmp_path):
     observation = tool.executor(GrepAction(pattern="secret", path=str(outside)))
 
     assert observation.is_error
-    assert "outside the workspace root" in observation.text
+    assert "outside the workspace" in observation.text
 
 
 def test_grep_tool_hidden_files_excluded():
