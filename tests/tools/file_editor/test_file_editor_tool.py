@@ -3,12 +3,14 @@
 import os
 import tempfile
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 import pytest
 from pydantic import SecretStr
 
 from openhands.sdk.agent import Agent
+from openhands.sdk.conversation import LocalConversation
 from openhands.sdk.conversation.state import ConversationState
 from openhands.sdk.llm import LLM
 from openhands.sdk.tool import DeclaredResources
@@ -127,13 +129,17 @@ def test_file_editor_tool_view_file():
 
 def test_file_editor_executor_resolves_workspace_relative_path(tmp_path):
     """Executor accepts short workspace-relative paths and normalizes them."""
-    workflow = tmp_path / "workflow.py"
+    workflow_dir = tmp_path / "public_data" / "workflow_canvas"
+    workflow_dir.mkdir(parents=True)
+    workflow = workflow_dir / "workflow.py"
     workflow.write_text("# workflow: Demo\nlimit = 10\n", encoding="utf-8")
 
     executor = FileEditorExecutor(workspace_root=str(tmp_path))
     conversation = _DirtyConversation()
 
-    view_result = executor(FileEditorAction(command="view", path="workflow.py"))
+    view_result = executor(
+        FileEditorAction(command="view", path="public_data/workflow_canvas/workflow.py")
+    )
     assert not view_result.is_error
     assert view_result.path == str(workflow.resolve())
     assert "limit = 10" in view_result.text
@@ -142,16 +148,74 @@ def test_file_editor_executor_resolves_workspace_relative_path(tmp_path):
     edit_result = executor(
         FileEditorAction(
             command="str_replace",
-            path="workflow.py",
+            path="public_data/workflow_canvas/workflow.py",
             old_str="limit = 10",
             new_str="limit = 20",
         ),
-        conversation=conversation,
+        conversation=cast(LocalConversation, conversation),
     )
     assert not edit_result.is_error
     assert edit_result.path == str(workflow.resolve())
     assert conversation._state.agent_state[PYROMIND_WORKFLOW_DIRTY_KEY] is True
     assert workflow.read_text(encoding="utf-8") == "# workflow: Demo\nlimit = 20\n"
+
+
+def test_file_editor_executor_views_knowledge_alias_but_cannot_edit(tmp_path):
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    article = knowledge / "article.md"
+    article.write_text("workflow article\n", encoding="utf-8")
+    executor = FileEditorExecutor(
+        workspace_root=str(tmp_path / "conversation"),
+        read_only_roots=[str(knowledge)],
+    )
+
+    view_result = executor(
+        FileEditorAction(command="view", path="knowledge/article.md")
+    )
+    edit_result = executor(
+        FileEditorAction(
+            command="str_replace",
+            path="knowledge/article.md",
+            old_str="workflow",
+            new_str="changed",
+        )
+    )
+
+    assert not view_result.is_error
+    assert view_result.path == "knowledge/article.md"
+    assert "workflow article" in view_result.text
+    assert edit_result.is_error
+    assert article.read_text(encoding="utf-8") == "workflow article\n"
+
+
+def test_file_editor_executor_views_skills_alias_but_cannot_edit(tmp_path):
+    skills = tmp_path / ".agents" / "skills"
+    skills.mkdir(parents=True)
+    skill = skills / "SKILL.md"
+    skill.write_text("workflow skill\n", encoding="utf-8")
+    executor = FileEditorExecutor(
+        workspace_root=str(tmp_path / "conversation"),
+        read_only_roots=[str(skills)],
+    )
+
+    view_result = executor(
+        FileEditorAction(command="view", path=".agents/skills/SKILL.md")
+    )
+    edit_result = executor(
+        FileEditorAction(
+            command="str_replace",
+            path=".agents/skills/SKILL.md",
+            old_str="workflow",
+            new_str="changed",
+        )
+    )
+
+    assert not view_result.is_error
+    assert view_result.path == ".agents/skills/SKILL.md"
+    assert "workflow skill" in view_result.text
+    assert edit_result.is_error
+    assert skill.read_text(encoding="utf-8") == "workflow skill\n"
 
 
 def test_file_editor_executor_non_workflow_edit_does_not_mark_dirty(tmp_path):
@@ -167,7 +231,7 @@ def test_file_editor_executor_non_workflow_edit_does_not_mark_dirty(tmp_path):
             old_str="10",
             new_str="20",
         ),
-        conversation=conversation,
+        conversation=cast(LocalConversation, conversation),
     )
 
     assert not result.is_error
@@ -181,7 +245,9 @@ def test_file_editor_executor_resolves_cwd_relative_conversation_path(
     repo = tmp_path / "software-agent-sdk"
     conversation_dir = repo / "workspace" / "conversations" / "abc123"
     conversation_dir.mkdir(parents=True)
-    workflow = conversation_dir / "workflow.py"
+    workflow_dir = conversation_dir / "public_data" / "workflow_canvas"
+    workflow_dir.mkdir(parents=True)
+    workflow = workflow_dir / "workflow.py"
     workflow.write_text("# workflow: Demo\nlimit = 10\n", encoding="utf-8")
     monkeypatch.chdir(repo)
 
@@ -190,7 +256,7 @@ def test_file_editor_executor_resolves_cwd_relative_conversation_path(
     result = executor(
         FileEditorAction(
             command="view",
-            path="workspace/conversations/abc123/workflow.py",
+            path="workspace/conversations/abc123/public_data/workflow_canvas/workflow.py",
         )
     )
 
@@ -201,7 +267,7 @@ def test_file_editor_executor_resolves_cwd_relative_conversation_path(
     absolute_alias_result = executor(
         FileEditorAction(
             command="view",
-            path="/workspace/conversations/abc123/workflow.py",
+            path="/workspace/conversations/abc123/public_data/workflow_canvas/workflow.py",
         )
     )
     assert not absolute_alias_result.is_error
@@ -501,3 +567,70 @@ def test_str_replace_exact_match_preserves_new_str_whitespace():
         with open(test_file) as f:
             content = f.read()
         assert content == "HELLO WORLD  \nsecond line\n"
+
+
+def test_file_editor_executor_conversation_mode_restricts_subpaths(tmp_path):
+    from openhands.tools.utils import (
+        CONVERSATION_READ_ONLY_SUBPATHS,
+        CONVERSATION_READ_WRITE_SUBPATHS,
+    )
+
+    conversation_dir = tmp_path / "conversation"
+    conversation_dir.mkdir()
+    (conversation_dir / "events").mkdir()
+    public_data_dir = conversation_dir / "public_data"
+    public_data_dir.mkdir()
+    (conversation_dir / "workflow").mkdir()
+    workflow_file = conversation_dir / "workflow" / "workflow.py"
+    workflow_file.write_text("# original\nlimit = 1\n", encoding="utf-8")
+    canvas_file = public_data_dir / "state.json"
+    canvas_file.write_text('{"layout": "A"}\n', encoding="utf-8")
+    events_file = conversation_dir / "events" / "0001.json"
+    events_file.write_text('{"kind": "message"}\n', encoding="utf-8")
+    meta_file = conversation_dir / "meta.json"
+    meta_file.write_text("{}", encoding="utf-8")
+
+    executor = FileEditorExecutor(
+        workspace_root=str(conversation_dir),
+        workspace_read_only_subpaths=list(CONVERSATION_READ_ONLY_SUBPATHS),
+        workspace_read_write_subpaths=list(CONVERSATION_READ_WRITE_SUBPATHS),
+        exclude_workspace_fallback=True,
+    )
+
+    workflow_view = executor(
+        FileEditorAction(command="view", path="workflow/workflow.py")
+    )
+    assert workflow_view.is_error
+
+    canvas_view = executor(
+        FileEditorAction(command="view", path="public_data/state.json")
+    )
+    assert not canvas_view.is_error
+
+    canvas_edit = executor(
+        FileEditorAction(
+            command="str_replace",
+            path="public_data/state.json",
+            old_str='"layout": "A"',
+            new_str='"layout": "B"',
+        )
+    )
+    assert not canvas_edit.is_error
+    assert canvas_file.read_text(encoding="utf-8") == '{"layout": "B"}\n'
+
+    events_view = executor(FileEditorAction(command="view", path="events/0001.json"))
+    assert not events_view.is_error
+
+    events_edit = executor(
+        FileEditorAction(
+            command="str_replace",
+            path="events/0001.json",
+            old_str='"kind": "message"',
+            new_str='"kind": "tampered"',
+        )
+    )
+    assert events_edit.is_error
+    assert events_file.read_text(encoding="utf-8") == '{"kind": "message"}\n'
+
+    meta_view = executor(FileEditorAction(command="view", path="meta.json"))
+    assert meta_view.is_error

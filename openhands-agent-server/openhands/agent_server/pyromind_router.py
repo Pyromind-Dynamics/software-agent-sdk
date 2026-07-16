@@ -58,12 +58,12 @@ from openhands.sdk import LLM, AgentContext, TextContent, Tool, register_tool
 from openhands.sdk.conversation.request import (
     StartConversationRequest,
 )
-from openhands.sdk.tool.builtins import SkillsListTool, SkillsReadTool
 from openhands.sdk.llm.message import Message
 from openhands.sdk.secret import SecretSource, SecretValue, StaticSecret
 from openhands.sdk.security.confirmation_policy import ConfirmRisky
 from openhands.sdk.security.defense_in_depth import PatternSecurityAnalyzer
 from openhands.sdk.skills import Skill, load_skills_from_dir
+from openhands.sdk.tool.builtins import SkillsListTool, SkillsReadTool
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
@@ -79,15 +79,16 @@ from openhands.tools.pyromind_dataset.definition import (
 from openhands.tools.pyromind_debug import get_debug_result_broker
 from openhands.tools.utils import PUBLIC_READ_ALIASES
 from openhands.tools.workflow import (
-    DslToXyflowTool,
     RunWorkflowTool,
     ValidateWorkflowDslTool,
 )
+from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 from openhands.tools.workflow.dsl_to_xyflow import convert_xyflow_to_dsl
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
 )
+from openhands.tools.workflow_debug import WorkflowDebugTool
 
 
 PYROMIND_AUTH_TOKEN_SECRET = "auth_token"
@@ -155,23 +156,31 @@ Skill usage rules:
 Your current working directory is this conversation's private workspace:
 {working_dir}
 
-Create and edit the workflow DSL at the relative path `workflow.py` from the
-current working directory. Prefer `apply_patch` with `workflow.py` for workflow
-changes. If you use `file_editor` for this file, set its `path` to `workflow.py`;
-the runtime resolves workspace-relative paths to host-absolute paths. Do not
-hand-author long absolute paths, and do not use `/workspace/...` or
-`workspace/conversations/...` as a `file_editor.path` for `workflow.py`.
-After creating or modifying `workflow.py`, stop normally; the server sends
+Create and edit the workflow DSL at the relative path
+`public_data/workflow_canvas/workflow.py` from the current working directory.
+Prefer `apply_patch` for workflow changes. When using `apply_patch`, always
+use the full relative path in the patch header, e.g.
+`*** Add File: public_data/workflow_canvas/workflow.py` or
+`*** Update File: public_data/workflow_canvas/workflow.py` — never use the
+bare name `workflow.py`. If you use `file_editor` for this file, set its
+`path` to `public_data/workflow_canvas/workflow.py`; the runtime resolves
+workspace-relative paths to host-absolute paths. Do not hand-author long
+absolute paths, and do not use `/workspace/...` or
+`workspace/conversations/...` as a `file_editor.path` for the workflow file.
+After creating or modifying the workflow file, stop normally; the server sends
 the workflow to the frontend once the run finishes. Do not say the workflow has
-been generated unless a tool call actually created or modified `workflow.py`.
+been generated unless a tool call actually created or modified the workflow file.
 
+- If a listed skill fits the request (for example, generating a workflow), \
+invoke it via `invoke_skill` before searching the knowledge base. Do not invoke
+a workflow-generation skill for an article lookup alone.
 - For knowledge-base or skill-document requests that are not skill-linked,
   prefer `grep` and `file_editor` with the logical `{knowledge_alias}/` or
   `{skills_alias}/` path. `terminal` is also available when direct filesystem
   inspection is needed. Do not use `apply_patch` to modify public knowledge or
-  skill documents. Open matched files with `file_editor` before answering or
-  editing `workflow.py`; never infer APIs or operational facts from filenames or
-  directory listings.
+  skill documents. Open matched files with `file_editor` before
+answering or editing the workflow file; never infer APIs or operational facts from
+filenames or directory listings.
 - For "查看知识库有哪些信息" or similar inventory requests, use one `grep`
   call per top-level directory (`basic`, `jupyterlab`, `sdk`, `studio`, and
   `nodes`) with `include="*.mdx"` and pattern `^title:|^# `; do not use pattern
@@ -345,6 +354,19 @@ def _build_workflow_run_tool(
     return Tool(name=RunWorkflowTool.name, params=params), secrets
 
 
+def _build_workflow_debug_tool(
+    http_request: Request,
+) -> tuple[Tool, dict[str, SecretSource]]:
+    """Build ``workflow_debug`` with the same env/auth params as ``run_workflow``."""
+    params: dict[str, Any] = {}
+    secrets: dict[str, SecretSource] = {}
+    params, secrets = _load_env_to_tools(
+        http_request=http_request, params=params, secrets=secrets
+    )
+    secrets = _load_auth_token(http_request=http_request, secrets=secrets)
+    return Tool(name=WorkflowDebugTool.name, params=params), secrets
+
+
 def _build_pyromind_storage_tools(
     http_request: Request,
     extra: dict[str, Any],
@@ -503,7 +525,7 @@ class PyromindCreateConversationRequest(BaseModel):
         description=(
             "Optional xyflow JSON of the workflow currently on the canvas. "
             "When provided, the server converts it to workflow DSL before "
-            "seeding workflow.py."
+            "seeding the workflow file."
         ),
     )
     extra: dict[str, Any] = Field(
@@ -524,7 +546,7 @@ class PyromindSendMessageRequest(BaseModel):
     """Request body for sending a message in a Pyromind conversation.
 
     Unlike the generic ``POST /api/conversations/{id}/events`` endpoint, this
-    also accepts the workflow currently shown on the canvas, so that workflow.py
+    also accepts the workflow currently shown on the canvas, so that the workflow file
     is synced to what the user actually sees *before* the agent acts on this
     message.
     """
@@ -536,7 +558,7 @@ class PyromindSendMessageRequest(BaseModel):
         description=(
             "xyflow JSON of the workflow currently on the canvas. When "
             "provided, the server converts it to workflow DSL before syncing "
-            "workflow.py and saving the input snapshot."
+            "the workflow file and saving the input snapshot."
         ),
     )
     run: bool = Field(
@@ -643,6 +665,13 @@ class PyromindWorkflowCallbackRequest(BaseModel):
         default=True,
         description="Restart the agent on the target conversation after delivery.",
     )
+    from_workflow_debug: bool = Field(
+        default=False,
+        description=(
+            "True when simulating a workflow_debug (test) terminal callback. "
+            "Kafka derives this from out_id agent1#debug#..."
+        ),
+    )
 
 
 class PyromindWorkflowCallbackResponse(BaseModel):
@@ -699,7 +728,7 @@ def _sync_workflow_with_canvas(
     if workflow_dsl is None:
         return None
 
-    workflow_path = working_dir / "workflow.py"
+    workflow_path = working_dir / WORKFLOW_RELATIVE_PATH
     existed = workflow_path.is_file()
     current = workflow_path.read_text(encoding="utf-8") if existed else ""
 
@@ -709,7 +738,7 @@ def _sync_workflow_with_canvas(
         return None  # Already in sync -- also covers the from-scratch case
         # where the canvas and workflow.py are both empty/missing.
 
-    working_dir.mkdir(parents=True, exist_ok=True)
+    workflow_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not normalized_canvas:
         # The user cleared the canvas. Remove workflow.py entirely (rather
@@ -761,12 +790,12 @@ def _apply_workflow_snapshot_to_workspace(
     working_dir: Path,
     workflow_dsl: str,
 ) -> Literal["updated", "removed"]:
-    workflow_path = working_dir / "workflow.py"
+    workflow_path = working_dir / WORKFLOW_RELATIVE_PATH
     if not _normalize_dsl(workflow_dsl):
         workflow_path.unlink(missing_ok=True)
         return "removed"
 
-    working_dir.mkdir(parents=True, exist_ok=True)
+    workflow_path.parent.mkdir(parents=True, exist_ok=True)
     workflow_path.write_text(workflow_dsl, encoding="utf-8")
     return "updated"
 
@@ -959,8 +988,9 @@ async def create_pyromind_conversation(
         http_request, request.extra
     )
 
-    # run_workflow reuses validate auth/header wiring / 运行工具复用校验鉴权配置
+    # run_workflow / workflow_debug reuse validate auth/header wiring
     run_tool, run_secrets = _build_workflow_run_tool(http_request)
+    debug_tool, debug_secrets = _build_workflow_debug_tool(http_request)
     # storage
     storage_tools, storage_secrets = _build_pyromind_storage_tools(
         http_request, request.extra
@@ -994,6 +1024,7 @@ async def create_pyromind_conversation(
             Tool(name="grep"),
             Tool(name="file_editor"),
             Tool(name=RunWorkflowTool.name, params=run_tool.params),
+            Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
             *storage_tools,
             validation_tool,
         ],
@@ -1009,7 +1040,9 @@ async def create_pyromind_conversation(
     # prior-turn workflow.py content for the agent to contrast against.
     workflow_dsl = _workflow_dsl_from_xyflow(request.workflow_xyflow)
     if workflow_dsl:
-        (conversation_dir / "workflow.py").write_text(workflow_dsl, encoding="utf-8")
+        workflow_file = conversation_dir / WORKFLOW_RELATIVE_PATH
+        workflow_file.parent.mkdir(parents=True, exist_ok=True)
+        workflow_file.write_text(workflow_dsl, encoding="utf-8")
 
     # 7. Assemble StartConversationRequest. Pyromind sends the initial message
     # after startup through EventService so the workflow snapshot hook can bind
@@ -1020,7 +1053,12 @@ async def create_pyromind_conversation(
         workspace=workspace,
         conversation_id=conversation_id,
         initial_message=None,
-        secrets={**validation_secrets, **run_secrets, **storage_secrets},
+        secrets={
+            **validation_secrets,
+            **run_secrets,
+            **debug_secrets,
+            **storage_secrets,
+        },
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
         user_id=user_id,
         # Pyromind exposes terminal, patch, and workflow execution tools. Treat
@@ -1270,6 +1308,7 @@ async def pyromind_workflow_callback(
         error_log=request.error_log,
         conversation_id=request.conversation_id,
         auto_run=request.auto_run,
+        from_workflow_debug=request.from_workflow_debug,
     )
     if result.outcome in {"unknown_task", "unknown_conversation"}:
         raise HTTPException(

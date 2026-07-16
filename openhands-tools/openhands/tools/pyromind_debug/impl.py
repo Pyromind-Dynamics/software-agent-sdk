@@ -26,6 +26,7 @@ from openhands.tools.pyromind_debug.mock_platform import (
     DebugPlatformClient,
     MockDebugPlatform,
 )
+from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 
 
 if TYPE_CHECKING:
@@ -34,7 +35,9 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-class DebugWorkflowExecutor(ToolExecutor[DebugWorkflowAction, DebugWorkflowObservation]):
+class DebugWorkflowExecutor(
+    ToolExecutor[DebugWorkflowAction, DebugWorkflowObservation]
+):
     """Submits workflow.py to the debug platform and blocks for the result.
 
     Attempt counting lives on the executor instance, which is created once
@@ -58,7 +61,7 @@ class DebugWorkflowExecutor(ToolExecutor[DebugWorkflowAction, DebugWorkflowObser
     def __call__(
         self,
         action: DebugWorkflowAction,
-        conversation: "LocalConversation | None" = None,
+        conversation: LocalConversation | None = None,
     ) -> DebugWorkflowObservation:
         if conversation is None:
             return DebugWorkflowObservation.from_text(
@@ -70,7 +73,7 @@ class DebugWorkflowExecutor(ToolExecutor[DebugWorkflowAction, DebugWorkflowObser
             )
 
         working_dir = Path(conversation.workspace.working_dir)
-        workflow_path = working_dir / "workflow.py"
+        workflow_path = working_dir / WORKFLOW_RELATIVE_PATH
         if not workflow_path.is_file():
             return DebugWorkflowObservation.from_text(
                 text=(
@@ -105,10 +108,11 @@ class DebugWorkflowExecutor(ToolExecutor[DebugWorkflowAction, DebugWorkflowObser
         broker = get_debug_result_broker()
         broker.register(task_id)
         logger.info(
-            "Submitting debug_workflow attempt %d/%d (task_id=%s)",
+            "Submitting debug_workflow attempt %d/%d (task_id=%s, note=%r)",
             attempt,
             self._max_attempts,
             task_id,
+            action.note,
         )
         self._platform.submit(
             task_id=task_id, workflow_source=workflow_source, attempt=attempt

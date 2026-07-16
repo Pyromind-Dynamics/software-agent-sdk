@@ -81,14 +81,6 @@ class RunWorkflowAction(Action):
         default="workflow",
         description="Workflow name passed to the platform when submitting the run.",
     )
-    test_mode: bool = Field(
-        default=False,
-        description=(
-            "When true, submit a platform test/debug run (execution_mode=test). "
-            "Use for 测试/调试/试跑 requests; the tool returns after submission and "
-            "delivers pass/fail via callback."
-        ),
-    )
 
 
 class RunWorkflowObservation(Observation):
@@ -122,24 +114,17 @@ class RunWorkflowObservation(Observation):
     )
     max_attempts: int = Field(description="The maximum number of run attempts allowed.")
 
-    keep_ui_lock: bool = Field(
-        default=False,
-        description="Whether to keep the UI lock after the workflow runs.",
-    )
-
 
 TOOL_DESCRIPTION = """Submit the current Pyromind workflow to the platform for asynchronous execution.
 
-Use this tool when the user asks to run, publish, or execute a workflow in production mode
-(`test_mode=false`, the default).
+Use this tool when the user asks to run, publish, or execute a workflow in production mode.
 
-Use `test_mode=true` when the user asks to test, debug, 测试, 调试, or 试跑 a workflow.
-That is the replacement for the legacy `debug_workflow` tool: it submits a real platform
-test run with `execution_mode=test` and returns a task ID after submission. Final pass/fail
-status and runtime errors are delivered later via a platform callback (system reminder).
+For test / debug / 测试 / 调试 / 试跑, do **not** use this tool.
+Call the dedicated `workflow_debug` tool instead (it wraps this implementation with
+platform `execution_mode=test` and returns `keep_ui_lock`).
 
 Pass the required workflow Python DSL source code in `dsl` (not a file path). Read
-`workflow.py` from the workspace and pass its contents as `dsl`. Do not execute the
+`public_data/workflow_canvas/workflow.py` from the workspace and pass its contents as `dsl`. Do not execute the
 workflow locally with bash or Python.
 
 Platform execution is asynchronous: this tool returns a workflow task ID after
@@ -199,6 +184,8 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
         self,
         action: RunWorkflowAction,
         conversation: BaseConversation | None = None,
+        *,
+        test_mode: bool = False,
     ) -> RunWorkflowObservation:
         """Handle one ``run_workflow`` tool invocation from the agent loop.
 
@@ -207,6 +194,10 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
         1. Require a local conversation so workspace paths and secrets exist.
         2. Require non-empty workflow DSL source code in ``action.dsl``.
         3. Enforce the per-executor attempt budget.
+
+        ``test_mode`` is **not** part of the agent-facing action schema. The
+        agent tool path always uses ``test_mode=False`` (production). Only
+        programmatic callers such as ``workflow_debug`` pass ``test_mode=True``.
 
         Returns an error observation immediately when any pre-flight check fails;
         otherwise increments the attempt counter and forwards to the platform
@@ -219,6 +210,9 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
         1. 必须有本地 conversation，以便访问 workspace 路径与 secrets。
         2. 要求 ``action.dsl`` 提供非空的工作流 DSL 源码。
         3. 检查本 Executor 的尝试次数上限。
+
+        ``test_mode`` 不在 Agent 可见的 action schema 中；工具路径始终为正式运行。
+        仅 ``workflow_debug`` 等程序化调用方传入 ``test_mode=True``。
 
         任一预检失败则立即返回 error observation；否则递增计数并进入平台集成逻辑。
         """
@@ -280,7 +274,7 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
                 client=client,
                 workflow_json=workflow_json,
                 workflow_name=action.name,
-                test_mode=action.test_mode,
+                test_mode=test_mode,
                 attempt=self._attempt,
                 conversation_id=str(conversation.id),
             )
@@ -292,7 +286,7 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
                 dsl_ms,
                 submit_ms,
                 (time.monotonic() - call_t0) * 1000,
-                action.test_mode,
+                test_mode,
                 observation.status,
             )
             return observation
@@ -397,6 +391,7 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
                 workflow=workflow_xyflow,
                 name=_workflow_name,
                 conversation_id=conversation_id,
+                test_mode=test_mode,
             )
 
             if test_mode:
@@ -424,7 +419,6 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
                 attempt=attempt,
                 max_attempts=self._max_attempts,
                 is_error=False,
-                keep_ui_lock=True,
             )
         except Exception as exc:
             return RunWorkflowObservation.from_text(

@@ -131,23 +131,51 @@ def build_run_workflow_terminal_reminder(
     task_id: str,
     status: RunWorkflowStatus,
     error_log: str | None = None,
+    from_workflow_debug: bool = False,
 ) -> str:
     """Build ``<system_reminder>`` for LLM context (via extended_content).
 
     构造注入 LLM 上下文的 ``<system_reminder>``（通过 extended_content）。
+
+    When ``from_workflow_debug`` is True (Kafka out_id tagged
+    ``agent1#debug#...``), success/failure guidance is specific to the
+    debug/test loop. Production ``run_workflow`` callbacks keep the generic
+    resume wording.
     """
     lines = [
         "<system_reminder>",
         f"Pyromind workflow task {task_id} completed with status {status}.",
-        (
+    ]
+    if from_workflow_debug and status == "Succeeded":
+        lines.append(
+            "This terminal status is from a workflow_debug (test) run that "
+            "passed. Briefly tell the user that this test workflow succeeded, "
+            "then wait for their next message. Do not call workflow_debug "
+            "again unless they ask."
+        )
+    elif from_workflow_debug and status in ("Failed", "Error"):
+        lines.append(
+            "This terminal status is from a workflow_debug (test) run that "
+            "failed. The workflow DSL may be wrong. Read the runtime error "
+            "below, regenerate or fix "
+            "public_data/workflow_canvas/workflow.py accordingly (validate if "
+            "needed), then call workflow_debug again to continue testing."
+        )
+    elif from_workflow_debug and status == "Terminated":
+        lines.append(
+            "This terminal status is from a workflow_debug (test) run that "
+            "was terminated. Briefly explain that to the user. Use any error "
+            "log below to decide whether to fix the DSL and call "
+            "workflow_debug again, or wait for the user's next message."
+        )
+    else:
+        lines.append(
             "Resume the tool invocation associated with this task and follow "
             "that tool's result contract when inspecting outputs or errors."
-        ),
-        (
-            "Respond in the language of the user's most recent non-empty "
-            "visible message."
-        ),
-    ]
+        )
+    lines.append(
+        "Respond in the language of the user's most recent non-empty visible message."
+    )
     if error_log:
         lines.append("Runtime error log:")
         lines.append(error_log)
@@ -278,6 +306,7 @@ async def resume_conversation_after_workflow(
     status: RunWorkflowStatus,
     error_log: str | None = None,
     auto_run: bool = True,
+    from_workflow_debug: bool = False,
 ) -> None:
     """Inject terminal status into a conversation and optionally start the agent.
 
@@ -290,6 +319,7 @@ async def resume_conversation_after_workflow(
         task_id=task_id,
         status=status,
         error_log=error_log,
+        from_workflow_debug=from_workflow_debug,
     )
     await event_service.send_internal_context(
         [TextContent(text=reminder)],
@@ -310,6 +340,7 @@ async def deliver_run_workflow_status(
     conversation_id: str | None = None,
     updated_at: datetime | None = None,
     auto_run: bool = True,
+    from_workflow_debug: bool = False,
     conversation_service: ConversationService | None = None,
 ) -> RunWorkflowCallbackResult:
     """Handle one workflow status update from Kafka or HTTP webhook.
@@ -330,6 +361,8 @@ async def deliver_run_workflow_status(
         conversation_id: Usually from task ``out_id`` / Kafka message.
         updated_at: Reserved for future ordering / idempotency.
         auto_run: Restart agent after injecting terminal reminder (default True).
+        from_workflow_debug: True when the task was submitted by ``workflow_debug``
+            (``out_id`` contains ``agent1#debug#``). Selects debug-only reminder text.
         conversation_service: Override for tests; else process singleton.
     """
     del updated_at  # reserved for future idempotency / ordering
@@ -442,6 +475,7 @@ async def deliver_run_workflow_status(
             status=normalized_status,
             error_log=error_log,
             auto_run=auto_run,
+            from_workflow_debug=from_workflow_debug,
         )
         resume_ms = (time.monotonic() - resume_t0) * 1000
     except Exception:

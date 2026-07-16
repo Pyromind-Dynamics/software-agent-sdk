@@ -57,12 +57,22 @@ def submit_workflow_task(
     workflow: dict,
     name: str,
     conversation_id: str,
+    test_mode: bool = False,
 ) -> TrainingTaskCreateResponse:
-    """Create one Studio task with the standard conversation correlation ID."""
+    """Create one Studio task with the standard conversation correlation ID.
+
+    When ``test_mode`` is True (``workflow_debug`` path), ``out_id`` is
+    ``agent1#debug#<conversation_id>`` so Kafka callbacks can apply
+    debug-only agent guidance. Production runs keep ``agent1#<conversation_id>``.
+    """
+    if test_mode:
+        out_id = f"agent1#debug#{conversation_id}"
+    else:
+        out_id = f"agent1#{conversation_id}"
     request = TrainingTaskCreateRequest(
         name=name,
         workflow=workflow,
-        out_id=f"agent1#{conversation_id}",
+        out_id=out_id,
     )
     response = client.studio.create(request)
     if response is None:

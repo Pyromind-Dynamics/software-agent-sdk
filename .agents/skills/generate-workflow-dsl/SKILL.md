@@ -175,9 +175,9 @@ bench 工作流结构（完整模板见 [references/example-workflows.md](refere
    会话目录的长绝对路径，也不要只口头说已生成。若 patch 失败一次，不再重试；重新读取
    文件确认实际状态后切换到 `str_replace`。
 2. 每次写入/修改后立即进入下方"校验循环"。
-3. 校验通过后正常结束：不要调用额外发布工具，也不要主动调用 `run_workflow(test_mode=true)`
-   （那是用户明确要求"测试/调试/试跑"时由 **debug-workflow** 技能通过 `run_workflow` test
-   模式处理）。若用户要求**正式运行/发布**工作流，使用 `run_workflow(test_mode=false)`（默认）。
+3. 校验通过后正常结束：不要调用额外发布工具，也不要主动调用 `workflow_debug`
+   （那是用户明确要求"测试/调试/试跑"时由 **debug-workflow** 技能处理）。若用户要求
+   **正式运行/发布**工作流，使用 `run_workflow`（默认非 test）。
    后端会在本轮结束后自动把 workflow.py 同步给前端。
 
 ## DSL 语法
@@ -236,17 +236,17 @@ variable_name = NodeType(
 4. **最多重试 5 轮**（自己计数）。5 轮后仍不通过，或同一 `code`/`node_id` 连续两轮没消失，
    停止重试并如实说明剩余错误
 
-`validate_workflow_dsl`（静态结构校验，秒级返回）和 `run_workflow`（提交平台异步执行）职责不同：
+`validate_workflow_dsl`（静态结构校验，秒级返回）与平台执行工具职责不同：
 
-| 工具 | 模式 | 职责 |
-|------|------|------|
-| `validate_workflow_dsl` | — | 每次写入后必须调；只做静态结构校验 |
-| `run_workflow` | `test_mode=true` | 平台真实 test 执行；属于 **debug-workflow** 技能；callback 返回终态 |
-| `run_workflow` | `test_mode=false`（默认） | 正式运行/发布；非生成技能默认行为 |
+| 工具 | 职责 |
+|------|------|
+| `validate_workflow_dsl` | 每次写入后必须调；只做静态结构校验 |
+| `workflow_debug` | 平台真实 test 执行；属于 **debug-workflow** 技能；callback 返回终态 |
+| `run_workflow` | 正式运行/发布；非生成技能默认行为 |
 
-前者每次写入后必须调；后者只在用户明确要求"测试/调试/试跑"（test 模式）或"运行/发布"
-（正式模式）时用。报错来源要分清再修。原 `debug_workflow` / `pyromind_debug` 已停用，统一走
-`run_workflow`。
+前者每次写入后必须调；`workflow_debug` / `run_workflow` 只在用户明确要求"测试/调试/试跑"
+或"运行/发布"时用。报错来源要分清再修。原 `debug_workflow` / `pyromind_debug` 已停用；
+也不要再直接调用 `run_workflow(test_mode=true)`。
 
 ## 参考文件
 

@@ -113,11 +113,6 @@ def _get_bash_event_service(websocket: WebSocket) -> BashEventService:
     return bash_event_service
 
 
-def _global_bash_socket_disabled(websocket: WebSocket) -> bool:
-    config: Config = websocket.app.state.config
-    return config.command_policy_mode == "multi_tenant_strict"
-
-
 def _resolve_websocket_session_api_key(
     websocket: WebSocket,
     session_api_key: str | None,
@@ -530,11 +525,6 @@ async def bash_events_socket(
                 # Keep the connection alive and handle any incoming messages
                 data = await websocket.receive_json()
                 logger.info("Received bash request")
-                if _global_bash_socket_disabled(websocket):
-                    raise PermissionError(
-                        "direct_bash_api_disabled: global bash command execution "
-                        "is disabled in multi-tenant mode"
-                    )
                 request = ExecuteBashRequest.model_validate(data)
                 await bash_service.start_bash_command(request)
             except WebSocketDisconnect:

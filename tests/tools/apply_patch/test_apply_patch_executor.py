@@ -75,7 +75,7 @@ def test_create_modify_delete(tmp_ws: Path):
 def test_apply_patch_marks_workflow_dirty(tmp_ws: Path):
     patch = (
         "*** Begin Patch\n"
-        "*** Add File: workflow.py\n"
+        "*** Add File: public_data/workflow_canvas/workflow.py\n"
         "+# workflow: Patch Demo\n"
         "+limit = 20\n"
         "*** End Patch"
@@ -149,12 +149,7 @@ def test_patch_parse_errors_are_actionable(
     "patch",
     [
         # Whitespace around the envelope markers (codex trims boundary lines).
-        (
-            "*** Begin Patch \n"
-            "*** Add File: lenient.txt\n"
-            "+content\n"
-            "  *** End Patch  "
-        ),
+        ("*** Begin Patch \n*** Add File: lenient.txt\n+content\n  *** End Patch  "),
         # Whole patch wrapped in a markdown code fence.
         (
             "```\n"
@@ -182,12 +177,7 @@ def test_patch_parse_errors_are_actionable(
             "Done! The file has been created."
         ),
         # Spurious '+' prefix on the closing marker (over-applied content rule).
-        (
-            "*** Begin Patch\n"
-            "*** Add File: lenient.txt\n"
-            "+content\n"
-            "+*** End Patch"
-        ),
+        ("*** Begin Patch\n*** Add File: lenient.txt\n+content\n+*** End Patch"),
     ],
 )
 def test_lenient_envelope_parsing(tmp_ws: Path, patch: str):

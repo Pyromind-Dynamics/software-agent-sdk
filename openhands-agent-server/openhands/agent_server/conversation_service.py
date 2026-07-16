@@ -68,6 +68,7 @@ from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.workflow.definition import (
     PYROMIND_WORKFLOW_DIRTY_KEY,
     PYROMIND_WORKFLOW_EMITTED_KEY,
+    WORKFLOW_RELATIVE_PATH,
 )
 
 
@@ -1287,9 +1288,9 @@ class ConversationService:
             state._on_state_change = callback
 
         working_dir = Path(conversation.workspace.working_dir)
-        working_dir.mkdir(parents=True, exist_ok=True)
-        workflow_path = working_dir / "workflow.py"
+        workflow_path = working_dir / WORKFLOW_RELATIVE_PATH
         if workflow_dsl.strip():
+            workflow_path.parent.mkdir(parents=True, exist_ok=True)
             workflow_path.write_text(workflow_dsl, encoding="utf-8")
         else:
             workflow_path.unlink(missing_ok=True)
