@@ -22,7 +22,12 @@ from openhands.sdk.tool import (
 )
 from openhands.sdk.utils.redact import redact_text_secrets
 from openhands.tools.file_editor.utils.diff import visualize_diff
-from openhands.tools.utils import configured_public_read_roots
+from openhands.tools.utils import (
+    CONVERSATION_READ_ONLY_SUBPATHS,
+    CONVERSATION_READ_WRITE_SUBPATHS,
+    configured_public_read_roots,
+    is_conversation_workspace,
+)
 
 
 CommandLiteral = Literal["view", "create", "str_replace", "insert", "undo_edit"]
@@ -238,9 +243,18 @@ class FileEditorTool(ToolDefinition[FileEditorAction, FileEditorObservation]):
         configured_roots = read_only_roots
         if configured_roots is None:
             configured_roots = [str(root) for root in configured_public_read_roots()]
+        working_dir = conv_state.workspace.working_dir
+        conversation_mode = is_conversation_workspace(working_dir)
         executor = FileEditorExecutor(
-            workspace_root=conv_state.workspace.working_dir,
+            workspace_root=working_dir,
             read_only_roots=configured_roots,
+            workspace_read_only_subpaths=(
+                list(CONVERSATION_READ_ONLY_SUBPATHS) if conversation_mode else None
+            ),
+            workspace_read_write_subpaths=(
+                list(CONVERSATION_READ_WRITE_SUBPATHS) if conversation_mode else None
+            ),
+            exclude_workspace_fallback=conversation_mode,
         )
 
         # Build the tool description with conditional image viewing support
