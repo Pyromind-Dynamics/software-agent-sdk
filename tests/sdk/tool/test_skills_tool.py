@@ -1,12 +1,18 @@
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
+from openhands.sdk.conversation import LocalConversation
+from openhands.sdk.event.llm_convertible import ObservationEvent
+from openhands.sdk.llm import TextContent
 from openhands.sdk.skills import Skill, SkillResources, SkillRuntime
 from openhands.sdk.tool.builtins import (
     BUILT_IN_TOOL_CLASSES,
     SkillsListAction,
+    SkillsListObservation,
     SkillsListTool,
     SkillsReadAction,
+    SkillsReadObservation,
     SkillsReadTool,
 )
 
@@ -24,9 +30,7 @@ def make_runtime(tmp_path: Path) -> SkillRuntime:
                 description="Read workflow references",
                 source=str(root / "SKILL.md"),
                 is_agentskills_format=True,
-                resources=SkillResources(
-                    skill_root=str(root), references=["guide.md"]
-                ),
+                resources=SkillResources(skill_root=str(root), references=["guide.md"]),
             )
         ]
     )
@@ -56,16 +60,43 @@ def test_list_and_read_tools_execute(tmp_path):
     (list_tool,) = SkillsListTool.create()
     (read_tool,) = SkillsReadTool.create()
 
-    listed = list_tool(SkillsListAction(query="workflow"), conversation=conversation)
+    listed = cast(
+        SkillsListObservation,
+        list_tool(
+            SkillsListAction(query="workflow"),
+            conversation=cast(LocalConversation, conversation),
+        ),
+    )
     assert listed.skills == ["reader"]
+    assert listed.text == "reader"
 
-    read = read_tool(
-        SkillsReadAction(skill_name="reader", path="references/guide.md"),
-        conversation=conversation,
+    empty = cast(SkillsListObservation, list_tool(SkillsListAction()))
+    assert empty.skills == []
+    assert empty.text == "No skills found."
+
+    read = cast(
+        SkillsReadObservation,
+        read_tool(
+            SkillsReadAction(skill_name="reader", path="references/guide.md"),
+            conversation=cast(LocalConversation, conversation),
+        ),
     )
     assert read.skill_name == "reader"
     assert read.path == "references/guide.md"
     assert read.contents == "guide"
+    assert read.text == "guide"
+    assert isinstance(read.to_llm_content[0], TextContent)
+    assert read.to_llm_content[0].text == "guide"
+    assert read.model_dump(mode="json")["content"][0]["text"] == "guide"
+
+    message = ObservationEvent(
+        observation=read,
+        action_id="action-id",
+        tool_name="skills_read",
+        tool_call_id="tool-call-id",
+    ).to_llm_message()
+    assert isinstance(message.content[0], TextContent)
+    assert message.content[0].text == "guide"
 
 
 def test_tools_declare_read_only_resources(tmp_path):

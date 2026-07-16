@@ -68,6 +68,22 @@ from openhands.tools.workflow.validate_workflow_dsl import (
 _REMOVED_WORKFLOW_TOOL = "publish" + "_workflow"
 
 
+def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None:
+    repo_root = Path(__file__).parents[2]
+    skill_root = repo_root / ".agents" / "skills" / "generate-workflow-dsl"
+    skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    node_reference = (skill_root / "references" / "node-reference.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "references/` 列表是索引，不是必读清单" in skill_text
+    assert "不要用它们读取\n  `.agents/skills/...`" in skill_text
+    assert "首次校验前不要逐个确认节点" in skill_text
+    assert "生成训练工作流前先读" not in skill_text
+    assert "已确定要用的节点直接" not in skill_text
+    assert "足以生成第一版 DSL，不要再逐个读取节点文档" in node_reference
+
+
 def test_pyromind_llm_config_normalizes_chat_completions_base_url() -> None:
     config = PyromindLLMConfig(
         model="openai/glm-5.2-fp8",

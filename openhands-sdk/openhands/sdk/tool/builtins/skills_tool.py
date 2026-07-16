@@ -44,21 +44,29 @@ def _runtime_from_conversation(conversation) -> SkillRuntime:
 
 
 class SkillsListExecutor(ToolExecutor):
-    def __call__(self, action: SkillsListAction, conversation=None) -> SkillsListObservation:
+    def __call__(
+        self, action: SkillsListAction, conversation=None
+    ) -> SkillsListObservation:
         runtime = _runtime_from_conversation(conversation)
         if action.query:
             selection = runtime.select(action.query, limit=action.limit)
-            return SkillsListObservation(
-                skills=[entry.name for entry in selection.candidate_entries]
-            )
-        return SkillsListObservation(skills=[entry.name for entry in runtime.list()])
+            skills = [entry.name for entry in selection.candidate_entries]
+        else:
+            skills = [entry.name for entry in runtime.list()]
+        return SkillsListObservation.from_text(
+            text="\n".join(skills) if skills else "No skills found.",
+            skills=skills,
+        )
 
 
 class SkillsReadExecutor(ToolExecutor):
-    def __call__(self, action: SkillsReadAction, conversation=None) -> SkillsReadObservation:
+    def __call__(
+        self, action: SkillsReadAction, conversation=None
+    ) -> SkillsReadObservation:
         runtime = _runtime_from_conversation(conversation)
         result = runtime.read(action.skill_name, action.path)
-        return SkillsReadObservation(
+        return SkillsReadObservation.from_text(
+            text=result.handle.contents,
             skill_name=result.entry.name,
             path=result.handle.relative_path,
             contents=result.handle.contents,
@@ -66,11 +74,11 @@ class SkillsReadExecutor(ToolExecutor):
 
 
 class SkillsListTool(ToolDefinition[SkillsListAction, SkillsListObservation]):
-    def declared_resources(self, action: Action) -> DeclaredResources:
+    def declared_resources(self, action: Action) -> DeclaredResources:  # noqa: ARG002
         return DeclaredResources(keys=(), declared=True)
 
     @classmethod
-    def create(cls, conv_state=None, **params) -> Sequence[Self]:
+    def create(cls, conv_state=None, **params) -> Sequence[Self]:  # noqa: ARG003
         if params:
             raise ValueError("SkillsListTool doesn't accept parameters")
         return [
@@ -100,14 +108,17 @@ class SkillsReadTool(ToolDefinition[SkillsReadAction, SkillsReadObservation]):
         )
 
     @classmethod
-    def create(cls, conv_state=None, **params) -> Sequence[Self]:
+    def create(cls, conv_state=None, **params) -> Sequence[Self]:  # noqa: ARG003
         if params:
             raise ValueError("SkillsReadTool doesn't accept parameters")
         return [
             cls(
                 action_type=SkillsReadAction,
                 observation_type=SkillsReadObservation,
-                description="Read a skill document or bundled resource by skill name and relative path.",
+                description=(
+                    "Read a skill document or bundled resource by skill name and "
+                    "relative path."
+                ),
                 executor=SkillsReadExecutor(),
                 annotations=ToolAnnotations(
                     title="skills_read",
