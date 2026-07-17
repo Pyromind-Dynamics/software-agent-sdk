@@ -861,3 +861,97 @@ def test_preview_dataset_byte_start_exceeds_file_size(
 
     assert observation.is_error
     assert "exceeds file size" in observation.text
+
+
+def test_preview_dataset_byte_end_before_byte_start_returns_error(
+    monkeypatch,
+    tmp_path,
+):
+    """byte_end <= byte_start should return an error."""
+    content = b"x" * 1000
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": "data.txt",
+                        "size": len(content),
+                        "content_type": "text/plain",
+                        "is_dir": False,
+                    },
+                },
+            )
+        return _Response(200, {"success": True, "data": {"url": "https://dl"}})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", lambda *a, **kw: None)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(
+            dataset_path="data.txt",
+            byte_start=500,
+            byte_end=100,
+        ),
+        cast(Any, conversation),
+    )
+
+    assert observation.is_error
+    assert "must be greater than" in observation.text
+
+
+def test_preview_dataset_byte_range_at_eof_sets_num_rows_none(
+    monkeypatch,
+    tmp_path,
+):
+    """When byte_start > 0 and range reaches EOF, num_rows must be None
+    because we only read a tail portion, not the whole file."""
+    lines = [f"line-{i:03d}" for i in range(100)]
+    content = ("\n".join(lines) + "\n").encode()
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": "data.txt",
+                        "size": len(content),
+                        "content_type": "text/plain",
+                        "is_dir": False,
+                    },
+                },
+            )
+        return _Response(200, {"success": True, "data": {"url": "https://dl"}})
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        raw_range = headers["range"].removeprefix("bytes=")
+        start, end = [int(p) for p in raw_range.split("-", maxsplit=1)]
+        return _StreamResponse(content[start : end + 1])
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(
+            dataset_path="data.txt",
+            n=100,
+            byte_start=len(content) - 200,
+        ),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.preview_truncated is True
+    assert observation.num_rows is None
+    assert observation.previewed_rows is not None
+    assert observation.previewed_rows > 0
