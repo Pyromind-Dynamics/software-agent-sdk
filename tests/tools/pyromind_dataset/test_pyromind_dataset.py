@@ -170,7 +170,7 @@ def test_preview_dataset_reads_jsonl_samples_with_storage_context(
     def fake_stream(method, url, *, headers, timeout, follow_redirects):
         assert method == "GET"
         assert url == "https://download.test/train"
-        assert headers["range"] == "bytes=0-102399"
+        assert headers["range"] == "bytes=0-10239"
         assert timeout == 5.0
         assert follow_redirects is True
         return _StreamResponse(jsonl)
@@ -197,19 +197,15 @@ def test_preview_dataset_reads_jsonl_samples_with_storage_context(
     assert observation.num_rows == 2
     assert observation.previewed_rows == 2
     assert observation.preview_truncated is False
-    assert observation.columns == ["prompt", "completion"]
-    assert observation.sample_rows == [{"prompt": "p1", "completion": "c1"}]
-    assert observation.sample_file_path is not None
-    sample_file = Path(observation.sample_file_path)
-    assert sample_file.is_file()
-    assert sample_file.parent == tmp_path / "preview_dataset"
-    assert sample_file.name.startswith("train.jsonl-sample-")
-    assert jsonlib.loads(sample_file.read_text(encoding="utf-8")) == [
-        {"prompt": "p1", "completion": "c1"}
-    ]
-    assert observation.sample_size == len(sample_file.read_bytes())
-    assert f"sample_file_path={sample_file}" in observation.text
-    assert "sample_rows:" not in observation.text
+    assert "prompt" in observation.columns
+    assert "completion" in observation.columns
+    assert len(observation.sample_rows) == 1
+    row = observation.sample_rows[0]
+    assert row["line"] == 1
+    assert row["text"] == '{"prompt":"p1","completion":"c1"}'
+    assert row["prompt"] == "p1"
+    assert row["completion"] == "c1"
+    assert "sample_file_path" not in observation.text
     assert calls[0]["headers"]["cookie"] == "auth_token=session-token"
     assert calls[0]["headers"]["x-cluster"] == "pre"
 
@@ -262,13 +258,7 @@ def test_preview_dataset_formats_text_file_content(
     assert observation.num_rows == 18
     assert observation.previewed_rows == 18
     assert len(observation.sample_rows) == 18
-    assert observation.sample_file_path is not None
-    sample_file = Path(observation.sample_file_path)
-    assert sample_file.parent == tmp_path / "preview_dataset"
-    assert sample_file.name.startswith("start-hook.sh-sample-")
-    assert sample_file.read_text(encoding="utf-8").splitlines() == lines
-    assert f"sample_file_path={sample_file}" in observation.text
-    assert "sample_text:" not in observation.text
+    assert "sample_file_path" not in observation.text
 
 
 def test_preview_dataset_defaults_to_ten_sample_rows(
@@ -314,69 +304,11 @@ def test_preview_dataset_defaults_to_ten_sample_rows(
     assert not observation.is_error
     assert observation.num_rows == 18
     assert len(observation.sample_rows) == 10
-    assert observation.sample_file_path is not None
-    sample_file = Path(observation.sample_file_path)
-    assert sample_file.parent == tmp_path / "preview_dataset"
-    assert sample_file.read_text(encoding="utf-8").splitlines() == lines[:10]
     assert "rows=18" in observation.text
     assert "sample_rows=10" in observation.text
 
 
-def test_preview_dataset_tail_strategy_samples_last_rows(
-    monkeypatch,
-    tmp_path,
-):
-    lines = [f"line-{index}" for index in range(1, 19)]
-    content = ("\n".join(lines) + "\n").encode()
-
-    def fake_post(url, *, headers, json, timeout):
-        if url.endswith("/get_file_metadata"):
-            return _Response(
-                200,
-                {
-                    "success": True,
-                    "data": {
-                        "object_name": "small.txt",
-                        "size": len(content),
-                        "content_type": "text/plain",
-                        "is_dir": False,
-                    },
-                },
-            )
-        if url.endswith("/get_url"):
-            return _Response(
-                200,
-                {"success": True, "data": {"url": "https://download.test/small"}},
-            )
-        raise AssertionError(f"unexpected URL: {url}")
-
-    def fake_stream(method, url, *, headers, timeout, follow_redirects):
-        return _StreamResponse(content)
-
-    monkeypatch.setattr(httpx, "post", fake_post)
-    monkeypatch.setattr(httpx, "stream", fake_stream)
-    conversation = _fake_conversation(tmp_path)
-
-    observation = PreviewDatasetExecutor(
-        storage_base_url="https://portal.test/storage_api",
-    )(
-        PreviewDatasetAction(
-            dataset_path="/small.txt",
-            n=5,
-            sample_strategy="tail",
-        ),
-        cast(Any, conversation),
-    )
-
-    assert not observation.is_error
-    assert [row["text"] for row in observation.sample_rows] == lines[-5:]
-    assert observation.sample_file_path is not None
-    sample_file = Path(observation.sample_file_path)
-    assert sample_file.read_text(encoding="utf-8").splitlines() == lines[-5:]
-    assert "sample_strategy=tail" in observation.text
-
-
-def test_preview_dataset_stratified_large_file_uses_multiple_ranges(
+def test_preview_dataset_large_file_uses_random_ranges(
     monkeypatch,
     tmp_path,
 ):
@@ -417,13 +349,8 @@ def test_preview_dataset_stratified_large_file_uses_multiple_ranges(
 
     observation = PreviewDatasetExecutor(
         storage_base_url="https://portal.test/storage_api",
-        max_preview_bytes=20 * 1024,
     )(
-        PreviewDatasetAction(
-            dataset_path="/large.txt",
-            n=8,
-            sample_strategy="stratified",
-        ),
+        PreviewDatasetAction(dataset_path="/large.txt", n=8),
         cast(Any, conversation),
     )
 
@@ -432,23 +359,15 @@ def test_preview_dataset_stratified_large_file_uses_multiple_ranges(
     assert len(ranges) > 1
     assert any(start > 0 for start, _ in ranges)
     assert 0 < len(observation.sample_rows) <= 8
-    sampled_numbers = [
-        int(str(row["text"]).split()[0].removeprefix("line-"))
-        for row in observation.sample_rows
-    ]
-    assert max(sampled_numbers) > 100
-    assert observation.sample_file_path is not None
-    sample_file = Path(observation.sample_file_path)
-    assert len(sample_file.read_bytes()) <= 20 * 1024
-    assert "sample_strategy=stratified" in observation.text
 
 
 def test_preview_dataset_truncates_large_jsonl_and_reduces_samples(
     monkeypatch,
     tmp_path,
 ):
-    rows = [f'{{"i":{i}}}\n'.encode() for i in range(10)]
+    rows = [f'{{"i":{i}}}\n'.encode() for i in range(3000)]
     content = b"".join(rows)
+    assert len(content) > 10 * 1024
 
     def fake_post(url, *, headers, json, timeout):
         if url.endswith("/get_file_metadata"):
@@ -467,7 +386,9 @@ def test_preview_dataset_truncates_large_jsonl_and_reduces_samples(
         return _Response(200, {"success": True, "data": {"url": "https://download"}})
 
     def fake_stream(method, url, *, headers, timeout, follow_redirects):
-        return _StreamResponse(content)
+        raw_range = headers["range"].removeprefix("bytes=")
+        start, end = [int(p) for p in raw_range.split("-", maxsplit=1)]
+        return _StreamResponse(content[start : end + 1])
 
     monkeypatch.setattr(httpx, "post", fake_post)
     monkeypatch.setattr(httpx, "stream", fake_stream)
@@ -486,13 +407,9 @@ def test_preview_dataset_truncates_large_jsonl_and_reduces_samples(
     assert not observation.is_error
     assert observation.preview_truncated is True
     assert observation.num_rows is None
-    assert observation.previewed_rows == 5
+    assert observation.previewed_rows is not None
+    assert observation.previewed_rows > 0
     assert 0 < len(observation.sample_rows) <= 10
-    assert observation.sample_file_path is not None
-    sample_file = Path(observation.sample_file_path)
-    assert sample_file.is_file()
-    assert len(sample_file.read_bytes()) <= len(rows[0]) * 5 + 2
-    assert "sample_strategy=head" in observation.text
 
 
 def test_upload_file_to_pyromind_posts_workspace_file(
@@ -587,3 +504,113 @@ def test_preview_dataset_reports_invalid_json(monkeypatch):
 
     assert observation.is_error
     assert "invalid JSON" in observation.text
+
+
+def test_preview_dataset_single_line_jsonl_returns_partial_content(
+    monkeypatch,
+    tmp_path,
+):
+    """A single-line JSONL file larger than 20KB should still
+    return a truncated preview instead of zero rows."""
+    big_value = "x" * 25000
+    single_line = f'{{"prompt":"hello","value":"{big_value}"}}'
+    content = single_line.encode("utf-8")
+    assert len(content) > 10 * 1024
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": "single.jsonl",
+                        "size": len(content),
+                        "content_type": "application/jsonl",
+                        "is_dir": False,
+                    },
+                },
+            )
+        if url.endswith("/get_url"):
+            return _Response(
+                200,
+                {"success": True, "data": {"url": "https://download.test/single"}},
+            )
+        raise AssertionError(f"unexpected URL: {url}")
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        raw_range = headers["range"].removeprefix("bytes=")
+        start, end = [int(p) for p in raw_range.split("-", maxsplit=1)]
+        return _StreamResponse(content[start : end + 1])
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="single.jsonl", n=5),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.preview_truncated is True
+    assert observation.previewed_rows is not None
+    assert observation.previewed_rows > 0
+    assert len(observation.sample_rows) > 0
+    assert "text" in observation.sample_rows[0]
+
+
+def test_preview_dataset_single_line_text_returns_partial_content(
+    monkeypatch,
+    tmp_path,
+):
+    """A single-line text file larger than 20KB should still
+    return a truncated preview instead of zero rows."""
+    content = b"a" * 25000
+    assert len(content) > 10 * 1024
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": "single.txt",
+                        "size": len(content),
+                        "content_type": "text/plain",
+                        "is_dir": False,
+                    },
+                },
+            )
+        if url.endswith("/get_url"):
+            return _Response(
+                200,
+                {"success": True, "data": {"url": "https://download.test/single"}},
+            )
+        raise AssertionError(f"unexpected URL: {url}")
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        raw_range = headers["range"].removeprefix("bytes=")
+        start, end = [int(p) for p in raw_range.split("-", maxsplit=1)]
+        return _StreamResponse(content[start : end + 1])
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="single.txt", n=5),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.preview_truncated is True
+    assert observation.previewed_rows is not None
+    assert observation.previewed_rows > 0
+    assert len(observation.sample_rows) > 0
+    assert observation.sample_rows[0]["text"].startswith("a")

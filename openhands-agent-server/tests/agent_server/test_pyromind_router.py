@@ -69,6 +69,11 @@ def test_kb_instructions_use_logical_read_only_paths() -> None:
     # Skill-first guidance must be present.
     assert "invoke_skill" in rendered
     assert "article lookup alone" in rendered
+    assert "Immediately after that single workflow read" in rendered
+    assert "Then read only the exact skill resource" in rendered
+    assert "do not inspect general `knowledge/` before invoking the skill" in rendered
+    assert "Treat any requested node, model, parameter" in rendered
+    assert "do not\n  invoke `debug-workflow` or `workflow_debug`" in rendered
     assert "`terminal` is also available" in rendered
     assert 'include="*.mdx"' in rendered
     assert "`.` or `^`" in rendered
