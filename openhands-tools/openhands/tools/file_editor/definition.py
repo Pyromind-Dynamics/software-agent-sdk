@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import Field, PrivateAttr, field_validator
+from pydantic import Field, PrivateAttr
 
 
 if TYPE_CHECKING:
@@ -20,7 +20,6 @@ from openhands.sdk.tool import (
     ToolDefinition,
     register_tool,
 )
-from openhands.sdk.utils.redact import redact_text_secrets
 from openhands.tools.file_editor.utils.diff import visualize_diff
 from openhands.tools.utils import (
     CONVERSATION_READ_ONLY_SUBPATHS,
@@ -98,11 +97,6 @@ class FileEditorObservation(Observation):
     )
 
     _diff_cache: Text | None = PrivateAttr(default=None)
-
-    @field_validator("old_content", "new_content")
-    @classmethod
-    def _redact_sensitive_content(cls, value: str | None) -> str | None:
-        return redact_text_secrets(value) if value is not None else None
 
     @property
     def visualize(self) -> Text:
