@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from openhands.sdk.logger import get_logger
+from openhands.tools.utils import resolve_workspace_subpath
 
 
 logger = get_logger(__name__)
@@ -55,12 +56,18 @@ class TerminalSandbox:
         read_only_paths: tuple[str, ...] = (),
         read_write_paths: tuple[str, ...] | None = None,
     ):
-        self.work_dir = Path(work_dir).resolve()
+        resolved_work_dir = Path(work_dir).resolve()
+        self.work_dir = resolved_work_dir
         self.mode: TerminalSandboxMode = mode
-        self._tmp_dir = self.work_dir / ".openhands-tmp"
-        self.read_only_paths = tuple(Path(path).resolve() for path in read_only_paths)
+        self._tmp_dir = resolved_work_dir / ".openhands-tmp"
+        self.read_only_paths = tuple(
+            resolve_workspace_subpath(p, resolved_work_dir) for p in read_only_paths
+        )
+        rw_paths = (
+            read_write_paths if read_write_paths is not None else (resolved_work_dir,)
+        )
         self.read_write_paths = tuple(
-            Path(path).resolve() for path in (read_write_paths or (str(self.work_dir),))
+            resolve_workspace_subpath(p, resolved_work_dir) for p in rw_paths
         )
         self._landlock_factory: Any | None = None
         self._seatbelt_profile: Path | None = None

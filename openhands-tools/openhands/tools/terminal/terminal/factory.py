@@ -79,6 +79,30 @@ def _create_windows_terminal(
     return TerminalSession(terminal, no_change_timeout_seconds)
 
 
+def _create_subprocess_session(
+    work_dir: str,
+    username: str | None,
+    no_change_timeout_seconds: int | None,
+    shell_path: str | None,
+    sandbox_mode: TerminalSandboxMode,
+    read_only_paths: tuple[str, ...],
+    read_write_paths: tuple[str, ...] | None,
+) -> TerminalSession:
+    from openhands.tools.terminal.terminal.subprocess_terminal import (
+        SubprocessTerminal,
+    )
+
+    terminal = SubprocessTerminal(
+        work_dir,
+        username,
+        shell_path,
+        sandbox_mode,
+        read_only_paths=read_only_paths,
+        read_write_paths=read_write_paths,
+    )
+    return TerminalSession(terminal, no_change_timeout_seconds)
+
+
 def create_terminal_session(
     work_dir: str,
     username: str | None = None,
@@ -86,6 +110,8 @@ def create_terminal_session(
     terminal_type: Literal["tmux", "subprocess", "powershell"] | None = None,
     shell_path: str | None = None,
     sandbox_mode: TerminalSandboxMode = "off",
+    read_only_paths: tuple[str, ...] = (),
+    read_write_paths: tuple[str, ...] | None = None,
 ) -> TerminalSession:
     """Create an appropriate terminal session based on system capabilities.
 
@@ -139,24 +165,30 @@ def create_terminal_session(
                     no_change_timeout_seconds,
                     shell_path,
                 )
-            from openhands.tools.terminal.terminal.subprocess_terminal import (
-                SubprocessTerminal,
-            )
-
             logger.info("Using forced SubprocessTerminal")
-            terminal = SubprocessTerminal(work_dir, username, shell_path, sandbox_mode)
-            return TerminalSession(terminal, no_change_timeout_seconds)
+            return _create_subprocess_session(
+                work_dir,
+                username,
+                no_change_timeout_seconds,
+                shell_path,
+                sandbox_mode,
+                read_only_paths,
+                read_write_paths,
+            )
 
         raise ValueError(f"Unknown session type: {terminal_type}")
 
     if terminal_sandbox_enabled(sandbox_mode):
         logger.info("Terminal sandbox enabled; using an isolated subprocess session")
-        from openhands.tools.terminal.terminal.subprocess_terminal import (
-            SubprocessTerminal,
+        return _create_subprocess_session(
+            work_dir,
+            username,
+            no_change_timeout_seconds,
+            shell_path,
+            sandbox_mode,
+            read_only_paths,
+            read_write_paths,
         )
-
-        terminal = SubprocessTerminal(work_dir, username, shell_path, sandbox_mode)
-        return TerminalSession(terminal, no_change_timeout_seconds)
 
     if platform.system() == "Windows":
         logger.info("Auto-detected: Using WindowsTerminal (PowerShell backend)")
@@ -174,10 +206,6 @@ def create_terminal_session(
         terminal = TmuxTerminal(work_dir, username)
         return TerminalSession(terminal, no_change_timeout_seconds)
 
-    from openhands.tools.terminal.terminal.subprocess_terminal import (
-        SubprocessTerminal,
-    )
-
     _tmux_warning = (
         "tmux is not installed. Falling back to subprocess-based terminal, "
         "which may be less stable. For best agent performance, install tmux "
@@ -185,5 +213,12 @@ def create_terminal_session(
     )
     logger.warning(_tmux_warning)
     warnings.warn(_tmux_warning, stacklevel=2)
-    terminal = SubprocessTerminal(work_dir, username, shell_path, sandbox_mode)
-    return TerminalSession(terminal, no_change_timeout_seconds)
+    return _create_subprocess_session(
+        work_dir,
+        username,
+        no_change_timeout_seconds,
+        shell_path,
+        sandbox_mode,
+        read_only_paths,
+        read_write_paths,
+    )

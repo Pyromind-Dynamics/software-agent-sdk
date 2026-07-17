@@ -27,7 +27,6 @@ import httpx
 SECRET_KEY_PATTERNS = frozenset(
     {
         "AUTHORIZATION",
-        "BASE_URL",
         "COOKIE",
         "CREDENTIAL",
         "KEY",
@@ -302,33 +301,6 @@ def redact_text_secrets(text: str) -> str:
     # api_key='...' patterns (single or double quotes)
     text = re.sub(r"api_key='[^']*'", "api_key='<redacted>'", text)
     text = re.sub(r'api_key="[^"]*"', 'api_key="<redacted>"', text)
-
-    # API endpoints are operational configuration, but exposing them in tool
-    # observations can reveal private gateways and internal routing.
-    text = re.sub(
-        r'((?:["\'](?:base_url|api_base)["\']\s*:\s*["\']))[^"\']*(["\'])',
-        r"\g<1><redacted>\2",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r'((?:["\']model["\']\s*:\s*["\']))[^"\']*(["\'])',
-        r"\g<1><redacted>\2",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r'((?:base_url|api_base)\s*=\s*["\'])[^"\']*(["\'])',
-        r"\g<1><redacted>\2",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r'(model\s*=\s*["\'])[^"\']*(["\'])',
-        r"\g<1><redacted>\2",
-        text,
-        flags=re.IGNORECASE,
-    )
 
     # Dict entries with sensitive key names
     text = re.sub(
