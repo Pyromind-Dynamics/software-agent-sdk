@@ -630,6 +630,14 @@ class PreviewDatasetExecutor(
                 is_error=True,
                 dataset_path=dataset_path,
             )
+        if byte_end is not None and byte_end <= byte_start:
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    f"byte_end={byte_end} must be greater than byte_start={byte_start}."
+                ),
+                is_error=True,
+                dataset_path=dataset_path,
+            )
         end = byte_end - 1 if byte_end is not None else None
         if file_size is not None:
             end = min(end if end is not None else file_size - 1, file_size - 1)
@@ -646,7 +654,9 @@ class PreviewDatasetExecutor(
             starts_at_zero=byte_start == 0,
             ends_at_eof=ends_at_eof,
         )
-        truncated = not ends_at_eof
+        # When byte_start > 0 we only read a portion of the file, so num_rows
+        # cannot be determined even if the range reaches EOF.
+        truncated = not ends_at_eof or byte_start > 0
         return [chunk], truncated
 
     def _download_range(
