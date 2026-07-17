@@ -162,6 +162,7 @@ a = Analysis(
         *collect_submodules("fastmcp"),
         *collect_submodules("fakeredis"),
         *collect_submodules("pyromind_sdk"),
+        "py_landlock",  # Dynamic import in openhands.tools.terminal.sandbox
         *collect_submodules("lupa"),  # Required for fakeredis[lua] Lua scripting support
         # rich._unicode_data.unicodeX_Y_Z is imported dynamically based on
         # unicodedata.unidata_version (e.g. unicode17_0_0 on Python 3.13).
