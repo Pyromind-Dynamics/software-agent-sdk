@@ -420,7 +420,7 @@ def _compose_conversation_info(
         agent_state.get("acp_supports_runtime_model_switch", False)
     )
     return ConversationInfo(
-        **state.model_dump(mode="json", context={"redact_model_names": True}),
+        **state.model_dump(mode="json"),
         title=stored.title,
         metrics=stored.metrics,
         created_at=stored.created_at,
