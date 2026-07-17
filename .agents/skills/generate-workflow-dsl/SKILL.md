@@ -2,9 +2,9 @@
 name: generate-workflow-dsl
 description: >-
   为 Pyromind 生成、修改或校验模型训练与评测工作流。用户用自然语言要求“用这份数据训练模型”、
-  微调、基线评测、SFT/DPO/GRPO、修改画布或检查 workflow.py 时使用；负责预览 Storage 数据、
-  推断训练阶段、整组决定参数、生成并上传自定义 Metrics/Reward、绑定阶段产物并校验 Python DSL。
-  不执行正式训练，不在训练生成场景自动清洗数据。
+  微调、基线评测、SFT/DPO/GRPO、修改画布、换模型跑 benchmark/看看效果或检查 workflow.py
+  时使用；负责预览 Storage 数据、推断训练阶段、整组决定参数、生成并上传自定义
+  Metrics/Reward、绑定阶段产物并校验 Python DSL。不执行正式训练，不在训练生成场景自动清洗数据。
 ---
 
 # 生成 Pyromind 工作流
@@ -24,10 +24,29 @@ description: >-
 | `references/node-reference.md` | 需要节点参数、端口、默认值或数据/模型入口 |
 | `references/platform-contract-overrides.md` | 选择易漂移枚举、Secret，或校验结果与节点资料冲突 |
 
-Skill 资源只通过 `skills_read` 读取。平台知识只通过逻辑路径 `knowledge/` 的 `grep`、
-`file_editor` 定向读取；不要扫描或修改知识库、Skill 目录。
+调用格式固定为 `skills_read(skill_name="generate-workflow-dsl", path="references/...")`；
+同一用户轮次不得重复读取同一路径。只有 reference 仍缺平台细节时才定向读取逻辑路径
+`knowledge/`；不要扫描或修改知识库、Skill 目录。
 
 ## 执行状态机
+
+### 0. 先判定局部修改
+
+若请求只改已有节点参数，或把一个节点替换为输出端口兼容的单节点，走快路径：
+
+- 保留原变量名、节点 ID、下游连线和所有未被点名的参数；只写需求图差分。
+- 跳过数据画像、阶段选择和整组配参；不调用 preview，不读取 reference 或 `knowledge/`。
+- 只有缺少新节点契约或校验返回结构错误时，才读取一份最相关的 reference，然后修改并进入第 8 步。
+
+模型入口规则供快路径和完整生成共用：
+
+- `Qwen/Qwen3-0.6B`、`Qwen/Qwen3-1.7B`、`Qwen/Qwen3-4B`、
+  `Qwen/Qwen3-VL-2B-Instruct`、`Qwen/Qwen3-VL-4B-Instruct` 使用 `CloneAndCacheModel(model=...)`。
+- 用户指定其他开源模型时使用
+  `DownloadAndCacheModel(modelname=..., cache_dir="/workspace/models/<org>/<model>", download_source="huggingface")`；
+  它与 Clone 都输出 `model_path`，不得改下游绑定。
+- 将 `qwen3.5-2b` 规范化为 `Qwen/Qwen3.5-2B`，缓存到
+  `/workspace/models/Qwen/Qwen3.5-2B`；用户指定其他来源时再覆盖默认 Hugging Face。
 
 ### 1. 锁定目标
 
@@ -55,8 +74,8 @@ Skill 资源只通过 `skills_read` 读取。平台知识只通过逻辑路径 `
 
 ### 4. 决定枚举
 
-按 `node-reference.md` 选择节点、模型、GPU、scheduler、Metric 和 Reward；易漂移值再读取
-`platform-contract-overrides.md`。用户指定非推荐开源模型时使用 Download Model。
+仅在需要选择节点或缺少参数/端口契约时读取 `node-reference.md`。仅在枚举、Secret 或实时校验
+与静态契约冲突时读取 `platform-contract-overrides.md`；不要把它作为默认后继读取。
 
 ### 5. 整组配参
 
@@ -85,11 +104,13 @@ batch、grad accumulation、learning rate、epoch、LoRA rank、max steps 和 nu
 
 1. `valid=true`：结束；warnings 只在最终回复简述。
 2. `valid=false`：按 `code`、`node_id`、`field` 和 `detail.*_node_code` 做唯一片段最小修改。
-3. `retryable=true`：最多重试两次；仍失败则停止并说明平台校验未完成。
-4. 最多修改五轮；同一错误连续两轮不消失时停止并报告。
+3. `retryable=false`（包括 401）：立即停止，不重复校验，也不得用 terminal 探测凭证。
+4. `retryable=true`：最多重试两次；仍失败则停止并说明平台校验未完成。
+5. 最多修改五轮；同一错误连续两轮不消失时停止并报告。
 
-生成 Skill 不调用 `workflow_debug`、`run_workflow` 或 `run_dataset_cleaning`。用户明确要求调试时转用
-`debug-workflow`；正式执行由前端/平台触发。
+生成 Skill 不调用 `workflow_debug`、`run_workflow` 或 `run_dataset_cleaning`。只有不含配置修改的
+显式调试请求才转用 `debug-workflow`；“换模型/改参数后跑或看效果”本轮只修改并校验 DSL，正式
+执行由前端/平台触发。
 
 ## 最终回复
 
