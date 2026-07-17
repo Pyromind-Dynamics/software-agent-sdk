@@ -43,14 +43,29 @@ def test_get_codex_agent_appends_extra_tools() -> None:
 
     from openhands.sdk.tool import Tool
 
-    agent = get_codex_agent(
-        _make_llm(), cli_mode=True, extra_tools=[Tool(name="grep")]
-    )
+    agent = get_codex_agent(_make_llm(), cli_mode=True, extra_tools=[Tool(name="grep")])
     tool_names = {t.name for t in agent.tools}
 
     assert "terminal" in tool_names
     assert "apply_patch" in tool_names
     assert "grep" in tool_names
+
+
+def test_get_codex_agent_threads_terminal_params() -> None:
+    agent = get_codex_agent(
+        _make_llm(),
+        cli_mode=True,
+        terminal_params={
+            "command_working_subdir": "public_data",
+            "restrict_workspace_discovery": True,
+        },
+    )
+    terminal = next(tool for tool in agent.tools if tool.name == "terminal")
+
+    assert terminal.params == {
+        "command_working_subdir": "public_data",
+        "restrict_workspace_discovery": True,
+    }
 
 
 def test_get_codex_agent_threads_prompt_kwargs() -> None:
@@ -98,7 +113,18 @@ def test_codex_prompt_injects_custom_instructions_and_skills() -> None:
     assert "KNOWLEDGE BASE RULES" in prompt
     assert "<SKILLS>" in prompt
     assert "invoke_skill" in prompt
+    assert "resource list as an index, not a checklist" in prompt
+    assert "zero resource reads is valid" in prompt
+    assert "same resource should not be read twice" in prompt
     assert "<skill>demo-skill</skill>" in prompt
+
+
+def test_codex_prompt_reuses_unchanged_tool_results() -> None:
+    prompt = get_codex_agent(_make_llm(), cli_mode=True).static_system_message
+
+    assert "Before repeating a tool call" in prompt
+    assert "underlying resource and user-supplied inputs have not changed" in prompt
+    assert "Agent-chosen changes to limits, pagination" in prompt
 
 
 def test_codex_prompt_omits_optional_blocks_when_absent() -> None:

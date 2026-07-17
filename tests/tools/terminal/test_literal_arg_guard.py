@@ -15,7 +15,11 @@ from openhands.tools.terminal.definition import (
     TerminalObservation,
     looks_like_python_literal_argument,
 )
-from openhands.tools.terminal.impl import TerminalExecutor
+from openhands.tools.terminal.impl import (
+    TerminalExecutor,
+    is_workspace_discovery_command,
+)
+from openhands.tools.terminal.metadata import CmdOutputMetadata
 
 
 # --------------------------------------------------------------------------
@@ -153,3 +157,71 @@ def test_guard_warning_is_logged(
         "Rejected terminal call" in rec.message and "list literal" in rec.message
         for rec in caplog.records
     )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ls -la && find . -maxdepth 3 -type f 2>/dev/null | head -50",
+        'echo "shell ok"; pwd; ls -la public_data',
+        "cd public_data && python check.py",
+        "rg --files public_data",
+        "/bin/ls public_data",
+    ],
+)
+def test_workspace_discovery_commands_are_detected(command: str) -> None:
+    assert is_workspace_discovery_command(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python metric.py",
+        "python -m py_compile reward.py",
+        "pytest -q test_metric.py",
+        "bash run_known_asset.sh",
+    ],
+)
+def test_known_script_execution_is_not_workspace_discovery(command: str) -> None:
+    assert not is_workspace_discovery_command(command)
+
+
+def test_restricted_terminal_rejects_discovery_without_shell(
+    executor_without_shell: TerminalExecutor,
+) -> None:
+    executor_without_shell._restrict_workspace_discovery = True
+    action = TerminalAction(command="ls -la && find . -type f")
+
+    observation = executor_without_shell(action)
+
+    assert observation.is_error is True
+    assert observation.exit_code is None
+    assert observation.command == action.command
+    assert "Workspace discovery commands are disabled" in observation.text
+    assert "do not retry" in observation.text
+
+
+def test_restricted_terminal_runs_known_script_from_configured_subdir() -> None:
+    executor = TerminalExecutor.__new__(TerminalExecutor)
+    executor._pool = None
+    executor._restrict_workspace_discovery = True
+    executor._command_working_subdir = "public_data"
+    executed_commands: list[str] = []
+
+    def _execute(action: TerminalAction, _conversation=None) -> TerminalObservation:
+        executed_commands.append(action.command)
+        return TerminalObservation.from_text(
+            text="ok",
+            command=action.command,
+            exit_code=0,
+            metadata=CmdOutputMetadata(exit_code=0, working_dir="host-path"),
+        )
+
+    executor._execute_single_session = _execute  # type: ignore[method-assign]
+    action = TerminalAction(command="python metric.py")
+
+    observation = executor(action)
+
+    assert executed_commands == ["cd -- public_data && python metric.py"]
+    assert observation.command == action.command
+    assert observation.metadata.working_dir == "public_data"

@@ -10,23 +10,21 @@ description: >-
 # 生成 Pyromind 工作流
 
 把工作流视为少量阶段模板的组合。先证明数据和参数可用，再写 DSL；不要从完整示例反推需求。
+本 Skill 只生成并校验 DSL；实际数据加载与处理、Benchmark、训练和推理由 Pyromind 平台节点
+执行，禁止用 Agent 本地 terminal 替代平台运行时。
 
-## 按需读取
-
-只读取当前步骤需要的一份 reference；不要预读整个目录。
+## 资料索引
 
 | reference | 读取时机 |
 |---|---|
 | `references/data-routing.md` | 判断数据源、preview 结果、训练格式、字段映射或训练类型 |
 | `references/stage-templates.md` | 选择或组合 Benchmark/SFT/DPO/GRPO/Merge/Inference/Eval 阶段 |
-| `references/parameter-decision.md` | 需要按 N、L、模态、模型规模和 GPU 自动配参或处理 OOM |
+| `references/parameter-decision.md` | 训练数值参数的整组决策或训练 OOM 调整 |
 | `references/custom-python-assets.md` | 内置 Metrics/Reward 不适用，需要生成、上传并回填 Python 入口 |
 | `references/node-reference.md` | 需要节点参数、端口、默认值或数据/模型入口 |
-| `references/platform-contract-overrides.md` | 选择易漂移枚举、Secret，或校验结果与节点资料冲突 |
+| `references/platform-contract-overrides.md` | 本文件已记录的易漂移枚举、Secret 和已验证平台差异 |
 
-调用格式固定为 `skills_read(skill_name="generate-workflow-dsl", path="references/...")`；
-同一用户轮次不得重复读取同一路径。只有 reference 仍缺平台细节时才定向读取逻辑路径
-`knowledge/`；不要扫描或修改知识库、Skill 目录。
+调用格式为 `skills_read(skill_name="generate-workflow-dsl", path="references/...")`。
 
 ## 执行状态机
 
@@ -56,7 +54,7 @@ description: >-
 
 ### 2. 建立数据画像
 
-- Storage 相对路径：读取 `data-routing.md`，对用户原路径调用一次 `preview_dataset`。
+- Storage 相对路径：按 `data-routing.md` 获取或复用数据画像。
 - 平台预置或外部数据集标识：选择 Clone/Download，不调用 `preview_dataset`。
 - 未提供数据：先索要 Storage 路径；只有用户明确要求演示/模板时才使用测试集。
 - 内部记录数据源、实际训练文件、N、P95 长度 L、字段、模态和样本形态，不向用户展示冗长清单。
@@ -74,12 +72,12 @@ description: >-
 
 ### 4. 决定枚举
 
-仅在需要选择节点或缺少参数/端口契约时读取 `node-reference.md`。仅在枚举、Secret 或实时校验
-与静态契约冲突时读取 `platform-contract-overrides.md`；不要把它作为默认后继读取。
+仅在缺少具体节点参数或端口契约时读取 `node-reference.md`。仅在需要本文件已记录的枚举、Secret
+或已验证平台差异时读取 `platform-contract-overrides.md`；结构和类型错误不读取该文件。
 
 ### 5. 整组配参
 
-需要自动决定或调整数值时读取 `parameter-decision.md`，一次性确定 max sequence length、
+需要自动决定或调整训练数值时读取 `parameter-decision.md`，一次性确定 max sequence length、
 batch、grad accumulation、learning rate、epoch、LoRA rank、max steps 和 num generations。
 
 参数优先级：**用户明确要求 > 修改任务中已有有效值 > 数据与资源决策 > 模板兜底值**。

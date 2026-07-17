@@ -44,6 +44,7 @@ def test_ps1_metadata_json_structure():
         "py_interpreter_path",
     }
     assert set(data.keys()) == expected_fields
+    assert data["working_dir"] == "${PWD}"
 
 
 def test_ps1_metadata_parsing():

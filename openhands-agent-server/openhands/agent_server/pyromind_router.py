@@ -42,6 +42,8 @@ from openhands.agent_server.pyromind_auth import (
 from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
     PYROMIND_APP_TAG_VALUE,
+    PYROMIND_RUNTIME_CONTRACT,
+    PYROMIND_TERMINAL_PARAMS,
 )
 from openhands.agent_server.run_workflow_callback import (
     RunWorkflowCallbackResult,
@@ -171,8 +173,7 @@ Skill usage rules:
 - Use `grep` and `file_editor` only as a fallback when the request is not skill-
   addressed or when you need a free-form knowledge-base article.
 
-Your current working directory is this conversation's private workspace:
-{working_dir}
+__PYROMIND_RUNTIME_CONTRACT__
 
 Create and edit the workflow DSL at the relative path
 `public_data/workflow_canvas/workflow.py` from the current working directory.
@@ -193,8 +194,7 @@ been generated unless a tool call actually created or modified the workflow file
   skill for an article lookup alone.
 - For knowledge-base or skill-document requests that are not skill-linked,
   prefer `grep` and `file_editor` with the logical `{knowledge_alias}/` or
-  `{skills_alias}/` path. `terminal` is also available when direct filesystem
-  inspection is needed. Do not use `apply_patch` to modify public knowledge or
+  `{skills_alias}/` path. Do not use `apply_patch` to modify public knowledge or
   skill documents. Open matched files with `file_editor` before
 answering or editing the workflow file; never infer APIs or operational facts from
 filenames or directory listings.
@@ -216,7 +216,7 @@ filenames or directory listings.
   Do not show this internal checklist unless the user asks for sources.
 - For workflow generation, use the matching skill and consult `knowledge/` only
   when needed for platform details.
-"""
+""".replace("__PYROMIND_RUNTIME_CONTRACT__", PYROMIND_RUNTIME_CONTRACT.rstrip())
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +726,19 @@ def _workflow_dsl_from_xyflow(workflow_xyflow: dict[str, Any] | None) -> str | N
         ) from exc
 
 
+def _empty_workflow_reminder() -> TextContent:
+    return TextContent(
+        text=(
+            "<system_reminder>\n"
+            "The current canvas is empty and workflow.py does not exist. "
+            "Treat this as authoritative: start from scratch, invoke the "
+            "matching skill immediately, and do not inspect state.json or "
+            "use terminal commands to verify the missing file.\n"
+            "</system_reminder>"
+        )
+    )
+
+
 def _sync_workflow_with_canvas(
     working_dir: Path, workflow_dsl: str | None
 ) -> TextContent | None:
@@ -735,8 +748,8 @@ def _sync_workflow_with_canvas(
     re-synced from the converted canvas state before each new user message is
     processed -- otherwise the agent would keep editing a stale version. Returns a
     ``<system_reminder>`` TextContent to inject into the LLM's context (via
-    ``extended_content``) when workflow.py actually changed as a result, or
-    None when nothing needed to change.
+    ``extended_content``) when workflow.py changed or the attached canvas is
+    confirmed empty, or None when no canvas state was attached.
 
     `workflow_dsl=None` means the caller attached no xyflow canvas state at all
     and is a deliberate no-op, distinct from `workflow_dsl=""` which means the
@@ -752,8 +765,9 @@ def _sync_workflow_with_canvas(
     normalized_canvas = _normalize_dsl(workflow_dsl)
     normalized_current = _normalize_dsl(current)
     if normalized_canvas == normalized_current:
-        return None  # Already in sync -- also covers the from-scratch case
-        # where the canvas and workflow.py are both empty/missing.
+        if normalized_canvas:
+            return None
+        return _empty_workflow_reminder()
 
     workflow_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -982,6 +996,7 @@ async def create_pyromind_conversation(
     conversation_dir = conversation_service.conversations_dir / conversation_id.hex
     conversation_dir.mkdir(parents=True, exist_ok=True)
     conversation_dir.chmod(0o700)
+    (conversation_dir / "public_data").mkdir(mode=0o700, exist_ok=True)
 
     # 2. Assemble the pyromind KB instructions (layered on the codex base prompt)
     custom_instructions = PYROMIND_KB_INSTRUCTIONS.format(
@@ -1029,6 +1044,7 @@ async def create_pyromind_conversation(
         cli_mode=True,
         agent_context=agent_context,
         custom_instructions=custom_instructions,
+        terminal_params=dict(PYROMIND_TERMINAL_PARAMS),
         extra_tools=[
             *(
                 [
@@ -1099,27 +1115,27 @@ async def create_pyromind_conversation(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Conversation event service not found: {info.id}",
             )
+        if workflow_dsl:
+            initial_reminder = TextContent(
+                text=(
+                    "<system_reminder>\n"
+                    "A workflow from the current canvas is already loaded at "
+                    "public_data/workflow_canvas/workflow.py. Treat it as "
+                    "authoritative context. Read the full file with file_editor "
+                    "before interpreting this request or asking for dataset, "
+                    "model, or topology details already present there.\n"
+                    "</system_reminder>"
+                )
+            )
+        elif request.workflow_xyflow is not None:
+            initial_reminder = _empty_workflow_reminder()
+        else:
+            initial_reminder = None
+
         await event_service.send_message(
             Message(role="user", content=[TextContent(text=request.message)]),
             run=True,
-            extended_content=(
-                [
-                    TextContent(
-                        text=(
-                            "<system_reminder>\n"
-                            "A workflow from the current canvas is already loaded at "
-                            "public_data/workflow_canvas/workflow.py. Treat it as "
-                            "authoritative context. Read the full file with "
-                            "file_editor "
-                            "before interpreting this request or asking for dataset, "
-                            "model, or topology details already present there.\n"
-                            "</system_reminder>"
-                        )
-                    )
-                ]
-                if workflow_dsl
-                else None
-            ),
+            extended_content=[initial_reminder] if initial_reminder else None,
             workflow_dsl_snapshot=workflow_dsl,
             workflow_xyflow_snapshot=request.workflow_xyflow,
         )

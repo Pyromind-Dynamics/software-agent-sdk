@@ -1,7 +1,7 @@
 # 阶段模板与组合契约
 
-这里只定义阶段边界、选择条件和产物绑定。节点参数查 `node-reference.md`，数值查
-`parameter-decision.md`。
+这里只定义阶段边界、选择条件和产物绑定。仅在本文件未给出所需的具体节点参数或端口时查
+`node-reference.md`；训练数值决策查 `parameter-decision.md`。
 
 ## 阶段目录
 

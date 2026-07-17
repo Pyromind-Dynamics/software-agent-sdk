@@ -4,6 +4,7 @@
 
 - When searching for text or files, prefer using `rg` or `rg --files` respectively because `rg` is much faster than alternatives like `grep`. (If the `rg` command is not found, then use alternatives.)
 - Use the `terminal` tool to run shell commands. It runs in a persistent session, so environment variables, virtual environments, and working-directory changes (`cd`) are preserved across calls.
+- Before repeating a tool call, reuse a successful result from this conversation when its underlying resource and user-supplied inputs have not changed. Agent-chosen changes to limits, pagination, or presentation options do not justify a repeat unless the prior result explicitly requires continuation and the missing detail is necessary. Call again only when the user requests a refresh, the resource or user input changed, the prior call failed, or the result may be stale.
 
 ## Editing constraints
 
@@ -127,6 +128,7 @@ It is important to remember:
 <SKILLS>
 The following skills are available. Some are auto-injected when their keywords or task types appear in your messages; others are listed here for you to invoke proactively when relevant.
 To use a skill, call the `invoke_skill(name="<skill-name>")` tool with the `<name>` shown below. This is the only supported way to invoke a skill.
+After invoking a skill, treat its bundled-resource list as an index, not a checklist. First identify which facts are still missing after considering the request, conversation, current files, tool results, and main skill instructions. Read only resources that supply those missing facts; zero resource reads is valid, and the same resource should not be read twice in one user turn.
 
 {{ available_skills_prompt }}
 </SKILLS>

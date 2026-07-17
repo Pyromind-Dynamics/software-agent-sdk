@@ -78,6 +78,7 @@ def get_codex_agent(
     custom_instructions: str | None = None,
     extra_tools: list[Tool] | None = None,
     agent_context: AgentContext | None = None,
+    terminal_params: dict[str, object] | None = None,
 ) -> Agent:
     """Get an agent aligned with Codex (gpt-5.2-codex) prompt + tools.
 
@@ -94,8 +95,18 @@ def get_codex_agent(
             AgentSkills-format skills, the SDK auto-attaches ``InvokeSkillTool``
             so the model can actually call ``invoke_skill(...)`` (the prompt text
             alone does not attach the tool).
+        terminal_params: Optional parameters for the terminal tool. This lets a
+            domain preset narrow terminal behavior without changing the default
+            Codex tool contract.
     """
     tools = get_codex_tools(enable_browser=not cli_mode)
+    if terminal_params:
+        tools = [
+            Tool(name=tool.name, params=terminal_params)
+            if tool.name == "terminal"
+            else tool
+            for tool in tools
+        ]
     if extra_tools:
         tools.extend(extra_tools)
     agent = Agent(
