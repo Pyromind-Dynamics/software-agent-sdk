@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Self
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 
 from openhands.sdk.skills import SkillRuntime
 from openhands.sdk.tool.tool import (
@@ -26,7 +26,10 @@ class SkillsListObservation(Observation):
 
 
 class SkillsReadAction(Action):
-    skill_name: str
+    skill_name: str = Field(
+        validation_alias=AliasChoices("skill_name", "name"),
+        description="Skill name. The legacy input key `name` is also accepted.",
+    )
     path: str = Field(default="SKILL.md")
 
 

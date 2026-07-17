@@ -415,6 +415,24 @@ def test_validate_workflow_dsl_reports_transport_and_json_errors(monkeypatch):
     assert observation.failure_stage == "transport"
 
 
+def test_validate_workflow_dsl_401_exposes_non_retryable_stop_guidance(monkeypatch):
+    def return_unauthorized(url, *, headers, json, timeout):
+        return _Response(401, {}, text="login required")
+
+    monkeypatch.setattr(httpx, "post", return_unauthorized)
+
+    observation = ValidateWorkflowDslExecutor()(
+        ValidateWorkflowDslAction(dsl="# workflow: demo\n")
+    )
+
+    assert observation.is_error
+    assert observation.retryable is False
+    assert observation.failure_stage == "transport"
+    assert "retryable=false" in observation.text
+    assert "do not call validate_workflow_dsl again" in observation.text
+    assert "do not use terminal commands" in observation.text
+
+
 def test_validate_workflow_dsl_classifies_deterministic_failure_stages(monkeypatch):
     issue: dict[str, Any] = {}
 
@@ -468,6 +486,8 @@ def test_validate_workflow_dsl_tool_is_explicitly_available() -> None:
     assert tool.annotations is not None
     assert tool.annotations.readOnlyHint is True
     assert tool.annotations.openWorldHint is True
+    assert "when retryable=false" in tool.description
+    assert "do not use terminal commands" in tool.description
     assert "headers" not in tool.action_type.model_fields
     assert "secret_headers" not in tool.action_type.model_fields
 

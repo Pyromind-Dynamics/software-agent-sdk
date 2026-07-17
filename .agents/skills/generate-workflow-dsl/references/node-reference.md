@@ -1,7 +1,7 @@
 # 节点契约速查
 
 这里只记录生成训练/评测工作流所需的参数和端口。先按本表生成，再以
-`platform-contract-overrides.md` 和 `validate_workflow_dsl` 纠正漂移契约。
+`validate_workflow_dsl` 纠正漂移契约。
 
 ## 数据、模型与路径
 
@@ -16,14 +16,6 @@
 
 `download_source` 只允许 `huggingface`、`modelscope`。Storage 路径先用
 `PathJoinNode(base_path="/workspace/", subpath=<relative>)`，再传给 `LoadDataset`。
-
-默认推荐基模：
-
-- 文本：`Qwen/Qwen3-0.6B`、`Qwen/Qwen3-1.7B`、`Qwen/Qwen3-4B`
-- 多模态：`Qwen/Qwen3-VL-2B-Instruct`、`Qwen/Qwen3-VL-4B-Instruct`
-
-推荐列表不是平台动态枚举的替代品。用户指定其他开源模型时用 `DownloadAndCacheModel`；若
-Clone 对推荐模型校验失败，也改用 Download，不要换成用户没选的模型。
 
 ## 配置 Builder
 

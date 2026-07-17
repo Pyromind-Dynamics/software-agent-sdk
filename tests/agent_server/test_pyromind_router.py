@@ -22,6 +22,7 @@ from openhands.agent_server.pyromind_constants import (
 )
 from openhands.agent_server.pyromind_router import (
     PYROMIND_AUTH_TOKEN_SECRET,
+    PYROMIND_KB_INSTRUCTIONS,
     PyromindCreateConversationRequest,
     PyromindLLMConfig,
     PyromindSendMessageRequest,
@@ -84,6 +85,11 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     ) == {"name", "description"}
     assert len(skill_text.splitlines()) <= 120
     assert "只读取当前步骤需要的一份 reference" in skill_text
+    assert 'skills_read(skill_name="generate-workflow-dsl"' in skill_text
+    assert "### 0. 先判定局部修改" in skill_text
+    assert "qwen3.5-2b" in skill_text
+    assert "不读取 reference 或 `knowledge/`" in skill_text
+    assert "retryable=false" in skill_text
     assert "ModelTrainSFTNode(" not in skill_text
     assert set(references) == {
         "custom-python-assets.md",
@@ -97,6 +103,28 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert "PathJoinNode → LoadDataset" in references["data-routing.md"]
     assert "sample_file_path" in references["data-routing.md"]
     assert "禁止调用 `run_dataset_cleaning`" in skill_text
+    assert "Qwen/Qwen3" not in references["node-reference.md"]
+    assert "Qwen/Qwen3" not in references["platform-contract-overrides.md"]
+
+    debug_skill_text = (
+        repo_root / ".agents" / "skills" / "debug-workflow" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "使用 generate-workflow-dsl" in debug_skill_text
+    assert "本轮不得调用 workflow_debug" in debug_skill_text
+
+
+def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
+    rendered = PYROMIND_KB_INSTRUCTIONS.format(
+        knowledge_alias="knowledge",
+        skills_alias=".agents/skills",
+        working_dir="workspace/conversations/test",
+    )
+
+    assert "Immediately after that single workflow read" in rendered
+    assert "Then read only the exact skill resource" in rendered
+    assert "do not inspect general `knowledge/` before invoking the skill" in rendered
+    assert "Treat any requested node, model, parameter" in rendered
+    assert "do not\n  invoke `debug-workflow` or `workflow_debug`" in rendered
 
 
 def test_pyromind_llm_config_normalizes_chat_completions_base_url() -> None:
