@@ -6,8 +6,6 @@ import csv
 import json
 import os
 import random
-import re
-import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -40,11 +38,12 @@ PYROMIND_STORAGE_HEADERS_STATE_KEY = "pyromind_storage_headers"
 DEFAULT_UPLOAD_TARGET_DIR = "/agentTest"
 
 _PROD_APP_ENVS = {"prod", "production", "online"}
-_DEFAULT_PREVIEW_BYTES = 10 * 1024
-_MAX_PREVIEW_BYTES = 10 * 1024
+_SMALL_FILE_THRESHOLD = 10 * 1024
+_LARGE_FILE_RANGE_BYTES = 5 * 1024
+_LARGE_FILE_RANGE_COUNT = 3
+_DEFAULT_PREVIEW_BYTES = _LARGE_FILE_RANGE_BYTES * _LARGE_FILE_RANGE_COUNT
+_MAX_PREVIEW_BYTES = _DEFAULT_PREVIEW_BYTES
 _MAX_REQUESTED_SAMPLES = 100
-_MAX_RANGE_REQUESTS = 8
-_MIN_RANGE_BYTES = 4096
 _DELIMITED_HEADER_BYTES = 4096
 _MAX_SAMPLE_STRING_CHARS = 2000
 _TEXT_PREVIEW_SUFFIXES = {".txt", ".md", ".log", ".sh"}
@@ -151,17 +150,6 @@ class PreviewDatasetObservation(Observation):
     sample_rows: list[dict[str, Any]] = Field(
         default_factory=list, description="A few raw sample rows."
     )
-    sample_file_path: str | None = Field(
-        default=None,
-        description=(
-            "Absolute local path of the saved sample file under the conversation "
-            "preview_dataset directory."
-        ),
-    )
-    sample_size: int | None = Field(
-        default=None,
-        description="Size in bytes of the saved sample file.",
-    )
     requested_rows: int | None = Field(
         default=None,
         description="Maximum sample rows requested by the caller.",
@@ -225,8 +213,6 @@ class PreviewDatasetObservation(Observation):
             content.append(f"\nrows={self.num_rows}")
         if self.columns:
             content.append(f"\ncolumns={', '.join(self.columns)}")
-        if self.sample_file_path:
-            content.append(f"\nsample_file_path={self.sample_file_path}")
         return content
 
 
@@ -237,8 +223,7 @@ storage API and returns:
 - the data files found under the path
 - storage metadata such as object name, bucket, size, content type, and is_dir
 - exact row count when the file fits inside the bounded preview
-- previewed row count and a saved sample file path for JSONL, JSON, CSV/TSV,
-  and text
+- previewed row count and sample rows for JSONL, CSV/TSV, and text
 
 Use this only to inspect an actual file or directory uploaded to Pyromind
 storage. A slash in the value is not enough to classify it: when the user says
@@ -248,11 +233,11 @@ Dataset IDs, such as `pyromind/self-cognition` or `pyromind/easyhard-24k`; those
 are not storage paths. Known IDs fail locally with `NOT_A_STORAGE_PATH` and a
 `suggested_node`; no storage request is sent and path variants must not be retried.
 
-Files up to 10KB are downloaded in full; larger files are sampled with random
-byte-range requests under a total 10KB cap. Sample content is saved under the
-current conversation directory's `public_data/preview_dataset/` folder. When
-preview_truncated=true, num_rows is left unset because the tool did not read the
-full file; use previewed_rows and the saved sample file only as a format hint.
+Files up to 10KB are downloaded in full; larger files are sampled with 3 random
+5KB byte-range requests (15KB total). Sample rows are returned directly in the
+observation. When preview_truncated=true, num_rows is left unset because the tool
+did not read the full file; use previewed_rows and sample_rows only as a format
+hint.
 """
 
 
@@ -367,7 +352,6 @@ class PreviewDatasetExecutor(
             preview_path,
             size,
             str(metadata.get("content_type") or ""),
-            action.n,
         )
         if isinstance(content_result, PreviewDatasetObservation):
             return content_result
@@ -380,25 +364,16 @@ class PreviewDatasetExecutor(
             max_samples=action.n,
             truncated=preview_truncated,
         )
-        sample_result = _write_preview_sample(
-            conversation,
-            preview_path,
-            parsed["sample_rows"],
-            self._max_preview_bytes,
+        parsed["sample_rows"] = _trim_sample_rows(
+            parsed["sample_rows"], self._max_preview_bytes
         )
-        if isinstance(sample_result, PreviewDatasetObservation):
-            return sample_result
-        sample_file_path, sample_size, sample_rows = sample_result
-        parsed["sample_rows"] = sample_rows
-        parsed["columns"] = _collect_columns(sample_rows)
+        parsed["columns"] = _collect_columns(parsed["sample_rows"])
         text = _format_preview_text(
             dataset_path=dataset_path,
             preview_path=preview_path,
             files=files,
             metadata=metadata,
             parsed=parsed,
-            sample_file_path=sample_file_path,
-            sample_size=sample_size,
             requested_rows=action.n,
             preview_truncated=preview_truncated,
         )
@@ -412,8 +387,6 @@ class PreviewDatasetExecutor(
             p95_sequence_length=None,
             has_vision=_infer_has_vision(parsed["columns"], parsed["sample_rows"]),
             sample_rows=parsed["sample_rows"],
-            sample_file_path=sample_file_path,
-            sample_size=sample_size,
             requested_rows=action.n,
             preview_file_path=preview_path,
             previewed_rows=parsed["previewed_rows"],
@@ -537,17 +510,14 @@ class PreviewDatasetExecutor(
         dataset_path: str,
         file_size: int | None,
         content_type: str,
-        requested_rows: int,
     ) -> tuple[list[_PreviewChunk], bool] | PreviewDatasetObservation:
         kind = _preview_kind(dataset_path, content_type)
         ranges = _build_preview_ranges(
             file_size=file_size,
-            max_bytes=self._max_preview_bytes,
-            requested_rows=requested_rows,
             preview_kind=kind,
         )
         chunks: list[_PreviewChunk] = []
-        truncated = file_size is None or file_size > self._max_preview_bytes
+        truncated = file_size is None or file_size > _SMALL_FILE_THRESHOLD
         for start, end in ranges:
             chunk_result = self._download_range(url, dataset_path, start, end)
             if isinstance(chunk_result, PreviewDatasetObservation):
@@ -1077,35 +1047,24 @@ def _select_preview_file(files: list[str]) -> str | None:
 def _build_preview_ranges(
     *,
     file_size: int | None,
-    max_bytes: int,
-    requested_rows: int,
     preview_kind: str | None,
 ) -> list[tuple[int, int]]:
-    if file_size is None or file_size <= max_bytes:
-        return [(0, max_bytes - 1)]
+    if file_size is None or file_size <= _SMALL_FILE_THRESHOLD:
+        return [(0, _SMALL_FILE_THRESHOLD - 1)]
 
     include_header = preview_kind in {"csv", "tsv"}
     header_range: list[tuple[int, int]] = []
-    remaining_budget = max_bytes
     min_sample_start = 0
     if include_header:
-        header_bytes = min(_DELIMITED_HEADER_BYTES, max(1, max_bytes // 4), file_size)
+        header_bytes = min(
+            _DELIMITED_HEADER_BYTES, max(1, _SMALL_FILE_THRESHOLD // 4), file_size
+        )
         header_range = [(0, header_bytes - 1)]
-        remaining_budget -= header_bytes
         min_sample_start = header_bytes
 
-    if remaining_budget <= 0:
-        return header_range or [(0, max_bytes - 1)]
-
-    range_count = min(
-        _MAX_RANGE_REQUESTS,
-        max(1, requested_rows),
-        max(1, remaining_budget // _MIN_RANGE_BYTES),
-    )
-    range_size = max(1, remaining_budget // range_count)
+    range_size = _LARGE_FILE_RANGE_BYTES
     max_start = max(min_sample_start, file_size - range_size)
-
-    starts = _random_starts(min_sample_start, max_start, range_count)
+    starts = _random_starts(min_sample_start, max_start, _LARGE_FILE_RANGE_COUNT)
     ranges = [(start, min(file_size - 1, start + range_size - 1)) for start in starts]
     return header_range + ranges
 
@@ -1133,18 +1092,6 @@ def _parse_preview_chunks(
     truncated: bool,
 ) -> dict[str, Any]:
     kind = _preview_kind(file_path, content_type)
-    if kind is None:
-        return {
-            "num_rows": None,
-            "columns": [],
-            "sample_rows": [],
-            "previewed_rows": 0,
-            "preview_error": (
-                "Content preview skipped because the file type is not a supported "
-                "text, JSON, JSONL, CSV, or TSV format."
-            ),
-        }
-
     lines = _complete_lines_from_chunks(chunks)
     if kind == "jsonl":
         return _parse_jsonl_lines(lines, max_samples, truncated)
@@ -1314,59 +1261,18 @@ def _infer_has_vision(
     return False
 
 
-def _write_preview_sample(
-    conversation: BaseConversation | None,
-    preview_path: str,
+def _trim_sample_rows(
     sample_rows: list[dict[str, Any]],
     max_bytes: int,
-) -> tuple[str | None, int | None, list[dict[str, Any]]] | PreviewDatasetObservation:
-    if not sample_rows or conversation is None:
-        return None, None, sample_rows
-
-    workspace = cast(Any, conversation).workspace
-    workspace_dir = Path(workspace.working_dir).resolve()
-    sample_dir = workspace_dir / "public_data" / "preview_dataset"
-    path_policy = default_path_access_policy(workspace_dir)
-
-    sample_content, limited_rows = _render_sample_content(sample_rows, max_bytes)
-    if not sample_content:
-        return None, None, limited_rows
-
-    sample_file = (
-        sample_dir
-        / f"{_safe_sample_file_stem(preview_path)}-sample-{uuid.uuid4().hex[:8]}.txt"
-    )
-    path_policy.require(sample_file, "write")
-    try:
-        sample_dir.mkdir(parents=True, exist_ok=True)
-        sample_file.write_text(sample_content, encoding="utf-8")
-    except OSError as exc:
-        return PreviewDatasetObservation.from_text(
-            text=f"Failed to write preview sample file: {exc}",
-            is_error=True,
-            dataset_path=preview_path,
-        )
-    return str(sample_file), len(sample_content.encode("utf-8")), limited_rows
-
-
-def _safe_sample_file_stem(path: str) -> str:
-    name = PurePosixPath(path.rstrip("/")).name or "dataset"
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
-    return (safe or "dataset")[:60]
-
-
-def _render_sample_content(
-    sample_rows: list[dict[str, Any]],
-    max_bytes: int,
-) -> tuple[str, list[dict[str, Any]]]:
+) -> list[dict[str, Any]]:
     rows = list(sample_rows)
     while rows:
         lines = [str(row.get("text", "")) for row in rows if row.get("text")]
         content = "\n".join(lines) + ("\n" if lines else "")
         if len(content.encode("utf-8")) <= max_bytes:
-            return content, rows
+            return rows
         rows = rows[:-1]
-    return "", []
+    return []
 
 
 def _format_preview_text(
@@ -1376,8 +1282,6 @@ def _format_preview_text(
     files: list[str],
     metadata: dict[str, Any],
     parsed: dict[str, Any],
-    sample_file_path: str | None,
-    sample_size: int | None,
     requested_rows: int,
     preview_truncated: bool,
 ) -> str:
@@ -1399,10 +1303,6 @@ def _format_preview_text(
     parts.append(f"sample_rows={len(parsed['sample_rows'])}")
     if parsed["preview_error"]:
         parts.append(f"preview_error={parsed['preview_error']}")
-    if sample_file_path:
-        parts.append(f"sample_file_path={sample_file_path}")
-    if sample_size is not None:
-        parts.append(f"sample_size={sample_size} bytes")
     parts.append(f"preview_truncated={str(preview_truncated).lower()}")
     return "\n".join(parts)
 
