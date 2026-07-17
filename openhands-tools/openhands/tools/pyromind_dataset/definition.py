@@ -40,14 +40,13 @@ PYROMIND_STORAGE_HEADERS_STATE_KEY = "pyromind_storage_headers"
 DEFAULT_UPLOAD_TARGET_DIR = "/agentTest"
 
 _PROD_APP_ENVS = {"prod", "production", "online"}
-_DEFAULT_PREVIEW_BYTES = 100 * 1024
-_MAX_PREVIEW_BYTES = 100 * 1024
+_DEFAULT_PREVIEW_BYTES = 10 * 1024
+_MAX_PREVIEW_BYTES = 10 * 1024
 _MAX_REQUESTED_SAMPLES = 100
 _MAX_RANGE_REQUESTS = 8
 _MIN_RANGE_BYTES = 4096
 _DELIMITED_HEADER_BYTES = 4096
 _MAX_SAMPLE_STRING_CHARS = 2000
-_MAX_SAMPLE_CONTAINER_ITEMS = 20
 _TEXT_PREVIEW_SUFFIXES = {".txt", ".md", ".log", ".sh"}
 _SUPPORTED_PREVIEW_SUFFIXES = {
     ".jsonl",
@@ -127,6 +126,25 @@ class PreviewDatasetAction(Action):
             "for random byte-range line samples, or stratified for head/middle/tail "
             "byte-range line samples."
         ),
+    )
+    byte_start: int | None = Field(
+        default=None,
+        description=(
+            "When set, download an exact byte range starting at this offset "
+            "(0-based, inclusive) instead of using sample_strategy. "
+            "Use for precise follow-up inspection of a specific file section "
+            "after an initial sampling pass."
+        ),
+        ge=0,
+    )
+    byte_end: int | None = Field(
+        default=None,
+        description=(
+            "End offset for byte_start (exclusive). If omitted or larger than "
+            "the file size, reads to EOF. The downloaded range is at most "
+            "max_preview_bytes (default 10KB)."
+        ),
+        ge=0,
     )
 
     @property
@@ -255,6 +273,8 @@ storage API and returns:
   and text
 - configurable sampling with `sample_strategy`: `head`, `tail`, `random`, or
   `stratified`
+- optional `byte_start` / `byte_end` for precise follow-up inspection of a
+  specific byte range after an initial sampling pass
 
 Use this only to inspect an actual file or directory uploaded to Pyromind
 storage. A slash in the value is not enough to classify it: when the user says
@@ -265,10 +285,12 @@ are not storage paths. Known IDs fail locally with `NOT_A_STORAGE_PATH` and a
 `suggested_node`; no storage request is sent and path variants must not be retried.
 
 Sample content is saved under the current conversation directory's
-`preview_dataset/` folder, next to `workflow_canvas/`. Large files are sampled
-with one or more HTTP byte-range requests under a total 100KB byte cap. When
-preview_truncated=true, num_rows is left unset because the tool did not read the
-full file; use previewed_rows and the saved sample file only as a format hint.
+`public_data/preview_dataset/` folder, next to `workflow_canvas/`. Large files
+are sampled with one or more HTTP byte-range requests under a total 10KB byte
+cap. When preview_truncated=true, num_rows is left unset because the tool did
+not read the full file; use previewed_rows and the saved sample file only as a
+format hint. To inspect a specific section, pass `byte_start` (and optionally
+`byte_end`) to download an exact byte range.
 """
 
 
@@ -378,14 +400,23 @@ class PreviewDatasetExecutor(
             return preview_url_result
 
         size = _optional_int(metadata.get("size"))
-        content_result = self._download_preview(
-            preview_url_result,
-            preview_path,
-            size,
-            str(metadata.get("content_type") or ""),
-            action.sample_strategy,
-            action.n,
-        )
+        if action.byte_start is not None:
+            content_result = self._download_byte_range(
+                preview_url_result,
+                preview_path,
+                size,
+                action.byte_start,
+                action.byte_end,
+            )
+        else:
+            content_result = self._download_preview(
+                preview_url_result,
+                preview_path,
+                size,
+                str(metadata.get("content_type") or ""),
+                action.sample_strategy,
+                action.n,
+            )
         if isinstance(content_result, PreviewDatasetObservation):
             return content_result
         preview_chunks, preview_truncated = content_result
@@ -401,7 +432,6 @@ class PreviewDatasetExecutor(
         sample_result = _write_preview_sample(
             conversation,
             preview_path,
-            str(metadata.get("content_type") or ""),
             parsed["sample_rows"],
             self._max_preview_bytes,
         )
@@ -421,6 +451,8 @@ class PreviewDatasetExecutor(
             requested_rows=action.n,
             sample_strategy=action.sample_strategy,
             preview_truncated=preview_truncated,
+            byte_start=action.byte_start,
+            byte_end=action.byte_end,
         )
 
         return PreviewDatasetObservation.from_text(
@@ -583,6 +615,39 @@ class PreviewDatasetExecutor(
                 )
             )
         return chunks, truncated
+
+    def _download_byte_range(
+        self,
+        url: str,
+        dataset_path: str,
+        file_size: int | None,
+        byte_start: int,
+        byte_end: int | None,
+    ) -> tuple[list[_PreviewChunk], bool] | PreviewDatasetObservation:
+        if file_size is not None and byte_start >= file_size:
+            return PreviewDatasetObservation.from_text(
+                text=(f"byte_start={byte_start} exceeds file size={file_size}."),
+                is_error=True,
+                dataset_path=dataset_path,
+            )
+        end = byte_end - 1 if byte_end is not None else None
+        if file_size is not None:
+            end = min(end if end is not None else file_size - 1, file_size - 1)
+        end = min(
+            end if end is not None else byte_start + self._max_preview_bytes - 1,
+            byte_start + self._max_preview_bytes - 1,
+        )
+        chunk_result = self._download_range(url, dataset_path, byte_start, end)
+        if isinstance(chunk_result, PreviewDatasetObservation):
+            return chunk_result
+        ends_at_eof = file_size is not None and end >= file_size - 1
+        chunk = _PreviewChunk(
+            content=chunk_result,
+            starts_at_zero=byte_start == 0,
+            ends_at_eof=ends_at_eof,
+        )
+        truncated = not ends_at_eof
+        return [chunk], truncated
 
     def _download_range(
         self,
@@ -1167,28 +1232,6 @@ def _random_starts(start: int, end: int, count: int) -> list[int]:
     return sorted(starts)
 
 
-def _parse_preview_bytes(
-    file_path: str,
-    content_type: str,
-    content: bytes,
-    *,
-    max_samples: int,
-    truncated: bool,
-) -> dict[str, Any]:
-    return _parse_preview_chunks(
-        file_path,
-        content_type,
-        [
-            _PreviewChunk(
-                content=content, starts_at_zero=True, ends_at_eof=not truncated
-            )
-        ],
-        max_samples=max_samples,
-        sample_strategy="head",
-        truncated=truncated,
-    )
-
-
 def _parse_preview_chunks(
     file_path: str,
     content_type: str,
@@ -1212,25 +1255,106 @@ def _parse_preview_chunks(
         }
 
     lines = _complete_lines_from_chunks(chunks)
-    sample_limit = _effective_sample_limit(max_samples, truncated)
-    if kind == "json" and not truncated and len(chunks) == 1:
-        text = chunks[0].content.decode("utf-8", errors="replace")
-        return _parse_json_preview(text, sample_limit, sample_strategy)
-    if kind == "json":
-        preview = _parse_text_lines(lines, sample_limit, sample_strategy, truncated)
-        preview["preview_error"] = (
-            "JSON file was larger than the preview byte limit, so it was sampled "
-            "as text chunks instead of parsed as complete JSON."
-        )
-        return preview
     if kind == "jsonl":
-        return _parse_jsonl_lines(lines, sample_limit, sample_strategy, truncated)
+        return _parse_jsonl_lines(lines, max_samples, sample_strategy, truncated)
     if kind in {"csv", "tsv"}:
         delimiter = "\t" if kind == "tsv" else ","
         return _parse_delimited_lines(
-            lines, sample_limit, sample_strategy, truncated, delimiter
+            lines, max_samples, sample_strategy, truncated, delimiter
         )
-    return _parse_text_lines(lines, sample_limit, sample_strategy, truncated)
+    return _parse_raw_text_lines(lines, max_samples, sample_strategy, truncated)
+
+
+def _parse_jsonl_lines(
+    lines: list[str],
+    sample_limit: int,
+    sample_strategy: SampleStrategy,
+    truncated: bool,
+) -> dict[str, Any]:
+    non_empty = [line for line in lines if line.strip()]
+    indexed = list(enumerate(non_empty, start=1))
+    sampled = _sample_sequence(indexed, sample_limit, sample_strategy)
+    sample_rows: list[dict[str, Any]] = []
+    for idx, line in sampled:
+        row: dict[str, Any] = {
+            "line": idx,
+            "text": _truncate_text(line, _MAX_SAMPLE_STRING_CHARS),
+        }
+        try:
+            parsed = json.loads(line)
+            if isinstance(parsed, dict):
+                row.update(_trim_dict(parsed))
+            else:
+                row["value"] = _trim_value(parsed)
+        except json.JSONDecodeError:
+            pass
+        sample_rows.append(row)
+    previewed_rows = len(non_empty)
+    return {
+        "num_rows": previewed_rows if not truncated else None,
+        "columns": _collect_columns(sample_rows),
+        "sample_rows": sample_rows,
+        "previewed_rows": previewed_rows,
+        "preview_error": None,
+    }
+
+
+def _parse_delimited_lines(
+    lines: list[str],
+    sample_limit: int,
+    sample_strategy: SampleStrategy,
+    truncated: bool,
+    delimiter: str,
+) -> dict[str, Any]:
+    if not lines or delimiter not in lines[0]:
+        return _parse_raw_text_lines(lines, sample_limit, sample_strategy, truncated)
+
+    header = lines[0]
+    data_lines = lines[1:]
+    sampled_data = _sample_sequence(data_lines, sample_limit, sample_strategy)
+    reader = csv.DictReader([header, *sampled_data], delimiter=delimiter)
+    columns = [str(name) for name in reader.fieldnames or []]
+    sample_rows: list[dict[str, Any]] = []
+    for idx, row in enumerate(reader, start=1):
+        raw_text = _truncate_text(
+            sampled_data[idx - 1] if idx - 1 < len(sampled_data) else "",
+            _MAX_SAMPLE_STRING_CHARS,
+        )
+        entry: dict[str, Any] = {"line": idx, "text": raw_text}
+        for key, value in row.items():
+            if key is not None and value is not None:
+                entry[key] = _truncate_text(str(value), _MAX_SAMPLE_STRING_CHARS)
+        sample_rows.append(entry)
+    previewed_rows = max(len(lines) - 1, 0)
+    return {
+        "num_rows": previewed_rows if not truncated else None,
+        "columns": columns,
+        "sample_rows": sample_rows,
+        "previewed_rows": previewed_rows,
+        "preview_error": None,
+    }
+
+
+def _parse_raw_text_lines(
+    lines: list[str],
+    sample_limit: int,
+    sample_strategy: SampleStrategy,
+    truncated: bool,
+) -> dict[str, Any]:
+    indexed = list(enumerate(lines, start=1))
+    sampled = _sample_sequence(indexed, sample_limit, sample_strategy)
+    sample_rows = [
+        {"line": idx, "text": _truncate_text(text, _MAX_SAMPLE_STRING_CHARS)}
+        for idx, text in sampled
+    ]
+    previewed_rows = len(lines)
+    return {
+        "num_rows": previewed_rows if not truncated else None,
+        "columns": [],
+        "sample_rows": sample_rows,
+        "previewed_rows": previewed_rows,
+        "preview_error": None,
+    }
 
 
 def _preview_kind(file_path: str, content_type: str) -> str | None:
@@ -1249,154 +1373,6 @@ def _preview_kind(file_path: str, content_type: str) -> str | None:
     return None
 
 
-def _parse_jsonl_preview(
-    text: str,
-    sample_limit: int,
-    truncated: bool,
-) -> dict[str, Any]:
-    lines = _complete_preview_lines(text, truncated)
-    return _parse_jsonl_lines(lines, sample_limit, "head", truncated)
-
-
-def _parse_jsonl_lines(
-    lines: list[str],
-    sample_limit: int,
-    sample_strategy: SampleStrategy,
-    truncated: bool,
-) -> dict[str, Any]:
-    non_empty_lines = [line for line in lines if line.strip()]
-    indexed_lines = list(enumerate(non_empty_lines, start=1))
-    sampled_lines = _sample_sequence(indexed_lines, sample_limit, sample_strategy)
-    sample_rows: list[dict[str, Any]] = []
-    preview_error = None
-    for index, line in sampled_lines:
-        try:
-            sample_rows.append(_sample_row(json.loads(line)))
-        except json.JSONDecodeError as exc:
-            preview_error = f"Failed to parse JSONL line {index}: {exc.msg}"
-            sample_rows.append(
-                {"line": index, "raw": _truncate_text(line, _MAX_SAMPLE_STRING_CHARS)}
-            )
-
-    previewed_rows = len(non_empty_lines)
-    return {
-        "num_rows": previewed_rows if not truncated else None,
-        "columns": _collect_columns(sample_rows),
-        "sample_rows": sample_rows,
-        "previewed_rows": previewed_rows,
-        "preview_error": preview_error,
-    }
-
-
-def _parse_json_preview(
-    text: str,
-    sample_limit: int,
-    sample_strategy: SampleStrategy,
-) -> dict[str, Any]:
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError as exc:
-        preview = _parse_text_preview(text, sample_limit, False)
-        preview["preview_error"] = f"Failed to parse JSON: {exc.msg}"
-        return preview
-
-    if isinstance(value, list):
-        rows = [_sample_row(item) for item in value]
-    else:
-        rows = [_sample_row(value)]
-    sample_rows = _sample_sequence(rows, sample_limit, sample_strategy)
-    return {
-        "num_rows": len(rows),
-        "columns": _collect_columns(sample_rows),
-        "sample_rows": sample_rows,
-        "previewed_rows": len(rows),
-        "preview_error": None,
-    }
-
-
-def _parse_delimited_preview(
-    text: str,
-    sample_limit: int,
-    truncated: bool,
-    delimiter: str,
-) -> dict[str, Any]:
-    lines = _complete_preview_lines(text, truncated)
-    return _parse_delimited_lines(lines, sample_limit, "head", truncated, delimiter)
-
-
-def _parse_delimited_lines(
-    lines: list[str],
-    sample_limit: int,
-    sample_strategy: SampleStrategy,
-    truncated: bool,
-    delimiter: str,
-) -> dict[str, Any]:
-    if not lines:
-        return {
-            "num_rows": 0 if not truncated else None,
-            "columns": [],
-            "sample_rows": [],
-            "previewed_rows": 0,
-            "preview_error": None,
-        }
-
-    header = lines[0]
-    data_lines = _sample_sequence(lines[1:], sample_limit, sample_strategy)
-    reader = csv.DictReader([header, *data_lines], delimiter=delimiter)
-    sample_rows = [
-        _sample_row(dict(row))
-        for index, row in enumerate(reader)
-        if index < sample_limit
-    ]
-    previewed_rows = max(len(lines) - 1, 0)
-    columns = [str(name) for name in reader.fieldnames or []]
-    return {
-        "num_rows": previewed_rows if not truncated else None,
-        "columns": columns,
-        "sample_rows": sample_rows,
-        "previewed_rows": previewed_rows,
-        "preview_error": None,
-    }
-
-
-def _parse_text_preview(
-    text: str,
-    sample_limit: int,
-    truncated: bool,
-) -> dict[str, Any]:
-    lines = _complete_preview_lines(text, truncated)
-    return _parse_text_lines(lines, sample_limit, "head", truncated)
-
-
-def _parse_text_lines(
-    lines: list[str],
-    sample_limit: int,
-    sample_strategy: SampleStrategy,
-    truncated: bool,
-) -> dict[str, Any]:
-    indexed_lines = list(enumerate(lines, start=1))
-    sampled_lines = _sample_sequence(indexed_lines, sample_limit, sample_strategy)
-    sample_rows = [
-        {"line": index, "text": _truncate_text(line, _MAX_SAMPLE_STRING_CHARS)}
-        for index, line in sampled_lines
-    ]
-    previewed_rows = len(lines)
-    return {
-        "num_rows": previewed_rows if not truncated else None,
-        "columns": ["line", "text"],
-        "sample_rows": sample_rows,
-        "previewed_rows": previewed_rows,
-        "preview_error": None,
-    }
-
-
-def _complete_preview_lines(text: str, truncated: bool) -> list[str]:
-    lines = text.splitlines()
-    if truncated and text and not text.endswith(("\n", "\r")) and lines:
-        return lines[:-1]
-    return lines
-
-
 def _complete_lines_from_chunks(chunks: list[_PreviewChunk]) -> list[str]:
     lines: list[str] = []
     for chunk in chunks:
@@ -1404,14 +1380,8 @@ def _complete_lines_from_chunks(chunks: list[_PreviewChunk]) -> list[str]:
         chunk_lines = text.splitlines()
         if not chunk.starts_at_zero and chunk_lines:
             chunk_lines = chunk_lines[1:]
-        if not chunk.ends_at_eof and text and not text.endswith(("\n", "\r")):
-            chunk_lines = chunk_lines[:-1]
         lines.extend(chunk_lines)
     return lines
-
-
-def _effective_sample_limit(max_samples: int, _truncated: bool) -> int:
-    return max_samples
 
 
 def _sample_sequence(
@@ -1442,31 +1412,18 @@ def _stratified_values(values: list[Any], sample_limit: int) -> list[Any]:
     return [values[index] for index in indexes]
 
 
-def _sample_row(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        trimmed = _trim_value(value)
-        return trimmed if isinstance(trimmed, dict) else {"value": trimmed}
-    return {"value": _trim_value(value)}
-
-
 def _trim_value(value: Any) -> Any:
     if isinstance(value, str):
         return _truncate_text(value, _MAX_SAMPLE_STRING_CHARS)
     if isinstance(value, list):
-        trimmed = [_trim_value(item) for item in value[:_MAX_SAMPLE_CONTAINER_ITEMS]]
-        if len(value) > _MAX_SAMPLE_CONTAINER_ITEMS:
-            trimmed.append(f"... [{len(value) - _MAX_SAMPLE_CONTAINER_ITEMS} more]")
-        return trimmed
+        return [_trim_value(item) for item in value]
     if isinstance(value, dict):
-        items = list(value.items())
-        trimmed_dict = {
-            str(key): _trim_value(item_value)
-            for key, item_value in items[:_MAX_SAMPLE_CONTAINER_ITEMS]
-        }
-        if len(items) > _MAX_SAMPLE_CONTAINER_ITEMS:
-            trimmed_dict["..."] = f"[{len(items) - _MAX_SAMPLE_CONTAINER_ITEMS} more]"
-        return trimmed_dict
+        return _trim_dict(value)
     return value
+
+
+def _trim_dict(value: dict[str, Any]) -> dict[str, Any]:
+    return {str(key): _trim_value(item) for key, item in value.items()}
 
 
 def _collect_columns(sample_rows: list[dict[str, Any]]) -> list[str]:
@@ -1488,53 +1445,41 @@ def _infer_has_vision(
     if not columns and not sample_rows:
         return None
     for column in columns:
-        column_lower = column.lower()
-        if any(marker in column_lower for marker in _VISION_FIELD_MARKERS):
+        if any(marker in column.lower() for marker in _VISION_FIELD_MARKERS):
             return True
-    return any(_value_mentions_vision(row) for row in sample_rows)
-
-
-def _value_mentions_vision(value: Any) -> bool:
-    if isinstance(value, str):
-        suffix = PurePosixPath(value.split("?", 1)[0]).suffix.lower()
-        return suffix in _VISION_SUFFIXES
-    if isinstance(value, list):
-        return any(_value_mentions_vision(item) for item in value)
-    if isinstance(value, dict):
-        return any(_value_mentions_vision(item) for item in value.values())
+    for row in sample_rows:
+        for value in row.values():
+            if not isinstance(value, str):
+                continue
+            if any(
+                PurePosixPath(part.split("?", 1)[0]).suffix.lower() in _VISION_SUFFIXES
+                for part in value.split()
+            ):
+                return True
     return False
 
 
 def _write_preview_sample(
     conversation: BaseConversation | None,
     preview_path: str,
-    content_type: str,
     sample_rows: list[dict[str, Any]],
     max_bytes: int,
 ) -> tuple[str | None, int | None, list[dict[str, Any]]] | PreviewDatasetObservation:
-    if not sample_rows:
-        return None, None, sample_rows
-    if conversation is None:
+    if not sample_rows or conversation is None:
         return None, None, sample_rows
 
     workspace = cast(Any, conversation).workspace
     workspace_dir = Path(workspace.working_dir).resolve()
-    sample_dir = workspace_dir / "preview_dataset"
+    sample_dir = workspace_dir / "public_data" / "preview_dataset"
     path_policy = default_path_access_policy(workspace_dir)
 
-    sample_content, suffix, limited_rows = _render_sample_file_content(
-        preview_path,
-        content_type,
-        sample_rows,
-        max_bytes,
-    )
+    sample_content, limited_rows = _render_sample_content(sample_rows, max_bytes)
     if not sample_content:
         return None, None, limited_rows
 
     sample_file = (
         sample_dir
-        / f"{_safe_sample_file_stem(preview_path)}-sample-{uuid.uuid4().hex[:8]}"
-        f"{suffix}"
+        / f"{_safe_sample_file_stem(preview_path)}-sample-{uuid.uuid4().hex[:8]}.txt"
     )
     path_policy.require(sample_file, "write")
     try:
@@ -1555,31 +1500,18 @@ def _safe_sample_file_stem(path: str) -> str:
     return (safe or "dataset")[:60]
 
 
-def _render_sample_file_content(
-    preview_path: str,
-    content_type: str,
+def _render_sample_content(
     sample_rows: list[dict[str, Any]],
     max_bytes: int,
-) -> tuple[str, str, list[dict[str, Any]]]:
-    suffix = ".txt" if _preview_kind(preview_path, content_type) == "text" else ".json"
+) -> tuple[str, list[dict[str, Any]]]:
     rows = list(sample_rows)
     while rows:
-        content = _format_sample_file_content(rows, suffix)
+        lines = [str(row.get("text", "")) for row in rows if row.get("text")]
+        content = "\n".join(lines) + ("\n" if lines else "")
         if len(content.encode("utf-8")) <= max_bytes:
-            return content, suffix, rows
+            return content, rows
         rows = rows[:-1]
-    return "", suffix, []
-
-
-def _format_sample_file_content(sample_rows: list[dict[str, Any]], suffix: str) -> str:
-    if suffix == ".txt":
-        lines = [
-            str(row["text"])
-            for row in sample_rows
-            if set(row) == {"line", "text"} and row.get("text") is not None
-        ]
-        return "\n".join(lines) + ("\n" if lines else "")
-    return json.dumps(sample_rows, ensure_ascii=False) + "\n"
+    return "", []
 
 
 def _format_preview_text(
@@ -1594,6 +1526,8 @@ def _format_preview_text(
     requested_rows: int,
     sample_strategy: SampleStrategy,
     preview_truncated: bool,
+    byte_start: int | None = None,
+    byte_end: int | None = None,
 ) -> str:
     fields = _metadata_observation_fields(metadata)
     parts = [
@@ -1603,6 +1537,11 @@ def _format_preview_text(
     ]
     if fields["size"] is not None:
         parts.append(f"size={fields['size']} bytes")
+    if byte_start is not None:
+        range_desc = f"byte_range={byte_start}-"
+        if byte_end is not None:
+            range_desc += str(byte_end)
+        parts.append(range_desc)
     if parsed["num_rows"] is not None:
         parts.append(f"rows={parsed['num_rows']}")
     else:
