@@ -145,7 +145,25 @@ The shared skill documents are available through the read-only logical path
 `{skills_alias}/`. Do not use or request their host filesystem path.
 
 Skill usage rules:
-- If the user request matches a listed skill, invoke that skill first.
+- A conversation may already contain a workflow at
+  `public_data/workflow_canvas/workflow.py`. Before asking for information or
+  answering any request that may inspect, modify, validate, test, or run the
+  current workflow, read that file in full with `file_editor`. Apply this rule
+  especially to short contextual requests such as "看数据", "改一下", or
+  "换个模型". Reuse dataset/model identifiers and topology already present in
+  the file instead of asking the user to provide them again.
+- Immediately after that single workflow read, invoke the matching listed skill.
+  Then read only the exact skill resource that the skill requires. For a local
+  workflow edit, do not inspect general `knowledge/` before invoking the skill,
+  and do not inspect it afterward unless the skill explicitly requires it.
+- For requests that do not involve a current workflow, invoke a matching listed
+  skill before searching the knowledge base.
+- Treat any requested node, model, parameter, data, or topology change as a
+  `generate-workflow-dsl` request, including phrases such as "换个模型跑一下"
+  or "跑下 <model> 的效果". Modify and validate the DSL, then stop; do not
+  invoke `debug-workflow` or `workflow_debug` in the same turn. Use
+  `debug-workflow` only for an explicit test/debug request that contains no
+  configuration change.
 - For skill document lookup, use `skills_list` / `skills_read` style access,
   not grep or directory scanning.
 - For skill-linked resources, read the exact relative path from the skill root;
@@ -171,9 +189,8 @@ After creating or modifying the workflow file, stop normally; the server sends
 the workflow to the frontend once the run finishes. Do not say the workflow has
 been generated unless a tool call actually created or modified the workflow file.
 
-- If a listed skill fits the request (for example, generating a workflow), \
-invoke it via `invoke_skill` before searching the knowledge base. Do not invoke
-a workflow-generation skill for an article lookup alone.
+- Invoke listed skills with `invoke_skill`. Do not invoke a workflow-generation
+  skill for an article lookup alone.
 - For knowledge-base or skill-document requests that are not skill-linked,
   prefer `grep` and `file_editor` with the logical `{knowledge_alias}/` or
   `{skills_alias}/` path. `terminal` is also available when direct filesystem
@@ -1023,7 +1040,6 @@ async def create_pyromind_conversation(
             ),
             Tool(name="grep"),
             Tool(name="file_editor"),
-            Tool(name=RunWorkflowTool.name, params=run_tool.params),
             Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
             *storage_tools,
             validation_tool,
@@ -1035,9 +1051,7 @@ async def create_pyromind_conversation(
     workspace = LocalWorkspace(working_dir=str(conversation_dir))
 
     # Seed workflow.py from a canvas the user already had before starting this
-    # conversation (e.g. they sketched something, then opened chat). No
-    # system_reminder is needed here -- this is turn 1, so there is no
-    # prior-turn workflow.py content for the agent to contrast against.
+    # conversation (e.g. they sketched something, then opened chat).
     workflow_dsl = _workflow_dsl_from_xyflow(request.workflow_xyflow)
     if workflow_dsl:
         workflow_file = conversation_dir / WORKFLOW_RELATIVE_PATH
@@ -1088,6 +1102,24 @@ async def create_pyromind_conversation(
         await event_service.send_message(
             Message(role="user", content=[TextContent(text=request.message)]),
             run=True,
+            extended_content=(
+                [
+                    TextContent(
+                        text=(
+                            "<system_reminder>\n"
+                            "A workflow from the current canvas is already loaded at "
+                            "public_data/workflow_canvas/workflow.py. Treat it as "
+                            "authoritative context. Read the full file with "
+                            "file_editor "
+                            "before interpreting this request or asking for dataset, "
+                            "model, or topology details already present there.\n"
+                            "</system_reminder>"
+                        )
+                    )
+                ]
+                if workflow_dsl
+                else None
+            ),
             workflow_dsl_snapshot=workflow_dsl,
             workflow_xyflow_snapshot=request.workflow_xyflow,
         )

@@ -110,3 +110,37 @@ def test_tools_declare_read_only_resources(tmp_path):
     )
     assert resource.declared is True
     assert resource.keys == ("skill:reader:references/guide.md",)
+
+
+def test_read_action_accepts_canonical_and_legacy_skill_name(tmp_path):
+    runtime = make_runtime(tmp_path)
+    conversation = make_conversation(runtime)
+    (read_tool,) = SkillsReadTool.create()
+    canonical = SkillsReadAction.model_validate(
+        {"skill_name": "reader", "path": "references/guide.md"}
+    )
+    legacy = SkillsReadAction.model_validate(
+        {"name": "reader", "path": "references/guide.md"}
+    )
+
+    assert canonical == legacy
+    schema = SkillsReadAction.to_mcp_schema()
+    assert "skill_name" in schema["properties"]
+    assert "name" not in schema["properties"]
+    assert canonical.model_dump(exclude={"kind"}) == {
+        "skill_name": "reader",
+        "path": "references/guide.md",
+    }
+    assert read_tool.declared_resources(canonical) == read_tool.declared_resources(
+        legacy
+    )
+
+    canonical_result = cast(
+        SkillsReadObservation,
+        read_tool(canonical, conversation=cast(LocalConversation, conversation)),
+    )
+    legacy_result = cast(
+        SkillsReadObservation,
+        read_tool(legacy, conversation=cast(LocalConversation, conversation)),
+    )
+    assert canonical_result == legacy_result
