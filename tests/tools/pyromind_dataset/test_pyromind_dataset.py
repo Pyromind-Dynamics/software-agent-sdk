@@ -328,61 +328,7 @@ def test_preview_dataset_defaults_to_ten_sample_rows(
     assert "sample_rows=10" in observation.text
 
 
-def test_preview_dataset_tail_strategy_samples_last_rows(
-    monkeypatch,
-    tmp_path,
-):
-    lines = [f"line-{index}" for index in range(1, 19)]
-    content = ("\n".join(lines) + "\n").encode()
-
-    def fake_post(url, *, headers, json, timeout):
-        if url.endswith("/get_file_metadata"):
-            return _Response(
-                200,
-                {
-                    "success": True,
-                    "data": {
-                        "object_name": "small.txt",
-                        "size": len(content),
-                        "content_type": "text/plain",
-                        "is_dir": False,
-                    },
-                },
-            )
-        if url.endswith("/get_url"):
-            return _Response(
-                200,
-                {"success": True, "data": {"url": "https://download.test/small"}},
-            )
-        raise AssertionError(f"unexpected URL: {url}")
-
-    def fake_stream(method, url, *, headers, timeout, follow_redirects):
-        return _StreamResponse(content)
-
-    monkeypatch.setattr(httpx, "post", fake_post)
-    monkeypatch.setattr(httpx, "stream", fake_stream)
-    conversation = _fake_conversation(tmp_path)
-
-    observation = PreviewDatasetExecutor(
-        storage_base_url="https://portal.test/storage_api",
-    )(
-        PreviewDatasetAction(
-            dataset_path="/small.txt",
-            n=5,
-            sample_strategy="tail",
-        ),
-        cast(Any, conversation),
-    )
-
-    assert not observation.is_error
-    assert [row["text"] for row in observation.sample_rows] == lines[-5:]
-    assert observation.sample_file_path is not None
-    sample_file = Path(observation.sample_file_path)
-    assert sample_file.read_text(encoding="utf-8").splitlines() == lines[-5:]
-    assert "sample_strategy=tail" in observation.text
-
-
-def test_preview_dataset_stratified_large_file_uses_multiple_ranges(
+def test_preview_dataset_large_file_uses_random_ranges(
     monkeypatch,
     tmp_path,
 ):
@@ -423,13 +369,8 @@ def test_preview_dataset_stratified_large_file_uses_multiple_ranges(
 
     observation = PreviewDatasetExecutor(
         storage_base_url="https://portal.test/storage_api",
-        max_preview_bytes=20 * 1024,
     )(
-        PreviewDatasetAction(
-            dataset_path="/large.txt",
-            n=8,
-            sample_strategy="stratified",
-        ),
+        PreviewDatasetAction(dataset_path="/large.txt", n=8),
         cast(Any, conversation),
     )
 
@@ -438,15 +379,9 @@ def test_preview_dataset_stratified_large_file_uses_multiple_ranges(
     assert len(ranges) > 1
     assert any(start > 0 for start, _ in ranges)
     assert 0 < len(observation.sample_rows) <= 8
-    sampled_numbers = [
-        int(str(row["text"]).split()[0].removeprefix("line-"))
-        for row in observation.sample_rows
-    ]
-    assert max(sampled_numbers) > 100
     assert observation.sample_file_path is not None
     sample_file = Path(observation.sample_file_path)
-    assert len(sample_file.read_bytes()) <= 20 * 1024
-    assert "sample_strategy=stratified" in observation.text
+    assert len(sample_file.read_bytes()) <= 10 * 1024
 
 
 def test_preview_dataset_truncates_large_jsonl_and_reduces_samples(
@@ -498,7 +433,6 @@ def test_preview_dataset_truncates_large_jsonl_and_reduces_samples(
     sample_file = Path(observation.sample_file_path)
     assert sample_file.is_file()
     assert len(sample_file.read_bytes()) <= len(rows[0]) * 5 + 2
-    assert "sample_strategy=head" in observation.text
 
 
 def test_upload_file_to_pyromind_posts_workspace_file(
@@ -711,247 +645,3 @@ def test_preview_dataset_single_line_text_returns_partial_content(
     assert observation.sample_rows[0]["line"] == 1
     assert observation.sample_rows[0]["text"].startswith("a")
     assert observation.sample_file_path is not None
-
-
-def test_preview_dataset_byte_range_downloads_exact_section(
-    monkeypatch,
-    tmp_path,
-):
-    """byte_start/byte_end should download an exact byte range."""
-    lines = [f"line-{index:03d} {'x' * 50}" for index in range(100)]
-    content = ("\n".join(lines) + "\n").encode()
-    assert len(content) > 500
-    byte_start = 200
-    byte_end = 400
-
-    def fake_post(url, *, headers, json, timeout):
-        if url.endswith("/get_file_metadata"):
-            return _Response(
-                200,
-                {
-                    "success": True,
-                    "data": {
-                        "object_name": "big.txt",
-                        "size": len(content),
-                        "content_type": "text/plain",
-                        "is_dir": False,
-                    },
-                },
-            )
-        return _Response(200, {"success": True, "data": {"url": "https://dl"}})
-
-    captured_ranges: list[str] = []
-
-    def fake_stream(method, url, *, headers, timeout, follow_redirects):
-        raw_range = headers["range"].removeprefix("bytes=")
-        captured_ranges.append(raw_range)
-        start, end = [int(p) for p in raw_range.split("-", maxsplit=1)]
-        return _StreamResponse(content[start : end + 1])
-
-    monkeypatch.setattr(httpx, "post", fake_post)
-    monkeypatch.setattr(httpx, "stream", fake_stream)
-    conversation = _fake_conversation(tmp_path)
-
-    observation = PreviewDatasetExecutor(
-        storage_base_url="https://portal.test/storage_api",
-    )(
-        PreviewDatasetAction(
-            dataset_path="big.txt",
-            n=20,
-            byte_start=byte_start,
-            byte_end=byte_end,
-        ),
-        cast(Any, conversation),
-    )
-
-    assert not observation.is_error
-    assert captured_ranges == [f"{byte_start}-{byte_end - 1}"]
-    assert observation.preview_truncated is True
-    assert "byte_range=200-400" in observation.text
-    assert observation.sample_file_path is not None
-    sample_file = Path(observation.sample_file_path)
-    assert sample_file.is_file()
-    file_text = sample_file.read_text(encoding="utf-8")
-    assert len(file_text) > 0
-    assert "line-" in file_text
-
-
-def test_preview_dataset_byte_start_without_end_reads_to_max(
-    monkeypatch,
-    tmp_path,
-):
-    """byte_start without byte_end should read up to max_preview_bytes."""
-    content = b"x" * 50000
-
-    def fake_post(url, *, headers, json, timeout):
-        if url.endswith("/get_file_metadata"):
-            return _Response(
-                200,
-                {
-                    "success": True,
-                    "data": {
-                        "object_name": "big.txt",
-                        "size": len(content),
-                        "content_type": "text/plain",
-                        "is_dir": False,
-                    },
-                },
-            )
-        return _Response(200, {"success": True, "data": {"url": "https://dl"}})
-
-    captured_ranges: list[str] = []
-
-    def fake_stream(method, url, *, headers, timeout, follow_redirects):
-        raw_range = headers["range"].removeprefix("bytes=")
-        captured_ranges.append(raw_range)
-        start, end = [int(p) for p in raw_range.split("-", maxsplit=1)]
-        return _StreamResponse(content[start : end + 1])
-
-    monkeypatch.setattr(httpx, "post", fake_post)
-    monkeypatch.setattr(httpx, "stream", fake_stream)
-    conversation = _fake_conversation(tmp_path)
-
-    executor = PreviewDatasetExecutor(
-        storage_base_url="https://portal.test/storage_api",
-        max_preview_bytes=1024,
-    )
-    observation = executor(
-        PreviewDatasetAction(dataset_path="big.txt", byte_start=10000),
-        cast(Any, conversation),
-    )
-
-    assert not observation.is_error
-    assert captured_ranges == ["10000-11023"]
-    assert "byte_range=10000-" in observation.text
-
-
-def test_preview_dataset_byte_start_exceeds_file_size(
-    monkeypatch,
-    tmp_path,
-):
-    """byte_start beyond file size should return an error."""
-    content = b"small file\n"
-
-    def fake_post(url, *, headers, json, timeout):
-        if url.endswith("/get_file_metadata"):
-            return _Response(
-                200,
-                {
-                    "success": True,
-                    "data": {
-                        "object_name": "small.txt",
-                        "size": len(content),
-                        "content_type": "text/plain",
-                        "is_dir": False,
-                    },
-                },
-            )
-        return _Response(200, {"success": True, "data": {"url": "https://dl"}})
-
-    monkeypatch.setattr(httpx, "post", fake_post)
-    monkeypatch.setattr(httpx, "stream", lambda *a, **kw: None)
-    conversation = _fake_conversation(tmp_path)
-
-    observation = PreviewDatasetExecutor(
-        storage_base_url="https://portal.test/storage_api",
-    )(
-        PreviewDatasetAction(dataset_path="small.txt", byte_start=99999),
-        cast(Any, conversation),
-    )
-
-    assert observation.is_error
-    assert "exceeds file size" in observation.text
-
-
-def test_preview_dataset_byte_end_before_byte_start_returns_error(
-    monkeypatch,
-    tmp_path,
-):
-    """byte_end <= byte_start should return an error."""
-    content = b"x" * 1000
-
-    def fake_post(url, *, headers, json, timeout):
-        if url.endswith("/get_file_metadata"):
-            return _Response(
-                200,
-                {
-                    "success": True,
-                    "data": {
-                        "object_name": "data.txt",
-                        "size": len(content),
-                        "content_type": "text/plain",
-                        "is_dir": False,
-                    },
-                },
-            )
-        return _Response(200, {"success": True, "data": {"url": "https://dl"}})
-
-    monkeypatch.setattr(httpx, "post", fake_post)
-    monkeypatch.setattr(httpx, "stream", lambda *a, **kw: None)
-    conversation = _fake_conversation(tmp_path)
-
-    observation = PreviewDatasetExecutor(
-        storage_base_url="https://portal.test/storage_api",
-    )(
-        PreviewDatasetAction(
-            dataset_path="data.txt",
-            byte_start=500,
-            byte_end=100,
-        ),
-        cast(Any, conversation),
-    )
-
-    assert observation.is_error
-    assert "must be greater than" in observation.text
-
-
-def test_preview_dataset_byte_range_at_eof_sets_num_rows_none(
-    monkeypatch,
-    tmp_path,
-):
-    """When byte_start > 0 and range reaches EOF, num_rows must be None
-    because we only read a tail portion, not the whole file."""
-    lines = [f"line-{i:03d}" for i in range(100)]
-    content = ("\n".join(lines) + "\n").encode()
-
-    def fake_post(url, *, headers, json, timeout):
-        if url.endswith("/get_file_metadata"):
-            return _Response(
-                200,
-                {
-                    "success": True,
-                    "data": {
-                        "object_name": "data.txt",
-                        "size": len(content),
-                        "content_type": "text/plain",
-                        "is_dir": False,
-                    },
-                },
-            )
-        return _Response(200, {"success": True, "data": {"url": "https://dl"}})
-
-    def fake_stream(method, url, *, headers, timeout, follow_redirects):
-        raw_range = headers["range"].removeprefix("bytes=")
-        start, end = [int(p) for p in raw_range.split("-", maxsplit=1)]
-        return _StreamResponse(content[start : end + 1])
-
-    monkeypatch.setattr(httpx, "post", fake_post)
-    monkeypatch.setattr(httpx, "stream", fake_stream)
-    conversation = _fake_conversation(tmp_path)
-
-    observation = PreviewDatasetExecutor(
-        storage_base_url="https://portal.test/storage_api",
-    )(
-        PreviewDatasetAction(
-            dataset_path="data.txt",
-            n=100,
-            byte_start=len(content) - 200,
-        ),
-        cast(Any, conversation),
-    )
-
-    assert not observation.is_error
-    assert observation.preview_truncated is True
-    assert observation.num_rows is None
-    assert observation.previewed_rows is not None
-    assert observation.previewed_rows > 0
