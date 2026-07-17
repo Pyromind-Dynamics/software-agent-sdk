@@ -32,6 +32,11 @@ from openhands.tools.terminal.descriptions import (
     WINDOWS_TOOL_DESCRIPTION,
 )
 from openhands.tools.terminal.metadata import CmdOutputMetadata
+from openhands.tools.utils import (
+    CONVERSATION_READ_ONLY_SUBPATHS,
+    CONVERSATION_READ_WRITE_SUBPATHS,
+    is_conversation_workspace,
+)
 
 
 _LITERAL_ARG_HINT_TEMPLATE = (
@@ -313,8 +318,8 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
         if not os.path.isdir(working_dir):
             raise ValueError(f"working_dir '{working_dir}' is not a valid directory")
 
-        # Initialize the executor
         if executor is None:
+            is_conv_workspace = is_conversation_workspace(working_dir)
             executor = TerminalExecutor(
                 working_dir=working_dir,
                 username=username,
@@ -322,6 +327,12 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
                 terminal_type=terminal_type,
                 shell_path=shell_path,
                 full_output_save_dir=conv_state.env_observation_persistence_dir,
+                sandbox_read_only_paths=(
+                    CONVERSATION_READ_ONLY_SUBPATHS if is_conv_workspace else ()
+                ),
+                sandbox_read_write_paths=(
+                    CONVERSATION_READ_WRITE_SUBPATHS if is_conv_workspace else None
+                ),
             )
 
         tool_description = (

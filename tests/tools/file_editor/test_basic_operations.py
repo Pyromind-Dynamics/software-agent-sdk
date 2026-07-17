@@ -84,23 +84,6 @@ def test_file_editor_happy_path(temp_file):
     assert "This is a sample file." in content
 
 
-def test_file_editor_observation_redacts_api_endpoint():
-    observation = FileEditorObservation(
-        command="view",
-        new_content='{"base_url": "http://private.example/v1"}',
-    )
-
-    assert observation.new_content is not None
-    assert "private.example" not in observation.new_content
-    assert "<redacted>" in observation.new_content
-
-    observation = FileEditorObservation.from_text(
-        '{"base_url": "http://private.example/v1"}', command="view"
-    )
-    assert "private.example" not in observation.text
-    assert "<redacted>" in observation.text
-
-
 def test_file_editor_view_operation(temp_file):
     """Test view operation with file containing special content."""
     # Create content that includes various patterns

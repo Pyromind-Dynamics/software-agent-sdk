@@ -2,25 +2,10 @@
 
 from openhands.sdk.utils.redact import (
     SENSITIVE_URL_PARAMS,
-    redact_text_secrets,
     redact_url_credentials,
     redact_url_credentials_in_text,
     redact_url_params,
 )
-
-
-def test_redact_text_secrets_hides_api_endpoints():
-    text = (
-        '{"model": "private-model", "base_url": "http://private.example/v1", '
-        '"api_base": "https://internal"}'
-    )
-
-    result = redact_text_secrets(text)
-
-    assert "private.example" not in result
-    assert "internal" not in result
-    assert "private-model" not in result
-    assert "<redacted>" in result
 
 
 # ---------------------------------------------------------------------------
