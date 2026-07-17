@@ -1304,6 +1304,9 @@ def _format_preview_text(
     if parsed["preview_error"]:
         parts.append(f"preview_error={parsed['preview_error']}")
     parts.append(f"preview_truncated={str(preview_truncated).lower()}")
+    for row in parsed["sample_rows"]:
+        parts.append(f"\n--- sample line {row.get('line', '?')} ---")
+        parts.append(str(row.get("text", "")))
     return "\n".join(parts)
 
 
