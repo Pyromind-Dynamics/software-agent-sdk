@@ -18,6 +18,7 @@ from openhands.agent_server.conversation_lease import LEASE_FILE_NAME
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.event_service import (
     EventService,
+    _with_pyromind_runtime_contract,
     _with_pyromind_runtime_llm,
     _with_pyromind_runtime_skills,
 )
@@ -34,7 +35,15 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_WORKFLOW_EVENT_KEY,
 )
 from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
-from openhands.sdk import LLM, Agent, AgentBase, AgentContext, Conversation, Message
+from openhands.sdk import (
+    LLM,
+    Agent,
+    AgentBase,
+    AgentContext,
+    Conversation,
+    Message,
+    Tool,
+)
 from openhands.sdk.agent import ACPAgent
 from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.conversation.event_store import EventLog
@@ -324,6 +333,60 @@ def test_pyromind_runtime_skills_are_rehydrated_from_server_path(tmp_path, monke
     result = runtime.read("generate-workflow-dsl", "references/example-workflows.md")
     assert result.handle.contents == "example workflow"
     assert result.entry.resource_root == str(skill_dir.resolve())
+
+
+def test_pyromind_runtime_skills_refresh_valid_persisted_skill(tmp_path):
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "generate-workflow-dsl"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: generate-workflow-dsl\n"
+        "description: Generate workflow DSL\n"
+        "---\n"
+        "# Fresh runtime skill",
+        encoding="utf-8",
+    )
+    persisted_skill = Skill(
+        name="generate-workflow-dsl",
+        content="# Stale persisted skill",
+        source=str(skill_dir / "SKILL.md"),
+        is_agentskills_format=True,
+        resources=SkillResources(skill_root=str(skill_dir), references=[]),
+    )
+    agent = Agent(
+        llm=LLM(model="gpt-4o", usage_id="pyromind-agent"),
+        tools=[],
+        agent_context=AgentContext(skills=[persisted_skill]),
+    )
+
+    updated = _with_pyromind_runtime_skills(agent)
+
+    assert updated.agent_context is not None
+    assert updated.agent_context.skills[0].content == "# Fresh runtime skill"
+
+
+def test_pyromind_runtime_contract_refreshes_persisted_agent_once():
+    agent = Agent(
+        llm=LLM(model="gpt-4o", usage_id="pyromind-agent"),
+        tools=[Tool(name="terminal")],
+        system_prompt_filename="system_prompt_codex.j2",
+        system_prompt_kwargs={"custom_instructions": "old instructions"},
+    )
+
+    updated = _with_pyromind_runtime_contract(agent)
+    updated_again = _with_pyromind_runtime_contract(updated)
+
+    terminal = next(tool for tool in updated_again.tools if tool.name == "terminal")
+    assert terminal.params == {
+        "command_working_subdir": "public_data",
+        "restrict_workspace_discovery": True,
+    }
+    custom_instructions = updated_again.system_prompt_kwargs["custom_instructions"]
+    assert (
+        custom_instructions.count("This agent authors and validates workflow DSL") == 1
+    )
+    assert "never use the local terminal as a substitute" in custom_instructions
 
 
 def test_emit_pyromind_workflow_if_dirty_emits_event_and_clears_flag(

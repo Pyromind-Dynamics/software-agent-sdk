@@ -51,7 +51,9 @@ class CmdOutputMetadata(BaseModel):
                 "exit_code": "$?",
                 "username": r"\u",
                 "hostname": r"\h",
-                "working_dir": r"$(pwd)",
+                # Use the shell-maintained path. Calling ``pwd`` here fails before
+                # every prompt when a sandbox intentionally hides cwd ancestors.
+                "working_dir": r"${PWD}",
                 "py_interpreter_path": r'$(command -v python || echo "")',
             },
             indent=2,

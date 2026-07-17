@@ -84,12 +84,14 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
         if line and not line.startswith(" ")
     ) == {"name", "description"}
     assert len(skill_text.splitlines()) <= 120
-    assert "只读取当前步骤需要的一份 reference" in skill_text
+    assert "## 资料索引" in skill_text
     assert 'skills_read(skill_name="generate-workflow-dsl"' in skill_text
     assert "### 0. 先判定局部修改" in skill_text
     assert "qwen3.5-2b" in skill_text
     assert "不读取 reference 或 `knowledge/`" in skill_text
     assert "retryable=false" in skill_text
+    assert "只生成并校验 DSL" in skill_text
+    assert "禁止用 Agent 本地 terminal 替代平台运行时" in skill_text
     assert "ModelTrainSFTNode(" not in skill_text
     assert set(references) == {
         "custom-python-assets.md",
@@ -102,6 +104,11 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert not (skill_root / "references" / "example-workflows.md").exists()
     assert "PathJoinNode → LoadDataset" in references["data-routing.md"]
     assert "sample_file_path" in references["data-routing.md"]
+    assert "未返回时只用" in references["data-routing.md"]
+    assert "不得假设副本存在或搜索本地工作区" in references["data-routing.md"]
+    assert "去掉可选的 `/workspace/` 前缀和开头 `/`" in references["data-routing.md"]
+    assert "同一路径已有成功 preview 时复用" in references["data-routing.md"]
+    assert "可选统计为空不等于 preview 失败" in references["data-routing.md"]
     assert "禁止调用 `run_dataset_cleaning`" in skill_text
     assert "Qwen/Qwen3" not in references["node-reference.md"]
     assert "Qwen/Qwen3" not in references["platform-contract-overrides.md"]
@@ -125,6 +132,20 @@ def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
     assert "do not inspect general `knowledge/` before invoking the skill" in rendered
     assert "Treat any requested node, model, parameter" in rendered
     assert "do not\n  invoke `debug-workflow` or `workflow_debug`" in rendered
+    assert "Pyromind platform nodes perform actual" in rendered
+    assert "Use dedicated platform tools for preview/upload" in rendered
+    assert "never use the local terminal as a substitute" in rendered
+    assert "workspace-discovery commands are rejected" in rendered
+    assert "exact, already-known conversation-local script" in rendered
+    assert "do not\nuse it to inspect files or data" in rendered
+    assert "Do not run `pwd`, `cd`, or directory listings" not in rendered
+    assert "Do not use `/dev/null`" not in rendered
+    assert "Do not run `pwd`" not in rendered
+    assert "do not access host-absolute paths, `/workspace`" not in rendered
+    assert "access host-absolute paths, `/workspace`" in rendered
+    assert "`/workspace` remains valid inside workflow DSL" in rendered
+    assert "`terminal` only to execute" in rendered
+    assert "workspace/conversations/test" not in rendered
 
 
 def test_pyromind_llm_config_normalizes_chat_completions_base_url() -> None:
@@ -327,6 +348,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert expected_dir.is_dir()
 
     tool_names = {tool.name for tool in service.start_request.agent.tools}
+    assert "terminal" in tool_names
     assert "grep" in tool_names
     assert "file_editor" in tool_names
     assert SkillsListTool.__name__ not in tool_names
@@ -337,6 +359,14 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert UploadFileToPyromindTool.name in tool_names
     assert RunDatasetCleaningTool.name in tool_names
     assert _REMOVED_WORKFLOW_TOOL not in tool_names
+    terminal_tool = next(
+        tool for tool in service.start_request.agent.tools if tool.name == "terminal"
+    )
+    assert terminal_tool.params == {
+        "command_working_subdir": "public_data",
+        "restrict_workspace_discovery": True,
+    }
+    assert (expected_dir / "public_data").is_dir()
     validation_tool = next(
         tool
         for tool in service.start_request.agent.tools
@@ -580,6 +610,33 @@ async def test_pyromind_conversation_initial_message_saves_workflow_snapshot(
     assert isinstance(reminder, TextContent)
     assert "workflow.py" in reminder.text
     assert "Read the full file with file_editor" in reminder.text
+
+
+@pytest.mark.asyncio
+async def test_pyromind_conversation_initial_message_marks_empty_canvas(tmp_path):
+    service = _FakeConversationService(tmp_path / "conversations")
+    response = Response()
+    empty_xyflow = {"name": "Empty", "nodes": [], "edges": []}
+
+    await create_pyromind_conversation(
+        _make_request(),
+        PyromindCreateConversationRequest(
+            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            message="直接生成评测工作流",
+            workflow_xyflow=empty_xyflow,
+            extra={"skills_path": str(tmp_path / "missing-skills")},
+        ),
+        response,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert service.event_service.workflow_dsl_snapshot == ""
+    assert service.event_service.workflow_xyflow_snapshot == empty_xyflow
+    assert service.event_service.extended_content is not None
+    reminder = service.event_service.extended_content[0]
+    assert isinstance(reminder, TextContent)
+    assert "current canvas is empty" in reminder.text
+    assert "invoke the matching skill immediately" in reminder.text
 
 
 def test_workflow_dsl_from_xyflow_treats_empty_xyflow_as_empty_canvas():

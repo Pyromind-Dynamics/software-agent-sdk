@@ -1,8 +1,8 @@
 """Tests for the workflow<->canvas sync helper and the debug callback route.
 
 Covers the "工作流同步链路" cases from the debug-loop plan: from-scratch
-(no-op), canvas edited (overwrite + reminder), canvas cleared (remove file +
-reminder), already-in-sync (no-op), and no canvas attached (no-op).
+(empty reminder), canvas edited (overwrite + reminder), canvas cleared (remove
+file + reminder), already-in-sync (no-op), and no canvas attached (no-op).
 """
 
 from __future__ import annotations
@@ -26,8 +26,13 @@ def test_no_workflow_dsl_is_a_noop(tmp_path):
     assert not (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").exists()
 
 
-def test_from_scratch_both_empty_is_a_noop(tmp_path):
-    assert _sync_workflow_with_canvas(tmp_path, "") is None
+def test_from_scratch_both_empty_returns_authoritative_reminder(tmp_path):
+    reminder = _sync_workflow_with_canvas(tmp_path, "")
+
+    assert reminder is not None
+    assert "current canvas is empty" in reminder.text
+    assert "invoke the matching skill immediately" in reminder.text
+    assert "do not inspect state.json" in reminder.text
     assert not (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").exists()
 
 

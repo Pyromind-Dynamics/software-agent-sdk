@@ -31,6 +31,8 @@ from openhands.agent_server.pub_sub import PubSub, Subscriber
 from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
     PYROMIND_APP_TAG_VALUE,
+    PYROMIND_RUNTIME_CONTRACT,
+    PYROMIND_TERMINAL_PARAMS,
     PYROMIND_WORKFLOW_EVENT_KEY,
 )
 from openhands.agent_server.workflow_canvas_snapshot_hook import (
@@ -146,14 +148,20 @@ def _with_pyromind_runtime_llm(agent: AgentBase) -> AgentBase:
 
 def _with_pyromind_runtime_skills(agent: AgentBase) -> AgentBase:
     context = agent.agent_context
-    if context is None or not any(
-        skill.resources is not None and not Path(skill.resources.skill_root).is_dir()
-        for skill in context.skills
-    ):
+    if context is None:
         return agent
 
     default_path = Path(__file__).resolve().parents[3] / ".agents" / "skills"
-    skills_path = Path(os.environ.get("PYROMIND_SKILLS_PATH", str(default_path)))
+    persisted_roots = [
+        Path(skill.resources.skill_root)
+        for skill in context.skills
+        if skill.resources is not None and Path(skill.resources.skill_root).is_dir()
+    ]
+    skills_path = (
+        persisted_roots[0].parent
+        if persisted_roots
+        else Path(os.environ.get("PYROMIND_SKILLS_PATH", str(default_path)))
+    )
     if not skills_path.is_dir():
         return agent
 
@@ -162,6 +170,40 @@ def _with_pyromind_runtime_skills(agent: AgentBase) -> AgentBase:
     return agent.model_copy(
         update={"agent_context": context.model_copy(update={"skills": skills})}
     )
+
+
+def _with_pyromind_runtime_contract(agent: AgentBase) -> AgentBase:
+    """Refresh Pyromind's platform boundary for new and persisted conversations."""
+    tools = [
+        tool.model_copy(
+            update={
+                "params": {
+                    **tool.params,
+                    **PYROMIND_TERMINAL_PARAMS,
+                }
+            }
+        )
+        if tool.name == "terminal"
+        else tool
+        for tool in agent.tools
+    ]
+    updates: dict[str, Any] = {"tools": tools}
+
+    system_prompt_kwargs = getattr(agent, "system_prompt_kwargs", None)
+    if isinstance(system_prompt_kwargs, dict):
+        prompt_kwargs = dict(system_prompt_kwargs)
+        custom_instructions = prompt_kwargs.get("custom_instructions")
+        if not isinstance(custom_instructions, str):
+            custom_instructions = ""
+        runtime_contract = PYROMIND_RUNTIME_CONTRACT.strip()
+        if runtime_contract not in custom_instructions:
+            custom_instructions = (
+                f"{custom_instructions.rstrip()}\n\n{runtime_contract}"
+            ).strip()
+        prompt_kwargs["custom_instructions"] = custom_instructions
+        updates["system_prompt_kwargs"] = prompt_kwargs
+
+    return agent.model_copy(update=updates)
 
 
 logger = get_logger(__name__)
@@ -1064,6 +1106,7 @@ class EventService:
         self._ensure_workspace_is_git_repo(working_dir)
         if self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE:
             runtime_agent = _with_pyromind_runtime_skills(self.stored.agent)
+            runtime_agent = _with_pyromind_runtime_contract(runtime_agent)
             self.stored = self.stored.model_copy(
                 update={"agent": _with_pyromind_runtime_llm(runtime_agent)}
             )

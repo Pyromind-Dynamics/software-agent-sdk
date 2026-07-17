@@ -13,10 +13,14 @@
 
 ## Storage 数据画像
 
+同一路径已有成功 preview 时复用该结果。只有路径变化、上次失败、用户明确要求刷新或结果可能
+过期时才重新调用；`num_rows`、P95 等可选统计为空不等于 preview 失败。
+
 从 preview 结果内部记录：
 
 - `preview_file_path`：目录预览实际选中的 Storage 文件；DSL 使用它。
-- `sample_file_path`：Agent 工作区内的本地样本副本；只能分析，严禁写进 DSL。
+- `sample_file_path`：仅在工具明确返回时才表示 Agent 工作区内的本地样本副本；未返回时只用
+  `sample_rows`，不得假设副本存在或搜索本地工作区。该路径只能分析，严禁写进 DSL。
 - `num_rows`：完整读取时的 N；为空时把 `previewed_rows` 当样本量下界，不伪装成总条数。
 - `p95_sequence_length`：配参用 L；为空时按样本保守估算并说明不确定性。
 - `columns`、`sample_rows`、`has_vision`：字段映射、模态和训练类型依据。
@@ -38,8 +42,9 @@ dataset_config = DatasetConfigBuilderNode(
 )
 ```
 
-如果 preview 的输入是目录，将 `subpath` 换成返回的具体 `preview_file_path`。若返回值仍包含
-`/workspace/` 前缀，先去掉该前缀再作为 Storage 相对 `subpath`，避免重复拼接。
+如果 preview 的输入是目录，将 `subpath` 换成返回的具体 `preview_file_path`。写入 DSL 前将其
+规范为 Storage 相对路径：去掉可选的 `/workspace/` 前缀和开头 `/`，避免 PathJoin 被绝对路径
+覆盖或重复拼接。
 
 Clone/Download 已输出本地 `dataset_path`，可直接传给 `DatasetConfigBuilderNode`；只有需要目录内
 具体文件时才追加 `PathJoinNode(base_path=<dataset_path>, subpath=<file>)`。
