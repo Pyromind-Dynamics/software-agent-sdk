@@ -1,9 +1,11 @@
 ---
 name: debug-workflow
 description: >-
-  当用户要求对当前 Pyromind 工作流进行测试/调试/debug/试跑（在平台上真实执行一次并根据报错修复）
-  时使用此技能。调用 `workflow_debug` 工具（内部委托 `run_workflow(test_mode=true)`；原
-  `debug_workflow` / `pyromind_debug` 已停用，也不要再直接调 `run_workflow` 的 test_mode）。
+  仅当用户要求在不修改节点、模型或参数的前提下，对当前 Pyromind 工作流进行测试/调试/debug/试跑
+  （在平台上真实执行一次并根据报错修复）时使用。若请求同时包含换模型、改参数、改结构或生成
+  workflow，使用 generate-workflow-dsl，本轮不得调用 workflow_debug。调用 `workflow_debug`
+  工具（内部委托 `run_workflow(test_mode=true)`；原 `debug_workflow` / `pyromind_debug` 已停用，
+  也不要再直接调 `run_workflow` 的 test_mode）。
   用户可能会用"测试"“test”“调试”“debug”“试跑”等任意说法表达同一个诉求：把工作流提交到平台
   真实跑一次。驱动"触发测试 → Kafka/callback 终态自动续跑会话 → 失败则按报错内容局部修改
   再测；成功则简短通知用户并等待后续输入"。
@@ -22,6 +24,9 @@ triggers:
 ---
 
 # 测试 / 调试 Pyromind 工作流
+
+边界：请求同时要求修改配置与“跑一下/看看效果”时，先用 `generate-workflow-dsl` 完成 DSL 修改，
+本轮停止；不要调用 `workflow_debug`。本 Skill 只接收不含配置修改的显式测试/调试请求。
 
 ## 概述
 

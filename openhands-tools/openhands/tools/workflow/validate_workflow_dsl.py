@@ -63,6 +63,11 @@ _ISSUE_DETAIL_DESCRIPTION = (
     "available_inputs, source_types, and target_types."
 )
 
+_NON_RETRYABLE_TRANSPORT_GUIDANCE = (
+    "retryable=false. Stop after this call: do not call validate_workflow_dsl "
+    "again and do not use terminal commands to probe credentials."
+)
+
 
 class WorkflowValidationIssue(BaseModel):
     code: str | None = Field(
@@ -259,7 +264,9 @@ detail.source_node_code over xyflow-only fields because they point back to the
 original DSL statements.
 
 The observation also returns retryable and failure_stage. Retry only when
-retryable=true; deterministic DSL/schema errors must be fixed instead of retried.
+retryable=true; when retryable=false (including HTTP 401), stop after one call
+and do not use terminal commands to probe credentials. Deterministic DSL/schema
+errors must be fixed instead of retried.
 
 Note: a successful tool call can still return valid=false. In that case, use
 the returned node_id, node_type, edge_id, field, and detail line information to
@@ -325,13 +332,16 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
             )
 
         if response.status_code >= 400:
+            retryable = _is_retryable_http_status(response.status_code)
+            guidance = "" if retryable else f"\n{_NON_RETRYABLE_TRANSPORT_GUIDANCE}"
             return ValidateWorkflowDslObservation.from_text(
                 text=(
                     "Workflow DSL validation API returned HTTP "
                     f"{response.status_code}: {_truncate_response_text(response.text)}"
+                    f"{guidance}"
                 ),
                 is_error=True,
-                retryable=_is_retryable_http_status(response.status_code),
+                retryable=retryable,
                 failure_stage="transport",
             )
 
@@ -339,14 +349,20 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
             payload = response.json()
         except json.JSONDecodeError as exc:
             return ValidateWorkflowDslObservation.from_text(
-                text=(f"Workflow DSL validation API returned invalid JSON: {exc.msg}"),
+                text=(
+                    "Workflow DSL validation API returned invalid JSON: "
+                    f"{exc.msg}\n{_NON_RETRYABLE_TRANSPORT_GUIDANCE}"
+                ),
                 is_error=True,
                 failure_stage="transport",
             )
 
         if not isinstance(payload, dict):
             return ValidateWorkflowDslObservation.from_text(
-                text="Workflow DSL validation API returned a non-object JSON payload.",
+                text=(
+                    "Workflow DSL validation API returned a non-object JSON payload.\n"
+                    f"{_NON_RETRYABLE_TRANSPORT_GUIDANCE}"
+                ),
                 is_error=True,
                 failure_stage="transport",
             )
@@ -490,7 +506,9 @@ def _observation_from_payload(
     data = payload.get("data")
     if success is not True:
         return ValidateWorkflowDslObservation.from_text(
-            text=_format_api_failure(payload),
+            text=(
+                f"{_format_api_failure(payload)}\n{_NON_RETRYABLE_TRANSPORT_GUIDANCE}"
+            ),
             is_error=True,
             success=success if isinstance(success, bool) else None,
             message=_optional_str(payload.get("message")),
@@ -500,7 +518,10 @@ def _observation_from_payload(
         )
     if not isinstance(data, dict):
         return ValidateWorkflowDslObservation.from_text(
-            text="Workflow DSL validation API response is missing object field 'data'.",
+            text=(
+                "Workflow DSL validation API response is missing object field 'data'.\n"
+                f"{_NON_RETRYABLE_TRANSPORT_GUIDANCE}"
+            ),
             is_error=True,
             success=True,
             raw_response=payload,
