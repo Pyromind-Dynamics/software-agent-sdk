@@ -83,23 +83,25 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
         for line in frontmatter.splitlines()
         if line and not line.startswith(" ")
     ) == {"name", "description"}
-    assert len(skill_text.splitlines()) <= 120
+    assert len(skill_text.splitlines()) <= 140
     assert "## 资料索引" in skill_text
+    assert "## DSL 与资料边界" in skill_text
     assert 'skills_read(skill_name="generate-workflow-dsl"' in skill_text
     assert "### 0. 先判定局部修改" in skill_text
     assert "qwen3.5-2b" in skill_text
     assert "不读取 reference 或 `knowledge/`" in skill_text
     assert "retryable=false" in skill_text
     assert "只生成并校验 DSL" in skill_text
+    assert "不写 import" in skill_text
     assert "禁止用 Agent 本地 terminal 替代平台运行时" in skill_text
+    assert "只有校验明确暴露未覆盖的平台契约" in skill_text
+    assert "同一轮不得重复读取同一路径" in skill_text
     assert "ModelTrainSFTNode(" not in skill_text
     assert set(references) == {
         "custom-python-assets.md",
         "data-routing.md",
-        "node-reference.md",
         "parameter-decision.md",
-        "platform-contract-overrides.md",
-        "stage-templates.md",
+        "workflow-contracts.md",
     }
     assert not (skill_root / "references" / "example-workflows.md").exists()
     assert "PathJoinNode → LoadDataset" in references["data-routing.md"]
@@ -110,8 +112,21 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert "同一路径已有成功 preview 时复用" in references["data-routing.md"]
     assert "可选统计为空不等于 preview 失败" in references["data-routing.md"]
     assert "禁止调用 `run_dataset_cleaning`" in skill_text
-    assert "Qwen/Qwen3" not in references["node-reference.md"]
-    assert "Qwen/Qwen3" not in references["platform-contract-overrides.md"]
+    contracts = references["workflow-contracts.md"]
+    assert "Benchmark | 数据配置 → 模型入口 → VLLM → Metric → Eval" in contracts
+    assert "CloneAndCacheModel | model, target_path" in contracts
+    assert "每个 Metrics Builder 只输出一个 `metrics_config`" in contracts
+    assert "NVIDIA-H100-80GB-HBM3" in contracts
+    assert "只填 Secret 名" in contracts
+    assert "Qwen/Qwen3" not in contracts
+    assert "compute_gsm8k" not in references["custom-python-assets.md"]
+    assert "geometry_vqa_thinking_reward" not in references["custom-python-assets.md"]
+    for removed in (
+        "node-reference.md",
+        "platform-contract-overrides.md",
+        "stage-templates.md",
+    ):
+        assert not (skill_root / "references" / removed).exists()
 
     debug_skill_text = (
         repo_root / ".agents" / "skills" / "debug-workflow" / "SKILL.md"
@@ -138,6 +153,8 @@ def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
     assert "workspace-discovery commands are rejected" in rendered
     assert "exact, already-known conversation-local script" in rendered
     assert "do not\nuse it to inspect files or data" in rendered
+    assert "Do not consult `knowledge/` before validation" in rendered
+    assert "one\n  targeted knowledge-base lookup" in rendered
     assert "Do not run `pwd`, `cd`, or directory listings" not in rendered
     assert "Do not use `/dev/null`" not in rendered
     assert "Do not run `pwd`" not in rendered

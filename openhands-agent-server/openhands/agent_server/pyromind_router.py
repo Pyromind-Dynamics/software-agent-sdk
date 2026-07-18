@@ -214,8 +214,10 @@ filenames or directory listings.
      Omit an item only when it is tangential, and do not omit a peer item from the
      same list or table without a reason.
   Do not show this internal checklist unless the user asks for sources.
-- For workflow generation, use the matching skill and consult `knowledge/` only
-  when needed for platform details.
+- For workflow generation, use the matching skill and its exact resources.
+  Do not consult `knowledge/` before validation. Only when validation identifies
+  a specific platform contract missing from those resources may you make one
+  targeted knowledge-base lookup for that error.
 """.replace("__PYROMIND_RUNTIME_CONTRACT__", PYROMIND_RUNTIME_CONTRACT.rstrip())
 
 
