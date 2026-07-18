@@ -14,14 +14,7 @@
 
 ## Metrics
 
-优先使用系统 `MetricsConfigBuilderNode`：
-
-| 场景 | `entry` | `name` |
-|---|---|---|
-| 数学最终答案 | `compute_gsm8k` | `gsm8k` |
-| 分类/精确匹配 | `compute_accuracy` | `accuracy` |
-| 翻译/受约束生成 | `compute_bleu` | `bleu` |
-| 摘要/长文本生成 | `compute_rouge_l` | `rouge_l` |
+调用本文件前应已按阶段契约排除内置 Metric；能用系统 `MetricsConfigBuilderNode` 时不要生成脚本。
 
 自定义指标函数契约：
 
@@ -47,8 +40,8 @@ def business_metric(
 
 ## Reward
 
-内置 Geometry VQA 才使用 `geometry_vqa_thinking_reward`、
-`geometry_vqa_answer_reward`。其他业务使用 `RewardItemBuilderCustomNode`。
+调用本文件前应已按阶段契约排除内置 Reward；业务自定义项使用
+`RewardItemBuilderCustomNode`。
 
 自定义 reward 接收批量模型输出并返回等长分数列表：
 

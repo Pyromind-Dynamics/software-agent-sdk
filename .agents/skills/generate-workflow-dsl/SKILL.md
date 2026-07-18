@@ -10,19 +10,26 @@ description: >-
 # 生成 Pyromind 工作流
 
 把工作流视为少量阶段模板的组合。先证明数据和参数可用，再写 DSL；不要从完整示例反推需求。
-本 Skill 只生成并校验 DSL；实际数据加载与处理、Benchmark、训练和推理由 Pyromind 平台节点
-执行，禁止用 Agent 本地 terminal 替代平台运行时。
+
+## DSL 与资料边界
+
+- `workflow.py` 直接声明节点实例，不写 import，也不能当普通 Python 在 Agent 本地执行。
+- 本 Skill 只生成并校验 DSL；数据处理、Benchmark、训练和推理由 Pyromind 平台节点执行。
+- 数据、模型和训练产物通过输出端口绑定；禁止用 Agent 本地 terminal 替代平台运行时或查找数据副本。
+- Benchmark 最小骨架是数据配置 → 模型入口 → VLLM → Metric → Eval。
+- 每个 `MetricsConfigBuilderNode` 只输出一个 `metrics_config`；契约未声明的组合方式不得猜测。
+- Reference 是按缺失事实选择的索引，不是阅读清单；同一轮不得重复读取同一路径。
+- Skill 与 reference 足以生成初稿时不查 `knowledge/`。只有校验明确暴露未覆盖的平台契约时，
+  才能围绕该错误定向查询一次。
 
 ## 资料索引
 
 | reference | 读取时机 |
 |---|---|
 | `references/data-routing.md` | 判断数据源、preview 结果、训练格式、字段映射或训练类型 |
-| `references/stage-templates.md` | 选择或组合 Benchmark/SFT/DPO/GRPO/Merge/Inference/Eval 阶段 |
+| `references/workflow-contracts.md` | 完整生成或组合阶段时查拓扑、节点参数、端口、枚举和平台覆盖项 |
 | `references/parameter-decision.md` | 训练数值参数的整组决策或训练 OOM 调整 |
 | `references/custom-python-assets.md` | 内置 Metrics/Reward 不适用，需要生成、上传并回填 Python 入口 |
-| `references/node-reference.md` | 需要节点参数、端口、默认值或数据/模型入口 |
-| `references/platform-contract-overrides.md` | 本文件已记录的易漂移枚举、Secret 和已验证平台差异 |
 
 调用格式为 `skills_read(skill_name="generate-workflow-dsl", path="references/...")`。
 
@@ -39,7 +46,8 @@ description: >-
 模型入口规则供快路径和完整生成共用：
 
 - `Qwen/Qwen3-0.6B`、`Qwen/Qwen3-1.7B`、`Qwen/Qwen3-4B`、
-  `Qwen/Qwen3-VL-2B-Instruct`、`Qwen/Qwen3-VL-4B-Instruct` 使用 `CloneAndCacheModel(model=...)`。
+  `Qwen/Qwen3-VL-2B-Instruct`、`Qwen/Qwen3-VL-4B-Instruct` 使用
+  `CloneAndCacheModel(model=..., target_path="/workspace/models/")`。
 - 用户指定其他开源模型时使用
   `DownloadAndCacheModel(modelname=..., cache_dir="/workspace/models/<org>/<model>", download_source="huggingface")`；
   它与 Clone 都输出 `model_path`，不得改下游绑定。
@@ -66,14 +74,14 @@ description: >-
 
 - 默认 SFT；明确有 chosen/rejected 偏好对时选 DPO；只有 prompt 加可程序化验证答案或
   reward 时选 GRPO。
-- 复杂需求按 `stage-templates.md` 组合，不复制整套案例。
+- 完整生成或组合阶段时读取一次 `workflow-contracts.md`，按其中契约落图，不复制整套案例。
 - 用户要求训练时本轮仍生成训练 DSL。用户未说跳过基线时，在最终回复建议用同一数据切分和
   指标先跑基模 Benchmark；这不是生成门禁。
 
-### 4. 决定枚举
+### 4. 决定契约与枚举
 
-仅在缺少具体节点参数或端口契约时读取 `node-reference.md`。仅在需要本文件已记录的枚举、Secret
-或已验证平台差异时读取 `platform-contract-overrides.md`；结构和类型错误不读取该文件。
+使用第 3 步已读取的 `workflow-contracts.md`，不要为了参数、端口或枚举再次读取其他资料。
+局部修改只有缺少新节点契约时才读取该文件一次。
 
 ### 5. 整组配参
 
