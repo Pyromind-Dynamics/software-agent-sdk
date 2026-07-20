@@ -144,11 +144,10 @@ class TerminalSandbox:
         #
         # When the caller passed conversation-scoped ``read_only_paths`` or
         # ``read_write_paths``, the sandbox is meant to enforce a per-conversation
-        # PathAccessPolicy.  Only the Landlock backend can express that — AppArmor
-        # uses a single global denylist loaded at image build time and bwrap gives
-        # only a coarse namespace.  So in that case prefer Landlock; fall back to
-        # AppArmor / bwrap only when Landlock is unavailable (old kernel or
-        # py-landlock not installed).
+        # PathAccessPolicy. Landlock and bwrap can express that by allowing
+        # ``events/`` read-only and ``public_data/`` read-write. AppArmor uses a
+        # single global denylist loaded at image build time, so use it only as a
+        # fallback when neither per-conversation backend is available.
         #
         # Without a per-conversation policy, the default order stands:
         #   AppArmor (no capability / namespace) > bwrap > Landlock.
@@ -176,9 +175,9 @@ class TerminalSandbox:
             except ImportError:
                 logger.warning(
                     "Per-conversation policy requested but py-landlock is not "
-                    "importable; falling back to AppArmor / bwrap"
+                    "importable; falling back to bwrap / AppArmor"
                 )
-                if self._apparmor_available:
+                if shutil.which("bwrap") is None and self._apparmor_available:
                     self._backend = "apparmor"
                     backend_chosen = True
                     logger.info(
@@ -313,12 +312,12 @@ class TerminalSandbox:
         for path in PUBLIC_READ_ROOTS:
             if Path(path).exists():
                 args.extend(["--ro-bind", path, path])
-        for path in self.read_only_paths:
-            if path.exists():
-                args.extend(["--ro-bind", str(path), str(path)])
         args.extend(["--bind", str(self._tmp_dir), str(self._tmp_dir)])
         for path in self.read_write_paths:
             args.extend(["--bind", str(path), str(path)])
+        for path in self.read_only_paths:
+            if path.exists():
+                args.extend(["--ro-bind", str(path), str(path)])
         args.extend(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"])
         return args
 

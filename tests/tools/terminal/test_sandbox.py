@@ -11,6 +11,13 @@ from openhands.tools.terminal.sandbox import (
 )
 
 
+def _option_index(args: list[str], option: str, value: str) -> int:
+    for index, arg in enumerate(args[:-1]):
+        if arg == option and args[index + 1] == value:
+            return index
+    raise AssertionError(f"{option} {value} not found in {args}")
+
+
 def test_terminal_sandbox_mode_rejects_unknown_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -322,19 +329,60 @@ def test_conversation_policy_prefers_landlock_over_apparmor(
     assert wrapped[-2:] == ["--", "/bin/bash", "-i"][-2:]
 
 
-def test_conversation_policy_falls_back_to_apparmor_when_no_landlock(
+def test_conversation_policy_prefers_bwrap_over_apparmor_when_no_landlock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When Landlock is unavailable, AppArmor takes over even for conversation-
-    scoped policies — it's a coarser global denylist but still better than no
-    enforcement.
-    """
     monkeypatch.setattr(
         "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
     )
     monkeypatch.setattr(
         "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
     )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.shutil.which",
+        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _raise(name, *a, **kw):
+        if name == "py_landlock":
+            raise ImportError("no py-landlock")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _raise)
+
+    events_dir = tmp_path / "events"
+    public_data_dir = tmp_path / "public_data"
+    events_dir.mkdir()
+    public_data_dir.mkdir()
+    sandbox = TerminalSandbox(
+        str(tmp_path),
+        "required",
+        read_only_paths=(str(events_dir),),
+        read_write_paths=(str(public_data_dir),),
+    )
+    sandbox.prepare()
+
+    assert sandbox._backend == "bwrap"
+    wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
+    assert wrapped[:3] == ["bwrap", "--unshare-ipc", "--unshare-uts"]
+    assert _option_index(wrapped, "--bind", str(public_data_dir)) < _option_index(
+        wrapped, "--ro-bind", str(events_dir)
+    )
+
+
+def test_conversation_policy_falls_back_to_apparmor_when_no_landlock_or_bwrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
+    )
+    monkeypatch.setattr("openhands.tools.terminal.sandbox.shutil.which", lambda _: None)
     import builtins
 
     real_import = builtins.__import__
