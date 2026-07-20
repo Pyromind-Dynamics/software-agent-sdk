@@ -188,7 +188,7 @@ RUN set -eux; \
 # works at runtime without CAP_MAC_ADMIN. Best-effort: if the host kernel does
 # not have the AppArmor LSM active (e.g. some container runtimes), the parser
 # exits non-zero but we do not fail the whole image build.
-COPY --from=builder /agent-server/openhands-tools/openhands/tools/terminal/apparmor/openhands-agent-terminal \
+COPY --from=builder /agent-server/openhands-tools/openhands/tools/terminal/apparmor/openhands-agent-terminal.profile \
     /etc/apparmor.d/openhands-agent-terminal
 RUN if command -v apparmor_parser >/dev/null 2>&1; then \
         apparmor_parser -r -W /etc/apparmor.d/openhands-agent-terminal \
