@@ -6,7 +6,7 @@
 ## 统一资产链路
 
 1. 根据真实样本和业务目标确定可复现的评分规则与函数名。
-2. 在当前会话工作区创建单个 `.py` 文件；不得写知识库或 Skill 目录。
+2. 用 `file_editor` 在 `public_data/<name>.py` 创建单个脚本；不得写会话根目录、知识库或 Skill 目录。
 3. 检查函数签名、返回类型、空输入和异常样本；能本地导入时做一次最小调用。
 4. 调用 `upload_file_to_pyromind`，等待成功 observation。
 5. 只使用 observation 返回的 `storage_path`，拼成 `<storage_path>:<function_name>`。
