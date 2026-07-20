@@ -27,6 +27,31 @@ def test_sanitized_env_accepts_mapping_types():
     assert isinstance(sanitized_env(env), dict)
 
 
+def test_sanitized_env_strips_sensitive_vars(tmp_path):
+    """Credential and build env vars are stripped from subprocess env."""
+    env = {
+        "LLM_API_KEY": "sk-llm",
+        "OPENAI_API_KEY": "sk-openai",
+        "ANTHROPIC_API_KEY": "sk-ant",
+        "AZURE_OPENAI_API_KEY": "sk-azure",
+        "SESSION_API_KEY": "sk-session",
+        "GPG_KEY": "7169605F62C751356D054A26A821E680E5FA6305",
+        "OPENHANDS_BUILD_GIT_REF": "refs/heads/main",
+        "OPENHANDS_BUILD_GIT_SHA": "abc123",
+        "SAFE_VAR": "hello",
+    }
+    result = sanitized_env(env)
+    assert "LLM_API_KEY" not in result
+    assert "OPENAI_API_KEY" not in result
+    assert "ANTHROPIC_API_KEY" not in result
+    assert "AZURE_OPENAI_API_KEY" not in result
+    assert "SESSION_API_KEY" not in result
+    assert "GPG_KEY" not in result
+    assert "OPENHANDS_BUILD_GIT_REF" not in result
+    assert "OPENHANDS_BUILD_GIT_SHA" not in result
+    assert result["SAFE_VAR"] == "hello"
+
+
 @pytest.mark.parametrize(
     ("env", "expected_ld_path"),
     [

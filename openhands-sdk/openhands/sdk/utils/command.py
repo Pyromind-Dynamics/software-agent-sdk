@@ -15,7 +15,27 @@ logger = get_logger(__name__)
 # Env vars that should not be exposed to subprocesses (e.g., bash commands
 # executed by the agent). These credentials allow access to user secrets via
 # the SaaS API and must remain isolated to the SDK's Python process.
-_SENSITIVE_ENV_VARS = frozenset({"SESSION_API_KEY"})
+_LLM_API_ENV_VARS = {
+    "LLM_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "MISTRAL_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GROQ_API_KEY",
+    "TOGETHER_API_KEY",
+    "PERPLEXITY_API_KEY",
+    "COHERE_API_KEY",
+    "OPENAI_BASE_URL",
+    "AZURE_OPENAI_ENDPOINT",
+}
+_SENSITIVE_ENV_VARS = _LLM_API_ENV_VARS | {
+    "SESSION_API_KEY",
+    "GPG_KEY",
+    "OPENHANDS_BUILD_GIT_REF",
+    "OPENHANDS_BUILD_GIT_SHA",
+}
 
 
 def sanitized_env(
