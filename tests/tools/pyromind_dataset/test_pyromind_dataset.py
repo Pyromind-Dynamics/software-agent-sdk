@@ -895,3 +895,130 @@ def test_shared_preview_falls_back_to_storage(monkeypatch, tmp_path):
     assert not observation.is_error
     assert observation.source == "storage"
     assert observation.num_rows == 2
+
+
+# ---------------------------------------------------------------------------
+# User storage directory resolution tests
+# ---------------------------------------------------------------------------
+
+
+def test_storage_directory_multiple_files_asks_user(monkeypatch, tmp_path):
+    """A storage folder with multiple files returns the file list, no preview."""
+    _patch_shared_empty(monkeypatch)
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "list": [
+                            {
+                                "name": "clean_script.py",
+                                "path": "agentTest/clean_script.py",
+                                "type": "File",
+                                "size": 6854,
+                                "last_modified": "2026-07-20 03:55:34",
+                            },
+                            {
+                                "name": "test_data.jsonl",
+                                "path": "agentTest/test_data.jsonl",
+                                "type": "File",
+                                "size": 4270,
+                                "last_modified": "2026-07-20 03:55:34",
+                            },
+                        ]
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected POST URL: {url}")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="agentTest/", n=5),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.source == "storage"
+    assert observation.is_dir is True
+    assert observation.num_rows is None
+    assert observation.sample_rows == []
+    assert "2 files" in observation.text
+    assert "Ask the user which file to preview" in observation.text
+    assert "agentTest/clean_script.py" in observation.text
+    assert "agentTest/test_data.jsonl" in observation.text
+    assert "6.7KB" in observation.text
+    assert observation.files == [
+        "agentTest/clean_script.py",
+        "agentTest/test_data.jsonl",
+    ]
+
+
+def test_storage_directory_single_file_auto_previews(monkeypatch, tmp_path):
+    """A storage folder with exactly one file previews it directly."""
+    _patch_shared_empty(monkeypatch)
+    content = b'{"a":1}\n{"a":2}\n'
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "list": [
+                            {
+                                "name": "only.jsonl",
+                                "path": "solo/only.jsonl",
+                                "type": "File",
+                                "size": len(content),
+                                "last_modified": "2026-07-20 03:55:34",
+                            },
+                        ]
+                    },
+                },
+            )
+        if url.endswith("/get_file_metadata"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": "solo/only.jsonl",
+                        "size": len(content),
+                        "content_type": "application/jsonl",
+                        "is_dir": False,
+                    },
+                },
+            )
+        if url.endswith("/get_url"):
+            return _Response(
+                200,
+                {"success": True, "data": {"url": "https://download.test/f"}},
+            )
+        raise AssertionError(f"unexpected POST URL: {url}")
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        return _StreamResponse(content)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="solo/", n=5),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.source == "storage"
+    assert observation.preview_file_path == "solo/only.jsonl"
+    assert observation.num_rows == 2

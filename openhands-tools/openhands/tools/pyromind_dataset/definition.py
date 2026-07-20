@@ -77,6 +77,14 @@ class _PreviewChunk:
     ends_at_eof: bool
 
 
+@dataclass(frozen=True)
+class _StorageFileInfo:
+    path: str
+    name: str
+    size: int | None
+    last_modified: str | None
+
+
 def _default_storage_base_url() -> str:
     app_env = os.getenv("APP_ENV", "dev").strip().lower()
     if app_env in _PROD_APP_ENVS:
@@ -225,11 +233,16 @@ The tool automatically determines the source:
   shared space API.
 - Otherwise, it falls back to user storage.
 
-When only a dataset name is given (no specific file), the tool lists available
-files and auto-selects the first previewable one. If multiple files exist, the
-observation includes the full file list so you can ask the user which file to
-preview, or call this tool again with a specific file path like
-'openai/gsm8k/data/train.jsonl'.
+When only a dataset/folder name is given (no specific file):
+- Shared space: lists available files and auto-selects the first previewable
+  one. The observation includes the full file list so you can ask the user
+  which file to preview, or call this tool again with a specific file path
+  like 'openai/gsm8k/data/train.jsonl'.
+- User storage: if the folder contains multiple files, the tool returns the
+  file list (with sizes and modified times) WITHOUT previewing anything.
+  You MUST ask the user which file to preview, then call this tool again
+  with the exact file path. If the folder has exactly one file, it is
+  previewed directly.
 
 Returns:
 - files found under the path
@@ -664,18 +677,10 @@ class PreviewDatasetExecutor(
         metadata: dict[str, Any] | None = None
 
         if _looks_like_directory(dataset_path):
-            list_result = self._list_files(dataset_path, headers)
-            if isinstance(list_result, PreviewDatasetObservation):
-                return list_result
-            files = list_result
-            preview_path = _select_preview_file(files) or ""
-            if not preview_path:
-                return PreviewDatasetObservation.from_text(
-                    text=f"No previewable files found under {dataset_path}.",
-                    dataset_path=dataset_path,
-                    files=files,
-                    is_dir=True,
-                )
+            dir_result = self._resolve_storage_directory(dataset_path, n, headers)
+            if isinstance(dir_result, PreviewDatasetObservation):
+                return dir_result
+            files, preview_path = dir_result
 
         metadata_result = self._get_metadata(preview_path, headers)
         if isinstance(metadata_result, PreviewDatasetObservation):
@@ -683,19 +688,10 @@ class PreviewDatasetExecutor(
         metadata = metadata_result
 
         if metadata.get("is_dir") is True:
-            list_result = self._list_files(dataset_path, headers)
-            if isinstance(list_result, PreviewDatasetObservation):
-                return list_result
-            files = list_result
-            preview_path = _select_preview_file(files) or ""
-            if not preview_path:
-                return PreviewDatasetObservation.from_text(
-                    text=f"No previewable files found under {dataset_path}.",
-                    dataset_path=dataset_path,
-                    files=files,
-                    is_dir=True,
-                    **_metadata_observation_fields(metadata),
-                )
+            dir_result = self._resolve_storage_directory(dataset_path, n, headers)
+            if isinstance(dir_result, PreviewDatasetObservation):
+                return dir_result
+            files, preview_path = dir_result
             metadata_result = self._get_metadata(preview_path, headers)
             if isinstance(metadata_result, PreviewDatasetObservation):
                 return metadata_result
@@ -758,6 +754,56 @@ class PreviewDatasetExecutor(
             **_metadata_observation_fields(metadata),
         )
 
+    def _resolve_storage_directory(
+        self,
+        dataset_path: str,
+        n: int,  # noqa: ARG002
+        headers: dict[str, str],
+    ) -> tuple[list[str], str] | PreviewDatasetObservation:
+        """Resolve a storage directory into a concrete preview file.
+
+        When the directory contains multiple files, returns an observation
+        listing file details so the agent asks the user which file to
+        preview. When exactly one file exists, auto-selects it.
+        """
+        list_result = self._list_files(dataset_path, headers)
+        if isinstance(list_result, PreviewDatasetObservation):
+            return list_result
+
+        file_infos = list_result
+        file_paths = [f.path for f in file_infos]
+
+        if not file_paths:
+            return PreviewDatasetObservation.from_text(
+                text=f"No previewable files found under {dataset_path}.",
+                dataset_path=dataset_path,
+                files=file_paths,
+                is_dir=True,
+                source="storage",
+            )
+
+        if len(file_paths) == 1:
+            return file_paths, file_paths[0]
+
+        file_list_text = "\n".join(
+            f"  - {f.path} ({_human_size(f.size)}"
+            + (f", modified {f.last_modified}" if f.last_modified else "")
+            + ")"
+            for f in file_infos
+        )
+        return PreviewDatasetObservation.from_text(
+            text=(
+                f"Directory '{dataset_path}' contains {len(file_paths)} files. "
+                "Ask the user which file to preview, then call this tool again "
+                "with the exact file path.\n"
+                f"Available files:\n{file_list_text}"
+            ),
+            dataset_path=dataset_path,
+            files=file_paths,
+            is_dir=True,
+            source="storage",
+        )
+
     def _get_metadata(
         self,
         path: str,
@@ -783,8 +829,10 @@ class PreviewDatasetExecutor(
         self,
         path: str,
         headers: dict[str, str],
-    ) -> list[str] | PreviewDatasetObservation:
-        payload_result = self._post_json("file_list", {"path": path}, headers)
+    ) -> list[_StorageFileInfo] | PreviewDatasetObservation:
+        payload_result = self._post_json(
+            "file_list", {"path": path, "search": ""}, headers
+        )
         if isinstance(payload_result, str):
             return PreviewDatasetObservation.from_text(
                 text=payload_result,
@@ -807,7 +855,7 @@ class PreviewDatasetExecutor(
                 dataset_path=path,
             )
 
-        files: list[str] = []
+        files: list[_StorageFileInfo] = []
         for item in raw_files:
             if not isinstance(item, dict):
                 continue
@@ -815,7 +863,14 @@ class PreviewDatasetExecutor(
                 continue
             item_path = item.get("path")
             if item_path is not None:
-                files.append(str(item_path))
+                files.append(
+                    _StorageFileInfo(
+                        path=str(item_path),
+                        name=str(item.get("name") or ""),
+                        size=_optional_int(item.get("size")),
+                        last_modified=_optional_str(item.get("last_modified")),
+                    )
+                )
         return files
 
     def _get_download_url(
@@ -1745,6 +1800,18 @@ def _truncate_text(text: str, limit: int = 1000) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}... [{len(text) - limit} characters truncated]"
+
+
+def _human_size(size: int | None) -> str:
+    if size is None:
+        return "size unknown"
+    if size < 1024:
+        return f"{size}B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f}KB"
+    if size < 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f}MB"
+    return f"{size / (1024 * 1024 * 1024):.2f}GB"
 
 
 register_tool(PreviewDatasetTool.name, PreviewDatasetTool)
