@@ -99,6 +99,11 @@ _OPENAI_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 
 logger = logging.getLogger(__name__)
 
+# Register skill-runtime tools at module level so persisted conversations
+# that reference them can resolve the tools on resume after a server restart.
+register_tool(SkillsListTool.__name__, SkillsListTool)
+register_tool(SkillsReadTool.__name__, SkillsReadTool)
+
 _PUBLIC_READ_ALIAS_NAMES = {alias: alias for alias, _, _, _ in PUBLIC_READ_ALIASES}
 _KNOWLEDGE_ALIAS = _PUBLIC_READ_ALIAS_NAMES["knowledge"]
 _SKILLS_ALIAS = _PUBLIC_READ_ALIAS_NAMES[".agents/skills"]
@@ -975,10 +980,8 @@ async def create_pyromind_conversation(
       file_editor for KB search (grep finds files, file_editor views them)
     - Workspace pointing to a conversation-private directory
     """
-    # Register default and optional skill-runtime tools before agent resolution.
+    # Register default tools before agent resolution.
     register_default_tools(enable_browser=False)
-    register_tool(SkillsListTool.__name__, SkillsListTool)
-    register_tool(SkillsReadTool.__name__, SkillsReadTool)
 
     # 1. Resolve knowledge base path (extra can override the default)
     knowledge_base_path = request.extra.get(

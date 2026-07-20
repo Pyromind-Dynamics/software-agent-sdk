@@ -1,43 +1,17 @@
 # syntax=docker/dockerfile:1.7
-
-# NOTE: LC_ALL/LANG must be set to C.UTF-8 for libtmux to work correctly with
-# PyInstaller builds. Without proper locale, tmux converts UTF-8 separator
-# characters to underscores, breaking libtmux's format parsing.
 ARG BASE_IMAGE=nikolaik/python-nodejs:python3.13-nodejs22-slim
 ARG USERNAME=openhands
 ARG UID=10001
 ARG GID=10001
 ARG PORT=8000
-# Opt-in build flag for the Vertex AI extra (`openhands-sdk[vertex]`). Off by
-# default to keep the published image lean. Pass `--build-arg ENABLE_VERTEX=1`
-# to bundle google-cloud-aiplatform so the resulting binary supports
-# `vertex_ai/*` partner models (MiniMax, Qwen, Kimi MaaS endpoints).
 ARG ENABLE_VERTEX=0
 
-####################################################################################
-# Builder (source mode)
-# We copy source + build a venv here for local dev and debugging.
-#
-# SELF-CONTAINED /agent-server CONTRACT:
-# uv installs python-build-standalone into /agent-server/uv-managed-python and
-# creates .venv against it. Both live under /agent-server, so downstream
-# consumers can COPY /agent-server onto any base image and the venv works.
-#
-# uv >= 0.11.5 pulls python-build-standalone >= 20260408, which ships
-# libpython without PT_GNU_STACK PF_X (executable stack). Earlier releases
-# had this flag set due to LLVM/BOLT bugs, causing glibc >= 2.41 and
-# DinD/sysbox/seccomp to reject dlopen() with "cannot enable executable
-# stack". No sanitizer or workaround is needed on fixed releases.
-# See OpenHands/software-agent-sdk#2761.
 ####################################################################################
 FROM python:3.13-bookworm AS builder
 ARG USERNAME UID GID ENABLE_VERTEX
 ENV UV_PROJECT_ENVIRONMENT=/agent-server/.venv
 ENV UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python
 
-# uv 0.11.5+ embeds python-build-standalone 20260408 metadata, which is the
-# first release with the PT_GNU_STACK fix. Pin to 0.11.6 (latest at time of
-# writing) rather than :latest so builds are reproducible.
 COPY --from=ghcr.io/astral-sh/uv:0.11.6 /uv /uvx /bin/
 
 RUN groupadd -g ${GID} ${USERNAME} \
@@ -46,7 +20,6 @@ RUN groupadd -g ${GID} ${USERNAME} \
  && chown -R ${USERNAME}:${USERNAME} /agent-server
 USER ${USERNAME}
 WORKDIR /agent-server
-# Cache-friendly: lockfiles first
 COPY --chown=${USERNAME}:${USERNAME} pyproject.toml uv.lock README.md LICENSE ./
 COPY --chown=${USERNAME}:${USERNAME} openhands-sdk ./openhands-sdk
 COPY --chown=${USERNAME}:${USERNAME} openhands-tools ./openhands-tools
@@ -59,15 +32,8 @@ RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
     uv python install 3.13 && \
     uv venv --python-preference only-managed --python 3.13 .venv && \
     uv sync --frozen --no-editable --managed-python --extra boto3 $EXTRA_FLAGS && \
-    .venv/bin/python -m pip install \
-        --index-url https://test.pypi.org/simple/ \
-        --extra-index-url https://pypi.org/simple \
-        pyromind-sdk && \
     readlink -f .venv/bin/python | grep -q '^/agent-server/uv-managed-python/'
 
-####################################################################################
-# Binary Builder (binary mode)
-# We run pyinstaller here to produce openhands-agent-server
 ####################################################################################
 FROM builder AS binary-builder
 ARG USERNAME UID GID ENABLE_VERTEX
@@ -110,14 +76,8 @@ RUN set -eux; \
     }
 
 ####################################################################################
-# Base image (minimal)
-# It includes only basic packages and the UV runtime.
-# No Docker, no VNC, no Desktop, no VSCode Web.
-# Suitable for running in headless/evaluation mode.
-####################################################################################
 FROM ${BASE_IMAGE} AS base-image-minimal
 ARG USERNAME UID GID PORT
-
 
 ARG OPENHANDS_BUILD_GIT_SHA=unknown
 ARG OPENHANDS_BUILD_GIT_REF=unknown
@@ -135,13 +95,14 @@ RUN set -eux; \
     if command -v apt-get >/dev/null 2>&1; then \
         apt-get -o Acquire::Retries=5 update; \
         apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
-            bash bubblewrap ca-certificates curl wget sudo apt-utils git jq tmux tar \
+            bash ca-certificates curl wget sudo apt-utils git jq tmux tar \
             build-essential coreutils util-linux procps findutils grep sed \
-            tini apt-transport-https gnupg lsb-release xz-utils; \
+            tini apt-transport-https gnupg lsb-release xz-utils \
+            apparmor apparmor-utils; \
         rm -rf /var/lib/apt/lists/*; \
     elif command -v apk >/dev/null 2>&1; then \
         apk add --no-cache \
-            bash bubblewrap ca-certificates curl wget sudo git jq tmux tar build-base \
+            bash ca-certificates curl wget sudo git jq tmux tar build-base \
             coreutils util-linux procps findutils grep sed tini gnupg shadow xz; \
     elif command -v microdnf >/dev/null 2>&1; then \
         microdnf install -y \
@@ -173,15 +134,22 @@ RUN set -eux; \
     grep -Eq "^[^:]*:[^:]*:${GID}:" /etc/group || groupadd -g "${GID}" "${USERNAME}"; \
     grep -Eq "^${USERNAME}:" /etc/passwd || \
         useradd -m -u "${UID}" -g "${GID}" -s /bin/bash "${USERNAME}"; \
-    # Best-effort: add user to a sudo group when one exists (Debian-style
-    # `sudo` group). On Alpine/RHEL/SUSE there is no `sudo` group by default,
-    # and the NOPASSWD sudoers line below grants sudo regardless of group.
-    # usermod -aG sudo "${USERNAME}" 2>/dev/null || true; \
-    # echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers; \
-    # mkdir -p /appworkspace/project; \
-    # chown -R "${USERNAME}:${USERNAME}" /appworkspace
     usermod -aG sudo "${USERNAME}" 2>/dev/null || true; \
-    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers; 
+    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers;
+
+
+# Pre-load the terminal AppArmor profile so `aa-exec -p openhands-agent-terminal`
+# works at runtime without CAP_MAC_ADMIN. Best-effort: if the host kernel does
+# not have the AppArmor LSM active (e.g. some container runtimes), the parser
+# exits non-zero but we do not fail the whole image build.
+COPY --from=builder /agent-server/openhands-tools/openhands/tools/terminal/apparmor/openhands-agent-terminal.profile \
+    /etc/apparmor.d/openhands-agent-terminal
+RUN if command -v apparmor_parser >/dev/null 2>&1; then \
+        apparmor_parser -r -W /etc/apparmor.d/openhands-agent-terminal \
+            || echo "Warning: apparmor_parser failed; AppArmor LSM likely inactive on build host. Runtime aa-exec will be a no-op." >&2; \
+    else \
+        echo "Warning: apparmor_parser not installed; skipping profile load" >&2; \
+    fi
 
 # Pre-install ACP servers for ACPAgent support (Claude Code, Codex, Gemini CLI)
 # Install Node.js 22 to a dedicated prefix so ACP packages get a modern runtime
@@ -192,6 +160,7 @@ RUN set -eux; \
 # and some have an old glibc (or use musl) that cannot run the upstream Node
 # 22 glibc tarball. When that happens we leave $ACP_NODE_DIR empty and skip
 # ACP setup so the rest of the build (and non-ACP agents) still work.
+
 ENV ACP_NODE_DIR=/opt/acp-node
 RUN set -ux; \
     mkdir -p "$ACP_NODE_DIR"; \
@@ -239,18 +208,13 @@ RUN set -ux; \
     fi; \
     rm -f "$NODE_TARBALL" 2>/dev/null || true
 
-# Configure Claude Code managed settings for headless operation:
-# Allow all tool permissions (no human in the loop to approve).
 RUN mkdir -p /etc/claude-code && \
     echo '{"permissions":{"allow":["Edit","Read","Bash"]}}' > /etc/claude-code/managed-settings.json
 
-# NOTE: we should NOT include UV_PROJECT_ENVIRONMENT here,
-# since the agent might use it to perform other work (e.g. tools that use Python)
 COPY --from=ghcr.io/astral-sh/uv:0.11.6 /uv /uvx /bin/
 
 USER ${USERNAME}
 WORKDIR /
-# Locale settings required for libtmux to work with PyInstaller builds
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
 ENV OH_ENABLE_VNC=false
@@ -259,165 +223,6 @@ ENV workspace_dir=/workspace
 ENV WORKSPACE_DIR=/workspace
 EXPOSE ${PORT}
 
-####################################################################################
-# Base image (full)
-# It includes additional Docker, VNC, Desktop, and VSCode Web.
-####################################################################################
-FROM base-image-minimal AS base-image
-ARG USERNAME
-
-USER root
-# --- VSCode Web ---
-ENV EDITOR=code \
-    VISUAL=code \
-    GIT_EDITOR="code --wait" \
-    OPENVSCODE_SERVER_ROOT=/openhands/.openvscode-server
-ARG RELEASE_TAG="openvscode-server-v1.98.2"
-ARG RELEASE_ORG="gitpod-io"
-RUN set -eux; \
-    # Create necessary directories
-    mkdir -p $(dirname ${OPENVSCODE_SERVER_ROOT}); \
-    \
-    # Determine architecture
-    arch=$(uname -m); \
-    if [ "${arch}" = "x86_64" ]; then \
-        arch="x64"; \
-    elif [ "${arch}" = "aarch64" ]; then \
-        arch="arm64"; \
-    elif [ "${arch}" = "armv7l" ]; then \
-        arch="armhf"; \
-    fi; \
-    \
-    # Download and install VSCode Server
-    wget https://github.com/${RELEASE_ORG}/openvscode-server/releases/download/${RELEASE_TAG}/${RELEASE_TAG}-linux-${arch}.tar.gz; \
-    tar -xzf ${RELEASE_TAG}-linux-${arch}.tar.gz; \
-    if [ -d "${OPENVSCODE_SERVER_ROOT}" ]; then rm -rf "${OPENVSCODE_SERVER_ROOT}"; fi; \
-    mv ${RELEASE_TAG}-linux-${arch} ${OPENVSCODE_SERVER_ROOT}; \
-    cp ${OPENVSCODE_SERVER_ROOT}/bin/remote-cli/openvscode-server ${OPENVSCODE_SERVER_ROOT}/bin/remote-cli/code; \
-    rm -f ${RELEASE_TAG}-linux-${arch}.tar.gz; \
-    \
-    # Set proper ownership
-    chown -R ${USERNAME}:${USERNAME} ${OPENVSCODE_SERVER_ROOT}
-
-
-# Include VSCode extensions alongside the server so targets inheriting base-image
-# implicitly get the extensions; minimal images (without VSCode) won't.
-COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/openhands-agent-server/openhands/agent_server/vscode_extensions ${OPENVSCODE_SERVER_ROOT}/extensions
-
-# --- Docker ---
-RUN set -eux; \
-    # Determine OS type and install Docker accordingly
-    if grep -q "ubuntu" /etc/os-release; then \
-        # Handle Ubuntu
-        install -m 0755 -d /etc/apt/keyrings; \
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc; \
-        chmod a+r /etc/apt/keyrings/docker.asc; \
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null; \
-    else \
-        # Handle Debian
-        install -m 0755 -d /etc/apt/keyrings; \
-        curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc; \
-        chmod a+r /etc/apt/keyrings/docker.asc; \
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null; \
-    fi; \
-    # Install Docker Engine, containerd, and Docker Compose
-    apt-get update; \
-    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; \
-    apt-get clean; \
-    rm -rf /var/lib/apt/lists/*
-
-# Configure Docker daemon with MTU 1450 to prevent packet fragmentation issues
-RUN mkdir -p /etc/docker && \
-    echo '{"mtu": 1450}' > /etc/docker/daemon.json
-
-# --- GitHub CLI ---
-RUN set -eux; \
-    mkdir -p -m 755 /etc/apt/keyrings; \
-    wget -nv -O /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-        https://cli.github.com/packages/githubcli-archive-keyring.gpg; \
-    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg; \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        > /etc/apt/sources.list.d/github-cli.list; \
-    apt-get update; \
-    apt-get install -y gh; \
-    apt-get clean; \
-    rm -rf /var/lib/apt/lists/*
-
-# --- VNC + Desktop + noVNC ---
-RUN set -eux; \
-  apt-get update; \
-  apt-get install -y --no-install-recommends \
-    # GUI bits (remove entirely if headless)
-    tigervnc-standalone-server xfce4 dbus-x11 novnc websockify \
-    # Browser
-    $(if grep -q "ubuntu" /etc/os-release; then echo "chromium-browser"; else echo "chromium"; fi); \
-  apt-get clean; rm -rf /var/lib/apt/lists/*
-
-ENV NOVNC_WEB=/usr/share/novnc \
-    NOVNC_PORT=8002 \
-    DISPLAY=:1 \
-    VNC_GEOMETRY=1280x800 \
-    CHROME_BIN=/usr/bin/chromium \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
-    CHROMIUM_FLAGS="--no-sandbox --disable-dev-shm-usage --disable-gpu"
-
-RUN chown -R ${USERNAME}:${USERNAME} ${NOVNC_WEB}
-# Override default XFCE wallpaper
-COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server/openhands/agent_server/docker/wallpaper.svg /usr/share/backgrounds/xfce/xfce-shapes.svg
-
-USER ${USERNAME}
-WORKDIR /
-ENV OH_ENABLE_VNC=false
-ENV LOG_JSON=true
-EXPOSE ${PORT} ${NOVNC_PORT}
-
-
-####################################################################################
-####################################################################################
-# Build Targets
-####################################################################################
-####################################################################################
-
-############################
-# Target A: source
-# Local dev and debugging mode: copy source + venv from builder
-############################
-FROM base-image AS source
-ARG USERNAME
-COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server /agent-server
-COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
-ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
-ENV PYROMIND_PUBLIC_READ_PATHS=/agent-server/.agents/skills
-ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
-ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "openhands.agent_server"]
-
-FROM base-image-minimal AS source-minimal
-ARG USERNAME
-COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server /agent-server
-COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
-ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
-ENV PYROMIND_PUBLIC_READ_PATHS=/agent-server/.agents/skills
-ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
-ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "openhands.agent_server"]
-
-############################
-# Target B: binary-runtime
-# Production mode: build the binary inside Docker and copy it in.
-# NOTE: no support for external artifact contexts anymore.
-############################
-FROM base-image AS binary
-ARG USERNAME
-
-COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/openhands-agent-server /usr/local/bin/openhands-agent-server
-COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/.agents /agent-server/.agents
-COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
-RUN chmod +x /usr/local/bin/openhands-agent-server
-# Fix library path to use system GCC libraries instead of bundled ones
-ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
-ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
-ENV PYROMIND_PUBLIC_READ_PATHS=/agent-server/.agents/skills
-ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
-ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]
 
 FROM base-image-minimal AS binary-minimal
 ARG USERNAME
