@@ -292,6 +292,37 @@ async def test_pyromind_skill_read_survives_persistence_round_trip(
 
 
 @pytest.mark.asyncio
+async def test_pyromind_fork_creates_missing_public_data(
+    conversation_service,
+    tmp_path,
+):
+    source_id = uuid4()
+    source_workspace = tmp_path / "source-workspace"
+    source_workspace.mkdir()
+    request = StartConversationRequest(
+        conversation_id=source_id,
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=LocalWorkspace(working_dir=str(source_workspace)),
+        confirmation_policy=NeverConfirm(),
+        tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
+    )
+    source_info, _ = await conversation_service.start_conversation(request)
+    _safe_rmtree(source_workspace / "public_data")
+
+    fork_id = uuid4()
+    fork_workspace = conversation_service.conversations_dir / fork_id.hex
+    fork_info = await conversation_service.fork_conversation(
+        source_info.id,
+        fork_id=fork_id,
+        workspace=LocalWorkspace(working_dir=str(fork_workspace)),
+        tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
+    )
+
+    assert fork_info is not None
+    assert (fork_workspace / "public_data").is_dir()
+
+
+@pytest.mark.asyncio
 async def test_fork_conversation_at_event_creates_rollback_branch(
     conversation_service,
     tmp_path,
