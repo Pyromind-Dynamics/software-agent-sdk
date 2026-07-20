@@ -9,6 +9,7 @@ from openhands.agent_server.run_workflow_callback import (
     deliver_run_workflow_status,
 )
 from openhands.sdk.logger import get_logger
+from openhands.sdk.utils import env_util
 from openhands.sdk.utils.env_util import get_pod_name
 
 
@@ -52,7 +53,8 @@ class StudioWorkflowNotifyHandler(MessageHandler):
     def group_id(self) -> str:
         # Per-pod group → every pod receives every message (broadcast).
         # Only the pod that holds the conversation will deliver; others skip.
-        return get_pod_name()
+        # kafka广播，区分集群
+        return get_pod_name() + "-" + env_util.get_env_value()
 
     async def handle(self, event: MessageEvent):
         """Handle studio workflow notify message.
