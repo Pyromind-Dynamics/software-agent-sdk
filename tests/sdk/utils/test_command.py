@@ -30,7 +30,6 @@ def test_sanitized_env_accepts_mapping_types():
 def test_sanitized_env_strips_sensitive_vars(tmp_path):
     """Credential and build env vars are stripped from subprocess env."""
     env = {
-        "LLM_API_KEY": "sk-llm",
         "OPENAI_API_KEY": "sk-openai",
         "ANTHROPIC_API_KEY": "sk-ant",
         "AZURE_OPENAI_API_KEY": "sk-azure",
@@ -41,7 +40,6 @@ def test_sanitized_env_strips_sensitive_vars(tmp_path):
         "SAFE_VAR": "hello",
     }
     result = sanitized_env(env)
-    assert "LLM_API_KEY" not in result
     assert "OPENAI_API_KEY" not in result
     assert "ANTHROPIC_API_KEY" not in result
     assert "AZURE_OPENAI_API_KEY" not in result
@@ -50,6 +48,23 @@ def test_sanitized_env_strips_sensitive_vars(tmp_path):
     assert "OPENHANDS_BUILD_GIT_REF" not in result
     assert "OPENHANDS_BUILD_GIT_SHA" not in result
     assert result["SAFE_VAR"] == "hello"
+
+
+def test_sanitized_env_strips_all_llm_prefix(tmp_path):
+    """Every LLM_* env var is stripped by prefix, not by name enumeration."""
+    env = {
+        "LLM_API_KEY": "sk-llm",
+        "LLM_BASE_URL": "http://208.64.254.187:8000/v1",
+        "LLM_MODEL": "openai/glm-5.2-fp8",
+        "LLM_CUSTOM_FIELD": "anything",
+        "NORMAL_VAR": "keep",
+    }
+    result = sanitized_env(env)
+    assert "LLM_API_KEY" not in result
+    assert "LLM_BASE_URL" not in result
+    assert "LLM_MODEL" not in result
+    assert "LLM_CUSTOM_FIELD" not in result
+    assert result["NORMAL_VAR"] == "keep"
 
 
 @pytest.mark.parametrize(
