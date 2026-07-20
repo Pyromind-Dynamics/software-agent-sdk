@@ -140,31 +140,83 @@ class TerminalSandbox:
             self._seatbelt_profile.write_text(self._build_seatbelt_profile())
             self._backend = "seatbelt"
             return
-        # Linux: prefer AppArmor (no capability/namespace needed), then
-        # bwrap (requires user-namespace / CAP_SYS_ADMIN), then landlock.
-        if _is_apparmor_available():
-            self._backend = "apparmor"
-            self._apparmor_available = True
-            logger.info(
-                "Using AppArmor terminal sandbox (profile=%s)", APPARMOR_PROFILE_NAME
-            )
-            return
-        bwrap_path = shutil.which("bwrap")
-        if bwrap_path is not None:
-            self._backend = "bwrap"
-            return
-        try:
-            landlock_module: Any = import_module("py_landlock")
-            self._landlock_factory = landlock_module.Landlock
-            self._backend = "landlock"
-        except ImportError as exc:
-            if self.mode == "required":
-                raise RuntimeError(
-                    "Terminal sandbox is required, but no backend is available "
-                    "(AppArmor profile not loaded, bwrap not on PATH, "
-                    "py-landlock not importable)"
-                ) from exc
-            logger.warning("no sandbox backend available")
+        # Linux backend selection.
+        #
+        # When the caller passed conversation-scoped ``read_only_paths`` or
+        # ``read_write_paths``, the sandbox is meant to enforce a per-conversation
+        # PathAccessPolicy.  Only the Landlock backend can express that — AppArmor
+        # uses a single global denylist loaded at image build time and bwrap gives
+        # only a coarse namespace.  So in that case prefer Landlock; fall back to
+        # AppArmor / bwrap only when Landlock is unavailable (old kernel or
+        # py-landlock not installed).
+        #
+        # Without a per-conversation policy, the default order stands:
+        #   AppArmor (no capability / namespace) > bwrap > Landlock.
+        has_conversation_policy = bool(
+            self.read_only_paths or self.read_write_paths != (self.work_dir,)
+        )
+        backend_chosen = False
+
+        # Conversation-scoped policy → prefer Landlock (per-conversation
+        # semantics) over AppArmor (global denylist).  Stack AppArmor on top
+        # when both are available for defense-in-depth.
+        if has_conversation_policy:
+            self._apparmor_available = _is_apparmor_available()
+            try:
+                landlock_module = import_module("py_landlock")
+                self._landlock_factory = landlock_module.Landlock
+                self._backend = "landlock"
+                backend_chosen = True
+                logger.info(
+                    "Using Landlock terminal sandbox for per-conversation policy%s",
+                    " (+ AppArmor as defense-in-depth)"
+                    if self._apparmor_available
+                    else "",
+                )
+            except ImportError:
+                logger.warning(
+                    "Per-conversation policy requested but py-landlock is not "
+                    "importable; falling back to AppArmor / bwrap"
+                )
+                if self._apparmor_available:
+                    self._backend = "apparmor"
+                    backend_chosen = True
+                    logger.info(
+                        "Using AppArmor terminal sandbox (profile=%s) as fallback",
+                        APPARMOR_PROFILE_NAME,
+                    )
+
+        # No conversation policy → keep the legacy order: AppArmor first.
+        if not backend_chosen and not has_conversation_policy:
+            if _is_apparmor_available():
+                self._backend = "apparmor"
+                self._apparmor_available = True
+                backend_chosen = True
+                logger.info(
+                    "Using AppArmor terminal sandbox (profile=%s)",
+                    APPARMOR_PROFILE_NAME,
+                )
+
+        if not backend_chosen:
+            bwrap_path = shutil.which("bwrap")
+            if bwrap_path is not None:
+                self._backend = "bwrap"
+                backend_chosen = True
+
+        if not backend_chosen:
+            try:
+                landlock_module = import_module("py_landlock")
+                self._landlock_factory = landlock_module.Landlock
+                self._backend = "landlock"
+                backend_chosen = True
+            except ImportError as exc:
+                if self.mode == "required":
+                    raise RuntimeError(
+                        "Terminal sandbox is required, but no backend is available "
+                        "(AppArmor profile not loaded, bwrap not on PATH, "
+                        "py-landlock not importable)"
+                    ) from exc
+                logger.warning("no sandbox backend available")
 
     def apply(self) -> None:
         """Apply the policy in the child process, failing closed when required."""
@@ -208,6 +260,21 @@ class TerminalSandbox:
 
     def wrap_command(self, command: list[str]) -> list[str]:
         """Wrap a command with the platform-specific sandbox launcher."""
+        # Landlock is applied via ``apply()`` in the child preexec; it does not
+        # need a wrapper process.  But when AppArmor is also loaded on the host,
+        # we additionally prepend ``aa-exec`` so the child runs under both LSMs
+        # (Landlock for the per-conversation policy, AppArmor for the broader
+        # denylist of high-value paths and privilege-escalation tools).
+        if self._backend == "landlock":
+            if self._apparmor_available:
+                return [
+                    "aa-exec",
+                    "-p",
+                    APPARMOR_PROFILE_NAME,
+                    "--",
+                    *command,
+                ]
+            return command
         if self._backend == "apparmor":
             return [
                 "aa-exec",
