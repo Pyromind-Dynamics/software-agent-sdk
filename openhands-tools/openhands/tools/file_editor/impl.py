@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from openhands.sdk.logger import get_logger
 from openhands.sdk.tool import ToolExecutor
 from openhands.sdk.utils.path import is_host_absolute_path
 
@@ -17,6 +18,7 @@ from openhands.tools.file_editor.exceptions import ToolError
 from openhands.tools.utils import (
     configured_public_read_roots,
     default_path_access_policy,
+    is_conversation_workspace,
     logical_public_read_path,
     resolve_public_read_alias,
 )
@@ -25,6 +27,8 @@ from openhands.tools.workflow.definition import (
     mark_pyromind_workflow_dirty,
 )
 
+
+logger = get_logger(__name__)
 
 # Module-global editor instance (lazily initialized in file_editor)
 _GLOBAL_EDITOR: FileEditor | None = None
@@ -65,6 +69,15 @@ class FileEditorExecutor(ToolExecutor):
             workspace_read_write_subpaths=self.workspace_read_write_subpaths,
             exclude_workspace_fallback=self.exclude_workspace_fallback,
         )
+        _conversation = is_conversation_workspace(self.workspace_root)
+        logger.debug(
+            "FileEditor path policy for %s: conv=%s ro=%s rw=%s rules=%s",
+            self.workspace_root,
+            _conversation,
+            self.workspace_read_only_subpaths,
+            self.workspace_read_write_subpaths,
+            [(str(r.path), r.perm) for r in self.path_policy.rules],
+        )
         self.read_only_editors = {
             root: FileEditor(workspace_root=str(root)) for root in self.read_only_roots
         }
@@ -90,9 +103,10 @@ class FileEditorExecutor(ToolExecutor):
 
         if is_host_absolute_path(action_path):
             if str(action_path).startswith("/workspace/"):
-                cwd_candidate = (Path.cwd() / str(action_path).lstrip("/")).resolve()
-                if cwd_candidate.exists() or cwd_candidate.parent.exists():
-                    return str(cwd_candidate)
+                mapped = (
+                    self.workspace_root / str(action_path).removeprefix("/workspace/")
+                ).resolve()
+                return str(mapped)
             return str(action_path.resolve())
 
         workspace_candidate = (self.workspace_root / action_path).resolve()
@@ -100,9 +114,10 @@ class FileEditorExecutor(ToolExecutor):
             return str(workspace_candidate)
 
         if str(action_path).startswith("workspace/"):
-            cwd_candidate = (Path.cwd() / action_path).resolve()
-            if cwd_candidate.exists() or cwd_candidate.parent.exists():
-                return str(cwd_candidate)
+            mapped = (
+                self.workspace_root / str(action_path).removeprefix("workspace/")
+            ).resolve()
+            return str(mapped)
 
         return str(workspace_candidate)
 
