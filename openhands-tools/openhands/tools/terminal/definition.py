@@ -3,6 +3,7 @@
 import os
 import platform
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import Field
@@ -36,6 +37,8 @@ from openhands.tools.terminal.sandbox import TerminalSandboxMode
 from openhands.tools.utils import (
     CONVERSATION_READ_ONLY_SUBPATHS,
     CONVERSATION_READ_WRITE_SUBPATHS,
+    configured_public_read_roots,
+    default_path_access_policy,
     is_conversation_workspace,
 )
 
@@ -323,7 +326,31 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
             raise ValueError(f"working_dir '{working_dir}' is not a valid directory")
 
         if executor is None:
-            is_conv_workspace = is_conversation_workspace(working_dir)
+            is_conv = is_conversation_workspace(working_dir)
+            sandbox_read_only_paths: tuple[str, ...] = ()
+            sandbox_read_write_paths: tuple[str, ...] | None = None
+            if is_conv:
+                ws_root = Path(working_dir).resolve()
+                read_only_roots = configured_public_read_roots()
+                policy = default_path_access_policy(
+                    ws_root,
+                    read_only_roots,
+                    workspace_read_only_subpaths=CONVERSATION_READ_ONLY_SUBPATHS,
+                    workspace_read_write_subpaths=CONVERSATION_READ_WRITE_SUBPATHS,
+                    exclude_workspace_fallback=True,
+                )
+                r_only_paths: list[str] = []
+                rw_paths: list[str] = []
+                for rule in policy.rules:
+                    resolved = str(rule.path)
+                    has_read = "read" in rule.perm
+                    has_write = "write" in rule.perm
+                    if has_write:
+                        rw_paths.append(resolved)
+                    elif has_read:
+                        r_only_paths.append(resolved)
+                sandbox_read_only_paths = tuple(r_only_paths)
+                sandbox_read_write_paths = tuple(rw_paths) if rw_paths else None
             executor = TerminalExecutor(
                 working_dir=working_dir,
                 username=username,
@@ -332,12 +359,8 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
                 shell_path=shell_path,
                 full_output_save_dir=conv_state.env_observation_persistence_dir,
                 sandbox_mode=sandbox_mode,
-                sandbox_read_only_paths=(
-                    CONVERSATION_READ_ONLY_SUBPATHS if is_conv_workspace else ()
-                ),
-                sandbox_read_write_paths=(
-                    CONVERSATION_READ_WRITE_SUBPATHS if is_conv_workspace else None
-                ),
+                sandbox_read_only_paths=sandbox_read_only_paths,
+                sandbox_read_write_paths=sandbox_read_write_paths,
             )
 
         tool_description = (
