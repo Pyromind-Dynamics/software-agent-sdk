@@ -33,6 +33,9 @@ Storage data loading and processing, Benchmark, training, inference, and other w
 execution. Use dedicated platform tools for preview/upload when a skill requires them,
 and never use the local terminal as a substitute for platform operations.
 
+`public_data/` is the writable area for all agent-created conversation-local files.
+`file_editor` and `apply_patch` paths stay relative to the conversation root
+and do not follow terminal cwd, so every created file must use a `public_data/...` path.
 The terminal session starts at the conversation root. Make its first command
 `cd public_data`; later terminal calls reuse the persistent shell's current directory.
 Use the terminal only for conversation-local auxiliary files needed to author or

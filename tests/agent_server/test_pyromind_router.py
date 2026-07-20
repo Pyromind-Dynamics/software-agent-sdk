@@ -96,6 +96,10 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert "禁止用 Agent 本地 terminal 替代平台运行时" in skill_text
     assert "只有校验明确暴露未覆盖的平台契约" in skill_text
     assert "同一轮不得重复读取同一路径" in skill_text
+    assert "可程序验证只说明 reward 可构造" in skill_text
+    assert "数据同时支持\n  SFT/GRPO 时默认 SFT" in skill_text
+    assert "自动选择 GRPO 还要求当前模型是 SFT/指令 checkpoint" in skill_text
+    assert skill_text.count("阶段锁定后") == 2
     assert "ModelTrainSFTNode(" not in skill_text
     assert set(references) == {
         "custom-python-assets.md",
@@ -111,16 +115,22 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert "去掉可选的 `/workspace/` 前缀和开头 `/`" in references["data-routing.md"]
     assert "同一路径已有成功 preview 时复用" in references["data-routing.md"]
     assert "可选统计为空不等于 preview 失败" in references["data-routing.md"]
+    assert "## 监督信号分类" in references["data-routing.md"]
+    assert "即使答案也能程序验证" in references["data-routing.md"]
+    assert "本文件只识别数据形态" in references["data-routing.md"]
     assert "禁止调用 `run_dataset_cleaning`" in skill_text
     contracts = references["workflow-contracts.md"]
     assert "Benchmark | 数据配置 → 模型入口 → VLLM → Metric → Eval" in contracts
     assert "CloneAndCacheModel | model, target_path" in contracts
     assert "每个 Metrics Builder 只输出一个 `metrics_config`" in contracts
     assert "NVIDIA-H100-80GB-HBM3" in contracts
+    assert "训练阶段由主 Skill 的“选择阶段”唯一决定" in contracts
+    assert "有可程序化验证答案或 reward 时选 GRPO" not in contracts
     assert "只填 Secret 名" in contracts
     assert "Qwen/Qwen3" not in contracts
     assert "compute_gsm8k" not in references["custom-python-assets.md"]
     assert "geometry_vqa_thinking_reward" not in references["custom-python-assets.md"]
+    assert "`public_data/<name>.py`" in references["custom-python-assets.md"]
     for removed in (
         "node-reference.md",
         "platform-contract-overrides.md",
@@ -150,6 +160,9 @@ def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
     assert "Pyromind platform nodes perform actual" in rendered
     assert "Use dedicated platform tools for preview/upload" in rendered
     assert "never use the local terminal as a substitute" in rendered
+    assert "`public_data/` is the writable area" in rendered
+    assert "do not follow terminal cwd" in rendered
+    assert "every created file must use a `public_data/...` path" in rendered
     assert "terminal session starts at the conversation root" in rendered
     assert "Make its first command\n`cd public_data`" in rendered
     assert "reuse the persistent shell's current directory" in rendered

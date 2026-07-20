@@ -17,7 +17,7 @@ Merge、推理与评测｜平台边界。
 | LoRA 训后评测 | 训练 → Merge → VLLM → Metric → Eval | `benchmark_output_path` |
 | Full 训后评测 | 训练 → VLLM → Metric → Eval | `benchmark_output_path` |
 
-默认训练选 SFT；有 chosen/rejected 时选 DPO；有可程序化验证答案或 reward 时选 GRPO。
+训练阶段由主 Skill 的“选择阶段”唯一决定；本文件只在阶段锁定后提供对应拓扑。
 明确要求 Benchmark 时不添加训练节点。训练前后比较必须复用同一数据切分、字段映射、Metric
 和 `max_samples`。
 
