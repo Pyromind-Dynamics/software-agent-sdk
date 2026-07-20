@@ -126,7 +126,7 @@ _DEFAULT_SKILLS_PATH = os.environ.get(
 )
 
 # Only load these skills for Pyromind (avoids loading unrelated SDK skills)
-_PYROMIND_SKILL_NAMES = ["generate-workflow-dsl", "debug-workflow"]
+_PYROMIND_SKILL_NAMES = ["generate-workflow-dsl", "debug-workflow", "data-cleaning"]
 _PYROMIND_VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
 _PYROMIND_VALIDATE_FORWARD_HEADERS = ("x-cluster", "accept-language")
 _PYROMIND_DEBUG_URL_TIMEOUT_SECONDS = 30.0
