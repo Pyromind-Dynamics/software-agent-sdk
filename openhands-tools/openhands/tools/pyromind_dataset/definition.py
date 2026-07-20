@@ -9,12 +9,13 @@ import random
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 from pydantic import AliasChoices, Field
 from rich.text import Text
 
+from openhands.sdk.llm.message import TextContent
 from openhands.sdk.tool import (
     Action,
     Observation,
@@ -67,14 +68,6 @@ _VISION_SUFFIXES = {
     ".webm",
 }
 _VISION_FIELD_MARKERS = ("image", "video", "vision")
-SuggestedDatasetNode = Literal["CloneAndCacheDataset", "DownloadAndCacheDataset"]
-_KNOWN_DATASET_NODES: dict[str, SuggestedDatasetNode] = {
-    "pyromind/alpaca-gpt4-llm-demo": "CloneAndCacheDataset",
-    "pyromind/geometry-vqa-vlm-demo": "CloneAndCacheDataset",
-    "pyromind/self-cognition": "CloneAndCacheDataset",
-    "pyromind/easyhard-24k": "DownloadAndCacheDataset",
-    "pyromind/agentic-tool-call-dataset-12k": "DownloadAndCacheDataset",
-}
 
 
 @dataclass(frozen=True)
@@ -97,14 +90,15 @@ def _default_storage_base_url() -> str:
 
 
 class PreviewDatasetAction(Action):
-    """Preview a dataset stored on Pyromind storage."""
+    """Preview a dataset from shared space or user storage."""
 
     dataset_path: str = Field(
         description=(
-            "Relative path of the dataset on Pyromind storage, as pasted by "
-            "the user (e.g. 'datasets/my_data/' or "
-            "'datasets/my_data/train.jsonl'). Directories and single files "
-            "are both accepted."
+            "Path of the dataset to preview. Can be a shared dataset name "
+            "(e.g. 'openai/gsm8k'), a shared dataset with file path "
+            "(e.g. 'openai/gsm8k/data/train.jsonl'), or a user storage "
+            "relative path (e.g. 'datasets/my_data/' or "
+            "'datasets/my_data/train.jsonl')."
         ),
     )
     n: int = Field(
@@ -196,11 +190,11 @@ class PreviewDatasetObservation(Observation):
         default=None,
         description="Machine-readable input or preview error code.",
     )
-    suggested_node: SuggestedDatasetNode | None = Field(
+    source: str | None = Field(
         default=None,
         description=(
-            "Workflow node to use when dataset_path is a known dataset identifier "
-            "rather than a storage path."
+            "Data source: 'shared' for shared dataset space, "
+            "'storage' for user storage."
         ),
     )
 
@@ -216,35 +210,43 @@ class PreviewDatasetObservation(Observation):
         return content
 
 
-_PREVIEW_DATASET_DESCRIPTION = """Preview a Pyromind storage dataset.
+_PREVIEW_DATASET_DESCRIPTION = """Preview a dataset from shared space or user storage.
 
-Given the storage path the user pasted into the chat, this calls the Pyromind
-storage API and returns:
-- the data files found under the path
-- storage metadata such as object name, bucket, size, content type, and is_dir
-- exact row count when the file fits inside the bounded preview
-- previewed row count and sample rows for JSONL, CSV/TSV, and text
+This tool inspects dataset content from two sources (tried in order):
+1. Shared dataset space: platform-curated datasets identified by org/name
+   (e.g. 'openai/gsm8k', 'pyromind/self-cognition'). Supports listing files
+   and previewing content directly.
+2. User storage: files/directories the user uploaded, identified by a
+   storage-relative path (e.g. 'datasets/my_data/train.jsonl' or
+   'datasets/my_data/').
 
-Use this only to inspect an actual file or directory uploaded to Pyromind
-storage. A slash in the value is not enough to classify it: when the user says
-they uploaded the data and pasted a storage-relative path, preview that exact
-path. Do not use this tool for values identified as Clone Dataset or Download
-Dataset IDs, such as `pyromind/self-cognition` or `pyromind/easyhard-24k`; those
-are not storage paths. Known IDs fail locally with `NOT_A_STORAGE_PATH` and a
-`suggested_node`; no storage request is sent and path variants must not be retried.
+The tool automatically determines the source:
+- If the path matches a known shared dataset (exact or prefix), it uses the
+  shared space API.
+- Otherwise, it falls back to user storage.
 
-Files up to 10KB are downloaded in full; larger files are sampled with 3 random
-5KB byte-range requests (15KB total). Sample rows are returned directly in the
-observation. When preview_truncated=true, num_rows is left unset because the tool
-did not read the full file; use previewed_rows and sample_rows only as a format
-hint.
+When only a dataset name is given (no specific file), the tool lists available
+files and auto-selects the first previewable one. If multiple files exist, the
+observation includes the full file list so you can ask the user which file to
+preview, or call this tool again with a specific file path like
+'openai/gsm8k/data/train.jsonl'.
+
+Returns:
+- files found under the path
+- row count (exact for small files, estimated for large)
+- column names and sample rows for JSONL, CSV/TSV, and text formats
+- source indicator ('shared' or 'storage')
+
+For user storage: files up to 10KB are downloaded in full; larger files are
+sampled with random byte-range requests. When preview_truncated=true, num_rows
+is unset; use previewed_rows and sample_rows as a format hint only.
 """
 
 
 class PreviewDatasetExecutor(
     ToolExecutor[PreviewDatasetAction, PreviewDatasetObservation]
 ):
-    """Preview Pyromind storage files through the platform storage API."""
+    """Preview datasets from shared space or user storage."""
 
     def __init__(
         self,
@@ -256,6 +258,9 @@ class PreviewDatasetExecutor(
     ) -> None:
         base_url = storage_base_url or _default_storage_base_url()
         self._storage_base_url = base_url.rstrip("/")
+        self._shared_base_url = self._storage_base_url.replace(
+            "/storage_api", "/api/v1"
+        )
         self._headers = dict(headers or {})
         self._secret_headers = dict(secret_headers or {})
         self._timeout = timeout
@@ -269,23 +274,9 @@ class PreviewDatasetExecutor(
         dataset_path = action.dataset_path.strip()
         if not dataset_path:
             return PreviewDatasetObservation.from_text(
-                text="dataset_path must be a non-empty storage path.",
+                text="dataset_path must be a non-empty path.",
                 is_error=True,
                 dataset_path=action.dataset_path,
-            )
-
-        suggested_node = _KNOWN_DATASET_NODES.get(dataset_path.rstrip("/"))
-        if suggested_node is not None:
-            return PreviewDatasetObservation.from_text(
-                text=(
-                    f"NOT_A_STORAGE_PATH: {dataset_path!r} is a known dataset "
-                    f"identifier, not a Pyromind storage path. Use {suggested_node} "
-                    "and do not retry preview_dataset with path variants."
-                ),
-                is_error=True,
-                dataset_path=dataset_path,
-                error_code="NOT_A_STORAGE_PATH",
-                suggested_node=suggested_node,
             )
 
         try:
@@ -297,6 +288,377 @@ class PreviewDatasetExecutor(
                 dataset_path=dataset_path,
             )
 
+        # Option C: try shared dataset space first
+        shared_result = self._try_shared_preview(dataset_path, action.n, headers)
+        if shared_result is not None:
+            return shared_result
+
+        # Fall back to user storage
+        return self._storage_preview(dataset_path, action.n, headers)
+
+    # ------------------------------------------------------------------
+    # Shared dataset space
+    # ------------------------------------------------------------------
+
+    def _try_shared_preview(
+        self,
+        dataset_path: str,
+        n: int,
+        headers: dict[str, str],
+    ) -> PreviewDatasetObservation | None:
+        """Attempt shared space preview. Returns None if not a shared dataset."""
+        datasets = self._shared_list_datasets(headers)
+        if datasets is None:
+            return None
+
+        match = _match_shared_dataset(dataset_path, datasets)
+        if match is None:
+            return None
+
+        dataset_name, file_path = match
+
+        if not file_path:
+            return self._shared_resolve_and_preview(dataset_name, n, headers)
+
+        return self._shared_preview_file(dataset_name, file_path, n, headers)
+
+    def _shared_resolve_and_preview(
+        self,
+        dataset_name: str,
+        n: int,
+        headers: dict[str, str],
+    ) -> PreviewDatasetObservation:
+        """List files in a shared dataset and preview the first previewable one."""
+        files_result = self._shared_list_files(dataset_name, headers)
+        if isinstance(files_result, PreviewDatasetObservation):
+            return files_result
+
+        file_paths = [f["path"] for f in files_result]
+        preview_file = _select_preview_file(file_paths)
+
+        if not preview_file:
+            file_list_text = "\n".join(
+                f"  - {f['path']} ({f.get('human_size', '?')})" for f in files_result
+            )
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    f"Shared dataset '{dataset_name}' contains no previewable "
+                    f"text files.\nAvailable files:\n{file_list_text}"
+                ),
+                dataset_path=dataset_name,
+                files=file_paths,
+                is_dir=True,
+                source="shared",
+            )
+
+        if len(files_result) > 1:
+            file_list_text = "\n".join(
+                f"  - {f['path']} ({f.get('human_size', '?')})" for f in files_result
+            )
+            preview_result = self._shared_preview_file(
+                dataset_name, preview_file, n, headers
+            )
+            if not preview_result.is_error:
+                header = (
+                    f"Dataset '{dataset_name}' has {len(files_result)} "
+                    f"files. Auto-selected '{preview_file}' for preview.\n"
+                    f"Available files:\n{file_list_text}\n\n"
+                )
+                new_content = [
+                    TextContent(text=header + item.text)
+                    if isinstance(item, TextContent)
+                    else item
+                    for item in preview_result.content
+                ]
+                preview_result = preview_result.model_copy(
+                    update={"files": file_paths, "content": new_content}
+                )
+            return preview_result
+
+        return self._shared_preview_file(dataset_name, preview_file, n, headers)
+
+    def _shared_list_datasets(
+        self,
+        headers: dict[str, str],
+    ) -> list[str] | None:
+        """Fetch shared dataset list. Returns None on failure (allows fallback)."""
+        try:
+            response = httpx.get(
+                f"{self._shared_base_url}/datasets",
+                headers=headers,
+                timeout=self._timeout,
+            )
+        except httpx.RequestError:
+            return None
+        if response.status_code >= 400:
+            return None
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            return None
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return None
+        datasets = data.get("datasets")
+        if not isinstance(datasets, list):
+            return None
+        return [str(d) for d in datasets]
+
+    def _shared_list_files(
+        self,
+        dataset_name: str,
+        headers: dict[str, str],
+    ) -> list[dict[str, Any]] | PreviewDatasetObservation:
+        """List files in a shared dataset."""
+        try:
+            response = httpx.get(
+                f"{self._shared_base_url}/datasets/files",
+                headers=headers,
+                params={"dataset": dataset_name},
+                timeout=self._timeout,
+            )
+        except httpx.RequestError as exc:
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    f"Failed to list shared dataset files: {type(exc).__name__}: {exc}"
+                ),
+                is_error=True,
+                dataset_path=dataset_name,
+                source="shared",
+            )
+        if response.status_code >= 400:
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    f"Shared dataset files API returned HTTP "
+                    f"{response.status_code}: {_truncate_text(response.text)}"
+                ),
+                is_error=True,
+                dataset_path=dataset_name,
+                source="shared",
+            )
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, ValueError):
+            return PreviewDatasetObservation.from_text(
+                text="Shared dataset files API returned invalid JSON.",
+                is_error=True,
+                dataset_path=dataset_name,
+                source="shared",
+            )
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            message = "Shared dataset files API failed."
+            if isinstance(payload, dict):
+                err = payload.get("error")
+                if isinstance(err, dict):
+                    message = str(err.get("message") or message)
+            return PreviewDatasetObservation.from_text(
+                text=message,
+                is_error=True,
+                dataset_path=dataset_name,
+                source="shared",
+            )
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return PreviewDatasetObservation.from_text(
+                text="Shared dataset files API response missing data.",
+                is_error=True,
+                dataset_path=dataset_name,
+                source="shared",
+            )
+        files = data.get("files")
+        if not isinstance(files, list):
+            return PreviewDatasetObservation.from_text(
+                text="Shared dataset files API response missing files list.",
+                is_error=True,
+                dataset_path=dataset_name,
+                source="shared",
+            )
+        return [f for f in files if isinstance(f, dict)]
+
+    def _shared_preview_file(
+        self,
+        dataset_name: str,
+        file_path: str,
+        n: int,
+        headers: dict[str, str],
+    ) -> PreviewDatasetObservation:
+        """Preview a specific file in a shared dataset."""
+        try:
+            response = httpx.get(
+                f"{self._shared_base_url}/datasets/preview",
+                headers=headers,
+                params={
+                    "dataset": dataset_name,
+                    "file_path": file_path,
+                    "lines": n,
+                },
+                timeout=self._timeout,
+            )
+        except httpx.RequestError as exc:
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    f"Failed to preview shared dataset file: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                is_error=True,
+                dataset_path=f"{dataset_name}/{file_path}",
+                source="shared",
+            )
+        if response.status_code >= 400:
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    f"Shared dataset preview API returned HTTP "
+                    f"{response.status_code}: {_truncate_text(response.text)}"
+                ),
+                is_error=True,
+                dataset_path=f"{dataset_name}/{file_path}",
+                source="shared",
+            )
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, ValueError):
+            return PreviewDatasetObservation.from_text(
+                text="Shared dataset preview API returned invalid JSON.",
+                is_error=True,
+                dataset_path=f"{dataset_name}/{file_path}",
+                source="shared",
+            )
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            message = "Shared dataset preview API failed."
+            if isinstance(payload, dict):
+                err = payload.get("error")
+                if isinstance(err, dict):
+                    message = str(err.get("message") or message)
+            return PreviewDatasetObservation.from_text(
+                text=message,
+                is_error=True,
+                dataset_path=f"{dataset_name}/{file_path}",
+                source="shared",
+            )
+
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return PreviewDatasetObservation.from_text(
+                text="Shared dataset preview API response missing data.",
+                is_error=True,
+                dataset_path=f"{dataset_name}/{file_path}",
+                source="shared",
+            )
+
+        return self._build_shared_observation(dataset_name, file_path, data, n)
+
+    def _build_shared_observation(
+        self,
+        dataset_name: str,
+        file_path: str,
+        data: dict[str, Any],
+        requested_rows: int,
+    ) -> PreviewDatasetObservation:
+        """Build observation from shared preview API response data."""
+        preview = data.get("preview")
+        if not isinstance(preview, dict):
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    f"Shared dataset '{dataset_name}/{file_path}' preview "
+                    "not available (binary or unsupported format)."
+                ),
+                dataset_path=f"{dataset_name}/{file_path}",
+                preview_file_path=file_path,
+                source="shared",
+                size=_optional_int(data.get("file_size")),
+            )
+
+        preview_type = str(preview.get("type") or "text")
+        if preview_type not in {"text", "parquet"}:
+            message = str(
+                preview.get("message") or "Preview not supported for this file type."
+            )
+            return PreviewDatasetObservation.from_text(
+                text=f"Shared dataset '{dataset_name}/{file_path}': {message}",
+                dataset_path=f"{dataset_name}/{file_path}",
+                preview_file_path=file_path,
+                source="shared",
+                size=_optional_int(data.get("file_size")),
+            )
+
+        lines: list[str] = []
+        if preview_type == "text":
+            raw_lines = preview.get("lines")
+            if isinstance(raw_lines, list):
+                lines = [str(line) for line in raw_lines]
+        elif preview_type == "parquet":
+            rows = preview.get("rows")
+            if isinstance(rows, list):
+                lines = [
+                    json.dumps(row, ensure_ascii=False)
+                    for row in rows
+                    if isinstance(row, dict)
+                ]
+
+        total_lines = preview.get("total_lines") or preview.get("total_rows")
+        truncated = data.get("truncated", False)
+        if isinstance(total_lines, int) and total_lines < 0:
+            total_lines = None
+
+        parsed = _parse_preview_chunks(
+            file_path,
+            "",
+            [
+                _PreviewChunk(
+                    content="\n".join(lines).encode("utf-8"),
+                    starts_at_zero=True,
+                    ends_at_eof=not truncated,
+                )
+            ],
+            max_samples=requested_rows,
+            truncated=truncated,
+        )
+        parsed["sample_rows"] = _trim_sample_rows(
+            parsed["sample_rows"], self._max_preview_bytes
+        )
+        parsed["columns"] = _collect_columns(parsed["sample_rows"])
+
+        if not truncated and isinstance(total_lines, int) and total_lines > 0:
+            parsed["num_rows"] = total_lines
+
+        text = _format_shared_preview_text(
+            dataset_name=dataset_name,
+            file_path=file_path,
+            data=data,
+            parsed=parsed,
+            requested_rows=requested_rows,
+            truncated=truncated,
+        )
+
+        return PreviewDatasetObservation.from_text(
+            text=text,
+            dataset_path=f"{dataset_name}/{file_path}",
+            files=[file_path],
+            num_rows=parsed["num_rows"],
+            columns=parsed["columns"],
+            has_vision=_infer_has_vision(parsed["columns"], parsed["sample_rows"]),
+            sample_rows=parsed["sample_rows"],
+            requested_rows=requested_rows,
+            preview_file_path=file_path,
+            previewed_rows=parsed["previewed_rows"],
+            preview_truncated=truncated,
+            preview_error=parsed["preview_error"],
+            size=_optional_int(data.get("file_size")),
+            source="shared",
+        )
+
+    # ------------------------------------------------------------------
+    # User storage (original flow)
+    # ------------------------------------------------------------------
+
+    def _storage_preview(
+        self,
+        dataset_path: str,
+        n: int,
+        headers: dict[str, str],
+    ) -> PreviewDatasetObservation:
         files: list[str] = []
         preview_path = dataset_path
         metadata: dict[str, Any] | None = None
@@ -361,7 +723,7 @@ class PreviewDatasetExecutor(
             preview_path,
             str(metadata.get("content_type") or ""),
             preview_chunks,
-            max_samples=action.n,
+            max_samples=n,
             truncated=preview_truncated,
         )
         parsed["sample_rows"] = _trim_sample_rows(
@@ -374,7 +736,7 @@ class PreviewDatasetExecutor(
             files=files,
             metadata=metadata,
             parsed=parsed,
-            requested_rows=action.n,
+            requested_rows=n,
             preview_truncated=preview_truncated,
         )
 
@@ -387,11 +749,12 @@ class PreviewDatasetExecutor(
             p95_sequence_length=None,
             has_vision=_infer_has_vision(parsed["columns"], parsed["sample_rows"]),
             sample_rows=parsed["sample_rows"],
-            requested_rows=action.n,
+            requested_rows=n,
             preview_file_path=preview_path,
             previewed_rows=parsed["previewed_rows"],
             preview_truncated=preview_truncated,
             preview_error=parsed["preview_error"],
+            source="storage",
             **_metadata_observation_fields(metadata),
         )
 
@@ -403,7 +766,7 @@ class PreviewDatasetExecutor(
         payload_result = self._post_json("get_file_metadata", {"path": path}, headers)
         if isinstance(payload_result, str):
             return PreviewDatasetObservation.from_text(
-                text=_with_cleaned_dataset_hint(payload_result, path),
+                text=payload_result,
                 is_error=True,
                 dataset_path=path,
             )
@@ -985,16 +1348,6 @@ def _decode_json_response(
     return payload
 
 
-def _with_cleaned_dataset_hint(message: str, dataset_path: str) -> str:
-    if "HTTP 404" not in message or not dataset_path.startswith("pyromind/"):
-        return message
-    return (
-        f"{message} This looks like a cleaned dataset identifier for Clone Dataset "
-        "or Download Dataset, not a Pyromind storage path; use it directly in the "
-        "workflow and do not retry preview_dataset with path variants."
-    )
-
-
 def _extract_api_data(api_name: str, payload: dict[str, Any]) -> dict[str, Any] | str:
     success = payload.get("success")
     data = payload.get("data")
@@ -1035,6 +1388,34 @@ def _metadata_observation_fields(metadata: dict[str, Any]) -> dict[str, Any]:
 
 def _looks_like_directory(path: str) -> bool:
     return path.endswith("/")
+
+
+def _match_shared_dataset(
+    dataset_path: str,
+    datasets: list[str],
+) -> tuple[str, str] | None:
+    """Match dataset_path against shared datasets.
+
+    Returns (dataset_name, remaining_file_path) or None if no match.
+    Uses longest-prefix matching so 'openai/gsm8k/data/train.jsonl' matches
+    dataset 'openai/gsm8k' with file_path 'data/train.jsonl'.
+    """
+    normalized = dataset_path.strip("/")
+    best_match: str | None = None
+    for ds in datasets:
+        ds_normalized = ds.strip("/")
+        if normalized == ds_normalized:
+            best_match = ds_normalized
+            break
+        if normalized.startswith(ds_normalized + "/"):
+            if best_match is None or len(ds_normalized) > len(best_match):
+                best_match = ds_normalized
+    if best_match is None:
+        return None
+    if normalized == best_match:
+        return best_match, ""
+    file_path = normalized[len(best_match) + 1 :]
+    return best_match, file_path
 
 
 def _select_preview_file(files: list[str]) -> str | None:
@@ -1304,6 +1685,41 @@ def _format_preview_text(
     if parsed["preview_error"]:
         parts.append(f"preview_error={parsed['preview_error']}")
     parts.append(f"preview_truncated={str(preview_truncated).lower()}")
+    for row in parsed["sample_rows"]:
+        parts.append(f"\n--- sample line {row.get('line', '?')} ---")
+        parts.append(str(row.get("text", "")))
+    return "\n".join(parts)
+
+
+def _format_shared_preview_text(
+    *,
+    dataset_name: str,
+    file_path: str,
+    data: dict[str, Any],
+    parsed: dict[str, Any],
+    requested_rows: int,
+    truncated: bool,
+) -> str:
+    parts = [
+        f"Shared dataset preview: {dataset_name}",
+        f"file={file_path}",
+    ]
+    human_size = data.get("human_size")
+    if human_size:
+        parts.append(f"size={human_size}")
+    elif data.get("file_size") is not None:
+        parts.append(f"size={data['file_size']} bytes")
+    if parsed["num_rows"] is not None:
+        parts.append(f"rows={parsed['num_rows']}")
+    else:
+        parts.append(f"previewed_rows={parsed['previewed_rows']}")
+    if parsed["columns"]:
+        parts.append(f"columns={', '.join(parsed['columns'])}")
+    parts.append(f"requested_rows={requested_rows}")
+    parts.append(f"sample_rows={len(parsed['sample_rows'])}")
+    if parsed["preview_error"]:
+        parts.append(f"preview_error={parsed['preview_error']}")
+    parts.append(f"truncated={str(truncated).lower()}")
     for row in parsed["sample_rows"]:
         parts.append(f"\n--- sample line {row.get('line', '?')} ---")
         parts.append(str(row.get("text", "")))
