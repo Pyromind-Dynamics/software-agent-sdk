@@ -1,6 +1,7 @@
 """Tests for TerminalTool subclass."""
 
 import tempfile
+from pathlib import Path
 from uuid import uuid4
 
 from pydantic import SecretStr
@@ -14,6 +15,7 @@ from openhands.tools.terminal import (
     TerminalObservation,
     TerminalTool,
 )
+from openhands.tools.terminal.impl import TerminalExecutor
 
 
 def _create_test_conv_state(temp_dir: str) -> ConversationState:
@@ -88,6 +90,38 @@ def test_bash_tool_working_directory():
         # Check that the working directory is correct
         assert isinstance(result, TerminalObservation)
         assert temp_dir in result.text
+
+
+def test_terminal_sandbox_override_preserves_persistent_working_directory():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        public_data = Path(temp_dir) / "public_data"
+        public_data.mkdir()
+        conv_state = _create_test_conv_state(temp_dir)
+        tool = TerminalTool.create(
+            conv_state,
+            terminal_type="subprocess",
+            sandbox_mode="off",
+        )[0]
+        executor = tool.executor
+        assert isinstance(executor, TerminalExecutor)
+
+        try:
+            first = tool(TerminalAction(command="cd public_data"))
+            second = tool(TerminalAction(command="echo hello"))
+        finally:
+            executor.close()
+
+        assert isinstance(first, TerminalObservation)
+        assert isinstance(second, TerminalObservation)
+        assert executor._sandbox_mode == "off"
+        assert first.command == "cd public_data"
+        assert second.command == "echo hello"
+        assert second.text.strip() == "hello"
+        assert second.metadata is not None
+        assert second.metadata.working_dir is not None
+        assert Path(second.metadata.working_dir).resolve() == public_data.resolve()
+        assert "chdir" not in first.text + second.text
+        assert "getcwd" not in first.text + second.text
 
 
 def test_bash_tool_to_openai_tool():

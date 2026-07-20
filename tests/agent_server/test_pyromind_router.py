@@ -150,18 +150,18 @@ def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
     assert "Pyromind platform nodes perform actual" in rendered
     assert "Use dedicated platform tools for preview/upload" in rendered
     assert "never use the local terminal as a substitute" in rendered
-    assert "workspace-discovery commands are rejected" in rendered
-    assert "exact, already-known conversation-local script" in rendered
-    assert "do not\nuse it to inspect files or data" in rendered
+    assert "terminal session starts at the conversation root" in rendered
+    assert "Make its first command\n`cd public_data`" in rendered
+    assert "reuse the persistent shell's current directory" in rendered
+    assert "conversation-local auxiliary files" in rendered
     assert "Do not consult `knowledge/` before validation" in rendered
     assert "one\n  targeted knowledge-base lookup" in rendered
     assert "Do not run `pwd`, `cd`, or directory listings" not in rendered
     assert "Do not use `/dev/null`" not in rendered
     assert "Do not run `pwd`" not in rendered
     assert "do not access host-absolute paths, `/workspace`" not in rendered
-    assert "access host-absolute paths, `/workspace`" in rendered
-    assert "`/workspace` remains valid inside workflow DSL" in rendered
-    assert "`terminal` only to execute" in rendered
+    assert "workspace-discovery commands are rejected" not in rendered
+    assert "exact, already-known conversation-local script" not in rendered
     assert "workspace/conversations/test" not in rendered
 
 
@@ -379,10 +379,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     terminal_tool = next(
         tool for tool in service.start_request.agent.tools if tool.name == "terminal"
     )
-    assert terminal_tool.params == {
-        "command_working_subdir": "public_data",
-        "restrict_workspace_discovery": True,
-    }
+    assert terminal_tool.params == {"sandbox_mode": "off"}
     assert (expected_dir / "public_data").is_dir()
     validation_tool = next(
         tool
