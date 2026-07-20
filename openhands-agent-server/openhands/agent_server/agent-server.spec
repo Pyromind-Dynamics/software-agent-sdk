@@ -169,6 +169,10 @@ a = Analysis(
         *collect_submodules("fakeredis"),
         *collect_submodules("pyromind_sdk"),
         "py_landlock",  # Dynamic import in openhands.tools.terminal.sandbox
+        # New helper module imported transitively from tmux_terminal/tmux_pane_pool.
+        # collect_submodules("openhands.tools") should already cover it, but pin
+        # it explicitly so a stale analysis cache cannot silently drop it.
+        "openhands.tools.terminal.terminal.tmux_env",
         *collect_submodules("lupa"),  # Required for fakeredis[lua] Lua scripting support
         # rich._unicode_data.unicodeX_Y_Z is imported dynamically based on
         # unicodedata.unidata_version (e.g. unicode17_0_0 on Python 3.13).
