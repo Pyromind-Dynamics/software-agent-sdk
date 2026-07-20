@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from openhands.tools.terminal.sandbox import (
+    APPARMOR_PROFILE_NAME,
     TerminalSandbox,
     terminal_sandbox_enabled,
     terminal_sandbox_mode,
@@ -39,6 +40,9 @@ def test_terminal_sandbox_applies_allowlist(
     monkeypatch.setattr(
         "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
     )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
+    )
     calls: list[tuple[str, tuple[str, ...]]] = []
 
     class FakeLandlock:
@@ -73,6 +77,9 @@ def test_terminal_sandbox_uses_explicit_read_and_write_paths(
 ) -> None:
     monkeypatch.setattr(
         "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
     )
     calls: list[tuple[str, tuple[str, ...]]] = []
 
@@ -199,3 +206,74 @@ def test_sandbox_resolves_relative_subpaths_against_work_dir(
     )
     assert sandbox.read_only_paths == (conv_dir / "events",)
     assert sandbox.read_write_paths == (conv_dir / "public_data",)
+
+
+def test_apparmor_wrap_command_prefixes_aa_exec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
+    )
+    sandbox = TerminalSandbox(str(tmp_path), "required")
+    sandbox.prepare()
+
+    wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
+
+    assert wrapped == [
+        "aa-exec",
+        "-p",
+        APPARMOR_PROFILE_NAME,
+        "--",
+        "/bin/bash",
+        "-i",
+    ]
+    assert sandbox._backend == "apparmor"
+
+
+def test_apparmor_takes_priority_over_bwrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.shutil.which",
+        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+    sandbox = TerminalSandbox(str(tmp_path), "required")
+
+    sandbox.prepare()
+
+    assert sandbox._backend == "apparmor"
+
+
+def test_required_mode_error_mentions_all_backends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
+    )
+    monkeypatch.setattr("openhands.tools.terminal.sandbox.shutil.which", lambda _: None)
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _raise(name, *a, **kw):
+        if name == "py_landlock":
+            raise ImportError("no py-landlock")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _raise)
+
+    sandbox = TerminalSandbox(str(tmp_path), "required")
+    with pytest.raises(RuntimeError, match="AppArmor profile not loaded"):
+        sandbox.prepare()

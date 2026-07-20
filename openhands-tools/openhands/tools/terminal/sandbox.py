@@ -22,6 +22,12 @@ PUBLIC_READ_ROOTS = (
     "/agent-server/.agents/skills",
 )
 
+# Name of the AppArmor profile loaded into the kernel at image build time
+# by `apparmor_parser -r -W /etc/apparmor.d/openhands-agent-terminal`.
+# The profile file ships under openhands/tools/terminal/apparmor/ and is
+# copied into /etc/apparmor.d/ by the Dockerfile.
+APPARMOR_PROFILE_NAME = "openhands-agent-terminal"
+
 
 def terminal_sandbox_mode() -> TerminalSandboxMode:
     """Return the configured terminal sandbox mode.
@@ -45,17 +51,48 @@ def terminal_sandbox_enabled(mode: TerminalSandboxMode) -> bool:
     return mode != "off" and platform.system() in {"Linux", "Darwin"}
 
 
+def _is_apparmor_available() -> bool:
+    """Return whether the AppArmor terminal sandbox backend is usable.
+
+    Requires three conditions, all checkable without privilege:
+      1. ``aa-exec`` is on PATH (ships with ``apparmor-utils``).
+      2. The kernel has the AppArmor LSM active (``/sys/kernel/security/lsm``
+         contains ``apparmor``).
+      3. The ``openhands-agent-terminal`` profile file is installed under
+         ``/etc/apparmor.d/``. The Dockerfile loads it into the kernel at
+         image build time via ``apparmor_parser``; we do not reload at
+         runtime to avoid requiring CAP_MAC_ADMIN on the pod.
+    """
+    if platform.system() != "Linux":
+        return False
+    if shutil.which("aa-exec") is None:
+        return False
+    try:
+        lsm = Path("/sys/kernel/security/lsm").read_text(
+            encoding="utf-8", errors="ignore"
+        )
+    except OSError:
+        return False
+    if "apparmor" not in lsm.split(","):
+        return False
+    profile_path = Path(f"/etc/apparmor.d/{APPARMOR_PROFILE_NAME}")
+    return profile_path.is_file()
+
+
 class TerminalSandbox:
     """Apply a platform-specific kernel policy before starting a shell.
 
     Backend selection (Linux):
-      1. ``bwrap`` (Bubblewrap) — user-namespace-based, no kernel feature required
-      2. ``py_landlock`` — Landlock LSM (Linux 5.13+ kernel support needed)
+      1. ``apparmor`` — LSM-based, no capability/namespace required. Requires
+         ``aa-exec`` and a pre-loaded ``openhands-agent-terminal`` profile
+         (the Dockerfile loads it at image build time via ``apparmor_parser``).
+      2. ``bwrap`` (Bubblewrap) — user-namespace-based, no kernel feature required
+      3. ``py_landlock`` — Landlock LSM (Linux 5.13+ kernel support needed)
 
     macOS always uses ``sandbox-exec`` (Seatbelt).
     """
 
-    _backend: Literal["bwrap", "landlock", "seatbelt"] | None
+    _backend: Literal["apparmor", "bwrap", "landlock", "seatbelt"] | None
 
     def __init__(
         self,
@@ -81,6 +118,7 @@ class TerminalSandbox:
         self._backend = None
         self._landlock_factory: Any | None = None
         self._seatbelt_profile: Path | None = None
+        self._apparmor_available: bool = False
 
     def prepare(self) -> None:
         """Probe available sandbox backends and prepare the chosen one."""
@@ -102,6 +140,15 @@ class TerminalSandbox:
             self._seatbelt_profile.write_text(self._build_seatbelt_profile())
             self._backend = "seatbelt"
             return
+        # Linux: prefer AppArmor (no capability/namespace needed), then
+        # bwrap (requires user-namespace / CAP_SYS_ADMIN), then landlock.
+        if _is_apparmor_available():
+            self._backend = "apparmor"
+            self._apparmor_available = True
+            logger.info(
+                "Using AppArmor terminal sandbox (profile=%s)", APPARMOR_PROFILE_NAME
+            )
+            return
         bwrap_path = shutil.which("bwrap")
         if bwrap_path is not None:
             self._backend = "bwrap"
@@ -113,8 +160,9 @@ class TerminalSandbox:
         except ImportError as exc:
             if self.mode == "required":
                 raise RuntimeError(
-                    "Terminal sandbox is required, but neither bwrap "
-                    "nor py-landlock is available"
+                    "Terminal sandbox is required, but no backend is available "
+                    "(AppArmor profile not loaded, bwrap not on PATH, "
+                    "py-landlock not importable)"
                 ) from exc
             logger.warning("no sandbox backend available")
 
@@ -160,6 +208,14 @@ class TerminalSandbox:
 
     def wrap_command(self, command: list[str]) -> list[str]:
         """Wrap a command with the platform-specific sandbox launcher."""
+        if self._backend == "apparmor":
+            return [
+                "aa-exec",
+                "-p",
+                APPARMOR_PROFILE_NAME,
+                "--",
+                *command,
+            ]
         if self._backend == "bwrap":
             return self._build_bwrap_args() + command
         if self._backend == "seatbelt":
