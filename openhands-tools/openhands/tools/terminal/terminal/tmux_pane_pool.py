@@ -25,6 +25,10 @@ from openhands.tools.terminal.constants import (
     TMUX_SESSION_WIDTH,
     TMUX_SOCKET_NAME,
 )
+from openhands.tools.terminal.terminal.tmux_env import (
+    kill_tmux_server,
+    strip_sensitive_tmux_env,
+)
 from openhands.tools.terminal.terminal.tmux_terminal import TmuxTerminal
 
 
@@ -113,6 +117,11 @@ class TmuxPanePool:
             return
 
         env = sanitized_env()
+        # Kill any stale server on this socket first.  libtmux's
+        # ``Server(environment=...)`` is only applied when a **new** tmux
+        # server is spawned; an existing server keeps its original process
+        # environ (which may contain credentials from an older build).
+        kill_tmux_server(TMUX_SOCKET_NAME)
         self._server = libtmux.Server(socket_name=TMUX_SOCKET_NAME, environment=env)
         session_name = f"openhands-pool-{self.username}-{uuid.uuid4()}"
         self._session = self._server.new_session(
@@ -124,6 +133,11 @@ class TmuxPanePool:
         )
         for k, v in env.items():
             self._session.set_environment(k, v)
+        # Defense-in-depth: explicitly unset sensitive vars from the tmux
+        # server's global environment.  tmux copies the server process
+        # environ to new panes, so any var the server inherited (e.g. from
+        # a stale agent-server) would otherwise leak into the agent's bash.
+        strip_sensitive_tmux_env(self._session)
         self._session.set_option("history-limit", str(HISTORY_LIMIT))
 
         # Keep a reference to the default window so we can kill it once

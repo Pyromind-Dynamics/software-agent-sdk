@@ -16,6 +16,10 @@ from openhands.tools.terminal.constants import (
 from openhands.tools.terminal.metadata import CmdOutputMetadata
 from openhands.tools.terminal.terminal import TerminalInterface
 from openhands.tools.terminal.terminal.interface import parse_ctrl_key
+from openhands.tools.terminal.terminal.tmux_env import (
+    kill_tmux_server,
+    strip_sensitive_tmux_env,
+)
 
 
 logger = get_logger(__name__)
@@ -72,6 +76,11 @@ class TmuxTerminal(TerminalInterface):
         env.setdefault("GIT_PAGER", "cat")
         env.setdefault("PAGER", "cat")
         # Use a dedicated socket to isolate OpenHands sessions from the user's tmux
+        # Kill any stale server on this socket first — see
+        # ``kill_tmux_server`` in tmux_env.py for the rationale:
+        # libtmux's ``Server(environment=...)`` is only applied when a new
+        # tmux server is spawned, not when connecting to an existing one.
+        kill_tmux_server(TMUX_SOCKET_NAME)
         self.server = libtmux.Server(socket_name=TMUX_SOCKET_NAME, environment=env)
         _shell_command = "/bin/bash"
         if self.username in ["root", "openhands"]:
@@ -91,6 +100,10 @@ class TmuxTerminal(TerminalInterface):
         )
         for k, v in env.items():
             self.session.set_environment(k, v)
+        # Defense-in-depth: unset sensitive vars in the tmux server's global
+        # environment so panes don't inherit them from the server process
+        # environ (tmux copies server environ to each new pane).
+        strip_sensitive_tmux_env(self.session)
 
         # Set history limit to a large number to avoid losing history
         # https://unix.stackexchange.com/questions/43414/unlimited-history-in-tmux
