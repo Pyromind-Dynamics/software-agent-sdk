@@ -58,8 +58,8 @@ Clone/Download 已输出本地 `dataset_path`，可直接传给 `DatasetConfigBu
 | 文本监督 | 可识别的 prompt/user 与 response/assistant 字段 | `DatasetConfigBuilderTextNode` |
 | 对话监督 | `messages` 数组；每项有 `role`、`content` | `DatasetConfigBuilderMessageNode` |
 | 多模态 | prompt/messages 中存在 image/video 内容，或独立媒体字段 | `DatasetConfigBuilderVisionNode` |
-| DPO | 同一输入有 chosen 与 rejected 回答 | 对应 Builder 的 `rejected_field` |
-| GRPO | prompt 加 ground truth/可程序化验证信息，且能定义 reward | 对应 Builder + Reward 配置 |
+| 偏好监督 | 同一输入有 chosen 与 rejected 回答 | 对应 Builder 的 `rejected_field` |
+| 可验证信号 | prompt 加 ground truth/可程序化验证信息，且能定义 reward | 对应 Builder + Reward 配置 |
 
 `messages[].content` 可为字符串，也可为显式内容块数组；内容块必须有 `type`，文本使用 `text`，
 图片/视频使用可访问的 `url` 或 `path`。允许 `assistant.tool_calls` 与 `tool` 角色结果。
@@ -67,12 +67,13 @@ Clone/Download 已输出本地 `dataset_path`，可直接传给 `DatasetConfigBu
 字段名不必固定。根据真实样本把 `prompt`、`response`、`messages`、`chosen`、`rejected`、
 `image`、`ground_truth` 等实际列名填入 Builder，禁止仅按常见名字猜测。
 
-## 训练类型推断
+## 监督信号分类
 
-1. 有 chosen/rejected：DPO。
-2. 只有 prompt 且存在客观可复现的答案或 reward：GRPO。
-3. 其他可监督样本：SFT。
-4. 用户的行业背景和业务目标可影响模型、Metric、Reward，但不能覆盖真实数据结构。
+1. 有 chosen/rejected：偏好监督。
+2. 有 prompt/user 与 response/assistant：文本或对话监督，即使答案也能程序验证。
+3. 只有 prompt 加客观可复现的 ground truth 或 reward：可验证信号。
+
+本文件只识别数据形态；训练阶段由主 Skill 结合用户要求、已有阶段和模型 checkpoint 决定。
 
 ## 不合规处理
 

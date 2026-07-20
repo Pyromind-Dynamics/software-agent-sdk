@@ -72,8 +72,12 @@ description: >-
 
 ### 3. 选择阶段
 
-- 默认 SFT；明确有 chosen/rejected 偏好对时选 DPO；只有 prompt 加可程序化验证答案或
-  reward 时选 GRPO。
+- 用户明确指定阶段时遵从；仅修改已有训练工作流时保留原阶段。否则，有 chosen/rejected
+  偏好对时选 DPO；存在 response/assistant 示范目标时选 SFT；仅有 prompt 加 ground truth
+  或 reward 时才考虑 GRPO。
+- 可程序验证只说明 reward 可构造，不能把监督样本改判为 GRPO；未明确阶段且数据同时支持
+  SFT/GRPO 时默认 SFT。自动选择 GRPO 还要求当前模型是 SFT/指令 checkpoint 或上游 SFT
+  产物；缺少该条件时说明冷启动缺口。用户明确要求基模 GRPO 时遵从并提示风险。
 - 完整生成或组合阶段时读取一次 `workflow-contracts.md`，按其中契约落图，不复制整套案例。
 - 用户要求训练时本轮仍生成训练 DSL。用户未说跳过基线时，在最终回复建议用同一数据切分和
   指标先跑基模 Benchmark；这不是生成门禁。
@@ -85,7 +89,7 @@ description: >-
 
 ### 5. 整组配参
 
-需要自动决定或调整训练数值时读取 `parameter-decision.md`，一次性确定 max sequence length、
+阶段锁定后，需要自动决定或调整训练数值时读取 `parameter-decision.md`，一次性确定 max sequence length、
 batch、grad accumulation、learning rate、epoch、LoRA rank、max steps 和 num generations。
 
 参数优先级：**用户明确要求 > 修改任务中已有有效值 > 数据与资源决策 > 模板兜底值**。
@@ -93,7 +97,7 @@ batch、grad accumulation、learning rate、epoch、LoRA rank、max steps 和 nu
 
 ### 6. 准备自定义资产
 
-只有内置 Metric/Reward 不满足业务目标时才读取 `custom-python-assets.md`。必须先在工作区写脚本、
+阶段锁定后，只有内置 Metric/Reward 不满足业务目标时才读取 `custom-python-assets.md`。必须先在工作区写脚本、
 校验接口、调用 `upload_file_to_pyromind` 成功取得 Storage 路径，再把
 `<storage_path>:<function>` 写入 DSL。上传失败就停止，不得伪造路径。
 
