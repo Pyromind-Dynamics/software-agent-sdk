@@ -1,5 +1,4 @@
 import re
-import shlex
 import threading
 import time
 from contextlib import suppress
@@ -59,34 +58,6 @@ _TMUX_RECOVERABLE_ERROR_MARKERS = (
     "could not find pane_id",
 )
 
-_WORKSPACE_DISCOVERY_COMMAND_RE = re.compile(
-    r"(?:^|[;&|()\n])\s*"
-    r"(?:(?:command|builtin|sudo|env)\s+)*"
-    r"(?:[^\s;&|()]+/)?(?:cd|pwd|ls|find|tree|fd)\b",
-    re.IGNORECASE,
-)
-_RG_FILES_COMMAND_RE = re.compile(
-    r"(?:^|[;&|()\n])\s*(?:[^\s;&|()]+/)?(?:rg|ripgrep)\b"
-    r"[^;&|\n]*\s--files(?:\s|$)",
-    re.IGNORECASE,
-)
-_RESTRICTED_TERMINAL_MESSAGE = (
-    "[Pyromind terminal restriction] Workspace discovery commands are disabled. "
-    "The terminal is only for executing an already-known conversation-local "
-    "script. Use the canvas, prior tool results, or file_editor with an exact "
-    "path instead; do not retry with another discovery command."
-)
-
-
-def is_workspace_discovery_command(command: str) -> bool:
-    """Return whether *command* attempts broad workspace/path discovery."""
-    return bool(
-        "/dev/null" in command
-        or _WORKSPACE_DISCOVERY_COMMAND_RE.search(command)
-        or _RG_FILES_COMMAND_RE.search(command)
-    )
-
-
 logger = get_logger(__name__)
 
 # Environment variable names must be alphanumeric + underscores, starting with
@@ -109,8 +80,6 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         sandbox_mode: TerminalSandboxMode | None = None,
         sandbox_read_only_paths: tuple[str, ...] = (),
         sandbox_read_write_paths: tuple[str, ...] | None = None,
-        command_working_subdir: str | None = None,
-        restrict_workspace_discovery: bool = False,
     ):
         """Initialize TerminalExecutor with auto-detected or specified session type.
 
@@ -127,10 +96,6 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
             full_output_save_dir: Path to directory to save full output
                                   logs and files, used when truncation is needed.
             max_panes: Maximum number of concurrent panes in pool mode.
-            command_working_subdir: Optional workspace-relative directory entered
-                                   before every new command.
-            restrict_workspace_discovery: Reject broad path and directory discovery
-                                          commands before they reach the shell.
         """
         self.shell_path = shell_path
         self._working_dir = working_dir
@@ -145,8 +110,6 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         )
         self._sandbox_read_only_paths = sandbox_read_only_paths
         self._sandbox_read_write_paths = sandbox_read_write_paths
-        self._command_working_subdir = command_working_subdir
-        self._restrict_workspace_discovery = restrict_workspace_discovery
         self.full_output_save_dir: str | None = full_output_save_dir
 
         # Pool mode: use TmuxPanePool for parallel execution
@@ -599,38 +562,6 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         if action.reset and action.is_input:
             raise ValueError("Cannot use reset=True with is_input=True")
 
-        original_action = action
-        if not action.is_input and getattr(
-            self, "_restrict_workspace_discovery", False
-        ):
-            if is_workspace_discovery_command(action.command):
-                logger.warning(
-                    "Rejected restricted terminal workspace discovery command: %r",
-                    action.command,
-                )
-                return TerminalObservation.from_text(
-                    text=_RESTRICTED_TERMINAL_MESSAGE,
-                    is_error=True,
-                    command=action.command,
-                    exit_code=None,
-                )
-
-        if (
-            not action.is_input
-            and action.command.strip()
-            and getattr(self, "_command_working_subdir", None) is not None
-        ):
-            command_working_subdir = self._command_working_subdir
-            assert command_working_subdir is not None
-            action = action.model_copy(
-                update={
-                    "command": (
-                        f"cd -- {shlex.quote(command_working_subdir)} && "
-                        f"{action.command}"
-                    )
-                }
-            )
-
         # Short-circuit obvious tool-call malformation: Python/JSON literals
         # passed where the model should have sent a shell command. The shell
         # would otherwise echo a confusing `command not found` and the model
@@ -659,23 +590,9 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 )
 
         if self._pool is not None:
-            observation = self._execute_pooled(action, conversation)
+            return self._execute_pooled(action, conversation)
         else:
-            observation = self._execute_single_session(action, conversation)
-
-        if action is not original_action:
-            metadata = observation.metadata
-            if metadata is not None:
-                metadata = metadata.model_copy(
-                    update={"working_dir": self._command_working_subdir}
-                )
-            observation = observation.model_copy(
-                update={
-                    "command": original_action.command,
-                    "metadata": metadata,
-                }
-            )
-        return observation
+            return self._execute_single_session(action, conversation)
 
     def interrupt(self) -> None:
         """Send Ctrl+C to all active terminal sessions.

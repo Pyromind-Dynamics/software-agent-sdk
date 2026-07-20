@@ -32,6 +32,8 @@ from openhands.agent_server.pub_sub import Subscriber
 from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
     PYROMIND_APP_TAG_VALUE,
+    PYROMIND_LEGACY_RUNTIME_CONTRACT,
+    PYROMIND_RUNTIME_CONTRACT,
     PYROMIND_WORKFLOW_EVENT_KEY,
 )
 from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
@@ -369,9 +371,22 @@ def test_pyromind_runtime_skills_refresh_valid_persisted_skill(tmp_path):
 def test_pyromind_runtime_contract_refreshes_persisted_agent_once():
     agent = Agent(
         llm=LLM(model="gpt-4o", usage_id="pyromind-agent"),
-        tools=[Tool(name="terminal")],
+        tools=[
+            Tool(
+                name="terminal",
+                params={
+                    "command_working_subdir": "public_data",
+                    "restrict_workspace_discovery": True,
+                    "terminal_type": "subprocess",
+                },
+            )
+        ],
         system_prompt_filename="system_prompt_codex.j2",
-        system_prompt_kwargs={"custom_instructions": "old instructions"},
+        system_prompt_kwargs={
+            "custom_instructions": (
+                f"old instructions\n\n{PYROMIND_LEGACY_RUNTIME_CONTRACT.strip()}"
+            )
+        },
     )
 
     updated = _with_pyromind_runtime_contract(agent)
@@ -379,13 +394,14 @@ def test_pyromind_runtime_contract_refreshes_persisted_agent_once():
 
     terminal = next(tool for tool in updated_again.tools if tool.name == "terminal")
     assert terminal.params == {
-        "command_working_subdir": "public_data",
-        "restrict_workspace_discovery": True,
+        "terminal_type": "subprocess",
+        "sandbox_mode": "off",
     }
-    custom_instructions = updated_again.system_prompt_kwargs["custom_instructions"]
-    assert (
-        custom_instructions.count("This agent authors and validates workflow DSL") == 1
+    custom_instructions = cast(
+        str, updated_again.system_prompt_kwargs["custom_instructions"]
     )
+    assert custom_instructions.count(PYROMIND_RUNTIME_CONTRACT.strip()) == 1
+    assert PYROMIND_LEGACY_RUNTIME_CONTRACT.strip() not in custom_instructions
     assert "never use the local terminal as a substitute" in custom_instructions
 
 
@@ -3695,6 +3711,34 @@ def _make_mock_conv() -> MagicMock:
     mock_conv.state = mock_state
     mock_conv._on_event = MagicMock()
     return mock_conv
+
+
+@pytest.mark.asyncio
+async def test_pyromind_restore_creates_missing_public_data(tmp_path: Path) -> None:
+    conversations_dir = tmp_path / "conversations"
+    stored = _make_stored(tmp_path / "placeholder")
+    workspace = conversations_dir / stored.id.hex
+    workspace.mkdir(parents=True)
+    stored = stored.model_copy(
+        update={
+            "workspace": LocalWorkspace(working_dir=str(workspace)),
+            "tags": {PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
+        }
+    )
+    service = EventService(
+        stored=stored,
+        conversations_dir=conversations_dir,
+        lease_ttl_seconds=0,
+    )
+
+    assert not (workspace / "public_data").exists()
+    with patch(
+        "openhands.agent_server.event_service.LocalConversation",
+        return_value=_make_mock_conv(),
+    ):
+        await service.start()
+
+    assert (workspace / "public_data").is_dir()
 
 
 @pytest.mark.asyncio

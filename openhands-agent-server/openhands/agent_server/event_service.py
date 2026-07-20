@@ -31,6 +31,8 @@ from openhands.agent_server.pub_sub import PubSub, Subscriber
 from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
     PYROMIND_APP_TAG_VALUE,
+    PYROMIND_LEGACY_RUNTIME_CONTRACT,
+    PYROMIND_LEGACY_TERMINAL_PARAM_KEYS,
     PYROMIND_RUNTIME_CONTRACT,
     PYROMIND_TERMINAL_PARAMS,
     PYROMIND_WORKFLOW_EVENT_KEY,
@@ -178,7 +180,11 @@ def _with_pyromind_runtime_contract(agent: AgentBase) -> AgentBase:
         tool.model_copy(
             update={
                 "params": {
-                    **tool.params,
+                    **{
+                        key: value
+                        for key, value in tool.params.items()
+                        if key not in PYROMIND_LEGACY_TERMINAL_PARAM_KEYS
+                    },
                     **PYROMIND_TERMINAL_PARAMS,
                 }
             }
@@ -196,6 +202,9 @@ def _with_pyromind_runtime_contract(agent: AgentBase) -> AgentBase:
         if not isinstance(custom_instructions, str):
             custom_instructions = ""
         runtime_contract = PYROMIND_RUNTIME_CONTRACT.strip()
+        custom_instructions = custom_instructions.replace(
+            PYROMIND_LEGACY_RUNTIME_CONTRACT.strip(), runtime_contract
+        ).strip()
         if runtime_contract not in custom_instructions:
             custom_instructions = (
                 f"{custom_instructions.rstrip()}\n\n{runtime_contract}"
@@ -1105,6 +1114,7 @@ class EventService:
         working_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_workspace_is_git_repo(working_dir)
         if self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE:
+            (working_dir / "public_data").mkdir(mode=0o700, exist_ok=True)
             runtime_agent = _with_pyromind_runtime_skills(self.stored.agent)
             runtime_agent = _with_pyromind_runtime_contract(runtime_agent)
             self.stored = self.stored.model_copy(

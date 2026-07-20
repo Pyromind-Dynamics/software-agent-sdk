@@ -3,7 +3,6 @@
 import os
 import platform
 from collections.abc import Sequence
-from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import Field
@@ -33,6 +32,7 @@ from openhands.tools.terminal.descriptions import (
     WINDOWS_TOOL_DESCRIPTION,
 )
 from openhands.tools.terminal.metadata import CmdOutputMetadata
+from openhands.tools.terminal.sandbox import TerminalSandboxMode
 from openhands.tools.utils import (
     CONVERSATION_READ_ONLY_SUBPATHS,
     CONVERSATION_READ_WRITE_SUBPATHS,
@@ -293,8 +293,7 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
         no_change_timeout_seconds: int | None = None,
         terminal_type: Literal["tmux", "subprocess", "powershell"] | None = None,
         shell_path: str | None = None,
-        command_working_subdir: str | None = None,
-        restrict_workspace_discovery: bool = False,
+        sandbox_mode: TerminalSandboxMode | None = None,
         executor: ToolExecutor | None = None,
     ) -> Sequence["TerminalTool"]:
         """Initialize TerminalTool with executor parameters.
@@ -313,10 +312,8 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
             shell_path: Path to the shell binary. On Unix this applies to the
                        subprocess backend; on Windows it can point to a
                        PowerShell executable.
-            command_working_subdir: Optional workspace-relative directory to enter
-                       before each new command.
-            restrict_workspace_discovery: Reject broad workspace/path discovery
-                       commands while keeping exact script execution available.
+            sandbox_mode: Optional filesystem sandbox mode for the terminal
+                       executor. If omitted, the configured default is used.
         """
         # Import here to avoid circular imports
         from openhands.tools.terminal.impl import TerminalExecutor
@@ -324,18 +321,6 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
         working_dir = conv_state.workspace.working_dir
         if not os.path.isdir(working_dir):
             raise ValueError(f"working_dir '{working_dir}' is not a valid directory")
-        if command_working_subdir is not None:
-            workspace_root = Path(working_dir).resolve()
-            command_working_dir = (workspace_root / command_working_subdir).resolve()
-            if not command_working_dir.is_relative_to(workspace_root):
-                raise ValueError(
-                    "command_working_subdir must stay within the workspace"
-                )
-            if not command_working_dir.is_dir():
-                raise ValueError(
-                    f"command_working_subdir '{command_working_subdir}' "
-                    "is not a valid directory"
-                )
 
         if executor is None:
             is_conv_workspace = is_conversation_workspace(working_dir)
@@ -346,14 +331,13 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
                 terminal_type=terminal_type,
                 shell_path=shell_path,
                 full_output_save_dir=conv_state.env_observation_persistence_dir,
+                sandbox_mode=sandbox_mode,
                 sandbox_read_only_paths=(
                     CONVERSATION_READ_ONLY_SUBPATHS if is_conv_workspace else ()
                 ),
                 sandbox_read_write_paths=(
                     CONVERSATION_READ_WRITE_SUBPATHS if is_conv_workspace else None
                 ),
-                command_working_subdir=command_working_subdir,
-                restrict_workspace_discovery=restrict_workspace_discovery,
             )
 
         tool_description = (

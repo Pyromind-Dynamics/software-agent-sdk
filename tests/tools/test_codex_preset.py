@@ -55,17 +55,11 @@ def test_get_codex_agent_threads_terminal_params() -> None:
     agent = get_codex_agent(
         _make_llm(),
         cli_mode=True,
-        terminal_params={
-            "command_working_subdir": "public_data",
-            "restrict_workspace_discovery": True,
-        },
+        terminal_params={"sandbox_mode": "off"},
     )
     terminal = next(tool for tool in agent.tools if tool.name == "terminal")
 
-    assert terminal.params == {
-        "command_working_subdir": "public_data",
-        "restrict_workspace_discovery": True,
-    }
+    assert terminal.params == {"sandbox_mode": "off"}
 
 
 def test_get_codex_agent_threads_prompt_kwargs() -> None:
