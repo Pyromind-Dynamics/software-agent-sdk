@@ -131,6 +131,12 @@ a = Analysis(
         # OpenHands Tools browser recording JS files
         *collect_data_files("openhands.tools.browser_use", includes=["js/*.js"]),
 
+        # Terminal sandbox AppArmor profile (loaded by apparmor_parser at runtime
+        # when the kernel AppArmor LSM is active; no-op otherwise).
+        *collect_data_files(
+            "openhands.tools.terminal", includes=["apparmor/*.profile"]
+        ),
+
         # Built-in subagent definitions consumed by register_builtins_agents()
         # at agent-server startup. Without these, the registry stays empty in
         # PyInstaller builds and downstream clients see an unpopulated
