@@ -15,47 +15,39 @@ from openhands.tools.pyromind_dataset.definition import (
     PreviewDatasetExecutor,
     UploadFileToPyromindAction,
     UploadFileToPyromindExecutor,
-    _with_cleaned_dataset_hint,
+    _match_shared_dataset,
 )
 
 
-def test_preview_description_excludes_cleaned_dataset_identifiers() -> None:
-    assert "Do not" in _PREVIEW_DATASET_DESCRIPTION
-    assert "pyromind/self-cognition" in _PREVIEW_DATASET_DESCRIPTION
-    assert "must not be retried" in _PREVIEW_DATASET_DESCRIPTION
-    assert "uploaded the data" in _PREVIEW_DATASET_DESCRIPTION
-    assert "storage-relative path" in _PREVIEW_DATASET_DESCRIPTION
+def test_preview_description_mentions_shared_and_storage() -> None:
+    assert "shared" in _PREVIEW_DATASET_DESCRIPTION.lower()
+    assert "storage" in _PREVIEW_DATASET_DESCRIPTION.lower()
+    assert "openai/gsm8k" in _PREVIEW_DATASET_DESCRIPTION
+    assert "auto-selects" in _PREVIEW_DATASET_DESCRIPTION
 
 
-def test_preview_404_hints_when_path_is_cleaned_dataset_identifier() -> None:
-    message = _with_cleaned_dataset_hint(
-        "Pyromind storage get_file_metadata API returned HTTP 404",
-        "pyromind/self-cognition",
-    )
-    assert "cleaned dataset identifier" in message
-    assert "do not retry" in message
+def test_match_shared_dataset_exact() -> None:
+    datasets = ["openai/gsm8k", "pyromind/self-cognition"]
+    assert _match_shared_dataset("openai/gsm8k", datasets) == ("openai/gsm8k", "")
+    assert _match_shared_dataset("openai/gsm8k/", datasets) == ("openai/gsm8k", "")
 
 
-def test_preview_rejects_known_dataset_ids_without_storage_request(monkeypatch):
-    def unexpected_post(*args, **kwargs):
-        raise AssertionError("storage API must not be called for dataset IDs")
+def test_match_shared_dataset_with_file_path() -> None:
+    datasets = ["openai/gsm8k", "pyromind/self-cognition"]
+    result = _match_shared_dataset("openai/gsm8k/data/train.jsonl", datasets)
+    assert result == ("openai/gsm8k", "data/train.jsonl")
 
-    monkeypatch.setattr(httpx, "post", unexpected_post)
-    expected_nodes = {
-        "pyromind/self-cognition": "CloneAndCacheDataset",
-        "pyromind/geometry-vqa-vlm-demo": "CloneAndCacheDataset",
-        "pyromind/easyhard-24k": "DownloadAndCacheDataset",
-    }
 
-    for dataset_id, expected_node in expected_nodes.items():
-        observation = PreviewDatasetExecutor()(
-            PreviewDatasetAction(dataset_path=dataset_id)
-        )
+def test_match_shared_dataset_no_match() -> None:
+    datasets = ["openai/gsm8k", "pyromind/self-cognition"]
+    assert _match_shared_dataset("datasets/my_data/train.jsonl", datasets) is None
+    assert _match_shared_dataset("/start-hook.sh", datasets) is None
 
-        assert observation.is_error
-        assert observation.error_code == "NOT_A_STORAGE_PATH"
-        assert observation.suggested_node == expected_node
-        assert "do not retry" in observation.text
+
+def test_match_shared_dataset_longest_prefix() -> None:
+    datasets = ["org/data", "org/data-v2"]
+    result = _match_shared_dataset("org/data-v2/file.jsonl", datasets)
+    assert result == ("org/data-v2", "file.jsonl")
 
 
 class _FakeWorkspace:
@@ -117,6 +109,15 @@ def _fake_conversation(
     )()
 
 
+def _patch_shared_empty(monkeypatch) -> None:
+    """Patch httpx.get so shared dataset lookup returns no match (fallback)."""
+
+    def fake_get(url, *, headers, params=None, timeout):
+        return _Response(200, {"success": True, "data": {"datasets": [], "total": 0}})
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+
 def _secret_registry() -> SecretRegistry:
     secret_registry = SecretRegistry()
     secret_registry.update_secrets(
@@ -133,6 +134,7 @@ def test_preview_dataset_reads_jsonl_samples_with_storage_context(
     monkeypatch,
     tmp_path,
 ):
+    _patch_shared_empty(monkeypatch)
     calls: list[dict[str, Any]] = []
     jsonl = b'{"prompt":"p1","completion":"c1"}\n{"prompt":"p2","completion":"c2"}\n'
 
@@ -214,6 +216,7 @@ def test_preview_dataset_formats_text_file_content(
     monkeypatch,
     tmp_path,
 ):
+    _patch_shared_empty(monkeypatch)
     lines = [f"echo line-{index}" for index in range(1, 19)]
     content = ("\n".join(lines) + "\n").encode()
 
@@ -265,6 +268,7 @@ def test_preview_dataset_defaults_to_ten_sample_rows(
     monkeypatch,
     tmp_path,
 ):
+    _patch_shared_empty(monkeypatch)
     lines = [f"line-{index}" for index in range(1, 19)]
     content = ("\n".join(lines) + "\n").encode()
 
@@ -312,6 +316,7 @@ def test_preview_dataset_large_file_uses_random_ranges(
     monkeypatch,
     tmp_path,
 ):
+    _patch_shared_empty(monkeypatch)
     lines = [f"line-{index:04d} {'x' * 120}" for index in range(1, 500)]
     content = ("\n".join(lines) + "\n").encode()
     ranges: list[tuple[int, int]] = []
@@ -365,6 +370,7 @@ def test_preview_dataset_truncates_large_jsonl_and_reduces_samples(
     monkeypatch,
     tmp_path,
 ):
+    _patch_shared_empty(monkeypatch)
     rows = [f'{{"i":{i}}}\n'.encode() for i in range(3000)]
     content = b"".join(rows)
     assert len(content) > 10 * 1024
@@ -493,6 +499,8 @@ def test_upload_file_to_pyromind_rejects_workspace_escape(monkeypatch, tmp_path)
 
 
 def test_preview_dataset_reports_invalid_json(monkeypatch):
+    _patch_shared_empty(monkeypatch)
+
     def fake_post(url, *, headers, json, timeout):
         return _Response(200, jsonlib.JSONDecodeError("bad json", doc="{", pos=0))
 
@@ -512,6 +520,7 @@ def test_preview_dataset_single_line_jsonl_returns_partial_content(
 ):
     """A single-line JSONL file larger than 20KB should still
     return a truncated preview instead of zero rows."""
+    _patch_shared_empty(monkeypatch)
     big_value = "x" * 25000
     single_line = f'{{"prompt":"hello","value":"{big_value}"}}'
     content = single_line.encode("utf-8")
@@ -568,6 +577,7 @@ def test_preview_dataset_single_line_text_returns_partial_content(
 ):
     """A single-line text file larger than 20KB should still
     return a truncated preview instead of zero rows."""
+    _patch_shared_empty(monkeypatch)
     content = b"a" * 25000
     assert len(content) > 10 * 1024
 
@@ -614,3 +624,401 @@ def test_preview_dataset_single_line_text_returns_partial_content(
     assert observation.previewed_rows > 0
     assert len(observation.sample_rows) > 0
     assert observation.sample_rows[0]["text"].startswith("a")
+
+
+# ---------------------------------------------------------------------------
+# Shared dataset space tests
+# ---------------------------------------------------------------------------
+
+
+def test_shared_preview_with_specific_file(monkeypatch, tmp_path):
+    """Preview a specific file in a shared dataset."""
+    preview_lines = [
+        '{"prompt":"p1","completion":"c1"}',
+        '{"prompt":"p2","completion":"c2"}',
+    ]
+
+    def fake_get(url, *, headers, params=None, timeout):
+        if "/datasets/preview" in url:
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "dataset": "openai/gsm8k",
+                        "file_path": "data/train.jsonl",
+                        "file_name": "train.jsonl",
+                        "file_size": 5000,
+                        "human_size": "4.9KB",
+                        "file_type": "text",
+                        "preview": {
+                            "type": "text",
+                            "lines": preview_lines,
+                            "preview_lines": 2,
+                            "total_lines": 100,
+                        },
+                        "truncated": True,
+                    },
+                },
+            )
+        if url.endswith("/datasets"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {"datasets": ["openai/gsm8k"], "total": 1},
+                },
+            )
+        raise AssertionError(f"unexpected GET URL: {url}")
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="openai/gsm8k/data/train.jsonl", n=5),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.source == "shared"
+    assert observation.preview_truncated is True
+    assert len(observation.sample_rows) == 2
+    assert observation.sample_rows[0]["prompt"] == "p1"
+    assert "Shared dataset preview" in observation.text
+
+
+def test_shared_preview_dataset_only_auto_selects_file(monkeypatch, tmp_path):
+    """When only dataset name is given, auto-select first previewable file."""
+
+    def fake_get(url, *, headers, params=None, timeout):
+        if url.endswith("/datasets"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "datasets": ["pyromind/alpaca-gpt4-llm-demo"],
+                        "total": 1,
+                    },
+                },
+            )
+        if "/datasets/files" in url:
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "dataset": "pyromind/alpaca-gpt4-llm-demo",
+                        "files": [
+                            {
+                                "path": "alpaca_gpt4_demo.jsonl",
+                                "name": "alpaca_gpt4_demo.jsonl",
+                                "size": 1633696,
+                                "human_size": "1.6MB",
+                                "type": "text",
+                            },
+                        ],
+                        "total_files": 1,
+                        "truncated": False,
+                    },
+                },
+            )
+        if "/datasets/preview" in url:
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "dataset": "pyromind/alpaca-gpt4-llm-demo",
+                        "file_path": "alpaca_gpt4_demo.jsonl",
+                        "file_name": "alpaca_gpt4_demo.jsonl",
+                        "file_size": 1633696,
+                        "human_size": "1.6MB",
+                        "file_type": "text",
+                        "preview": {
+                            "type": "text",
+                            "lines": ['{"id":"alpaca-0","text":"hello"}'],
+                            "preview_lines": 1,
+                            "total_lines": 5000,
+                        },
+                        "truncated": True,
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected GET URL: {url}")
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="pyromind/alpaca-gpt4-llm-demo"),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.source == "shared"
+    assert observation.preview_file_path == "alpaca_gpt4_demo.jsonl"
+    assert len(observation.sample_rows) == 1
+
+
+def test_shared_preview_multiple_files_shows_list(monkeypatch, tmp_path):
+    """When dataset has multiple files, observation includes file list."""
+
+    def fake_get(url, *, headers, params=None, timeout):
+        if url.endswith("/datasets"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {"datasets": ["org/multi"], "total": 1},
+                },
+            )
+        if "/datasets/files" in url:
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "dataset": "org/multi",
+                        "files": [
+                            {
+                                "path": "train.jsonl",
+                                "name": "train.jsonl",
+                                "size": 1000,
+                                "human_size": "1000B",
+                                "type": "text",
+                            },
+                            {
+                                "path": "test.jsonl",
+                                "name": "test.jsonl",
+                                "size": 500,
+                                "human_size": "500B",
+                                "type": "text",
+                            },
+                        ],
+                        "total_files": 2,
+                        "truncated": False,
+                    },
+                },
+            )
+        if "/datasets/preview" in url:
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "dataset": "org/multi",
+                        "file_path": "train.jsonl",
+                        "file_name": "train.jsonl",
+                        "file_size": 1000,
+                        "human_size": "1000B",
+                        "file_type": "text",
+                        "preview": {
+                            "type": "text",
+                            "lines": ['{"x":1}'],
+                            "preview_lines": 1,
+                            "total_lines": 10,
+                        },
+                        "truncated": False,
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected GET URL: {url}")
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="org/multi"),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.source == "shared"
+    assert "2 files" in observation.text
+    assert "train.jsonl" in observation.text
+    assert "test.jsonl" in observation.text
+
+
+def test_shared_preview_falls_back_to_storage(monkeypatch, tmp_path):
+    """When shared datasets don't match, falls back to user storage."""
+    content = b'{"a":1}\n{"a":2}\n'
+
+    def fake_get(url, *, headers, params=None, timeout):
+        return _Response(
+            200,
+            {"success": True, "data": {"datasets": ["openai/gsm8k"], "total": 1}},
+        )
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": "my_data.jsonl",
+                        "size": len(content),
+                        "content_type": "application/jsonl",
+                        "is_dir": False,
+                    },
+                },
+            )
+        if url.endswith("/get_url"):
+            return _Response(
+                200,
+                {"success": True, "data": {"url": "https://download.test/f"}},
+            )
+        raise AssertionError(f"unexpected POST URL: {url}")
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        return _StreamResponse(content)
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="datasets/my_data.jsonl"),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.source == "storage"
+    assert observation.num_rows == 2
+
+
+# ---------------------------------------------------------------------------
+# User storage directory resolution tests
+# ---------------------------------------------------------------------------
+
+
+def test_storage_directory_multiple_files_asks_user(monkeypatch, tmp_path):
+    """A storage folder with multiple files returns the file list, no preview."""
+    _patch_shared_empty(monkeypatch)
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "list": [
+                            {
+                                "name": "clean_script.py",
+                                "path": "agentTest/clean_script.py",
+                                "type": "File",
+                                "size": 6854,
+                                "last_modified": "2026-07-20 03:55:34",
+                            },
+                            {
+                                "name": "test_data.jsonl",
+                                "path": "agentTest/test_data.jsonl",
+                                "type": "File",
+                                "size": 4270,
+                                "last_modified": "2026-07-20 03:55:34",
+                            },
+                        ]
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected POST URL: {url}")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="agentTest/", n=5),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.source == "storage"
+    assert observation.is_dir is True
+    assert observation.num_rows is None
+    assert observation.sample_rows == []
+    assert "2 files" in observation.text
+    assert "Ask the user which file to preview" in observation.text
+    assert "agentTest/clean_script.py" in observation.text
+    assert "agentTest/test_data.jsonl" in observation.text
+    assert "6.7KB" in observation.text
+    assert observation.files == [
+        "agentTest/clean_script.py",
+        "agentTest/test_data.jsonl",
+    ]
+
+
+def test_storage_directory_single_file_auto_previews(monkeypatch, tmp_path):
+    """A storage folder with exactly one file previews it directly."""
+    _patch_shared_empty(monkeypatch)
+    content = b'{"a":1}\n{"a":2}\n'
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "list": [
+                            {
+                                "name": "only.jsonl",
+                                "path": "solo/only.jsonl",
+                                "type": "File",
+                                "size": len(content),
+                                "last_modified": "2026-07-20 03:55:34",
+                            },
+                        ]
+                    },
+                },
+            )
+        if url.endswith("/get_file_metadata"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": "solo/only.jsonl",
+                        "size": len(content),
+                        "content_type": "application/jsonl",
+                        "is_dir": False,
+                    },
+                },
+            )
+        if url.endswith("/get_url"):
+            return _Response(
+                200,
+                {"success": True, "data": {"url": "https://download.test/f"}},
+            )
+        raise AssertionError(f"unexpected POST URL: {url}")
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        return _StreamResponse(content)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="solo/", n=5),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.source == "storage"
+    assert observation.preview_file_path == "solo/only.jsonl"
+    assert observation.num_rows == 2
