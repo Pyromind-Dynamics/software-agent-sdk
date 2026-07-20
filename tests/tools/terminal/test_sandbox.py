@@ -277,3 +277,84 @@ def test_required_mode_error_mentions_all_backends(
     sandbox = TerminalSandbox(str(tmp_path), "required")
     with pytest.raises(RuntimeError, match="AppArmor profile not loaded"):
         sandbox.prepare()
+
+
+def test_conversation_policy_prefers_landlock_over_apparmor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a conversation-scoped policy is in effect, Landlock (which can
+    express per-conversation allowlists) wins over AppArmor (global denylist).
+    AppArmor is still stacked via ``wrap_command`` as defense-in-depth.
+    """
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
+    )
+
+    class FakeLandlock:
+        def __init__(self, *, strict: bool):
+            pass
+
+        def __getattr__(self, name: str):
+            return lambda *a, **kw: self
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "py_landlock",
+        SimpleNamespace(Landlock=FakeLandlock),
+    )
+
+    events_dir = tmp_path / "events"
+    events_dir.mkdir()
+    sandbox = TerminalSandbox(
+        str(tmp_path),
+        "required",
+        read_only_paths=(str(events_dir),),
+    )
+    sandbox.prepare()
+
+    assert sandbox._backend == "landlock"
+    # AppArmor stacked on top for defense-in-depth
+    wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
+    assert wrapped[:3] == ["aa-exec", "-p", APPARMOR_PROFILE_NAME]
+    assert wrapped[-2:] == ["--", "/bin/bash", "-i"][-2:]
+
+
+def test_conversation_policy_falls_back_to_apparmor_when_no_landlock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When Landlock is unavailable, AppArmor takes over even for conversation-
+    scoped policies — it's a coarser global denylist but still better than no
+    enforcement.
+    """
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
+    )
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _raise(name, *a, **kw):
+        if name == "py_landlock":
+            raise ImportError("no py-landlock")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _raise)
+
+    events_dir = tmp_path / "events"
+    events_dir.mkdir()
+    sandbox = TerminalSandbox(
+        str(tmp_path),
+        "required",
+        read_only_paths=(str(events_dir),),
+    )
+    sandbox.prepare()
+
+    assert sandbox._backend == "apparmor"
+    wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
+    assert wrapped[:3] == ["aa-exec", "-p", APPARMOR_PROFILE_NAME]
