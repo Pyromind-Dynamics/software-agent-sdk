@@ -97,7 +97,8 @@ RUN set -eux; \
         apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
             bash ca-certificates curl wget sudo apt-utils git jq tmux tar \
             build-essential coreutils util-linux procps findutils grep sed \
-            tini apt-transport-https gnupg lsb-release xz-utils; \
+            tini apt-transport-https gnupg lsb-release xz-utils \
+            apparmor apparmor-utils; \
         rm -rf /var/lib/apt/lists/*; \
     elif command -v apk >/dev/null 2>&1; then \
         apk add --no-cache \
@@ -135,6 +136,30 @@ RUN set -eux; \
         useradd -m -u "${UID}" -g "${GID}" -s /bin/bash "${USERNAME}"; \
     usermod -aG sudo "${USERNAME}" 2>/dev/null || true; \
     echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers;
+
+
+# Pre-load the terminal AppArmor profile so `aa-exec -p openhands-agent-terminal`
+# works at runtime without CAP_MAC_ADMIN. Best-effort: if the host kernel does
+# not have the AppArmor LSM active (e.g. some container runtimes), the parser
+# exits non-zero but we do not fail the whole image build.
+COPY --from=builder /agent-server/openhands-tools/openhands/tools/terminal/apparmor/openhands-agent-terminal.profile \
+    /etc/apparmor.d/openhands-agent-terminal
+RUN if command -v apparmor_parser >/dev/null 2>&1; then \
+        apparmor_parser -r -W /etc/apparmor.d/openhands-agent-terminal \
+            || echo "Warning: apparmor_parser failed; AppArmor LSM likely inactive on build host. Runtime aa-exec will be a no-op." >&2; \
+    else \
+        echo "Warning: apparmor_parser not installed; skipping profile load" >&2; \
+    fi
+
+# Pre-install ACP servers for ACPAgent support (Claude Code, Codex, Gemini CLI)
+# Install Node.js 22 to a dedicated prefix so ACP packages get a modern runtime
+# WITHOUT overwriting the repo-specific Node.js that test suites depend on.
+# SWE-bench images ship NVM/apt-managed Node 8-14 which cannot run ACP packages.
+#
+# This step is best-effort: SWE-Bench Pro base images come from many distros
+# and some have an old glibc (or use musl) that cannot run the upstream Node
+# 22 glibc tarball. When that happens we leave $ACP_NODE_DIR empty and skip
+# ACP setup so the rest of the build (and non-ACP agents) still work.
 
 ENV ACP_NODE_DIR=/opt/acp-node
 RUN set -ux; \
