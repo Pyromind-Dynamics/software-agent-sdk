@@ -26,6 +26,8 @@ spec:
     serviceName: software-agent-sdk
     template:
         metadata:
+            annotations:
+                container.apparmor.security.beta.kubernetes.io/main: unconfined
             labels:
                 app: software-agent-sdk
                 enable-sts-monitor: 'true'
@@ -88,8 +90,8 @@ spec:
                         name: workspace
             securityContext:
                 fsGroup: 10001
-                runAsUser: 10001
-                runAsGroup: 10001
+                runAsUser: 0
+                runAsGroup: 0
             dnsPolicy: ClusterFirst
             imagePullSecrets:
                 - name: niqi-dev-secret

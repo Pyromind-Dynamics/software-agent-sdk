@@ -119,23 +119,13 @@ def _is_bwrap_usable() -> bool:
     bwrap_path = shutil.which("bwrap")
     if bwrap_path is None:
         return False
-    cmd = [bwrap_path]
+    cmd = [bwrap_path, "--unshare-ipc", "--unshare-uts"]
     if os.geteuid() != 0:
         cmd.append("--unshare-user-try")
-    cmd.extend(
-        [
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-            "--tmpfs",
-            "/tmp",
-            "/usr/bin/env",
-        ]
-    )
+    for path in ("/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"):
+        if Path(path).exists():
+            cmd.extend(["--ro-bind", path, path])
+    cmd.extend(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "/usr/bin/env"])
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=5)
     except (subprocess.TimeoutExpired, OSError):
