@@ -163,10 +163,6 @@ class SubprocessTerminal(TerminalInterface):
 
         logger.debug("Initializing PTY terminal with: %s", " ".join(bash_cmd))
 
-        def setup_child() -> None:
-            os.setsid()
-            self.sandbox.apply()
-
         try:
             self.process = subprocess.Popen(
                 bash_cmd,
@@ -177,7 +173,7 @@ class SubprocessTerminal(TerminalInterface):
                 env=env,
                 text=False,  # bytes I/O
                 bufsize=0,
-                preexec_fn=setup_child,
+                start_new_session=True,
                 close_fds=True,
             )
         finally:

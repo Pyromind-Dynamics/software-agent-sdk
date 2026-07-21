@@ -1,3 +1,5 @@
+import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -6,9 +8,17 @@ import pytest
 from openhands.tools.terminal.sandbox import (
     APPARMOR_PROFILE_NAME,
     TerminalSandbox,
+    _is_bwrap_usable,
     terminal_sandbox_enabled,
     terminal_sandbox_mode,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_bwrap_cache():
+    _is_bwrap_usable.cache_clear()
+    yield
+    _is_bwrap_usable.cache_clear()
 
 
 def _option_index(args: list[str], option: str, value: str) -> int:
@@ -50,18 +60,13 @@ def test_terminal_sandbox_applies_allowlist(
     monkeypatch.setattr(
         "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
     )
-    calls: list[tuple[str, tuple[str, ...]]] = []
 
     class FakeLandlock:
         def __init__(self, *, strict: bool):
             assert strict
 
         def __getattr__(self, name: str):
-            def record(*paths: str):
-                calls.append((name, paths))
-                return self
-
-            return record
+            return lambda *paths: self
 
     monkeypatch.setitem(
         __import__("sys").modules,
@@ -71,12 +76,20 @@ def test_terminal_sandbox_applies_allowlist(
     sandbox = TerminalSandbox(str(tmp_path), "required")
     sandbox.prepare()
 
-    sandbox.apply()
-
-    assert any(
-        name == "allow_read_write" and str(tmp_path) in paths for name, paths in calls
+    assert sandbox._landlock_wrapper is not None
+    wrapper = sandbox._landlock_wrapper.read_text()
+    assert wrapper.startswith("#!/usr/bin/env python3\n")
+    assert "from py_landlock import Landlock" in wrapper
+    assert "os.execv(parent_python" in wrapper
+    assert (
+        str(tmp_path / ".openhands-tmp" / ".openhands-landlock-policy.json") in wrapper
     )
-    assert any(name == "allow_execute" for name, _ in calls)
+
+    policy = json.loads(
+        (tmp_path / ".openhands-tmp" / ".openhands-landlock-policy.json").read_text()
+    )
+    assert str(tmp_path) in policy["read_write_paths"]
+    assert any(p in {"/usr", "/bin", "/sbin"} for p in policy["executable_paths"])
 
 
 def test_terminal_sandbox_uses_explicit_read_and_write_paths(
@@ -88,18 +101,13 @@ def test_terminal_sandbox_uses_explicit_read_and_write_paths(
     monkeypatch.setattr(
         "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
     )
-    calls: list[tuple[str, tuple[str, ...]]] = []
 
     class FakeLandlock:
         def __init__(self, *, strict: bool):
             assert strict
 
         def __getattr__(self, name: str):
-            def record(*paths: str):
-                calls.append((name, paths))
-                return self
-
-            return record
+            return lambda *paths: self
 
     monkeypatch.setitem(
         __import__("sys").modules,
@@ -117,12 +125,14 @@ def test_terminal_sandbox_uses_explicit_read_and_write_paths(
         read_write_paths=(str(workflow_dir),),
     )
     sandbox.prepare()
-    sandbox.apply()
 
-    read_write_calls = [paths for name, paths in calls if name == "allow_read_write"]
-    read_calls = [paths for name, paths in calls if name == "allow_read"]
-    assert any(str(workflow_dir) in paths for paths in read_write_calls)
-    assert any(str(events_dir) in paths for paths in read_calls)
+    policy = json.loads(
+        (
+            workflow_dir / ".openhands-tmp" / ".openhands-landlock-policy.json"
+        ).read_text()
+    )
+    assert str(workflow_dir) in policy["read_write_paths"]
+    assert str(events_dir) in policy["read_only_paths"]
 
 
 def test_terminal_sandbox_off_does_not_enable_on_linux(
@@ -250,8 +260,7 @@ def test_apparmor_takes_priority_over_bwrap(
         "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
     )
     monkeypatch.setattr(
-        "openhands.tools.terminal.sandbox.shutil.which",
-        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+        "openhands.tools.terminal.sandbox._is_bwrap_usable", lambda: True
     )
     sandbox = TerminalSandbox(str(tmp_path), "required")
 
@@ -286,18 +295,17 @@ def test_required_mode_error_mentions_all_backends(
         sandbox.prepare()
 
 
-def test_conversation_policy_prefers_landlock_over_apparmor(
+def test_conversation_policy_prefers_bwrap_over_landlock_and_apparmor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When a conversation-scoped policy is in effect, Landlock (which can
-    express per-conversation allowlists) wins over AppArmor (global denylist).
-    AppArmor is still stacked via ``wrap_command`` as defense-in-depth.
-    """
     monkeypatch.setattr(
         "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
     )
     monkeypatch.setattr(
         "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_bwrap_usable", lambda: True
     )
 
     class FakeLandlock:
@@ -312,46 +320,6 @@ def test_conversation_policy_prefers_landlock_over_apparmor(
         "py_landlock",
         SimpleNamespace(Landlock=FakeLandlock),
     )
-
-    events_dir = tmp_path / "events"
-    events_dir.mkdir()
-    sandbox = TerminalSandbox(
-        str(tmp_path),
-        "required",
-        read_only_paths=(str(events_dir),),
-    )
-    sandbox.prepare()
-
-    assert sandbox._backend == "landlock"
-    # AppArmor stacked on top for defense-in-depth
-    wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
-    assert wrapped[:3] == ["aa-exec", "-p", APPARMOR_PROFILE_NAME]
-    assert wrapped[-2:] == ["--", "/bin/bash", "-i"][-2:]
-
-
-def test_conversation_policy_prefers_bwrap_over_apparmor_when_no_landlock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(
-        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
-    )
-    monkeypatch.setattr(
-        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
-    )
-    monkeypatch.setattr(
-        "openhands.tools.terminal.sandbox.shutil.which",
-        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
-    )
-    import builtins
-
-    real_import = builtins.__import__
-
-    def _raise(name, *a, **kw):
-        if name == "py_landlock":
-            raise ImportError("no py-landlock")
-        return real_import(name, *a, **kw)
-
-    monkeypatch.setattr(builtins, "__import__", _raise)
 
     events_dir = tmp_path / "events"
     public_data_dir = tmp_path / "public_data"
@@ -371,6 +339,50 @@ def test_conversation_policy_prefers_bwrap_over_apparmor_when_no_landlock(
     assert _option_index(wrapped, "--bind", str(public_data_dir)) < _option_index(
         wrapped, "--ro-bind", str(events_dir)
     )
+
+
+def test_conversation_policy_uses_landlock_when_bwrap_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
+    )
+    monkeypatch.setattr("openhands.tools.terminal.sandbox.shutil.which", lambda _: None)
+
+    class FakeLandlock:
+        def __init__(self, *, strict: bool):
+            pass
+
+        def __getattr__(self, name: str):
+            return lambda *a, **kw: self
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "py_landlock",
+        SimpleNamespace(Landlock=FakeLandlock),
+    )
+
+    events_dir = tmp_path / "events"
+    public_data_dir = tmp_path / "public_data"
+    events_dir.mkdir()
+    public_data_dir.mkdir()
+    sandbox = TerminalSandbox(
+        str(tmp_path),
+        "required",
+        read_only_paths=(str(events_dir),),
+        read_write_paths=(str(public_data_dir),),
+    )
+    sandbox.prepare()
+
+    assert sandbox._backend == "landlock"
+    wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
+    assert wrapped[0] == str(sandbox._landlock_wrapper)
+    assert wrapped[1] == sys.executable
+    assert wrapped[2:5] == ["aa-exec", "-p", APPARMOR_PROFILE_NAME]
+    assert wrapped[-2:] == ["/bin/bash", "-i"]
 
 
 def test_conversation_policy_falls_back_to_apparmor_when_no_landlock_or_bwrap(
@@ -406,3 +418,94 @@ def test_conversation_policy_falls_back_to_apparmor_when_no_landlock_or_bwrap(
     assert sandbox._backend == "apparmor"
     wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
     assert wrapped[:3] == ["aa-exec", "-p", APPARMOR_PROFILE_NAME]
+
+
+def test_landlock_skipped_in_pyinstaller_frozen_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
+    )
+    monkeypatch.setattr("openhands.tools.terminal.sandbox.shutil.which", lambda _: None)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+    class FakeLandlock:
+        def __init__(self, *, strict: bool):
+            pass
+
+        def __getattr__(self, name: str):
+            return lambda *a, **kw: self
+
+    monkeypatch.setitem(
+        sys.modules,
+        "py_landlock",
+        SimpleNamespace(Landlock=FakeLandlock),
+    )
+
+    required_sandbox = TerminalSandbox(str(tmp_path), "required")
+    with pytest.raises(RuntimeError, match="PyInstaller frozen mode"):
+        required_sandbox.prepare()
+    assert required_sandbox._backend is None
+    assert required_sandbox._landlock_wrapper is None
+
+    auto_sandbox = TerminalSandbox(str(tmp_path), "auto")
+    auto_sandbox.prepare()
+    assert auto_sandbox._backend is None
+    assert auto_sandbox._landlock_wrapper is None
+
+
+def test_landlock_skipped_in_pyinstaller_frozen_mode_falls_back_to_apparmor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
+    )
+    monkeypatch.setattr("openhands.tools.terminal.sandbox.shutil.which", lambda _: None)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+    class FakeLandlock:
+        def __init__(self, *, strict: bool):
+            pass
+
+        def __getattr__(self, name: str):
+            return lambda *a, **kw: self
+
+    monkeypatch.setitem(
+        sys.modules,
+        "py_landlock",
+        SimpleNamespace(Landlock=FakeLandlock),
+    )
+
+    sandbox = TerminalSandbox(str(tmp_path), "required")
+    sandbox.prepare()
+    assert sandbox._backend == "apparmor"
+    assert sandbox._landlock_wrapper is None
+
+
+def test_bwrap_smoke_test_failure_falls_back_to_apparmor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.shutil.which",
+        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_bwrap_usable", lambda: False
+    )
+
+    sandbox = TerminalSandbox(str(tmp_path), "required")
+    sandbox.prepare()
+
+    assert sandbox._backend == "apparmor"

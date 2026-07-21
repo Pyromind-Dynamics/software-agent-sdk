@@ -4,9 +4,7 @@ PYROMIND_APP_TAG_KEY = "app"
 PYROMIND_APP_TAG_VALUE = "pyromind"
 PYROMIND_WORKFLOW_EVENT_KEY = "pyromind_workflow"
 
-PYROMIND_TERMINAL_PARAMS: dict[str, object] = {
-    "sandbox_mode": "off",
-}
+PYROMIND_TERMINAL_PARAMS: dict[str, object] = {}
 
 PYROMIND_LEGACY_TERMINAL_PARAM_KEYS = frozenset(
     {"command_working_subdir", "restrict_workspace_discovery"}
