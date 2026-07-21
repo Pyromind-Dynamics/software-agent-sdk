@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -50,18 +51,13 @@ def test_terminal_sandbox_applies_allowlist(
     monkeypatch.setattr(
         "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
     )
-    calls: list[tuple[str, tuple[str, ...]]] = []
 
     class FakeLandlock:
         def __init__(self, *, strict: bool):
             assert strict
 
         def __getattr__(self, name: str):
-            def record(*paths: str):
-                calls.append((name, paths))
-                return self
-
-            return record
+            return lambda *paths: self
 
     monkeypatch.setitem(
         __import__("sys").modules,
@@ -71,12 +67,18 @@ def test_terminal_sandbox_applies_allowlist(
     sandbox = TerminalSandbox(str(tmp_path), "required")
     sandbox.prepare()
 
-    sandbox.apply()
-
-    assert any(
-        name == "allow_read_write" and str(tmp_path) in paths for name, paths in calls
+    assert sandbox._landlock_wrapper is not None
+    wrapper = sandbox._landlock_wrapper.read_text()
+    assert "from py_landlock import Landlock" in wrapper
+    assert (
+        str(tmp_path / ".openhands-tmp" / ".openhands-landlock-policy.json") in wrapper
     )
-    assert any(name == "allow_execute" for name, _ in calls)
+
+    policy = json.loads(
+        (tmp_path / ".openhands-tmp" / ".openhands-landlock-policy.json").read_text()
+    )
+    assert str(tmp_path) in policy["read_write_paths"]
+    assert any(p in {"/usr", "/bin", "/sbin"} for p in policy["executable_paths"])
 
 
 def test_terminal_sandbox_uses_explicit_read_and_write_paths(
@@ -88,18 +90,13 @@ def test_terminal_sandbox_uses_explicit_read_and_write_paths(
     monkeypatch.setattr(
         "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
     )
-    calls: list[tuple[str, tuple[str, ...]]] = []
 
     class FakeLandlock:
         def __init__(self, *, strict: bool):
             assert strict
 
         def __getattr__(self, name: str):
-            def record(*paths: str):
-                calls.append((name, paths))
-                return self
-
-            return record
+            return lambda *paths: self
 
     monkeypatch.setitem(
         __import__("sys").modules,
@@ -117,12 +114,14 @@ def test_terminal_sandbox_uses_explicit_read_and_write_paths(
         read_write_paths=(str(workflow_dir),),
     )
     sandbox.prepare()
-    sandbox.apply()
 
-    read_write_calls = [paths for name, paths in calls if name == "allow_read_write"]
-    read_calls = [paths for name, paths in calls if name == "allow_read"]
-    assert any(str(workflow_dir) in paths for paths in read_write_calls)
-    assert any(str(events_dir) in paths for paths in read_calls)
+    policy = json.loads(
+        (
+            workflow_dir / ".openhands-tmp" / ".openhands-landlock-policy.json"
+        ).read_text()
+    )
+    assert str(workflow_dir) in policy["read_write_paths"]
+    assert str(events_dir) in policy["read_only_paths"]
 
 
 def test_terminal_sandbox_off_does_not_enable_on_linux(
@@ -371,8 +370,9 @@ def test_conversation_policy_uses_landlock_when_bwrap_is_unavailable(
 
     assert sandbox._backend == "landlock"
     wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
-    assert wrapped[:3] == ["aa-exec", "-p", APPARMOR_PROFILE_NAME]
-    assert wrapped[-2:] == ["--", "/bin/bash", "-i"][-2:]
+    assert wrapped[0] == str(sandbox._landlock_wrapper)
+    assert wrapped[1:4] == ["aa-exec", "-p", APPARMOR_PROFILE_NAME]
+    assert wrapped[-2:] == ["/bin/bash", "-i"]
 
 
 def test_conversation_policy_falls_back_to_apparmor_when_no_landlock_or_bwrap(
