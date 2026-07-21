@@ -119,25 +119,25 @@ def _is_bwrap_usable() -> bool:
     bwrap_path = shutil.which("bwrap")
     if bwrap_path is None:
         return False
+    cmd = [bwrap_path]
+    if os.geteuid() != 0:
+        cmd.append("--unshare-user-try")
+    cmd.extend(
+        [
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "/usr/bin/env",
+        ]
+    )
     try:
-        result = subprocess.run(
-            [
-                bwrap_path,
-                "--unshare-user-try",
-                "--ro-bind",
-                "/usr",
-                "/usr",
-                "--dev",
-                "/dev",
-                "--proc",
-                "/proc",
-                "--tmpfs",
-                "/tmp",
-                "/usr/bin/env",
-            ],
-            capture_output=True,
-            timeout=5,
-        )
+        result = subprocess.run(cmd, capture_output=True, timeout=5)
     except (subprocess.TimeoutExpired, OSError):
         return False
     if result.returncode != 0:
@@ -419,7 +419,9 @@ class TerminalSandbox:
             policy.unlink(missing_ok=True)
 
     def _build_bwrap_args(self) -> list[str]:
-        args = ["bwrap", "--unshare-ipc", "--unshare-uts", "--unshare-user-try"]
+        args = ["bwrap", "--unshare-ipc", "--unshare-uts"]
+        if os.geteuid() != 0:
+            args.append("--unshare-user-try")
         for path in ("/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"):
             if Path(path).exists():
                 args.extend(["--ro-bind", path, path])
