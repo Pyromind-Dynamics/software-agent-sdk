@@ -82,6 +82,27 @@ def _is_apparmor_available() -> bool:
     return profile_path.is_file()
 
 
+def _is_landlock_available() -> bool:
+    """Return whether the Landlock terminal sandbox backend is usable.
+
+    Landlock is applied via a small Python wrapper script that re-execs a
+    Python interpreter (``sys.executable``) so ``py_landlock`` can apply the
+    LSM policy before ``exec``-ing the shell. In PyInstaller mode
+    (``sys.frozen=True``), ``sys.executable`` points at the frozen binary
+    (e.g. ``/usr/local/bin/openhands-agent-server``) rather than a Python
+    interpreter, so the wrapper's ``os.execv`` would feed CLI args the
+    frozen binary cannot parse. Skip landlock in that case and let the
+    caller fall back to AppArmor or bwrap, which are external binaries.
+    """
+    if getattr(sys, "frozen", False):
+        return False
+    try:
+        import_module("py_landlock")
+        return True
+    except ImportError:
+        return False
+
+
 class TerminalSandbox:
     """Apply a platform-specific kernel policy before starting a shell.
 
@@ -170,8 +191,7 @@ class TerminalSandbox:
                 logger.info("Using bwrap terminal sandbox for per-conversation policy")
 
             if not backend_chosen:
-                try:
-                    import_module("py_landlock")
+                if _is_landlock_available():
                     self._backend = "landlock"
                     backend_chosen = True
                     logger.info(
@@ -180,10 +200,11 @@ class TerminalSandbox:
                         if self._apparmor_available
                         else "",
                     )
-                except ImportError:
+                else:
                     logger.warning(
                         "Per-conversation policy requested but bwrap is unavailable "
-                        "and py-landlock is not importable; falling back to AppArmor"
+                        "and Landlock is unavailable (py-landlock not importable or "
+                        "PyInstaller frozen mode); falling back to AppArmor"
                     )
                 if not backend_chosen and self._apparmor_available:
                     self._backend = "apparmor"
@@ -211,17 +232,17 @@ class TerminalSandbox:
                 backend_chosen = True
 
         if not backend_chosen:
-            try:
-                import_module("py_landlock")
+            if _is_landlock_available():
                 self._backend = "landlock"
                 backend_chosen = True
-            except ImportError as exc:
-                if self.mode == "required":
-                    raise RuntimeError(
-                        "Terminal sandbox is required, but no backend is available "
-                        "(AppArmor profile not loaded, bwrap not on PATH, "
-                        "py-landlock not importable)"
-                    ) from exc
+            elif self.mode == "required":
+                raise RuntimeError(
+                    "Terminal sandbox is required, but no backend is available "
+                    "(AppArmor profile not loaded, bwrap not on PATH, "
+                    "py-landlock not importable, or PyInstaller frozen mode "
+                    "disables landlock)"
+                )
+            else:
                 logger.warning("no sandbox backend available")
 
         if self._backend == "landlock":
