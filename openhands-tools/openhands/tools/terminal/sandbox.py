@@ -144,7 +144,7 @@ class TerminalSandbox:
         #
         # When the caller passed conversation-scoped ``read_only_paths`` or
         # ``read_write_paths``, the sandbox is meant to enforce a per-conversation
-        # PathAccessPolicy. Landlock and bwrap can express that by allowing
+        # PathAccessPolicy. bwrap and Landlock can express that by allowing
         # ``events/`` read-only and ``public_data/`` read-write. AppArmor uses a
         # single global denylist loaded at image build time, so use it only as a
         # fallback when neither per-conversation backend is available.
@@ -156,28 +156,35 @@ class TerminalSandbox:
         )
         backend_chosen = False
 
-        # Conversation-scoped policy → prefer Landlock (per-conversation
-        # semantics) over AppArmor (global denylist).  Stack AppArmor on top
-        # when both are available for defense-in-depth.
+        # Conversation-scoped policy needs per-workspace mount semantics. Prefer
+        # bwrap because it fails before exec with visible stderr, while Landlock
+        # applies from preexec_fn and reports failures as a generic subprocess
+        # error to the parent process.
         if has_conversation_policy:
             self._apparmor_available = _is_apparmor_available()
-            try:
-                landlock_module = import_module("py_landlock")
-                self._landlock_factory = landlock_module.Landlock
-                self._backend = "landlock"
+            if shutil.which("bwrap") is not None:
+                self._backend = "bwrap"
                 backend_chosen = True
-                logger.info(
-                    "Using Landlock terminal sandbox for per-conversation policy%s",
-                    " (+ AppArmor as defense-in-depth)"
-                    if self._apparmor_available
-                    else "",
-                )
-            except ImportError:
-                logger.warning(
-                    "Per-conversation policy requested but py-landlock is not "
-                    "importable; falling back to bwrap / AppArmor"
-                )
-                if shutil.which("bwrap") is None and self._apparmor_available:
+                logger.info("Using bwrap terminal sandbox for per-conversation policy")
+
+            if not backend_chosen:
+                try:
+                    landlock_module = import_module("py_landlock")
+                    self._landlock_factory = landlock_module.Landlock
+                    self._backend = "landlock"
+                    backend_chosen = True
+                    logger.info(
+                        "Using Landlock terminal sandbox for per-conversation policy%s",
+                        " (+ AppArmor as defense-in-depth)"
+                        if self._apparmor_available
+                        else "",
+                    )
+                except ImportError:
+                    logger.warning(
+                        "Per-conversation policy requested but bwrap is unavailable "
+                        "and py-landlock is not importable; falling back to AppArmor"
+                    )
+                if not backend_chosen and self._apparmor_available:
                     self._backend = "apparmor"
                     backend_chosen = True
                     logger.info(
