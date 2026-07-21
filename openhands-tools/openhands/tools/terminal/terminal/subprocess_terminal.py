@@ -163,9 +163,12 @@ class SubprocessTerminal(TerminalInterface):
 
         logger.debug("Initializing PTY terminal with: %s", " ".join(bash_cmd))
 
+        _needs_landlock = self.sandbox._backend == "landlock"
+
         def setup_child() -> None:
             os.setsid()
-            self.sandbox.apply()
+            if _needs_landlock:
+                self.sandbox.apply()
 
         try:
             self.process = subprocess.Popen(
