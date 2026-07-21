@@ -255,8 +255,14 @@ class TerminalSandbox:
 
         wrapper = self._tmp_dir / ".openhands-landlock-wrapper"
         wrapper.write_text(
-            f"#!{sys.executable}\n"
-            "import json, os, sys\n"
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            "\n"
+            "parent_python = sys.argv[1]\n"
+            "if os.path.realpath(sys.executable) != os.path.realpath(parent_python):\n"
+            "    os.execv(parent_python, [parent_python, __file__, *sys.argv[1:]])\n"
+            "\n"
+            "import json\n"
             "from py_landlock import Landlock\n"
             f"policy = json.load(open({str(policy_path)!r}))\n"
             "try:\n"
@@ -281,7 +287,7 @@ class TerminalSandbox:
             "            file=sys.stderr,\n"
             "        )\n"
             "        sys.exit(1)\n"
-            "os.execvp(sys.argv[1], sys.argv[1:])\n"
+            "os.execvp(sys.argv[2], sys.argv[2:])\n"
         )
         wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
         self._landlock_wrapper = wrapper
@@ -296,16 +302,18 @@ class TerminalSandbox:
         if self._backend == "landlock":
             assert self._landlock_wrapper is not None
             wrapper = str(self._landlock_wrapper)
+            parent_python = sys.executable
             if self._apparmor_available:
                 return [
                     wrapper,
+                    parent_python,
                     "aa-exec",
                     "-p",
                     APPARMOR_PROFILE_NAME,
                     "--",
                     *command,
                 ]
-            return [wrapper, *command]
+            return [wrapper, parent_python, *command]
         if self._backend == "apparmor":
             return [
                 "aa-exec",

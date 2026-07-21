@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -69,7 +70,9 @@ def test_terminal_sandbox_applies_allowlist(
 
     assert sandbox._landlock_wrapper is not None
     wrapper = sandbox._landlock_wrapper.read_text()
+    assert wrapper.startswith("#!/usr/bin/env python3\n")
     assert "from py_landlock import Landlock" in wrapper
+    assert "os.execv(parent_python" in wrapper
     assert (
         str(tmp_path / ".openhands-tmp" / ".openhands-landlock-policy.json") in wrapper
     )
@@ -371,7 +374,8 @@ def test_conversation_policy_uses_landlock_when_bwrap_is_unavailable(
     assert sandbox._backend == "landlock"
     wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
     assert wrapped[0] == str(sandbox._landlock_wrapper)
-    assert wrapped[1:4] == ["aa-exec", "-p", APPARMOR_PROFILE_NAME]
+    assert wrapped[1] == sys.executable
+    assert wrapped[2:5] == ["aa-exec", "-p", APPARMOR_PROFILE_NAME]
     assert wrapped[-2:] == ["/bin/bash", "-i"]
 
 
