@@ -412,3 +412,71 @@ def test_conversation_policy_falls_back_to_apparmor_when_no_landlock_or_bwrap(
     assert sandbox._backend == "apparmor"
     wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
     assert wrapped[:3] == ["aa-exec", "-p", APPARMOR_PROFILE_NAME]
+
+
+def test_landlock_skipped_in_pyinstaller_frozen_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
+    )
+    monkeypatch.setattr("openhands.tools.terminal.sandbox.shutil.which", lambda _: None)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+    class FakeLandlock:
+        def __init__(self, *, strict: bool):
+            pass
+
+        def __getattr__(self, name: str):
+            return lambda *a, **kw: self
+
+    monkeypatch.setitem(
+        sys.modules,
+        "py_landlock",
+        SimpleNamespace(Landlock=FakeLandlock),
+    )
+
+    required_sandbox = TerminalSandbox(str(tmp_path), "required")
+    with pytest.raises(RuntimeError, match="PyInstaller frozen mode"):
+        required_sandbox.prepare()
+    assert required_sandbox._backend is None
+    assert required_sandbox._landlock_wrapper is None
+
+    auto_sandbox = TerminalSandbox(str(tmp_path), "auto")
+    auto_sandbox.prepare()
+    assert auto_sandbox._backend is None
+    assert auto_sandbox._landlock_wrapper is None
+
+
+def test_landlock_skipped_in_pyinstaller_frozen_mode_falls_back_to_apparmor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
+    )
+    monkeypatch.setattr("openhands.tools.terminal.sandbox.shutil.which", lambda _: None)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+    class FakeLandlock:
+        def __init__(self, *, strict: bool):
+            pass
+
+        def __getattr__(self, name: str):
+            return lambda *a, **kw: self
+
+    monkeypatch.setitem(
+        sys.modules,
+        "py_landlock",
+        SimpleNamespace(Landlock=FakeLandlock),
+    )
+
+    sandbox = TerminalSandbox(str(tmp_path), "required")
+    sandbox.prepare()
+    assert sandbox._backend == "apparmor"
+    assert sandbox._landlock_wrapper is None
