@@ -8,9 +8,17 @@ import pytest
 from openhands.tools.terminal.sandbox import (
     APPARMOR_PROFILE_NAME,
     TerminalSandbox,
+    _is_bwrap_usable,
     terminal_sandbox_enabled,
     terminal_sandbox_mode,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_bwrap_cache():
+    _is_bwrap_usable.cache_clear()
+    yield
+    _is_bwrap_usable.cache_clear()
 
 
 def _option_index(args: list[str], option: str, value: str) -> int:
@@ -252,8 +260,7 @@ def test_apparmor_takes_priority_over_bwrap(
         "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
     )
     monkeypatch.setattr(
-        "openhands.tools.terminal.sandbox.shutil.which",
-        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+        "openhands.tools.terminal.sandbox._is_bwrap_usable", lambda: True
     )
     sandbox = TerminalSandbox(str(tmp_path), "required")
 
@@ -298,8 +305,7 @@ def test_conversation_policy_prefers_bwrap_over_landlock_and_apparmor(
         "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
     )
     monkeypatch.setattr(
-        "openhands.tools.terminal.sandbox.shutil.which",
-        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+        "openhands.tools.terminal.sandbox._is_bwrap_usable", lambda: True
     )
 
     class FakeLandlock:
@@ -480,3 +486,26 @@ def test_landlock_skipped_in_pyinstaller_frozen_mode_falls_back_to_apparmor(
     sandbox.prepare()
     assert sandbox._backend == "apparmor"
     assert sandbox._landlock_wrapper is None
+
+
+def test_bwrap_smoke_test_failure_falls_back_to_apparmor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: True
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.shutil.which",
+        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_bwrap_usable", lambda: False
+    )
+
+    sandbox = TerminalSandbox(str(tmp_path), "required")
+    sandbox.prepare()
+
+    assert sandbox._backend == "apparmor"

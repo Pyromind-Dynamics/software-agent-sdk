@@ -7,7 +7,9 @@ import os
 import platform
 import shutil
 import stat
+import subprocess
 import sys
+from functools import lru_cache
 from importlib import import_module
 from pathlib import Path
 from typing import Literal, cast
@@ -103,6 +105,52 @@ def _is_landlock_available() -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
+def _is_bwrap_usable() -> bool:
+    """Return whether bwrap can actually run in this environment.
+
+    Being on PATH is necessary but not sufficient: container seccomp
+    profiles commonly block the ``mount`` syscall that bwrap requires to
+    set up bind mounts and mount namespaces, even when ``--unshare-user-try``
+    succeeds (seccomp does not understand user-namespace capability
+    boundaries). This smoke test runs a minimal bwrap invocation to verify
+    that mount operations actually work.
+    """
+    bwrap_path = shutil.which("bwrap")
+    if bwrap_path is None:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                bwrap_path,
+                "--unshare-user-try",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--tmpfs",
+                "/tmp",
+                "/usr/bin/env",
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if result.returncode != 0:
+        logger.warning(
+            "bwrap is on PATH but failed a smoke test (rc=%d, stderr=%s); "
+            "the container's seccomp profile may be blocking mount syscalls",
+            result.returncode,
+            result.stderr.decode(errors="replace").strip()[:200],
+        )
+        return False
+    return True
+
+
 class TerminalSandbox:
     """Apply a platform-specific kernel policy before starting a shell.
 
@@ -185,7 +233,7 @@ class TerminalSandbox:
         # applied via a wrapper script that the sandbox writes in prepare().
         if has_conversation_policy:
             self._apparmor_available = _is_apparmor_available()
-            if shutil.which("bwrap") is not None:
+            if _is_bwrap_usable():
                 self._backend = "bwrap"
                 backend_chosen = True
                 logger.info("Using bwrap terminal sandbox for per-conversation policy")
@@ -226,8 +274,7 @@ class TerminalSandbox:
                 )
 
         if not backend_chosen:
-            bwrap_path = shutil.which("bwrap")
-            if bwrap_path is not None:
+            if _is_bwrap_usable():
                 self._backend = "bwrap"
                 backend_chosen = True
 
@@ -238,9 +285,11 @@ class TerminalSandbox:
             elif self.mode == "required":
                 raise RuntimeError(
                     "Terminal sandbox is required, but no backend is available "
-                    "(AppArmor profile not loaded, bwrap not on PATH, "
+                    "(AppArmor profile not loaded or LSM not exposed by container, "
+                    "bwrap not installed or blocked by seccomp, "
                     "py-landlock not importable, or PyInstaller frozen mode "
-                    "disables landlock)"
+                    "disables landlock). Consider setting OH_TERMINAL_SANDBOX=auto "
+                    "or adjusting the container securityContext."
                 )
             else:
                 logger.warning("no sandbox backend available")
