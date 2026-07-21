@@ -36,6 +36,7 @@ def _fake_conversation(tmp_path: Path):
         (),
         {
             "secret_registry": _secret_registry(),
+            "agent_state": {},
         },
     )()
     return type(
@@ -43,6 +44,15 @@ def _fake_conversation(tmp_path: Path):
         (),
         {"id": _CONVERSATION_ID, "workspace": workspace, "state": state},
     )()
+
+
+def _patch_valid_script_preflight(monkeypatch) -> MagicMock:
+    download = MagicMock(return_value=b"def main():\n    return 0\n")
+    monkeypatch.setattr(
+        "openhands.tools.pyromind_cleaning.definition.download_file_from_pyromind",
+        download,
+    )
+    return download
 
 
 def test_cleaning_tool_derives_execution_target_from_legacy_headers():
@@ -73,13 +83,30 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
         "openhands.tools.pyromind_cleaning.definition.create_workflow_api_client",
         client_factory,
     )
+    download_script = _patch_valid_script_preflight(monkeypatch)
+    upload_runtime = MagicMock(
+        side_effect=lambda **kwargs: (
+            f"{kwargs['target_dir']}/{kwargs['local_path'].name}"
+        )
+    )
+    monkeypatch.setattr(
+        "openhands.tools.pyromind_cleaning.definition.upload_local_file_to_pyromind",
+        upload_runtime,
+    )
     task_store_dir = tmp_path / "tasks"
     conversation = _fake_conversation(tmp_path)
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    (runtime_dir / "cleaning_utils.py").write_text("__all__ = []\n")
+    (runtime_dir / "validate_format.py").write_text("# validator\n")
 
     observation = RunDatasetCleaningExecutor(
         env="pre",
         cluster="us-west-1",
         headers={"x-cluster": "us-west-1#pre", "request-app": "openhands"},
+        runtime_dir=str(runtime_dir),
+        storage_base_url="https://storage.test/api",
+        storage_headers={"x-cluster": "us-west-1"},
         task_store_dir=str(task_store_dir),
         timeout=5,
     )(
@@ -96,8 +123,17 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
     assert observation.run_id is not None
     assert observation.output_dir == (f"/agentTest/data_cleaning/{observation.run_id}")
     assert observation.resumed is False
-    assert f"{observation.output_dir}/stats.json" in observation.text
-    assert "checkpoint.json and errors.jsonl" in observation.text
+    assert f"{observation.output_dir}/validation.json" in observation.text
+    assert "output.jsonl, and checkpoint.json" in observation.text
+    assert upload_runtime.call_count == 2
+    download_script.assert_called_once()
+    assert {
+        call.kwargs["local_path"].name for call in upload_runtime.call_args_list
+    } == {"cleaning_utils.py", "validate_format.py"}
+    assert all(
+        call.kwargs["target_dir"] == observation.output_dir
+        for call in upload_runtime.call_args_list
+    )
     client_factory.assert_called_once_with(
         env="pre",
         cluster="us-west-1",
@@ -118,7 +154,7 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
     command = node["data"]["config"]["command"]
     pod_output_dir = f"/target-workspace{observation.output_dir}"
     assert "mkdir -p /target-workspace/agentTest/data_cleaning" in command
-    assert f"mkdir {pod_output_dir}" in command
+    assert f"mkdir -p {pod_output_dir}" in command
     assert (
         f"cp /target-workspace/agentTest/clean.py {pod_output_dir}/clean_script.py"
     ) in command
@@ -127,6 +163,11 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
     assert f"--state-dir {pod_output_dir}" in command
     assert "--limit 25" in command
     assert "--resume" not in command
+    assert (
+        f"python3 {pod_output_dir}/validate_format.py "
+        f"--input {pod_output_dir}/output.jsonl "
+        f"--report {pod_output_dir}/validation.json"
+    ) in command
 
     association = DatasetCleaningTaskStore(task_store_dir).get("9876")
     assert association is not None
@@ -185,9 +226,13 @@ def test_run_dataset_cleaning_resume_uses_frozen_script(monkeypatch, tmp_path):
     frozen_script = (
         f"/target-workspace/agentTest/data_cleaning/{run_id}/clean_script.py"
     )
-    assert command.startswith(f"test -f {frozen_script} && python3 {frozen_script}")
+    assert command.startswith(f"test -f {frozen_script}")
+    assert f"test -f {frozen_script.rsplit('/', 1)[0]}/cleaning_utils.py" in command
+    assert f"test -f {frozen_script.rsplit('/', 1)[0]}/validate_format.py" in command
+    assert f"python3 {frozen_script}" in command
     assert "--resume" in command
     assert "cp " not in command
+    assert "--report" in command
     association = task_store.get("task-2")
     assert association is not None
     assert association.script_path == "/agentTest/original.py"
@@ -239,3 +284,91 @@ def test_run_dataset_cleaning_rejects_invalid_paths(
 
     assert observation.is_error
     assert expected_error in observation.text
+
+
+def test_run_dataset_cleaning_reports_runtime_storage_auth_failure(
+    monkeypatch,
+    tmp_path,
+):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    (runtime_dir / "cleaning_utils.py").write_text("__all__ = []\n")
+    (runtime_dir / "validate_format.py").write_text("# validator\n")
+    _patch_valid_script_preflight(monkeypatch)
+    monkeypatch.setattr(
+        "openhands.tools.pyromind_cleaning.definition.upload_local_file_to_pyromind",
+        MagicMock(side_effect=ValueError("login required")),
+    )
+
+    observation = RunDatasetCleaningExecutor(
+        runtime_dir=str(runtime_dir),
+        task_store_dir=str(tmp_path / "tasks"),
+    )(
+        RunDatasetCleaningAction(
+            input_path="/datasets/source.jsonl",
+            script_path="/agentTest/clean.py",
+        ),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert observation.is_error
+    assert (
+        "Failed to stage dataset cleaning runtime cleaning_utils.py" in observation.text
+    )
+    assert "login required" in observation.text
+
+
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        (b"def main():\n", "syntax error"),
+        (
+            b"from cleaning_utils import undocumented_helper\n",
+            "unsupported cleaning_utils APIs: undocumented_helper",
+        ),
+        (
+            b"from cleaning_utils import *\n",
+            "must import explicit cleaning_utils APIs",
+        ),
+        (
+            b"import cleaning_utils\n",
+            "must use explicit from cleaning_utils import",
+        ),
+    ],
+)
+def test_run_dataset_cleaning_preflights_script_before_submission(
+    monkeypatch,
+    tmp_path,
+    script,
+    expected,
+):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    (runtime_dir / "cleaning_utils.py").write_text(
+        '__all__ = ["run_cleaning"]\n', encoding="utf-8"
+    )
+    (runtime_dir / "validate_format.py").write_text("# validator\n")
+    monkeypatch.setattr(
+        "openhands.tools.pyromind_cleaning.definition.download_file_from_pyromind",
+        MagicMock(return_value=script),
+    )
+    submit = MagicMock()
+    monkeypatch.setattr(
+        "openhands.tools.pyromind_cleaning.definition.create_workflow_api_client",
+        submit,
+    )
+
+    observation = RunDatasetCleaningExecutor(
+        runtime_dir=str(runtime_dir),
+        task_store_dir=str(tmp_path / "tasks"),
+    )(
+        RunDatasetCleaningAction(
+            input_path="/datasets/source.jsonl",
+            script_path="/agentTest/clean.py",
+        ),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert observation.is_error
+    assert expected in observation.text
+    submit.assert_not_called()

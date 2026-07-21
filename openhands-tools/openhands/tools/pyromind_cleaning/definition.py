@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import shlex
 import uuid
 from collections.abc import Sequence
@@ -25,6 +26,13 @@ from openhands.tools.pyromind_cleaning.task_store import (
     DatasetCleaningTaskAssociation,
     DatasetCleaningTaskStore,
 )
+from openhands.tools.pyromind_dataset.definition import (
+    _default_storage_base_url,
+    _resolve_conversation_headers,
+    _resolve_secret_headers,
+    download_file_from_pyromind,
+    upload_local_file_to_pyromind,
+)
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
     create_workflow_api_client,
@@ -39,6 +47,8 @@ if TYPE_CHECKING:
 
 DEFAULT_CLEANING_OUTPUT_ROOT = "/agentTest/data_cleaning"
 DEFAULT_GPU_PRODUCT = "NVIDIA-H100-NVL"
+RUNTIME_FILENAMES = ("cleaning_utils.py", "validate_format.py")
+MAX_CLEANING_SCRIPT_BYTES = 1024 * 1024
 
 
 class RunDatasetCleaningAction(Action):
@@ -104,7 +114,7 @@ class RunDatasetCleaningObservation(Observation):
         return content
 
 
-TOOL_DESCRIPTION = """Submit an uploaded dataset cleaning script to Pyromind Studio.
+TOOL_DESCRIPTION = """Run an uploaded dataset cleaner entirely on Pyromind.
 
 Call this after previewing the source dataset, generating a cleaning script that
 implements the CLI contract below, and uploading that script to Pyromind storage.
@@ -112,22 +122,23 @@ The tool creates a one-node CustomCommandNode workflow; do not construct or run
 shell commands yourself.
 
 The script must accept `--input`, `--output`, `--state-dir`, optional `--resume`,
-and optional `--limit N`. It must process records as a stream, append output,
-periodically write `checkpoint.json`, avoid duplicate output after resume, record
-recoverable row errors in `errors.jsonl`, exit non-zero for structural failures,
-and always write final aggregate counters to `stats.json` after success. A limit
-applies to source records considered by that invocation.
+and optional `--limit N`. `--output` is the concrete output.jsonl path, while
+`--state-dir` is the run directory. A limit applies to source records considered
+by that invocation. Output is homogeneous messages or text DPO preference JSONL.
 
 The submission is asynchronous. A new run gets a unique result directory under
-`/agentTest/data_cleaning/<run_id>` containing the frozen `clean_script.py`,
-`output.jsonl`, and state files. Use `limit` for a bounded sample run. To continue
-an interrupted run, call this tool again with `resume_run_id`; the platform
-executes the frozen script copy and passes `--resume`.
+`/agentTest/data_cleaning/<run_id>`. The tool uploads `cleaning_utils.py` and
+`validate_format.py` beside the frozen `clean_script.py`, runs the cleaner, then
+validates output.jsonl in the same Pod and writes validation.json. Before creating
+a new run it statically checks script syntax and explicit cleaning_utils imports;
+it does not execute the script or read dataset content. Use `limit=3` for a sample
+run. To continue an interrupted run, call this tool again with `resume_run_id`;
+the platform reuses all frozen runtime files and passes `--resume`.
 
 When the terminal workflow callback resumes the conversation, use the
-`output_dir` returned by this tool. Preview its `stats.json` before reporting
-success, and treat a missing `stats.json` as an incomplete run. For failed runs,
-inspect `checkpoint.json` and `errors.jsonl` before deciding whether to resume.
+`output_dir` returned by this tool. Inspect platform artifacts only with
+`preview_dataset`, starting with validation.json, then stats.json/errors.jsonl,
+output.jsonl, and checkpoint.json. Never run or validate Storage data locally.
 """
 
 
@@ -143,6 +154,10 @@ class RunDatasetCleaningExecutor(
         cluster: str | None = None,
         output_root: str = DEFAULT_CLEANING_OUTPUT_ROOT,
         headers: dict[str, str] | None = None,
+        runtime_dir: str | None = None,
+        storage_base_url: str | None = None,
+        storage_headers: dict[str, str] | None = None,
+        storage_secret_headers: dict[str, str] | None = None,
         task_store_dir: str | None = None,
         timeout: int = 30,
     ) -> None:
@@ -150,6 +165,12 @@ class RunDatasetCleaningExecutor(
         self._cluster = cluster
         self._output_root = _normalize_storage_path(output_root, "output_root")
         self._headers = dict(headers or {})
+        self._runtime_dir = Path(runtime_dir) if runtime_dir else None
+        self._storage_base_url = (
+            storage_base_url or _default_storage_base_url()
+        ).rstrip("/")
+        self._storage_headers = dict(storage_headers or {})
+        self._storage_secret_headers = dict(storage_secret_headers or {})
         self._task_store_dir = Path(task_store_dir) if task_store_dir else None
         self._timeout = timeout
 
@@ -198,6 +219,8 @@ class RunDatasetCleaningExecutor(
                     raise ValueError("script_path is required for a new run.")
                 effective_script_path = uploaded_script_path
                 output_dir = str(PurePosixPath(self._output_root) / str(run_id))
+                self._preflight_script(effective_script_path, conversation)
+                self._stage_runtime_files(output_dir, conversation)
             command = _build_cleaning_command(
                 input_path=input_path,
                 script_path=effective_script_path,
@@ -274,9 +297,9 @@ class RunDatasetCleaningExecutor(
             text=(
                 "Dataset cleaning workflow submitted. "
                 f"task_id={task_id}, run_id={run_id}, output_dir={output_dir}. "
-                "After the terminal callback, inspect "
-                f"{output_dir}/stats.json before reporting success; on failure, "
-                "inspect checkpoint.json and errors.jsonl."
+                "After the terminal callback, preview "
+                f"{output_dir}/validation.json first, then stats.json, "
+                "errors.jsonl, output.jsonl, and checkpoint.json."
             ),
             status=response.status,
             task_id=task_id,
@@ -291,6 +314,101 @@ class RunDatasetCleaningExecutor(
         workspace = cast(Any, conversation).workspace
         conversations_dir = Path(workspace.working_dir).resolve().parent
         return DatasetCleaningTaskStore(conversations_dir / TASK_ASSOCIATION_DIRNAME)
+
+    def _stage_runtime_files(
+        self,
+        output_dir: str,
+        conversation: BaseConversation,
+    ) -> None:
+        if self._runtime_dir is None:
+            raise ValueError("Dataset cleaning runtime_dir is not configured.")
+        headers = self._resolved_storage_headers(conversation)
+        for filename in RUNTIME_FILENAMES:
+            local_path = self._runtime_dir / filename
+            if not local_path.is_file():
+                raise ValueError(
+                    f"Dataset cleaning runtime file is missing: {local_path}"
+                )
+            try:
+                upload_local_file_to_pyromind(
+                    local_path=local_path,
+                    target_dir=output_dir,
+                    storage_base_url=self._storage_base_url,
+                    headers=headers,
+                    timeout=float(self._timeout),
+                )
+            except (OSError, ValueError) as exc:
+                raise ValueError(
+                    f"Failed to stage dataset cleaning runtime {filename}: {exc}"
+                ) from exc
+
+    def _resolved_storage_headers(
+        self,
+        conversation: BaseConversation,
+    ) -> dict[str, str]:
+        headers = {"accept": "*/*", **self._storage_headers}
+        headers.update(_resolve_conversation_headers(conversation))
+        headers.update(
+            _resolve_secret_headers(conversation, self._storage_secret_headers)
+        )
+        return headers
+
+    def _preflight_script(
+        self,
+        script_path: str,
+        conversation: BaseConversation,
+    ) -> None:
+        if self._runtime_dir is None:
+            raise ValueError("Dataset cleaning runtime_dir is not configured.")
+        utils_path = self._runtime_dir / "cleaning_utils.py"
+        if not utils_path.is_file():
+            raise ValueError(f"Dataset cleaning runtime file is missing: {utils_path}")
+        try:
+            source_bytes = download_file_from_pyromind(
+                storage_path=script_path,
+                storage_base_url=self._storage_base_url,
+                headers=self._resolved_storage_headers(conversation),
+                timeout=float(self._timeout),
+                max_bytes=MAX_CLEANING_SCRIPT_BYTES,
+            )
+            source = source_bytes.decode("utf-8-sig")
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise ValueError(
+                f"Failed to read dataset cleaning script for preflight: {exc}"
+            ) from exc
+        try:
+            tree = ast.parse(source, filename=script_path)
+            compile(tree, script_path, "exec")
+        except SyntaxError as exc:
+            location = f"line {exc.lineno}"
+            if exc.offset is not None:
+                location += f", column {exc.offset}"
+            raise ValueError(
+                f"Dataset cleaning script syntax error at {location}: {exc.msg}"
+            ) from exc
+
+        public_names = _runtime_public_names(utils_path)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import) and any(
+                alias.name == "cleaning_utils" for alias in node.names
+            ):
+                raise ValueError(
+                    "Dataset cleaning script must use explicit "
+                    "from cleaning_utils import ... APIs."
+                )
+            if not isinstance(node, ast.ImportFrom) or node.module != "cleaning_utils":
+                continue
+            imported = {alias.name for alias in node.names}
+            if "*" in imported:
+                raise ValueError(
+                    "Dataset cleaning script must import explicit cleaning_utils APIs."
+                )
+            unknown = sorted(imported - public_names)
+            if unknown:
+                raise ValueError(
+                    "Dataset cleaning script imports unsupported cleaning_utils APIs: "
+                    + ", ".join(unknown)
+                )
 
 
 class RunDatasetCleaningTool(
@@ -311,9 +429,19 @@ class RunDatasetCleaningTool(
         params.pop("current_user", None)
         output_root = str(params.pop("output_root", DEFAULT_CLEANING_OUTPUT_ROOT))
         headers = _normalize_headers(params.pop("headers", None))
+        runtime_dir_value = params.pop("runtime_dir", None)
+        runtime_dir = str(runtime_dir_value) if runtime_dir_value is not None else None
+        storage_base_url_value = params.pop("storage_base_url", None)
+        storage_base_url = (
+            str(storage_base_url_value) if storage_base_url_value is not None else None
+        )
+        storage_headers = _normalize_headers(params.pop("storage_headers", None))
+        legacy_secret_headers = params.pop("secret_headers", None)
+        storage_secret_headers = _normalize_headers(
+            params.pop("storage_secret_headers", legacy_secret_headers)
+        )
         env, cluster = _resolve_execution_target(env, cluster, headers)
         params.pop("endpoint_url", None)
-        params.pop("secret_headers", None)
         task_store_dir_value = params.pop("task_store_dir", None)
         task_store_dir = (
             str(task_store_dir_value) if task_store_dir_value is not None else None
@@ -335,6 +463,10 @@ class RunDatasetCleaningTool(
                     cluster=cluster,
                     output_root=output_root,
                     headers=headers,
+                    runtime_dir=runtime_dir,
+                    storage_base_url=storage_base_url,
+                    storage_headers=storage_headers,
+                    storage_secret_headers=storage_secret_headers,
                     task_store_dir=task_store_dir,
                     timeout=timeout,
                 ),
@@ -355,6 +487,37 @@ def _normalize_headers(value: Any) -> dict[str, str] | None:
     if not isinstance(value, dict):
         raise ValueError("headers must be a dictionary when provided")
     return {str(name): str(header_value) for name, header_value in value.items()}
+
+
+def _runtime_public_names(utils_path: Path) -> set[str]:
+    try:
+        tree = ast.parse(
+            utils_path.read_text(encoding="utf-8"),
+            filename=str(utils_path),
+        )
+    except (OSError, SyntaxError) as exc:
+        raise ValueError(f"Could not inspect cleaning_utils public API: {exc}") from exc
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(
+            isinstance(target, ast.Name) and target.id == "__all__"
+            for target in targets
+        ):
+            continue
+        if node.value is None:
+            raise ValueError("cleaning_utils __all__ must have a literal value")
+        try:
+            value = ast.literal_eval(node.value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("cleaning_utils __all__ must be a literal list") from exc
+        if not isinstance(value, list) or not all(
+            isinstance(name, str) for name in value
+        ):
+            raise ValueError("cleaning_utils __all__ must contain only strings")
+        return set(value)
+    raise ValueError("cleaning_utils does not define a public __all__ contract")
 
 
 def _resolve_execution_target(
@@ -408,7 +571,10 @@ def _build_cleaning_command(
     pod_output_root = _pod_path(output_root)
     pod_output_dir = _pod_path(output_dir)
     frozen_script = f"{pod_output_dir}/clean_script.py"
+    cleaning_utils = f"{pod_output_dir}/cleaning_utils.py"
+    validator = f"{pod_output_dir}/validate_format.py"
     output_file = f"{pod_output_dir}/output.jsonl"
+    validation_file = f"{pod_output_dir}/validation.json"
 
     command_parts = [
         "python3",
@@ -422,12 +588,15 @@ def _build_cleaning_command(
     ]
     if resumed:
         command_parts.append("--resume")
-        prefix = f"test -f {shlex.quote(frozen_script)}"
+        prefix = " && ".join(
+            f"test -f {shlex.quote(path)}"
+            for path in (frozen_script, cleaning_utils, validator)
+        )
     else:
         prefix = " && ".join(
             [
                 f"mkdir -p {shlex.quote(pod_output_root)}",
-                f"mkdir {shlex.quote(pod_output_dir)}",
+                f"mkdir -p {shlex.quote(pod_output_dir)}",
                 (
                     f"cp {shlex.quote(_pod_path(script_path))} "
                     f"{shlex.quote(frozen_script)}"
@@ -436,7 +605,15 @@ def _build_cleaning_command(
         )
     if limit is not None:
         command_parts.extend(["--limit", str(limit)])
-    return f"{prefix} && {' '.join(command_parts)}"
+    validator_parts = [
+        "python3",
+        shlex.quote(validator),
+        "--input",
+        shlex.quote(output_file),
+        "--report",
+        shlex.quote(validation_file),
+    ]
+    return f"{prefix} && {' '.join(command_parts)} && {' '.join(validator_parts)}"
 
 
 def _build_cleaning_workflow(

@@ -16,6 +16,7 @@ from openhands.tools.pyromind_dataset.definition import (
     UploadFileToPyromindAction,
     UploadFileToPyromindExecutor,
     _match_shared_dataset,
+    download_file_from_pyromind,
 )
 
 
@@ -362,8 +363,49 @@ def test_preview_dataset_large_file_uses_random_ranges(
     assert not observation.is_error
     assert observation.preview_truncated is True
     assert len(ranges) > 1
+    assert ranges[0][0] == 0
     assert any(start > 0 for start, _ in ranges)
     assert 0 < len(observation.sample_rows) <= 8
+    assert "sample_integrity=partial_byte_fragments" in observation.text
+    assert "use them only as a format hint" in observation.text
+
+
+def test_preview_dataset_empty_file_does_not_request_download_url(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_shared_empty(monkeypatch)
+
+    def fake_post(url, *, headers, json, timeout):
+        assert url.endswith("/get_file_metadata")
+        return _Response(
+            200,
+            {
+                "success": True,
+                "data": {
+                    "object_name": "errors.jsonl",
+                    "size": 0,
+                    "content_type": "application/jsonl",
+                    "is_dir": False,
+                },
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="/run/errors.jsonl", n=3),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.num_rows == 0
+    assert observation.previewed_rows == 0
+    assert observation.preview_truncated is False
+    assert observation.sample_rows == []
 
 
 def test_preview_dataset_truncates_large_jsonl_and_reduces_samples(
@@ -476,6 +518,32 @@ def test_upload_file_to_pyromind_posts_workspace_file(
     assert calls["filename"] == "metric.py"
     assert calls["content"] == b"def acc():\n    return 1\n"
     assert calls["timeout"] == 7.0
+
+
+def test_download_file_from_pyromind_returns_bounded_script(monkeypatch):
+    def fake_post(url, *, headers, json, timeout):
+        assert json == {"path": "/agentTest/clean.py"}
+        return _Response(
+            200,
+            {"success": True, "data": {"url": "https://download.test/script"}},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(
+        httpx,
+        "stream",
+        lambda *args, **kwargs: _StreamResponse(b"def main():\n    return 0\n"),
+    )
+
+    content = download_file_from_pyromind(
+        storage_path="/agentTest/clean.py",
+        storage_base_url="https://portal.test/storage_api",
+        headers={"cookie": "session"},
+        timeout=3,
+        max_bytes=1024,
+    )
+
+    assert content == b"def main():\n    return 0\n"
 
 
 def test_upload_file_to_pyromind_rejects_workspace_escape(monkeypatch, tmp_path):
@@ -624,6 +692,53 @@ def test_preview_dataset_single_line_text_returns_partial_content(
     assert observation.previewed_rows > 0
     assert len(observation.sample_rows) > 0
     assert observation.sample_rows[0]["text"].startswith("a")
+
+
+def test_preview_dataset_marks_json_wrapped_text_with_format_hint(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_shared_empty(monkeypatch)
+    content = jsonlib.dumps(
+        {"rows": [{"row_idx": 0, "row": {"text": "x" * 25000}}]}
+    ).encode()
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": "wrapped.txt",
+                        "size": len(content),
+                        "content_type": "text/plain",
+                        "is_dir": False,
+                    },
+                },
+            )
+        return _Response(
+            200,
+            {"success": True, "data": {"url": "https://download.test/wrapped"}},
+        )
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        raw_range = headers["range"].removeprefix("bytes=")
+        start, end = [int(part) for part in raw_range.split("-", maxsplit=1)]
+        return _StreamResponse(content[start : end + 1])
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="wrapped.txt", n=3),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert not observation.is_error
+    assert "format_hint=json-like" in observation.text
+    assert observation.sample_rows[0]["text"].startswith('{"rows"')
 
 
 # ---------------------------------------------------------------------------

@@ -394,6 +394,7 @@ def _build_workflow_debug_tool(
 def _build_pyromind_storage_tools(
     http_request: Request,
     extra: dict[str, Any],
+    skills_path: str | Path,
 ) -> tuple[list[Tool], dict[str, SecretSource]]:
     headers = {
         name: value
@@ -430,6 +431,15 @@ def _build_pyromind_storage_tools(
     cleaning_output_root = extra.get("dataset_cleaning_output_root")
     if isinstance(cleaning_output_root, str) and cleaning_output_root:
         cleaning_params["output_root"] = cleaning_output_root
+    cleaning_params["runtime_dir"] = str(
+        Path(skills_path) / "data-cleaning" / "scripts"
+    )
+    if "storage_base_url" in params:
+        cleaning_params["storage_base_url"] = params["storage_base_url"]
+    if "headers" in params:
+        cleaning_params["storage_headers"] = dict(params["headers"])
+    if "secret_headers" in params:
+        cleaning_params["storage_secret_headers"] = dict(params["secret_headers"])
 
     return (
         [
@@ -1030,7 +1040,7 @@ async def create_pyromind_conversation(
     debug_tool, debug_secrets = _build_workflow_debug_tool(http_request)
     # storage
     storage_tools, storage_secrets = _build_pyromind_storage_tools(
-        http_request, request.extra
+        http_request, request.extra, skills_path
     )
 
     # 4. Build LLM config
