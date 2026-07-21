@@ -79,6 +79,7 @@ from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
 )
 from openhands.tools.pyromind_debug import get_debug_result_broker
+from openhands.tools.pyromind_remote_dataset import PreviewRemoteDatasetTool
 from openhands.tools.utils import PUBLIC_READ_ALIASES
 from openhands.tools.workflow import (
     RunWorkflowTool,
@@ -436,6 +437,7 @@ def _build_pyromind_storage_tools(
             Tool(name=PreviewDatasetTool.name, params=dict(params)),
             Tool(name=UploadFileToPyromindTool.name, params=dict(params)),
             Tool(name=RunDatasetCleaningTool.name, params=cleaning_params),
+            Tool(name=PreviewRemoteDatasetTool.name, params={}),
         ],
         secrets,
     )
