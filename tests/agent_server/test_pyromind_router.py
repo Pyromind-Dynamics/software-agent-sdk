@@ -392,7 +392,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     terminal_tool = next(
         tool for tool in service.start_request.agent.tools if tool.name == "terminal"
     )
-    assert terminal_tool.params == {"sandbox_mode": "off"}
+    assert "sandbox_mode" not in terminal_tool.params
     assert (expected_dir / "public_data").is_dir()
     validation_tool = next(
         tool

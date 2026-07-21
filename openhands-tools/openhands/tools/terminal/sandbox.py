@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import shutil
+import stat
+import subprocess
+import sys
+from functools import lru_cache
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Literal, cast
 
 from openhands.sdk.logger import get_logger
 from openhands.tools.utils import resolve_workspace_subpath
@@ -79,6 +84,63 @@ def _is_apparmor_available() -> bool:
     return profile_path.is_file()
 
 
+def _is_landlock_available() -> bool:
+    """Return whether the Landlock terminal sandbox backend is usable.
+
+    Landlock is applied via a small Python wrapper script that re-execs a
+    Python interpreter (``sys.executable``) so ``py_landlock`` can apply the
+    LSM policy before ``exec``-ing the shell. In PyInstaller mode
+    (``sys.frozen=True``), ``sys.executable`` points at the frozen binary
+    (e.g. ``/usr/local/bin/openhands-agent-server``) rather than a Python
+    interpreter, so the wrapper's ``os.execv`` would feed CLI args the
+    frozen binary cannot parse. Skip landlock in that case and let the
+    caller fall back to AppArmor or bwrap, which are external binaries.
+    """
+    if getattr(sys, "frozen", False):
+        return False
+    try:
+        import_module("py_landlock")
+        return True
+    except ImportError:
+        return False
+
+
+@lru_cache(maxsize=1)
+def _is_bwrap_usable() -> bool:
+    """Return whether bwrap can actually run in this environment.
+
+    Being on PATH is necessary but not sufficient: container seccomp
+    profiles commonly block the ``mount`` syscall that bwrap requires to
+    set up bind mounts and mount namespaces, even when ``--unshare-user-try``
+    succeeds (seccomp does not understand user-namespace capability
+    boundaries). This smoke test runs a minimal bwrap invocation to verify
+    that mount operations actually work.
+    """
+    bwrap_path = shutil.which("bwrap")
+    if bwrap_path is None:
+        return False
+    cmd = [bwrap_path, "--unshare-ipc", "--unshare-uts"]
+    if os.geteuid() != 0:
+        cmd.append("--unshare-user-try")
+    for path in ("/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"):
+        if Path(path).exists():
+            cmd.extend(["--ro-bind", path, path])
+    cmd.extend(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "/usr/bin/env"])
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if result.returncode != 0:
+        logger.warning(
+            "bwrap is on PATH but failed a smoke test (rc=%d, stderr=%s); "
+            "the container's seccomp profile may be blocking mount syscalls",
+            result.returncode,
+            result.stderr.decode(errors="replace").strip()[:200],
+        )
+        return False
+    return True
+
+
 class TerminalSandbox:
     """Apply a platform-specific kernel policy before starting a shell.
 
@@ -116,7 +178,7 @@ class TerminalSandbox:
             resolve_workspace_subpath(p, resolved_work_dir) for p in rw_paths
         )
         self._backend = None
-        self._landlock_factory: Any | None = None
+        self._landlock_wrapper: Path | None = None
         self._seatbelt_profile: Path | None = None
         self._apparmor_available: bool = False
 
@@ -144,7 +206,7 @@ class TerminalSandbox:
         #
         # When the caller passed conversation-scoped ``read_only_paths`` or
         # ``read_write_paths``, the sandbox is meant to enforce a per-conversation
-        # PathAccessPolicy. Landlock and bwrap can express that by allowing
+        # PathAccessPolicy. bwrap and Landlock can express that by allowing
         # ``events/`` read-only and ``public_data/`` read-write. AppArmor uses a
         # single global denylist loaded at image build time, so use it only as a
         # fallback when neither per-conversation backend is available.
@@ -156,28 +218,33 @@ class TerminalSandbox:
         )
         backend_chosen = False
 
-        # Conversation-scoped policy → prefer Landlock (per-conversation
-        # semantics) over AppArmor (global denylist).  Stack AppArmor on top
-        # when both are available for defense-in-depth.
+        # Conversation-scoped policy needs per-workspace mount semantics. Prefer
+        # bwrap because it fails before exec with visible stderr; Landlock is
+        # applied via a wrapper script that the sandbox writes in prepare().
         if has_conversation_policy:
             self._apparmor_available = _is_apparmor_available()
-            try:
-                landlock_module = import_module("py_landlock")
-                self._landlock_factory = landlock_module.Landlock
-                self._backend = "landlock"
+            if _is_bwrap_usable():
+                self._backend = "bwrap"
                 backend_chosen = True
-                logger.info(
-                    "Using Landlock terminal sandbox for per-conversation policy%s",
-                    " (+ AppArmor as defense-in-depth)"
-                    if self._apparmor_available
-                    else "",
-                )
-            except ImportError:
-                logger.warning(
-                    "Per-conversation policy requested but py-landlock is not "
-                    "importable; falling back to bwrap / AppArmor"
-                )
-                if shutil.which("bwrap") is None and self._apparmor_available:
+                logger.info("Using bwrap terminal sandbox for per-conversation policy")
+
+            if not backend_chosen:
+                if _is_landlock_available():
+                    self._backend = "landlock"
+                    backend_chosen = True
+                    logger.info(
+                        "Using Landlock terminal sandbox for per-conversation policy%s",
+                        " (+ AppArmor as defense-in-depth)"
+                        if self._apparmor_available
+                        else "",
+                    )
+                else:
+                    logger.warning(
+                        "Per-conversation policy requested but bwrap is unavailable "
+                        "and Landlock is unavailable (py-landlock not importable or "
+                        "PyInstaller frozen mode); falling back to AppArmor"
+                    )
+                if not backend_chosen and self._apparmor_available:
                     self._backend = "apparmor"
                     backend_chosen = True
                     logger.info(
@@ -197,83 +264,116 @@ class TerminalSandbox:
                 )
 
         if not backend_chosen:
-            bwrap_path = shutil.which("bwrap")
-            if bwrap_path is not None:
+            if _is_bwrap_usable():
                 self._backend = "bwrap"
                 backend_chosen = True
 
         if not backend_chosen:
-            try:
-                landlock_module = import_module("py_landlock")
-                self._landlock_factory = landlock_module.Landlock
+            if _is_landlock_available():
                 self._backend = "landlock"
                 backend_chosen = True
-            except ImportError as exc:
-                if self.mode == "required":
-                    raise RuntimeError(
-                        "Terminal sandbox is required, but no backend is available "
-                        "(AppArmor profile not loaded, bwrap not on PATH, "
-                        "py-landlock not importable)"
-                    ) from exc
+            elif self.mode == "required":
+                raise RuntimeError(
+                    "Terminal sandbox is required, but no backend is available "
+                    "(AppArmor profile not loaded or LSM not exposed by container, "
+                    "bwrap not installed or blocked by seccomp, "
+                    "py-landlock not importable, or PyInstaller frozen mode "
+                    "disables landlock). Consider setting OH_TERMINAL_SANDBOX=auto "
+                    "or adjusting the container securityContext."
+                )
+            else:
                 logger.warning("no sandbox backend available")
 
-    def apply(self) -> None:
-        """Apply the policy in the child process, failing closed when required."""
-        if self._backend != "landlock":
-            return
-        if not terminal_sandbox_enabled(self.mode):
-            return
-        landlock = self._landlock_factory
-        if landlock is None:
-            if self.mode == "required":
-                raise RuntimeError("Terminal sandbox was not prepared")
-            return
+        if self._backend == "landlock":
+            self._write_landlock_wrapper()
 
-        try:
-            system_read_paths = tuple(
-                path
-                for path in ("/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin", "/dev")
-                if Path(path).exists()
-            )
-            public_read_paths = tuple(
-                path for path in PUBLIC_READ_ROOTS if Path(path).exists()
-            )
-            executable_paths = tuple(
-                path for path in ("/usr", "/bin", "/sbin") if Path(path).exists()
-            )
-            (
-                landlock(strict=True)
-                .allow_read(*system_read_paths)
-                .allow_read(*public_read_paths, *map(str, self.read_only_paths))
-                .allow_write("/dev/null", "/dev/tty")
-                .allow_execute(*executable_paths)
-                .allow_read_write(str(self._tmp_dir), *map(str, self.read_write_paths))
-                .apply()
-            )
-        except Exception as exc:
-            if self.mode == "required":
-                raise RuntimeError(
-                    "Failed to apply the terminal Landlock policy"
-                ) from exc
-            logger.warning("Failed to apply terminal Landlock policy: %s", exc)
+    def _write_landlock_wrapper(self) -> None:
+        """Generate a wrapper script that applies landlock then execs the command.
+
+        This avoids using preexec_fn, which is unsafe in multithreaded processes.
+        """
+        system_read_paths = [
+            path
+            for path in ("/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin", "/dev")
+            if Path(path).exists()
+        ]
+        public_read_paths = [path for path in PUBLIC_READ_ROOTS if Path(path).exists()]
+        executable_paths = [
+            path for path in ("/usr", "/bin", "/sbin") if Path(path).exists()
+        ]
+        policy = {
+            "system_read_paths": system_read_paths,
+            "public_read_paths": public_read_paths,
+            "read_only_paths": [str(p) for p in self.read_only_paths],
+            "executable_paths": executable_paths,
+            "tmp_dir": str(self._tmp_dir),
+            "read_write_paths": [str(p) for p in self.read_write_paths],
+            "mode": self.mode,
+        }
+        policy_path = self._tmp_dir / ".openhands-landlock-policy.json"
+        policy_path.write_text(json.dumps(policy))
+
+        wrapper = self._tmp_dir / ".openhands-landlock-wrapper"
+        wrapper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            "\n"
+            "parent_python = sys.argv[1]\n"
+            "if os.path.realpath(sys.executable) != os.path.realpath(parent_python):\n"
+            "    os.execv(parent_python, [parent_python, __file__, *sys.argv[1:]])\n"
+            "\n"
+            "import json\n"
+            "from py_landlock import Landlock\n"
+            f"policy = json.load(open({str(policy_path)!r}))\n"
+            "try:\n"
+            "    (\n"
+            "        Landlock(strict=True)\n"
+            "        .allow_read(*policy['system_read_paths'])\n"
+            "        .allow_read(\n"
+            "            *policy['public_read_paths'],\n"
+            "            *policy['read_only_paths'],\n"
+            "        )\n"
+            "        .allow_write('/dev/null', '/dev/tty')\n"
+            "        .allow_execute(*policy['executable_paths'])\n"
+            "        .allow_read_write(\n"
+            "            policy['tmp_dir'], *policy['read_write_paths']\n"
+            "        )\n"
+            "        .apply()\n"
+            "    )\n"
+            "except Exception as exc:\n"
+            "    if policy['mode'] == 'required':\n"
+            "        print(\n"
+            "            f'Failed to apply Landlock policy: {exc}',\n"
+            "            file=sys.stderr,\n"
+            "        )\n"
+            "        sys.exit(1)\n"
+            "os.execvp(sys.argv[2], sys.argv[2:])\n"
+        )
+        wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+        self._landlock_wrapper = wrapper
 
     def wrap_command(self, command: list[str]) -> list[str]:
         """Wrap a command with the platform-specific sandbox launcher."""
-        # Landlock is applied via ``apply()`` in the child preexec; it does not
-        # need a wrapper process.  But when AppArmor is also loaded on the host,
-        # we additionally prepend ``aa-exec`` so the child runs under both LSMs
-        # (Landlock for the per-conversation policy, AppArmor for the broader
-        # denylist of high-value paths and privilege-escalation tools).
+        # Landlock is applied by a small Python wrapper script that the
+        # TerminalSandbox writes during prepare(); the wrapper execs the target
+        # command so no extra process outlives the shell.  When AppArmor is
+        # also loaded, aa-exec is the wrapper's first child so the process
+        # runs under both LSMs.
         if self._backend == "landlock":
+            assert self._landlock_wrapper is not None
+            wrapper = str(self._landlock_wrapper)
+            parent_python = sys.executable
             if self._apparmor_available:
                 return [
+                    wrapper,
+                    parent_python,
                     "aa-exec",
                     "-p",
                     APPARMOR_PROFILE_NAME,
                     "--",
                     *command,
                 ]
-            return command
+            return [wrapper, parent_python, *command]
         if self._backend == "apparmor":
             return [
                 "aa-exec",
@@ -300,12 +400,18 @@ class TerminalSandbox:
         return command
 
     def cleanup(self) -> None:
-        """Remove the generated macOS profile after the shell exits."""
+        """Remove the generated sandbox profile/wrapper after the shell exits."""
         if self._seatbelt_profile is not None:
             self._seatbelt_profile.unlink(missing_ok=True)
+        if self._landlock_wrapper is not None:
+            self._landlock_wrapper.unlink(missing_ok=True)
+            policy = self._tmp_dir / ".openhands-landlock-policy.json"
+            policy.unlink(missing_ok=True)
 
     def _build_bwrap_args(self) -> list[str]:
         args = ["bwrap", "--unshare-ipc", "--unshare-uts"]
+        if os.geteuid() != 0:
+            args.append("--unshare-user-try")
         for path in ("/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"):
             if Path(path).exists():
                 args.extend(["--ro-bind", path, path])

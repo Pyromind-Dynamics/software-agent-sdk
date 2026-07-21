@@ -393,10 +393,7 @@ def test_pyromind_runtime_contract_refreshes_persisted_agent_once():
     updated_again = _with_pyromind_runtime_contract(updated)
 
     terminal = next(tool for tool in updated_again.tools if tool.name == "terminal")
-    assert terminal.params == {
-        "terminal_type": "subprocess",
-        "sandbox_mode": "off",
-    }
+    assert terminal.params == {"terminal_type": "subprocess"}
     custom_instructions = cast(
         str, updated_again.system_prompt_kwargs["custom_instructions"]
     )
