@@ -370,7 +370,7 @@ class TerminalSandbox:
             policy.unlink(missing_ok=True)
 
     def _build_bwrap_args(self) -> list[str]:
-        args = ["bwrap", "--unshare-ipc", "--unshare-uts"]
+        args = ["bwrap", "--unshare-ipc", "--unshare-uts", "--unshare-user-try"]
         for path in ("/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"):
             if Path(path).exists():
                 args.extend(["--ro-bind", path, path])
