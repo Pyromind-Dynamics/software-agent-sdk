@@ -250,9 +250,9 @@ Returns:
 - column names and sample rows for JSONL, CSV/TSV, and text formats
 - source indicator ('shared' or 'storage')
 
-For user storage: files up to 10KB are downloaded in full; larger files are
-sampled with random byte-range requests. When preview_truncated=true, num_rows
-is unset; use previewed_rows and sample_rows as a format hint only.
+For user storage: files up to 10KB are downloaded in full; larger files use one
+head byte range plus random ranges. When preview_truncated=true, sample lines may
+be partial byte fragments, num_rows is unset, and samples are format hints only.
 """
 
 
@@ -700,20 +700,22 @@ class PreviewDatasetExecutor(
         if not files:
             files = [preview_path]
 
-        preview_url_result = self._get_download_url(preview_path, headers)
-        if isinstance(preview_url_result, PreviewDatasetObservation):
-            return preview_url_result
-
         size = _optional_int(metadata.get("size"))
-        content_result = self._download_preview(
-            preview_url_result,
-            preview_path,
-            size,
-            str(metadata.get("content_type") or ""),
-        )
-        if isinstance(content_result, PreviewDatasetObservation):
-            return content_result
-        preview_chunks, preview_truncated = content_result
+        if size == 0:
+            preview_chunks, preview_truncated = [], False
+        else:
+            preview_url_result = self._get_download_url(preview_path, headers)
+            if isinstance(preview_url_result, PreviewDatasetObservation):
+                return preview_url_result
+            content_result = self._download_preview(
+                preview_url_result,
+                preview_path,
+                size,
+                str(metadata.get("content_type") or ""),
+            )
+            if isinstance(content_result, PreviewDatasetObservation):
+                return content_result
+            preview_chunks, preview_truncated = content_result
 
         parsed = _parse_preview_chunks(
             preview_path,
@@ -1154,68 +1156,22 @@ class UploadFileToPyromindExecutor(
                 is_error=True,
             )
 
-        filename = local_path.name
-        storage_path = str(PurePosixPath(action.target_dir) / filename)
         try:
-            with local_path.open("rb") as file_obj:
-                response = httpx.post(
-                    f"{self._storage_base_url}/upload_file",
-                    headers=headers,
-                    data={
-                        "name": filename,
-                        "path": action.target_dir,
-                        "bucket": "",
-                    },
-                    files={"file": (filename, file_obj, "application/octet-stream")},
-                    timeout=self._timeout,
-                )
-        except httpx.RequestError as exc:
+            storage_path = upload_local_file_to_pyromind(
+                local_path=local_path,
+                target_dir=action.target_dir,
+                storage_base_url=self._storage_base_url,
+                headers=headers,
+                timeout=self._timeout,
+            )
+        except ValueError as exc:
             return UploadFileToPyromindObservation.from_text(
-                text=(
-                    "Failed to call Pyromind storage upload_file API: "
-                    f"{type(exc).__name__}: {exc}"
-                ),
+                text=str(exc),
                 is_error=True,
             )
         except OSError as exc:
             return UploadFileToPyromindObservation.from_text(
                 text=f"Failed to read file for upload: {exc}",
-                is_error=True,
-            )
-
-        payload_result = _decode_json_response(
-            response,
-            "Pyromind storage upload_file API",
-        )
-        if isinstance(payload_result, str):
-            return UploadFileToPyromindObservation.from_text(
-                text=payload_result,
-                is_error=True,
-            )
-        data_result = _extract_api_data("upload_file", payload_result)
-        if isinstance(data_result, str):
-            return UploadFileToPyromindObservation.from_text(
-                text=data_result,
-                is_error=True,
-            )
-
-        failed_files = data_result.get("failed_files")
-        if isinstance(failed_files, list) and failed_files:
-            return UploadFileToPyromindObservation.from_text(
-                text=(
-                    "Pyromind storage upload_file API reported failed files: "
-                    f"{_truncate_text(json.dumps(failed_files, ensure_ascii=False))}"
-                ),
-                is_error=True,
-            )
-
-        success_count = data_result.get("success_count")
-        if success_count != 1:
-            return UploadFileToPyromindObservation.from_text(
-                text=(
-                    "Pyromind storage upload_file API did not report one uploaded "
-                    f"file: {json.dumps(data_result, ensure_ascii=False)}"
-                ),
                 is_error=True,
             )
 
@@ -1232,6 +1188,112 @@ class UploadFileToPyromindExecutor(
         headers.update(_resolve_conversation_headers(conversation))
         headers.update(_resolve_secret_headers(conversation, self._secret_headers))
         return headers
+
+
+def upload_local_file_to_pyromind(
+    *,
+    local_path: Path,
+    target_dir: str,
+    storage_base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+) -> str:
+    """Upload a trusted local runtime file and return its Storage path."""
+    filename = local_path.name
+    storage_path = str(PurePosixPath(target_dir) / filename)
+    try:
+        with local_path.open("rb") as file_obj:
+            response = httpx.post(
+                f"{storage_base_url.rstrip('/')}/upload_file",
+                headers=headers,
+                data={"name": filename, "path": target_dir, "bucket": ""},
+                files={"file": (filename, file_obj, "application/octet-stream")},
+                timeout=timeout,
+            )
+    except httpx.RequestError as exc:
+        raise ValueError(
+            "Failed to call Pyromind storage upload_file API: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    payload_result = _decode_json_response(response, "Pyromind storage upload_file API")
+    if isinstance(payload_result, str):
+        raise ValueError(payload_result)
+    data_result = _extract_api_data("upload_file", payload_result)
+    if isinstance(data_result, str):
+        raise ValueError(data_result)
+
+    failed_files = data_result.get("failed_files")
+    if isinstance(failed_files, list) and failed_files:
+        detail = _truncate_text(json.dumps(failed_files, ensure_ascii=False))
+        raise ValueError(
+            f"Pyromind storage upload_file API reported failed files: {detail}"
+        )
+    if data_result.get("success_count") != 1:
+        detail = json.dumps(data_result, ensure_ascii=False)
+        raise ValueError(
+            "Pyromind storage upload_file API did not report one uploaded "
+            f"file: {detail}"
+        )
+    return storage_path
+
+
+def download_file_from_pyromind(
+    *,
+    storage_path: str,
+    storage_base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+    max_bytes: int,
+) -> bytes:
+    """Download one bounded storage file for non-data control-plane checks."""
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be greater than 0")
+    try:
+        response = httpx.post(
+            f"{storage_base_url.rstrip('/')}/get_url",
+            headers=headers,
+            json={"path": storage_path},
+            timeout=timeout,
+        )
+    except httpx.RequestError as exc:
+        raise ValueError(
+            f"Failed to request Pyromind storage download URL: {exc}"
+        ) from exc
+    payload = _decode_json_response(response, "Pyromind storage get_url API")
+    if isinstance(payload, str):
+        raise ValueError(payload)
+    data = _extract_api_data("get_url", payload)
+    if isinstance(data, str):
+        raise ValueError(data)
+    url = data.get("url")
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("Pyromind storage get_url API response is missing url data.")
+
+    content = bytearray()
+    try:
+        with httpx.stream(
+            "GET",
+            url,
+            headers={},
+            timeout=timeout,
+            follow_redirects=True,
+        ) as download:
+            if download.status_code >= 400:
+                body = download.read().decode("utf-8", errors="replace")
+                raise ValueError(
+                    "Pyromind storage download URL returned HTTP "
+                    f"{download.status_code}: {_truncate_text(body)}"
+                )
+            for chunk in download.iter_bytes():
+                if len(content) + len(chunk) > max_bytes:
+                    raise ValueError(
+                        f"Storage file exceeds the {max_bytes}-byte preflight limit."
+                    )
+                content.extend(chunk)
+    except httpx.RequestError as exc:
+        raise ValueError(f"Failed to download Pyromind storage file: {exc}") from exc
+    return bytes(content)
 
 
 class UploadFileToPyromindTool(
@@ -1488,19 +1550,20 @@ def _build_preview_ranges(
     if file_size is None or file_size <= _SMALL_FILE_THRESHOLD:
         return [(0, _SMALL_FILE_THRESHOLD - 1)]
 
-    include_header = preview_kind in {"csv", "tsv"}
-    header_range: list[tuple[int, int]] = []
-    min_sample_start = 0
-    if include_header:
-        header_bytes = min(
-            _DELIMITED_HEADER_BYTES, max(1, _SMALL_FILE_THRESHOLD // 4), file_size
-        )
-        header_range = [(0, header_bytes - 1)]
-        min_sample_start = header_bytes
-
     range_size = _LARGE_FILE_RANGE_BYTES
+    head_bytes = (
+        min(_DELIMITED_HEADER_BYTES, range_size, file_size)
+        if preview_kind in {"csv", "tsv"}
+        else min(range_size, file_size)
+    )
+    header_range = [(0, head_bytes - 1)]
+    min_sample_start = head_bytes
     max_start = max(min_sample_start, file_size - range_size)
-    starts = _random_starts(min_sample_start, max_start, _LARGE_FILE_RANGE_COUNT)
+    starts = _random_starts(
+        min_sample_start,
+        max_start,
+        max(1, _LARGE_FILE_RANGE_COUNT - 1),
+    )
     ranges = [(start, min(file_size - 1, start + range_size - 1)) for start in starts]
     return header_range + ranges
 
@@ -1530,11 +1593,28 @@ def _parse_preview_chunks(
     kind = _preview_kind(file_path, content_type)
     lines = _complete_lines_from_chunks(chunks)
     if kind == "jsonl":
-        return _parse_jsonl_lines(lines, max_samples, truncated)
-    if kind in {"csv", "tsv"}:
+        parsed = _parse_jsonl_lines(lines, max_samples, truncated)
+    elif kind in {"csv", "tsv"}:
         delimiter = "\t" if kind == "tsv" else ","
-        return _parse_delimited_lines(lines, max_samples, truncated, delimiter)
-    return _parse_raw_text_lines(lines, max_samples, truncated)
+        parsed = _parse_delimited_lines(lines, max_samples, truncated, delimiter)
+    else:
+        parsed = _parse_raw_text_lines(lines, max_samples, truncated)
+    parsed["format_hint"] = _preview_format_hint(kind, chunks)
+    return parsed
+
+
+def _preview_format_hint(
+    kind: str | None,
+    chunks: list[_PreviewChunk],
+) -> str:
+    if kind in {"json", "jsonl", "csv", "tsv"}:
+        return kind
+    head = next((chunk for chunk in chunks if chunk.starts_at_zero), None)
+    if head is not None:
+        prefix = head.content.decode("utf-8-sig", errors="replace").lstrip()
+        if prefix.startswith(("{", "[")):
+            return "json-like"
+    return kind or "text"
 
 
 def _parse_jsonl_lines(
@@ -1739,7 +1819,14 @@ def _format_preview_text(
     parts.append(f"sample_rows={len(parsed['sample_rows'])}")
     if parsed["preview_error"]:
         parts.append(f"preview_error={parsed['preview_error']}")
+    parts.append(f"format_hint={parsed['format_hint']}")
     parts.append(f"preview_truncated={str(preview_truncated).lower()}")
+    if preview_truncated:
+        parts.append("sample_integrity=partial_byte_fragments")
+        parts.append(
+            "warning=sample lines may start or end inside a source record; "
+            "use them only as a format hint"
+        )
     for row in parsed["sample_rows"]:
         parts.append(f"\n--- sample line {row.get('line', '?')} ---")
         parts.append(str(row.get("text", "")))

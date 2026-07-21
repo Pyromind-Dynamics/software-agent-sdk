@@ -75,6 +75,10 @@ Clone/Download 已输出本地 `dataset_path`，可直接传给 `DatasetConfigBu
 
 本文件只识别数据形态；训练阶段由主 Skill 结合用户要求、已有阶段和模型 checkpoint 决定。
 
+数据清洗产物若为顶层严格的 `prompt`、`chosen`、`rejected`，直接配置 DPO：
+`user_prompt_field=prompt`、`assistant_response_field=chosen`、
+`rejected_field=rejected`。不得把该产物改判为 SFT 或 GRPO。
+
 ## 不合规处理
 
 停止写工作流，列出具体缺口，并给最小目标 JSONL；不得调用清洗工具或换占位数据。

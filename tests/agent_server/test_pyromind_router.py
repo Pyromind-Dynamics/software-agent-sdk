@@ -411,6 +411,9 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
             "x-cluster": "us-west-1#pre",
             "request-app": "openhands",
         },
+        "runtime_dir": str(tmp_path / "missing-skills" / "data-cleaning" / "scripts"),
+        "storage_headers": {"x-cluster": "us-west-1#pre"},
+        "storage_secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
     assert "session-token" not in str(validation_tool.params)
     assert (
@@ -878,6 +881,7 @@ def test_pyromind_storage_tools_use_user_context_headers():
             "storage_base_url": "https://storage.test/api",
             "dataset_cleaning_output_root": "/agentTest/clean-results",
         },
+        "/srv/skills",
     )
 
     assert [tool.name for tool in tools] == [
@@ -907,6 +911,10 @@ def test_pyromind_storage_tools_use_user_context_headers():
             "request-app": "openhands",
         },
         "output_root": "/agentTest/clean-results",
+        "runtime_dir": "/srv/skills/data-cleaning/scripts",
+        "storage_base_url": "https://storage.test/api",
+        "storage_headers": {"x-cluster": "context-cluster"},
+        "storage_secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
     assert (
         secrets["PYROMIND_STORAGE_AUTH_COOKIE"].get_value()
