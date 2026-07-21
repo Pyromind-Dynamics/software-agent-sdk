@@ -1,116 +1,123 @@
+---
 apiVersion: v1
 kind: Secret
 metadata:
-  name: software-agent-sdk-secret
-  namespace: webapp-pre
+    name: software-agent-sdk-secret
+    namespace: webapp-pre
 type: Opaque
 data:
-  SESSION_API_KEY: NjkyNzY1OGM1YTdhOGNhNmJhM2UwMmZiYzNmOWFmYzk3MDEyYTg1Y2VhMDlkZDg3MGZmYjc3NmE2NjNlOWUwYwo=
-  OH_SECRET_KEY: MjdmZmE0Y2I5ODQzNjE2ZjE0Yjc3ZmVkOGQ0YWI3MDBlMTQ4NDZmOGRkNzZjNGU0YmViOWU3YzNmMjk5ZTc3Mgo=
+    SESSION_API_KEY: NjkyNzY1OGM1YTdhOGNhNmJhM2UwMmZiYzNmOWFmYzk3MDEyYTg1Y2VhMDlkZDg3MGZmYjc3NmE2NjNlOWUwYwo=
+    OH_SECRET_KEY: MjdmZmE0Y2I5ODQzNjE2ZjE0Yjc3ZmVkOGQ0YWI3MDBlMTQ4NDZmOGRkNzZjNGU0YmViOWU3YzNmMjk5ZTc3Mgo=
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  labels:
-    app: software-agent-sdk
-    enable-sts-monitor: "true"
-  name: software-agent-sdk
-  namespace: webapp-pre
-spec:
-  replicas: 1
-  revisionHistoryLimit: 10
-  selector:
-    matchLabels:
-      app: software-agent-sdk
-  serviceName: software-agent-sdk
-  template:
-    metadata:
-      labels:
+    labels:
         app: software-agent-sdk
-        enable-sts-monitor: "true"
-    spec:
-      containers:
-      - env:
-        - name: RunMode
-          value: agent-server
-        - name: workspace_dir
-          value: /workspace
-        - name: SESSION_API_KEY
-          valueFrom:
-            secretKeyRef:
-              key: SESSION_API_KEY
-              name: software-agent-sdk-secret
-        - name: OH_SECRET_KEY
-          valueFrom:
-            secretKeyRef:
-              key: OH_SECRET_KEY
-              name: software-agent-sdk-secret
-        image: pyrominddynamics/software-agent-sdk:feat-dockerfile-a34541ee-07020635
-        imagePullPolicy: IfNotPresent
-        name: main
-        ports:
-        - containerPort: 8000
-          name: http
-          protocol: TCP
-        resources:
-          requests:
-            memory: "512Mi"
-            cpu: "250m"
-          limits:
-            memory: "1Gi"
-            cpu: "500m"
-        terminationMessagePath: /dev/termination-log
-        terminationMessagePolicy: File
-        volumeMounts:
-        - mountPath: /workspace
-          name: workspace
-      initContainers:
-      - name: setup-workspace
-        image: busybox:latest
-        command:
-        - /bin/sh
-        - -c
-        - |
-          mkdir -p /workspace/conversations
-          mkdir -p /workspace/project
-          mkdir -p /workspace/bash_events
-          chown -R 10001:10001 /workspace
-          echo "Workspace initialized successfully"
-        volumeMounts:
-        - mountPath: /workspace
-          name: workspace
-      securityContext:
-        fsGroup: 10001
-        runAsUser: 10001
-        runAsGroup: 10001
-      dnsPolicy: ClusterFirst
-      imagePullSecrets:
-      - name: niqi-dev-secret
-      restartPolicy: Always
-  volumeClaimTemplates:
-  - metadata:
-      name: workspace
-    spec:
-      accessModes:
-      - ReadWriteOnce
-      resources:
-        requests:
-          storage: 100Gi
-      storageClassName: gp2
+        enable-sts-monitor: 'true'
+    name: software-agent-sdk
+    namespace: webapp-pre
+spec:
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+        matchLabels:
+            app: software-agent-sdk
+    serviceName: software-agent-sdk
+    template:
+        metadata:
+            labels:
+                app: software-agent-sdk
+                enable-sts-monitor: 'true'
+        spec:
+            containers:
+                - env:
+                      - name: RunMode
+                        value: agent-server
+                      - name: workspace_dir
+                        value: /workspace
+                      - name: SESSION_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                key: SESSION_API_KEY
+                                name: software-agent-sdk-secret
+                      - name: OH_SECRET_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                key: OH_SECRET_KEY
+                                name: software-agent-sdk-secret
+                  image: pyrominddynamics/software-agent-sdk:feat-dockerfile-a34541ee-07020635
+                  imagePullPolicy: IfNotPresent
+                  name: main
+                  ports:
+                      - containerPort: 8000
+                        name: http
+                        protocol: TCP
+                  resources:
+                      requests:
+                          memory: 512Mi
+                          cpu: 250m
+                      limits:
+                          memory: 1Gi
+                          cpu: 500m
+                  terminationMessagePath: /dev/termination-log
+                  terminationMessagePolicy: File
+                  volumeMounts:
+                      - mountPath: /workspace
+                        name: workspace
+                  securityContext:
+                      capabilities:
+                          add:
+                              - SYS_ADMIN
+                      seccompProfile:
+                          type: Unconfined
+            initContainers:
+                - name: setup-workspace
+                  image: busybox:latest
+                  command:
+                      - /bin/sh
+                      - -c
+                      - |
+                        mkdir -p /workspace/conversations
+                        mkdir -p /workspace/project
+                        mkdir -p /workspace/bash_events
+                        chown -R 10001:10001 /workspace
+                        echo "Workspace initialized successfully"
+                  volumeMounts:
+                      - mountPath: /workspace
+                        name: workspace
+            securityContext:
+                fsGroup: 10001
+                runAsUser: 10001
+                runAsGroup: 10001
+            dnsPolicy: ClusterFirst
+            imagePullSecrets:
+                - name: niqi-dev-secret
+            restartPolicy: Always
+    volumeClaimTemplates:
+        - metadata:
+              name: workspace
+          spec:
+              accessModes:
+                  - ReadWriteOnce
+              resources:
+                  requests:
+                      storage: 100Gi
+              storageClassName: gp2
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: software-agent-sdk
-  namespace: webapp-pre
-  labels:
-    app: software-agent-sdk
+    name: software-agent-sdk
+    namespace: webapp-pre
+    labels:
+        app: software-agent-sdk
 spec:
-  selector:
-    app: software-agent-sdk
-  ports:
-  - name: http
-    port: 80
-    targetPort: 8000
-    protocol: TCP
-  type: ClusterIP
+    selector:
+        app: software-agent-sdk
+    ports:
+        - name: http
+          port: 80
+          targetPort: 8000
+          protocol: TCP
+    type: ClusterIP
