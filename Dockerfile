@@ -98,34 +98,36 @@ RUN set -eux; \
             bash ca-certificates curl wget sudo apt-utils git jq tmux tar \
             build-essential coreutils util-linux procps findutils grep sed \
             tini apt-transport-https gnupg lsb-release xz-utils \
-            apparmor apparmor-utils; \
+            apparmor apparmor-utils bubblewrap; \
         rm -rf /var/lib/apt/lists/*; \
     elif command -v apk >/dev/null 2>&1; then \
         apk add --no-cache \
             bash ca-certificates curl wget sudo git jq tmux tar build-base \
-            coreutils util-linux procps findutils grep sed tini gnupg shadow xz; \
+            coreutils util-linux procps findutils grep sed tini gnupg shadow xz \
+            bubblewrap; \
     elif command -v microdnf >/dev/null 2>&1; then \
         microdnf install -y \
             bash ca-certificates curl wget sudo git jq tmux tar make gcc gcc-c++ \
             coreutils util-linux procps-ng findutils grep sed shadow-utils \
-            gnupg2 xz; \
+            gnupg2 xz bubblewrap; \
         microdnf clean all; \
     elif command -v dnf >/dev/null 2>&1; then \
         dnf install -y \
             bash ca-certificates curl wget sudo git jq tmux tar make gcc gcc-c++ \
             coreutils util-linux procps-ng findutils grep sed shadow-utils \
-            gnupg2 xz; \
+            gnupg2 xz bubblewrap; \
         dnf clean all; \
     elif command -v yum >/dev/null 2>&1; then \
         yum install -y \
             bash ca-certificates curl wget sudo git jq tmux tar make gcc gcc-c++ \
             coreutils util-linux procps-ng findutils grep sed shadow-utils \
-            gnupg2 xz; \
+            gnupg2 xz bubblewrap; \
         yum clean all; \
     elif command -v zypper >/dev/null 2>&1; then \
         zypper --non-interactive install --no-recommends \
             bash ca-certificates curl wget sudo git jq tmux tar make gcc gcc-c++ \
-            coreutils util-linux procps findutils grep sed shadow gpg2 xz; \
+            coreutils util-linux procps findutils grep sed shadow gpg2 xz \
+            bubblewrap; \
         zypper clean --all; \
     else \
         echo "Unsupported base image: no known package manager found" >&2; \
