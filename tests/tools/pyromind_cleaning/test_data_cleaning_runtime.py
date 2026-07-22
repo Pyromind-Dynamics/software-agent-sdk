@@ -183,6 +183,8 @@ def test_runner_limit_counts_source_rows_and_isolates_errors(
         "error_samples": [
             {
                 "reason": "json_decode_error",
+                "source_path": str(source),
+                "source_index": 2,
                 "line_number": 2,
                 "error": "could not parse JSON",
                 "sample": "{bad json}",
@@ -191,8 +193,13 @@ def test_runner_limit_counts_source_rows_and_isolates_errors(
         "status": "completed",
     }
     assert len(output.read_text(encoding="utf-8").splitlines()) == 2
-    errors = (output.parent / "errors.jsonl").read_text(encoding="utf-8")
-    assert '"source_index":2' in errors
+    report = json.loads((output.parent / "report.json").read_text(encoding="utf-8"))
+    assert report["stats"]["read"] == 3
+    assert report["errors"][0]["source_index"] == 2
+    assert {path.name for path in output.parent.iterdir()} == {
+        "output.jsonl",
+        "report.json",
+    }
 
 
 def test_runner_redacts_sensitive_error_samples(runtime_modules, tmp_path):
@@ -214,10 +221,10 @@ def test_runner_redacts_sensitive_error_samples(runtime_modules, tmp_path):
         mapper=invalid_mapper,
     )
 
-    errors = (run_dir / "errors.jsonl").read_text(encoding="utf-8")
+    report = (run_dir / "report.json").read_text(encoding="utf-8")
     assert stats.errors == 1
-    assert "private-value" not in errors
-    assert "***REDACTED***" in errors
+    assert "private-value" not in report
+    assert "***REDACTED***" in report
 
 
 def test_runner_writes_failed_stats_and_checkpoint_for_structural_input_error(
@@ -235,12 +242,14 @@ def test_runner_writes_failed_stats_and_checkpoint_for_structural_input_error(
             mapper=_message_record,
         )
 
-    stats = json.loads((run_dir / "stats.json").read_text())
-    checkpoint = json.loads((run_dir / "checkpoint.json").read_text())
-    assert stats["status"] == "failed"
-    assert stats["read"] == 0
-    assert checkpoint["source_records_committed"] == 0
-    assert (run_dir / "errors.jsonl").is_file()
+    report = json.loads((run_dir / "report.json").read_text())
+    assert report["stats"]["status"] == "failed"
+    assert report["stats"]["read"] == 0
+    assert report["checkpoint"]["source_records_committed"] == 0
+    assert {path.name for path in run_dir.iterdir()} == {
+        "output.jsonl",
+        "report.json",
+    }
 
 
 def test_runner_resume_truncates_uncommitted_tails_without_duplicates(
@@ -270,10 +279,10 @@ def test_runner_resume_truncates_uncommitted_tails_without_duplicates(
             mapper=interrupted_mapper,
         )
 
-    failed_stats = json.loads((run_dir / "stats.json").read_text())
-    checkpoint = json.loads((run_dir / "checkpoint.json").read_text())
-    assert failed_stats["status"] == "failed"
-    assert checkpoint["source"] == {
+    report_path = run_dir / "report.json"
+    failed_report = json.loads(report_path.read_text())
+    assert failed_report["stats"]["status"] == "failed"
+    assert failed_report["checkpoint"]["source"] == {
         "index": 3,
         "path": str(source),
         "line": 3,
@@ -281,8 +290,8 @@ def test_runner_resume_truncates_uncommitted_tails_without_duplicates(
 
     with output.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(_message_record({"text": "uncommitted"})) + "\n")
-    with (run_dir / "errors.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write('{"error":"uncommitted"}\n')
+    failed_report["errors"].append({"error": "uncommitted"})
+    report_path.write_text(json.dumps(failed_report), encoding="utf-8")
 
     stats = utils.run_cleaning(
         input_path=source,
@@ -298,7 +307,11 @@ def test_runner_resume_truncates_uncommitted_tails_without_duplicates(
     assert stats.read == 5
     assert stats.written == 4
     assert stats.duplicates == 1
-    assert "uncommitted" not in (run_dir / "errors.jsonl").read_text()
+    assert "uncommitted" not in report_path.read_text()
+    assert {path.name for path in run_dir.iterdir()} == {
+        "output.jsonl",
+        "report.json",
+    }
 
 
 def test_messages_validator_enforces_top_level_and_tool_links(runtime_modules):
@@ -419,12 +432,12 @@ def test_validator_rejects_mixed_output_formats(runtime_modules, tmp_path):
         + "\n",
         encoding="utf-8",
     )
-    report_path = tmp_path / "validation.json"
+    report_path = tmp_path / "report.json"
 
     assert validator.main(["--input", str(output), "--report", str(report_path)]) == 1
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["format"] == "mixed"
-    assert report["reasons"] == {"invalid_format": 1}
+    assert report["validation"]["reasons"] == {"invalid_format": 1}
 
 
 def test_validator_reports_preference_format(runtime_modules, tmp_path):
@@ -434,13 +447,41 @@ def test_validator_reports_preference_format(runtime_modules, tmp_path):
         json.dumps({"prompt": "p", "chosen": "c", "rejected": "r"}) + "\n",
         encoding="utf-8",
     )
-    report_path = tmp_path / "validation.json"
+    report_path = tmp_path / "report.json"
 
     assert validator.main(["--input", str(output), "--report", str(report_path)]) == 0
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["format"] == "preference"
-    assert report["valid"] == 1
-    assert report["role_counts"] == {}
+    assert report["validation"]["valid"] == 1
+    assert report["validation"]["role_counts"] == {}
+
+
+def test_validator_merges_into_cleaning_report(runtime_modules, tmp_path):
+    utils, validator = runtime_modules
+    source = tmp_path / "source.jsonl"
+    source.write_text(json.dumps({"text": "one"}) + "\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    output = run_dir / "output.jsonl"
+    utils.run_cleaning(
+        input_path=source,
+        output_path=output,
+        state_dir=run_dir,
+        mapper=_message_record,
+    )
+
+    report_path = run_dir / "report.json"
+    assert validator.main(["--input", str(output), "--report", str(report_path)]) == 0
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "passed"
+    assert report["format"] == "messages"
+    assert report["stats"]["written"] == 1
+    assert report["checkpoint"]["source_records_committed"] == 1
+    assert report["validation"]["valid"] == 1
+    assert {path.name for path in run_dir.iterdir()} == {
+        "output.jsonl",
+        "report.json",
+    }
 
 
 @pytest.mark.parametrize(
@@ -521,7 +562,7 @@ def test_validator_always_writes_report_and_rejects_empty_output(
     _, validator = runtime_modules
     output = tmp_path / "output.jsonl"
     output.write_text("", encoding="utf-8")
-    report_path = tmp_path / "validation.json"
+    report_path = tmp_path / "report.json"
 
     exit_code = validator.main(["--input", str(output), "--report", str(report_path)])
 
@@ -529,7 +570,7 @@ def test_validator_always_writes_report_and_rejects_empty_output(
     assert exit_code == 1
     assert report["status"] == "failed"
     assert report["format"] == "unknown"
-    assert report["reasons"] == {"empty_dataset": 1}
+    assert report["validation"]["reasons"] == {"empty_dataset": 1}
 
 
 def test_skill_requires_platform_sample_and_user_confirmation():
@@ -544,6 +585,8 @@ def test_skill_requires_platform_sample_and_user_confirmation():
     assert "不要查看、搜索或反复读取 `cleaning_utils.py`" in skill
     assert "prompt/chosen/rejected 自动按 DPO 清洗" in skill
     assert "不透明 `error_log`" in skill
+    assert "`report.json` 和 `output.jsonl`" in skill
+    assert "只生成两个数据产物" in skill
     assert "`read_file`" not in skill
     assert "`execute_bash`" not in skill
     assert "approved_run_id" not in skill

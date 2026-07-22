@@ -24,11 +24,10 @@ validator。平台产物只能用 `preview_dataset` 查看。
 4. 用 `upload_file_to_pyromind` 上传脚本，再调用 `run_dataset_cleaning`，传
    `script_path`、`input_path` 和 `limit=3`。不要自行传 `output_dir`。
 5. 收到通用 callback 后，从最近一次工具 Observation 取得 `run_id` 和
-   `output_dir`，依次用 `preview_dataset` 查看：
-   `validation.json`、`stats.json`/`errors.jsonl`、`output.jsonl`、
-   `checkpoint.json`。格式失败或存在系统性清洗错误时修改脚本并创建新的试跑，
-   不恢复错误 run。失败且没有产物时按启动失败处理，不要在本地解码 callback 的
-   不透明 `error_log`。
+   `output_dir`，用 `preview_dataset` 查看 `report.json` 和 `output.jsonl`。
+   `report.json` 包含格式校验、统计、错误样本和 checkpoint。格式失败或存在系统性
+   清洗错误时修改脚本并创建新的试跑，不恢复错误 run。失败且没有报告时按启动失败
+   处理，不要在本地解码 callback 的不透明 `error_log`。
 6. 格式和语义检查通过后，展示最多三条结果并等待用户明确确认。确认后优先用
    `<sample_output_dir>/clean_script.py` 创建一个不传 `limit` 的新全量 run。
 7. 只有平台或进程中断且脚本逻辑正确时，才传原 `input_path` 和
@@ -49,8 +48,7 @@ python3 clean_script.py \
 `--limit` 限制解包后考虑的源记录数，不是最终保留数。平台会在创建 run 前静态
 检查脚本语法和 Utils import；这不读取或执行数据。平台自动把冻结的
 `clean_script.py`、`cleaning_utils.py` 和 `validate_format.py` 放在同一 run 目录，
-cleaner 完成后在同一 Pod 校验并生成 `validation.json`。
+cleaner 完成后在同一 Pod 校验并合并更新 `report.json`。
 
-每个 run 的 Storage 目录包含 `clean_script.py`、`cleaning_utils.py`、
-`validate_format.py`、`output.jsonl`、`stats.json`、`errors.jsonl`、
-`checkpoint.json` 和 `validation.json`。
+每个 run 只生成两个数据产物：纯训练数据 `output.jsonl`，以及包含统计、错误、
+checkpoint 和格式校验的 `report.json`。

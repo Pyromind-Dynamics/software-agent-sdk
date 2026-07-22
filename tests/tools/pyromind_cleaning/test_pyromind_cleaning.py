@@ -123,8 +123,8 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
     assert observation.run_id is not None
     assert observation.output_dir == (f"/agentTest/data_cleaning/{observation.run_id}")
     assert observation.resumed is False
-    assert f"{observation.output_dir}/validation.json" in observation.text
-    assert "output.jsonl, and checkpoint.json" in observation.text
+    assert f"{observation.output_dir}/report.json" in observation.text
+    assert "then output.jsonl" in observation.text
     assert upload_runtime.call_count == 2
     download_script.assert_called_once()
     assert {
@@ -166,7 +166,7 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
     assert (
         f"python3 {pod_output_dir}/validate_format.py "
         f"--input {pod_output_dir}/output.jsonl "
-        f"--report {pod_output_dir}/validation.json"
+        f"--report {pod_output_dir}/report.json"
     ) in command
 
     association = DatasetCleaningTaskStore(task_store_dir).get("9876")

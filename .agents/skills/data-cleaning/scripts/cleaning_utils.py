@@ -186,7 +186,7 @@ class ValidationError:
 
 @dataclass
 class CleaningStats:
-    """Collect stable counters written to ``stats.json`` and checkpoints."""
+    """Collect stable counters written to the cleaning report."""
 
     read: int = 0
     written: int = 0
@@ -223,6 +223,8 @@ class CleaningStats:
         *,
         sample: Any | None = None,
         line_number: int | None = None,
+        source_index: int | None = None,
+        source_path: str | None = None,
         error: str | None = None,
         is_error: bool = False,
         is_duplicate: bool = False,
@@ -237,6 +239,10 @@ class CleaningStats:
         if len(self.error_samples) >= self.max_error_samples:
             return
         item: dict[str, Any] = {"reason": reason}
+        if source_path is not None:
+            item["source_path"] = source_path
+        if source_index is not None:
+            item["source_index"] = source_index
         if line_number is not None:
             item["line_number"] = line_number
         if error:
@@ -729,7 +735,7 @@ def atomic_write_json(path: str | Path, value: Any) -> None:
 
 
 def truncate_for_stats(value: Any, *, max_chars: int = 500) -> Any:
-    """Return a compact sample suitable for stats.json."""
+    """Return a compact sample suitable for the cleaning report."""
     redacted = redact_sensitive_data(value)
     text = redacted if isinstance(redacted, str) else stable_json_dumps(redacted)
     if len(text) <= max_chars:
@@ -2040,50 +2046,72 @@ def _checkpoint_payload(
     *,
     source_records_committed: int,
     output_offset: int,
-    errors_offset: int,
     stats: CleaningStats,
     source_path: str | None = None,
     source_line: int | None = None,
 ) -> dict[str, Any]:
+    stats_payload = stats.to_dict()
+    stats_payload.pop("error_samples", None)
     return {
-        "version": 1,
+        "version": 2,
         "source_records_committed": source_records_committed,
         "output_offset": output_offset,
-        "errors_offset": errors_offset,
+        "error_samples_committed": len(stats.error_samples),
         "source": {
             "index": source_records_committed,
             "path": source_path,
             "line": source_line,
         },
-        "stats": stats.to_dict(),
+        "stats": stats_payload,
+    }
+
+
+def _report_payload(
+    stats: CleaningStats,
+    checkpoint: dict[str, Any],
+    *,
+    validation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    stats_payload = stats.to_dict()
+    errors = stats_payload.pop("error_samples", [])
+    return {
+        "status": stats.status,
+        "format": None,
+        "stats": stats_payload,
+        "checkpoint": checkpoint,
+        "validation": validation,
+        "errors": errors,
     }
 
 
 def _load_checkpoint(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise DataCleaningError(
-            f"resume requested but checkpoint is missing: {path}",
+            f"resume requested but report is missing: {path}",
             code=ERROR_INVALID_FORMAT,
         )
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise DataCleaningError(
-            f"could not read checkpoint: {exc}",
+            f"could not read report: {exc}",
             code=ERROR_JSON_DECODE,
         ) from exc
-    required = {
-        "source_records_committed",
-        "output_offset",
-        "errors_offset",
-        "stats",
-    }
-    if not isinstance(value, dict) or not required.issubset(value):
+    checkpoint = value.get("checkpoint") if isinstance(value, dict) else None
+    required = {"source_records_committed", "output_offset", "stats"}
+    if not isinstance(checkpoint, dict) or not required.issubset(checkpoint):
         raise DataCleaningError(
-            "checkpoint has an unsupported structure",
+            "report checkpoint has an unsupported structure",
             code=ERROR_INVALID_FORMAT,
         )
-    return value
+    checkpoint = dict(checkpoint)
+    stats = dict(checkpoint["stats"])
+    errors = value.get("errors", [])
+    if isinstance(errors, list):
+        committed = int(checkpoint.get("error_samples_committed", len(errors)))
+        stats["error_samples"] = errors[:committed]
+    checkpoint["stats"] = stats
+    return checkpoint
 
 
 def _truncate_to_checkpoint(handle: Any, offset: int, label: str) -> None:
@@ -2129,24 +2157,6 @@ def _restore_deduper(
     return output_format
 
 
-def _error_payload(
-    parsed: ParsedRecord,
-    *,
-    source_index: int,
-    code: str,
-    error: str,
-) -> dict[str, Any]:
-    sample = parsed.data if parsed.data is not None else parsed.raw
-    return {
-        "source_path": parsed.source_path,
-        "source_index": source_index,
-        "line": parsed.line_number,
-        "code": code,
-        "error": redact_sensitive_data(error),
-        "raw": truncate_for_stats(sample),
-    }
-
-
 def run_cleaning(
     *,
     input_path: str | Path,
@@ -2158,8 +2168,8 @@ def run_cleaning(
 ) -> CleaningStats:
     """Run a resumable streaming cleaner around source-specific mapping logic.
 
-    A checkpoint is committed only after both append-only files are durable.
-    Resume truncates any uncommitted tails before rebuilding exact dedupe state.
+    A checkpoint is committed after output is durable. Resume truncates any
+    uncommitted output tail before rebuilding exact dedupe state.
     """
     if limit is not None and limit < 1:
         raise ValueError("limit must be greater than 0")
@@ -2168,22 +2178,19 @@ def run_cleaning(
     state = Path(state_dir)
     state.mkdir(parents=True, exist_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    errors_path = state / "errors.jsonl"
-    stats_path = state / "stats.json"
-    checkpoint_path = state / "checkpoint.json"
+    report_path = state / "report.json"
     deduper = ExactDeduper()
     committed = 0
     target_format: Literal["messages", "preference"] | None = None
 
     if resume:
-        checkpoint = _load_checkpoint(checkpoint_path)
-        if not output.is_file() or not errors_path.is_file():
+        checkpoint = _load_checkpoint(report_path)
+        if not output.is_file():
             raise DataCleaningError(
-                "resume requires output.jsonl and errors.jsonl",
+                "resume requires output.jsonl",
                 code=ERROR_INVALID_FORMAT,
             )
         output_handle = output.open("r+b")
-        errors_handle = errors_path.open("r+b")
         stats = CleaningStats.from_dict(checkpoint["stats"])
         stats.status = "running"
         stats.failure = None
@@ -2191,13 +2198,9 @@ def run_cleaning(
         _truncate_to_checkpoint(
             output_handle, int(checkpoint["output_offset"]), "output"
         )
-        _truncate_to_checkpoint(
-            errors_handle, int(checkpoint["errors_offset"]), "errors"
-        )
         target_format = _restore_deduper(output, deduper)
     else:
         output_handle = output.open("w+b")
-        errors_handle = errors_path.open("w+b")
         stats = CleaningStats()
 
     invocation_read = 0
@@ -2207,20 +2210,17 @@ def run_cleaning(
     if isinstance(source_checkpoint, dict):
         committed_source_path = source_checkpoint.get("path")
         committed_source_line = source_checkpoint.get("line")
+    checkpoint = _checkpoint_payload(
+        source_records_committed=committed,
+        output_offset=output_handle.tell(),
+        stats=stats,
+        source_path=committed_source_path,
+        source_line=committed_source_line,
+    )
     try:
-        with output_handle, errors_handle:
-            _flush_durable(output_handle, errors_handle)
-            atomic_write_json(
-                checkpoint_path,
-                _checkpoint_payload(
-                    source_records_committed=committed,
-                    output_offset=output_handle.tell(),
-                    errors_offset=errors_handle.tell(),
-                    stats=stats,
-                    source_path=committed_source_path,
-                    source_line=committed_source_line,
-                ),
-            )
+        with output_handle:
+            _flush_durable(output_handle)
+            atomic_write_json(report_path, _report_payload(stats, checkpoint))
             for source_index, parsed in enumerate(iter_records(input_path), start=1):
                 if source_index <= committed:
                     continue
@@ -2232,19 +2232,12 @@ def run_cleaning(
                 if not parsed.ok:
                     code = parsed.error_type or ERROR_JSON_DECODE
                     message = parsed.error or "source record could not be parsed"
-                    _write_json_line(
-                        errors_handle,
-                        _error_payload(
-                            parsed,
-                            source_index=source_index,
-                            code=code,
-                            error=message,
-                        ),
-                    )
                     stats.record_drop(
                         code,
                         sample=parsed.raw,
                         line_number=parsed.line_number,
+                        source_index=source_index,
+                        source_path=parsed.source_path,
                         error=message,
                         is_error=True,
                     )
@@ -2300,58 +2293,44 @@ def run_cleaning(
                         )
                     except (DataCleaningError, KeyError, TypeError, ValueError) as exc:
                         code = getattr(exc, "code", ERROR_INVALID_FORMAT)
-                        _write_json_line(
-                            errors_handle,
-                            _error_payload(
-                                parsed,
-                                source_index=source_index,
-                                code=code,
-                                error=str(exc),
-                            ),
-                        )
                         stats.record_drop(
                             code,
                             sample=parsed.data,
                             line_number=parsed.line_number,
+                            source_index=source_index,
+                            source_path=parsed.source_path,
                             error=str(exc),
                             is_error=True,
                         )
 
-                _flush_durable(output_handle, errors_handle)
+                _flush_durable(output_handle)
                 committed = source_index
                 committed_source_path = parsed.source_path
                 committed_source_line = parsed.line_number
-                atomic_write_json(
-                    checkpoint_path,
-                    _checkpoint_payload(
-                        source_records_committed=committed,
-                        output_offset=output_handle.tell(),
-                        errors_offset=errors_handle.tell(),
-                        stats=stats,
-                        source_path=committed_source_path,
-                        source_line=committed_source_line,
-                    ),
-                )
-
-            stats.status = "completed"
-            _flush_durable(output_handle, errors_handle)
-            atomic_write_json(
-                checkpoint_path,
-                _checkpoint_payload(
+                checkpoint = _checkpoint_payload(
                     source_records_committed=committed,
                     output_offset=output_handle.tell(),
-                    errors_offset=errors_handle.tell(),
                     stats=stats,
                     source_path=committed_source_path,
                     source_line=committed_source_line,
-                ),
+                )
+                atomic_write_json(report_path, _report_payload(stats, checkpoint))
+
+            stats.status = "completed"
+            _flush_durable(output_handle)
+            checkpoint = _checkpoint_payload(
+                source_records_committed=committed,
+                output_offset=output_handle.tell(),
+                stats=stats,
+                source_path=committed_source_path,
+                source_line=committed_source_line,
             )
-        stats.write_json(stats_path)
+            atomic_write_json(report_path, _report_payload(stats, checkpoint))
         return stats
     except Exception as exc:
         stats.status = "failed"
         stats.failure = f"{type(exc).__name__}: {exc}"
-        stats.write_json(stats_path)
+        atomic_write_json(report_path, _report_payload(stats, checkpoint))
         raise
 
 

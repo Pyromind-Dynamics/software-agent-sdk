@@ -129,16 +129,18 @@ by that invocation. Output is homogeneous messages or text DPO preference JSONL.
 The submission is asynchronous. A new run gets a unique result directory under
 `/agentTest/data_cleaning/<run_id>`. The tool uploads `cleaning_utils.py` and
 `validate_format.py` beside the frozen `clean_script.py`, runs the cleaner, then
-validates output.jsonl in the same Pod and writes validation.json. Before creating
-a new run it statically checks script syntax and explicit cleaning_utils imports;
-it does not execute the script or read dataset content. Use `limit=3` for a sample
+validates output.jsonl in the same Pod and merges validation into report.json.
+The only generated artifacts are output.jsonl and report.json. Before creating a
+new run it statically checks script syntax and explicit cleaning_utils imports; it
+does not execute the script or read dataset content. Use `limit=3` for a sample
 run. To continue an interrupted run, call this tool again with `resume_run_id`;
 the platform reuses all frozen runtime files and passes `--resume`.
 
 When the terminal workflow callback resumes the conversation, use the
 `output_dir` returned by this tool. Inspect platform artifacts only with
-`preview_dataset`, starting with validation.json, then stats.json/errors.jsonl,
-output.jsonl, and checkpoint.json. Never run or validate Storage data locally.
+`preview_dataset`: read report.json for validation, counters, errors, and
+checkpoint state, then output.jsonl for cleaned rows. Never run or validate
+Storage data locally.
 """
 
 
@@ -298,8 +300,7 @@ class RunDatasetCleaningExecutor(
                 "Dataset cleaning workflow submitted. "
                 f"task_id={task_id}, run_id={run_id}, output_dir={output_dir}. "
                 "After the terminal callback, preview "
-                f"{output_dir}/validation.json first, then stats.json, "
-                "errors.jsonl, output.jsonl, and checkpoint.json."
+                f"{output_dir}/report.json, then output.jsonl."
             ),
             status=response.status,
             task_id=task_id,
@@ -574,7 +575,7 @@ def _build_cleaning_command(
     cleaning_utils = f"{pod_output_dir}/cleaning_utils.py"
     validator = f"{pod_output_dir}/validate_format.py"
     output_file = f"{pod_output_dir}/output.jsonl"
-    validation_file = f"{pod_output_dir}/validation.json"
+    report_file = f"{pod_output_dir}/report.json"
 
     command_parts = [
         "python3",
@@ -611,7 +612,7 @@ def _build_cleaning_command(
         "--input",
         shlex.quote(output_file),
         "--report",
-        shlex.quote(validation_file),
+        shlex.quote(report_file),
     ]
     return f"{prefix} && {' '.join(command_parts)} && {' '.join(validator_parts)}"
 

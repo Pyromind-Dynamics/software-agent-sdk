@@ -18,7 +18,7 @@ run_cleaning(
 
 `mapper(record)` 返回一个目标格式对象；返回 `None` 等价于 `DropRecord("filtered")`。
 可抛 `DropRecord(reason)` 表示有意过滤。解析、映射或行级校验错误写入
-`errors.jsonl` 后继续；未处理的结构性错误写失败 stats 并非零退出。
+`report.json` 的有界错误样本后继续；未处理的结构性错误写入失败状态并非零退出。
 
 ## 目标映射
 
@@ -79,6 +79,7 @@ validate_messages_record(record: Any, *, line_number: int | None = None) -> list
 validate_preference_record(record: Any, *, line_number: int | None = None) -> list[ValidationError]
 ```
 
-Runner 对完整输出记录做 SHA-256 精确去重。`stats.json` 包含 read、written、dropped、
-errors、duplicates、drop_reasons 和 status。checkpoint 保存已安全提交的源位置及
-output/errors 偏移；resume 先截断未提交尾部，再恢复去重状态并追加执行。
+`run_cleaning` 对完整输出记录做 SHA-256 精确去重。`report.json` 集中保存 stats、错误样本、
+checkpoint 和 validation；checkpoint 保存已安全提交的源位置、输出偏移和累计统计。
+resume 先按输出偏移截断未提交尾部，再恢复去重状态并追加执行。除纯训练数据
+`output.jsonl` 外，不生成其他数据产物。

@@ -23,7 +23,7 @@ from cleaning_utils import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="training JSONL to validate")
-    parser.add_argument("--report", required=True, help="validation.json path")
+    parser.add_argument("--report", required=True, help="report.json path")
     parser.add_argument(
         "--max-errors",
         type=int,
@@ -42,6 +42,34 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+
+
+def _read_report(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _merge_validation(
+    report: dict[str, Any],
+    validation: dict[str, Any],
+) -> dict[str, Any]:
+    stats = report.get("stats")
+    cleaning_status = stats.get("status") if isinstance(stats, dict) else None
+    passed = validation["status"] == "passed" and cleaning_status in {
+        None,
+        "completed",
+    }
+    return {
+        **report,
+        "status": "passed" if passed else "failed",
+        "format": validation["format"],
+        "validation": validation,
+    }
 
 
 def _append_error(
@@ -163,8 +191,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.max_errors < 1:
         raise SystemExit("--max-errors must be greater than 0")
-    report = validate(Path(args.input), max_errors=args.max_errors)
-    _atomic_write_json(Path(args.report), report)
+    validation = validate(Path(args.input), max_errors=args.max_errors)
+    report_path = Path(args.report)
+    report = _merge_validation(_read_report(report_path), validation)
+    _atomic_write_json(report_path, report)
     print(json.dumps(report, ensure_ascii=False))
     return 0 if report["status"] == "passed" else 1
 
