@@ -116,8 +116,6 @@ if ! command -v uv >/dev/null 2>&1; then
   echo "Install it with: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2
   exit 127
 fi
-export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/software-agent-sdk-uv-cache}"
-mkdir -p "${UV_CACHE_DIR}"
 
 # ----------------------------------------------------------
 # Start Agent Server
