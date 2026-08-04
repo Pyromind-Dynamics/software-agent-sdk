@@ -24,11 +24,11 @@ answer，二者去除首尾空白后不能相同。
 ## `vision`
 
 ```json
-{"id":"v-1","image_path":"images/a.png","images":["images/a.png"],"system_prompt":"You are helpful.","user_prompt":"问题","gt":"<think>推理</think>\n<answer>A</answer>"}
+{"messages":[{"role":"system","content":[{"type":"text","value":"You are helpful."}]},{"role":"user","content":[{"type":"image_url","value":"images/a.png"},{"type":"text","value":"问题"}]},{"role":"assistant","content":[{"type":"text","value":"<think>推理</think>\n<answer>A</answer>"}]}]}
 ```
 
-图片路径是相对 POSIX 路径，`image_path == images[0]`；`gt` 含一组非空
-`think/answer`。
+消息固定按 `system → user → assistant` 排列；图片以有序的 `image_url` block 放在
+user 文本前，路径是相对 POSIX 路径；assistant 文本含一组非空 `think/answer`。
 
 ## `multiturn`
 

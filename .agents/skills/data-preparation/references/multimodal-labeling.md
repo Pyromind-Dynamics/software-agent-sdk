@@ -60,13 +60,16 @@ df_run_pipeline(model_profile="vision", output_schema="vision")
 
 ```json
 {
-  "id": "sample-0",
-  "image_path": "sample-a/front.png",
-  "images": ["sample-a/front.png", "sample-a/back.png"],
-  "system_prompt": "You are a helpful assistant.",
-  "user_prompt": "判断两张图片是否描述同一对象",
-  "gt": "<think>推理</think>\n\n<answer>答案</answer>"
+  "messages": [
+    {"role": "system", "content": [{"type": "text", "value": "You are a helpful assistant."}]},
+    {"role": "user", "content": [
+      {"type": "image_url", "value": "sample-a/front.png"},
+      {"type": "image_url", "value": "sample-a/back.png"},
+      {"type": "text", "value": "判断两张图片是否描述同一对象"}
+    ]},
+    {"role": "assistant", "content": [{"type": "text", "value": "<think>推理</think>\n\n<answer>答案</answer>"}]}
+  ]
 }
 ```
 
-`validate_prepared_data.py` 继续执行最终字段、ID、图片路径、图片解码和标签校验。
+`validate_prepared_data.py` 继续执行最终消息结构、图片路径、图片解码和标签校验。
