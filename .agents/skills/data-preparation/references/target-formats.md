@@ -38,19 +38,21 @@
 
 ```json
 {
-  "id": "geo-training-0",
-  "image_path": "images/geo-training-000000.png",
-  "images": ["images/geo-training-000000.png"],
-  "system_prompt": "You are a helpful assistant.",
-  "user_prompt": "用户问题",
-  "gt": "<think>推理</think>\n\n<answer>A</answer>"
+  "messages": [
+    {"role": "system", "content": [{"type": "text", "value": "You are a helpful assistant."}]},
+    {"role": "user", "content": [
+      {"type": "image_url", "value": "images/geo-training-000000.png"},
+      {"type": "text", "value": "用户问题"}
+    ]},
+    {"role": "assistant", "content": [{"type": "text", "value": "<think>推理</think>\n\n<answer>A</answer>"}]}
+  ]
 }
 ```
 
-- `images` 是非空、有序的相对 POSIX 路径列表。
-- `image_path` 必须等于 `images[0]`。
+- user 消息中的 `image_url` 是非空、有序的相对 POSIX 路径列表，并位于文本前。
 - 路径不允许绝对路径或 `..`。
-- `gt` 只能包含一组非空 `<think>` 和 `<answer>`；是否限制 A/B/C/D 由任务决定。
+- assistant 文本只能包含一组非空 `<think>` 和 `<answer>`；是否限制 A/B/C/D
+  由任务决定。
 
 Pipeline 直接写出上述格式，并通过 `df_run_pipeline(output_schema=...)` 或
 `df_submit_pipeline(output_schema=...)` 自动校验。
