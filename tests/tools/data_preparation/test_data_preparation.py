@@ -890,17 +890,20 @@ def test_image_utils_multi_image_prompt_retry_and_output_order(
         json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
     ]
     assert fake.request_sizes == [2, 1]
-    assert [row["id"] for row in rows] == ["first", "second"]
-    assert rows[0]["images"] == ["front.jpg", "back.jpg"]
-    assert rows[1]["gt"] == "<think>second</think>\n\n<answer>B</answer>"
-    assert set(rows[0]) == {
-        "id",
-        "image_path",
-        "images",
-        "system_prompt",
-        "user_prompt",
-        "gt",
-    }
+    assert [item["role"] for item in rows[0]["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+    ]
+    assert rows[0]["messages"][1]["content"] == [
+        {"type": "image_url", "value": "front.jpg"},
+        {"type": "image_url", "value": "back.jpg"},
+        {"type": "text", "value": "Compare both."},
+    ]
+    assert rows[1]["messages"][2]["content"][0]["value"] == (
+        "<think>second</think>\n\n<answer>B</answer>"
+    )
+    assert set(rows[0]) == {"messages"}
 
 
 def test_image_utils_dataflow_checkpoint_resume_without_duplicates(
@@ -958,7 +961,9 @@ def test_image_utils_dataflow_checkpoint_resume_without_duplicates(
         image_utils.run_image_pipeline(config, str(manifest), str(output))
 
     first_rows = [json.loads(line) for line in output.read_text().splitlines()]
-    assert [row["id"] for row in first_rows] == ["first"]
+    assert [row["messages"][1]["content"][-1]["value"] for row in first_rows] == [
+        "Inspect first."
+    ]
     assert (state_dir / "image_pipeline_last_success_step.txt").read_text() == "0,1\n"
 
     class SuccessfulServing:
@@ -977,7 +982,10 @@ def test_image_utils_dataflow_checkpoint_resume_without_duplicates(
     )
     image_utils.run_image_pipeline(config, str(manifest), str(output))
     resumed = [json.loads(line) for line in output.read_text().splitlines()]
-    assert [row["id"] for row in resumed] == ["first", "second"]
+    assert [row["messages"][1]["content"][-1]["value"] for row in resumed] == [
+        "Inspect first.",
+        "Inspect second.",
+    ]
 
 
 def test_image_utils_converts_webp_for_dataflow(
