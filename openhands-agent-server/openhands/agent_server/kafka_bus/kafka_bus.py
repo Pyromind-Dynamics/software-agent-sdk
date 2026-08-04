@@ -322,7 +322,8 @@ class KafkaMessageBus:
         message_id = event.message_id
         attempt = event.attempt or 0
         logger.info(
-            f"[MessageBus] 收到消息: message_id={message_id}, attempt={attempt}"
+            f"[MessageBus] 收到消息: message_id={message_id}, attempt={attempt}, "
+            f"topic={event.topic}, event_type={event.event_type}, data={event.data}"
         )
 
         topic = event.topic
