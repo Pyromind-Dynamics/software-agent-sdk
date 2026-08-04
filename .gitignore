@@ -219,6 +219,9 @@ tests/integration/api_compliance/outputs/
 /openhands-tools/openhands/tools/workflow_debug/*.md
 /tests/wangting/
 
+# Local tool configurations
+.qoder/settings.local.json
+
 
 #knowledge/basic/
 #knowledge/jupyterlab/

@@ -74,6 +74,8 @@ extend-select = ["B006", "B008", "B039", "RUF012"]
 [tool.ruff.lint.per-file-ignores]
 # Test files often have unused arguments (fixtures, mocks, interface implementations)
 "tests/**/*.py" = ["ARG"]
+"openhands-tools/openhands/tools/node_signature/definition.py" = ["E501"]
+"openhands-tools/openhands/tools/node_signature/impl.py" = ["E501"]
 
 
 # Allowlist safe default calls for flake8-bugbear rules (e.g., FastAPI Depends)

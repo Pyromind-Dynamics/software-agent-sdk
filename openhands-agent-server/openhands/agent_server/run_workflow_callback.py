@@ -176,7 +176,9 @@ def build_run_workflow_terminal_reminder(
     lines.append(
         "Respond in the language of the user's most recent non-empty visible message."
     )
+
     if error_log:
+        lines.append("")
         lines.append("Runtime error log:")
         lines.append(error_log)
     lines.append("</system_reminder>")
