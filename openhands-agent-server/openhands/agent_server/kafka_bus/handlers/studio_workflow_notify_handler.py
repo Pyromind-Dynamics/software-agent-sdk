@@ -1,10 +1,12 @@
+import base64
+import json
+import zlib
 from enum import Enum
 
 from pyromind_sdk.client.models import StudioTaskStatus
 
 from openhands.agent_server.kafka_bus.kafka_handler import MessageHandler
 from openhands.agent_server.kafka_bus.kafka_topic import KafkaTopic
-from openhands.agent_server.kafka_bus.kafka_utils import decompression
 from openhands.agent_server.kafka_bus.message_event import MessageEvent
 from openhands.agent_server.run_workflow_callback import (
     deliver_run_workflow_status,
@@ -81,6 +83,13 @@ class StudioWorkflowNotifyHandler(MessageHandler):
             return
 
         message_data = event.data
+        logger.info(
+            "Kafka workflow notify received: message_id=%s event_type=%s data=%s",
+            event.message_id,
+            event.event_type,
+            message_data,
+        )
+
         status = _get_task_status(message_data.get("status"))
         if status is None or status not in _TERMINAL_STUDIO_STATUSES:
             return
@@ -106,16 +115,8 @@ class StudioWorkflowNotifyHandler(MessageHandler):
             )
             return
 
-        # 压缩前的内容
-        error_log = (
-            str(message_data["error_msg"])
-            if message_data.get("error_msg") is not None
-            else None
-        )
-
-        if error_log:
-            # 解压缩
-            error_log = decompression(error_log)
+        # error_msg 是 base64+zlib 压缩的 JSON，_decode_error_msg 会解压成可读文本
+        error_log = _decode_error_msg(message_data.get("error_msg"))
 
         result = await deliver_run_workflow_status(
             task_id=task_id,
@@ -188,3 +189,37 @@ def _get_task_status(task_status_value):
         ):
             return status
     return None
+
+
+def _decode_error_msg(raw: object | None) -> str | None:
+    """Decode error_msg from Kafka (base64+zlib compressed JSON).
+
+    The middleware compresses error logs via zlib+base64 before sending.
+    Format: {"node_code": ["line1", "line2", ...], ...}
+    Returns a human-readable string, or None if empty/undecodable.
+    """
+    if raw is None:
+        return None
+    raw_str = str(raw).strip()
+    if not raw_str:
+        return None
+
+    # Try decompress (base64 → zlib → JSON)
+    try:
+        decoded_bytes = base64.b64decode(raw_str)
+        decompressed = zlib.decompress(decoded_bytes)
+        data = json.loads(decompressed.decode("utf-8"))
+        if not data:
+            return None
+        # Format: {"node_code": ["line1", ...]} → readable text
+        parts: list[str] = []
+        for node_code, lines in data.items():
+            parts.append(f"--- {node_code} ---")
+            if isinstance(lines, list):
+                parts.extend(lines[-50:])  # last 50 lines per node
+            else:
+                parts.append(str(lines))
+        return "\n".join(parts)
+    except Exception:
+        # Not compressed or decode failed — return raw string as fallback
+        return raw_str
