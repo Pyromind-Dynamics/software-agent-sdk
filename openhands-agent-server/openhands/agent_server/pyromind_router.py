@@ -76,6 +76,7 @@ from openhands.tools.data_preparation import (
 from openhands.tools.data_preparation.progress import DfCheckProgressExecutor
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
+from openhands.tools.pyromind_archive import ExtractArchiveTool
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
@@ -488,6 +489,13 @@ def _build_pyromind_storage_tools(
     if "secret_headers" in params:
         stop_params["secret_headers"] = dict(params["secret_headers"])
 
+    # Archive extraction tool params (mirrors cleaning pattern without runtime_dir)
+    extraction_params: dict[str, Any] = dict(cleaning_params)
+    extraction_params.pop("runtime_dir", None)
+    extraction_output_root = extra.get("dataset_extraction_output_root")
+    if isinstance(extraction_output_root, str) and extraction_output_root:
+        extraction_params["output_root"] = extraction_output_root
+
     return (
         [
             Tool(name=PreviewDatasetTool.name, params=dict(params)),
@@ -496,6 +504,7 @@ def _build_pyromind_storage_tools(
             Tool(name=DfSubmitPipelineTool.name, params=preparation_params),
             Tool(name=DfCheckProgressTool.name, params=dict(params)),
             Tool(name=DfStopTaskTool.name, params=stop_params),
+            Tool(name=ExtractArchiveTool.name, params=extraction_params),
             Tool(name=PreviewRemoteDatasetTool.name, params={}),
         ],
         secrets,

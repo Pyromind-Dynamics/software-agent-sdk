@@ -16,14 +16,28 @@ class _FakeEventService:
     def __init__(self) -> None:
         self.run: bool | None = None
         self.internal_context: list[TextContent] | None = None
+        self.visible: bool = False
+        self.calls: list[dict] = []
 
     async def send_internal_context(
         self,
         content: list[TextContent],
         run: bool = False,
+        visible: bool = False,
+        extended_content: list[TextContent] | None = None,
     ) -> str:
         self.run = run
         self.internal_context = content
+        self.visible = visible
+        self.extended = extended_content
+        self.calls.append(
+            {
+                "content": content,
+                "run": run,
+                "visible": visible,
+                "extended_content": extended_content,
+            }
+        )
         return "internal-event"
 
 
@@ -58,13 +72,27 @@ async def test_generic_callback_silently_resumes_conversation(tmp_path):
     assert service.requested_conversation_id == conversation_id
     assert service.event_service.run is False
     assert service.event_service.internal_context is not None
-    reminder = service.event_service.internal_context[0].text
+    visible_text = service.event_service.internal_context[0].text
+    assert "工作流已完成" in visible_text
+    assert task_id in visible_text
+    assert "Succeeded" in visible_text
+    # The <system_reminder> is in extended_content, not in the visible text
+    assert service.event_service.extended is not None
+    assert len(service.event_service.extended) == 1
+    reminder = service.event_service.extended[0].text
     assert task_id in reminder
     assert "Resume the tool invocation associated with this task" in reminder
     assert "most recent non-empty visible message" in reminder
     assert "workflow_debug" not in reminder
     assert "Review the outcome and continue helping the user" not in reminder
     assert "stats.json" not in reminder
+
+    # Verify single call with both visible and extended content
+    assert len(service.event_service.calls) == 1
+    call = service.event_service.calls[0]
+    assert call["visible"] is True
+    assert call["run"] is False
+    assert call["extended_content"] is not None
 
     duplicate = await deliver_run_workflow_status(
         task_id=task_id,
@@ -93,10 +121,19 @@ async def test_workflow_debug_callback_success_uses_debug_guidance(tmp_path):
 
     assert result.outcome == "delivered_async"
     assert service.event_service.internal_context is not None
-    reminder = service.event_service.internal_context[0].text
+    visible_text = service.event_service.internal_context[0].text
+    assert "工作流调试运行成功" in visible_text
+    assert task_id in visible_text
+
+    # <system_reminder> is in extended_content
+    assert service.event_service.extended is not None
+    reminder = service.event_service.extended[0].text
     assert "workflow_debug (test) run that passed" in reminder
     assert "wait for their next message" in reminder
     assert "Resume the tool invocation associated with this task" not in reminder
+
+    # Verify single call
+    assert len(service.event_service.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -117,11 +154,21 @@ async def test_workflow_debug_callback_failure_uses_debug_guidance(tmp_path):
 
     assert result.outcome == "delivered_async"
     assert service.event_service.internal_context is not None
-    reminder = service.event_service.internal_context[0].text
+    visible_text = service.event_service.internal_context[0].text
+    assert "工作流调试运行失败" in visible_text
+    assert task_id in visible_text
+    assert "node X failed" in visible_text
+
+    # <system_reminder> is in extended_content
+    assert service.event_service.extended is not None
+    reminder = service.event_service.extended[0].text
     assert "workflow_debug (test) run that failed" in reminder
     assert "call workflow_debug again" in reminder
     assert "node X failed" in reminder
     assert "Resume the tool invocation associated with this task" not in reminder
+
+    # Verify single call
+    assert len(service.event_service.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -191,6 +238,15 @@ async def test_workflow_debug_callback_terminated_uses_debug_guidance(tmp_path):
 
     assert result.outcome == "delivered_async"
     assert service.event_service.internal_context is not None
-    reminder = service.event_service.internal_context[0].text
+    visible_text = service.event_service.internal_context[0].text
+    assert "工作流调试运行已终止" in visible_text
+    assert task_id in visible_text
+
+    # <system_reminder> is in extended_content
+    assert service.event_service.extended is not None
+    reminder = service.event_service.extended[0].text
     assert "was terminated" in reminder
     assert "Resume the tool invocation associated with this task" not in reminder
+
+    # Verify single call
+    assert len(service.event_service.calls) == 1

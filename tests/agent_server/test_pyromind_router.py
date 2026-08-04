@@ -51,6 +51,7 @@ from openhands.tools.data_preparation import (
     DfStopTaskTool,
     DfSubmitPipelineTool,
 )
+from openhands.tools.pyromind_archive import ExtractArchiveTool
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
@@ -327,11 +328,13 @@ class _FakePyromindMessageEventService(_FakeEventService):
         self,
         content: list[TextContent],
         run: bool = False,
+        visible: bool = False,
         workflow_dsl_snapshot: str | None = None,
         workflow_xyflow_snapshot: dict[str, Any] | None = None,
     ) -> str:
         self.internal_context = content
         self.run = run
+        self.visible = visible
         self.workflow_dsl_snapshot = workflow_dsl_snapshot
         self.workflow_xyflow_snapshot = workflow_xyflow_snapshot
         return "internal-event"
@@ -903,6 +906,7 @@ def test_pyromind_storage_tools_use_user_context_headers():
         DfSubmitPipelineTool.name,
         DfCheckProgressTool.name,
         DfStopTaskTool.name,
+        ExtractArchiveTool.name,
         PreviewRemoteDatasetTool.name,
     ]
     assert tools[0].params == {
