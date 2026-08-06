@@ -706,6 +706,7 @@ def _parse_jsonl(
 ) -> dict[str, Any]:
     non_empty = [line for line in lines if line.strip()]
     sample_rows: list[dict[str, Any]] = []
+    parse_failures = 0
     for idx, line in enumerate(non_empty[:max_samples], start=1):
         row: dict[str, Any] = {
             "line": idx,
@@ -716,15 +717,21 @@ def _parse_jsonl(
             if isinstance(parsed, dict):
                 row.update(_trim_dict(parsed))
         except json.JSONDecodeError:
-            pass
+            parse_failures += 1
         sample_rows.append(row)
+    preview_error = None
+    if parse_failures:
+        preview_error = (
+            f"{parse_failures} of {len(sample_rows)} sampled line(s) failed "
+            "JSON parsing; shown as raw text."
+        )
     return {
         "num_rows": len(non_empty) if not truncated else None,
         "columns": _collect_columns(sample_rows),
         "sample_rows": sample_rows,
         "previewed_rows": len(non_empty),
         "truncated": truncated,
-        "preview_error": None,
+        "preview_error": preview_error,
     }
 
 
@@ -767,14 +774,16 @@ def _parse_json(
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError as exc:
-        return {
-            "num_rows": None,
-            "columns": [],
-            "sample_rows": [],
-            "previewed_rows": 0,
-            "truncated": truncated,
-            "preview_error": f"JSON parse error: {exc}",
-        }
+        # Fall back to raw-text lines so truncated single-line JSON (e.g. a
+        # huge line cut by the range download) still shows some content.
+        text_result = _parse_text(
+            content.decode("utf-8", errors="replace").splitlines(),
+            max_samples,
+            truncated,
+        )
+        text_result["num_rows"] = None
+        text_result["preview_error"] = f"JSON parse error: {exc}; shown as raw text."
+        return text_result
     if isinstance(parsed, list):
         rows = parsed[:max_samples]
         sample_rows: list[dict[str, Any]] = []

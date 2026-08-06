@@ -1,20 +1,25 @@
-"""wandb 训练数据分析 CLI — Pyromind skill 辅助工具。
+"""训练数据分析 CLI — Pyromind skill 辅助工具。
 
 子命令:
-- resolve-target <task_id>: 通过平台 API 定位 wandb run(entity/project/run_id)并提取凭证
+- resolve-target <task_id>: 自动探测数据源并通过平台 API 定位
+  run(entity/project/run_id)与凭证
 - probe <entity/project> [--run-id]: 探查 project/run 的指标与 config 键
 - analyze-run <entity/project> <run_id>: 单 run 稳定性诊断
 - compare-runs <entity/project> <run_a> <run_b>: 两 run config 与指标对比
 - project-summary <entity/project>: 按 config 轴分桶统计
 - report <entity/project> <run_id> --out <md>: 四阶段分析报告
 
+数据源抽象: resolve-target 根据平台节点 config 自动探测数据源(wandb 等),
+分析命令从 creds 文件读 data_source 字段选择适配器,数据分析层只消费
+标准 RunData 格式,与具体数据源解耦(见 data_sources/)。
+
 平台 API 认证与 validate_workflow 工具对齐: cookie / x-cluster /
 authorization 三个 header 小写透传,分别从环境变量 PYROMIND_COOKIE /
 X_CLUSTER / PYROMIND_AUTHORIZATION 读取,或通过 --cookie / --cluster /
 --authorization 参数传入;base URL 按 APP_ENV(prod/production/online 走
 正式环境,否则 pre 环境)推断,可用 --api-base 或 PYROMIND_API_BASE 覆盖。
-wandb 凭证优先从 --api-key 或 --creds-file(resolve-target 的 --creds-out
-产物)读取,否则回退环境变量 WANDB_API_KEY。
+凭证优先从 --api-key 或 --creds-file(resolve-target 的 --creds-out
+产物)读取,否则回退环境变量。
 """
 
 from __future__ import annotations
@@ -22,7 +27,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import ssl
 import sys
 import tempfile
@@ -34,12 +38,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from wandb_helpers import (
-    compare_configs,
-    diagnose_run,
-    probe_project,
-    scan_history,
-)
+from analysis_helpers import compare_configs, diagnose_run
+from data_sources import create_data_source, detect_data_source
 
 
 PRE_API_BASE = "https://pre-api-portal.pyromind.ai/std2/studio_api/"
@@ -47,29 +47,13 @@ PROD_API_BASE = "https://api-portal.pyromind.ai/std2/studio_api/"
 _PROD_APP_ENVS = {"prod", "production", "online"}
 
 
-def _default_api_base() -> str:
-    """按 APP_ENV 推断平台 API base,与 validate_workflow 的默认端点选择一致。"""
-    app_env = os.getenv("APP_ENV", "dev").strip().lower()
-    if app_env in _PROD_APP_ENVS:
-        return PROD_API_BASE
-    return PRE_API_BASE
-
-
-RUN_SETUP_RE = re.compile(r"wandb:\s+setting up run\s+(\w+)")
-RUN_URL_RE = re.compile(
-    r"View run at\s+https://wandb\.ai/([^/\s]+)/([^/\s]+)/runs/(\w+)"
-)
-CONFIG_LINE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*$")
-
-# Cloudflare 会拦截 urllib 默认 UA(browser_signature_banned),需浏览器风格 UA
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
-# 训练节点类型关键词,用于从任务节点列表中识别 wandb 输出源
+# 训练节点类型关键词(平台通用概念,与具体数据源无关)
 TRAIN_NODE_KEYWORDS = ("Train", "train")
-WANDB_NODE_TYPE = "WandbConfigBuilderNode"
 
 
 class WandbAnalysisError(Exception):
@@ -239,89 +223,8 @@ def _is_train_node(node: dict[str, Any]) -> bool:
     return any(keyword in _node_type(node) for keyword in TRAIN_NODE_KEYWORDS)
 
 
-def _parse_config_text(text: str) -> dict[str, str]:
-    """解析 wandb_config YAML 文本(仅 key: value 行,嵌套不做展开)。"""
-    result: dict[str, str] = {}
-    for line in text.splitlines():
-        match = CONFIG_LINE_RE.match(line)
-        if match:
-            result[match.group(1)] = match.group(2)
-    return result
-
-
-def _collect_wandb_env(output: dict[str, Any]) -> dict[str, str]:
-    """从节点输出/config 提取 WANDB_* 环境变量,覆盖三种真实形态:
-
-    - wandb_config 文本块(训练节点 config / node_output 输出)
-    - wandb_config 为 dict
-    - 结构化字段 wandb_api_key / wandb_project / wandb_name(Builder 节点 config)
-    - entries[].m 文本数组(node_output 接口响应)
-    """
-    result: dict[str, str] = {}
-
-    def merge_text(text: str) -> None:
-        for key, value in _parse_config_text(text).items():
-            if value:
-                result.setdefault(key, value)
-
-    config_value = output.get("wandb_config")
-    if isinstance(config_value, dict):
-        for key, value in config_value.items():
-            result[str(key).upper()] = str(value)
-    elif isinstance(config_value, str):
-        merge_text(config_value)
-
-    for key in ("wandb_api_key", "wandb_project", "wandb_name"):
-        if output.get(key) is not None:
-            result["WANDB_" + key.removeprefix("wandb_").upper()] = str(output[key])
-
-    entries = output.get("entries")
-    if isinstance(entries, list):
-        merge_text(
-            "".join(
-                e.get("m", "")
-                for e in entries
-                if isinstance(e, dict) and isinstance(e.get("m"), str)
-            )
-        )
-
-    if not result:
-        for value in output.values():
-            if isinstance(value, str) and value.strip():
-                merge_text(value)
-                break
-    return result
-
-
-def _collect_wandb_env_from_node(node: dict[str, Any]) -> dict[str, str]:
-    """从 task_workflow_result 节点的 data.config 提取 wandb 凭证。"""
-    data = node.get("data")
-    if not isinstance(data, dict):
-        return {}
-    config = data.get("config")
-    if not isinstance(config, dict):
-        return {}
-    return _collect_wandb_env(config)
-
-
-def _extract_run_info(log_text: str) -> tuple[str, str, str] | None:
-    """从日志中提取 (entity, project, run_id);URL 行优先,其次 setting up run。"""
-    for match in RUN_URL_RE.finditer(log_text):
-        return match.group(1), match.group(2), match.group(3)
-    match = RUN_SETUP_RE.search(log_text)
-    if match:
-        return "", "", match.group(1)
-    return None
-
-
-def _run_id_from_path(text: str) -> str | None:
-    """从 run-<ts>-<run_id> 本地路径行提取 run id(兜底)。"""
-    match = re.search(r"run-\d{8}_\d{6}-(\w+)", text)
-    return match.group(1) if match else None
-
-
 def _credential_file() -> Path:
-    return Path(tempfile.gettempdir()) / "wandb_analysis_creds.json"
+    return Path(tempfile.gettempdir()) / "train_analysis_creds.json"
 
 
 def _load_creds(path: Path | None = None) -> dict[str, str]:
@@ -336,39 +239,15 @@ def _load_creds(path: Path | None = None) -> dict[str, str]:
     return {}
 
 
-def _resolve_api_key(args: argparse.Namespace) -> str:
+def _source_from_args(args: argparse.Namespace) -> tuple[Any, dict[str, str]]:
+    """从 creds 文件创建数据源;creds 缺 data_source 时默认 wandb(向后兼容)。"""
     creds = _load_creds(getattr(args, "creds_file", None))
-    api_key = (
-        getattr(args, "api_key", None)
-        or creds.get("WANDB_API_KEY")
-        or os.environ.get("WANDB_API_KEY", "")
-    )
-    if not api_key:
-        raise WandbAnalysisError(
-            "WANDB_API_KEY missing: 先运行 resolve-target --creds-out,"
-            "或传入 --api-key / 设置环境变量 WANDB_API_KEY"
-        )
-    return api_key
-
-
-def _resolve_entity(
-    api_key: str, project: str, fallback_entity: str = ""
-) -> tuple[str, str]:
-    """通过 wandb API 确认 entity(优先 api.viewer(),其次显式 fallback)。"""
-    entity = fallback_entity or os.environ.get("WANDB_ENTITY", "")
-    if entity and project:
-        return entity, project
-    from wandb import Api  # 延迟导入,仅需凭证解析时避免强制依赖
-
-    viewer = Api(api_key=api_key, timeout=120).viewer()
-    username = getattr(viewer, "username", "") or ""
-    if not username:
-        raise WandbAnalysisError("无法从 wandb API 推断 entity,请用 --entity 显式指定")
-    return username, project
+    name = getattr(args, "data_source", "") or creds.get("data_source") or "wandb"
+    return create_data_source(name), creds
 
 
 def cmd_resolve_target(args: argparse.Namespace) -> int:
-    """定位 wandb run:平台节点列表 → 训练节点日志(run id)+ Builder 输出(凭证)。"""
+    """定位训练 run:自动探测数据源 → 节点 config 提取凭证 + 训练节点日志定位 run id。"""
     client = PlatformClient(
         base_url=args.api_base,
         cookie=args.cookie,
@@ -383,63 +262,59 @@ def cmd_resolve_target(args: argparse.Namespace) -> int:
             f"{json.dumps(payload, ensure_ascii=False)[:800]}"
         )
 
+    source_name = args.data_source or detect_data_source(nodes)
+    if not source_name:
+        raise WandbAnalysisError(
+            "未能从平台节点自动识别数据源类型,请用 --data-source 指定"
+            "(如 --data-source wandb)"
+        )
+    source = create_data_source(source_name)
+
+    # 凭证提取(适配器内部含 Builder 节点输出接口兑底)
+    creds = source.extract_creds(nodes, client=client, task_id=args.task_id) or {}
+
+    # run 定位:训练节点日志提取 (entity, project, run_id)
     run_id = ""
     run_entity = ""
     run_project = ""
-    wandb_env: dict[str, str] = {}
-
     for node in nodes:
-        node_type = _node_type(node)
         node_id = _node_identifier(node)
-        if not node_id:
+        if not node_id or not _is_train_node(node):
             continue
-        # 凭证优先从节点 config 直接提取(task_workflow_result 已含全部 config)
-        if not wandb_env:
-            wandb_env = _collect_wandb_env_from_node(node)
-        if _is_train_node(node) and not run_id:
-            log_text = client.node_log(node_id, args.task_id)
-            info = _extract_run_info(log_text)
-            if info and info[2]:
-                run_entity, run_project, run_id = info
-            elif not run_id:
-                run_id = _run_id_from_path(log_text) or ""
+        if run_id:
+            break
+        info = source.extract_run_ref(client.node_log(node_id, args.task_id))
+        if info and info[2]:
+            run_entity, run_project, run_id = info
 
-    # 回退:config 未含凭证时查 WandbConfigBuilderNode 输出接口
-    if not wandb_env:
-        for node in nodes:
-            node_type = _node_type(node)
-            node_id = _node_identifier(node)
-            if WANDB_NODE_TYPE in node_type and node_id:
-                wandb_env = _collect_wandb_env(
-                    client.node_output(node_id, args.task_id)
-                )
-                break
-
-    if not run_id and not wandb_env:
+    if not run_id and not creds:
         raise WandbAnalysisError(
-            "未能从平台 API 定位 run:训练节点日志无 wandb run 记录,"
-            "且未找到 WandbConfigBuilderNode 输出。请提供 --run-url 或检查 task_id。"
+            "未能从平台 API 定位 run:训练节点日志无数据源 run 记录,"
+            "且未在节点 config 找到凭证。请提供 --run-url 或检查 task_id。"
         )
 
-    api_key = wandb_env.get("WANDB_API_KEY") or os.environ.get("WANDB_API_KEY", "")
-    project = (
-        wandb_env.get("WANDB_PROJECT")
-        or run_project
-        or (args.run_url_project if args.run_url else "")
-    )
-    entity = wandb_env.get("WANDB_ENTITY") or run_entity or args.entity
-    if api_key and project and (entity or True):
+    api_key = creds.get("WANDB_API_KEY") or os.environ.get("WANDB_API_KEY", "")
+    run_url_project = ""
+    if getattr(args, "run_url", ""):
+        segments = [s for s in args.run_url.rstrip("/").split("/") if s]
+        if len(segments) >= 3 and segments[-2] == "runs":
+            run_url_project = segments[-3]
+    project = creds.get("WANDB_PROJECT") or run_project or run_url_project
+    entity = creds.get("WANDB_ENTITY") or run_entity or args.entity
+    if api_key and project:
         try:
-            entity, project = _resolve_entity(api_key, project, fallback_entity=entity)
+            source.connect(creds)
+            entity, project = source.resolve_entity(project, fallback=entity)
         except Exception:
             pass  # 平台网络受限时保留原始值,由后续命令报错
 
     result: dict[str, Any] = {
         "task_id": args.task_id,
+        "data_source": source_name,
         "entity": entity,
         "project": project,
         "run_id": run_id,
-        "wandb_env": {k: v for k, v in wandb_env.items() if k != "WANDB_API_KEY"},
+        "env": {k: v for k, v in creds.items() if k != "WANDB_API_KEY"},
     }
     if args.creds_out:
         creds_path = Path(args.creds_out)
@@ -447,9 +322,10 @@ def cmd_resolve_target(args: argparse.Namespace) -> int:
         creds_path.write_text(
             json.dumps(
                 {
+                    "data_source": source_name,
                     "WANDB_API_KEY": api_key,
                     "api_key": api_key,
-                    **wandb_env,
+                    **creds,
                 },
                 ensure_ascii=False,
             ),
@@ -465,25 +341,10 @@ def cmd_resolve_target(args: argparse.Namespace) -> int:
     return 0
 
 
-def _make_api(args: argparse.Namespace):
-    os.environ.setdefault("WANDB_SILENT", "true")
-    from wandb import Api
-
-    return Api(api_key=_resolve_api_key(args), timeout=120)
-
-
-def _run_keys(api: Any, entity: str, project: str, run_id: str) -> list[str]:
-    run = api.run(f"{entity}/{project}/{run_id}")
-    return sorted({str(k) for k in (run.summary or {}).keys()})
-
-
 def cmd_probe(args: argparse.Namespace) -> int:
-    api = _make_api(args)
-    result = probe_project(api, args.entity_project)
-    if args.run_id:
-        run = api.run(f"{args.entity_project}/{args.run_id}")
-        result["run_summary_keys"] = sorted((run.summary or {}).keys())
-        result["run_config_keys"] = sorted((run.config or {}).keys())
+    source, creds = _source_from_args(args)
+    source.connect(creds)
+    result = source.probe(args.entity_project, run_id=args.run_id or None)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
@@ -522,75 +383,69 @@ def _history_stats(values: list[float]) -> dict[str, Any]:
     }
 
 
-def _loss_metric_key(run: Any) -> str:
-    """从 summary 选默认 loss 键;SummarySubDict 迭代会 KeyError,需先转 dict。"""
-    summary = dict(run.summary or {})
+def _loss_metric_key(summary: dict[str, Any]) -> str:
+    """从 summary 选默认 loss 键。"""
     return next((k for k in summary if "loss" in k), "")
 
 
-def _json_safe(value: Any) -> Any:
-    """递归转原生 JSON 类型(wandb SummarySubDict/Config 等 dict 子类不可直接序列化)。"""
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return str(value)
-
-
 def cmd_analyze_run(args: argparse.Namespace) -> int:
-    api = _make_api(args)
-    run = api.run(f"{args.entity_project}/{args.run_id}")
-    metric = args.metric or _loss_metric_key(run)
+    source, creds = _source_from_args(args)
+    source.connect(creds)
+    data = source.get_run_data(args.entity_project, args.run_id, keys=[])
+    metric = args.metric or _loss_metric_key(data["summary"])
 
     # 多指标支持:--keys 指定逗号分隔的指标键列表
     history_keys = [k.strip() for k in args.keys.split(",")] if args.keys else []
     if not history_keys:
         history_keys = [metric] if metric else []
 
+    if history_keys:
+        data = source.get_run_data(args.entity_project, args.run_id, keys=history_keys)
+
     report: dict[str, Any] = {
         "run": args.run_id,
-        "display_name": run.display_name,
-        "state": run.state,
-        "config": _json_safe(dict(run.config or {})),
-        "summary": _json_safe(dict(run.summary or {})),
+        "display_name": data["display_name"],
+        "state": data["state"],
+        "config": data["config"],
+        "summary": data["summary"],
         "metric": metric or None,
     }
-    if history_keys:
-        history = scan_history(run, keys=history_keys)
-        if history:
-            # 主指标统计
-            if metric in history_keys:
-                vals = _history_float_values(history, metric)
-                report["metric_stats"] = _history_stats(vals)
-                report["diagnostics"] = diagnose_run(run, train_key=metric)
-            # 多指标原始数据
-            if len(history_keys) > 1:
-                multi: dict[str, list[float]] = {}
-                for k in history_keys:
-                    vals = _history_float_values(history, k)
-                    if vals:
-                        multi[k] = vals
-                if multi:
-                    report["multi_metrics"] = multi
-            first_step = history[0].get("_step")
-            last_step = history[-1].get("_step")
-            if first_step is not None:
-                report["steps"] = [first_step, last_step]
+    history = data["history"]
+    if history:
+        # 主指标统计
+        if metric in history_keys:
+            vals = _history_float_values(history, metric)
+            report["metric_stats"] = _history_stats(vals)
+            report["diagnostics"] = diagnose_run(data, train_key=metric)
+        # 多指标原始数据
+        if len(history_keys) > 1:
+            multi: dict[str, list[float]] = {}
+            for k in history_keys:
+                vals = _history_float_values(history, k)
+                if vals:
+                    multi[k] = vals
+            if multi:
+                report["multi_metrics"] = multi
+        first_step = history[0].get("_step")
+        last_step = history[-1].get("_step")
+        if first_step is not None:
+            report["steps"] = [first_step, last_step]
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
 
 def cmd_compare_runs(args: argparse.Namespace) -> int:
-    api = _make_api(args)
-    run_a = api.run(f"{args.entity_project}/{args.run_a}")
-    run_b = api.run(f"{args.entity_project}/{args.run_b}")
-    config_diff = compare_configs(run_a, run_b)
-    metric_a = _loss_metric_key(run_a)
-    metric_b = _loss_metric_key(run_b)
-    summary_a = dict(run_a.summary or {})
-    summary_b = dict(run_b.summary or {})
+    source, creds = _source_from_args(args)
+    source.connect(creds)
+    data_a = source.get_run_data(args.entity_project, args.run_a, keys=[])
+    data_b = source.get_run_data(args.entity_project, args.run_b, keys=[])
+    name_a = data_a["display_name"] or args.run_a
+    name_b = data_b["display_name"] or args.run_b
+    config_diff = compare_configs(data_a["config"], data_b["config"], name_a, name_b)
+    metric_a = _loss_metric_key(data_a["summary"])
+    metric_b = _loss_metric_key(data_b["summary"])
+    summary_a = data_a["summary"]
+    summary_b = data_b["summary"]
     summary_keys = sorted(set(summary_a) | set(summary_b))
     summary_diff = {
         key: {"a": summary_a.get(key), "b": summary_b.get(key)}
@@ -598,14 +453,13 @@ def cmd_compare_runs(args: argparse.Namespace) -> int:
         if summary_a.get(key) != summary_b.get(key)
     }
     config_diff_map = {
-        d["key"]: {run_a.name: d[run_a.name], run_b.name: d[run_b.name]}
-        for d in config_diff
+        d["key"]: {name_a: d[name_a], name_b: d[name_b]} for d in config_diff
     }
     print(
         json.dumps(
             {
-                "config_diff": _json_safe(config_diff_map),
-                "summary_diff": _json_safe(summary_diff),
+                "config_diff": config_diff_map,
+                "summary_diff": summary_diff,
                 "run_a_metric": metric_a,
                 "run_b_metric": metric_b,
             },
@@ -617,15 +471,16 @@ def cmd_compare_runs(args: argparse.Namespace) -> int:
 
 
 def cmd_project_summary(args: argparse.Namespace) -> int:
-    api = _make_api(args)
-    runs = list(api.runs(f"{args.entity_project}", per_page=200))
+    source, creds = _source_from_args(args)
+    source.connect(creds)
+    runs = source.list_runs(args.entity_project)
     buckets: dict[str, dict[str, Any]] = defaultdict(lambda: {"count": 0, "losses": []})
     for run in runs:
-        config = dict(run.config or {})
+        config = run["config"]
         axis = str(config.get(args.axis, "default"))
         bucket = buckets[axis]
         bucket["count"] += 1
-        loss = next((v for k, v in (run.summary or {}).items() if "loss" in k), None)
+        loss = run["loss"]
         if loss is not None:
             bucket["losses"].append(float(loss))
     for bucket in buckets.values():
@@ -681,13 +536,15 @@ def _probe_suggestions(
 
 
 def cmd_report(args: argparse.Namespace) -> int:
-    api = _make_api(args)
-    run = api.run(f"{args.entity_project}/{args.run_id}")
-    metric = args.metric or _loss_metric_key(run)
+    source, creds = _source_from_args(args)
+    source.connect(creds)
+    data = source.get_run_data(args.entity_project, args.run_id, keys=[])
+    metric = args.metric or _loss_metric_key(data["summary"])
     diagnostics: dict[str, Any] = {}
     if metric:
-        diagnostics = diagnose_run(run, train_key=metric) or {}
-    config = dict(run.config or {})
+        data = source.get_run_data(args.entity_project, args.run_id, keys=[metric])
+        diagnostics = diagnose_run(data, train_key=metric) or {}
+    config = data["config"]
     stats = {
         "total_steps": diagnostics.get("total_steps"),
         "final_value": diagnostics.get("final_value"),
@@ -701,7 +558,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     suggestions = _probe_suggestions(config, stats)
 
     lines = [
-        f"# wandb 训练分析报告:{args.entity_project}/{args.run_id}",
+        f"# 训练分析报告:{args.entity_project}/{args.run_id}",
         "",
         "## 1. 先验假设",
         "- 训练类型:由 config 推断(SFT/DPO/GRPO,见 config 摘要)",
@@ -709,7 +566,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         "- 基线预期: loss 单调下降或收敛至平台期",
         "",
         "## 2. 数据惊奇",
-        f"- run state: {run.state}, display_name: {run.display_name}",
+        f"- run state: {data['state']}, display_name: {data['display_name']}",
         f"- 诊断: {json.dumps(stats, ensure_ascii=False)}",
         "",
         "## 3. 候选机制",
@@ -748,7 +605,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         f"- entity/project: `{args.entity_project}`",
         f"- run id: `{args.run_id}`",
         f"- 指标键: `{metric or 'N/A'}`",
-        "- 数据来源: wandb SDK(wandb.Api),凭证来自平台 WandbConfigBuilderNode 输出",
+        f"- 数据来源: {source.name} 数据源,凭证来自平台节点 config/输出",
     ]
     output = "\n".join(lines) + "\n"
     if args.out:
@@ -757,6 +614,11 @@ def cmd_report(args: argparse.Namespace) -> int:
     else:
         print(output)
     return 0
+
+
+def _default_api_base() -> str:
+    app_env = os.environ.get("APP_ENV", "").lower()
+    return PROD_API_BASE if app_env in _PROD_APP_ENVS else PRE_API_BASE
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -772,6 +634,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default="")
     parser.add_argument("--creds-file", default="")
     parser.add_argument("--entity", default="")
+    parser.add_argument(
+        "--data-source",
+        default="",
+        help="数据源类型(如 wandb);留空则自动探测或读 creds",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     p_resolve = subparsers.add_parser("resolve-target", help="定位 wandb run 与凭证")

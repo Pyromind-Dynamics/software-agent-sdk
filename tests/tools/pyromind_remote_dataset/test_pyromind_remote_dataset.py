@@ -92,6 +92,42 @@ def test_parse_invalid_json() -> None:
     result = _parse_content("bad.json", content, 10, truncated=False)
     assert result["num_rows"] is None
     assert result["preview_error"] is not None
+    # Fallback: the raw text is still shown as sample rows.
+    assert len(result["sample_rows"]) == 1
+    assert result["sample_rows"][0]["text"] == "{not valid json"
+
+
+def test_parse_jsonl_malformed_line() -> None:
+    content = (
+        json.dumps({"prompt": "ok", "response": "good"}) + "\n" + "{not json}\n"
+    ).encode("utf-8")
+    result = _parse_content("data/train.jsonl", content, 10, truncated=False)
+    assert result["num_rows"] == 2
+    assert len(result["sample_rows"]) == 2
+    # The malformed line is kept as raw text and reported.
+    assert result["sample_rows"][1]["text"] == "{not json}"
+    assert result["preview_error"] is not None
+    assert "1 of 2" in result["preview_error"]
+
+
+def test_parse_json_truncated_single_line_fallback() -> None:
+    # Simulates a huge single-line JSON cut by the range download.
+    content = ('{"prompt": "' + "x" * 10000).encode("utf-8")
+    result = _parse_content("huge.json", content, 3, truncated=True)
+    assert result["num_rows"] is None
+    assert len(result["sample_rows"]) == 1
+    assert result["sample_rows"][0]["text"].startswith('{"prompt": "')
+    assert "raw text" in result["preview_error"]
+
+
+def test_parse_jsonl_truncated_single_line_fallback() -> None:
+    # Simulates a huge single-line JSONL entry cut by the range download.
+    content = ('{"prompt": "' + "x" * 10000).encode("utf-8")
+    result = _parse_content("huge.jsonl", content, 3, truncated=True)
+    assert result["num_rows"] is None
+    assert len(result["sample_rows"]) == 1
+    assert result["sample_rows"][0]["text"].startswith('{"prompt": "')
+    assert "1 of 1" in result["preview_error"]
 
 
 # ---------------------------------------------------------------------------
