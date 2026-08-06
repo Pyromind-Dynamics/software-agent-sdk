@@ -1,21 +1,29 @@
 from pathlib import Path
-from typing import cast
+from types import SimpleNamespace
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 import pytest
 
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.run_workflow_callback import (
+    _extract_node_names_from_dsl,
+    _failed_node_names_from_error_log,
     build_run_workflow_terminal_reminder,
     deliver_run_workflow_status,
 )
-from openhands.sdk.llm import TextContent
+from openhands.sdk.llm import Message, TextContent
+from openhands.tools.node_signature import (
+    NodeSignatureObservation,
+)
+from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 
 
 class _FakeEventService:
-    def __init__(self) -> None:
+    def __init__(self, conversation: Any = None) -> None:
         self.run: bool | None = None
         self.internal_context: list[TextContent] | None = None
+        self.conversation = conversation
 
     async def send_internal_context(
         self,
@@ -26,16 +34,103 @@ class _FakeEventService:
         self.internal_context = content
         return "internal-event"
 
+    def get_conversation(self):
+        if self.conversation is None:
+            raise ValueError("inactive_service")
+        return self.conversation
+
 
 class _FakeConversationService:
-    def __init__(self, conversations_dir: Path) -> None:
+    def __init__(self, conversations_dir: Path, conversation: Any = None) -> None:
         self.conversations_dir = conversations_dir
-        self.event_service = _FakeEventService()
+        self.event_service = _FakeEventService(conversation=conversation)
         self.requested_conversation_id: UUID | None = None
 
     async def get_event_service(self, conversation_id: UUID):
         self.requested_conversation_id = conversation_id
         return self.event_service
+
+
+class _FakeSecretRegistry:
+    def __init__(self, token: str = "auth-token") -> None:
+        self.token = token
+
+    def get_secret_value(self, name: str) -> str:
+        return self.token
+
+
+class _FakeConversation:
+    def __init__(
+        self,
+        working_dir: Path,
+        *,
+        llm: Any = None,
+        agent_state: dict | None = None,
+    ) -> None:
+        self.workspace = SimpleNamespace(working_dir=str(working_dir))
+        self.state = SimpleNamespace(
+            agent=SimpleNamespace(llm=llm),
+            agent_state=agent_state or {},
+            secret_registry=_FakeSecretRegistry(),
+        )
+
+
+class _FakeNodeSignatureExecutor:
+    def __init__(self, observation: NodeSignatureObservation) -> None:
+        self.observation = observation
+        self.node_names: list[str] | None = None
+
+    def __call__(self, action, conversation=None):
+        self.node_names = list(action.node_names)
+        return self.observation
+
+
+class _FakeLLM:
+    def __init__(self, text: str = "", error: Exception | None = None) -> None:
+        self.text = text
+        self.error = error
+
+    async def acompletion(self, messages, **kwargs):
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(
+            message=Message(role="assistant", content=[TextContent(text=self.text)])
+        )
+
+
+def _signature_observation(
+    *,
+    success: bool = True,
+    status: Literal["success", "error"] = "success",
+) -> NodeSignatureObservation:
+    if not success:
+        return NodeSignatureObservation(
+            status="error",
+            node_name="CloneAndCacheDataset",
+            error_message="HTTP error fetching node signatures",
+        )
+    return NodeSignatureObservation(
+        status=status,
+        results=[
+            {
+                "node_name": "CloneAndCacheDataset",
+                "success": True,
+                "function_signature": "def CloneAndCacheDataset(dataset, target_path)",
+                "docstring": "Clone a dataset into the workspace.",
+                "parameters": [
+                    {
+                        "name": "dataset",
+                        "type": "STRING",
+                        "required": True,
+                        "default": None,
+                    }
+                ],
+                "source_code": (
+                    "def CloneAndCacheDataset(dataset, target_path):\n    pass\n"
+                ),
+            }
+        ],
+    )
 
 
 @pytest.mark.asyncio
@@ -194,3 +289,281 @@ async def test_workflow_debug_callback_terminated_uses_debug_guidance(tmp_path):
     reminder = service.event_service.internal_context[0].text
     assert "was terminated" in reminder
     assert "Resume the tool invocation associated with this task" not in reminder
+
+
+def test_extract_node_names_from_dsl():
+    dsl = """# workflow: workflow
+na54dbd4 = CloneAndCacheDataset(id=15, dataset="x", target_path=base.dataset_path)
+n9bdbba6 = DatasetConfigBuilderVisionNode(id=24, image_field="image_path")
+na702f68 = RewardItemBuilderNode(id=26, entry="reward:func")
+"""
+    assert _extract_node_names_from_dsl(dsl) == [
+        "CloneAndCacheDataset",
+        "DatasetConfigBuilderVisionNode",
+        "RewardItemBuilderNode",
+    ]
+
+
+def test_extract_node_names_from_dsl_deduplicates_and_skips_comments():
+    dsl = """# comment = NotANode(id=1)
+a = Foo(id=1)
+b = Foo(id=2)
+c = Bar(id=3)
+"""
+    assert _extract_node_names_from_dsl(dsl) == ["Foo", "Bar"]
+
+
+def test_failed_node_names_from_error_log_matches_group_headers():
+    dsl = """na54dbd4 = CloneAndCacheDataset(id=15, dataset="x")
+n9bdbba6 = DatasetConfigBuilderVisionNode(id=24, image_field="image_path")
+na702f68 = RewardItemBuilderNode(id=26, entry="reward:func")
+"""
+    error_log = "--- 15 ---\nboom\n--- 26 ---\nbad\n"
+    assert _failed_node_names_from_error_log(error_log, dsl) == [
+        "CloneAndCacheDataset",
+        "RewardItemBuilderNode",
+    ]
+
+
+@pytest.mark.parametrize(
+    "error_log",
+    [None, "", "node X failed", "--- 999 ---\nboom\n"],
+)
+def test_failed_node_names_from_error_log_returns_none_without_match(error_log):
+    dsl = 'na54dbd4 = CloneAndCacheDataset(id=15, dataset="x")\n'
+    assert _failed_node_names_from_error_log(error_log, dsl) is None
+
+
+def test_failed_node_names_from_error_log_keeps_only_matching_ids():
+    dsl = 'na54dbd4 = CloneAndCacheDataset(id=15, dataset="x")\n'
+    error_log = "--- 15 ---\nboom\n--- 999 ---\nunknown\n"
+    assert _failed_node_names_from_error_log(error_log, dsl) == ["CloneAndCacheDataset"]
+
+
+def test_failed_node_names_from_error_log_falls_back_to_line_number_without_id():
+    dsl = 'a = Foo(dataset="x")\n'
+    error_log = "--- 1 ---\nboom\n"
+    assert _failed_node_names_from_error_log(error_log, dsl) == ["Foo"]
+
+
+def test_build_reminder_debug_failure_includes_signature_guidance():
+    reminder = build_run_workflow_terminal_reminder(
+        task_id="t1",
+        status="Failed",
+        error_log="boom",
+        from_workflow_debug=True,
+        node_signature_guidance="Node CloneAndCacheDataset requires dataset (STRING).",
+    )
+    assert "Node signature guidance:" in reminder
+    assert "requires dataset" in reminder
+    assert reminder.index("Runtime error log:") < reminder.index(
+        "Node signature guidance:"
+    )
+
+
+@pytest.mark.asyncio
+async def test_workflow_debug_callback_failure_fetches_only_failed_nodes(
+    tmp_path, monkeypatch
+):
+    import openhands.tools.node_signature.impl as node_signature_impl
+
+    conversation_id = uuid4()
+    conversation_dir = tmp_path / "conversations" / conversation_id.hex
+    workflow = conversation_dir / WORKFLOW_RELATIVE_PATH
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(
+        'na54dbd4 = CloneAndCacheDataset(id=15, dataset="x")\n'
+        'n9bdbba6 = DatasetConfigBuilderVisionNode(id=24, image_field="x")\n'
+    )
+
+    captured: list[_FakeNodeSignatureExecutor] = []
+
+    def executor_factory(**kw):
+        executor = _FakeNodeSignatureExecutor(_signature_observation())
+        captured.append(executor)
+        return executor
+
+    monkeypatch.setattr(node_signature_impl, "NodeSignatureExecutor", executor_factory)
+    service = _FakeConversationService(
+        tmp_path / "conversations",
+        conversation=_FakeConversation(conversation_dir, llm=_FakeLLM(text="x")),
+    )
+
+    result = await deliver_run_workflow_status(
+        task_id=f"workflow-task-{uuid4()}",
+        status="Failed",
+        error_log="--- 15 ---\nboom\n",
+        conversation_id=str(conversation_id),
+        auto_run=False,
+        from_workflow_debug=True,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert result.outcome == "delivered_async"
+    assert captured[0].node_names == ["CloneAndCacheDataset"]
+    assert service.event_service.internal_context is not None
+    reminder = service.event_service.internal_context[0].text
+    assert "Node signature guidance:" in reminder
+
+
+@pytest.mark.asyncio
+async def test_workflow_debug_callback_failure_injects_summarized_node_signature(
+    tmp_path, monkeypatch
+):
+    import openhands.tools.node_signature.impl as node_signature_impl
+
+    conversation_id = uuid4()
+    conversation_dir = tmp_path / "conversations" / conversation_id.hex
+    workflow = conversation_dir / WORKFLOW_RELATIVE_PATH
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text('na54dbd4 = CloneAndCacheDataset(id=15, dataset="x")\n')
+
+    monkeypatch.setattr(
+        node_signature_impl,
+        "NodeSignatureExecutor",
+        lambda **kw: _FakeNodeSignatureExecutor(_signature_observation()),
+    )
+    conversation = _FakeConversation(
+        conversation_dir,
+        llm=_FakeLLM(text="简洁摘要：dataset 为必填 STRING 参数。"),
+        agent_state={
+            "pyromind_validate_workflow_dsl_headers": {"x-cluster": "us-west-1#pre"}
+        },
+    )
+    service = _FakeConversationService(
+        tmp_path / "conversations", conversation=conversation
+    )
+
+    result = await deliver_run_workflow_status(
+        task_id=f"workflow-task-{uuid4()}",
+        status="Failed",
+        error_log="node X failed",
+        conversation_id=str(conversation_id),
+        auto_run=False,
+        from_workflow_debug=True,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert result.outcome == "delivered_async"
+    assert service.event_service.internal_context is not None
+    reminder = service.event_service.internal_context[0].text
+    assert "Node signature guidance:" in reminder
+    assert "简洁摘要" in reminder
+    assert "def CloneAndCacheDataset" not in reminder
+
+
+@pytest.mark.asyncio
+async def test_workflow_debug_callback_failure_falls_back_to_raw_signatures(
+    tmp_path, monkeypatch
+):
+    import openhands.tools.node_signature.impl as node_signature_impl
+
+    conversation_id = uuid4()
+    conversation_dir = tmp_path / "conversations" / conversation_id.hex
+    workflow = conversation_dir / WORKFLOW_RELATIVE_PATH
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text('na54dbd4 = CloneAndCacheDataset(id=15, dataset="x")\n')
+
+    monkeypatch.setattr(
+        node_signature_impl,
+        "NodeSignatureExecutor",
+        lambda **kw: _FakeNodeSignatureExecutor(_signature_observation()),
+    )
+    conversation = _FakeConversation(
+        conversation_dir,
+        llm=_FakeLLM(error=RuntimeError("llm down")),
+    )
+    service = _FakeConversationService(
+        tmp_path / "conversations", conversation=conversation
+    )
+
+    result = await deliver_run_workflow_status(
+        task_id=f"workflow-task-{uuid4()}",
+        status="Error",
+        error_log="node X failed",
+        conversation_id=str(conversation_id),
+        auto_run=False,
+        from_workflow_debug=True,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert result.outcome == "delivered_async"
+    assert service.event_service.internal_context is not None
+    reminder = service.event_service.internal_context[0].text
+    assert "Node signature guidance:" in reminder
+    assert "def CloneAndCacheDataset(dataset, target_path)" in reminder
+
+
+@pytest.mark.asyncio
+async def test_workflow_debug_callback_failure_skips_guidance_when_fetch_fails(
+    tmp_path, monkeypatch
+):
+    import openhands.tools.node_signature.impl as node_signature_impl
+
+    conversation_id = uuid4()
+    conversation_dir = tmp_path / "conversations" / conversation_id.hex
+    workflow = conversation_dir / WORKFLOW_RELATIVE_PATH
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text('na54dbd4 = CloneAndCacheDataset(id=15, dataset="x")\n')
+
+    monkeypatch.setattr(
+        node_signature_impl,
+        "NodeSignatureExecutor",
+        lambda **kw: _FakeNodeSignatureExecutor(_signature_observation(success=False)),
+    )
+    service = _FakeConversationService(
+        tmp_path / "conversations",
+        conversation=_FakeConversation(conversation_dir, llm=_FakeLLM(text="x")),
+    )
+
+    result = await deliver_run_workflow_status(
+        task_id=f"workflow-task-{uuid4()}",
+        status="Failed",
+        error_log="node X failed",
+        conversation_id=str(conversation_id),
+        auto_run=False,
+        from_workflow_debug=True,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert result.outcome == "delivered_async"
+    assert service.event_service.internal_context is not None
+    reminder = service.event_service.internal_context[0].text
+    assert "Node signature guidance:" not in reminder
+    assert "node X failed" in reminder
+
+
+@pytest.mark.asyncio
+async def test_workflow_debug_callback_failure_skips_guidance_without_workflow(
+    tmp_path, monkeypatch
+):
+    import openhands.tools.node_signature.impl as node_signature_impl
+
+    conversation_id = uuid4()
+    conversation_dir = tmp_path / "conversations" / conversation_id.hex
+    conversation_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(
+        node_signature_impl,
+        "NodeSignatureExecutor",
+        lambda **kw: _FakeNodeSignatureExecutor(_signature_observation()),
+    )
+    service = _FakeConversationService(
+        tmp_path / "conversations",
+        conversation=_FakeConversation(conversation_dir, llm=_FakeLLM(text="x")),
+    )
+
+    result = await deliver_run_workflow_status(
+        task_id=f"workflow-task-{uuid4()}",
+        status="Failed",
+        error_log="node X failed",
+        conversation_id=str(conversation_id),
+        auto_run=False,
+        from_workflow_debug=True,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert result.outcome == "delivered_async"
+    assert service.event_service.internal_context is not None
+    reminder = service.event_service.internal_context[0].text
+    assert "Node signature guidance:" not in reminder
