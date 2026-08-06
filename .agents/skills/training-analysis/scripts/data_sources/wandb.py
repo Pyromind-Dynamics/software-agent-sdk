@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 from .base import RunData
@@ -29,6 +30,30 @@ RUN_PATH_RE = re.compile(r"run-\d{8}_\d{6}-(\w+)")
 CONFIG_LINE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*$")
 
 WANDB_NODE_TYPE = "WandbConfigBuilderNode"
+
+
+def _ensure_wandb_runtime_dirs(creds: dict[str, str]) -> None:
+    """受限沙箱中重定向 wandb 临时/缓存/日志目录到可写位置。
+
+    优先 resolve-target 写入 creds 的 wandb_tmp;已有可用 TMPDIR 时不动它,
+    只补缓存/日志目录。创建失败时静默跳过,交给 wandb 原生报错。
+    """
+    base = creds.get("wandb_tmp") or os.environ.get("WANDB_TMP") or "wandb_tmp"
+    path = Path(base).expanduser()
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        for sub in ("cache", "wandb", "config"):
+            (path / sub).mkdir(exist_ok=True)
+    except OSError:
+        return
+    if not os.access(str(path), os.W_OK):
+        return
+    tmpdir = os.environ.get("TMPDIR", "")
+    if not tmpdir or not os.access(tmpdir, os.W_OK):
+        os.environ["TMPDIR"] = str(path)
+    os.environ.setdefault("WANDB_CACHE_DIR", str(path / "cache"))
+    os.environ.setdefault("WANDB_DIR", str(path / "wandb"))
+    os.environ.setdefault("WANDB_CONFIG_DIR", str(path / "config"))
 
 
 class WandbDataSource:
@@ -176,6 +201,7 @@ class WandbDataSource:
     def connect(self, creds: dict[str, str]) -> None:
         """用凭证初始化 wandb.Api(WANDB_SILENT 抑制日志噪音)。"""
         os.environ.setdefault("WANDB_SILENT", "true")
+        _ensure_wandb_runtime_dirs(creds)
         from wandb import Api
 
         api_key = creds.get("WANDB_API_KEY") or os.environ.get("WANDB_API_KEY", "")
@@ -184,7 +210,8 @@ class WandbDataSource:
                 "WANDB_API_KEY missing: 先运行 resolve-target --creds-out,"
                 "或传入 --api-key / 设置环境变量 WANDB_API_KEY"
             )
-        self._api = Api(api_key=api_key, timeout=120)
+        timeout = int(os.environ.get("WANDB_API_TIMEOUT", "60"))
+        self._api = Api(api_key=api_key, timeout=timeout)
 
     def resolve_entity(self, project: str, fallback: str = "") -> tuple[str, str]:
         """通过 wandb API 确认 entity(优先 api.viewer(),其次显式 fallback)。"""
@@ -287,25 +314,6 @@ class WandbDataSource:
         if keys:
             data["history"] = self.scan_history(run, keys=keys)
         return data
-
-    def list_runs(self, project_path: str, per_page: int = 200) -> list[dict[str, Any]]:
-        """列出项目下 run 摘要(config + loss 终值),供分桶统计使用。"""
-        if self._api is None:
-            raise ValueError("connect() 未初始化 wandb API")
-        result: list[dict[str, Any]] = []
-        for run in self._api.runs(project_path, per_page=per_page):
-            summary = dict(run.summary or {})
-            loss = next((v for k, v in summary.items() if "loss" in k), None)
-            result.append(
-                {
-                    "run_id": str(run.id or ""),
-                    "display_name": str(run.display_name or ""),
-                    "state": str(run.state or ""),
-                    "config": self._json_safe(dict(run.config or {})),
-                    "loss": float(loss) if loss is not None else None,
-                }
-            )
-        return result
 
     # ------------------------------------------------------------------
     # 内部工具

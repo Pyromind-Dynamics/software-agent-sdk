@@ -5,8 +5,6 @@
   run(entity/project/run_id)与凭证
 - probe <entity/project> [--run-id]: 探查 project/run 的指标与 config 键
 - analyze-run <entity/project> <run_id>: 单 run 稳定性诊断
-- compare-runs <entity/project> <run_a> <run_b>: 两 run config 与指标对比
-- project-summary <entity/project>: 按 config 轴分桶统计
 - report <entity/project> <run_id> --out <md>: 四阶段分析报告
 
 数据源抽象: resolve-target 根据平台节点 config 自动探测数据源(wandb 等),
@@ -33,12 +31,11 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from analysis_helpers import compare_configs, diagnose_run
+from analysis_helpers import diagnose_run
 from data_sources import create_data_source, detect_data_source
 
 
@@ -434,73 +431,6 @@ def cmd_analyze_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_compare_runs(args: argparse.Namespace) -> int:
-    source, creds = _source_from_args(args)
-    source.connect(creds)
-    data_a = source.get_run_data(args.entity_project, args.run_a, keys=[])
-    data_b = source.get_run_data(args.entity_project, args.run_b, keys=[])
-    name_a = data_a["display_name"] or args.run_a
-    name_b = data_b["display_name"] or args.run_b
-    config_diff = compare_configs(data_a["config"], data_b["config"], name_a, name_b)
-    metric_a = _loss_metric_key(data_a["summary"])
-    metric_b = _loss_metric_key(data_b["summary"])
-    summary_a = data_a["summary"]
-    summary_b = data_b["summary"]
-    summary_keys = sorted(set(summary_a) | set(summary_b))
-    summary_diff = {
-        key: {"a": summary_a.get(key), "b": summary_b.get(key)}
-        for key in summary_keys
-        if summary_a.get(key) != summary_b.get(key)
-    }
-    config_diff_map = {
-        d["key"]: {name_a: d[name_a], name_b: d[name_b]} for d in config_diff
-    }
-    print(
-        json.dumps(
-            {
-                "config_diff": config_diff_map,
-                "summary_diff": summary_diff,
-                "run_a_metric": metric_a,
-                "run_b_metric": metric_b,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return 0
-
-
-def cmd_project_summary(args: argparse.Namespace) -> int:
-    source, creds = _source_from_args(args)
-    source.connect(creds)
-    runs = source.list_runs(args.entity_project)
-    buckets: dict[str, dict[str, Any]] = defaultdict(lambda: {"count": 0, "losses": []})
-    for run in runs:
-        config = run["config"]
-        axis = str(config.get(args.axis, "default"))
-        bucket = buckets[axis]
-        bucket["count"] += 1
-        loss = run["loss"]
-        if loss is not None:
-            bucket["losses"].append(float(loss))
-    for bucket in buckets.values():
-        losses = bucket.pop("losses")
-        bucket["mean_loss"] = sum(losses) / len(losses) if losses else None
-        bucket["min_loss"] = min(losses) if losses else None
-    print(
-        json.dumps(
-            {
-                "total_runs": len(runs),
-                "axis": args.axis,
-                "buckets": dict(sorted(buckets.items())),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return 0
-
-
 def _probe_suggestions(
     config: dict[str, Any], stats: dict[str, Any]
 ) -> list[dict[str, str]]:
@@ -582,7 +512,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     if diagnostics.get("converged") is False:
         lines.append("- 未收敛 → 训练不足,考虑延长 epoch 或调整学习率")
     if not diagnostics.get("has_nan") and not diagnostics.get("likely_overfit"):
-        lines.append("- 未发现明显异常,可能需要与基线/相邻 run 对比(compare-runs)")
+        lines.append("- 未发现明显异常,可能与基线/相邻 run 的指标对比确认")
         lines.append(
             "  - 数据集质量基线检查:若后续调优效果不达预期,"
             " 建议检查训练数据集质量(重复样本/标签噪声/分布)"
@@ -662,17 +592,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="逗号分隔的多指标键,如 train/loss,train/entropy,train/learning_rate",
     )
     p_analyze.set_defaults(func=cmd_analyze_run)
-
-    p_compare = subparsers.add_parser("compare-runs", help="两 run 对比")
-    p_compare.add_argument("entity_project")
-    p_compare.add_argument("run_a")
-    p_compare.add_argument("run_b")
-    p_compare.set_defaults(func=cmd_compare_runs)
-
-    p_summary = subparsers.add_parser("project-summary", help="project 分桶统计")
-    p_summary.add_argument("entity_project")
-    p_summary.add_argument("--axis", default="job_type")
-    p_summary.set_defaults(func=cmd_project_summary)
 
     p_report = subparsers.add_parser("report", help="四阶段分析报告")
     p_report.add_argument("entity_project")

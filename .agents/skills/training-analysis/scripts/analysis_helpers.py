@@ -104,36 +104,3 @@ def diagnose_run(
         diagnostics["converged"] = bool(np.std(last_pct) < np.mean(last_pct) * 0.01)
 
     return diagnostics
-
-
-def compare_configs(
-    config_a: dict[str, Any],
-    config_b: dict[str, Any],
-    name_a: str,
-    name_b: str,
-) -> list[dict[str, Any]]:
-    """Side-by-side config comparison between two runs (pure dicts).
-
-    Args:
-        config_a: First run's config (RunData["config"]).
-        config_b: Second run's config.
-        name_a: First run identifier (used in output keys).
-        name_b: Second run identifier.
-
-    Returns:
-        List of dicts with differing keys and their values per run.
-    """
-    all_keys = sorted(set(config_a) | set(config_b))
-    diffs = []
-    for k in all_keys:
-        val_a = config_a.get(k)
-        val_b = config_b.get(k)
-        if val_a != val_b:
-            diffs.append(
-                {
-                    "key": k,
-                    name_a: val_a,
-                    name_b: val_b,
-                }
-            )
-    return diffs

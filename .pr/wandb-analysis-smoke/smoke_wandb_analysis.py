@@ -141,8 +141,6 @@ def main():
         "resolve-target",
         "probe",
         "analyze-run",
-        "compare-runs",
-        "project-summary",
         "report",
     ):
         assert cmd in out, f"--help 缺少 {cmd}"
@@ -176,32 +174,7 @@ def main():
     assert result["steps"] == [0, 2]
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
-    print("== 5. compare-runs ==")
-    out = capture(
-        ["--creds-file", CREDS, "compare-runs", "acme/sft-proj", "run1", "run2"]
-    )
-    result = json.loads(out)
-    assert "learning_rate" in result["config_diff"]
-    assert result["run_a_metric"] == "loss"
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-
-    print("== 6. project-summary ==")
-    out = capture(
-        [
-            "--creds-file",
-            CREDS,
-            "project-summary",
-            "acme/sft-proj",
-            "--axis",
-            "job_type",
-        ]
-    )
-    result = json.loads(out)
-    assert result["total_runs"] == 2
-    assert result["buckets"]["sft"]["count"] == 2
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-
-    print("== 7. report ==")
+    print("== 5. report ==")
     out = capture(
         ["--creds-file", CREDS, "report", "acme/sft-proj", "run1", "--out", REPORT]
     )
@@ -212,7 +185,7 @@ def main():
     print(report_text[:400])
 
     # 兼容性:creds 缺 data_source 字段时默认 wandb
-    print("== 8. 旧 creds 兼容(无 data_source 字段)==")
+    print("== 6. 旧 creds 兼容(无 data_source 字段)==")
     legacy = "/tmp/smoke_creds_legacy.json"
     with open(legacy, "w", encoding="utf-8") as f:
         json.dump({"WANDB_API_KEY": "test-key-123"}, f)
@@ -222,7 +195,7 @@ def main():
     print("ok")
 
     # 数据源自动探测失败时显式 --data-source 可指定
-    print("== 9. --data-source 显式指定 ==")
+    print("== 7. --data-source 显式指定 ==")
     out = capture(
         [
             "--creds-file",
