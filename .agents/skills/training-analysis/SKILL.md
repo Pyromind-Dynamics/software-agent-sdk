@@ -68,18 +68,21 @@ wandb 凭证与 run id **均从平台 API 动态获取,不需要用户提供环�
 > 网络慢时等待 CLI 报错即可,不要手动 Ctrl-C,更不要绕过 CLI 写自定义 python
 > 调用 wandb SDK(CLI 已封装超时与目录处理)。
 
-1. **定位**: `python scripts/train_analysis.py --api-base {api_base} --cookie "$PYROMIND_VALIDATE_AUTH_COOKIE" --cluster "$PYROMIND_X_CLUSTER" resolve-target {task_id} --creds-out {tmp}/creds.json`
+1. **定位**: `python scripts/train_analysis.py --api-base {api_base} --cookie "$PYROMIND_VALIDATE_AUTH_COOKIE" --cluster "$PYROMIND_X_CLUSTER" resolve-target {task_id} --creds-out public_data/analysis_tmp/creds.json`
    自动探测数据源,输出 `data_source`/`entity`/`project`/`run_id`;凭证写至
-   creds 文件(600 权限)。**后续所有命令的 `{creds}` 直接复制此步骤输出中的
-   `creds_file` 字段值,不要重新拼路径**(拼错会导致 FileNotFoundError)。
+   creds 文件(600 权限)。**先把输出的 `creds_file` 值存入环境变量**:
+   `export CREDS="<creds_file 值>"`,后续命令一律用 `--creds-file "$CREDS"`
+   ——不要每次重抄长路径(手抄会抄错导致 FileNotFoundError / WANDB_API_KEY
+   missing)。输出文件用相对路径(对话工作目录内)。**不要用系统 /tmp
+   存放任何产物**(sandbox 拒绝写入,会报 PermissionError)。
    cookie/x-cluster 环境变量由 agent-server 注入;
    若本机调试无注入,改用 `--cookie`/`--cluster` 显式传入。
-2. **探查**: `python scripts/train_analysis.py --creds-file {creds} probe {entity}/{project} --run-id {run_id}`
+2. **探查**: `python scripts/train_analysis.py --creds-file "$CREDS" probe {entity}/{project} --run-id {run_id}`
    确认指标键族(如 `train/loss`)与 config 键族。
 3. **分析**: 按场景选择
-   - 单 run 诊断: `python scripts/train_analysis.py --creds-file {creds} analyze-run {entity}/{project} {run_id} --metric train/loss`
+   - 单 run 诊断: `python scripts/train_analysis.py --creds-file "$CREDS" analyze-run {entity}/{project} {run_id} --metric train/loss`
      `--keys` 参数支持多指标同时拉取: `--keys train/loss,train/entropy,train/learning_rate,train/grad_norm`
-4. **报告**: `python scripts/train_analysis.py --creds-file {creds} report {entity}/{project} {run_id} --out report.md`,
+4. **报告**: `python scripts/train_analysis.py --creds-file "$CREDS" report {entity}/{project} {run_id} --out report.md`,
    输出四阶段结论(先验 → 惊奇 → 机制 → 探针实验表)。
    若诊断发现 NaN/过拟合/未收敛,报告会自动包含数据集质量检查建议。
 5. **数据集质量检查**: 当报告建议检查训练数据时,内部路由到数据清洗能力
