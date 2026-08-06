@@ -22,7 +22,7 @@
 
 | # | 探针 | 参数变更 | 验证方式 |
 |---|---|---|---|
-| 1 | 降 lr | `learning_rate` → ×0.5 | `compare-runs` 新旧 run: 尖峰数/NaN 应下降 |
+| 1 | 降 lr | `learning_rate` → ×0.5 | analyze-run/report 新 run: 尖峰数/NaN 应下降 |
 | 2 | 升 lr | `learning_rate` → ×2 | 对比: loss 下降速度应提升且不引入不稳定 |
 | 3 | 加 epoch | `num_epochs` → +1 | 对比: 平台期 loss 应下降 |
 | 4 | 升 rank | `lora_rank` → ×2 | 对比: 平台期 loss 应下降(容量假说) |
@@ -31,7 +31,7 @@
 
 ## 使用规则
 
-- 每轮只执行一行探针;新 run 完成后用 `compare-runs` 验证,再决定收敛或下一个。
+- 每轮只执行一行探针;新 run 完成后用 analyze-run/report 与基线指标对比,再决定收敛或下一个。
 - 修改 `batch_size` 时同步调整 `grad_accumulation_steps`,保持有效 batch
   (= batch × accum × gpu_count)不变,避免混淆变量。
 - 若某机制的两个探针都无效,放弃该机制,回到异常表选下一个候选。
