@@ -1,26 +1,31 @@
 ---
-name: wandb-training-analysis
+name: training-analysis
 description: >-
-  分析 Pyromind 平台训练工作流的 wandb 训练数据并给出优化建议,并联动
-  data-cleaning/data-preparation skill 分析训练数据集质量。用户说“分析训练效果”、
-  “看看 loss 曲线”、“训练发散/NaN/尖峰了”、“对比两次训练”、“优化超参”、
-  “评估这次训练怎么样”、“分析一下{task_id}的执行情况”或给出 task_id / wandb run 链接
-  时使用;负责定位 wandb run、探查指标与配置、单 run 稳定性诊断、run 对比、
-  四阶段分析报告,并与 generate-workflow-dsl 衔接生成调优后的训练工作流。
-  不需要本地 workflow.py 文件,通过 task_id 独立分析。
+  分析 Pyromind 平台训练工作流的训练数据(数据源自动探测,当前支持 wandb)并给出
+  优化建议,并联动 data-cleaning/data-preparation skill 分析训练数据集质量。
+  用户说“分析训练效果”、“看看 loss 曲线”、“训练发散/NaN/尖峰了”、
+  “对比两次训练”、“优化超参”、“评估这次训练怎么样”、“分析一下{task_id}的执行情况”
+  或给出 task_id / 训练 run 链接时使用;负责定位训练 run、探查指标与配置、
+  单 run 稳定性诊断、run 对比、四阶段分析报告,并与 generate-workflow-dsl
+  衔接生成调优后的训练工作流。不需要本地 workflow.py 文件,通过 task_id 独立分析。
 ---
 
-# wandb 训练数据分析与优化
+# 训练数据分析与优化
 
-把 wandb 训练数据查询、异常诊断和优化建议集成为一条链路:定位 run → 探查契约 →
-分析 → 报告 → 检查数据集质量 → 生成调优工作流。所有数据经 wandb SDK 读取,
-不依赖页面可访问性。
+把训练数据查询、异常诊断和优化建议集成为一条链路:定位 run → 探查契约 →
+分析 → 报告 → 检查数据集质量 → 生成调优工作流。所有数据经数据源适配器读取
+(当前实现为 wandb SDK),不依赖页面可访问性。
 
 当报告发现 NaN/过拟合/未收敛时,建议用户检查训练数据集质量。对用户沟通时
 一律使用业务语言(如“检查并优化训练数据集”),不得向用户暴露内部 skill 名称;
 内部按需路由到数据清洗能力(基于规则的确定性清洗,或需 LLM 理解的数据处理)。
 
 ## 数据定位(关键)
+
+**数据源自动探测**: resolve-target 遍历数据源注册表(见 scripts/data_sources/),
+对每个适配器尝试从平台节点提取凭证,第一个成功者即为数据源类型(wandb 等);
+探测失败可用 `--data-source {type}` 显式指定。creds 文件写入 `data_source`
+字段,后续命令据此选择适配器(旧 creds 缺该字段时默认 wandb)。
 
 wandb 凭证与 run id **均从平台 API 动态获取,不需要用户提供环境变量**:
 
@@ -55,20 +60,20 @@ wandb 凭证与 run id **均从平台 API 动态获取,不需要用户提供环�
 
 ## 主流程
 
-> 命令约定:全局参数(`--api-base`/`--cookie`/`--cluster`/`--authorization`/`--api-key`/`--creds-file`/`--entity`)必须写在子命令名之前。
+> 命令约定:全局参数(`--api-base`/`--cookie`/`--cluster`/`--authorization`/`--api-key`/`--creds-file`/`--entity`/`--data-source`)必须写在子命令名之前。
 
-1. **定位**: `python scripts/wandb_analysis.py --api-base {api_base} --cookie "$PYROMIND_VALIDATE_AUTH_COOKIE" --cluster "$PYROMIND_X_CLUSTER" resolve-target {task_id} --creds-out {tmp}/creds.json`
-   输出 `entity`/`project`/`run_id`;凭证写至 creds 文件(600 权限)。
-   cookie/x-cluster 环境变量由 agent-server 注入;若本机调试无注入,改用
-   `--cookie`/`--cluster` 显式传入。
-2. **探查**: `python scripts/wandb_analysis.py --creds-file {creds} probe {entity}/{project} --run-id {run_id}`
+1. **定位**: `python scripts/train_analysis.py --api-base {api_base} --cookie "$PYROMIND_VALIDATE_AUTH_COOKIE" --cluster "$PYROMIND_X_CLUSTER" resolve-target {task_id} --creds-out {tmp}/creds.json`
+   自动探测数据源,输出 `data_source`/`entity`/`project`/`run_id`;凭证写至
+   creds 文件(600 权限)。cookie/x-cluster 环境变量由 agent-server 注入;
+   若本机调试无注入,改用 `--cookie`/`--cluster` 显式传入。
+2. **探查**: `python scripts/train_analysis.py --creds-file {creds} probe {entity}/{project} --run-id {run_id}`
    确认指标键族(如 `train/loss`)与 config 键族。
 3. **分析**: 按场景选择
-   - 单 run 诊断: `python scripts/wandb_analysis.py --creds-file {creds} analyze-run {entity}/{project} {run_id} --metric train/loss`
+   - 单 run 诊断: `python scripts/train_analysis.py --creds-file {creds} analyze-run {entity}/{project} {run_id} --metric train/loss`
      `--keys` 参数支持多指标同时拉取: `--keys train/loss,train/entropy,train/learning_rate,train/grad_norm`
-   - 两 run 对比: `python scripts/wandb_analysis.py --creds-file {creds} compare-runs {entity}/{project} {run_a} {run_b}`
-   - 项目分桶: `python scripts/wandb_analysis.py --creds-file {creds} project-summary {entity}/{project} --axis learning_rate`
-4. **报告**: `python scripts/wandb_analysis.py --creds-file {creds} report {entity}/{project} {run_id} --out report.md`,
+   - 两 run 对比: `python scripts/train_analysis.py --creds-file {creds} compare-runs {entity}/{project} {run_a} {run_b}`
+   - 项目分桶: `python scripts/train_analysis.py --creds-file {creds} project-summary {entity}/{project} --axis learning_rate`
+4. **报告**: `python scripts/train_analysis.py --creds-file {creds} report {entity}/{project} {run_id} --out report.md`,
    输出四阶段结论(先验 → 惊奇 → 机制 → 探针实验表)。
    若诊断发现 NaN/过拟合/未收敛,报告会自动包含数据集质量检查建议。
 5. **数据集质量检查**: 当报告建议检查训练数据时,内部路由到数据清洗能力
@@ -84,18 +89,22 @@ wandb 凭证与 run id **均从平台 API 动态获取,不需要用户提供环�
 
 ## 技术说明
 
-核心分析函数(probe/analyze-run/compare-runs/report)集成自
-[wandb-primary skill](https://github.com/coreweave/skills/tree/main/skills/wandb-primary)
-(CoreWeave, Apache-2.0):
-- `probe_project` / `scan_history` / `diagnose_run` / `compare_configs`
-  从官方 wandb_helpers_impl.py 适配,见 `scripts/wandb_helpers.py`
+数据获取与数据分析分层解耦,新数据源无需改动分析层:
+
+- 数据获取层: `scripts/data_sources/` 数据源适配器。`base.py` 定义标准
+  `RunData` 格式与注册表,`wandb.py` 为 wandb 实现(凭证提取/run 定位/
+  SDK 连接/数据拉取)。新增数据源 = 新建适配器文件 + 注册一行。
+- 分析层: `scripts/analysis_helpers.py` 只消费 `RunData`/纯 dict,与具体
+  数据源无关(`diagnose_run`/`compare_configs`),集成自
+  [wandb-primary skill](https://github.com/coreweave/skills/tree/main/skills/wandb-primary)
+  (CoreWeave, Apache-2.0)。
 - `diagnose_run` 提供收敛检测、过拟合检测、NaN 检测,替代手写
   `_history_stats`
-- `scan_history` 使用 `run.scan_history(keys=...)` 替代 `run.history()`,
+- wandb 适配器用 `run.scan_history(keys=...)` 替代 `run.history()`,
   避免大项目(万级 metric) 502 超时
 - `resolve-target` / `report` 四阶段模板为 Pyromind 平台特有逻辑
 
-## 大项目性能规则(CRITICAL)
+## 大项目性能规则(CRITICAL, wandb 数据源)
 
 - 始终 `wandb.Api(timeout=120)`,避免默认超时。
 - 拉取 history 必须显式 `keys=[...]`,禁止无 keys 全量拉取。

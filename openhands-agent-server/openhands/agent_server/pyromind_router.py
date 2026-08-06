@@ -142,7 +142,7 @@ _PYROMIND_SKILL_NAMES = [
     "debug-workflow",
     "data-cleaning",
     "data-preparation",
-    "wandb-training-analysis",
+    "training-analysis",
 ]
 _PYROMIND_VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
 _PYROMIND_VALIDATE_FORWARD_HEADERS = ("x-cluster", "accept-language")
