@@ -30,7 +30,7 @@ description: >-
 | `references/workflow-contracts.md` | 完整生成或组合阶段时查拓扑、节点参数、端口、枚举和平台覆盖项 |
 | `references/parameter-decision.md` | 训练数值参数的整组决策或训练 OOM 调整 |
 | `references/custom-python-assets.md` | 内置 Metrics/Reward 不适用，需要生成、上传并回填 Python 入口 |
-| 其他 Skill: `wandb-training-analysis` | 分析已有训练效果（loss 异常/对比/优化超参）时，先调该 skill 产出报告与探针实验，再按 `parameter-decision.md` 落参数 |
+| 其他 Skill: `training-analysis` | 分析已有训练效果（loss 异常/对比/优化超参）时，先调该 skill 产出报告与探针实验，再按 `parameter-decision.md` 落参数 |
 
 调用格式为 `skills_read(skill_name="generate-workflow-dsl", path="references/...")`。
 
