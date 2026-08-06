@@ -104,6 +104,7 @@ from openhands.tools.workflow_debug import WorkflowDebugTool
 
 
 PYROMIND_AUTH_TOKEN_SECRET = "auth_token"
+PYROMIND_X_CLUSTER_SECRET = "PYROMIND_X_CLUSTER"
 _OPENAI_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 
 
@@ -141,6 +142,7 @@ _PYROMIND_SKILL_NAMES = [
     "debug-workflow",
     "data-cleaning",
     "data-preparation",
+    "wandb-training-analysis",
 ]
 _PYROMIND_VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
 _PYROMIND_VALIDATE_FORWARD_HEADERS = ("x-cluster", "accept-language")
@@ -545,6 +547,8 @@ async def apply_pyromind_validation_context(
         secrets_update[PYROMIND_STORAGE_AUTH_COOKIE_SECRET] = current_user.cookie
     if auth_token := parse_auth_token_from_cookie_header(current_user.cookie):
         secrets_update[PYROMIND_AUTH_TOKEN_SECRET] = auth_token
+    if current_user.x_cluster:
+        secrets_update[PYROMIND_X_CLUSTER_SECRET] = current_user.x_cluster
     if secrets_update:
         await event_service.update_secrets(secrets_update)
 
