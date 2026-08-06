@@ -36,7 +36,7 @@
 每轮只改一个变量,实验必须能推翻机制假设:
 
 - 参数修改幅度要能产生可观测差异(如 lr 减半、rank 翻倍),但保持单变量。
-- 记录基线 run id 与探针 run id,新 run 完成后用 `compare-runs` 验证。
+- 记录基线 run id 与探针 run id,新 run 完成后用 analyze-run/report 对比基线指标。
 - 无效即放弃该机制,换下一个;有效则收敛或继续沿该方向微调。
 
 ## Pyromind 场景要点

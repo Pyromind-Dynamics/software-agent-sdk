@@ -61,18 +61,24 @@ wandb 凭证与 run id **均从平台 API 动态获取,不需要用户提供环�
 ## 主流程
 
 > 命令约定:全局参数(`--api-base`/`--cookie`/`--cluster`/`--authorization`/`--api-key`/`--creds-file`/`--entity`/`--data-source`)必须写在子命令名之前。
+>
+> 运行环境:CLI 会自动把 wandb 临时/缓存/日志目录重定向到可写位置(优先
+> resolve-target 输出的 `wandb_tmp`),**无需手动 export TMPDIR/WANDB_CACHE_DIR**;
+> wandb 网络请求默认 60s 超时(`WANDB_API_TIMEOUT` 可调),超时/失败会打印 error。
+> 网络慢时等待 CLI 报错即可,不要手动 Ctrl-C,更不要绕过 CLI 写自定义 python
+> 调用 wandb SDK(CLI 已封装超时与目录处理)。
 
 1. **定位**: `python scripts/train_analysis.py --api-base {api_base} --cookie "$PYROMIND_VALIDATE_AUTH_COOKIE" --cluster "$PYROMIND_X_CLUSTER" resolve-target {task_id} --creds-out {tmp}/creds.json`
    自动探测数据源,输出 `data_source`/`entity`/`project`/`run_id`;凭证写至
-   creds 文件(600 权限)。cookie/x-cluster 环境变量由 agent-server 注入;
+   creds 文件(600 权限)。**后续所有命令的 `{creds}` 直接复制此步骤输出中的
+   `creds_file` 字段值,不要重新拼路径**(拼错会导致 FileNotFoundError)。
+   cookie/x-cluster 环境变量由 agent-server 注入;
    若本机调试无注入,改用 `--cookie`/`--cluster` 显式传入。
 2. **探查**: `python scripts/train_analysis.py --creds-file {creds} probe {entity}/{project} --run-id {run_id}`
    确认指标键族(如 `train/loss`)与 config 键族。
 3. **分析**: 按场景选择
    - 单 run 诊断: `python scripts/train_analysis.py --creds-file {creds} analyze-run {entity}/{project} {run_id} --metric train/loss`
      `--keys` 参数支持多指标同时拉取: `--keys train/loss,train/entropy,train/learning_rate,train/grad_norm`
-   - 两 run 对比: `python scripts/train_analysis.py --creds-file {creds} compare-runs {entity}/{project} {run_a} {run_b}`
-   - 项目分桶: `python scripts/train_analysis.py --creds-file {creds} project-summary {entity}/{project} --axis learning_rate`
 4. **报告**: `python scripts/train_analysis.py --creds-file {creds} report {entity}/{project} {run_id} --out report.md`,
    输出四阶段结论(先验 → 惊奇 → 机制 → 探针实验表)。
    若诊断发现 NaN/过拟合/未收敛,报告会自动包含数据集质量检查建议。
@@ -85,7 +91,8 @@ wandb 凭证与 run id **均从平台 API 动态获取,不需要用户提供环�
      清洗/增强”),不要直接说出内部 skill 名称。
 6. **调优**: 把报告中的探针实验(单变量参数修改)+ 数据集质量发现交给
    `generate-workflow-dsl` 生成修改后的训练工作流;用户确认后提交平台执行,
-   新 run 完成后回到第 1 步做闭环对比(`compare-runs` 新旧 run)。
+   新 run 完成后回到第 3 步用 analyze-run/report 分析新 run,与基线指标
+   对比确认探针生效,再决定收敛或下一个探针。
 
 ## 技术说明
 
@@ -95,7 +102,7 @@ wandb 凭证与 run id **均从平台 API 动态获取,不需要用户提供环�
   `RunData` 格式与注册表,`wandb.py` 为 wandb 实现(凭证提取/run 定位/
   SDK 连接/数据拉取)。新增数据源 = 新建适配器文件 + 注册一行。
 - 分析层: `scripts/analysis_helpers.py` 只消费 `RunData`/纯 dict,与具体
-  数据源无关(`diagnose_run`/`compare_configs`),集成自
+  数据源无关(`diagnose_run`),集成自
   [wandb-primary skill](https://github.com/coreweave/skills/tree/main/skills/wandb-primary)
   (CoreWeave, Apache-2.0)。
 - `diagnose_run` 提供收敛检测、过拟合检测、NaN 检测,替代手写
@@ -106,7 +113,7 @@ wandb 凭证与 run id **均从平台 API 动态获取,不需要用户提供环�
 
 ## 大项目性能规则(CRITICAL, wandb 数据源)
 
-- 始终 `wandb.Api(timeout=120)`,避免默认超时。
+- 始终 `wandb.Api(timeout=60)`(可用 `WANDB_API_TIMEOUT` 调大),避免默认超时导致请求长时间挂起。
 - 拉取 history 必须显式 `keys=[...]`,禁止无 keys 全量拉取。
 - 列 run 必须 `per_page` 分页;计数用 lazy,不展开所有对象。
 - system 指标(如 GPU 利用率)单独 stream 拉取,不与训练指标混拉。
