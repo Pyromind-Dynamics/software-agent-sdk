@@ -16,6 +16,11 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator
 
+# Keep the node_signature tool registered (module-level side effect) so
+# persisted conversation events that referenced it before it was removed
+# from the agent tool surface still deserialize on restart. It is not added
+# to the agent's extra_tools below.
+import openhands.tools.node_signature  # noqa: F401
 from openhands.agent_server.conversation_service import (
     ConversationForkAtEventConflictError,
     ConversationForkAtEventSourceNotFoundError,
@@ -74,7 +79,6 @@ from openhands.tools.data_preparation import (
     DfSubmitPipelineTool,
 )
 from openhands.tools.data_preparation.progress import DfCheckProgressExecutor
-from openhands.tools.node_signature import GetNodeFunctionSignatureTool
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
@@ -423,19 +427,6 @@ def _build_workflow_debug_tool(
     )
     secrets = _load_auth_token(http_request=http_request, secrets=secrets)
     return Tool(name=WorkflowDebugTool.name, params=params), secrets
-
-
-def _build_node_signature_tool(
-    http_request: Request,
-) -> tuple[Tool, dict[str, SecretSource]]:
-    """Build ``get_node_function_signature`` with env/auth params."""
-    params: dict[str, Any] = {}
-    secrets: dict[str, SecretSource] = {}
-    params, secrets = _load_env_to_tools(
-        http_request=http_request, params=params, secrets=secrets
-    )
-    secrets = _load_auth_token(http_request=http_request, secrets=secrets)
-    return Tool(name=GetNodeFunctionSignatureTool.name, params=params), secrets
 
 
 def _build_pyromind_storage_tools(
@@ -1143,8 +1134,6 @@ async def create_pyromind_conversation(
     # run_workflow / workflow_debug reuse validate auth/header wiring
     run_tool, run_secrets = _build_workflow_run_tool(http_request)
     debug_tool, debug_secrets = _build_workflow_debug_tool(http_request)
-    # get_node_function_signature
-    node_sig_tool, node_sig_secrets = _build_node_signature_tool(http_request)
     # storage
     storage_tools, storage_secrets = _build_pyromind_storage_tools(
         http_request, request.extra, skills_path
@@ -1191,7 +1180,6 @@ async def create_pyromind_conversation(
             ),
             Tool(name="df_convert"),
             validation_tool,
-            node_sig_tool,
         ],
     )
 
@@ -1221,7 +1209,6 @@ async def create_pyromind_conversation(
             **run_secrets,
             **debug_secrets,
             **storage_secrets,
-            **node_sig_secrets,
         },
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
         user_id=user_id,

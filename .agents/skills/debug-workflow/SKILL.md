@@ -54,14 +54,15 @@ test 执行**一次（平台侧附加 `execution_mode=test`）。
 
 ```python
 workflow_debug(
-    dsl=<workflow.py 全文>,   # 必填：DSL 源码字符串，不是文件路径
+    dsl_path="public_data/workflow_canvas/workflow.py",  # 可选：工作区相对路径，默认此文件
     name="workflow",          # 可选
     note="optional",          # 可选：本轮改动说明
 )
 ```
 
-调用前用 `file_editor` 读取 `workflow.py`，将全文传入 `dsl`。不要用 bash/Python 本地执行
-`workflow.py`（声明式 DSL）。
+工具直接读取工作区里 `dsl_path` 指向的文件（缺省为
+`public_data/workflow_canvas/workflow.py`），**不要把 DSL 全文传入参数**。不要用
+bash/Python 本地执行 `workflow.py`（声明式 DSL）。
 
 ## 与 `validate_workflow_dsl` 的区别
 
@@ -78,7 +79,7 @@ workflow_debug(
 
 ## 循环步骤
 
-1. 读取 `workflow.py`，调用 `workflow_debug(dsl=<全文>)`
+1. 调用 `workflow_debug`（缺省 `dsl_path` 即读取工作区 `workflow.py`）
 2. 提交失败（`is_error` / `Failed`/`Error`）：按 observation 处理，勿盲目重试
 3. 提交成功：告知用户已提交、正在等待平台结果；**等待 Kafka callback**（会自动续跑）
 4. 收到终态 `<system_reminder>` 后：

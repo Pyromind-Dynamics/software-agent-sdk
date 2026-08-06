@@ -17,7 +17,10 @@ from openhands.tools.workflow import (
     RunWorkflowObservation,
     RunWorkflowTool,
 )
-from openhands.tools.workflow.run_workflow import DEFAULT_MAX_ATTEMPTS
+from openhands.tools.workflow.run_workflow import (
+    DEFAULT_MAX_ATTEMPTS,
+    WORKFLOW_ATTEMPT_STATE_KEY,
+)
 
 
 _CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000123")
@@ -46,6 +49,7 @@ def _fake_conversation(
             workspace=SimpleNamespace(working_dir=str(tmp_path)),
             state=SimpleNamespace(
                 secret_registry=secret_registry or SecretRegistry(),
+                agent_state={},
             ),
         ),
     )
@@ -244,8 +248,11 @@ def test_run_workflow_applies_test_mode_to_xyflow() -> None:
 
 def test_run_workflow_enforces_max_attempts(tmp_path: Path) -> None:
     executor = RunWorkflowExecutor(**_executor_kwargs())
-    executor._attempt = DEFAULT_MAX_ATTEMPTS
     conversation = _fake_conversation(tmp_path)
+    conversation.state.agent_state = {
+        **conversation.state.agent_state,
+        WORKFLOW_ATTEMPT_STATE_KEY: DEFAULT_MAX_ATTEMPTS,
+    }
 
     observation = executor(
         RunWorkflowAction(dsl="# workflow"),
@@ -256,3 +263,51 @@ def test_run_workflow_enforces_max_attempts(tmp_path: Path) -> None:
     assert observation.status == "Error"
     assert observation.attempt == DEFAULT_MAX_ATTEMPTS
     assert "Reached the maximum" in observation.text
+
+
+def test_run_workflow_reset_round_starts_new_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = SecretRegistry()
+    registry.update_secrets({"auth_token": "jwt-token"})
+
+    mock_client = MagicMock()
+    mock_client.studio.create.return_value = TrainingTaskCreateResponse(
+        task_id="task-reset",
+        name="demo",
+        status="Pending",
+    )
+
+    monkeypatch.setattr(
+        "openhands.tools.workflow.task_submission.get_api_key",
+        lambda **kwargs: "access-key-1",
+    )
+    monkeypatch.setattr(
+        "openhands.tools.workflow.task_submission.get_pyromind_api_client",
+        lambda **kwargs: mock_client,
+    )
+    monkeypatch.setattr(
+        RunWorkflowExecutor,
+        "_convert_dsl_to_xyflow",
+        lambda self, *, dsl, name: SimpleNamespace(
+            is_error=False,
+            xyflow={"name": name, "nodes": [], "edges": []},
+            text="",
+        ),
+    )
+
+    conversation = _fake_conversation(tmp_path, secret_registry=registry)
+    conversation.state.agent_state = {
+        **conversation.state.agent_state,
+        WORKFLOW_ATTEMPT_STATE_KEY: DEFAULT_MAX_ATTEMPTS,
+    }
+
+    observation = RunWorkflowExecutor(**_executor_kwargs())(
+        RunWorkflowAction(dsl="# workflow: demo", name="demo", reset_round=True),
+        conversation=conversation,
+    )
+
+    assert not observation.is_error
+    assert observation.status == "Pending"
+    assert observation.attempt == 1
+    assert conversation.state.agent_state[WORKFLOW_ATTEMPT_STATE_KEY] == 1

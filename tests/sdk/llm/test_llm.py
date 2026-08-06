@@ -137,7 +137,8 @@ def test_openhands_provider_translates_only_for_litellm(mock_completion, mock_ge
 
 @patch("openhands.sdk.llm.utils.model_info.httpx.get")
 def test_kimi_k2_5_uses_provider_defaults(mock_get):
-    """Test that kimi-k2.5 uses provider defaults (None) for temperature and top_p."""
+    """Test that kimi-k2.5 uses provider defaults for temperature
+    and the default top_p."""
     mock_get.return_value = Mock(json=lambda: {"data": []})
 
     llm = LLM(
@@ -145,9 +146,9 @@ def test_kimi_k2_5_uses_provider_defaults(mock_get):
         api_key=SecretStr("test-key"),
         usage_id="test-kimi-llm",
     )
-    # Both temperature and top_p should be None (use provider defaults)
+    # temperature uses provider default, top_p uses the global default
     assert llm.temperature is None
-    assert llm.top_p is None
+    assert llm.top_p == 0.95
 
     # Explicit values should still be respected
     llm_explicit = LLM(

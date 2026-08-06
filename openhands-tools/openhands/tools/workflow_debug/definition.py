@@ -11,7 +11,8 @@ that always submits with ``test_mode=True`` (platform ``execution_mode=test``).
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Literal, Self
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
 from pydantic import Field
 
@@ -23,7 +24,9 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
+from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 from openhands.tools.workflow.run_workflow import (
+    DEFAULT_MAX_ATTEMPTS,
     RunWorkflowAction,
     RunWorkflowExecutor,
     RunWorkflowObservation,
@@ -48,17 +51,26 @@ class WorkflowDebugAction(Action):
             "attempt. Not sent to the platform; purely for conversation history."
         ),
     )
-    dsl: str | None = Field(
+    dsl_path: str | None = Field(
         default=None,
         description=(
-            "Pyromind workflow Python DSL source code to debug (not a file path). "
-            "Required: pass the declarative workflow script text the agent "
-            "generated or edited."
+            "Workspace-relative path to the workflow DSL file to debug. Pass "
+            "the path of the declarative workflow script the agent generated "
+            "or edited. If omitted, reads "
+            "public_data/workflow_canvas/workflow.py from the workspace."
         ),
     )
     name: str = Field(
         default="workflow",
         description="Workflow name passed to the platform when submitting the run.",
+    )
+    reset_round: bool = Field(
+        default=False,
+        description=(
+            "Start a new debug round by clearing the current round's submission "
+            "count. Only use this when the tool reports the round attempt limit "
+            "was reached AND the user explicitly asks to continue debugging."
+        ),
     )
 
 
@@ -89,9 +101,7 @@ class WorkflowDebugObservation(Observation):
         default=None,
         description="工作流提交成功，返回的任务 ID",
     )
-    attempt: int = Field(
-        description="This debug attempt number for the current conversation."
-    )
+    attempt: int = Field(description="This debug attempt number for the current round.")
     max_attempts: int = Field(
         description="The maximum number of debug attempts allowed."
     )
@@ -110,8 +120,8 @@ Use this tool whenever the user asks to test, debug, 测试, 调试, or 试跑 a
 This is the only tool for debug/test runs — do **not** use `run_workflow` for
 测试/调试/试跑 (`run_workflow` has no agent-facing `test_mode` parameter).
 
-`public_data/workflow_canvas/workflow.py` is a declarative DSL, not a runnable Python script. Read
-`public_data/workflow_canvas/workflow.py` from the workspace and pass its contents as `dsl`. Do not execute
+`public_data/workflow_canvas/workflow.py` is a declarative DSL, not a runnable Python script. Pass its
+workspace-relative path as `dsl_path` (default `public_data/workflow_canvas/workflow.py`); the tool reads the file itself. Do not execute
 it locally with bash or Python.
 
 This tool delegates to `run_workflow`'s executor with internal `test_mode=true`
@@ -135,6 +145,9 @@ How to use the result:
 - Terminal Failed/Error (debug-tagged): the DSL may be wrong. Read `error_log`,
   regenerate or fix `public_data/workflow_canvas/workflow.py` from the error, validate if needed, then call
   `workflow_debug` again to continue testing.
+- Round limit reached: if the tool reports the round attempt limit (10 accepted
+  submissions) was reached and the user explicitly asks to keep debugging, call
+  `workflow_debug` again with `reset_round=true` to start a fresh round.
 - Do not use this tool for production run/publish — use `run_workflow` instead.
   Production `run_workflow` does not return `keep_ui_lock`.
 """  # noqa: E501
@@ -181,16 +194,61 @@ class WorkflowDebugExecutor(
             headers=headers,
         )
 
+    def _resolve_dsl_source(
+        self,
+        action: WorkflowDebugAction,
+        conversation: BaseConversation | None,
+    ) -> str:
+        """Read the workflow DSL file referenced by ``action.dsl_path``.
+
+        ``dsl_path`` is a workspace-relative path resolved against the
+        conversation's working dir; it defaults to
+        ``public_data/workflow_canvas/workflow.py``. Reads are confined to the
+        workspace so a stray path cannot escape it.
+
+        ``dsl_path`` 为相对工作区的路径，基于 conversation 的 working dir 解析，
+        缺省为 ``public_data/workflow_canvas/workflow.py``；读取被限制在工作区内。
+        """
+        dsl_path = action.dsl_path or WORKFLOW_RELATIVE_PATH
+        if conversation is None:
+            raise ValueError(
+                "Cannot read the workflow DSL file without an active conversation."
+            )
+        workspace = cast(Any, conversation).workspace
+        base_dir = Path(workspace.working_dir).resolve()
+        workflow_path = (base_dir / dsl_path).resolve()
+        if not workflow_path.is_relative_to(base_dir):
+            raise ValueError(
+                f"Workflow DSL path must stay inside the workspace: {dsl_path!r}"
+            )
+        if not workflow_path.is_file():
+            raise ValueError(
+                f"Cannot read workflow DSL file: {dsl_path!r} does not exist."
+            )
+        return workflow_path.read_text(encoding="utf-8")
+
     def __call__(
         self,
         action: WorkflowDebugAction,
         conversation: BaseConversation | None = None,
     ) -> WorkflowDebugObservation:
+        try:
+            dsl_source = self._resolve_dsl_source(action, conversation)
+        except ValueError as exc:
+            return WorkflowDebugObservation.from_text(
+                text=str(exc),
+                status="Failed",
+                attempt=0,
+                max_attempts=DEFAULT_MAX_ATTEMPTS,
+                is_error=True,
+                error_log=str(exc),
+            )
         observation = self._run_executor(
             RunWorkflowAction(
                 note=action.note,
-                dsl=action.dsl,
+                dsl=dsl_source,
                 name=action.name,
+                reset_round=action.reset_round,
             ),
             conversation,
             test_mode=True,

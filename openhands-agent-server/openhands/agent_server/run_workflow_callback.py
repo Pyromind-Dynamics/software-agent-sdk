@@ -29,11 +29,13 @@ Module layout / 模块结构
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, cast
 from uuid import UUID
 
 from openhands.agent_server.conversation_service import (
@@ -41,11 +43,40 @@ from openhands.agent_server.conversation_service import (
     get_default_conversation_service,
 )
 from openhands.agent_server.event_service import EventService
-from openhands.sdk.llm import TextContent
+from openhands.sdk.llm import LLM, Message, TextContent
 from openhands.sdk.logger import get_logger
 
 
+if TYPE_CHECKING:
+    from openhands.sdk.conversation.impl.local_conversation import LocalConversation
+    from openhands.sdk.conversation.state import ConversationState
+    from openhands.tools.node_signature.definition import NodeSignatureObservation
+
+
 logger = get_logger(__name__)
+
+# Matches `<var> = <NodeType>(...` lines of the generated workflow DSL; the
+# line anchor keeps parameter values (which may contain ``=`` or ``(``) out.
+_NODE_DEFINITION_PATTERN = re.compile(r"^(\w+)\s*=\s*([A-Za-z_]\w*)\s*\(", re.MULTILINE)
+
+# Full DSL assignment lines (including the parameter list) so failed node ids
+# can be matched against their ``id=`` keyword, pairing with
+# ``_NODE_DEFINITION_PATTERN`` which only extracts type names.
+_DSL_NODE_LINE_PATTERN = re.compile(
+    r"^(\w+)\s*=\s*([A-Za-z_]\w*)\s*\(([^)]*)\)", re.MULTILINE
+)
+
+# `--- <node_code> ---` group headers in the decoded error log; the middleware
+# groups per-node failure logs by node_code, which is the DSL node id.
+_ERROR_LOG_NODE_HEADER_PATTERN = re.compile(r"^---\s*(\S+?)\s*---\s*$", re.MULTILINE)
+
+# Instructs the LLM to condense raw node signatures into concise fix guidance.
+_NODE_SIGNATURE_SUMMARY_PROMPT = """\
+你是一个工作流调试助手。下面是一次失败的 Pyromind 工作流运行所使用的节点的原始
+函数签名、docstring、参数规格与源码。请为每个节点产出一段简洁的说明，帮助 AI
+智能体修复 workflow DSL：列出必填参数、关键可选参数及默认值，以及调用时必须遵守
+的约束（入口、类型、跨节点连线）。不要复述源码，不要使用 markdown 标题或前言，
+直接用中文输出精简内容。"""
 
 # ---------------------------------------------------------------------------
 # 1. Types & constants / 类型与常量
@@ -132,6 +163,7 @@ def build_run_workflow_terminal_reminder(
     status: RunWorkflowStatus,
     error_log: str | None = None,
     from_workflow_debug: bool = False,
+    node_signature_guidance: str | None = None,
 ) -> str:
     """Build ``<system_reminder>`` for LLM context (via extended_content).
 
@@ -141,6 +173,11 @@ def build_run_workflow_terminal_reminder(
     ``agent1#debug#...``), success/failure guidance is specific to the
     debug/test loop. Production ``run_workflow`` callbacks keep the generic
     resume wording.
+
+    ``node_signature_guidance`` is appended after the runtime error log: it is
+    either an LLM-condensed summary of the workflow nodes' signatures or the
+    raw signature text when summarization failed (see
+    :func:`build_node_signature_guidance`).
     """
     lines = [
         "<system_reminder>",
@@ -181,6 +218,10 @@ def build_run_workflow_terminal_reminder(
         lines.append("")
         lines.append("Runtime error log:")
         lines.append(error_log)
+    if node_signature_guidance:
+        lines.append("")
+        lines.append("Node signature guidance:")
+        lines.append(node_signature_guidance)
     lines.append("</system_reminder>")
     return "\n".join(lines)
 
@@ -276,6 +317,29 @@ def _try_resolve_blocked_waiter(
     )
 
 
+def _reset_workflow_attempt_counter(event_service: EventService) -> None:
+    """Reset the conversation's round submission counter after a successful debug round.
+
+    A successful debug/test round ends here (Succeeded terminal status), so the
+    next debug session starts with a fresh attempt budget. Kept in sync with
+    ``openhands.tools.workflow.run_workflow.WORKFLOW_ATTEMPT_STATE_KEY``.
+    """
+    try:
+        conversation = event_service.get_conversation()
+    except ValueError:
+        return
+    import importlib
+
+    run_workflow_module = importlib.import_module(
+        "openhands.tools.workflow.run_workflow"
+    )
+    state = conversation.state
+    state.agent_state = {
+        **state.agent_state,
+        run_workflow_module.WORKFLOW_ATTEMPT_STATE_KEY: 0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 5. Idempotency / 终态去重
 # ---------------------------------------------------------------------------
@@ -301,6 +365,209 @@ def _release_terminal_delivery(task_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _extract_node_names_from_dsl(dsl_text: str) -> list[str]:
+    """Extract distinct node type names from generated workflow DSL text.
+
+    DSL lines look like ``<var> = <NodeType>(id=..., ...)``; the line anchor
+    excludes comment lines and parameter values. Order of first appearance is
+    preserved and duplicates are dropped.
+    """
+    node_names: list[str] = []
+    seen: set[str] = set()
+    for _, node_name in _NODE_DEFINITION_PATTERN.findall(dsl_text):
+        if node_name not in seen:
+            seen.add(node_name)
+            node_names.append(node_name)
+    return node_names
+
+
+def _extract_dsl_node_types(dsl_text: str) -> dict[str, str]:
+    """Map DSL node ids to their type names in order of first appearance.
+
+    ``<var> = <NodeType>(id=15, ...)`` → ``{"15": "NodeType"}``. Nodes without
+    an explicit ``id=`` keyword fall back to their DSL line number, mirroring
+    the middleware's ``node_code`` derivation. Duplicate ids keep the first
+    type.
+    """
+    node_types: dict[str, str] = {}
+    for match in _DSL_NODE_LINE_PATTERN.finditer(dsl_text):
+        node_name, params = match.group(2), match.group(3)
+        id_match = re.search(r"\bid\s*=\s*([^,\s)]+)", params)
+        if id_match:
+            node_id = id_match.group(1).strip("\"'")
+        else:
+            node_id = str(dsl_text[: match.start()].count("\n") + 1)
+        node_types.setdefault(node_id, node_name)
+    return node_types
+
+
+def _failed_node_names_from_error_log(
+    error_log: str | None,
+    dsl_text: str,
+) -> list[str] | None:
+    """Type names of only the failed nodes, when the error log identifies them.
+
+    The decoded error log groups per-node logs under ``--- <node_code> ---``
+    headers whose values match DSL ``id=`` keywords. Returns the matched node
+    types (DSL order, deduplicated). Returns None when the error log has no
+    usable headers or none match, so the caller can fall back to all nodes.
+    """
+    if not error_log:
+        return None
+    failed_ids = [
+        node_id.strip("\"'")
+        for node_id in _ERROR_LOG_NODE_HEADER_PATTERN.findall(error_log)
+    ]
+    if not failed_ids:
+        return None
+    node_types = _extract_dsl_node_types(dsl_text)
+    matched: list[str] = []
+    seen: set[str] = set()
+    for node_id in failed_ids:
+        node_type = node_types.get(node_id)
+        if node_type is None or node_type in seen:
+            continue
+        seen.add(node_type)
+        matched.append(node_type)
+    return matched or None
+
+
+def _env_from_x_cluster(x_cluster: str | None) -> str | None:
+    """Derive the platform env (pre/pre2/prod) from an ``x-cluster`` header.
+
+    Mirrors ``dependencies.load_base_env``: ``us-west-1#pre`` → ``pre``. Returns
+    None when the header is missing or has no env suffix, letting the signature
+    executor fall back to its own ``APP_ENV`` default.
+    """
+    if not x_cluster or "#" not in x_cluster:
+        return None
+    return x_cluster.rsplit("#", 1)[-1].strip().lower() or None
+
+
+def _fetch_node_signatures_text(
+    conversation: LocalConversation,
+    node_names: list[str],
+) -> str | None:
+    """Fetch raw signature text for all requested nodes via the middleware API.
+
+    Returns None when nothing usable was fetched. Headers and auth token come
+    from the conversation state, mirroring the workflow tools' wiring.
+    """
+    from openhands.tools.node_signature.definition import NodeSignatureAction
+    from openhands.tools.node_signature.impl import NodeSignatureExecutor
+    from openhands.tools.workflow.validate_workflow_dsl import (
+        PYROMIND_VALIDATE_HEADERS_STATE_KEY,
+    )
+
+    state = cast("ConversationState", conversation.state)
+    raw_headers = state.agent_state.get(PYROMIND_VALIDATE_HEADERS_STATE_KEY)
+    headers = (
+        {str(k): str(v) for k, v in raw_headers.items() if v is not None}
+        if isinstance(raw_headers, dict)
+        else {}
+    )
+    observation: NodeSignatureObservation = NodeSignatureExecutor(
+        env=_env_from_x_cluster(headers.get("x-cluster")),
+        headers=headers,
+    )(
+        NodeSignatureAction(node_names=node_names, include_source=True),
+        conversation=conversation,
+    )
+    if observation.status == "error" or not observation.results:
+        return None
+    if not any(result.get("success") for result in observation.results):
+        return None
+    return "\n".join(
+        content.text
+        for content in observation.to_llm_content
+        if isinstance(content, TextContent)
+    )
+
+
+async def build_node_signature_guidance(
+    *,
+    event_service: EventService,
+    error_log: str | None = None,
+    llm: LLM | None = None,
+) -> str | None:
+    """Summarize the failing run's node signatures for the debug callback.
+
+    Reads ``public_data/workflow_canvas/workflow.py`` from the conversation
+    workspace, resolves the failed nodes from the error log's
+    ``--- <node_code> ---`` group headers, fetches only their signatures via
+    the middleware API, and asks the conversation's LLM to condense them into
+    concise fix guidance. When the error log does not identify any node, all
+    nodes are used instead.
+
+    Degradation policy: when LLM summarization fails, the raw signature text is
+    returned instead; when no workflow file exists or signatures cannot be
+    fetched, None is returned and the callback keeps today's error-log-only
+    behavior. Never raises — failures must not break terminal delivery.
+    """
+    try:
+        conversation = event_service.get_conversation()
+    except ValueError:
+        return None
+
+    from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
+
+    try:
+        working_dir = Path(conversation.workspace.working_dir)
+        workflow_path = working_dir / WORKFLOW_RELATIVE_PATH
+        if not workflow_path.is_file():
+            return None
+        dsl_text = workflow_path.read_text(encoding="utf-8")
+        node_names = _failed_node_names_from_error_log(error_log, dsl_text)
+        if node_names is None:
+            node_names = _extract_node_names_from_dsl(dsl_text)
+        if not node_names:
+            return None
+        logger.info(
+            "Resolved nodes for failed workflow callback: %s",
+            ", ".join(node_names),
+        )
+        raw_text = _fetch_node_signatures_text(conversation, node_names)
+    except Exception:
+        logger.warning(
+            "Failed to fetch node signatures for debug callback; skipping "
+            "node signature guidance",
+            exc_info=True,
+        )
+        return None
+    if raw_text is None:
+        return None
+
+    effective_llm = llm or getattr(
+        getattr(conversation.state, "agent", None), "llm", None
+    )
+    if effective_llm is None:
+        return raw_text
+    try:
+        response = await effective_llm.acompletion(
+            messages=[
+                Message(
+                    role="system",
+                    content=[TextContent(text=_NODE_SIGNATURE_SUMMARY_PROMPT)],
+                ),
+                Message(role="user", content=[TextContent(text=raw_text)]),
+            ]
+        )
+        summary = "\n".join(
+            content.text
+            for content in response.message.content
+            if isinstance(content, TextContent)
+        ).strip()
+        if summary:
+            return summary
+    except Exception:
+        logger.warning(
+            "LLM node signature summarization failed; falling back to raw "
+            "node signatures",
+            exc_info=True,
+        )
+    return raw_text
+
+
 async def resume_conversation_after_workflow(
     *,
     event_service: EventService,
@@ -315,13 +582,33 @@ async def resume_conversation_after_workflow(
     Uses hidden environment context so the LLM receives the workflow status
     without creating a user-authored chat event.
 
+    For failed debug runs, node signature guidance is appended to the reminder
+    (condensed by the LLM, or raw signatures when summarization fails).
+
     通过隐藏的 environment 上下文注入终态并可选启动 Agent，不会伪造用户消息。
     """
+    guidance: str | None = None
+    if from_workflow_debug and status in ("Failed", "Error"):
+        guidance = await build_node_signature_guidance(
+            event_service=event_service,
+            error_log=error_log,
+        )
+    if status in ("Failed", "Error", "Terminated"):
+        logger.info(
+            "Workflow terminal failure task_id=%s status=%s\n"
+            "--- decoded error_log ---\n%s\n"
+            "--- node signature guidance ---\n%s",
+            task_id,
+            status,
+            error_log or "(none)",
+            guidance or "(none)",
+        )
     reminder = build_run_workflow_terminal_reminder(
         task_id=task_id,
         status=status,
         error_log=error_log,
         from_workflow_debug=from_workflow_debug,
+        node_signature_guidance=guidance,
     )
     await event_service.send_internal_context(
         [TextContent(text=reminder)],
@@ -468,7 +755,12 @@ async def deliver_run_workflow_status(
             conversation_id=str(conversation_uuid),
         )
 
-    # Step 7: Deliver to conversation and auto_run.
+    # Step 7: A successful debug round ends here — reset the round counter so
+    # the next debug session starts with a fresh attempt budget.
+    if from_workflow_debug and normalized_status == "Succeeded":
+        _reset_workflow_attempt_counter(event_service)
+
+    # Step 8: Deliver to conversation and auto_run.
     try:
         resume_t0 = time.monotonic()
         await resume_conversation_after_workflow(

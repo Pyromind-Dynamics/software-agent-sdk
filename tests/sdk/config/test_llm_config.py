@@ -21,7 +21,7 @@ def test_llm_config_defaults():
     assert config.timeout == 300  # Default timeout is 5 minutes
     assert config.max_message_chars == 30_000
     assert config.temperature is None  # None to use provider defaults
-    assert config.top_p is None  # None to use provider defaults
+    assert config.top_p == 0.95  # global default top_p
     assert config.top_k is None
     assert config.max_input_tokens is None  # None means use discovered value
     assert config.max_output_tokens is None  # None means use discovered value
