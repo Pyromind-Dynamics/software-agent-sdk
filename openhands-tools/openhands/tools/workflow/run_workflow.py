@@ -52,8 +52,13 @@ if TYPE_CHECKING:
     from openhands.sdk.conversation.state import ConversationState
 
 
-# Default retry budget per executor instance / 每个 Executor 实例的默认最大尝试次数
+# Default retry budget per debug round / 每轮调试的默认最大提交次数
 DEFAULT_MAX_ATTEMPTS = 10
+
+# Conversation-state key persisting the current round's accepted-submission count.
+# Reset to zero when a debug terminal callback reports Succeeded (new round).
+# 会话状态中持久化“本轮已提交成功次数”的键；Succeeded 终态回调会清零开启新一轮。
+WORKFLOW_ATTEMPT_STATE_KEY = "pyromind_workflow_attempts"
 
 
 class RunWorkflowAction(Action):
@@ -80,6 +85,14 @@ class RunWorkflowAction(Action):
     name: str = Field(
         default="workflow",
         description="Workflow name passed to the platform when submitting the run.",
+    )
+    reset_round: bool = Field(
+        default=False,
+        description=(
+            "Start a new round by clearing the current round's submission count. "
+            "Only use this when the tool reports the round attempt limit was "
+            "reached AND the user explicitly asks to continue debugging."
+        ),
     )
 
 
@@ -109,9 +122,7 @@ class RunWorkflowObservation(Observation):
         default=None,
         description="工作流提交成功，返回的任务 ID",
     )
-    attempt: int = Field(
-        description="This run attempt number for the current conversation."
-    )
+    attempt: int = Field(description="This run attempt number for the current round.")
     max_attempts: int = Field(description="The maximum number of run attempts allowed.")
 
 
@@ -137,18 +148,21 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
     """Submit a workflow run to Pyromind asynchronously.
 
     One executor instance is created per conversation via
-    :meth:`RunWorkflowTool.create`. It owns the per-conversation attempt counter
-    and the env/cluster/header context injected by the agent-server Pyromind
+    :meth:`RunWorkflowTool.create`. It owns the attempt budget — capped at
+    ``DEFAULT_MAX_ATTEMPTS`` accepted submissions per debug round, persisted in
+    conversation state and reset on a Succeeded terminal callback — plus the
+    env/cluster/header context injected by the agent-server Pyromind
     router. This tool returns after the platform accepts the submission; it does
     not block until the workflow finishes. Terminal run status is delivered later
     via a platform callback.
 
     向 Pyromind 异步提交工作流运行。
 
-    每个会话通过 :meth:`RunWorkflowTool.create` 创建一个 Executor 实例，维护本会话
-    的尝试计数，以及 agent-server Pyromind router 注入的 env/cluster/header 上下文。
-    工具在平台接受提交后即返回，不会阻塞等待工作流执行结束；终态结果通过平台
-    callback 异步回传。
+    每个会话通过 :meth:`RunWorkflowTool.create` 创建一个 Executor 实例，维护每轮调试
+    的提交预算（上限 DEFAULT_MAX_ATTEMPTS 次被平台接受的提交；计数持久化在会话状态，
+    Succeeded 终态回调会清零开启新一轮），以及 agent-server Pyromind router 注入的
+    env/cluster/header 上下文。工具在平台接受提交后即返回，不会阻塞等待工作流执行
+    结束；终态结果通过平台 callback 异步回传。
     """
 
     def __init__(
@@ -176,8 +190,7 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
         self.cluster = cluster
         self.env = env
         self.current_user = current_user
-        self._max_attempts = DEFAULT_MAX_ATTEMPTS  # 最大尝试次数
-        self._attempt = 0  # 当前尝试次数
+        self._max_attempts = DEFAULT_MAX_ATTEMPTS  # 每轮最大提交次数
         self.headers = headers or {}
 
     def __call__(
@@ -220,26 +233,31 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
             return RunWorkflowObservation.from_text(
                 text="run_workflow requires a local conversation context.",
                 status="Error",
-                attempt=self._attempt,
+                attempt=0,
                 max_attempts=self._max_attempts,
                 is_error=True,
             )
 
-        if self._attempt >= self._max_attempts:
+        attempts = self._read_attempts(conversation)
+        if action.reset_round:
+            attempts = 0
+            self._write_attempts(conversation, 0)
+        if attempts >= self._max_attempts:
             return RunWorkflowObservation.from_text(
                 text=(
-                    f"Reached the maximum of {self._max_attempts} run attempts. "
-                    "Stop calling run_workflow and report the remaining failure "
-                    "to the user."
+                    f"Reached the maximum of {self._max_attempts} accepted "
+                    "submissions for this round. If the user explicitly asks "
+                    "to continue, call again with reset_round=true to start a "
+                    "new round; otherwise report the remaining failure to the "
+                    "user."
                 ),
                 status="Error",
-                attempt=self._attempt,
+                attempt=attempts,
                 max_attempts=self._max_attempts,
                 is_error=True,
                 error_log="Reached the maximum number of run attempts.",
             )
-        # 记录执行次数
-        self._attempt += 1
+        attempt_number = attempts + 1  # 本次提交在本轮中的序号
         call_t0 = time.monotonic()
 
         try:
@@ -275,7 +293,7 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
                 workflow_json=workflow_json,
                 workflow_name=action.name,
                 test_mode=test_mode,
-                attempt=self._attempt,
+                attempt=attempt_number,
                 conversation_id=str(conversation.id),
             )
             submit_ms = (time.monotonic() - submit_t0) * 1000
@@ -289,6 +307,10 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
                 test_mode,
                 observation.status,
             )
+            # 只有平台接受提交（非 Failed/Error）才计入本轮预算；瞬时错误
+            # （get_api_key 503、参数校验失败等）不消耗尝试次数。
+            if observation.status not in ("Failed", "Error"):
+                self._write_attempts(conversation, attempt_number)
             return observation
         except Exception as exc:
             logger.info(
@@ -298,11 +320,21 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
             return RunWorkflowObservation.from_text(
                 text=str(exc),
                 status="Failed",
-                attempt=self._attempt,
+                attempt=attempt_number,
                 max_attempts=self._max_attempts,
                 is_error=True,
                 error_log=str(exc),
             )
+
+    def _read_attempts(self, conversation: BaseConversation) -> int:
+        """Read the round's accepted-submission count from conversation state."""
+        state = cast("ConversationState", conversation.state)
+        return int(state.agent_state.get(WORKFLOW_ATTEMPT_STATE_KEY, 0))
+
+    def _write_attempts(self, conversation: BaseConversation, value: int) -> None:
+        """Persist the round count (reassign the dict to trigger autosave)."""
+        state = cast("ConversationState", conversation.state)
+        state.agent_state = {**state.agent_state, WORKFLOW_ATTEMPT_STATE_KEY: value}
 
     def _execute_run(
         self,

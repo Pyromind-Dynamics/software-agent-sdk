@@ -64,15 +64,16 @@ class NodeSignatureExecutor(
         action: NodeSignatureAction,
         conversation: LocalConversation | None = None,
     ) -> NodeSignatureObservation:
-        """Fetch the function signature of a workflow node."""
-        node_name = action.node_name
+        """Fetch the function signature of one or more workflow nodes."""
+        node_names = [n for n in (action.node_names or []) if n]
+        if action.node_name and action.node_name not in node_names:
+            node_names.insert(0, action.node_name)
         node_type = action.node_type
         include_source = action.include_source
 
         if conversation is None:
             return NodeSignatureObservation(
                 status="error",
-                node_name=node_name,
                 error_message=(
                     "get_node_function_signature requires a conversation context."
                 ),
@@ -86,62 +87,106 @@ class NodeSignatureExecutor(
         if not auth_token:
             return NodeSignatureObservation(
                 status="error",
-                node_name=node_name,
                 error_message="No auth token available for middleware API access.",
             )
 
-        # Build the endpoint URL
-        endpoint = _resolve_endpoint(self._env)
+        if not node_names:
+            return NodeSignatureObservation(
+                status="error",
+                error_message=(
+                    "Either node_name or node_names with at least one entry is required."
+                ),
+            )
 
-        # Build auth headers
+        return self._batch_query(
+            auth_token=auth_token,
+            endpoint=_resolve_endpoint(self._env),
+            node_names=node_names,
+            node_type=node_type,
+            include_source=include_source,
+        )
+
+    def _batch_query(
+        self,
+        *,
+        auth_token: str,
+        endpoint: str,
+        node_names: list[str],
+        node_type: str | None,
+        include_source: bool,
+    ) -> NodeSignatureObservation:
+        """Batch query: one HTTP request for all requested nodes."""
         headers = _build_access_key_request_headers(
             origin_headers=self._headers,
             auth_token=auth_token,
         )
-
         try:
             response = httpx.post(
-                endpoint,
+                f"{endpoint}/batch",
                 json={
-                    "node_name": node_name,
+                    "node_names": node_names,
                     "node_type": node_type,
                     "include_source": include_source,
                     "max_source_lines": 300,
                 },
                 headers=headers,
-                timeout=30,
+                timeout=60,
             )
             response.raise_for_status()
-            data = response.json()
-
-            if not data.get("success"):
-                error_msg = data.get("message") or "Unknown error"
+            payload = response.json()
+            if not payload.get("success"):
                 return NodeSignatureObservation(
                     status="error",
-                    node_name=node_name,
-                    error_message=f"API error: {error_msg}",
+                    node_name=node_names[0],
+                    error_message=f"API error: {payload.get('message') or 'Unknown error'}",
                 )
 
-            result = data.get("data", {})
+            entries = payload.get("data", {})
+            results: list[dict] = []
+            all_ok = True
+            for name in node_names:
+                entry = entries.get(name) or {}
+                if entry.get("success"):
+                    sig = entry.get("data", {})
+                    results.append(
+                        {
+                            "node_name": name,
+                            "success": True,
+                            "function_signature": sig.get("function_signature"),
+                            "docstring": sig.get("docstring"),
+                            "parameters": sig.get("parameters"),
+                            "source_code": sig.get("source_code"),
+                        }
+                    )
+                else:
+                    all_ok = False
+                    results.append(
+                        {
+                            "node_name": name,
+                            "success": False,
+                            "error_message": entry.get("message") or "Unknown error",
+                        }
+                    )
             return NodeSignatureObservation(
-                status="success",
-                node_name=node_name,
-                function_signature=result.get("function_signature"),
-                docstring=result.get("docstring"),
-                parameters=result.get("parameters"),
-                source_code=result.get("source_code"),
+                status="success" if all_ok else "error",
+                results=results,
+                error_message=(
+                    None
+                    if all_ok
+                    else f"Failed for {len(node_names) - sum(1 for r in results if r['success'])} node(s)"
+                ),
             )
 
         except httpx.HTTPError as e:
             return NodeSignatureObservation(
                 status="error",
-                node_name=node_name,
-                error_message=f"HTTP error fetching function signature: {e}",
+                node_name=node_names[0] if node_names else None,
+                error_message=f"HTTP error fetching node signatures: {e}",
             )
         except Exception as e:
-            logger.exception("Error fetching node function signature")
+            logger.exception("Error fetching node function signatures")
             return NodeSignatureObservation(
                 status="error",
-                node_name=node_name,
-                error_message=f"Error fetching function signature: {e}",
+                node_name=node_names[0] if node_names else None,
+                error_message=f"Error fetching node signatures: {e}",
             )
