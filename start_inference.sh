@@ -24,7 +24,7 @@ if [[ -z "${OPENAI_API_KEY:-}" ]]; then
   echo "ERROR: OPENAI_API_KEY is required. Export it before running start.sh." >&2
   exit 1
 fi
-export LLM_MODEL="${LLM_MODEL:-openai/glm-5.2-fp8}"
+export LLM_MODEL="${LLM_MODEL:-openai/deepseek-v4-flash-0731}"
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
   echo "ERROR: OPENAI_API_KEY is required. Set it in start_inference.sh." >&2
   exit 1
