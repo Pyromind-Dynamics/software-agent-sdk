@@ -72,6 +72,10 @@ def _text_message(text: str) -> Message:
 def test_subagent_description_routes_intermediate_knowledge_lookups_to_search():
     assert "including an intermediate lookup inside" in SUBAGENT_TOOL_DESCRIPTION
     assert "search, grep, or read" in SUBAGENT_TOOL_DESCRIPTION
+    assert "at most once per parent-agent turn" in SUBAGENT_TOOL_DESCRIPTION
+    assert "instead of issuing multiple or\n  parallel searches" in (
+        SUBAGENT_TOOL_DESCRIPTION
+    )
 
 
 def test_knowledge_index_covers_every_searchable_document():

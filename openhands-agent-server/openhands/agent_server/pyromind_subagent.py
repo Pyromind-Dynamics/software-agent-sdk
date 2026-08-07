@@ -89,7 +89,9 @@ its final handoff. Supported types:
   platform documentation, SDK APIs, Studio, nodes, training, inference, or
   evaluation. Use it whenever the parent task needs to search, grep, or read
   general `knowledge/` documentation, including an intermediate lookup inside
-  another task. Do not use it for skill instructions.
+  another task. Invoke it at most once per parent-agent turn: combine all related
+  knowledge-base subquestions into one task instead of issuing multiple or
+  parallel searches. Do not use it for skill instructions.
 - `general_purpose`: multi-step workspace work with read/write tools, shell
   commands, and tests. Use it when delegating the work keeps the main context
   smaller; do not use it for a trivial single read or edit.

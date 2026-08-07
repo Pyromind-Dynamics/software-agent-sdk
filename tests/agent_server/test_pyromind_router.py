@@ -182,11 +182,11 @@ def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
     assert "reuse the persistent shell's current directory" in rendered
     assert "conversation-local auxiliary files" in rendered
     assert "Do not consult `knowledge/` before validation" in rendered
-    assert "Whenever any task requires searching" in rendered
-    assert '`type="search"`' in rendered
-    assert "documentation lookup needed as an\n  intermediate step" in rendered
-    assert "Do not use the main agent's grep" in rendered
-    assert "delegate every required lookup in general" in rendered
+    assert "Whenever a direct question or an intermediate step requires" in rendered
+    assert "The parent must not inspect those documents" in rendered
+    assert 'at most one `subagent(type="search")` call' in rendered
+    assert "all related knowledge-base subquestions into one" in rendered
+    assert "never issue multiple or parallel search subagent calls" in rendered
     assert "reads `knowledge/index.md` first" in rendered
     assert "Do not repeat the search subagent's work" in rendered
     assert '`type="general_purpose"`' in rendered

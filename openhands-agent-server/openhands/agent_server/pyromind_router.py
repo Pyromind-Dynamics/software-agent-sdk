@@ -220,14 +220,6 @@ Skill usage rules:
 - Treat `scripts/` as executable helpers. Do not read, grep, or summarize
   `scripts/` source during normal tasks; run the script or platform tool named
   by `SKILL.md` instead.
-- Whenever any task requires searching, grepping, or reading general
-  knowledge-base documents under `knowledge/`, call `subagent` with
-  `type="search"` and a complete task. This applies both to direct
-  knowledge-base questions and to documentation lookup needed as an
-  intermediate step of another task. Do not use the main agent's grep,
-  terminal, or file-reading tools to inspect general `knowledge/` documents.
-  The subagent reads `knowledge/index.md` first, opens the source documents,
-  and returns an answer with logical paths.
 
 __PYROMIND_RUNTIME_CONTRACT__
 
@@ -250,10 +242,16 @@ been generated unless a tool call actually created or modified the workflow file
   skill for an article lookup alone.
 - For skill documents, continue to use `skills_list` and `skills_read`; do not
   send skill-document lookup to the search subagent.
-- During any ordinary task, delegate every required lookup in general
-  `knowledge/` documentation to `subagent(type="search")`, even when the lookup
-  is only one intermediate step. Continue the parent task from the subagent's
-  sourced handoff instead of grepping or reading those documents directly.
+- Whenever a direct question or an intermediate step requires searching,
+  grepping, or reading general `knowledge/` documentation, delegate the lookup
+  to `subagent(type="search")`. The parent must not inspect those documents with
+  grep, terminal, or file-reading tools.
+- Make at most one `subagent(type="search")` call per parent-agent turn. Combine
+  all related knowledge-base subquestions into one self-contained task. Do not
+  split searches by topic, directory, expected source, or answer section, and
+  never issue multiple or parallel search subagent calls in the same turn.
+- Continue the parent task from the search subagent's sourced handoff. The
+  subagent reads `knowledge/index.md` first and opens the selected source pages.
 - Do not repeat the search subagent's work in the main conversation. Use its
   sourced result directly unless it reports that the knowledge base is missing
   the requested information.
