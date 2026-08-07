@@ -94,6 +94,7 @@ from openhands.tools.workflow import (
     RunWorkflowTool,
     ValidateWorkflowDslTool,
 )
+from openhands.tools.workflow.analyze_task_failure import AnalyzeTaskFailureTool
 from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 from openhands.tools.workflow.dsl_to_xyflow import convert_xyflow_to_dsl
 from openhands.tools.workflow.validate_workflow_dsl import (
@@ -306,10 +307,11 @@ def _load_agent_skills(
 # ---------------------------------------------------------------------------
 
 
-def _build_workflow_validation_tool(
+def _build_studio_api_auth(
     http_request: Request,
     extra: dict[str, Any],
-) -> tuple[Tool, dict[str, SecretSource]]:
+) -> tuple[dict[str, str], dict[str, str], dict[str, SecretSource]]:
+    """Build forwarded headers + secret headers + secrets for studio_api tools."""
     headers = {
         name: value
         for name in _PYROMIND_VALIDATE_FORWARD_HEADERS
@@ -318,15 +320,8 @@ def _build_workflow_validation_tool(
     if cluster := _get_validation_cluster_header(http_request, extra):
         headers["x-cluster"] = cluster
 
-    params: dict[str, Any] = {}
-    endpoint_url = extra.get("workflow_validation_endpoint_url")
-    if isinstance(endpoint_url, str) and endpoint_url:
-        params["endpoint_url"] = endpoint_url
-    if headers:
-        params["headers"] = headers
-
-    secrets: dict[str, SecretSource] = {}
     secret_headers: dict[str, str] = {}
+    secrets: dict[str, SecretSource] = {}
     cookie_header = _get_validation_cookie_header(http_request)
     if cookie_header:
         secret_headers["cookie"] = PYROMIND_VALIDATE_AUTH_COOKIE_SECRET
@@ -340,11 +335,39 @@ def _build_workflow_validation_tool(
         secrets[_PYROMIND_VALIDATE_AUTHORIZATION_SECRET] = StaticSecret(
             value=SecretStr(authorization)
         )
+    return headers, secret_headers, secrets
 
+
+def _build_workflow_validation_tool(
+    http_request: Request,
+    extra: dict[str, Any],
+) -> tuple[Tool, dict[str, SecretSource]]:
+    headers, secret_headers, secrets = _build_studio_api_auth(http_request, extra)
+
+    params: dict[str, Any] = {}
+    endpoint_url = extra.get("workflow_validation_endpoint_url")
+    if isinstance(endpoint_url, str) and endpoint_url:
+        params["endpoint_url"] = endpoint_url
+    if headers:
+        params["headers"] = headers
     if secret_headers:
         params["secret_headers"] = secret_headers
 
     return Tool(name=ValidateWorkflowDslTool.name, params=params), secrets
+
+
+def _build_analyze_task_failure_tool(
+    http_request: Request,
+    extra: dict[str, Any],
+) -> tuple[Tool, dict[str, SecretSource]]:
+    """Build ``analyze_task_failure`` with the same studio_api auth wiring."""
+    headers, secret_headers, secrets = _build_studio_api_auth(http_request, extra)
+    params: dict[str, Any] = {}
+    if headers:
+        params["headers"] = headers
+    if secret_headers:
+        params["secret_headers"] = secret_headers
+    return Tool(name=AnalyzeTaskFailureTool.name, params=params), secrets
 
 
 def _load_env_to_tools(
@@ -1152,6 +1175,9 @@ async def create_pyromind_conversation(
     validation_tool, validation_secrets = _build_workflow_validation_tool(
         http_request, request.extra
     )
+    analysis_tool, analysis_secrets = _build_analyze_task_failure_tool(
+        http_request, request.extra
+    )
 
     # run_workflow / workflow_debug reuse validate auth/header wiring
     run_tool, run_secrets = _build_workflow_run_tool(http_request)
@@ -1204,6 +1230,7 @@ async def create_pyromind_conversation(
             ),
             Tool(name="df_convert"),
             validation_tool,
+            analysis_tool,
             node_sig_tool,
         ],
     )
@@ -1231,6 +1258,7 @@ async def create_pyromind_conversation(
         initial_message=None,
         secrets={
             **validation_secrets,
+            **analysis_secrets,
             **run_secrets,
             **debug_secrets,
             **storage_secrets,
