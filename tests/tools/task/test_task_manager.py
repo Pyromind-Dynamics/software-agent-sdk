@@ -1,3 +1,4 @@
+import logging
 import uuid
 from pathlib import Path
 from typing import Any, cast
@@ -11,6 +12,7 @@ from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.hooks.config import HookConfig, HookDefinition, HookMatcher
 from openhands.sdk.subagent.registry import (
+    AgentFactory,
     _reset_registry_for_tests,
     register_agent,
 )
@@ -190,6 +192,37 @@ class TestTaskManager:
         task = manager._create_task(subagent_type="general-purpose", description=None)
         assert task.id in manager._tasks
         assert isinstance(manager._tasks[task.id].conversation_id, uuid.UUID)
+
+    def test_start_task_with_conversation_scoped_factory(self, tmp_path, caplog):
+        manager, parent = _manager_with_parent(tmp_path)
+        definition = AgentDefinition(
+            name="request-scoped",
+            tools=[],
+            max_iteration_per_run=3,
+        )
+        factory = AgentFactory(
+            factory_func=lambda llm: Agent(llm=llm, tools=[]),
+            definition=definition,
+        )
+
+        with (
+            caplog.at_level(logging.INFO, logger="openhands.tools.task.manager"),
+            patch.object(manager, "_run_task", side_effect=lambda task, prompt: task),
+        ):
+            task = manager.start_task_with_factory(
+                prompt="inspect the configured resource",
+                factory=factory,
+                conversation=parent,
+            )
+
+        assert task.conversation is not None
+        assert task.conversation.max_iteration_per_run == 3
+        assert task.status == TaskStatus.RUNNING
+        assert "[subagent] event=started" in caplog.text
+        assert f"parent_conversation_id={parent.state.id}" in caplog.text
+        assert f"child_conversation_id={task.conversation_id}" in caplog.text
+        assert f"task_id={task.id}" in caplog.text
+        assert "subagent=request-scoped" in caplog.text
 
     def test_create_task_uses_parent_max_iteration_when_factory_is_none(self, tmp_path):
         """Fallback to parent's max_iteration_per_run when factory has none."""

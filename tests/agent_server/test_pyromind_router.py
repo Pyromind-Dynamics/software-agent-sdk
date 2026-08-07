@@ -39,6 +39,7 @@ from openhands.agent_server.pyromind_router import (
     rollback_pyromind_workflow_at_event,
     send_pyromind_message,
 )
+from openhands.agent_server.pyromind_subagent import PyromindSubAgentTool
 from openhands.agent_server.workflow_canvas_models import (
     SaveWorkflowCanvasEventSnapshotRequest,
 )
@@ -181,7 +182,15 @@ def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
     assert "reuse the persistent shell's current directory" in rendered
     assert "conversation-local auxiliary files" in rendered
     assert "Do not consult `knowledge/` before validation" in rendered
-    assert "one\n  targeted knowledge-base lookup" in rendered
+    assert "Whenever any task requires searching" in rendered
+    assert '`type="search"`' in rendered
+    assert "documentation lookup needed as an\n  intermediate step" in rendered
+    assert "Do not use the main agent's grep" in rendered
+    assert "delegate every required lookup in general" in rendered
+    assert "reads `knowledge/index.md` first" in rendered
+    assert "Do not repeat the search subagent's work" in rendered
+    assert '`type="general_purpose"`' in rendered
+    assert "The call is blocking" in rendered
     assert "Do not run `pwd`, `cd`, or directory listings" not in rendered
     assert "Do not use `/dev/null`" not in rendered
     assert "Do not run `pwd`" not in rendered
@@ -396,6 +405,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert "terminal" in tool_names
     assert "grep" in tool_names
     assert "file_editor" in tool_names
+    assert PyromindSubAgentTool.name in tool_names
     assert "update_plan" in tool_names
     assert SkillsListTool.__name__ not in tool_names
     assert SkillsReadTool.__name__ not in tool_names
