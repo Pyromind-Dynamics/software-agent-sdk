@@ -23,6 +23,7 @@ from openhands.agent_server.pyromind_constants import (
 from openhands.agent_server.pyromind_router import (
     PYROMIND_AUTH_TOKEN_SECRET,
     PYROMIND_KB_INSTRUCTIONS,
+    PYROMIND_X_CLUSTER_SECRET,
     PyromindCreateConversationRequest,
     PyromindLLMConfig,
     PyromindSendMessageRequest,
@@ -736,6 +737,7 @@ async def test_pyromind_message_refreshes_storage_auth_context(tmp_path):
         PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: "auth_token=context-token; other=value",
         PYROMIND_AUTH_TOKEN_SECRET: "context-token",
         PYROMIND_STORAGE_AUTH_COOKIE_SECRET: "auth_token=context-token; other=value",
+        PYROMIND_X_CLUSTER_SECRET: "context-cluster",
     }
     assert service.agent_state == {
         PYROMIND_VALIDATE_HEADERS_STATE_KEY: {"x-cluster": "context-cluster"},
@@ -975,6 +977,7 @@ async def test_pyromind_validation_context_uses_websocket_user_headers():
         PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: "auth_token=websocket-token; other=value",
         PYROMIND_AUTH_TOKEN_SECRET: "websocket-token",
         PYROMIND_STORAGE_AUTH_COOKIE_SECRET: "auth_token=websocket-token; other=value",
+        PYROMIND_X_CLUSTER_SECRET: "websocket-cluster",
     }
     assert service.agent_state == {
         PYROMIND_VALIDATE_HEADERS_STATE_KEY: {"x-cluster": "websocket-cluster"},
