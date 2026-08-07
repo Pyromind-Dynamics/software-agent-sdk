@@ -16,6 +16,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from enum import StrEnum
+from itertools import count
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -36,7 +37,7 @@ from openhands.sdk.subagent.registry import AgentFactory, get_agent_factory
 
 
 if TYPE_CHECKING:
-    from openhands.sdk.event import ActionEvent
+    from openhands.sdk.event import ActionEvent, Event
 
 ConfirmationHandler = Callable[[str, list["ActionEvent"]], bool]
 
@@ -198,6 +199,35 @@ class TaskManager:
             prompt=prompt,
         )
 
+    def start_task_with_factory(
+        self,
+        prompt: str,
+        factory: AgentFactory,
+        description: str | None = None,
+        conversation: LocalConversation | None = None,
+    ) -> Task:
+        """Run a fresh task with a conversation-scoped agent factory.
+
+        This is intended for tools whose agent configuration contains runtime
+        state that must not be placed in the process-wide subagent registry.
+        """
+        if conversation:
+            self._ensure_parent(conversation)
+
+        task = self._create_task_from_factory(
+            factory=factory,
+            description=description,
+        )
+        logger.info(
+            "[subagent] event=started parent_conversation_id=%s "
+            "child_conversation_id=%s task_id=%s subagent=%s",
+            self.parent_conversation.state.id,
+            task.conversation_id,
+            task.id,
+            factory.definition.name,
+        )
+        return self._run_task(task=task, prompt=prompt)
+
     def _resume_task(self, resume: str, subagent_type: str) -> Task:
         """Resume a sub-agent task."""
         with self._tasks_lock:
@@ -245,6 +275,14 @@ class TaskManager:
         2. The parent conversation's ``max_iteration_per_run``
         """
         factory = get_agent_factory(subagent_type)
+        return self._create_task_from_factory(factory, description)
+
+    def _create_task_from_factory(
+        self,
+        factory: AgentFactory,
+        description: str | None,
+    ) -> Task:
+        """Create a fresh task from an already resolved agent factory."""
         worker_agent = self._get_sub_agent_from_factory(factory)
 
         effective_max_iter = (
@@ -296,6 +334,20 @@ class TaskManager:
     ) -> LocalConversation:
         parent = self.parent_conversation
         parent_visualizer = parent._visualizer
+        event_indices = count()
+
+        def log_subagent_event(event: "Event") -> None:
+            logger.info(
+                "[subagent-event] parent_conversation_id=%s "
+                "child_conversation_id=%s task_id=%s event_index=%d "
+                "event_id=%s kind=%s",
+                parent.state.id,
+                conversation_id,
+                task_id,
+                next(event_indices),
+                event.id,
+                event.__class__.__name__,
+            )
 
         visualizer = None
         if parent_visualizer is not None:
@@ -310,6 +362,7 @@ class TaskManager:
             conversation_id=conversation_id,
             max_iteration_per_run=max_iteration_per_run,
             max_budget_per_run=max_budget_per_run,
+            callbacks=[log_subagent_event],
             hook_config=hook_config,
             delete_on_close=True,
             prompt_cache_key=str(parent.state.id),
