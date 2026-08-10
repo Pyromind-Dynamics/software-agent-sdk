@@ -50,6 +50,10 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_RUNTIME_CONTRACT,
     PYROMIND_TERMINAL_PARAMS,
 )
+from openhands.agent_server.pyromind_subagent import (
+    PyromindSubAgentTool,
+    configure_subagents,
+)
 from openhands.agent_server.run_workflow_callback import (
     RunWorkflowCallbackResult,
     deliver_run_workflow_status,
@@ -81,6 +85,7 @@ from openhands.tools.data_preparation import (
 from openhands.tools.data_preparation.progress import DfCheckProgressExecutor
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
+from openhands.tools.pyromind_archive import ExtractArchiveTool
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
@@ -97,6 +102,7 @@ from openhands.tools.workflow import (
     RunWorkflowTool,
     ValidateWorkflowDslTool,
 )
+from openhands.tools.workflow.analyze_task_failure import AnalyzeTaskFailureTool
 from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 from openhands.tools.workflow.dsl_to_xyflow import convert_xyflow_to_dsl
 from openhands.tools.workflow.validate_workflow_dsl import (
@@ -107,6 +113,7 @@ from openhands.tools.workflow_debug import WorkflowDebugTool
 
 
 PYROMIND_AUTH_TOKEN_SECRET = "auth_token"
+PYROMIND_X_CLUSTER_SECRET = "PYROMIND_X_CLUSTER"
 _OPENAI_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 
 
@@ -144,6 +151,7 @@ _PYROMIND_SKILL_NAMES = [
     "debug-workflow",
     "data-cleaning",
     "data-preparation",
+    "training-analysis",
 ]
 _PYROMIND_VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
 _PYROMIND_VALIDATE_FORWARD_HEADERS = ("x-cluster", "accept-language")
@@ -152,8 +160,9 @@ _PYROMIND_DEBUG_RESPONSE_BODY_LIMIT = 20000
 
 # Knowledge-base retrieval guidance layered on top of the codex base prompt via
 # get_codex_agent(custom_instructions=...). Match the Codex flow: prefer the
-# matching skill first; read references intentionally; run skill scripts instead
-# of expanding their implementation into context.
+# matching skill first; then use skill/runtime reads for skill docs; delegate
+# free-form knowledge-base research and complex workspace work to isolated,
+# blocking subagents.
 PYROMIND_KB_INSTRUCTIONS = """\
 The Pyromind platform knowledge base is available through the read-only logical
 path `{knowledge_alias}/`. Do not use or request its host filesystem path.
@@ -210,11 +219,11 @@ Skill usage rules:
   configuration change.
 - For skill document lookup, use `invoke_skill` first, then `skills_read` only
   for `SKILL.md`, `references/**`, or assets explicitly referenced by the skill.
+- For skill-linked resources, read the exact relative path from the skill root;
+  do not manually search `references/`, `scripts/`, or `assets/` with grep.
 - Treat `scripts/` as executable helpers. Do not read, grep, or summarize
   `scripts/` source during normal tasks; run the script or platform tool named
   by `SKILL.md` instead.
-- Use `grep` and `file_editor` only as a fallback when the request is not skill-
-  addressed or when you need a free-form knowledge-base article.
 
 __PYROMIND_RUNTIME_CONTRACT__
 
@@ -235,32 +244,30 @@ been generated unless a tool call actually created or modified the workflow file
 
 - Invoke listed skills with `invoke_skill`. Do not invoke a workflow-generation
   skill for an article lookup alone.
-- For knowledge-base or skill-document requests that are not skill-linked,
-  prefer `grep` and `file_editor` with the logical `{knowledge_alias}/` or
-  `{skills_alias}/` path. Do not use `apply_patch` to modify public knowledge or
-  skill documents. Open matched files with `file_editor` before
-answering or editing the workflow file; never infer APIs or operational facts from
-filenames or directory listings.
-- For "查看知识库有哪些信息" or similar inventory requests, use one `grep`
-  call per top-level directory (`basic`, `jupyterlab`, `sdk`, `studio`, and
-  `nodes`) with `include="*.mdx"` and pattern `^title:|^# `; do not use pattern
-  `.` or `^` because those return document bodies instead of an index.
-- For requests to output, summarize, or explain specific knowledge-base
-  articles, first search with `grep` under `knowledge/<subdirectory>` using
-  `include="*.mdx"`, then open only the matched files with `file_editor` using
-  the same logical path. Use `*.md` only when an `.mdx` search has no matches.
-- For a Pyromind knowledge-base answer:
-  1. Split the user's request into explicit subquestions.
-  2. From files you actually opened, make a short checklist of directly relevant
-     headings, tables, warnings, alternatives, and ordered steps for each subquestion.
-  3. Before answering, mark every checklist item as covered or intentionally omitted.
-     Omit an item only when it is tangential, and do not omit a peer item from the
-     same list or table without a reason.
-  Do not show this internal checklist unless the user asks for sources.
+- For skill documents, continue to use `skills_list` and `skills_read`; do not
+  send skill-document lookup to the search subagent.
+- Whenever a direct question or an intermediate step requires searching,
+  grepping, or reading general `knowledge/` documentation, delegate the lookup
+  to `subagent(type="search")`. The parent must not inspect those documents with
+  grep, terminal, or file-reading tools.
+- Make at most one `subagent(type="search")` call per parent-agent turn. Combine
+  all related knowledge-base subquestions into one self-contained task. Do not
+  split searches by topic, directory, expected source, or answer section, and
+  never issue multiple or parallel search subagent calls in the same turn.
+- Continue the parent task from the search subagent's sourced handoff. The
+  subagent reads `knowledge/index.md` first and opens the selected source pages.
+- Do not repeat the search subagent's work in the main conversation. Use its
+  sourced result directly unless it reports that the knowledge base is missing
+  the requested information.
+- For a genuinely complex, multi-step workspace task whose intermediate reads,
+  edits, and test output would clutter the main context, call `subagent` with
+  `type="general_purpose"` and a self-contained task. The call is blocking and
+  returns only the subagent's final handoff. Keep simple reads and edits in the
+  main agent.
 - For workflow generation, use the matching skill and its exact resources.
   Do not consult `knowledge/` before validation. Only when validation identifies
   a specific platform contract missing from those resources may you make one
-  targeted knowledge-base lookup for that error.
+  targeted `subagent(type="search")` call for that error.
 """.replace("__PYROMIND_RUNTIME_CONTRACT__", PYROMIND_RUNTIME_CONTRACT.rstrip())
 
 
@@ -307,10 +314,11 @@ def _load_agent_skills(
 # ---------------------------------------------------------------------------
 
 
-def _build_workflow_validation_tool(
+def _build_studio_api_auth(
     http_request: Request,
     extra: dict[str, Any],
-) -> tuple[Tool, dict[str, SecretSource]]:
+) -> tuple[dict[str, str], dict[str, str], dict[str, SecretSource]]:
+    """Build forwarded headers + secret headers + secrets for studio_api tools."""
     headers = {
         name: value
         for name in _PYROMIND_VALIDATE_FORWARD_HEADERS
@@ -319,15 +327,8 @@ def _build_workflow_validation_tool(
     if cluster := _get_validation_cluster_header(http_request, extra):
         headers["x-cluster"] = cluster
 
-    params: dict[str, Any] = {}
-    endpoint_url = extra.get("workflow_validation_endpoint_url")
-    if isinstance(endpoint_url, str) and endpoint_url:
-        params["endpoint_url"] = endpoint_url
-    if headers:
-        params["headers"] = headers
-
-    secrets: dict[str, SecretSource] = {}
     secret_headers: dict[str, str] = {}
+    secrets: dict[str, SecretSource] = {}
     cookie_header = _get_validation_cookie_header(http_request)
     if cookie_header:
         secret_headers["cookie"] = PYROMIND_VALIDATE_AUTH_COOKIE_SECRET
@@ -341,11 +342,39 @@ def _build_workflow_validation_tool(
         secrets[_PYROMIND_VALIDATE_AUTHORIZATION_SECRET] = StaticSecret(
             value=SecretStr(authorization)
         )
+    return headers, secret_headers, secrets
 
+
+def _build_workflow_validation_tool(
+    http_request: Request,
+    extra: dict[str, Any],
+) -> tuple[Tool, dict[str, SecretSource]]:
+    headers, secret_headers, secrets = _build_studio_api_auth(http_request, extra)
+
+    params: dict[str, Any] = {}
+    endpoint_url = extra.get("workflow_validation_endpoint_url")
+    if isinstance(endpoint_url, str) and endpoint_url:
+        params["endpoint_url"] = endpoint_url
+    if headers:
+        params["headers"] = headers
     if secret_headers:
         params["secret_headers"] = secret_headers
 
     return Tool(name=ValidateWorkflowDslTool.name, params=params), secrets
+
+
+def _build_analyze_task_failure_tool(
+    http_request: Request,
+    extra: dict[str, Any],
+) -> tuple[Tool, dict[str, SecretSource]]:
+    """Build ``analyze_task_failure`` with the same studio_api auth wiring."""
+    headers, secret_headers, secrets = _build_studio_api_auth(http_request, extra)
+    params: dict[str, Any] = {}
+    if headers:
+        params["headers"] = headers
+    if secret_headers:
+        params["secret_headers"] = secret_headers
+    return Tool(name=AnalyzeTaskFailureTool.name, params=params), secrets
 
 
 def _load_env_to_tools(
@@ -493,6 +522,13 @@ def _build_pyromind_storage_tools(
     if "secret_headers" in params:
         stop_params["secret_headers"] = dict(params["secret_headers"])
 
+    # Archive extraction tool params (mirrors cleaning pattern without runtime_dir)
+    extraction_params: dict[str, Any] = dict(cleaning_params)
+    extraction_params.pop("runtime_dir", None)
+    extraction_output_root = extra.get("dataset_extraction_output_root")
+    if isinstance(extraction_output_root, str) and extraction_output_root:
+        extraction_params["output_root"] = extraction_output_root
+
     return (
         [
             Tool(name=PreviewDatasetTool.name, params=dict(params)),
@@ -501,6 +537,7 @@ def _build_pyromind_storage_tools(
             Tool(name=DfSubmitPipelineTool.name, params=preparation_params),
             Tool(name=DfCheckProgressTool.name, params=dict(params)),
             Tool(name=DfStopTaskTool.name, params=stop_params),
+            Tool(name=ExtractArchiveTool.name, params=extraction_params),
             Tool(name=PreviewRemoteDatasetTool.name, params={}),
         ],
         secrets,
@@ -527,6 +564,8 @@ async def apply_pyromind_validation_context(
         secrets_update[PYROMIND_STORAGE_AUTH_COOKIE_SECRET] = current_user.cookie
     if auth_token := parse_auth_token_from_cookie_header(current_user.cookie):
         secrets_update[PYROMIND_AUTH_TOKEN_SECRET] = auth_token
+    if current_user.x_cluster:
+        secrets_update[PYROMIND_X_CLUSTER_SECRET] = current_user.x_cluster
     if secrets_update:
         await event_service.update_secrets(secrets_update)
 
@@ -1079,8 +1118,8 @@ async def create_pyromind_conversation(
     The server assembles:
     - A codex-style base agent (prompt + tools) via ``get_codex_agent``
     - Pyromind KB-retrieval instructions layered on top via ``custom_instructions``
-    - Tools: codex set (terminal + apply_patch + update_plan) + grep and
-      file_editor for KB search (grep finds files, file_editor views them)
+    - Tools: codex set plus one blocking ``subagent`` entry point with search
+      and general-purpose profiles
     - Workspace pointing to a conversation-private directory
     """
     # Register default tools before agent resolution.
@@ -1108,6 +1147,7 @@ async def create_pyromind_conversation(
     conversation_dir.mkdir(parents=True, exist_ok=True)
     conversation_dir.chmod(0o700)
     (conversation_dir / "public_data").mkdir(mode=0o700, exist_ok=True)
+    configure_subagents(conversation_dir, Path(knowledge_base_path))
 
     # 2. Assemble the pyromind KB instructions (layered on the codex base prompt)
     custom_instructions = PYROMIND_KB_INSTRUCTIONS.format(
@@ -1130,6 +1170,9 @@ async def create_pyromind_conversation(
     validation_tool, validation_secrets = _build_workflow_validation_tool(
         http_request, request.extra
     )
+    analysis_tool, analysis_secrets = _build_analyze_task_failure_tool(
+        http_request, request.extra
+    )
 
     # run_workflow / workflow_debug reuse validate auth/header wiring
     run_tool, run_secrets = _build_workflow_run_tool(http_request)
@@ -1148,8 +1191,7 @@ async def create_pyromind_conversation(
         persist_runtime_config=False,
     )
 
-    # 5. Build the codex-style agent with the KB instructions + KB retrieval
-    #    tools (grep to find files, file_editor to view their content).
+    # 5. Build the codex-style agent with Pyromind tools and blocking subagents.
     agent = get_codex_agent(
         llm=llm,
         cli_mode=True,
@@ -1167,6 +1209,7 @@ async def create_pyromind_conversation(
             ),
             Tool(name="grep"),
             Tool(name="file_editor"),
+            Tool(name=PyromindSubAgentTool.name),
             Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
             *storage_tools,
             Tool(name="dataset_download"),
@@ -1180,6 +1223,7 @@ async def create_pyromind_conversation(
             ),
             Tool(name="df_convert"),
             validation_tool,
+            analysis_tool,
         ],
     )
 
@@ -1206,6 +1250,7 @@ async def create_pyromind_conversation(
         initial_message=None,
         secrets={
             **validation_secrets,
+            **analysis_secrets,
             **run_secrets,
             **debug_secrets,
             **storage_secrets,
