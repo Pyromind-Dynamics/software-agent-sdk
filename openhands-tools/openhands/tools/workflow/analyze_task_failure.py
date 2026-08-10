@@ -628,12 +628,23 @@ def _format_observation_text(
     if failed_nodes:
         ids = ", ".join(node.node_id for node in failed_nodes)
         parts.append(f"failed nodes (status-based): {ids}")
-    if logs:
-        for node_id, log_text in logs.items():
-            parts.append(f"--- node {node_id} (last log tail) ---\n{log_text}")
-    if node_sources:
-        for node_id, source_code in node_sources.items():
-            parts.append(f"--- node {node_id} operator source ---\n{source_code}")
+    if node_sources or logs:
+        type_by_id = {node.node_id: node.node_type for node in nodes}
+        # Source blocks come first: short operator code is the primary
+        # signal, while log tails are long evidence that would crowd it out.
+        for node_id in dict.fromkeys((*node_sources, *logs)):
+            source_code = node_sources.get(node_id)
+            if source_code:
+                label = type_by_id.get(node_id)
+                marker = (
+                    f"--- node {node_id} operator source code ({label}) ---"
+                    if label
+                    else f"--- node {node_id} operator source code ---"
+                )
+                parts.append(f"{marker}\n{source_code}")
+            log_text = logs.get(node_id)
+            if log_text:
+                parts.append(f"--- node {node_id} (last log tail) ---\n{log_text}")
     elif source == "all":
         parts.append(
             "No failed node could be identified from the task result (the payload "
