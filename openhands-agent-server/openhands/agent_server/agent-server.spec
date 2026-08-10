@@ -119,6 +119,10 @@ a = Analysis(
         *collect_data_files("mcp"),
         *collect_data_files("fakeredis"),  # Required for commands.json used by fakeredis ACL
         *get_fakeredis_data(),  # Ensure fakeredis/model/ directory structure exists
+        # binaryornot.data resources are looked up via importlib.resources.files()
+        # with a string package name, which PyInstaller's static analysis cannot
+        # discover; bundle both the subpackage and its CSV data files.
+        *collect_data_files("binaryornot"),
 
         # OpenHands SDK prompt templates (adjusted for shallow namespace layout)
         *collect_data_files("openhands.sdk.agent", includes=["prompts/*.j2"]),
@@ -169,6 +173,7 @@ a = Analysis(
         *collect_submodules("fakeredis"),
         *collect_submodules("pyromind_sdk"),
         "py_landlock",  # Dynamic import in openhands.tools.terminal.sandbox
+        "binaryornot.data",  # Loaded via importlib.resources.files("binaryornot.data")
         # New helper module imported transitively from tmux_terminal/tmux_pane_pool.
         # collect_submodules("openhands.tools") should already cover it, but pin
         # it explicitly so a stale analysis cache cannot silently drop it.
