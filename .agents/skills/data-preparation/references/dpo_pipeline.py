@@ -20,6 +20,13 @@ from typing import Any
 
 import dataflow
 import pandas as pd
+
+
+# open-dataflow 1.0.10 内部 storage.write 仍调用 pandas 1.x 的 applymap，
+# pandas 3.0 已移除该方法；映射到语义相同的 DataFrame.map 保证兼容。
+if not hasattr(pd.DataFrame, "applymap"):
+    pd.DataFrame.applymap = pd.DataFrame.map  # type: ignore[attr-defined]
+
 from dataflow.operators.core_text import (
     FormatStrPromptedGenerator,
     GeneralFilter,
@@ -62,8 +69,7 @@ def _first_string(row: pd.Series, names: list[str], default: str = "") -> str:
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
     result["id"] = [
-        _first_string(row, ["id"], f"dpo-{index}")
-        for index, row in result.iterrows()
+        _first_string(row, ["id"], f"dpo-{index}") for index, row in result.iterrows()
     ]
     result["system_prompt"] = [
         _first_string(row, ["system_prompt", "system"], DEFAULT_SYSTEM_PROMPT)
@@ -108,7 +114,11 @@ def apply_generated_pair(df: pd.DataFrame) -> pd.DataFrame:
         existing_rejected = row.get("existing_rejected")
         try:
             parsed = parse_pair(row.get("dpo_pair"))
-            chosen = existing_gt if isinstance(existing_gt, str) and existing_gt else parsed["chosen"]
+            chosen = (
+                existing_gt
+                if isinstance(existing_gt, str) and existing_gt
+                else parsed["chosen"]
+            )
             rejected = (
                 existing_rejected
                 if isinstance(existing_rejected, str) and existing_rejected
@@ -127,7 +137,9 @@ def apply_generated_pair(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def write_canonical_output(input_path: str, output_path: str, limit: int | None) -> None:
+def write_canonical_output(
+    input_path: str, output_path: str, limit: int | None
+) -> None:
     storage = LazyFileStorage(
         input_path,
         cache_path=str(Path(output_path).parent / ".dataflow_cache"),
@@ -166,10 +178,12 @@ def write_canonical_output(input_path: str, output_path: str, limit: int | None)
     prompt = FormatStrPrompt(
         f_str_template=(
             "为下面用户问题生成 DPO 偏好回答对。"
-            "如果给出了现有优质回答，请把它作为 chosen 的依据；否则生成一个完整、准确、有帮助的 chosen。"
-            "rejected 必须看似相关但明显更差，例如过短、遗漏关键约束、推理错误或没有回答问题。"
+            "如果给出了现有优质回答，请把它作为 chosen 的依据；否则生成"
+            "一个完整、准确、有帮助的 chosen。"
+            "rejected 必须看似相关但明显更差，例如过短、遗漏关键约束、"
+            "推理错误或没有回答问题。"
             "不要让 rejected 包含有害内容、隐私泄露、歧视或违法指导。"
-            "只返回 JSON：{\"chosen\":\"...\",\"rejected\":\"...\"}\n\n"
+            '只返回 JSON：{"chosen":"...","rejected":"..."}\n\n'
             "用户问题：{question}\n"
             "现有优质回答（可为空）：{chosen_seed}\n"
             "现有负样本（可为空）：{rejected_seed}"
