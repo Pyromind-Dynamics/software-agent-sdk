@@ -785,14 +785,26 @@ class EventService:
         self,
         content: list[TextContent],
         run: bool = False,
+        visible: bool = False,
         workflow_dsl_snapshot: str | None = None,
         workflow_xyflow_snapshot: dict[str, Any] | None = None,
+        extended_content: list[TextContent] | None = None,
     ) -> str:
         """Persist hidden context and optionally continue the agent.
 
         The LLM message remains a ``user`` turn so it can prompt continuation,
         while the event source is ``environment`` so it is not user-authored and
-        does not update ``last_user_message_id``.
+        does not update ``last_user_message_id``. When ``visible=True``, the
+        event source is ``agent`` and content is visible in the conversation
+        history, suitable for external callback notifications.
+
+        When ``visible=True``, ``extended_content`` is added to the event's
+        ``extended_content`` field (invisible to the frontend but merged into
+        the LLM prompt via ``to_llm_message()``). This allows a single event
+        to carry both user-visible text and hidden LLM context.
+
+        When ``visible=False``, ``extended_content`` is ignored and ``content``
+        is placed in the event's ``extended_content`` field (legacy behavior).
         """
         if not self._conversation:
             raise ValueError("inactive_service")
@@ -803,6 +815,8 @@ class EventService:
             None,
             self._append_internal_context_sync,
             content,
+            visible,
+            extended_content,
         )
         if workflow_dsl_snapshot is not None:
             await loop.run_in_executor(
@@ -819,15 +833,30 @@ class EventService:
         )
         return event_id
 
-    def _append_internal_context_sync(self, content: list[TextContent]) -> str:
+    def _append_internal_context_sync(
+        self,
+        content: list[TextContent],
+        visible: bool = False,
+        extended_content: list[TextContent] | None = None,
+    ) -> str:
         conversation = self._conversation
         if not conversation:
             raise ValueError("inactive_service")
-        event = MessageEvent(
-            source="environment",
-            llm_message=Message(role="user", content=[]),
-            extended_content=list(content),
-        )
+        if visible:
+            event = MessageEvent(
+                source="agent",
+                llm_message=Message(
+                    role="assistant",
+                    content=[TextContent(text=block.text) for block in content],
+                ),
+                extended_content=list(extended_content) if extended_content else [],
+            )
+        else:
+            event = MessageEvent(
+                source="environment",
+                llm_message=Message(role="user", content=[]),
+                extended_content=list(content),
+            )
         with conversation._state as state:
             if state.execution_status in (
                 ConversationExecutionStatus.FINISHED,

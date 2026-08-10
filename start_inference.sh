@@ -16,30 +16,33 @@ export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 # LLM Configuration
 # ----------------------------------------------------------
 # LiteLLM requires a provider prefix (e.g. openai/) for custom OpenAI-compatible endpoints.
-export LLM_BASE_URL="${LLM_BASE_URL:-http://208.64.254.187:8000/v1}"
-if [[ -z "${OPENAI_API_KEY:-}" && -n "${LLM_API_KEY:-}" ]]; then
-  export OPENAI_API_KEY="${LLM_API_KEY}"
-fi
+export LLM_MODEL="openai/deepseek-v4-flash-0731"
+export LLM_BASE_URL="http://208.64.254.187:8000/v1"
+export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+
+#export LLM_MODEL="openai/deepseek-v4-pro"
+#export LLM_BASE_URL="https://api.deepseek.com"
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
   echo "ERROR: OPENAI_API_KEY is required. Export it before running start.sh." >&2
   exit 1
 fi
-export LLM_MODEL="${LLM_MODEL:-openai/glm-5.2-fp8}"
+export LLM_MODEL="${LLM_MODEL:-openai/deepseek-v4-flash-0731}"
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
   echo "ERROR: OPENAI_API_KEY is required. Set it in start_inference.sh." >&2
   exit 1
 fi
 export OPENAI_API_KEY
 
-if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
-  export DF_API_BASE_URL="https://openrouter.ai/api/v1"
-  export DF_API_URL="https://openrouter.ai/api/v1/chat/completions"
-  export DF_MODEL_NAME="google/gemma-4-31b-it"
-  export DF_API_KEY="${OPENROUTER_API_KEY}"
-else
-  unset DF_API_BASE_URL DF_API_URL DF_MODEL_NAME DF_API_KEY
-  echo "WARN: OPENROUTER_API_KEY is not set; vision DataFlow will use the conversation model fallback." >&2
+export DF_API_BASE_URL="https://openrouter.ai/api/v1"
+export DF_API_URL="https://openrouter.ai/api/v1/chat/completions"
+export DF_MODEL_NAME="google/gemma-4-31b-it"
+export DF_API_KEY="${DF_API_KEY:-${OPENROUTER_API_KEY:-}}"
+if [[ -z "${DF_API_KEY:-}" ]]; then
+  echo "ERROR: DF_API_KEY is required. Set DF_API_KEY or OPENROUTER_API_KEY." >&2
+  exit 1
 fi
+export DF_API_KEY
+
 
 # ----------------------------------------------------------
 # Agent Server Configuration

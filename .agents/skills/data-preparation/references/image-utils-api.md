@@ -12,7 +12,7 @@ from image_utils import ImagePipelineConfig, run_image_pipeline_from_cli
 必填：
 
 - `labeling_system_prompt`：发送给 VLM 的任务规则。
-- `training_system_prompt`：写入最终训练数据的 `system_prompt`。
+- `training_system_prompt`：写入最终训练数据 system 消息的 text block。
 
 常用字段映射：
 

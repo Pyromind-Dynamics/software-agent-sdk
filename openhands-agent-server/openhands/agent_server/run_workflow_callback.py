@@ -577,15 +577,19 @@ async def resume_conversation_after_workflow(
     auto_run: bool = True,
     from_workflow_debug: bool = False,
 ) -> None:
-    """Inject terminal status into a conversation and optionally start the agent.
+    """Send a visible notification with hidden LLM context on workflow completion.
 
-    Uses hidden environment context so the LLM receives the workflow status
-    without creating a user-authored chat event.
+    A single ``MessageEvent`` (``source="agent"``) carries both:
+    - ``llm_message.content`` — user-friendly status text visible to the frontend
+    - ``extended_content`` — the ``<system_reminder>`` merged into the LLM prompt
+      via ``to_llm_message()``, invisible to the frontend
 
     For failed debug runs, node signature guidance is appended to the reminder
     (condensed by the LLM, or raw signatures when summarization fails).
 
-    通过隐藏的 environment 上下文注入终态并可选启动 Agent，不会伪造用户消息。
+    一次调用发送一条可见事件，同时携带隐藏的 ``<system_reminder>``
+    （通过 ``extended_content`` 注入 LLM 上下文，前端不可见）。
+    避免两次发事件导致 agent 产生空响应。
     """
     guidance: str | None = None
     if from_workflow_debug and status in ("Failed", "Error"):
@@ -603,6 +607,12 @@ async def resume_conversation_after_workflow(
             error_log or "(none)",
             guidance or "(none)",
         )
+    visible_text = _build_workflow_completion_text(
+        task_id=task_id,
+        status=status,
+        error_log=error_log,
+        from_workflow_debug=from_workflow_debug,
+    )
     reminder = build_run_workflow_terminal_reminder(
         task_id=task_id,
         status=status,
@@ -611,9 +621,50 @@ async def resume_conversation_after_workflow(
         node_signature_guidance=guidance,
     )
     await event_service.send_internal_context(
-        [TextContent(text=reminder)],
+        [TextContent(text=visible_text)],
         run=auto_run,
+        visible=True,
+        extended_content=[TextContent(text=reminder)],
     )
+
+
+def _build_workflow_completion_text(
+    *,
+    task_id: str,
+    status: RunWorkflowStatus,
+    error_log: str | None = None,
+    from_workflow_debug: bool = False,
+) -> str:
+    """Build a user-friendly visible summary of a completed workflow."""
+    if from_workflow_debug:
+        if status == "Succeeded":
+            return f"工作流调试运行成功\n\n- task_id: {task_id}\n- status: {status}"
+        if status in ("Failed", "Error"):
+            lines = [
+                "工作流调试运行失败",
+                "",
+                f"- task_id: {task_id}",
+                f"- status: {status}",
+            ]
+            if error_log:
+                lines.append(f"- error_log: {error_log}")
+            return "\n".join(lines)
+        return f"工作流调试运行已终止\n\n- task_id: {task_id}\n- status: {status}"
+
+    # Production path
+    if status == "Succeeded":
+        return f"工作流已完成\n\n- task_id: {task_id}\n- status: {status}"
+    if status in ("Failed", "Error"):
+        lines = [
+            "工作流运行失败",
+            "",
+            f"- task_id: {task_id}",
+            f"- status: {status}",
+        ]
+        if error_log:
+            lines.append(f"- error_log: {error_log}")
+        return "\n".join(lines)
+    return f"工作流运行已终止\n\n- task_id: {task_id}\n- status: {status}"
 
 
 # ---------------------------------------------------------------------------

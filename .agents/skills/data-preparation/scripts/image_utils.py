@@ -836,12 +836,33 @@ def _canonical_output(
     if config.answer_is_json:
         json.loads(answer)
     return {
-        "id": sample["id"],
-        "image_path": sample["images"][0],
-        "images": sample["images"],
-        "system_prompt": config.training_system_prompt,
-        "user_prompt": sample["_user_prompt"],
-        "gt": f"<think>{reasoning}</think>\n\n<answer>{answer}</answer>",
+        "messages": [
+            {
+                "role": "system",
+                "content": [{"type": "text", "value": config.training_system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    *(
+                        {"type": "image_url", "value": image}
+                        for image in sample["images"]
+                    ),
+                    {"type": "text", "value": sample["_user_prompt"]},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "value": (
+                            f"<think>{reasoning}</think>\n\n<answer>{answer}</answer>"
+                        ),
+                    }
+                ],
+            },
+        ]
     }
 
 

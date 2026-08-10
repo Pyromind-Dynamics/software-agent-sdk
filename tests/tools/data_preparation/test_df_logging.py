@@ -498,12 +498,28 @@ def test_validate_canonical_vision_jsonl(
         output,
         [
             {
-                "id": "vision-1",
-                "image_path": "images/one.png",
-                "images": ["images/one.png"],
-                "system_prompt": "You are helpful.",
-                "user_prompt": "Question",
-                "gt": "<think>reason</think>\n\n<answer>A</answer>",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "value": "You are helpful."}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "value": "images/one.png"},
+                            {"type": "text", "value": "Question"},
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "value": "<think>reason</think>\n\n<answer>A</answer>",
+                            }
+                        ],
+                    },
+                ]
             }
         ],
     )
