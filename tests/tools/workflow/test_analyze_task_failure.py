@@ -567,7 +567,16 @@ def test_include_source_fetches_operator_source(monkeypatch):
     def fake_post(url, *, json, headers, timeout):
         post_calls.append((url, json, headers))
         return _Response(
-            200, {"success": True, "data": {"source_code": "def train(...):\n    pass"}}
+            200,
+            {
+                "success": True,
+                "data": {
+                    "ModelTrainSFTNode": {
+                        "success": True,
+                        "data": {"source_code": "def train(...):\n    pass"},
+                    }
+                },
+            },
         )
 
     monkeypatch.setattr(httpx, "post", fake_post)
@@ -582,9 +591,9 @@ def test_include_source_fetches_operator_source(monkeypatch):
     assert not observation.is_error
     assert "RuntimeError: boom" in observation.logs["1"]
     assert observation.node_sources["1"] == "def train(...):\n    pass"
-    assert post_calls[0][0].endswith("api/agent/nodes/function_signature")
+    assert post_calls[0][0].endswith("api/agent/nodes/function_signature/batch")
     assert post_calls[0][1] == {
-        "node_name": "ModelTrainSFTNode",
+        "node_names": ["ModelTrainSFTNode"],
         "node_type": None,
         "include_source": True,
         "max_source_lines": 200,

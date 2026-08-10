@@ -529,7 +529,7 @@ class AnalyzeTaskFailureExecutor(
         source_lines: int,
     ) -> str | None:
         """Fetch a node operator's source code; best-effort, never raises."""
-        url = f"{self._api_base}/api/agent/nodes/function_signature"
+        url = f"{self._api_base}/api/agent/nodes/function_signature/batch"
         headers = _build_access_key_request_headers(
             self._headers, auth_token=auth_token
         )
@@ -537,7 +537,7 @@ class AnalyzeTaskFailureExecutor(
             response = httpx.post(
                 url,
                 json={
-                    "node_name": node_type,
+                    "node_names": [node_type],
                     "node_type": None,
                     "include_source": True,
                     "max_source_lines": source_lines,
@@ -558,7 +558,13 @@ class AnalyzeTaskFailureExecutor(
         data = payload.get("data")
         if not isinstance(data, dict):
             return None
-        source = data.get("source_code")
+        entry = data.get(node_type)
+        if not isinstance(entry, dict) or entry.get("success") is not True:
+            return None
+        entry_data = entry.get("data")
+        if not isinstance(entry_data, dict):
+            return None
+        source = entry_data.get("source_code")
         return str(source) if isinstance(source, str) and source else None
 
     def _get_json(
