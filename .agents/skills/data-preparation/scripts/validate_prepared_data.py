@@ -29,14 +29,7 @@ SCHEMA_CHOICES = (
 )
 TEXT_FIELDS = {"id", "system_prompt", "user_prompt", "gt"}
 DPO_FIELDS = {"id", "system_prompt", "user_prompt", "gt", "rejected_answer"}
-VISION_FIELDS = {
-    "id",
-    "image_path",
-    "images",
-    "system_prompt",
-    "user_prompt",
-    "gt",
-}
+VISION_FIELDS = {"messages"}
 MULTITURN_FIELDS = {"id", "messages"}
 FUNCTION_CALL_FIELDS = {"id", "tools", "messages"}
 QUALITY_EVALUATION_FIELDS = {"id", "subject", "evaluation"}
@@ -152,7 +145,7 @@ def _validate_text_or_vision(
     schema: SchemaName,
     line_number: int,
     image_root: Path | None,
-) -> str:
+) -> str | None:
     expected_fields = TEXT_FIELDS if schema == "text" else VISION_FIELDS
     _expect_exact_fields(
         row,
@@ -160,27 +153,94 @@ def _validate_text_or_vision(
         line_number=line_number,
         label=f"{schema} schema",
     )
-    record_id = _nonempty_string(row, "id", line_number)
-    _nonempty_string(row, "system_prompt", line_number)
-    _nonempty_string(row, "user_prompt", line_number)
-    gt = _nonempty_string(row, "gt", line_number)
     if schema == "text":
+        record_id = _nonempty_string(row, "id", line_number)
+        _nonempty_string(row, "system_prompt", line_number)
+        _nonempty_string(row, "user_prompt", line_number)
+        _nonempty_string(row, "gt", line_number)
         return record_id
 
-    image_path = _nonempty_string(row, "image_path", line_number)
-    images = row.get("images")
-    if not isinstance(images, list) or not images:
-        raise ValueError(f"line {line_number}: images must be a non-empty list")
-    if any(not isinstance(item, str) or not item for item in images):
-        raise ValueError(f"line {line_number}: every images item must be a string")
-    if image_path != images[0]:
-        raise ValueError(f"line {line_number}: image_path must equal images[0]")
-    for item in images:
-        _validate_relative_path(item, line_number)
-        if image_root is not None:
-            _validate_image_file(image_root / item, line_number, item)
-    _validate_gt(gt, line_number)
-    return record_id
+    messages = row.get("messages")
+    if not isinstance(messages, list) or len(messages) != 3:
+        raise ValueError(f"line {line_number}: vision messages must contain 3 items")
+    expected_roles = ("system", "user", "assistant")
+    for index, (message, expected_role) in enumerate(zip(messages, expected_roles)):
+        if not isinstance(message, dict):
+            raise ValueError(f"line {line_number}: messages[{index}] must be an object")
+        _expect_exact_fields(
+            message,
+            {"role", "content"},
+            line_number=line_number,
+            label=f"messages[{index}]",
+        )
+        if message.get("role") != expected_role:
+            raise ValueError(
+                f"line {line_number}: messages[{index}].role must be {expected_role!r}"
+            )
+        if not isinstance(message.get("content"), list) or not message["content"]:
+            raise ValueError(
+                f"line {line_number}: messages[{index}].content must be a "
+                "non-empty list"
+            )
+
+    system_content = messages[0]["content"]
+    assistant_content = messages[2]["content"]
+    for index, content in ((0, system_content), (2, assistant_content)):
+        if len(content) != 1 or not isinstance(content[0], dict):
+            raise ValueError(
+                f"line {line_number}: messages[{index}].content must contain "
+                "one text item"
+            )
+        _expect_exact_fields(
+            content[0],
+            {"type", "value"},
+            line_number=line_number,
+            label=f"messages[{index}].content[0]",
+        )
+        if content[0].get("type") != "text":
+            raise ValueError(
+                f"line {line_number}: messages[{index}].content[0].type must be 'text'"
+            )
+        _nonempty_string_value(
+            content[0].get("value"),
+            line_number=line_number,
+            label=f"messages[{index}].content[0].value",
+        )
+
+    user_content = messages[1]["content"]
+    if len(user_content) < 2:
+        raise ValueError(
+            f"line {line_number}: user content must contain images followed by text"
+        )
+    for index, item in enumerate(user_content):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"line {line_number}: messages[1].content[{index}] must be an object"
+            )
+        _expect_exact_fields(
+            item,
+            {"type", "value"},
+            line_number=line_number,
+            label=f"messages[1].content[{index}]",
+        )
+        expected_type = "text" if index == len(user_content) - 1 else "image_url"
+        if item.get("type") != expected_type:
+            raise ValueError(
+                f"line {line_number}: messages[1].content[{index}].type must be "
+                f"{expected_type!r}"
+            )
+        value = _nonempty_string_value(
+            item.get("value"),
+            line_number=line_number,
+            label=f"messages[1].content[{index}].value",
+        )
+        if expected_type == "image_url":
+            _validate_relative_path(value, line_number)
+            if image_root is not None:
+                _validate_image_file(image_root / value, line_number, value)
+
+    _validate_gt(assistant_content[0]["value"], line_number)
+    return None
 
 
 def _validate_dpo(row: dict[str, Any], *, line_number: int) -> str:
@@ -549,9 +609,7 @@ def _validate_quality_evaluation(
         )
     leaked = sorted(set(subject) & FORBIDDEN_AUDIT_FIELDS)
     if leaked:
-        raise ValueError(
-            f"line {line_number}: subject contains audit fields: {leaked}"
-        )
+        raise ValueError(f"line {line_number}: subject contains audit fields: {leaked}")
 
     evaluation = row.get("evaluation")
     if not isinstance(evaluation, dict):
@@ -580,8 +638,7 @@ def _validate_quality_evaluation(
     for index, dimension in enumerate(dimensions):
         if not isinstance(dimension, dict):
             raise ValueError(
-                f"line {line_number}: evaluation.dimensions[{index}] "
-                "must be an object"
+                f"line {line_number}: evaluation.dimensions[{index}] must be an object"
             )
         _expect_exact_fields(
             dimension,
@@ -784,7 +841,7 @@ def validate_row(
     schema: SchemaName,
     line_number: int,
     image_root: Path | None = None,
-) -> str:
+) -> str | None:
     if schema in {"text", "vision"}:
         return _validate_text_or_vision(
             row,
@@ -831,9 +888,10 @@ def validate_jsonl(
                 line_number=line_number,
                 image_root=image_root,
             )
-            if record_id in seen_ids:
+            if record_id is not None and record_id in seen_ids:
                 raise ValueError(f"line {line_number}: duplicate id: {record_id}")
-            seen_ids.add(record_id)
+            if record_id is not None:
+                seen_ids.add(record_id)
             rows += 1
     if rows == 0:
         raise ValueError("output JSONL must contain at least one record")

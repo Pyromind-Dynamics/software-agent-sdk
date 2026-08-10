@@ -23,6 +23,7 @@ from openhands.agent_server.pyromind_constants import (
 from openhands.agent_server.pyromind_router import (
     PYROMIND_AUTH_TOKEN_SECRET,
     PYROMIND_KB_INSTRUCTIONS,
+    PYROMIND_X_CLUSTER_SECRET,
     PyromindCreateConversationRequest,
     PyromindLLMConfig,
     PyromindSendMessageRequest,
@@ -38,6 +39,7 @@ from openhands.agent_server.pyromind_router import (
     rollback_pyromind_workflow_at_event,
     send_pyromind_message,
 )
+from openhands.agent_server.pyromind_subagent import PyromindSubAgentTool
 from openhands.agent_server.workflow_canvas_models import (
     SaveWorkflowCanvasEventSnapshotRequest,
 )
@@ -51,6 +53,7 @@ from openhands.tools.data_preparation import (
     DfStopTaskTool,
     DfSubmitPipelineTool,
 )
+from openhands.tools.pyromind_archive import ExtractArchiveTool
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
@@ -179,7 +182,15 @@ def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
     assert "reuse the persistent shell's current directory" in rendered
     assert "conversation-local auxiliary files" in rendered
     assert "Do not consult `knowledge/` before validation" in rendered
-    assert "one\n  targeted knowledge-base lookup" in rendered
+    assert "Whenever a direct question or an intermediate step requires" in rendered
+    assert "The parent must not inspect those documents" in rendered
+    assert 'at most one `subagent(type="search")` call' in rendered
+    assert "all related knowledge-base subquestions into one" in rendered
+    assert "never issue multiple or parallel search subagent calls" in rendered
+    assert "reads `knowledge/index.md` first" in rendered
+    assert "Do not repeat the search subagent's work" in rendered
+    assert '`type="general_purpose"`' in rendered
+    assert "The call is blocking" in rendered
     assert "Do not run `pwd`, `cd`, or directory listings" not in rendered
     assert "Do not use `/dev/null`" not in rendered
     assert "Do not run `pwd`" not in rendered
@@ -327,11 +338,13 @@ class _FakePyromindMessageEventService(_FakeEventService):
         self,
         content: list[TextContent],
         run: bool = False,
+        visible: bool = False,
         workflow_dsl_snapshot: str | None = None,
         workflow_xyflow_snapshot: dict[str, Any] | None = None,
     ) -> str:
         self.internal_context = content
         self.run = run
+        self.visible = visible
         self.workflow_dsl_snapshot = workflow_dsl_snapshot
         self.workflow_xyflow_snapshot = workflow_xyflow_snapshot
         return "internal-event"
@@ -392,6 +405,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert "terminal" in tool_names
     assert "grep" in tool_names
     assert "file_editor" in tool_names
+    assert PyromindSubAgentTool.name in tool_names
     assert "update_plan" in tool_names
     assert SkillsListTool.__name__ not in tool_names
     assert SkillsReadTool.__name__ not in tool_names
@@ -733,6 +747,7 @@ async def test_pyromind_message_refreshes_storage_auth_context(tmp_path):
         PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: "auth_token=context-token; other=value",
         PYROMIND_AUTH_TOKEN_SECRET: "context-token",
         PYROMIND_STORAGE_AUTH_COOKIE_SECRET: "auth_token=context-token; other=value",
+        PYROMIND_X_CLUSTER_SECRET: "context-cluster",
     }
     assert service.agent_state == {
         PYROMIND_VALIDATE_HEADERS_STATE_KEY: {"x-cluster": "context-cluster"},
@@ -903,6 +918,7 @@ def test_pyromind_storage_tools_use_user_context_headers():
         DfSubmitPipelineTool.name,
         DfCheckProgressTool.name,
         DfStopTaskTool.name,
+        ExtractArchiveTool.name,
         PreviewRemoteDatasetTool.name,
     ]
     assert tools[0].params == {
@@ -971,6 +987,7 @@ async def test_pyromind_validation_context_uses_websocket_user_headers():
         PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: "auth_token=websocket-token; other=value",
         PYROMIND_AUTH_TOKEN_SECRET: "websocket-token",
         PYROMIND_STORAGE_AUTH_COOKIE_SECRET: "auth_token=websocket-token; other=value",
+        PYROMIND_X_CLUSTER_SECRET: "websocket-cluster",
     }
     assert service.agent_state == {
         PYROMIND_VALIDATE_HEADERS_STATE_KEY: {"x-cluster": "websocket-cluster"},

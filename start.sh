@@ -25,7 +25,7 @@ if [[ -z "${OPENAI_API_KEY:-}" ]]; then
 fi
 export OPENAI_API_KEY
 # LiteLLM requires a provider prefix (e.g. openai/) for custom OpenAI-compatible endpoints.
-export LLM_MODEL="${LLM_MODEL:-openai/glm-5.2-fp8}"
+export LLM_MODEL="${LLM_MODEL:-openai/deepseek-v4-flash-0731}"
 
 export DF_API_BASE_URL=https://openrouter.ai/api/v1
 export DF_API_URL=https://openrouter.ai/api/v1/chat/completions
