@@ -10,11 +10,14 @@ the canonical Pyromind DPO JSONL schema.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
 import sys
+import time
 import types
+from datetime import datetime, timezone  # noqa: UP017
 from pathlib import Path
 from typing import Any
 
@@ -27,12 +30,8 @@ import pandas as pd
 if not hasattr(pd.DataFrame, "applymap"):
     pd.DataFrame.applymap = pd.DataFrame.map  # type: ignore[attr-defined]
 
-from dataflow.operators.core_text import (
-    FormatStrPromptedGenerator,
-    GeneralFilter,
-    PandasOperator,
-)
-from dataflow.operators.general_text import ContentNullFilter, HashDeduplicateFilter
+from dataflow.operators.core_text import PandasOperator
+from dataflow.operators.general_text import ContentNullFilter
 from dataflow.prompts.core_text import FormatStrPrompt
 from dataflow.utils.storage import LazyFileStorage
 from df_logging import LoggingLLMServing
@@ -137,9 +136,54 @@ def apply_generated_pair(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def _write_progress_snapshot(
+    progress_path: str | Path,
+    *,
+    total: int,
+    processed: int,
+    succeeded: int,
+    failed: int,
+    started_at: float,
+    attempted_this_run: int,
+) -> None:
+    elapsed_s = time.monotonic() - started_at
+    rate = (
+        attempted_this_run / elapsed_s
+        if elapsed_s > 0 and attempted_this_run > 0
+        else 0.0
+    )
+    remaining = max(total - processed, 0)
+    eta_ms = int(remaining / rate * 1000) if rate > 0 else None
+    payload = {
+        "total": total,
+        "processed": processed,
+        "succeeded": succeeded,
+        "failed": failed,
+        "elapsed_ms": int(elapsed_s * 1000),
+        "records_per_second": round(rate, 2),
+        "eta_ms": eta_ms,
+        "updated_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017
+    }
+    tmp_path = Path(str(progress_path) + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.flush()
+        f.close()
+    tmp_path.rename(progress_path)
+
+
+def _count_output_lines(path: str | Path) -> int:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return sum(1 for _ in f)
+    except (FileNotFoundError, OSError):
+        return 0
+
+
 def write_canonical_output(
     input_path: str, output_path: str, limit: int | None
 ) -> None:
+    # === Phase 1: Preprocessing (DataFlow operators) ===
     storage = LazyFileStorage(
         input_path,
         cache_path=str(Path(output_path).parent / ".dataflow_cache"),
@@ -156,7 +200,13 @@ def write_canonical_output(
     storage = storage.step()
 
     ContentNullFilter().run(storage=storage, input_key="user_prompt")
-    storage = storage.step()
+    df = storage.read("dataframe")
+    total = len(df)
+    if total == 0:
+        return
+
+    # === Phase 2: Batch LLM generation with progress ===
+    BATCH_SIZE = int(os.environ.get("DF_BATCH_SIZE", "8"))
 
     raw_llm = APILLMServing_request(
         api_url=os.environ["DF_API_URL"],
@@ -189,57 +239,133 @@ def write_canonical_output(
             "现有负样本（可为空）：{rejected_seed}"
         )
     )
-    FormatStrPromptedGenerator(
-        llm_serving=llm,
-        system_prompt="You generate preference-pair training data.",
-        prompt_template=prompt,
-        json_schema=schema,
-    ).run(
-        storage=storage,
-        output_key="dpo_pair",
-        question="user_prompt",
-        chosen_seed="existing_gt",
-        rejected_seed="existing_rejected",
-    )
-    storage = storage.step()
 
-    PandasOperator([apply_generated_pair]).run(storage=storage)
-    storage = storage.step()
+    # Build all prompt texts (same logic as FormatStrPromptedGenerator)
+    prompts = []
+    for _, row in df.iterrows():
+        question = str(row.get("user_prompt", ""))
+        chosen_seed = str(row.get("existing_gt", ""))
+        rejected_seed = str(row.get("existing_rejected", ""))
+        text = prompt.build_prompt(
+            need_fields={"question", "chosen_seed", "rejected_seed"},
+            question=question,
+            chosen_seed=chosen_seed,
+            rejected_seed=rejected_seed,
+        )
+        prompts.append(text)
 
-    GeneralFilter(
-        [
-            lambda df: df["dpo_pair_parse_ok"],
-            lambda df: df["gt"].str.strip() != df["rejected_answer"].str.strip(),
-        ]
-    ).run(storage=storage)
-    storage = storage.step()
+    # Resume: skip already-processed records
+    output_file = Path(output_path)
+    existing = _count_output_lines(output_file)
+    start_index = existing
 
-    for key in ["system_prompt", "user_prompt", "gt", "rejected_answer"]:
-        ContentNullFilter().run(storage=storage, input_key=key)
-        storage = storage.step()
+    progress_path = output_file.with_name("progress.json")
+    started_at = time.monotonic()
+    attempted_this_run = 0
+    succeeded = existing
 
-    HashDeduplicateFilter(hash_func="md5").run(
-        storage=storage,
-        input_keys=["system_prompt", "user_prompt", "gt", "rejected_answer"],
-    )
-    storage = storage.step()
+    batch_count = (total - start_index + BATCH_SIZE - 1) // BATCH_SIZE
+    if batch_count > 0:
+        print(
+            f"Generating {total - start_index} DPO pairs in {batch_count} batches...",
+            flush=True,
+        )
 
-    rows = storage.read(output_type="dict")
-    with open(output_path, "w", encoding="utf-8") as target:
-        for row in rows:
-            target.write(
-                json.dumps(
-                    {
-                        "id": str(row["id"]),
-                        "system_prompt": str(row["system_prompt"]).strip(),
-                        "user_prompt": str(row["user_prompt"]).strip(),
-                        "gt": str(row["gt"]).strip(),
-                        "rejected_answer": str(row["rejected_answer"]).strip(),
-                    },
-                    ensure_ascii=False,
+    for batch_start in range(start_index, total, BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, total)
+        batch_prompts = prompts[batch_start:batch_end]
+        batch_rows = df.iloc[batch_start:batch_end].to_dict("records")
+
+        # Generate batch via LLM
+        outputs = llm.generate_from_input(
+            user_inputs=batch_prompts,
+            system_prompt="You generate preference-pair training data.",
+            json_schema=schema,
+        )
+        attempted_this_run += len(outputs)
+
+        # Parse, validate, append to output (open-append-write-close per batch)
+        batch_succeeded = 0
+        with open(output_file, "a", encoding="utf-8") as f:
+            for row_obj, text in zip(batch_rows, outputs):
+                try:
+                    parsed = parse_pair(text)
+                    chosen = parsed["chosen"].strip()
+                    rejected = parsed["rejected"].strip()
+                    if not chosen or not rejected or chosen == rejected:
+                        continue
+                except Exception:
+                    continue
+                f.write(
+                    json.dumps(
+                        {
+                            "id": str(row_obj.get("id", "")),
+                            "system_prompt": (
+                                str(row_obj.get("system_prompt", "")).strip()
+                            ),
+                            "user_prompt": (
+                                str(row_obj.get("user_prompt", "")).strip()
+                            ),
+                            "gt": chosen,
+                            "rejected_answer": rejected,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
+                batch_succeeded += 1
+            # close() on `with` exit triggers FUSE upload
+
+        succeeded += batch_succeeded
+        processed = batch_end
+        failed = processed - succeeded
+
+        _write_progress_snapshot(
+            progress_path,
+            total=total,
+            processed=processed,
+            succeeded=succeeded,
+            failed=failed,
+            started_at=started_at,
+            attempted_this_run=attempted_this_run,
+        )
+
+        batch_num = (batch_start - start_index) // BATCH_SIZE + 1
+        print(
+            f"\rBatch {batch_num}/{batch_count}: "
+            f"{processed}/{total} ({processed / total * 100:.0f}%), "
+            f"succeeded {batch_succeeded},",
+            end="",
+            flush=True,
+        )
+    if batch_count > 0:
+        print()
+
+    # === Phase 3: Global dedup ===
+    with open(output_file, encoding="utf-8") as f:
+        records = [json.loads(line) for line in f]
+
+    seen = set()
+    deduped = []
+    for r in records:
+        key = hashlib.md5(
+            (
+                r["system_prompt"] + r["user_prompt"] + r["gt"] + r["rejected_answer"]
+            ).encode()
+        ).hexdigest()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(r)
+
+    removed = len(records) - len(deduped)
+    if removed:
+        with open(output_file, "w", encoding="utf-8") as f:
+            for r in deduped:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(
+        f"Dedup: {len(records)} \u2192 {len(deduped)} rows (removed {removed})",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
