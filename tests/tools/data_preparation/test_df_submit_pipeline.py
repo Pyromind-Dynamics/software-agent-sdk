@@ -136,12 +136,11 @@ def test_build_dataflow_workflow() -> None:
     assert wf["name"].startswith("agent-data-prep-")
     assert len(wf["nodes"]) == 1
     node_data = wf["nodes"][0]["data"]
-    assert node_data["nodeType"] == "CustomCommandNode"
+    assert node_data["nodeType"] == "CustomCommandCPUNode"
     config = node_data["config"]
     assert config["command"] == "echo hello"
     assert config["cpu"] == 8
     assert config["memory"] == 64
-    assert config["gpu_count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -161,9 +160,15 @@ def _make_conversation_with_llm(
 
     state = MagicMock()
     state.agent.llm = llm
+    state.active_long_tasks = []
 
     conv = MagicMock()
     conv.state = state
+
+    def _register_task(task: Any) -> None:
+        state.active_long_tasks = [*state.active_long_tasks, task]
+
+    conv.register_active_long_task.side_effect = _register_task
     return conv
 
 
@@ -355,6 +360,60 @@ def test_executor_missing_runtime_dir(tmp_path: Path) -> None:
     obs = executor(action, conversation=conv)
     assert obs.status == "Failed"
     assert "runtime_dir" in obs.text
+
+
+def test_executor_submit_failure_omits_progress_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed submission must not leak run/output dirs that would make the
+    frontend render a live progress panel for a task that never exists."""
+    executor = _make_executor(tmp_path)
+    script = tmp_path / "pipeline.py"
+    script.write_text("print('hi')")
+    conversation = _make_conversation_with_llm()
+    conversation.id = "conv-1"
+    conversation.workspace = MagicMock()
+    conversation.workspace.working_dir = str(tmp_path / "conversation")
+
+    monkeypatch.setattr(
+        executor,
+        "_stage_runtime_files",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_stage_script",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.create_workflow_api_client",
+        lambda **kwargs: object(),
+    )
+
+    def _fail_submit(**kwargs: Any) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.submit_workflow_task",
+        _fail_submit,
+    )
+
+    observation = executor(
+        DfSubmitPipelineAction(
+            script_path=str(script),
+            input_path="/data/in.jsonl",
+            output_schema="text",
+        ),
+        conversation=conversation,
+    )
+
+    assert observation.is_error
+    assert observation.status == "Failed"
+    assert observation.task_id is None
+    assert observation.run_id is None
+    assert observation.output_dir is None
+    assert "boom" in observation.text
 
 
 def test_stage_runtime_files_uses_revision_directory(
@@ -549,3 +608,13 @@ def test_new_full_run_uses_conversation_scoped_output_root(
     saved = DataPreparationTaskStore(tmp_path / "tasks").get("task-new")
     assert saved is not None
     assert saved.output_dir == observation.output_dir
+    assert conversation.state.active_long_tasks[0].model_dump() == {
+        "task_id": "task-new",
+        "kind": "data_preparation",
+        "status": "Pending",
+    }
+    conversation.send_agent_message.assert_called_once()
+    notification = conversation.send_agent_message.call_args.args[0]
+    assert "task_id=task-new" in notification
+    assert "run_id=" in notification
+    assert "异步执行" in notification

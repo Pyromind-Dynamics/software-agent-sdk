@@ -26,6 +26,10 @@ class _FakeEventService:
         self.conversation = conversation
         self.visible: bool = False
         self.calls: list[dict] = []
+        self.removed_tasks: dict[str, Any] = {}
+
+    async def remove_active_long_task(self, task_id: str):
+        return self.removed_tasks.pop(task_id, None)
 
     async def send_internal_context(
         self,
@@ -197,6 +201,75 @@ async def test_generic_callback_silently_resumes_conversation(tmp_path):
         conversation_service=cast(ConversationService, service),
     )
     assert duplicate.outcome == "duplicate_terminal"
+
+
+@pytest.mark.asyncio
+async def test_terminal_callback_removes_active_long_task(tmp_path):
+    conversation_id = uuid4()
+    task_id = f"workflow-task-{uuid4()}"
+    service = _FakeConversationService(tmp_path / "conversations")
+    service.event_service.removed_tasks[task_id] = SimpleNamespace(status="Running")
+
+    result = await deliver_run_workflow_status(
+        task_id=task_id,
+        status="Succeeded",
+        conversation_id=str(conversation_id),
+        auto_run=True,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert result.outcome == "delivered_async"
+    assert task_id not in service.event_service.removed_tasks
+    assert service.event_service.run is True
+
+
+@pytest.mark.asyncio
+async def test_terminal_callback_stopped_task_does_not_resume(tmp_path):
+    conversation_id = uuid4()
+    task_id = f"workflow-task-{uuid4()}"
+    service = _FakeConversationService(tmp_path / "conversations")
+    service.event_service.removed_tasks[task_id] = SimpleNamespace(status="Stopped")
+
+    result = await deliver_run_workflow_status(
+        task_id=task_id,
+        status="Stopped",
+        conversation_id=str(conversation_id),
+        auto_run=True,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert result.outcome == "delivered_async"
+    assert result.normalized_status == "Terminated"
+    assert task_id not in service.event_service.removed_tasks
+    assert service.event_service.run is False
+
+
+@pytest.mark.asyncio
+async def test_terminated_callback_wakes_conversation_for_in_flight_task(tmp_path):
+    """A platform-cancelled (Terminated) task still wakes the conversation.
+
+    Mirrors the Kafka payload for a task cancelled on the platform while it
+    was running: the task is not marked ``Stopped`` (that only happens when
+    the user interrupted the conversation), so the terminal callback must
+    deliver the visible notification and re-run the agent.
+    """
+    conversation_id = uuid4()
+    task_id = "7796"
+    service = _FakeConversationService(tmp_path / "conversations")
+    service.event_service.removed_tasks[task_id] = SimpleNamespace(status="Running")
+
+    result = await deliver_run_workflow_status(
+        task_id=task_id,
+        status="Terminated",
+        conversation_id=str(conversation_id),
+        auto_run=True,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert result.outcome == "delivered_async"
+    assert result.normalized_status == "Terminated"
+    assert task_id not in service.event_service.removed_tasks
+    assert service.event_service.run is True
 
 
 @pytest.mark.asyncio
@@ -456,8 +529,8 @@ async def test_workflow_debug_callback_failure_fetches_only_failed_nodes(
 
     assert result.outcome == "delivered_async"
     assert captured[0].node_names == ["CloneAndCacheDataset"]
-    assert service.event_service.internal_context is not None
-    reminder = service.event_service.internal_context[0].text
+    assert service.event_service.extended is not None
+    reminder = service.event_service.extended[0].text
     assert "Node signature guidance:" in reminder
 
 
@@ -500,8 +573,8 @@ async def test_workflow_debug_callback_failure_injects_summarized_node_signature
     )
 
     assert result.outcome == "delivered_async"
-    assert service.event_service.internal_context is not None
-    reminder = service.event_service.internal_context[0].text
+    assert service.event_service.extended is not None
+    reminder = service.event_service.extended[0].text
     assert "Node signature guidance:" in reminder
     assert "简洁摘要" in reminder
     assert "def CloneAndCacheDataset" not in reminder
@@ -543,8 +616,8 @@ async def test_workflow_debug_callback_failure_falls_back_to_raw_signatures(
     )
 
     assert result.outcome == "delivered_async"
-    assert service.event_service.internal_context is not None
-    reminder = service.event_service.internal_context[0].text
+    assert service.event_service.extended is not None
+    reminder = service.event_service.extended[0].text
     assert "Node signature guidance:" in reminder
     assert "def CloneAndCacheDataset(dataset, target_path)" in reminder
 
