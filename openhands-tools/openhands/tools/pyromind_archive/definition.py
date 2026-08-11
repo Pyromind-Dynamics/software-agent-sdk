@@ -39,9 +39,6 @@ if TYPE_CHECKING:
     from openhands.sdk.conversation.state import ConversationState
 
 
-GPU_PRODUCT_FALLBACKS = ("NVIDIA-H100-NVL", "NVIDIA-H100-80GB-HBM3")
-
-
 class ExtractArchiveAction(Action):
     """Submit an archive extraction task as a Studio workflow."""
 
@@ -173,13 +170,11 @@ def _build_archive_workflow(
                 "position": {"x": 0, "y": 0},
                 "data": {
                     "display_name": "Custom Command",
-                    "nodeType": "CustomCommandNode",
+                    "nodeType": "CustomCommandCPUNode",
                     "config": {
                         "command": command,
                         "cpu": action.cpu,
                         "memory": action.memory,
-                        "gpu_count": 0,
-                        "gpu_product": GPU_PRODUCT_FALLBACKS[0],
                     },
                 },
             }
@@ -328,22 +323,13 @@ class ExtractArchiveExecutor(
                 headers=self._headers,
                 timeout=self._timeout,
             )
-            last_exc: Exception | None = None
-            for gpu_product in GPU_PRODUCT_FALLBACKS:
-                workflow["nodes"][0]["data"]["config"]["gpu_product"] = gpu_product
-                try:
-                    response = submit_workflow_task(
-                        client=client,
-                        workflow=workflow,
-                        name=str(workflow["name"]),
-                        conversation_id=str(conversation.id),
-                    )
-                    task_id = response.task_id
-                    break
-                except Exception as exc:
-                    last_exc = exc
-            else:
-                raise last_exc  # type: ignore[misc]
+            response = submit_workflow_task(
+                client=client,
+                workflow=workflow,
+                name=str(workflow["name"]),
+                conversation_id=str(conversation.id),
+            )
+            task_id = response.task_id
         except Exception as exc:
             return ExtractArchiveObservation.from_text(
                 text=f"Failed to submit extraction workflow: {exc}",

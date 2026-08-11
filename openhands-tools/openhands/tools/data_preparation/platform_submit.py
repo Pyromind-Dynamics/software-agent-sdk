@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal, Self, cast
 from pydantic import BaseModel, Field
 from rich.text import Text
 
+from openhands.sdk.conversation.state import ActiveLongTask
 from openhands.sdk.tool import (
     Action,
     Observation,
@@ -63,7 +64,6 @@ RUNTIME_FILENAMES = (
     "validate_prepared_data.py",
 )
 IMAGE_UTILS_API_VERSION = "1"
-GPU_PRODUCT_FALLBACKS = ("NVIDIA-H100-NVL", "NVIDIA-H100-80GB-HBM3")
 OutputSchema = Literal[
     "text",
     "dpo",
@@ -181,8 +181,23 @@ class DfSubmitPipelineAction(Action):
             " 'none' skips conversion."
         ),
     )
-    cpu: int = Field(default=4, ge=1, le=64)
-    memory: int = Field(default=32, ge=1, le=256)
+    cpu: int = Field(
+        default=4,
+        ge=1,
+        le=64,
+        description=("CPU cores for the pipeline pod (1-64, default 4)."),
+    )
+    memory: int = Field(
+        default=32,
+        ge=1,
+        le=256,
+        description=(
+            "Memory for the pipeline pod in GiB (1-256, default 32). "
+            "32 is enough for typical text pipelines; use 64 for image/"
+            "multimodal data. Memory is per-pod, not per-dataset, so it does "
+            "not scale with dataset size."
+        ),
+    )
 
     @property
     def visualize(self) -> Text:
@@ -605,30 +620,17 @@ class DfSubmitPipelineExecutor(
                 headers=self._headers,
                 timeout=self._timeout,
             )
-            last_exc: Exception | None = None
-            for gpu_product in GPU_PRODUCT_FALLBACKS:
-                workflow["nodes"][0]["data"]["config"]["gpu_product"] = gpu_product
-                try:
-                    response = submit_workflow_task(
-                        client=client,
-                        workflow=workflow,
-                        name=str(workflow["name"]),
-                        conversation_id=str(conversation.id),
-                    )
-                    task_id = response.task_id
-                    break
-                except Exception as exc:
-                    last_exc = exc
-            else:
-                raise last_exc  # type: ignore[misc]
+            response = submit_workflow_task(
+                client=client,
+                workflow=workflow,
+                name=str(workflow["name"]),
+                conversation_id=str(conversation.id),
+            )
+            task_id = response.task_id
         except Exception as exc:
             return DfSubmitPipelineObservation.from_text(
                 text=f"Failed to submit DataFlow pipeline: {exc}",
                 status="Failed",
-                run_id=str(run_id),
-                output_dir=output_dir,
-                resumed=resumed,
-                execution_revision=execution_revision,
                 is_error=True,
             )
 
@@ -675,11 +677,30 @@ class DfSubmitPipelineExecutor(
                 is_error=True,
             )
 
+        # Register the task on the conversation so it stays presented as
+        # running while the task is in flight, and can be stopped together
+        # with the conversation.
+        conversation.register_active_long_task(
+            ActiveLongTask(
+                task_id=task_id,
+                kind="data_preparation",
+                status=response.status,
+            )
+        )
+        conversation.send_agent_message(
+            f"已提交数据准备任务（task_id={task_id}, run_id={run_id}），"
+            "平台正在后台异步执行。任务完成或失败后我会在此通知你，"
+            "也可以随时让我查询进度。"
+        )
+
         return DfSubmitPipelineObservation.from_text(
             text=(
                 "DataFlow pipeline submitted. "
                 f"task_id={task_id}, run_id={run_id}, "
                 f"revision={execution_revision}, output_dir={output_dir}. "
+                "A submission confirmation message has already been sent "
+                "to the user, so do not repeat the submission details in "
+                "your reply. "
                 "While the job runs, call df_check_progress with this "
                 "output_dir to report live progress, ETA, and recent output "
                 "records. After the terminal callback, preview "
@@ -1002,13 +1023,11 @@ def _build_dataflow_workflow(
                 "position": {"x": 0, "y": 0},
                 "data": {
                     "display_name": "DataFlow Pipeline",
-                    "nodeType": "CustomCommandNode",
+                    "nodeType": "CustomCommandCPUNode",
                     "config": {
                         "command": command,
                         "cpu": action.cpu,
                         "memory": action.memory,
-                        "gpu_count": 0,
-                        "gpu_product": GPU_PRODUCT_FALLBACKS[0],
                     },
                 },
             }

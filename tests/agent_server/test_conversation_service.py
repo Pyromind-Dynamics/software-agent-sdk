@@ -20,6 +20,7 @@ from openhands.agent_server.conversation_lease import (
 from openhands.agent_server.conversation_service import (
     AutoTitleSubscriber,
     ConversationService,
+    _compose_conversation_info,
     _get_worktree_start_point,
 )
 from openhands.agent_server.event_service import EventService
@@ -45,6 +46,7 @@ from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
 from openhands.sdk import LLM, Agent, AgentContext, Message
 from openhands.sdk.agent.acp_agent import ACPAgent
 from openhands.sdk.conversation.state import (
+    ActiveLongTask,
     ConversationExecutionStatus,
     ConversationState,
 )
@@ -3432,3 +3434,173 @@ class TestACPActivityHeartbeatWiring:
         # Should not raise and should not set any attribute
         EventService._setup_acp_activity_heartbeat(service, agent)
         assert not hasattr(agent, "_on_activity")
+
+
+# ---------------------------------------------------------------------------
+# ActiveLongTask — RUNNING derivation and interrupt stop
+# ---------------------------------------------------------------------------
+
+
+def _stored_and_state(
+    status: ConversationExecutionStatus,
+    tasks: list[ActiveLongTask],
+):
+    stored = StoredConversation(
+        id=uuid4(),
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=LocalWorkspace(working_dir="workspace/project"),
+        confirmation_policy=NeverConfirm(),
+        initial_message=None,
+        metrics=None,
+        created_at=datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC),
+        updated_at=datetime(2025, 1, 1, 12, 30, 0, tzinfo=UTC),
+    )
+    state = ConversationState(
+        id=stored.id,
+        agent=stored.agent,
+        workspace=stored.workspace,
+        execution_status=status,
+        active_long_tasks=tasks,
+        confirmation_policy=stored.confirmation_policy,
+    )
+    return stored, state
+
+
+def test_conversation_info_derives_running_while_task_in_flight():
+    stored, state = _stored_and_state(
+        ConversationExecutionStatus.IDLE,
+        [ActiveLongTask(task_id="t1", kind="data_preparation")],
+    )
+    info = _compose_conversation_info(stored, state)
+    assert info.execution_status == ConversationExecutionStatus.RUNNING
+
+
+def test_conversation_info_derives_running_from_finished():
+    stored, state = _stored_and_state(
+        ConversationExecutionStatus.FINISHED,
+        [ActiveLongTask(task_id="t1", kind="data_cleaning", status="Running")],
+    )
+    info = _compose_conversation_info(stored, state)
+    assert info.execution_status == ConversationExecutionStatus.RUNNING
+
+
+def test_conversation_info_keeps_idle_when_all_tasks_stopped():
+    stored, state = _stored_and_state(
+        ConversationExecutionStatus.IDLE,
+        [ActiveLongTask(task_id="t1", kind="data_preparation", status="Stopped")],
+    )
+    info = _compose_conversation_info(stored, state)
+    assert info.execution_status == ConversationExecutionStatus.IDLE
+
+
+def test_conversation_info_keeps_running_status():
+    stored, state = _stored_and_state(
+        ConversationExecutionStatus.RUNNING,
+        [ActiveLongTask(task_id="t1", kind="data_preparation")],
+    )
+    info = _compose_conversation_info(stored, state)
+    assert info.execution_status == ConversationExecutionStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_stop_active_long_tasks_marks_stopped(conversation_service, monkeypatch):
+    _, state = _stored_and_state(
+        ConversationExecutionStatus.IDLE,
+        [
+            ActiveLongTask(task_id="task-1", kind="data_preparation"),
+            ActiveLongTask(task_id="task-2", kind="data_cleaning"),
+        ],
+    )
+    event_service = AsyncMock(spec=EventService)
+    event_service.get_state.return_value = state
+    event_service.get_conversation.return_value = MagicMock()
+
+    stopped: list[str] = []
+
+    def _stop(action, conversation=None):
+        stopped.append(action.task_id)
+        observation = MagicMock()
+        observation.is_error = False
+        return observation
+
+    fake_executor = MagicMock(side_effect=_stop)
+    monkeypatch.setattr(
+        "openhands.agent_server.conversation_service.DfStopTaskExecutor",
+        lambda: fake_executor,
+    )
+
+    await conversation_service._stop_active_long_tasks(event_service)
+
+    assert stopped == ["task-1", "task-2"]
+    assert [task.status for task in state.active_long_tasks] == [
+        "Stopped",
+        "Stopped",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stop_active_long_tasks_failures_do_not_block(
+    conversation_service, monkeypatch
+):
+    _, state = _stored_and_state(
+        ConversationExecutionStatus.IDLE,
+        [ActiveLongTask(task_id="task-1", kind="data_preparation")],
+    )
+    event_service = AsyncMock(spec=EventService)
+    event_service.get_state.return_value = state
+    event_service.get_conversation.return_value = MagicMock()
+
+    def _failing_stop(action, conversation=None):
+        observation = MagicMock()
+        observation.is_error = True
+        observation.text = "boom"
+        return observation
+
+    monkeypatch.setattr(
+        "openhands.agent_server.conversation_service.DfStopTaskExecutor",
+        lambda: MagicMock(side_effect=_failing_stop),
+    )
+
+    await conversation_service._stop_active_long_tasks(event_service)
+
+    assert state.active_long_tasks[0].status == "Stopped"
+
+
+@pytest.mark.asyncio
+async def test_stop_active_long_tasks_no_tasks_is_noop(
+    conversation_service, monkeypatch
+):
+    _, state = _stored_and_state(ConversationExecutionStatus.IDLE, [])
+    event_service = AsyncMock(spec=EventService)
+    event_service.get_state.return_value = state
+
+    executor_cls = MagicMock()
+    monkeypatch.setattr(
+        "openhands.agent_server.conversation_service.DfStopTaskExecutor",
+        executor_cls,
+    )
+
+    await conversation_service._stop_active_long_tasks(event_service)
+
+    executor_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_conversation_stops_long_tasks_first(
+    conversation_service,
+):
+    stored = _stored_conversation_for_user(None)
+    event_service = _add_mock_event_service_for_stored(conversation_service, stored)
+
+    with (
+        patch.object(
+            conversation_service, "_stop_active_long_tasks", new=AsyncMock()
+        ) as mock_stop,
+        patch.object(
+            conversation_service, "_notify_conversation_webhooks", new=AsyncMock()
+        ),
+    ):
+        assert await conversation_service.interrupt_conversation(stored.id)
+
+    mock_stop.assert_awaited_once_with(event_service)
+    event_service.interrupt.assert_awaited_once()

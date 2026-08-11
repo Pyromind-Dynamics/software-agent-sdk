@@ -13,6 +13,7 @@ from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.context.agent_context import AgentContext
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.conversation.state import (
+    ActiveLongTask,
     ConversationExecutionStatus,
     ConversationState,
 )
@@ -1517,3 +1518,28 @@ def test_v1_17_0_conversation_with_mcp_config_restores(tmp_path: Path) -> None:
 
     assert isinstance(conversation, LocalConversation)
     assert conversation.state.agent.mcp_config == runtime_mcp_config
+
+
+def test_active_long_tasks_survive_state_round_trip():
+    llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test-key"), usage_id="test-llm")
+    agent = Agent(llm=llm, tools=[])
+    state = ConversationState.create(
+        agent=agent,
+        id=uuid.UUID("12345678-1234-5678-9abc-123456789002"),
+        workspace=LocalWorkspace(working_dir="/tmp"),
+    )
+    state.active_long_tasks = [
+        ActiveLongTask(task_id="task-1", kind="data_preparation"),
+        ActiveLongTask(task_id="task-2", kind="data_cleaning", status="Running"),
+    ]
+
+    deserialized = ConversationState.model_validate_json(
+        state.model_dump_json(exclude_none=True)
+    )
+
+    assert [task.task_id for task in deserialized.active_long_tasks] == [
+        "task-1",
+        "task-2",
+    ]
+    assert deserialized.active_long_tasks[0].status == "Pending"
+    assert deserialized.active_long_tasks[1].status == "Running"

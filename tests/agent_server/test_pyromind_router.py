@@ -28,6 +28,7 @@ from openhands.agent_server.pyromind_router import (
     PyromindLLMConfig,
     PyromindSendMessageRequest,
     PyromindWorkflowRollbackRequest,
+    _build_analyze_task_failure_tool,
     _build_debug_context_headers,
     _build_pyromind_storage_tools,
     _build_workflow_run_tool,
@@ -65,6 +66,7 @@ from openhands.tools.pyromind_dataset.definition import (
 )
 from openhands.tools.pyromind_remote_dataset import PreviewRemoteDatasetTool
 from openhands.tools.workflow import (
+    AnalyzeTaskFailureTool,
     RunWorkflowTool,
     ValidateWorkflowDslTool,
 )
@@ -1019,6 +1021,28 @@ def test_build_workflow_run_tool_wires_env_headers_and_auth_token():
         },
     }
     assert secrets["auth_token"].get_value() == "jwt-token"
+
+
+def test_build_analyze_task_failure_tool_matches_create_params():
+    request = _make_request(
+        {
+            "cookie": f"{PYROMIND_AUTH_COOKIE_NAME}=jwt-token",
+            "x-cluster": "us-west-1#pre",
+            "accept-language": "en-US",
+        }
+    )
+
+    tool, secrets = _build_analyze_task_failure_tool(request, {})
+
+    assert tool.name == AnalyzeTaskFailureTool.name
+    assert secrets["auth_token"].get_value() == "jwt-token"
+    assert tool.params["headers"]["x-cluster"] == "us-west-1#pre"
+    assert tool.params["headers"]["accept-language"] == "en-US"
+    assert "env" not in tool.params
+    assert "cluster" not in tool.params
+    # The emitted params must round-trip through create() (no unknown params).
+    instances = AnalyzeTaskFailureTool.create(**tool.params)
+    assert len(instances) == 1
 
 
 def test_build_workflow_run_tool_does_not_persist_current_user_cookie():

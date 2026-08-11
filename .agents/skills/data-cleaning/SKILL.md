@@ -31,7 +31,8 @@ validator。平台产物只能用 `preview_dataset` 查看。
    `report.json` 包含格式校验、统计、错误样本和 checkpoint。格式失败或存在系统性
    清洗错误时修改脚本并创建新的试跑，不恢复错误 run。失败且没有报告时按启动失败
    处理，不要在本地解码 callback 的不透明 `error_log`。
-6. 格式和语义检查通过后，展示最多三条结果并等待用户明确确认。确认后优先用
+6. 格式和语义检查通过后，展示最多三条结果并等待用户明确确认；未通过的试跑迭代
+   不向用户展示。确认后优先用
    `<sample_output_dir>/clean_script.py` 创建一个不传 `limit` 的新全量 run。
 7. 只有平台或进程中断且脚本逻辑正确时，才传原 `input_path` 和
    `resume_run_id` 恢复；恢复时不传新脚本。Pending/Running 时等待 callback，

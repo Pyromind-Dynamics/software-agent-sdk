@@ -15,6 +15,7 @@ description: >-
 - 工作区中间文件放在 `public_data/data-preparation/`。
 - Storage 数据和平台产物只能用 `preview_dataset` 查看，不得用本地文件工具读取。
 - `df_run_pipeline` 只运行本地 Sample；用户确认前不得调用 `df_submit_pipeline`。
+- Sample 结果不符合预期时自行修正并重跑，迭代过程不向用户展示；只展示符合预期的结果。
 - 新链路直接生成规范 JSONL，不以 `df_convert` 或 Parquet 作为正式产物。
 - 新链路优先复用 DataFlow Storage 和 Operator 编排；生成、打分、过滤、去重等已有
   算子能覆盖的环节，尽量不要手写重复实现。
@@ -32,14 +33,16 @@ description: >-
    字段，Pipeline 末尾负责映射正式 Schema。
 4. 调用 `df_run_pipeline`，显式设置 `model_profile` 和 `output_schema`，检查
    `processed.sample.jsonl`、`validation.json` 和 `report.json`。
-5. 展示 Sample 结果并等待用户明确确认。
-6. 调用 `df_submit_pipeline(mode="full")`。收到 Kafka callback 后，调用
+5. Sample 结果不符合预期（质量、格式、字段映射等问题）时，直接修正 pipeline 并
+   重新试跑，直到结果符合预期；迭代过程不向用户展示。
+6. 展示符合预期的 Sample 结果并等待用户明确确认。
+7. 调用 `df_submit_pipeline(mode="full")`。收到 Kafka callback 后，调用
    `preview_dataset` 查看 `<output_dir>/report.json`；如失败，再查看同目录的
    `failure.json`、`validation.json` 和必要的 `llm_calls.jsonl`。
-7. Agent 修复后先在本地重跑失败记录、失败前一条和同类成功记录：
+8. Agent 修复后先在本地重跑失败记录、失败前一条和同类成功记录：
    - 旧结果仍可用：`mode="resume"`，提交 `reuse_assessment` 和可选新脚本。
    - 旧结果不可用：重新执行 Sample、人工确认并创建新的 full run。
-8. 提交后可用 `df_check_progress`（传 `output_dir`）查看实时进度、ETA 和最近产出。
+9. 提交后可用 `df_check_progress`（传 `output_dir`）查看实时进度、ETA 和最近产出。
    若用户预览后发现不符合预期、要介入调整，**先调用 `df_stop_task`**（传 `task_id`，
    或 `df_submit_pipeline` 返回的 `run_id` / `output_dir`）停掉平台任务，再修改
    pipeline 并重新提交，避免旧任务继续消耗资源或覆盖输出目录。
