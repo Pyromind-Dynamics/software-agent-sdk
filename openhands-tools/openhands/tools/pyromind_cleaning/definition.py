@@ -264,9 +264,6 @@ class RunDatasetCleaningExecutor(
             return RunDatasetCleaningObservation.from_text(
                 text=f"Failed to submit dataset cleaning workflow: {exc}",
                 status="Failed",
-                run_id=str(run_id),
-                output_dir=output_dir,
-                resumed=resumed,
                 is_error=True,
             )
 

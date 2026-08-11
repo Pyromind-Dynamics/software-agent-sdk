@@ -631,10 +631,6 @@ class DfSubmitPipelineExecutor(
             return DfSubmitPipelineObservation.from_text(
                 text=f"Failed to submit DataFlow pipeline: {exc}",
                 status="Failed",
-                run_id=str(run_id),
-                output_dir=output_dir,
-                resumed=resumed,
-                execution_revision=execution_revision,
                 is_error=True,
             )
 
