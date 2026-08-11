@@ -40,7 +40,10 @@ def _conversation_tag_attributes(
 
 if TYPE_CHECKING:
     from openhands.sdk.agent.base import AgentBase
-    from openhands.sdk.conversation.state import ConversationExecutionStatus
+    from openhands.sdk.conversation.state import (
+        ActiveLongTask,
+        ConversationExecutionStatus,
+    )
     from openhands.sdk.hooks import HookConfig
 
 
@@ -215,6 +218,50 @@ class BaseConversation(ABC):
         message or reaches the maximum iteration limit.
         """
         ...
+
+    def send_agent_message(self, message: str) -> None:
+        """Append a visible agent-authored message without triggering a run.
+
+        Unlike :meth:`send_message`, this does not enqueue a user prompt, so
+        the agent is not asked to respond. It is intended for server-side
+        notifications (e.g. a long-running platform task has been submitted).
+
+        Raises:
+            NotImplementedError: If this conversation does not support
+                emitting agent-authored messages.
+        """
+        raise NotImplementedError(
+            "This conversation does not support sending agent messages"
+        )
+
+    def register_active_long_task(self, task: "ActiveLongTask") -> None:
+        """Track a long-running platform task on the conversation.
+
+        The task stays presented as running on the conversation while it is
+        in flight, and is removed when it completes or the conversation is
+        stopped.
+
+        Raises:
+            NotImplementedError: If this conversation does not support
+                tracking long-running tasks.
+        """
+        raise NotImplementedError(
+            "This conversation does not support registering long-running tasks"
+        )
+
+    def remove_active_long_task(self, task_id: str) -> "ActiveLongTask | None":
+        """Remove a finished long-running platform task from the conversation.
+
+        Returns the removed task, or None when the task was already gone
+        (idempotent).
+
+        Raises:
+            NotImplementedError: If this conversation does not support
+                tracking long-running tasks.
+        """
+        raise NotImplementedError(
+            "This conversation does not support removing long-running tasks"
+        )
 
     async def arun(self) -> None:
         """Async variant of :meth:`run`.

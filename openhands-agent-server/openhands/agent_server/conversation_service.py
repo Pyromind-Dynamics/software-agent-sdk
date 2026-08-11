@@ -50,6 +50,7 @@ from openhands.sdk.conversation.persistence_const import (
     EVENTS_DIR,
 )
 from openhands.sdk.conversation.state import (
+    ActiveLongTask,
     ConversationExecutionStatus,
     ConversationState,
 )
@@ -65,6 +66,10 @@ from openhands.sdk.skills.skill import PRESERVE_SKILL_PATH_CONTEXT
 from openhands.sdk.tool.client_tool import register_client_tools
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
+from openhands.tools.data_preparation.stop_task import (
+    DfStopTaskAction,
+    DfStopTaskExecutor,
+)
 from openhands.tools.workflow.definition import (
     PYROMIND_WORKFLOW_DIRTY_KEY,
     PYROMIND_WORKFLOW_EMITTED_KEY,
@@ -363,6 +368,17 @@ def _resolve_agent_from_profile(
 def _compose_conversation_info(
     stored: StoredConversation, state: ConversationState
 ) -> ConversationInfo:
+    # Present the conversation as running while long-running platform tasks are
+    # still in flight (derived, never persisted). Tasks the user already
+    # stopped via interrupt are excluded.
+    derived_status = state.execution_status
+    if any(
+        task.status != "Stopped" for task in state.active_long_tasks
+    ) and state.execution_status in (
+        ConversationExecutionStatus.IDLE,
+        ConversationExecutionStatus.FINISHED,
+    ):
+        derived_status = ConversationExecutionStatus.RUNNING
     # Use mode='json' so SecretStr in nested structures (e.g. LookupSecret.headers,
     # agent.agent_context.secrets) serialize to strings. Without it, validation
     # fails because ConversationInfo expects dict[str, str] but receives SecretStr.
@@ -420,7 +436,7 @@ def _compose_conversation_info(
         agent_state.get("acp_supports_runtime_model_switch", False)
     )
     return ConversationInfo(
-        **state.model_dump(mode="json"),
+        **state.model_dump(mode="json", exclude={"execution_status"}),
         title=stored.title,
         metrics=stored.metrics,
         created_at=stored.created_at,
@@ -430,6 +446,7 @@ def _compose_conversation_info(
         supports_runtime_model_switch=supports_runtime_model_switch,
         client_tools=stored.client_tools,
         launched_agent_profile=stored.launched_agent_profile,
+        execution_status=derived_status,
     )
 
 
@@ -964,11 +981,16 @@ class ConversationService:
         Unlike :meth:`pause_conversation`, which waits for the current
         LLM request to finish, this cancels the running ``arun()`` task
         so the interruption takes effect mid-stream.
+
+        Long-running platform tasks tracked on the conversation are stopped
+        together (best effort), since interrupting the conversation is the
+        user's way of abandoning them.
         """
         if self._event_services is None:
             raise ValueError("inactive_service")
         event_service = await self.get_event_service(conversation_id, user_id=user_id)
         if event_service:
+            await self._stop_active_long_tasks(event_service)
             await event_service.interrupt()
             state = await event_service.get_state()
             conversation_info = _compose_webhook_conversation_info(
@@ -976,6 +998,44 @@ class ConversationService:
             )
             await self._notify_conversation_webhooks(conversation_info)
         return bool(event_service)
+
+    async def _stop_active_long_tasks(self, event_service: EventService) -> None:
+        """Best-effort stop of in-flight platform tasks on conversation interrupt.
+
+        Each task gets a platform ``stop_task`` call; failures are logged and
+        never block the interrupt. Tasks are marked ``Stopped`` afterwards so
+        their terminal callbacks do not re-wake the conversation.
+        """
+        state = await event_service.get_state()
+        tasks = list(state.active_long_tasks)
+        if not tasks:
+            return
+        conversation = event_service.get_conversation()
+        executor = DfStopTaskExecutor()
+        for task in tasks:
+            try:
+                observation = await asyncio.to_thread(
+                    executor,
+                    DfStopTaskAction(task_id=task.task_id),
+                    conversation,
+                )
+                if observation.is_error:
+                    logger.warning(
+                        "Failed to stop platform task %s on interrupt: %s",
+                        task.task_id,
+                        observation.text,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to stop platform task %s on interrupt: %s",
+                    task.task_id,
+                    exc,
+                )
+        with state:
+            state.active_long_tasks = [
+                ActiveLongTask(task_id=t.task_id, kind=t.kind, status="Stopped")
+                for t in state.active_long_tasks
+            ]
 
     async def resume_conversation(
         self, conversation_id: UUID, user_id: str | None = None

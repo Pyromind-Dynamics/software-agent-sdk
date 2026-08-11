@@ -367,8 +367,9 @@ def _build_analyze_task_failure_tool(
     http_request: Request,
     extra: dict[str, Any],
 ) -> tuple[Tool, dict[str, SecretSource]]:
-    """Build ``analyze_task_failure`` with the same studio_api auth wiring."""
+    """Build ``analyze_task_failure`` with studio_api auth wiring."""
     headers, secret_headers, secrets = _build_studio_api_auth(http_request, extra)
+    secrets = _load_auth_token(http_request, secrets)
     params: dict[str, Any] = {}
     if headers:
         params["headers"] = headers

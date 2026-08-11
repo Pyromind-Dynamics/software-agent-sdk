@@ -99,7 +99,7 @@ def test_extract_archive_submits_zip_workflow(monkeypatch):
     assert workflow["edges"] == []
     assert len(workflow["nodes"]) == 1
     node = workflow["nodes"][0]
-    assert node["data"]["nodeType"] == "CustomCommandNode"
+    assert node["data"]["nodeType"] == "CustomCommandCPUNode"
     assert node["data"]["config"]["cpu"] == 1
     command = node["data"]["config"]["command"]
     pod_output_dir = f"/target-workspace{observation.output_dir}"

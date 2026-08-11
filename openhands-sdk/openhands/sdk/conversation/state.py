@@ -3,7 +3,7 @@ import json
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Self
 
@@ -45,7 +45,7 @@ from openhands.sdk.workspace.base import BaseWorkspace
 logger = get_logger(__name__)
 
 
-class ConversationExecutionStatus(str, Enum):
+class ConversationExecutionStatus(StrEnum):
     """Enum representing the current execution state of the conversation."""
 
     IDLE = "idle"  # Conversation is ready to receive tasks
@@ -77,6 +77,24 @@ class ConversationExecutionStatus(str, Enum):
             ConversationExecutionStatus.ERROR,
             ConversationExecutionStatus.STUCK,
         )
+
+
+class ActiveLongTask(OpenHandsModel):
+    """A long-running platform task submitted from a conversation.
+
+    Tracked on ``ConversationState.active_long_tasks`` so the presentation
+    layer can keep the conversation in the running state while any task is
+    in flight, and so interrupting the conversation can stop the tasks too.
+    """
+
+    task_id: str = Field(description="Platform task id.")
+    kind: str = Field(
+        description=("Task kind, e.g. 'data_preparation' or 'data_cleaning'.")
+    )
+    status: str = Field(
+        default="Pending",
+        description="Latest known platform status snapshot for display.",
+    )
 
 
 class ConversationState(OpenHandsModel):
@@ -120,6 +138,18 @@ class ConversationState(OpenHandsModel):
     execution_status: ConversationExecutionStatus = Field(
         default=ConversationExecutionStatus.IDLE
     )
+
+    # Long-running platform tasks submitted from this conversation (e.g.
+    # Pyromind data preparation / data cleaning). While any task is in flight
+    # the conversation is presented as running, and interrupting the
+    # conversation stops these tasks too.
+    active_long_tasks: list[ActiveLongTask] = Field(
+        default_factory=list,
+        description=(
+            "Long-running platform tasks currently in flight for this conversation."
+        ),
+    )
+
     confirmation_policy: ConfirmationPolicyBase = NeverConfirm()
     security_analyzer: SecurityAnalyzerBase | None = Field(
         default=None,

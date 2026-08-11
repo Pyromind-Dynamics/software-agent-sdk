@@ -898,3 +898,22 @@ async def test_acp_arun_leaves_queued_message_idle_at_iteration_cap(tmp_path):
 
     assert prompts_seen == ["initial request"]
     assert conversation.state.execution_status == ConversationExecutionStatus.IDLE
+
+
+def test_send_agent_message_appends_visible_agent_message_without_running():
+    """send_agent_message emits a visible agent message without triggering a run."""
+    agent = SendMessageDummyAgent()
+    conversation = Conversation(agent=agent)
+
+    conversation.send_agent_message("平台任务已提交，正在后台执行。")
+
+    # No run happened: status stays IDLE and only this single message event
+    # was produced (no user prompt, no agent step).
+    assert conversation.state.execution_status == ConversationExecutionStatus.IDLE
+    assert len(conversation.state.events) == 1
+    event = conversation.state.events[-1]
+    assert isinstance(event, MessageEvent)
+    assert event.source == "agent"
+    assert event.llm_message.role == "assistant"
+    assert isinstance(event.llm_message.content[0], TextContent)
+    assert event.llm_message.content[0].text == "平台任务已提交，正在后台执行。"
