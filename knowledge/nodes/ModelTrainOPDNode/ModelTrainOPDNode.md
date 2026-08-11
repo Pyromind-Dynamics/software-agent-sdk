@@ -22,6 +22,8 @@
 | model_config | STRING\|MODEL_CONFIG | 是 | 模型配置 YAML 字符串 |
 | teacher_model_config | STRING\|TEACHER_MODEL_CONFIG | 是 | Teacher 模型配置 YAML 字符串（OPD/GKD） |
 | wandb_config | WANDB_CONFIG | 否 | W&B 配置对象 |
+> **注意：** GPU 型号与数量以部署环境实际可用的显卡为准。
+
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |

@@ -17,6 +17,8 @@ Run SFT training and return output directory.
 | lora_config | STRING\|LORA_CONFIG | 否 | 来自 Lora Config Builder 的 LoRA 配置 YAML |
 | wandb_config | WANDB_CONFIG | 否 | W&B 配置对象 |
 | thinking_as_input_ratio | FLOAT | 否 | 将思维链内容作为输入的比例。默认值：`0.0` |
+> **注意：** GPU 型号与数量以部署环境实际可用的显卡为准。
+
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
