@@ -12,6 +12,8 @@ GPU node example using accelerate launch mode
 |------|---------|------|------|
 | message | STRING | 是 | Message |
 
+> **注意：** GPU 型号与数量以部署环境实际可用的显卡为准。
+
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
