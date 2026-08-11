@@ -181,8 +181,23 @@ class DfSubmitPipelineAction(Action):
             " 'none' skips conversion."
         ),
     )
-    cpu: int = Field(default=4, ge=1, le=64)
-    memory: int = Field(default=32, ge=1, le=256)
+    cpu: int = Field(
+        default=4,
+        ge=1,
+        le=64,
+        description=("CPU cores for the pipeline pod (1-64, default 4)."),
+    )
+    memory: int = Field(
+        default=32,
+        ge=1,
+        le=256,
+        description=(
+            "Memory for the pipeline pod in GiB (1-256, default 32). "
+            "32 is enough for typical text pipelines; use 64 for image/"
+            "multimodal data. Memory is per-pod, not per-dataset, so it does "
+            "not scale with dataset size."
+        ),
+    )
 
     @property
     def visualize(self) -> Text:
