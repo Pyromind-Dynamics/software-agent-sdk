@@ -205,6 +205,20 @@ def write_canonical_output(
     if total == 0:
         return
 
+    # Progress tracking
+    output_file = Path(output_path)
+    progress_path = output_file.with_name("progress.json")
+    started_at = time.monotonic()
+    _write_progress_snapshot(
+        progress_path,
+        total=total,
+        processed=0,
+        succeeded=0,
+        failed=0,
+        started_at=started_at,
+        attempted_this_run=0,
+    )
+
     # === Phase 2: Batch LLM generation with progress ===
     BATCH_SIZE = int(os.environ.get("DF_BATCH_SIZE", "8"))
 
@@ -255,14 +269,12 @@ def write_canonical_output(
         prompts.append(text)
 
     # Resume: skip already-processed records
-    output_file = Path(output_path)
     existing = _count_output_lines(output_file)
     start_index = existing
 
-    progress_path = output_file.with_name("progress.json")
-    started_at = time.monotonic()
     attempted_this_run = 0
     succeeded = existing
+    failed = 0
 
     batch_count = (total - start_index + BATCH_SIZE - 1) // BATCH_SIZE
     if batch_count > 0:
@@ -365,6 +377,17 @@ def write_canonical_output(
     print(
         f"Dedup: {len(records)} \u2192 {len(deduped)} rows (removed {removed})",
         flush=True,
+    )
+
+    # Final progress snapshot
+    _write_progress_snapshot(
+        progress_path,
+        total=total,
+        processed=total,
+        succeeded=succeeded if attempted_this_run > 0 else total,
+        failed=failed,
+        started_at=started_at,
+        attempted_this_run=attempted_this_run or total,
     )
 
 
