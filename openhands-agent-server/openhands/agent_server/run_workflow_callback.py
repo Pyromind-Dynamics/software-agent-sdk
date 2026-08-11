@@ -205,6 +205,12 @@ def build_run_workflow_terminal_reminder(
             "log below to decide whether to fix the DSL and call "
             "workflow_debug again, or wait for the user's next message."
         )
+    elif status == "Terminated":
+        lines.append(
+            "This task was terminated by the platform (cancelled or aborted). "
+            "Briefly explain this to the user and ask whether they want to "
+            "resubmit. Do NOT automatically resubmit the task."
+        )
     else:
         lines.append(
             "Resume the tool invocation associated with this task and follow "
@@ -811,7 +817,14 @@ async def deliver_run_workflow_status(
     if from_workflow_debug and normalized_status == "Succeeded":
         _reset_workflow_attempt_counter(event_service)
 
-    # Step 8: Deliver to conversation and auto_run.
+    # Step 8: Drop the task from the conversation's in-flight list. A task the
+    # user already stopped via interrupt is marked ``Stopped`` and must NOT
+    # re-wake the conversation (its terminal callback is just the stop echo).
+    removed_task = await event_service.remove_active_long_task(task_id)
+    if removed_task is not None and removed_task.status == "Stopped":
+        auto_run = False
+
+    # Step 9: Deliver to conversation and auto_run.
     try:
         resume_t0 = time.monotonic()
         await resume_conversation_after_workflow(

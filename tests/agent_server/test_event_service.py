@@ -56,6 +56,7 @@ from openhands.sdk.conversation.impl.local_conversation import (
     LocalConversation,
 )
 from openhands.sdk.conversation.state import (
+    ActiveLongTask,
     ConversationExecutionStatus,
     ConversationState,
 )
@@ -2623,6 +2624,7 @@ class TestEventServiceConcurrentSubscriptions:
         # Set up minimal state attributes needed for ConversationStateUpdateEvent
         state.events = []
         state.execution_status = ConversationExecutionStatus.IDLE
+        state.active_long_tasks = []
         state.model_dump = MagicMock(
             return_value={
                 "execution_status": "idle",
@@ -3773,3 +3775,140 @@ async def test_event_service_creates_lease_with_custom_ttl(tmp_path: Path) -> No
     assert service._lease is not None
     assert service._lease._ttl_seconds == 10.0
     assert (tmp_path / stored.id.hex / LEASE_FILE_NAME).exists()
+
+
+# ---------------------------------------------------------------------------
+# ActiveLongTask — state event derivation and removal
+# ---------------------------------------------------------------------------
+
+
+def _state_update_service(
+    tmp_path: Path,
+    status: ConversationExecutionStatus,
+    tasks: list[ActiveLongTask],
+) -> EventService:
+    stored = StoredConversation(
+        id=uuid4(),
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=LocalWorkspace(working_dir=str(tmp_path)),
+    )
+    service = EventService(stored=stored, conversations_dir=tmp_path / "conversations")
+    state = ConversationState(
+        id=stored.id,
+        agent=stored.agent,
+        workspace=stored.workspace,
+        execution_status=status,
+        active_long_tasks=tasks,
+    )
+    conversation = MagicMock(spec=LocalConversation)
+    conversation._state = state
+
+    def _remove_task(task_id: str) -> ActiveLongTask | None:
+        for task in state.active_long_tasks:
+            if task.task_id == task_id:
+                state.active_long_tasks = [
+                    t for t in state.active_long_tasks if t.task_id != task_id
+                ]
+                return task
+        return None
+
+    conversation.remove_active_long_task.side_effect = _remove_task
+    service._conversation = conversation
+    return service
+
+
+def test_state_update_event_derives_running_while_task_in_flight(tmp_path):
+    service = _state_update_service(
+        tmp_path,
+        ConversationExecutionStatus.IDLE,
+        [ActiveLongTask(task_id="t1", kind="data_preparation")],
+    )
+    event = service._create_state_update_event_sync()
+    assert event.value["execution_status"] == ConversationExecutionStatus.RUNNING.value
+
+
+def test_state_update_event_keeps_idle_when_all_tasks_stopped(tmp_path):
+    service = _state_update_service(
+        tmp_path,
+        ConversationExecutionStatus.IDLE,
+        [ActiveLongTask(task_id="t1", kind="data_preparation", status="Stopped")],
+    )
+    event = service._create_state_update_event_sync()
+    assert event.value["execution_status"] == ConversationExecutionStatus.IDLE.value
+
+
+@pytest.mark.asyncio
+async def test_publish_derived_status_derives_running_for_raw_finished(tmp_path):
+    """SDK-generated state events carry the raw persisted status; the publish
+    path must derive a running presentation while a task is in flight without
+    mutating the persisted state.
+    """
+    service = _state_update_service(
+        tmp_path,
+        ConversationExecutionStatus.FINISHED,
+        [ActiveLongTask(task_id="t1", kind="data_preparation")],
+    )
+    received: list[ConversationStateUpdateEvent] = []
+
+    class CaptureSubscriber(Subscriber[Event]):
+        async def __call__(self, event: Event) -> None:
+            received.append(cast(ConversationStateUpdateEvent, event))
+
+    await service.subscribe_to_events(CaptureSubscriber())
+    # Mimic ConversationState.__setattr__ emitting the raw status.
+    await service._publish_derived_status(
+        ConversationStateUpdateEvent(key="execution_status", value="finished")
+    )
+    assert received[-1].value == ConversationExecutionStatus.RUNNING.value
+    assert (
+        cast(LocalConversation, service._conversation)._state.execution_status
+        == ConversationExecutionStatus.FINISHED
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_derived_status_keeps_raw_status_without_tasks(tmp_path):
+    service = _state_update_service(
+        tmp_path,
+        ConversationExecutionStatus.FINISHED,
+        [],
+    )
+    received: list[ConversationStateUpdateEvent] = []
+
+    class CaptureSubscriber(Subscriber[Event]):
+        async def __call__(self, event: Event) -> None:
+            received.append(cast(ConversationStateUpdateEvent, event))
+
+    await service.subscribe_to_events(CaptureSubscriber())
+    await service._publish_derived_status(
+        ConversationStateUpdateEvent(key="execution_status", value="finished")
+    )
+    assert received[-1].value == ConversationExecutionStatus.FINISHED.value
+
+
+@pytest.mark.asyncio
+async def test_remove_active_long_task_is_idempotent(tmp_path):
+    service = _state_update_service(
+        tmp_path,
+        ConversationExecutionStatus.IDLE,
+        [ActiveLongTask(task_id="t1", kind="data_preparation")],
+    )
+
+    removed = await service.remove_active_long_task("t1")
+    assert removed is not None
+    assert removed.task_id == "t1"
+    assert cast(LocalConversation, service._conversation)._state.active_long_tasks == []
+    assert await service.remove_active_long_task("t1") is None
+
+
+@pytest.mark.asyncio
+async def test_remove_active_long_task_inactive_service_raises(tmp_path):
+    stored = StoredConversation(
+        id=uuid4(),
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=LocalWorkspace(working_dir=str(tmp_path)),
+    )
+    service = EventService(stored=stored, conversations_dir=tmp_path / "conversations")
+
+    with pytest.raises(ValueError, match="inactive_service"):
+        await service.remove_active_long_task("t1")

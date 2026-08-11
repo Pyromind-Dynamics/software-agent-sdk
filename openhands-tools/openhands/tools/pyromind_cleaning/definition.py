@@ -8,11 +8,12 @@ import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Literal, Self, cast
+from typing import TYPE_CHECKING, Any, Self, cast
 
 from pydantic import Field
 from rich.text import Text
 
+from openhands.sdk.conversation.state import ActiveLongTask
 from openhands.sdk.tool import (
     Action,
     Observation,
@@ -46,7 +47,6 @@ if TYPE_CHECKING:
     from openhands.sdk.conversation.state import ConversationState
 
 
-DEFAULT_GPU_PRODUCT = "NVIDIA-H100-NVL"
 RUNTIME_FILENAMES = ("cleaning_utils.py", "validate_format.py")
 MAX_CLEANING_SCRIPT_BYTES = 1024 * 1024
 
@@ -75,13 +75,6 @@ class RunDatasetCleaningAction(Action):
     )
     cpu: int = Field(default=4, ge=1, le=64)
     memory: int = Field(default=32, ge=1, le=256)
-    gpu_count: int = Field(default=0, ge=0, le=8)
-    gpu_product: Literal[
-        "NVIDIA-H100-NVL",
-        "NVIDIA-L40S",
-        "NVIDIA-H200",
-        "NVIDIA-H100-80GB-HBM3",
-    ] = Field(default=DEFAULT_GPU_PRODUCT)
 
     @property
     def visualize(self) -> Text:
@@ -304,10 +297,29 @@ class RunDatasetCleaningExecutor(
                 is_error=True,
             )
 
+        # Register the task on the conversation so it stays presented as
+        # running while the task is in flight, and can be stopped together
+        # with the conversation.
+        conversation.register_active_long_task(
+            ActiveLongTask(
+                task_id=task_id,
+                kind="data_cleaning",
+                status=response.status,
+            )
+        )
+        conversation.send_agent_message(
+            f"已提交数据清洗任务（task_id={task_id}, run_id={run_id}），"
+            "平台正在后台异步执行。任务完成或失败后我会在此通知你，"
+            "也可以随时让我查询进度。"
+        )
+
         return RunDatasetCleaningObservation.from_text(
             text=(
                 "Dataset cleaning workflow submitted. "
                 f"task_id={task_id}, run_id={run_id}, output_dir={output_dir}. "
+                "A submission confirmation message has already been sent "
+                "to the user, so do not repeat the submission details in "
+                "your reply. "
                 "After the terminal callback, preview "
                 f"{output_dir}/report.json, then output.jsonl."
             ),
@@ -643,13 +655,11 @@ def _build_cleaning_workflow(
                 "position": {"x": 0, "y": 0},
                 "data": {
                     "display_name": "Custom Command",
-                    "nodeType": "CustomCommandNode",
+                    "nodeType": "CustomCommandCPUNode",
                     "config": {
                         "command": command,
                         "cpu": action.cpu,
                         "memory": action.memory,
-                        "gpu_count": action.gpu_count,
-                        "gpu_product": action.gpu_product,
                     },
                 },
             }
