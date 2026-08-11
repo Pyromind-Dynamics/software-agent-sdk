@@ -63,6 +63,7 @@ from openhands.sdk.conversation.impl.local_conversation import (
 from openhands.sdk.conversation.response_utils import get_agent_final_response
 from openhands.sdk.conversation.secret_registry import SecretValue
 from openhands.sdk.conversation.state import (
+    ActiveLongTask,
     ConversationExecutionStatus,
     ConversationState,
 )
@@ -216,6 +217,21 @@ def _with_pyromind_runtime_contract(agent: AgentBase) -> AgentBase:
 
 
 logger = get_logger(__name__)
+
+
+def _derive_execution_status(
+    state: ConversationState, raw: ConversationExecutionStatus
+) -> ConversationExecutionStatus:
+    """Present the conversation as running while long-running platform
+    tasks are still in flight (derived, never persisted). Tasks the user
+    already stopped via interrupt are excluded.
+    """
+    if any(task.status != "Stopped" for task in state.active_long_tasks) and raw in (
+        ConversationExecutionStatus.IDLE,
+        ConversationExecutionStatus.FINISHED,
+    ):
+        return ConversationExecutionStatus.RUNNING
+    return raw
 
 
 @dataclass
@@ -703,11 +719,56 @@ class EventService:
             raise ValueError("inactive_service")
         state = self._conversation._state
         with state:
-            return ConversationStateUpdateEvent.from_conversation_state(state)
+            event = ConversationStateUpdateEvent.from_conversation_state(state)
+            event.value["execution_status"] = _derive_execution_status(
+                state, state.execution_status
+            ).value
+            return event
 
     async def _create_state_update_event(self) -> ConversationStateUpdateEvent:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._create_state_update_event_sync)
+
+    def _derive_execution_status_sync(self) -> ConversationExecutionStatus:
+        if not self._conversation:
+            raise ValueError("inactive_service")
+        with self._conversation._state as state:
+            return _derive_execution_status(state, state.execution_status)
+
+    async def _publish_derived_status(self, event: Event) -> None:
+        """Publish an event, deriving a running presentation for
+        conversations with in-flight long-running platform tasks.
+
+        SDK-generated ``ConversationStateUpdateEvent`` instances carry the raw
+        persisted status; deriving keeps WebSocket subscribers in sync with
+        the REST view (see :meth:`_create_state_update_event_sync`).
+        """
+        if (
+            isinstance(event, ConversationStateUpdateEvent)
+            and event.key == "execution_status"
+            and self._conversation is not None
+        ):
+            loop = asyncio.get_running_loop()
+            derived = await loop.run_in_executor(
+                None, self._derive_execution_status_sync
+            )
+            raw_value = event.value
+            raw_status = (
+                raw_value
+                if isinstance(raw_value, ConversationExecutionStatus)
+                else ConversationExecutionStatus(raw_value)
+            )
+            if derived != raw_status:
+                event = event.model_copy(
+                    update={
+                        "value": (
+                            derived
+                            if isinstance(raw_value, ConversationExecutionStatus)
+                            else derived.value
+                        )
+                    }
+                )
+        await self._pub_sub(event)
 
     def _event_matches_body(self, event: Event, body: str) -> bool:
         """Check if event's message content matches body filter (case-insensitive)."""
@@ -857,7 +918,7 @@ class EventService:
                 llm_message=Message(role="user", content=[]),
                 extended_content=list(content),
             )
-        with conversation._state as state:
+        with conversation._state_lock_for_step() as state:
             if state.execution_status in (
                 ConversationExecutionStatus.FINISHED,
                 ConversationExecutionStatus.STUCK,
@@ -1166,7 +1227,7 @@ class EventService:
 
         # Create and store callback wrapper to allow flushing pending events
         self._callback_wrapper = AsyncCallbackWrapper(
-            self._pub_sub, loop=asyncio.get_running_loop()
+            self._publish_derived_status, loop=asyncio.get_running_loop()
         )
 
         # Only wire token streaming for agents that can actually emit token
@@ -1810,6 +1871,23 @@ class EventService:
             raise ValueError("inactive_service")
         with self._conversation._state as state:
             state.agent_state = {**state.agent_state, **values}
+
+    async def remove_active_long_task(self, task_id: str) -> ActiveLongTask | None:
+        """Remove a finished long-running platform task from the conversation.
+
+        Returns the removed task, or None when the task was already gone
+        (idempotent)."""
+        if not self._conversation:
+            raise ValueError("inactive_service")
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._remove_active_long_task_sync, task_id
+        )
+
+    def _remove_active_long_task_sync(self, task_id: str) -> ActiveLongTask | None:
+        if self._conversation is None:
+            raise ValueError("inactive_service")
+        return self._conversation.remove_active_long_task(task_id)
 
     async def set_confirmation_policy(self, policy: ConfirmationPolicyBase):
         """Set the confirmation policy for the conversation."""

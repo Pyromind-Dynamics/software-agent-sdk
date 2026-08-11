@@ -5,7 +5,7 @@ import copy
 import json
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypeGuard
 
@@ -19,6 +19,7 @@ from openhands.sdk.conversation.event_store import EventLog
 from openhands.sdk.conversation.exceptions import ConversationRunError
 from openhands.sdk.conversation.secret_registry import SecretValue
 from openhands.sdk.conversation.state import (
+    ActiveLongTask,
     ConversationExecutionStatus,
     ConversationState,
 )
@@ -1304,17 +1305,12 @@ class LocalConversation(BaseConversation):
         except KeyError:
             new_llm = create_subscription_llm_from_config(llm)
             self.llm_registry.add(new_llm)
-        # A switch_llm tool runs on a worker thread while run()/arun() holds the
-        # state lock across the agent step on another thread, blocked awaiting
-        # this very tool. Re-acquiring _state here would deadlock, so skip it:
-        # the run loop is parked and no other mutator can run, so the swap is
-        # safe without the lock (#3485). Only skip when the lock is held by a
-        # different thread (the run loop); when the caller already owns it (a
-        # sync step, or the switch endpoint reentering on the event-loop thread)
-        # acquire normally — FIFOLock is reentrant for the owning thread.
-        skip_lock = self._step_holds_state_lock and not self._state.owned()
-        lock = contextlib.nullcontext() if skip_lock else self._state
-        with lock:
+        # A switch_llm tool runs on a worker thread while run()/arun() holds
+        # the state lock across the agent step on another thread, blocked
+        # awaiting this very tool. _state_lock_for_step() skips re-acquiring
+        # in that case; FIFOLock is reentrant for the owning thread, so a
+        # caller that already owns the lock acquires normally (#3485).
+        with self._state_lock_for_step():
             update: dict[str, object] = {"llm": new_llm}
             if new_llm.is_subscription:
                 if self.agent.condenser is not None:
@@ -1514,9 +1510,74 @@ class LocalConversation(BaseConversation):
             )
             self._on_event(user_msg_event)
 
+    @observe(name="conversation.send_agent_message")
+    def send_agent_message(self, message: str) -> None:
+        """Append a visible agent-authored message without triggering a run.
+
+        Unlike :meth:`send_message`, this does not enqueue a user prompt, so
+        the agent is not asked to respond. It is intended for server-side
+        notifications (e.g. a long-running platform task has been submitted).
+        """
+        event = MessageEvent(
+            source="agent",
+            llm_message=Message(role="assistant", content=[TextContent(text=message)]),
+        )
+        self._on_event_with_state_lock(event)
+
+    def register_active_long_task(self, task: ActiveLongTask) -> None:
+        """Track a long-running platform task on the conversation state.
+
+        Keeps the conversation presented as running while the task is in
+        flight. Same skip-lock pattern as :meth:`switch_llm` and
+        :meth:`send_agent_message` (#3485): tools calling this from a worker
+        thread while the run loop holds the state lock across the agent step
+        must not re-acquire it.
+        """
+        lock = self._state_lock_for_step()
+        with lock:
+            self._state.active_long_tasks = [*self._state.active_long_tasks, task]
+
+    def remove_active_long_task(self, task_id: str) -> ActiveLongTask | None:
+        """Remove a finished long-running platform task from the state.
+
+        Returns the removed task, or None when the task was already gone
+        (idempotent). Same skip-lock pattern as
+        :meth:`register_active_long_task`.
+        """
+        lock = self._state_lock_for_step()
+        with lock:
+            for task in self._state.active_long_tasks:
+                if task.task_id == task_id:
+                    self._state.active_long_tasks = [
+                        t for t in self._state.active_long_tasks if t.task_id != task_id
+                    ]
+                    return task
+            return None
+
+    @contextlib.contextmanager
+    def _state_lock_for_step(
+        self,
+    ) -> Iterator[ConversationState]:
+        """Yield the state, skipping re-acquisition on worker threads.
+
+        Tools and callbacks run on worker threads while run()/arun() holds the
+        state lock across an agent step on another thread, blocked awaiting
+        this very call. Re-acquiring ``_state`` there would deadlock, so skip
+        it: the run loop is parked and no other mutator can run (#3485). Only
+        skip when the lock is held by a different thread (the run loop); when
+        the caller already owns it, acquire normally — FIFOLock is reentrant
+        for the owning thread.
+        """
+        if self._step_holds_state_lock and not self._state.owned():
+            yield self._state
+            return
+        with self._state as state:
+            yield state
+
     def _on_event_with_state_lock(self, event: Event) -> None:
         """Emit an event while holding the conversation state lock."""
-        with self._state:
+        lock = self._state_lock_for_step()
+        with lock:
             self._on_event(event)
 
     @observe(name="conversation.run")
