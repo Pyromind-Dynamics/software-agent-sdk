@@ -402,6 +402,40 @@ class EventService:
             )
             return None
 
+    def _derive_search_event(self, event: Event) -> Event:
+        """Derive a running presentation for persisted ``execution_status``
+        events while long-running platform tasks are still in flight.
+
+        ``_search_events_sync`` returns the raw persisted history; deriving
+        here mirrors ``_publish_derived_status`` so history reloads agree
+        with real-time WebSocket pushes. Only the returned copy is derived
+        -- the stored event is never mutated.
+        """
+        if (
+            isinstance(event, ConversationStateUpdateEvent)
+            and event.key == "execution_status"
+            and self._conversation is not None
+        ):
+            raw_value = event.value
+            raw_status = (
+                raw_value
+                if isinstance(raw_value, ConversationExecutionStatus)
+                else ConversationExecutionStatus(raw_value)
+            )
+            with self._conversation._state as state:
+                derived = _derive_execution_status(state, raw_status)
+            if derived != raw_status:
+                return event.model_copy(
+                    update={
+                        "value": (
+                            derived
+                            if isinstance(raw_value, ConversationExecutionStatus)
+                            else derived.value
+                        )
+                    }
+                )
+        return event
+
     def _search_events_sync(
         self,
         page_id: str | None = None,
@@ -430,6 +464,9 @@ class EventService:
             sort into O(limit + skipped) reads with no sort, which is the
             difference between "loads instantly" and "blocks for seconds"
             for long conversations.
+
+            Returned ``execution_status`` state-update events are
+            presentation-derived from in-flight long-running platform tasks.
         """
         if not self._conversation:
             raise ValueError("inactive_service")
@@ -482,7 +519,7 @@ class EventService:
             if len(items) >= limit:
                 next_page_id = event.id
                 break
-            items.append(event)
+            items.append(self._derive_search_event(event))
 
         return EventPage(items=items, next_page_id=next_page_id)
 

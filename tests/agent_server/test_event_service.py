@@ -1000,6 +1000,99 @@ class TestEventServiceSearchEvents:
         assert result.items[0].id == "event1"
         assert result.items[4].id == "event5"
 
+    @pytest.mark.asyncio
+    async def test_search_events_derives_running_with_inflight_long_task(
+        self, event_service, tmp_path
+    ):
+        """Persisted execution_status history is presented as running while a
+        long-running platform task is still in flight.
+
+        The string value mirrors the shape of events deserialized from disk
+        (the common case for history reloads after a refresh).
+        """
+        conversation = LocalConversation(
+            agent=Agent(
+                llm=LLM(model="gpt-4o", usage_id="search-derive-test"),
+                tools=[],
+            ),
+            workspace=str(tmp_path / "workspace"),
+            stuck_detection=False,
+        )
+        status_event = ConversationStateUpdateEvent(
+            key="execution_status",
+            value="finished",
+        )
+        with conversation._state as state:
+            state.events.append(status_event)
+            state.active_long_tasks = [
+                ActiveLongTask(task_id="task-1", kind="run_workflow")
+            ]
+        event_service._conversation = conversation
+
+        result = await event_service.search_events()
+
+        assert len(result.items) == 1
+        derived = result.items[0]
+        assert isinstance(derived, ConversationStateUpdateEvent)
+        assert derived.value == "running"
+        # The stored event is untouched; only the returned copy is derived.
+        assert status_event.value == "finished"
+
+    @pytest.mark.asyncio
+    async def test_search_events_keeps_raw_status_without_long_task(
+        self, event_service, tmp_path
+    ):
+        """execution_status history is returned as-is without in-flight tasks."""
+        conversation = LocalConversation(
+            agent=Agent(
+                llm=LLM(model="gpt-4o", usage_id="search-derive-test"),
+                tools=[],
+            ),
+            workspace=str(tmp_path / "workspace"),
+            stuck_detection=False,
+        )
+        status_event = ConversationStateUpdateEvent(
+            key="execution_status",
+            value=ConversationExecutionStatus.FINISHED,
+        )
+        with conversation._state as state:
+            state.events.append(status_event)
+        event_service._conversation = conversation
+
+        result = await event_service.search_events()
+
+        assert len(result.items) == 1
+        assert result.items[0].value == ConversationExecutionStatus.FINISHED
+
+    @pytest.mark.asyncio
+    async def test_search_events_keeps_raw_status_for_stopped_long_task(
+        self, event_service, tmp_path
+    ):
+        """Stopped long-running tasks never derive execution_status to running."""
+        conversation = LocalConversation(
+            agent=Agent(
+                llm=LLM(model="gpt-4o", usage_id="search-derive-test"),
+                tools=[],
+            ),
+            workspace=str(tmp_path / "workspace"),
+            stuck_detection=False,
+        )
+        status_event = ConversationStateUpdateEvent(
+            key="execution_status",
+            value=ConversationExecutionStatus.FINISHED,
+        )
+        with conversation._state as state:
+            state.events.append(status_event)
+            state.active_long_tasks = [
+                ActiveLongTask(task_id="task-1", kind="run_workflow", status="Stopped")
+            ]
+        event_service._conversation = conversation
+
+        result = await event_service.search_events()
+
+        assert len(result.items) == 1
+        assert result.items[0].value == ConversationExecutionStatus.FINISHED
+
 
 class TestEventServiceCountEvents:
     """Test cases for EventService.count_events method."""
