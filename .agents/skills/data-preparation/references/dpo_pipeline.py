@@ -89,11 +89,47 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def _extract_json_object(text: str) -> dict[str, Any]:
+    """Extract the first balanced JSON object from model output.
+
+    The serving API cannot enforce grammar-constrained decoding, so model
+    output may be wrapped in a ```json code fence or contain prose.
+    """
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("no JSON object in dpo_pair")
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                value = json.loads(text[start : index + 1])
+                if not isinstance(value, dict):
+                    raise ValueError("dpo_pair must be a JSON object")
+                return value
+    raise ValueError("unbalanced braces in dpo_pair")
+
+
 def parse_pair(value: Any) -> dict[str, str]:
     if isinstance(value, dict):
         payload = value
     elif isinstance(value, str):
-        payload = json.loads(value)
+        payload = _extract_json_object(value)
     else:
         raise ValueError("dpo_pair must be a JSON object or JSON object string")
     chosen = payload.get("chosen")
@@ -230,15 +266,6 @@ def write_canonical_output(
     )
     llm = LoggingLLMServing(raw_llm)
 
-    schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "chosen": {"type": "string"},
-            "rejected": {"type": "string"},
-        },
-        "required": ["chosen", "rejected"],
-    }
     prompt = FormatStrPrompt(
         f_str_template=(
             "为下面用户问题生成 DPO 偏好回答对。"
@@ -292,7 +319,6 @@ def write_canonical_output(
         outputs = llm.generate_from_input(
             user_inputs=batch_prompts,
             system_prompt="You generate preference-pair training data.",
-            json_schema=schema,
         )
         attempted_this_run += len(outputs)
 
