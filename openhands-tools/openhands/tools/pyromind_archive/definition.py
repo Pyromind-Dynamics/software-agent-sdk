@@ -7,6 +7,7 @@ import shlex
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
 import httpx
@@ -22,7 +23,6 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.pyromind_dataset.definition import (
-    PYROMIND_AGENT_STORAGE_ROOT,
     _default_storage_base_url,
     _resolve_conversation_headers,
     _resolve_secret_headers,
@@ -55,9 +55,11 @@ class ExtractArchiveAction(Action):
     output_dir: str | None = Field(
         default=None,
         description=(
-            "Optional target storage directory for extracted files. "
-            "Defaults to a unique run directory under "
-            "`/.pyromind-agent/<conversation_id>/extracted/<run_id>/`."
+            "Optional explicit target storage directory for extracted files. "
+            "It must not already exist in storage. When omitted, files are "
+            "extracted into a new folder next to the archive named after it "
+            "(e.g. datasets/data.zip -> datasets/data/); if that name is "
+            "already taken, a numeric suffix is appended (data_1/, data_2/)."
         ),
     )
     cpu: int = Field(default=1, ge=1, le=64)
@@ -99,14 +101,30 @@ The tool submits a one-node CustomCommandNode workflow; do not construct or run
 shell commands yourself. Supported formats: zip, tar, tar.gz, tgz. The format
 is auto-detected from the filename extension unless specified explicitly.
 
-The submission is asynchronous. A new run gets a unique result directory under
-`/.pyromind-agent/<conversation_id>/extracted/<run_id>`. When the terminal
-workflow callback resumes the conversation, use `preview_dataset` with the
-`output_dir` returned by this tool to inspect the extracted files.
+The submission is asynchronous. By default, files are extracted into a new
+folder next to the archive and named after it (e.g. datasets/data.zip ->
+datasets/data/). If a folder with that name already exists, a numeric suffix
+is appended automatically (data_1/, data_2/, ...) so existing files are never
+overwritten. Pass `output_dir` to choose an explicit target directory; it must
+not already exist in storage.
+
+When the terminal workflow callback resumes the conversation, use
+`preview_dataset` with the `output_dir` returned by this tool to inspect the
+extracted files.
 
 v1 extracts archives in a single pass. Nested archives inside the extracted
 output require a separate call.
 """
+
+
+def _archive_stem(path: str) -> str:
+    """Return the archive name without its compression extension(s)."""
+    name = PurePosixPath(path).name
+    lower = name.lower()
+    for suffix in (".tar.gz", ".tgz", ".zip", ".tar"):
+        if lower.endswith(suffix):
+            return name[: -len(suffix)]
+    return PurePosixPath(name).stem
 
 
 def _detect_format(archive_path: str, format: str) -> str:  # noqa: A002
@@ -288,15 +306,12 @@ class ExtractArchiveExecutor(
             if error is not None:
                 raise ValueError(error)
 
-            output_root = (
-                self._output_root
-                or f"{PYROMIND_AGENT_STORAGE_ROOT}/{conversation.id}/extracted"
-            )
             run_id = uuid.uuid4()
-            if action.output_dir is not None:
-                output_dir = _normalize_storage_path(action.output_dir, "output_dir")
-            else:
-                output_dir = f"{output_root}/{run_id}"
+            output_dir = self._resolve_output_dir(
+                archive_path=archive_path,
+                output_dir=action.output_dir,
+                conversation=conversation,
+            )
 
             command = _build_extract_command(
                 archive_path=archive_path,
@@ -362,6 +377,65 @@ class ExtractArchiveExecutor(
             _resolve_secret_headers(conversation, self._storage_secret_headers)
         )
         return headers
+
+    def _resolve_output_dir(
+        self,
+        *,
+        archive_path: str,
+        output_dir: str | None,
+        conversation: BaseConversation,
+    ) -> str:
+        """Resolve the extraction target, never reusing an existing directory."""
+        if output_dir is not None:
+            target = _normalize_storage_path(output_dir, "output_dir")
+            exists = self._check_storage_directory_exists(target, conversation)
+            if isinstance(exists, str):
+                raise ValueError(exists)
+            if exists:
+                raise ValueError(
+                    f"Target directory already exists in storage: {target}. "
+                    "Choose a different output_dir to avoid overwriting files."
+                )
+            return target
+
+        base = self._output_root or str(PurePosixPath(archive_path).parent)
+        stem = _archive_stem(archive_path)
+        target = f"{base}/{stem}"
+        index = 1
+        while True:
+            exists = self._check_storage_directory_exists(target, conversation)
+            if isinstance(exists, str):
+                raise ValueError(exists)
+            if not exists:
+                return target
+            target = f"{base}/{stem}_{index}"
+            index += 1
+
+    def _check_storage_directory_exists(
+        self,
+        path: str,
+        conversation: BaseConversation,
+    ) -> bool | str:
+        """Check if a storage directory exists. Returns bool or error message."""
+        headers = self._resolved_storage_headers(conversation)
+        try:
+            response = httpx.post(
+                f"{self._storage_base_url}/get_file_metadata",
+                headers=headers,
+                json={"path": path},
+                timeout=self._timeout,
+            )
+            if response.status_code >= 400:
+                return False
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("success") is not True:
+                return False
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                return False
+            return data.get("is_dir") is True
+        except (httpx.RequestError, json.JSONDecodeError) as exc:
+            return f"Failed to check target directory in storage: {exc}"
 
     def _check_storage_file_exists(
         self,
