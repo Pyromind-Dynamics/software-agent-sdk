@@ -477,8 +477,125 @@ class SandboxReadFileExecutor(
 
 
 # ---------------------------------------------------------------------------
+# sandbox_write_file
 # ---------------------------------------------------------------------------
-# sandbox_terminal
+
+
+class SandboxWriteFileAction(Action):
+    """Write a file into a custom sandbox."""
+
+    sandbox_id: str = Field(description="The id of the custom sandbox.")
+    path: str = Field(
+        description="Absolute path of the file inside the container (parent "
+        "directories are created automatically)."
+    )
+    content: str = Field(description="File content to write (UTF-8 text).")
+
+
+class SandboxWriteFileObservation(Observation):
+    """Confirmation that a file was written."""
+
+    sandbox_id: str | None = Field(
+        default=None, description="The sandbox the file was written to."
+    )
+    path: str | None = Field(
+        default=None, description="Path of the file inside the container."
+    )
+    size: int | None = Field(default=None, description="Number of bytes written.")
+
+
+class SandboxWriteFileExecutor(
+    _SandboxExecutorMixin,
+    ToolExecutor[SandboxWriteFileAction, SandboxWriteFileObservation],
+):
+    """Write one file into a custom sandbox."""
+
+    def __call__(
+        self,
+        action: SandboxWriteFileAction,
+        conversation: BaseConversation | None = None,
+    ) -> SandboxWriteFileObservation:
+        try:
+            raw = action.content.encode("utf-8")
+            self._sandbox_client(conversation).write_file(
+                action.sandbox_id, action.path, raw
+            )
+            return SandboxWriteFileObservation.from_text(
+                text=f"Wrote {len(raw)} bytes to {action.path}.",
+                sandbox_id=action.sandbox_id,
+                path=action.path,
+                size=len(raw),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return SandboxWriteFileObservation.from_text(
+                text=(
+                    f"Failed to write file {action.path} to sandbox "
+                    f"{action.sandbox_id}: {exc}"
+                ),
+                is_error=True,
+            )
+
+
+# ---------------------------------------------------------------------------
+# sandbox_delete_file
+# ---------------------------------------------------------------------------
+
+
+class SandboxDeleteFileAction(Action):
+    """Delete a file or directory from a custom sandbox."""
+
+    sandbox_id: str = Field(description="The id of the custom sandbox.")
+    path: str = Field(
+        description="Absolute path of the file or directory inside the container."
+    )
+    recursive: bool = Field(
+        default=False,
+        description="Recursively delete a directory; required when path is a "
+        "non-empty directory.",
+    )
+
+
+class SandboxDeleteFileObservation(Observation):
+    """Confirmation that a file was deleted."""
+
+    sandbox_id: str | None = Field(
+        default=None, description="The sandbox the file was deleted from."
+    )
+    path: str | None = Field(
+        default=None, description="Path of the deleted file or directory."
+    )
+
+
+class SandboxDeleteFileExecutor(
+    _SandboxExecutorMixin,
+    ToolExecutor[SandboxDeleteFileAction, SandboxDeleteFileObservation],
+):
+    """Delete one file or directory from a custom sandbox."""
+
+    def __call__(
+        self,
+        action: SandboxDeleteFileAction,
+        conversation: BaseConversation | None = None,
+    ) -> SandboxDeleteFileObservation:
+        try:
+            self._sandbox_client(conversation).delete_file(
+                action.sandbox_id, action.path, recursive=action.recursive
+            )
+            return SandboxDeleteFileObservation.from_text(
+                text=f"Deleted {action.path}.",
+                sandbox_id=action.sandbox_id,
+                path=action.path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return SandboxDeleteFileObservation.from_text(
+                text=(
+                    f"Failed to delete {action.path} from sandbox "
+                    f"{action.sandbox_id}: {exc}"
+                ),
+                is_error=True,
+            )
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -790,6 +907,80 @@ class SandboxReadFileTool(
         ]
 
 
+class SandboxWriteFileTool(
+    ToolDefinition[SandboxWriteFileAction, SandboxWriteFileObservation]
+):
+    """Write a file into a custom sandbox."""
+
+    @classmethod
+    def create(
+        cls,
+        conv_state: Any = None,  # noqa: ARG003
+        **params: Any,
+    ) -> Sequence[Self]:
+        return [
+            cls(
+                description=(
+                    "Write a file into a custom (headless) Pyromind sandbox. "
+                    "The content is written as UTF-8 text; parent directories "
+                    "are created automatically."
+                ),
+                action_type=SandboxWriteFileAction,
+                observation_type=SandboxWriteFileObservation,
+                executor=SandboxWriteFileExecutor(
+                    cluster=params.get("cluster"),
+                    env=params.get("env"),
+                    current_user=params.get("current_user"),
+                    headers=params.get("headers", {}),
+                ),
+                annotations=ToolAnnotations(
+                    title="Sandbox write file",
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    idempotentHint=False,
+                    openWorldHint=True,
+                ),
+            )
+        ]
+
+
+class SandboxDeleteFileTool(
+    ToolDefinition[SandboxDeleteFileAction, SandboxDeleteFileObservation]
+):
+    """Delete a file or directory from a custom sandbox."""
+
+    @classmethod
+    def create(
+        cls,
+        conv_state: Any = None,  # noqa: ARG003
+        **params: Any,
+    ) -> Sequence[Self]:
+        return [
+            cls(
+                description=(
+                    "Delete a file or directory from a custom (headless) "
+                    "Pyromind sandbox. Use recursive=True for non-empty "
+                    "directories."
+                ),
+                action_type=SandboxDeleteFileAction,
+                observation_type=SandboxDeleteFileObservation,
+                executor=SandboxDeleteFileExecutor(
+                    cluster=params.get("cluster"),
+                    env=params.get("env"),
+                    current_user=params.get("current_user"),
+                    headers=params.get("headers", {}),
+                ),
+                annotations=ToolAnnotations(
+                    title="Sandbox delete file",
+                    readOnlyHint=False,
+                    destructiveHint=True,
+                    idempotentHint=False,
+                    openWorldHint=True,
+                ),
+            )
+        ]
+
+
 class SandboxTerminalTool(
     ToolDefinition[SandboxTerminalAction, SandboxTerminalObservation]
 ):
@@ -832,3 +1023,5 @@ register_tool(SandboxCreateTool.name, SandboxCreateTool)
 register_tool(SandboxDeleteTool.name, SandboxDeleteTool)
 register_tool(SandboxReadFileTool.name, SandboxReadFileTool)
 register_tool(SandboxTerminalTool.name, SandboxTerminalTool)
+register_tool(SandboxWriteFileTool.name, SandboxWriteFileTool)
+register_tool(SandboxDeleteFileTool.name, SandboxDeleteFileTool)

@@ -65,6 +65,7 @@ from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
 )
 from openhands.tools.pyromind_remote_dataset import PreviewRemoteDatasetTool
+from openhands.tools.sandbox import SandboxDownloadTool, SandboxUploadTool
 from openhands.tools.workflow import (
     AnalyzeTaskFailureTool,
     RunWorkflowTool,
@@ -922,6 +923,8 @@ def test_pyromind_storage_tools_use_user_context_headers():
         DfStopTaskTool.name,
         ExtractArchiveTool.name,
         PreviewRemoteDatasetTool.name,
+        SandboxUploadTool.name,
+        SandboxDownloadTool.name,
     ]
     assert tools[0].params == {
         "storage_base_url": "https://storage.test/api",
