@@ -313,9 +313,9 @@ automatically stripped of that prefix and the remainder is resolved as a
 user storage relative path (e.g. '/workspace/proto.zip' -> 'proto.zip').
 
 Archive files (zip, tar, tar.gz, tgz) cannot be previewed directly; the tool
-reports that and you should call `extract_archive` to unpack them (confirm
-the target directory with the user if needed), then call this tool again on
-the extracted files.
+reports that and you should call `extract_archive` to unpack them into a new
+folder next to the archive (an existing folder with the same name is never
+overwritten), then call this tool again on the extracted files.
 
 The tool automatically determines the source:
 - If the path matches a known shared dataset (exact or prefix), it uses the
@@ -2163,9 +2163,10 @@ def _archive_extract_hint(file_path: str, content_type: str) -> str | None:
         return None
     return (
         f"'{file_path}' is a compressed archive and cannot be previewed "
-        "directly. Use `extract_archive` to unpack it (confirm the target "
-        "directory with the user first), then call `preview_dataset` on the "
-        "extracted files."
+        "directly. Use `extract_archive` to unpack it into a new folder next "
+        "to the archive named after it (an existing folder with the same name "
+        "is never overwritten), then call `preview_dataset` on the extracted "
+        "files."
     )
 
 
