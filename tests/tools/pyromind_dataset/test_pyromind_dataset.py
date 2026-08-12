@@ -219,6 +219,110 @@ def test_preview_dataset_reads_jsonl_samples_with_storage_context(
     assert calls[0]["headers"]["x-cluster"] == "pre"
 
 
+def test_preview_dataset_strips_workspace_prefix(monkeypatch, tmp_path):
+    _patch_shared_empty(monkeypatch)
+    metadata_calls: list[dict[str, Any]] = []
+    jsonl = b'{"prompt":"p1"}\n'
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            metadata_calls.append(json)
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": "proto.jsonl",
+                        "bucket_name": "1001",
+                        "size": len(jsonl),
+                        "content_type": "application/jsonl",
+                        "is_dir": False,
+                        "metadata": {},
+                    },
+                },
+            )
+        if url.endswith("/get_url"):
+            return _Response(
+                200,
+                {"success": True, "data": {"url": "https://download.test/proto"}},
+            )
+        raise AssertionError(f"unexpected URL: {url}")
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        return _StreamResponse(jsonl)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    conversation = _fake_conversation(
+        tmp_path,
+        secret_registry=_secret_registry(),
+        agent_state={PYROMIND_STORAGE_HEADERS_STATE_KEY: {"x-cluster": "pre"}},
+    )
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+        timeout=5.0,
+    )(
+        PreviewDatasetAction.model_validate({"dataset_path": "/workspace/proto.jsonl"}),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.preview_file_path == "proto.jsonl"
+    assert observation.source == "storage"
+    assert metadata_calls[0]["path"] == "proto.jsonl"
+
+
+def test_preview_dataset_reports_archive_with_extract_hint(monkeypatch, tmp_path):
+    _patch_shared_empty(monkeypatch)
+    url_calls: list[dict[str, Any]] = []
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": "proto.zip",
+                        "bucket_name": "1001",
+                        "size": 4096,
+                        "content_type": "application/zip",
+                        "is_dir": False,
+                        "metadata": {},
+                    },
+                },
+            )
+        if url.endswith("/get_url"):
+            url_calls.append({"url": url, "json": json})
+            return _Response(
+                200,
+                {"success": True, "data": {"url": "https://download.test/proto"}},
+            )
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    conversation = _fake_conversation(
+        tmp_path,
+        secret_registry=_secret_registry(),
+        agent_state={PYROMIND_STORAGE_HEADERS_STATE_KEY: {"x-cluster": "pre"}},
+    )
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+        timeout=5.0,
+    )(
+        PreviewDatasetAction.model_validate({"dataset_path": "/workspace/proto.zip"}),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert "extract_archive" in observation.text
+    assert observation.preview_file_path == "proto.zip"
+    assert observation.source == "storage"
+    assert url_calls == []
+
+
 def test_preview_dataset_formats_text_file_content(
     monkeypatch,
     tmp_path,
