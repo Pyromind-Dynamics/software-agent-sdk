@@ -303,7 +303,6 @@ class MultiImageSemanticLabelOperator(OperatorABC):
                     system_prompt="",
                     user_prompts=[prompts[index] for index in request_indices],
                     timeout=self.config.timeout,
-                    json_schema=self.config.response_json_schema,
                 )
                 if len(raw_responses) != len(request_indices):
                     raise ValueError(
