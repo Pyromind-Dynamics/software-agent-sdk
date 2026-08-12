@@ -99,9 +99,13 @@ from openhands.tools.pyromind_debug import get_debug_result_broker
 from openhands.tools.pyromind_remote_dataset import PreviewRemoteDatasetTool
 from openhands.tools.sandbox import (
     SandboxCreateTool,
+    SandboxDeleteFileTool,
     SandboxDeleteTool,
+    SandboxDownloadTool,
     SandboxReadFileTool,
     SandboxTerminalTool,
+    SandboxUploadTool,
+    SandboxWriteFileTool,
 )
 from openhands.tools.utils import PUBLIC_READ_ALIASES
 from openhands.tools.workflow import (
@@ -470,6 +474,8 @@ _SANDBOX_TOOL_TYPES = (
     SandboxCreateTool,
     SandboxDeleteTool,
     SandboxReadFileTool,
+    SandboxWriteFileTool,
+    SandboxDeleteFileTool,
     SandboxTerminalTool,
 )
 
@@ -561,6 +567,11 @@ def _build_pyromind_storage_tools(
     if isinstance(extraction_output_root, str) and extraction_output_root:
         extraction_params["output_root"] = extraction_output_root
 
+    # Sandbox storage-ops params (mirrors extraction pattern; keeps storage
+    # headers so the upload operation can stream files back to storage).
+    sandbox_storage_params: dict[str, Any] = dict(extraction_params)
+    sandbox_storage_params.pop("output_root", None)
+
     return (
         [
             Tool(name=PreviewDatasetTool.name, params=dict(params)),
@@ -571,6 +582,8 @@ def _build_pyromind_storage_tools(
             Tool(name=DfStopTaskTool.name, params=stop_params),
             Tool(name=ExtractArchiveTool.name, params=extraction_params),
             Tool(name=PreviewRemoteDatasetTool.name, params={}),
+            Tool(name=SandboxUploadTool.name, params=sandbox_storage_params),
+            Tool(name=SandboxDownloadTool.name, params=sandbox_storage_params),
         ],
         secrets,
     )
