@@ -29,6 +29,7 @@ from openhands.tools.data_preparation.runner import (
     summarize_dataflow_env,
     validate_managed_image_pipeline,
 )
+from openhands.tools.utils.dataflow_config import DEFAULT_DATAFLOW_MODEL_NAME
 
 
 def _fake_conversation(
@@ -172,6 +173,17 @@ def test_build_dataflow_env_rejects_mismatched_urls(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="do not describe the same endpoint"):
         build_dataflow_env(_conversation_with_llm())
+
+
+def test_build_dataflow_env_falls_back_to_default_model(monkeypatch) -> None:
+    for name in ("DF_API_KEY", "DF_API_URL", "DF_API_BASE_URL", "DF_MODEL_NAME"):
+        monkeypatch.delenv(name, raising=False)
+    conversation = _conversation_with_llm()
+    conversation.state.agent.llm.model = ""
+
+    env = build_dataflow_env(conversation)
+
+    assert env["DF_MODEL_NAME"] == DEFAULT_DATAFLOW_MODEL_NAME
 
 
 def test_run_dataflow_python_redacts_api_key(tmp_path: Path) -> None:
@@ -321,6 +333,7 @@ def test_df_run_pipeline_validates_dpo_output(
 
     assert not observation.is_error
     assert observation.exit_code == 0
+    assert observation.report_path is not None
     report = json.loads(Path(observation.report_path).read_text())
     assert report["validation"] == {"status": "passed", "schema": "dpo", "rows": 1}
     assert observation.sample_records == [
