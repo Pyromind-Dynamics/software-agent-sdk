@@ -44,6 +44,12 @@ from openhands.tools.pyromind_dataset.definition import (
     _resolve_secret_headers,
     upload_local_file_to_pyromind,
 )
+from openhands.tools.utils.dataflow_config import (
+    ENV_DF_API_BASE_URL,
+    ENV_DF_API_KEY,
+    ENV_DF_API_URL,
+    ENV_DF_MODEL_NAME,
+)
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
     create_workflow_api_client,
@@ -917,10 +923,10 @@ def _build_dataflow_command(
     # Environment variables for LLM access
     env_parts = []
     for key in (
-        "DF_API_KEY",
-        "DF_API_URL",
-        "DF_API_BASE_URL",
-        "DF_MODEL_NAME",
+        ENV_DF_API_KEY,
+        ENV_DF_API_URL,
+        ENV_DF_API_BASE_URL,
+        ENV_DF_MODEL_NAME,
     ):
         value = llm_env.get(key, "")
         if value:
@@ -1070,7 +1076,9 @@ def _file_sha256(path: Path) -> str:
 
 
 def _model_fingerprint(llm_env: dict[str, str]) -> str:
-    nonsecret = {name: value for name, value in llm_env.items() if name != "DF_API_KEY"}
+    nonsecret = {
+        name: value for name, value in llm_env.items() if name != ENV_DF_API_KEY
+    }
     serialized = json.dumps(nonsecret, sort_keys=True).encode("utf-8")
     return hashlib.sha256(serialized).hexdigest()
 
