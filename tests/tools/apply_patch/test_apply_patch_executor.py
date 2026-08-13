@@ -3,7 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from openhands.tools.apply_patch.definition import ApplyPatchAction, ApplyPatchExecutor
+from openhands.tools.apply_patch.definition import (
+    _DESCRIPTION,
+    ApplyPatchAction,
+    ApplyPatchExecutor,
+)
 from openhands.tools.workflow.definition import PYROMIND_WORKFLOW_DIRTY_KEY
 
 
@@ -407,3 +411,17 @@ def test_invalid_move_to_path_returns_differror(tmp_ws: Path):
     obs = run_exec(tmp_ws, patch)
     assert obs.is_error
     assert "Invalid move path" in obs.text
+
+
+def test_patch_field_description_forbids_separate_path_argument() -> None:
+    """LLM-facing docs must make clear `patch` is the only accepted argument.
+
+    Models that know file editors with a `path` parameter tend to pass one to
+    `apply_patch` too, which fails `extra="forbid"` validation. The field
+    description and tool description both spell this out to prevent that.
+    """
+    patch_description = ApplyPatchAction.model_fields["patch"].description
+    assert patch_description is not None
+    assert "only argument" in patch_description
+    assert "never pass a separate 'path' argument" in patch_description
+    assert "exactly one argument" in _DESCRIPTION

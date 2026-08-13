@@ -45,8 +45,12 @@ class ApplyPatchAction(Action):
     patch: str = Field(
         description=(
             "The full patch text, starting with '*** Begin Patch' and ending "
-            "with '*** End Patch'. Pass it as a plain string (newlines escaped "
-            "as \\n inside the JSON argument); do not wrap it in a code fence."
+            "with '*** End Patch'. This is the only argument this tool accepts; "
+            "file paths must be declared inside the patch itself via the "
+            "'*** Add File:', '*** Update File:', or '*** Delete File:' "
+            "headers - never pass a separate 'path' argument. Pass it as a "
+            "plain string (newlines escaped as \\n inside the JSON argument); "
+            "do not wrap it in a code fence."
         ),
     )
 
@@ -178,6 +182,10 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
 # (codex-rs/prompts/templates/apply_patch_tool_instructions.md), reworked for
 # a JSON function tool that takes the patch text in a single `patch` argument.
 _DESCRIPTION = """Use the `apply_patch` tool to create, delete, or edit files.
+
+This tool takes exactly one argument: `patch`. File paths are declared
+inside the patch text itself via the file-section headers below; do not
+pass a separate `path` argument.
 
 The `patch` argument is a stripped-down, file-oriented diff format:
 
