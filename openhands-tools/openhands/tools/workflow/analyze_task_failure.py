@@ -365,7 +365,7 @@ class AnalyzeTaskFailureExecutor(
     ) -> None:
         self._api_base = (api_base or _resolve_api_base()).rstrip("/")
         parts = urlsplit(self._api_base)
-        self._nodes_api_base = f"{parts.scheme}://{parts.netloc}/api/v1"
+        self._nodes_api_base = f"{parts.scheme}://{parts.netloc}/user_node"
         self._headers = dict(headers or {})
         self._secret_headers = dict(secret_headers or {})
         self._timeout = timeout
@@ -532,7 +532,7 @@ class AnalyzeTaskFailureExecutor(
         source_lines: int,
     ) -> str | None:
         """Fetch a node operator's source code; best-effort, never raises."""
-        url = f"{self._nodes_api_base}/nodes/function_signature/batch"
+        url = f"{self._nodes_api_base}/function_signature/batch"
         headers = _build_access_key_request_headers(
             self._headers, auth_token=auth_token
         )
