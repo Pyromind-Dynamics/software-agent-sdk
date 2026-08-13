@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
+import httpx
 from pydantic import BaseModel, Field
 from rich.text import Text
 
@@ -39,7 +40,9 @@ from openhands.tools.data_preparation.runner import (
 )
 from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_AGENT_STORAGE_ROOT,
+    _decode_json_response,
     _default_storage_base_url,
+    _extract_api_data,
     _resolve_conversation_headers,
     _resolve_secret_headers,
     upload_local_file_to_pyromind,
@@ -69,7 +72,8 @@ RUNTIME_FILENAMES = (
     "preparation_runtime.py",
     "validate_prepared_data.py",
 )
-IMAGE_UTILS_API_VERSION = "1"
+IMAGE_UTILS_API_VERSION = "2"
+DATAFLOW_NODE_TYPE = "CustomCommandCPUNode"
 OutputSchema = Literal[
     "text",
     "dpo",
@@ -100,7 +104,8 @@ all Pyromind artifacts exclusively with `preview_dataset`; never use Terminal,
 workspace file APIs, or local filesystem reads for these Storage paths:
 - report.json: execution summary, LLM call stats, error samples
 - failure.json / validation.json: detailed failure evidence when present
-- llm_calls.jsonl: full per-call request/response log
+- llm_calls.jsonl: per-attempt audit; invalid model output includes a redacted preview
+- label_corrections.jsonl: human-label corrections with reasons and visual evidence
 - processed.jsonl: pipeline output data
 
 To continue a failed run, use mode='resume' and resume_run_id. An unchanged
@@ -222,6 +227,8 @@ class DfSubmitPipelineObservation(Observation):
     output_dir: str | None = Field(default=None)
     resumed: bool = Field(default=False)
     execution_revision: int | None = Field(default=None)
+    failure_stage: str | None = Field(default=None)
+    retryable: bool | None = Field(default=None)
 
     @property
     def visualize(self) -> Text:
@@ -264,12 +271,13 @@ class DataPreparationTaskAssociation:
         model_fingerprint: str | None = None,
         runtime_fingerprint: str | None = None,
         runtime_dir_name: str = "",
+        runtime_storage_dir: str | None = None,
         image_utils_api_version: str | None = None,
         resumed: bool = False,
         reuse_assessment: dict[str, Any] | None = None,
         status: str = "Pending",
     ):
-        self.schema_version = 3
+        self.schema_version = 4
         self.task_id = task_id
         self.conversation_id = conversation_id
         self.run_id = run_id
@@ -285,6 +293,7 @@ class DataPreparationTaskAssociation:
         self.model_fingerprint = model_fingerprint
         self.runtime_fingerprint = runtime_fingerprint
         self.runtime_dir_name = runtime_dir_name
+        self.runtime_storage_dir = runtime_storage_dir
         self.image_utils_api_version = image_utils_api_version
         self.resumed = resumed
         self.reuse_assessment = reuse_assessment
@@ -310,6 +319,7 @@ class DataPreparationTaskAssociation:
             "model_fingerprint": self.model_fingerprint,
             "runtime_fingerprint": self.runtime_fingerprint,
             "runtime_dir_name": self.runtime_dir_name,
+            "runtime_storage_dir": self.runtime_storage_dir,
             "image_utils_api_version": self.image_utils_api_version,
             "resumed": self.resumed,
             "reuse_assessment": self.reuse_assessment,
@@ -339,6 +349,7 @@ class DataPreparationTaskAssociation:
             model_fingerprint=data.get("model_fingerprint"),
             runtime_fingerprint=data.get("runtime_fingerprint"),
             runtime_dir_name=data.get("runtime_dir_name", ""),
+            runtime_storage_dir=data.get("runtime_storage_dir"),
             image_utils_api_version=data.get("image_utils_api_version"),
             resumed=bool(data.get("resumed", False)),
             reuse_assessment=data.get("reuse_assessment"),
@@ -466,6 +477,8 @@ class DfSubmitPipelineExecutor(
             task_store = self._task_store(conversation)
             resumed = action.mode == "resume"
             prior_run: DataPreparationTaskAssociation | None = None
+            should_stage_runtime = False
+            should_stage_script = False
 
             if resumed:
                 if action.resume_run_id is None:
@@ -501,6 +514,7 @@ class DfSubmitPipelineExecutor(
                     pipeline_fingerprint = prior_run.pipeline_fingerprint
                     runtime_fingerprint = prior_run.runtime_fingerprint
                     runtime_dir_name = prior_run.runtime_dir_name
+                    runtime_storage_dir = prior_run.runtime_storage_dir
                     image_utils_api_version = prior_run.image_utils_api_version
                 else:
                     script_path = _validate_local_pipeline(action.script_path)
@@ -508,7 +522,12 @@ class DfSubmitPipelineExecutor(
                     frozen_script_name = f"pipeline-r{execution_revision}.py"
                     runtime_fingerprint = self._runtime_fingerprint()
                     runtime_dir_name = f"runtime-r{execution_revision}"
+                    runtime_storage_dir = self._runtime_cache_dir(
+                        conversation, runtime_fingerprint
+                    )
                     image_utils_api_version = IMAGE_UTILS_API_VERSION
+                    should_stage_runtime = True
+                    should_stage_script = True
                     if output_schema == "vision":
                         self._preflight_managed_image_pipeline(Path(script_path))
                 llm_env = _build_llm_env(conversation, model_profile)
@@ -537,18 +556,6 @@ class DfSubmitPipelineExecutor(
                             "reuse_assessment.changed_dimensions is missing: "
                             + ", ".join(sorted(missing_assessment))
                         )
-                if action.script_path is not None:
-                    self._stage_runtime_files(
-                        output_dir,
-                        conversation,
-                        runtime_dir_name=runtime_dir_name,
-                    )
-                    self._stage_script(
-                        script_path,
-                        output_dir,
-                        conversation,
-                        frozen_script_name=frozen_script_name,
-                    )
             else:
                 if action.resume_run_id is not None:
                     raise ValueError("resume_run_id is only valid when mode='resume'.")
@@ -572,21 +579,15 @@ class DfSubmitPipelineExecutor(
                 model_fingerprint = _model_fingerprint(llm_env)
                 runtime_fingerprint = self._runtime_fingerprint()
                 runtime_dir_name = "runtime-r1"
+                runtime_storage_dir = self._runtime_cache_dir(
+                    conversation, runtime_fingerprint
+                )
                 image_utils_api_version = IMAGE_UTILS_API_VERSION
+                should_stage_runtime = True
+                should_stage_script = True
                 if output_schema == "vision":
                     self._preflight_managed_image_pipeline(Path(script_path))
                 changed_dimensions = []
-                self._stage_runtime_files(
-                    output_dir,
-                    conversation,
-                    runtime_dir_name=runtime_dir_name,
-                )
-                self._stage_script(
-                    script_path,
-                    output_dir,
-                    conversation,
-                    frozen_script_name=frozen_script_name,
-                )
 
             command = _build_dataflow_command(
                 input_path=input_path,
@@ -597,6 +598,7 @@ class DfSubmitPipelineExecutor(
                 resumed=resumed,
                 execution_revision=execution_revision,
                 runtime_dir_name=runtime_dir_name,
+                runtime_storage_dir=runtime_storage_dir,
                 runtime_fingerprint=runtime_fingerprint,
                 image_utils_api_version=image_utils_api_version,
                 output_schema=output_schema,
@@ -626,6 +628,31 @@ class DfSubmitPipelineExecutor(
                 headers=self._headers,
                 timeout=self._timeout,
             )
+            node_available = self._node_capability_available(client)
+            if node_available is False:
+                return DfSubmitPipelineObservation.from_text(
+                    text=(
+                        f"Pyromind Studio does not expose required node "
+                        f"{DATAFLOW_NODE_TYPE}; no runtime or pipeline files "
+                        "were uploaded. Retry after the platform capability "
+                        "is available."
+                    ),
+                    status="Failed",
+                    failure_stage="capability_preflight",
+                    retryable=True,
+                    is_error=True,
+                )
+            if should_stage_runtime:
+                if runtime_storage_dir is None:
+                    raise ValueError("DataFlow runtime cache path is unavailable.")
+                self._stage_runtime_files(runtime_storage_dir, conversation)
+            if should_stage_script:
+                self._stage_script(
+                    script_path,
+                    output_dir,
+                    conversation,
+                    frozen_script_name=frozen_script_name,
+                )
             response = submit_workflow_task(
                 client=client,
                 workflow=workflow,
@@ -657,6 +684,7 @@ class DfSubmitPipelineExecutor(
             model_fingerprint=model_fingerprint,
             runtime_fingerprint=runtime_fingerprint,
             runtime_dir_name=runtime_dir_name,
+            runtime_storage_dir=runtime_storage_dir,
             image_utils_api_version=image_utils_api_version,
             resumed=resumed,
             reuse_assessment=(
@@ -693,20 +721,11 @@ class DfSubmitPipelineExecutor(
                 status=response.status,
             )
         )
-        conversation.send_agent_message(
-            f"已提交数据准备任务（task_id={task_id}, run_id={run_id}），"
-            "平台正在后台异步执行。任务完成或失败后我会在此通知你，"
-            "也可以随时让我查询进度。"
-        )
-
         return DfSubmitPipelineObservation.from_text(
             text=(
                 "DataFlow pipeline submitted. "
                 f"task_id={task_id}, run_id={run_id}, "
                 f"revision={execution_revision}, output_dir={output_dir}. "
-                "A submission confirmation message has already been sent "
-                "to the user, so do not repeat the submission details in "
-                "your reply. "
                 "While the job runs, call df_check_progress with this "
                 "output_dir to report live progress, ETA, and recent output "
                 "records. After the terminal callback, preview "
@@ -729,23 +748,23 @@ class DfSubmitPipelineExecutor(
 
     def _stage_runtime_files(
         self,
-        output_dir: str,
+        runtime_storage_dir: str,
         conversation: BaseConversation,
-        *,
-        runtime_dir_name: str,
     ) -> None:
         if self._runtime_dir is None:
             raise ValueError("DataFlow pipeline runtime_dir is not configured.")
         headers = self._resolved_storage_headers(conversation)
-        target_dir = str(PurePosixPath(output_dir) / runtime_dir_name)
+        existing_files = self._storage_file_names(runtime_storage_dir, headers)
         for filename in RUNTIME_FILENAMES:
             local_path = self._runtime_dir / filename
             if not local_path.is_file():
                 raise ValueError(f"DataFlow runtime file is missing: {local_path}")
+            if filename in existing_files:
+                continue
             try:
                 upload_local_file_to_pyromind(
                     local_path=local_path,
-                    target_dir=target_dir,
+                    target_dir=runtime_storage_dir,
                     storage_base_url=self._storage_base_url,
                     headers=headers,
                     timeout=float(self._timeout),
@@ -754,6 +773,64 @@ class DfSubmitPipelineExecutor(
                 raise ValueError(
                     f"Failed to stage DataFlow runtime {filename}: {exc}"
                 ) from exc
+
+    def _storage_file_names(
+        self,
+        storage_dir: str,
+        headers: dict[str, str],
+    ) -> set[str]:
+        """Best-effort cache lookup; upload remains the safe fallback."""
+        try:
+            response = httpx.post(
+                f"{self._storage_base_url}/file_list",
+                headers=headers,
+                json={"path": storage_dir, "search": ""},
+                timeout=float(self._timeout),
+            )
+        except httpx.RequestError:
+            return set()
+        payload = _decode_json_response(response, "Pyromind storage file_list API")
+        if isinstance(payload, str):
+            return set()
+        data = _extract_api_data("file_list", payload)
+        if isinstance(data, str) or not isinstance(data.get("list"), list):
+            return set()
+        names: set[str] = set()
+        for item in data["list"]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if isinstance(name, str) and name:
+                names.add(name)
+                continue
+            item_path = item.get("path")
+            if isinstance(item_path, str) and item_path:
+                names.add(PurePosixPath(item_path).name)
+        return names
+
+    def _runtime_cache_dir(
+        self,
+        conversation: BaseConversation,
+        runtime_fingerprint: str,
+    ) -> str:
+        return str(
+            PurePosixPath(PYROMIND_AGENT_STORAGE_ROOT)
+            / str(conversation.id)
+            / "data_preparation"
+            / "runtime-cache"
+            / runtime_fingerprint
+        )
+
+    @staticmethod
+    def _node_capability_available(client: Any) -> bool | None:
+        """Return None when the query itself is unavailable, preserving fallback."""
+        try:
+            nodes = client.studio.get_node_info(names=DATAFLOW_NODE_TYPE)
+        except Exception:
+            return None
+        if not isinstance(nodes, dict):
+            return None
+        return DATAFLOW_NODE_TYPE in nodes
 
     def _runtime_fingerprint(self) -> str:
         if self._runtime_dir is None:
@@ -900,6 +977,7 @@ def _build_dataflow_command(
     resumed: bool = False,
     execution_revision: int = 1,
     runtime_dir_name: str = "",
+    runtime_storage_dir: str | None = None,
     runtime_fingerprint: str | None = None,
     image_utils_api_version: str | None = None,
     output_schema: str | None = None,
@@ -908,15 +986,20 @@ def _build_dataflow_command(
     """Assemble the shell command executed inside the CustomCommandNode Pod."""
     pod_input = _pod_path(input_path)
     pod_output_dir = _pod_path(output_dir)
-    pod_runtime_dir = (
-        f"{pod_output_dir}/{runtime_dir_name}" if runtime_dir_name else pod_output_dir
-    )
+    if runtime_storage_dir:
+        pod_runtime_dir = _pod_path(runtime_storage_dir)
+    else:
+        pod_runtime_dir = (
+            f"{pod_output_dir}/{runtime_dir_name}"
+            if runtime_dir_name
+            else pod_output_dir
+        )
     frozen_script = f"{pod_output_dir}/{frozen_script_name}"
     output_file = f"{pod_output_dir}/processed.jsonl"
     venv_python = "/tmp/df-venv/bin/python"
     required_runtime_files = (
         RUNTIME_FILENAMES
-        if runtime_dir_name
+        if runtime_dir_name or runtime_storage_dir
         else tuple(name for name in RUNTIME_FILENAMES if name != "image_utils.py")
     )
 
@@ -1029,7 +1112,7 @@ def _build_dataflow_workflow(
                 "position": {"x": 0, "y": 0},
                 "data": {
                     "display_name": "DataFlow Pipeline",
-                    "nodeType": "CustomCommandCPUNode",
+                    "nodeType": DATAFLOW_NODE_TYPE,
                     "config": {
                         "command": command,
                         "cpu": action.cpu,

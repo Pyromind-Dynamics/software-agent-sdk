@@ -118,6 +118,25 @@ def test_build_dataflow_command_validates_dpo_schema() -> None:
     assert "--image-root" not in cmd
 
 
+def test_build_dataflow_command_uses_shared_runtime_cache() -> None:
+    cmd = _build_dataflow_command(
+        input_path="/data/input.jsonl",
+        output_dir="/output/run1",
+        llm_env={},
+        convert_format="none",
+        runtime_dir_name="runtime-r1",
+        runtime_storage_dir=(
+            "/.pyromind-agent/conv/data_preparation/runtime-cache/runtime-sha"
+        ),
+    )
+
+    assert (
+        "/target-workspace/.pyromind-agent/conv/data_preparation/"
+        "runtime-cache/runtime-sha/image_utils.py"
+    ) in cmd
+    assert "/target-workspace/output/run1/runtime-r1/image_utils.py" not in cmd
+
+
 # ---------------------------------------------------------------------------
 # _build_dataflow_workflow
 # ---------------------------------------------------------------------------
@@ -220,6 +239,7 @@ def test_task_store_roundtrip(tmp_path: Path) -> None:
         script_path="/scripts/p.py",
         runtime_fingerprint="runtime-sha",
         runtime_dir_name="runtime-r1",
+        runtime_storage_dir="/.pyromind-agent/conv-1/runtime-cache/runtime-sha",
         image_utils_api_version="1",
         status="Running",
     )
@@ -233,8 +253,11 @@ def test_task_store_roundtrip(tmp_path: Path) -> None:
     assert loaded.output_dir == "/out/run-1"
     assert loaded.runtime_fingerprint == "runtime-sha"
     assert loaded.runtime_dir_name == "runtime-r1"
+    assert loaded.runtime_storage_dir == (
+        "/.pyromind-agent/conv-1/runtime-cache/runtime-sha"
+    )
     assert loaded.image_utils_api_version == "1"
-    assert loaded.schema_version == 3
+    assert loaded.schema_version == 4
     assert loaded.status == "Running"
 
 
@@ -291,6 +314,7 @@ def test_task_association_reads_legacy_runtime_location() -> None:
     )
 
     assert loaded.runtime_dir_name == ""
+    assert loaded.runtime_storage_dir is None
     assert loaded.runtime_fingerprint is None
     assert loaded.image_utils_api_version is None
 
@@ -416,6 +440,52 @@ def test_executor_submit_failure_omits_progress_fields(
     assert "boom" in observation.text
 
 
+def test_executor_missing_node_fails_before_upload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executor = _make_executor(tmp_path)
+    script = tmp_path / "pipeline.py"
+    script.write_text("print('hi')")
+    conversation = _make_conversation_with_llm()
+    conversation.id = "conv-1"
+    conversation.workspace = MagicMock()
+    conversation.workspace.working_dir = str(tmp_path / "conversation")
+    stage_runtime = MagicMock()
+    stage_script = MagicMock()
+    monkeypatch.setattr(executor, "_stage_runtime_files", stage_runtime)
+    monkeypatch.setattr(executor, "_stage_script", stage_script)
+    client = MagicMock()
+    client.studio.get_node_info.return_value = {}
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.create_workflow_api_client",
+        lambda **kwargs: client,
+    )
+    submit = MagicMock()
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.submit_workflow_task",
+        submit,
+    )
+
+    observation = executor(
+        DfSubmitPipelineAction(
+            script_path=str(script),
+            input_path="/data/in.jsonl",
+            output_schema="text",
+        ),
+        conversation=conversation,
+    )
+
+    assert observation.is_error
+    assert observation.failure_stage == "capability_preflight"
+    assert observation.retryable is True
+    assert observation.run_id is None
+    stage_runtime.assert_not_called()
+    stage_script.assert_not_called()
+    submit.assert_not_called()
+    assert not list((tmp_path / "tasks").glob("*.json"))
+
+
 def test_stage_runtime_files_uses_revision_directory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -429,17 +499,40 @@ def test_stage_runtime_files_uses_revision_directory(
             (Path(local_path).name, target_dir)
         ),
     )
+    monkeypatch.setattr(executor, "_storage_file_names", lambda *args: set())
 
     executor._stage_runtime_files(
-        "/agentTest/data_preparation/run",
+        "/agentTest/data_preparation/runtime-cache/runtime-sha",
         _make_conversation_with_llm(),
-        runtime_dir_name="runtime-r2",
     )
 
     assert {name for name, _ in uploads} == set(RUNTIME_FILENAMES)
     assert {target for _, target in uploads} == {
-        "/agentTest/data_preparation/run/runtime-r2"
+        "/agentTest/data_preparation/runtime-cache/runtime-sha"
     }
+
+
+def test_stage_runtime_files_reuses_complete_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executor = _make_executor(tmp_path)
+    upload = MagicMock()
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit."
+        "upload_local_file_to_pyromind",
+        upload,
+    )
+    monkeypatch.setattr(
+        executor, "_storage_file_names", lambda *args: set(RUNTIME_FILENAMES)
+    )
+
+    executor._stage_runtime_files(
+        "/agentTest/data_preparation/runtime-cache/runtime-sha",
+        _make_conversation_with_llm(),
+    )
+
+    upload.assert_not_called()
 
 
 def _saved_prior_run(
@@ -613,8 +706,4 @@ def test_new_full_run_uses_conversation_scoped_output_root(
         "kind": "data_preparation",
         "status": "Pending",
     }
-    conversation.send_agent_message.assert_called_once()
-    notification = conversation.send_agent_message.call_args.args[0]
-    assert "task_id=task-new" in notification
-    assert "run_id=" in notification
-    assert "异步执行" in notification
+    conversation.send_agent_message.assert_not_called()

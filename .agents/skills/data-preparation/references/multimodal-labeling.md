@@ -34,6 +34,9 @@ Base64、重试或 Checkpoint。完整字段见
 - 每条记录优先读取 `user_prompt_key`；字段为空时才渲染
   `user_prompt_template`。两者都无法生成 Prompt 时失败。
 - `image_labels` 可省略；运行时生成 `Image 1`、`Image 2`。
+- 对已有人工标签的数据添加 CoT 时，必须通过 `reference_label_path` 和
+  `reference_label_map` 把标签交给共享运行时。默认保留人工标签；视觉证据直接且明确
+  矛盾时允许模型单轮纠正。不得在 Pipeline 脚本里手写标签覆盖或 JSON 解析逻辑。
 
 目录输入按直接子目录或直接图片划分样本，并生成冻结的
 `source_manifest.jsonl`；目录样本通常需要配置 `user_prompt_template`。
@@ -73,3 +76,6 @@ df_run_pipeline(model_profile="vision", output_schema="vision")
 ```
 
 `validate_prepared_data.py` 继续执行最终消息结构、图片路径、图片解码和标签校验。
+实际纠错写入 `label_corrections.jsonl`，并在
+`report.json.label_reconciliation` 汇总；`corrected > 0` 时向用户说明纠错数量、
+原标签、新标签及明细产物路径。

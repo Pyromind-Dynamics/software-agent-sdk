@@ -919,6 +919,147 @@ def test_image_utils_multi_image_prompt_retry_and_output_order(
     assert set(rows[0]) == {"messages"}
 
 
+def test_image_utils_accepts_json_fence_and_logs_invalid_response_preview(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_utils = _load_image_utils()
+    _write_image(tmp_path / "one.jpg", (1, 2, 3))
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        json.dumps({"id": "one", "images": ["one.jpg"], "user_prompt": "Inspect."})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    class FakeServing:
+        calls = 0
+
+        def generate_from_input_multi_images(self, *args, **kwargs):
+            del args
+            self.calls += 1
+            assert kwargs["json_schema"]["required"] == ["reasoning", "answer"]
+            if self.calls == 1:
+                return ["not-json sk-secret"]
+            return ['```json\n{"reasoning":"ok","answer":"A"}\n```']
+
+        def cleanup(self):
+            return None
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("DF_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("DF_RESUME", "0")
+    monkeypatch.setenv("DF_API_KEY", "sk-secret")
+    monkeypatch.setattr(
+        image_utils, "_create_vlm_serving", lambda config: FakeServing()
+    )
+    config = image_utils.ImagePipelineConfig(
+        labeling_system_prompt="Label.",
+        training_system_prompt="Train.",
+        max_attempts=2,
+    )
+
+    output = tmp_path / "processed.jsonl"
+    image_utils.run_image_pipeline(config, str(manifest), str(output))
+
+    row = json.loads(output.read_text(encoding="utf-8"))
+    assert row["messages"][2]["content"][0]["value"].endswith("<answer>A</answer>")
+    calls = [
+        json.loads(line)
+        for line in (state_dir / "llm_calls.jsonl").read_text().splitlines()
+    ]
+    assert calls[0]["status"] == "invalid_output"
+    assert calls[0]["parse_mode"] == "raw_json"
+    assert calls[0]["response_preview"]["head"] == "not-json <redacted>"
+    assert "response_preview" not in calls[1]
+    assert calls[1]["parse_mode"] == "markdown_json_fence"
+
+
+def test_image_utils_reconciles_sidecar_human_labels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_utils = _load_image_utils()
+    for name, label in (("keep", "skip"), ("correct", "true")):
+        sample = tmp_path / name
+        sample.mkdir()
+        _write_image(sample / "image.jpg", (1, 2, 3))
+        (sample / "meta.json").write_text(
+            json.dumps({"label": label, "note": f"human-{name}"}),
+            encoding="utf-8",
+        )
+
+    class FakeServing:
+        def generate_from_input_multi_images(self, *args, **kwargs):
+            del args
+            schema = kwargs["json_schema"]
+            assert "label_review" in schema["properties"]
+            prompts = kwargs["user_prompts"]
+            assert "Human label" in prompts[0]
+            return [
+                json.dumps(
+                    {
+                        "reasoning": "obvious mismatch",
+                        "answer": "机台误报",
+                        "label_review": {
+                            "decision": "correct",
+                            "correction_reason": "人工标签与可见形态直接矛盾",
+                            "visual_evidence": ["检出图与参考图的目标区域形态一致"],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "reasoning": "matches",
+                        "answer": "机台误报",
+                        "label_review": {
+                            "decision": "keep",
+                            "correction_reason": "",
+                            "visual_evidence": [],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+
+        def cleanup(self):
+            return None
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("DF_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("DF_RESUME", "0")
+    monkeypatch.setattr(
+        image_utils, "_create_vlm_serving", lambda config: FakeServing()
+    )
+    config = image_utils.ImagePipelineConfig(
+        labeling_system_prompt="Label.",
+        training_system_prompt="Train.",
+        user_prompt_template="Inspect.",
+        metadata_filename="meta.json",
+        reference_label_path="metadata.label",
+        reference_note_path="metadata.note",
+        reference_label_map={"skip": "机台误报", "true": "真实缺陷"},
+        allow_reference_correction=True,
+        batch_size=2,
+    )
+
+    output = tmp_path / "processed.jsonl"
+    image_utils.run_image_pipeline(config, str(tmp_path), str(output))
+
+    calls = [
+        json.loads(line)
+        for line in (state_dir / "llm_calls.jsonl").read_text().splitlines()
+    ]
+    decisions = [call["label_reconciliation"]["decision"] for call in calls]
+    assert decisions == ["correct", "keep"]
+    corrected = calls[0]["label_reconciliation"]
+    assert corrected["original_label"] == "真实缺陷"
+    assert corrected["final_label"] == "机台误报"
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert all(set(row) == {"messages"} for row in rows)
+
+
 def test_image_utils_dataflow_checkpoint_resume_without_duplicates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

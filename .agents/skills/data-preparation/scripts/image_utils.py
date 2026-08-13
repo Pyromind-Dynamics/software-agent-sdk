@@ -43,7 +43,7 @@ except ImportError:  # DataFlow normally installs it transitively.
 
 
 SUPPORTED_DATAFLOW_VERSION = "1.0.10"
-IMAGE_UTILS_API_VERSION = "1"
+IMAGE_UTILS_API_VERSION = "2"
 NATIVE_VLM_SUFFIXES = {".jpg", ".jpeg", ".png"}
 CONVERTIBLE_VLM_SUFFIXES = {".gif", ".webp", ".bmp"}
 IMAGE_SUFFIXES = NATIVE_VLM_SUFFIXES | CONVERTIBLE_VLM_SUFFIXES
@@ -86,6 +86,11 @@ class ImagePipelineConfig:
     reasoning_key: str = "reasoning"
     answer_key: str = "answer"
     answer_is_json: bool = False
+    metadata_filename: str | None = None
+    reference_label_path: str | None = None
+    reference_note_path: str | None = None
+    reference_label_map: dict[str, str] = field(default_factory=dict)
+    allow_reference_correction: bool = False
     batch_size: int = 8
     max_attempts: int = 3
     max_workers: int = 8
@@ -114,9 +119,47 @@ class ImagePipelineConfig:
                 _Draft202012Validator.check_schema(self.response_json_schema)
             except Exception as exc:
                 raise ValueError(f"response_json_schema is invalid: {exc}") from exc
+        if self.metadata_filename is not None:
+            filename = PurePosixPath(self.metadata_filename)
+            if (
+                not self.metadata_filename.strip()
+                or filename.is_absolute()
+                or len(filename.parts) != 1
+                or filename.name != self.metadata_filename
+            ):
+                raise ValueError("metadata_filename must be a plain file name")
+        if self.allow_reference_correction:
+            if not self.reference_label_path:
+                raise ValueError(
+                    "reference_label_path is required when reference correction "
+                    "is enabled"
+                )
+            if not self.reference_label_map:
+                raise ValueError(
+                    "reference_label_map is required when reference correction "
+                    "is enabled"
+                )
+        for name in ("reference_label_path", "reference_note_path"):
+            value = getattr(self, name)
+            if value is not None and not _valid_dotted_path(value):
+                raise ValueError(f"{name} must be a dotted field path")
+        if any(
+            not isinstance(key, str)
+            or not key.strip()
+            or not isinstance(value, str)
+            or not value.strip()
+            for key, value in self.reference_label_map.items()
+        ):
+            raise ValueError(
+                "reference_label_map must contain non-empty string keys and values"
+            )
         for name in ("batch_size", "max_attempts", "max_workers", "timeout"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be greater than zero")
+
+
+def _valid_dotted_path(value: str) -> bool:
+    return bool(value.strip()) and all(part.strip() for part in value.split("."))
 
 
 class ManagedStreamBatchedFileStorage(StreamBatchedFileStorage):
@@ -303,6 +346,7 @@ class MultiImageSemanticLabelOperator(OperatorABC):
                     system_prompt="",
                     user_prompts=[prompts[index] for index in request_indices],
                     timeout=self.config.timeout,
+                    json_schema=_effective_response_schema(self.config),
                 )
                 if len(raw_responses) != len(request_indices):
                     raise ValueError(
@@ -331,7 +375,11 @@ class MultiImageSemanticLabelOperator(OperatorABC):
                 strict=True,
             ):
                 try:
-                    parsed = _validate_response(raw_response, self.config)
+                    parsed, parse_mode = _validate_response(
+                        raw_response,
+                        self.config,
+                        samples[index],
+                    )
                 except (TypeError, ValueError, json.JSONDecodeError) as exc:
                     error = _safe_error(exc)
                     last_errors[index] = error
@@ -347,6 +395,8 @@ class MultiImageSemanticLabelOperator(OperatorABC):
                         attempt=attempt,
                         status="invalid_output",
                         error=error,
+                        raw_response=raw_response,
+                        parse_mode=_response_parse_mode(raw_response),
                     )
                     continue
                 results[index] = parsed
@@ -355,6 +405,12 @@ class MultiImageSemanticLabelOperator(OperatorABC):
                     samples[index],
                     attempt=attempt,
                     status="success",
+                    parse_mode=parse_mode,
+                    reconciliation=_reconciliation_log_record(
+                        samples[index],
+                        parsed,
+                        self.config,
+                    ),
                 )
             if not pending:
                 return [value for value in results if value is not None]
@@ -397,6 +453,7 @@ def run_image_pipeline(
                 raise ValueError("cannot resume: source_manifest.jsonl is missing")
             _refresh_resume_metadata(state_dir, manifest, config)
         else:
+            _reset_run_audit(state_dir)
             records, image_root = _load_source_records(source, config, limit)
             _write_jsonl_atomic(manifest, records)
             _write_runtime_metadata(
@@ -472,6 +529,18 @@ def run_image_pipeline(
                 serving.cleanup()
             except Exception:
                 pass
+
+
+def _reset_run_audit(state_dir: Path) -> None:
+    for filename in (
+        "llm_calls.jsonl",
+        "label_corrections.jsonl",
+        "report.json",
+        "failure.json",
+        "validation.json",
+        "progress.json",
+    ):
+        (state_dir / filename).unlink(missing_ok=True)
 
 
 def run_image_pipeline_from_cli(config: ImagePipelineConfig) -> None:
@@ -596,10 +665,95 @@ def _discover_directory(path: Path, limit: int | None) -> list[dict[str, Any]]:
             continue
         if not images:
             continue
-        records.append({"id": entry.relative_to(path).as_posix(), "images": images})
+        source_path = entry.relative_to(path).as_posix()
+        records.append(
+            {"id": source_path, "source_path": source_path, "images": images}
+        )
         if limit is not None and len(records) >= limit:
             break
     return records
+
+
+def _load_record_metadata(
+    record: dict[str, Any],
+    *,
+    image_root: Path,
+    raw_images: list[Any],
+    config: ImagePipelineConfig,
+) -> dict[str, Any]:
+    embedded = record.get("metadata")
+    if embedded is not None and not isinstance(embedded, dict):
+        raise ValueError("metadata must be an object")
+    merged: dict[str, Any] = {}
+    if config.metadata_filename:
+        candidates: list[PurePosixPath] = []
+        raw_files = record.get("files")
+        if isinstance(raw_files, list):
+            candidates.extend(
+                PurePosixPath(item)
+                for item in raw_files
+                if isinstance(item, str)
+                and PurePosixPath(item).name == config.metadata_filename
+            )
+        if not candidates:
+            parents = {
+                PurePosixPath(item).parent
+                for item in raw_images
+                if isinstance(item, str) and item.strip()
+            }
+            if len(parents) == 1:
+                candidates.append(next(iter(parents)) / config.metadata_filename)
+        unique_candidates = list(dict.fromkeys(candidates))
+        if len(unique_candidates) > 1:
+            raise ValueError(
+                f"multiple {config.metadata_filename} files match one image sample"
+            )
+        if unique_candidates:
+            relative = unique_candidates[0]
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(
+                    "metadata sidecar path must remain inside the input root"
+                )
+            local = (image_root / Path(*relative.parts)).resolve()
+            try:
+                local.relative_to(image_root.resolve())
+            except ValueError as exc:
+                raise ValueError("metadata sidecar escapes the input root") from exc
+            if not local.is_file():
+                raise ValueError(f"missing metadata sidecar {relative.as_posix()}")
+            try:
+                sidecar = json.loads(local.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"invalid metadata sidecar {relative.as_posix()}: {exc}"
+                ) from exc
+            if not isinstance(sidecar, dict):
+                raise ValueError("metadata sidecar must contain a JSON object")
+            merged.update(sidecar)
+        elif embedded is None:
+            raise ValueError(
+                f"metadata sidecar {config.metadata_filename} was not found"
+            )
+    if isinstance(embedded, dict):
+        merged.update(copy.deepcopy(embedded))
+    return merged
+
+
+def _get_dotted_value(record: dict[str, Any], path: str) -> Any:
+    value: Any = record
+    for part in path.split("."):
+        if not isinstance(value, dict) or part not in value:
+            raise ValueError(f"missing configured reference field {path}")
+        value = value[part]
+    return value
+
+
+def _reference_map_key(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    return str(value).strip()
 
 
 def _normalize_source_record(
@@ -653,6 +807,33 @@ def _normalize_source_record(
 
     normalized["id"] = str(record_id).strip()
     normalized["images"] = output_images
+    metadata = _load_record_metadata(
+        record,
+        image_root=image_root,
+        raw_images=raw_images,
+        config=config,
+    )
+    if metadata:
+        normalized["metadata"] = metadata
+    if config.reference_label_path:
+        raw_reference_label = _get_dotted_value(
+            normalized,
+            config.reference_label_path,
+        )
+        reference_key = _reference_map_key(raw_reference_label)
+        reference_label = config.reference_label_map.get(reference_key)
+        if not reference_label:
+            raise ValueError(
+                "reference label is not mapped: "
+                f"{config.reference_label_path}={reference_key!r}"
+            )
+        normalized["_reference_label_raw"] = raw_reference_label
+        normalized["_reference_label"] = reference_label.strip()
+    if config.reference_note_path:
+        raw_note = _get_dotted_value(normalized, config.reference_note_path)
+        normalized["_reference_note"] = (
+            raw_note.strip() if isinstance(raw_note, str) else str(raw_note)
+        )
     normalized["_local_images"] = local_images
     normalized["_source_index"] = source_index
     normalized["_source_path"] = str(record.get("source_path") or "")
@@ -690,10 +871,31 @@ def _prepare_sample(
         candidate = sample.get(config.sample_system_prompt_key)
         if isinstance(candidate, str) and candidate.strip():
             sample_system_prompt = candidate.strip()
+    reconciliation_prompt = ""
+    if config.allow_reference_correction:
+        reference_label = _stringify(
+            sample.get("_reference_label"),
+            "reference label",
+        )
+        reference_note = str(sample.get("_reference_note") or "").strip()
+        reconciliation_prompt = (
+            "\n\nHuman-label reconciliation protocol:\n"
+            f"- Human label: {json.dumps(reference_label, ensure_ascii=False)}\n"
+            f"- Human note: {json.dumps(reference_note, ensure_ascii=False)}\n"
+            "- Treat the human label as authoritative by default. Use decision=keep "
+            "and return that exact label unless the visible image evidence directly "
+            "and clearly contradicts it.\n"
+            "- Use decision=correct only for an obvious annotation error. Then return "
+            "a different configured label, a non-empty correction_reason, and one or "
+            "more concrete visual_evidence strings.\n"
+            "- For decision=keep, correction_reason and visual_evidence must be empty."
+        )
     sample["_local_images"] = local_images
     sample["_image_labels"] = labels
     sample["_user_prompt"] = user_prompt
-    sample["_model_prompt"] = f"{sample_system_prompt}\n\n{user_prompt}".strip()
+    sample["_model_prompt"] = (
+        f"{sample_system_prompt}\n\n{user_prompt}{reconciliation_prompt}"
+    ).strip()
     sample["images"] = output_images
     return sample
 
@@ -748,21 +950,120 @@ def _prepare_vlm_image(path: Path, state_dir: Path) -> Path:
     return target
 
 
+def _effective_response_schema(config: ImagePipelineConfig) -> dict[str, Any]:
+    schema = copy.deepcopy(config.response_json_schema)
+    if not config.allow_reference_correction:
+        return schema
+    properties = schema.setdefault("properties", {})
+    required = schema.setdefault("required", [])
+    properties["label_review"] = {
+        "type": "object",
+        "properties": {
+            "decision": {"type": "string", "enum": ["keep", "correct"]},
+            "correction_reason": {"type": "string"},
+            "visual_evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["decision", "correction_reason", "visual_evidence"],
+        "additionalProperties": False,
+    }
+    if "label_review" not in required:
+        required.append("label_review")
+    return schema
+
+
+def _unwrap_json_response(raw_response: str) -> tuple[str, str]:
+    stripped = raw_response.strip()
+    if not stripped.startswith("```"):
+        return stripped, "raw_json"
+    lines = stripped.splitlines()
+    if len(lines) < 3 or lines[-1].strip() != "```":
+        raise ValueError("VLM response contains an incomplete Markdown code fence")
+    opening = lines[0].strip().lower()
+    if opening not in {"```", "```json"}:
+        raise ValueError("VLM response code fence must be untyped or tagged json")
+    inner = "\n".join(lines[1:-1]).strip()
+    if "```" in inner:
+        raise ValueError("VLM response must contain exactly one Markdown code fence")
+    if not inner:
+        raise ValueError("VLM response Markdown code fence is empty")
+    return inner, "markdown_json_fence"
+
+
+def _response_parse_mode(raw_response: Any) -> str:
+    if not isinstance(raw_response, str):
+        return "non_string"
+    stripped = raw_response.strip()
+    if stripped.startswith("```"):
+        return "markdown_code_fence"
+    return "raw_json"
+
+
 def _validate_response(
     raw_response: Any,
     config: ImagePipelineConfig,
-) -> dict[str, Any]:
+    sample: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str]:
     if not isinstance(raw_response, str) or not raw_response.strip():
         raise ValueError("VLM response must be a non-empty string")
-    value = json.loads(raw_response)
+    payload, parse_mode = _unwrap_json_response(raw_response)
+    value = json.loads(payload)
     if not isinstance(value, dict):
         raise ValueError("VLM response must be a JSON object")
-    _validate_json_schema(value, config.response_json_schema)
+    _validate_json_schema(value, _effective_response_schema(config))
     _stringify(value.get(config.reasoning_key), config.reasoning_key)
     answer = _stringify(value.get(config.answer_key), config.answer_key)
     if config.answer_is_json:
         json.loads(answer)
-    return value
+    if config.allow_reference_correction:
+        if sample is None:
+            raise ValueError("reference correction requires the prepared source sample")
+        _validate_label_reconciliation(sample, value, config)
+    return value, parse_mode
+
+
+def _validate_label_reconciliation(
+    sample: dict[str, Any],
+    response: dict[str, Any],
+    config: ImagePipelineConfig,
+) -> None:
+    reference_label = _stringify(sample.get("_reference_label"), "reference label")
+    answer = _stringify(response.get(config.answer_key), config.answer_key)
+    review = response.get("label_review")
+    if not isinstance(review, dict):
+        raise ValueError("label_review must be an object")
+    decision = review.get("decision")
+    reason = review.get("correction_reason")
+    evidence = review.get("visual_evidence")
+    if not isinstance(reason, str):
+        raise ValueError("label_review.correction_reason must be a string")
+    if not isinstance(evidence, list) or any(
+        not isinstance(item, str) or not item.strip() for item in evidence
+    ):
+        raise ValueError("label_review.visual_evidence must contain non-empty strings")
+    configured_labels = set(config.reference_label_map.values())
+    if answer not in configured_labels:
+        raise ValueError("answer must be one of the configured reference labels")
+    if decision == "keep":
+        if answer != reference_label:
+            raise ValueError(
+                "label_review keep requires answer to equal the human label"
+            )
+        if reason.strip():
+            raise ValueError("label_review keep must use an empty correction_reason")
+        if evidence:
+            raise ValueError("label_review keep must use an empty visual_evidence list")
+        return
+    if decision != "correct":
+        raise ValueError("label_review.decision must be keep or correct")
+    if answer == reference_label:
+        raise ValueError("label_review correct requires a changed answer")
+    if not reason.strip():
+        raise ValueError("label correction requires a non-empty correction_reason")
+    if not evidence:
+        raise ValueError("label correction requires concrete visual_evidence")
 
 
 def _validate_json_schema(value: Any, schema: dict[str, Any]) -> None:
@@ -946,6 +1247,9 @@ def _log_attempt(
     attempt: int,
     status: str,
     error: str | None = None,
+    raw_response: Any = None,
+    parse_mode: str | None = None,
+    reconciliation: dict[str, Any] | None = None,
 ) -> None:
     path = state_dir / "llm_calls.jsonl"
     record = {
@@ -962,8 +1266,61 @@ def _log_attempt(
         },
         "error": error,
     }
+    if parse_mode:
+        record["parse_mode"] = parse_mode
+    if reconciliation is not None:
+        record["label_reconciliation"] = reconciliation
+    if status == "invalid_output" and isinstance(raw_response, str):
+        record["response_preview"] = _response_preview(raw_response)
     with path.open("a", encoding="utf-8") as target:
         target.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _reconciliation_log_record(
+    sample: dict[str, Any],
+    response: dict[str, Any],
+    config: ImagePipelineConfig,
+) -> dict[str, Any] | None:
+    if not config.allow_reference_correction:
+        return None
+    review = response["label_review"]
+    return {
+        "source_index": sample.get("_source_index"),
+        "source_id": sample.get("id"),
+        "source_path": sample.get("_source_path"),
+        "original_label": sample.get("_reference_label"),
+        "original_label_raw": sample.get("_reference_label_raw"),
+        "final_label": response.get(config.answer_key),
+        "human_note": sample.get("_reference_note"),
+        "decision": review.get("decision"),
+        "correction_reason": review.get("correction_reason"),
+        "visual_evidence": review.get("visual_evidence"),
+    }
+
+
+def _redact_text(value: str) -> str:
+    api_key = os.environ.get("DF_API_KEY")
+    if api_key:
+        value = value.replace(api_key, "<redacted>")
+    return value
+
+
+def _response_preview(value: str) -> dict[str, Any]:
+    redacted = _redact_text(value)
+    preview_chars = 2000
+    if len(redacted) <= preview_chars * 2:
+        return {
+            "head": redacted,
+            "tail": "",
+            "raw_chars": len(value),
+            "truncated": False,
+        }
+    return {
+        "head": redacted[:preview_chars],
+        "tail": redacted[-preview_chars:],
+        "raw_chars": len(value),
+        "truncated": True,
+    }
 
 
 def _write_failure(
@@ -989,11 +1346,7 @@ def _write_failure(
 
 
 def _safe_error(error: BaseException | str) -> str:
-    value = str(error)
-    api_key = os.environ.get("DF_API_KEY")
-    if api_key:
-        value = value.replace(api_key, "<redacted>")
-    return value[:2000]
+    return _redact_text(str(error))[:2000]
 
 
 def _write_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> None:
