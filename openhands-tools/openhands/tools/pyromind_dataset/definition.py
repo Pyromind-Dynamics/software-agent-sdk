@@ -322,9 +322,10 @@ automatically stripped of that prefix and the remainder is resolved as a
 user storage relative path (e.g. '/workspace/proto.zip' -> 'proto.zip').
 
 Archive files (zip, tar, tar.gz, tgz) cannot be previewed directly; the tool
-reports that and you should call `extract_archive` to unpack them into a new
-folder next to the archive (an existing folder with the same name is never
-overwritten), then call this tool again on the extracted files.
+detects this automatically and submits an extraction task through the same
+platform workflow path as ``extract_archive``. When the extraction completes,
+call ``preview_dataset`` again on the returned ``output_dir`` path to inspect
+the extracted files.
 
 The tool automatically determines the source:
 - If the path matches a known shared dataset (exact or prefix), it uses the
@@ -377,6 +378,7 @@ class PreviewDatasetExecutor(
         secret_headers: dict[str, str] | None = None,
         timeout: float = 30.0,
         max_preview_bytes: int = _DEFAULT_PREVIEW_BYTES,
+        extract_params: dict[str, Any] | None = None,
     ) -> None:
         base_url = storage_base_url or _default_storage_base_url()
         self._storage_base_url = base_url.rstrip("/")
@@ -387,6 +389,7 @@ class PreviewDatasetExecutor(
         self._secret_headers = dict(secret_headers or {})
         self._timeout = timeout
         self._max_preview_bytes = min(max_preview_bytes, _MAX_PREVIEW_BYTES)
+        self._extract_params = extract_params or {}
 
     def __call__(
         self,
@@ -419,6 +422,20 @@ class PreviewDatasetExecutor(
             return shared_result
 
         # Fall back to user storage
+        # Suffix-based archive check: metadata + actual extraction happens
+        # inside _handle_archive_storage, so a minimal suffix match is
+        # sufficient here -- content-type false negatives are rare.
+        if _is_archive_suffix(dataset_path):
+            files: list[str] = [dataset_path]
+            metadata: dict[str, Any] = {}
+            return self._handle_archive_storage(
+                archive_path=dataset_path,
+                dataset_path=dataset_path,
+                files=files,
+                metadata=metadata,
+                conversation=conversation,
+            )
+
         return self._storage_preview(
             dataset_path,
             action.n,
@@ -1136,19 +1153,6 @@ class PreviewDatasetExecutor(
         if not files:
             files = [preview_path]
 
-        archive_hint = _archive_extract_hint(
-            preview_path, str(metadata.get("content_type") or "")
-        )
-        if archive_hint:
-            return PreviewDatasetObservation.from_text(
-                text=archive_hint,
-                dataset_path=dataset_path,
-                files=files,
-                preview_file_path=preview_path,
-                source="storage",
-                **_metadata_observation_fields(metadata),
-            )
-
         size = _optional_int(metadata.get("size"))
         content_type = str(metadata.get("content_type") or "")
         if _is_image_path(preview_path) or content_type.lower().startswith("image/"):
@@ -1212,6 +1216,62 @@ class PreviewDatasetExecutor(
             previewed_rows=parsed["previewed_rows"],
             preview_truncated=preview_truncated,
             preview_error=parsed["preview_error"],
+            source="storage",
+            **_metadata_observation_fields(metadata),
+        )
+
+    def _handle_archive_storage(
+        self,
+        *,
+        archive_path: str,
+        dataset_path: str,
+        files: list[str],
+        metadata: dict[str, Any],
+        conversation: BaseConversation | None,
+    ) -> PreviewDatasetObservation:
+        """Submit an archive extraction task and return a preview observation.
+
+        Called when the previewed storage file is a compressed archive (zip,
+        tar, tar.gz, tgz).  Submits the extraction through the same platform
+        workflow path as the standalone ``extract_archive`` tool, then returns
+        an observation with the task_id and output_dir so the agent can follow
+        up after the callback fires.
+        """
+        # Lazy import to avoid circular dependency (pyromind_archive imports us).
+        from openhands.tools.pyromind_archive.definition import (  # noqa: PLC0415
+            ExtractArchiveAction,
+            ExtractArchiveExecutor,
+        )
+
+        extract_executor = ExtractArchiveExecutor(**self._extract_params)
+        extract_action = ExtractArchiveAction(archive_path=archive_path)
+        extract_result = extract_executor(extract_action, conversation)
+
+        if extract_result.is_error:
+            return PreviewDatasetObservation.from_text(
+                text=f"Archive extraction submission failed: {extract_result.text}",
+                is_error=True,
+                dataset_path=dataset_path,
+                files=files,
+                preview_file_path=archive_path,
+                source="storage",
+                **_metadata_observation_fields(metadata),
+            )
+
+        output_dir = extract_result.output_dir or ""
+        task_id = extract_result.task_id or ""
+        text = (
+            f"'{archive_path}' is a compressed archive. "
+            f"Extraction task submitted (task_id={task_id}, "
+            f"output_dir={output_dir}). "
+            "When the extraction completes, call `preview_dataset` with the "
+            "output_dir path to inspect the extracted files."
+        )
+        return PreviewDatasetObservation.from_text(
+            text=text,
+            dataset_path=dataset_path,
+            files=files,
+            preview_file_path=archive_path,
             source="storage",
             **_metadata_observation_fields(metadata),
         )
@@ -1663,6 +1723,10 @@ class PreviewDatasetTool(
         secret_headers = params.pop("secret_headers", None)
         timeout = float(params.pop("timeout", 30.0))
         max_preview_bytes = int(params.pop("max_preview_bytes", _DEFAULT_PREVIEW_BYTES))
+        extract_params_raw = params.pop("extract_params", None)
+        if extract_params_raw is not None and not isinstance(extract_params_raw, dict):
+            raise ValueError("extract_params must be a dict when provided")
+        extract_params: dict[str, Any] | None = extract_params_raw
         if params:
             names = ", ".join(sorted(params))
             raise ValueError(f"PreviewDatasetTool got unknown params: {names}")
@@ -1684,6 +1748,7 @@ class PreviewDatasetTool(
                     secret_headers=_normalize_headers(secret_headers),
                     timeout=timeout,
                     max_preview_bytes=max_preview_bytes,
+                    extract_params=extract_params,
                 ),
                 annotations=ToolAnnotations(
                     title="preview_dataset",
@@ -2156,6 +2221,16 @@ def _strip_workspace_prefix(path: str) -> str:
     if path.startswith(_WORKSPACE_PATH_PREFIX):
         return path[len(_WORKSPACE_PATH_PREFIX) :]
     return path
+
+
+def _is_archive_suffix(path: str) -> bool:
+    """Check whether *path* looks like an archive by its file suffix."""
+    lower = path.lower()
+    return (
+        lower.endswith(".tar.gz")
+        or lower.endswith(".tgz")
+        or PurePosixPath(lower).suffix in _ARCHIVE_SUFFIXES
+    )
 
 
 def _archive_extract_hint(file_path: str, content_type: str) -> str | None:
