@@ -67,13 +67,13 @@ def test_openai_compatible_model_name() -> None:
     )
 
 
-def _conversation_with_llm() -> Any:
+def _conversation_with_llm(base_url: str | None = "https://example.com/v1/") -> Any:
     llm = type(
         "FakeLlm",
         (),
         {
             "api_key": SecretStr("secret"),
-            "base_url": "https://example.com/v1/",
+            "base_url": base_url,
             "model": "openai/vision-model",
         },
     )()
@@ -98,10 +98,11 @@ def test_build_dataflow_env_vision_falls_back_to_defaults(
         "DF_API_URL",
         "DF_API_BASE_URL",
         "DF_MODEL_NAME",
+        "LLM_BASE_URL",
     ):
         monkeypatch.delenv(name, raising=False)
 
-    env = build_dataflow_env(_conversation_with_llm())
+    env = build_dataflow_env(_conversation_with_llm(base_url=None))
 
     assert env == {
         "DF_API_KEY": "secret",
@@ -176,6 +177,38 @@ def test_build_dataflow_env_rejects_mismatched_urls(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="do not describe the same endpoint"):
         build_dataflow_env(_conversation_with_llm())
+
+
+def test_build_dataflow_env_vision_falls_back_to_llm_base_url(monkeypatch) -> None:
+    monkeypatch.setenv("DF_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.delenv("DF_API_BASE_URL", raising=False)
+    monkeypatch.delenv("DF_API_URL", raising=False)
+    monkeypatch.delenv("DF_MODEL_NAME", raising=False)
+
+    env = build_dataflow_env(_conversation_with_llm())
+
+    assert env["DF_API_BASE_URL"] == "https://openrouter.ai/api/v1"
+    assert env["DF_API_URL"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert env["DF_MODEL_NAME"] == DEFAULT_DATAFLOW_MODEL_NAME
+    assert env["DF_API_KEY"] == "openrouter-secret"
+
+
+def test_build_dataflow_env_vision_falls_back_to_conversation_llm(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("DF_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("DF_API_BASE_URL", raising=False)
+    monkeypatch.delenv("DF_API_URL", raising=False)
+    monkeypatch.delenv("DF_MODEL_NAME", raising=False)
+
+    env = build_dataflow_env(_conversation_with_llm())
+
+    assert env["DF_API_BASE_URL"] == "https://example.com/v1"
+    assert env["DF_API_URL"] == "https://example.com/v1/chat/completions"
+    assert env["DF_MODEL_NAME"] == DEFAULT_DATAFLOW_MODEL_NAME
+    assert env["DF_API_KEY"] == "secret"
 
 
 def test_run_dataflow_python_redacts_api_key(tmp_path: Path) -> None:

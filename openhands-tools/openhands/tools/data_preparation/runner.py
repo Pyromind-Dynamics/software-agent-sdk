@@ -26,6 +26,7 @@ from openhands.tools.utils.dataflow_config import (
     ENV_DF_API_KEY,
     ENV_DF_API_URL,
     ENV_DF_MODEL_NAME,
+    ENV_LLM_BASE_URL,
 )
 
 
@@ -270,8 +271,9 @@ def build_dataflow_env(
 
     Process-wide ``DF_*`` values configure the vision model without changing
     the conversation's main coding model. Text always uses the conversation
-    model. Missing vision values fall back to the DataFlow defaults, with the
-    conversation model as a final fallback.
+    model. Missing vision values fall back to ``LLM_BASE_URL``, then the
+    conversation LLM, then the DataFlow defaults (mirroring
+    ``_vision_api_config`` so preview and pipeline runs share one endpoint).
 
     Raises:
         ValueError: If the resolved configuration is incomplete or inconsistent.
@@ -287,15 +289,11 @@ def build_dataflow_env(
     fallback_base_url = (llm.base_url or DEFAULT_DATAFLOW_API_BASE_URL).rstrip("/")
     if model_profile == "vision":
         api_key = _nonempty_env(ENV_DF_API_KEY) or llm_api_key
-        model_name = (
-            _nonempty_env(ENV_DF_MODEL_NAME)
-            or DEFAULT_DATAFLOW_MODEL_NAME
-            or openai_compatible_model_name(str(llm.model))
-        )
+        model_name = _nonempty_env(ENV_DF_MODEL_NAME) or DEFAULT_DATAFLOW_MODEL_NAME
         base_url, api_url = _resolve_dataflow_urls(
             _nonempty_env(ENV_DF_API_BASE_URL),
             _nonempty_env(ENV_DF_API_URL),
-            DEFAULT_DATAFLOW_API_BASE_URL or fallback_base_url,
+            _nonempty_env(ENV_LLM_BASE_URL) or fallback_base_url,
         )
     else:
         api_key = llm_api_key

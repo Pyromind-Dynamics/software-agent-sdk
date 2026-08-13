@@ -50,7 +50,7 @@ PYROMIND_STORAGE_AUTH_COOKIE_SECRET = "PYROMIND_STORAGE_AUTH_COOKIE"
 PYROMIND_STORAGE_HEADERS_STATE_KEY = "pyromind_storage_headers"
 PYROMIND_AGENT_STORAGE_ROOT = "/.pyromind-agent"
 
-_WORKSPACE_PATH_PREFIX = "/workspace/"
+_WORKSPACE_PATH_PREFIXES = ("/workspace/", "workspace/")
 _ARCHIVE_SUFFIXES = {".zip", ".tar", ".tar.gz", ".tgz"}
 _ARCHIVE_CONTENT_TYPE_HINTS = ("zip", "tar", "gzip", "x-compress", "x-tar")
 
@@ -135,9 +135,10 @@ class PreviewDatasetAction(Action):
             "(e.g. 'openai/gsm8k'), a shared dataset with file path "
             "(e.g. 'openai/gsm8k/data/train.jsonl'), or a user storage "
             "relative path (e.g. 'datasets/my_data/' or "
-            "'datasets/my_data/train.jsonl'). A leading '/workspace/' prefix "
-            "(platform workspace path) is stripped automatically and the "
-            "remainder is treated as a user storage relative path."
+            "'datasets/my_data/train.jsonl'). A leading '/workspace/' or "
+            "'workspace/' prefix (platform workspace path) is stripped "
+            "automatically and the remainder is treated as a user storage "
+            "relative path."
         ),
     )
     n: int = Field(
@@ -317,9 +318,10 @@ This tool inspects dataset content from two sources (tried in order):
    storage-relative path (e.g. 'datasets/my_data/train.jsonl' or
    'datasets/my_data/').
 
-Paths that start with '/workspace/' (platform workspace paths) are
-automatically stripped of that prefix and the remainder is resolved as a
-user storage relative path (e.g. '/workspace/proto.zip' -> 'proto.zip').
+Paths that start with '/workspace/' or 'workspace/' (platform workspace
+paths) are automatically stripped of that prefix and the remainder is
+resolved as a user storage relative path (e.g. '/workspace/proto.zip' ->
+'proto.zip').
 
 Archive files (zip, tar, tar.gz, tgz) cannot be previewed directly; the tool
 detects this automatically and submits an extraction task through the same
@@ -1241,9 +1243,13 @@ class PreviewDatasetExecutor(
         from openhands.tools.pyromind_archive.definition import (  # noqa: PLC0415
             ExtractArchiveAction,
             ExtractArchiveExecutor,
+            ExtractArchiveTool,
         )
 
-        extract_executor = ExtractArchiveExecutor(**self._extract_params)
+        # Route params through ExtractArchiveTool.create so unsupported keys
+        # (e.g. current_user) are dropped exactly like the standalone tool.
+        extract_tool = ExtractArchiveTool.create(**self._extract_params)[0]
+        extract_executor = cast(ExtractArchiveExecutor, extract_tool.executor)
         extract_action = ExtractArchiveAction(archive_path=archive_path)
         extract_result = extract_executor(extract_action, conversation)
 
@@ -2217,9 +2223,10 @@ def _looks_like_directory(path: str) -> bool:
 
 
 def _strip_workspace_prefix(path: str) -> str:
-    """Strip the platform '/workspace/' prefix, yielding a storage path."""
-    if path.startswith(_WORKSPACE_PATH_PREFIX):
-        return path[len(_WORKSPACE_PATH_PREFIX) :]
+    """Strip a leading platform workspace prefix, yielding a storage path."""
+    for prefix in _WORKSPACE_PATH_PREFIXES:
+        if path.startswith(prefix):
+            return path[len(prefix) :]
     return path
 
 
