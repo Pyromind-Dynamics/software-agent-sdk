@@ -18,8 +18,10 @@ from openhands.tools.pyromind_dataset.definition import (
     UploadFileToPyromindExecutor,
     _match_shared_dataset,
     _resolve_workspace_dir,
+    _vision_api_config,
     download_file_from_pyromind,
 )
+from openhands.tools.utils.dataflow_config import DEFAULT_DATAFLOW_MODEL_NAME
 
 
 def test_preview_description_mentions_shared_and_storage() -> None:
@@ -1814,3 +1816,48 @@ def test_inspect_storage_image_uses_vision_model(monkeypatch, tmp_path) -> None:
     assert "vision_summary=AOI image" in observation.text
     assert any(item.type == "image" for item in observation.content)
     assert all(item.type == "text" for item in observation.to_llm_content)
+
+
+def _clear_vision_env(monkeypatch) -> None:
+    for name in (
+        "DF_API_URL",
+        "DF_API_BASE_URL",
+        "DF_MODEL_NAME",
+        "DF_API_KEY",
+        "LLM_BASE_URL",
+        "LLM_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_vision_api_config_uses_defaults_when_unset(monkeypatch) -> None:
+    _clear_vision_env(monkeypatch)
+
+    api_url, model, api_key = _vision_api_config()
+
+    assert api_url == "https://api.openai.com/v1/chat/completions"
+    assert model == DEFAULT_DATAFLOW_MODEL_NAME
+    assert api_key is None
+
+
+def test_vision_api_config_falls_back_to_llm_base_url(monkeypatch) -> None:
+    _clear_vision_env(monkeypatch)
+    monkeypatch.setenv("LLM_BASE_URL", "https://llm.example/v1/")
+
+    api_url, model, _ = _vision_api_config()
+
+    assert api_url == "https://llm.example/v1/chat/completions"
+    assert model == DEFAULT_DATAFLOW_MODEL_NAME
+
+
+def test_vision_api_config_prefers_df_env(monkeypatch) -> None:
+    _clear_vision_env(monkeypatch)
+    monkeypatch.setenv("DF_API_BASE_URL", "https://vision.example/v1")
+    monkeypatch.setenv("DF_API_URL", "https://vision.example/v1/chat/completions")
+    monkeypatch.setenv("DF_MODEL_NAME", "vision-model")
+    monkeypatch.setenv("LLM_BASE_URL", "https://llm.example/v1")
+
+    api_url, model, _ = _vision_api_config()
+
+    assert api_url == "https://vision.example/v1/chat/completions"
+    assert model == "vision-model"
