@@ -29,8 +29,8 @@ logger = get_logger(__name__)
 
 PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET = "auth_token"
 
-_PRE_URL = "https://pre-api-portal.pyromind.ai/api/v1/nodes/function_signature"
-_PROD_URL = "https://api-portal.pyromind.ai/api/v1/nodes/function_signature"
+_PRE_URL = "https://pre-api-portal.pyromind.ai/user_node/function_signature"
+_PROD_URL = "https://api-portal.pyromind.ai/user_node/function_signature"
 _PROD_APP_ENVS = {"prod", "production", "online"}
 
 
