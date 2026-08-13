@@ -27,11 +27,10 @@ if TYPE_CHECKING:
 
 
 PRE_VALIDATE_URL = (
-    "https://pre-api-portal.pyromind.ai/std2/studio_api/api/agent/workflows/"
-    "dsl/validate"
+    "https://pre-api-portal.pyromind.ai/std2/studio_api/api/workflows/dsl/validate"
 )
 PROD_VALIDATE_URL = (
-    "https://api-portal.pyromind.ai/std2/studio_api/api/agent/workflows/dsl/validate"
+    "https://api-portal.pyromind.ai/std2/studio_api/api/workflows/dsl/validate"
 )
 PYROMIND_VALIDATE_AUTH_COOKIE_SECRET = "PYROMIND_VALIDATE_AUTH_COOKIE"
 PYROMIND_VALIDATE_HEADERS_STATE_KEY = "pyromind_validate_workflow_dsl_headers"
