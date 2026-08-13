@@ -28,6 +28,15 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.utils import default_path_access_policy
+from openhands.tools.utils.dataflow_config import (
+    DEFAULT_DATAFLOW_API_BASE_URL,
+    DEFAULT_DATAFLOW_MODEL_NAME,
+    ENV_DF_API_BASE_URL,
+    ENV_DF_API_KEY,
+    ENV_DF_API_URL,
+    ENV_DF_MODEL_NAME,
+    ENV_LLM_BASE_URL,
+)
 
 
 if TYPE_CHECKING:
@@ -2833,18 +2842,16 @@ def _vision_content_type(path: str) -> str:
 
 
 def _vision_api_config() -> tuple[str, str, str | None]:
-    api_url = os.environ.get("DF_API_URL", "").strip()
+    api_url = os.environ.get(ENV_DF_API_URL, "").strip()
     if not api_url:
-        base_url = os.environ.get("DF_API_BASE_URL", "").strip().rstrip("/")
-        if base_url:
-            api_url = f"{base_url}/chat/completions"
-    model = os.environ.get("DF_MODEL_NAME", "").strip()
-    api_key = os.environ.get("DF_API_KEY")
-    if not api_url or not model:
-        raise ValueError(
-            "Vision preview is not configured; set DF_API_URL (or "
-            "DF_API_BASE_URL) and DF_MODEL_NAME."
+        base_url = (
+            os.environ.get(ENV_DF_API_BASE_URL, "").strip().rstrip("/")
+            or os.environ.get(ENV_LLM_BASE_URL, "").strip().rstrip("/")
+            or DEFAULT_DATAFLOW_API_BASE_URL
         )
+        api_url = f"{base_url}/chat/completions"
+    model = os.environ.get(ENV_DF_MODEL_NAME, "").strip() or DEFAULT_DATAFLOW_MODEL_NAME
+    api_key = os.environ.get(ENV_DF_API_KEY)
     return api_url, model, api_key
 
 
