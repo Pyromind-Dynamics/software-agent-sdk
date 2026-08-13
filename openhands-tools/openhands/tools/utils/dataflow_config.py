@@ -18,4 +18,4 @@ ENV_LLM_MODEL = "LLM_MODEL"
 # LLM config
 DEFAULT_DATAFLOW_API_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_DATAFLOW_API_URL = f"{DEFAULT_DATAFLOW_API_BASE_URL}/chat/completions"
-DEFAULT_DATAFLOW_MODEL_NAME = "google/gemma-4-31b-it"
+DEFAULT_DATAFLOW_MODEL_NAME = "openai/gpt-5.6-luna"
