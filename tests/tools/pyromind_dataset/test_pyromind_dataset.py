@@ -18,8 +18,10 @@ from openhands.tools.pyromind_dataset.definition import (
     UploadFileToPyromindExecutor,
     _match_shared_dataset,
     _resolve_workspace_dir,
+    _vision_api_config,
     download_file_from_pyromind,
 )
+from openhands.tools.utils.dataflow_config import DEFAULT_DATAFLOW_MODEL_NAME
 
 
 def test_preview_description_mentions_shared_and_storage() -> None:
@@ -217,6 +219,110 @@ def test_preview_dataset_reads_jsonl_samples_with_storage_context(
     assert "sample_file_path" not in observation.text
     assert calls[0]["headers"]["cookie"] == "auth_token=session-token"
     assert calls[0]["headers"]["x-cluster"] == "pre"
+
+
+def test_preview_dataset_strips_workspace_prefix(monkeypatch, tmp_path):
+    _patch_shared_empty(monkeypatch)
+    metadata_calls: list[dict[str, Any]] = []
+    jsonl = b'{"prompt":"p1"}\n'
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            metadata_calls.append(json)
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": "proto.jsonl",
+                        "bucket_name": "1001",
+                        "size": len(jsonl),
+                        "content_type": "application/jsonl",
+                        "is_dir": False,
+                        "metadata": {},
+                    },
+                },
+            )
+        if url.endswith("/get_url"):
+            return _Response(
+                200,
+                {"success": True, "data": {"url": "https://download.test/proto"}},
+            )
+        raise AssertionError(f"unexpected URL: {url}")
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        return _StreamResponse(jsonl)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    conversation = _fake_conversation(
+        tmp_path,
+        secret_registry=_secret_registry(),
+        agent_state={PYROMIND_STORAGE_HEADERS_STATE_KEY: {"x-cluster": "pre"}},
+    )
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+        timeout=5.0,
+    )(
+        PreviewDatasetAction.model_validate({"dataset_path": "/workspace/proto.jsonl"}),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.preview_file_path == "proto.jsonl"
+    assert observation.source == "storage"
+    assert metadata_calls[0]["path"] == "proto.jsonl"
+
+
+def test_preview_dataset_reports_archive_with_extract_hint(monkeypatch, tmp_path):
+    _patch_shared_empty(monkeypatch)
+    url_calls: list[dict[str, Any]] = []
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": "proto.zip",
+                        "bucket_name": "1001",
+                        "size": 4096,
+                        "content_type": "application/zip",
+                        "is_dir": False,
+                        "metadata": {},
+                    },
+                },
+            )
+        if url.endswith("/get_url"):
+            url_calls.append({"url": url, "json": json})
+            return _Response(
+                200,
+                {"success": True, "data": {"url": "https://download.test/proto"}},
+            )
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    conversation = _fake_conversation(
+        tmp_path,
+        secret_registry=_secret_registry(),
+        agent_state={PYROMIND_STORAGE_HEADERS_STATE_KEY: {"x-cluster": "pre"}},
+    )
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+        timeout=5.0,
+    )(
+        PreviewDatasetAction.model_validate({"dataset_path": "/workspace/proto.zip"}),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert "extract_archive" in observation.text
+    assert observation.preview_file_path == "proto.zip"
+    assert observation.source == "storage"
+    assert url_calls == []
 
 
 def test_preview_dataset_formats_text_file_content(
@@ -1710,3 +1816,48 @@ def test_inspect_storage_image_uses_vision_model(monkeypatch, tmp_path) -> None:
     assert "vision_summary=AOI image" in observation.text
     assert any(item.type == "image" for item in observation.content)
     assert all(item.type == "text" for item in observation.to_llm_content)
+
+
+def _clear_vision_env(monkeypatch) -> None:
+    for name in (
+        "DF_API_URL",
+        "DF_API_BASE_URL",
+        "DF_MODEL_NAME",
+        "DF_API_KEY",
+        "LLM_BASE_URL",
+        "LLM_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_vision_api_config_uses_defaults_when_unset(monkeypatch) -> None:
+    _clear_vision_env(monkeypatch)
+
+    api_url, model, api_key = _vision_api_config()
+
+    assert api_url == "https://api.openai.com/v1/chat/completions"
+    assert model == DEFAULT_DATAFLOW_MODEL_NAME
+    assert api_key is None
+
+
+def test_vision_api_config_falls_back_to_llm_base_url(monkeypatch) -> None:
+    _clear_vision_env(monkeypatch)
+    monkeypatch.setenv("LLM_BASE_URL", "https://llm.example/v1/")
+
+    api_url, model, _ = _vision_api_config()
+
+    assert api_url == "https://llm.example/v1/chat/completions"
+    assert model == DEFAULT_DATAFLOW_MODEL_NAME
+
+
+def test_vision_api_config_prefers_df_env(monkeypatch) -> None:
+    _clear_vision_env(monkeypatch)
+    monkeypatch.setenv("DF_API_BASE_URL", "https://vision.example/v1")
+    monkeypatch.setenv("DF_API_URL", "https://vision.example/v1/chat/completions")
+    monkeypatch.setenv("DF_MODEL_NAME", "vision-model")
+    monkeypatch.setenv("LLM_BASE_URL", "https://llm.example/v1")
+
+    api_url, model, _ = _vision_api_config()
+
+    assert api_url == "https://vision.example/v1/chat/completions"
+    assert model == "vision-model"
