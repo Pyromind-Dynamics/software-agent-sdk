@@ -3,8 +3,8 @@
 DataFlow runs isolated in a subprocess so heavy dependencies (torch,
 transformers, datasets) never enter the agent-server process. The ``text``
 profile uses the conversation LLM; the ``vision`` profile prefers server-wide
-``DF_*`` configuration and falls back to the conversation LLM. Pipelines must
-never hardcode secrets.
+``DF_*`` configuration, then DataFlow defaults, with the conversation LLM as a
+final fallback. Pipelines must never hardcode secrets.
 """
 
 from __future__ import annotations
@@ -270,7 +270,8 @@ def build_dataflow_env(
 
     Process-wide ``DF_*`` values configure the vision model without changing
     the conversation's main coding model. Text always uses the conversation
-    model. Missing vision values fall back to that model for compatibility.
+    model. Missing vision values fall back to the DataFlow defaults, with the
+    conversation model as a final fallback.
 
     Raises:
         ValueError: If the resolved configuration is incomplete or inconsistent.
@@ -288,13 +289,13 @@ def build_dataflow_env(
         api_key = _nonempty_env(ENV_DF_API_KEY) or llm_api_key
         model_name = (
             _nonempty_env(ENV_DF_MODEL_NAME)
-            or openai_compatible_model_name(str(llm.model))
             or DEFAULT_DATAFLOW_MODEL_NAME
+            or openai_compatible_model_name(str(llm.model))
         )
         base_url, api_url = _resolve_dataflow_urls(
             _nonempty_env(ENV_DF_API_BASE_URL),
             _nonempty_env(ENV_DF_API_URL),
-            fallback_base_url,
+            DEFAULT_DATAFLOW_API_BASE_URL or fallback_base_url,
         )
     else:
         api_key = llm_api_key

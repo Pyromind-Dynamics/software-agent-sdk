@@ -644,6 +644,21 @@ class EventService:
             if state.execution_status != ConversationExecutionStatus.ERROR:
                 state.execution_status = ConversationExecutionStatus.ERROR
 
+    def _mark_running_status_sync(self) -> None:
+        """Set the conversation to RUNNING before the background run starts.
+
+        ``EventService.run()`` sets this synchronously (via the executor) so
+        the HTTP response that accepted the message — and any REST reads that
+        follow it — observe the running state instead of a stale IDLE, which
+        otherwise races the background task's own status transition. No-op
+        once the status is already RUNNING.
+        """
+        if not self._conversation:
+            return
+        with self._conversation._state as state:
+            if state.execution_status != ConversationExecutionStatus.RUNNING:
+                state.execution_status = ConversationExecutionStatus.RUNNING
+
     def _is_pyromind_conversation(self) -> bool:
         return self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE
 
@@ -1447,8 +1462,15 @@ class EventService:
             # Capture conversation reference for the closure
             conversation = self._conversation
 
-            # Start run in background
+            # Set the status to RUNNING synchronously before starting the
+            # background task, so the HTTP response and any REST reads that
+            # follow it observe the running state instead of a stale IDLE.
+            # The background task re-sets it inside conversation.run()/arun(),
+            # which is a no-op once already RUNNING.
             loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._mark_running_status_sync)
+
+            # Start run in background
 
             async def _run_and_publish():
                 run_t0 = time.monotonic()
