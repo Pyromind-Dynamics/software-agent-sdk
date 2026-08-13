@@ -17,9 +17,29 @@ _CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000789")
 
 
 def _mock_storage_check_success(monkeypatch):
-    """Monkeypatch httpx.post so _check_storage_file_exists returns None."""
+    """Monkeypatch httpx.post so storage checks report success / no conflicts."""
 
     def _mock_post(*args, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"success": True}
+        return resp
+
+    monkeypatch.setattr(httpx, "post", _mock_post)
+
+
+def _mock_storage_with_existing_dirs(monkeypatch, existing_dirs):
+    """Mock httpx.post; get_file_metadata reports is_dir for existing_dirs."""
+
+    def _mock_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {
+                "success": True,
+                "data": {"is_dir": json["path"] in existing_dirs},
+            }
+            return resp
         resp = MagicMock()
         resp.status_code = 200
         resp.json.return_value = {"success": True}
@@ -81,9 +101,7 @@ def test_extract_archive_submits_zip_workflow(monkeypatch):
     assert not observation.is_error
     assert observation.task_id == "task-123"
     assert observation.run_id is not None
-    assert observation.output_dir == (
-        f"/.pyromind-agent/{_CONVERSATION_ID}/extracted/{observation.run_id}"
-    )
+    assert observation.output_dir == "/datasets/data"
 
     client_factory.assert_called_once_with(
         env="pre",
@@ -137,6 +155,7 @@ def test_extract_archive_auto_detects_tar_gz(monkeypatch):
     assert "import tarfile,sys" in command
     assert "tarfile.open" in command
     assert "extractall" in command
+    assert observation.output_dir == "/datasets/data"
 
 
 def test_extract_archive_requires_conversation():
@@ -250,6 +269,9 @@ def test_extract_archive_strips_workspace_prefix(monkeypatch):
         "/target-workspace/datasets/michaelauli/data/wikipedia-biography-dataset.zip"
         in command
     )
+    assert observation.output_dir == (
+        "/datasets/michaelauli/data/wikipedia-biography-dataset"
+    )
 
 
 def test_extract_archive_file_not_found(monkeypatch):
@@ -308,4 +330,93 @@ def test_extract_archive_workspace_path_not_found(monkeypatch):
     assert observation.is_error
     # The error message should reference the stripped path (without /workspace)
     assert "not found in storage" in observation.text
+    assert observation.status == "Failed"
+
+
+def test_extract_archive_appends_suffix_when_default_dir_exists(monkeypatch):
+    """Default output dir gets a numeric suffix when the folder name is taken."""
+    _mock_storage_with_existing_dirs(monkeypatch, {"/datasets/data"})
+    mock_client = MagicMock()
+    mock_client.studio.create.return_value = TrainingTaskCreateResponse(
+        task_id="task-dup", name="agent-extract", status="Pending"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.pyromind_archive.definition.create_workflow_api_client",
+        MagicMock(return_value=mock_client),
+    )
+
+    conversation = _fake_conversation()
+    observation = ExtractArchiveExecutor(
+        env="pre",
+        cluster="us-west-1",
+        headers={"x-cluster": "us-west-1#pre"},
+        timeout=5,
+    )(
+        ExtractArchiveAction(
+            archive_path="datasets/data.zip",
+            format="zip",
+        ),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.output_dir == "/datasets/data_1"
+    request = mock_client.studio.create.call_args.args[0]
+    command = request.workflow["nodes"][0]["data"]["config"]["command"]
+    assert "/target-workspace/datasets/data_1" in command
+
+
+def test_extract_archive_skips_existing_suffixed_dirs(monkeypatch):
+    """Suffix should keep incrementing while the target name is taken."""
+    _mock_storage_with_existing_dirs(
+        monkeypatch, {"/datasets/data", "/datasets/data_1"}
+    )
+    mock_client = MagicMock()
+    mock_client.studio.create.return_value = TrainingTaskCreateResponse(
+        task_id="task-dup2", name="agent-extract", status="Pending"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.pyromind_archive.definition.create_workflow_api_client",
+        MagicMock(return_value=mock_client),
+    )
+
+    conversation = _fake_conversation()
+    observation = ExtractArchiveExecutor(
+        env="pre",
+        cluster="us-west-1",
+        headers={"x-cluster": "us-west-1#pre"},
+        timeout=5,
+    )(
+        ExtractArchiveAction(
+            archive_path="datasets/data.tar.gz",
+            format="tar.gz",
+        ),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.output_dir == "/datasets/data_2"
+
+
+def test_extract_archive_explicit_output_dir_exists_errors(monkeypatch):
+    """Explicit output_dir that already exists should error, not overwrite."""
+    _mock_storage_with_existing_dirs(monkeypatch, {"/my/custom/output"})
+
+    conversation = _fake_conversation()
+    observation = ExtractArchiveExecutor(
+        env="pre",
+        cluster="us-west-1",
+        headers={"x-cluster": "us-west-1#pre"},
+        timeout=5,
+    )(
+        ExtractArchiveAction(
+            archive_path="datasets/data.zip",
+            format="zip",
+            output_dir="my/custom/output",
+        ),
+        cast(Any, conversation),
+    )
+
+    assert observation.is_error
+    assert "already exists in storage" in observation.text
     assert observation.status == "Failed"
