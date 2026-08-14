@@ -425,3 +425,12 @@ def test_patch_field_description_forbids_separate_path_argument() -> None:
     assert "only argument" in patch_description
     assert "never pass a separate 'path' argument" in patch_description
     assert "exactly one argument" in _DESCRIPTION
+
+
+def test_redundant_path_argument_is_ignored_for_compatibility() -> None:
+    """A copied ``file_editor.path`` must not block an otherwise valid patch."""
+    patch = "*** Begin Patch\n*** Add File: example.txt\n+hello\n*** End Patch"
+
+    action = ApplyPatchAction.model_validate({"path": "example.txt", "patch": patch})
+
+    assert action == ApplyPatchAction(patch=patch)
