@@ -3,6 +3,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from openhands.sdk.agent.utils import fix_malformed_tool_arguments
 from openhands.tools.update_plan import (
     PlanStep,
     UpdatePlanAction,
@@ -56,3 +57,27 @@ def test_update_plan_rejects_incremental_patch_and_multiple_active_steps() -> No
                 PlanStep(step="Two", status="in_progress"),
             ]
         )
+
+
+def test_update_plan_accepts_wrapped_payload_after_repair() -> None:
+    """A payload wrapped in the plan list is repaired.
+
+    fix_malformed_tool_arguments hoists the nested plan back to the top level.
+    """
+    data = {
+        "plan": [
+            {
+                "explanation": "",
+                "plan": [
+                    {"step": "Locate modules", "status": "in_progress"},
+                    {"step": "Trace flow", "status": "pending"},
+                ],
+                "status": "in_progress",
+            }
+        ]
+    }
+    fixed_data = fix_malformed_tool_arguments(data, UpdatePlanAction)
+    action = UpdatePlanAction.model_validate(fixed_data)
+
+    assert action.explanation == ""
+    assert [step.status for step in action.plan] == ["in_progress", "pending"]

@@ -91,18 +91,53 @@ def _is_chunked_str_field(value: Any, expected_origins: list[Any]) -> bool:
     )
 
 
+def _hoist_wrapped_list_payload(
+    arguments: dict[str, Any], action_type: type[Action]
+) -> dict[str, Any]:
+    """Lift a payload wrapped inside a list-typed field to the top level.
+
+    Some models emit the whole action payload as the first element of a list
+    parameter (e.g. update_plan's ``plan``), producing
+    ``{"plan": [{"explanation": "", "plan": [...]}]}``. The wrapper's
+    action-level keys are hoisted, and existing top-level values win.
+    """
+    fixed_arguments = arguments.copy()
+    field_keys = {
+        field_info.alias or name
+        for name, field_info in action_type.model_fields.items()
+    }
+    for field_name, field_info in action_type.model_fields.items():
+        data_key = field_info.alias if field_info.alias else field_name
+        value = fixed_arguments.get(data_key)
+        while (
+            isinstance(value, list)
+            and value
+            and isinstance(value[0], dict)
+            and data_key in value[0]
+        ):
+            wrapper = value[0]
+            for key, val in wrapper.items():
+                if key in field_keys and key not in fixed_arguments:
+                    fixed_arguments[key] = val
+            fixed_arguments[data_key] = wrapper[data_key]
+            value = fixed_arguments[data_key]
+    return fixed_arguments
+
+
 def fix_malformed_tool_arguments(
     arguments: dict[str, Any], action_type: type[Action]
 ) -> dict[str, Any]:
     """Fix malformed tool arguments emitted by some LLMs under native fn calling.
 
-    Two malformations are repaired:
+    Three malformations are repaired:
 
     1. list/dict parameters encoded as JSON strings (e.g. GLM 4.6), which are
        decoded back into native arrays/objects (see example below).
     2. str-only parameters emitted as a JSON array of string chunks (e.g.
        minimax-m2.5 chunking file_editor's old_str/new_str), which are joined
        back into a single string.
+    3. the whole action payload wrapped inside a list parameter (e.g.
+       update_plan), which is hoisted back to the top level.
 
     Example raw LLM output from GLM 4.6:
     {
@@ -139,7 +174,7 @@ def fix_malformed_tool_arguments(
     if not isinstance(arguments, dict):
         return arguments
 
-    fixed_arguments = arguments.copy()
+    fixed_arguments = _hoist_wrapped_list_payload(arguments, action_type)
 
     # Use model_fields to properly handle aliases and inherited fields
     for field_name, field_info in action_type.model_fields.items():
