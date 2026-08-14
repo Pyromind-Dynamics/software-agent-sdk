@@ -382,6 +382,9 @@ async def events_socket(
             code=1013, reason="Too many connections for this conversation"
         )
         return
+    # The conversation is actively watched while this socket is open; idle
+    # eviction must not unload it underneath the subscriber.
+    event_service.register_user_connection()
 
     # Determine effective resend mode (handle deprecated resend_all)
     effective_mode = resend_mode
@@ -459,6 +462,7 @@ async def events_socket(
                     return
     finally:
         await event_service.unsubscribe_from_events(subscriber_id)
+        event_service.unregister_user_connection()
 
 
 @sockets_router.websocket("/bash-events")

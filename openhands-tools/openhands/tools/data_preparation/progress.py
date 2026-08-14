@@ -77,9 +77,9 @@ class DfCheckProgressAction(Action):
     )
     tail_lines: int = Field(
         default=DEFAULT_TAIL_LINES,
-        ge=1,
+        ge=0,
         le=50,
-        description="Number of most recent processed records to show.",
+        description="Number of most recent processed records to show (0 = none).",
     )
 
     @property
@@ -154,7 +154,9 @@ class DfCheckProgressExecutor(
         action: DfCheckProgressAction,
         conversation: BaseConversation | None = None,
     ) -> DfCheckProgressObservation:
-        output_dir = action.output_dir.strip().strip("/")
+        # Storage paths are absolute (e.g. '/.pyromind-agent/...'); keep the
+        # leading slash and only normalize a trailing one.
+        output_dir = action.output_dir.strip().rstrip("/")
         headers = self._resolved_headers(conversation)
 
         progress_path = f"{output_dir}/{PROGRESS_FILENAME}"
@@ -347,7 +349,8 @@ class DfCheckProgressExecutor(
         if start > 0 and lines:
             lines = lines[1:]
         records: list[dict[str, Any]] = []
-        for line in lines[-tail_lines:]:
+        # lines[-0:] would return every line, so 0 must mean "no records".
+        for line in lines[-tail_lines:] if tail_lines > 0 else []:
             try:
                 parsed = json.loads(line)
             except json.JSONDecodeError:
