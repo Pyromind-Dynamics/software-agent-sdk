@@ -28,6 +28,15 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.utils import default_path_access_policy
+from openhands.tools.utils.dataflow_config import (
+    DEFAULT_DATAFLOW_API_BASE_URL,
+    DEFAULT_DATAFLOW_MODEL_NAME,
+    ENV_DF_API_BASE_URL,
+    ENV_DF_API_KEY,
+    ENV_DF_API_URL,
+    ENV_DF_MODEL_NAME,
+    ENV_LLM_BASE_URL,
+)
 
 
 if TYPE_CHECKING:
@@ -40,6 +49,10 @@ PROD_STORAGE_API_BASE_URL = "https://api-portal.pyromind.ai/storage_api"
 PYROMIND_STORAGE_AUTH_COOKIE_SECRET = "PYROMIND_STORAGE_AUTH_COOKIE"
 PYROMIND_STORAGE_HEADERS_STATE_KEY = "pyromind_storage_headers"
 PYROMIND_AGENT_STORAGE_ROOT = "/.pyromind-agent"
+
+_WORKSPACE_PATH_PREFIXES = ("/workspace/", "workspace/")
+_ARCHIVE_SUFFIXES = {".zip", ".tar", ".tar.gz", ".tgz"}
+_ARCHIVE_CONTENT_TYPE_HINTS = ("zip", "tar", "gzip", "x-compress", "x-tar")
 
 _PROD_APP_ENVS = {"prod", "production", "online"}
 _SMALL_FILE_THRESHOLD = 10 * 1024
@@ -122,7 +135,10 @@ class PreviewDatasetAction(Action):
             "(e.g. 'openai/gsm8k'), a shared dataset with file path "
             "(e.g. 'openai/gsm8k/data/train.jsonl'), or a user storage "
             "relative path (e.g. 'datasets/my_data/' or "
-            "'datasets/my_data/train.jsonl')."
+            "'datasets/my_data/train.jsonl'). A leading '/workspace/' or "
+            "'workspace/' prefix (platform workspace path) is stripped "
+            "automatically and the remainder is treated as a user storage "
+            "relative path."
         ),
     )
     n: int = Field(
@@ -302,6 +318,17 @@ This tool inspects dataset content from two sources (tried in order):
    storage-relative path (e.g. 'datasets/my_data/train.jsonl' or
    'datasets/my_data/').
 
+Paths that start with '/workspace/' or 'workspace/' (platform workspace
+paths) are automatically stripped of that prefix and the remainder is
+resolved as a user storage relative path (e.g. '/workspace/proto.zip' ->
+'proto.zip').
+
+Archive files (zip, tar, tar.gz, tgz) cannot be previewed directly; the tool
+detects this automatically and submits an extraction task through the same
+platform workflow path as ``extract_archive``. When the extraction completes,
+call ``preview_dataset`` again on the returned ``output_dir`` path to inspect
+the extracted files.
+
 The tool automatically determines the source:
 - If the path matches a known shared dataset (exact or prefix), it uses the
   shared space API.
@@ -353,6 +380,7 @@ class PreviewDatasetExecutor(
         secret_headers: dict[str, str] | None = None,
         timeout: float = 30.0,
         max_preview_bytes: int = _DEFAULT_PREVIEW_BYTES,
+        extract_params: dict[str, Any] | None = None,
     ) -> None:
         base_url = storage_base_url or _default_storage_base_url()
         self._storage_base_url = base_url.rstrip("/")
@@ -363,13 +391,14 @@ class PreviewDatasetExecutor(
         self._secret_headers = dict(secret_headers or {})
         self._timeout = timeout
         self._max_preview_bytes = min(max_preview_bytes, _MAX_PREVIEW_BYTES)
+        self._extract_params = extract_params or {}
 
     def __call__(
         self,
         action: PreviewDatasetAction,
         conversation: BaseConversation | None = None,
     ) -> PreviewDatasetObservation:
-        dataset_path = action.dataset_path.strip()
+        dataset_path = _strip_workspace_prefix(action.dataset_path.strip())
         if not dataset_path:
             return PreviewDatasetObservation.from_text(
                 text="dataset_path must be a non-empty path.",
@@ -395,6 +424,20 @@ class PreviewDatasetExecutor(
             return shared_result
 
         # Fall back to user storage
+        # Suffix-based archive check: metadata + actual extraction happens
+        # inside _handle_archive_storage, so a minimal suffix match is
+        # sufficient here -- content-type false negatives are rare.
+        if _is_archive_suffix(dataset_path):
+            files: list[str] = [dataset_path]
+            metadata: dict[str, Any] = {}
+            return self._handle_archive_storage(
+                archive_path=dataset_path,
+                dataset_path=dataset_path,
+                files=files,
+                metadata=metadata,
+                conversation=conversation,
+            )
+
         return self._storage_preview(
             dataset_path,
             action.n,
@@ -1179,6 +1222,66 @@ class PreviewDatasetExecutor(
             **_metadata_observation_fields(metadata),
         )
 
+    def _handle_archive_storage(
+        self,
+        *,
+        archive_path: str,
+        dataset_path: str,
+        files: list[str],
+        metadata: dict[str, Any],
+        conversation: BaseConversation | None,
+    ) -> PreviewDatasetObservation:
+        """Submit an archive extraction task and return a preview observation.
+
+        Called when the previewed storage file is a compressed archive (zip,
+        tar, tar.gz, tgz).  Submits the extraction through the same platform
+        workflow path as the standalone ``extract_archive`` tool, then returns
+        an observation with the task_id and output_dir so the agent can follow
+        up after the callback fires.
+        """
+        # Lazy import to avoid circular dependency (pyromind_archive imports us).
+        from openhands.tools.pyromind_archive.definition import (  # noqa: PLC0415
+            ExtractArchiveAction,
+            ExtractArchiveExecutor,
+            ExtractArchiveTool,
+        )
+
+        # Route params through ExtractArchiveTool.create so unsupported keys
+        # (e.g. current_user) are dropped exactly like the standalone tool.
+        extract_tool = ExtractArchiveTool.create(**self._extract_params)[0]
+        extract_executor = cast(ExtractArchiveExecutor, extract_tool.executor)
+        extract_action = ExtractArchiveAction(archive_path=archive_path)
+        extract_result = extract_executor(extract_action, conversation)
+
+        if extract_result.is_error:
+            return PreviewDatasetObservation.from_text(
+                text=f"Archive extraction submission failed: {extract_result.text}",
+                is_error=True,
+                dataset_path=dataset_path,
+                files=files,
+                preview_file_path=archive_path,
+                source="storage",
+                **_metadata_observation_fields(metadata),
+            )
+
+        output_dir = extract_result.output_dir or ""
+        task_id = extract_result.task_id or ""
+        text = (
+            f"'{archive_path}' is a compressed archive. "
+            f"Extraction task submitted (task_id={task_id}, "
+            f"output_dir={output_dir}). "
+            "When the extraction completes, call `preview_dataset` with the "
+            "output_dir path to inspect the extracted files."
+        )
+        return PreviewDatasetObservation.from_text(
+            text=text,
+            dataset_path=dataset_path,
+            files=files,
+            preview_file_path=archive_path,
+            source="storage",
+            **_metadata_observation_fields(metadata),
+        )
+
     def _storage_image_preview(
         self,
         *,
@@ -1626,6 +1729,10 @@ class PreviewDatasetTool(
         secret_headers = params.pop("secret_headers", None)
         timeout = float(params.pop("timeout", 30.0))
         max_preview_bytes = int(params.pop("max_preview_bytes", _DEFAULT_PREVIEW_BYTES))
+        extract_params_raw = params.pop("extract_params", None)
+        if extract_params_raw is not None and not isinstance(extract_params_raw, dict):
+            raise ValueError("extract_params must be a dict when provided")
+        extract_params: dict[str, Any] | None = extract_params_raw
         if params:
             names = ", ".join(sorted(params))
             raise ValueError(f"PreviewDatasetTool got unknown params: {names}")
@@ -1647,6 +1754,7 @@ class PreviewDatasetTool(
                     secret_headers=_normalize_headers(secret_headers),
                     timeout=timeout,
                     max_preview_bytes=max_preview_bytes,
+                    extract_params=extract_params,
                 ),
                 annotations=ToolAnnotations(
                     title="preview_dataset",
@@ -2112,6 +2220,45 @@ def _metadata_observation_fields(metadata: dict[str, Any]) -> dict[str, Any]:
 
 def _looks_like_directory(path: str) -> bool:
     return path.endswith("/")
+
+
+def _strip_workspace_prefix(path: str) -> str:
+    """Strip a leading platform workspace prefix, yielding a storage path."""
+    for prefix in _WORKSPACE_PATH_PREFIXES:
+        if path.startswith(prefix):
+            return path[len(prefix) :]
+    return path
+
+
+def _is_archive_suffix(path: str) -> bool:
+    """Check whether *path* looks like an archive by its file suffix."""
+    lower = path.lower()
+    return (
+        lower.endswith(".tar.gz")
+        or lower.endswith(".tgz")
+        or PurePosixPath(lower).suffix in _ARCHIVE_SUFFIXES
+    )
+
+
+def _archive_extract_hint(file_path: str, content_type: str) -> str | None:
+    """Return an extract_archive hint when the storage file is an archive."""
+    lower_name = file_path.lower()
+    lower_type = content_type.lower()
+    is_archive = (
+        lower_name.endswith(".tar.gz")
+        or lower_name.endswith(".tgz")
+        or PurePosixPath(lower_name).suffix in _ARCHIVE_SUFFIXES
+        or any(hint in lower_type for hint in _ARCHIVE_CONTENT_TYPE_HINTS)
+    )
+    if not is_archive:
+        return None
+    return (
+        f"'{file_path}' is a compressed archive and cannot be previewed "
+        "directly. Use `extract_archive` to unpack it into a new folder next "
+        "to the archive named after it (an existing folder with the same name "
+        "is never overwritten), then call `preview_dataset` on the extracted "
+        "files."
+    )
 
 
 def _match_shared_dataset(
@@ -2777,18 +2924,16 @@ def _vision_content_type(path: str) -> str:
 
 
 def _vision_api_config() -> tuple[str, str, str | None]:
-    api_url = os.environ.get("DF_API_URL", "").strip()
+    api_url = os.environ.get(ENV_DF_API_URL, "").strip()
     if not api_url:
-        base_url = os.environ.get("DF_API_BASE_URL", "").strip().rstrip("/")
-        if base_url:
-            api_url = f"{base_url}/chat/completions"
-    model = os.environ.get("DF_MODEL_NAME", "").strip()
-    api_key = os.environ.get("DF_API_KEY")
-    if not api_url or not model:
-        raise ValueError(
-            "Vision preview is not configured; set DF_API_URL (or "
-            "DF_API_BASE_URL) and DF_MODEL_NAME."
+        base_url = (
+            os.environ.get(ENV_DF_API_BASE_URL, "").strip().rstrip("/")
+            or os.environ.get(ENV_LLM_BASE_URL, "").strip().rstrip("/")
+            or DEFAULT_DATAFLOW_API_BASE_URL
         )
+        api_url = f"{base_url}/chat/completions"
+    model = os.environ.get(ENV_DF_MODEL_NAME, "").strip() or DEFAULT_DATAFLOW_MODEL_NAME
+    api_key = os.environ.get(ENV_DF_API_KEY)
     return api_url, model, api_key
 
 

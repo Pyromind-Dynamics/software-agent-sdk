@@ -43,6 +43,9 @@ description: >-
 7. 调用 `df_submit_pipeline(mode="full")`。收到 Kafka callback 后，调用
    `preview_dataset` 查看 `<output_dir>/report.json`；如失败，再查看同目录的
    `failure.json`、`validation.json` 和必要的 `llm_calls.jsonl`。
+   图片任务若 `report.json.label_reconciliation.corrected > 0`，继续查看
+   `label_corrections.jsonl`，并向用户说明修正数量、原/新标签和证据；训练数据中不写
+   审计字段。
 8. Agent 修复后先在本地重跑失败记录、失败前一条和同类成功记录：
    - 旧结果仍可用：`mode="resume"`，提交 `reuse_assessment` 和可选新脚本。
    - 旧结果不可用：重新执行 Sample、人工确认并创建新的 full run。

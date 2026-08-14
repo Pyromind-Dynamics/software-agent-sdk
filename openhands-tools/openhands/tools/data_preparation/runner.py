@@ -3,8 +3,8 @@
 DataFlow runs isolated in a subprocess so heavy dependencies (torch,
 transformers, datasets) never enter the agent-server process. The ``text``
 profile uses the conversation LLM; the ``vision`` profile prefers server-wide
-``DF_*`` configuration and falls back to the conversation LLM. Pipelines must
-never hardcode secrets.
+``DF_*`` configuration, then DataFlow defaults, with the conversation LLM as a
+final fallback. Pipelines must never hardcode secrets.
 """
 
 from __future__ import annotations
@@ -19,10 +19,17 @@ from pathlib import Path
 from typing import Any, Literal
 
 from openhands.sdk.utils.redact import redact_text_secrets
+from openhands.tools.utils.dataflow_config import (
+    DEFAULT_DATAFLOW_API_BASE_URL,
+    DEFAULT_DATAFLOW_MODEL_NAME,
+    ENV_DF_API_BASE_URL,
+    ENV_DF_API_KEY,
+    ENV_DF_API_URL,
+    ENV_DF_MODEL_NAME,
+    ENV_LLM_BASE_URL,
+)
 
 
-DEFAULT_DATAFLOW_API_BASE_URL = "https://api.openai.com/v1"
-DEFAULT_DATAFLOW_API_URL = f"{DEFAULT_DATAFLOW_API_BASE_URL}/chat/completions"
 SUPPORTED_DATAFLOW_VERSION = "1.0.10"
 
 _DATAFLOW_CHECK_CACHE: dict[str, tuple[bool, str]] = {}
@@ -264,7 +271,9 @@ def build_dataflow_env(
 
     Process-wide ``DF_*`` values configure the vision model without changing
     the conversation's main coding model. Text always uses the conversation
-    model. Missing vision values fall back to that model for compatibility.
+    model. Missing vision values fall back to ``LLM_BASE_URL``, then the
+    conversation LLM, then the DataFlow defaults (mirroring
+    ``_vision_api_config`` so preview and pipeline runs share one endpoint).
 
     Raises:
         ValueError: If the resolved configuration is incomplete or inconsistent.
@@ -279,14 +288,12 @@ def build_dataflow_env(
         llm_api_key = str(llm.api_key)
     fallback_base_url = (llm.base_url or DEFAULT_DATAFLOW_API_BASE_URL).rstrip("/")
     if model_profile == "vision":
-        api_key = _nonempty_env("DF_API_KEY") or llm_api_key
-        model_name = _nonempty_env("DF_MODEL_NAME") or openai_compatible_model_name(
-            str(llm.model)
-        )
+        api_key = _nonempty_env(ENV_DF_API_KEY) or llm_api_key
+        model_name = _nonempty_env(ENV_DF_MODEL_NAME) or DEFAULT_DATAFLOW_MODEL_NAME
         base_url, api_url = _resolve_dataflow_urls(
-            _nonempty_env("DF_API_BASE_URL"),
-            _nonempty_env("DF_API_URL"),
-            fallback_base_url,
+            _nonempty_env(ENV_DF_API_BASE_URL),
+            _nonempty_env(ENV_DF_API_URL),
+            _nonempty_env(ENV_LLM_BASE_URL) or fallback_base_url,
         )
     else:
         api_key = llm_api_key
@@ -300,8 +307,8 @@ def build_dataflow_env(
     missing = [
         name
         for name, value in (
-            ("DF_MODEL_NAME", model_name),
-            ("DF_API_BASE_URL", base_url),
+            (ENV_DF_MODEL_NAME, model_name),
+            (ENV_DF_API_BASE_URL, base_url),
         )
         if not value
     ]
@@ -312,12 +319,12 @@ def build_dataflow_env(
             + "."
         )
     resolved = {
-        "DF_API_URL": api_url,
-        "DF_API_BASE_URL": base_url,
-        "DF_MODEL_NAME": model_name,
+        ENV_DF_API_URL: api_url,
+        ENV_DF_API_BASE_URL: base_url,
+        ENV_DF_MODEL_NAME: model_name,
     }
     if api_key:
-        resolved["DF_API_KEY"] = api_key
+        resolved[ENV_DF_API_KEY] = api_key
     return resolved
 
 
@@ -325,15 +332,15 @@ def summarize_dataflow_env(env: dict[str, str]) -> str:
     """Return a secret-free summary suitable for logs and observations."""
 
     return (
-        f"model={env['DF_MODEL_NAME']} "
-        f"base_url={env['DF_API_BASE_URL']} "
-        f"api_key_configured={'yes' if env.get('DF_API_KEY') else 'no'}"
+        f"model={env[ENV_DF_MODEL_NAME]} "
+        f"base_url={env[ENV_DF_API_BASE_URL]} "
+        f"api_key_configured={'yes' if env.get(ENV_DF_API_KEY) else 'no'}"
     )
 
 
 def _redact_subprocess_output(text: str, env_extra: dict[str, str]) -> str:
     redacted = text
-    api_key = env_extra.get("DF_API_KEY")
+    api_key = env_extra.get(ENV_DF_API_KEY)
     if api_key:
         redacted = redacted.replace(api_key, "<redacted>")
     return redact_text_secrets(redacted)

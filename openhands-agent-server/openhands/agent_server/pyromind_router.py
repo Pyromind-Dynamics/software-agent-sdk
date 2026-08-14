@@ -574,7 +574,10 @@ def _build_pyromind_storage_tools(
 
     return (
         [
-            Tool(name=PreviewDatasetTool.name, params=dict(params)),
+            Tool(
+                name=PreviewDatasetTool.name,
+                params={**params, "extract_params": extraction_params},
+            ),
             Tool(name=UploadFileToPyromindTool.name, params=dict(params)),
             Tool(name=RunDatasetCleaningTool.name, params=cleaning_params),
             Tool(name=DfSubmitPipelineTool.name, params=preparation_params),

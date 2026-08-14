@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import socket
 import tempfile
 import threading
@@ -7,7 +8,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from litellm.types.utils import ChatCompletionMessageToolCall, Function
@@ -757,7 +758,13 @@ async def test_stale_owner_cannot_append_after_lease_takeover(tmp_path):
             conversations_dir=conversations_dir,
         ) as secondary:
             assert secondary._event_services is not None
-            secondary_event_service = secondary._event_services[conversation_info.id]
+            # Startup only indexes meta.json; the takeover happens when the
+            # conversation is activated on first access.
+            assert conversation_info.id not in secondary._event_services
+            secondary_event_service = await secondary.get_event_service(
+                conversation_info.id
+            )
+            assert secondary_event_service is not None
             secondary_state = await secondary_event_service.get_state()
 
             assert any(
@@ -932,11 +939,172 @@ async def test_restart_resumes_conversations_after_non_graceful_shutdown(tmp_pat
 
     async with ConversationService(conversations_dir=conversations_dir) as restarted:
         assert restarted._event_services is not None
-        # The conversation must be present in the restarted service.
-        assert conversation_id in restarted._event_services, (
+        # Startup only indexes meta.json; the conversation is activated on
+        # first access, which must take over the orphaned lease.
+        assert conversation_id not in restarted._event_services
+        resumed = await restarted.get_event_service(conversation_id)
+        assert resumed is not None, (
             "Restart failed to pick up an existing conversation whose lease "
             "was left orphaned by a non-graceful shutdown."
         )
+
+
+async def _persist_conversation(conversations_dir: Path, workspace_dir: Path) -> UUID:
+    """Start a real conversation, persist it to disk, and return its id.
+
+    The service context exits cleanly so the lease is released and a fresh
+    service instance can resume the conversation.
+    """
+    request = StartConversationRequest(
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=LocalWorkspace(working_dir=str(workspace_dir)),
+        confirmation_policy=NeverConfirm(),
+    )
+    async with ConversationService(conversations_dir=conversations_dir) as svc:
+        conversation_info, _ = await svc.start_conversation(request)
+        return conversation_info.id
+
+
+@pytest.mark.asyncio
+async def test_startup_indexes_meta_without_loading_services(tmp_path):
+    """Startup builds the lightweight index but never instantiates an
+    EventService for persisted conversations."""
+    conversations_dir = tmp_path / "conversations"
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+    conversation_id = await _persist_conversation(conversations_dir, workspace_dir)
+
+    async with ConversationService(conversations_dir=conversations_dir) as svc:
+        assert svc._event_services is not None
+        assert conversation_id not in svc._event_services
+        assert conversation_id in svc._conversation_index
+        entry = svc._conversation_index[conversation_id]
+        assert entry.id == conversation_id
+        assert entry.title is None
+
+
+@pytest.mark.asyncio
+async def test_get_event_service_lazy_loads_persisted_conversation(tmp_path):
+    """First access activates the conversation; subsequent accesses reuse the
+    same instance."""
+    conversations_dir = tmp_path / "conversations"
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+    conversation_id = await _persist_conversation(conversations_dir, workspace_dir)
+
+    async with ConversationService(conversations_dir=conversations_dir) as svc:
+        assert svc._event_services is not None
+        event_service = await svc.get_event_service(conversation_id)
+        assert event_service is not None
+        assert svc._event_services[conversation_id] is event_service
+        assert await svc.get_event_service(conversation_id) is event_service
+
+
+@pytest.mark.asyncio
+async def test_get_event_service_returns_none_for_unknown(tmp_path):
+    conversations_dir = tmp_path / "conversations"
+
+    async with ConversationService(conversations_dir=conversations_dir) as svc:
+        assert await svc.get_event_service(uuid4()) is None
+
+
+@pytest.mark.asyncio
+async def test_lazy_load_concurrent_requests_single_instance(tmp_path):
+    """Concurrent first accesses must not instantiate the conversation twice."""
+    conversations_dir = tmp_path / "conversations"
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+    conversation_id = await _persist_conversation(conversations_dir, workspace_dir)
+
+    async with ConversationService(conversations_dir=conversations_dir) as svc:
+        first, second = await asyncio.gather(
+            svc.get_event_service(conversation_id),
+            svc.get_event_service(conversation_id),
+        )
+        assert first is not None
+        assert first is second
+
+
+@pytest.mark.asyncio
+async def test_lazy_load_respects_held_lease(tmp_path):
+    """A conversation whose lease is held by a live owner stays unloaded."""
+    conversations_dir = tmp_path / "conversations"
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+    conversation_id = await _persist_conversation(conversations_dir, workspace_dir)
+
+    lease_path = conversations_dir / conversation_id.hex / LEASE_FILE_NAME
+    lease_path.write_text(
+        json.dumps(
+            {
+                "owner_instance_id": "other-live-instance",
+                "generation": 1,
+                "expires_at": time.time() + 3600.0,
+                "owner_host": socket.gethostname(),
+                "owner_pid": os.getpid(),
+            }
+        )
+    )
+
+    async with ConversationService(conversations_dir=conversations_dir) as svc:
+        assert await svc.get_event_service(conversation_id) is None
+
+
+@pytest.mark.asyncio
+async def test_search_and_count_include_unloaded_conversations(tmp_path):
+    """List/count surface persisted conversations without activating them; the
+    page is resolved lazily from meta.json and base_state.json."""
+    conversations_dir = tmp_path / "conversations"
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+    conversation_id = await _persist_conversation(conversations_dir, workspace_dir)
+
+    async with ConversationService(conversations_dir=conversations_dir) as svc:
+        assert svc._event_services is not None
+        assert conversation_id not in svc._event_services
+        page = await svc.search_conversations()
+        assert [item.id for item in page.items] == [conversation_id]
+        assert await svc.count_conversations() == 1
+        # Reading a page must not activate the conversation.
+        assert conversation_id not in svc._event_services
+
+
+@pytest.mark.asyncio
+async def test_search_status_filter_reads_unloaded_base_state(tmp_path):
+    """Status filtering on unloaded conversations reads the autosaved
+    base_state.json payload without instantiating a ConversationState."""
+    conversations_dir = tmp_path / "conversations"
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+    conversation_id = await _persist_conversation(conversations_dir, workspace_dir)
+
+    async with ConversationService(conversations_dir=conversations_dir) as svc:
+        assert svc._event_services is not None
+        assert conversation_id not in svc._event_services
+        page = await svc.search_conversations(
+            execution_status=ConversationExecutionStatus.IDLE
+        )
+        assert [item.id for item in page.items] == [conversation_id]
+        page = await svc.search_conversations(
+            execution_status=ConversationExecutionStatus.ERROR
+        )
+        assert page.items == []
+        assert svc._event_services is not None
+        assert conversation_id not in svc._event_services
+
+
+@pytest.mark.asyncio
+async def test_delete_lazy_conversation_removes_dir_and_index(tmp_path):
+    conversations_dir = tmp_path / "conversations"
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+    conversation_id = await _persist_conversation(conversations_dir, workspace_dir)
+
+    async with ConversationService(conversations_dir=conversations_dir) as svc:
+        assert await svc.delete_conversation(conversation_id) is True
+        assert conversation_id not in svc._conversation_index
+        assert not (conversations_dir / conversation_id.hex).exists()
+        assert await svc.delete_conversation(conversation_id) is False
 
 
 class TestConversationServiceSearchConversations:

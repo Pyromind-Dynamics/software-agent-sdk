@@ -1,6 +1,6 @@
 """Implementation of the node signature executor.
 
-Fetches function signature from the Pyromind middleware agent-internal API.
+Fetches function signature from the Pyromind middleware nodes API.
 """
 
 from __future__ import annotations
@@ -29,13 +29,8 @@ logger = get_logger(__name__)
 
 PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET = "auth_token"
 
-_PRE_URL = (
-    "https://pre-api-portal.pyromind.ai/std2/studio_api/api/agent"
-    "/nodes/function_signature"
-)
-_PROD_URL = (
-    "https://api-portal.pyromind.ai/std2/studio_api/api/agent/nodes/function_signature"
-)
+_PRE_URL = "https://pre-api-portal.pyromind.ai/user_node/function_signature"
+_PROD_URL = "https://api-portal.pyromind.ai/user_node/function_signature"
 _PROD_APP_ENVS = {"prod", "production", "online"}
 
 

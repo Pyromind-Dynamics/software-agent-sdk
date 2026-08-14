@@ -27,6 +27,14 @@ CONFIG = ImagePipelineConfig(
     },
     reasoning_key="reasoning",
     answer_key="answer",
+    # For add-CoT tasks with human labels, configure the metadata sidecar and
+    # label mapping below. The shared runtime will prefer the human label and
+    # only accept a correction with an explicit reason and visual evidence.
+    # metadata_filename="meta.json",
+    # reference_label_path="annotation.is_skip",
+    # reference_note_path="annotation.note",
+    # reference_label_map={"true": "skip", "false": "keep"},
+    # allow_reference_correction=True,
 )
 
 

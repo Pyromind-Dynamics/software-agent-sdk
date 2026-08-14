@@ -591,7 +591,7 @@ def test_include_source_fetches_operator_source(monkeypatch):
     assert not observation.is_error
     assert "RuntimeError: boom" in observation.logs["1"]
     assert observation.node_sources["1"] == "def train(...):\n    pass"
-    assert post_calls[0][0].endswith("api/agent/nodes/function_signature/batch")
+    assert post_calls[0][0].endswith("user_node/function_signature/batch")
     assert post_calls[0][1] == {
         "node_names": ["ModelTrainSFTNode"],
         "node_type": None,
