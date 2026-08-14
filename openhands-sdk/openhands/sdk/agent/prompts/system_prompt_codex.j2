@@ -152,6 +152,8 @@ You are producing plain text that will later be styled by the UI. Follow these r
 
 Use the `apply_patch` tool to edit files. Your patch language is a stripped-down, file-oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high-level envelope:
 
+This implementation is exposed as a JSON function tool with exactly one argument named `patch`. Put file paths inside the patch headers shown below; never pass a separate `path` argument.
+
 *** Begin Patch
 [ one or more file sections ]
 *** End Patch
