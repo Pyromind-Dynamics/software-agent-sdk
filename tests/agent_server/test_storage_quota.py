@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -134,3 +135,73 @@ def test_quota_command_failure_returns_false(monkeypatch, tmp_path):
 
     quota = ConversationStorageQuota(10 * 1024)
     assert not quota.apply(directory, UUID(int=2))
+
+
+def _fake_device_for(mount_point, devices):
+    return Path(str(mount_point) + "-dev") if devices else None
+
+
+def test_run_uses_device_node_when_available(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.shutil.which",
+        lambda _: "/usr/bin/xfs_quota",
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+    )
+    dev = tmp_path / "dev-node"
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._device_node_for",
+        lambda _: dev,
+    )
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("openhands.agent_server.storage_quota.subprocess.run", fake_run)
+    quota = ConversationStorageQuota(10)
+    assert quota.apply(tmp_path, UUID("af3258e4-6542-408a-ba43-1c6f8ee37821")) is True
+    assert calls and all(str(dev) in args for args in calls)
+
+
+def test_run_falls_back_to_mountpoint_without_device(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.shutil.which",
+        lambda _: "/usr/bin/xfs_quota",
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._device_node_for", lambda _: None
+    )
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("openhands.agent_server.storage_quota.subprocess.run", fake_run)
+    quota = ConversationStorageQuota(10)
+    assert quota.apply(tmp_path, UUID("af3258e4-6542-408a-ba43-1c6f8ee37821")) is True
+    assert calls and str(tmp_path) in calls[0]
+
+
+def test_device_node_parses_mountinfo_major_minor(monkeypatch, tmp_path):
+
+    mountinfo = "23 21 259:5 / /workspace rw,relatime - xfs /dev/nvme1n1 rw,prjquota"
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.Path.read_text",
+        lambda self: mountinfo,
+    )
+    made = []
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.os.mknod",
+        lambda path, mode, dev: made.append((path, mode, dev)),
+    )
+    from openhands.agent_server.storage_quota import _device_node_for
+
+    node = _device_node_for(Path("/workspace"))
+    assert node is not None

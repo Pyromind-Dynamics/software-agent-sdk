@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 from uuid import UUID
@@ -73,6 +74,45 @@ def _mountpoint_for(path: Path) -> Path | None:
     return deepest
 
 
+def _device_node_for(mount_point: Path) -> Path | None:
+    """Return a block-device node for ``mount_point``, or ``None``.
+
+    Containers do not expose the EBS backing device under ``/dev``, which
+    ``xfs_quota`` needs to open to read/write quota state. Recreate the node
+    from the ``major:minor`` pair in ``/proc/self/mountinfo`` (requires
+    ``CAP_MKNOD``/``CAP_SYS_ADMIN``, which the pod already has), and fall
+    back to ``None`` so callers keep passing the mount point.
+    """
+    major_minor: tuple[int, int] | None = None
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 7 or Path(convert_mount_point(fields[4])) != mount_point:
+            continue
+        parts = fields[2].split(":")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            major_minor = (int(parts[0]), int(parts[1]))
+            break
+    if major_minor is None:
+        return None
+    device = Path("/dev") / f"openhands-quota-{major_minor[0]}-{major_minor[1]}"
+    if device.exists():
+        return device
+    try:
+        os.mknod(device, stat.S_IFBLK | 0o600, os.makedev(*major_minor))
+    except OSError:
+        return None
+    return device
+
+
+def convert_mount_point(field: str) -> str:
+    """Unescape a mountinfo path field (octal `\040` etc.)."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
 class ConversationStorageQuota:
     """Set and remove per-conversation XFS project quota limits."""
 
@@ -115,9 +155,10 @@ class ConversationStorageQuota:
                 "storage quota requested but %s is unavailable", self._xfs_quota
             )
             return False
+        target = _device_node_for(mount_point) or mount_point
         try:
             result = subprocess.run(
-                [self._xfs_quota, "-x", "-c", command, str(mount_point)],
+                [self._xfs_quota, "-x", "-c", command, str(target)],
                 capture_output=True,
                 text=True,
                 timeout=30,
