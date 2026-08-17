@@ -1713,6 +1713,11 @@ class ConversationService:
                     f"error_indexing_conversation:{conversation_dir}", stack_info=True
                 )
 
+        logger.info(
+            "Indexed %d conversations from disk; none loaded into memory yet",
+            len(self._conversation_index),
+        )
+
         # Initialize conversation webhook subscribers
         self._conversation_webhook_subscribers = [
             ConversationWebhookSubscriber(
@@ -1787,6 +1792,7 @@ class ConversationService:
         """
         if conversation_id not in self._conversation_index:
             return None
+        started = time.monotonic()
         async with self._lazy_load_locks.setdefault(conversation_id, asyncio.Lock()):
             event_services = self._event_services
             if event_services is None:
@@ -1810,6 +1816,13 @@ class ConversationService:
                     exc.expires_at,
                 )
                 return None
+            assert event_service._conversation is not None
+            logger.info(
+                "Loaded conversation %s into memory: %d events in %.1fs",
+                conversation_id,
+                len(event_service._conversation._state.events),
+                time.monotonic() - started,
+            )
             return event_service
 
     def _load_stored_from_disk(

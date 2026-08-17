@@ -385,6 +385,10 @@ async def events_socket(
     # The conversation is actively watched while this socket is open; idle
     # eviction must not unload it underneath the subscriber.
     event_service.register_user_connection()
+    logger.info(
+        "User WebSocket connected for conversation %s; idle eviction paused",
+        conversation_id,
+    )
 
     # Determine effective resend mode (handle deprecated resend_all)
     effective_mode = resend_mode
@@ -463,6 +467,12 @@ async def events_socket(
     finally:
         await event_service.unsubscribe_from_events(subscriber_id)
         event_service.unregister_user_connection()
+        logger.info(
+            "User WebSocket disconnected for conversation %s; memory is released "
+            "after the idle-eviction window (~%.0fs) with no further activity",
+            conversation_id,
+            conv_service.idle_eviction_timeout,
+        )
 
 
 @sockets_router.websocket("/bash-events")

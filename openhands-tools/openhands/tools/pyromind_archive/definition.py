@@ -43,7 +43,12 @@ class ExtractArchiveAction(Action):
     """Submit an archive extraction task as a Studio workflow."""
 
     archive_path: str = Field(
-        description="Storage path of the archive file to extract.",
+        description=(
+            "Storage path of the archive file to extract. A leading "
+            "'/workspace/' or 'workspace/' prefix (a legacy alias for the "
+            "platform user-storage namespace, NOT the conversation working "
+            "directory) is stripped automatically."
+        ),
     )
     format: Literal["auto", "zip", "tar", "tar.gz", "tgz"] = Field(
         default="auto",
@@ -250,7 +255,7 @@ def _pod_path(storage_path: str) -> str:
 
 
 def _strip_workspace_prefix(path: str) -> str:
-    """Strip /workspace prefix if present (agent workspace path -> storage path)."""
+    """Strip a legacy '/workspace/' user-storage alias prefix from a path."""
     if path.startswith("/workspace/"):
         return path[len("/workspace") :]
     return path
