@@ -49,6 +49,8 @@ spec:
                         value: pre2
                       - name: OH_CONVERSATION_STORAGE_QUOTA
                         value: 500M
+                      - name: OH_SANDBOX_MEMORY_LIMIT
+                        value: 500M
                       - name: LLM_CONFIG_PATH
                         value: /etc/llm-config/llm_config.json
                       - name: LLM_MODEL

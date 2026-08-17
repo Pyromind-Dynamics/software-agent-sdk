@@ -185,6 +185,7 @@ class SubprocessTerminal(TerminalInterface):
                 pass
 
         self._pty_master_fd = master_fd
+        self.sandbox.attach_memory_cgroup(self.process.pid)
 
         # Set master FD non-blocking
         flags = fcntl.fcntl(self._pty_master_fd, fcntl.F_GETFL)

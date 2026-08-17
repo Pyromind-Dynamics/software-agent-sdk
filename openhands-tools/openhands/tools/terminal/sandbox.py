@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
 import sys
+import uuid
 from functools import lru_cache
 from importlib import import_module
 from pathlib import Path
@@ -22,10 +24,22 @@ logger = get_logger(__name__)
 
 TerminalSandboxMode = Literal["off", "auto", "required"]
 TERMINAL_SANDBOX_ENV = "OH_TERMINAL_SANDBOX"
+OH_SANDBOX_MEMORY_LIMIT_ENV = "OH_SANDBOX_MEMORY_LIMIT"
+_DEFAULT_SANDBOX_MEMORY_LIMIT = "500M"
 PUBLIC_READ_ROOTS = (
     "/agent-server/knowledge",
     "/agent-server/.agents/skills",
 )
+
+_CGROUP_MEMORY_ROOT = Path("/sys/fs/cgroup")
+_MEMORY_UNITS = {
+    "": 1,
+    "k": 1024,
+    "m": 1024**2,
+    "g": 1024**3,
+    "t": 1024**4,
+    "p": 1024**5,
+}
 
 # Name of the AppArmor profile loaded into the kernel at image build time
 # by `apparmor_parser -r -W /etc/apparmor.d/openhands-agent-terminal`.
@@ -49,6 +63,103 @@ def terminal_sandbox_mode() -> TerminalSandboxMode:
             f"{TERMINAL_SANDBOX_ENV} must be one of: off, auto, required; got {value!r}"
         )
     return cast(TerminalSandboxMode, value)
+
+
+def parse_memory_limit(text: str) -> int:
+    """Parse a human readable memory limit (``512M``, ``1G``) into bytes."""
+    match = re.fullmatch(
+        r"(?P<number>\d+)\s*(?P<unit>[kmgtp]?)", text.strip(), re.IGNORECASE
+    )
+    if match is None:
+        raise ValueError(f"invalid memory limit: {text!r}")
+    number = int(match.group("number"))
+    unit = match.group("unit").lower()
+    return number * _MEMORY_UNITS[unit]
+
+
+def _descendant_pids(root_pid: int) -> list[int]:
+    """Return all descendant pids of ``root_pid`` by walking ``/proc``."""
+    pids: list[int] = []
+    frontier = [root_pid]
+    while frontier:
+        next_frontier: list[int] = []
+        for pid in frontier:
+            children_file = Path(f"/proc/{pid}/task/{pid}/children")
+            try:
+                children = children_file.read_text().split()
+            except OSError:
+                continue
+            for child in children:
+                child_pid = int(child)
+                pids.append(child_pid)
+                next_frontier.append(child_pid)
+        frontier = next_frontier
+    return pids
+
+
+class SandboxMemoryCgroup:
+    """Pin a sandbox process tree into a cgroup with a hard memory cap.
+
+    Requires writable cgroup v2 delegation (``/sys/fs/cgroup`` mounted rw and
+    memory controller delegated); otherwise creation degrades to unlimited.
+    """
+
+    def __init__(self, limit_bytes: int, *, root: Path = _CGROUP_MEMORY_ROOT):
+        self._limit_bytes = limit_bytes
+        self._root = root
+        self._path: Path | None = None
+
+    @property
+    def path(self) -> Path | None:
+        return self._path
+
+    def create(self) -> bool:
+        """Create the child cgroup and set memory limits; False when unwritable."""
+        path = self._root / f"openhands-sandbox-{uuid.uuid4().hex[:12]}"
+        try:
+            path.mkdir()
+            (path / "memory.max").write_text(str(self._limit_bytes))
+            (path / "memory.high").write_text(str(self._limit_bytes * 3 // 4))
+            try:
+                (path / "memory.swap.max").write_text("0")
+            except OSError:
+                pass
+        except OSError as exc:
+            logger.warning("sandbox memory cgroup unavailable: %s", exc)
+            return False
+        self._path = path
+        return True
+
+    def attach(self, root_pid: int) -> None:
+        if self._path is None:
+            return
+        procs = self._path / "cgroup.procs"
+        for pid in (root_pid, *_descendant_pids(root_pid)):
+            try:
+                with procs.open("a") as stream:
+                    stream.write(f"{pid}\n")
+            except OSError:
+                return
+
+    def cleanup(self) -> None:
+        if self._path is None:
+            return
+        shutil.rmtree(self._path, ignore_errors=True)
+        self._path = None
+
+
+def sandbox_memory_cgroup_from_env() -> SandboxMemoryCgroup | None:
+    """Build a memory cgroup from ``OH_SANDBOX_MEMORY_LIMIT`` (default 500M)."""
+    value = os.environ.get(OH_SANDBOX_MEMORY_LIMIT_ENV, _DEFAULT_SANDBOX_MEMORY_LIMIT)
+    if not value.strip():
+        return None
+    try:
+        limit = parse_memory_limit(value)
+    except ValueError as exc:
+        logger.warning("invalid %s=%r: %s", OH_SANDBOX_MEMORY_LIMIT_ENV, value, exc)
+        return None
+    memory_cgroup = SandboxMemoryCgroup(limit)
+    return memory_cgroup if memory_cgroup.create() else None
 
 
 def terminal_sandbox_enabled(mode: TerminalSandboxMode) -> bool:
@@ -185,6 +296,7 @@ class TerminalSandbox:
         self._landlock_wrapper: Path | None = None
         self._seatbelt_profile: Path | None = None
         self._apparmor_available: bool = False
+        self._memory_cgroup: SandboxMemoryCgroup | None = None
 
     def prepare(self) -> None:
         """Probe available sandbox backends and prepare the chosen one."""
@@ -288,6 +400,7 @@ class TerminalSandbox:
 
         if self._backend == "landlock":
             self._write_landlock_wrapper()
+        self._memory_cgroup = sandbox_memory_cgroup_from_env()
 
     def _write_landlock_wrapper(self) -> None:
         """Generate a wrapper script that applies landlock then execs the command.
@@ -355,6 +468,11 @@ class TerminalSandbox:
         wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
         self._landlock_wrapper = wrapper
 
+    def attach_memory_cgroup(self, root_pid: int) -> None:
+        """Move the sandbox process tree into the session memory cgroup."""
+        if self._memory_cgroup is not None:
+            self._memory_cgroup.attach(root_pid)
+
     def wrap_command(self, command: list[str]) -> list[str]:
         """Wrap a command with the platform-specific sandbox launcher."""
         # Landlock is applied by a small Python wrapper script that the
@@ -404,6 +522,8 @@ class TerminalSandbox:
 
     def cleanup(self) -> None:
         """Remove the generated sandbox profile/wrapper after the shell exits."""
+        if self._memory_cgroup is not None:
+            self._memory_cgroup.cleanup()
         if self._seatbelt_profile is not None:
             self._seatbelt_profile.unlink(missing_ok=True)
         if self._landlock_wrapper is not None:

@@ -10,8 +10,11 @@ import pytest
 
 from openhands.tools.terminal.sandbox import (
     APPARMOR_PROFILE_NAME,
+    SandboxMemoryCgroup,
     TerminalSandbox,
     _is_bwrap_usable,
+    parse_memory_limit,
+    sandbox_memory_cgroup_from_env,
     terminal_sandbox_enabled,
     terminal_sandbox_mode,
 )
@@ -29,6 +32,101 @@ def _option_index(args: list[str], option: str, value: str) -> int:
         if arg == option and args[index + 1] == value:
             return index
     raise AssertionError(f"{option} {value} not found in {args}")
+
+
+def test_parse_memory_limit_accepts_human_sizes():
+    assert parse_memory_limit("512M") == 512 * 1024 * 1024
+    assert parse_memory_limit("1g") == 1024**3
+    assert parse_memory_limit("300") == 300
+
+
+def test_parse_memory_limit_rejects_invalid_value():
+    with pytest.raises(ValueError):
+        parse_memory_limit("banana")
+
+
+def test_memory_cgroup_defaults_to_500m(monkeypatch: pytest.MonkeyPatch):
+    captured: list[int] = []
+
+    class FakeMemoryCgroup:
+        def __init__(self, limit_bytes: int, *, root: Path = Path("/sys/fs/cgroup")):
+            captured.append(limit_bytes)
+
+        def create(self) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.SandboxMemoryCgroup", FakeMemoryCgroup
+    )
+    monkeypatch.delenv("OH_SANDBOX_MEMORY_LIMIT", raising=False)
+    assert sandbox_memory_cgroup_from_env() is not None
+    assert captured == [500 * 1024 * 1024]
+
+
+def test_memory_cgroup_empty_env_disables_limit(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("OH_SANDBOX_MEMORY_LIMIT", "")
+    assert sandbox_memory_cgroup_from_env() is None
+
+
+def test_memory_cgroup_create_sets_limits_in_root(tmp_path: Path):
+    memory_cgroup = SandboxMemoryCgroup(64 * 1024 * 1024, root=tmp_path)
+    assert memory_cgroup.create()
+    assert memory_cgroup.path is not None
+    assert memory_cgroup.path.parent == tmp_path
+    assert (memory_cgroup.path / "memory.max").read_text() == str(64 * 1024 * 1024)
+    assert (memory_cgroup.path / "memory.high").read_text() == str(
+        64 * 1024 * 1024 * 3 // 4
+    )
+    assert (memory_cgroup.path / "memory.swap.max").read_text() == "0"
+
+
+def test_memory_cgroup_create_degrades_on_unwritable_root(tmp_path: Path):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    memory_cgroup = SandboxMemoryCgroup(1024, root=blocker)
+    assert not memory_cgroup.create()
+    assert memory_cgroup.path is None
+
+
+def test_memory_cgroup_attach_moves_pid_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
+    assert memory_cgroup.create()
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: [100, 200]
+    )
+    memory_cgroup.attach(42)
+    path = memory_cgroup.path
+    assert path is not None
+    procs = (path / "cgroup.procs").read_text().split()
+    assert procs == ["42", "100", "200"]
+
+
+def test_memory_cgroup_cleanup_removes_directory(tmp_path: Path):
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
+    assert memory_cgroup.create()
+    path = memory_cgroup.path
+    assert path is not None and path.exists()
+    memory_cgroup.cleanup()
+    assert not path.exists()
+    assert memory_cgroup.path is None
+
+
+def test_terminal_sandbox_attaches_spawned_pid_to_memory_cgroup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
+    assert memory_cgroup.create()
+    sandbox = TerminalSandbox(str(tmp_path), "off")
+    sandbox._memory_cgroup = memory_cgroup
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: []
+    )
+    sandbox.attach_memory_cgroup(1234)
+    path = memory_cgroup.path
+    assert path is not None
+    assert (path / "cgroup.procs").read_text().split() == ["1234"]
 
 
 def test_terminal_sandbox_mode_rejects_unknown_value(
