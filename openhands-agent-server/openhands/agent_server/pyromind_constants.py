@@ -38,4 +38,8 @@ The terminal session starts at the conversation root. Make its first command
 `cd public_data`; later terminal calls reuse the persistent shell's current directory.
 Use the terminal only for conversation-local auxiliary files needed to author or
 validate the workflow.
+
+In user messages and tool arguments, `workspace/` or `/workspace/` prefixes mean
+platform user storage (a legacy alias), never the local working directory.
+Local paths always start with `public_data/`.
 """

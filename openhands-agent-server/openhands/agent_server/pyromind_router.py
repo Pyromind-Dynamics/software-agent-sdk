@@ -178,6 +178,11 @@ Knowledge base layout:
 The shared skill documents are available through the read-only logical path
 `{skills_alias}/`. Do not use or request their host filesystem path.
 
+User paths are platform storage paths (e.g. `datasets/...`,
+`/.pyromind-agent/...`, or a `workspace/` prefix) — never this conversation's
+local files. Read them with `preview_dataset` directly, without searching
+local files. Only `public_data/...` paths are local.
+
 Skill usage rules:
 - A conversation may already contain a workflow at
   `public_data/workflow_canvas/workflow.py`. Before asking for information or
@@ -238,7 +243,7 @@ bare name `workflow.py`.
 
 The separate `file_editor` tool does accept `path`. When using it for this file,
 set `path` to `public_data/workflow_canvas/workflow.py`; the runtime resolves
-workspace-relative paths to host-absolute paths. Do not hand-author long absolute
+conversation-relative paths to host-absolute paths. Do not hand-author long absolute
 paths, and do not use `/workspace/...` or `workspace/conversations/...` as a
 `file_editor.path` for the workflow file.
 After creating or modifying the workflow file, stop normally; the server sends
