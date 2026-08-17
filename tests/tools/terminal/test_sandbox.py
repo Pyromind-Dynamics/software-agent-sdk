@@ -478,6 +478,13 @@ def test_conversation_policy_bwrap_binds_container_root_read_only(
         wrapped, "--bind", str(public_data_dir)
     )
     assert "--tmpfs" not in wrapped
+    private_binds = [
+        wrapped[i + 1]
+        for i in range(len(wrapped) - 1)
+        if wrapped[i] == "--bind"
+        and wrapped[i + 1] in (str(sandbox._tmp_dir), str(sandbox._sandbox_tmp))
+    ]
+    assert private_binds == []
 
 
 def test_without_conversation_policy_keeps_sandbox_root_writable(

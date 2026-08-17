@@ -303,13 +303,16 @@ class TerminalSandbox:
         executable_paths = [
             path for path in ("/usr", "/bin", "/sbin") if Path(path).exists()
         ]
+        writable_paths = [str(p) for p in self.read_write_paths]
+        if not self.has_conversation_policy:
+            writable_paths.insert(0, str(self._tmp_dir))
         policy = {
             "system_read_paths": system_read_paths,
             "public_read_paths": public_read_paths,
             "read_only_paths": [str(p) for p in self.read_only_paths],
             "executable_paths": executable_paths,
             "tmp_dir": str(self._tmp_dir),
-            "read_write_paths": [str(p) for p in self.read_write_paths],
+            "read_write_paths": writable_paths,
             "mode": self.mode,
         }
         policy_path = self._tmp_dir / ".openhands-landlock-policy.json"
@@ -337,9 +340,7 @@ class TerminalSandbox:
             "        )\n"
             "        .allow_write('/dev/null', '/dev/tty')\n"
             "        .allow_execute(*policy['executable_paths'])\n"
-            "        .allow_read_write(\n"
-            "            policy['tmp_dir'], *policy['read_write_paths']\n"
-            "        )\n"
+            "        .allow_read_write(*policy['read_write_paths'])\n"
             "        .apply()\n"
             "    )\n"
             "except Exception as exc:\n"
@@ -426,15 +427,16 @@ class TerminalSandbox:
         for path in PUBLIC_READ_ROOTS:
             if Path(path).exists():
                 args.extend(["--ro-bind", path, path])
-        args.extend(["--bind", str(self._tmp_dir), str(self._tmp_dir)])
         for path in self.read_write_paths:
             args.extend(["--bind", str(path), str(path)])
         for path in self.read_only_paths:
             if path.exists():
                 args.extend(["--ro-bind", str(path), str(path)])
         args.extend(["--dev", "/dev", "--proc", "/proc"])
-        self._sandbox_tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
-        args.extend(["--bind", str(self._sandbox_tmp), "/tmp"])
+        if not self.has_conversation_policy:
+            args.extend(["--bind", str(self._tmp_dir), str(self._tmp_dir)])
+            self._sandbox_tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
+            args.extend(["--bind", str(self._sandbox_tmp), "/tmp"])
         return args
 
     def _build_seatbelt_profile(self) -> str:
