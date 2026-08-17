@@ -205,3 +205,20 @@ def test_device_node_parses_mountinfo_major_minor(monkeypatch, tmp_path):
 
     node = _device_node_for(Path("/workspace"))
     assert node is not None
+
+
+def test_device_node_prefers_existing_source_device(monkeypatch, tmp_path):
+    device = tmp_path / "nvme1n1"
+    device.write_text("block device")
+    mountinfo = f"23 21 259:5 / /workspace rw,relatime - xfs {device} rw,prjquota"
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.Path.read_text",
+        lambda self: mountinfo,
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.stat.S_ISBLK",
+        lambda _mode: True,
+    )
+    from openhands.agent_server.storage_quota import _device_node_for
+
+    assert _device_node_for(Path("/workspace")) == device

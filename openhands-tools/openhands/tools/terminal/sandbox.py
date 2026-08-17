@@ -138,7 +138,10 @@ class SandboxMemoryCgroup:
             try:
                 with procs.open("a") as stream:
                     stream.write(f"{pid}\n")
-            except OSError:
+            except OSError as exc:
+                logger.warning(
+                    "failed to attach pid %s to sandbox memory cgroup: %s", pid, exc
+                )
                 return
 
     def cleanup(self) -> None:

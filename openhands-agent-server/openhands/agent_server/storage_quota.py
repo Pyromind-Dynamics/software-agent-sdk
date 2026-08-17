@@ -77,13 +77,15 @@ def _mountpoint_for(path: Path) -> Path | None:
 def _device_node_for(mount_point: Path) -> Path | None:
     """Return a block-device node for ``mount_point``, or ``None``.
 
-    Containers do not expose the EBS backing device under ``/dev``, which
-    ``xfs_quota`` needs to open to read/write quota state. Recreate the node
-    from the ``major:minor`` pair in ``/proc/self/mountinfo`` (requires
-    ``CAP_MKNOD``/``CAP_SYS_ADMIN``, which the pod already has), and fall
-    back to ``None`` so callers keep passing the mount point.
+    Prefer the device path already exposed by the mount (e.g. a privileged
+    container sees ``/dev/nvme1n1``), which ``xfs_quota`` must open to
+    read/write quota state. Otherwise recreate the node from the
+    ``major:minor`` pair in ``/proc/self/mountinfo`` (requires
+    ``CAP_MKNOD``/``CAP_SYS_ADMIN``), and fall back to ``None`` so callers
+    keep passing the mount point.
     """
     major_minor: tuple[int, int] | None = None
+    source_path: Path | None = None
     try:
         lines = Path("/proc/self/mountinfo").read_text().splitlines()
     except OSError:
@@ -92,10 +94,21 @@ def _device_node_for(mount_point: Path) -> Path | None:
         fields = line.split()
         if len(fields) < 7 or Path(convert_mount_point(fields[4])) != mount_point:
             continue
+        if "-" in fields:
+            separator = fields.index("-")
+            source = fields[separator + 2] if separator + 2 < len(fields) else ""
+            if source.startswith("/"):
+                source_path = Path(source)
         parts = fields[2].split(":")
         if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
             major_minor = (int(parts[0]), int(parts[1]))
-            break
+        break
+    if source_path is not None:
+        try:
+            if stat.S_ISBLK(source_path.stat().st_mode):
+                return source_path
+        except OSError:
+            pass
     if major_minor is None:
         return None
     device = Path("/dev") / f"openhands-quota-{major_minor[0]}-{major_minor[1]}"
