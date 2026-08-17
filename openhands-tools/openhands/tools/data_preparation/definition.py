@@ -148,7 +148,7 @@ class DatasetDownloadAction(Action):
     )
     output_path: str = Field(
         description=(
-            "Conversation-relative destination JSONL path, e.g. "
+            "Workspace-relative destination JSONL path, e.g. "
             "'public_data/data-preparation/sample.jsonl'."
         )
     )
@@ -419,7 +419,7 @@ class DatasetDownloadTool(
 class DfRunPipelineAction(Action):
     pipeline_path: str = Field(
         description=(
-            "Conversation-relative path of the DataFlow pipeline script to run, "
+            "Workspace-relative path of the DataFlow pipeline script to run, "
             "e.g. 'public_data/data-preparation/pipeline.py'."
         )
     )
@@ -429,7 +429,7 @@ class DfRunPipelineAction(Action):
             "Positional arguments forwarded to the pipeline script. Their meaning "
             "is defined by that script; multimodal templates use input path, "
             "output path, and optional limit. When output_schema is set, args[0] "
-            "and args[1] are conversation-relative input/output paths and are "
+            "and args[1] are workspace-relative input/output paths and are "
             "normalized before execution."
         ),
     )
@@ -810,13 +810,13 @@ class DfRunPipelineTool(ToolDefinition[DfRunPipelineAction, DfRunPipelineObserva
 class DfConvertAction(Action):
     input_path: str = Field(
         description=(
-            "Conversation-relative processed JSONL path, e.g."
+            "Workspace-relative processed JSONL path, e.g."
             " 'public_data/data-preparation/processed.jsonl'."
         )
     )
     output_path: str = Field(
         description=(
-            "Conversation-relative output path. Use .jsonl for messages/preference "
+            "Workspace-relative output path. Use .jsonl for messages/preference "
             "or .parquet for trl_vision_sft/vision_sft_flat."
         )
     )
