@@ -444,6 +444,65 @@ def test_bwrap_tmp_is_bound_to_disk_not_tmpfs(
     assert sandbox._sandbox_tmp.is_dir()
 
 
+def test_conversation_policy_bwrap_binds_container_root_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_bwrap_usable", lambda: True
+    )
+
+    events_dir = tmp_path / "events"
+    public_data_dir = tmp_path / "public_data"
+    events_dir.mkdir()
+    public_data_dir.mkdir()
+    sandbox = TerminalSandbox(
+        str(tmp_path),
+        "required",
+        read_only_paths=(str(events_dir),),
+        read_write_paths=(str(public_data_dir),),
+    )
+    sandbox.prepare()
+
+    assert sandbox._backend == "bwrap"
+    wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
+    # The container root is mounted read-only before the declared rw path so
+    # untracked paths (e.g. a sibling /workspace/models) are denied instead of
+    # landing on an implicit writable sandbox root.
+    assert _option_index(wrapped, "--ro-bind", "/") < _option_index(
+        wrapped, "--bind", str(public_data_dir)
+    )
+    assert "--tmpfs" not in wrapped
+
+
+def test_without_conversation_policy_keeps_sandbox_root_writable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_bwrap_usable", lambda: True
+    )
+
+    sandbox = TerminalSandbox(str(tmp_path), "required")
+    sandbox.prepare()
+
+    assert sandbox._backend == "bwrap"
+    wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
+    assert ("--ro-bind", "/") not in [
+        (wrapped[i], wrapped[i + 1]) for i in range(len(wrapped) - 1)
+    ]
+
+
 def test_conversation_policy_uses_landlock_when_bwrap_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

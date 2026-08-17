@@ -178,6 +178,9 @@ class TerminalSandbox:
         self.read_write_paths = tuple(
             resolve_workspace_subpath(p, resolved_work_dir) for p in rw_paths
         )
+        self.has_conversation_policy = bool(
+            self.read_only_paths or self.read_write_paths != (self.work_dir,)
+        )
         self._backend = None
         self._landlock_wrapper: Path | None = None
         self._seatbelt_profile: Path | None = None
@@ -214,9 +217,7 @@ class TerminalSandbox:
         #
         # Without a per-conversation policy, the default order stands:
         #   AppArmor (no capability / namespace) > bwrap > Landlock.
-        has_conversation_policy = bool(
-            self.read_only_paths or self.read_write_paths != (self.work_dir,)
-        )
+        has_conversation_policy = self.has_conversation_policy
         backend_chosen = False
 
         # Conversation-scoped policy needs per-workspace mount semantics. Prefer
@@ -413,6 +414,12 @@ class TerminalSandbox:
         args = ["bwrap", "--unshare-ipc", "--unshare-uts"]
         if os.geteuid() != 0:
             args.append("--unshare-user-try")
+        if self.has_conversation_policy:
+            # Expose the container root read-only and let the declared
+            # conversation paths bind over it. This denies writes to paths
+            # outside public_data/events (e.g. /workspace/models) instead of
+            # letting them land on the sandbox's implicit writable root.
+            args.extend(["--ro-bind", "/", "/"])
         for path in ("/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"):
             if Path(path).exists():
                 args.extend(["--ro-bind", path, path])

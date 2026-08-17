@@ -1,4 +1,14 @@
 ---
+# StatefulSet for webapp-pre2 (merges the live baseline with:
+#   - per-conversation storage quota (XFS project quota, 500M)
+#   - multi-LLM failover via the llm-config ConfigMap
+#   - gp2-xfs StorageClass volume (fsType=xfs + mountOptions=[prjquota])
+#
+# REQUIRED BEFORE APPLY: the image must contain the xfs_quota binary.
+# The current feature_llm_router tag does NOT (root Dockerfile lacks
+# xfsprogs), so quota stays disabled. Rebuild from this repo after adding
+# "xfsprogs" to the root Dockerfile apt-get install list, push a new tag,
+# and update `image` below with the rebuilt tag.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -20,25 +30,14 @@ spec:
     serviceName: software-agent-sdk
     template:
         metadata:
-            annotations:
-                container.apparmor.security.beta.kubernetes.io/main: unconfined
             labels:
                 app: software-agent-sdk
                 enable-sts-monitor: 'true'
         spec:
             containers:
                 - name: main
-          # Rebuilt from the current repo: ships xfsprogs + storage_quota.py.
-                  image: pyrominddynamics/software-agent-sdk:feature_pyromind-agent-main-02c829a3-07210624
-          # Fallback for CSI/drivers that do not propagate StorageClass
-          # mountOptions: enable project quota accounting before the server
-          # starts, then run the image entrypoint.
-                  command:
-                      - /bin/sh
-                      - -c
-                      - |
-                        mount -o remount,prjquota /workspace || true
-                        exec /agent-server/.venv/bin/python -m openhands.agent_server
+          # TODO(admin): point at a rebuilt tag that ships xfsprogs
+                  image: pyrominddynamics/software-agent-sdk:feature_llm_router-785a5758-08170325
                   env:
                       - name: RunMode
                         value: agent-server
@@ -50,6 +49,8 @@ spec:
                         value: pre2
                       - name: OH_CONVERSATION_STORAGE_QUOTA
                         value: 500M
+                      - name: LLM_CONFIG_PATH
+                        value: /etc/llm-config/llm_config.json
                       - name: LLM_MODEL
                         value: deepseek/deepseek-v4-flash-0731
                       - name: LLM_BASE_URL
@@ -68,6 +69,11 @@ spec:
                         valueFrom:
                             secretKeyRef:
                                 key: OPENAI_API_KEY
+                                name: software-agent-sdk-secret
+                      - name: DEEPSEEK_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                key: DEEPSEEK_API_KEY
                                 name: software-agent-sdk-secret
                       - name: DF_API_KEY
                         valueFrom:
@@ -104,6 +110,9 @@ spec:
                       - mountPath: /etc/myhttps-ca/us-west-1/
                         name: us-west-1-ca-volume
                         readOnly: true
+                      - mountPath: /etc/llm-config
+                        name: llm-config
+                        readOnly: true
             initContainers:
                 - name: setup-workspace
                   image: busybox:latest
@@ -126,6 +135,28 @@ spec:
             imagePullSecrets:
                 - name: niqi-dev-secret
             restartPolicy: Always
+            volumes:
+                - name: full-web-key-secret
+                  secret:
+                      defaultMode: 420
+                      secretName: web-portal-secret-pre2
+                - name: us-west-2-ca-volume
+                  secret:
+                      defaultMode: 420
+                      items:
+                          - key: tls.crt
+                            path: tls-root-ca.crt
+                      secretName: https-tls-certs-pre2
+                - name: us-west-1-ca-volume
+                  secret:
+                      defaultMode: 420
+                      items:
+                          - key: rootCA.crt
+                            path: tls-root-ca.crt
+                      secretName: grpc-root-ca-pre2
+                - name: llm-config
+                  configMap:
+                      name: llm-config
     volumeClaimTemplates:
         - metadata:
               name: workspace
