@@ -54,7 +54,7 @@ class WorkflowDebugAction(Action):
     dsl_path: str | None = Field(
         default=None,
         description=(
-            "Conversation-relative path to the workflow DSL file to debug. Pass "
+            "Workspace-relative path to the workflow DSL file to debug. Pass "
             "the path of the declarative workflow script the agent generated "
             "or edited. If omitted, reads "
             "public_data/workflow_canvas/workflow.py from the workspace."
@@ -121,7 +121,7 @@ This is the only tool for debug/test runs — do **not** use `run_workflow` for
 测试/调试/试跑 (`run_workflow` has no agent-facing `test_mode` parameter).
 
 `public_data/workflow_canvas/workflow.py` is a declarative DSL, not a runnable Python script. Pass its
-conversation-relative path as `dsl_path` (default `public_data/workflow_canvas/workflow.py`); the tool reads the file itself. Do not execute
+workspace-relative path as `dsl_path` (default `public_data/workflow_canvas/workflow.py`); the tool reads the file itself. Do not execute
 it locally with bash or Python.
 
 This tool delegates to `run_workflow`'s executor with internal `test_mode=true`
@@ -201,7 +201,7 @@ class WorkflowDebugExecutor(
     ) -> str:
         """Read the workflow DSL file referenced by ``action.dsl_path``.
 
-        ``dsl_path`` is a conversation-relative path resolved against the
+        ``dsl_path`` is a workspace-relative path resolved against the
         conversation's working dir; it defaults to
         ``public_data/workflow_canvas/workflow.py``. Reads are confined to the
         workspace so a stray path cannot escape it.

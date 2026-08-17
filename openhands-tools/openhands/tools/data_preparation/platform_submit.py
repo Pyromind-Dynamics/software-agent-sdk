@@ -101,7 +101,7 @@ The tool creates a one-node CustomCommandNode workflow that:
 Execution is asynchronous. A terminal Kafka callback resumes the
 conversation when the workflow completes. After the callback, inspect
 all Pyromind artifacts exclusively with `preview_dataset`; never use Terminal,
-conversation file APIs, or local filesystem reads for these Storage paths:
+workspace file APIs, or local filesystem reads for these Storage paths:
 - report.json: execution summary, LLM call stats, error samples
 - failure.json / validation.json: detailed failure evidence when present
 - llm_calls.jsonl: per-attempt audit; invalid model output includes a redacted preview
