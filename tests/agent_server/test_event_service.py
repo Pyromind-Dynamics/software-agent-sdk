@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import json
 import shutil
 import threading
 import time
@@ -18,6 +19,7 @@ from openhands.agent_server.conversation_lease import LEASE_FILE_NAME
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.event_service import (
     EventService,
+    _rehydrate_runtime_agent,
     _with_pyromind_runtime_contract,
     _with_pyromind_runtime_llm,
     _with_pyromind_runtime_skills,
@@ -70,7 +72,7 @@ from openhands.sdk.event.llm_convertible import (
 )
 from openhands.sdk.io.local import LocalFileStore
 from openhands.sdk.io.memory import InMemoryFileStore
-from openhands.sdk.llm import MessageToolCall, TextContent
+from openhands.sdk.llm import FailoverRouter, MessageToolCall, TextContent
 from openhands.sdk.security.confirmation_policy import NeverConfirm
 from openhands.sdk.skills import Skill, SkillResources, SkillRuntime
 from openhands.sdk.workspace import LocalWorkspace
@@ -293,6 +295,51 @@ def test_pyromind_runtime_llm_is_rehydrated_from_server_env(monkeypatch):
     assert "base_url" not in dumped["llm"]
     assert "api_key" not in dumped["condenser"]["llm"]
     assert "base_url" not in dumped["condenser"]["llm"]
+
+
+def test_pyromind_runtime_router_survives_agent_roundtrip(tmp_path, monkeypatch):
+    config_path = tmp_path / "llm_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "llms": [
+                    {
+                        "name": "openrouter",
+                        "model": "openai/deepseek-v4-flash-0731",
+                        "base_url": "https://openrouter.ai/api/v1",
+                    },
+                    {
+                        "name": "deepseek",
+                        "model": "openai/deepseek-chat",
+                        "base_url": "https://api.deepseek.com",
+                    },
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("LLM_CONFIG_PATH", str(config_path))
+    agent = Agent(
+        llm=LLM(model="openai/glm-5.2-fp8", usage_id="pyromind-agent"),
+        tools=[],
+    )
+
+    rehydrated = _rehydrate_runtime_agent(agent, pyromind=True)
+
+    assert isinstance(rehydrated.llm, FailoverRouter)
+    assert set(rehydrated.llm.llms_for_routing) == {"openrouter", "deepseek"}
+    assert (
+        rehydrated.llm.llms_for_routing["openrouter"].model
+        == "openai/deepseek-v4-flash-0731"
+    )
+
+
+def test_rehydrate_runtime_agent_non_pyromind_keeps_plain_llm():
+    agent = Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[])
+
+    rehydrated = _rehydrate_runtime_agent(agent, pyromind=False)
+
+    assert type(rehydrated.llm) is LLM
+    assert rehydrated.llm.model == "gpt-4o"
 
 
 def test_pyromind_runtime_skills_are_rehydrated_from_server_path(tmp_path, monkeypatch):

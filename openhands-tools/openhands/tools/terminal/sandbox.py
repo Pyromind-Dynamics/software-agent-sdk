@@ -168,6 +168,7 @@ class TerminalSandbox:
         self.work_dir = resolved_work_dir
         self.mode: TerminalSandboxMode = mode
         self._tmp_dir = resolved_work_dir / ".openhands-tmp"
+        self._sandbox_tmp = self._tmp_dir / "sandbox-tmp"
         self.read_only_paths = tuple(
             resolve_workspace_subpath(p, resolved_work_dir) for p in read_only_paths
         )
@@ -424,7 +425,9 @@ class TerminalSandbox:
         for path in self.read_only_paths:
             if path.exists():
                 args.extend(["--ro-bind", str(path), str(path)])
-        args.extend(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"])
+        args.extend(["--dev", "/dev", "--proc", "/proc"])
+        self._sandbox_tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
+        args.extend(["--bind", str(self._sandbox_tmp), "/tmp"])
         return args
 
     def _build_seatbelt_profile(self) -> str:

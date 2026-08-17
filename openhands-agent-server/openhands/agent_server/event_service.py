@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import SecretStr, ValidationError
+from pydantic import ValidationError
 
 from openhands.agent_server.conversation_lease import (
     DEFAULT_LEASE_TTL_SECONDS,
@@ -37,6 +37,8 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_TERMINAL_PARAMS,
     PYROMIND_WORKFLOW_EVENT_KEY,
 )
+from openhands.agent_server.pyromind_llm_config import build_runtime_llm
+from openhands.agent_server.storage_quota import quota_from_env
 from openhands.agent_server.workflow_canvas_snapshot_hook import (
     WorkflowCanvasSnapshotHook,
 )
@@ -107,46 +109,42 @@ LEASE_RENEW_INTERVAL_SECONDS = 15.0
 # Bounds initial-state push so subscribe_to_events does not stall on a
 # subscriber whose __call__ blocks (e.g. WS with a full TCP send buffer).
 INITIAL_STATE_PUSH_TIMEOUT_SECONDS = 0.5
-_OPENAI_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
-
-
-def _normalize_openai_base_url(base_url: str | None) -> str | None:
-    if base_url is None:
-        return None
-    normalized = base_url.strip().rstrip("/")
-    if not normalized:
-        return None
-    if normalized.endswith(_OPENAI_CHAT_COMPLETIONS_SUFFIX):
-        return normalized[: -len(_OPENAI_CHAT_COMPLETIONS_SUFFIX)]
-    return normalized
 
 
 def _pyromind_runtime_llm(existing: LLM) -> LLM:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    return existing.model_copy(
-        update={
-            "model": os.environ.get("LLM_MODEL") or existing.model,
-            "api_key": SecretStr(api_key) if api_key is not None else existing.api_key,
-            "base_url": _normalize_openai_base_url(
-                os.environ.get("LLM_BASE_URL") or existing.base_url
-            ),
-            "persist_runtime_config": False,
-        }
-    )
+    """Apply the runtime LLM configuration (multi-provider failover capable)."""
+    return build_runtime_llm(existing)
 
 
 def _with_pyromind_runtime_llm(agent: AgentBase) -> AgentBase:
     runtime_llm = _pyromind_runtime_llm(agent.llm)
     condenser = agent.condenser
     if isinstance(condenser, LLMSummarizingCondenser):
-        condenser = condenser.model_copy(
-            update={
-                "llm": runtime_llm.model_copy(
-                    update={"usage_id": condenser.llm.usage_id}
-                )
+        # Rebuild a fresh runtime LLM for the condenser so its inner providers
+        # do not share Metrics/Telemetry objects with the agent's router.
+        condenser_llm = _pyromind_runtime_llm(condenser.llm)
+        condenser = condenser.model_copy(update={"llm": condenser_llm})
+    return agent.model_copy(update={"llm": runtime_llm, "condenser": condenser})
+
+
+def _rehydrate_runtime_agent(agent: AgentBase, *, pyromind: bool) -> AgentBase:
+    """Re-instantiate the stored agent, then re-apply the runtime LLM config.
+
+    The model_dump/model_validate round-trip re-creates ``agent.llm`` as a
+    plain LLM and would drop a FailoverRouter's provider cohort, so the runtime
+    LLM must be applied after the round-trip validation.
+    """
+    revalidated = type(agent).model_validate(
+        agent.model_dump(
+            context={
+                "expose_secrets": True,
+                PRESERVE_SKILL_PATH_CONTEXT: True,
             }
         )
-    return agent.model_copy(update={"llm": runtime_llm, "condenser": condenser})
+    )
+    if pyromind:
+        return _with_pyromind_runtime_llm(revalidated)
+    return revalidated
 
 
 def _with_pyromind_runtime_skills(agent: AgentBase) -> AgentBase:
@@ -1214,12 +1212,19 @@ class EventService:
                 "Failed to initialize git repository at %s: %s", working_dir, e
             )
 
+    def _apply_storage_quota(self) -> None:
+        """Apply the configured storage quota to this conversation's directory."""
+        quota = quota_from_env()
+        if quota.limit_bytes is not None:
+            quota.apply(self.conversation_dir, self.stored.id)
+
     async def start(self):
         # Store the main event loop for cross-thread communication
         self._main_loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
 
         # self.stored contains an Agent configuration we can instantiate
         _ensure_secure_directory(self.conversation_dir)
+        self._apply_storage_quota()
         # lease_ttl_seconds=0 disables leasing for single-instance deployments
         # where shared-storage stale leases would otherwise block pod restarts.
         if self.lease_ttl_seconds > 0:
@@ -1243,17 +1248,13 @@ class EventService:
         if self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE:
             (working_dir / "public_data").mkdir(mode=0o700, exist_ok=True)
             runtime_agent = _with_pyromind_runtime_skills(self.stored.agent)
-            runtime_agent = _with_pyromind_runtime_contract(runtime_agent)
             self.stored = self.stored.model_copy(
-                update={"agent": _with_pyromind_runtime_llm(runtime_agent)}
+                update={"agent": _with_pyromind_runtime_contract(runtime_agent)}
             )
-        agent_cls = type(self.stored.agent)
-        agent = agent_cls.model_validate(
-            self.stored.agent.model_dump(
-                context={
-                    "expose_secrets": True,
-                    PRESERVE_SKILL_PATH_CONTEXT: True,
-                }
+        agent = _rehydrate_runtime_agent(
+            self.stored.agent,
+            pyromind=(
+                self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE
             ),
         )
 

@@ -1,14 +1,4 @@
 ---
-apiVersion: v1
-kind: Secret
-metadata:
-    name: software-agent-sdk-secret
-    namespace: webapp-pre
-type: Opaque
-data:
-    SESSION_API_KEY: NjkyNzY1OGM1YTdhOGNhNmJhM2UwMmZiYzNmOWFmYzk3MDEyYTg1Y2VhMDlkZDg3MGZmYjc3NmE2NjNlOWUwYwo=
-    OH_SECRET_KEY: MjdmZmE0Y2I5ODQzNjE2ZjE0Yjc3ZmVkOGQ0YWI3MDBlMTQ4NDZmOGRkNzZjNGU0YmViOWU3YzNmMjk5ZTc3Mgo=
----
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -16,8 +6,12 @@ metadata:
         app: software-agent-sdk
         enable-sts-monitor: 'true'
     name: software-agent-sdk
-    namespace: webapp-pre
+    namespace: webapp-pre2
 spec:
+    persistentVolumeClaimRetentionPolicy:
+        whenDeleted: Retain
+        whenScaled: Retain
+    podManagementPolicy: OrderedReady
     replicas: 1
     revisionHistoryLimit: 10
     selector:
@@ -33,13 +27,33 @@ spec:
                 enable-sts-monitor: 'true'
         spec:
             containers:
-                - env:
+                - name: main
+          # Rebuilt from the current repo: ships xfsprogs + storage_quota.py.
+                  image: pyrominddynamics/software-agent-sdk:feature_pyromind-agent-main-02c829a3-07210624
+          # Fallback for CSI/drivers that do not propagate StorageClass
+          # mountOptions: enable project quota accounting before the server
+          # starts, then run the image entrypoint.
+                  command:
+                      - /bin/sh
+                      - -c
+                      - |
+                        mount -o remount,prjquota /workspace || true
+                        exec /agent-server/.venv/bin/python -m openhands.agent_server
+                  env:
                       - name: RunMode
                         value: agent-server
-                      - name: workspace_dir
-                        value: /workspace
+                      - name: POD_NAME
+                        valueFrom:
+                            fieldRef:
+                                fieldPath: metadata.name
+                      - name: APP_ENV
+                        value: pre2
                       - name: OH_CONVERSATION_STORAGE_QUOTA
                         value: 500M
+                      - name: LLM_MODEL
+                        value: deepseek/deepseek-v4-flash-0731
+                      - name: LLM_BASE_URL
+                        value: https://openrouter.ai/api/v1
                       - name: SESSION_API_KEY
                         valueFrom:
                             secretKeyRef:
@@ -50,31 +64,46 @@ spec:
                             secretKeyRef:
                                 key: OH_SECRET_KEY
                                 name: software-agent-sdk-secret
-                  image: pyrominddynamics/software-agent-sdk:feat-dockerfile-a34541ee-07020635
-                  imagePullPolicy: IfNotPresent
-                  name: main
+                      - name: OPENAI_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                key: OPENAI_API_KEY
+                                name: software-agent-sdk-secret
+                      - name: DF_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                key: DF_API_KEY
+                                name: software-agent-sdk-secret
                   ports:
                       - containerPort: 8000
                         name: http
-                        protocol: TCP
                   resources:
-                      requests:
-                          memory: 512Mi
-                          cpu: 250m
                       limits:
-                          memory: 1Gi
+                          cpu: 1
+                          memory: 2Gi
+                      requests:
                           cpu: 500m
-                  terminationMessagePath: /dev/termination-log
-                  terminationMessagePolicy: File
-                  volumeMounts:
-                      - mountPath: /workspace
-                        name: workspace
+                          memory: 1Gi
                   securityContext:
+                      appArmorProfile:
+                          type: Unconfined
                       capabilities:
                           add:
                               - SYS_ADMIN
                       seccompProfile:
                           type: Unconfined
+                  volumeMounts:
+                      - mountPath: /workspace
+                        name: workspace
+                      - mountPath: /etc/secrets
+                        name: full-web-key-secret
+                        readOnly: true
+                      - mountPath: /etc/myhttps-ca/us-west-2/
+                        name: us-west-2-ca-volume
+                        readOnly: true
+                      - mountPath: /etc/myhttps-ca/us-west-1/
+                        name: us-west-1-ca-volume
+                        readOnly: true
             initContainers:
                 - name: setup-workspace
                   image: busybox:latest
@@ -84,7 +113,6 @@ spec:
                       - |
                         mkdir -p /workspace/conversations
                         mkdir -p /workspace/project
-                        mkdir -p /workspace/bash_events
                         chown -R 10001:10001 /workspace
                         echo "Workspace initialized successfully"
                   volumeMounts:
@@ -92,16 +120,13 @@ spec:
                         name: workspace
             securityContext:
                 fsGroup: 10001
-                runAsUser: 0
                 runAsGroup: 0
+                runAsUser: 0
             dnsPolicy: ClusterFirst
             imagePullSecrets:
                 - name: niqi-dev-secret
             restartPolicy: Always
     volumeClaimTemplates:
-        # Enforcing the per-conversation storage quota requires the workspace
-        # volume to be mounted with prjquota (XFS). Provision it through a
-        # StorageClass with fsType: xfs and mountOptions: [prjquota].
         - metadata:
               name: workspace
           spec:
@@ -110,21 +135,4 @@ spec:
               resources:
                   requests:
                       storage: 100Gi
-              storageClassName: gp2
----
-apiVersion: v1
-kind: Service
-metadata:
-    name: software-agent-sdk
-    namespace: webapp-pre
-    labels:
-        app: software-agent-sdk
-spec:
-    selector:
-        app: software-agent-sdk
-    ports:
-        - name: http
-          port: 80
-          targetPort: 8000
-          protocol: TCP
-    type: ClusterIP
+              storageClassName: gp2-xfs

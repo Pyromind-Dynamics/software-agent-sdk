@@ -420,6 +420,30 @@ def test_conversation_policy_prefers_bwrap_over_landlock_and_apparmor(
     )
 
 
+def test_bwrap_tmp_is_bound_to_disk_not_tmpfs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_bwrap_usable", lambda: True
+    )
+
+    sandbox = TerminalSandbox(str(tmp_path), "required")
+    sandbox.prepare()
+
+    assert sandbox._backend == "bwrap"
+    wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
+    assert "--tmpfs" not in wrapped
+    tmp_index = _option_index(wrapped, "--bind", str(sandbox._sandbox_tmp))
+    assert wrapped[tmp_index + 2] == "/tmp"
+    assert sandbox._sandbox_tmp.is_dir()
+
+
 def test_conversation_policy_uses_landlock_when_bwrap_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
