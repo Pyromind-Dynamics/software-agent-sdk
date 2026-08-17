@@ -136,9 +136,10 @@ class PreviewDatasetAction(Action):
             "(e.g. 'openai/gsm8k/data/train.jsonl'), or a user storage "
             "relative path (e.g. 'datasets/my_data/' or "
             "'datasets/my_data/train.jsonl'). A leading '/workspace/' or "
-            "'workspace/' prefix (platform workspace path) is stripped "
-            "automatically and the remainder is treated as a user storage "
-            "relative path."
+            "'workspace/' prefix (a legacy alias for the platform "
+            "user-storage namespace, NOT the conversation working "
+            "directory) is stripped automatically and the remainder is "
+            "treated as a user storage relative path."
         ),
     )
     n: int = Field(
@@ -273,11 +274,11 @@ class PreviewDatasetObservation(Observation):
     )
     local_sample_paths: list[str] = Field(
         default_factory=list,
-        description="Workspace-relative paths materialized for local sample runs.",
+        description="Conversation-relative paths materialized for local sample runs.",
     )
     sample_manifest_path: str | None = Field(
         default=None,
-        description="Workspace-relative JSONL manifest created in sample mode.",
+        description="Conversation-relative JSONL manifest created in sample mode.",
     )
     vision_previews: list[dict[str, Any]] = Field(
         default_factory=list,
@@ -318,8 +319,9 @@ This tool inspects dataset content from two sources (tried in order):
    storage-relative path (e.g. 'datasets/my_data/train.jsonl' or
    'datasets/my_data/').
 
-Paths that start with '/workspace/' or 'workspace/' (platform workspace
-paths) are automatically stripped of that prefix and the remainder is
+Paths that start with '/workspace/' or 'workspace/' (a legacy alias for
+the platform user-storage namespace, NOT the conversation working
+directory) are automatically stripped of that prefix and the remainder is
 resolved as a user storage relative path (e.g. '/workspace/proto.zip' ->
 'proto.zip').
 
@@ -346,7 +348,7 @@ When only a dataset/folder name is given (no specific file):
   previewed directly.
 
 Use mode='sample' for user storage after inspection. It materializes at most
-three selected files or folders inside the conversation workspace, preserves
+three selected files or folders inside the conversation working directory, preserves
 their storage-relative layout, and returns a sample_manifest_path for
 df_run_pipeline. Image samples are sent to the configured DF vision model
 (normally Gemma) for OCR and a short visual summary.
@@ -1773,12 +1775,12 @@ class PreviewDatasetTool(
 
 
 class UploadFileToPyromindAction(Action):
-    """Upload a local workspace file to Pyromind storage."""
+    """Upload a file from the conversation working directory to Pyromind storage."""
 
     file_path: str = Field(
         description=(
-            "Path of the file in the current conversation workspace to "
-            "upload (e.g. 'acc.py')."
+            "Path of the file in the current conversation working directory "
+            "to upload (e.g. 'acc.py')."
         ),
     )
     target_dir: str | None = Field(
@@ -2223,7 +2225,7 @@ def _looks_like_directory(path: str) -> bool:
 
 
 def _strip_workspace_prefix(path: str) -> str:
-    """Strip a leading platform workspace prefix, yielding a storage path."""
+    """Strip a legacy 'workspace/' user-storage alias prefix from a path."""
     for prefix in _WORKSPACE_PATH_PREFIXES:
         if path.startswith(prefix):
             return path[len(prefix) :]

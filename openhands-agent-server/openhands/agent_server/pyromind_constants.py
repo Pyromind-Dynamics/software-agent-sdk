@@ -38,4 +38,13 @@ The terminal session starts at the conversation root. Make its first command
 `cd public_data`; later terminal calls reuse the persistent shell's current directory.
 Use the terminal only for conversation-local auxiliary files needed to author or
 validate the workflow.
+
+Two distinct namespaces use the word "workspace", do not confuse them:
+- The conversation working directory: `public_data/` and conversation root
+  paths, owned by this agent. Access it with `file_editor`/`apply_patch`/`terminal`.
+- Platform user storage: paths like `/.pyromind-agent/<conversation_id>/...`
+  or `datasets/...`, owned by the user's Pyromind Storage. Access it only with
+  storage tools (`preview_dataset`, `upload_file_to_pyromind`, `extract_archive`).
+  A leading `workspace/` or `/workspace/` prefix in those storage tools is a
+  legacy alias for user storage, NOT the conversation working directory.
 """

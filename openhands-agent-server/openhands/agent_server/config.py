@@ -268,7 +268,7 @@ class Config(BaseModel):
         ),
     )
     idle_conversation_eviction_seconds: int = Field(
-        default=1800,
+        default=300,
         ge=0,
         description=(
             "Minimum inactivity (seconds) before an activated conversation is "
