@@ -18,6 +18,11 @@ description: >-
 - 数据、模型和训练产物通过输出端口绑定；禁止用 Agent 本地 terminal 替代平台运行时或查找数据副本。
 - Benchmark 最小骨架是数据配置 → 模型入口 → VLLM → Metric → Eval。
 - 每个 `MetricsConfigBuilderNode` 只输出一个 `metrics_config`；契约未声明的组合方式不得猜测。
+- 节点契约的单一事实源是 `knowledge/nodes/<NodeType>/<NodeType>.md`（输入/输出/必填/枚举）；
+  `references/workflow-contracts.md` 是整理后的快速索引。两者冲突以 `knowledge/` 原文为准，并按
+  `validate_workflow_dsl` 实时结果回写 skill 规则。
+- GPU 枚举、必填端口等平台契约会随迭代漂移；不确定时构造最小可验证 DSL 调一次
+  `validate_workflow_dsl`，以返回的 `code`/`node_id`/`field` 为准，不要凭经验猜测。
 - Reference 是按缺失事实选择的索引，不是阅读清单；同一轮不得重复读取同一路径。
 - Skill 与 reference 足以生成初稿时不查 `knowledge/`。只有校验明确暴露未覆盖的平台契约时，
   才能围绕该错误定向查询一次。
@@ -107,17 +112,24 @@ batch、grad accumulation、learning rate、epoch、LoRA rank、max steps 和 nu
 - 文件固定为 `public_data/workflow_canvas/workflow.py`；新建或整体生成使用 `apply_patch`。
 - 修改前先读取现有文件，列出内部“需求验收项”和“图差分”，仅替换相关节点与连线。
 - 所有上游产物都通过输出端口绑定。不得把 SFT、Merge、GRPO、Inference 之间的模型路径写死。
-- WandB 仅写 Secret 名；不得把 API Key、Cookie、集群凭证或其他明文 Secret 写入 DSL。
+- SFT/DPO/GRPO 的 `wandb_config`、`accelerate_config` 平台当前按必填校验：必须由对应 Builder
+  的输出端口连接，不得省略或写空串。WandB 仅写 Secret 名；不得把 API Key、Cookie、集群凭证或
+  其他明文 Secret 写入 DSL。
 
 ### 8. 校验闭环
 
-每次写入后立即调用 `validate_workflow_dsl`，不传 `dsl` 参数：
+每次写入后立即调用
+`validate_workflow_dsl(dsl_path="public_data/workflow_canvas/workflow.py")`；不要传 DSL 全文：
 
 1. `valid=true`：结束；warnings 只在最终回复简述。
 2. `valid=false`：按 `code`、`node_id`、`field` 和 `detail.*_node_code` 做唯一片段最小修改。
+   平台契约漂移（如 `MISSING_REQUIRED_INPUT`、`ENUM_VALUE_INVALID`）以校验返回为准，不得照搬
+   skill 旧表格；修正后顺带回写 `references/workflow-contracts.md` 对应行。
 3. `retryable=false`（包括 401）：立即停止，不重复校验，也不得用 terminal 探测凭证。
 4. `retryable=true`：最多重试两次；仍失败则停止并说明平台校验未完成。
 5. 最多修改五轮；同一错误连续两轮不消失时停止并报告。
+6. 对 GPU 枚举、必填端口等不确定契约，可构造只含目标节点和最小依赖的最小 DSL 单独调一次校验
+   探测，再据此生成正式工作流；不得用 `run_workflow` 探测。
 
 生成 Skill 不调用 `workflow_debug`、`run_workflow` 或 `run_dataset_cleaning`。只有不含配置修改的
 显式调试请求才转用 `debug-workflow`；“换模型/改参数后跑或看效果”本轮只修改并校验 DSL，正式

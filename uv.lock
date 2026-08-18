@@ -21,10 +21,13 @@ pyromind-sdk = "2026-08-04T00:00:00Z"
 
 [manifest]
 members = [
+    "harness-adapter",
     "openhands-agent-server",
     "openhands-sdk",
     "openhands-tools",
     "openhands-workspace",
+    "pyromind-agent-server",
+    "pyromind-runtime",
 ]
 constraints = [
     { name = "aiohttp", specifier = ">=3.13.3" },
@@ -348,7 +351,7 @@ name = "argon2-cffi"
 version = "25.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "argon2-cffi-bindings" },
+    { name = "argon2-cffi-bindings", marker = "python_full_version < '3.14'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/0e/89/ce5af8a7d472a67cc819d5d998aa8c82c5d860608c4db9f46f1162d7dab9/argon2_cffi-25.1.0.tar.gz", hash = "sha256:694ae5cc8a42f4c4e2bf2ca0e64e51e23a040c6a517a85074683d3959e1346c1", size = 45706, upload-time = "2025-06-03T06:55:32.073Z" }
 wheels = [
@@ -360,7 +363,7 @@ name = "argon2-cffi-bindings"
 version = "25.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi" },
+    { name = "cffi", marker = "python_full_version < '3.14'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/5c/2d/db8af0df73c1cf454f71b2bbe5e356b8c1f8041c979f505b3d3186e520a9/argon2_cffi_bindings-25.1.0.tar.gz", hash = "sha256:b957f3e6ea4d55d820e40ff76f450952807013d361a65d7f28acc0acbf29229d", size = 1783441, upload-time = "2025-07-30T10:02:05.147Z" }
 wheels = [
@@ -1782,6 +1785,26 @@ wheels = [
 ]
 
 [[package]]
+name = "harness-adapter"
+version = "0.1.0"
+source = { editable = "harness-adapter" }
+dependencies = [
+    { name = "pyromind-runtime" },
+]
+
+[package.optional-dependencies]
+openhands = [
+    { name = "openhands-agent-server" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "openhands-agent-server", marker = "extra == 'openhands'", editable = "openhands-agent-server" },
+    { name = "pyromind-runtime", editable = "pyromind-runtime" },
+]
+provides-extras = ["openhands"]
+
+[[package]]
 name = "hf-xet"
 version = "1.5.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2464,7 +2487,7 @@ name = "macholib"
 version = "1.16.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "altgraph" },
+    { name = "altgraph", marker = "(python_full_version >= '3.13' and sys_platform == 'emscripten') or (sys_platform != 'emscripten' and sys_platform != 'win32')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/10/2f/97589876ea967487978071c9042518d28b958d87b17dceb7cdc1d881f963/macholib-1.16.4.tar.gz", hash = "sha256:f408c93ab2e995cd2c46e34fe328b130404be143469e41bc366c807448979362", size = 59427, upload-time = "2025-11-22T08:28:38.373Z" }
 wheels = [
@@ -2610,11 +2633,11 @@ name = "minio"
 version = "7.2.20"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "argon2-cffi" },
-    { name = "certifi" },
-    { name = "pycryptodome" },
-    { name = "typing-extensions" },
-    { name = "urllib3" },
+    { name = "argon2-cffi", marker = "python_full_version < '3.14'" },
+    { name = "certifi", marker = "python_full_version < '3.14'" },
+    { name = "pycryptodome", marker = "python_full_version < '3.14'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.14'" },
+    { name = "urllib3", marker = "python_full_version < '3.14'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/40/df/6dfc6540f96a74125a11653cce717603fd5b7d0001a8e847b3e54e72d238/minio-7.2.20.tar.gz", hash = "sha256:95898b7a023fbbfde375985aa77e2cd6a0762268db79cf886f002a9ea8e68598", size = 136113, upload-time = "2025-11-27T00:37:15.569Z" }
 wheels = [
@@ -6888,16 +6911,46 @@ nodejs = [
 ]
 
 [[package]]
+name = "pyromind-agent-server"
+version = "0.1.0"
+source = { editable = "pyromind-agent-server" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "harness-adapter", extra = ["openhands"] },
+    { name = "openhands-agent-server" },
+    { name = "pyromind-runtime" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.104" },
+    { name = "harness-adapter", extras = ["openhands"], editable = "harness-adapter" },
+    { name = "openhands-agent-server", editable = "openhands-agent-server" },
+    { name = "pyromind-runtime", editable = "pyromind-runtime" },
+]
+
+[[package]]
+name = "pyromind-runtime"
+version = "0.1.0"
+source = { editable = "pyromind-runtime" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2.12.5" }]
+
+[[package]]
 name = "pyromind-sdk"
 version = "0.1.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "aiohttp" },
-    { name = "minio" },
-    { name = "pydantic" },
-    { name = "pyyaml" },
-    { name = "requests" },
-    { name = "urllib3" },
+    { name = "aiohttp", marker = "python_full_version < '3.14'" },
+    { name = "minio", marker = "python_full_version < '3.14'" },
+    { name = "pydantic", marker = "python_full_version < '3.14'" },
+    { name = "pyyaml", marker = "python_full_version < '3.14'" },
+    { name = "requests", marker = "python_full_version < '3.14'" },
+    { name = "urllib3", marker = "python_full_version < '3.14'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/84/2f/f02e6789464ef59317576a436ca56ee011d4fa5ee71e60fe63c9bcbbaa23/pyromind_sdk-0.1.8.tar.gz", hash = "sha256:686c6b4afa1b60e05846980002f2826c6fa54eda604a602c0c40784d44223f5d", size = 124847, upload-time = "2026-08-03T03:12:04.22Z" }
 wheels = [
@@ -7464,8 +7517,8 @@ name = "secretstorage"
 version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cryptography" },
-    { name = "jeepney" },
+    { name = "cryptography", marker = "(python_full_version >= '3.13' and sys_platform == 'emscripten') or (sys_platform != 'emscripten' and sys_platform != 'win32')" },
+    { name = "jeepney", marker = "(python_full_version >= '3.13' and sys_platform == 'emscripten') or (sys_platform != 'emscripten' and sys_platform != 'win32')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [

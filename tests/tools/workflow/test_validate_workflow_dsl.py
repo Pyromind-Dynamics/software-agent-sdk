@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import httpx
+import pytest
 from pydantic import SecretStr
 
 from openhands.agent_server.pyromind_router import (
@@ -239,7 +240,9 @@ def test_validate_workflow_dsl_reads_workflow_file_when_dsl_omitted(
     monkeypatch.setattr(httpx, "post", fake_post)
 
     observation = ValidateWorkflowDslExecutor()(
-        ValidateWorkflowDslAction(),
+        ValidateWorkflowDslAction(
+            dsl_path="public_data/workflow_canvas/workflow.py"
+        ),
         cast(Any, _fake_conversation(tmp_path)),
     )
 
@@ -257,13 +260,58 @@ def test_validate_workflow_dsl_reports_missing_workflow_file(monkeypatch, tmp_pa
     monkeypatch.setattr(httpx, "post", fake_post)
 
     observation = ValidateWorkflowDslExecutor()(
-        ValidateWorkflowDslAction(),
+        ValidateWorkflowDslAction(
+            dsl_path="public_data/workflow_canvas/workflow.py"
+        ),
         cast(Any, _fake_conversation(tmp_path)),
     )
 
     assert observation.is_error
     assert "workflow.py" in observation.text
     assert "does not exist" in observation.text
+
+
+@pytest.mark.parametrize("dsl_path", ["../workflow.py", "/tmp/workflow.py"])
+def test_validate_workflow_dsl_rejects_paths_outside_workspace(
+    monkeypatch, tmp_path, dsl_path
+):
+    def fake_post(url, *, headers, json, timeout):
+        raise AssertionError("validation API should not be called")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    observation = ValidateWorkflowDslExecutor()(
+        ValidateWorkflowDslAction(dsl_path=dsl_path),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert observation.is_error
+    assert "stay inside the workspace" in observation.text
+
+
+def test_validate_workflow_dsl_rejects_symlink(monkeypatch, tmp_path):
+    def fake_post(url, *, headers, json, timeout):
+        raise AssertionError("validation API should not be called")
+
+    target = tmp_path / "target.py"
+    target.write_text("# workflow\n", encoding="utf-8")
+    link = tmp_path / "workflow.py"
+    link.symlink_to(target)
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    observation = ValidateWorkflowDslExecutor()(
+        ValidateWorkflowDslAction(dsl_path="workflow.py"),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert observation.is_error
+    assert "must not contain symlinks" in observation.text
+
+
+def test_validate_workflow_dsl_tool_schema_exposes_only_dsl_path():
+    schema = ValidateWorkflowDslAction.model_json_schema()
+
+    assert "dsl_path" in schema["properties"]
+    assert "dsl" not in schema["properties"]
 
 
 def test_validate_workflow_dsl_resolves_headers_from_conversation_secrets(

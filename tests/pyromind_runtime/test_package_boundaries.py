@@ -1,0 +1,35 @@
+import ast
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _imports(package_root: Path) -> set[str]:
+    imported: set[str] = set()
+    for path in package_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+    return imported
+
+
+def test_runtime_has_no_server_or_harness_dependencies() -> None:
+    imports = _imports(ROOT / "pyromind-runtime" / "pyromind_runtime")
+    forbidden = ("fastapi", "openhands", "harness_adapter", "pyromind_agent_server")
+    assert not any(name.startswith(forbidden) for name in imports)
+
+
+def test_adapter_does_not_depend_on_pyromind_server() -> None:
+    imports = _imports(ROOT / "harness-adapter" / "harness_adapter")
+    assert not any(name.startswith("pyromind_agent_server") for name in imports)
+
+
+def test_pyromind_start_scripts_use_composed_server_entrypoint() -> None:
+    for script_name in ("start.sh", "start_inference.sh"):
+        script = (ROOT / script_name).read_text(encoding="utf-8")
+        assert "python -m pyromind_agent_server" in script
+        assert "python -m openhands.agent_server" not in script

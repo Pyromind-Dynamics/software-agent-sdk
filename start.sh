@@ -127,7 +127,7 @@ echo " Auto-reload:       enabled"
 echo "============================================"
 echo ""
 
-uv run python -m openhands.agent_server \
+uv run python -m pyromind_agent_server \
   --host 127.0.0.1 \
   --port 8000 \
   --reload

@@ -98,6 +98,10 @@ make build
 ./start.sh
 ```
 
+`start.sh` starts the composed `pyromind_agent_server` application. It preserves
+the OpenHands API and adds the Product API under
+`/api/v2/pyromind/conversations`.
+
 Set `workspace_dir` before startup to place conversations, project files, and bash
 events under a deployment-specific workspace root.
 

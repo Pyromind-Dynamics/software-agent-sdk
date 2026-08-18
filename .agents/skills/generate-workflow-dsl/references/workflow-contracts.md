@@ -48,9 +48,10 @@ Merge、推理与评测｜平台边界。
 | DatasetConfigBuilderNode | train_data_path | val_data_path, dataset_kind_config, dataset_extra_config | `dataset_config` |
 | ModelConfigBuilderNode | model_path | model_type | `model_config` |
 
-Message 默认字段为 `messages`；Text/Vision 的 assistant 默认 `gt`，rejected 默认
-`rejected_answer`，但必须以 preview 的真实字段为准。`model_type` 只用 `auto`、`qwen3vl`、
-`qwen3.5`。
+Text 的 assistant 默认 `gt`，rejected 默认 `rejected_answer`；Message 的 `messages_field` 必填、
+rejected 默认 `rejected_messages`；Vision 的 image_field 可选（文档标记可选，实际按 preview
+是否有图片字段为准）。字段名一律以 preview 真实列名为准，禁止按常见名猜测。`model_type` 只用
+`auto`、`qwen3vl`、`qwen3.5`。
 
 ## 训练配置与阶段
 
@@ -60,13 +61,17 @@ Message 默认字段为 `messages`；Text/Vision 的 assistant 默认 `gt`，rej
 | TrainingConfigBuilderNode | num_epochs, batch_size, grad_accum, learning_rate, lr_scheduler_type, logging/save/eval steps, seed, max_grad_norm | `training_config` |
 | AccelerateConfigBuilderNode | zero_stage | `accelerate_config` |
 | WandbConfigBuilderNode | wandb_api_key, wandb_project, wandb_name | `wandb_config` |
-| GRPOTrainingExtraConfigBuilderNode | max_steps, num_generations, prompt/completion length, temperature, enable_chord, enable_hint | `grpo_extra_config` |
+| GRPOTrainingExtraConfigBuilderNode | max_steps, num_generations, max_prompt_length, max_completion_length, temperature, enable_chord, enable_hint | `grpo_extra_config` |
+
+SFT/DPO/GRPO 的 `wandb_config` 平台当前按必填校验：必须连接 `WandbConfigBuilderNode.wandb_config`。
+`WandbConfigBuilderNode.wandb_api_key` 只填 Secret 名，不填明文 Key；`wandb_project` 必填，
+`wandb_name` 可选。`accelerate_config` 同样按必填连接，缺省会被校验拦截。
 
 | 训练节点 | 必填输入 | 常用可选输入 | 输出 |
 |---|---|---|---|
-| ModelTrainSFTNode | output_path, dataset_config, training_config, model_config, accelerate_config, gpu_count, gpu_product | lora_config, wandb_config, thinking_as_input_ratio | `model_output_path` |
-| ModelTrainDPONode | 同 SFT | lora_config, wandb_config, thinking_as_input_ratio | `model_output_path` |
-| ModelTrainGRPONode | SFT 必填项 + reward_config | grpo_extra_config, lora_config, wandb_config, thinking_as_input_ratio | `model_output_path` |
+| ModelTrainSFTNode | output_path, dataset_config, training_config, model_config, accelerate_config, wandb_config, gpu_count, gpu_product | lora_config, thinking_as_input_ratio | `model_output_path` |
+| ModelTrainDPONode | 同 SFT | lora_config, thinking_as_input_ratio | `model_output_path` |
+| ModelTrainGRPONode | SFT 必填项 + reward_config | grpo_extra_config, lora_config, thinking_as_input_ratio | `model_output_path` |
 
 单卡 LoRA 显式使用 `zero_stage=0`。scheduler 只用 `linear`、`cosine`、
 `cosine_with_restarts`、`polynomial`、`constant`、`constant_with_warmup`。数值参数整组决策查
@@ -82,19 +87,22 @@ Message 默认字段为 `messages`；Text/Vision 的 assistant 默认 `gt`，rej
 | RewardItemBuilderCustomNode | entry, name | kwargs, weight | `reward_item` |
 | RewardConfigBuilderNode | — | reward_item_1...reward_item_5, normalize | `reward_config` |
 
-内置 Metric 的 `entry` 填裸函数名：数学答案用 `compute_gsm8k`，精确匹配用
-`compute_accuracy`，翻译或受约束生成用 `compute_bleu`，摘要或长文本生成用
-`compute_rouge_l`。每个 Metrics Builder 只输出一个 `metrics_config`，Eval 只接一个该端口；
-未声明的多指标合并方式不得猜测。
+内置 Metric 的 `entry` 填 `module.py:function_name` 形式：数学答案用
+`examples/eval_metrics_common.py:compute_gsm8k`，精确匹配用
+`examples/eval_metrics_common.py:compute_accuracy`，翻译或受约束生成用
+`examples/eval_metrics_common.py:compute_bleu`，摘要或长文本生成用
+`examples/eval_metrics_common.py:compute_rouge_l`。每个 Metrics Builder 只输出一个
+`metrics_config`，Eval 只接一个该端口；未声明的多指标合并方式不得猜测。
 
-内置 Reward 仅有 `geometry_vqa_thinking_reward`、`geometry_vqa_answer_reward`。其他业务指标或
+内置 Reward 仅有 `examples/geometry_vqa/reward.py:geometry_vqa_thinking_reward`、
+`examples/geometry_vqa/reward.py:geometry_vqa_answer_reward`。其他业务指标或
 Reward 按 `custom-python-assets.md` 生成、上传并回填 Custom 节点。
 
 ## Merge、推理与评测
 
 | NodeType | 必填输入 | 常用可选输入 | 输出 |
 |---|---|---|---|
-| ModelMergeLoraNode | lora_path, output_path, model_path, gpu_count, gpu_product | model_type | `merged_model_path` |
+| ModelMergeLoraNode | lora_path, output_path | model_path, model_type | `merged_model_path` |
 | VLLMInference | model_path, port, gpu_count, gpu_product | environment, max_model_len | `endpoint` |
 | ModelEvalApiNode | endpoint, output_path, dataset_config, metrics_config | endpoint_api_key, endpoint_model, max_samples, max_tokens, temperature | `benchmark_output_path` |
 
@@ -111,11 +119,13 @@ Reward 按 `custom-python-assets.md` 生成、上传并回填 Custom 节点。
 
 ## 平台边界
 
-- 训练和 LoRA Merge 的 `gpu_product` 当前允许 `NVIDIA-H200`、
-  `NVIDIA-H100-80GB-HBM3`，默认后者；Merge 固定单卡。
-- VLLM 在 `us-west-1` 使用 `NVIDIA-H100-NVL` 或 `NVIDIA-L40S`，在 `us-west-2` 使用
-  `NVIDIA-H200` 或 `NVIDIA-H100-80GB-HBM3`；不要从推理枚举反推训练枚举。
-- 训练和推理 `gpu_count` 为 1～8。
+- 训练阶段 `gpu_product` 当前平台允许值为 `NVIDIA-H100-NVL`、`NVIDIA-L40S`；训练节点
+  （SFT/DPO/GRPO）的 `gpu_count`、`gpu_product` 端口必填。Merge LoRA 节点端口未暴露 GPU 字段，
+  按单卡合并处理。
+- 推理（VLLM/Inference）`gpu_product` 枚举为 `NVIDIA-H200`、`NVIDIA-H100-80GB-HBM3`，以部署
+  环境实际可用显卡为准；不要从推理枚举反推训练枚举。
+- 训练和推理 `gpu_count` 为 1～8（推理节点端口标 `gpu_count`、`gpu_product` 均必填）。
 - `WandbConfigBuilderNode.wandb_api_key` 只填 Secret 名，不填 Secret 值。
 - DatasetValidator、DatasetToJsonl、DataPreprocess 不是训练生成默认阶段；格式不合规时停止，
   不自动插入清洗节点。
+- GPU 枚举随平台迭代漂移；生成后以 `validate_workflow_dsl` 的 `ENUM_VALUE_INVALID` 为准回写。

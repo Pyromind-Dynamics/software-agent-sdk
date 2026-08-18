@@ -1,0 +1,105 @@
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+from pyromind_runtime.domain.capabilities import HarnessCapabilities
+from pyromind_runtime.domain.commands import CommandReceipt, UserMessageCommand
+from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.snapshot import ConversationSnapshot
+from pyromind_runtime.infrastructure.file_product_store import (
+    CommandConflictError,
+    FileProductStore,
+)
+
+
+def _store(tmp_path: Path) -> FileProductStore:
+    conversation = tmp_path / "workspace" / "conversations" / "conversation-1"
+    conversation.mkdir(parents=True)
+    store = FileProductStore(conversation)
+    store.create(
+        ConversationSnapshot(
+            conversation_id="conversation-1",
+            capabilities=HarnessCapabilities(cancel=True),
+        ),
+        user_id="user-1",
+    )
+    return store
+
+
+def test_store_lives_inside_conversation_and_rebuilds_snapshot(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    persisted, snapshot = store.append(
+        ProductEvent(
+            event_id="event-1",
+            conversation_id="conversation-1",
+            type="status.changed",
+            payload={"status": "running"},
+        )
+    )
+
+    assert persisted.seq == 1
+    assert snapshot.status == "running"
+    assert store.directory == (
+        tmp_path / "workspace" / "conversations" / "conversation-1" / "product"
+    )
+    store.snapshot_path.write_text("broken", encoding="utf-8")
+    assert store.load_snapshot().status == "running"
+
+
+def test_store_deduplicates_events(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    event = ProductEvent(
+        event_id="stable-event",
+        conversation_id="conversation-1",
+        type="status.changed",
+        payload={"status": "running"},
+    )
+    first, _ = store.append(event)
+    second, snapshot = store.append(event)
+
+    assert first == second
+    assert snapshot.through_seq == 1
+    assert len(store.replay()) == 1
+
+
+def test_store_does_not_persist_event_that_cannot_be_projected(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    with pytest.raises(ValidationError):
+        store.append(
+            ProductEvent(
+                event_id="invalid-plan",
+                conversation_id="conversation-1",
+                type="plan.updated",
+                payload={"steps": ["not-a-plan-step"]},
+            )
+        )
+
+    assert store.replay() == ()
+    assert store.load_snapshot().through_seq == 0
+
+
+def test_command_idempotency_checks_payload(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    command = UserMessageCommand(
+        command_id="command-1",
+        content=({"type": "text", "text": "hello"},),
+    )
+    receipt, claimed = store.claim_command(command)
+    repeated, claimed_again = store.claim_command(command)
+
+    assert receipt == repeated
+    assert claimed
+    assert not claimed_again
+
+    with pytest.raises(CommandConflictError):
+        store.claim_command(
+            UserMessageCommand(
+                command_id="command-1",
+                content=({"type": "text", "text": "different"},),
+            )
+        )
+
+    completed = receipt.model_copy(update={"status": "completed"})
+    assert store.complete_command(completed) == completed
+    assert isinstance(completed, CommandReceipt)

@@ -467,11 +467,17 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         for tool in service.start_request.agent.tools
         if tool.name == RunDatasetCleaningTool.name
     )
-    assert preview_tool.params == {
+    expected_storage_params = {
         "headers": {"x-cluster": "us-west-1#pre"},
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
-    assert upload_tool.params == preview_tool.params
+    expected_extraction_params = dict(expected_execution_params)
+    expected_extraction_params.pop("runtime_dir")
+    assert preview_tool.params == {
+        **expected_storage_params,
+        "extract_params": expected_extraction_params,
+    }
+    assert upload_tool.params == expected_storage_params
     assert cleaning_tool.params == expected_execution_params
     assert "secret_headers" not in cleaning_tool.params
     assert "session-token" not in str(preview_tool.params)
@@ -926,12 +932,11 @@ def test_pyromind_storage_tools_use_user_context_headers():
         ExtractArchiveTool.name,
         PreviewRemoteDatasetTool.name,
     ]
-    assert tools[0].params == {
+    expected_storage_params = {
         "storage_base_url": "https://storage.test/api",
         "headers": {"x-cluster": "context-cluster"},
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
-    assert tools[1].params == tools[0].params
     cleaning_params = tools[2].params
     assert cleaning_params == {
         "current_user": CurrentLoginUser(
@@ -953,6 +958,13 @@ def test_pyromind_storage_tools_use_user_context_headers():
         "storage_headers": {"x-cluster": "context-cluster"},
         "storage_secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
+    expected_extraction_params = dict(cleaning_params)
+    expected_extraction_params.pop("runtime_dir")
+    assert tools[0].params == {
+        **expected_storage_params,
+        "extract_params": expected_extraction_params,
+    }
+    assert tools[1].params == expected_storage_params
     assert (
         secrets["PYROMIND_STORAGE_AUTH_COOKIE"].get_value()
         == f"{PYROMIND_AUTH_COOKIE_NAME}=context-token; other=value"
