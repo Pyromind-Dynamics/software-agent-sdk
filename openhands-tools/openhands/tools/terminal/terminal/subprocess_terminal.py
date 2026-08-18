@@ -185,7 +185,13 @@ class SubprocessTerminal(TerminalInterface):
                 pass
 
         self._pty_master_fd = master_fd
-        self.sandbox.attach_memory_cgroup(self.process.pid)
+        try:
+            self.sandbox.attach_memory_cgroup(self.process.pid)
+        except RuntimeError:
+            # The sandbox memory limit did not take effect; do not keep an
+            # unconstrained sandbox running.
+            self.close()
+            raise
 
         # Set master FD non-blocking
         flags = fcntl.fcntl(self._pty_master_fd, fcntl.F_GETFL)

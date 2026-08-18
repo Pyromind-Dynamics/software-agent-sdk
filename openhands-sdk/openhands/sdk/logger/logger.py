@@ -9,9 +9,13 @@ Usage:
     logger.info("Hello from this module!")
 """
 
+import contextvars
 import logging
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from logging.handlers import TimedRotatingFileHandler
+from typing import Any
 
 import litellm
 from pythonjsonlogger.json import JsonFormatter
@@ -51,6 +55,62 @@ ENV_RICH_TRACEBACKS = os.getenv("LOG_RICH_TRACEBACKS", "true").lower() in {
 
 ENV_AUTO_CONFIG = os.getenv("LOG_AUTO_CONFIG", "true").lower() in {"1", "true", "yes"}
 ENV_DEBUG_LLM = os.getenv("DEBUG_LLM", "false").lower() in {"1", "true", "yes"}
+
+_conversation_context: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "conversation_id", default=""
+)
+
+
+@contextmanager
+def conversation_log_context(conversation_id: object) -> Iterator[None]:
+    """Bind log records emitted inside the block to ``conversation_id``.
+
+    Works across asyncio task boundaries because ``contextvars`` propagate
+    into child tasks and ``asyncio.to_thread`` workers.
+    """
+    token = _conversation_context.set(str(conversation_id))
+    try:
+        yield
+    finally:
+        _conversation_context.reset(token)
+
+
+def set_conversation_log_context(conversation_id: object) -> contextvars.Token:
+    """Set the conversation id for log records; returns a reset token."""
+    return _conversation_context.set(str(conversation_id))
+
+
+def reset_conversation_log_context(token: contextvars.Token) -> None:
+    """Restore the previous conversation id from its token."""
+    _conversation_context.reset(token)
+
+
+_conversation_aware_records_installed = False
+
+
+def _install_conversation_aware_records() -> None:
+    """Make every log record carry the active conversation id.
+
+    A record factory runs before any handler (Rich, JSON, third-party, pytest
+    caplog), so the prefix and ``conversation_id`` field apply everywhere.
+    """
+    global _conversation_aware_records_installed
+    if _conversation_aware_records_installed:
+        return
+
+    default_factory = logging.getLogRecordFactory()
+
+    def _record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = default_factory(*args, **kwargs)
+        conversation_id = _conversation_context.get()
+        setattr(record, "conversation_id", conversation_id or "-")
+        if conversation_id:
+            record.msg = f"[cid={conversation_id}] {record.getMessage()}"
+            record.args = ()
+        return record
+
+    logging.setLogRecordFactory(_record_factory)
+    _conversation_aware_records_installed = True
 
 
 # ========= LiteLLM controls =========
@@ -125,7 +185,7 @@ def setup_logging(
             ch.setFormatter(
                 JsonFormatter(
                     fmt="%(asctime)s %(levelname)s %(name)s "
-                    "%(filename)s %(lineno)d %(message)s"
+                    "%(filename)s %(lineno)d %(conversation_id)s %(message)s"
                 )
             )
             root.addHandler(ch)
@@ -153,7 +213,7 @@ def setup_logging(
             fh.setFormatter(
                 JsonFormatter(
                     fmt="%(asctime)s %(levelname)s %(name)s "
-                    "%(filename)s %(lineno)d %(message)s"
+                    "%(filename)s %(lineno)d %(conversation_id)s %(message)s"
                 )
             )
         else:
@@ -164,6 +224,8 @@ def setup_logging(
             )
             fh.setFormatter(logging.Formatter(log_fmt))
         root.addHandler(fh)
+
+    _install_conversation_aware_records()
 
 
 def get_logger(name: str) -> logging.Logger:

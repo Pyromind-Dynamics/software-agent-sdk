@@ -51,6 +51,8 @@ spec:
                         value: 500M
                       - name: OH_SANDBOX_MEMORY_LIMIT
                         value: 500M
+                      - name: OH_SANDBOX_MEMORY_REQUIRED
+                        value: '1'
                       - name: LLM_CONFIG_PATH
                         value: /etc/llm-config/llm_config.json
                       - name: LLM_MODEL

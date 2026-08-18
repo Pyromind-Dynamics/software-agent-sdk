@@ -56,7 +56,11 @@ from openhands.sdk.llm.auth.openai import create_subscription_llm_from_config
 from openhands.sdk.llm.llm import LLMCallContext
 from openhands.sdk.llm.llm_profile_store import LLMProfileStore
 from openhands.sdk.llm.llm_registry import LLMRegistry
-from openhands.sdk.logger import get_logger
+from openhands.sdk.logger import (
+    get_logger,
+    reset_conversation_log_context,
+    set_conversation_log_context,
+)
 from openhands.sdk.marketplace.registry import MarketplaceRegistry
 from openhands.sdk.mcp import create_mcp_tools
 from openhands.sdk.observability.laminar import observe
@@ -1596,6 +1600,7 @@ class LocalConversation(BaseConversation):
         # Ensure agent is fully initialized (loads plugins and initializes agent)
         self._ensure_agent_ready()
         self._cancel_token = CancellationToken()
+        conversation_log_token = set_conversation_log_context(self._state.id)
 
         with self._state:
             if self._state.execution_status in [
@@ -1751,6 +1756,7 @@ class LocalConversation(BaseConversation):
                 self._state.id, e, persistence_dir=self._state.persistence_dir
             ) from e
         finally:
+            reset_conversation_log_context(conversation_log_token)
             self._cancel_token = None
 
     @observe(name="conversation.arun")
@@ -1774,6 +1780,7 @@ class LocalConversation(BaseConversation):
         """
         self._arun_task = asyncio.current_task()
         self._cancel_token = CancellationToken()
+        conversation_log_token = set_conversation_log_context(self._state.id)
         arun_t0 = time.monotonic()
         iteration = 0
         # Off-load lazy init to a worker thread: init_state may block the loop
@@ -2248,6 +2255,7 @@ class LocalConversation(BaseConversation):
             # fresh token is created on the next run().
             if self._cancel_token is not None and not self._cancel_token.is_cancelled:
                 self._cancel_token = None
+            reset_conversation_log_context(conversation_log_token)
             self._arun_task = None
 
     def set_confirmation_policy(self, policy: ConfirmationPolicyBase) -> None:

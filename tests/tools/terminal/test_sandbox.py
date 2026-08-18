@@ -13,6 +13,7 @@ from openhands.tools.terminal.sandbox import (
     SandboxMemoryCgroup,
     TerminalSandbox,
     _is_bwrap_usable,
+    _memory_limit_required,
     parse_memory_limit,
     sandbox_memory_cgroup_from_env,
     terminal_sandbox_enabled,
@@ -49,8 +50,15 @@ def test_memory_cgroup_defaults_to_500m(monkeypatch: pytest.MonkeyPatch):
     captured: list[int] = []
 
     class FakeMemoryCgroup:
-        def __init__(self, limit_bytes: int, *, root: Path = Path("/sys/fs/cgroup")):
+        def __init__(
+            self,
+            limit_bytes: int,
+            *,
+            root: Path = Path("/sys/fs/cgroup"),
+            required: bool = False,
+        ):
             captured.append(limit_bytes)
+            self.required = required
 
         def create(self) -> bool:
             return True
@@ -101,6 +109,139 @@ def test_memory_cgroup_attach_moves_pid_tree(
     assert path is not None
     procs = (path / "cgroup.procs").read_text().split()
     assert procs == ["42", "100", "200"]
+
+
+def test_memory_cgroup_attach_reports_empty_cgroup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """Attach failures must surface as an ERROR so an unenforced limit is visible."""
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
+    assert memory_cgroup.create()
+    path = memory_cgroup.path
+    assert path is not None
+    # Make every pid write fail so nothing can enter the cgroup.
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: [100, 200]
+    )
+    procs = path / "cgroup.procs"
+    procs.touch()
+    procs.chmod(0)
+    with caplog.at_level("ERROR", logger="openhands.tools.terminal.sandbox"):
+        memory_cgroup.attach(42)
+    assert "empty after attach" in caplog.text
+    assert "root_pid=42" in caplog.text
+
+
+def test_memory_cgroup_create_logs_active_limit(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    memory_cgroup = SandboxMemoryCgroup(512 * 1024 * 1024, root=tmp_path)
+    with caplog.at_level("INFO", logger="openhands.tools.terminal.sandbox"):
+        assert memory_cgroup.create()
+    assert "sandbox memory cgroup active" in caplog.text
+    assert "512 MiB" in caplog.text
+
+
+def test_memory_cgroup_attach_logs_enforced_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
+    assert memory_cgroup.create()
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: [100, 200]
+    )
+    with caplog.at_level("INFO", logger="openhands.tools.terminal.sandbox"):
+        memory_cgroup.attach(42)
+    assert "enforced on 3 process(es)" in caplog.text
+
+
+def test_memory_cgroup_required_attach_empty_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path, required=True)
+    assert memory_cgroup.create()
+    path = memory_cgroup.path
+    assert path is not None
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: [100, 200]
+    )
+    procs = path / "cgroup.procs"
+    procs.touch()
+    procs.chmod(0)
+    with pytest.raises(RuntimeError, match="memory limit is not enforced"):
+        memory_cgroup.attach(42)
+
+
+def test_sandbox_memory_required_create_failure_raises(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeMemoryCgroup:
+        def __init__(
+            self,
+            limit_bytes: int,
+            *,
+            root: Path = Path("/sys/fs/cgroup"),
+            required: bool = False,
+        ):
+            self.required = required
+
+        def create(self) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.SandboxMemoryCgroup", FakeMemoryCgroup
+    )
+    monkeypatch.setenv("OH_SANDBOX_MEMORY_REQUIRED", "1")
+    monkeypatch.delenv("OH_SANDBOX_MEMORY_LIMIT", raising=False)
+    with pytest.raises(RuntimeError, match="OH_SANDBOX_MEMORY_REQUIRED"):
+        sandbox_memory_cgroup_from_env()
+
+
+def test_memory_limit_required_flag(monkeypatch: pytest.MonkeyPatch):
+    for value, expected in (
+        ("1", True),
+        ("true", True),
+        ("on", True),
+        ("", False),
+    ):
+        monkeypatch.setenv("OH_SANDBOX_MEMORY_REQUIRED", value)
+        assert _memory_limit_required() is expected
+    monkeypatch.delenv("OH_SANDBOX_MEMORY_REQUIRED")
+    assert _memory_limit_required() is False
+
+
+def test_terminal_sandbox_bwrap_unshare_pid_keeps_attach(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """bwrap --unshare-pid must not disable the per-session memory cgroup attach."""
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_bwrap_usable", lambda: True
+    )
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
+    assert memory_cgroup.create()
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.sandbox_memory_cgroup_from_env",
+        lambda: None,
+    )
+    sandbox = TerminalSandbox(str(tmp_path), "required")
+    sandbox.prepare()
+    assert sandbox._backend == "bwrap"
+    sandbox._memory_cgroup = memory_cgroup
+    wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
+    assert "--unshare-pid" in wrapped
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: []
+    )
+    sandbox.attach_memory_cgroup(1234)
+    path = memory_cgroup.path
+    assert path is not None
+    assert (path / "cgroup.procs").read_text().split() == ["1234"]
 
 
 def test_memory_cgroup_cleanup_removes_directory(tmp_path: Path):

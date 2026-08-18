@@ -42,6 +42,8 @@ spec:
                         value: 500M
                       - name: OH_SANDBOX_MEMORY_LIMIT
                         value: 500M
+                      - name: OH_SANDBOX_MEMORY_REQUIRED
+                        value: '1'
                       - name: SESSION_API_KEY
                         valueFrom:
                             secretKeyRef:

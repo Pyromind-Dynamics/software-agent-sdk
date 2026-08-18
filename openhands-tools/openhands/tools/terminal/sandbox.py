@@ -25,6 +25,7 @@ logger = get_logger(__name__)
 TerminalSandboxMode = Literal["off", "auto", "required"]
 TERMINAL_SANDBOX_ENV = "OH_TERMINAL_SANDBOX"
 OH_SANDBOX_MEMORY_LIMIT_ENV = "OH_SANDBOX_MEMORY_LIMIT"
+OH_SANDBOX_MEMORY_REQUIRED_ENV = "OH_SANDBOX_MEMORY_REQUIRED"
 _DEFAULT_SANDBOX_MEMORY_LIMIT = "500M"
 PUBLIC_READ_ROOTS = (
     "/agent-server/knowledge",
@@ -77,6 +78,27 @@ def parse_memory_limit(text: str) -> int:
     return number * _MEMORY_UNITS[unit]
 
 
+def _format_bytes(value: int) -> str:
+    """Format a byte count into a compact label (e.g. 524288000 -> 512 MiB)."""
+    units = ("B", "KiB", "MiB", "GiB")
+    size = float(value)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.0f} {unit}"
+        size /= 1024
+    return f"{size:.0f} {units[-1]}"
+
+
+def _memory_limit_required() -> bool:
+    """Whether the sandbox memory limit must be enforced or startup must fail."""
+    return os.environ.get(OH_SANDBOX_MEMORY_REQUIRED_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _descendant_pids(root_pid: int) -> list[int]:
     """Return all descendant pids of ``root_pid`` by walking ``/proc``."""
     pids: list[int] = []
@@ -101,12 +123,20 @@ class SandboxMemoryCgroup:
     """Pin a sandbox process tree into a cgroup with a hard memory cap.
 
     Requires writable cgroup v2 delegation (``/sys/fs/cgroup`` mounted rw and
-    memory controller delegated); otherwise creation degrades to unlimited.
+    memory controller delegated); otherwise creation degrades to unlimited
+    unless ``required`` turns an unenforced limit into a startup error.
     """
 
-    def __init__(self, limit_bytes: int, *, root: Path = _CGROUP_MEMORY_ROOT):
+    def __init__(
+        self,
+        limit_bytes: int,
+        *,
+        root: Path = _CGROUP_MEMORY_ROOT,
+        required: bool = False,
+    ):
         self._limit_bytes = limit_bytes
         self._root = root
+        self._required = required
         self._path: Path | None = None
 
     @property
@@ -128,21 +158,41 @@ class SandboxMemoryCgroup:
             logger.warning("sandbox memory cgroup unavailable: %s", exc)
             return False
         self._path = path
+        logger.info(
+            "sandbox memory cgroup active: path=%s limit=%s",
+            path,
+            _format_bytes(self._limit_bytes),
+        )
         return True
 
     def attach(self, root_pid: int) -> None:
         if self._path is None:
             return
         procs = self._path / "cgroup.procs"
+        attached: list[int] = []
         for pid in (root_pid, *_descendant_pids(root_pid)):
             try:
                 with procs.open("a") as stream:
                     stream.write(f"{pid}\n")
+                attached.append(pid)
             except OSError as exc:
                 logger.warning(
                     "failed to attach pid %s to sandbox memory cgroup: %s", pid, exc
                 )
-                return
+        if not attached:
+            message = (
+                f"sandbox memory cgroup {self._path} empty after attach "
+                f"(root_pid={root_pid}); memory limit is not enforced"
+            )
+            if self._required:
+                raise RuntimeError(message)
+            logger.error(message)
+            return
+        logger.info(
+            "sandbox memory cgroup enforced on %d process(es) (limit=%s)",
+            len(attached),
+            _format_bytes(self._limit_bytes),
+        )
 
     def cleanup(self) -> None:
         if self._path is None:
@@ -152,17 +202,35 @@ class SandboxMemoryCgroup:
 
 
 def sandbox_memory_cgroup_from_env() -> SandboxMemoryCgroup | None:
-    """Build a memory cgroup from ``OH_SANDBOX_MEMORY_LIMIT`` (default 500M)."""
+    """Build a memory cgroup from ``OH_SANDBOX_MEMORY_LIMIT`` (default 500M).
+
+    With ``OH_SANDBOX_MEMORY_REQUIRED=1`` the limit is mandatory: startup
+    refuses to run unconstrained when the cgroup cannot be created.
+    """
     value = os.environ.get(OH_SANDBOX_MEMORY_LIMIT_ENV, _DEFAULT_SANDBOX_MEMORY_LIMIT)
     if not value.strip():
         return None
+    required = _memory_limit_required()
     try:
         limit = parse_memory_limit(value)
     except ValueError as exc:
         logger.warning("invalid %s=%r: %s", OH_SANDBOX_MEMORY_LIMIT_ENV, value, exc)
+        if required:
+            raise RuntimeError(
+                f"invalid sandbox memory limit {value!r}; refusing to start "
+                f"because {OH_SANDBOX_MEMORY_REQUIRED_ENV}=1"
+            ) from exc
         return None
-    memory_cgroup = SandboxMemoryCgroup(limit)
-    return memory_cgroup if memory_cgroup.create() else None
+    memory_cgroup = SandboxMemoryCgroup(limit, required=required)
+    if not memory_cgroup.create():
+        if required:
+            raise RuntimeError(
+                "sandbox memory limit is required "
+                f"({OH_SANDBOX_MEMORY_REQUIRED_ENV}=1) but the memory cgroup "
+                "could not be created; refusing to start an unconstrained sandbox"
+            )
+        return None
+    return memory_cgroup
 
 
 def terminal_sandbox_enabled(mode: TerminalSandboxMode) -> bool:
