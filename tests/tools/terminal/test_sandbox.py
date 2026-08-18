@@ -542,7 +542,7 @@ def test_bwrap_tmp_is_bound_to_disk_not_tmpfs(
     assert sandbox._sandbox_tmp.is_dir()
 
 
-def test_conversation_policy_bwrap_binds_container_root_read_only(
+def test_conversation_policy_bwrap_whitelists_read_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -569,13 +569,25 @@ def test_conversation_policy_bwrap_binds_container_root_read_only(
 
     assert sandbox._backend == "bwrap"
     wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
-    # The container root is mounted read-only before the declared rw path so
-    # untracked paths (e.g. a sibling /workspace/models) are denied instead of
-    # landing on an implicit writable sandbox root.
-    assert _option_index(wrapped, "--ro-bind", "/") < _option_index(
-        wrapped, "--bind", str(public_data_dir)
-    )
-    assert "--tmpfs" not in wrapped
+    # Whitelisted conversation paths are bound; the container root is not, so
+    # untracked paths (e.g. a sibling workspace) do not exist in the sandbox.
+    assert ("--ro-bind", "/") not in [
+        (wrapped[i], wrapped[i + 1]) for i in range(len(wrapped) - 1)
+    ]
+    assert ("--ro-bind", "/usr") in [
+        (wrapped[i], wrapped[i + 1]) for i in range(len(wrapped) - 1)
+    ]
+    wrapped_binds = [
+        (wrapped[i], wrapped[i + 1])
+        for i in range(len(wrapped) - 1)
+        if wrapped[i] in ("--bind", "--ro-bind", "--tmpfs", "--dev", "--proc")
+    ]
+    assert wrapped_binds.count(("--tmpfs", "/tmp")) == 1
+    assert ("--bind", str(public_data_dir)) in wrapped_binds
+    assert ("--ro-bind", str(events_dir)) in wrapped_binds
+    # The conversation directory itself is only a skeleton for the bound
+    # children; its own files (meta.json etc.) are not exposed.
+    assert ("--ro-bind", str(tmp_path)) not in wrapped_binds
     private_binds = [
         wrapped[i + 1]
         for i in range(len(wrapped) - 1)

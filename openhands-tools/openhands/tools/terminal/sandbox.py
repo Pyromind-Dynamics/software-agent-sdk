@@ -538,12 +538,6 @@ class TerminalSandbox:
         args = ["bwrap", "--unshare-ipc", "--unshare-uts"]
         if os.geteuid() != 0:
             args.append("--unshare-user-try")
-        if self.has_conversation_policy:
-            # Expose the container root read-only and let the declared
-            # conversation paths bind over it. This denies writes to paths
-            # outside public_data/events (e.g. /workspace/models) instead of
-            # letting them land on the sandbox's implicit writable root.
-            args.extend(["--ro-bind", "/", "/"])
         for path in ("/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"):
             if Path(path).exists():
                 args.extend(["--ro-bind", path, path])
@@ -556,7 +550,14 @@ class TerminalSandbox:
             if path.exists():
                 args.extend(["--ro-bind", str(path), str(path)])
         args.extend(["--dev", "/dev", "--proc", "/proc"])
-        if not self.has_conversation_policy:
+        if self.has_conversation_policy:
+            # Whitelist-only view: without a root bind, paths outside the
+            # bound system/public/conversation directories do not exist in the
+            # sandbox at all, so sibling conversations and configs are not
+            # readable. A private tmpfs keeps transient command output away
+            # from the host filesystem.
+            args.extend(["--tmpfs", "/tmp"])
+        else:
             args.extend(["--bind", str(self._tmp_dir), str(self._tmp_dir)])
             self._sandbox_tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
             args.extend(["--bind", str(self._sandbox_tmp), "/tmp"])
