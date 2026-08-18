@@ -30,7 +30,11 @@ from openhands.tools.terminal.constants import (
     HISTORY_LIMIT,
 )
 from openhands.tools.terminal.metadata import CmdOutputMetadata
-from openhands.tools.terminal.sandbox import TerminalSandbox, TerminalSandboxMode
+from openhands.tools.terminal.sandbox import (
+    TerminalSandbox,
+    TerminalSandboxMode,
+    parse_memory_limit,
+)
 from openhands.tools.terminal.terminal import TerminalInterface
 from openhands.tools.terminal.terminal.interface import parse_ctrl_key
 
@@ -38,6 +42,29 @@ from openhands.tools.terminal.terminal.interface import parse_ctrl_key
 logger = get_logger(__name__)
 
 ENTER = b"\n"
+
+# Virtual address-space cap (RLIMIT_AS) applied to each sandbox shell so a
+# single runaway command (e.g. large allocations during downloads) fails with
+# MemoryError instead of exhausting the whole pod.
+OH_SANDBOX_VMEM_LIMIT_ENV = "OH_SANDBOX_VMEM_LIMIT"
+_DEFAULT_SANDBOX_VMEM_LIMIT = "500M"
+
+
+def _sandbox_vmem_kb() -> int:
+    """Return the sandbox virtual memory cap in KiB (``OH_SANDBOX_VMEM_LIMIT``).
+
+    RLIMIT_AS is a process-level soft limit inherited by every forked command;
+    it does not require privileges and works even when cgroup delegation is
+    unavailable. Defaults to 500MiB.
+    """
+    value = os.environ.get(OH_SANDBOX_VMEM_LIMIT_ENV, _DEFAULT_SANDBOX_VMEM_LIMIT)
+    try:
+        return parse_memory_limit(value) // 1024
+    except ValueError as exc:
+        raise RuntimeError(
+            f"invalid {OH_SANDBOX_VMEM_LIMIT_ENV}={value!r}: {exc}"
+        ) from exc
+
 
 # Map normalized special key names to ANSI escape bytes for PTY.
 _SUBPROCESS_SPECIALS: dict[str, bytes] = {
@@ -207,7 +234,9 @@ class SubprocessTerminal(TerminalInterface):
         # Configure bash: disable history expansion, set up PS1/PS2 prompts
         work_dir = shlex.quote(os.path.abspath(self.work_dir))
         init_cmd = (
-            f"set +H; export PROMPT_COMMAND='export PS1=\"{self.PS1}\"'; "
+            f"ulimit -v {_sandbox_vmem_kb()} 2>/dev/null; "
+            "set +H; "
+            f"export PROMPT_COMMAND='export PS1=\"{self.PS1}\"'; "
             f'export PS2=""; cd -- {work_dir}'
         ).encode("utf-8", "ignore")
 
