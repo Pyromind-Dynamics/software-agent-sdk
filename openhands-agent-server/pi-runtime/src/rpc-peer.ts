@@ -17,21 +17,30 @@ export type RpcRequestHandler = (method: string, params: JsonObject) => Promise<
 interface PendingRequest {
   resolve(value: JsonValue): void;
   reject(error: Error): void;
+  timer: NodeJS.Timeout;
 }
 
 export interface RunnerRpcClient {
   request(method: string, params: JsonObject, signal?: AbortSignal): Promise<JsonValue>;
 }
 
+export interface JsonlRpcPeerOptions {
+  requestTimeoutMs?: number;
+}
+
+export const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+
 export class JsonlRpcPeer implements RunnerRpcClient {
   private readonly input: Readable;
   private readonly output: Writable;
+  private readonly requestTimeoutMs: number;
   private readonly pending = new Map<string, PendingRequest>();
   private handler: RpcRequestHandler | undefined;
 
-  constructor(input: Readable, output: Writable) {
+  constructor(input: Readable, output: Writable, options: JsonlRpcPeerOptions = {}) {
     this.input = input;
     this.output = output;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   }
 
   async listen(handler: RpcRequestHandler): Promise<void> {
@@ -42,7 +51,10 @@ export class JsonlRpcPeer implements RunnerRpcClient {
       this.handleMessage(decodeMessage(line));
     }
     const error = new Error("Python PiAdapter closed the JSONL stream");
-    for (const pending of this.pending.values()) pending.reject(error);
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
     this.pending.clear();
   }
 
@@ -57,9 +69,10 @@ export class JsonlRpcPeer implements RunnerRpcClient {
       params,
     };
     return new Promise<JsonValue>((resolve, reject) => {
-      const onAbort = (): void => {
+      const fail = (reason: unknown): void => {
         if (!this.pending.delete(requestId)) return;
-        reject(signal?.reason instanceof Error ? signal.reason : new Error("Request aborted"));
+        const error = reason instanceof Error ? reason : new Error(String(reason));
+        reject(error);
         this.write({
           protocolVersion: PROTOCOL_VERSION,
           type: "request",
@@ -68,15 +81,25 @@ export class JsonlRpcPeer implements RunnerRpcClient {
           params: { request_id: requestId },
         });
       };
+      const onAbort = (): void => {
+        fail(signal?.reason instanceof Error ? signal.reason : new Error("Request aborted"));
+      };
+      const timer = setTimeout(
+        () => fail(new Error(`JSONL RPC request timed out after ${this.requestTimeoutMs}ms: ${method}`)),
+        this.requestTimeoutMs,
+      );
       this.pending.set(requestId, {
         resolve: (value) => {
+          clearTimeout(timer);
           signal?.removeEventListener("abort", onAbort);
           resolve(value);
         },
         reject: (error) => {
+          clearTimeout(timer);
           signal?.removeEventListener("abort", onAbort);
           reject(error);
         },
+        timer,
       });
       signal?.addEventListener("abort", onAbort, { once: true });
       this.write(request);
