@@ -535,7 +535,7 @@ class TerminalSandbox:
             policy.unlink(missing_ok=True)
 
     def _build_bwrap_args(self) -> list[str]:
-        args = ["bwrap", "--unshare-ipc", "--unshare-uts"]
+        args = ["bwrap", "--unshare-ipc", "--unshare-uts", "--unshare-pid"]
         if os.geteuid() != 0:
             args.append("--unshare-user-try")
         for path in ("/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"):

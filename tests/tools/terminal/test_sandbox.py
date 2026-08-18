@@ -618,6 +618,7 @@ def test_without_conversation_policy_keeps_sandbox_root_writable(
     assert ("--ro-bind", "/") not in [
         (wrapped[i], wrapped[i + 1]) for i in range(len(wrapped) - 1)
     ]
+    assert "--unshare-pid" in wrapped
 
 
 def test_conversation_policy_uses_landlock_when_bwrap_is_unavailable(

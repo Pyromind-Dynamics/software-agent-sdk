@@ -22,6 +22,9 @@ logger = get_logger(__name__)
 _SENSITIVE_ENV_VARS: frozenset[str] = frozenset(
     {
         "SESSION_API_KEY",
+        "OH_SECRET_KEY",
+        "DF_API_KEY",
+        "OPENROUTER_API_KEY",
         "GPG_KEY",
         "OPENHANDS_BUILD_GIT_REF",
         "OPENHANDS_BUILD_GIT_SHA",
