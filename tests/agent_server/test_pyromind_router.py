@@ -97,14 +97,14 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert len(skill_text.splitlines()) <= 140
     assert "## 资料索引" in skill_text
     assert "## DSL 与资料边界" in skill_text
-    assert 'skills_read(skill_name="generate-workflow-dsl"' in skill_text
+    assert 'skills_read(skill_name="generate-workflow-dsl"' not in skill_text
     assert "### 0. 先判定局部修改" in skill_text
     assert "qwen3.5-2b" in skill_text
     assert "不读取 reference 或 `knowledge/`" in skill_text
     assert "retryable=false" in skill_text
     assert "只生成并校验 DSL" in skill_text
     assert "不写 import" in skill_text
-    assert "禁止用 Agent 本地 terminal 替代平台运行时" in skill_text
+    assert "不得在本地运行环境替代平台执行" in skill_text
     assert "只有校验明确暴露未覆盖的平台契约" in skill_text
     assert "同一轮不得重复读取同一路径" in skill_text
     assert "可程序验证只说明 reward 可构造" in skill_text
@@ -142,6 +142,7 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert "compute_gsm8k" not in references["custom-python-assets.md"]
     assert "geometry_vqa_thinking_reward" not in references["custom-python-assets.md"]
     assert "`public_data/<name>.py`" in references["custom-python-assets.md"]
+    assert "file_editor" not in references["custom-python-assets.md"]
     for removed in (
         "node-reference.md",
         "platform-contract-overrides.md",
@@ -154,6 +155,36 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     ).read_text(encoding="utf-8")
     assert "使用 generate-workflow-dsl" in debug_skill_text
     assert "本轮不得调用 workflow_debug" in debug_skill_text
+
+
+def test_business_skills_do_not_document_native_harness_tools() -> None:
+    repo_root = Path(__file__).parents[2]
+    skill_names = (
+        "generate-workflow-dsl",
+        "debug-workflow",
+        "data-cleaning",
+        "data-preparation",
+    )
+    forbidden = (
+        "TerminalTool",
+        "`terminal`",
+        "`bash`",
+        "`file_editor`",
+        "`apply_patch`",
+        "`edit`",
+        "`read`",
+        "`write`",
+    )
+
+    for skill_name in skill_names:
+        skill_root = repo_root / ".agents" / "skills" / skill_name
+        for path in skill_root.rglob("*.md"):
+            text = path.read_text(encoding="utf-8")
+            for native_tool in forbidden:
+                assert native_tool not in text, (
+                    f"{path.relative_to(repo_root)} documents Harness-native "
+                    f"tool mechanics: {native_tool}"
+                )
 
 
 def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
@@ -174,21 +205,17 @@ def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
     assert "Treat any requested node, model, parameter" in rendered
     assert "do not\n  invoke `debug-workflow` or `workflow_debug`" in rendered
     assert "Pyromind platform nodes perform actual" in rendered
-    assert "Use dedicated platform tools for preview/upload" in rendered
-    assert "never use the local terminal as a substitute" in rendered
+    assert "Use the platform capabilities selected by the relevant skill" in rendered
+    assert "never use\nthe local workspace runtime as a substitute" in rendered
     assert "`public_data/` is the writable area" in rendered
-    assert "do not follow terminal cwd" in rendered
-    assert "every created file must use a `public_data/...` path" in rendered
-    assert "It accepts only the `patch` argument" in rendered
-    assert "never pass a separate `path` argument" in rendered
-    assert "The separate `file_editor` tool does accept `path`" in rendered
-    assert "terminal session starts at the conversation root" in rendered
-    assert "Make its first command\n`cd public_data`" in rendered
-    assert "reuse the persistent shell's current directory" in rendered
-    assert "conversation-local auxiliary files" in rendered
+    assert "every created file must\nuse a `public_data/...` path" in rendered
+    assert "active Harness's workspace editing capability" in rendered
+    assert "apply_patch" not in rendered
+    assert "file_editor" not in rendered
+    assert "Local execution is limited to conversation-local auxiliary" in rendered
     assert "Do not consult `knowledge/` before validation" in rendered
     assert "Whenever a direct question or an intermediate step requires" in rendered
-    assert "The parent must not inspect those documents" in rendered
+    assert "The parent must not inspect those documents\n  directly" in rendered
     assert 'at most one `subagent(type="search")` call' in rendered
     assert "all related knowledge-base subquestions into one" in rendered
     assert "never issue multiple or parallel search subagent calls" in rendered
@@ -670,7 +697,9 @@ async def test_pyromind_conversation_initial_message_saves_workflow_snapshot(
     reminder = service.event_service.extended_content[0]
     assert isinstance(reminder, TextContent)
     assert "workflow.py" in reminder.text
-    assert "Read the full file with file_editor" in reminder.text
+    assert (
+        "Read the full file through the available workspace capability" in reminder.text
+    )
 
 
 @pytest.mark.asyncio

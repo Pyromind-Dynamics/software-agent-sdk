@@ -11,6 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-${TMPDIR:-/tmp}/pyromind-uv-cache}"
 
 # ----------------------------------------------------------
 # LLM Configuration
@@ -30,8 +31,12 @@ export LLM_MODEL="${LLM_MODEL:-openai/deepseek-v4-flash-0731}"
 export DF_API_BASE_URL=https://openrouter.ai/api/v1
 export DF_API_URL=https://openrouter.ai/api/v1/chat/completions
 export DF_MODEL_NAME=google/gemma-4-31b-it
-export DF_API_KEY="${OPENROUTER_API_KEY}"
-
+export DF_API_KEY="${OPENROUTER_API_KEY:-${DF_API_KEY:-}}"
+export PYROMIND_ENABLE_PI=true
+export PYROMIND_DEFAULT_HARNESS="${PYROMIND_DEFAULT_HARNESS:-pi}"
+export PYROMIND_PI_MODEL_PROVIDER="${PYROMIND_PI_MODEL_PROVIDER:-deepseek}"
+export PYROMIND_PI_MODEL_ID="${PYROMIND_PI_MODEL_ID:-deepseek-v4-flash-0731}"
+export PYROMIND_PI_MODEL_BASE_URL="${PYROMIND_PI_MODEL_BASE_URL:-${LLM_BASE_URL}}"
 # ----------------------------------------------------------
 # Agent Server Configuration
 # ----------------------------------------------------------
@@ -110,6 +115,7 @@ echo "============================================"
 echo " Pyromind Agent Server"
 echo "============================================"
 echo " LLM Base URL:      ${LLM_BASE_URL}"
+echo " Default harness:   ${PYROMIND_DEFAULT_HARNESS}"
 echo " Server root:       ${SOFTWARE_AGENT_SDK_DIR}"
 echo " Knowledge Base:    ${PYROMIND_KNOWLEDGE_BASE_PATH}"
 echo " Public read paths: ${PYROMIND_PUBLIC_READ_PATHS}"

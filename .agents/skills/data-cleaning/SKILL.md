@@ -35,8 +35,8 @@ validator。平台产物只能用 `preview_dataset` 查看。
    不向用户展示。确认后优先用
    `<sample_output_dir>/clean_script.py` 创建一个不传 `limit` 的新全量 run。
 7. 只有平台或进程中断且脚本逻辑正确时，才传原 `input_path` 和
-   `resume_run_id` 恢复；恢复时不传新脚本。Pending/Running 时等待 callback，
-   不重复提交。
+   `resume_run_id` 恢复；恢复时不传新脚本。
+   Pending/Running 时等待 callback，不重复提交。
 
 ## 平台脚本契约
 

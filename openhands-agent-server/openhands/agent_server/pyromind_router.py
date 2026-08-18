@@ -5,6 +5,7 @@ system prompt, tools, and workspace on the server side so that the
 frontend only needs to pass minimal configuration fields.
 """
 
+import asyncio
 import logging
 import os
 import uuid
@@ -14,7 +15,24 @@ from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    SecretStr,
+    TypeAdapter,
+    field_validator,
+)
+from pyromind_runtime.contracts import TextContentBlock, ToolResult
+from pyromind_runtime.contracts.content import JsonObject
+from pyromind_runtime.tool_host import (
+    PREVIEW_DATASET_TOOL_SPEC,
+    VALIDATE_WORKFLOW_DSL_TOOL_SPEC,
+    PythonToolHost,
+    SessionToolContextStore,
+    ToolExecutionContext,
+    ToolRequestContext,
+)
 
 # Keep the node_signature tool registered (module-level side effect) so
 # persisted conversation events that referenced it before it was removed
@@ -65,7 +83,15 @@ from openhands.agent_server.workflow_canvas_store import (
     WorkflowCanvasStoreError,
     WorkflowCanvasVersionNotFoundError,
 )
-from openhands.sdk import LLM, AgentContext, TextContent, Tool, register_tool
+from openhands.sdk import (
+    LLM,
+    AgentContext,
+    ImageContent,
+    Observation,
+    TextContent,
+    Tool,
+    register_tool,
+)
 from openhands.sdk.conversation.request import (
     StartConversationRequest,
 )
@@ -88,18 +114,22 @@ from openhands.tools.preset.default import register_default_tools
 from openhands.tools.pyromind_archive import ExtractArchiveTool
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
+    PreviewDatasetAction,
     PreviewDatasetTool,
     UploadFileToPyromindTool,
 )
 from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
+    PreviewDatasetExecutor,
 )
 from openhands.tools.pyromind_debug import get_debug_result_broker
 from openhands.tools.pyromind_remote_dataset import PreviewRemoteDatasetTool
 from openhands.tools.utils import PUBLIC_READ_ALIASES
 from openhands.tools.workflow import (
     RunWorkflowTool,
+    ValidateWorkflowDslAction,
+    ValidateWorkflowDslExecutor,
     ValidateWorkflowDslTool,
 )
 from openhands.tools.workflow.analyze_task_failure import AnalyzeTaskFailureTool
@@ -115,9 +145,112 @@ from openhands.tools.workflow_debug import WorkflowDebugTool
 PYROMIND_AUTH_TOKEN_SECRET = "auth_token"
 PYROMIND_X_CLUSTER_SECRET = "PYROMIND_X_CLUSTER"
 _OPENAI_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
+_JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
 
 
 logger = logging.getLogger(__name__)
+
+
+def get_product_tool_request_context(request: Request) -> ToolRequestContext:
+    """Extract the small credential surface allowed for Python business tools."""
+    headers: dict[str, str] = {}
+    current_user = getattr(request.state, "current_user", None)
+    if isinstance(current_user, CurrentLoginUser):
+        if current_user.cookie:
+            headers["cookie"] = current_user.cookie
+        if current_user.x_cluster:
+            headers["x-cluster"] = current_user.x_cluster
+    if authorization := request.headers.get("authorization"):
+        headers["authorization"] = authorization
+    return ToolRequestContext(headers=headers)
+
+
+def build_product_tool_host(
+    context_store: SessionToolContextStore,
+) -> PythonToolHost:
+    """Wrap existing OpenHands Python executors for the neutral tool contract."""
+    host = PythonToolHost()
+
+    async def preview_dataset(
+        arguments: JsonObject,
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        request_context = context_store.get(context.session_id)
+        action = PreviewDatasetAction.model_validate(arguments)
+        executor = PreviewDatasetExecutor(headers=dict(request_context.headers))
+        observation = await asyncio.to_thread(executor, action, None)
+        return _product_tool_result("preview_dataset", observation)
+
+    async def validate_workflow_dsl(
+        arguments: JsonObject,
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        request_context = context_store.get(context.session_id)
+        action = ValidateWorkflowDslAction.model_validate(arguments)
+        executor = ValidateWorkflowDslExecutor(headers=dict(request_context.headers))
+        observation = await asyncio.to_thread(executor, action, None)
+        return _product_tool_result("validate_workflow_dsl", observation)
+
+    host.register(PREVIEW_DATASET_TOOL_SPEC, preview_dataset)
+    host.register(VALIDATE_WORKFLOW_DSL_TOOL_SPEC, validate_workflow_dsl)
+    return host
+
+
+def _product_tool_result(tool_name: str, observation: Observation) -> ToolResult:
+    content: list[TextContentBlock] = []
+    for item in observation.to_llm_content:
+        if isinstance(item, TextContent):
+            content.append(TextContentBlock(text=item.text))
+        elif isinstance(item, ImageContent) and item.image_urls:
+            content.append(
+                TextContentBlock(
+                    text=(
+                        "Image output was omitted from the cross-runtime transport; "
+                        "use the structured text preview instead."
+                    )
+                )
+            )
+    dumped = observation.model_dump(mode="json", exclude={"content"})
+    details = _JSON_OBJECT_ADAPTER.validate_python(dumped)
+    details = _redact_product_tool_details(details)
+    raw_error_code = details.get("error_code")
+    error_code = None
+    if observation.is_error:
+        error_code = (
+            raw_error_code
+            if isinstance(raw_error_code, str) and raw_error_code
+            else f"{tool_name}_failed"
+        )
+    return ToolResult(
+        content=tuple(content),
+        details=details,
+        is_error=observation.is_error,
+        error_code=error_code,
+    )
+
+
+def _redact_product_tool_details(value: JsonObject) -> JsonObject:
+    redacted: JsonObject = {}
+    for name, item in value.items():
+        lowered = name.lower()
+        if any(
+            marker in lowered
+            for marker in ("authorization", "cookie", "secret", "token", "url")
+        ):
+            redacted[name] = "[REDACTED]"
+        elif isinstance(item, dict):
+            redacted[name] = _redact_product_tool_details(item)
+        elif isinstance(item, list):
+            redacted[name] = [
+                _redact_product_tool_details(entry)
+                if isinstance(entry, dict)
+                else entry
+                for entry in item
+            ]
+        else:
+            redacted[name] = item
+    return redacted
+
 
 # Register skill-runtime tools at module level so persisted conversations
 # that reference them can resolve the tools on resume after a server restart.
@@ -187,10 +320,10 @@ Skill usage rules:
 - A conversation may already contain a workflow at
   `public_data/workflow_canvas/workflow.py`. Before asking for information or
   answering any request that may inspect, modify, validate, test, or run the
-  current workflow, read that file in full with `file_editor`. Apply this rule
-  especially to short contextual requests such as "看数据", "改一下", or
-  "换个模型". Reuse dataset/model identifiers and topology already present in
-  the file instead of asking the user to provide them again.
+  current workflow, read that file in full through the available workspace
+  capability. Apply this rule especially to short contextual requests such as
+  "看数据", "改一下", or "换个模型". Reuse dataset/model identifiers and topology
+  already present in the file instead of asking the user to provide them again.
 - Immediately after that single workflow read, invoke the matching listed skill.
   Then read only the exact `references/` resource that the skill requires. For
   a local workflow edit, do not inspect general `knowledge/` before invoking the
@@ -234,18 +367,9 @@ __PYROMIND_RUNTIME_CONTRACT__
 
 Create and edit the workflow DSL at the relative path
 `public_data/workflow_canvas/workflow.py` from the current working directory.
-Prefer `apply_patch` for workflow changes. It accepts only the `patch` argument;
-never pass a separate `path` argument. Put the full relative path in the patch
-header, e.g.
-`*** Add File: public_data/workflow_canvas/workflow.py` or
-`*** Update File: public_data/workflow_canvas/workflow.py` — never use the
-bare name `workflow.py`.
-
-The separate `file_editor` tool does accept `path`. When using it for this file,
-set `path` to `public_data/workflow_canvas/workflow.py`; the runtime resolves
-conversation-relative paths to host-absolute paths. Do not hand-author long absolute
-paths, and do not use `/workspace/...` or `workspace/conversations/...` as a
-`file_editor.path` for the workflow file.
+Use the active Harness's workspace editing capability and preserve this exact relative
+artifact path. Do not hand-author host-absolute paths, and do not use `/workspace/...`
+or `workspace/conversations/...` for conversation-local files.
 After creating or modifying the workflow file, stop normally; the server sends
 the workflow to the frontend once the run finishes. Do not say the workflow has
 been generated unless a tool call actually created or modified the workflow file.
@@ -256,8 +380,8 @@ been generated unless a tool call actually created or modified the workflow file
   send skill-document lookup to the search subagent.
 - Whenever a direct question or an intermediate step requires searching,
   grepping, or reading general `knowledge/` documentation, delegate the lookup
-  to `subagent(type="search")`. The parent must not inspect those documents with
-  grep, terminal, or file-reading tools.
+  to `subagent(type="search")`. The parent must not inspect those documents
+  directly.
 - Make at most one `subagent(type="search")` call per parent-agent turn. Combine
   all related knowledge-base subquestions into one self-contained task. Do not
   split searches by topic, directory, expected source, or answer section, and
@@ -857,7 +981,7 @@ def _empty_workflow_reminder() -> TextContent:
             "The current canvas is empty and workflow.py does not exist. "
             "Treat this as authoritative: start from scratch, invoke the "
             "matching skill immediately, and do not inspect state.json or "
-            "use terminal commands to verify the missing file.\n"
+            "probe the local runtime to verify the missing file.\n"
             "</system_reminder>"
         )
     )
@@ -1299,7 +1423,8 @@ async def create_pyromind_conversation(
                     "<system_reminder>\n"
                     "A workflow from the current canvas is already loaded at "
                     "public_data/workflow_canvas/workflow.py. Treat it as "
-                    "authoritative context. Read the full file with file_editor "
+                    "authoritative context. Read the full file through the available "
+                    "workspace capability "
                     "before interpreting this request or asking for dataset, "
                     "model, or topology details already present there.\n"
                     "</system_reminder>"

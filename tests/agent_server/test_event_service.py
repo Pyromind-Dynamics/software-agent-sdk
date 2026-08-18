@@ -400,7 +400,7 @@ def test_pyromind_runtime_contract_refreshes_persisted_agent_once():
     )
     assert custom_instructions.count(PYROMIND_RUNTIME_CONTRACT.strip()) == 1
     assert PYROMIND_LEGACY_RUNTIME_CONTRACT.strip() not in custom_instructions
-    assert "never use the local terminal as a substitute" in custom_instructions
+    assert "local workspace runtime as a substitute" in custom_instructions
 
 
 def test_emit_pyromind_workflow_if_dirty_emits_event_and_clears_flag(

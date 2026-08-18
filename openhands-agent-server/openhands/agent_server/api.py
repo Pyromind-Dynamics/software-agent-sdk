@@ -10,10 +10,31 @@ from typing import Any
 from urllib.parse import urlparse
 
 import libtmux
-from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pyromind_runtime.adapters.openhands import (
+    OpenHandsAdapter,
+    PersistedSettingsOpenHandsSessionFactory,
+)
+from pyromind_runtime.adapters.pi import (
+    LocalPiRunnerLauncher,
+    PiAdapter,
+    SandboxGatewayError,
+    StaticPiModelConfigResolver,
+    safe_runner_environment,
+)
+from pyromind_runtime.product.router import create_product_router
+from pyromind_runtime.product.runtime import (
+    ProductRuntimeService,
+    ProductRuntimeSettings,
+)
+from pyromind_runtime.tool_host import (
+    PythonToolHost,
+    SessionToolContextStore,
+    first_version_tool_specs,
+)
 from starlette.requests import Request
 
 from openhands.agent_server.agent_profiles_router import agent_profiles_router
@@ -31,6 +52,7 @@ from openhands.agent_server.conversation_service import (
 from openhands.agent_server.dependencies import (
     check_session_api_key,
     check_workspace_session,
+    get_current_user_id,
 )
 from openhands.agent_server.desktop_router import desktop_router
 from openhands.agent_server.desktop_service import get_desktop_service
@@ -54,6 +76,8 @@ from openhands.agent_server.openai.router import (
 from openhands.agent_server.plugins_router import plugins_router
 from openhands.agent_server.profiles_router import profiles_router
 from openhands.agent_server.pyromind_router import (
+    build_product_tool_host,
+    get_product_tool_request_context,
     pyromind_debug_webhook_router,
     pyromind_router,
 )
@@ -78,6 +102,17 @@ from openhands.tools.terminal.constants import TMUX_SOCKET_NAME
 
 
 logger = get_logger(__name__)
+
+_DEFAULT_PI_SKILL_NAMES = ("generate-workflow-dsl",)
+_DEFAULT_PI_SYSTEM_PROMPT = """\
+You are the Pyromind workflow and dataset assistant.
+
+Work only inside the assigned workspace. Use preview_dataset for
+bounded dataset inspection and validate_workflow_dsl for platform validation.
+Create or edit the canonical workflow at
+public_data/workflow_canvas/workflow.py. Never expose credentials or attempt to
+access files outside the assigned workspace.
+"""
 
 _PYROMIND_PORTAL_CORS_ORIGINS = (
     "https://pyromind.ai",
@@ -336,6 +371,9 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
 
                 await stop_stateless_services()
     finally:
+        product_runtime = getattr(api.state, "product_runtime", None)
+        if product_runtime is not None:
+            await product_runtime.close()
         if tmux_tmpdir_was_defaulted and os.environ.get("TMUX_TMPDIR") == str(
             tmux_tmpdir
         ):
@@ -431,6 +469,12 @@ def _add_api_routes(app: FastAPI) -> None:
     api_router.include_router(profiles_router)
     api_router.include_router(agent_profiles_router)
     api_router.include_router(pyromind_router)
+    api_router.include_router(
+        create_product_router(
+            get_current_user_id,
+            get_product_tool_request_context,
+        )
+    )
     # /api/auth/* mints workspace cookies and requires the header to bootstrap,
     # so it lives under the header-only auth group.
     api_router.include_router(auth_router)
@@ -654,6 +698,119 @@ def _add_exception_handlers(api: FastAPI) -> None:
         # Return clean JSON response for all non-5xx HTTP exceptions
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
+    @api.exception_handler(SandboxGatewayError)
+    async def _sandbox_gateway_exception_handler(
+        request: Request, exc: SandboxGatewayError
+    ) -> JSONResponse:
+        status_code = {
+            "invalid": status.HTTP_400_BAD_REQUEST,
+            "permission_denied": status.HTTP_401_UNAUTHORIZED,
+            "not_found": status.HTTP_404_NOT_FOUND,
+        }.get(exc.code, status.HTTP_502_BAD_GATEWAY)
+        logger.warning(
+            "Sandbox gateway error [%s] on %s %s: %s",
+            exc.code,
+            request.method,
+            request.url.path,
+            exc,
+        )
+        return JSONResponse(status_code=status_code, content={"detail": str(exc)})
+
+
+def _pi_enabled(default_harness_id: str) -> bool:
+    configured = os.getenv("PYROMIND_ENABLE_PI", "").strip().lower()
+    return default_harness_id == "pi" or configured in {"1", "true", "yes", "on"}
+
+
+def _default_product_harness_id() -> str:
+    configured = os.getenv("PYROMIND_DEFAULT_HARNESS")
+    if configured is not None and configured.strip():
+        return configured.strip()
+    enabled = os.getenv("PYROMIND_ENABLE_PI", "").strip().lower()
+    return "pi" if enabled in {"1", "true", "yes", "on"} else "openhands"
+
+
+def _pi_skill_directories() -> tuple[Path, ...]:
+    skills_root = Path(
+        os.getenv(
+            "PYROMIND_SKILLS_PATH",
+            str(Path(__file__).resolve().parents[3] / ".agents" / "skills"),
+        )
+    ).resolve()
+    configured = os.getenv("PYROMIND_PI_SKILLS")
+    names = (
+        tuple(name.strip() for name in configured.split(",") if name.strip())
+        if configured is not None
+        else _DEFAULT_PI_SKILL_NAMES
+    )
+    skill_directories: list[Path] = []
+    for name in names:
+        if "/" in name or "\\" in name or name in {".", ".."}:
+            raise RuntimeError(f"Invalid PYROMIND_PI_SKILLS entry: {name}")
+        directory = (skills_root / name).resolve()
+        if directory.parent != skills_root or not (directory / "SKILL.md").is_file():
+            raise RuntimeError(f"Configured Pi skill is missing: {directory}")
+        skill_directories.append(directory)
+    return tuple(skill_directories)
+
+
+def _register_pi_adapter(
+    app: FastAPI,
+    *,
+    default_harness_id: str,
+    tool_host: PythonToolHost,
+    model_profile_id: str,
+    workspace_root: Path,
+) -> None:
+    if not _pi_enabled(default_harness_id):
+        return
+
+    llm_model = os.getenv("LLM_MODEL", "gpt-5.5").strip()
+    fallback_provider, fallback_model_id = (
+        llm_model.split("/", 1) if "/" in llm_model else ("openai", llm_model)
+    )
+    model_provider = os.getenv("PYROMIND_PI_MODEL_PROVIDER", fallback_provider).strip()
+    model_id = os.getenv("PYROMIND_PI_MODEL_ID", fallback_model_id).strip()
+    model_api_key = (
+        os.getenv("PYROMIND_PI_MODEL_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or os.getenv("LLM_API_KEY")
+        or ""
+    )
+    model_base_url = os.getenv("PYROMIND_PI_MODEL_BASE_URL") or os.getenv(
+        "LLM_BASE_URL"
+    )
+    thinking_level = os.getenv("PYROMIND_PI_THINKING_LEVEL", "high").strip()
+    pi_runtime_dir = Path(__file__).resolve().parents[2] / "pi-runtime"
+    runner_entry = pi_runtime_dir / "src" / "index.ts"
+    if not runner_entry.is_file():
+        raise RuntimeError(f"Pi runner entrypoint is missing: {runner_entry}")
+
+    launcher = LocalPiRunnerLauncher(
+        command=(
+            os.getenv("PYROMIND_PI_NODE_BINARY", "node"),
+            str(runner_entry),
+        ),
+        workspace_root=workspace_root,
+        cwd=str(pi_runtime_dir),
+        environment=safe_runner_environment(),
+        model_resolver=StaticPiModelConfigResolver(
+            profile_id=model_profile_id,
+            provider=model_provider,
+            model_id=model_id,
+            api_key=model_api_key,
+            base_url=model_base_url,
+            thinking_level=thinking_level,
+        ),
+        tool_host=tool_host,
+        skill_directories=_pi_skill_directories(),
+        system_prompt=os.getenv(
+            "PYROMIND_PI_SYSTEM_PROMPT",
+            _DEFAULT_PI_SYSTEM_PROMPT,
+        ),
+    )
+    app.state.product_runtime.registry.register("pi", PiAdapter(launcher))
+
 
 def create_app(config: Config | None = None) -> FastAPI:
     """Create and configure the FastAPI application.
@@ -668,6 +825,42 @@ def create_app(config: Config | None = None) -> FastAPI:
         config = get_default_config()
     app = _create_fastapi_instance(config)
     app.state.config = config
+    product_storage_root = Path(
+        os.getenv(
+            "PYROMIND_PRODUCT_RUNTIME_DIR",
+            str(config.conversations_path.parent / "product_conversations"),
+        )
+    )
+    default_harness_id = _default_product_harness_id()
+    model_profile_id = os.getenv("PYROMIND_MODEL_PROFILE", "default")
+    tool_context_store = SessionToolContextStore(
+        allowed_header_names={"authorization", "cookie", "x-cluster"}
+    )
+    product_tool_host = build_product_tool_host(tool_context_store)
+    app.state.product_runtime = ProductRuntimeService(
+        ProductRuntimeSettings(
+            storage_root=product_storage_root,
+            default_harness_id=default_harness_id,
+            default_workspace_root=str(config.workspace_path),
+            default_model_profile_id=model_profile_id,
+        ),
+        default_tools_by_harness={"pi": first_version_tool_specs()},
+        tool_context_store=tool_context_store,
+    )
+    app.state.product_runtime.registry.register(
+        "openhands",
+        OpenHandsAdapter(
+            lambda: app.state.conversation_service,
+            PersistedSettingsOpenHandsSessionFactory(lambda: app.state.config),
+        ),
+    )
+    _register_pi_adapter(
+        app,
+        default_harness_id=default_harness_id,
+        tool_host=product_tool_host,
+        model_profile_id=model_profile_id,
+        workspace_root=config.workspace_path,
+    )
 
     _add_api_routes(app)
     _setup_static_files(app, config)

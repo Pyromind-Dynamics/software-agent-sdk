@@ -11,6 +11,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
+# Keep uv's cache in a writable temporary location when the user cache is
+# unavailable (for example inside a restricted service account).
+export UV_CACHE_DIR="${UV_CACHE_DIR:-${TMPDIR:-/tmp}/pyromind-uv-cache}"
+
+export PYROMIND_ENABLE_PI=true
+export PYROMIND_DEFAULT_HARNESS="${PYROMIND_DEFAULT_HARNESS:-pi}"
 
 # ----------------------------------------------------------
 # LLM Configuration
@@ -20,7 +26,12 @@ export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 # export LLM_BASE_URL="http://208.64.254.187:8000/v1"
 export LLM_MODEL="deepseek/deepseek-v4-flash-0731"
 export LLM_BASE_URL="https://openrouter.ai/api/v1"
-export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+export PYROMIND_PI_MODEL_PROVIDER="${PYROMIND_PI_MODEL_PROVIDER:-deepseek}"
+export PYROMIND_PI_MODEL_ID="${PYROMIND_PI_MODEL_ID:-deepseek-v4-flash-0731}"
+export PYROMIND_PI_MODEL_BASE_URL="${PYROMIND_PI_MODEL_BASE_URL:-${LLM_BASE_URL}}"
+if [[ -z "${OPENAI_API_KEY:-}" && -n "${LLM_API_KEY:-}" ]]; then
+  export OPENAI_API_KEY="${LLM_API_KEY}"
+fi
 
 #export LLM_MODEL="openai/deepseek-v4-pro"
 #export LLM_BASE_URL="https://api.deepseek.com"
@@ -29,10 +40,6 @@ if [[ -z "${OPENAI_API_KEY:-}" ]]; then
   exit 1
 fi
 export LLM_MODEL="${LLM_MODEL:-openai/deepseek-v4-flash-0731}"
-if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-  echo "ERROR: OPENAI_API_KEY is required. Set it in start_inference.sh." >&2
-  exit 1
-fi
 export OPENAI_API_KEY
 
 export DF_API_BASE_URL="https://openrouter.ai/api/v1"
@@ -131,6 +138,7 @@ echo "============================================"
 echo " Pyromind Agent Server"
 echo "============================================"
 echo " LLM Base URL:      ${LLM_BASE_URL}"
+echo " Default harness:   ${PYROMIND_DEFAULT_HARNESS}"
 echo " Server root:       ${SOFTWARE_AGENT_SDK_DIR}"
 echo " Knowledge Base:    ${PYROMIND_KNOWLEDGE_BASE_PATH}"
 echo " Skills:            ${PYROMIND_SKILLS_PATH}"

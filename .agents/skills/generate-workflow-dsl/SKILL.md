@@ -15,7 +15,7 @@ description: >-
 
 - `workflow.py` 直接声明节点实例，不写 import，也不能当普通 Python 在 Agent 本地执行。
 - 本 Skill 只生成并校验 DSL；数据处理、Benchmark、训练和推理由 Pyromind 平台节点执行。
-- 数据、模型和训练产物通过输出端口绑定；禁止用 Agent 本地 terminal 替代平台运行时或查找数据副本。
+- 数据、模型和训练产物通过输出端口绑定；不得在本地运行环境替代平台执行，或查找平台数据副本。
 - Benchmark 最小骨架是数据配置 → 模型入口 → VLLM → Metric → Eval。
 - 每个 `MetricsConfigBuilderNode` 只输出一个 `metrics_config`；契约未声明的组合方式不得猜测。
 - Reference 是按缺失事实选择的索引，不是阅读清单；同一轮不得重复读取同一路径。
@@ -31,8 +31,6 @@ description: >-
 | `references/parameter-decision.md` | 训练数值参数的整组决策或训练 OOM 调整 |
 | `references/custom-python-assets.md` | 内置 Metrics/Reward 不适用，需要生成、上传并回填 Python 入口 |
 | 其他 Skill: `training-analysis` | 分析已有训练效果（loss 异常/对比/优化超参）时，先调该 skill 产出报告与探针实验，再按 `parameter-decision.md` 落参数 |
-
-调用格式为 `skills_read(skill_name="generate-workflow-dsl", path="references/...")`。
 
 ## 执行状态机
 
@@ -104,7 +102,7 @@ batch、grad accumulation、learning rate、epoch、LoRA rank、max steps 和 nu
 
 ### 7. 写入或局部修改
 
-- 文件固定为 `public_data/workflow_canvas/workflow.py`；新建或整体生成使用 `apply_patch`。
+- 文件固定为 `public_data/workflow_canvas/workflow.py`；通过当前 Harness 提供的工作区编辑能力写入。
 - 修改前先读取现有文件，列出内部“需求验收项”和“图差分”，仅替换相关节点与连线。
 - 所有上游产物都通过输出端口绑定。不得把 SFT、Merge、GRPO、Inference 之间的模型路径写死。
 - WandB 仅写 Secret 名；不得把 API Key、Cookie、集群凭证或其他明文 Secret 写入 DSL。
@@ -115,7 +113,7 @@ batch、grad accumulation、learning rate、epoch、LoRA rank、max steps 和 nu
 
 1. `valid=true`：结束；warnings 只在最终回复简述。
 2. `valid=false`：按 `code`、`node_id`、`field` 和 `detail.*_node_code` 做唯一片段最小修改。
-3. `retryable=false`（包括 401）：立即停止，不重复校验，也不得用 terminal 探测凭证。
+3. `retryable=false`（包括 401）：立即停止，不重复校验，也不得在本地环境探测凭证。
 4. `retryable=true`：最多重试两次；仍失败则停止并说明平台校验未完成。
 5. 最多修改五轮；同一错误连续两轮不消失时停止并报告。
 

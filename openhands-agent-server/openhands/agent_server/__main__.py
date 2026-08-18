@@ -20,14 +20,13 @@ import argparse
 import atexit
 import faulthandler
 import importlib
-import signal
 import sys
-from types import FrameType
 
-import uvicorn
 from uvicorn import Config
+from uvicorn.supervisors import ChangeReload
 
 from openhands.agent_server.logging_config import LOGGING_CONFIG
+from openhands.agent_server.server import LoggingServer
 from openhands.sdk.logger import DEBUG, get_logger
 
 
@@ -162,25 +161,6 @@ def check_browser():
             executor.close()
 
 
-class LoggingServer(uvicorn.Server):
-    """Custom uvicorn Server that logs signal handling events.
-
-    This subclass overrides handle_exit to add structured logging when
-    termination signals are received, ensuring visibility into why the
-    server is shutting down.
-    """
-
-    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
-        """Handle exit signals with logging before delegating to parent."""
-        sig_name = signal.Signals(sig).name
-        logger.info(
-            "Received signal %s (%d), shutting down...",
-            sig_name,
-            sig,
-        )
-        super().handle_exit(sig, frame)
-
-
 def _setup_crash_diagnostics() -> None:
     """Enable crash diagnostics for debugging unexpected terminations.
 
@@ -280,11 +260,12 @@ def main() -> None:
         host=args.host,
         port=args.port,
         reload=args.reload,
-        reload_includes=[
+        reload_dirs=[
             "openhands-agent-server",
             "openhands-sdk",
             "openhands-tools",
         ],
+        reload_includes=["*.py"],
         log_level=log_level,
         log_config=LOGGING_CONFIG,
         ws="wsproto",  # Use wsproto instead of deprecated websockets implementation
@@ -294,7 +275,11 @@ def main() -> None:
     server = LoggingServer(config)
 
     try:
-        server.run()
+        if config.should_reload:
+            socket = config.bind_socket()
+            ChangeReload(config, target=server.run, sockets=[socket]).run()
+        else:
+            server.run()
     except Exception:
         logger.error("Server crashed with unexpected exception", exc_info=True)
         raise
