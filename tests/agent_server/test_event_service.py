@@ -1,12 +1,14 @@
 import asyncio
 import contextlib
 import json
+import logging
 import shutil
 import threading
 import time
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -4052,3 +4054,36 @@ async def test_remove_active_long_task_inactive_service_raises(tmp_path):
 
     with pytest.raises(ValueError, match="inactive_service"):
         await service.remove_active_long_task("t1")
+
+
+def test_apply_storage_quota_fails_closed_when_required(event_service, monkeypatch):
+    fake_quota = SimpleNamespace(
+        limit_bytes=500 * 1024 * 1024,
+        apply=lambda *args, **kwargs: False,
+        last_error="No such device or address",
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.event_service.quota_from_env", lambda: fake_quota
+    )
+    monkeypatch.setenv("OH_STORAGE_QUOTA_REQUIRED", "1")
+    with pytest.raises(RuntimeError, match="storage quota .* could not be enforced"):
+        event_service._apply_storage_quota()
+
+
+def test_apply_storage_quota_warns_when_not_required(
+    event_service, monkeypatch, caplog
+):
+    fake_quota = SimpleNamespace(
+        limit_bytes=500 * 1024 * 1024,
+        apply=lambda *args, **kwargs: False,
+        last_error="No such device or address",
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.event_service.quota_from_env", lambda: fake_quota
+    )
+    monkeypatch.delenv("OH_STORAGE_QUOTA_REQUIRED", raising=False)
+    with caplog.at_level(
+        logging.WARNING, logger="openhands.agent_server.event_service"
+    ):
+        event_service._apply_storage_quota()
+    assert "storage quota not enforced" in caplog.text

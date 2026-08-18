@@ -38,7 +38,7 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_WORKFLOW_EVENT_KEY,
 )
 from openhands.agent_server.pyromind_llm_config import build_runtime_llm
-from openhands.agent_server.storage_quota import quota_from_env
+from openhands.agent_server.storage_quota import quota_from_env, storage_quota_required
 from openhands.agent_server.workflow_canvas_snapshot_hook import (
     WorkflowCanvasSnapshotHook,
 )
@@ -1213,10 +1213,19 @@ class EventService:
             )
 
     def _apply_storage_quota(self) -> None:
-        """Apply the configured storage quota to this conversation's directory."""
+        """Apply the configured storage quota (fail closed when required)."""
         quota = quota_from_env()
-        if quota.limit_bytes is not None:
-            quota.apply(self.conversation_dir, self.stored.id)
+        if quota.limit_bytes is None:
+            return
+        if quota.apply(self.conversation_dir, self.stored.id):
+            return
+        detail = quota.last_error or "unknown error"
+        if storage_quota_required():
+            raise RuntimeError(
+                f"storage quota {quota.limit_bytes} bytes could not be "
+                f"enforced for conversation {self.stored.id}: {detail}"
+            )
+        logger.warning("storage quota not enforced for %s: %s", self.stored.id, detail)
 
     async def start(self):
         # Store the main event loop for cross-thread communication

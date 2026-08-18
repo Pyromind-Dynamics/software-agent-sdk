@@ -6,10 +6,13 @@ import pytest
 
 from openhands.agent_server.storage_quota import (
     OH_CONVERSATION_STORAGE_QUOTA_ENV,
+    OH_STORAGE_QUOTA_DEVICE_ENV,
+    OH_STORAGE_QUOTA_REQUIRED_ENV,
     ConversationStorageQuota,
     parse_storage_size,
     project_id_for,
     quota_from_env,
+    storage_quota_required,
 )
 
 
@@ -222,3 +225,89 @@ def test_device_node_prefers_existing_source_device(monkeypatch, tmp_path):
     from openhands.agent_server.storage_quota import _device_node_for
 
     assert _device_node_for(Path("/workspace")) == device
+
+
+def test_storage_quota_required_env(monkeypatch):
+    monkeypatch.delenv(OH_STORAGE_QUOTA_REQUIRED_ENV, raising=False)
+    assert not storage_quota_required()
+
+    for value in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv(OH_STORAGE_QUOTA_REQUIRED_ENV, value)
+        assert storage_quota_required()
+
+    for value in ("0", "false", "off", ""):
+        monkeypatch.setenv(OH_STORAGE_QUOTA_REQUIRED_ENV, value)
+        assert not storage_quota_required()
+
+
+def test_quota_from_env_parses_device_override(monkeypatch):
+    monkeypatch.delenv(OH_STORAGE_QUOTA_DEVICE_ENV, raising=False)
+    quota = ConversationStorageQuota(10)
+    assert quota.device is None
+
+    monkeypatch.setenv(OH_STORAGE_QUOTA_DEVICE_ENV, "/dev/nvme1n1")
+    monkeypatch.setenv(OH_CONVERSATION_STORAGE_QUOTA_ENV, "500M")
+    parsed = quota_from_env()
+    assert parsed.device == Path("/dev/nvme1n1")
+
+
+def test_apply_uses_configured_device(monkeypatch, tmp_path):
+    directory = tmp_path / "conv"
+    directory.mkdir()
+    calls = []
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.shutil.which",
+        lambda _: "/usr/bin/xfs_quota",
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+    )
+    dev = tmp_path / "real-device"
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("openhands.agent_server.storage_quota.subprocess.run", fake_run)
+    quota = ConversationStorageQuota(10, device=dev)
+    assert quota.apply(directory, UUID(int=3))
+    assert calls and all(str(dev) in args for args in calls)
+
+
+def test_apply_records_last_error_on_mountpoint_failure(monkeypatch, tmp_path):
+    directory = tmp_path / "conv"
+    directory.mkdir()
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: None
+    )
+    quota = ConversationStorageQuota(10)
+    assert not quota.apply(directory, UUID(int=4))
+    assert "cannot resolve mountpoint" in (quota.last_error or "")
+
+
+def test_run_records_command_failure_detail(monkeypatch, tmp_path):
+    directory = tmp_path / "conv"
+    directory.mkdir()
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.shutil.which",
+        lambda _: "/usr/bin/xfs_quota",
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._device_node_for", lambda _: None
+    )
+
+    def failing_run(args, **kwargs):
+        return SimpleNamespace(
+            returncode=1, stdout="", stderr="No such device or address"
+        )
+
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.subprocess.run", failing_run
+    )
+    quota = ConversationStorageQuota(10)
+    assert not quota.apply(directory, UUID(int=5))
+    assert quota.last_error is not None
+    assert "No such device or address" in quota.last_error

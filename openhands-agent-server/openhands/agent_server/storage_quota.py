@@ -3,8 +3,11 @@
 Each conversation directory maps to its own project id so that writes made
 inside the sandbox (including direct bash writes) hit the filesystem quota
 hard limit instead of relying on app-level accounting. The workspace
-filesystem must be mounted with ``prjquota`` and ``xfs_quota`` must exist;
-otherwise calls are logged and storage stays unlimited.
+filesystem must be mounted with ``prjquota`` and ``xfs_quota`` must exist.
+Failures are recorded on :attr:`ConversationStorageQuota.last_error`; when
+``OH_STORAGE_QUOTA_REQUIRED`` is set the caller fails closed, otherwise
+storage stays unlimited and the failure is only logged. ``OH_STORAGE_QUOTA_DEVICE``
+can point at the real block device when it is mapped into the container.
 """
 
 from __future__ import annotations
@@ -22,6 +25,8 @@ from uuid import UUID
 logger = logging.getLogger(__name__)
 
 OH_CONVERSATION_STORAGE_QUOTA_ENV = "OH_CONVERSATION_STORAGE_QUOTA"
+OH_STORAGE_QUOTA_REQUIRED_ENV = "OH_STORAGE_QUOTA_REQUIRED"
+OH_STORAGE_QUOTA_DEVICE_ENV = "OH_STORAGE_QUOTA_DEVICE"
 _MAX_PROJECT_ID = (1 << 31) - 1
 _SIZE_UNITS = {
     "": 1,
@@ -126,16 +131,44 @@ def convert_mount_point(field: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
 
 
+def storage_quota_required() -> bool:
+    """Whether a configured storage quota must be enforced or startup fails."""
+    return os.environ.get(OH_STORAGE_QUOTA_REQUIRED_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 class ConversationStorageQuota:
     """Set and remove per-conversation XFS project quota limits."""
 
-    def __init__(self, limit_bytes: int | None, *, xfs_quota: str = "xfs_quota"):
+    def __init__(
+        self,
+        limit_bytes: int | None,
+        *,
+        xfs_quota: str = "xfs_quota",
+        device: Path | None = None,
+    ):
         self._limit_bytes = limit_bytes
         self._xfs_quota = xfs_quota
+        self._device = device
+        self._last_error: str | None = None
 
     @property
     def limit_bytes(self) -> int | None:
         return self._limit_bytes
+
+    @property
+    def device(self) -> Path | None:
+        """Block device xfs_quota should target, if configured."""
+        return self._device
+
+    @property
+    def last_error(self) -> str | None:
+        """Why the most recent quota command failed, if it did."""
+        return self._last_error
 
     def apply(self, directory: Path, conversation_id: UUID) -> bool:
         """Assign a project id to the conversation dir and cap its size."""
@@ -143,13 +176,15 @@ class ConversationStorageQuota:
             return False
         mount_point = _mountpoint_for(directory)
         if mount_point is None:
-            logger.warning("storage quota: cannot resolve mountpoint for %s", directory)
+            self._last_error = f"cannot resolve mountpoint for {directory}"
+            logger.warning("storage quota: %s", self._last_error)
             return False
         project_id = project_id_for(conversation_id)
         commands = (
             f"project -s -p {directory} {project_id}",
             f"limit -p bhard={self._limit_bytes} {project_id}",
         )
+        self._last_error = None
         return all(self._run(mount_point, command) for command in commands)
 
     def remove(self, directory: Path, conversation_id: UUID) -> bool:
@@ -160,15 +195,15 @@ class ConversationStorageQuota:
         if mount_point is None:
             return False
         project_id = project_id_for(conversation_id)
+        self._last_error = None
         return self._run(mount_point, f"project -c {project_id}")
 
     def _run(self, mount_point: Path, command: str) -> bool:
         if shutil.which(self._xfs_quota) is None:
-            logger.warning(
-                "storage quota requested but %s is unavailable", self._xfs_quota
-            )
+            self._last_error = f"{self._xfs_quota} is unavailable"
+            logger.warning("storage quota: %s", self._last_error)
             return False
-        target = _device_node_for(mount_point) or mount_point
+        target = self._device or _device_node_for(mount_point) or mount_point
         try:
             result = subprocess.run(
                 [self._xfs_quota, "-x", "-c", command, str(target)],
@@ -177,12 +212,13 @@ class ConversationStorageQuota:
                 timeout=30,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            logger.warning("storage quota command failed: %s", exc)
+            self._last_error = f"{command} failed: {exc}"
+            logger.warning("storage quota: %s", self._last_error)
             return False
         if result.returncode != 0:
-            logger.warning(
-                "%s failed: %s", command, result.stderr.strip() or result.stdout.strip()
-            )
+            detail = result.stderr.strip() or result.stdout.strip()
+            self._last_error = f"{command} failed: {detail}" if detail else command
+            logger.warning("storage quota: %s", self._last_error)
             return False
         return True
 
@@ -192,4 +228,6 @@ def quota_from_env() -> ConversationStorageQuota:
     value = os.environ.get(OH_CONVERSATION_STORAGE_QUOTA_ENV)
     if value is None:
         return ConversationStorageQuota(None)
-    return ConversationStorageQuota(parse_storage_size(value))
+    device_text = os.environ.get(OH_STORAGE_QUOTA_DEVICE_ENV)
+    device = Path(device_text) if device_text else None
+    return ConversationStorageQuota(parse_storage_size(value), device=device)
