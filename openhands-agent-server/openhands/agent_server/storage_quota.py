@@ -126,6 +126,25 @@ def _device_node_for(mount_point: Path) -> Path | None:
     return device
 
 
+def _fs_type_and_options(mount_point: Path) -> tuple[str, tuple[str, ...]]:
+    """Return the filesystem type and mount options for ``mount_point``."""
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return "", ()
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 6 or Path(convert_mount_point(fields[4])) != mount_point:
+            continue
+        if "-" not in fields:
+            break
+        separator = fields.index("-")
+        if separator + 3 >= len(fields):
+            break
+        return fields[separator + 1], tuple(fields[separator + 3].split(","))
+    return "", ()
+
+
 def convert_mount_point(field: str) -> str:
     """Unescape a mountinfo path field (octal `\040` etc.)."""
     return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
@@ -231,3 +250,35 @@ def quota_from_env() -> ConversationStorageQuota:
     device_text = os.environ.get(OH_STORAGE_QUOTA_DEVICE_ENV)
     device = Path(device_text) if device_text else None
     return ConversationStorageQuota(parse_storage_size(value), device=device)
+
+
+def preflight_storage_quota(*, workspace_root: Path | None = None) -> list[str]:
+    """Return deployment problems that would prevent the storage quota.
+
+    When a quota is configured this verifies that the workspace filesystem is
+    XFS with project quotas enabled (``prjquota``) and that ``xfs_quota`` can
+    open the backing device. Callers decide whether the returned problems
+    should fail startup or only be logged.
+    """
+    quota = quota_from_env()
+    if quota.limit_bytes is None:
+        return []
+    root = workspace_root or Path(
+        os.environ.get("workspace_dir")
+        or os.environ.get("WORKSPACE_DIR")
+        or "workspace"
+    )
+    mount_point = _mountpoint_for(root)
+    if mount_point is None:
+        return [f"cannot resolve mountpoint for {root}"]
+    problems: list[str] = []
+    fs_type, options = _fs_type_and_options(mount_point)
+    if fs_type != "xfs":
+        problems.append(f"workspace filesystem is {fs_type or 'unknown'}, XFS required")
+    if "prjquota" not in options and "pquota" not in options:
+        problems.append(
+            f"workspace mount lacks prjquota option ({', '.join(options) or 'none'})"
+        )
+    if not quota._run(mount_point, "report -p"):
+        problems.append(f"xfs_quota cannot open device: {quota.last_error}")
+    return problems

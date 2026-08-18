@@ -40,6 +40,8 @@ spec:
                         value: /workspace
                       - name: OH_CONVERSATION_STORAGE_QUOTA
                         value: 500M
+                      - name: OH_STORAGE_QUOTA_REQUIRED
+                        value: '1'
                       - name: OH_SANDBOX_MEMORY_LIMIT
                         value: 500M
                       - name: OH_SANDBOX_MEMORY_REQUIRED

@@ -10,6 +10,7 @@ from openhands.agent_server.storage_quota import (
     OH_STORAGE_QUOTA_REQUIRED_ENV,
     ConversationStorageQuota,
     parse_storage_size,
+    preflight_storage_quota,
     project_id_for,
     quota_from_env,
     storage_quota_required,
@@ -311,3 +312,65 @@ def test_run_records_command_failure_detail(monkeypatch, tmp_path):
     assert not quota.apply(directory, UUID(int=5))
     assert quota.last_error is not None
     assert "No such device or address" in quota.last_error
+
+
+def test_preflight_disabled_quota_returns_empty(monkeypatch):
+    monkeypatch.delenv(OH_CONVERSATION_STORAGE_QUOTA_ENV, raising=False)
+    assert preflight_storage_quota() == []
+
+
+def _preflight_mount(monkeypatch, tmp_path, fs_type, options, report_ok=True):
+    monkeypatch.setenv(OH_CONVERSATION_STORAGE_QUOTA_ENV, "500M")
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._fs_type_and_options",
+        lambda _: (fs_type, options),
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.shutil.which",
+        lambda _: "/usr/bin/xfs_quota",
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._device_node_for", lambda _: None
+    )
+
+    def runner(*args, **kwargs):
+        status = 0 if report_ok else 1
+        stderr = "" if report_ok else "No such device or address"
+        return SimpleNamespace(returncode=status, stdout="", stderr=stderr)
+
+    monkeypatch.setattr("openhands.agent_server.storage_quota.subprocess.run", runner)
+
+
+def test_preflight_reports_filesystem_problems(monkeypatch, tmp_path):
+    _preflight_mount(
+        monkeypatch, tmp_path, fs_type="ext4", options=("rw",), report_ok=False
+    )
+    problems = preflight_storage_quota(workspace_root=tmp_path)
+    assert any("XFS" in problem for problem in problems)
+    assert any("prjquota" in problem for problem in problems)
+    assert any("No such device or address" in problem for problem in problems)
+
+
+def test_preflight_reports_unopenable_device(monkeypatch, tmp_path):
+    _preflight_mount(
+        monkeypatch, tmp_path, fs_type="xfs", options=("prjquota",), report_ok=False
+    )
+    problems = preflight_storage_quota(workspace_root=tmp_path)
+    assert any("cannot open device" in problem for problem in problems)
+
+
+def test_preflight_ok_returns_empty(monkeypatch, tmp_path):
+    _preflight_mount(monkeypatch, tmp_path, fs_type="xfs", options=("prjquota",))
+    assert preflight_storage_quota(workspace_root=tmp_path) == []
+
+
+def test_preflight_unknown_mountpoint(monkeypatch, tmp_path):
+    monkeypatch.setenv(OH_CONVERSATION_STORAGE_QUOTA_ENV, "500M")
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: None
+    )
+    problems = preflight_storage_quota(workspace_root=tmp_path)
+    assert problems and "mountpoint" in problems[0]
