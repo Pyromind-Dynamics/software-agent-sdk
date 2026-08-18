@@ -42,10 +42,12 @@ spec:
                         value: 500M
                       - name: OH_STORAGE_QUOTA_REQUIRED
                         value: '1'
+                      - name: OH_STORAGE_QUOTA_DEVICE
+                        value: /dev/nvme1n1
                       - name: OH_SANDBOX_MEMORY_LIMIT
                         value: 500M
                       - name: OH_SANDBOX_MEMORY_REQUIRED
-                        value: '1'
+                        value: '0'
                       - name: SESSION_API_KEY
                         valueFrom:
                             secretKeyRef:
@@ -65,16 +67,18 @@ spec:
                         protocol: TCP
                   resources:
                       requests:
-                          memory: 512Mi
-                          cpu: 250m
+                          memory: 2Gi
+                          cpu: 1
                       limits:
-                          memory: 1Gi
-                          cpu: 500m
+                          memory: 8Gi
+                          cpu: 4
                   terminationMessagePath: /dev/termination-log
                   terminationMessagePolicy: File
                   volumeMounts:
                       - mountPath: /workspace
                         name: workspace
+                      - mountPath: /dev/nvme1n1
+                        name: workspace-device
                   securityContext:
                       capabilities:
                           add:
@@ -104,6 +108,13 @@ spec:
             imagePullSecrets:
                 - name: niqi-dev-secret
             restartPolicy: Always
+            volumes:
+                # Host device backing the workspace quota volume; use a stable
+                # by-id path (e.g. /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol-xxx)
+                - name: workspace-device
+                  hostPath:
+                      path: /dev/nvme1n1
+                      type: BlockDevice
     volumeClaimTemplates:
         # Enforcing the per-conversation storage quota requires the workspace
         # volume to be mounted with prjquota (XFS). Provision it through a

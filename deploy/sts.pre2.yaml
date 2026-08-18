@@ -51,10 +51,12 @@ spec:
                         value: 500M
                       - name: OH_STORAGE_QUOTA_REQUIRED
                         value: '1'
+                      - name: OH_STORAGE_QUOTA_DEVICE
+                        value: /dev/nvme1n1
                       - name: OH_SANDBOX_MEMORY_LIMIT
                         value: 500M
                       - name: OH_SANDBOX_MEMORY_REQUIRED
-                        value: '1'
+                        value: '0'
                       - name: LLM_CONFIG_PATH
                         value: /etc/llm-config/llm_config.json
                       - name: LLM_MODEL
@@ -91,11 +93,11 @@ spec:
                         name: http
                   resources:
                       limits:
+                          cpu: 4
+                          memory: 8Gi
+                      requests:
                           cpu: 1
                           memory: 2Gi
-                      requests:
-                          cpu: 500m
-                          memory: 1Gi
                   securityContext:
                       appArmorProfile:
                           type: Unconfined
@@ -107,6 +109,8 @@ spec:
                   volumeMounts:
                       - mountPath: /workspace
                         name: workspace
+                      - mountPath: /dev/nvme1n1
+                        name: workspace-device
                       - mountPath: /etc/secrets
                         name: full-web-key-secret
                         readOnly: true
@@ -142,6 +146,12 @@ spec:
                 - name: niqi-dev-secret
             restartPolicy: Always
             volumes:
+                # Host device node backing the workspace volume; use the stable by-id
+                # path (e.g. /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol-xxx)
+                - name: workspace-device
+                  hostPath:
+                      path: /dev/nvme1n1
+                      type: BlockDevice
                 - name: full-web-key-secret
                   secret:
                       defaultMode: 420
