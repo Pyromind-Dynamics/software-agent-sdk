@@ -101,14 +101,16 @@ def test_memory_cgroup_attach_moves_pid_tree(
 ):
     memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
     assert memory_cgroup.create()
+    moved: list[int] = []
     monkeypatch.setattr(
         "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: [100, 200]
     )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._move_pid_to_cgroup",
+        lambda _path, pid: moved.append(pid),
+    )
     memory_cgroup.attach(42)
-    path = memory_cgroup.path
-    assert path is not None
-    procs = (path / "cgroup.procs").read_text().split()
-    assert procs == ["42", "100", "200"]
+    assert moved == [42, 100, 200]
 
 
 def test_memory_cgroup_attach_reports_empty_cgroup(
@@ -123,9 +125,10 @@ def test_memory_cgroup_attach_reports_empty_cgroup(
     monkeypatch.setattr(
         "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: [100, 200]
     )
-    procs = path / "cgroup.procs"
-    procs.touch()
-    procs.chmod(0)
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._move_pid_to_cgroup",
+        lambda _path, pid: (_ for _ in ()).throw(OSError("no write")),
+    )
     with caplog.at_level("ERROR", logger="openhands.tools.terminal.sandbox"):
         memory_cgroup.attach(42)
     assert "empty after attach" in caplog.text
@@ -155,6 +158,33 @@ def test_memory_cgroup_attach_logs_enforced_count(
     assert "enforced on 3 process(es)" in caplog.text
 
 
+def test_memory_cgroup_attach_sweeps_new_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A shell that forks after the first sweep (bwrap --unshare-pid) is still
+    captured by the settle loop instead of escaping the memory limit."""
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
+    assert memory_cgroup.create()
+    moved: list[int] = []
+    calls = 0
+
+    def fake_descendants(_pid: int) -> list[int]:
+        nonlocal calls
+        calls += 1
+        return [100] if calls == 1 else [100, 200]
+
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._descendant_pids", fake_descendants
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._move_pid_to_cgroup",
+        lambda _path, pid: moved.append(pid),
+    )
+    monkeypatch.setattr("openhands.tools.terminal.sandbox._ATTACH_SETTLE_DELAY", 0)
+    assert memory_cgroup.attach(42) == 3
+    assert moved == [42, 100, 200]
+
+
 def test_memory_cgroup_required_attach_empty_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -165,9 +195,10 @@ def test_memory_cgroup_required_attach_empty_raises(
     monkeypatch.setattr(
         "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: [100, 200]
     )
-    procs = path / "cgroup.procs"
-    procs.touch()
-    procs.chmod(0)
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._move_pid_to_cgroup",
+        lambda _path, pid: (_ for _ in ()).throw(OSError("no write")),
+    )
     with pytest.raises(RuntimeError, match="memory limit is not enforced"):
         memory_cgroup.attach(42)
 

@@ -214,6 +214,20 @@ class SubprocessTerminal(TerminalInterface):
         self._write_pty(init_cmd + ENTER)
         time.sleep(1.0)  # Wait for command to take effect
 
+        # The eager attach above can miss the interactive bash: bwrap
+        # --unshare-pid spawns it only after Popen returns. Re-run the sweep
+        # now that bash is up so the shell (and every later command process,
+        # which inherits its cgroup) stays inside the sandbox memory limit.
+        try:
+            attached = self.sandbox.attach_memory_cgroup(self.process.pid)
+        except RuntimeError:
+            self.close()
+            raise
+        logger.info(
+            "sandbox memory cgroup enforced on %d process(es) after shell init",
+            attached,
+        )
+
         self.clear_screen()
 
         logger.debug("PTY terminal initialized with work dir: %s", self.work_dir)

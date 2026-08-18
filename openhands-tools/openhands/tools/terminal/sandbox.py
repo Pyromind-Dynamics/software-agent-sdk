@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import uuid
 from functools import lru_cache
 from importlib import import_module
@@ -33,6 +34,8 @@ PUBLIC_READ_ROOTS = (
 )
 
 _CGROUP_MEMORY_ROOT = Path("/sys/fs/cgroup")
+_ATTACH_SETTLE_ATTEMPTS = 5
+_ATTACH_SETTLE_DELAY = 0.15
 _MEMORY_UNITS = {
     "": 1,
     "k": 1024,
@@ -119,6 +122,16 @@ def _descendant_pids(root_pid: int) -> list[int]:
     return pids
 
 
+def _move_pid_to_cgroup(procs_path: Path, pid: int) -> None:
+    """Write one pid into a cgroup v2 ``cgroup.procs`` stream.
+
+    One pid per write avoids the multi-pid EINVAL behavior; ``w`` mode is used
+    because some kernels reject append-style opens of cgroup files.
+    """
+    with procs_path.open("w") as stream:
+        stream.write(f"{pid}\n")
+
+
 class SandboxMemoryCgroup:
     """Pin a sandbox process tree into a cgroup with a hard memory cap.
 
@@ -165,20 +178,40 @@ class SandboxMemoryCgroup:
         )
         return True
 
-    def attach(self, root_pid: int) -> None:
+    def attach(self, root_pid: int) -> int:
+        """Move the sandbox process tree into this cgroup; return attached count.
+
+        The sweep re-enumerates the tree a few times because sandbox launchers
+        such as ``bwrap --unshare-pid`` spawn the interactive shell only after
+        Popen returns. A one-shot snapshot would leave the shell (and every
+        process it forks later) outside the cgroup.
+        """
         if self._path is None:
-            return
+            return 0
         procs = self._path / "cgroup.procs"
         attached: list[int] = []
-        for pid in (root_pid, *_descendant_pids(root_pid)):
-            try:
-                with procs.open("a") as stream:
-                    stream.write(f"{pid}\n")
-                attached.append(pid)
-            except OSError as exc:
-                logger.warning(
-                    "failed to attach pid %s to sandbox memory cgroup: %s", pid, exc
-                )
+        seen: set[int] = set()
+        for _ in range(_ATTACH_SETTLE_ATTEMPTS):
+            pids = (root_pid, *_descendant_pids(root_pid))
+            moved_any = False
+            for pid in pids:
+                if pid in seen:
+                    continue
+                try:
+                    _move_pid_to_cgroup(procs, pid)
+                except OSError as exc:
+                    logger.warning(
+                        "failed to attach pid %s to sandbox memory cgroup: %s",
+                        pid,
+                        exc,
+                    )
+                else:
+                    attached.append(pid)
+                    moved_any = True
+                seen.add(pid)
+            if not moved_any:
+                break
+            time.sleep(_ATTACH_SETTLE_DELAY)
         if not attached:
             message = (
                 f"sandbox memory cgroup {self._path} empty after attach "
@@ -187,12 +220,13 @@ class SandboxMemoryCgroup:
             if self._required:
                 raise RuntimeError(message)
             logger.error(message)
-            return
+            return 0
         logger.info(
             "sandbox memory cgroup enforced on %d process(es) (limit=%s)",
             len(attached),
             _format_bytes(self._limit_bytes),
         )
+        return len(attached)
 
     def cleanup(self) -> None:
         if self._path is None:
@@ -539,10 +573,14 @@ class TerminalSandbox:
         wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
         self._landlock_wrapper = wrapper
 
-    def attach_memory_cgroup(self, root_pid: int) -> None:
-        """Move the sandbox process tree into the session memory cgroup."""
-        if self._memory_cgroup is not None:
-            self._memory_cgroup.attach(root_pid)
+    def attach_memory_cgroup(self, root_pid: int) -> int:
+        """Move the sandbox process tree into the session memory cgroup.
+
+        Returns the number of processes attached (0 when no cgroup is active).
+        """
+        if self._memory_cgroup is None:
+            return 0
+        return self._memory_cgroup.attach(root_pid)
 
     def wrap_command(self, command: list[str]) -> list[str]:
         """Wrap a command with the platform-specific sandbox launcher."""
