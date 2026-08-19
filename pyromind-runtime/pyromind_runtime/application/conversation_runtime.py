@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ from pyromind_runtime.domain.commands import (
     CommandReceipt,
     ProductCommand,
     RollbackWorkflowCommand,
+    UserMessageCommand,
 )
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import ProductEvent
@@ -54,14 +56,24 @@ class ConversationRuntime:
         self._active: dict[str, _ActiveConversation] = {}
         self._activation_locks: dict[str, asyncio.Lock] = {}
         self._subscribers: dict[str, set[asyncio.Queue[ProductEvent]]] = {}
+        self._first_command_pending: set[str] = set()
+        self._first_delta_started_at: dict[tuple[str, str], float] = {}
 
     async def create_conversation(
         self,
         spec: SessionSpec,
         context: RequestContext,
     ) -> ConversationSnapshot:
+        total_started_at = time.perf_counter()
         adapter = self._adapter(self.default_harness_id)
+        adapter_started_at = time.perf_counter()
         handle = await adapter.create_session(spec, context)
+        self._log_timing(
+            "adapter.create_session_ms",
+            adapter_started_at,
+            conversation_id=handle.session_id,
+            harness_id=handle.harness_id,
+        )
         if handle.harness_id != self.default_harness_id:
             await adapter.close(handle)
             raise ValueError(
@@ -91,8 +103,23 @@ class ConversationRuntime:
             raise
         active = self._start_pump(handle, adapter, store)
         self._active[handle.session_id] = active
+        ready_started_at = time.perf_counter()
         await active.ready.wait()
-        return store.load_snapshot()
+        self._log_timing(
+            "runtime.ready_wait_ms",
+            ready_started_at,
+            conversation_id=handle.session_id,
+            harness_id=handle.harness_id,
+        )
+        self._first_command_pending.add(handle.session_id)
+        snapshot = store.load_snapshot()
+        self._log_timing(
+            "product.create.total_ms",
+            total_started_at,
+            conversation_id=handle.session_id,
+            harness_id=handle.harness_id,
+        )
+        return snapshot
 
     async def get_snapshot(
         self,
@@ -120,9 +147,22 @@ class ConversationRuntime:
         if not claimed:
             return receipt
         active = self._active[conversation_id]
+        first_command = (
+            isinstance(command, UserMessageCommand)
+            and conversation_id in self._first_command_pending
+        )
+        command_started_at = time.perf_counter()
+        if isinstance(command, UserMessageCommand):
+            self._first_delta_started_at[(conversation_id, command.command_id)] = (
+                command_started_at
+            )
         try:
             response = await active.adapter.send(active.handle, command, context)
         except Exception as exc:
+            if isinstance(command, UserMessageCommand):
+                self._first_delta_started_at.pop(
+                    (conversation_id, command.command_id), None
+                )
             failed = receipt.model_copy(
                 update={
                     "status": "failed",
@@ -134,6 +174,14 @@ class ConversationRuntime:
             )
             store.complete_command(failed)
             raise
+        if first_command:
+            self._first_command_pending.discard(conversation_id)
+            self._log_timing(
+                "first_command.accept_ms",
+                command_started_at,
+                conversation_id=conversation_id,
+                harness_id=active.handle.harness_id,
+            )
         completed = receipt.model_copy(
             update={"status": "completed", "response": response}
         )
@@ -170,6 +218,8 @@ class ConversationRuntime:
     async def close(self) -> None:
         active = tuple(self._active.values())
         self._active.clear()
+        self._first_command_pending.clear()
+        self._first_delta_started_at.clear()
         for conversation in active:
             conversation.task.cancel()
             await conversation.adapter.close(conversation.handle)
@@ -268,6 +318,26 @@ class ConversationRuntime:
                 if harness_event.type == "history.synced":
                     ready.set()
                     continue
+                if harness_event.type == "message.delta" and harness_event.run_id:
+                    started_at = self._first_delta_started_at.pop(
+                        (handle.session_id, harness_event.run_id), None
+                    )
+                    if started_at is not None:
+                        self._log_timing(
+                            "first_delta_latency_ms",
+                            started_at,
+                            conversation_id=handle.session_id,
+                            harness_id=handle.harness_id,
+                            run_id=harness_event.run_id,
+                        )
+                elif (
+                    harness_event.type == "message.completed"
+                    and harness_event.run_id
+                    and harness_event.payload.get("role") == "assistant"
+                ):
+                    self._first_delta_started_at.pop(
+                        (handle.session_id, harness_event.run_id), None
+                    )
                 product_event = self._projector.project(
                     handle.session_id, harness_event
                 )
@@ -311,3 +381,13 @@ class ConversationRuntime:
             return self.adapters[harness_id]
         except KeyError as exc:
             raise ValueError(f"harness is not registered: {harness_id}") from exc
+
+    @staticmethod
+    def _log_timing(
+        metric: str,
+        started_at: float,
+        **dimensions: str,
+    ) -> None:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        suffix = " ".join(f"{key}={value}" for key, value in dimensions.items())
+        logger.info("%s=%.3f %s", metric, elapsed_ms, suffix)

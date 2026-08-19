@@ -113,12 +113,14 @@ class FakeAdapter:
         payload: dict | None = None,
         *,
         event_id: str | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.queues[conversation_id].put_nowait(
             HarnessEvent(
                 event_id=event_id or f"{conversation_id}:{event_type}",
                 session_id=conversation_id,
                 type=event_type,
+                run_id=run_id,
                 payload=payload or {},
             )
         )

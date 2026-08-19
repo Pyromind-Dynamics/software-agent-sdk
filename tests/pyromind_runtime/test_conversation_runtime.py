@@ -139,3 +139,51 @@ async def test_runtime_routes_existing_session_by_persisted_harness(tmp_path) ->
     assert "pi-conversation" in pi.queues
     assert "pi-conversation" not in openhands.queues
     await restarted.close()
+
+
+async def test_runtime_logs_first_message_latency_metrics(tmp_path, caplog) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter)
+    context = RequestContext(user_id="42")
+
+    with caplog.at_level(
+        "INFO",
+        logger="pyromind_runtime.application.conversation_runtime",
+    ):
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id="conversation-metrics",
+                user_id="42",
+                workspace_root=str(conversations),
+            ),
+            context,
+        )
+        await runtime.submit_command(
+            "conversation-metrics",
+            UserMessageCommand(
+                command_id="first-command",
+                content=(TextContent(text="hello"),),
+            ),
+            context,
+        )
+        adapter.emit(
+            "conversation-metrics",
+            "message.delta",
+            {"message_id": "assistant-1", "text": "H"},
+            event_id="assistant-1:delta:1",
+            run_id="first-command",
+        )
+        for _ in range(10):
+            if "first_delta_latency_ms=" in caplog.text:
+                break
+            await asyncio.sleep(0)
+
+    assert "adapter.create_session_ms=" in caplog.text
+    assert "runtime.ready_wait_ms=" in caplog.text
+    assert "product.create.total_ms=" in caplog.text
+    assert "first_command.accept_ms=" in caplog.text
+    assert "first_delta_latency_ms=" in caplog.text
+    assert "conversation_id=conversation-metrics" in caplog.text
+    await runtime.close()

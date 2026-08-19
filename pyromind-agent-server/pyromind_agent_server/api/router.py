@@ -226,6 +226,10 @@ async def _sse_stream(
     context,
 ) -> AsyncGenerator[str]:
     events = runtime.stream_events(conversation_id, after_seq, context)
+    # Flush the HTTP response immediately, even when the cursor is already at
+    # the latest persisted event. This lets clients establish the SSE channel
+    # before submitting the first command without waiting for a heartbeat.
+    yield ": connected\n\n"
     pending = asyncio.ensure_future(anext(events))
     try:
         while True:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import tempfile
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +41,9 @@ from openhands.tools.workflow.dsl_to_xyflow import (
     convert_dsl_to_xyflow,
     convert_xyflow_to_dsl,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 PI_CAPABILITIES = HarnessCapabilities(
@@ -273,6 +278,7 @@ class PiAdapter:
             request_handler=on_request, event_handler=on_event, exit_handler=on_exit
         )
         session.runner = runner
+        started_at = time.perf_counter()
         await runner.start(
             {
                 "session_id": session.session_id,
@@ -283,6 +289,11 @@ class PiAdapter:
                 "tools": [validation_tool_spec()],
                 "transcript": session.files.load_checkpoint(),
             }
+        )
+        logger.info(
+            "pi.runner_start_ms=%.3f conversation_id=%s",
+            (time.perf_counter() - started_at) * 1000,
+            session.session_id,
         )
 
     async def _ensure_runner(self, session: _PiSession) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from uuid import UUID
@@ -95,8 +96,14 @@ class OpenHandsAdapter:
         spec: SessionSpec,
         context: RequestContext,
     ) -> SessionHandle:
+        started_at = time.perf_counter()
         conversation_id, event_service = await self._session_factory.create(
             spec, context
+        )
+        logger.info(
+            "openhands.start_event_service_ms=%.3f conversation_id=%s",
+            (time.perf_counter() - started_at) * 1000,
+            conversation_id,
         )
         return await self._attach(conversation_id, event_service)
 
@@ -124,6 +131,7 @@ class OpenHandsAdapter:
         conversation_id: str,
         event_service: EventService,
     ) -> SessionHandle:
+        backfill_started_at = time.perf_counter()
         queue: asyncio.Queue[HarnessEvent | None] = asyncio.Queue()
         translation = TranslationState(session_id=conversation_id)
         live_buffer: list[Event] = []
@@ -160,6 +168,12 @@ class OpenHandsAdapter:
                     session_id=conversation_id,
                     type="history.synced",
                 )
+            )
+            logger.info(
+                "adapter.history_backfill_ms=%.3f conversation_id=%s "
+                "harness_id=openhands",
+                (time.perf_counter() - backfill_started_at) * 1000,
+                conversation_id,
             )
         except Exception:
             await event_service.unsubscribe_from_events(subscriber_id)

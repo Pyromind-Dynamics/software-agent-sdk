@@ -120,9 +120,11 @@ async def test_sse_uses_persisted_sequence_as_event_id(tmp_path) -> None:
     )
     stream = _sse_stream(runtime, snapshot.conversation_id, 0, context)
     first = await asyncio.wait_for(anext(stream), timeout=1)
-    assert "id: 1\n" in first
-    assert "event: conversation.created\n" in first
-    assert '"seq":1' in first
+    assert first == ": connected\n\n"
+    event_frame = await asyncio.wait_for(anext(stream), timeout=1)
+    assert "id: 1\n" in event_frame
+    assert "event: conversation.created\n" in event_frame
+    assert '"seq":1' in event_frame
     await stream.aclose()
     await runtime.close()
 
