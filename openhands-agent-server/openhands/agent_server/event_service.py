@@ -130,6 +130,7 @@ def _pyromind_runtime_llm(existing: LLM) -> LLM:
             "base_url": _normalize_openai_base_url(
                 os.environ.get("LLM_BASE_URL") or existing.base_url
             ),
+            "stream": True,
             "persist_runtime_config": False,
         }
     )

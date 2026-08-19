@@ -1200,6 +1200,7 @@ async def create_pyromind_conversation(
         model=request.llm.model,
         api_key=request.llm.api_key,
         base_url=request.llm.base_url,
+        stream=True,
         persist_runtime_config=False,
     )
 

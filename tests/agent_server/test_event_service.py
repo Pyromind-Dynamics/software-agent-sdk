@@ -279,6 +279,7 @@ def test_pyromind_runtime_llm_is_rehydrated_from_server_env(monkeypatch):
     )
 
     updated = _with_pyromind_runtime_llm(agent)
+    assert updated.llm.stream is True
 
     assert updated.llm.base_url == "https://llm.example.test/v1"
     assert updated.llm.api_key is not None
