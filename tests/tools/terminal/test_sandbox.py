@@ -18,6 +18,7 @@ from openhands.tools.terminal.sandbox import (
     sandbox_memory_cgroup_from_env,
     terminal_sandbox_enabled,
     terminal_sandbox_mode,
+    userns_mounts_supported,
 )
 
 
@@ -961,3 +962,30 @@ def test_bwrap_smoke_test_failure_falls_back_to_apparmor(
     sandbox.prepare()
 
     assert sandbox._backend == "apparmor"
+
+
+def test_userns_mounts_supported_env_override(monkeypatch: pytest.MonkeyPatch):
+    userns_mounts_supported.cache_clear()
+    monkeypatch.setenv("OH_SANDBOX_UNSHARE_USER", "1")
+    assert userns_mounts_supported() is True
+
+    userns_mounts_supported.cache_clear()
+    monkeypatch.setenv("OH_SANDBOX_UNSHARE_USER", "0")
+    assert userns_mounts_supported() is False
+
+
+def test_userns_mounts_supported_probe(monkeypatch: pytest.MonkeyPatch):
+    userns_mounts_supported.cache_clear()
+    monkeypatch.delenv("OH_SANDBOX_UNSHARE_USER", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/unshare")
+
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=0)
+    )
+    assert userns_mounts_supported() is True
+
+    userns_mounts_supported.cache_clear()
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=32)
+    )
+    assert userns_mounts_supported() is False

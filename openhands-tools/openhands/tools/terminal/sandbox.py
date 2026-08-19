@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -27,6 +28,7 @@ TerminalSandboxMode = Literal["off", "auto", "required"]
 TERMINAL_SANDBOX_ENV = "OH_TERMINAL_SANDBOX"
 OH_SANDBOX_MEMORY_LIMIT_ENV = "OH_SANDBOX_MEMORY_LIMIT"
 OH_SANDBOX_MEMORY_REQUIRED_ENV = "OH_SANDBOX_MEMORY_REQUIRED"
+OH_SANDBOX_UNSHARE_USER_ENV = "OH_SANDBOX_UNSHARE_USER"
 _DEFAULT_SANDBOX_MEMORY_LIMIT = "500M"
 PUBLIC_READ_ROOTS = (
     "/agent-server/knowledge",
@@ -100,6 +102,46 @@ def _memory_limit_required() -> bool:
         "yes",
         "on",
     }
+
+
+@lru_cache(maxsize=1)
+def userns_mounts_supported() -> bool:
+    """Probe whether a new user namespace can mount inside this environment.
+
+    ``bwrap --unshare-user-try`` mounts proc/tmpfs from inside a fresh user
+    namespace. Restricted pod kernels deny those mounts, which makes bwrap
+    abort before the sandbox shell ever starts (every later terminal command
+    times out with no output). Probe once per process so the sandbox can fall
+    back to a plain (non-user-namespace) bwrap on such nodes.
+    ``OH_SANDBOX_UNSHARE_USER`` overrides the probe result.
+    """
+    override = os.environ.get(OH_SANDBOX_UNSHARE_USER_ENV, "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    if shutil.which("unshare") is None:
+        return False
+    probe = f"/tmp/openhands-userns-probe-{os.getpid()}"
+    try:
+        os.makedirs(probe, exist_ok=True)
+        result = subprocess.run(
+            [
+                "unshare",
+                "-Urm",
+                "sh",
+                "-c",
+                f"mount -t proc proc {shlex.quote(probe)} && umount {probe}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+    return result.returncode == 0
 
 
 def _descendant_pids(root_pid: int) -> list[int]:
@@ -642,11 +684,12 @@ class TerminalSandbox:
 
     def _build_bwrap_args(self) -> list[str]:
         args = ["bwrap", "--unshare-ipc", "--unshare-uts", "--unshare-pid"]
-        # Always try a private user namespace: per-sandbox RLIMIT_NPROC only
-        # counts processes within that namespace, so a process cap stays
-        # scoped to this sandbox instead of the whole container. bwrap falls
-        # back gracefully when user namespaces are unavailable.
-        args.append("--unshare-user-try")
+        # A private user namespace keeps the per-sandbox RLIMIT_NPROC scoped
+        # to the sandbox. Some pod kernels reject mounts inside a nested user
+        # namespace; bwrap then aborts before bash starts, so only enable the
+        # namespace when this node actually supports the mounts.
+        if userns_mounts_supported():
+            args.append("--unshare-user-try")
         for path in ("/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"):
             if Path(path).exists():
                 args.extend(["--ro-bind", path, path])
