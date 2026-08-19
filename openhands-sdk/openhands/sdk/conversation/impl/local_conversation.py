@@ -3,6 +3,7 @@ import atexit
 import contextlib
 import copy
 import json
+import os
 import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
@@ -102,6 +103,8 @@ ACP_INFLIGHT_PROMPT_USER_MESSAGE_ID = "acp_inflight_prompt_user_message_id"
 ACP_SUPERSEDE_INFLIGHT_PROMPT = "acp_supersede_inflight_prompt"
 _RUNTIME_MCP_TIMEOUT_SECS = 30
 
+OH_TERMINAL_RECYCLE_AFTER_RUN_ENV = "OH_TERMINAL_RECYCLE_AFTER_RUN"
+
 ACP_STOP_HOOK_FEEDBACK_PREFIX = "[Stop hook feedback]"
 
 
@@ -139,6 +142,16 @@ def _is_acp_prompt_message(event: Event) -> TypeGuard[MessageEvent]:
 def _copy_event_for_fork(event: Event) -> Event:
     # Mirrors persisted event loading and skips runtime-only fields like executors.
     return Event.model_validate_json(event.model_dump_json(exclude_none=True))
+
+
+def recycle_terminal_after_run_enabled() -> bool:
+    """Whether the conversation terminal is recycled after each run ends."""
+    return os.environ.get(OH_TERMINAL_RECYCLE_AFTER_RUN_ENV, "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 class LocalConversation(BaseConversation):
@@ -2250,6 +2263,8 @@ class LocalConversation(BaseConversation):
                 self._state.execution_status,
                 self._state.id,
             )
+            if recycle_terminal_after_run_enabled() and self._agent_ready:
+                self.agent.recycle_terminal()
             # A cancelled token must stay observable: interrupted tool calls run
             # in worker threads that can outlive arun() and still poll it. A
             # fresh token is created on the next run().
