@@ -11,7 +11,8 @@ Validate reward composition and score aggregation.
 | 参数 | 数据类型 | 必填 | 描述 |
 |------|---------|------|------|
 | reward_config | STRING\|REWARD_CONFIG | 是 | 来自 Reward Config Builder 的奖励配置 YAML |
-| completions | STRING | 否 | 用于奖励校验的可选 completions JSON。默认值：空字符串 |
+| completions | STRING | 是 | 用于奖励校验的 completions JSON（与 ground-truth 数据对比） |
+| ground_truths | STRING | 是 | 用于校验 completions 的 ground-truth 数据。默认值：空字符串 |
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
