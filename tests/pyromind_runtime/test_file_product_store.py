@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import CommandReceipt, UserMessageCommand
+from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 from pyromind_runtime.infrastructure.file_product_store import (
@@ -83,7 +84,7 @@ def test_command_idempotency_checks_payload(tmp_path: Path) -> None:
     store = _store(tmp_path)
     command = UserMessageCommand(
         command_id="command-1",
-        content=({"type": "text", "text": "hello"},),
+        content=(TextContent(text="hello"),),
     )
     receipt, claimed = store.claim_command(command)
     repeated, claimed_again = store.claim_command(command)
@@ -96,10 +97,17 @@ def test_command_idempotency_checks_payload(tmp_path: Path) -> None:
         store.claim_command(
             UserMessageCommand(
                 command_id="command-1",
-                content=({"type": "text", "text": "different"},),
+                content=(TextContent(text="different"),),
             )
         )
 
     completed = receipt.model_copy(update={"status": "completed"})
     assert store.complete_command(completed) == completed
     assert isinstance(completed, CommandReceipt)
+
+
+def test_missing_harness_metadata_defaults_to_openhands(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    metadata = store.metadata_path.read_text()
+    store.metadata_path.write_text(metadata.replace('"harness_id":"openhands",', ""))
+    assert store.harness_id() == "openhands"

@@ -104,3 +104,38 @@ async def test_stream_replays_then_continues_without_sequence_gap(tmp_path) -> N
     assert second.type == "status.changed"
     await stream.aclose()
     await runtime.close()
+
+
+async def test_runtime_routes_existing_session_by_persisted_harness(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    creator = FakeAdapter("pi")
+    runtime = ConversationRuntime(
+        conversations,
+        {"openhands": FakeAdapter(), "pi": creator},
+        default_harness_id="pi",
+    )
+    await runtime.create_conversation(
+        SessionSpec(
+            conversation_id="pi-conversation",
+            user_id="42",
+            workspace_root=str(conversations / "pi-conversation"),
+        ),
+        RequestContext(user_id="42"),
+    )
+    await runtime.close()
+
+    openhands = FakeAdapter("openhands")
+    pi = FakeAdapter("pi")
+    restarted = ConversationRuntime(
+        conversations,
+        {"openhands": openhands, "pi": pi},
+        default_harness_id="openhands",
+    )
+    snapshot = await restarted.get_snapshot(
+        "pi-conversation", RequestContext(user_id="42")
+    )
+    assert snapshot.conversation_id == "pi-conversation"
+    assert "pi-conversation" in pi.queues
+    assert "pi-conversation" not in openhands.queues
+    await restarted.close()

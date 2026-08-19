@@ -68,10 +68,12 @@ def create_product_router() -> APIRouter:
         request: Request,
     ) -> ConversationSnapshot:
         context = request_context(request)
+        conversation_id = uuid4().hex
+        conversations_dir = get_conversation_service(request).conversations_dir
         spec = SessionSpec(
-            conversation_id=uuid4().hex,
+            conversation_id=conversation_id,
             user_id=context.user_id,
-            workspace_root=str(get_conversation_service(request).conversations_dir),
+            workspace_root=str(conversations_dir / conversation_id),
             initial_message=((TextContent(text=body.message),) if body.message else ()),
             workflow_xyflow=body.workflow_xyflow,
             model_configuration=body.llm.model_dump(mode="json"),
@@ -165,6 +167,14 @@ def create_product_router() -> APIRouter:
         request: Request,
     ) -> ConversationSnapshot:
         context = request_context(request)
+        snapshot = await get_product_runtime(request).get_snapshot(
+            conversation_id, context
+        )
+        if not snapshot.capabilities.fork:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Current harness does not support fork",
+            )
         legacy_request = request_from_context(context)
         result = await fork_pyromind_conversation_at_event(
             legacy_request,

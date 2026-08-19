@@ -119,6 +119,10 @@ def test_model_resolution_rules() -> None:
         "openai",
         "gpt-5",
     )
+    assert _resolve_model("deepseek/deepseek-chat", "http://localhost:8000/v1") == (
+        "openai",
+        "deepseek/deepseek-chat",
+    )
 
 
 async def test_real_runner_starts_without_persisting_request_api_key(tmp_path) -> None:

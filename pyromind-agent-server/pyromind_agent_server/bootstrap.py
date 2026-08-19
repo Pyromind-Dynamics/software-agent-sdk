@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from harness_adapter.openhands_adapter import OpenHandsAdapter
+from harness_adapter.pi_adapter import PiAdapter
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.ports.harness import HarnessAdapter
 
 
 def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
@@ -14,9 +17,24 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     service = getattr(app.state, "conversation_service", None)
     if service is None:
         return None
+    backend = os.getenv("PYROMIND_HARNESS_BACKEND", "openhands").strip().lower()
+    if backend not in {"openhands", "pi"}:
+        raise RuntimeError(f"Unsupported PYROMIND_HARNESS_BACKEND: {backend}")
+    adapters: dict[str, HarnessAdapter] = {
+        "openhands": OpenHandsAdapter(lambda: app.state.conversation_service),
+    }
+    app_env = os.getenv("APP_ENV", "dev").strip().lower()
+    if app_env not in {"prod", "production", "online"}:
+        adapters["pi"] = PiAdapter(service.conversations_dir)
+    elif backend == "pi":
+        raise RuntimeError(
+            "Pi local execution is disabled in production until sk-sandbox "
+            "is integrated"
+        )
     runtime = ConversationRuntime(
         service.conversations_dir,
-        OpenHandsAdapter(lambda: app.state.conversation_service),
+        adapters,
+        default_harness_id=backend,
     )
     app.state.product_runtime = runtime
     return runtime

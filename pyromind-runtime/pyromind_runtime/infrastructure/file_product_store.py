@@ -37,6 +37,7 @@ class CommandConflictError(ProductStoreError):
 class _Metadata(ContractModel):
     conversation_id: str
     user_id: str
+    harness_id: str = Field(default="openhands", min_length=1)
     capabilities: HarnessCapabilities
     last_sequence: int = Field(default=0, ge=0)
 
@@ -61,7 +62,13 @@ class FileProductStore:
         self._thread_lock = threading.RLock()
         self._projector = SnapshotProjector()
 
-    def create(self, snapshot: ConversationSnapshot, *, user_id: str) -> None:
+    def create(
+        self,
+        snapshot: ConversationSnapshot,
+        *,
+        user_id: str,
+        harness_id: str = "openhands",
+    ) -> None:
         if not self.conversation_dir.is_dir():
             raise ProductStoreError("conversation directory does not exist")
         try:
@@ -78,6 +85,7 @@ class FileProductStore:
         metadata = _Metadata(
             conversation_id=snapshot.conversation_id,
             user_id=user_id,
+            harness_id=harness_id,
             capabilities=snapshot.capabilities,
         )
         try:
@@ -101,6 +109,12 @@ class FileProductStore:
         metadata = self._load_metadata()
         if metadata.user_id != user_id:
             raise PermissionError("conversation does not belong to current user")
+
+    def harness_id(self) -> str:
+        """Return persisted ownership; pre-version-two records are OpenHands."""
+        if not self.metadata_path.is_file():
+            return "openhands"
+        return self._load_metadata().harness_id
 
     def load_snapshot(self) -> ConversationSnapshot:
         with self._lock():

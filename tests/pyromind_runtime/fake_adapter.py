@@ -6,8 +6,9 @@ from pathlib import Path
 
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import ProductCommand
+from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.domain.events import HarnessEvent
+from pyromind_runtime.domain.events import HarnessEvent, HarnessEventType
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 from pyromind_runtime.ports.harness import SessionHandle, SessionSpec
 
@@ -21,10 +22,12 @@ class FakeAdapter:
         workflow_rollback=True,
     )
 
-    def __init__(self) -> None:
+    def __init__(self, harness_id: str = "openhands") -> None:
+        self.harness_id = harness_id
         self.queues: dict[str, asyncio.Queue[HarnessEvent | None]] = {}
         self.sent: list[tuple[str, ProductCommand, RequestContext]] = []
         self.closed: list[str] = []
+        self.created_specs: list[SessionSpec] = []
 
     async def describe(self):
         return "fake", self.capabilities
@@ -32,8 +35,11 @@ class FakeAdapter:
     async def create_session(
         self, spec: SessionSpec, context: RequestContext
     ) -> SessionHandle:
+        self.created_specs.append(spec)
         conversation_id = spec.conversation_id
-        conversation_dir = Path(spec.workspace_root) / conversation_id
+        conversation_dir = Path(spec.workspace_root)
+        if conversation_dir.name != conversation_id:
+            conversation_dir /= conversation_id
         (conversation_dir / "public_data").mkdir(parents=True)
         handle = self._open(conversation_id)
         for block in spec.initial_message:
@@ -72,7 +78,7 @@ class FakeAdapter:
         handle: SessionHandle,
         command: ProductCommand,
         context: RequestContext,
-    ):
+    ) -> JsonObject:
         self.sent.append((handle.session_id, command, context))
         return {"accepted": True}
 
@@ -103,7 +109,7 @@ class FakeAdapter:
     def emit(
         self,
         conversation_id: str,
-        event_type: str,
+        event_type: HarnessEventType,
         payload: dict | None = None,
         *,
         event_id: str | None = None,
@@ -129,5 +135,6 @@ class FakeAdapter:
         return SessionHandle(
             session_id=conversation_id,
             adapter_session_ref=conversation_id,
+            harness_id=self.harness_id,
             capabilities=self.capabilities,
         )

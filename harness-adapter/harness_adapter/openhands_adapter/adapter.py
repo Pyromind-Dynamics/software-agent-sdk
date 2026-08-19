@@ -320,5 +320,6 @@ class OpenHandsAdapter:
         return SessionHandle(
             session_id=conversation_id,
             adapter_session_ref=conversation_id,
+            harness_id="openhands",
             capabilities=OPENHANDS_CAPABILITIES,
         )

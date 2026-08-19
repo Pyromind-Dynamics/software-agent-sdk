@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from pyromind_runtime.application.event_projection import ProductEventProjector
-from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
+from pyromind_runtime.domain.commands import (
+    CommandReceipt,
+    ProductCommand,
+    RollbackWorkflowCommand,
+)
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
@@ -24,6 +28,7 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class _ActiveConversation:
     handle: SessionHandle
+    adapter: HarnessAdapter
     task: asyncio.Task[None]
     ready: asyncio.Event
 
@@ -32,10 +37,19 @@ class ConversationRuntime:
     def __init__(
         self,
         conversation_root: Path | str,
-        adapter: HarnessAdapter,
+        adapters: HarnessAdapter | Mapping[str, HarnessAdapter],
+        *,
+        default_harness_id: str = "openhands",
     ) -> None:
         self.conversation_root = Path(conversation_root)
-        self.adapter = adapter
+        self.adapters = (
+            dict(adapters)
+            if isinstance(adapters, Mapping)
+            else {default_harness_id: adapters}
+        )
+        if default_harness_id not in self.adapters:
+            raise ValueError(f"default harness is not registered: {default_harness_id}")
+        self.default_harness_id = default_harness_id
         self._projector = ProductEventProjector()
         self._active: dict[str, _ActiveConversation] = {}
         self._activation_locks: dict[str, asyncio.Lock] = {}
@@ -46,7 +60,14 @@ class ConversationRuntime:
         spec: SessionSpec,
         context: RequestContext,
     ) -> ConversationSnapshot:
-        handle = await self.adapter.create_session(spec, context)
+        adapter = self._adapter(self.default_harness_id)
+        handle = await adapter.create_session(spec, context)
+        if handle.harness_id != self.default_harness_id:
+            await adapter.close(handle)
+            raise ValueError(
+                "adapter returned a handle for a different harness: "
+                f"{handle.harness_id}"
+            )
         store = self._store(handle.session_id)
         try:
             store.create(
@@ -55,6 +76,7 @@ class ConversationRuntime:
                     capabilities=handle.capabilities,
                 ),
                 user_id=context.user_id,
+                harness_id=handle.harness_id,
             )
             store.append(
                 ProductEvent(
@@ -65,9 +87,9 @@ class ConversationRuntime:
                 )
             )
         except Exception:
-            await self.adapter.close(handle)
+            await adapter.close(handle)
             raise
-        active = self._start_pump(handle, store)
+        active = self._start_pump(handle, adapter, store)
         self._active[handle.session_id] = active
         await active.ready.wait()
         return store.load_snapshot()
@@ -89,12 +111,17 @@ class ConversationRuntime:
     ) -> CommandReceipt:
         store = await self._ensure_active(conversation_id, context)
         store.authorize(context.user_id)
+        if (
+            isinstance(command, RollbackWorkflowCommand)
+            and not store.load_snapshot().capabilities.workflow_rollback
+        ):
+            raise ValueError("current harness does not support workflow rollback")
         receipt, claimed = store.claim_command(command)
         if not claimed:
             return receipt
         active = self._active[conversation_id]
         try:
-            response = await self.adapter.send(active.handle, command, context)
+            response = await active.adapter.send(active.handle, command, context)
         except Exception as exc:
             failed = receipt.model_copy(
                 update={
@@ -145,7 +172,7 @@ class ConversationRuntime:
         self._active.clear()
         for conversation in active:
             conversation.task.cancel()
-            await self.adapter.close(conversation.handle)
+            await conversation.adapter.close(conversation.handle)
         await asyncio.gather(
             *(conversation.task for conversation in active),
             return_exceptions=True,
@@ -186,16 +213,27 @@ class ConversationRuntime:
             if existing is not None:
                 await existing.ready.wait()
                 return self._store(conversation_id)
-            handle = await self.adapter.attach_session(conversation_id, context)
             store = self._store(conversation_id)
+            if store.metadata_path.is_file():
+                store.authorize(context.user_id)
+            harness_id = store.harness_id()
+            adapter = self._adapter(harness_id)
+            handle = await adapter.attach_session(conversation_id, context)
+            if handle.harness_id != harness_id:
+                await adapter.close(handle)
+                raise ValueError(
+                    "adapter returned a handle for a different harness: "
+                    f"{handle.harness_id}"
+                )
             store.create(
                 ConversationSnapshot(
                     conversation_id=conversation_id,
                     capabilities=handle.capabilities,
                 ),
                 user_id=context.user_id,
+                harness_id=harness_id,
             )
-            active = self._start_pump(handle, store)
+            active = self._start_pump(handle, adapter, store)
             self._active[conversation_id] = active
             await active.ready.wait()
             return store
@@ -203,23 +241,30 @@ class ConversationRuntime:
     def _start_pump(
         self,
         handle: SessionHandle,
+        adapter: HarnessAdapter,
         store: FileProductStore,
     ) -> _ActiveConversation:
         ready = asyncio.Event()
         task = asyncio.create_task(
-            self._pump(handle, store, ready),
+            self._pump(handle, adapter, store, ready),
             name=f"product-events-{handle.session_id}",
         )
-        return _ActiveConversation(handle=handle, task=task, ready=ready)
+        return _ActiveConversation(
+            handle=handle,
+            adapter=adapter,
+            task=task,
+            ready=ready,
+        )
 
     async def _pump(
         self,
         handle: SessionHandle,
+        adapter: HarnessAdapter,
         store: FileProductStore,
         ready: asyncio.Event,
     ) -> None:
         try:
-            async for harness_event in self.adapter.subscribe(handle):
+            async for harness_event in adapter.subscribe(handle):
                 if harness_event.type == "history.synced":
                     ready.set()
                     continue
@@ -260,3 +305,9 @@ class ConversationRuntime:
         if not conversation_id or "/" in conversation_id or "\\" in conversation_id:
             raise ValueError("unsafe conversation id")
         return FileProductStore(self.conversation_root / conversation_id)
+
+    def _adapter(self, harness_id: str) -> HarnessAdapter:
+        try:
+            return self.adapters[harness_id]
+        except KeyError as exc:
+            raise ValueError(f"harness is not registered: {harness_id}") from exc

@@ -118,9 +118,9 @@ class PiAdapter:
         await self._register(session)
         try:
             await self._start_runner(session, _api_key(spec.model_configuration))
-            session.queue.put_nowait(_history_synced(session.session_id))
             if spec.workflow_xyflow is not None:
                 await self._sync_xyflow(session, dict(spec.workflow_xyflow))
+            session.queue.put_nowait(_history_synced(session.session_id))
             if spec.initial_message:
                 await self._prompt(
                     session, uuid4().hex, _runner_content(spec.initial_message)
@@ -512,6 +512,7 @@ class PiAdapter:
         return SessionHandle(
             session_id=session_id,
             adapter_session_ref=session_id,
+            harness_id="pi",
             capabilities=PI_CAPABILITIES,
         )
 
@@ -540,6 +541,8 @@ def _session_config(spec: SessionSpec) -> dict[str, Any]:
 def _resolve_model(model: str, base_url: str | None) -> tuple[str, str]:
     if base_url and "openrouter.ai" in base_url.lower():
         return "openrouter", model.removeprefix("openrouter/")
+    if base_url:
+        return "openai", model.removeprefix("openai/")
     if "/" in model:
         provider, model_id = model.split("/", 1)
         return provider, model_id
