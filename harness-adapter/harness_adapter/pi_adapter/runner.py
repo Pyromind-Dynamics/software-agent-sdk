@@ -141,6 +141,8 @@ class PiRunnerProcess:
         except Exception as exc:
             error = exc
             logger.exception("Pi runner protocol failed")
+            if self._process.returncode is None:
+                self._process.terminate()
         finally:
             code = await self._process.wait()
             failure = error or PiRunnerError(f"Pi runner exited with code {code}")

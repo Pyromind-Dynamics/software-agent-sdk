@@ -10,6 +10,7 @@ export class PiEventNormalizer {
   private messageId: string | undefined;
   private messageRole: "user" | "assistant" | undefined;
   private terminal: RunnerEventKind | undefined;
+  private readonly toolArguments = new Map<string, { name: string; path?: string }>();
 
   constructor(private readonly sessionId: string, private readonly runId: string) {}
 
@@ -27,16 +28,30 @@ export class PiEventNormalizer {
         if (event.assistantMessageEvent.type !== "text_delta" || !this.messageId) return [];
         return [this.make("message.delta", { message_id: this.messageId, text: event.assistantMessageEvent.delta })];
       case "message_end": return this.endMessage(event.message);
-      case "tool_execution_start": return [this.make("tool.started", {
-        tool_call_id: event.toolCallId, tool_name: visibleToolName(event.toolName), arguments: sanitizeJson(event.args),
-      })];
+      case "tool_execution_start":
+        this.toolArguments.set(event.toolCallId, {
+          name: visibleToolName(event.toolName),
+          ...(isRecord(event.args) && typeof event.args.path === "string" ? { path: event.args.path } : {}),
+        });
+        return [this.make("tool.started", {
+          tool_call_id: event.toolCallId, tool_name: visibleToolName(event.toolName), arguments: sanitizeJson(event.args),
+        })];
       case "tool_execution_update": return [this.make("tool.progress", {
         tool_call_id: event.toolCallId, tool_name: visibleToolName(event.toolName), ...resultPayload(event.partialResult),
       })];
-      case "tool_execution_end": return [this.make(event.isError ? "tool.failed" : "tool.completed", {
-        tool_call_id: event.toolCallId, tool_name: visibleToolName(event.toolName), ...resultPayload(event.result),
-        ...(event.isError ? { error_code: "tool_execution_failed" } : {}),
-      })];
+      case "tool_execution_end": {
+        const tool = this.toolArguments.get(event.toolCallId);
+        this.toolArguments.delete(event.toolCallId);
+        const result = [this.make(event.isError ? "tool.failed" : "tool.completed", {
+          tool_call_id: event.toolCallId, tool_name: visibleToolName(event.toolName), ...resultPayload(event.result),
+          ...(event.isError ? { error_code: "tool_execution_failed" } : {}),
+        })];
+        const path = tool?.path?.replace(/^\.\//, "");
+        if (!event.isError && tool && path === "public_data/workflow_canvas/workflow.py" && (tool.name === "write" || tool.name === "edit")) {
+          result.push(this.make("resource.updated", { resource_type: "workflow", path, operation_id: event.toolCallId }));
+        }
+        return result;
+      }
     }
   }
 

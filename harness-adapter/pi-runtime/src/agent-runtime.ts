@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { setImmediate } from "node:timers";
-import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
+import { Agent, formatSkillsForSystemPrompt, loadSkills, type AgentMessage } from "@earendil-works/pi-agent-core";
+import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import { type Api, InMemoryCredentialStore, type Model, type Models } from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { PiEventNormalizer } from "./pi-events.js";
 import { PROTOCOL_VERSION, isRecord, type JsonObject, type JsonValue, type RunnerEvent } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
+import { createTools, type BusinessToolConfig } from "./tools.js";
 
 interface SessionConfig {
   sessionId: string;
@@ -16,6 +18,9 @@ interface SessionConfig {
   systemPrompt: string;
   thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   transcript: AgentMessage[];
+  workspaceRoot: string;
+  skillRoot: string;
+  tools: BusinessToolConfig[];
 }
 
 export class PiAgentRuntime {
@@ -41,11 +46,32 @@ export class PiAgentRuntime {
     await credentials.modify(config.provider, async () => ({ type: "api_key", key: config.apiKey }));
     const models = builtinModels({ credentials });
     const model = resolveModel(models, config);
+    const shellEnv = Object.fromEntries(
+      ["PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"]
+        .flatMap((name) => process.env[name] ? [[name, process.env[name]!]] : []),
+    );
+    const env = new NodeExecutionEnv({ cwd: config.workspaceRoot, shellEnv });
+    const { skills, diagnostics } = await loadSkills(env, config.skillRoot);
+    for (const diagnostic of diagnostics) process.stderr.write(`skill warning: ${diagnostic.message}\n`);
+    const skillPrompt = formatSkillsForSystemPrompt(skills);
+    const systemPrompt = skillPrompt ? `${config.systemPrompt}\n\n${skillPrompt}` : config.systemPrompt;
+    const tools = createTools(this.peer, env, config.workspaceRoot, config.skillRoot, config.tools);
     const agent = new Agent({
-      initialState: { systemPrompt: config.systemPrompt, model, thinkingLevel: config.thinkingLevel, tools: [], messages: config.transcript },
+      initialState: { systemPrompt, model, thinkingLevel: config.thinkingLevel, tools, messages: config.transcript },
       sessionId: config.sessionId,
       streamFn: models.streamSimple.bind(models),
       toolExecution: "sequential",
+      beforeToolCall: async ({ toolCall, args }, signal) => {
+        if (toolCall.name !== "terminal") return undefined;
+        signal?.throwIfAborted();
+        const decision = await this.peer.request("permission.check", {
+          tool_call_id: toolCall.id,
+          tool_name: "terminal",
+          arguments: isRecord(args) ? JSON.parse(JSON.stringify(args)) as JsonObject : {},
+        }, signal);
+        if (!isRecord(decision) || typeof decision.allow !== "boolean") throw new Error("invalid permission response");
+        return decision.allow ? undefined : { block: true, reason: typeof decision.reason === "string" ? decision.reason : "User denied terminal command" };
+      },
     });
     agent.subscribe((event) => {
       if (!this.normalizer) return;
@@ -115,7 +141,22 @@ function parseConfig(value: JsonObject): SessionConfig {
     systemPrompt: typeof value.system_prompt === "string" ? value.system_prompt : "You are a coding agent.",
     thinkingLevel: thinking as SessionConfig["thinkingLevel"],
     transcript: Array.isArray(value.transcript) ? value.transcript as unknown as AgentMessage[] : [],
+    workspaceRoot: requiredString(value, "workspace_root"),
+    skillRoot: requiredString(value, "skill_root"),
+    tools: parseTools(value.tools),
   };
+}
+
+function parseTools(value: JsonValue | undefined): BusinessToolConfig[] {
+  if (!Array.isArray(value)) throw new Error("tools must be an array");
+  return value.map((item) => {
+    if (!isRecord(item)) throw new Error("invalid tool configuration");
+    return {
+      name: requiredString(item, "name"),
+      description: requiredString(item, "description"),
+      inputSchema: record(item, "input_schema") as JsonObject,
+    };
+  });
 }
 
 type PromptBlock =

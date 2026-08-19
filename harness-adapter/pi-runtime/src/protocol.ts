@@ -18,6 +18,7 @@ export type RunnerEventKind =
   | "tool.completed"
   | "tool.failed"
   | "usage.updated"
+  | "resource.updated"
   | "turn.completed";
 
 export interface RunnerEvent {
