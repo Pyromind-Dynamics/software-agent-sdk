@@ -1,48 +1,62 @@
-from pathlib import Path
-
-from pyromind_agent_server.__main__ import _reload_excludes
+from pyromind_agent_server.__main__ import RELOAD_DIRS
 from uvicorn.config import Config
 from uvicorn.supervisors.watchfilesreload import FileFilter
 
 
-def test_reload_excludes_generated_workspace_paths(tmp_path, monkeypatch) -> None:
-    workspace = tmp_path / "workspace"
-    conversations = workspace / "conversations"
-    project = workspace / "project"
-    for path in (workspace, conversations, project):
-        path.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("WORKSPACE_DIR", str(workspace))
-    monkeypatch.setenv("OH_CONVERSATIONS_PATH", str(conversations))
-    monkeypatch.setenv("OH_WORKSPACE_PATH", str(project))
-
-    assert _reload_excludes() == sorted(
-        {
-            str(Path(workspace).resolve()),
-            str(Path(conversations).resolve()),
-            str(Path(project).resolve()),
-        }
-    )
-
-
-def test_uvicorn_reload_filter_ignores_generated_workflow(
-    tmp_path, monkeypatch
-) -> None:
+def _file_filter(tmp_path):
     repository = tmp_path / "software-agent-sdk"
-    workspace = repository / "workspace"
-    generated = workspace / "conversations" / "conversation-1" / "workflow.py"
-    source = repository / "pyromind-agent-server" / "server.py"
-    generated.parent.mkdir(parents=True)
-    source.parent.mkdir(parents=True)
-    generated.write_text("workflow = None\n", encoding="utf-8")
-    source.write_text("app = None\n", encoding="utf-8")
-    monkeypatch.setenv("WORKSPACE_DIR", str(workspace))
+    repository.mkdir()
+    for path in RELOAD_DIRS:
+        (repository / path).mkdir(parents=True)
     config = Config(
         "example:app",
         reload=True,
-        reload_dirs=[str(repository)],
-        reload_excludes=_reload_excludes(),
+        reload_dirs=[str(repository / path) for path in RELOAD_DIRS],
+        reload_includes=["*.py"],
     )
-    file_filter = FileFilter(config)
+    return repository, config, FileFilter(config)
 
-    assert not file_filter(generated)
-    assert file_filter(source)
+
+def test_uvicorn_reload_filter_ignores_conversation_workflow(tmp_path) -> None:
+    repository, config, _ = _file_filter(tmp_path)
+    generated = (
+        repository
+        / "workspace"
+        / "conversations"
+        / "conversation-1"
+        / "public_data"
+        / "workflow_canvas"
+        / "workflow.py"
+    )
+    generated.parent.mkdir(parents=True)
+    generated.write_text("workflow = None\n", encoding="utf-8")
+
+    watched = any(
+        directory == generated or directory in generated.parents
+        for directory in config.reload_dirs
+    )
+    assert not watched
+
+
+def test_uvicorn_reload_filter_includes_all_python_source_dirs(tmp_path) -> None:
+    repository, _, file_filter = _file_filter(tmp_path)
+
+    for source_dir in RELOAD_DIRS:
+        source = repository / source_dir / "server.py"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("app = None\n", encoding="utf-8")
+        assert file_filter(source), source
+
+
+def test_uvicorn_reload_filter_only_includes_python_files(tmp_path) -> None:
+    repository, _, file_filter = _file_filter(tmp_path)
+    source_dir = repository / "pyromind-agent-server"
+    source_dir.mkdir(parents=True, exist_ok=True)
+
+    python_source = source_dir / "server.py"
+    python_source.write_text("app = None\n", encoding="utf-8")
+    text_file = source_dir / "README.md"
+    text_file.write_text("docs\n", encoding="utf-8")
+
+    assert file_filter(python_source)
+    assert not file_filter(text_file)
