@@ -143,8 +143,14 @@ class FileProductStore:
             events = self._load_events(repair_tail=True)
             metadata = self._reconcile(metadata, events)
             snapshot = self._recover_snapshot(metadata, events)
+            source_identity = self._source_identity(event)
             for persisted in events:
                 if persisted.event_id == event.event_id:
+                    return persisted, snapshot
+                if (
+                    source_identity is not None
+                    and self._source_identity(persisted) == source_identity
+                ):
                     return persisted, snapshot
             persisted = event.model_copy(update={"seq": len(events) + 1})
             updated = self._projector.reduce(snapshot, persisted)
@@ -276,6 +282,7 @@ class FileProductStore:
     def _recover_snapshot(
         self, metadata: _Metadata, events: list[ProductEvent]
     ) -> ConversationSnapshot:
+        duplicate_sources = self._has_duplicate_sources(events)
         try:
             snapshot = ConversationSnapshot.model_validate_json(
                 self.snapshot_path.read_bytes()
@@ -287,17 +294,46 @@ class FileProductStore:
             )
         if snapshot.conversation_id != metadata.conversation_id:
             raise ProductStoreCorruptionError("snapshot conversation mismatch")
-        if snapshot.through_seq > len(events):
+        if snapshot.through_seq > len(events) or duplicate_sources:
             snapshot = ConversationSnapshot(
                 conversation_id=metadata.conversation_id,
                 capabilities=metadata.capabilities,
             )
+        seen_sources = {
+            identity
+            for event in events[: snapshot.through_seq]
+            if (identity := self._source_identity(event)) is not None
+        }
         for event in events[snapshot.through_seq :]:
+            identity = self._source_identity(event)
+            if identity is not None and identity in seen_sources:
+                snapshot = snapshot.model_copy(update={"through_seq": event.seq})
+                continue
             snapshot = self._projector.reduce(snapshot, event)
+            if identity is not None:
+                seen_sources.add(identity)
         if snapshot.through_seq != metadata.last_sequence:
             raise ProductStoreCorruptionError("snapshot recovery did not reach tail")
         self._atomic_write(self.snapshot_path, snapshot.model_dump_json())
         return snapshot
+
+    @classmethod
+    def _has_duplicate_sources(cls, events: list[ProductEvent]) -> bool:
+        seen: set[tuple[str, str]] = set()
+        for event in events:
+            identity = cls._source_identity(event)
+            if identity is None:
+                continue
+            if identity in seen:
+                return True
+            seen.add(identity)
+        return False
+
+    @staticmethod
+    def _source_identity(event: ProductEvent) -> tuple[str, str] | None:
+        if event.source_event_id is None:
+            return None
+        return event.type, event.source_event_id
 
     @staticmethod
     def _fingerprint(command: ProductCommand) -> str:

@@ -63,6 +63,96 @@ def test_store_deduplicates_events(tmp_path: Path) -> None:
     assert len(store.replay()) == 1
 
 
+def test_store_deduplicates_translations_from_same_source_event(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    first, _ = store.append(
+        ProductEvent(
+            event_id="streamed-completion",
+            source_event_id="openhands-message",
+            conversation_id="conversation-1",
+            type="message.completed",
+            run_id="command-1",
+            payload={
+                "message_id": "command-1:assistant",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "done"}],
+            },
+        )
+    )
+    replayed, snapshot = store.append(
+        ProductEvent(
+            event_id="openhands-message:completed",
+            source_event_id="openhands-message",
+            conversation_id="conversation-1",
+            type="message.completed",
+            payload={
+                "message_id": "openhands-message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "done"}],
+            },
+        )
+    )
+
+    assert replayed == first
+    assert snapshot.through_seq == 1
+    assert len(snapshot.timeline) == 1
+    assert len(store.replay()) == 1
+
+
+def test_store_repairs_legacy_duplicate_source_events(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    original, snapshot = store.append(
+        ProductEvent(
+            event_id="streamed-completion",
+            source_event_id="openhands-message",
+            conversation_id="conversation-1",
+            type="message.completed",
+            run_id="command-1",
+            payload={
+                "message_id": "command-1:assistant",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "done"}],
+            },
+        )
+    )
+    duplicate = original.model_copy(
+        update={
+            "seq": 2,
+            "event_id": "openhands-message:completed",
+            "run_id": None,
+            "payload": {
+                "message_id": "openhands-message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "done"}],
+            },
+        }
+    )
+    with store.events_path.open("a", encoding="utf-8") as stream:
+        stream.write(duplicate.model_dump_json())
+        stream.write("\n")
+    store.snapshot_path.write_text(
+        snapshot.model_copy(
+            update={
+                "through_seq": 2,
+                "timeline": (
+                    *snapshot.timeline,
+                    snapshot.timeline[0].model_copy(
+                        update={"item_id": "openhands-message", "run_id": None}
+                    ),
+                ),
+            }
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+
+    repaired = store.load_snapshot()
+    assert repaired.through_seq == 2
+    assert len(repaired.timeline) == 1
+    assert repaired.timeline[0].item_id == "command-1:assistant"
+
+
 def test_store_does_not_persist_event_that_cannot_be_projected(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
