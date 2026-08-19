@@ -1258,6 +1258,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                 return
 
             arguments = fix_malformed_tool_arguments(arguments, tool.action_type)
+            arguments = tool.normalize_arguments(arguments)
             normalized_tool_call = tool_call.model_copy(
                 update={
                     "name": tool_name,

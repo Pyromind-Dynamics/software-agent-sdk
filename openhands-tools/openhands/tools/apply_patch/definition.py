@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from openhands.sdk.tool import (
     Action,
@@ -53,6 +53,15 @@ class ApplyPatchAction(Action):
             "do not wrap it in a code fence."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _discard_redundant_path(cls, data: Any) -> Any:
+        """Tolerate models that copy ``file_editor.path`` into this tool call."""
+        if isinstance(data, dict) and "path" in data:
+            data = dict(data)
+            data.pop("path")
+        return data
 
 
 class ApplyPatchObservation(Observation):
@@ -178,9 +187,9 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
                 return
 
 
-# Adapted from codex's apply_patch tool instructions
-# (codex-rs/prompts/templates/apply_patch_tool_instructions.md), reworked for
-# a JSON function tool that takes the patch text in a single `patch` argument.
+# Adapted from Codex's freeform apply_patch specification
+# (codex-rs/core/src/tools/handlers/apply_patch_spec.rs and apply_patch.lark),
+# reworked for a JSON function tool that takes patch text in one `patch` argument.
 _DESCRIPTION = """Use the `apply_patch` tool to create, delete, or edit files.
 
 This tool takes exactly one argument: `patch`. File paths are declared

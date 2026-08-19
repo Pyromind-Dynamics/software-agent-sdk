@@ -3772,3 +3772,110 @@ async def test_interrupt_conversation_stops_long_tasks_first(
 
     mock_stop.assert_awaited_once_with(event_service)
     event_service.interrupt.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_evict_idle_event_services_unloads_then_lazy_reloads(tmp_path):
+    """Idle conversations are unloaded from memory and re-activated lazily."""
+    conversations_dir = tmp_path / "conversations"
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+
+    request = StartConversationRequest(
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=LocalWorkspace(working_dir=str(workspace_dir)),
+        confirmation_policy=NeverConfirm(),
+    )
+
+    async with ConversationService(
+        conversations_dir=conversations_dir, idle_eviction_timeout=60.0
+    ) as svc:
+        info, _ = await svc.start_conversation(request)
+        conversation_id = info.id
+        assert svc._event_services is not None
+        es = svc._event_services[conversation_id]
+
+        # Simulate long inactivity
+        es.last_activity_time = time.monotonic() - 3600.0
+
+        evicted = await svc._evict_idle_event_services_once()
+        assert conversation_id in evicted
+        assert conversation_id not in svc._event_services
+        assert es._conversation is None  # service torn down
+        assert conversation_id in svc._conversation_index  # index retained
+
+        # Next access re-activates via the lazy-load path
+        resumed = await svc.get_event_service(conversation_id)
+        assert resumed is not None
+        assert resumed is not es
+        assert svc._event_services[conversation_id] is resumed
+
+
+@pytest.mark.asyncio
+async def test_evict_skips_active_running_and_watched_services(tmp_path):
+    """Eviction never unloads recently used, running, or WebSocket-watched services."""
+    conversations_dir = tmp_path / "conversations"
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+
+    request = StartConversationRequest(
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=LocalWorkspace(working_dir=str(workspace_dir)),
+        confirmation_policy=NeverConfirm(),
+    )
+
+    async with ConversationService(
+        conversations_dir=conversations_dir, idle_eviction_timeout=60.0
+    ) as svc:
+        info, _ = await svc.start_conversation(request)
+        conversation_id = info.id
+        assert svc._event_services is not None
+        es = svc._event_services[conversation_id]
+
+        # Recently active -> not evicted
+        es.last_activity_time = time.monotonic()
+        assert await svc._evict_idle_event_services_once() == []
+
+        # Idle but RUNNING -> not evicted
+        es.last_activity_time = time.monotonic() - 3600.0
+        state = await es.get_state()
+        with state:
+            state.execution_status = ConversationExecutionStatus.RUNNING
+        assert await svc._evict_idle_event_services_once() == []
+        with state:
+            state.execution_status = ConversationExecutionStatus.IDLE
+
+        # Idle but watched by a user WebSocket -> not evicted
+        es.register_user_connection()
+        assert await svc._evict_idle_event_services_once() == []
+
+        # After the connection drops -> evicted
+        es.unregister_user_connection()
+        evicted = await svc._evict_idle_event_services_once()
+        assert conversation_id in evicted
+
+
+@pytest.mark.asyncio
+async def test_eviction_disabled_with_zero_timeout(tmp_path):
+    """idle_eviction_timeout=0 disables eviction entirely."""
+    conversations_dir = tmp_path / "conversations"
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+
+    request = StartConversationRequest(
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=LocalWorkspace(working_dir=str(workspace_dir)),
+        confirmation_policy=NeverConfirm(),
+    )
+
+    async with ConversationService(
+        conversations_dir=conversations_dir, idle_eviction_timeout=0.0
+    ) as svc:
+        info, _ = await svc.start_conversation(request)
+        conversation_id = info.id
+        assert svc._event_services is not None
+        es = svc._event_services[conversation_id]
+        es.last_activity_time = time.monotonic() - 3600.0
+
+        assert await svc._evict_idle_event_services_once() == []
+        assert conversation_id in svc._event_services

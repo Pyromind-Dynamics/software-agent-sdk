@@ -180,6 +180,9 @@ def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
     assert "`public_data/` is the writable area" in rendered
     assert "do not follow terminal cwd" in rendered
     assert "every created file must use a `public_data/...` path" in rendered
+    assert "It accepts only the `patch` argument" in rendered
+    assert "never pass a separate `path` argument" in rendered
+    assert "The separate `file_editor` tool does accept `path`" in rendered
     assert "terminal session starts at the conversation root" in rendered
     assert "Make its first command\n`cd public_data`" in rendered
     assert "reuse the persistent shell's current directory" in rendered
