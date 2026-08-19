@@ -642,8 +642,11 @@ class TerminalSandbox:
 
     def _build_bwrap_args(self) -> list[str]:
         args = ["bwrap", "--unshare-ipc", "--unshare-uts", "--unshare-pid"]
-        if os.geteuid() != 0:
-            args.append("--unshare-user-try")
+        # Always try a private user namespace: per-sandbox RLIMIT_NPROC only
+        # counts processes within that namespace, so a process cap stays
+        # scoped to this sandbox instead of the whole container. bwrap falls
+        # back gracefully when user namespaces are unavailable.
+        args.append("--unshare-user-try")
         for path in ("/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"):
             if Path(path).exists():
                 args.extend(["--ro-bind", path, path])

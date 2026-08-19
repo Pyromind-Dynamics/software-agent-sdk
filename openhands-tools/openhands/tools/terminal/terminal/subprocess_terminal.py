@@ -66,6 +66,37 @@ def _sandbox_vmem_kb() -> int:
         ) from exc
 
 
+# Process cap (RLIMIT_NPROC) applied to each sandbox shell. It only counts
+# processes inside the sandbox's own user namespace (bwrap --unshare-user-try),
+# so one runaway sandbox cannot spawn an army of parallel commands.
+OH_SANDBOX_NPROC_LIMIT_ENV = "OH_SANDBOX_NPROC_LIMIT"
+_DEFAULT_SANDBOX_NPROC_LIMIT = 2
+
+
+def _sandbox_nproc_limit() -> int:
+    """Return the sandbox process cap (RLIMIT_NPROC) parsed from env.
+
+    Includes the shell itself (bash) plus one working child, so the sandbox
+    runs at most one command process at a time. A process cap only applies
+    inside a private user namespace; the caller guards on ``/proc/self/uid_map``
+    before applying it.
+    """
+    value = os.environ.get(
+        OH_SANDBOX_NPROC_LIMIT_ENV, str(_DEFAULT_SANDBOX_NPROC_LIMIT)
+    )
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"invalid {OH_SANDBOX_NPROC_LIMIT_ENV}={value!r}: {exc}"
+        ) from exc
+    if limit < 2:
+        raise RuntimeError(
+            f"{OH_SANDBOX_NPROC_LIMIT_ENV} must be at least 2 (bash + 1 child)"
+        )
+    return limit
+
+
 # Map normalized special key names to ANSI escape bytes for PTY.
 _SUBPROCESS_SPECIALS: dict[str, bytes] = {
     "ENTER": ENTER,
@@ -233,8 +264,13 @@ class SubprocessTerminal(TerminalInterface):
 
         # Configure bash: disable history expansion, set up PS1/PS2 prompts
         work_dir = shlex.quote(os.path.abspath(self.work_dir))
+        nproc_guard = (
+            "map=$(awk 'NR==1{print $3}' /proc/self/uid_map); "
+            '[ "$map" != "4294967295" ] '
+            f"&& ulimit -u {_sandbox_nproc_limit()} 2>/dev/null; "
+        )
         init_cmd = (
-            f"ulimit -v {_sandbox_vmem_kb()} 2>/dev/null; "
+            nproc_guard + f"ulimit -v {_sandbox_vmem_kb()} 2>/dev/null; "
             "set +H; "
             f"export PROMPT_COMMAND='export PS1=\"{self.PS1}\"'; "
             f'export PS2=""; cd -- {work_dir}'
