@@ -1,0 +1,23 @@
+{
+  "name": "@pyromind/pi-runtime",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "test": "node --test --import tsx test/*.test.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.2",
+    "@earendil-works/pi-ai": "0.84.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.0",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3"
+  }
+}
