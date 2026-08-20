@@ -1,0 +1,29 @@
+---
+# LLM 路由配置（三个环境 webapp-pre / webapp-pre2 / webapp 共享同一份内容）
+# 应用：kubectl -n <ns> apply -f llm-config.yaml
+# 说明：deepseek(本地网关) 优先，openrouter(OPENROUTER_API_KEY) 自动兜底；
+#       密钥不落文件，由 Secret 注入为同名环境变量。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+    name: llm-config
+data:
+    llm_config.json: |
+        {
+          "llms": [
+            {"name": "deepseek", "model": "openai/deepseek-v4-flash-0731",
+             "base_url": "http://208.64.254.187:8000/v1", "api_key_env": "DEEPSEEK_API_KEY",
+             "num_retries": 2},
+            {"name": "openrouter", "model": "openai/deepseek-v4-flash-0731",
+             "base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY",
+             "num_retries": 2}
+          ],
+          "multimodal_llms": [
+            {"name": "vision-primary", "model": "openai/google/gemma-4-31b-it",
+             "base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY",
+             "num_retries": 2},
+            {"name": "vision-fallback", "model": "openai/google/gemini-2.5-flash",
+             "base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY",
+             "num_retries": 2}
+          ]
+        }

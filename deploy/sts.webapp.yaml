@@ -1,0 +1,185 @@
+---
+# 生产环境(webapp namespace) StatefulSet —— 声明式清单（与当前线上一致）
+# 应用：kubectl -n webapp apply -f deploy/sts.webapp.yaml
+# 注意：block device 路径按当前节点实测为 /dev/nvme2n1（pre/pre2 是 /dev/nvme1n1），
+#       换机后设备名可能漂移，需用 deploy/sync_from_live.sh 重新刷新后再提交。
+# Secret 值不在此文件：软件-agent-sdk-secret 由运维/密钥管理注入（见 secrets.template.yaml）。
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+    name: software-agent-sdk
+    namespace: webapp
+    labels:
+        app: software-agent-sdk
+        enable-sts-monitor: 'true'
+spec:
+    serviceName: software-agent-sdk
+    podManagementPolicy: OrderedReady
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+        matchLabels:
+            app: software-agent-sdk
+    template:
+        metadata:
+            labels:
+                app: software-agent-sdk
+                enable-sts-monitor: 'true'
+            annotations:
+                container.apparmor.security.beta.kubernetes.io/main: unconfined
+        spec:
+            containers:
+                - name: main
+                  image: pyrominddynamics/software-agent-sdk:main-fc199aa1-08200829
+                  imagePullPolicy: IfNotPresent
+                  env:
+                      - name: RunMode
+                        value: agent-server
+                      - name: POD_NAME
+                        valueFrom:
+                            fieldRef:
+                                fieldPath: metadata.name
+                      - name: APP_ENV
+                        value: prod
+                      - name: LLM_CONFIG_PATH
+                        value: /etc/llm-config/llm_config.json
+                      - name: LLM_MODEL
+                        value: deepseek/deepseek-v4-flash-0731
+                      - name: LLM_BASE_URL
+                        value: https://openrouter.ai/api/v1
+                      - name: OH_CONVERSATION_STORAGE_QUOTA
+                        value: 500M
+                      - name: OH_STORAGE_QUOTA_REQUIRED
+                        value: '1'
+                      - name: OH_STORAGE_QUOTA_DEVICE
+                        value: /dev/nvme2n1
+                      - name: OH_SANDBOX_MEMORY_LIMIT
+                        value: 500M
+                      - name: OH_SANDBOX_MEMORY_REQUIRED
+                        value: '0'
+                      - name: SESSION_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                name: software-agent-sdk-secret
+                                key: SESSION_API_KEY
+                      - name: OH_SECRET_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                name: software-agent-sdk-secret
+                                key: OH_SECRET_KEY
+                      - name: OPENAI_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                name: software-agent-sdk-secret
+                                key: OPENAI_API_KEY
+                      - name: OPENROUTER_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                name: software-agent-sdk-secret
+                                key: OPENROUTER_API_KEY
+                      - name: DEEPSEEK_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                name: software-agent-sdk-secret
+                                key: DEEPSEEK_API_KEY
+                      - name: DF_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                name: software-agent-sdk-secret
+                                key: DF_API_KEY
+                  ports:
+                      - containerPort: 8000
+                        name: http
+                        protocol: TCP
+                  resources:
+                      requests:
+                          cpu: '1'
+                          memory: 2Gi
+                      limits:
+                          cpu: '4'
+                          memory: 8Gi
+                  securityContext:
+                      appArmorProfile:
+                          type: Unconfined
+                      capabilities:
+                          add:
+                              - SYS_ADMIN
+                      seccompProfile:
+                          type: Unconfined
+                  volumeMounts:
+                      - mountPath: /workspace
+                        name: workspace-xfs
+                      - mountPath: /dev/nvme2n1
+                        name: workspace-device
+                      - mountPath: /etc/llm-config
+                        name: llm-config
+                        readOnly: true
+                      - mountPath: /etc/secrets
+                        name: full-web-key-secret
+                        readOnly: true
+                      - mountPath: /etc/myhttps-ca/us-west-2/
+                        name: us-west-2-ca-volume
+                        readOnly: true
+                      - mountPath: /etc/myhttps-ca/us-west-1/
+                        name: us-west-1-ca-volume
+                        readOnly: true
+            initContainers:
+                - name: setup-workspace
+                  image: busybox:latest
+                  imagePullPolicy: Always
+                  command:
+                      - /bin/sh
+                      - -c
+                      - |
+                        mkdir -p /workspace/conversations
+                        mkdir -p /workspace/project
+                        chown -R 10001:10001 /workspace
+                        echo "Workspace initialized successfully"
+                  volumeMounts:
+                      - mountPath: /workspace
+                        name: workspace-xfs
+            securityContext:
+                fsGroup: 10001
+                runAsUser: 0
+                runAsGroup: 0
+            dnsPolicy: ClusterFirst
+            imagePullSecrets:
+                - name: niqi-dev-secret
+            restartPolicy: Always
+            volumes:
+                - name: workspace-device
+                  hostPath:
+                      path: /dev/nvme2n1
+                      type: BlockDevice
+                - name: llm-config
+                  configMap:
+                      name: llm-config
+                - name: full-web-key-secret
+                  secret:
+                      defaultMode: 420
+                      secretName: web-portal-secret-prod
+                - name: us-west-2-ca-volume
+                  secret:
+                      defaultMode: 420
+                      items:
+                          - key: tls.crt
+                            path: tls-root-ca.crt
+                      secretName: https-tls-certs-prod
+                - name: us-west-1-ca-volume
+                  secret:
+                      defaultMode: 420
+                      items:
+                          - key: rootCA.crt
+                            path: tls-root-ca.crt
+                      secretName: grpc-root-ca-prod
+    volumeClaimTemplates:
+        - metadata:
+              name: workspace-xfs
+          spec:
+              accessModes:
+                  - ReadWriteOnce
+              resources:
+                  requests:
+                      storage: 100Gi
+              storageClassName: gp2-xfs
+              volumeMode: Filesystem

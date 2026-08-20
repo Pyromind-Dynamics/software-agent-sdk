@@ -1,21 +1,14 @@
 {
   "llms": [
     {
-      "name": "person",
+      "name": "deepseek",
       "model": "openai/deepseek-v4-flash-0731",
       "base_url": "http://208.64.254.187:8000/v1",
-      "api_key_env": "PERSON_API_KEY",
+      "api_key_env": "DEEPSEEK_API_KEY",
       "num_retries": 2
     },
     {
-      "name": "openrouter-ds",
-      "model": "openai/deepseek-v4-flash-0731",
-      "base_url": "https://openrouter.ai/api/v1",
-      "api_key_env": "OPENROUTER_API_KEY",
-      "num_retries": 2
-    },
-    {
-      "name": "openrouter-ln",
+      "name": "openrouter",
       "model": "openai/deepseek-v4-flash-0731",
       "base_url": "https://openrouter.ai/api/v1",
       "api_key_env": "OPENROUTER_API_KEY",
