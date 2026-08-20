@@ -7,6 +7,8 @@ from openhands.tools.update_plan import (
     PlanStep,
     UpdatePlanAction,
     UpdatePlanExecutor,
+    UpdatePlanObservation,
+    UpdatePlanTool,
 )
 
 
@@ -56,3 +58,49 @@ def test_update_plan_rejects_incremental_patch_and_multiple_active_steps() -> No
                 PlanStep(step="Two", status="in_progress"),
             ]
         )
+
+
+def test_update_plan_normalizes_single_nested_argument_wrapper() -> None:
+    tool = UpdatePlanTool(
+        description="test",
+        action_type=UpdatePlanAction,
+        observation_type=UpdatePlanObservation,
+    )
+    malformed = {
+        "summary": "Prepare the data pipeline",
+        "plan": [
+            {
+                "explanation": "",
+                "plan": [
+                    {"step": "Prepare df_submit_pipeline", "status": "in_progress"}
+                ],
+                "status": "in_progress",
+            }
+        ],
+    }
+
+    assert tool.normalize_arguments(malformed) == {
+        "summary": "Prepare the data pipeline",
+        "explanation": "",
+        "plan": [{"step": "Prepare df_submit_pipeline", "status": "in_progress"}],
+    }
+
+
+def test_update_plan_leaves_ambiguous_nested_wrapper_unchanged() -> None:
+    tool = UpdatePlanTool(
+        description="test",
+        action_type=UpdatePlanAction,
+        observation_type=UpdatePlanObservation,
+    )
+    malformed = {
+        "plan": [
+            {
+                "plan": [
+                    {"step": "One", "status": "in_progress"},
+                    {"step": "Two", "status": "in_progress"},
+                ]
+            }
+        ]
+    }
+
+    assert tool.normalize_arguments(malformed) is malformed

@@ -496,3 +496,45 @@ def test_event_cache_survives_across_multiple_iterations():
     first_pass = list(log)
     second_pass = list(log)
     assert all(a is b for a, b in zip(first_pass, second_pass, strict=True))
+
+
+def test_event_cache_respects_max_cache_size():
+    """Past max_cache_size, oldest events are evicted and reloaded on demand."""
+    fs = InMemoryFileStore()
+    log = EventLog(fs, max_cache_size=2)
+
+    for i in range(3):
+        log.append(create_test_event(f"evt-{i}", f"Content {i}"))
+
+    # Only the two most recent events remain cached
+    assert len(log._event_cache) == 2
+    assert 0 not in log._event_cache
+    assert list(log._event_cache) == [1, 2]
+
+    # Accessing the evicted event reloads it and evicts the next oldest
+    assert log[0].id == "evt-0"
+    assert len(log._event_cache) == 2
+    assert 1 not in log._event_cache
+
+    # Full iteration stays bounded
+    assert [e.id for e in log] == [f"evt-{i}" for i in range(3)]
+    assert len(log._event_cache) == 2
+
+
+def test_event_cache_max_cache_size_settable_at_runtime():
+    """Setting max_cache_size after construction tightens the cache immediately."""
+    fs = InMemoryFileStore()
+    log = EventLog(fs)
+
+    for i in range(3):
+        log.append(create_test_event(f"evt-{i}", f"Content {i}"))
+    assert len(log._event_cache) == 3
+
+    log.max_cache_size = 1
+    assert len(log._event_cache) == 1
+    assert list(log._event_cache) == [2]
+
+    # Removing the bound restores unbounded caching on subsequent reads
+    log.max_cache_size = None
+    assert log[0].id == "evt-0"
+    assert len(log._event_cache) == 2

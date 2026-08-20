@@ -1484,6 +1484,41 @@ class TestEventServiceSendMessage:
         conversation.run.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_send_message_with_run_true_sets_running_before_background_task(
+        self, event_service
+    ):
+        """execution_status must be RUNNING once send_message(run=True) returns.
+
+        The POST handler returns Success() right after send_message resolves,
+        while the background run task only then transitions the status. Setting
+        it synchronously inside EventService.run() ensures REST reads that
+        follow the response observe "running" instead of a stale IDLE.
+        """
+        conversation = MagicMock()
+        state = MagicMock()
+        state.execution_status = ConversationExecutionStatus.IDLE
+        state.__enter__ = MagicMock(return_value=state)
+        state.__exit__ = MagicMock(return_value=None)
+        conversation.state = state
+        conversation._state = state
+        conversation.send_message = MagicMock()
+        conversation.run = MagicMock()
+
+        event_service._conversation = conversation
+        event_service._publish_state_update = AsyncMock()
+        message = Message(role="user", content=[])
+
+        await event_service.send_message(message, run=True)
+
+        # Status must be RUNNING before the background task executes
+        # conversation.run() — this is what REST reads observe after the
+        # POST that triggered the run returns.
+        assert state.execution_status == ConversationExecutionStatus.RUNNING
+        assert event_service._run_task is not None
+        await event_service._run_task
+        conversation.run.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_send_message_with_run_true_interrupts_running_acp_turn(
         self, event_service, tmp_path
     ):
@@ -3225,6 +3260,8 @@ class TestEventServiceClose:
         class SyncOnlyConversation(BaseConversation):
             """Minimal subclass that only implements sync run()."""
 
+            _state: MagicMock
+
             @property
             def id(self):
                 return mock.id
@@ -3282,6 +3319,8 @@ class TestEventServiceClose:
 
         conv = SyncOnlyConversation()
         event_service._conversation = conv  # type: ignore[assignment]
+        # EventService.run() sets the status synchronously via _state.
+        conv._state = MagicMock(execution_status=ConversationExecutionStatus.IDLE)
 
         # Sanity: this conversation does NOT override arun()
         assert type(conv).arun is BaseConversation.arun
@@ -3331,6 +3370,9 @@ class TestEventServiceClose:
         class AsyncConvSyncAgent:
             def __init__(self):
                 self.agent = agent
+                self._state = MagicMock(
+                    execution_status=ConversationExecutionStatus.IDLE
+                )
 
             async def arun(self):
                 nonlocal arun_called

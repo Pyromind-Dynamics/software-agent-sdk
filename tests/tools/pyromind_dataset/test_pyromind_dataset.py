@@ -1,13 +1,19 @@
 import json as jsonlib
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import MagicMock
 from uuid import UUID
 
 import httpx
+import pytest
 from pydantic import SecretStr
+from pyromind_sdk.client.models import TrainingTaskCreateResponse
 
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.secret import StaticSecret
+from openhands.tools.pyromind_archive.definition import (
+    PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
+)
 from openhands.tools.pyromind_dataset.definition import (
     _PREVIEW_DATASET_DESCRIPTION,
     PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
@@ -133,7 +139,10 @@ def _secret_registry() -> SecretRegistry:
         {
             PYROMIND_STORAGE_AUTH_COOKIE_SECRET: StaticSecret(
                 value=SecretStr("auth_token=session-token")
-            )
+            ),
+            PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET: StaticSecret(
+                value=SecretStr("session-token")
+            ),
         }
     )
     return secret_registry
@@ -221,7 +230,10 @@ def test_preview_dataset_reads_jsonl_samples_with_storage_context(
     assert calls[0]["headers"]["x-cluster"] == "pre"
 
 
-def test_preview_dataset_strips_workspace_prefix(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "dataset_path", ["/workspace/proto.jsonl", "workspace/proto.jsonl"]
+)
+def test_preview_dataset_strips_workspace_prefix(monkeypatch, tmp_path, dataset_path):
     _patch_shared_empty(monkeypatch)
     metadata_calls: list[dict[str, Any]] = []
     jsonl = b'{"prompt":"p1"}\n'
@@ -265,7 +277,7 @@ def test_preview_dataset_strips_workspace_prefix(monkeypatch, tmp_path):
         storage_base_url="https://portal.test/storage_api",
         timeout=5.0,
     )(
-        PreviewDatasetAction.model_validate({"dataset_path": "/workspace/proto.jsonl"}),
+        PreviewDatasetAction.model_validate({"dataset_path": dataset_path}),
         cast(Any, conversation),
     )
 
@@ -278,6 +290,14 @@ def test_preview_dataset_strips_workspace_prefix(monkeypatch, tmp_path):
 def test_preview_dataset_reports_archive_with_extract_hint(monkeypatch, tmp_path):
     _patch_shared_empty(monkeypatch)
     url_calls: list[dict[str, Any]] = []
+    mock_client = MagicMock()
+    mock_client.studio.create.return_value = TrainingTaskCreateResponse(
+        task_id="task-extract", name="agent-extract-abc", status="Pending"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.pyromind_archive.definition.create_workflow_api_client",
+        MagicMock(return_value=mock_client),
+    )
 
     def fake_post(url, *, headers, json, timeout):
         if url.endswith("/get_file_metadata"):
@@ -313,16 +333,22 @@ def test_preview_dataset_reports_archive_with_extract_hint(monkeypatch, tmp_path
     observation = PreviewDatasetExecutor(
         storage_base_url="https://portal.test/storage_api",
         timeout=5.0,
+        # Mirrors agent-server tool params that include current_user; it must
+        # be dropped before constructing the archive extract executor.
+        extract_params={"current_user": {"id": "user-1"}},
     )(
         PreviewDatasetAction.model_validate({"dataset_path": "/workspace/proto.zip"}),
         cast(Any, conversation),
     )
 
     assert not observation.is_error
-    assert "extract_archive" in observation.text
+    assert "Extraction task submitted" in observation.text
     assert observation.preview_file_path == "proto.zip"
     assert observation.source == "storage"
-    assert url_calls == []
+    # The archive existence check fetches a download URL; the preview itself
+    # must not stream the archive content.
+    assert len(url_calls) == 1
+    assert url_calls[0]["json"]["path"] == "/proto.zip"
 
 
 def test_preview_dataset_formats_text_file_content(
