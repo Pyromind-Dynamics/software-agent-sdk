@@ -244,7 +244,16 @@ class EventService:
     cipher: Cipher | None = None
     owner_instance_id: str = field(default_factory=lambda: uuid4().hex)
     lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS
+    # Upper bound on deserialized events cached in memory for this
+    # conversation; None leaves the EventLog cache unbounded (SDK default).
+    event_cache_max_events: int | None = None
     _conversation: LocalConversation | None = field(default=None, init=False)
+    # Monotonic clock timestamp of the last client activity (any API/WS
+    # access). Idle eviction compares against this; see is_evictable.
+    last_activity_time: float = field(default_factory=time.monotonic, init=False)
+    # Number of currently connected user WebSocket subscribers. Non-zero
+    # marks the conversation as actively watched and blocks eviction.
+    _user_connection_count: int = field(default=0, init=False)
     _pub_sub: PubSub[Event] = field(
         default_factory=lambda: PubSub[Event](max_subscribers=50), init=False
     )
@@ -341,6 +350,43 @@ class EventService:
         if not self._conversation:
             raise ValueError("inactive_service")
         return self._conversation
+
+    def touch(self) -> None:
+        """Mark this conversation as recently active (called on client access)."""
+        self.last_activity_time = time.monotonic()
+
+    def register_user_connection(self) -> None:
+        """Record an open user WebSocket so idle eviction skips the service."""
+        self._user_connection_count += 1
+
+    def unregister_user_connection(self) -> None:
+        """Drop a user WebSocket; eviction may proceed once none remain."""
+        self._user_connection_count = max(0, self._user_connection_count - 1)
+
+    def _is_evictable_sync(self, now: float, idle_timeout: float) -> bool:
+        """Return True when this service is safe and eligible for idle eviction.
+
+        Never evicts services that are closing, mid-run, watched by a user
+        WebSocket, or executing long-running platform tasks. Runs on a worker
+        thread (acquires the conversation state lock); callers should use
+        ``asyncio.to_thread``.
+        """
+        if self._closing or self._conversation is None:
+            return False
+        if self._run_task is not None and not self._run_task.done():
+            return False
+        if self._goal_loop_task is not None and not self._goal_loop_task.done():
+            return False
+        if self._user_connection_count > 0:
+            return False
+        if now - self.last_activity_time < idle_timeout:
+            return False
+        with self._conversation._state as state:
+            if state.execution_status == ConversationExecutionStatus.RUNNING:
+                return False
+            if any(task.status != "Stopped" for task in state.active_long_tasks):
+                return False
+        return True
 
     def _get_event_sync(self, event_id: str) -> Event | None:
         """Private sync function to get a single event.
@@ -641,6 +687,21 @@ class EventService:
         with self._conversation._state as state:
             if state.execution_status != ConversationExecutionStatus.ERROR:
                 state.execution_status = ConversationExecutionStatus.ERROR
+
+    def _mark_running_status_sync(self) -> None:
+        """Set the conversation to RUNNING before the background run starts.
+
+        ``EventService.run()`` sets this synchronously (via the executor) so
+        the HTTP response that accepted the message — and any REST reads that
+        follow it — observe the running state instead of a stale IDLE, which
+        otherwise races the background task's own status transition. No-op
+        once the status is already RUNNING.
+        """
+        if not self._conversation:
+            return
+        with self._conversation._state as state:
+            if state.execution_status != ConversationExecutionStatus.RUNNING:
+                state.execution_status = ConversationExecutionStatus.RUNNING
 
     def _is_pyromind_conversation(self) -> bool:
         return self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE
@@ -1367,6 +1428,10 @@ class EventService:
         conversation.set_security_analyzer(self.stored.security_analyzer)
         self._conversation = conversation
         self._conversation._state.set_write_guard(self._write_guard)
+        if self.event_cache_max_events is not None:
+            self._conversation._state.events.max_cache_size = (
+                self.event_cache_max_events
+            )
         if not self._external_lease_renewal:
             self._lease_task = asyncio.create_task(self._renew_lease_loop())
 
@@ -1457,8 +1522,15 @@ class EventService:
             # Capture conversation reference for the closure
             conversation = self._conversation
 
-            # Start run in background
+            # Set the status to RUNNING synchronously before starting the
+            # background task, so the HTTP response and any REST reads that
+            # follow it observe the running state instead of a stale IDLE.
+            # The background task re-sets it inside conversation.run()/arun(),
+            # which is a no-op once already RUNNING.
             loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._mark_running_status_sync)
+
+            # Start run in background
 
             async def _run_and_publish():
                 run_t0 = time.monotonic()

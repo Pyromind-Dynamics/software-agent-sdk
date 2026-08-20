@@ -224,6 +224,87 @@ def test_report_all_success(generate_report_mod: Any, tmp_path: Path) -> None:
     assert report["duration_seconds"] == 5.0
 
 
+def test_report_writes_deduplicated_label_corrections(
+    generate_report_mod: Any,
+    tmp_path: Path,
+) -> None:
+    calls = [
+        {
+            "seq": 0,
+            "status": "success",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "latency_ms": 1,
+            "label_reconciliation": {
+                "source_index": 0,
+                "source_id": "sample-0",
+                "original_label": "A",
+                "final_label": "B",
+                "decision": "correct",
+                "correction_reason": "old",
+                "visual_evidence": ["old evidence"],
+            },
+        },
+        {
+            "seq": 1,
+            "status": "success",
+            "timestamp": "2026-01-01T00:00:01+00:00",
+            "latency_ms": 1,
+            "label_reconciliation": {
+                "source_index": 1,
+                "source_id": "sample-1",
+                "original_label": "A",
+                "final_label": "A",
+                "decision": "keep",
+                "correction_reason": "",
+                "visual_evidence": [],
+            },
+        },
+        {
+            "seq": 2,
+            "status": "success",
+            "timestamp": "2026-01-01T00:00:02+00:00",
+            "latency_ms": 1,
+            "label_reconciliation": {
+                "source_index": 0,
+                "source_id": "sample-0",
+                "original_label": "A",
+                "final_label": "B",
+                "decision": "correct",
+                "correction_reason": "latest",
+                "visual_evidence": ["new evidence"],
+            },
+        },
+    ]
+    _write_jsonl(tmp_path / "llm_calls.jsonl", calls)
+
+    report = generate_report_mod.generate_report(str(tmp_path))
+
+    assert report["label_reconciliation"] == {
+        "reviewed": 2,
+        "kept": 1,
+        "corrected": 1,
+        "artifact": "label_corrections.jsonl",
+    }
+    correction = json.loads(
+        (tmp_path / "label_corrections.jsonl").read_text(encoding="utf-8")
+    )
+    assert correction["correction_reason"] == "latest"
+
+
+def test_report_removes_stale_empty_correction_artifact(
+    generate_report_mod: Any,
+    tmp_path: Path,
+) -> None:
+    stale = tmp_path / "label_corrections.jsonl"
+    stale.write_text('{"stale":true}\n', encoding="utf-8")
+
+    report = generate_report_mod.generate_report(str(tmp_path))
+
+    assert report["label_reconciliation"]["corrected"] == 0
+    assert report["label_reconciliation"]["artifact"] is None
+    assert not stale.exists()
+
+
 def test_report_partial_failure(generate_report_mod: Any, tmp_path: Path) -> None:
     calls = [
         {

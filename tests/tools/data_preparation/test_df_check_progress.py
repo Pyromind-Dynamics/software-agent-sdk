@@ -91,3 +91,22 @@ def test_check_progress_tail_drops_partial_first_line() -> None:
     assert len(obs.latest_records) <= 3
     assert all(isinstance(record, dict) for record in obs.latest_records)
     assert obs.latest_records[-1]["id"] == 9
+
+
+def test_check_progress_tail_lines_zero_returns_no_records() -> None:
+    """tail_lines=0 is valid and means no records are shown (# tail -0 pitfall)."""
+    processed = "".join(json.dumps({"id": i}) + "\n" for i in range(5))
+    progress = {"total": 5, "processed": 5, "succeeded": 5, "failed": 0}
+    files = {
+        "/run/progress.json": json.dumps(progress).encode(),
+        "/run/processed.jsonl": processed.encode(),
+    }
+    executor = _make_executor(files)
+
+    obs = executor(
+        DfCheckProgressAction(output_dir="/run", tail_lines=0),
+        conversation=None,
+    )
+
+    assert obs.percent == 100.0
+    assert obs.latest_records == []

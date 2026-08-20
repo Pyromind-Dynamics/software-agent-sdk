@@ -63,6 +63,14 @@ def _read_json_object(path: Path) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+def _write_jsonl_atomic(path: Path, rows: list[dict]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as target:
+        for row in rows:
+            target.write(json.dumps(row, ensure_ascii=False) + "\n")
+    temporary.replace(path)
+
+
 def _read_dataflow_checkpoint(
     log_path: Path,
     runtime_metadata: dict | None,
@@ -127,6 +135,7 @@ def generate_report(
     errors: list[dict] = []
     first_ts: str | None = None
     last_ts: str | None = None
+    reconciliations: dict[object, dict] = {}
 
     if calls_file.is_file():
         with open(calls_file, encoding="utf-8") as f:
@@ -149,6 +158,16 @@ def generate_report(
 
                 if status == "success":
                     success_calls += 1
+                    reconciliation = record.get("label_reconciliation")
+                    if isinstance(reconciliation, dict):
+                        source_index = reconciliation.get("source_index")
+                        reconciliation_key: object = (
+                            source_index
+                            if isinstance(source_index, int)
+                            else reconciliation.get("source_id")
+                        )
+                        if reconciliation_key is not None:
+                            reconciliations[reconciliation_key] = reconciliation
                 else:
                     failed_calls += 1
                     if len(errors) < MAX_ERROR_SAMPLES:
@@ -192,6 +211,15 @@ def generate_report(
             output_records=output_records,
         )
     runtime_failure = _read_json_object(log_path / "failure.json")
+    reviewed = list(reconciliations.values())
+    corrections = [value for value in reviewed if value.get("decision") == "correct"]
+    correction_path = log_path / "label_corrections.jsonl"
+    if corrections:
+        _write_jsonl_atomic(correction_path, corrections)
+        correction_artifact: str | None = correction_path.name
+    else:
+        correction_path.unlink(missing_ok=True)
+        correction_artifact = None
 
     # Determine overall status
     if pipeline_exit_code != 0:
@@ -238,6 +266,12 @@ def generate_report(
             "avg_latency_ms": avg_latency,
             "p95_latency_ms": p95_latency,
             "max_latency_ms": max_latency,
+        },
+        "label_reconciliation": {
+            "reviewed": len(reviewed),
+            "kept": sum(value.get("decision") == "keep" for value in reviewed),
+            "corrected": len(corrections),
+            "artifact": correction_artifact,
         },
         "duration_seconds": duration_seconds,
         "error_samples": errors,

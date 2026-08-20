@@ -1,5 +1,6 @@
 # state.py
 import operator
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, nullcontext
 from typing import SupportsIndex, overload
@@ -41,15 +42,43 @@ class EventLog(EventsListBase):
     _lock_path: str
     _write_guard: Callable[[], AbstractContextManager[None]] | None
 
-    def __init__(self, fs: FileStore, dir_path: str = EVENTS_DIR) -> None:
+    def __init__(
+        self,
+        fs: FileStore,
+        dir_path: str = EVENTS_DIR,
+        max_cache_size: int | None = None,
+    ) -> None:
         self._fs = fs
         self._dir = dir_path
         self._id_to_idx: dict[EventID, int] = {}
         self._idx_to_id: dict[int, EventID] = {}
-        self._event_cache: dict[int, Event] = {}
+        # LRU cache of deserialized events: most-recently-used at the tail.
+        # Bounded by max_cache_size so long-lived conversations cannot grow
+        # memory without bound; evicted events are re-read from disk on access.
+        self._event_cache: OrderedDict[int, Event] = OrderedDict()
+        self._max_cache_size = max_cache_size
         self._lock_path = f"{dir_path}/{LOCK_FILE_NAME}"
         self._write_guard = None
         self._length = self._scan_and_build_index()
+
+    @property
+    def max_cache_size(self) -> int | None:
+        """Upper bound on cached events, or None for an unbounded cache."""
+        return self._max_cache_size
+
+    @max_cache_size.setter
+    def max_cache_size(self, value: int | None) -> None:
+        self._max_cache_size = value
+        if value is not None:
+            while len(self._event_cache) > value:
+                self._event_cache.popitem(last=False)
+
+    def _cache_put(self, idx: int, evt: Event) -> None:
+        self._event_cache[idx] = evt
+        self._event_cache.move_to_end(idx)
+        if self._max_cache_size is not None:
+            while len(self._event_cache) > self._max_cache_size:
+                self._event_cache.popitem(last=False)
 
     def set_write_guard(
         self,
@@ -92,6 +121,7 @@ class EventLog(EventsListBase):
             raise IndexError("Event index out of range")
 
         if (cached := self._event_cache.get(i)) is not None:
+            self._event_cache.move_to_end(i)
             return cached
 
         try:
@@ -108,13 +138,14 @@ class EventLog(EventsListBase):
         if not txt:
             raise FileNotFoundError(f"Missing event file: {path}")
         evt = Event.model_validate_json(txt)
-        self._event_cache[i] = evt
+        self._cache_put(i, evt)
         return evt
 
     def __iter__(self) -> Iterator[Event]:
         for i in range(self._length):
             cached = self._event_cache.get(i)
             if cached is not None:
+                self._event_cache.move_to_end(i)
                 yield cached
                 continue
             txt = self._fs.read(self._path(i))
@@ -125,7 +156,7 @@ class EventLog(EventsListBase):
             if i not in self._idx_to_id:
                 self._idx_to_id[i] = evt_id
                 self._id_to_idx.setdefault(evt_id, i)
-            self._event_cache[i] = evt
+            self._cache_put(i, evt)
             yield evt
 
     def append(self, event: Event) -> None:
@@ -160,7 +191,7 @@ class EventLog(EventsListBase):
                     self._fs.write(target_path, payload)
                 self._idx_to_id[self._length] = evt_id
                 self._id_to_idx[evt_id] = self._length
-                self._event_cache[self._length] = event
+                self._cache_put(self._length, event)
                 self._length += 1
         except TimeoutError:
             logger.error(

@@ -29,7 +29,10 @@ from openhands.tools.data_preparation.runner import (
     summarize_dataflow_env,
     validate_managed_image_pipeline,
 )
-from openhands.tools.utils.dataflow_config import DEFAULT_DATAFLOW_MODEL_NAME
+from openhands.tools.utils.dataflow_config import (
+    DEFAULT_DATAFLOW_API_BASE_URL,
+    DEFAULT_DATAFLOW_MODEL_NAME,
+)
 
 
 def _fake_conversation(
@@ -64,13 +67,13 @@ def test_openai_compatible_model_name() -> None:
     )
 
 
-def _conversation_with_llm() -> Any:
+def _conversation_with_llm(base_url: str | None = "https://example.com/v1/") -> Any:
     llm = type(
         "FakeLlm",
         (),
         {
             "api_key": SecretStr("secret"),
-            "base_url": "https://example.com/v1/",
+            "base_url": base_url,
             "model": "openai/vision-model",
         },
     )()
@@ -87,7 +90,7 @@ def _conversation_with_llm() -> Any:
     )()
 
 
-def test_build_dataflow_env_includes_vlm_base_url(
+def test_build_dataflow_env_vision_falls_back_to_defaults(
     monkeypatch,
 ) -> None:
     for name in (
@@ -95,16 +98,17 @@ def test_build_dataflow_env_includes_vlm_base_url(
         "DF_API_URL",
         "DF_API_BASE_URL",
         "DF_MODEL_NAME",
+        "LLM_BASE_URL",
     ):
         monkeypatch.delenv(name, raising=False)
 
-    env = build_dataflow_env(_conversation_with_llm())
+    env = build_dataflow_env(_conversation_with_llm(base_url=None))
 
     assert env == {
         "DF_API_KEY": "secret",
-        "DF_API_URL": "https://example.com/v1/chat/completions",
-        "DF_API_BASE_URL": "https://example.com/v1",
-        "DF_MODEL_NAME": "vision-model",
+        "DF_API_URL": f"{DEFAULT_DATAFLOW_API_BASE_URL}/chat/completions",
+        "DF_API_BASE_URL": DEFAULT_DATAFLOW_API_BASE_URL,
+        "DF_MODEL_NAME": DEFAULT_DATAFLOW_MODEL_NAME,
     }
 
 
@@ -175,15 +179,36 @@ def test_build_dataflow_env_rejects_mismatched_urls(monkeypatch) -> None:
         build_dataflow_env(_conversation_with_llm())
 
 
-def test_build_dataflow_env_falls_back_to_default_model(monkeypatch) -> None:
-    for name in ("DF_API_KEY", "DF_API_URL", "DF_API_BASE_URL", "DF_MODEL_NAME"):
-        monkeypatch.delenv(name, raising=False)
-    conversation = _conversation_with_llm()
-    conversation.state.agent.llm.model = ""
+def test_build_dataflow_env_vision_falls_back_to_llm_base_url(monkeypatch) -> None:
+    monkeypatch.setenv("DF_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.delenv("DF_API_BASE_URL", raising=False)
+    monkeypatch.delenv("DF_API_URL", raising=False)
+    monkeypatch.delenv("DF_MODEL_NAME", raising=False)
 
-    env = build_dataflow_env(conversation)
+    env = build_dataflow_env(_conversation_with_llm())
 
+    assert env["DF_API_BASE_URL"] == "https://openrouter.ai/api/v1"
+    assert env["DF_API_URL"] == "https://openrouter.ai/api/v1/chat/completions"
     assert env["DF_MODEL_NAME"] == DEFAULT_DATAFLOW_MODEL_NAME
+    assert env["DF_API_KEY"] == "openrouter-secret"
+
+
+def test_build_dataflow_env_vision_falls_back_to_conversation_llm(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("DF_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("DF_API_BASE_URL", raising=False)
+    monkeypatch.delenv("DF_API_URL", raising=False)
+    monkeypatch.delenv("DF_MODEL_NAME", raising=False)
+
+    env = build_dataflow_env(_conversation_with_llm())
+
+    assert env["DF_API_BASE_URL"] == "https://example.com/v1"
+    assert env["DF_API_URL"] == "https://example.com/v1/chat/completions"
+    assert env["DF_MODEL_NAME"] == DEFAULT_DATAFLOW_MODEL_NAME
+    assert env["DF_API_KEY"] == "secret"
 
 
 def test_run_dataflow_python_redacts_api_key(tmp_path: Path) -> None:
@@ -917,6 +942,147 @@ def test_image_utils_multi_image_prompt_retry_and_output_order(
         "<think>second</think>\n\n<answer>B</answer>"
     )
     assert set(rows[0]) == {"messages"}
+
+
+def test_image_utils_accepts_json_fence_and_logs_invalid_response_preview(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_utils = _load_image_utils()
+    _write_image(tmp_path / "one.jpg", (1, 2, 3))
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        json.dumps({"id": "one", "images": ["one.jpg"], "user_prompt": "Inspect."})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    class FakeServing:
+        calls = 0
+
+        def generate_from_input_multi_images(self, *args, **kwargs):
+            del args
+            self.calls += 1
+            assert kwargs["json_schema"]["required"] == ["reasoning", "answer"]
+            if self.calls == 1:
+                return ["not-json sk-secret"]
+            return ['```json\n{"reasoning":"ok","answer":"A"}\n```']
+
+        def cleanup(self):
+            return None
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("DF_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("DF_RESUME", "0")
+    monkeypatch.setenv("DF_API_KEY", "sk-secret")
+    monkeypatch.setattr(
+        image_utils, "_create_vlm_serving", lambda config: FakeServing()
+    )
+    config = image_utils.ImagePipelineConfig(
+        labeling_system_prompt="Label.",
+        training_system_prompt="Train.",
+        max_attempts=2,
+    )
+
+    output = tmp_path / "processed.jsonl"
+    image_utils.run_image_pipeline(config, str(manifest), str(output))
+
+    row = json.loads(output.read_text(encoding="utf-8"))
+    assert row["messages"][2]["content"][0]["value"].endswith("<answer>A</answer>")
+    calls = [
+        json.loads(line)
+        for line in (state_dir / "llm_calls.jsonl").read_text().splitlines()
+    ]
+    assert calls[0]["status"] == "invalid_output"
+    assert calls[0]["parse_mode"] == "raw_json"
+    assert calls[0]["response_preview"]["head"] == "not-json <redacted>"
+    assert "response_preview" not in calls[1]
+    assert calls[1]["parse_mode"] == "markdown_json_fence"
+
+
+def test_image_utils_reconciles_sidecar_human_labels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_utils = _load_image_utils()
+    for name, label in (("keep", "skip"), ("correct", "true")):
+        sample = tmp_path / name
+        sample.mkdir()
+        _write_image(sample / "image.jpg", (1, 2, 3))
+        (sample / "meta.json").write_text(
+            json.dumps({"label": label, "note": f"human-{name}"}),
+            encoding="utf-8",
+        )
+
+    class FakeServing:
+        def generate_from_input_multi_images(self, *args, **kwargs):
+            del args
+            schema = kwargs["json_schema"]
+            assert "label_review" in schema["properties"]
+            prompts = kwargs["user_prompts"]
+            assert "Human label" in prompts[0]
+            return [
+                json.dumps(
+                    {
+                        "reasoning": "obvious mismatch",
+                        "answer": "机台误报",
+                        "label_review": {
+                            "decision": "correct",
+                            "correction_reason": "人工标签与可见形态直接矛盾",
+                            "visual_evidence": ["检出图与参考图的目标区域形态一致"],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "reasoning": "matches",
+                        "answer": "机台误报",
+                        "label_review": {
+                            "decision": "keep",
+                            "correction_reason": "",
+                            "visual_evidence": [],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+
+        def cleanup(self):
+            return None
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("DF_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("DF_RESUME", "0")
+    monkeypatch.setattr(
+        image_utils, "_create_vlm_serving", lambda config: FakeServing()
+    )
+    config = image_utils.ImagePipelineConfig(
+        labeling_system_prompt="Label.",
+        training_system_prompt="Train.",
+        user_prompt_template="Inspect.",
+        metadata_filename="meta.json",
+        reference_label_path="metadata.label",
+        reference_note_path="metadata.note",
+        reference_label_map={"skip": "机台误报", "true": "真实缺陷"},
+        allow_reference_correction=True,
+        batch_size=2,
+    )
+
+    output = tmp_path / "processed.jsonl"
+    image_utils.run_image_pipeline(config, str(tmp_path), str(output))
+
+    calls = [
+        json.loads(line)
+        for line in (state_dir / "llm_calls.jsonl").read_text().splitlines()
+    ]
+    decisions = [call["label_reconciliation"]["decision"] for call in calls]
+    assert decisions == ["correct", "keep"]
+    corrected = calls[0]["label_reconciliation"]
+    assert corrected["original_label"] == "真实缺陷"
+    assert corrected["final_label"] == "机台误报"
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert all(set(row) == {"messages"} for row in rows)
 
 
 def test_image_utils_dataflow_checkpoint_resume_without_duplicates(

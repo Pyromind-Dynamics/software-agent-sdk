@@ -178,6 +178,11 @@ Knowledge base layout:
 The shared skill documents are available through the read-only logical path
 `{skills_alias}/`. Do not use or request their host filesystem path.
 
+User paths are platform storage paths (e.g. `datasets/...`,
+`/.pyromind-agent/...`, or a `workspace/` prefix) — never this conversation's
+local files. Read them with `preview_dataset` directly, without searching
+local files. Only `public_data/...` paths are local.
+
 Skill usage rules:
 - A conversation may already contain a workflow at
   `public_data/workflow_canvas/workflow.py`. Before asking for information or
@@ -229,15 +234,18 @@ __PYROMIND_RUNTIME_CONTRACT__
 
 Create and edit the workflow DSL at the relative path
 `public_data/workflow_canvas/workflow.py` from the current working directory.
-Prefer `apply_patch` for workflow changes. When using `apply_patch`, always
-use the full relative path in the patch header, e.g.
+Prefer `apply_patch` for workflow changes. It accepts only the `patch` argument;
+never pass a separate `path` argument. Put the full relative path in the patch
+header, e.g.
 `*** Add File: public_data/workflow_canvas/workflow.py` or
 `*** Update File: public_data/workflow_canvas/workflow.py` — never use the
-bare name `workflow.py`. If you use `file_editor` for this file, set its
-`path` to `public_data/workflow_canvas/workflow.py`; the runtime resolves
-workspace-relative paths to host-absolute paths. Do not hand-author long
-absolute paths, and do not use `/workspace/...` or
-`workspace/conversations/...` as a `file_editor.path` for the workflow file.
+bare name `workflow.py`.
+
+The separate `file_editor` tool does accept `path`. When using it for this file,
+set `path` to `public_data/workflow_canvas/workflow.py`; the runtime resolves
+conversation-relative paths to host-absolute paths. Do not hand-author long absolute
+paths, and do not use `/workspace/...` or `workspace/conversations/...` as a
+`file_editor.path` for the workflow file.
 After creating or modifying the workflow file, stop normally; the server sends
 the workflow to the frontend once the run finishes. Do not say the workflow has
 been generated unless a tool call actually created or modified the workflow file.
@@ -532,7 +540,10 @@ def _build_pyromind_storage_tools(
 
     return (
         [
-            Tool(name=PreviewDatasetTool.name, params=dict(params)),
+            Tool(
+                name=PreviewDatasetTool.name,
+                params={**params, "extract_params": extraction_params},
+            ),
             Tool(name=UploadFileToPyromindTool.name, params=dict(params)),
             Tool(name=RunDatasetCleaningTool.name, params=cleaning_params),
             Tool(name=DfSubmitPipelineTool.name, params=preparation_params),

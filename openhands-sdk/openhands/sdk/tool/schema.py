@@ -158,6 +158,14 @@ def _process_schema_node(
         if "required" in node:
             result["required"] = node["required"]
 
+    if node.get("type") == "object" and "additionalProperties" in node:
+        additional_properties = node["additionalProperties"]
+        result["additionalProperties"] = (
+            _process_schema_node(additional_properties, defs, _visiting)
+            if isinstance(additional_properties, dict)
+            else additional_properties
+        )
+
     # Handle arrays
     if node.get("type") == "array" and "items" in node:
         result["type"] = "array"

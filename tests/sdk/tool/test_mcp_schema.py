@@ -3,7 +3,7 @@
 import json
 from collections.abc import Sequence
 
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from openhands.sdk.llm import ImageContent, TextContent
 from openhands.sdk.tool.schema import Action, Observation, Schema, _process_schema_node
@@ -22,6 +22,16 @@ class MCPComplexAction(Action):
     simple_field: str = Field(description="Simple string field")
     optional_int: int | None = Field(default=None, description="Optional integer")
     string_list: list[str] = Field(default_factory=list, description="List of strings")
+
+
+class MCPNestedItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    value: str
+
+
+class MCPNestedAction(Action):
+    items: list[MCPNestedItem]
 
 
 class MCPSchemaTestObservation(Observation):
@@ -118,6 +128,13 @@ def test_mcp_schema_structure():
     # Should have required list
     assert "required" in schema
     assert isinstance(schema["required"], list)
+
+
+def test_mcp_schema_preserves_forbidden_additional_properties():
+    schema = MCPNestedAction.to_mcp_schema()
+
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["items"]["items"]["additionalProperties"] is False
 
 
 def test_kind_field_works_for_discriminated_union():

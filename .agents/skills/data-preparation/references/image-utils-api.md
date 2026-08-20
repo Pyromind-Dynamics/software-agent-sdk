@@ -33,6 +33,20 @@ Prompt 优先读取样本的 `user_prompt_key`；为空时使用
 - `answer_key="answer"`
 - `answer_is_json=False`
 
+已有人工标签的数据需要补 CoT 时，配置：
+
+- `metadata_filename`：可选 sidecar 文件名，例如 `meta.json`。
+- `reference_label_path`：人工标签的 dotted path，例如 `metadata.label` 或
+  `reference_annotations.label`。
+- `reference_note_path`：可选人工备注路径。
+- `reference_label_map`：原始标签到训练标签的显式映射。
+- `allow_reference_correction=True`：默认保留人工标签；只有模型声明 `correct` 并提供
+  非空纠错原因和具体视觉证据时才采用新标签。纠错审计不进入训练 JSONL。
+
+共享运行时会把严格 Schema 传给 VLM，并兼容响应整体为单个
+```` ```json ... ``` ```` 或 ```` ``` ... ``` ```` 代码块。Pipeline 不得自行增加
+JSON fence 解析、响应修复或日志逻辑。
+
 执行配置：
 
 - `batch_size=8`：失败时整个未提交 batch 重跑；设为 1 可获得逐条恢复。

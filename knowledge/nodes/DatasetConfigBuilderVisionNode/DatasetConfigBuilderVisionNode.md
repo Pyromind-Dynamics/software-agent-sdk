@@ -12,7 +12,7 @@
 |------|---------|------|------|
 | system_prompt_field | STRING | 否 | system prompt 字段名。默认值：空字符串 |
 | user_prompt_field | STRING | 否 | user prompt 字段名。默认值：空字符串 |
-| image_field | STRING | 否 | 图片字段名。默认值：空字符串 |
+| image_field | STRING | 是 | 图片字段名。默认值：空字符串 |
 | assistant_response_field | STRING | 否 | 助手回复 / ground-truth 字段名。默认值：`gt` |
 | rejected_field | STRING | 否 | 拒绝回复 / rejected messages 字段名。默认值：`rejected_answer` |
 ## 1.3 输出类型

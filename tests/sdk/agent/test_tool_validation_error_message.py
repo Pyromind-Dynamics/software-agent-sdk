@@ -2,7 +2,7 @@
 
 import json
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Any, Self
 from unittest.mock import patch
 
 from litellm import ChatCompletionMessageToolCall
@@ -61,6 +61,12 @@ class ValidationTestTool(
     """Tool for testing validation error messages."""
 
     name = "validation_test_tool"
+
+    def normalize_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        normalized = arguments.copy()
+        if "legacy_command" in normalized:
+            normalized["command"] = normalized.pop("legacy_command")
+        return normalized
 
     @classmethod
     def create(cls, conv_state: "ConversationState | None" = None) -> Sequence[Self]:
@@ -247,6 +253,37 @@ def _mock_llm_response_factory(tool_args: str):
         )
 
     return mock_llm_response
+
+
+def test_tool_argument_normalization_is_persisted_in_action_event():
+    llm = LLM(
+        usage_id="test-llm",
+        model="test-model",
+        api_key=SecretStr("test-key"),
+        base_url="http://test",
+    )
+    agent = Agent(llm=llm, tools=[Tool(name="ValidationTestTool")])
+    collected_events = []
+    conversation = Conversation(agent=agent, callbacks=[collected_events.append])
+
+    with patch(
+        "openhands.sdk.llm.llm.litellm_completion",
+        side_effect=_mock_llm_response_factory('{"legacy_command": "view"}'),
+    ):
+        conversation.send_message(
+            Message(role="user", content=[TextContent(text="Do something")])
+        )
+        agent.step(conversation, on_event=collected_events.append)
+
+    action_events = [
+        event
+        for event in collected_events
+        if isinstance(event, ActionEvent) and event.action is not None
+    ]
+    assert len(action_events) == 1
+    assert isinstance(action_events[0].action, ValidationTestAction)
+    assert action_events[0].action.command == "view"
+    assert json.loads(action_events[0].tool_call.arguments) == {"command": "view"}
 
 
 def test_tool_call_without_security_risk_succeeds():
