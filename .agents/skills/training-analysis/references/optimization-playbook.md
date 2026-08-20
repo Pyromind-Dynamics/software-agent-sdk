@@ -1,8 +1,7 @@
 # 优化手册:异常 → 机制 → 探针实验
 
 按 `analysis-methodology.md` 的四阶段,把常见异常映射到候选机制与可操作的单变量
-探针实验。每行探针实验可直接交给 `generate-workflow-dsl` 的
-`references/parameter-decision.md` 落参数。
+探针实验。每行探针实验可直接交给 `generate-workflow-dsl` 整组落参数。
 
 ## 异常 → 候选机制
 

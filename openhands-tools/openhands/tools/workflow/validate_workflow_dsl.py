@@ -19,6 +19,9 @@ from openhands.sdk.tool.tool import (
     ToolDefinition,
     ToolExecutor,
 )
+from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
+
+
 if TYPE_CHECKING:
     from openhands.sdk.conversation.base import BaseConversation
     from openhands.sdk.conversation.state import ConversationState
@@ -129,10 +132,10 @@ class ValidateWorkflowDslAction(Action):
     dsl_path: str | None = Field(
         default=None,
         description=(
-            "Workspace-relative path to the Pyromind workflow Python DSL file. "
-            "Use `public_data/workflow_canvas/workflow.py` for the canonical "
-            "conversation workflow. Absolute paths, parent traversal, and "
-            "symlinks are rejected."
+            "Optional workspace-relative path to the Pyromind workflow Python DSL "
+            f"file. Defaults to `{WORKFLOW_RELATIVE_PATH}`, the canonical "
+            "conversation workflow, so omit it unless validating another file. "
+            "Absolute paths, parent traversal, and symlinks are rejected."
         ),
     )
     # Kept out of the generated tool schema. This only allows persisted legacy
@@ -143,8 +146,8 @@ class ValidateWorkflowDslAction(Action):
 
     @model_validator(mode="after")
     def validate_source(self) -> "ValidateWorkflowDslAction":
-        if (self.dsl_path is None) == (self.dsl is None):
-            raise ValueError("exactly one of dsl_path or legacy dsl must be provided")
+        if self.dsl_path is not None and self.dsl is not None:
+            raise ValueError("pass at most one of dsl_path or legacy dsl")
         return self
 
     @property
@@ -383,9 +386,7 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
     ) -> str:
         if action.dsl is not None:
             return action.dsl
-        dsl_path = action.dsl_path
-        if dsl_path is None:
-            raise ValueError("dsl_path is required")
+        dsl_path = action.dsl_path or WORKFLOW_RELATIVE_PATH
         if conversation is None:
             raise ValueError(
                 "Cannot read a workflow DSL path without an active conversation "

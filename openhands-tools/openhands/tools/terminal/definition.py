@@ -300,6 +300,7 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
         terminal_type: Literal["tmux", "subprocess", "powershell"] | None = None,
         shell_path: str | None = None,
         sandbox_mode: TerminalSandboxMode | None = None,
+        reset_cwd_each_command: bool = False,
         executor: ToolExecutor | None = None,
     ) -> Sequence["TerminalTool"]:
         """Initialize TerminalTool with executor parameters.
@@ -320,6 +321,9 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
                        PowerShell executable.
             sandbox_mode: Optional filesystem sandbox mode for the terminal
                        executor. If omitted, the configured default is used.
+            reset_cwd_each_command: Enter the workspace root before every new
+                       command so the shell's current directory never drifts
+                       between calls.
         """
         # Import here to avoid circular imports
         from openhands.tools.terminal.impl import TerminalExecutor
@@ -364,6 +368,7 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
                 sandbox_mode=sandbox_mode,
                 sandbox_read_only_paths=sandbox_read_only_paths,
                 sandbox_read_write_paths=sandbox_read_write_paths,
+                reset_cwd_each_command=reset_cwd_each_command,
             )
 
         tool_description = (

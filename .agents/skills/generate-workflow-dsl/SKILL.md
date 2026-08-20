@@ -33,9 +33,8 @@ description: >-
 |---|---|
 | `references/data-routing.md` | 判断数据源、preview 结果、训练格式、字段映射或训练类型 |
 | `references/workflow-contracts.md` | 完整生成或组合阶段时查拓扑、节点参数、端口、枚举和平台覆盖项 |
-| `references/parameter-decision.md` | 训练数值参数的整组决策或训练 OOM 调整 |
 | `references/custom-python-assets.md` | 内置 Metrics/Reward 不适用，需要生成、上传并回填 Python 入口 |
-| 其他 Skill: `training-analysis` | 分析已有训练效果（loss 异常/对比/优化超参）时，先调该 skill 产出报告与探针实验，再按 `parameter-decision.md` 落参数 |
+| 其他 Skill: `training-analysis` | 分析已有训练效果（loss 异常/对比/优化超参）时，先调该 skill 产出报告与探针实验，再整组落参数 |
 
 调用格式为 `skills_read(skill_name="generate-workflow-dsl", path="references/...")`。
 
@@ -95,10 +94,11 @@ description: >-
 
 ### 5. 整组配参
 
-阶段锁定后，需要自动决定或调整训练数值时读取 `parameter-decision.md`，一次性确定 max sequence length、
-batch、grad accumulation、learning rate、epoch、LoRA rank、max steps 和 num generations。
+阶段锁定后，结合数据规模、P95 长度、模型规模和可用资源，一次性整组决定 max sequence length、
+batch、grad accumulation、learning rate、epoch、LoRA rank 和 GRPO 的 max steps、num generations
+与生成长度。平台默认值与 DSL 字段约束以 `workflow-contracts.md` 为准，其余调参自行推理。
 
-参数优先级：**用户明确要求 > 修改任务中已有有效值 > 数据与资源决策 > 模板兜底值**。
+参数优先级：**用户明确要求 > 修改任务中已有有效值 > 数据与资源决策 > 模型兜底**。
 不要只改一个相互依赖参数，也不要用模板覆盖无关配置。
 
 ### 6. 准备自定义资产
@@ -118,8 +118,7 @@ batch、grad accumulation、learning rate、epoch、LoRA rank、max steps 和 nu
 
 ### 8. 校验闭环
 
-每次写入后立即调用
-`validate_workflow_dsl(dsl_path="public_data/workflow_canvas/workflow.py")`；不要传 DSL 全文：
+每次写入后立即调用 `validate_workflow_dsl()`（缺省即校验工作区 `workflow.py`）；不要传 DSL 全文：
 
 1. `valid=true`：结束；warnings 只在最终回复简述。
 2. `valid=false`：按 `code`、`node_id`、`field` 和 `detail.*_node_code` 做唯一片段最小修改。

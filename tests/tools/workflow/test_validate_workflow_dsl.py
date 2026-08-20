@@ -253,6 +253,33 @@ def test_validate_workflow_dsl_reads_workflow_file_when_dsl_omitted(
     }
 
 
+def test_validate_workflow_dsl_defaults_to_canonical_workflow_path(
+    monkeypatch, tmp_path
+):
+    calls: dict[str, Any] = {}
+
+    def fake_post(url, *, headers, json, timeout):
+        calls["json"] = json
+        return _valid_response()
+
+    (tmp_path / "public_data" / "workflow_canvas").mkdir(parents=True)
+    (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").write_text(
+        "# workflow: default-path\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    observation = ValidateWorkflowDslExecutor()(
+        ValidateWorkflowDslAction(),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert not observation.is_error
+    assert calls["json"] == {
+        "name": "workflow",
+        "dsl": "# workflow: default-path\n",
+    }
+
+
 def test_validate_workflow_dsl_reports_missing_workflow_file(monkeypatch, tmp_path):
     def fake_post(url, *, headers, json, timeout):
         raise AssertionError("validation API should not be called")

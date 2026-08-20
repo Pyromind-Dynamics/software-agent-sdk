@@ -163,13 +163,13 @@ def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
         working_dir="workspace/conversations/test",
     )
 
-    assert "Immediately after that single workflow read" in rendered
-    assert "Then read only the exact `references/` resource" in rendered
+    assert "Then invoke the matching listed skill" in rendered
+    assert "read only the exact `references/`\n  resource" in rendered
     assert "then `skills_read` only\n  for `SKILL.md`, `references/**`" in rendered
     assert "Treat `scripts/` as executable helpers" in rendered
     assert "Do not read, grep, or summarize\n  `scripts/` source" in rendered
     assert (
-        "do not inspect general `knowledge/` before invoking the\n  skill" in rendered
+        "do not inspect\n  general `knowledge/` before invoking the skill" in rendered
     )
     assert "Treat any requested node, model, parameter" in rendered
     assert "do not\n  invoke `debug-workflow` or `workflow_debug`" in rendered
@@ -177,15 +177,13 @@ def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
     assert "Use dedicated platform tools for preview/upload" in rendered
     assert "never use the local terminal as a substitute" in rendered
     assert "`public_data/` is the writable area" in rendered
-    assert "do not follow terminal cwd" in rendered
-    assert "every created file must use a `public_data/...` path" in rendered
+    assert "every path you write or read starts with `public_data/`" in rendered
     assert "It accepts only the `patch` argument" in rendered
     assert "never pass a separate `path` argument" in rendered
     assert "The separate `file_editor` tool does accept `path`" in rendered
-    assert "terminal session starts at the conversation root" in rendered
-    assert "Make its first command\n`cd public_data`" in rendered
-    assert "reuse the persistent shell's current directory" in rendered
-    assert "conversation-local auxiliary files" in rendered
+    assert "Each terminal call also starts at the conversation root" in rendered
+    assert "never rely on a `cd`" in rendered
+    assert "conversation-local auxiliary" in rendered
     assert "Do not consult `knowledge/` before validation" in rendered
     assert "Whenever a direct question or an intermediate step requires" in rendered
     assert "The parent must not inspect those documents" in rendered
@@ -676,7 +674,7 @@ async def test_pyromind_conversation_initial_message_saves_workflow_snapshot(
     reminder = service.event_service.extended_content[0]
     assert isinstance(reminder, TextContent)
     assert "workflow.py" in reminder.text
-    assert "Read the full file with file_editor" in reminder.text
+    assert "read the full file with " in reminder.text
 
 
 @pytest.mark.asyncio
@@ -704,6 +702,30 @@ async def test_pyromind_conversation_initial_message_marks_empty_canvas(tmp_path
     assert isinstance(reminder, TextContent)
     assert "current canvas is empty" in reminder.text
     assert "invoke the matching skill immediately" in reminder.text
+
+
+@pytest.mark.asyncio
+async def test_pyromind_conversation_reminds_when_no_canvas_attached(tmp_path):
+    """Clients without a canvas still get the workflow-state reminder."""
+    service = _FakeConversationService(tmp_path / "conversations")
+    response = Response()
+
+    await create_pyromind_conversation(
+        _make_request(),
+        PyromindCreateConversationRequest(
+            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            message="直接生成评测工作流",
+            extra={"skills_path": str(tmp_path / "missing-skills")},
+        ),
+        response,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert service.event_service.workflow_xyflow_snapshot is None
+    assert service.event_service.extended_content is not None
+    reminder = service.event_service.extended_content[0]
+    assert isinstance(reminder, TextContent)
+    assert "workflow.py does not exist" in reminder.text
 
 
 def test_workflow_dsl_from_xyflow_treats_empty_xyflow_as_empty_canvas():

@@ -2,17 +2,15 @@
 
 UNIX_TOOL_DESCRIPTION = "\n".join(
     [
-        "Runs a shell command in one persistent session and returns its output.",
-        "The next command starts in the cwd reported by the previous observation.",
-        "Do not repeat the same relative `cd`; use the reported cwd as current state.",
+        "Runs a shell command and returns its output.",
+        "Execute a shell command in the terminal within a persistent shell session.",
         "",
         "",
         "### Command Execution",
         "* One command at a time: You can only execute one shell command at a time.",
         "  If you need to run multiple commands sequentially, use `&&` or `;`.",
         "* Persistent session: Environment variables, virtual environments, and",
-        "  working directory changes persist across commands. A command starts in",
-        "  the previous observation's reported cwd unless the terminal is reset.",
+        "  working directory changes persist across commands.",
         "* Soft timeout: Commands pause for confirmation after 10 seconds without",
         "  new output unless you provide a longer `timeout`.",
         "* Shell options: Do NOT use `set -e`, `set -eu`, or `set -euo pipefail`.",
@@ -48,17 +46,18 @@ UNIX_TOOL_DESCRIPTION = "\n".join(
 
 WINDOWS_TOOL_DESCRIPTION = "\n".join(
     [
-        "Runs a PowerShell command in one persistent session and returns its output.",
-        "The next command starts in the cwd reported by the previous observation.",
-        "Do not repeat the same relative `cd`; use the reported cwd as current state.",
+        "Runs a shell command and returns its output.",
+        (
+            "Execute a shell command in the terminal within a persistent "
+            "PowerShell session."
+        ),
         "",
         "",
         "### Command Execution",
         "* One command at a time: You can only execute one PowerShell command at a",
         "  time. If you need multiple commands, prefer `;` to chain them.",
         "* Persistent session: Environment variables, modules, and working",
-        "  directory changes persist across commands. A command starts in the",
-        "  previous observation's reported cwd unless the terminal is reset.",
+        "  directory changes persist across commands.",
         "* Soft timeout: Commands pause for confirmation after 10 seconds without",
         "  new output unless you provide a longer `timeout`.",
         "* PowerShell syntax: Prefer native cmdlets such as `Get-ChildItem` or",
