@@ -26,7 +26,10 @@ from openhands.sdk.tool.tool import (
     ToolDefinition,
     ToolExecutor,
 )
-from openhands.tools.utils.pyromind_api_client import _build_access_key_request_headers
+from openhands.tools.utils.pyromind_api_client import (
+    _build_access_key_request_headers,
+    decompress_gzip_base64_data,
+)
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
@@ -544,6 +547,7 @@ class AnalyzeTaskFailureExecutor(
                     "node_type": None,
                     "include_source": True,
                     "max_source_lines": source_lines,
+                    "compressed": True,
                 },
                 headers=headers,
                 timeout=self._timeout,
@@ -559,6 +563,11 @@ class AnalyzeTaskFailureExecutor(
         if not isinstance(payload, dict) or payload.get("success") is not True:
             return None
         data = payload.get("data")
+        if isinstance(data, str):
+            try:
+                data = decompress_gzip_base64_data(data)
+            except Exception:
+                return None
         if not isinstance(data, dict):
             return None
         entry = data.get(node_type)

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import gzip
+import json
 from pathlib import Path
 from typing import Any, cast
 
@@ -597,10 +600,45 @@ def test_include_source_fetches_operator_source(monkeypatch):
         "node_type": None,
         "include_source": True,
         "max_source_lines": 200,
+        "compressed": True,
     }
     assert post_calls[0][2]["auth_token"] == "token-123"
     # Source block is rendered into the observation text.
     assert "operator source" in observation.text
+
+
+def test_include_source_decompresses_gzip_base64_payload(monkeypatch):
+    routes = {
+        "task_workflow_result": _Response(200, _task_result_payload()),
+        "logs/node/raw": _Response(
+            200, _log_payload(["Traceback", "RuntimeError: boom"])
+        ),
+    }
+    _install_router(monkeypatch, routes)
+    data = {
+        "ModelTrainSFTNode": {
+            "success": True,
+            "data": {"source_code": "def train(...):\n    pass"},
+        }
+    }
+    compressed = base64.b64encode(
+        gzip.compress(json.dumps(data).encode("utf-8"))
+    ).decode("ascii")
+
+    def fake_post(url, *, json, headers, timeout):
+        return _Response(200, {"success": True, "data": compressed})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    registry = _cookie_registry()
+    registry.update_secrets({"auth_token": StaticSecret(value=SecretStr("token-123"))})
+    conversation = cast(Any, _fake_conversation(secret_registry=registry))
+
+    observation = AnalyzeTaskFailureExecutor()(
+        AnalyzeTaskFailureAction(task_id="7758"), conversation
+    )
+
+    assert not observation.is_error
+    assert observation.node_sources["1"] == "def train(...):\n    pass"
 
 
 def test_include_source_false_skips_source_fetch(monkeypatch):

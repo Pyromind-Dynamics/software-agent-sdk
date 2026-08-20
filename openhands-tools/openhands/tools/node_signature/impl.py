@@ -18,6 +18,7 @@ from openhands.tools.node_signature.definition import (
 )
 from openhands.tools.utils.pyromind_api_client import (
     _build_access_key_request_headers,
+    decompress_gzip_base64_data,
 )
 
 
@@ -123,6 +124,7 @@ class NodeSignatureExecutor(
                     "node_type": node_type,
                     "include_source": include_source,
                     "max_source_lines": 300,
+                    "compressed": True,
                 },
                 headers=headers,
                 timeout=60,
@@ -137,6 +139,14 @@ class NodeSignatureExecutor(
                 )
 
             entries = payload.get("data", {})
+            if isinstance(entries, str):
+                entries = decompress_gzip_base64_data(entries)
+            if not isinstance(entries, dict):
+                return NodeSignatureObservation(
+                    status="error",
+                    node_name=node_names[0],
+                    error_message="Unexpected signature response payload.",
+                )
             results: list[dict] = []
             all_ok = True
             for name in node_names:
