@@ -35,6 +35,14 @@ from openhands.tools.terminal.sandbox import (
     TerminalSandboxMode,
     parse_memory_limit,
 )
+from openhands.tools.terminal.session_memory_guard import (
+    MARKER_ENV,
+    SessionMemoryGuard,
+    new_session_marker,
+    procfs_root,
+    session_memory_limit_bytes,
+    session_memory_monitor_enabled,
+)
 from openhands.tools.terminal.terminal import TerminalInterface
 from openhands.tools.terminal.terminal.interface import parse_ctrl_key
 
@@ -165,6 +173,9 @@ class SubprocessTerminal(TerminalInterface):
             read_only_paths=read_only_paths,
             read_write_paths=read_write_paths,
         )
+        self.session_marker = new_session_marker()
+        self.memory_guard: SessionMemoryGuard | None = None
+        self._terminated_by_memory_guard = False
 
     # ------------------------- Lifecycle -------------------------
 
@@ -269,8 +280,14 @@ class SubprocessTerminal(TerminalInterface):
             '[ "$map" != "4294967295" ] '
             f"&& ulimit -u {_sandbox_nproc_limit()} 2>/dev/null; "
         )
+        # Max out the OOM score so, if the pod ever hits its kubelet memory
+        # limit, the kernel prefers killing sandbox shells over the server.
+        # Raising one's own score needs no privilege and children inherit it.
         init_cmd = (
-            nproc_guard + f"ulimit -v {_sandbox_vmem_kb()} 2>/dev/null; "
+            "echo 1000 > /proc/self/oom_score_adj 2>/dev/null; "
+            + nproc_guard
+            + f"ulimit -v {_sandbox_vmem_kb()} 2>/dev/null; "
+            + f"export {MARKER_ENV}={self.session_marker}; "
             "set +H; "
             f"export PROMPT_COMMAND='export PS1=\"{self.PS1}\"'; "
             f'export PS2=""; cd -- {work_dir}'
@@ -293,6 +310,13 @@ class SubprocessTerminal(TerminalInterface):
             attached,
         )
 
+        if session_memory_monitor_enabled() and os.path.isdir(procfs_root()):
+            self.memory_guard = SessionMemoryGuard(
+                marker=self.session_marker,
+                on_exceed=self._on_sandbox_memory_exceeded,
+            )
+            self.memory_guard.start()
+
         self.clear_screen()
 
         logger.debug("PTY terminal initialized with work dir: %s", self.work_dir)
@@ -301,6 +325,9 @@ class SubprocessTerminal(TerminalInterface):
         """Clean up the PTY terminal."""
         if self._closed:
             return
+
+        if self.memory_guard is not None:
+            self.memory_guard.stop()
 
         try:
             if self.process:
@@ -335,6 +362,25 @@ class SubprocessTerminal(TerminalInterface):
             self.process = None
             self.sandbox.cleanup()
             self._closed: bool = True
+
+    def _on_sandbox_memory_exceeded(self, pids: list[int]) -> None:
+        """SIGKILL every sandbox process once the session RSS exceeds its cap."""
+        self._terminated_by_memory_guard = True
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        if self.process is not None:
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        logger.warning(
+            "sandbox memory guard terminated session %s (%d process(es))",
+            self.session_marker[:8],
+            len(pids),
+        )
 
     # ------------------------- I/O Core -------------------------
 
@@ -475,6 +521,14 @@ class SubprocessTerminal(TerminalInterface):
         """
         if not self._initialized:
             raise RuntimeError("PTY terminal is not initialized")
+
+        if self._terminated_by_memory_guard:
+            limit_mib = session_memory_limit_bytes() // 1024**2
+            raise RuntimeError(
+                "The sandbox session exceeded its memory cap "
+                f"({limit_mib} MiB of summed process RSS) and was terminated. "
+                "Send `reset=true` to start a fresh terminal session."
+            )
 
         upper = text.upper().strip()
         payload: bytes | None = None
