@@ -22,16 +22,15 @@ from openhands.tools.data_preparation.definition import (
     DfRunPipelineExecutor,
 )
 from openhands.tools.data_preparation.runner import (
+    DEFAULT_DATAFLOW_API_BASE_URL,
+    DEFAULT_DATAFLOW_MODEL_NAME,
     build_dataflow_env,
     openai_compatible_model_name,
+    preflight_dataflow_llm,
     run_dataflow_python,
     runtime_public_names,
     summarize_dataflow_env,
     validate_managed_image_pipeline,
-)
-from openhands.tools.utils.dataflow_config import (
-    DEFAULT_DATAFLOW_API_BASE_URL,
-    DEFAULT_DATAFLOW_MODEL_NAME,
 )
 
 
@@ -65,6 +64,163 @@ def test_openai_compatible_model_name() -> None:
         openai_compatible_model_name("openrouter/anthropic/claude-3-5-sonnet")
         == "anthropic/claude-3-5-sonnet"
     )
+    assert openai_compatible_model_name("openrouter/google/gemma-4-31b-it") == (
+        "google/gemma-4-31b-it"
+    )
+    # Vendor-prefixed native IDs (no LiteLLM provider prefix) must be preserved.
+    assert openai_compatible_model_name("google/gemma-4-31b-it") == (
+        "google/gemma-4-31b-it"
+    )
+    assert openai_compatible_model_name("anthropic/claude-opus-4.5") == (
+        "claude-opus-4.5"
+    )
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    ["router", "{{model}}", "{model}", "<model>", "${MODEL_NAME}", "x{{y}}"],
+)
+def test_build_dataflow_env_rejects_unsubstituted_placeholder_model(
+    monkeypatch,
+    placeholder: str,
+) -> None:
+    monkeypatch.setenv("DF_API_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("DF_MODEL_NAME", placeholder)
+
+    with pytest.raises(ValueError, match="unsubstituted placeholder"):
+        build_dataflow_env(_conversation_with_llm())
+
+
+def test_build_dataflow_env_empty_model_falls_back_to_default(monkeypatch) -> None:
+    for name in ("DF_MODEL_NAME", "DF_API_BASE_URL", "DF_API_URL"):
+        monkeypatch.delenv(name, raising=False)
+
+    env = build_dataflow_env(_conversation_with_llm(base_url="https://x.example"))
+
+    assert env["DF_MODEL_NAME"] == DEFAULT_DATAFLOW_MODEL_NAME
+
+
+def test_build_dataflow_env_text_profile_rejects_placeholder_llm_model(
+    monkeypatch,
+) -> None:
+    """Text profile takes the model from the conversation LLM, so a routing
+    placeholder there (e.g. ``router``) must be caught even when the process
+    env names a real model."""
+    for name in ("DF_API_KEY", "DF_MODEL_NAME", "DF_API_BASE_URL", "DF_API_URL"):
+        monkeypatch.delenv(name, raising=False)
+    conversation = _conversation_with_llm()
+    conversation.state.agent.llm.model = "router"
+
+    with pytest.raises(ValueError, match="unsubstituted placeholder"):
+        build_dataflow_env(conversation, "text")
+
+
+class _FakePreflightResponse:
+    def __init__(self, status_code: int, text: str, content_type: str) -> None:
+        self.status_code = status_code
+        self.text = text
+        self.headers = {"content-type": content_type}
+
+
+def test_preflight_passes_on_200(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.runner.httpx.post",
+        lambda *args, **kwargs: _FakePreflightResponse(
+            200, '{"choices": [{"message": {"content": "p"}}]}', "application/json"
+        ),
+    )
+
+    preflight_dataflow_llm(
+        {
+            "DF_API_URL": "https://openrouter.ai/api/v1/chat/completions",
+            "DF_MODEL_NAME": "google/gemma-4-31b-it",
+        }
+    )
+
+
+def test_preflight_rejects_unknown_model(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.runner.httpx.post",
+        lambda *args, **kwargs: _FakePreflightResponse(
+            404,
+            '{"error": {"message": "No endpoints found for router"}}',
+            "application/json",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="rejected model 'router'"):
+        preflight_dataflow_llm(
+            {
+                "DF_API_URL": "https://openrouter.ai/api/v1/chat/completions",
+                "DF_MODEL_NAME": "router",
+            }
+        )
+
+
+def test_preflight_detects_html_endpoint_hit(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.runner.httpx.post",
+        lambda *args, **kwargs: _FakePreflightResponse(
+            200, "<html><body>home</body></html>", "text/html; charset=utf-8"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="non-JSON"):
+        preflight_dataflow_llm(
+            {
+                "DF_API_URL": "https://openrouter.ai/api/v1",
+                "DF_MODEL_NAME": "google/gemma-4-31b-it",
+            }
+        )
+
+
+def test_preflight_reports_auth_failure(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.runner.httpx.post",
+        lambda *args, **kwargs: _FakePreflightResponse(
+            401, '{"error": "unauthorized"}', "application/json"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="auth failed"):
+        preflight_dataflow_llm(
+            {
+                "DF_API_URL": "https://openrouter.ai/api/v1/chat/completions",
+                "DF_MODEL_NAME": "google/gemma-4-31b-it",
+            }
+        )
+
+
+def test_preflight_can_be_skipped(monkeypatch) -> None:
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.runner.httpx.post",
+        lambda *args, **kwargs: pytest.fail("preflight should be skipped"),
+    )
+
+    preflight_dataflow_llm(
+        {
+            "DF_API_URL": "https://openrouter.ai/api/v1/chat/completions",
+            "DF_MODEL_NAME": "google/gemma-4-31b-it",
+        }
+    )
+
+
+def test_preflight_reports_connection_failure(monkeypatch) -> None:
+    import httpx as _httpx
+
+    def _raise(*args, **kwargs):
+        raise _httpx.ConnectError("unreachable")
+
+    monkeypatch.setattr("openhands.tools.data_preparation.runner.httpx.post", _raise)
+
+    with pytest.raises(ValueError, match="could not reach"):
+        preflight_dataflow_llm(
+            {
+                "DF_API_URL": "https://openrouter.ai/api/v1/chat/completions",
+                "DF_MODEL_NAME": "google/gemma-4-31b-it",
+            }
+        )
 
 
 def _conversation_with_llm(base_url: str | None = "https://example.com/v1/") -> Any:
@@ -237,7 +393,9 @@ def test_run_dataflow_python_redacts_api_key(tmp_path: Path) -> None:
 
 def test_df_run_pipeline_validates_output_and_writes_local_report(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
     pipeline_dir = tmp_path / "public_data" / "data-preparation"
     pipeline_dir.mkdir(parents=True)
     pipeline = pipeline_dir / "pipeline.py"
@@ -311,7 +469,9 @@ def test_df_run_pipeline_validates_output_and_writes_local_report(
 
 def test_df_run_pipeline_validates_dpo_output(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
     pipeline_dir = tmp_path / "public_data" / "data-preparation"
     pipeline_dir.mkdir(parents=True)
     pipeline = pipeline_dir / "pipeline.py"
@@ -374,7 +534,9 @@ def test_df_run_pipeline_validates_dpo_output(
 
 def test_df_run_pipeline_rejects_handwritten_vision_transport(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
     pipeline_dir = tmp_path / "public_data" / "data-preparation"
     pipeline_dir.mkdir(parents=True)
     (pipeline_dir / "pipeline.py").write_text(

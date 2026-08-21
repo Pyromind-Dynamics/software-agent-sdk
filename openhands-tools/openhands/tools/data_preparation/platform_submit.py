@@ -32,8 +32,13 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.data_preparation.runner import (
+    ENV_DF_API_BASE_URL,
+    ENV_DF_API_KEY,
+    ENV_DF_API_URL,
+    ENV_DF_MODEL_NAME,
     SUPPORTED_DATAFLOW_VERSION,
     build_dataflow_env,
+    preflight_dataflow_llm,
     runtime_bundle_fingerprint,
     runtime_public_names,
     validate_managed_image_pipeline,
@@ -46,12 +51,6 @@ from openhands.tools.pyromind_dataset.definition import (
     _resolve_conversation_headers,
     _resolve_secret_headers,
     upload_local_file_to_pyromind,
-)
-from openhands.tools.utils.dataflow_config import (
-    ENV_DF_API_BASE_URL,
-    ENV_DF_API_KEY,
-    ENV_DF_API_URL,
-    ENV_DF_MODEL_NAME,
 )
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
@@ -589,6 +588,7 @@ class DfSubmitPipelineExecutor(
                     self._preflight_managed_image_pipeline(Path(script_path))
                 changed_dimensions = []
 
+            preflight_dataflow_llm(llm_env)
             command = _build_dataflow_command(
                 input_path=input_path,
                 output_dir=output_dir,

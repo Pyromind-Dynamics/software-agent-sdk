@@ -23,7 +23,7 @@ from openhands.tools.data_preparation.platform_submit import (
     _normalize_storage_path,
     _pod_path,
 )
-from openhands.tools.utils.dataflow_config import DEFAULT_DATAFLOW_API_URL
+from openhands.tools.data_preparation.runner import DEFAULT_DATAFLOW_API_URL
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +393,7 @@ def test_executor_submit_failure_omits_progress_fields(
 ) -> None:
     """A failed submission must not leak run/output dirs that would make the
     frontend render a live progress panel for a task that never exists."""
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
     executor = _make_executor(tmp_path)
     script = tmp_path / "pipeline.py"
     script.write_text("print('hi')")
@@ -445,6 +446,7 @@ def test_executor_missing_node_fails_before_upload(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
     executor = _make_executor(tmp_path)
     script = tmp_path / "pipeline.py"
     script.write_text("print('hi')")
@@ -589,6 +591,7 @@ def test_compatible_resume_accepts_agent_assessment(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
     executor = _make_executor(tmp_path)
     original = tmp_path / "original.py"
     original.write_text("print('old')")
@@ -654,6 +657,7 @@ def test_new_full_run_uses_conversation_scoped_output_root(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
     executor = _make_executor(tmp_path)
     script = tmp_path / "pipeline.py"
     script.write_text("print('hi')")
@@ -707,4 +711,51 @@ def test_new_full_run_uses_conversation_scoped_output_root(
         "kind": "data_preparation",
         "status": "Pending",
     }
+
+
+def test_submit_rejects_placeholder_model_before_platform_submit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """A broken DF_MODEL_NAME must fail locally instead of burning a platform
+    run where every batch item would 404."""
+    monkeypatch.setenv("DF_API_KEY", "sk-test")
+    monkeypatch.setenv("DF_API_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("DF_MODEL_NAME", "router")
+    executor = _make_executor(tmp_path)
+    script = tmp_path / "pipeline.py"
+    script.write_text("print('hi')")
+    conversation = _make_conversation_with_llm()
+    conversation.id = "conv-1"
+    conversation.workspace = MagicMock()
+    conversation.workspace.working_dir = str(tmp_path / "conversation")
+    monkeypatch.setattr(
+        executor,
+        "_stage_runtime_files",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_stage_script",
+        lambda *args, **kwargs: None,
+    )
+    submit = MagicMock()
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.submit_workflow_task",
+        submit,
+    )
+
+    observation = executor(
+        DfSubmitPipelineAction(
+            script_path=str(script),
+            input_path="/data/in.jsonl",
+            output_schema="vision",
+            model_profile="vision",
+        ),
+        conversation=conversation,
+    )
+
+    assert observation.is_error
+    assert "unsubstituted placeholder" in observation.text
+    submit.assert_not_called()
     conversation.send_agent_message.assert_not_called()

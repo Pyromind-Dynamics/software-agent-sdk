@@ -40,6 +40,7 @@ from openhands.tools.data_preparation.runner import (
     build_dataflow_env,
     check_dataflow_installed,
     check_dataflow_version,
+    preflight_dataflow_llm,
     resolve_dataflow_python,
     run_dataflow_python,
     runtime_bundle_fingerprint,
@@ -608,6 +609,13 @@ class DfRunPipelineExecutor(ToolExecutor):
         except ValueError as exc:
             return DfRunPipelineObservation.from_text(
                 text=f"Invalid DataFlow model configuration: {exc}",
+                is_error=True,
+            )
+        try:
+            preflight_dataflow_llm(env_extra)
+        except ValueError as exc:
+            return DfRunPipelineObservation.from_text(
+                text=f"DataFlow LLM preflight failed: {exc}",
                 is_error=True,
             )
         process_args = list(action.args)
