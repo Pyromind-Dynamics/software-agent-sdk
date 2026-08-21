@@ -23,6 +23,7 @@ from openhands.tools.data_preparation.platform_submit import (
     _normalize_storage_path,
     _pod_path,
 )
+from openhands.tools.utils.dataflow_config import DEFAULT_DATAFLOW_API_URL
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +215,7 @@ def test_build_llm_env_no_key() -> None:
 def test_build_llm_env_no_base_url() -> None:
     conv = _make_conversation_with_llm(base_url=None)
     env = _build_llm_env(conv)
-    assert env["DF_API_URL"] == ("https://api.openai.com/v1/chat/completions")
+    assert env["DF_API_URL"] == DEFAULT_DATAFLOW_API_URL
 
 
 def test_build_llm_env_model_no_prefix() -> None:

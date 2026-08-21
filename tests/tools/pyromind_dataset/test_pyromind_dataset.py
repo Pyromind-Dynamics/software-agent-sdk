@@ -27,7 +27,10 @@ from openhands.tools.pyromind_dataset.definition import (
     _vision_api_config,
     download_file_from_pyromind,
 )
-from openhands.tools.utils.dataflow_config import DEFAULT_DATAFLOW_MODEL_NAME
+from openhands.tools.utils.dataflow_config import (
+    DEFAULT_DATAFLOW_API_URL,
+    DEFAULT_DATAFLOW_MODEL_NAME,
+)
 
 
 def test_preview_description_mentions_shared_and_storage() -> None:
@@ -1861,7 +1864,7 @@ def test_vision_api_config_uses_defaults_when_unset(monkeypatch) -> None:
 
     api_url, model, api_key = _vision_api_config()
 
-    assert api_url == "https://api.openai.com/v1/chat/completions"
+    assert api_url == DEFAULT_DATAFLOW_API_URL
     assert model == DEFAULT_DATAFLOW_MODEL_NAME
     assert api_key is None
 

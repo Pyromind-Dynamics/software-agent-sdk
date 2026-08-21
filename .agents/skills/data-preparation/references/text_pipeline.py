@@ -40,6 +40,10 @@ _spec.loader.exec_module(_module)
 APILLMServing_request = _module.APILLMServing_request
 # --- End shim ---
 
+from dataflow_config import (  # noqa: E402
+    DEFAULT_DATAFLOW_API_URL,
+    DEFAULT_DATAFLOW_MODEL_NAME,
+)
 from df_logging import LoggingLLMServing  # noqa: E402
 
 
@@ -143,10 +147,8 @@ def main(input_path: str, output_path: str) -> None:
     # 3. Initialize LLM from environment variables
     #    Wrap with LoggingLLMServing for full call traceability.
     raw_llm = APILLMServing_request(
-        api_url=os.environ.get(
-            "DF_API_URL", "https://api.openai.com/v1/chat/completions"
-        ),
-        model_name=os.environ.get("DF_MODEL_NAME", "gpt-4o-mini"),
+        api_url=os.environ.get("DF_API_URL", DEFAULT_DATAFLOW_API_URL),
+        model_name=os.environ.get("DF_MODEL_NAME", DEFAULT_DATAFLOW_MODEL_NAME),
         key_name_of_api_key="DF_API_KEY",
         temperature=0.0,
         max_workers=8,

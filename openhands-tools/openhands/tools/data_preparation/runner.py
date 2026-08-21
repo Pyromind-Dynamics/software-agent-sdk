@@ -32,6 +32,11 @@ from openhands.tools.utils.dataflow_config import (
 
 SUPPORTED_DATAFLOW_VERSION = "1.0.10"
 
+# Staged runtime module that is the single source of truth for DataFlow LLM
+# env var names and defaults. It lives in the openhands.tools package and is
+# copied into the runtime dir at staging time (see runtime_file_source).
+DATAFLOW_CONFIG_FILENAME = "dataflow_config.py"
+
 _DATAFLOW_CHECK_CACHE: dict[str, tuple[bool, str]] = {}
 _FORBIDDEN_MANAGED_IMAGE_IMPORTS = {
     "base64",
@@ -108,6 +113,22 @@ def check_dataflow_version(
     return True, actual
 
 
+def runtime_file_source(runtime_dir: Path, filename: str) -> Path:
+    """Resolve the canonical source path of a staged DataFlow runtime file.
+
+    ``dataflow_config.py`` lives in the ``openhands.tools`` package (its single
+    source of truth) and is copied from there at stage time; every other
+    runtime helper is read from the skill ``scripts`` directory.
+    """
+
+    if filename == DATAFLOW_CONFIG_FILENAME:
+        import openhands.tools.utils.dataflow_config as df_config
+
+        assert df_config.__file__
+        return Path(df_config.__file__)
+    return runtime_dir / filename
+
+
 def runtime_bundle_fingerprint(
     runtime_dir: Path,
     filenames: Iterable[str],
@@ -116,7 +137,7 @@ def runtime_bundle_fingerprint(
 
     digest = hashlib.sha256()
     for filename in sorted(filenames):
-        path = runtime_dir / filename
+        path = runtime_file_source(runtime_dir, filename)
         if not path.is_file():
             raise ValueError(f"DataFlow runtime file is missing: {path}")
         digest.update(filename.encode("utf-8"))
