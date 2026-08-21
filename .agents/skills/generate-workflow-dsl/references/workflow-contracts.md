@@ -136,4 +136,4 @@ Reward 按 `custom-python-assets.md` 生成、上传并回填 Custom 节点。
 - `WandbConfigBuilderNode.wandb_api_key` 只填 Secret 名，不填 Secret 值。
 - DatasetValidator、DatasetToJsonl、DataPreprocess 不是训练生成默认阶段；格式不合规时停止，
   不自动插入清洗节点。
-- GPU 枚举随平台迭代漂移；生成后以 `validate_workflow_dsl` 的 `ENUM_VALUE_INVALID` 为准回写。
+- GPU 枚举随平台迭代漂移；生成后按 `validate_workflow_dsl` 的 `ENUM_VALUE_INVALID` 修正当前 DSL。

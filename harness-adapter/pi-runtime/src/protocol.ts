@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 1 as const;
+export const PROTOCOL_VERSION = 2 as const;
 export const MAX_FRAME_BYTES = 1024 * 1024;
 
 export type JsonPrimitive = string | number | boolean | null;
@@ -7,9 +7,7 @@ export type JsonObject = { [key: string]: JsonValue };
 
 export type RunnerEventKind =
   | "agent.started"
-  | "agent.completed"
-  | "agent.failed"
-  | "agent.cancelled"
+  | "run.finished"
   | "message.started"
   | "message.delta"
   | "message.completed"
@@ -17,9 +15,16 @@ export type RunnerEventKind =
   | "tool.progress"
   | "tool.completed"
   | "tool.failed"
-  | "usage.updated"
-  | "resource.updated"
-  | "turn.completed";
+  | "usage.updated";
+
+export type RunOutcomeStatus = "completed" | "failed" | "cancelled" | "suspended";
+
+export interface RunOutcome {
+  status: RunOutcomeStatus;
+  stop_reason?: string;
+  error_code?: string;
+  message?: string;
+}
 
 export interface RunnerEvent {
   protocolVersion: typeof PROTOCOL_VERSION;

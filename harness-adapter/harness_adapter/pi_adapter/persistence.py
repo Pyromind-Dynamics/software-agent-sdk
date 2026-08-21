@@ -11,7 +11,7 @@ class PiSessionFiles:
     def __init__(self, conversation_dir: Path) -> None:
         self.directory = conversation_dir / "pi"
         self.session_path = self.directory / "session.json"
-        self.checkpoint_path = self.directory / "checkpoint.json"
+        self.session_log_path = self.directory / "session.jsonl"
         self.inflight_path = self.directory / "inflight.json"
 
     def initialize(self, session: dict[str, Any]) -> None:
@@ -20,17 +20,6 @@ class PiSessionFiles:
 
     def load_session(self) -> dict[str, Any]:
         return _load_object(self.session_path)
-
-    def load_checkpoint(self) -> list[Any]:
-        if not self.checkpoint_path.is_file():
-            return []
-        value = _load_object(self.checkpoint_path).get("transcript", [])
-        if not isinstance(value, list):
-            raise ValueError("Pi checkpoint transcript must be an array")
-        return value
-
-    def save_checkpoint(self, transcript: list[Any]) -> None:
-        _atomic_json(self.checkpoint_path, {"transcript": transcript})
 
     def load_inflight(self) -> dict[str, Any] | None:
         if not self.inflight_path.is_file():

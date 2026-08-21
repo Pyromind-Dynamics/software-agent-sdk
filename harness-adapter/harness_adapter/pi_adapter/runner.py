@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from harness_adapter.pi_adapter.protocol import (
+    MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
     PiProtocolError,
     decode_frame,
@@ -18,6 +19,7 @@ from harness_adapter.pi_adapter.protocol import (
 
 
 logger = logging.getLogger(__name__)
+_STREAM_LIMIT = MAX_FRAME_BYTES + 2
 RequestHandler = Callable[[str, dict[str, Any]], Awaitable[Any]]
 EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
 ExitHandler = Callable[[int | None], Awaitable[None]]
@@ -69,6 +71,7 @@ class PiRunnerProcess:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_runner_environment(),
+            limit=_STREAM_LIMIT,
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())

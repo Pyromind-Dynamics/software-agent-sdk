@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { AgentEvent, AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Usage, UserMessage } from "@earendil-works/pi-ai";
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { PROTOCOL_VERSION, isRecord, type JsonObject, type JsonValue, type RunnerEvent, type RunnerEventKind } from "./protocol.js";
 
 const SECRET = /(^|[_-])(api[_-]?key|authorization|cookie|password|secret|token)($|[_-])/i;
@@ -9,19 +10,15 @@ const MAX_STRING = 64 * 1024;
 export class PiEventNormalizer {
   private messageId: string | undefined;
   private messageRole: "user" | "assistant" | undefined;
-  private terminal: RunnerEventKind | undefined;
-  private readonly toolArguments = new Map<string, { name: string; path?: string }>();
+  private readonly toolArguments = new Map<string, JsonValue>();
 
   constructor(private readonly sessionId: string, private readonly runId: string) {}
 
-  translate(event: AgentEvent, transcript?: unknown): RunnerEvent[] {
+  translate(event: AgentSessionEvent): RunnerEvent[] {
     switch (event.type) {
       case "agent_start": return [this.make("agent.started", {})];
-      case "agent_end":
-        if (this.terminal) return [];
-        this.terminal = "agent.completed";
-        return [this.make("agent.completed", {})];
-      case "turn_end": return [this.make("turn.completed", { transcript: sanitizeJson(transcript ?? []) })];
+      case "agent_end": return [];
+      case "turn_end": return [];
       case "turn_start": return [];
       case "message_start": return this.startMessage(event.message);
       case "message_update":
@@ -29,10 +26,7 @@ export class PiEventNormalizer {
         return [this.make("message.delta", { message_id: this.messageId, text: event.assistantMessageEvent.delta })];
       case "message_end": return this.endMessage(event.message);
       case "tool_execution_start":
-        this.toolArguments.set(event.toolCallId, {
-          name: visibleToolName(event.toolName),
-          ...(isRecord(event.args) && typeof event.args.path === "string" ? { path: event.args.path } : {}),
-        });
+        this.toolArguments.set(event.toolCallId, sanitizeJson(event.args));
         return [this.make("tool.started", {
           tool_call_id: event.toolCallId, tool_name: visibleToolName(event.toolName), arguments: sanitizeJson(event.args),
         })];
@@ -40,18 +34,15 @@ export class PiEventNormalizer {
         tool_call_id: event.toolCallId, tool_name: visibleToolName(event.toolName), ...resultPayload(event.partialResult),
       })];
       case "tool_execution_end": {
-        const tool = this.toolArguments.get(event.toolCallId);
+        const arguments_ = this.toolArguments.get(event.toolCallId);
         this.toolArguments.delete(event.toolCallId);
-        const result = [this.make(event.isError ? "tool.failed" : "tool.completed", {
+        return [this.make(event.isError ? "tool.failed" : "tool.completed", {
           tool_call_id: event.toolCallId, tool_name: visibleToolName(event.toolName), ...resultPayload(event.result),
+          ...(arguments_ !== undefined ? { arguments: arguments_ } : {}),
           ...(event.isError ? { error_code: "tool_execution_failed" } : {}),
         })];
-        const path = tool?.path?.replace(/^\.\//, "");
-        if (!event.isError && tool && path === "public_data/workflow_canvas/workflow.py" && (tool.name === "write" || tool.name === "edit")) {
-          result.push(this.make("resource.updated", { resource_type: "workflow", path, operation_id: event.toolCallId }));
-        }
-        return result;
       }
+      default: return [];
     }
   }
 
@@ -70,13 +61,6 @@ export class PiEventNormalizer {
     const events = [this.make("message.completed", { message_id: id, role: message.role, content: messageContent(message) })];
     if (message.role === "assistant") {
       events.push(this.make("usage.updated", usagePayload(message.usage)));
-      if (message.stopReason === "error") {
-        this.terminal = "agent.failed";
-        events.push(this.make("agent.failed", { error_code: "model_error", message: message.errorMessage ?? "Pi model request failed" }));
-      } else if (message.stopReason === "aborted") {
-        this.terminal = "agent.cancelled";
-        events.push(this.make("agent.cancelled", {}));
-      }
     }
     return events;
   }

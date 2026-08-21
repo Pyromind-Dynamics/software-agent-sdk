@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_FRAME_BYTES = 1024 * 1024
 
 

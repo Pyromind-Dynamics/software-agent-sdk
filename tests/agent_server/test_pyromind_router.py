@@ -97,7 +97,11 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert len(skill_text.splitlines()) <= 140
     assert "## 资料索引" in skill_text
     assert "## DSL 与资料边界" in skill_text
-    assert 'skills_read(skill_name="generate-workflow-dsl"' in skill_text
+    assert "当前运行时原生的 Skill 读取能力" in skill_text
+    assert "<available_skills>" in skill_text
+    assert 'skills_read(skill_name="generate-workflow-dsl"' not in skill_text
+    assert "单一事实源" not in skill_text
+    assert "不在生成任务中编辑 Skill、reference 或 knowledge" in skill_text
     assert "### 0. 先判定局部修改" in skill_text
     assert "qwen3.5-2b" in skill_text
     assert "不读取 reference 或 `knowledge/`" in skill_text
@@ -115,7 +119,6 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert set(references) == {
         "custom-python-assets.md",
         "data-routing.md",
-        "parameter-decision.md",
         "workflow-contracts.md",
     }
     assert not (skill_root / "references" / "example-workflows.md").exists()
@@ -126,14 +129,15 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert "去掉可选的 `/workspace/` 前缀和开头 `/`" in references["data-routing.md"]
     assert "同一路径已有成功 preview 时复用" in references["data-routing.md"]
     assert "可选统计为空不等于 preview 失败" in references["data-routing.md"]
-    assert "## 监督信号分类" in references["data-routing.md"]
-    assert "即使答案也能程序验证" in references["data-routing.md"]
+    assert "## 训练格式门禁" in references["data-routing.md"]
+    assert "可验证信号" in references["data-routing.md"]
     assert "本文件只识别数据形态" in references["data-routing.md"]
     assert "禁止调用 `run_dataset_cleaning`" in skill_text
     contracts = references["workflow-contracts.md"]
     assert "Benchmark | 数据配置 → 模型入口 → VLLM → Metric → Eval" in contracts
     assert "CloneAndCacheModel | model, target_path" in contracts
-    assert "每个 Metrics Builder 只输出一个 `metrics_config`" in contracts
+    assert "每个 Metrics Builder 只输出一个" in contracts
+    assert "`metrics_config`，Eval 只接一个该端口" in contracts
     assert "NVIDIA-H100-80GB-HBM3" in contracts
     assert "训练阶段由主 Skill 的“选择阶段”唯一决定" in contracts
     assert "有可程序化验证答案或 reward 时选 GRPO" not in contracts

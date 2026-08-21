@@ -101,6 +101,66 @@ def test_store_deduplicates_translations_from_same_source_event(
     assert len(store.replay()) == 1
 
 
+def test_store_keeps_business_projection_with_same_tool_source_event(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    operation, _ = store.append(
+        ProductEvent(
+            event_id="write-event",
+            source_event_id="write-event",
+            conversation_id="conversation-1",
+            type="operation.completed",
+            payload={
+                "operation_id": "write-call",
+                "name": "write",
+                "output": [],
+                "details": None,
+            },
+        )
+    )
+    workflow, snapshot = store.append(
+        ProductEvent(
+            event_id="write-event:workflow",
+            source_event_id="write-event",
+            conversation_id="conversation-1",
+            type="workflow.updated",
+            payload={
+                "resource_id": "pyromind_workflow",
+                "version": "v000001",
+                "dsl": "workflow = InputNode()",
+                "canvas": None,
+            },
+        )
+    )
+
+    assert operation.event_id == "write-event"
+    assert workflow.event_id == "write-event:workflow"
+    assert snapshot.current_workflow is not None
+    assert snapshot.current_workflow.version == "v000001"
+    assert [event.type for event in store.replay()] == [
+        "operation.completed",
+        "workflow.updated",
+    ]
+
+    repeated, replayed_snapshot = store.append(
+        ProductEvent(
+            event_id="another-workflow-event",
+            source_event_id="write-event",
+            conversation_id="conversation-1",
+            type="workflow.updated",
+            payload={
+                "resource_id": "pyromind_workflow",
+                "version": "v000001",
+                "dsl": "workflow = InputNode()",
+                "canvas": None,
+            },
+        )
+    )
+    assert repeated.event_id == workflow.event_id
+    assert replayed_snapshot.through_seq == 2
+
+
 def test_store_repairs_legacy_duplicate_source_events(tmp_path: Path) -> None:
     store = _store(tmp_path)
     original, snapshot = store.append(

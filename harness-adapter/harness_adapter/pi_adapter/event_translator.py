@@ -23,23 +23,35 @@ def translate_runner_event(frame: dict[str, Any]) -> tuple[HarnessEvent, ...]:
                 **common, type="status.changed", payload={"status": "running"}
             ),
         )
-    if kind == "agent.completed":
-        return (
-            HarnessEvent(**common, type="status.changed", payload={"status": "idle"}),
-        )
-    if kind == "agent.cancelled":
-        return (
-            HarnessEvent(**common, type="status.changed", payload={"status": "paused"}),
-        )
-    if kind == "agent.failed":
-        message = payload.get("message")
+    if kind == "run.finished":
+        outcome = payload.get("outcome")
+        if not isinstance(outcome, dict):
+            outcome = {}
+        status = outcome.get("status")
+        if status == "completed":
+            return (
+                HarnessEvent(
+                    **common, type="status.changed", payload={"status": "idle"}
+                ),
+            )
+        if status in {"cancelled", "suspended"}:
+            return (
+                HarnessEvent(
+                    **common, type="status.changed", payload={"status": "paused"}
+                ),
+            )
+        message = outcome.get("message")
+        error_code = outcome.get("error_code")
+        if status != "failed":
+            error_code = "unknown_pi_outcome"
+            message = f"Unknown Pi run outcome: {status!r}"
         return (
             HarnessEvent(
                 **common,
                 type="notice.raised",
                 payload={
                     "severity": "error",
-                    "code": str(payload.get("error_code") or "pi_runner_failed"),
+                    "code": str(error_code or "pi_runner_failed"),
                     "message": message
                     if isinstance(message, str)
                     else "Pi runner failed",

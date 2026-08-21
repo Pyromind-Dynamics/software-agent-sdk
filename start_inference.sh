@@ -12,6 +12,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 
+export PYROMIND_HARNESS_BACKEND="pi"
+
 # ----------------------------------------------------------
 # LLM Configuration
 # ----------------------------------------------------------
@@ -121,6 +123,27 @@ if ! command -v uv >/dev/null 2>&1; then
   echo "Install it with: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2
   exit 127
 fi
+
+# ----------------------------------------------------------
+# Pi Runtime
+# ----------------------------------------------------------
+PI_RUNTIME_DIR="${SOFTWARE_AGENT_SDK_DIR}/harness-adapter/pi-runtime"
+
+if ! command -v npm >/dev/null 2>&1; then
+  echo "Error: npm is required to install and build the Pi runtime." >&2
+  exit 127
+fi
+
+if [[ ! -f "${PI_RUNTIME_DIR}/package.json" || ! -f "${PI_RUNTIME_DIR}/package-lock.json" ]]; then
+  echo "ERROR: Pi runtime package is incomplete: ${PI_RUNTIME_DIR}" >&2
+  exit 1
+fi
+
+echo "Installing Pi runtime dependencies..."
+npm --prefix "${PI_RUNTIME_DIR}" ci
+
+echo "Building Pi runtime..."
+npm --prefix "${PI_RUNTIME_DIR}" run build
 
 # ----------------------------------------------------------
 # Start Agent Server

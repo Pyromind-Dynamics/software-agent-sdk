@@ -629,6 +629,8 @@ class PyromindLLMConfig(BaseModel):
     base_url: str | None = Field(
         default_factory=lambda: os.environ.get("LLM_BASE_URL"),
     )
+    api: Literal["openai-completions", "openai-responses"] | None = None
+    context_window: int | None = Field(default=None, gt=0)
 
     @field_validator("base_url", mode="before")
     @classmethod

@@ -1,19 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
+import harness_adapter.pi_adapter.adapter as pi_adapter_module
 import httpx
+import pytest
 from harness_adapter.pi_adapter import PiAdapter
-from harness_adapter.pi_adapter.adapter import _resolve_model
+from harness_adapter.pi_adapter.adapter import (
+    _is_workflow_mutation,
+    _resolve_model,
+    _session_config,
+)
 from harness_adapter.pi_adapter.business_tools import (
     execute_validation_tool,
     validation_tool_spec,
 )
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
+from pydantic import ValidationError
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.ports.harness import SessionSpec
+
+from openhands.agent_server.pyromind_router import PyromindLLMConfig
 
 
 def test_validation_schema_is_generated_and_only_exposes_dsl_path() -> None:
@@ -94,16 +105,73 @@ def test_terminal_only_confirms_high_risk_commands() -> None:
     assert policy.requires_confirmation("danger", {"command": "rm -rf /tmp/example"})
 
 
-def test_checkpoint_is_atomic_and_session_is_non_secret(tmp_path) -> None:
+def test_session_metadata_is_non_secret_and_uses_pi_jsonl(tmp_path) -> None:
     files = PiSessionFiles(tmp_path)
     files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
-    files.save_checkpoint([{"role": "user", "content": "hello"}])
     files.save_inflight({"run_id": "run-1", "operation_id": "op-1"})
-    assert files.load_checkpoint()[0]["role"] == "user"
+    assert files.session_log_path == tmp_path / "pi" / "session.jsonl"
     assert files.load_inflight() == {"run_id": "run-1", "operation_id": "op-1"}
     assert "api_key" not in files.session_path.read_text()
     files.clear_inflight()
     assert files.load_inflight() is None
+
+
+def test_adapter_resolves_available_knowledge_root(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("PYROMIND_KNOWLEDGE_BASE_PATH", raising=False)
+    explicit = tmp_path / "knowledge"
+    explicit.mkdir()
+    assert PiAdapter(
+        tmp_path / "explicit", knowledge_root=explicit
+    )._knowledge_root == (explicit.resolve())
+    assert (
+        PiAdapter(
+            tmp_path / "missing-adapter",
+            knowledge_root=tmp_path / "missing-knowledge",
+        )._knowledge_root
+        is None
+    )
+
+    repository = Path(pi_adapter_module.__file__).parents[3]
+    assert (
+        PiAdapter(tmp_path / "default")._knowledge_root
+        == (repository / "knowledge").resolve()
+    )
+
+
+async def test_runner_start_receives_configured_knowledge_root(
+    tmp_path, monkeypatch
+) -> None:
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, config) -> None:
+            captured.update(config)
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    adapter = PiAdapter(conversations, knowledge_root=knowledge)
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="conversation-1",
+            user_id="42",
+            workspace_root=str(conversations / "conversation-1"),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    try:
+        assert captured["knowledge_root"] == str(knowledge.resolve())
+    finally:
+        await adapter.close(handle)
 
 
 def test_model_resolution_rules() -> None:
@@ -122,6 +190,167 @@ def test_model_resolution_rules() -> None:
     assert _resolve_model("deepseek/deepseek-chat", "http://localhost:8000/v1") == (
         "openai",
         "deepseek/deepseek-chat",
+    )
+
+
+def test_session_config_persists_model_api_resolution() -> None:
+    def model_config(configuration):
+        return _session_config(
+            SessionSpec(
+                conversation_id="conversation-1",
+                user_id="42",
+                workspace_root="/tmp/conversation-1",
+                model_configuration=configuration,
+            )
+        )["model"]
+
+    assert (
+        model_config({"model": "custom-model", "base_url": "http://localhost:8000/v1"})[
+            "api"
+        ]
+        == "openai-completions"
+    )
+    assert (
+        model_config(
+            {
+                "model": "deepseek-v4-flash-0731",
+                "base_url": "http://localhost:8000/v1",
+            }
+        )["context_window"]
+        == 200_000
+    )
+    assert (
+        model_config(
+            {
+                "model": "deepseek-v4-flash-0731",
+                "base_url": "http://localhost:8000/v1",
+                "context_window": 196_608,
+            }
+        )["context_window"]
+        == 196_608
+    )
+    assert (
+        model_config({"model": "custom-model", "base_url": "http://localhost:8000/v1"})[
+            "context_window"
+        ]
+        == 128_000
+    )
+    assert (
+        model_config(
+            {
+                "model": "deepseek/deepseek-chat",
+                "base_url": "https://openrouter.ai/api/v1",
+            }
+        )["api"]
+        == "openai-completions"
+    )
+    assert (
+        model_config(
+            {
+                "model": "custom-model",
+                "base_url": "http://localhost:8000/v1",
+                "api": "openai-responses",
+            }
+        )["api"]
+        == "openai-responses"
+    )
+    assert "api" not in model_config({"model": "gpt-5"})
+    assert "context_window" not in model_config({"model": "gpt-5"})
+    assert "api" not in model_config(
+        {"model": "gpt-5", "base_url": "https://api.openai.com/v1"}
+    )
+
+
+def test_pyromind_llm_config_rejects_unknown_model_api() -> None:
+    with pytest.raises(ValidationError):
+        PyromindLLMConfig(model="gpt-5", api="other")
+
+
+def test_pyromind_llm_config_rejects_invalid_context_window() -> None:
+    with pytest.raises(ValidationError):
+        PyromindLLMConfig(model="gpt-5", context_window=0)
+
+
+async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
+    adapter = PiAdapter(tmp_path)
+    files = PiSessionFiles(tmp_path / "conversation-1")
+    files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
+    session = SimpleNamespace(
+        session_id="conversation-1",
+        finished_runs=set(),
+        running=True,
+        files=files,
+        queue=asyncio.Queue(),
+    )
+    frame = {
+        "protocolVersion": 2,
+        "type": "pi.event",
+        "eventId": "e1",
+        "sessionId": "conversation-1",
+        "runId": "run-1",
+        "occurredAt": "2026-08-20T00:00:00Z",
+        "kind": "run.finished",
+        "payload": {"outcome": {"status": "completed", "stop_reason": "stop"}},
+    }
+
+    await adapter._runner_event(session, frame)
+    await adapter._runner_event(session, {**frame, "eventId": "e2"})
+
+    assert session.queue.qsize() == 1
+    assert (await session.queue.get()).payload["status"] == "idle"
+
+
+async def test_adapter_projects_generic_write_completion_to_workflow(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = PiAdapter(tmp_path)
+    workspace = tmp_path / "conversation-1"
+    files = PiSessionFiles(workspace)
+    files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
+    session = SimpleNamespace(
+        session_id="conversation-1",
+        workspace_root=workspace,
+        finished_runs=set(),
+        running=True,
+        files=files,
+        queue=asyncio.Queue(),
+    )
+    emitted = []
+
+    async def capture_workflow(_session, event_id, **kwargs) -> None:
+        emitted.append((event_id, kwargs.get("source_event_id")))
+
+    monkeypatch.setattr(adapter, "_emit_workflow", capture_workflow)
+    frame = {
+        "protocolVersion": 2,
+        "type": "pi.event",
+        "eventId": "write-event",
+        "sessionId": "conversation-1",
+        "runId": "run-1",
+        "occurredAt": "2026-08-20T00:00:00Z",
+        "kind": "tool.completed",
+        "payload": {
+            "tool_call_id": "call-write",
+            "tool_name": "write",
+            "arguments": {
+                "path": "public_data/workflow_canvas/workflow.py",
+                "content": "workflow = SFTWorkflow()",
+            },
+            "content": [],
+            "details": None,
+        },
+    }
+
+    await adapter._runner_event(session, frame)
+
+    assert emitted == [("write-event:workflow", "write-event")]
+    assert (await session.queue.get()).type == "operation.completed"
+    assert not _is_workflow_mutation(
+        workspace,
+        {
+            "tool_name": "write",
+            "arguments": {"path": "other.py"},
+        },
     )
 
 
