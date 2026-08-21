@@ -52,6 +52,28 @@ logger = get_logger(__name__)
 _REDACTED_SKILL_PATH = "<REDACTED_SKILL_PATH>"
 PRESERVE_SKILL_PATH_CONTEXT = "preserve_skill_path"
 
+_ASCII_WORD_RE = re.compile(r"[a-z0-9_]+")
+
+
+def _trigger_keyword_matches(message_lower: str, keyword: str) -> bool:
+    """Match a trigger keyword against a lowercased message.
+
+    ASCII word keywords (``[a-z0-9_]+``) are matched at word boundaries so a
+    trigger like ``test`` does not fire on substrings inside filenames or
+    compound words (``testdata_3.csv``, ``testing``). Keywords that contain
+    non-word characters (``/review``, ``best practices``, Chinese phrases)
+    keep plain substring semantics.
+    """
+    kw = keyword.lower()
+    if not kw:
+        return False
+    if _ASCII_WORD_RE.fullmatch(kw):
+        return (
+            re.search(rf"(?<![a-z0-9_]){re.escape(kw)}(?![a-z0-9_])", message_lower)
+            is not None
+        )
+    return kw in message_lower
+
 
 class SkillInfo(BaseModel):
     """Lightweight representation of a skill's essential information.
@@ -633,12 +655,12 @@ class Skill(BaseModel):
         if isinstance(self.trigger, KeywordTrigger):
             message_lower = message.lower()
             for keyword in self.trigger.keywords:
-                if keyword.lower() in message_lower:
+                if _trigger_keyword_matches(message_lower, keyword):
                     return keyword
         elif isinstance(self.trigger, TaskTrigger):
             message_lower = message.lower()
             for trigger_str in self.trigger.triggers:
-                if trigger_str.lower() in message_lower:
+                if _trigger_keyword_matches(message_lower, trigger_str):
                     return trigger_str
         return None
 

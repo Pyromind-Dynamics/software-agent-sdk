@@ -572,6 +572,102 @@ def test_df_run_pipeline_rejects_handwritten_vision_transport(
     assert "cannot import base64" in observation.text
 
 
+def _write_legacy_copy_pipeline(pipeline: Path) -> None:
+    """Write a minimal legacy pipeline that copies input lines to the output."""
+    pipeline.write_text(
+        "\n".join(
+            [
+                "import sys",
+                "with open(sys.argv[1], encoding='utf-8') as src:",
+                "    lines = src.readlines()",
+                "with open(sys.argv[2], 'w', encoding='utf-8') as dst:",
+                "    dst.writelines(lines)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_df_run_pipeline_legacy_accepts_workspace_relative_args(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Legacy runs (no output_schema) must accept workspace-relative args.
+
+    The child process runs with cwd=pipeline.parent, so passing
+    ``public_data/...`` used to double-prefix the path and fail with
+    FileNotFoundError; args[0] is now resolved from the workspace root first.
+    """
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    pipeline_dir = tmp_path / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    _write_legacy_copy_pipeline(pipeline_dir / "pipeline.py")
+    (pipeline_dir / "input.jsonl").write_text("{'a': 1}\n", encoding="utf-8")
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-preparation"
+        / "scripts"
+    )
+    conversation = cast(Any, _fake_conversation(tmp_path))
+    conversation.state.agent = _conversation_with_llm().state.agent
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/filtered.sample.jsonl",
+            ],
+            model_profile="text",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.exit_code == 0
+    assert (pipeline_dir / "filtered.sample.jsonl").is_file()
+    # Regression guard: the input must not be double-prefixed against the
+    # pipeline directory.
+    assert not (tmp_path / "public_data" / "public_data").exists()
+
+
+def test_df_run_pipeline_legacy_keeps_pipeline_relative_args(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Legacy args relative to the pipeline directory keep working."""
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    pipeline_dir = tmp_path / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    _write_legacy_copy_pipeline(pipeline_dir / "pipeline.py")
+    (pipeline_dir / "input.jsonl").write_text("{'a': 1}\n", encoding="utf-8")
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-preparation"
+        / "scripts"
+    )
+    conversation = cast(Any, _fake_conversation(tmp_path))
+    conversation.state.agent = _conversation_with_llm().state.agent
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=["input.jsonl", "filtered.sample.jsonl"],
+            model_profile="text",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.exit_code == 0
+    assert (pipeline_dir / "filtered.sample.jsonl").is_file()
+    assert not (tmp_path / "filtered.sample.jsonl").exists()
+
+
 def test_df_convert_messages_format(tmp_path: Path) -> None:
     # Prepare input
     input_file = tmp_path / "input.jsonl"

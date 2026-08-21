@@ -138,6 +138,32 @@ def _resolve_output_path(conversation: Any, path: str) -> Path:
     return resolved
 
 
+def _resolve_legacy_input_arg(
+    conversation: Any, arg: str, pipeline: Path
+) -> tuple[Path, Path] | None:
+    """Resolve a legacy pipeline input argument.
+
+    Legacy arguments were historically interpreted by the child process
+    relative to the pipeline script directory, which is inconsistent with the
+    workspace-root resolution used everywhere else in this tool family. Resolve
+    ``arg`` from the workspace root when it exists there, otherwise fall back to
+    the pipeline directory. Returns the resolved input and the base directory
+    used to anchor the matching output argument, or ``None`` when neither exists
+    so script-defined non-path arguments pass through unchanged.
+    """
+    try:
+        input_path = _resolve_input_path(conversation, arg)
+    except ValueError:
+        input_path = None
+    if input_path is not None:
+        return input_path, Path(conversation.workspace.working_dir)
+    base = pipeline.parent
+    candidate = base / arg
+    if candidate.exists():
+        return candidate.resolve(), base
+    return None
+
+
 # ---------------------------------------------------------------------------
 # dataset_download
 # ---------------------------------------------------------------------------
@@ -431,7 +457,9 @@ class DfRunPipelineAction(Action):
             "is defined by that script; multimodal templates use input path, "
             "output path, and optional limit. When output_schema is set, args[0] "
             "and args[1] are workspace-relative input/output paths and are "
-            "normalized before execution."
+            "normalized before execution. Without output_schema (legacy), "
+            "args[0] is resolved from the workspace root when the input exists "
+            "there, otherwise it is left unchanged."
         ),
     )
     timeout: int = Field(default=3600, ge=60, le=7200, description="Timeout seconds.")
@@ -644,9 +672,24 @@ class DfRunPipelineExecutor(ToolExecutor):
             process_args[0] = str(standard_input_path)
             process_args[1] = str(output_path)
         elif len(process_args) >= 2:
-            output_path = Path(process_args[1])
-            if not output_path.is_absolute():
-                output_path = pipeline.parent / output_path
+            # Legacy mode: the child process runs with cwd=pipeline.parent, but
+            # the rest of this tool family resolves arguments from the workspace
+            # root. Resolve args[0] from the workspace root when the input
+            # exists there (falling back to the historical pipeline-relative
+            # interpretation) and anchor the relative output at the same base so
+            # both stay consistent.
+            legacy_paths = _resolve_legacy_input_arg(
+                conversation, process_args[0], pipeline
+            )
+            if legacy_paths is not None:
+                input_path, base = legacy_paths
+                process_args[0] = str(input_path)
+                output_path = base / process_args[1]
+                process_args[1] = str(output_path)
+            else:
+                output_path = Path(process_args[1])
+                if not output_path.is_absolute():
+                    output_path = pipeline.parent / output_path
 
         if output_path is not None:
             state_dir = output_path.parent / f".{output_path.stem}.state"
@@ -794,7 +837,9 @@ class DfRunPipelineTool(ToolDefinition[DfRunPipelineAction, DfRunPipelineObserva
                     "auto-staged next to the pipeline — "
                     "the agent must NOT create or copy them manually. For standard "
                     "runs with output_schema, input/output arguments are resolved "
-                    "from the workspace root; legacy arguments remain unchanged. "
+                    "from the workspace root; legacy arguments are resolved from "
+                    "the workspace root when the input exists there, and otherwise "
+                    "pass through unchanged. "
                     "The tool returns textual "
                     "status only; image content is read by the DataFlow VLM."
                 ),

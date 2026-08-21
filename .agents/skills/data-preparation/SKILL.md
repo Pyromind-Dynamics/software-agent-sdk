@@ -63,14 +63,14 @@ description: >-
 | DPO 偏好对清洗或生成 | [DPO 数据](references/dpo-data.md) | `dpo` |
 | 推理问题和答案合成 | [Reasoning 数据](references/reasoning-data.md) | `text` |
 | 代码指令和代码生成 | [Code 数据](references/code-data.md) | `text` |
-| 文本/Markdown 清洗并生成 QA | [知识库与 QA](references/knowledge-qa.md) | `text` |
-| Agentic RAG 任务与 QA | [Agentic RAG](references/agentic-rag.md) | `text` |
-| 多轮对话生成或整理 | [多轮对话](references/multiturn-data.md) | `multiturn` |
-| 工具定义和调用轨迹 | [Function Call](references/function-call-data.md) | `function_call` |
-| 样本质量评分、保留、改写或丢弃 | [质量评估](references/quality-evaluation.md) | `quality_evaluation` |
-| 已有 SQLite Text2SQL 数据精炼 | [Text2SQL](references/text2sql-data.md) | `text2sql` |
+<!-- | 文本/Markdown 清洗并生成 QA | [知识库与 QA](references/knowledge-qa.md) | `text` | -->
+<!-- | Agentic RAG 任务与 QA | [Agentic RAG](references/agentic-rag.md) | `text` | -->
+<!-- | 多轮对话生成或整理 | [多轮对话](references/multiturn-data.md) | `multiturn` | -->
+<!-- | 工具定义和调用轨迹 | [Function Call](references/function-call-data.md) | `function_call` | -->
+<!-- | 样本质量评分、保留、改写或丢弃 | [质量评估](references/quality-evaluation.md) | `quality_evaluation` | -->
+<!-- | 已有 SQLite Text2SQL 数据精炼 | [Text2SQL](references/text2sql-data.md) | `text2sql` | -->
 | 图片 OCR、理解和多图语义标注 | [多模态标注](references/multimodal-labeling.md) | `vision` |
-| 从文本抽取 SMILES | [化学数据](references/chemistry-data.md) | `text` |
+<!-- | 从文本抽取 SMILES | [化学数据](references/chemistry-data.md) | `text` | -->
 
 ## 运行与完成条件
 

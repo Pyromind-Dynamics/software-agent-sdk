@@ -1,3 +1,4 @@
+import errno
 import re
 import threading
 import time
@@ -67,6 +68,17 @@ _POD_MEMORY_HINT_TEMPLATE = (
     "Wait a moment and retry the same command, or ask the user to reduce "
     "concurrent heavy workloads (downloads, parallel agents) so memory can be "
     "reclaimed."
+)
+
+_SANDBOX_IO_ERROR_HINT_TEMPLATE = (
+    "[Terminal-unavailable] The terminal backend hit an I/O error (errno "
+    "{errno}: {strerror}) — usually the sandbox is out of processes/PTYs or "
+    "the shell session died, not a problem with this specific command, so "
+    "retrying the same command immediately is unlikely to help.\n\n"
+    "Prefer creating and editing files with file_editor/apply_patch, and "
+    "running commands through dedicated execution tools (for example dataflow "
+    "or task runners) that execute in their own subprocesses. If you do retry "
+    "the terminal, start from a fresh session with reset=true."
 )
 
 logger = get_logger(__name__)
@@ -620,10 +632,29 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                     exit_code=None,
                 )
 
-        if self._pool is not None:
-            return self._execute_pooled(action, conversation)
-        else:
-            return self._execute_single_session(action, conversation)
+        try:
+            if self._pool is not None:
+                return self._execute_pooled(action, conversation)
+            else:
+                return self._execute_single_session(action, conversation)
+        except OSError as exc:
+            if exc.errno not in (errno.EIO, errno.EAGAIN):
+                raise
+            logger.warning(
+                "Terminal backend I/O failure (errno=%s); returning structured "
+                "hint instead of a raw error",
+                exc.errno,
+                exc_info=True,
+            )
+            return TerminalObservation.from_text(
+                _SANDBOX_IO_ERROR_HINT_TEMPLATE.format(
+                    errno=exc.errno,
+                    strerror=exc.strerror or str(exc),
+                ),
+                is_error=True,
+                command=action.command,
+                exit_code=-1,
+            )
 
     def interrupt(self) -> None:
         """Send Ctrl+C to all active terminal sessions.
