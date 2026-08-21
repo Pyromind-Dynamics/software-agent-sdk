@@ -238,6 +238,11 @@ RUN uv python install 3.12 \
     && uv venv --python 3.12 ${HOME}/dataflow-venv \
     && uv pip install --python ${HOME}/dataflow-venv/bin/python open-dataflow==1.0.10
 ENV DATAFLOW_PYTHON=/home/openhands/dataflow-venv/bin/python
+# DataFlow LLM defaults (overridden per-run by build_dataflow_env when a
+# conversation supplies its own model/endpoint)
+ENV DF_API_URL=https://openrouter.ai/api/v1/chat/completions
+ENV DF_API_BASE_URL=https://openrouter.ai/api/v1
+ENV DF_MODEL_NAME=openai/gpt-5.6-luna
 # Fix library path to use system GCC libraries instead of bundled ones
 ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge

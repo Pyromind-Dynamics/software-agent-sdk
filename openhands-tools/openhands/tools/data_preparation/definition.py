@@ -43,7 +43,6 @@ from openhands.tools.data_preparation.runner import (
     resolve_dataflow_python,
     run_dataflow_python,
     runtime_bundle_fingerprint,
-    runtime_file_source,
     runtime_public_names,
     summarize_dataflow_env,
     validate_managed_image_pipeline,
@@ -52,7 +51,6 @@ from openhands.tools.utils import default_path_access_policy
 
 
 RUNTIME_FILENAMES = (
-    "dataflow_config.py",
     "df_logging.py",
     "generate_report.py",
     "image_utils.py",
@@ -547,7 +545,7 @@ class DfRunPipelineExecutor(ToolExecutor):
             return None
         target_dir.mkdir(parents=True, exist_ok=True)
         for filename in RUNTIME_FILENAMES:
-            src = runtime_file_source(self._runtime_dir, filename)
+            src = self._runtime_dir / filename
             dst = target_dir / filename
             if src.is_file():
                 dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")

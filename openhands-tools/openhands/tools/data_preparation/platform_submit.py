@@ -35,7 +35,6 @@ from openhands.tools.data_preparation.runner import (
     SUPPORTED_DATAFLOW_VERSION,
     build_dataflow_env,
     runtime_bundle_fingerprint,
-    runtime_file_source,
     runtime_public_names,
     validate_managed_image_pipeline,
 )
@@ -67,7 +66,6 @@ if TYPE_CHECKING:
 
 
 RUNTIME_FILENAMES = (
-    "dataflow_config.py",
     "df_logging.py",
     "generate_report.py",
     "image_utils.py",
@@ -758,7 +756,7 @@ class DfSubmitPipelineExecutor(
         headers = self._resolved_storage_headers(conversation)
         existing_files = self._storage_file_names(runtime_storage_dir, headers)
         for filename in RUNTIME_FILENAMES:
-            local_path = runtime_file_source(self._runtime_dir, filename)
+            local_path = self._runtime_dir / filename
             if not local_path.is_file():
                 raise ValueError(f"DataFlow runtime file is missing: {local_path}")
             if filename in existing_files:

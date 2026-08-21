@@ -34,10 +34,6 @@ from dataflow.operators.core_text import PandasOperator
 from dataflow.operators.general_text import ContentNullFilter
 from dataflow.prompts.core_text import FormatStrPrompt
 from dataflow.utils.storage import LazyFileStorage
-from dataflow_config import (
-    DEFAULT_DATAFLOW_API_URL,
-    DEFAULT_DATAFLOW_MODEL_NAME,
-)
 from df_logging import LoggingLLMServing
 
 
@@ -263,8 +259,10 @@ def write_canonical_output(
     BATCH_SIZE = int(os.environ.get("DF_BATCH_SIZE", "8"))
 
     raw_llm = APILLMServing_request(
-        api_url=os.environ.get("DF_API_URL", DEFAULT_DATAFLOW_API_URL),
-        model_name=os.environ.get("DF_MODEL_NAME", DEFAULT_DATAFLOW_MODEL_NAME),
+        api_url=os.environ.get(
+            "DF_API_URL", "https://openrouter.ai/api/v1/chat/completions"
+        ),
+        model_name=os.environ.get("DF_MODEL_NAME", "openai/gpt-5.6-luna"),
         key_name_of_api_key="DF_API_KEY",
         max_workers=int(os.environ.get("DF_MAX_WORKERS", "8")),
     )
