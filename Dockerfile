@@ -242,7 +242,7 @@ ENV DATAFLOW_PYTHON=/home/openhands/dataflow-venv/bin/python
 # conversation supplies its own model/endpoint)
 ENV DF_API_URL=https://openrouter.ai/api/v1/chat/completions
 ENV DF_API_BASE_URL=https://openrouter.ai/api/v1
-ENV DF_MODEL_NAME=openai/gpt-5.6-luna
+ENV DF_MODEL_NAME=google/gemma-4-31b-it
 # Fix library path to use system GCC libraries instead of bundled ones
 ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge

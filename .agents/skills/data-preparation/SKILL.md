@@ -74,7 +74,8 @@ description: >-
 
 ## 运行与完成条件
 
-- 文本任务使用 `model_profile="text"`；图片任务使用 `model_profile="vision"`。
+- 文本任务使用 `model_profile="text"`（LLM 用会话本体模型）；图片任务使用
+  `model_profile="vision"`。
 - 图片 Pipeline 只配置 `ImagePipelineConfig`，不得自行实现 HTTP、Base64、重试或
   Checkpoint。
 - `directory_summary` 只是结构摘要，不是数据 Schema；低置信度、混合结构或需要
