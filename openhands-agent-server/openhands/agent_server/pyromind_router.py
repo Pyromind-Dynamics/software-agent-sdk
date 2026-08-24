@@ -56,7 +56,7 @@ from openhands.agent_server.pyromind_subagent import (
 )
 from openhands.agent_server.run_workflow_callback import (
     RunWorkflowCallbackResult,
-    deliver_run_workflow_status,
+    dispatch_run_workflow_status as deliver_run_workflow_status,
 )
 from openhands.agent_server.workflow_canvas_models import WorkflowCanvasEventSnapshot
 from openhands.agent_server.workflow_canvas_store import (

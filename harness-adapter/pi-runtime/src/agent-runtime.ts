@@ -19,6 +19,10 @@ export class PiAgentRuntime {
   private normalizer: PiEventNormalizer | undefined;
   private readonly outcome = new PiOutcomeNormalizer();
   private readonly finishedRuns = new Set<string>();
+  private readonly pendingNotifications: Array<{
+    runId: string;
+    message: { customType: string; content: string; display: boolean; details: JsonObject };
+  }> = [];
 
   constructor(private readonly peer: JsonlRpcPeer) {}
 
@@ -27,6 +31,7 @@ export class PiAgentRuntime {
     if (method === "prompt") return this.prompt(params, false);
     if (method === "steer") return this.prompt(params, true);
     if (method === "cancel") return this.cancel();
+    if (method === "notify") return this.notify(params);
     if (method === "close") return this.close();
     throw new Error(`unknown runner method: ${method}`);
   }
@@ -75,6 +80,7 @@ export class PiAgentRuntime {
       });
     } finally {
       this.normalizer = undefined;
+      this.drainNotifications();
     }
   }
 
@@ -99,6 +105,62 @@ export class PiAgentRuntime {
     return { cancelled: true };
   }
 
+  private async notify(params: JsonObject): Promise<JsonValue> {
+    const session = this.requireSession();
+    const runId = requiredString(params, "run_id");
+    const content = requiredString(params, "content");
+    const details = isObject(params.details) ? params.details : {};
+    const message = {
+      customType: "pyromind.external_task",
+      content,
+      display: false,
+      details,
+    };
+    if (session.isStreaming || this.normalizer) {
+      this.pendingNotifications.push({ runId, message });
+      return { accepted: true, queued: true };
+    }
+    this.startNotification(runId, message);
+    return { accepted: true, queued: false };
+  }
+
+  private startNotification(
+    runId: string,
+    message: { customType: string; content: string; display: boolean; details: JsonObject },
+  ): void {
+    this.normalizer = new PiEventNormalizer(this.sessionId!, runId);
+    this.outcome.reset();
+    setImmediate(() => void this.runNotification(runId, message));
+  }
+
+  private async runNotification(
+    runId: string,
+    message: { customType: string; content: string; display: boolean; details: JsonObject },
+  ): Promise<void> {
+    try {
+      const session = this.requireSession();
+      await session.sendCustomMessage(message, {
+        triggerTurn: true,
+      });
+      this.finishRun(runId, this.outcome.normalize(session.messages));
+    } catch (error) {
+      this.finishRun(runId, {
+        status: "failed",
+        error_code: "runner_error",
+        message: error instanceof Error ? error.message : "Pi notification failed",
+      });
+    } finally {
+      this.normalizer = undefined;
+      this.drainNotifications();
+    }
+  }
+
+  private drainNotifications(): void {
+    if (this.normalizer || this.requireSession().isStreaming) return;
+    const next = this.pendingNotifications.shift();
+    if (next) this.startNotification(next.runId, next.message);
+  }
+
   private async close(): Promise<JsonValue> {
     const session = this.requireSession();
     await session.abort();
@@ -112,6 +174,10 @@ export class PiAgentRuntime {
     if (!this.session) throw new Error("Pi session is not started");
     return this.session;
   }
+}
+
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function requiredString(value: Record<string, unknown>, name: string): string {

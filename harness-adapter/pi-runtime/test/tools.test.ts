@@ -73,3 +73,27 @@ test("safePath rejects symlink escape", async () => {
     /symlink/,
   );
 });
+
+test("safePath accepts each named skill root but keeps them read-only", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-tools-skills-"));
+  const workspace = join(root, "conversation");
+  const cleaning = join(root, "data-cleaning");
+  const preparation = join(root, "data-preparation");
+  await mkdir(workspace);
+  await mkdir(cleaning);
+  await mkdir(preparation);
+  await writeFile(join(cleaning, "SKILL.md"), "cleaning");
+  await writeFile(join(preparation, "SKILL.md"), "preparation");
+  const skills = [
+    { name: "data-cleaning", path: cleaning },
+    { name: "data-preparation", path: preparation },
+  ];
+  assert.equal(
+    await safePath(join(preparation, "SKILL.md"), workspace, skills, undefined, true),
+    join(preparation, "SKILL.md"),
+  );
+  await assert.rejects(
+    () => safePath(join(cleaning, "SKILL.md"), workspace, skills, undefined, false),
+    /read-only/,
+  );
+});

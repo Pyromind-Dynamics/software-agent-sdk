@@ -347,8 +347,11 @@ When only a dataset/folder name is given (no specific file):
 
 Use mode='sample' for user storage after inspection. It materializes at most
 three selected files or folders inside the conversation workspace, preserves
-their storage-relative layout, and returns a sample_manifest_path for
-df_run_pipeline. Image samples are sent to the configured DF vision model
+their storage-relative layout, and returns workspace-relative
+local_sample_paths plus a sample_manifest_path. Pass the returned
+df_run_input_path (single input) or selected local_sample_paths entry directly
+to df_run_pipeline; storage source paths are not local workspace inputs. Image
+samples are sent to the configured DF vision model
 (normally Gemma) for OCR and a short visual summary.
 
 Returns:
@@ -928,6 +931,7 @@ class PreviewDatasetExecutor(
                 manifest_row: dict[str, Any] = {
                     "id": f"sample-{index}",
                     "source_path": selected_path,
+                    "workspace_path": selected_workspace_path,
                     "local_path": selected_manifest_path,
                     "files": row_files,
                     "images": row_images,
@@ -944,11 +948,18 @@ class PreviewDatasetExecutor(
                     )
 
             manifest_relative = manifest_path.relative_to(workspace_dir).as_posix()
-            summary_text = (
-                f"Materialized {len(manifest_rows)} sample unit(s), "
-                f"{total_files} file(s), {_human_size(total_bytes)}. "
-                f"Manifest: {manifest_relative}"
-            )
+            summary_lines = [
+                (
+                    f"Materialized {len(manifest_rows)} sample unit(s), "
+                    f"{total_files} file(s), {_human_size(total_bytes)}."
+                ),
+                f"sample_manifest_path={manifest_relative}",
+                "local_sample_paths:",
+                *(f"- {path}" for path in local_paths),
+            ]
+            if len(local_paths) == 1:
+                summary_lines.append(f"df_run_input_path={local_paths[0]}")
+            summary_text = "\n".join(summary_lines)
             for preview in vision_previews:
                 summary_text += (
                     f"\n\n--- vision preview: {preview['source_path']} ---\n"

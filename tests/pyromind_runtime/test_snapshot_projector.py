@@ -113,3 +113,32 @@ def test_projector_reads_legacy_stringified_plan_steps() -> None:
         {"step": "Inspect input", "status": "completed"},
         {"step": "Build output", "status": "in_progress"},
     ]
+
+
+def test_projector_tracks_external_task_lifecycle() -> None:
+    projector = SnapshotProjector()
+    submitted = {
+        "task_id": "task-1",
+        "kind": "data_cleaning",
+        "run_id": "run-1",
+        "status": "running",
+        "output_dir": "/agent/conv/data_cleaning/run-1",
+        "submitted_at": "2026-08-24T00:00:00+00:00",
+        "updated_at": "2026-08-24T00:00:00+00:00",
+        "resume_pending": False,
+    }
+    snapshot = projector.reduce(
+        _snapshot(), _event(1, "external_task.submitted", submitted)
+    )
+    assert snapshot.status == "waiting_for_external_task"
+    snapshot = projector.reduce(
+        snapshot,
+        _event(
+            2,
+            "external_task.completed",
+            {**submitted, "status": "succeeded", "resume_pending": True},
+        ),
+    )
+    assert snapshot.status == "idle"
+    assert snapshot.external_tasks[0].status == "succeeded"
+    assert snapshot.external_tasks[0].resume_pending is True

@@ -1,7 +1,7 @@
 import { lstat } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { mkdirSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
-  createBashTool,
   createEditTool,
   createReadTool,
   createWriteTool,
@@ -11,9 +11,13 @@ import {
   type ExecutionToolContext,
 } from "@earendil-works/pi-agent-core";
 import { type ImageContent, type TextContent, type TSchema } from "@earendil-works/pi-ai";
-import type { InlineExtension } from "@earendil-works/pi-coding-agent";
+import {
+  createBashTool,
+  type InlineExtension,
+} from "@earendil-works/pi-coding-agent";
 import { isRecord, type JsonObject } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
+import { createWorkspaceSandboxedBashOperations } from "./workspace-sandbox.js";
 
 export interface BusinessToolConfig {
   name: string;
@@ -21,29 +25,52 @@ export interface BusinessToolConfig {
   inputSchema: JsonObject;
 }
 
+export interface SkillRootConfig {
+  name: string;
+  path: string;
+}
+
 export function createTools(
   peer: JsonlRpcPeer,
   env: ExecutionEnv,
   workspaceRoot: string,
-  skillRoot: string,
+  skillRoots: SkillRootConfig[],
   knowledgeRoot: string | undefined,
   businessTools: BusinessToolConfig[],
 ): AgentTool[] {
+  const terminalOutputTemp = join(
+    resolve(workspaceRoot),
+    "pi",
+    "terminal-output",
+  );
+  mkdirSync(terminalOutputTemp, { recursive: true, mode: 0o700 });
+  process.env.TMPDIR = terminalOutputTemp;
+  process.env.TMP = terminalOutputTemp;
+  process.env.TEMP = terminalOutputTemp;
   const read = createReadTool();
   const write = createWriteTool();
   const edit = createEditTool();
-  const bash = createBashTool({
-    prepare(execution) {
-      execution.cwd = workspaceRoot;
-      execution.inheritEnv = false;
-      execution.env = safeShellEnvironment();
-    },
+  const bash = createBashTool(workspaceRoot, {
+    operations: createWorkspaceSandboxedBashOperations(workspaceRoot),
+    exposeSessionEnvironment: false,
+    spawnHook: ({ command }) => ({
+      command,
+      cwd: workspaceRoot,
+      env: safeShellEnvironment(),
+    }),
   });
   return [
-    bindPathTool(read, env, workspaceRoot, skillRoot, knowledgeRoot, true),
-    bindPathTool(write, env, workspaceRoot, skillRoot, knowledgeRoot, false),
-    bindPathTool(edit, env, workspaceRoot, skillRoot, knowledgeRoot, false),
-    { ...bindNative(bash, env), name: "terminal", label: "terminal" },
+    bindPathTool(read, env, workspaceRoot, skillRoots, knowledgeRoot, true),
+    bindPathTool(write, env, workspaceRoot, skillRoots, knowledgeRoot, false),
+    bindPathTool(edit, env, workspaceRoot, skillRoots, knowledgeRoot, false),
+    {
+      ...bash,
+      name: "terminal",
+      label: "terminal",
+      async execute(callId, params: any, signal, onUpdate) {
+        return bash.execute(callId, params, signal, onUpdate);
+      },
+    },
     ...businessTools.map((config) => businessTool(peer, config)),
   ];
 }
@@ -84,7 +111,7 @@ function bindPathTool(
   tool: AgentHarnessTool<ExecutionToolContext, any, any>,
   env: ExecutionEnv,
   workspaceRoot: string,
-  skillRoot: string,
+  skillRoots: SkillRootConfig[],
   knowledgeRoot: string | undefined,
   allowReadOnlyResources: boolean,
 ): AgentTool<any, any> {
@@ -98,7 +125,7 @@ function bindPathTool(
         path: await safePath(
           params.path,
           workspaceRoot,
-          skillRoot,
+          skillRoots,
           knowledgeRoot,
           allowReadOnlyResources,
         ),
@@ -141,13 +168,15 @@ function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig): AgentTool
 export async function safePath(
   input: string,
   workspaceRoot: string,
-  skillRoot: string,
+  skillRoots: SkillRootConfig[] | string,
   knowledgeRoot: string | undefined,
   allowReadOnlyResources: boolean,
 ): Promise<string> {
   if (!input || input.split(/[\\/]/).includes("..")) throw new Error(`unsafe path: ${input}`);
   const workspace = resolve(workspaceRoot);
-  const skill = resolve(skillRoot);
+  const skills = (typeof skillRoots === "string"
+    ? [{ name: "skill", path: skillRoots }]
+    : skillRoots).map((root) => ({ ...root, path: resolve(root.path) }));
   const knowledge = knowledgeRoot ? resolve(knowledgeRoot) : undefined;
 
   if (!isAbsolute(input) && input.split(/[\\/]/)[0] === "knowledge") {
@@ -173,8 +202,9 @@ export async function safePath(
         "PATH_SCOPE_ERROR: write and edit paths must be workspace-relative; skill and knowledge files are read-only",
       );
     }
-    if (inside(target, skill)) {
-      await rejectSymlinks(skill, target);
+    const matchingSkill = skills.find((root) => inside(target, root.path));
+    if (matchingSkill) {
+      await rejectSymlinks(matchingSkill.path, target);
       return target;
     }
     if (knowledge && inside(target, knowledge)) {

@@ -32,6 +32,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -119,6 +120,7 @@ _PLATFORM_STATUS_MAP: dict[str, RunWorkflowStatus] = {
 # 进程内终态去重，避免 Kafka 重复消息多次 auto_run。
 _delivered_terminal_lock = threading.Lock()
 _delivered_terminal_task_ids: set[str] = set()
+_status_dispatcher: Callable[..., Awaitable[RunWorkflowCallbackResult]] | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,19 @@ class RunWorkflowCallbackResult:
     task_id: str
     normalized_status: RunWorkflowStatus | None
     conversation_id: str | None
+
+
+def set_workflow_status_dispatcher(
+    dispatcher: Callable[..., Awaitable[RunWorkflowCallbackResult]] | None,
+) -> None:
+    global _status_dispatcher
+    _status_dispatcher = dispatcher
+
+
+async def dispatch_run_workflow_status(**kwargs) -> RunWorkflowCallbackResult:
+    if _status_dispatcher is not None:
+        return await _status_dispatcher(**kwargs)
+    return await deliver_run_workflow_status(**kwargs)
 
 
 # ---------------------------------------------------------------------------

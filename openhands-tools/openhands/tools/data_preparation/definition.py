@@ -37,11 +37,11 @@ from openhands.sdk.tool import (
 )
 from openhands.sdk.workspace.workspace import LocalWorkspace
 from openhands.tools.data_preparation.runner import (
+    ProcessLocalSampleExecutor,
     build_dataflow_env,
     check_dataflow_installed,
     check_dataflow_version,
     resolve_dataflow_python,
-    run_dataflow_python,
     runtime_bundle_fingerprint,
     runtime_public_names,
     summarize_dataflow_env,
@@ -487,6 +487,15 @@ class DfRunPipelineObservation(Observation):
     exit_code: int = Field(default=-1)
     stdout_tail: str = Field(default="")
     stderr_tail: str = Field(default="")
+    failure_stage: str | None = Field(
+        default=None, description="Stable stage at which the local Sample failed."
+    )
+    error_code: str | None = Field(
+        default=None, description="Machine-readable local Sample failure code."
+    )
+    error_message: str | None = Field(
+        default=None, description="Controlled human-readable failure reason."
+    )
     report_path: str | None = Field(default=None)
     output_path: str | None = Field(default=None)
     record_count: int | None = Field(
@@ -499,6 +508,33 @@ class DfRunPipelineObservation(Observation):
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
+        original_text = "\n".join(
+            item.text for item in self.content if isinstance(item, TextContent)
+        ).strip()
+        if self.is_error:
+            error_message = (
+                self.error_message or original_text or "DataFlow pipeline failed."
+            )
+            lines = [
+                self.ERROR_MESSAGE_HEADER,
+                f"failure_stage={self.failure_stage or 'pipeline_execution'}",
+                f"error_code={self.error_code or 'dataflow_pipeline_failed'}",
+                f"error_message={error_message}",
+                f"exit_code={self.exit_code}",
+                f"report_path={self.report_path or 'none'}",
+            ]
+            if (
+                original_text
+                and original_text != self.error_message
+                and not (self.stdout_tail or self.stderr_tail)
+            ):
+                lines.extend(["--- diagnostic ---", original_text])
+            if self.stdout_tail:
+                lines.extend(["--- stdout (tail) ---", self.stdout_tail])
+            if self.stderr_tail:
+                lines.extend(["--- stderr (tail) ---", self.stderr_tail])
+            return [TextContent(text="\n".join(lines))]
+
         content = [
             TextContent(
                 text=(
@@ -535,9 +571,40 @@ class DfRunPipelineObservation(Observation):
         return text
 
 
+def _df_failure(
+    *,
+    stage: str,
+    code: str,
+    message: str,
+    exit_code: int = 2,
+    stdout_tail: str = "",
+    stderr_tail: str = "",
+    report_path: str | None = None,
+    output_path: str | None = None,
+) -> DfRunPipelineObservation:
+    """Build a structured error without losing the diagnostic text."""
+
+    return DfRunPipelineObservation.from_text(
+        text=message,
+        is_error=True,
+        exit_code=exit_code,
+        failure_stage=stage,
+        error_code=code,
+        error_message=message,
+        stdout_tail=stdout_tail,
+        stderr_tail=stderr_tail,
+        report_path=report_path,
+        output_path=output_path,
+    )
+
+
 class DfRunPipelineExecutor(ToolExecutor):
     def __init__(self, *, runtime_dir: str | None = None) -> None:
         self._runtime_dir = Path(runtime_dir) if runtime_dir else None
+        self._sample_executor = ProcessLocalSampleExecutor()
+
+    def interrupt(self) -> None:
+        self._sample_executor.interrupt()
 
     def _stage_runtime_files(self, target_dir: Path) -> Path | None:
         """Copy runtime helpers into a hidden tool-owned directory."""
@@ -572,43 +639,10 @@ class DfRunPipelineExecutor(ToolExecutor):
         try:
             pipeline = _resolve_workspace_path(conversation, action.pipeline_path)
         except Exception as exc:
-            return DfRunPipelineObservation.from_text(
-                text=f"Invalid pipeline path: {exc}", is_error=True
-            )
-
-        python = resolve_dataflow_python(action.python)
-        ok, detail = check_dataflow_installed(python)
-        if not ok:
-            return DfRunPipelineObservation.from_text(
-                text=(
-                    f"DataFlow is not installed for interpreter `{python}`.\n"
-                    "Install it with `uv pip install open-dataflow` (preferably "
-                    "in a dedicated venv) or set DATAFLOW_PYTHON to an "
-                    f"interpreter that has it.\nImport check: {detail or 'failed'}"
-                ),
-                is_error=True,
-            )
-        if action.output_schema == "vision":
-            try:
-                version_ok, version_detail = check_dataflow_version(python)
-                if not version_ok:
-                    raise ValueError(
-                        f"Local DataFlow version must match Pyromind: {version_detail}"
-                    )
-                self._preflight_managed_image_pipeline(pipeline)
-            except ValueError as exc:
-                return DfRunPipelineObservation.from_text(
-                    text=f"Invalid managed image pipeline: {exc}",
-                    is_error=True,
-                    exit_code=2,
-                )
-
-        try:
-            env_extra = build_dataflow_env(conversation, action.model_profile)
-        except ValueError as exc:
-            return DfRunPipelineObservation.from_text(
-                text=f"Invalid DataFlow model configuration: {exc}",
-                is_error=True,
+            return _df_failure(
+                stage="pipeline_resolution",
+                code="workspace_pipeline_not_found",
+                message=f"Invalid pipeline path: {exc}",
             )
         process_args = list(action.args)
         standard_input_path: Path | None = None
@@ -616,22 +650,37 @@ class DfRunPipelineExecutor(ToolExecutor):
         state_dir: Path | None = None
         if action.output_schema is not None:
             if len(process_args) < 2:
-                return DfRunPipelineObservation.from_text(
-                    text=(
+                return _df_failure(
+                    stage="input_resolution",
+                    code="standard_pipeline_args_missing",
+                    message=(
                         "output_schema requires standard pipeline arguments: "
                         "args[0]=workspace input and args[1]=workspace output JSONL."
                     ),
-                    is_error=True,
-                    exit_code=2,
                 )
             try:
                 standard_input_path = _resolve_input_path(conversation, process_args[0])
+            except ValueError as exc:
+                return _df_failure(
+                    stage="input_resolution",
+                    code=(
+                        "workspace_input_outside"
+                        if "outside" in str(exc).lower()
+                        else "workspace_input_not_found"
+                    ),
+                    message=f"Invalid standard pipeline input: {exc}",
+                )
+            try:
                 output_path = _resolve_output_path(conversation, process_args[1])
             except ValueError as exc:
-                return DfRunPipelineObservation.from_text(
-                    text=f"Invalid standard pipeline path: {exc}",
-                    is_error=True,
-                    exit_code=2,
+                return _df_failure(
+                    stage="output_resolution",
+                    code=(
+                        "workspace_output_outside"
+                        if "outside" in str(exc).lower()
+                        else "workspace_output_not_writable"
+                    ),
+                    message=f"Invalid standard pipeline output: {exc}",
                 )
             process_args[0] = str(standard_input_path)
             process_args[1] = str(output_path)
@@ -639,6 +688,47 @@ class DfRunPipelineExecutor(ToolExecutor):
             output_path = Path(process_args[1])
             if not output_path.is_absolute():
                 output_path = pipeline.parent / output_path
+
+        python = resolve_dataflow_python(action.python)
+        ok, detail = check_dataflow_installed(python)
+        if not ok:
+            return _df_failure(
+                stage="runtime_dependency",
+                code="dataflow_not_installed",
+                message=(
+                    f"DataFlow is not installed for interpreter `{python}`.\n"
+                    "Install it with `uv pip install open-dataflow` (preferably "
+                    "in a dedicated venv) or set DATAFLOW_PYTHON to an "
+                    f"interpreter that has it.\nImport check: {detail or 'failed'}"
+                ),
+            )
+        if action.output_schema == "vision":
+            version_ok, version_detail = check_dataflow_version(python)
+            if not version_ok:
+                return _df_failure(
+                    stage="runtime_dependency",
+                    code="dataflow_version_mismatch",
+                    message=(
+                        f"Local DataFlow version must match Pyromind: {version_detail}"
+                    ),
+                )
+            try:
+                self._preflight_managed_image_pipeline(pipeline)
+            except ValueError as exc:
+                return _df_failure(
+                    stage="pipeline_resolution",
+                    code="managed_image_pipeline_invalid",
+                    message=f"Invalid managed image pipeline: {exc}",
+                )
+
+        try:
+            env_extra = build_dataflow_env(conversation, action.model_profile)
+        except ValueError as exc:
+            return _df_failure(
+                stage="model_configuration",
+                code="dataflow_model_configuration_invalid",
+                message=f"Invalid DataFlow model configuration: {exc}",
+            )
 
         if output_path is not None:
             state_dir = output_path.parent / f".{output_path.stem}.state"
@@ -654,10 +744,10 @@ class DfRunPipelineExecutor(ToolExecutor):
                         RUNTIME_FILENAMES,
                     )
                 except ValueError as exc:
-                    return DfRunPipelineObservation.from_text(
-                        text=f"Invalid DataFlow runtime: {exc}",
-                        is_error=True,
-                        exit_code=2,
+                    return _df_failure(
+                        stage="runtime_dependency",
+                        code="dataflow_runtime_invalid",
+                        message=f"Invalid DataFlow runtime: {exc}",
                     )
         elif self._runtime_dir is not None:
             state_dir = pipeline.parent / f".{pipeline.stem}.state"
@@ -669,7 +759,9 @@ class DfRunPipelineExecutor(ToolExecutor):
             if runtime_stage_dir is not None:
                 self._add_runtime_pythonpath(env_extra, runtime_stage_dir)
         config_summary = summarize_dataflow_env(env_extra)
-        rc, stdout, stderr = run_dataflow_python(
+        validation_rc: int | None = None
+        report_rc: int | None = None
+        rc, stdout, stderr = self._sample_executor.run(
             python,
             [str(pipeline), *process_args],
             cwd=str(pipeline.parent),
@@ -698,12 +790,14 @@ class DfRunPipelineExecutor(ToolExecutor):
                 input_path = standard_input_path
                 image_root = input_path if input_path.is_dir() else input_path.parent
                 validation_args.extend(["--image-root", str(image_root)])
-            validation_rc, validation_stdout, validation_stderr = run_dataflow_python(
-                python,
-                validation_args,
-                cwd=str(pipeline.parent),
-                env_extra=env_extra,
-                timeout=min(action.timeout, 600),
+            validation_rc, validation_stdout, validation_stderr = (
+                self._sample_executor.run(
+                    python,
+                    validation_args,
+                    cwd=str(pipeline.parent),
+                    env_extra=env_extra,
+                    timeout=min(action.timeout, 600),
+                )
             )
             stdout = f"{stdout}\n--- validation ---\n{validation_stdout}"
             stderr = f"{stderr}\n--- validation ---\n{validation_stderr}"
@@ -729,7 +823,7 @@ class DfRunPipelineExecutor(ToolExecutor):
                 "--output-file",
                 str(output_path),
             ]
-            report_rc, report_stdout, report_stderr = run_dataflow_python(
+            report_rc, report_stdout, report_stderr = self._sample_executor.run(
                 python,
                 report_args,
                 cwd=str(pipeline.parent),
@@ -744,6 +838,48 @@ class DfRunPipelineExecutor(ToolExecutor):
         record_count: int | None = None
         if rc == 0 and output_path is not None and output_path.is_file():
             sample_records, record_count = _read_output_records(output_path)
+        failure_stage: str | None = None
+        error_code: str | None = None
+        error_message: str | None = None
+        if rc != 0:
+            if rc == 124:
+                failure_stage = "timeout"
+                timed_out_step = (
+                    "pipeline"
+                    if pipeline_rc == 124
+                    else "validation"
+                    if validation_rc == 124
+                    else "report"
+                )
+                error_code = f"dataflow_{timed_out_step}_timeout"
+                error_message = (
+                    f"DataFlow {timed_out_step} timed out after {action.timeout}s."
+                )
+            elif rc < 0:
+                failure_stage = "cancelled"
+                error_code = "dataflow_pipeline_cancelled"
+                error_message = "DataFlow local Sample execution was cancelled."
+            elif pipeline_rc != 0:
+                failure_stage = "pipeline_execution"
+                error_code = "dataflow_pipeline_failed"
+                error_message = f"DataFlow pipeline exited with code {pipeline_rc}."
+            elif validation_rc is not None and validation_rc != 0:
+                failure_stage = "schema_validation"
+                error_code = "dataflow_schema_validation_failed"
+                error_message = (
+                    "DataFlow output schema validation exited with code "
+                    f"{validation_rc}."
+                )
+            elif report_rc is not None and report_rc != 0:
+                failure_stage = "report_generation"
+                error_code = "dataflow_report_generation_failed"
+                error_message = (
+                    f"DataFlow report generation exited with code {report_rc}."
+                )
+            else:
+                failure_stage = "pipeline_execution"
+                error_code = "dataflow_pipeline_failed"
+                error_message = f"DataFlow pipeline exited with code {rc}."
         return DfRunPipelineObservation.from_text(
             text=(
                 f"DataFlow model: {config_summary}\n"
@@ -753,6 +889,9 @@ class DfRunPipelineExecutor(ToolExecutor):
             ),
             is_error=rc != 0,
             exit_code=rc,
+            failure_stage=failure_stage,
+            error_code=error_code,
+            error_message=error_message,
             stdout_tail=stdout[-_LOG_TAIL_CHARS:],
             stderr_tail=stderr[-_LOG_TAIL_CHARS:],
             report_path=str(report_path) if report_path is not None else None,

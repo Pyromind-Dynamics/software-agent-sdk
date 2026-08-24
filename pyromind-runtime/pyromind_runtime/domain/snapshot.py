@@ -14,6 +14,7 @@ type ConversationStatus = Literal[
     "running",
     "paused",
     "waiting_for_confirmation",
+    "waiting_for_external_task",
     "finished",
     "error",
     "stuck",
@@ -117,6 +118,20 @@ class UsageState(ContractModel):
     cost_usd: float | None = Field(default=None, ge=0)
 
 
+class ExternalTaskState(ContractModel):
+    task_id: str = Field(min_length=1)
+    kind: Literal["data_cleaning", "data_preparation"]
+    run_id: str = Field(min_length=1)
+    status: Literal[
+        "pending", "running", "succeeded", "failed", "terminated", "stopped"
+    ]
+    output_dir: str
+    submitted_at: str
+    updated_at: str
+    resume_pending: bool = False
+    error_summary: str | None = None
+
+
 class ConversationSnapshot(ContractModel):
     schema_version: int = Field(default=1, ge=1)
     conversation_id: str = Field(min_length=1)
@@ -131,6 +146,7 @@ class ConversationSnapshot(ContractModel):
         None
     )
     usage: UsageState = Field(default_factory=UsageState)
+    external_tasks: tuple[ExternalTaskState, ...] = ()
 
 
 class ConversationSummary(ContractModel):

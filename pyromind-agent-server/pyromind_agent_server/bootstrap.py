@@ -9,6 +9,9 @@ from harness_adapter.pi_adapter import PiAdapter
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.ports.harness import HarnessAdapter
 
+from openhands.agent_server.run_workflow_callback import set_workflow_status_dispatcher
+from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
+
 
 def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     runtime = getattr(app.state, "product_runtime", None)
@@ -36,6 +39,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         adapters,
         default_harness_id=backend,
     )
+    set_workflow_status_dispatcher(WorkflowStatusDispatcher(runtime).dispatch)
     app.state.product_runtime = runtime
     return runtime
 
@@ -57,6 +61,7 @@ def install_product_api(app: FastAPI) -> FastAPI:
                 runtime = getattr(current_app.state, "product_runtime", None)
                 if isinstance(runtime, ConversationRuntime):
                     await runtime.close()
+                set_workflow_status_dispatcher(None)
                 current_app.state.product_runtime = None
 
     app.router.lifespan_context = product_lifespan

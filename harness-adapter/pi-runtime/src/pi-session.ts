@@ -16,6 +16,7 @@ import {
   createTerminalPermissionExtension,
   createTools,
   type BusinessToolConfig,
+  type SkillRootConfig,
 } from "./tools.js";
 
 interface PiSessionConfig extends PiModelConfig {
@@ -24,7 +25,7 @@ interface PiSessionConfig extends PiModelConfig {
   thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   workspaceRoot: string;
   sessionPath: string;
-  skillRoot: string;
+  skillRoots: SkillRootConfig[];
   knowledgeRoot?: string;
   tools: BusinessToolConfig[];
 }
@@ -45,7 +46,7 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
     peer,
     env,
     config.workspaceRoot,
-    config.skillRoot,
+    config.skillRoots,
     config.knowledgeRoot,
     config.tools,
   );
@@ -61,7 +62,7 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
     settingsManager,
     systemPrompt: config.systemPrompt,
     extensionFactories: [createTerminalPermissionExtension(peer)],
-    additionalSkillPaths: [config.skillRoot],
+    additionalSkillPaths: config.skillRoots.map((root) => root.path),
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
@@ -124,10 +125,25 @@ function parseConfig(value: JsonObject): PiSessionConfig {
     thinkingLevel: thinking as PiSessionConfig["thinkingLevel"],
     workspaceRoot: requiredString(value, "workspace_root"),
     sessionPath: requiredString(value, "session_path"),
-    skillRoot: requiredString(value, "skill_root"),
+    skillRoots: parseSkillRoots(value),
     knowledgeRoot: optionalString(value, "knowledge_root"),
     tools: parseTools(value.tools),
   };
+}
+
+function parseSkillRoots(value: JsonObject): SkillRootConfig[] {
+  if (Array.isArray(value.skill_roots)) {
+    if (value.skill_roots.length === 0) throw new Error("skill_roots must not be empty");
+    const names = new Set<string>();
+    return value.skill_roots.map((item) => {
+      if (!isRecord(item)) throw new Error("invalid skill root configuration");
+      const name = requiredString(item, "name");
+      if (names.has(name)) throw new Error(`duplicate skill root name: ${name}`);
+      names.add(name);
+      return { name, path: requiredString(item, "path") };
+    });
+  }
+  return [{ name: "skill", path: requiredString(value, "skill_root") }];
 }
 
 function parseTools(value: JsonValue | undefined): BusinessToolConfig[] {

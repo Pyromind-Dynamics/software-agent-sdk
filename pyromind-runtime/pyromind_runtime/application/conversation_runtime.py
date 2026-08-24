@@ -5,7 +5,9 @@ import logging
 import time
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from pyromind_runtime.application.event_projection import ProductEventProjector
 from pyromind_runtime.domain.commands import (
@@ -33,6 +35,7 @@ class _ActiveConversation:
     adapter: HarnessAdapter
     task: asyncio.Task[None]
     ready: asyncio.Event
+    context: RequestContext
 
 
 class ConversationRuntime:
@@ -101,7 +104,7 @@ class ConversationRuntime:
         except Exception:
             await adapter.close(handle)
             raise
-        active = self._start_pump(handle, adapter, store)
+        active = self._start_pump(handle, adapter, store, context)
         self._active[handle.session_id] = active
         ready_started_at = time.perf_counter()
         await active.ready.wait()
@@ -147,6 +150,7 @@ class ConversationRuntime:
         if not claimed:
             return receipt
         active = self._active[conversation_id]
+        active.context = context
         first_command = (
             isinstance(command, UserMessageCommand)
             and conversation_id in self._first_command_pending
@@ -186,6 +190,93 @@ class ConversationRuntime:
             update={"status": "completed", "response": response}
         )
         return store.complete_command(completed)
+
+    async def deliver_external_task_status(
+        self,
+        conversation_id: str,
+        *,
+        task_id: str,
+        status: str,
+        error_summary: str | None = None,
+    ) -> ProductEvent:
+        """Persist an external task callback and wake an active Pi session once."""
+        store = self._store(conversation_id)
+        if store.harness_id() != "pi":
+            raise ValueError("external task callbacks are only routed to Pi sessions")
+        snapshot = store.load_snapshot()
+        task = next(
+            (item for item in snapshot.external_tasks if item.task_id == task_id),
+            None,
+        )
+        if task is None:
+            raise ValueError(f"unknown external task: {task_id}")
+        normalized = _normalize_external_status(status)
+        terminal = normalized in {"succeeded", "failed", "terminated", "stopped"}
+        active = self._active.get(conversation_id)
+        notification: dict[str, Any] = {
+            **task.model_dump(mode="json"),
+            "status": normalized,
+            "updated_at": datetime.now().astimezone().isoformat(),
+            "resume_pending": active is None and normalized != "stopped",
+            "error_summary": _controlled_error(error_summary),
+        }
+        event = ProductEvent(
+            event_id=f"external-task:{task_id}:{normalized}",
+            conversation_id=conversation_id,
+            type="external_task.completed" if terminal else "external_task.updated",
+            payload=notification,
+        )
+        before_seq = snapshot.through_seq
+        persisted, updated_snapshot = store.append(event)
+        if updated_snapshot.through_seq == before_seq:
+            logger.info(
+                "external_task.callback_duplicate conversation_id=%s task_id=%s "
+                "status=%s",
+                conversation_id,
+                task_id,
+                normalized,
+            )
+            return persisted
+        self._publish(persisted)
+        if active is not None and terminal and normalized != "stopped":
+            deliver = getattr(active.adapter, "deliver_external_task_status", None)
+            if deliver is not None:
+                try:
+                    await deliver(active.handle, notification, active.context)
+                except Exception:
+                    logger.exception(
+                        "Could not wake Pi for external task %s; deferring", task_id
+                    )
+                    pending = {**notification, "resume_pending": True}
+                    persisted, _ = store.append(
+                        ProductEvent(
+                            event_id=f"external-task:{task_id}:{normalized}:pending",
+                            conversation_id=conversation_id,
+                            type="external_task.updated",
+                            payload=pending,
+                        )
+                    )
+                    self._publish(persisted)
+        return persisted
+
+    def register_external_task(
+        self, conversation_id: str, payload: dict[str, Any]
+    ) -> ProductEvent:
+        store = self._store(conversation_id)
+        snapshot = store.load_snapshot()
+        task_id = str(payload.get("task_id") or "")
+        if not task_id:
+            raise ValueError("external task_id is required")
+        event = ProductEvent(
+            event_id=f"external-task:{task_id}:submitted",
+            conversation_id=conversation_id,
+            type="external_task.submitted",
+            payload=payload,
+        )
+        persisted, updated = store.append(event)
+        if updated.through_seq != snapshot.through_seq:
+            self._publish(persisted)
+        return persisted
 
     async def stream_events(
         self,
@@ -283,16 +374,40 @@ class ConversationRuntime:
                 user_id=context.user_id,
                 harness_id=harness_id,
             )
-            active = self._start_pump(handle, adapter, store)
+            active = self._start_pump(handle, adapter, store, context)
             self._active[conversation_id] = active
             await active.ready.wait()
+            await self._resume_pending_external_tasks(active, store)
             return store
+
+    async def _resume_pending_external_tasks(
+        self, active: _ActiveConversation, store: FileProductStore
+    ) -> None:
+        deliver = getattr(active.adapter, "deliver_external_task_status", None)
+        if deliver is None:
+            return
+        for task in store.load_snapshot().external_tasks:
+            if not task.resume_pending or task.status == "stopped":
+                continue
+            notification = task.model_dump(mode="json")
+            await deliver(active.handle, notification, active.context)
+            notification["resume_pending"] = False
+            persisted, _ = store.append(
+                ProductEvent(
+                    event_id=f"external-task:{task.task_id}:{task.status}:resumed",
+                    conversation_id=active.handle.session_id,
+                    type="external_task.updated",
+                    payload=notification,
+                )
+            )
+            self._publish(persisted)
 
     def _start_pump(
         self,
         handle: SessionHandle,
         adapter: HarnessAdapter,
         store: FileProductStore,
+        context: RequestContext,
     ) -> _ActiveConversation:
         ready = asyncio.Event()
         task = asyncio.create_task(
@@ -304,6 +419,7 @@ class ConversationRuntime:
             adapter=adapter,
             task=task,
             ready=ready,
+            context=context,
         )
 
     async def _pump(
@@ -391,3 +507,28 @@ class ConversationRuntime:
         elapsed_ms = (time.perf_counter() - started_at) * 1000
         suffix = " ".join(f"{key}={value}" for key, value in dimensions.items())
         logger.info("%s=%.3f %s", metric, elapsed_ms, suffix)
+
+
+def _normalize_external_status(value: str) -> str:
+    normalized = value.strip().lower()
+    aliases = {
+        "success": "succeeded",
+        "succeeded": "succeeded",
+        "error": "failed",
+        "failed": "failed",
+        "terminated": "terminated",
+        "stopped": "stopped",
+        "pending": "pending",
+        "running": "running",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(f"unsupported external task status: {value!r}") from exc
+
+
+def _controlled_error(value: str | None) -> str | None:
+    if not value:
+        return None
+    compact = " ".join(value.split())
+    return compact[:2000]

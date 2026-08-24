@@ -14,6 +14,7 @@ from harness_adapter.pi_adapter.adapter import (
     _resolve_model,
     _session_config,
 )
+from harness_adapter.pi_adapter.business_tool_host import PyromindBusinessToolHost
 from harness_adapter.pi_adapter.business_tools import (
     execute_validation_tool,
     validation_tool_spec,
@@ -172,6 +173,65 @@ async def test_runner_start_receives_configured_knowledge_root(
         assert captured["knowledge_root"] == str(knowledge.resolve())
     finally:
         await adapter.close(handle)
+
+
+async def test_runner_loads_three_named_skills_and_eight_business_tools(
+    tmp_path, monkeypatch
+) -> None:
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, config) -> None:
+            captured.update(config)
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations)
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="conversation-skills",
+            user_id="42",
+            workspace_root=str(conversations / "conversation-skills"),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    try:
+        assert [item["name"] for item in captured["skill_roots"]] == [
+            "generate-workflow-dsl",
+            "data-cleaning",
+            "data-preparation",
+        ]
+        assert {item["name"] for item in captured["tools"]} == {
+            "validate_workflow_dsl",
+            "preview_dataset",
+            "upload_file_to_pyromind",
+            "run_dataset_cleaning",
+            "df_run_pipeline",
+            "df_submit_pipeline",
+            "df_check_progress",
+            "df_stop_task",
+        }
+    finally:
+        await adapter.close(handle)
+
+
+def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
+    repository = Path(pi_adapter_module.__file__).parents[3]
+    roots = [
+        repository / ".agents" / "skills" / "data-cleaning",
+        repository / ".agents" / "skills" / "data-preparation",
+    ]
+    specs = PyromindBusinessToolHost(roots).specs()
+    assert len(specs) == 8
+    assert all(spec["input_schema"].get("type") == "object" for spec in specs)
 
 
 def test_model_resolution_rules() -> None:

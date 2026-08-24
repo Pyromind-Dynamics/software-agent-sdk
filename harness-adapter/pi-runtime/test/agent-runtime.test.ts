@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, AssistantMessage, Model, Models } from "@earendil-works/pi-ai";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import { PiAgentRuntime } from "../src/agent-runtime.js";
 import { resolveModel } from "../src/pi-model.js";
 import { normalizePiOutcome } from "../src/pi-outcome.js";
+import type { JsonObject, JsonValue, RunnerEvent } from "../src/protocol.js";
+import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 
 function model(id: string, api: Api = "openai-responses"): Model<Api> {
   return {
@@ -126,6 +130,41 @@ test("final Pi stop reasons normalize without treating length as success", () =>
     ).error_code,
     "output_truncated",
   );
+});
+
+test("idle external notification triggers an independent hidden Pi turn", async () => {
+  const events: RunnerEvent[] = [];
+  const peer = {
+    emit: (event: RunnerEvent) => events.push(event),
+    request: async (): Promise<JsonValue> => ({}),
+  } as unknown as JsonlRpcPeer;
+  const runtime = new PiAgentRuntime(peer);
+  const calls: Array<{ message: unknown; options: unknown }> = [];
+  const session = {
+    isStreaming: false,
+    messages: [assistant("stop")],
+    sendCustomMessage: async (message: unknown, options: unknown) => {
+      calls.push({ message, options });
+    },
+  } as unknown as AgentSession;
+  const state = runtime as unknown as {
+    session: AgentSession;
+    sessionId: string;
+  };
+  state.session = session;
+  state.sessionId = "session-1";
+
+  const result = await runtime.handle("notify", {
+    run_id: "callback:task-1:succeeded",
+    content: "<system_reminder>done</system_reminder>",
+    details: { task_id: "task-1" } as JsonObject,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(result, { accepted: true, queued: false });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0]!.options, { triggerTurn: true });
+  assert.equal(events.at(-1)?.kind, "run.finished");
 });
 
 function assistant(stopReason: AssistantMessage["stopReason"]): AgentMessage {

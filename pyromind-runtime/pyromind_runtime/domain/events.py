@@ -27,6 +27,9 @@ type HarnessEventType = Literal[
     "workflow.updated",
     "usage.updated",
     "notice.raised",
+    "external_task.submitted",
+    "external_task.updated",
+    "external_task.completed",
 ]
 
 type ProductEventType = Literal[
@@ -46,6 +49,9 @@ type ProductEventType = Literal[
     "workflow.updated",
     "usage.updated",
     "notice.raised",
+    "external_task.submitted",
+    "external_task.updated",
+    "external_task.completed",
 ]
 
 
