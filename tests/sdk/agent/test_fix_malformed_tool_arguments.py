@@ -9,7 +9,7 @@ JSON arrays/objects.
 from typing import Annotated
 
 import pytest
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from openhands.sdk.agent.utils import fix_malformed_tool_arguments
 from openhands.sdk.tool.schema import Action
@@ -68,6 +68,22 @@ class _NestedActionForMalformedArgs(Action):
 
     nested_list: list[list[int]] = Field(description="Nested list")
     nested_dict: dict[str, dict[str, str]] = Field(description="Nested dict")
+
+
+class _PlanStepForMalformedArgs(BaseModel):
+    """Mirror of update_plan's PlanStep: extra keys are forbidden."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step: str = Field(description="A concise description of the plan step.")
+    status: str = Field(description="The current status of the step.")
+
+
+class _UpdatePlanLikeAction(Action):
+    """Mirror of UpdatePlanAction for testing nested payload hoisting."""
+
+    explanation: str | None = Field(default=None, description="Optional explanation.")
+    plan: list[_PlanStepForMalformedArgs] = Field(description="Plan steps.")
 
 
 def test_decode_json_string_list():
@@ -383,3 +399,73 @@ def test_str_or_list_field_list_passthrough():
     action = StrOrListAction.model_validate(fixed_data)
 
     assert action.value == ["a", "b", "c"]
+
+
+def test_nested_plan_payload_hoisted():
+    """A plan payload wrapped inside the plan list is hoisted to the top level."""
+    data = {
+        "plan": [
+            {
+                "explanation": "",
+                "plan": [
+                    {"step": "Locate modules", "status": "in_progress"},
+                    {"step": "Trace flow", "status": "pending"},
+                ],
+                "status": "in_progress",
+            }
+        ]
+    }
+    fixed_data = fix_malformed_tool_arguments(data, _UpdatePlanLikeAction)
+    action = _UpdatePlanLikeAction.model_validate(fixed_data)
+
+    assert action.explanation == ""
+    assert [(s.step, s.status) for s in action.plan] == [
+        ("Locate modules", "in_progress"),
+        ("Trace flow", "pending"),
+    ]
+
+
+def test_nested_plan_payload_without_explanation():
+    """A wrapper without extra action-level keys still hoists the nested plan."""
+    data = {
+        "plan": [
+            {"plan": [{"step": "A", "status": "completed"}], "status": "completed"}
+        ]
+    }
+    fixed_data = fix_malformed_tool_arguments(data, _UpdatePlanLikeAction)
+    action = _UpdatePlanLikeAction.model_validate(fixed_data)
+
+    assert action.explanation is None
+    assert [(s.step, s.status) for s in action.plan] == [("A", "completed")]
+
+
+def test_nested_plan_payload_keeps_top_level_explanation():
+    """An existing top-level value is never overwritten by the wrapper."""
+    data = {
+        "explanation": "top",
+        "plan": [
+            {"explanation": "nested", "plan": [{"step": "A", "status": "pending"}]}
+        ],
+    }
+    fixed_data = fix_malformed_tool_arguments(data, _UpdatePlanLikeAction)
+    action = _UpdatePlanLikeAction.model_validate(fixed_data)
+
+    assert action.explanation == "top"
+    assert [s.step for s in action.plan] == ["A"]
+
+
+def test_nested_plan_payload_doubly_wrapped():
+    """Doubly-wrapped payloads are unwrapped iteratively."""
+    data = {"plan": [{"plan": [{"plan": [{"step": "A", "status": "pending"}]}]}]}
+    fixed_data = fix_malformed_tool_arguments(data, _UpdatePlanLikeAction)
+    action = _UpdatePlanLikeAction.model_validate(fixed_data)
+
+    assert [(s.step, s.status) for s in action.plan] == [("A", "pending")]
+
+
+def test_regular_plan_passthrough():
+    """A well-formed plan list is left untouched."""
+    data = {"plan": [{"step": "A", "status": "pending"}]}
+    fixed_data = fix_malformed_tool_arguments(data, _UpdatePlanLikeAction)
+
+    assert fixed_data == data

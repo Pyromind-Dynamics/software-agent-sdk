@@ -13,10 +13,11 @@ storage = storage.step()
 data = storage.read(output_type="dict")
 ```
 
-`df_run_pipeline` 注入凭证和模型配置。文本 serving 使用完整 endpoint
-`DF_API_URL`；VLM serving 使用 OpenAI-compatible 根地址 `DF_API_BASE_URL`；
-模型名使用 `DF_MODEL_NAME`，密钥环境变量名为 `DF_API_KEY`。脚本不得读取、打印或
-硬编码密钥。
+`df_run_pipeline` 按 `model_profile` 注入凭证和模型配置：`text` 场景注入会话
+本体 LLM 的配置，`vision` 场景使用服务端 `DF_*` 配置（缺失时按 `LLM_BASE_URL` →
+本体 LLM → 默认值兜底）。文本 serving 使用完整 endpoint `DF_API_URL`；VLM serving
+使用 OpenAI-compatible 根地址 `DF_API_BASE_URL`；模型名使用 `DF_MODEL_NAME`，密钥
+环境变量名为 `DF_API_KEY`。脚本不得读取、打印或硬编码密钥。
 
 DataFlow serving 包可能引入不需要的重依赖。文本 pipeline 优先复制并修改
 [example_pipeline.py](example_pipeline.py) 中的 importlib shim，不要直接从

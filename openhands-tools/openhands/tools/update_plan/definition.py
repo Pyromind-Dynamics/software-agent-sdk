@@ -1,7 +1,7 @@
 import json
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -119,11 +119,55 @@ Use this tool for complex, multi-step work. Provide the full plan on every call;
 incremental patches are not supported. After completing a step, call this tool
 again with its status set to completed and the next step set to in_progress.
 Keep at most one step in_progress, and mark every step completed before finishing.
+Top-level arguments are explanation and plan. Each plan item contains only step
+and status.
 Do not use this tool for simple or single-step tasks.
 """
 
 
 class UpdatePlanTool(ToolDefinition[UpdatePlanAction, UpdatePlanObservation]):
+    def normalize_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        outer_keys = set(arguments)
+        if not outer_keys <= {"plan", "security_risk", "summary"}:
+            return arguments
+
+        plan = arguments.get("plan")
+        if not isinstance(plan, list) or len(plan) != 1:
+            return arguments
+
+        wrapper = plan[0]
+        if not isinstance(wrapper, dict) or "step" in wrapper:
+            return arguments
+        if not set(wrapper) <= {"explanation", "plan", "status"}:
+            return arguments
+        if not isinstance(wrapper.get("plan"), list):
+            return arguments
+        if wrapper.get("status") not in {None, "pending", "in_progress", "completed"}:
+            return arguments
+
+        normalized = {
+            key: arguments[key]
+            for key in ("security_risk", "summary")
+            if key in arguments
+        }
+        normalized["plan"] = wrapper["plan"]
+        if "explanation" in wrapper:
+            normalized["explanation"] = wrapper["explanation"]
+
+        try:
+            UpdatePlanAction.model_validate(
+                {
+                    key: value
+                    for key, value in normalized.items()
+                    if key not in {"security_risk", "summary"}
+                }
+            )
+        except ValidationError:
+            return arguments
+
+        logger.warning("Normalized nested update_plan argument wrapper")
+        return normalized
+
     @classmethod
     def create(cls, conv_state: "ConversationState") -> Sequence["UpdatePlanTool"]:
         return [

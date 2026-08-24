@@ -14,8 +14,11 @@ storage = storage.step()
 rows = storage.read(output_type="dict")
 ```
 
-LLM 配置只读取 `DF_API_URL`、`DF_MODEL_NAME` 和 `DF_API_KEY`。使用
-`APILLMServing_request`，并立即包装：
+LLM 配置由 `df_run_pipeline`/`df_submit_pipeline` 按 `model_profile` 注入环境变量：
+`text` 场景注入当前会话本体 LLM（`llm.model`/`llm.base_url`/`llm.api_key`）；
+`vision` 场景优先使用服务端 `DF_*` 配置，缺失时按 `LLM_BASE_URL` → 本体 LLM →
+默认值兜底。Pipeline 内只读取 `DF_API_URL`、`DF_MODEL_NAME` 和 `DF_API_KEY`
+三个名字。使用 `APILLMServing_request`，并立即包装：
 
 ```python
 raw_llm = APILLMServing_request(

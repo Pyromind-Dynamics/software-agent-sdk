@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import base64
+import gzip
+import json
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -79,13 +82,13 @@ def get_api_key(
     ``{"success": true, "data": {"accessKey": ...}}`` 格式并返回 access key。
     HTTP 错误或响应格式异常时抛出异常。
     """
-    ## Construct the request
+    # Construct the request
     endpoint_url = _access_key_url(env)
 
-    ## 构建请求头
+    # 构建请求头
     headers = _build_access_key_request_headers(origin_headers, auth_token=auth_token)
 
-    ## 发送请求
+    # 发送请求
     response = httpx.post(
         endpoint_url,
         headers=headers,
@@ -112,6 +115,15 @@ def get_api_key(
         raise RuntimeError("Invalid api key response: missing accessKey")
 
     return str(access_key)
+
+
+def decompress_gzip_base64_data(value: str) -> Any:
+    """Decode a gzip+base64 compressed payload back into JSON data.
+
+    还原 middleware 以 gzip+base64 压缩下发的 JSON 载荷。
+    """
+    raw = gzip.decompress(base64.b64decode(value))
+    return json.loads(raw.decode("utf-8"))
 
 
 def _build_access_key_request_headers(

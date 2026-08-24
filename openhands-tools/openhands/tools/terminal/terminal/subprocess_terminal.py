@@ -30,7 +30,19 @@ from openhands.tools.terminal.constants import (
     HISTORY_LIMIT,
 )
 from openhands.tools.terminal.metadata import CmdOutputMetadata
-from openhands.tools.terminal.sandbox import TerminalSandbox, TerminalSandboxMode
+from openhands.tools.terminal.sandbox import (
+    TerminalSandbox,
+    TerminalSandboxMode,
+    parse_memory_limit,
+)
+from openhands.tools.terminal.session_memory_guard import (
+    MARKER_ENV,
+    SessionMemoryGuard,
+    new_session_marker,
+    procfs_root,
+    session_memory_limit_bytes,
+    session_memory_monitor_enabled,
+)
 from openhands.tools.terminal.terminal import TerminalInterface
 from openhands.tools.terminal.terminal.interface import parse_ctrl_key
 
@@ -38,6 +50,60 @@ from openhands.tools.terminal.terminal.interface import parse_ctrl_key
 logger = get_logger(__name__)
 
 ENTER = b"\n"
+
+# Virtual address-space cap (RLIMIT_AS) applied to each sandbox shell so a
+# single runaway command (e.g. large allocations during downloads) fails with
+# MemoryError instead of exhausting the whole pod.
+OH_SANDBOX_VMEM_LIMIT_ENV = "OH_SANDBOX_VMEM_LIMIT"
+_DEFAULT_SANDBOX_VMEM_LIMIT = "500M"
+
+
+def _sandbox_vmem_kb() -> int:
+    """Return the sandbox virtual memory cap in KiB (``OH_SANDBOX_VMEM_LIMIT``).
+
+    RLIMIT_AS is a process-level soft limit inherited by every forked command;
+    it does not require privileges and works even when cgroup delegation is
+    unavailable. Defaults to 500MiB.
+    """
+    value = os.environ.get(OH_SANDBOX_VMEM_LIMIT_ENV, _DEFAULT_SANDBOX_VMEM_LIMIT)
+    try:
+        return parse_memory_limit(value) // 1024
+    except ValueError as exc:
+        raise RuntimeError(
+            f"invalid {OH_SANDBOX_VMEM_LIMIT_ENV}={value!r}: {exc}"
+        ) from exc
+
+
+# Process cap (RLIMIT_NPROC) applied to each sandbox shell. It only counts
+# processes inside the sandbox's own user namespace (bwrap --unshare-user-try),
+# so one runaway sandbox cannot spawn an army of parallel commands.
+OH_SANDBOX_NPROC_LIMIT_ENV = "OH_SANDBOX_NPROC_LIMIT"
+_DEFAULT_SANDBOX_NPROC_LIMIT = 2
+
+
+def _sandbox_nproc_limit() -> int:
+    """Return the sandbox process cap (RLIMIT_NPROC) parsed from env.
+
+    Includes the shell itself (bash) plus one working child, so the sandbox
+    runs at most one command process at a time. A process cap only applies
+    inside a private user namespace; the caller guards on ``/proc/self/uid_map``
+    before applying it.
+    """
+    value = os.environ.get(
+        OH_SANDBOX_NPROC_LIMIT_ENV, str(_DEFAULT_SANDBOX_NPROC_LIMIT)
+    )
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"invalid {OH_SANDBOX_NPROC_LIMIT_ENV}={value!r}: {exc}"
+        ) from exc
+    if limit < 2:
+        raise RuntimeError(
+            f"{OH_SANDBOX_NPROC_LIMIT_ENV} must be at least 2 (bash + 1 child)"
+        )
+    return limit
+
 
 # Map normalized special key names to ANSI escape bytes for PTY.
 _SUBPROCESS_SPECIALS: dict[str, bytes] = {
@@ -107,6 +173,9 @@ class SubprocessTerminal(TerminalInterface):
             read_only_paths=read_only_paths,
             read_write_paths=read_write_paths,
         )
+        self.session_marker = new_session_marker()
+        self.memory_guard: SessionMemoryGuard | None = None
+        self._terminated_by_memory_guard = False
 
     # ------------------------- Lifecycle -------------------------
 
@@ -185,6 +254,13 @@ class SubprocessTerminal(TerminalInterface):
                 pass
 
         self._pty_master_fd = master_fd
+        try:
+            self.sandbox.attach_memory_cgroup(self.process.pid)
+        except RuntimeError:
+            # The sandbox memory limit did not take effect; do not keep an
+            # unconstrained sandbox running.
+            self.close()
+            raise
 
         # Set master FD non-blocking
         flags = fcntl.fcntl(self._pty_master_fd, fcntl.F_GETFL)
@@ -199,13 +275,47 @@ class SubprocessTerminal(TerminalInterface):
 
         # Configure bash: disable history expansion, set up PS1/PS2 prompts
         work_dir = shlex.quote(os.path.abspath(self.work_dir))
+        nproc_guard = (
+            "map=$(awk 'NR==1{print $3}' /proc/self/uid_map); "
+            '[ "$map" != "4294967295" ] '
+            f"&& ulimit -u {_sandbox_nproc_limit()} 2>/dev/null; "
+        )
+        # Max out the OOM score so, if the pod ever hits its kubelet memory
+        # limit, the kernel prefers killing sandbox shells over the server.
+        # Raising one's own score needs no privilege and children inherit it.
         init_cmd = (
-            f"set +H; export PROMPT_COMMAND='export PS1=\"{self.PS1}\"'; "
+            "echo 1000 > /proc/self/oom_score_adj 2>/dev/null; "
+            + nproc_guard
+            + f"ulimit -v {_sandbox_vmem_kb()} 2>/dev/null; "
+            + f"export {MARKER_ENV}={self.session_marker}; "
+            "set +H; "
+            f"export PROMPT_COMMAND='export PS1=\"{self.PS1}\"'; "
             f'export PS2=""; cd -- {work_dir}'
         ).encode("utf-8", "ignore")
 
         self._write_pty(init_cmd + ENTER)
         time.sleep(1.0)  # Wait for command to take effect
+
+        # The eager attach above can miss the interactive bash: bwrap
+        # --unshare-pid spawns it only after Popen returns. Re-run the sweep
+        # now that bash is up so the shell (and every later command process,
+        # which inherits its cgroup) stays inside the sandbox memory limit.
+        try:
+            attached = self.sandbox.attach_memory_cgroup(self.process.pid)
+        except RuntimeError:
+            self.close()
+            raise
+        logger.info(
+            "sandbox memory cgroup enforced on %d process(es) after shell init",
+            attached,
+        )
+
+        if session_memory_monitor_enabled() and os.path.isdir(procfs_root()):
+            self.memory_guard = SessionMemoryGuard(
+                marker=self.session_marker,
+                on_exceed=self._on_sandbox_memory_exceeded,
+            )
+            self.memory_guard.start()
 
         self.clear_screen()
 
@@ -215,6 +325,9 @@ class SubprocessTerminal(TerminalInterface):
         """Clean up the PTY terminal."""
         if self._closed:
             return
+
+        if self.memory_guard is not None:
+            self.memory_guard.stop()
 
         try:
             if self.process:
@@ -249,6 +362,25 @@ class SubprocessTerminal(TerminalInterface):
             self.process = None
             self.sandbox.cleanup()
             self._closed: bool = True
+
+    def _on_sandbox_memory_exceeded(self, pids: list[int]) -> None:
+        """SIGKILL every sandbox process once the session RSS exceeds its cap."""
+        self._terminated_by_memory_guard = True
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        if self.process is not None:
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        logger.warning(
+            "sandbox memory guard terminated session %s (%d process(es))",
+            self.session_marker[:8],
+            len(pids),
+        )
 
     # ------------------------- I/O Core -------------------------
 
@@ -389,6 +521,14 @@ class SubprocessTerminal(TerminalInterface):
         """
         if not self._initialized:
             raise RuntimeError("PTY terminal is not initialized")
+
+        if self._terminated_by_memory_guard:
+            limit_mib = session_memory_limit_bytes() // 1024**2
+            raise RuntimeError(
+                "The sandbox session exceeded its memory cap "
+                f"({limit_mib} MiB of summed process RSS) and was terminated. "
+                "Send `reset=true` to start a fresh terminal session."
+            )
 
         upper = text.upper().strip()
         payload: bytes | None = None

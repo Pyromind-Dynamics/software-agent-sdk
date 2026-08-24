@@ -1,11 +1,14 @@
 import asyncio
 import contextlib
+import json
+import logging
 import shutil
 import threading
 import time
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -18,6 +21,7 @@ from openhands.agent_server.conversation_lease import LEASE_FILE_NAME
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.event_service import (
     EventService,
+    _rehydrate_runtime_agent,
     _with_pyromind_runtime_contract,
     _with_pyromind_runtime_llm,
     _with_pyromind_runtime_skills,
@@ -70,7 +74,7 @@ from openhands.sdk.event.llm_convertible import (
 )
 from openhands.sdk.io.local import LocalFileStore
 from openhands.sdk.io.memory import InMemoryFileStore
-from openhands.sdk.llm import MessageToolCall, TextContent
+from openhands.sdk.llm import FailoverRouter, MessageToolCall, TextContent
 from openhands.sdk.security.confirmation_policy import NeverConfirm
 from openhands.sdk.skills import Skill, SkillResources, SkillRuntime
 from openhands.sdk.workspace import LocalWorkspace
@@ -293,6 +297,51 @@ def test_pyromind_runtime_llm_is_rehydrated_from_server_env(monkeypatch):
     assert "base_url" not in dumped["llm"]
     assert "api_key" not in dumped["condenser"]["llm"]
     assert "base_url" not in dumped["condenser"]["llm"]
+
+
+def test_pyromind_runtime_router_survives_agent_roundtrip(tmp_path, monkeypatch):
+    config_path = tmp_path / "llm_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "llms": [
+                    {
+                        "name": "openrouter",
+                        "model": "openai/deepseek-v4-flash-0731",
+                        "base_url": "https://openrouter.ai/api/v1",
+                    },
+                    {
+                        "name": "deepseek",
+                        "model": "openai/deepseek-chat",
+                        "base_url": "https://api.deepseek.com",
+                    },
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("LLM_CONFIG_PATH", str(config_path))
+    agent = Agent(
+        llm=LLM(model="openai/glm-5.2-fp8", usage_id="pyromind-agent"),
+        tools=[],
+    )
+
+    rehydrated = _rehydrate_runtime_agent(agent, pyromind=True)
+
+    assert isinstance(rehydrated.llm, FailoverRouter)
+    assert set(rehydrated.llm.llms_for_routing) == {"openrouter", "deepseek"}
+    assert (
+        rehydrated.llm.llms_for_routing["openrouter"].model
+        == "openai/deepseek-v4-flash-0731"
+    )
+
+
+def test_rehydrate_runtime_agent_non_pyromind_keeps_plain_llm():
+    agent = Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[])
+
+    rehydrated = _rehydrate_runtime_agent(agent, pyromind=False)
+
+    assert type(rehydrated.llm) is LLM
+    assert rehydrated.llm.model == "gpt-4o"
 
 
 def test_pyromind_runtime_skills_are_rehydrated_from_server_path(tmp_path, monkeypatch):
@@ -4047,3 +4096,36 @@ async def test_remove_active_long_task_inactive_service_raises(tmp_path):
 
     with pytest.raises(ValueError, match="inactive_service"):
         await service.remove_active_long_task("t1")
+
+
+def test_apply_storage_quota_fails_closed_when_required(event_service, monkeypatch):
+    fake_quota = SimpleNamespace(
+        limit_bytes=500 * 1024 * 1024,
+        apply=lambda *args, **kwargs: False,
+        last_error="No such device or address",
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.event_service.quota_from_env", lambda: fake_quota
+    )
+    monkeypatch.setenv("OH_STORAGE_QUOTA_REQUIRED", "1")
+    with pytest.raises(RuntimeError, match="storage quota .* could not be enforced"):
+        event_service._apply_storage_quota()
+
+
+def test_apply_storage_quota_warns_when_not_required(
+    event_service, monkeypatch, caplog
+):
+    fake_quota = SimpleNamespace(
+        limit_bytes=500 * 1024 * 1024,
+        apply=lambda *args, **kwargs: False,
+        last_error="No such device or address",
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.event_service.quota_from_env", lambda: fake_quota
+    )
+    monkeypatch.delenv("OH_STORAGE_QUOTA_REQUIRED", raising=False)
+    with caplog.at_level(
+        logging.WARNING, logger="openhands.agent_server.event_service"
+    ):
+        event_service._apply_storage_quota()
+    assert "storage quota not enforced" in caplog.text

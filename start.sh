@@ -15,15 +15,27 @@ export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 # ----------------------------------------------------------
 # LLM Configuration
 # ----------------------------------------------------------
+# Single-provider defaults (used when llm_config.json is absent).
+# For automatic failover, write ${OPENHANDS_CONFIG_DIR}/llm_config.json:
+#   {"llms": [
+#     {"name": "openrouter", "model": "openai/deepseek-v4-flash-0731",
+#      "base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY"},
+#     {"name": "deepseek", "model": "openai/deepseek-chat",
+#      "base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY"}
+#   ]}
+# Keys are never stored in the config file: staging/production deployment
+# manifests (e.g. Kubernetes Secret + secretKeyRef) inject the env vars above.
 export LLM_BASE_URL="${LLM_BASE_URL:-http://208.64.254.187:8000/v1}"
-if [[ -z "${OPENAI_API_KEY:-}" && -n "${LLM_API_KEY:-}" ]]; then
-  export OPENAI_API_KEY="${LLM_API_KEY}"
+if [[ ! -f "${LLM_CONFIG_PATH:-${OPENHANDS_CONFIG_DIR:-${WORKSPACE_DIR:-${SOFTWARE_AGENT_SDK_DIR}/workspace}}/llm_config.json}" ]]; then
+  if [[ -z "${OPENAI_API_KEY:-}" && -n "${LLM_API_KEY:-}" ]]; then
+    export OPENAI_API_KEY="${LLM_API_KEY}"
+  fi
+  if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+    echo "ERROR: OPENAI_API_KEY is required (no llm_config.json found)." >&2
+    exit 1
+  fi
+  export OPENAI_API_KEY
 fi
-if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-  echo "ERROR: OPENAI_API_KEY is required. Export it before running start.sh." >&2
-  exit 1
-fi
-export OPENAI_API_KEY
 # LiteLLM requires a provider prefix (e.g. openai/) for custom OpenAI-compatible endpoints.
 export LLM_MODEL="${LLM_MODEL:-openai/deepseek-v4-flash-0731}"
 
@@ -62,7 +74,11 @@ export workspace_dir="${workspace_dir:-${WORKSPACE_DIR:-${SOFTWARE_AGENT_SDK_DIR
 export WORKSPACE_DIR="${workspace_dir}"
 export OPENHANDS_CONFIG_DIR="${OPENHANDS_CONFIG_DIR:-${WORKSPACE_DIR}}"
 export OPENHANDS_AGENT_SERVER_CONFIG_PATH="${OPENHANDS_AGENT_SERVER_CONFIG_PATH:-${OPENHANDS_CONFIG_DIR}/openhands_agent_server_config.json}"
+export LLM_CONFIG_PATH="${LLM_CONFIG_PATH:-${OPENHANDS_CONFIG_DIR}/llm_config.json}"
+export LLM_FAILOVER_COOLDOWN_SECONDS="${LLM_FAILOVER_COOLDOWN_SECONDS:-300}"
 export OH_CONVERSATIONS_PATH="${OH_CONVERSATIONS_PATH:-${WORKSPACE_DIR}/conversations}"
+export OH_CONVERSATION_STORAGE_QUOTA="${OH_CONVERSATION_STORAGE_QUOTA:-500M}"
+export OH_SANDBOX_MEMORY_LIMIT="${OH_SANDBOX_MEMORY_LIMIT:-500M}"
 export OH_WORKSPACE_PATH="${OH_WORKSPACE_PATH:-${WORKSPACE_DIR}/project}"
 export OH_BASH_EVENTS_DIR="${OH_BASH_EVENTS_DIR:-${WORKSPACE_DIR}/bash_events}"
 mkdir -p \
@@ -101,6 +117,36 @@ if [[ ! -f "${PYROMIND_SKILLS_PATH}/generate-workflow-dsl/SKILL.md" ]]; then
   exit 1
 fi
 
+# Validate the multi-provider LLM config when present (single env-var mode
+# otherwise). Failing validation aborts startup with a clear message.
+if [[ -f "${LLM_CONFIG_PATH}" ]]; then
+  LLM_CONFIG_SUMMARY="$(python3 - "${LLM_CONFIG_PATH}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+if isinstance(data, dict):
+    sections = [("llms", data.get("llms"))]
+    if "multimodal_llms" in data:
+        sections.append(("multimodal_llms", data["multimodal_llms"]))
+else:
+    sections = [("llms", data)]
+summary = []
+for name, entries in sections:
+    if entries is None:
+        continue
+    if not isinstance(entries, list) or not entries:
+        raise SystemExit(f"'{name}' must be a non-empty list")
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not entry.get("model"):
+            raise SystemExit(f"{name} entry {i} must declare a 'model'")
+    summary.append(f"{len(entries)} {name}")
+print(", ".join(summary))
+PY
+)"
+fi
+
 # ----------------------------------------------------------
 # Start Agent Server
 # ----------------------------------------------------------
@@ -109,7 +155,12 @@ cd "${SOFTWARE_AGENT_SDK_DIR}"
 echo "============================================"
 echo " Pyromind Agent Server"
 echo "============================================"
-echo " LLM Base URL:      ${LLM_BASE_URL}"
+if [[ -n "${LLM_CONFIG_SUMMARY:-}" ]]; then
+  echo " LLM providers:     ${LLM_CONFIG_SUMMARY} from ${LLM_CONFIG_PATH} (auto-failover on)"
+else
+  echo " LLM base URL:      ${LLM_BASE_URL} (single provider)"
+  echo " Failover tip:      create ${LLM_CONFIG_PATH} with ordered 'llms'/'multimodal_llms' lists"
+fi
 echo " Server root:       ${SOFTWARE_AGENT_SDK_DIR}"
 echo " Knowledge Base:    ${PYROMIND_KNOWLEDGE_BASE_PATH}"
 echo " Public read paths: ${PYROMIND_PUBLIC_READ_PATHS}"

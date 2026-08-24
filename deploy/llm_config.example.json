@@ -1,0 +1,41 @@
+{
+  "llms": [
+    {
+      "name": "person",
+      "model": "openai/deepseek-v4-flash-0731",
+      "base_url": "http://208.64.254.187:8000/v1",
+      "api_key_env": "PERSON_API_KEY",
+      "num_retries": 2
+    },
+    {
+      "name": "openrouter-ds",
+      "model": "openai/deepseek-v4-flash-0731",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "num_retries": 2
+    },
+    {
+      "name": "openrouter-ln",
+      "model": "openai/deepseek-v4-flash-0731",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "num_retries": 2
+    }
+  ],
+  "multimodal_llms": [
+    {
+      "name": "vision-primary",
+      "model": "openai/google/gemma-4-31b-it",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "num_retries": 2
+    },
+    {
+      "name": "vision-fallback",
+      "model": "openai/google/gemini-2.5-flash",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "num_retries": 2
+    }
+  ]
+}

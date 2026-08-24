@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -35,6 +36,7 @@ from openhands.agent_server.models import (
 from openhands.agent_server.persistence.store import _ensure_secure_directory
 from openhands.agent_server.pub_sub import Subscriber
 from openhands.agent_server.server_details_router import update_last_execution_time
+from openhands.agent_server.storage_quota import quota_from_env
 from openhands.agent_server.utils import safe_rmtree, utc_now
 from openhands.agent_server.workflow_canvas_models import (
     SaveWorkflowCanvasEventSnapshotRequest,
@@ -82,6 +84,9 @@ from openhands.tools.workflow.definition import (
 
 if TYPE_CHECKING:
     from openhands.sdk.subagent.schema import AgentDefinition
+
+# How often the idle-eviction background task scans activated conversations.
+EVICTION_CHECK_INTERVAL_SECONDS = 60
 
 CONVERSATION_WORKTREE_ROOT = Path("/tmp/conversation-worktrees")
 
@@ -591,7 +596,15 @@ class ConversationService:
         default_factory=list, init=False
     )
     _lease_renewal_task: asyncio.Task | None = field(default=None, init=False)
+    _eviction_task: asyncio.Task | None = field(default=None, init=False)
     _run_executor: ThreadPoolExecutor | None = field(default=None, init=False)
+
+    # Idle-eviction parameters. ``idle_eviction_timeout`` is the minimum
+    # inactivity (seconds, monotonic) before an unloaded conversation may be
+    # evicted; 0 disables eviction. ``event_cache_max_events`` caps the
+    # in-memory event cache of each activated conversation (None = unbounded).
+    idle_eviction_timeout: float = 1800.0
+    event_cache_max_events: int | None = None
 
     def _index_event_service(self, event_service: EventService) -> None:
         user_id = event_service.stored.user_id
@@ -1274,13 +1287,14 @@ class ConversationService:
                 f"Failed to close event service for conversation {conversation_id}: {e}"
             )
 
-        # Safely remove only the conversation directory (workspace is preserved).
-        # This operation may fail due to permission issues, but we don't want that
-        # to prevent the conversation from being marked as deleted.
-        safe_rmtree(
-            event_service.conversation_dir,
-            f"conversation directory for {conversation_id}",
-        )
+            # Safely remove only the conversation directory (workspace is preserved).
+            # This operation may fail due to permission issues, but we don't want that
+            # to prevent the conversation from being marked as deleted.
+            quota_from_env().remove(event_service.conversation_dir, conversation_id)
+            safe_rmtree(
+                event_service.conversation_dir,
+                f"conversation directory for {conversation_id}",
+            )
 
         logger.info(f"Successfully deleted conversation {conversation_id}")
         return True
@@ -1357,6 +1371,7 @@ class ConversationService:
             event_service, user_id
         ):
             return None
+        event_service.touch()
         return event_service
 
     async def generate_conversation_title(
@@ -1700,6 +1715,11 @@ class ConversationService:
                     f"error_indexing_conversation:{conversation_dir}", stack_info=True
                 )
 
+        logger.info(
+            "Indexed %d conversations from disk; none loaded into memory yet",
+            len(self._conversation_index),
+        )
+
         # Initialize conversation webhook subscribers
         self._conversation_webhook_subscribers = [
             ConversationWebhookSubscriber(
@@ -1710,6 +1730,7 @@ class ConversationService:
         ]
 
         self._lease_renewal_task = asyncio.create_task(self._renew_all_leases_loop())
+        self._eviction_task = asyncio.create_task(self._evict_idle_services_loop())
 
         return self
 
@@ -1773,6 +1794,7 @@ class ConversationService:
         """
         if conversation_id not in self._conversation_index:
             return None
+        started = time.monotonic()
         async with self._lazy_load_locks.setdefault(conversation_id, asyncio.Lock()):
             event_services = self._event_services
             if event_services is None:
@@ -1796,6 +1818,13 @@ class ConversationService:
                     exc.expires_at,
                 )
                 return None
+            assert event_service._conversation is not None
+            logger.info(
+                "Loaded conversation %s into memory: %d events in %.1fs",
+                conversation_id,
+                len(event_service._conversation._state.events),
+                time.monotonic() - started,
+            )
             return event_service
 
     def _load_stored_from_disk(
@@ -1827,12 +1856,67 @@ class ConversationService:
         except asyncio.CancelledError:
             raise
 
+    async def _evict_idle_services_loop(self) -> None:
+        """Background task that periodically unloads idle conversations.
+
+        Complements the lazy-load index: activation loads conversations on
+        demand, this loop releases them again so memory tracks recent usage
+        instead of cumulative history. Eviction never touches persisted data;
+        the lightweight index entry stays so the next access re-activates the
+        conversation via the normal lazy-load path.
+        """
+        try:
+            while True:
+                await asyncio.sleep(EVICTION_CHECK_INTERVAL_SECONDS)
+                await self._evict_idle_event_services_once()
+        except asyncio.CancelledError:
+            raise
+
+    async def _evict_idle_event_services_once(self) -> list[UUID]:
+        """Evict currently idle event services; returns evicted conversation ids."""
+        if self.idle_eviction_timeout <= 0:
+            return []
+        event_services = self._event_services
+        if event_services is None:
+            return []
+        now = time.monotonic()
+        evicted: list[UUID] = []
+        for conversation_id, event_service in list(event_services.items()):
+            if not await asyncio.to_thread(
+                event_service._is_evictable_sync,
+                now,
+                self.idle_eviction_timeout,
+            ):
+                continue
+            async with self._lazy_load_locks.setdefault(
+                conversation_id, asyncio.Lock()
+            ):
+                if event_services.get(conversation_id) is not event_service:
+                    continue
+                # __aexit__ persists meta and tears down the service; the
+                # index entry and on-disk events are retained for lazy reload.
+                await event_service.__aexit__(None, None, None)
+                event_services.pop(conversation_id, None)
+                self._unindex_event_service(event_service)
+                evicted.append(conversation_id)
+                logger.info(
+                    "Evicted idle conversation %s after %.0fs",
+                    conversation_id,
+                    now - event_service.last_activity_time,
+                )
+        return evicted
+
     async def __aexit__(self, exc_type, exc_value, traceback):
         if self._lease_renewal_task is not None:
             self._lease_renewal_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._lease_renewal_task
             self._lease_renewal_task = None
+        if self._eviction_task is not None:
+            self._eviction_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._eviction_task
+            self._eviction_task = None
 
         event_services = self._event_services
         if event_services is None:
@@ -1867,6 +1951,8 @@ class ConversationService:
             cipher=config.cipher,
             max_concurrent_runs=config.max_concurrent_runs,
             lease_ttl_seconds=config.lease_ttl_seconds,
+            idle_eviction_timeout=config.idle_conversation_eviction_seconds,
+            event_cache_max_events=config.event_cache_max_events,
         )
 
     async def _start_event_service(self, stored: StoredConversation) -> EventService:
@@ -1880,6 +1966,7 @@ class ConversationService:
             cipher=self.cipher,
             owner_instance_id=self.owner_instance_id,
             lease_ttl_seconds=self.lease_ttl_seconds,
+            event_cache_max_events=self.event_cache_max_events,
         )
         # Lease renewal is handled by the centralized
         # _renew_all_leases_loop task on ConversationService.

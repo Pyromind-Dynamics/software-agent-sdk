@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import gzip
+import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
@@ -14,12 +18,14 @@ from openhands.agent_server.pyromind_router import (
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
 )
 from openhands.sdk.conversation.secret_registry import SecretRegistry
+from openhands.sdk.llm import TextContent
 from openhands.sdk.secret import StaticSecret
 from openhands.sdk.tool import Tool
 from openhands.sdk.tool.registry import resolve_tool
 from openhands.tools.workflow import (
     AnalyzeTaskFailureAction,
     AnalyzeTaskFailureExecutor,
+    AnalyzeTaskFailureObservation,
     AnalyzeTaskFailureTool,
 )
 from openhands.tools.workflow.analyze_task_failure import (
@@ -46,24 +52,37 @@ class _Response:
         return self._payload
 
 
+class _FakeLLM:
+    def __init__(self, text: str = "", error: Exception | None = None) -> None:
+        self.text = text
+        self.error = error
+
+    def completion(self, messages, **kwargs):
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(
+            message=SimpleNamespace(content=[TextContent(text=self.text)])
+        )
+
+
 def _fake_conversation(
     *,
     secret_registry: SecretRegistry | None = None,
     agent_state: dict[str, Any] | None = None,
+    llm: _FakeLLM | None = None,
 ) -> Any:
+    state_fields: dict[str, Any] = {
+        "secret_registry": secret_registry or SecretRegistry(),
+        "agent_state": agent_state or {},
+    }
+    if llm is not None:
+        state_fields["agent"] = type("FakeAgent", (), {"llm": llm})()
     return type(
         "FakeConversation",
         (),
         {
             "workspace": _FakeWorkspace(Path("/tmp")),
-            "state": type(
-                "FakeState",
-                (),
-                {
-                    "secret_registry": secret_registry or SecretRegistry(),
-                    "agent_state": agent_state or {},
-                },
-            )(),
+            "state": type("FakeState", (), state_fields)(),
         },
     )()
 
@@ -553,8 +572,10 @@ def test_log_fetch_failure_reports_placeholder(monkeypatch):
 # Operator source integration (get_node_function_signature API)
 # ---------------------------------------------------------------------------
 
+_DIAGNOSIS = "根因：dataset 参数缺失。修复：补充 dataset 参数。"
 
-def test_include_source_fetches_operator_source(monkeypatch):
+
+def test_include_source_condenses_source_free_diagnosis(monkeypatch):
     routes = {
         "task_workflow_result": _Response(200, _task_result_payload()),
         "logs/node/raw": _Response(
@@ -582,7 +603,9 @@ def test_include_source_fetches_operator_source(monkeypatch):
     monkeypatch.setattr(httpx, "post", fake_post)
     registry = _cookie_registry()
     registry.update_secrets({"auth_token": StaticSecret(value=SecretStr("token-123"))})
-    conversation = cast(Any, _fake_conversation(secret_registry=registry))
+    conversation = cast(
+        Any, _fake_conversation(secret_registry=registry, llm=_FakeLLM(text=_DIAGNOSIS))
+    )
 
     observation = AnalyzeTaskFailureExecutor()(
         AnalyzeTaskFailureAction(task_id="7758"), conversation
@@ -590,17 +613,59 @@ def test_include_source_fetches_operator_source(monkeypatch):
 
     assert not observation.is_error
     assert "RuntimeError: boom" in observation.logs["1"]
-    assert observation.node_sources["1"] == "def train(...):\n    pass"
+    # Source is fetched server-side for condensation...
     assert post_calls[0][0].endswith("user_node/function_signature/batch")
     assert post_calls[0][1] == {
         "node_names": ["ModelTrainSFTNode"],
         "node_type": None,
         "include_source": True,
         "max_source_lines": 200,
+        "compressed": True,
     }
     assert post_calls[0][2]["auth_token"] == "token-123"
-    # Source block is rendered into the observation text.
-    assert "operator source" in observation.text
+    # ...but only the source-free diagnosis reaches the agent.
+    assert observation.diagnosis == _DIAGNOSIS
+    assert "failure diagnosis" in observation.text
+    assert _DIAGNOSIS in observation.text
+    assert "def train" not in observation.text
+    assert "operator source" not in observation.text
+
+
+def test_include_source_decompresses_gzip_base64_payload(monkeypatch):
+    routes = {
+        "task_workflow_result": _Response(200, _task_result_payload()),
+        "logs/node/raw": _Response(
+            200, _log_payload(["Traceback", "RuntimeError: boom"])
+        ),
+    }
+    _install_router(monkeypatch, routes)
+    data = {
+        "ModelTrainSFTNode": {
+            "success": True,
+            "data": {"source_code": "def train(...):\n    pass"},
+        }
+    }
+    compressed = base64.b64encode(
+        gzip.compress(json.dumps(data).encode("utf-8"))
+    ).decode("ascii")
+
+    def fake_post(url, *, json, headers, timeout):
+        return _Response(200, {"success": True, "data": compressed})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    registry = _cookie_registry()
+    registry.update_secrets({"auth_token": StaticSecret(value=SecretStr("token-123"))})
+    conversation = cast(
+        Any, _fake_conversation(secret_registry=registry, llm=_FakeLLM(text=_DIAGNOSIS))
+    )
+
+    observation = AnalyzeTaskFailureExecutor()(
+        AnalyzeTaskFailureAction(task_id="7758"), conversation
+    )
+
+    assert not observation.is_error
+    assert observation.diagnosis == _DIAGNOSIS
+    assert "def train" not in observation.text
 
 
 def test_include_source_false_skips_source_fetch(monkeypatch):
@@ -618,15 +683,54 @@ def test_include_source_false_skips_source_fetch(monkeypatch):
     monkeypatch.setattr(httpx, "post", fake_post)
     registry = _cookie_registry()
     registry.update_secrets({"auth_token": StaticSecret(value=SecretStr("token-123"))})
-    conversation = cast(Any, _fake_conversation(secret_registry=registry))
+    conversation = cast(
+        Any, _fake_conversation(secret_registry=registry, llm=_FakeLLM(text=_DIAGNOSIS))
+    )
 
     observation = AnalyzeTaskFailureExecutor()(
         AnalyzeTaskFailureAction(task_id="7758", include_source=False), conversation
     )
 
     assert not observation.is_error
-    assert observation.node_sources == {}
+    assert observation.diagnosis is None
     assert post_calls == []
+
+
+def test_source_fetch_succeeds_without_llm_does_not_leak(monkeypatch):
+    routes = {
+        "task_workflow_result": _Response(200, _task_result_payload()),
+        "logs/node/raw": _Response(200, _log_payload(["Traceback", "boom"])),
+    }
+    _install_router(monkeypatch, routes)
+
+    def fake_post(url, *, json, headers, timeout):
+        return _Response(
+            200,
+            {
+                "success": True,
+                "data": {
+                    "ModelTrainSFTNode": {
+                        "success": True,
+                        "data": {"source_code": "def train(...):\n    pass"},
+                    }
+                },
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    registry = _cookie_registry()
+    registry.update_secrets({"auth_token": StaticSecret(value=SecretStr("token-123"))})
+    conversation = cast(Any, _fake_conversation(secret_registry=registry))
+
+    observation = AnalyzeTaskFailureExecutor()(
+        AnalyzeTaskFailureAction(task_id="7758"), conversation
+    )
+
+    assert not observation.is_error
+    assert observation.logs["1"]
+    assert observation.diagnosis is None
+    assert "def train" not in observation.text
+    assert "operator source" not in observation.text
 
 
 def test_source_fetch_failure_keeps_logs(monkeypatch):
@@ -642,7 +746,9 @@ def test_source_fetch_failure_keeps_logs(monkeypatch):
     monkeypatch.setattr(httpx, "post", fake_post)
     registry = _cookie_registry()
     registry.update_secrets({"auth_token": StaticSecret(value=SecretStr("token-123"))})
-    conversation = cast(Any, _fake_conversation(secret_registry=registry))
+    conversation = cast(
+        Any, _fake_conversation(secret_registry=registry, llm=_FakeLLM(text=_DIAGNOSIS))
+    )
 
     observation = AnalyzeTaskFailureExecutor()(
         AnalyzeTaskFailureAction(task_id="7758"), conversation
@@ -651,7 +757,21 @@ def test_source_fetch_failure_keeps_logs(monkeypatch):
     assert not observation.is_error
     assert "RuntimeError" not in observation.text or "boom" in observation.logs["1"]
     assert observation.logs["1"]  # logs survive a failed source fetch
-    assert observation.node_sources == {}
+    assert observation.diagnosis is None
+
+
+def test_deprecated_node_sources_field_is_dropped_on_load():
+    observation = AnalyzeTaskFailureObservation.model_validate(
+        {
+            "source": "all",
+            "nodes": [],
+            "failed_nodes": [],
+            "logs": {},
+            "node_sources": {"1": "def secret_source(): ..."},
+        }
+    )
+    assert observation.text == ""
+    assert not hasattr(observation, "node_sources")
 
 
 # ---------------------------------------------------------------------------

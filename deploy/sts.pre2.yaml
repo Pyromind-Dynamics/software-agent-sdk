@@ -1,0 +1,185 @@
+---
+# StatefulSet for webapp-pre2 (merges the live baseline with:
+#   - per-conversation storage quota (XFS project quota, 500M)
+#   - multi-LLM failover via the llm-config ConfigMap
+#   - gp2-xfs StorageClass volume (fsType=xfs + mountOptions=[prjquota])
+#
+# REQUIRED BEFORE APPLY: the image must contain the xfs_quota binary.
+# The current feature_llm_router tag does NOT (root Dockerfile lacks
+# xfsprogs), so quota stays disabled. Rebuild from this repo after adding
+# "xfsprogs" to the root Dockerfile apt-get install list, push a new tag,
+# and update `image` below with the rebuilt tag.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+    labels:
+        app: software-agent-sdk
+        enable-sts-monitor: 'true'
+    name: software-agent-sdk
+    namespace: webapp-pre2
+spec:
+    persistentVolumeClaimRetentionPolicy:
+        whenDeleted: Retain
+        whenScaled: Retain
+    podManagementPolicy: OrderedReady
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+        matchLabels:
+            app: software-agent-sdk
+    serviceName: software-agent-sdk
+    template:
+        metadata:
+            labels:
+                app: software-agent-sdk
+                enable-sts-monitor: 'true'
+        spec:
+            containers:
+                - name: main
+          # TODO(admin): point at a rebuilt tag that ships xfsprogs
+                  image: pyrominddynamics/software-agent-sdk:feature_llm_router-785a5758-08170325
+                  env:
+                      - name: RunMode
+                        value: agent-server
+                      - name: POD_NAME
+                        valueFrom:
+                            fieldRef:
+                                fieldPath: metadata.name
+                      - name: APP_ENV
+                        value: pre2
+                      - name: OH_CONVERSATION_STORAGE_QUOTA
+                        value: 500M
+                      - name: OH_STORAGE_QUOTA_REQUIRED
+                        value: '1'
+                      - name: OH_STORAGE_QUOTA_DEVICE
+                        value: /dev/nvme1n1
+                      - name: OH_SANDBOX_MEMORY_LIMIT
+                        value: 500M
+                      - name: OH_SANDBOX_MEMORY_REQUIRED
+                        value: '0'
+                      - name: LLM_CONFIG_PATH
+                        value: /etc/llm-config/llm_config.json
+                      - name: LLM_MODEL
+                        value: deepseek/deepseek-v4-flash-0731
+                      - name: LLM_BASE_URL
+                        value: https://openrouter.ai/api/v1
+                      - name: SESSION_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                key: SESSION_API_KEY
+                                name: software-agent-sdk-secret
+                      - name: OH_SECRET_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                key: OH_SECRET_KEY
+                                name: software-agent-sdk-secret
+                      - name: OPENAI_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                key: OPENAI_API_KEY
+                                name: software-agent-sdk-secret
+                      - name: DEEPSEEK_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                key: DEEPSEEK_API_KEY
+                                name: software-agent-sdk-secret
+                      - name: DF_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                key: DF_API_KEY
+                                name: software-agent-sdk-secret
+                  ports:
+                      - containerPort: 8000
+                        name: http
+                  resources:
+                      limits:
+                          cpu: 4
+                          memory: 8Gi
+                      requests:
+                          cpu: 1
+                          memory: 2Gi
+                  securityContext:
+                      appArmorProfile:
+                          type: Unconfined
+                      capabilities:
+                          add:
+                              - SYS_ADMIN
+                      seccompProfile:
+                          type: Unconfined
+                  volumeMounts:
+                      - mountPath: /workspace
+                        name: workspace
+                      - mountPath: /dev/nvme1n1
+                        name: workspace-device
+                      - mountPath: /etc/secrets
+                        name: full-web-key-secret
+                        readOnly: true
+                      - mountPath: /etc/myhttps-ca/us-west-2/
+                        name: us-west-2-ca-volume
+                        readOnly: true
+                      - mountPath: /etc/myhttps-ca/us-west-1/
+                        name: us-west-1-ca-volume
+                        readOnly: true
+                      - mountPath: /etc/llm-config
+                        name: llm-config
+                        readOnly: true
+            initContainers:
+                - name: setup-workspace
+                  image: busybox:latest
+                  command:
+                      - /bin/sh
+                      - -c
+                      - |
+                        mkdir -p /workspace/conversations
+                        mkdir -p /workspace/project
+                        chown -R 10001:10001 /workspace
+                        echo "Workspace initialized successfully"
+                  volumeMounts:
+                      - mountPath: /workspace
+                        name: workspace
+            securityContext:
+                fsGroup: 10001
+                runAsGroup: 0
+                runAsUser: 0
+            dnsPolicy: ClusterFirst
+            imagePullSecrets:
+                - name: niqi-dev-secret
+            restartPolicy: Always
+            volumes:
+                # Host device node backing the workspace volume; use the stable by-id
+                # path (e.g. /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol-xxx)
+                - name: workspace-device
+                  hostPath:
+                      path: /dev/nvme1n1
+                      type: BlockDevice
+                - name: full-web-key-secret
+                  secret:
+                      defaultMode: 420
+                      secretName: web-portal-secret-pre2
+                - name: us-west-2-ca-volume
+                  secret:
+                      defaultMode: 420
+                      items:
+                          - key: tls.crt
+                            path: tls-root-ca.crt
+                      secretName: https-tls-certs-pre2
+                - name: us-west-1-ca-volume
+                  secret:
+                      defaultMode: 420
+                      items:
+                          - key: rootCA.crt
+                            path: tls-root-ca.crt
+                      secretName: grpc-root-ca-pre2
+                - name: llm-config
+                  configMap:
+                      name: llm-config
+    volumeClaimTemplates:
+        - metadata:
+              name: workspace
+          spec:
+              accessModes:
+                  - ReadWriteOnce
+              resources:
+                  requests:
+                      storage: 100Gi
+              storageClassName: gp2-xfs

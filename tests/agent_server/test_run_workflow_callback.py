@@ -581,7 +581,7 @@ async def test_workflow_debug_callback_failure_injects_summarized_node_signature
 
 
 @pytest.mark.asyncio
-async def test_workflow_debug_callback_failure_falls_back_to_raw_signatures(
+async def test_workflow_debug_callback_failure_falls_back_to_source_free_signatures(
     tmp_path, monkeypatch
 ):
     import openhands.tools.node_signature.impl as node_signature_impl
@@ -619,7 +619,10 @@ async def test_workflow_debug_callback_failure_falls_back_to_raw_signatures(
     assert service.event_service.extended is not None
     reminder = service.event_service.extended[0].text
     assert "Node signature guidance:" in reminder
-    assert "def CloneAndCacheDataset(dataset, target_path)" in reminder
+    # Fallback keeps the source-free signature/parameter contract...
+    assert "Signature: def CloneAndCacheDataset(dataset, target_path)" in reminder
+    # ...and must not leak the node source body.
+    assert "    pass" not in reminder
 
 
 @pytest.mark.asyncio

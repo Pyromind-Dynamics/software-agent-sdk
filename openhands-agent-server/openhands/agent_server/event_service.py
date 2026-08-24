@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import SecretStr, ValidationError
+from pydantic import ValidationError
 
 from openhands.agent_server.conversation_lease import (
     DEFAULT_LEASE_TTL_SECONDS,
@@ -37,6 +37,8 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_TERMINAL_PARAMS,
     PYROMIND_WORKFLOW_EVENT_KEY,
 )
+from openhands.agent_server.pyromind_llm_config import build_runtime_llm
+from openhands.agent_server.storage_quota import quota_from_env, storage_quota_required
 from openhands.agent_server.workflow_canvas_snapshot_hook import (
     WorkflowCanvasSnapshotHook,
 )
@@ -107,46 +109,42 @@ LEASE_RENEW_INTERVAL_SECONDS = 15.0
 # Bounds initial-state push so subscribe_to_events does not stall on a
 # subscriber whose __call__ blocks (e.g. WS with a full TCP send buffer).
 INITIAL_STATE_PUSH_TIMEOUT_SECONDS = 0.5
-_OPENAI_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
-
-
-def _normalize_openai_base_url(base_url: str | None) -> str | None:
-    if base_url is None:
-        return None
-    normalized = base_url.strip().rstrip("/")
-    if not normalized:
-        return None
-    if normalized.endswith(_OPENAI_CHAT_COMPLETIONS_SUFFIX):
-        return normalized[: -len(_OPENAI_CHAT_COMPLETIONS_SUFFIX)]
-    return normalized
 
 
 def _pyromind_runtime_llm(existing: LLM) -> LLM:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    return existing.model_copy(
-        update={
-            "model": os.environ.get("LLM_MODEL") or existing.model,
-            "api_key": SecretStr(api_key) if api_key is not None else existing.api_key,
-            "base_url": _normalize_openai_base_url(
-                os.environ.get("LLM_BASE_URL") or existing.base_url
-            ),
-            "persist_runtime_config": False,
-        }
-    )
+    """Apply the runtime LLM configuration (multi-provider failover capable)."""
+    return build_runtime_llm(existing)
 
 
 def _with_pyromind_runtime_llm(agent: AgentBase) -> AgentBase:
     runtime_llm = _pyromind_runtime_llm(agent.llm)
     condenser = agent.condenser
     if isinstance(condenser, LLMSummarizingCondenser):
-        condenser = condenser.model_copy(
-            update={
-                "llm": runtime_llm.model_copy(
-                    update={"usage_id": condenser.llm.usage_id}
-                )
+        # Rebuild a fresh runtime LLM for the condenser so its inner providers
+        # do not share Metrics/Telemetry objects with the agent's router.
+        condenser_llm = _pyromind_runtime_llm(condenser.llm)
+        condenser = condenser.model_copy(update={"llm": condenser_llm})
+    return agent.model_copy(update={"llm": runtime_llm, "condenser": condenser})
+
+
+def _rehydrate_runtime_agent(agent: AgentBase, *, pyromind: bool) -> AgentBase:
+    """Re-instantiate the stored agent, then re-apply the runtime LLM config.
+
+    The model_dump/model_validate round-trip re-creates ``agent.llm`` as a
+    plain LLM and would drop a FailoverRouter's provider cohort, so the runtime
+    LLM must be applied after the round-trip validation.
+    """
+    revalidated = type(agent).model_validate(
+        agent.model_dump(
+            context={
+                "expose_secrets": True,
+                PRESERVE_SKILL_PATH_CONTEXT: True,
             }
         )
-    return agent.model_copy(update={"llm": runtime_llm, "condenser": condenser})
+    )
+    if pyromind:
+        return _with_pyromind_runtime_llm(revalidated)
+    return revalidated
 
 
 def _with_pyromind_runtime_skills(agent: AgentBase) -> AgentBase:
@@ -246,7 +244,16 @@ class EventService:
     cipher: Cipher | None = None
     owner_instance_id: str = field(default_factory=lambda: uuid4().hex)
     lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS
+    # Upper bound on deserialized events cached in memory for this
+    # conversation; None leaves the EventLog cache unbounded (SDK default).
+    event_cache_max_events: int | None = None
     _conversation: LocalConversation | None = field(default=None, init=False)
+    # Monotonic clock timestamp of the last client activity (any API/WS
+    # access). Idle eviction compares against this; see is_evictable.
+    last_activity_time: float = field(default_factory=time.monotonic, init=False)
+    # Number of currently connected user WebSocket subscribers. Non-zero
+    # marks the conversation as actively watched and blocks eviction.
+    _user_connection_count: int = field(default=0, init=False)
     _pub_sub: PubSub[Event] = field(
         default_factory=lambda: PubSub[Event](max_subscribers=50), init=False
     )
@@ -343,6 +350,43 @@ class EventService:
         if not self._conversation:
             raise ValueError("inactive_service")
         return self._conversation
+
+    def touch(self) -> None:
+        """Mark this conversation as recently active (called on client access)."""
+        self.last_activity_time = time.monotonic()
+
+    def register_user_connection(self) -> None:
+        """Record an open user WebSocket so idle eviction skips the service."""
+        self._user_connection_count += 1
+
+    def unregister_user_connection(self) -> None:
+        """Drop a user WebSocket; eviction may proceed once none remain."""
+        self._user_connection_count = max(0, self._user_connection_count - 1)
+
+    def _is_evictable_sync(self, now: float, idle_timeout: float) -> bool:
+        """Return True when this service is safe and eligible for idle eviction.
+
+        Never evicts services that are closing, mid-run, watched by a user
+        WebSocket, or executing long-running platform tasks. Runs on a worker
+        thread (acquires the conversation state lock); callers should use
+        ``asyncio.to_thread``.
+        """
+        if self._closing or self._conversation is None:
+            return False
+        if self._run_task is not None and not self._run_task.done():
+            return False
+        if self._goal_loop_task is not None and not self._goal_loop_task.done():
+            return False
+        if self._user_connection_count > 0:
+            return False
+        if now - self.last_activity_time < idle_timeout:
+            return False
+        with self._conversation._state as state:
+            if state.execution_status == ConversationExecutionStatus.RUNNING:
+                return False
+            if any(task.status != "Stopped" for task in state.active_long_tasks):
+                return False
+        return True
 
     def _get_event_sync(self, event_id: str) -> Event | None:
         """Private sync function to get a single event.
@@ -1229,12 +1273,28 @@ class EventService:
                 "Failed to initialize git repository at %s: %s", working_dir, e
             )
 
+    def _apply_storage_quota(self) -> None:
+        """Apply the configured storage quota (fail closed when required)."""
+        quota = quota_from_env()
+        if quota.limit_bytes is None:
+            return
+        if quota.apply(self.conversation_dir, self.stored.id):
+            return
+        detail = quota.last_error or "unknown error"
+        if storage_quota_required():
+            raise RuntimeError(
+                f"storage quota {quota.limit_bytes} bytes could not be "
+                f"enforced for conversation {self.stored.id}: {detail}"
+            )
+        logger.warning("storage quota not enforced for %s: %s", self.stored.id, detail)
+
     async def start(self):
         # Store the main event loop for cross-thread communication
         self._main_loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
 
         # self.stored contains an Agent configuration we can instantiate
         _ensure_secure_directory(self.conversation_dir)
+        self._apply_storage_quota()
         # lease_ttl_seconds=0 disables leasing for single-instance deployments
         # where shared-storage stale leases would otherwise block pod restarts.
         if self.lease_ttl_seconds > 0:
@@ -1258,17 +1318,13 @@ class EventService:
         if self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE:
             (working_dir / "public_data").mkdir(mode=0o700, exist_ok=True)
             runtime_agent = _with_pyromind_runtime_skills(self.stored.agent)
-            runtime_agent = _with_pyromind_runtime_contract(runtime_agent)
             self.stored = self.stored.model_copy(
-                update={"agent": _with_pyromind_runtime_llm(runtime_agent)}
+                update={"agent": _with_pyromind_runtime_contract(runtime_agent)}
             )
-        agent_cls = type(self.stored.agent)
-        agent = agent_cls.model_validate(
-            self.stored.agent.model_dump(
-                context={
-                    "expose_secrets": True,
-                    PRESERVE_SKILL_PATH_CONTEXT: True,
-                }
+        agent = _rehydrate_runtime_agent(
+            self.stored.agent,
+            pyromind=(
+                self.stored.tags.get(PYROMIND_APP_TAG_KEY) == PYROMIND_APP_TAG_VALUE
             ),
         )
 
@@ -1372,6 +1428,10 @@ class EventService:
         conversation.set_security_analyzer(self.stored.security_analyzer)
         self._conversation = conversation
         self._conversation._state.set_write_guard(self._write_guard)
+        if self.event_cache_max_events is not None:
+            self._conversation._state.events.max_cache_size = (
+                self.event_cache_max_events
+            )
         if not self._external_lease_renewal:
             self._lease_task = asyncio.create_task(self._renew_lease_loop())
 

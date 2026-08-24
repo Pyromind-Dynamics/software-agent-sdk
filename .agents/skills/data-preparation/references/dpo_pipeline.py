@@ -259,8 +259,10 @@ def write_canonical_output(
     BATCH_SIZE = int(os.environ.get("DF_BATCH_SIZE", "8"))
 
     raw_llm = APILLMServing_request(
-        api_url=os.environ["DF_API_URL"],
-        model_name=os.environ["DF_MODEL_NAME"],
+        api_url=os.environ.get(
+            "DF_API_URL", "https://openrouter.ai/api/v1/chat/completions"
+        ),
+        model_name=os.environ.get("DF_MODEL_NAME", "openai/gpt-5.6-luna"),
         key_name_of_api_key="DF_API_KEY",
         max_workers=int(os.environ.get("DF_MAX_WORKERS", "8")),
     )

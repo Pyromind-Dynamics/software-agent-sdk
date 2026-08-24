@@ -344,6 +344,10 @@ class ToolDefinition[ActionT, ObservationT](DiscriminatedUnionMixin, ABC):
         """
         return DeclaredResources(keys=(), declared=False)
 
+    def normalize_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Normalize model-produced arguments before validation and persistence."""
+        return arguments
+
     def action_from_arguments(self, arguments: dict[str, Any]) -> Action:
         """Create an action from parsed arguments.
 

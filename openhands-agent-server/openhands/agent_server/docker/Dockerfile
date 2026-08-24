@@ -109,7 +109,7 @@ RUN set -eux; \
             bash ca-certificates curl wget sudo apt-utils git jq tmux tar \
             build-essential coreutils util-linux procps findutils grep sed \
             tini apt-transport-https gnupg lsb-release xz-utils \
-            apparmor apparmor-utils bubblewrap; \
+            apparmor apparmor-utils bubblewrap xfsprogs; \
         rm -rf /var/lib/apt/lists/*; \
     elif command -v apk >/dev/null 2>&1; then \
         apk add --no-cache \

@@ -1,3 +1,4 @@
+import errno
 import re
 import threading
 import time
@@ -20,6 +21,7 @@ from openhands.tools.terminal.definition import (
     TerminalObservation,
     looks_like_python_literal_argument,
 )
+from openhands.tools.terminal.pod_memory import pod_memory_gate_allowed
 from openhands.tools.terminal.sandbox import (
     TerminalSandboxMode,
     terminal_sandbox_enabled,
@@ -56,6 +58,27 @@ _TMUX_RECOVERABLE_ERROR_MARKERS = (
     "can't find session",
     "could not find window_id",
     "could not find pane_id",
+)
+
+_POD_MEMORY_HINT_TEMPLATE = (
+    "[Memory-pressure] This pod is at {usage_pct}% of its memory high-water "
+    "mark ({high_water_pct}%), so the terminal blocked the command to protect "
+    "the server (all conversations share the pod). The terminal session is "
+    "preserved and this is temporary.\n\n"
+    "Wait a moment and retry the same command, or ask the user to reduce "
+    "concurrent heavy workloads (downloads, parallel agents) so memory can be "
+    "reclaimed."
+)
+
+_SANDBOX_IO_ERROR_HINT_TEMPLATE = (
+    "[Terminal-unavailable] The terminal backend hit an I/O error (errno "
+    "{errno}: {strerror}) — usually the sandbox is out of processes/PTYs or "
+    "the shell session died, not a problem with this specific command, so "
+    "retrying the same command immediately is unlikely to help.\n\n"
+    "Prefer creating and editing files with file_editor/apply_patch, and "
+    "running commands through dedicated execution tools (for example dataflow "
+    "or task runners) that execute in their own subprocesses. If you do retry "
+    "the terminal, start from a fresh session with reset=true."
 )
 
 logger = get_logger(__name__)
@@ -589,10 +612,49 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                     exit_code=None,
                 )
 
-        if self._pool is not None:
-            return self._execute_pooled(action, conversation)
-        else:
-            return self._execute_single_session(action, conversation)
+        if not action.is_input:
+            allowed, memory_stats, high_water = pod_memory_gate_allowed()
+            if not allowed:
+                usage_pct = round(memory_stats.usage_ratio * 100) if memory_stats else 0
+                logger.warning(
+                    "Refusing terminal command under pod memory pressure "
+                    "(usage=%d%%, high-water=%.0f%%)",
+                    usage_pct,
+                    high_water * 100,
+                )
+                return TerminalObservation.from_text(
+                    _POD_MEMORY_HINT_TEMPLATE.format(
+                        usage_pct=usage_pct,
+                        high_water_pct=round(high_water * 100),
+                    ),
+                    is_error=True,
+                    command=action.command,
+                    exit_code=None,
+                )
+
+        try:
+            if self._pool is not None:
+                return self._execute_pooled(action, conversation)
+            else:
+                return self._execute_single_session(action, conversation)
+        except OSError as exc:
+            if exc.errno not in (errno.EIO, errno.EAGAIN):
+                raise
+            logger.warning(
+                "Terminal backend I/O failure (errno=%s); returning structured "
+                "hint instead of a raw error",
+                exc.errno,
+                exc_info=True,
+            )
+            return TerminalObservation.from_text(
+                _SANDBOX_IO_ERROR_HINT_TEMPLATE.format(
+                    errno=exc.errno,
+                    strerror=exc.strerror or str(exc),
+                ),
+                is_error=True,
+                command=action.command,
+                exit_code=-1,
+            )
 
     def interrupt(self) -> None:
         """Send Ctrl+C to all active terminal sessions.

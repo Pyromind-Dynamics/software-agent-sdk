@@ -267,6 +267,25 @@ class Config(BaseModel):
             "used for conversation.run() calls."
         ),
     )
+    idle_conversation_eviction_seconds: int = Field(
+        default=300,
+        ge=0,
+        description=(
+            "Minimum inactivity (seconds) before an activated conversation is "
+            "unloaded from memory by the idle-eviction background task. The "
+            "conversation is re-activated lazily on next access; its persisted "
+            "events are never removed. 0 disables eviction."
+        ),
+    )
+    event_cache_max_events: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Upper bound on the number of deserialized events cached in memory "
+            "per activated conversation. Evicted events are re-read from disk "
+            "on access. None leaves the cache unbounded."
+        ),
+    )
     secret_key: SecretStr | None = Field(
         default_factory=_default_secret_key,
         description=(

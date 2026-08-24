@@ -54,8 +54,8 @@ JSON fence 解析、响应修复或日志逻辑。
 - `max_workers=8`
 - `timeout=1800`
 
-模型配置统一来自 `DF_API_KEY`、`DF_API_BASE_URL` 和 `DF_MODEL_NAME`，不得写入
-Pipeline。
+模型配置统一来自 `DF_API_KEY`、`DF_API_BASE_URL` 和 `DF_MODEL_NAME`（缺失时按
+`LLM_BASE_URL` → 会话本体 LLM → 默认值兜底），不得写入 Pipeline。
 
 ## 执行入口
 

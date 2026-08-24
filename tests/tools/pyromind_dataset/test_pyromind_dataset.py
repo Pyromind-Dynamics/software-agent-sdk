@@ -12,6 +12,10 @@ from pyromind_sdk.client.models import TrainingTaskCreateResponse
 
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.secret import StaticSecret
+from openhands.tools.data_preparation.runner import (
+    DEFAULT_DATAFLOW_API_URL,
+    DEFAULT_DATAFLOW_MODEL_NAME,
+)
 from openhands.tools.pyromind_archive.definition import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
 )
@@ -30,7 +34,6 @@ from openhands.tools.pyromind_dataset.definition import (
     _vision_api_config,
     download_file_from_pyromind,
 )
-from openhands.tools.utils.dataflow_config import DEFAULT_DATAFLOW_MODEL_NAME
 
 
 def test_preview_description_mentions_shared_and_storage() -> None:
@@ -1953,7 +1956,7 @@ def test_vision_api_config_uses_defaults_when_unset(monkeypatch) -> None:
 
     api_url, model, api_key = _vision_api_config()
 
-    assert api_url == "https://api.openai.com/v1/chat/completions"
+    assert api_url == DEFAULT_DATAFLOW_API_URL
     assert model == DEFAULT_DATAFLOW_MODEL_NAME
     assert api_key is None
 
@@ -1979,3 +1982,24 @@ def test_vision_api_config_prefers_df_env(monkeypatch) -> None:
 
     assert api_url == "https://vision.example/v1/chat/completions"
     assert model == "vision-model"
+
+
+def test_vision_api_config_rejects_bare_base_url(monkeypatch) -> None:
+    """DF_API_URL is used verbatim by the runtime, so a bare base URL would
+    hit a web page instead of the API and fail with a confusing JSON decode
+    error; reject it up front."""
+    _clear_vision_env(monkeypatch)
+    monkeypatch.setenv("DF_API_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("DF_MODEL_NAME", "vision-model")
+
+    with pytest.raises(ValueError, match="/chat/completions"):
+        _vision_api_config()
+
+
+def test_vision_api_config_rejects_placeholder_model(monkeypatch) -> None:
+    _clear_vision_env(monkeypatch)
+    monkeypatch.setenv("DF_API_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("DF_MODEL_NAME", "router")
+
+    with pytest.raises(ValueError, match="unsubstituted placeholder"):
+        _vision_api_config()

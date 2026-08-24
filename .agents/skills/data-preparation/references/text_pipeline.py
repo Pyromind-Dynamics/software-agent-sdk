@@ -144,9 +144,9 @@ def main(input_path: str, output_path: str) -> None:
     #    Wrap with LoggingLLMServing for full call traceability.
     raw_llm = APILLMServing_request(
         api_url=os.environ.get(
-            "DF_API_URL", "https://api.openai.com/v1/chat/completions"
+            "DF_API_URL", "https://openrouter.ai/api/v1/chat/completions"
         ),
-        model_name=os.environ.get("DF_MODEL_NAME", "gpt-4o-mini"),
+        model_name=os.environ.get("DF_MODEL_NAME", "openai/gpt-5.6-luna"),
         key_name_of_api_key="DF_API_KEY",
         temperature=0.0,
         max_workers=8,

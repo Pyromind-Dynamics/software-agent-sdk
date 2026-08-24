@@ -114,6 +114,8 @@ def test_codex_prompt_renders_key_sections() -> None:
     assert "complete plan snapshot" in prompt
     assert "## Presenting your work and final message" in prompt
     assert "## apply_patch" in prompt
+    assert "exactly one argument named `patch`" in prompt
+    assert "never pass a separate `path` argument" in prompt
     # Tool references must match the codex preset's actual tools.
     assert "update_plan" in prompt
     assert "apply_patch" in prompt

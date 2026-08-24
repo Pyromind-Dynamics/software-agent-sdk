@@ -112,6 +112,15 @@ class RouterLLM(LLM):
 
     def __getattr__(self, name):
         """Delegate other attributes/methods to the active LLM."""
+        # Pydantic stores private attributes (e.g. _metrics) in
+        # __pydantic_private__; resolve them first so routers keep their own
+        # private state instead of accidentally sharing a child LLM's.
+        try:
+            private = object.__getattribute__(self, "__pydantic_private__")
+        except AttributeError:
+            private = None
+        if private is not None and name in private:
+            return private[name]
         fallback_llm = next(iter(self.llms_for_routing.values()))
         logger.info(f"RouterLLM: No active LLM, using first LLM for attribute '{name}'")
         return getattr(fallback_llm, name)

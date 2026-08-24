@@ -10,10 +10,15 @@ import pytest
 
 from openhands.tools.terminal.sandbox import (
     APPARMOR_PROFILE_NAME,
+    SandboxMemoryCgroup,
     TerminalSandbox,
     _is_bwrap_usable,
+    _memory_limit_required,
+    parse_memory_limit,
+    sandbox_memory_cgroup_from_env,
     terminal_sandbox_enabled,
     terminal_sandbox_mode,
+    userns_mounts_supported,
 )
 
 
@@ -29,6 +34,272 @@ def _option_index(args: list[str], option: str, value: str) -> int:
         if arg == option and args[index + 1] == value:
             return index
     raise AssertionError(f"{option} {value} not found in {args}")
+
+
+def test_parse_memory_limit_accepts_human_sizes():
+    assert parse_memory_limit("512M") == 512 * 1024 * 1024
+    assert parse_memory_limit("1g") == 1024**3
+    assert parse_memory_limit("300") == 300
+
+
+def test_parse_memory_limit_rejects_invalid_value():
+    with pytest.raises(ValueError):
+        parse_memory_limit("banana")
+
+
+def test_memory_cgroup_defaults_to_500m(monkeypatch: pytest.MonkeyPatch):
+    captured: list[int] = []
+
+    class FakeMemoryCgroup:
+        def __init__(
+            self,
+            limit_bytes: int,
+            *,
+            root: Path = Path("/sys/fs/cgroup"),
+            required: bool = False,
+        ):
+            captured.append(limit_bytes)
+            self.required = required
+
+        def create(self) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.SandboxMemoryCgroup", FakeMemoryCgroup
+    )
+    monkeypatch.delenv("OH_SANDBOX_MEMORY_LIMIT", raising=False)
+    assert sandbox_memory_cgroup_from_env() is not None
+    assert captured == [500 * 1024 * 1024]
+
+
+def test_memory_cgroup_empty_env_disables_limit(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("OH_SANDBOX_MEMORY_LIMIT", "")
+    assert sandbox_memory_cgroup_from_env() is None
+
+
+def test_memory_cgroup_create_sets_limits_in_root(tmp_path: Path):
+    memory_cgroup = SandboxMemoryCgroup(64 * 1024 * 1024, root=tmp_path)
+    assert memory_cgroup.create()
+    assert memory_cgroup.path is not None
+    assert memory_cgroup.path.parent == tmp_path
+    assert (memory_cgroup.path / "memory.max").read_text() == str(64 * 1024 * 1024)
+    assert (memory_cgroup.path / "memory.high").read_text() == str(
+        64 * 1024 * 1024 * 3 // 4
+    )
+    assert (memory_cgroup.path / "memory.swap.max").read_text() == "0"
+
+
+def test_memory_cgroup_create_degrades_on_unwritable_root(tmp_path: Path):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    memory_cgroup = SandboxMemoryCgroup(1024, root=blocker)
+    assert not memory_cgroup.create()
+    assert memory_cgroup.path is None
+
+
+def test_memory_cgroup_attach_moves_pid_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
+    assert memory_cgroup.create()
+    moved: list[int] = []
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: [100, 200]
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._move_pid_to_cgroup",
+        lambda _path, pid: moved.append(pid),
+    )
+    memory_cgroup.attach(42)
+    assert moved == [42, 100, 200]
+
+
+def test_memory_cgroup_attach_reports_empty_cgroup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """Attach failures must surface as an ERROR so an unenforced limit is visible."""
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
+    assert memory_cgroup.create()
+    path = memory_cgroup.path
+    assert path is not None
+    # Make every pid write fail so nothing can enter the cgroup.
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: [100, 200]
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._move_pid_to_cgroup",
+        lambda _path, pid: (_ for _ in ()).throw(OSError("no write")),
+    )
+    with caplog.at_level("ERROR", logger="openhands.tools.terminal.sandbox"):
+        memory_cgroup.attach(42)
+    assert "empty after attach" in caplog.text
+    assert "root_pid=42" in caplog.text
+
+
+def test_memory_cgroup_create_logs_active_limit(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    memory_cgroup = SandboxMemoryCgroup(512 * 1024 * 1024, root=tmp_path)
+    with caplog.at_level("INFO", logger="openhands.tools.terminal.sandbox"):
+        assert memory_cgroup.create()
+    assert "sandbox memory cgroup active" in caplog.text
+    assert "512 MiB" in caplog.text
+
+
+def test_memory_cgroup_attach_logs_enforced_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
+    assert memory_cgroup.create()
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: [100, 200]
+    )
+    with caplog.at_level("INFO", logger="openhands.tools.terminal.sandbox"):
+        memory_cgroup.attach(42)
+    assert "enforced on 3 process(es)" in caplog.text
+
+
+def test_memory_cgroup_attach_sweeps_new_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A shell that forks after the first sweep (bwrap --unshare-pid) is still
+    captured by the settle loop instead of escaping the memory limit."""
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
+    assert memory_cgroup.create()
+    moved: list[int] = []
+    calls = 0
+
+    def fake_descendants(_pid: int) -> list[int]:
+        nonlocal calls
+        calls += 1
+        return [100] if calls == 1 else [100, 200]
+
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._descendant_pids", fake_descendants
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._move_pid_to_cgroup",
+        lambda _path, pid: moved.append(pid),
+    )
+    monkeypatch.setattr("openhands.tools.terminal.sandbox._ATTACH_SETTLE_DELAY", 0)
+    assert memory_cgroup.attach(42) == 3
+    assert moved == [42, 100, 200]
+
+
+def test_memory_cgroup_required_attach_empty_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path, required=True)
+    assert memory_cgroup.create()
+    path = memory_cgroup.path
+    assert path is not None
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: [100, 200]
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._move_pid_to_cgroup",
+        lambda _path, pid: (_ for _ in ()).throw(OSError("no write")),
+    )
+    with pytest.raises(RuntimeError, match="memory limit is not enforced"):
+        memory_cgroup.attach(42)
+
+
+def test_sandbox_memory_required_create_failure_raises(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeMemoryCgroup:
+        def __init__(
+            self,
+            limit_bytes: int,
+            *,
+            root: Path = Path("/sys/fs/cgroup"),
+            required: bool = False,
+        ):
+            self.required = required
+
+        def create(self) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.SandboxMemoryCgroup", FakeMemoryCgroup
+    )
+    monkeypatch.setenv("OH_SANDBOX_MEMORY_REQUIRED", "1")
+    monkeypatch.delenv("OH_SANDBOX_MEMORY_LIMIT", raising=False)
+    with pytest.raises(RuntimeError, match="OH_SANDBOX_MEMORY_REQUIRED"):
+        sandbox_memory_cgroup_from_env()
+
+
+def test_memory_limit_required_flag(monkeypatch: pytest.MonkeyPatch):
+    for value, expected in (
+        ("1", True),
+        ("true", True),
+        ("on", True),
+        ("", False),
+    ):
+        monkeypatch.setenv("OH_SANDBOX_MEMORY_REQUIRED", value)
+        assert _memory_limit_required() is expected
+    monkeypatch.delenv("OH_SANDBOX_MEMORY_REQUIRED")
+    assert _memory_limit_required() is False
+
+
+def test_terminal_sandbox_bwrap_unshare_pid_keeps_attach(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """bwrap --unshare-pid must not disable the per-session memory cgroup attach."""
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_bwrap_usable", lambda: True
+    )
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
+    assert memory_cgroup.create()
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.sandbox_memory_cgroup_from_env",
+        lambda: None,
+    )
+    sandbox = TerminalSandbox(str(tmp_path), "required")
+    sandbox.prepare()
+    assert sandbox._backend == "bwrap"
+    sandbox._memory_cgroup = memory_cgroup
+    wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
+    assert "--unshare-pid" in wrapped
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: []
+    )
+    sandbox.attach_memory_cgroup(1234)
+    path = memory_cgroup.path
+    assert path is not None
+    assert (path / "cgroup.procs").read_text().split() == ["1234"]
+
+
+def test_memory_cgroup_cleanup_removes_directory(tmp_path: Path):
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
+    assert memory_cgroup.create()
+    path = memory_cgroup.path
+    assert path is not None and path.exists()
+    memory_cgroup.cleanup()
+    assert not path.exists()
+    assert memory_cgroup.path is None
+
+
+def test_terminal_sandbox_attaches_spawned_pid_to_memory_cgroup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    memory_cgroup = SandboxMemoryCgroup(1024, root=tmp_path)
+    assert memory_cgroup.create()
+    sandbox = TerminalSandbox(str(tmp_path), "off")
+    sandbox._memory_cgroup = memory_cgroup
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._descendant_pids", lambda _pid: []
+    )
+    sandbox.attach_memory_cgroup(1234)
+    path = memory_cgroup.path
+    assert path is not None
+    assert (path / "cgroup.procs").read_text().split() == ["1234"]
 
 
 def test_terminal_sandbox_mode_rejects_unknown_value(
@@ -420,6 +691,109 @@ def test_conversation_policy_prefers_bwrap_over_landlock_and_apparmor(
     )
 
 
+def test_bwrap_tmp_is_bound_to_disk_not_tmpfs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_bwrap_usable", lambda: True
+    )
+
+    sandbox = TerminalSandbox(str(tmp_path), "required")
+    sandbox.prepare()
+
+    assert sandbox._backend == "bwrap"
+    wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
+    assert "--tmpfs" not in wrapped
+    tmp_index = _option_index(wrapped, "--bind", str(sandbox._sandbox_tmp))
+    assert wrapped[tmp_index + 2] == "/tmp"
+    assert sandbox._sandbox_tmp.is_dir()
+
+
+def test_conversation_policy_bwrap_whitelists_read_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_bwrap_usable", lambda: True
+    )
+
+    events_dir = tmp_path / "events"
+    public_data_dir = tmp_path / "public_data"
+    events_dir.mkdir()
+    public_data_dir.mkdir()
+    sandbox = TerminalSandbox(
+        str(tmp_path),
+        "required",
+        read_only_paths=(str(events_dir),),
+        read_write_paths=(str(public_data_dir),),
+    )
+    sandbox.prepare()
+
+    assert sandbox._backend == "bwrap"
+    wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
+    # Whitelisted conversation paths are bound; the container root is not, so
+    # untracked paths (e.g. a sibling workspace) do not exist in the sandbox.
+    assert ("--ro-bind", "/") not in [
+        (wrapped[i], wrapped[i + 1]) for i in range(len(wrapped) - 1)
+    ]
+    assert ("--ro-bind", "/usr") in [
+        (wrapped[i], wrapped[i + 1]) for i in range(len(wrapped) - 1)
+    ]
+    wrapped_binds = [
+        (wrapped[i], wrapped[i + 1])
+        for i in range(len(wrapped) - 1)
+        if wrapped[i] in ("--bind", "--ro-bind", "--tmpfs", "--dev", "--proc")
+    ]
+    assert wrapped_binds.count(("--tmpfs", "/tmp")) == 1
+    assert ("--bind", str(public_data_dir)) in wrapped_binds
+    assert ("--ro-bind", str(events_dir)) in wrapped_binds
+    # The conversation directory itself is only a skeleton for the bound
+    # children; its own files (meta.json etc.) are not exposed.
+    assert ("--ro-bind", str(tmp_path)) not in wrapped_binds
+    private_binds = [
+        wrapped[i + 1]
+        for i in range(len(wrapped) - 1)
+        if wrapped[i] == "--bind"
+        and wrapped[i + 1] in (str(sandbox._tmp_dir), str(sandbox._sandbox_tmp))
+    ]
+    assert private_binds == []
+
+
+def test_without_conversation_policy_keeps_sandbox_root_writable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox.platform.system", lambda: "Linux"
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_apparmor_available", lambda: False
+    )
+    monkeypatch.setattr(
+        "openhands.tools.terminal.sandbox._is_bwrap_usable", lambda: True
+    )
+
+    sandbox = TerminalSandbox(str(tmp_path), "required")
+    sandbox.prepare()
+
+    assert sandbox._backend == "bwrap"
+    wrapped = sandbox.wrap_command(["/bin/bash", "-i"])
+    assert ("--ro-bind", "/") not in [
+        (wrapped[i], wrapped[i + 1]) for i in range(len(wrapped) - 1)
+    ]
+    assert "--unshare-pid" in wrapped
+
+
 def test_conversation_policy_uses_landlock_when_bwrap_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -588,3 +962,30 @@ def test_bwrap_smoke_test_failure_falls_back_to_apparmor(
     sandbox.prepare()
 
     assert sandbox._backend == "apparmor"
+
+
+def test_userns_mounts_supported_env_override(monkeypatch: pytest.MonkeyPatch):
+    userns_mounts_supported.cache_clear()
+    monkeypatch.setenv("OH_SANDBOX_UNSHARE_USER", "1")
+    assert userns_mounts_supported() is True
+
+    userns_mounts_supported.cache_clear()
+    monkeypatch.setenv("OH_SANDBOX_UNSHARE_USER", "0")
+    assert userns_mounts_supported() is False
+
+
+def test_userns_mounts_supported_probe(monkeypatch: pytest.MonkeyPatch):
+    userns_mounts_supported.cache_clear()
+    monkeypatch.delenv("OH_SANDBOX_UNSHARE_USER", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/unshare")
+
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=0)
+    )
+    assert userns_mounts_supported() is True
+
+    userns_mounts_supported.cache_clear()
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=32)
+    )
+    assert userns_mounts_supported() is False
