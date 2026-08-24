@@ -14,13 +14,14 @@ These tools implement the local data-preparation loop:
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
 from collections.abc import Sequence
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Final, Literal, Self
 
 import httpx
 from pydantic import Field, field_validator, model_validator
@@ -162,6 +163,60 @@ def _resolve_legacy_input_arg(
     if candidate.exists():
         return candidate.resolve(), base
     return None
+
+
+# Local sample cap for ``df_run_pipeline``. Local runs validate a small sample
+# before a full ``df_submit_pipeline``; cap the input so an agent-authored
+# pipeline without its own ``--limit`` cannot silently process the whole file.
+DF_SAMPLE_LIMIT_ENV: Final[str] = "DF_SAMPLE_LIMIT"
+DEFAULT_SAMPLE_LIMIT: Final[int] = 3
+
+
+def _sample_limit() -> int:
+    """Return the local sample row cap (``DF_SAMPLE_LIMIT``, default 3)."""
+    raw = os.environ.get(DF_SAMPLE_LIMIT_ENV, str(DEFAULT_SAMPLE_LIMIT))
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_SAMPLE_LIMIT
+
+
+def _truncate_sample_input(input_path: Path, limit: int) -> Path | None:
+    """Return a copy of *input_path* capped to ``limit`` records, or ``None``.
+
+    Only single text files (``.csv`` with a header, or newline-delimited
+    JSONL/text) are truncated. Directories (multimodal samples) and inputs with
+    ``limit`` or fewer records are left untouched. A copy is written next to the
+    original so the pipeline receives an unambiguously sized sample.
+    """
+
+    if not input_path.is_file() or limit <= 0:
+        return None
+
+    if input_path.suffix.lower() == ".csv":
+        with input_path.open(encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle)
+            try:
+                header = next(reader)
+            except StopIteration:
+                return None
+            rows = list(reader)
+        if len(rows) <= limit:
+            return None
+        sample_path = input_path.with_name(f"{input_path.stem}.sample.csv")
+        with sample_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(header)
+            writer.writerows(rows[:limit])
+        return sample_path
+
+    lines = input_path.read_text(encoding="utf-8").splitlines()
+    records = [line for line in lines if line.strip()]
+    if len(records) <= limit:
+        return None
+    sample_path = input_path.with_name(f"{input_path.stem}.sample.jsonl")
+    sample_path.write_text("\n".join(records[:limit]) + "\n", encoding="utf-8")
+    return sample_path
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +726,11 @@ class DfRunPipelineExecutor(ToolExecutor):
                 )
             process_args[0] = str(standard_input_path)
             process_args[1] = str(output_path)
+            # Local sample cap: limit the input so an agent-authored pipeline
+            # without its own --limit can't silently process the whole file.
+            sample_input = _truncate_sample_input(standard_input_path, _sample_limit())
+            if sample_input is not None:
+                process_args[0] = str(sample_input)
         elif len(process_args) >= 2:
             # Legacy mode: the child process runs with cwd=pipeline.parent, but
             # the rest of this tool family resolves arguments from the workspace

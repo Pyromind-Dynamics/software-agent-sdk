@@ -15,12 +15,15 @@ from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.llm import LLM, FailoverRouter
 from openhands.sdk.workspace.workspace import LocalWorkspace
 from openhands.tools.data_preparation.definition import (
+    DEFAULT_SAMPLE_LIMIT,
     RUNTIME_FILENAMES,
     DfConvertAction,
     DfConvertExecutor,
     DfConvertObservation,
     DfRunPipelineAction,
     DfRunPipelineExecutor,
+    _sample_limit,
+    _truncate_sample_input,
 )
 from openhands.tools.data_preparation.runner import (
     DEFAULT_DATAFLOW_API_BASE_URL,
@@ -75,6 +78,56 @@ def test_openai_compatible_model_name() -> None:
     assert openai_compatible_model_name("anthropic/claude-opus-4.5") == (
         "claude-opus-4.5"
     )
+
+
+def test_truncate_sample_input_csv_caps_rows(tmp_path: Path) -> None:
+    input_path = tmp_path / "testdata_3.csv"
+    input_path.write_text(
+        "qid,question_text\n"
+        + "\n".join(f"id{i},question {i}" for i in range(1, 8))  # 7 data rows
+        + "\n",
+        encoding="utf-8",
+    )
+
+    sample = _truncate_sample_input(input_path, 3)
+
+    assert sample is not None
+    content = sample.read_text(encoding="utf-8").splitlines()
+    assert content[0] == "qid,question_text"  # header preserved
+    assert len(content) == 1 + 3  # header + 3 data rows
+
+
+def test_truncate_sample_input_jsonl_caps_rows(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_text("".join(f'{{"id": {i}}}\n' for i in range(5)))
+
+    sample = _truncate_sample_input(input_path, 3)
+
+    assert sample is not None
+    assert len(sample.read_text(encoding="utf-8").splitlines()) == 3
+
+
+def test_truncate_sample_input_skips_within_limit(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_text('{"id": 1}\n{"id": 2}\n')
+
+    assert _truncate_sample_input(input_path, 3) is None
+
+
+def test_truncate_sample_input_skips_directory(tmp_path: Path) -> None:
+    directory = tmp_path / "images"
+    directory.mkdir()
+
+    assert _truncate_sample_input(directory, 3) is None
+
+
+def test_sample_limit_env_and_default(monkeypatch) -> None:
+    monkeypatch.delenv("DF_SAMPLE_LIMIT", raising=False)
+    assert _sample_limit() == DEFAULT_SAMPLE_LIMIT
+    monkeypatch.setenv("DF_SAMPLE_LIMIT", "10")
+    assert _sample_limit() == 10
+    monkeypatch.setenv("DF_SAMPLE_LIMIT", "garbage")
+    assert _sample_limit() == DEFAULT_SAMPLE_LIMIT
 
 
 @pytest.mark.parametrize(
@@ -512,6 +565,64 @@ def test_df_run_pipeline_validates_output_and_writes_local_report(
             "gt": "answer",
         }
     ]
+
+
+def test_df_run_pipeline_caps_local_sample_rows(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A pipeline without ``--limit`` must still only see a 3-row local sample."""
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    monkeypatch.setenv("DF_SAMPLE_LIMIT", "3")
+    pipeline_dir = tmp_path / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    pipeline = pipeline_dir / "pipeline.py"
+    # Copied input lines verbatim into text-schema records, so output rows ==
+    # input rows the pipeline actually received.
+    pipeline.write_text(
+        "\n".join(
+            [
+                "import json, sys",
+                "inp = sys.argv[1]",
+                "out = sys.argv[2]",
+                "rows = [l for l in open(inp, encoding='utf-8') if l.strip()]",
+                "with open(out, 'w', encoding='utf-8') as f:",
+                "    for i, l in enumerate(rows):",
+                "        f.write(json.dumps({'id': f'text-{i}',",
+                "            'system_prompt': 's', 'user_prompt': l.strip(),",
+                "            'gt': 'a'}) + '\\n')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (pipeline_dir / "input.jsonl").write_text(
+        "".join(f"q{i}\n" for i in range(5)), encoding="utf-8"
+    )
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-preparation"
+        / "scripts"
+    )
+    conversation = cast(Any, _fake_conversation(tmp_path))
+    conversation.state.agent = _conversation_with_llm().state.agent
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/sample3.jsonl",
+            ],
+            output_schema="text",
+            model_profile="text",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error
+    assert observation.record_count == 3  # capped at DF_SAMPLE_LIMIT, not 5
 
 
 def test_df_run_pipeline_validates_dpo_output(
