@@ -19,7 +19,7 @@ export PYROMIND_HARNESS_BACKEND="pi"
 # ----------------------------------------------------------
 # LiteLLM requires a provider prefix (e.g. openai/) for custom OpenAI-compatible endpoints.
 export LLM_MODEL="openai/deepseek-v4-flash-0731"
-export LLM_BASE_URL="http://208.64.254.187:8000/v1"
+export LLM_BASE_URL="http://208.64.254.189:8000/v1"
 # export LLM_MODEL="deepseek/deepseek-v4-flash-0731"
 # export LLM_BASE_URL="https://openrouter.ai/api/v1"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
