@@ -528,6 +528,21 @@ def test_explicit_token_limit_overrides_agent_context_window(mock_llm: LLM) -> N
     assert condenser._effective_max_tokens(agent_llm) == 80
 
 
+def test_event_limit_can_be_disabled(mock_llm: LLM) -> None:
+    condenser = LLMSummarizingCondenser(
+        llm=mock_llm,
+        max_size=None,
+        max_tokens=1_000,
+    )
+    agent_llm = MagicMock(spec=LLM)
+    cast(MagicMock, agent_llm.get_token_count).return_value = 10
+    view = View.from_events([message_event("content") for _ in range(500)])
+
+    reasons = condenser.get_condensation_reasons(view, agent_llm=agent_llm)
+
+    assert reasons == set()
+
+
 def test_summary_input_budget_drops_oldest_events(mock_llm: LLM) -> None:
     cast(Any, mock_llm).effective_max_input_tokens = 100
 

@@ -30,7 +30,7 @@ from openhands.agent_server.pyromind_subagent import (
     _subagent_factories,
     configure_subagents,
 )
-from openhands.sdk import Agent, Conversation, Tool
+from openhands.sdk import Agent, AgentContext, Conversation, Tool
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
@@ -38,7 +38,9 @@ from openhands.sdk.conversation.state import (
 )
 from openhands.sdk.event.llm_convertible.observation import ObservationEvent
 from openhands.sdk.llm import LLM, Message, MessageToolCall, TextContent
+from openhands.sdk.skills import Skill
 from openhands.sdk.testing import TestLLM
+from openhands.sdk.tool.builtins import InvokeSkillTool
 from openhands.tools.file_editor import FileEditorObservation, FileEditorTool
 from openhands.tools.task.manager import TaskStatus
 
@@ -201,22 +203,52 @@ def test_search_agent_has_only_read_only_knowledge_tools():
     assert agent.agent_context.system_message_suffix == SEARCH_AGENT_PROMPT
 
 
-def test_general_purpose_agent_has_workspace_read_write_tools():
-    factory = _general_purpose_agent_factory()
+def test_general_purpose_agent_inherits_parent_skills_tools_and_secrets(tmp_path):
     llm = LLM(model="gpt-4o", api_key=SecretStr("test-key"))
+    skill = Skill(
+        name="workflow-builder",
+        content="# Workflow builder",
+        description="Build workflows.",
+        is_agentskills_format=True,
+    )
+    parent = LocalConversation(
+        agent=Agent(
+            llm=llm,
+            tools=[
+                Tool(
+                    name=FileEditorTool.name,
+                    params={"read_only_roots": [str(tmp_path / "shared")]},
+                ),
+                Tool(name=PyromindSubAgentTool.name),
+            ],
+            agent_context=AgentContext(
+                skills=[skill],
+                system_message_suffix="Parent-specific instructions.",
+            ),
+            system_prompt_kwargs={"custom_instructions": "Pyromind runtime"},
+        ),
+        workspace=str(tmp_path),
+        visualizer=None,
+        secrets={"PYROMIND_TOKEN": "secret-token"},
+        delete_on_close=False,
+    )
+
+    factory = _general_purpose_agent_factory(parent)
     agent = factory.factory_func(llm)
 
     assert factory.definition.name == GENERAL_PURPOSE_AGENT_NAME
     assert factory.definition.permission_mode is None
     assert factory.definition.max_iteration_per_run == 30
-    assert [tool.name for tool in agent.tools] == [
-        "grep",
-        "file_editor",
-        "terminal",
-        "task_tracker",
-    ]
+    assert factory.definition.tools == [FileEditorTool.name]
+    assert agent.tools == [parent.agent.tools[0]]
+    assert all(tool.name != PyromindSubAgentTool.name for tool in agent.tools)
+    assert agent.system_prompt_kwargs == parent.agent.system_prompt_kwargs
     assert agent.agent_context is not None
-    assert agent.agent_context.system_message_suffix == GENERAL_PURPOSE_AGENT_PROMPT
+    assert agent.agent_context.skills == [skill]
+    assert agent.agent_context.secrets == parent.state.secret_registry.secret_sources
+    assert agent.agent_context.system_message_suffix == (
+        "Parent-specific instructions.\n\n" + GENERAL_PURPOSE_AGENT_PROMPT
+    )
 
 
 def test_subagent_executor_selects_conversation_scoped_profile(caplog):
@@ -393,6 +425,12 @@ def test_general_purpose_subagent_writes_without_leaking_child_events(tmp_path, 
     knowledge = tmp_path / "knowledge"
     knowledge.mkdir()
     configure_subagents(workspace, knowledge)
+    skill = Skill(
+        name="create-result",
+        content="Create the requested file, then report its path.",
+        description="Create and report a requested result file.",
+        is_agentskills_format=True,
+    )
 
     llm = TestLLM.from_messages(
         [
@@ -403,6 +441,11 @@ def test_general_purpose_subagent_writes_without_leaking_child_events(tmp_path, 
                     "type": "general_purpose",
                     "task": "Create result.txt containing done and report the change.",
                 },
+            ),
+            _tool_call(
+                "child-skill",
+                InvokeSkillTool.name,
+                {"name": "create-result"},
             ),
             _tool_call(
                 "child-write",
@@ -420,7 +463,14 @@ def test_general_purpose_subagent_writes_without_leaking_child_events(tmp_path, 
         ]
     )
     conversation = Conversation(
-        agent=Agent(llm=llm, tools=[Tool(name=PyromindSubAgentTool.name)]),
+        agent=Agent(
+            llm=llm,
+            tools=[
+                Tool(name=FileEditorTool.name),
+                Tool(name=PyromindSubAgentTool.name),
+            ],
+            agent_context=AgentContext(skills=[skill]),
+        ),
         workspace=str(workspace),
         visualizer=None,
     )

@@ -1,6 +1,9 @@
 """Pyromind dataset tools: preview storage datasets and upload local files."""
 
 from openhands.tools.pyromind_dataset.definition import (
+    MaterializeStorageFilesAction,
+    MaterializeStorageFilesObservation,
+    MaterializeStorageFilesTool,
     PreviewDatasetAction,
     PreviewDatasetObservation,
     PreviewDatasetTool,
@@ -11,6 +14,9 @@ from openhands.tools.pyromind_dataset.definition import (
 
 
 __all__ = [
+    "MaterializeStorageFilesAction",
+    "MaterializeStorageFilesObservation",
+    "MaterializeStorageFilesTool",
     "PreviewDatasetAction",
     "PreviewDatasetObservation",
     "PreviewDatasetTool",

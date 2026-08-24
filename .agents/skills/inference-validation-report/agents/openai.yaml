@@ -1,0 +1,6 @@
+---
+interface:
+    display_name: Inference Validation Report
+    short_description: 调用推理接口评测文本或多模态验证集并生成可分享HTML报告
+    default_prompt: Use $inference-validation-report to evaluate my deployed inference endpoint on a validation set and generate a shareable HTML 
+        report.

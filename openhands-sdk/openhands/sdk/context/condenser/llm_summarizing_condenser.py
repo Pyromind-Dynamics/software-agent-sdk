@@ -50,7 +50,7 @@ class LLMSummarizingCondenser(RollingCondenser):
     """
 
     llm: LLM
-    max_size: int = Field(default=240, gt=0)
+    max_size: int | None = Field(default=240, gt=0)
     target_size: int | None = Field(default=None, gt=0)
     """Optional target number of events after condensation. When unset, the
     existing half-size behavior is preserved.
@@ -129,8 +129,12 @@ class LLMSummarizingCondenser(RollingCondenser):
 
     @model_validator(mode="after")
     def validate_keep_first_vs_max_size(self):
-        target_size = self.target_size or self.max_size // 2
-        if target_size >= self.max_size:
+        target_size = self.target_size
+        if target_size is None:
+            if self.max_size is None:
+                return self
+            target_size = self.max_size // 2
+        if self.max_size is not None and target_size >= self.max_size:
             raise ValueError("target_size must be less than max_size")
         events_from_tail = target_size - self.keep_first - 1
         if events_from_tail <= 0:
@@ -204,7 +208,7 @@ class LLMSummarizingCondenser(RollingCondenser):
                 reasons.add(Reason.TOKENS)
 
         # Reason 3: View exceeds maximum size in number of events.
-        if len(view) > self.max_size:
+        if self.max_size is not None and len(view) > self.max_size:
             reasons.add(Reason.EVENTS)
 
         return reasons
@@ -407,6 +411,7 @@ class LLMSummarizingCondenser(RollingCondenser):
             suffix_events_to_keep.add(target_size - self.keep_first - 1)
 
         if Reason.EVENTS in reasons:
+            assert self.max_size is not None
             target_size = (
                 configured_target_size
                 if configured_target_size is not None

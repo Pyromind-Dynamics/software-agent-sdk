@@ -1,7 +1,7 @@
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
-from litellm.exceptions import APIConnectionError
+from litellm.exceptions import APIConnectionError, APIError
 from litellm.types.utils import Choices, Message as LiteLLMMessage, ModelResponse, Usage
 from pydantic import SecretStr
 
@@ -25,6 +25,15 @@ def create_mock_response(content: str = "Test response", response_id: str = "tes
         object="chat.completion",
         system_fingerprint="test",
         usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+
+
+def malformed_json_response_error() -> APIError:
+    return APIError(
+        status_code=502,
+        message=("Unable to get json response - Expecting value, Original Response:"),
+        llm_provider="test_provider",
+        model="test_model",
     )
 
 
@@ -181,6 +190,43 @@ def test_completion_no_retry_on_non_retryable_error(
     # Verify that no retries were attempted
     assert mock_litellm_completion.call_count == 1  # Only the initial call
     assert "Invalid input" in str(excinfo.value)
+
+
+@patch("openhands.sdk.llm.llm.litellm_completion")
+def test_completion_retries_malformed_json_response(
+    mock_litellm_completion,
+    default_config,
+) -> None:
+    mock_litellm_completion.side_effect = [
+        malformed_json_response_error(),
+        create_mock_response("Retry successful"),
+    ]
+
+    response = default_config.completion(
+        messages=[Message(role="user", content=[TextContent(text="Hello!")])],
+    )
+
+    assert isinstance(response, LLMResponse)
+    assert mock_litellm_completion.call_count == 2
+
+
+@pytest.mark.asyncio
+@patch("openhands.sdk.llm.llm.litellm_acompletion", new_callable=AsyncMock)
+async def test_acompletion_retries_malformed_json_response(
+    mock_litellm_acompletion: AsyncMock,
+    default_config,
+) -> None:
+    mock_litellm_acompletion.side_effect = [
+        malformed_json_response_error(),
+        create_mock_response("Retry successful"),
+    ]
+
+    response = await default_config.acompletion(
+        messages=[Message(role="user", content=[TextContent(text="Hello!")])],
+    )
+
+    assert isinstance(response, LLMResponse)
+    assert mock_litellm_acompletion.call_count == 2
 
 
 def test_retry_configuration_validation():

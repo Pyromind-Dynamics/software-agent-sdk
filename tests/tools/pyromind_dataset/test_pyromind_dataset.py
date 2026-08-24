@@ -1,3 +1,4 @@
+import hashlib
 import json as jsonlib
 from pathlib import Path
 from typing import Any, cast
@@ -18,6 +19,8 @@ from openhands.tools.pyromind_dataset.definition import (
     _PREVIEW_DATASET_DESCRIPTION,
     PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
+    MaterializeStorageFilesAction,
+    MaterializeStorageFilesExecutor,
     PreviewDatasetAction,
     PreviewDatasetExecutor,
     UploadFileToPyromindAction,
@@ -1778,6 +1781,95 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
     assert observation.vision_previews[0]["ocr_text"] == "OCR: triangle ABC"
     assert any(item.type == "image" for item in observation.content)
     assert all(item.type == "text" for item in observation.to_llm_content)
+
+
+def test_sample_mode_records_oversized_file_without_downloading(
+    monkeypatch,
+    tmp_path,
+):
+    oversized = 391 * 1024 * 1024
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "size": oversized,
+                        "is_dir": False,
+                    },
+                },
+            )
+        raise AssertionError(f"oversized sample must not request a download: {url}")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(
+            dataset_path="/robot/episode/",
+            mode="sample",
+            sample_paths=["/robot/episode/head_depth.u16"],
+        ),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert not observation.is_error
+    assert observation.files == []
+    assert observation.sample_manifest_path is not None
+    manifest_path = tmp_path / observation.sample_manifest_path
+    manifest = jsonlib.loads(manifest_path.read_text(encoding="utf-8"))
+    metadata = manifest["file_metadata"][0]
+    assert metadata["size"] == oversized
+    assert metadata["materialized"] is False
+    sidecar = manifest_path.parent / Path(metadata["local_path"]).parent
+    sidecar_payload = jsonlib.loads(
+        (sidecar / ".pyromind_storage.json").read_text(encoding="utf-8")
+    )
+    assert sidecar_payload["files"][0]["name"] == "head_depth.u16"
+
+
+def test_materialize_storage_files_streams_exact_payload_with_checksum(
+    monkeypatch,
+    tmp_path,
+):
+    payload = b"depth-payload" * 1024
+
+    def fake_post(url, *, headers, json, timeout):
+        assert url.endswith("/get_url")
+        assert json["path"] == "/robot/episode/head_depth.u16"
+        return _Response(
+            200,
+            {
+                "success": True,
+                "data": {"url": "https://download.test/depth"},
+            },
+        )
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        assert method == "GET"
+        assert url == "https://download.test/depth"
+        return _StreamResponse(payload)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    observation = MaterializeStorageFilesExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        MaterializeStorageFilesAction(
+            paths=["/workspace/robot/episode/head_depth.u16"],
+            output_dir="materialized",
+        ),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert not observation.is_error
+    assert observation.total_bytes == len(payload)
+    local_path = tmp_path / observation.local_paths[0]
+    assert local_path == tmp_path / "materialized/robot/episode/head_depth.u16"
+    assert local_path.read_bytes() == payload
+    assert observation.files[0]["sha256"] == hashlib.sha256(payload).hexdigest()
 
 
 def test_sample_mode_allows_conversation_public_data_workspace(tmp_path) -> None:

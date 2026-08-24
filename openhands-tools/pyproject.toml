@@ -22,6 +22,7 @@ dependencies = [
     "huggingface_hub>=0.25",
     "pillow>=12.1.1",
     "pyarrow>=17.0",
+    "imageio-ffmpeg>=0.6.0",
 ]
 
 [project.urls]

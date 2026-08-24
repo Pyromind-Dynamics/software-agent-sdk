@@ -40,6 +40,19 @@ def test_get_codex_agent_uses_codex_template() -> None:
     assert agent.condenser.keep_last_user_turns == 3
 
 
+def test_get_codex_agent_threads_condenser_limits() -> None:
+    agent = get_codex_agent(
+        _make_llm(),
+        cli_mode=True,
+        condenser_max_tokens=750_000,
+        condenser_max_size=None,
+    )
+
+    assert isinstance(agent.condenser, LLMSummarizingCondenser)
+    assert agent.condenser.max_tokens == 750_000
+    assert agent.condenser.max_size is None
+
+
 def test_get_codex_agent_appends_extra_tools() -> None:
     """extra_tools (e.g. grep for KB search) are appended to the codex set."""
     from openhands.tools.preset.default import register_default_tools

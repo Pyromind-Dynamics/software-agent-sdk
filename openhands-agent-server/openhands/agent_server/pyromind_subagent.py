@@ -22,11 +22,7 @@ from openhands.sdk.tool import (
     ToolDefinition,
     ToolExecutor,
 )
-from openhands.tools.file_editor import FileEditorTool
-from openhands.tools.grep import GrepTool
 from openhands.tools.task.manager import TaskManager, TaskStatus
-from openhands.tools.task_tracker import TaskTrackerTool
-from openhands.tools.terminal import TerminalTool
 
 
 if TYPE_CHECKING:
@@ -70,6 +66,12 @@ You are a general-purpose Pyromind subagent for complex, multi-step work in the
 conversation workspace. Complete the delegated task end-to-end using the smallest
 useful set of reads, edits, commands, and tests.
 
+You inherit the parent agent's skills, tools, tool parameters, MCP configuration,
+and runtime credentials, except for the subagent launcher itself. Invoke a matching
+skill when the delegated task falls within that skill's scope, then follow its
+instructions and use any relevant platform or workspace tools. You are already a
+delegated subagent: do not delegate the task again.
+
 Keep your work isolated from the parent conversation. Do not ask the parent to
 repeat work you can complete yourself. When finished, return only a concise handoff:
 - outcome and key decisions;
@@ -92,9 +94,11 @@ its final handoff. Supported types:
   another task. Invoke it at most once per parent-agent turn: combine all related
   knowledge-base subquestions into one task instead of issuing multiple or
   parallel searches. Do not use it for skill instructions.
-- `general_purpose`: multi-step workspace work with read/write tools, shell
-  commands, and tests. Use it when delegating the work keeps the main context
-  smaller; do not use it for a trivial single read or edit.
+- `general_purpose`: multi-step workspace or platform work. It inherits the main
+  agent's loaded skills, tools, tool parameters, MCP configuration, and runtime
+  credentials, except for the subagent launcher itself. Use it when delegating the
+  work keeps the main context smaller; do not use it for a trivial single read or
+  edit.
 
 Pass a self-contained task. The call blocks until the subagent finishes, fails,
 or reaches its run limit. Intermediate subagent events are logged separately and
@@ -502,38 +506,56 @@ def _search_agent_factory() -> AgentFactory:
     return AgentFactory(factory_func=create_agent, definition=definition)
 
 
-def _general_purpose_agent_factory() -> AgentFactory:
-    tool_names = [
-        GrepTool.name,
-        FileEditorTool.name,
-        TerminalTool.name,
-        TaskTrackerTool.name,
+def _general_purpose_agent_factory(
+    parent_conversation: "LocalConversation",
+) -> AgentFactory:
+    parent_agent = parent_conversation.agent
+    if not isinstance(parent_agent, Agent):
+        raise TypeError("general_purpose requires an OpenHands Agent parent")
+
+    inherited_tools = [
+        tool for tool in parent_agent.tools if tool.name != PyromindSubAgentTool.name
     ]
+    parent_context = parent_agent.agent_context or AgentContext()
+    inherited_suffix = parent_context.system_message_suffix
+    child_suffix = (
+        f"{inherited_suffix}\n\n{GENERAL_PURPOSE_AGENT_PROMPT}"
+        if inherited_suffix
+        else GENERAL_PURPOSE_AGENT_PROMPT
+    )
+    child_context = parent_context.model_copy(
+        update={
+            "system_message_suffix": child_suffix,
+            "secrets": dict(parent_conversation.state.secret_registry.secret_sources),
+        }
+    )
     definition = AgentDefinition(
         name=GENERAL_PURPOSE_AGENT_NAME,
         description=(
-            "General-purpose specialist for complex workspace analysis, edits, "
-            "commands, and tests."
+            "General-purpose specialist inheriting the parent agent's skills and "
+            "tools for complex workspace and platform tasks."
         ),
         model="inherit",
-        tools=tool_names,
+        tools=[tool.name for tool in inherited_tools],
         system_prompt=GENERAL_PURPOSE_AGENT_PROMPT,
         max_iteration_per_run=30,
     )
 
     def create_agent(llm: LLM) -> Agent:
-        return Agent(
+        agent_config = {
+            name: getattr(parent_agent, name) for name in Agent.model_fields
+        }
+        agent_config.update(
             llm=llm,
-            tools=[Tool(name=name) for name in tool_names],
-            agent_context=AgentContext(
-                system_message_suffix=GENERAL_PURPOSE_AGENT_PROMPT
-            ),
+            tools=inherited_tools,
+            agent_context=child_context,
             condenser=default_condenser(
                 llm.model_copy(
                     update={"usage_id": "subagent-general-purpose-condenser"}
                 )
             ),
         )
+        return Agent(**agent_config)
 
     return AgentFactory(factory_func=create_agent, definition=definition)
 
@@ -541,7 +563,6 @@ def _general_purpose_agent_factory() -> AgentFactory:
 def _subagent_factories() -> dict[SubAgentType, AgentFactory]:
     return {
         SubAgentType.SEARCH: _search_agent_factory(),
-        SubAgentType.GENERAL_PURPOSE: _general_purpose_agent_factory(),
     }
 
 
@@ -585,7 +606,11 @@ class SubAgentExecutor(ToolExecutor[SubAgentAction, SubAgentObservation]):
                 type=action.type,
                 is_error=True,
             )
-        factory = self.factories[action.type]
+        factory = (
+            _general_purpose_agent_factory(conversation)
+            if action.type == SubAgentType.GENERAL_PURPOSE
+            else self.factories[action.type]
+        )
         parent_conversation_id = conversation.state.id
         logger.info(
             "[pyromind-subagent] event=delegation_started "

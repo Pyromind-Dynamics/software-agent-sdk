@@ -91,6 +91,7 @@ from litellm.utils import (
 from openhands.sdk.llm.exceptions import (
     LLMContextWindowTooSmallError,
     LLMNoResponseError,
+    LLMServiceUnavailableError,
     is_prompt_cache_too_small,
     map_provider_exception,
 )
@@ -140,7 +141,16 @@ LLM_RETRY_EXCEPTIONS: Final[tuple[type[Exception], ...]] = (
     LiteLLMTimeout,
     InternalServerError,
     LLMNoResponseError,
+    LLMServiceUnavailableError,
 )
+
+
+def _raise_for_malformed_provider_response(error: Exception) -> None:
+    if "unable to get json response" in str(error).lower():
+        raise LLMServiceUnavailableError(
+            "LLM provider returned a malformed JSON response"
+        ) from error
+
 
 # Minimum context window size required for OpenHands to function properly.
 # Based on typical usage: system prompt (~2k) + conversation history (~4k)
@@ -2060,11 +2070,17 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         **kwargs,
     ) -> ModelResponse:
         with self._transport_ctx():
-            ret = litellm_completion(
-                **self._prepare_transport_kwargs(
-                    messages=messages, enable_streaming=enable_streaming, **kwargs
+            try:
+                ret = litellm_completion(
+                    **self._prepare_transport_kwargs(
+                        messages=messages,
+                        enable_streaming=enable_streaming,
+                        **kwargs,
+                    )
                 )
-            )
+            except Exception as error:
+                _raise_for_malformed_provider_response(error)
+                raise
             if enable_streaming and on_token is not None:
                 assert isinstance(ret, CustomStreamWrapper)
                 chunks: list[ModelResponseStream] = []
@@ -2089,14 +2105,18 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         """Async variant of :meth:`_transport_call`."""
         auth_values = await self._aget_litellm_auth_values()
         with self._transport_ctx():
-            ret = await litellm_acompletion(
-                **self._prepare_transport_kwargs(
-                    messages=messages,
-                    enable_streaming=enable_streaming,
-                    auth_values=auth_values,
-                    **kwargs,
+            try:
+                ret = await litellm_acompletion(
+                    **self._prepare_transport_kwargs(
+                        messages=messages,
+                        enable_streaming=enable_streaming,
+                        auth_values=auth_values,
+                        **kwargs,
+                    )
                 )
-            )
+            except Exception as error:
+                _raise_for_malformed_provider_response(error)
+                raise
             if enable_streaming and on_token is not None:
                 assert isinstance(ret, CustomStreamWrapper)
                 chunks: list[ModelResponseStream] = []

@@ -64,12 +64,18 @@ def get_codex_tools(enable_browser: bool = True) -> list[Tool]:
     return tools
 
 
-def get_codex_condenser(llm: LLM) -> CondenserBase:
+def get_codex_condenser(
+    llm: LLM,
+    *,
+    max_tokens: int | None = None,
+    max_size: int | None = 480,
+) -> CondenserBase:
     """Get the default condenser for the codex preset."""
     return LLMSummarizingCondenser(
         llm=llm,
-        max_size=480,
+        max_size=max_size,
         target_size=120,
+        max_tokens=max_tokens,
         keep_first=4,
         keep_last_user_turns=3,
     )
@@ -83,6 +89,8 @@ def get_codex_agent(
     extra_tools: list[Tool] | None = None,
     agent_context: AgentContext | None = None,
     terminal_params: dict[str, object] | None = None,
+    condenser_max_tokens: int | None = None,
+    condenser_max_size: int | None = 480,
 ) -> Agent:
     """Get an agent aligned with Codex (gpt-5.2-codex) prompt + tools.
 
@@ -102,6 +110,8 @@ def get_codex_agent(
         terminal_params: Optional parameters for the terminal tool. This lets a
             domain preset narrow terminal behavior without changing the default
             Codex tool contract.
+        condenser_max_tokens: Optional token threshold for context condensation.
+        condenser_max_size: Event-count fallback threshold for condensation.
     """
     tools = get_codex_tools(enable_browser=not cli_mode)
     if terminal_params:
@@ -124,7 +134,9 @@ def get_codex_agent(
             "custom_instructions": custom_instructions,
         },
         condenser=get_codex_condenser(
-            llm=llm.model_copy(update={"usage_id": "condenser"})
+            llm=llm.model_copy(update={"usage_id": "condenser"}),
+            max_tokens=condenser_max_tokens,
+            max_size=condenser_max_size,
         ),
     )
     return agent

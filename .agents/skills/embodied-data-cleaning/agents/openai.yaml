@@ -1,0 +1,6 @@
+---
+interface:
+    display_name: Embodied Data Cleaning
+    short_description: Clean self-collected S2 data for LeRobot v2.1
+    default_prompt: Inspect this self-collected S2 dataset, confirm one representative plan, then batch-clean, validate, and publish one merged 
+        LeRobotDataset v2.1 output without narrating skill selection.

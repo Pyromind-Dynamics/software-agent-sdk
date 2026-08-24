@@ -21,6 +21,7 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_VALUE,
 )
 from openhands.agent_server.pyromind_router import (
+    _PYROMIND_SKILL_NAMES,
     PYROMIND_AUTH_TOKEN_SECRET,
     PYROMIND_KB_INSTRUCTIONS,
     PYROMIND_X_CLUSTER_SECRET,
@@ -45,6 +46,7 @@ from openhands.agent_server.workflow_canvas_models import (
     SaveWorkflowCanvasEventSnapshotRequest,
 )
 from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
+from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.conversation.request import StartConversationRequest
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.llm.message import Message, TextContent
@@ -54,9 +56,17 @@ from openhands.tools.data_preparation import (
     DfStopTaskTool,
     DfSubmitPipelineTool,
 )
+from openhands.tools.embodied_data import (
+    BatchCleanLeRobotV21Tool,
+    BuildEmbodiedEpisodePlanTool,
+    InspectEmbodiedDatasetTool,
+    PublishLeRobotV21Tool,
+    ValidateLeRobotV21Tool,
+)
 from openhands.tools.pyromind_archive import ExtractArchiveTool
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
+    MaterializeStorageFilesTool,
     PreviewDatasetTool,
     UploadFileToPyromindTool,
 )
@@ -210,6 +220,29 @@ def test_pyromind_llm_config_normalizes_chat_completions_base_url() -> None:
     )
 
     assert config.base_url == "http://208.64.254.187:8000/v1"
+    assert config.resolved_max_input_tokens == 1_000_000
+    assert config.resolved_condensation_max_tokens == 750_000
+
+
+def test_pyromind_llm_config_allows_context_limit_overrides() -> None:
+    config = PyromindLLMConfig(
+        model="openai/glm-5.2-fp8",
+        max_input_tokens=200_000,
+        condensation_max_tokens=140_000,
+    )
+
+    assert config.resolved_max_input_tokens == 200_000
+    assert config.resolved_condensation_max_tokens == 140_000
+
+    with pytest.raises(
+        ValidationError,
+        match="condensation_max_tokens must be smaller than max_input_tokens",
+    ):
+        PyromindLLMConfig(
+            model="openai/glm-5.2-fp8",
+            max_input_tokens=200_000,
+            condensation_max_tokens=200_000,
+        )
 
 
 class _FakeConversationService:
@@ -386,7 +419,12 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     info = await create_pyromind_conversation(
         request,
         PyromindCreateConversationRequest(
-            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            llm=PyromindLLMConfig(
+                model="gpt-4o",
+                api_key="test-key",
+                max_input_tokens=100_000,
+                condensation_max_tokens=75_000,
+            ),
             extra={
                 "knowledge_base_path": str(knowledge_base),
                 "skills_path": str(tmp_path / "missing-skills"),
@@ -399,6 +437,10 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert response.status_code == status.HTTP_201_CREATED
     assert service.start_request is not None
     assert service.start_request.conversation_id == info.id
+    assert service.start_request.agent.llm.max_input_tokens == 100_000
+    assert isinstance(service.start_request.agent.condenser, LLMSummarizingCondenser)
+    assert service.start_request.agent.condenser.max_tokens == 75_000
+    assert service.start_request.agent.condenser.max_size is None
     expected_dir = service.conversations_dir / info.id.hex
     assert Path(service.start_request.workspace.working_dir) == expected_dir
     assert expected_dir.is_dir()
@@ -415,6 +457,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert ValidateWorkflowDslTool.name in tool_names
     assert PreviewDatasetTool.name in tool_names
     assert UploadFileToPyromindTool.name in tool_names
+    assert PublishLeRobotV21Tool.name in tool_names
     assert RunDatasetCleaningTool.name in tool_names
     assert _REMOVED_WORKFLOW_TOOL not in tool_names
     terminal_tool = next(
@@ -459,16 +502,27 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         for tool in service.start_request.agent.tools
         if tool.name == UploadFileToPyromindTool.name
     )
+    publish_tool = next(
+        tool
+        for tool in service.start_request.agent.tools
+        if tool.name == PublishLeRobotV21Tool.name
+    )
     cleaning_tool = next(
         tool
         for tool in service.start_request.agent.tools
         if tool.name == RunDatasetCleaningTool.name
     )
-    assert preview_tool.params == {
+    expected_storage_params = {
         "headers": {"x-cluster": "us-west-1#pre"},
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
-    assert upload_tool.params == preview_tool.params
+    assert {
+        key: value
+        for key, value in preview_tool.params.items()
+        if key != "extract_params"
+    } == expected_storage_params
+    assert upload_tool.params == expected_storage_params
+    assert publish_tool.params == expected_storage_params
     assert cleaning_tool.params == expected_execution_params
     assert "secret_headers" not in cleaning_tool.params
     assert "session-token" not in str(preview_tool.params)
@@ -518,6 +572,37 @@ async def test_pyromind_conversation_registers_skill_runtime_tools(tmp_path):
     assert tools[SkillsListTool.__name__].params == {}
     assert tools[SkillsReadTool.__name__].params == {}
     service.start_request.model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_pyromind_conversation_registers_embodied_data_tools(tmp_path):
+    knowledge_base = tmp_path / "knowledge"
+    knowledge_base.mkdir()
+    service = _FakeConversationService(tmp_path / "conversations")
+    response = Response()
+
+    await create_pyromind_conversation(
+        _make_request(),
+        PyromindCreateConversationRequest(
+            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            extra={
+                "knowledge_base_path": str(knowledge_base),
+                "skills_path": str(tmp_path / "missing-skills"),
+            },
+        ),
+        response,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert service.start_request is not None
+    tool_names = {tool.name for tool in service.start_request.agent.tools}
+    assert InspectEmbodiedDatasetTool.name in tool_names
+    assert BuildEmbodiedEpisodePlanTool.name in tool_names
+    assert MaterializeStorageFilesTool.name in tool_names
+    assert BatchCleanLeRobotV21Tool.name in tool_names
+    assert ValidateLeRobotV21Tool.name in tool_names
+    assert PublishLeRobotV21Tool.name in tool_names
+    assert "embodied-data-cleaning" in _PYROMIND_SKILL_NAMES
 
 
 @pytest.mark.asyncio
@@ -915,7 +1000,9 @@ def test_pyromind_storage_tools_use_user_context_headers():
 
     assert [tool.name for tool in tools] == [
         PreviewDatasetTool.name,
+        MaterializeStorageFilesTool.name,
         UploadFileToPyromindTool.name,
+        PublishLeRobotV21Tool.name,
         RunDatasetCleaningTool.name,
         DfSubmitPipelineTool.name,
         DfCheckProgressTool.name,
@@ -923,13 +1010,18 @@ def test_pyromind_storage_tools_use_user_context_headers():
         ExtractArchiveTool.name,
         PreviewRemoteDatasetTool.name,
     ]
-    assert tools[0].params == {
+    expected_storage_params = {
         "storage_base_url": "https://storage.test/api",
         "headers": {"x-cluster": "context-cluster"},
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
-    assert tools[1].params == tools[0].params
-    cleaning_params = tools[2].params
+    assert {
+        key: value for key, value in tools[0].params.items() if key != "extract_params"
+    } == expected_storage_params
+    assert tools[1].params == expected_storage_params
+    assert tools[2].params == expected_storage_params
+    assert tools[3].params == expected_storage_params
+    cleaning_params = tools[4].params
     assert cleaning_params == {
         "current_user": CurrentLoginUser(
             username="debug-user-42",

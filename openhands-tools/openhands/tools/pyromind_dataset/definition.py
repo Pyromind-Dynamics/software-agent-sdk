@@ -350,6 +350,8 @@ three selected files or folders inside the conversation workspace, preserves
 their storage-relative layout, and returns a sample_manifest_path for
 df_run_pipeline. Image samples are sent to the configured DF vision model
 (normally Gemma) for OCR and a short visual summary.
+Files above the bounded sample limit are recorded as not materialized metadata;
+use materialize_storage_files with exact paths when full payloads are required.
 
 Returns:
 - files found under the path
@@ -842,12 +844,16 @@ class PreviewDatasetExecutor(
             preview_images: list[ImageContent] = []
             total_bytes = 0
             total_files = 0
+            materialized_files = 0
+            not_materialized_files = 0
             vision_images = 0
+            storage_sidecars: dict[Path, list[dict[str, Any]]] = {}
 
             for index, selected_path in enumerate(selected_paths):
                 storage_files = self._storage_sample_files(selected_path, headers)
                 row_files: list[str] = []
                 row_images: list[str] = []
+                row_file_metadata: list[dict[str, Any]] = []
                 selected_workspace_path: str | None = None
                 selected_manifest_path: str | None = None
 
@@ -858,6 +864,33 @@ class PreviewDatasetExecutor(
                             "Sample selection exceeds the "
                             f"{_MAX_SAMPLE_FILES}-file limit."
                         )
+                    local_file = _sample_local_file(preview_root, storage_file.path)
+                    local_file.parent.mkdir(parents=True, exist_ok=True)
+                    manifest_file_path = local_file.relative_to(preview_root).as_posix()
+                    file_metadata = {
+                        "name": storage_file.name,
+                        "source_path": storage_file.path,
+                        "local_path": manifest_file_path,
+                        "size": storage_file.size,
+                        "materialized": False,
+                    }
+                    row_file_metadata.append(file_metadata)
+                    storage_sidecars.setdefault(local_file.parent, []).append(
+                        file_metadata
+                    )
+                    if (
+                        storage_file.size is not None
+                        and storage_file.size > _MAX_SAMPLE_FILE_BYTES
+                    ):
+                        not_materialized_files += 1
+                        if selected_workspace_path is None:
+                            selected_workspace_path = local_file.parent.relative_to(
+                                workspace_dir
+                            ).as_posix()
+                            selected_manifest_path = local_file.parent.relative_to(
+                                preview_root
+                            ).as_posix()
+                        continue
                     content = download_file_from_pyromind(
                         storage_path=storage_file.path,
                         storage_base_url=self._storage_base_url,
@@ -866,17 +899,16 @@ class PreviewDatasetExecutor(
                         max_bytes=_MAX_SAMPLE_FILE_BYTES,
                     )
                     total_bytes += len(content)
+                    materialized_files += 1
                     if total_bytes > _MAX_SAMPLE_TOTAL_BYTES:
                         raise ValueError(
                             "Sample selection exceeds the "
                             f"{_human_size(_MAX_SAMPLE_TOTAL_BYTES)} total limit."
                         )
 
-                    local_file = _sample_local_file(preview_root, storage_file.path)
-                    local_file.parent.mkdir(parents=True, exist_ok=True)
                     local_file.write_bytes(content)
+                    file_metadata["materialized"] = True
                     workspace_path = local_file.relative_to(workspace_dir).as_posix()
-                    manifest_file_path = local_file.relative_to(preview_root).as_posix()
                     row_files.append(manifest_file_path)
                     if selected_workspace_path is None:
                         selected_workspace_path = workspace_path
@@ -930,12 +962,18 @@ class PreviewDatasetExecutor(
                     "source_path": selected_path,
                     "local_path": selected_manifest_path,
                     "files": row_files,
+                    "file_metadata": row_file_metadata,
                     "images": row_images,
                 }
                 if row_images:
                     manifest_row["image_path"] = row_images[0]
                 manifest_rows.append(manifest_row)
 
+            for directory, files in storage_sidecars.items():
+                (directory / ".pyromind_storage.json").write_text(
+                    json.dumps({"files": files}, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
             manifest_path = preview_root / "sample_manifest.jsonl"
             with manifest_path.open("w", encoding="utf-8") as manifest_file:
                 for row in manifest_rows:
@@ -946,7 +984,8 @@ class PreviewDatasetExecutor(
             manifest_relative = manifest_path.relative_to(workspace_dir).as_posix()
             summary_text = (
                 f"Materialized {len(manifest_rows)} sample unit(s), "
-                f"{total_files} file(s), {_human_size(total_bytes)}. "
+                f"{materialized_files} file(s), {_human_size(total_bytes)}; "
+                f"{not_materialized_files} oversized file(s) recorded as metadata. "
                 f"Manifest: {manifest_relative}"
             )
             for preview in vision_previews:
@@ -971,7 +1010,7 @@ class PreviewDatasetExecutor(
                 has_vision=any(row["images"] for row in manifest_rows),
                 source="storage",
             )
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, httpx.RequestError) as exc:
             return PreviewDatasetObservation.from_text(
                 text=f"Failed to materialize storage samples: {exc}",
                 is_error=True,
@@ -2060,6 +2099,262 @@ class UploadFileToPyromindTool(
         ]
 
 
+# ---------------------------------------------------------------------------
+# materialize_storage_files
+# ---------------------------------------------------------------------------
+
+
+class MaterializeStorageFilesAction(Action):
+    paths: list[str] = Field(
+        min_length=1,
+        max_length=_MAX_SAMPLE_FILES,
+        description="Exact Storage file paths to download into the workspace",
+    )
+    output_dir: str = Field(
+        default="public_data/data-preparation/materialized",
+        description="Workspace-relative destination preserving Storage paths",
+    )
+    max_total_bytes: int = Field(
+        default=2 * 1024 * 1024 * 1024,
+        ge=1,
+        le=20 * 1024 * 1024 * 1024,
+        description="Maximum total bytes downloaded by this call",
+    )
+
+
+class MaterializeStorageFilesObservation(Observation):
+    output_dir: str = ""
+    local_paths: list[str] = Field(default_factory=list)
+    files: list[dict[str, Any]] = Field(default_factory=list)
+    total_bytes: int = 0
+
+
+class MaterializeStorageFilesExecutor(
+    ToolExecutor[MaterializeStorageFilesAction, MaterializeStorageFilesObservation]
+):
+    def __init__(
+        self,
+        storage_base_url: str | None = None,
+        headers: dict[str, str] | None = None,
+        secret_headers: dict[str, str] | None = None,
+        timeout: float = 300.0,
+    ) -> None:
+        base_url = storage_base_url or _default_storage_base_url()
+        self._storage_base_url = base_url.rstrip("/")
+        self._headers = dict(headers or {})
+        self._secret_headers = dict(secret_headers or {})
+        self._timeout = timeout
+
+    def __call__(
+        self,
+        action: MaterializeStorageFilesAction,
+        conversation: BaseConversation | None = None,
+    ) -> MaterializeStorageFilesObservation:
+        try:
+            workspace_dir = _resolve_workspace_dir(conversation)
+            output_dir = _resolve_materialized_output_dir(
+                workspace_dir, action.output_dir
+            )
+            headers = {"accept": "*/*", **self._headers}
+            headers.update(_resolve_conversation_headers(conversation))
+            headers.update(_resolve_secret_headers(conversation, self._secret_headers))
+            results: list[dict[str, Any]] = []
+            local_paths: list[str] = []
+            total_bytes = 0
+            for raw_path in action.paths:
+                storage_path = _normalize_storage_sample_path(
+                    _strip_workspace_prefix(raw_path.strip())
+                )
+                destination = _sample_local_file(output_dir, storage_path)
+                if destination.exists():
+                    raise ValueError(
+                        f"destination already exists; refusing to overwrite: "
+                        f"{destination.relative_to(workspace_dir)}"
+                    )
+                size, checksum = materialize_file_from_pyromind(
+                    storage_path=storage_path,
+                    destination=destination,
+                    storage_base_url=self._storage_base_url,
+                    headers=headers,
+                    timeout=self._timeout,
+                    max_bytes=action.max_total_bytes - total_bytes,
+                )
+                total_bytes += size
+                workspace_path = destination.relative_to(workspace_dir).as_posix()
+                local_paths.append(workspace_path)
+                results.append(
+                    {
+                        "source_path": storage_path,
+                        "local_path": workspace_path,
+                        "size": size,
+                        "sha256": checksum,
+                    }
+                )
+            return MaterializeStorageFilesObservation.from_text(
+                text=(
+                    f"Materialized {len(results)} Storage file(s), "
+                    f"{_human_size(total_bytes)}, under "
+                    f"{output_dir.relative_to(workspace_dir)}."
+                ),
+                output_dir=output_dir.relative_to(workspace_dir).as_posix(),
+                local_paths=local_paths,
+                files=results,
+                total_bytes=total_bytes,
+            )
+        except (OSError, ValueError, httpx.RequestError) as exc:
+            return MaterializeStorageFilesObservation.from_text(
+                text=str(exc),
+                is_error=True,
+            )
+
+
+def materialize_file_from_pyromind(
+    *,
+    storage_path: str,
+    destination: Path,
+    storage_base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+    max_bytes: int,
+) -> tuple[int, str]:
+    if max_bytes < 1:
+        raise ValueError("materialization byte limit was exhausted")
+    url = _storage_download_url(
+        storage_path=storage_path,
+        storage_base_url=storage_base_url,
+        headers=headers,
+        timeout=timeout,
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.part")
+    if temporary.exists():
+        temporary.unlink()
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with httpx.stream(
+            "GET",
+            url,
+            headers={},
+            timeout=timeout,
+            follow_redirects=True,
+        ) as download:
+            if download.status_code >= 400:
+                body = download.read().decode("utf-8", errors="replace")
+                raise ValueError(
+                    "Pyromind storage download URL returned HTTP "
+                    f"{download.status_code}: {_truncate_text(body)}"
+                )
+            with temporary.open("xb") as output:
+                for chunk in download.iter_bytes():
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise ValueError(
+                            f"Storage materialization exceeds the "
+                            f"{max_bytes}-byte limit"
+                        )
+                    digest.update(chunk)
+                    output.write(chunk)
+        temporary.replace(destination)
+    except (OSError, ValueError, httpx.RequestError):
+        if temporary.exists():
+            temporary.unlink()
+        raise
+    return size, digest.hexdigest()
+
+
+def _storage_download_url(
+    *,
+    storage_path: str,
+    storage_base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+) -> str:
+    try:
+        response = httpx.post(
+            f"{storage_base_url.rstrip('/')}/get_url",
+            headers=headers,
+            json={"path": storage_path},
+            timeout=timeout,
+        )
+    except httpx.RequestError as exc:
+        raise ValueError(
+            f"Failed to request Pyromind storage download URL: {exc}"
+        ) from exc
+    payload = _decode_json_response(response, "Pyromind storage get_url API")
+    if isinstance(payload, str):
+        raise ValueError(payload)
+    data = _extract_api_data("get_url", payload)
+    if isinstance(data, str):
+        raise ValueError(data)
+    url = data.get("url")
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("Pyromind storage get_url API response is missing url data.")
+    return url
+
+
+def _resolve_materialized_output_dir(workspace_dir: Path, value: str) -> Path:
+    candidate = Path(value)
+    if candidate.is_absolute():
+        raise ValueError("output_dir must be workspace-relative")
+    resolved = (workspace_dir / candidate).resolve()
+    if not resolved.is_relative_to(workspace_dir):
+        raise ValueError("output_dir must stay inside the conversation workspace")
+    return resolved
+
+
+class MaterializeStorageFilesTool(
+    ToolDefinition[MaterializeStorageFilesAction, MaterializeStorageFilesObservation]
+):
+    @classmethod
+    def create(
+        cls,
+        conv_state: ConversationState | None = None,  # noqa: ARG003
+        **params: Any,
+    ) -> Sequence[ToolDefinition]:
+        storage_base_url = str(
+            params.pop("storage_base_url", _default_storage_base_url())
+        )
+        headers = params.pop("headers", None)
+        secret_headers = params.pop("secret_headers", None)
+        timeout = float(params.pop("timeout", 300.0))
+        if params:
+            names = ", ".join(sorted(params))
+            raise ValueError(f"MaterializeStorageFilesTool got unknown params: {names}")
+        _validate_storage_tool_params(
+            storage_base_url,
+            headers,
+            secret_headers,
+            timeout,
+            _DEFAULT_PREVIEW_BYTES,
+        )
+        return [
+            cls(
+                description=(
+                    "Stream exact Pyromind Storage files into the conversation "
+                    "workspace for full processing. Use after bounded preview when "
+                    "required payloads are marked not_materialized. Preserves "
+                    "Storage-relative paths and returns size plus SHA-256."
+                ),
+                action_type=MaterializeStorageFilesAction,
+                observation_type=MaterializeStorageFilesObservation,
+                executor=MaterializeStorageFilesExecutor(
+                    storage_base_url=storage_base_url,
+                    headers=_normalize_headers(headers),
+                    secret_headers=_normalize_headers(secret_headers),
+                    timeout=timeout,
+                ),
+                annotations=ToolAnnotations(
+                    title="materialize_storage_files",
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    idempotentHint=False,
+                    openWorldHint=True,
+                ),
+            )
+        ]
+
+
 def _validate_storage_tool_params(
     storage_base_url: str,
     headers: Any,
@@ -3052,4 +3347,5 @@ def _human_size(size: int | None) -> str:
 
 
 register_tool(PreviewDatasetTool.name, PreviewDatasetTool)
+register_tool(MaterializeStorageFilesTool.name, MaterializeStorageFilesTool)
 register_tool(UploadFileToPyromindTool.name, UploadFileToPyromindTool)

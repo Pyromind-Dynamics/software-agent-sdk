@@ -14,7 +14,14 @@ from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 # Keep the node_signature tool registered (module-level side effect) so
 # persisted conversation events that referenced it before it was removed
@@ -83,11 +90,19 @@ from openhands.tools.data_preparation import (
     DfSubmitPipelineTool,
 )
 from openhands.tools.data_preparation.progress import DfCheckProgressExecutor
+from openhands.tools.embodied_data import (
+    BatchCleanLeRobotV21Tool,
+    BuildEmbodiedEpisodePlanTool,
+    InspectEmbodiedDatasetTool,
+    PublishLeRobotV21Tool,
+    ValidateLeRobotV21Tool,
+)
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
 from openhands.tools.pyromind_archive import ExtractArchiveTool
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
+    MaterializeStorageFilesTool,
     PreviewDatasetTool,
     UploadFileToPyromindTool,
 )
@@ -115,6 +130,8 @@ from openhands.tools.workflow_debug import WorkflowDebugTool
 PYROMIND_AUTH_TOKEN_SECRET = "auth_token"
 PYROMIND_X_CLUSTER_SECRET = "PYROMIND_X_CLUSTER"
 _OPENAI_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
+_GLM_5_2_CONTEXT_WINDOW = 1_000_000
+_PYROMIND_CONDENSATION_TOKEN_RATIO = 0.75
 
 
 logger = logging.getLogger(__name__)
@@ -151,6 +168,7 @@ _PYROMIND_SKILL_NAMES = [
     "debug-workflow",
     "data-cleaning",
     "data-preparation",
+    "embodied-data-cleaning",
     "training-analysis",
 ]
 _PYROMIND_VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
@@ -536,7 +554,9 @@ def _build_pyromind_storage_tools(
                 name=PreviewDatasetTool.name,
                 params={**params, "extract_params": extraction_params},
             ),
+            Tool(name=MaterializeStorageFilesTool.name, params=dict(params)),
             Tool(name=UploadFileToPyromindTool.name, params=dict(params)),
+            Tool(name=PublishLeRobotV21Tool.name, params=dict(params)),
             Tool(name=RunDatasetCleaningTool.name, params=cleaning_params),
             Tool(name=DfSubmitPipelineTool.name, params=preparation_params),
             Tool(name=DfCheckProgressTool.name, params=dict(params)),
@@ -620,6 +640,51 @@ class PyromindLLMConfig(BaseModel):
     base_url: str | None = Field(
         default_factory=lambda: os.environ.get("LLM_BASE_URL"),
     )
+    max_input_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Context window configured by the inference server. GLM-5.2 defaults "
+            "to its native 1M-token window when this field is omitted."
+        ),
+    )
+    condensation_max_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "LiteLLM-estimated input token count that triggers condensation. "
+            "Defaults to 75% of the configured context window."
+        ),
+    )
+
+    @property
+    def resolved_max_input_tokens(self) -> int | None:
+        if self.max_input_tokens is not None:
+            return self.max_input_tokens
+        if "glm-5.2" in self.model.lower():
+            return _GLM_5_2_CONTEXT_WINDOW
+        return None
+
+    @property
+    def resolved_condensation_max_tokens(self) -> int | None:
+        if self.condensation_max_tokens is not None:
+            return self.condensation_max_tokens
+        if (context_window := self.resolved_max_input_tokens) is None:
+            return None
+        return int(context_window * _PYROMIND_CONDENSATION_TOKEN_RATIO)
+
+    @model_validator(mode="after")
+    def validate_condensation_max_tokens(self) -> "PyromindLLMConfig":
+        context_window = self.resolved_max_input_tokens
+        if (
+            context_window is not None
+            and self.condensation_max_tokens is not None
+            and self.condensation_max_tokens >= context_window
+        ):
+            raise ValueError(
+                "condensation_max_tokens must be smaller than max_input_tokens"
+            )
+        return self
 
     @field_validator("base_url", mode="before")
     @classmethod
@@ -1192,6 +1257,7 @@ async def create_pyromind_conversation(
         model=request.llm.model,
         api_key=request.llm.api_key,
         base_url=request.llm.base_url,
+        max_input_tokens=request.llm.resolved_max_input_tokens,
         persist_runtime_config=False,
     )
 
@@ -1202,6 +1268,8 @@ async def create_pyromind_conversation(
         agent_context=agent_context,
         custom_instructions=custom_instructions,
         terminal_params=dict(PYROMIND_TERMINAL_PARAMS),
+        condenser_max_tokens=request.llm.resolved_condensation_max_tokens,
+        condenser_max_size=None,
         extra_tools=[
             *(
                 [
@@ -1217,6 +1285,10 @@ async def create_pyromind_conversation(
             Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
             *storage_tools,
             Tool(name="dataset_download"),
+            Tool(name=InspectEmbodiedDatasetTool.name),
+            Tool(name=BuildEmbodiedEpisodePlanTool.name),
+            Tool(name=BatchCleanLeRobotV21Tool.name),
+            Tool(name=ValidateLeRobotV21Tool.name),
             Tool(
                 name="df_run_pipeline",
                 params={
