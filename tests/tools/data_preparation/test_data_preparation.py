@@ -12,6 +12,7 @@ from PIL import Image
 from pydantic import SecretStr
 
 from openhands.sdk.conversation.secret_registry import SecretRegistry
+from openhands.sdk.llm import LLM, FailoverRouter
 from openhands.sdk.workspace.workspace import LocalWorkspace
 from openhands.tools.data_preparation.definition import (
     RUNTIME_FILENAMES,
@@ -113,6 +114,52 @@ def test_build_dataflow_env_text_profile_rejects_placeholder_llm_model(
 
     with pytest.raises(ValueError, match="unsubstituted placeholder"):
         build_dataflow_env(conversation, "text")
+
+
+def test_build_dataflow_env_text_profile_uses_primary_router_provider(
+    monkeypatch,
+) -> None:
+    """A RouterLLM (no real ``model``) must resolve the primary provider's
+    model for DataFlow instead of failing on the ``router`` placeholder."""
+    for name in ("DF_API_KEY", "DF_MODEL_NAME", "DF_API_BASE_URL", "DF_API_URL"):
+        monkeypatch.delenv(name, raising=False)
+
+    router = FailoverRouter(
+        llms_for_routing={
+            "deepseek": LLM(
+                model="openai/deepseek-v4-flash-0731",
+                base_url="http://208.64.254.187:8000/v1",
+                api_key=SecretStr("first-key"),
+            ),
+            "openrouter": LLM(
+                model="openai/deepseek-v4-flash-0731",
+                base_url="https://openrouter.ai/api/v1",
+                api_key=SecretStr("second-key"),
+            ),
+        },
+    )
+    conversation = _conversation_with_llm()
+    conversation.state.agent.llm = router
+
+    env = build_dataflow_env(conversation, "text")
+
+    assert env["DF_MODEL_NAME"] == "deepseek-v4-flash-0731"
+    assert env["DF_API_BASE_URL"] == "http://208.64.254.187:8000/v1"
+    assert env["DF_API_KEY"] == "first-key"
+
+
+def test_concrete_llm_delegates_to_router_primary() -> None:
+    from openhands.tools.data_preparation.runner import _concrete_llm
+
+    router = FailoverRouter(
+        llms_for_routing={
+            "deepseek": LLM(model="openai/deepseek-v4-flash-0731"),
+            "openrouter": LLM(model="openai/deepseek-v4-flash-0731"),
+        },
+    )
+    assert _concrete_llm(router).model == "openai/deepseek-v4-flash-0731"
+    plain = LLM(model="openai/gpt-x")
+    assert _concrete_llm(plain) is plain
 
 
 class _FakePreflightResponse:

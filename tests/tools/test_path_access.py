@@ -2,7 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from openhands.tools.utils import PathAccessPolicy, PathRule
+from openhands.tools.utils import (
+    PathAccessPolicy,
+    PathRule,
+    _dataflow_venv_read_roots,
+    configured_public_read_roots,
+)
 
 
 def assert_conversation_policy_shape(
@@ -90,3 +95,35 @@ def test_conversation_workspace_restricts_to_subpaths(tmp_path: Path) -> None:
         exclude_workspace_fallback=True,
     )
     assert_conversation_policy_shape(policy, conversation_dir)
+
+
+def test_dataflow_venv_read_roots_empty_without_env() -> None:
+    assert _dataflow_venv_read_roots(None) == []
+    assert _dataflow_venv_read_roots("") == []
+
+
+def test_dataflow_venv_read_roots_exposes_home() -> None:
+    # <home>/dataflow-venv/bin/python -> expose <home> (covers the uv-managed
+    # interpreter symlinked under <home>/.local/share/uv/python as well).
+    roots = _dataflow_venv_read_roots("/home/openhands/dataflow-venv/bin/python")
+    assert roots == ["/home/openhands"]
+
+
+def test_dataflow_venv_read_roots_ignores_unconventional_paths() -> None:
+    # A system interpreter or non-<venv>/bin layout must not fan out to "/".
+    assert _dataflow_venv_read_roots("/usr/bin/python3") == []
+    assert _dataflow_venv_read_roots("/opt/python") == []
+
+
+def test_configured_public_read_roots_includes_dataflow_home(monkeypatch) -> None:
+    monkeypatch.setenv("DATAFLOW_PYTHON", "/home/openhands/dataflow-venv/bin/python")
+    for env_var in (
+        "PYROMIND_KNOWLEDGE_BASE_PATH",
+        "PYROMIND_SKILLS_PATH",
+        "PYROMIND_PUBLIC_READ_PATHS",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+
+    roots = configured_public_read_roots()
+
+    assert Path("/home/openhands").resolve() in roots

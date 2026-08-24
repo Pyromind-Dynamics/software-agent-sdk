@@ -155,9 +155,32 @@ def configured_public_read_roots(
                 for _, environment_variable, _, _ in PUBLIC_READ_ALIASES
             ),
             *os.environ.get("PYROMIND_PUBLIC_READ_PATHS", "").split(os.pathsep),
+            *_dataflow_venv_read_roots(os.environ.get("DATAFLOW_PYTHON")),
         ]
     resolved_roots = (Path(root).resolve() for root in roots if root)
     return tuple(dict.fromkeys(resolved_roots))
+
+
+def _dataflow_venv_read_roots(dataflow_python: str | None) -> list[str]:
+    """Return the paths the terminal sandbox must expose for DataFlow runs.
+
+    ``DATAFLOW_PYTHON`` points at ``<home>/dataflow-venv/bin/python``. The uv
+    venv's interpreter is a symlink into ``<home>/.local/share/uv/python/...``,
+    so binding the venv alone leaves the interpreter dangling inside the
+    sandbox. Expose the user home directory that contains both, read-only.
+    """
+
+    if not dataflow_python:
+        return []
+    interpreter = Path(dataflow_python).expanduser()
+    # Only the conventional <home>/dataflow-venv/bin/python layout is handled;
+    # anything else (e.g. a system interpreter) is left to the existing roots.
+    if (
+        interpreter.parent.name != "bin"
+        or interpreter.parents[1].name != "dataflow-venv"
+    ):
+        return []
+    return [str(interpreter.parents[2])]
 
 
 WORKFLOW_SUBPATH: Final[str] = "workflow"

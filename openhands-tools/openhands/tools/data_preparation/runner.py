@@ -20,6 +20,7 @@ from typing import Any, Literal
 
 import httpx
 
+from openhands.sdk.llm import RouterLLM
 from openhands.sdk.utils.redact import redact_text_secrets
 
 
@@ -253,6 +254,20 @@ def openai_compatible_model_name(model: str) -> str:
     return model
 
 
+def _concrete_llm(llm: Any) -> Any:
+    """Return the concrete LLM behind a router, or *llm* unchanged.
+
+    A :class:`~openhands.sdk.llm.RouterLLM` carries a placeholder ``model`` and
+    ``None`` ``base_url``/``api_key`` fields; its real per-provider values live
+    on the providers in ``llms_for_routing``. Resolve the primary provider so
+    DataFlow uses one coherent (model, endpoint, key) triple.
+    """
+
+    if isinstance(llm, RouterLLM):
+        return next(iter(llm.llms_for_routing.values()))
+    return llm
+
+
 _PLACEHOLDER_MODEL_NAMES = frozenset({"router", "<model>", "{model}", "{{model}}"})
 
 
@@ -333,7 +348,7 @@ def build_dataflow_env(
         ValueError: If the resolved configuration is incomplete or inconsistent.
     """
 
-    llm = conversation.state.agent.llm
+    llm = _concrete_llm(conversation.state.agent.llm)
     if llm.api_key is None:
         llm_api_key = None
     elif hasattr(llm.api_key, "get_secret_value"):
