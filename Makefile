@@ -35,6 +35,7 @@ build: check-uv-version
 	@$(ECHO) "$(CYAN)Setting up OpenHands V1 development environment...$(RESET)"
 	@$(ECHO) "$(YELLOW)Installing dependencies with uv sync --dev...$(RESET)"
 	@uv sync --dev
+	@uv pip install -r requirements-terminal.txt
 	@$(ECHO) "$(GREEN)Dependencies installed successfully.$(RESET)"
 	@$(ECHO) "$(YELLOW)Setting up pre-commit hooks...$(RESET)"
 	@uv run pre-commit install

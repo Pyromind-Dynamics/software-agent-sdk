@@ -5,10 +5,11 @@ ARG UID=10001
 ARG GID=10001
 ARG PORT=8000
 ARG ENABLE_VERTEX=0
+ARG ENABLE_TERMINAL_EXTRAS=1
 
 ####################################################################################
 FROM python:3.13-bookworm AS builder
-ARG USERNAME UID GID ENABLE_VERTEX
+ARG USERNAME UID GID ENABLE_VERTEX ENABLE_TERMINAL_EXTRAS
 ENV UV_PROJECT_ENVIRONMENT=/agent-server/.venv
 ENV UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python
 
@@ -26,12 +27,16 @@ COPY --chown=${USERNAME}:${USERNAME} openhands-tools ./openhands-tools
 COPY --chown=${USERNAME}:${USERNAME} openhands-workspace ./openhands-workspace
 COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server ./openhands-agent-server
 COPY --chown=${USERNAME}:${USERNAME} .agents ./.agents
+COPY --chown=${USERNAME}:${USERNAME} requirements-terminal.txt ./
 RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
     EXTRA_FLAGS=""; \
     if [ "$ENABLE_VERTEX" = "1" ]; then EXTRA_FLAGS="--extra vertex"; fi; \
     uv python install 3.13 && \
     uv venv --python-preference only-managed --python 3.13 .venv && \
     uv sync --frozen --no-editable --managed-python --extra boto3 $EXTRA_FLAGS && \
+    if [ "$ENABLE_TERMINAL_EXTRAS" = "1" ]; then \
+        uv pip install --python .venv/bin/python -r requirements-terminal.txt; \
+    fi; \
     readlink -f .venv/bin/python | grep -q '^/agent-server/uv-managed-python/'
 
 ####################################################################################
@@ -212,6 +217,15 @@ RUN set -ux; \
 
 RUN mkdir -p /etc/claude-code && \
     echo '{"permissions":{"allow":["Edit","Read","Bash"]}}' > /etc/claude-code/managed-settings.json
+
+# The runtime image does not carry the builder's /agent-server/.venv, and agent
+# terminals resolve `python` to the base image's system interpreter, so install
+# the terminal environment extras there directly (see requirements-terminal.txt).
+ARG ENABLE_TERMINAL_EXTRAS
+COPY requirements-terminal.txt /tmp/requirements-terminal.txt
+RUN if [ "$ENABLE_TERMINAL_EXTRAS" = "1" ]; then \
+        python3 -m pip install --no-cache-dir --disable-pip-version-check -r /tmp/requirements-terminal.txt; \
+    fi
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.6 /uv /uvx /bin/
 
