@@ -1,6 +1,12 @@
 # UV workspace configuration
 [tool.uv.workspace]
-members = ["openhands-sdk", "openhands-tools", "openhands-workspace", "openhands-agent-server"]
+members = [
+    "openhands-sdk",
+    "openhands-tools",
+    "openhands-embodied-runtime",
+    "openhands-workspace",
+    "openhands-agent-server",
+]
 
 # Security: Apply workspace-wide dependency guardrails.
 [tool.uv]
@@ -24,6 +30,7 @@ openhands-sdk = { workspace = true }
 openhands-tools = { workspace = true }
 openhands-workspace = { workspace = true }
 openhands-agent-server = { workspace = true }
+openhands-embodied-runtime = { workspace = true }
 #pyromind-sdk = { index = "testpypi" }
 
 [dependency-groups]
@@ -111,6 +118,7 @@ markers = [
 include = [
     "openhands-sdk",
     "openhands-tools",
+    "openhands-embodied-runtime",
     "openhands-workspace",
     "openhands-agent-server",
     "examples",
@@ -120,6 +128,7 @@ include = [
 extraPaths = [
     "openhands-sdk",
     "openhands-tools",
+    "openhands-embodied-runtime",
     "openhands-workspace",
     "openhands-agent-server"
 ]

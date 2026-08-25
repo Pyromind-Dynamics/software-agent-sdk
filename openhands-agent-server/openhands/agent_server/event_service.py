@@ -1999,14 +1999,47 @@ class EventService:
         if not self._conversation:
             raise ValueError("inactive_service")
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
+        removed = await loop.run_in_executor(
             None, self._remove_active_long_task_sync, task_id
         )
+        if removed is not None:
+            await self._publish_state_update()
+        return removed
 
     def _remove_active_long_task_sync(self, task_id: str) -> ActiveLongTask | None:
         if self._conversation is None:
             raise ValueError("inactive_service")
         return self._conversation.remove_active_long_task(task_id)
+
+    async def update_active_long_task_status(self, task_id: str, status: str) -> None:
+        if not self._conversation:
+            raise ValueError("inactive_service")
+        loop = asyncio.get_running_loop()
+        changed = await loop.run_in_executor(
+            None,
+            self._update_active_long_task_status_sync,
+            task_id,
+            status,
+        )
+        if changed:
+            await self._publish_state_update()
+
+    def _update_active_long_task_status_sync(self, task_id: str, status: str) -> bool:
+        if self._conversation is None:
+            raise ValueError("inactive_service")
+        with self._conversation._state as state:
+            updated = [
+                (
+                    ActiveLongTask(task_id=task.task_id, kind=task.kind, status=status)
+                    if task.task_id == task_id
+                    else task
+                )
+                for task in state.active_long_tasks
+            ]
+            if updated == state.active_long_tasks:
+                return False
+            state.active_long_tasks = updated
+            return True
 
     async def set_confirmation_policy(self, policy: ConfirmationPolicyBase):
         """Set the confirmation policy for the conversation."""

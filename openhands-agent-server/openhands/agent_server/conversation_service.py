@@ -83,6 +83,7 @@ from openhands.tools.workflow.definition import (
 
 
 if TYPE_CHECKING:
+    from openhands.agent_server.workflow_task_poller import WorkflowTaskPoller
     from openhands.sdk.subagent.schema import AgentDefinition
 
 # How often the idle-eviction background task scans activated conversations.
@@ -597,6 +598,7 @@ class ConversationService:
     )
     _lease_renewal_task: asyncio.Task | None = field(default=None, init=False)
     _eviction_task: asyncio.Task | None = field(default=None, init=False)
+    _workflow_task_poller: "WorkflowTaskPoller | None" = field(default=None, init=False)
     _run_executor: ThreadPoolExecutor | None = field(default=None, init=False)
 
     # Idle-eviction parameters. ``idle_eviction_timeout`` is the minimum
@@ -624,6 +626,11 @@ class ConversationService:
         conversation_ids.discard(event_service.stored.id)
         if not conversation_ids:
             self._conversation_ids_by_user.pop(user_id, None)
+
+    def _loaded_event_services_snapshot(self) -> list[EventService]:
+        if self._event_services is None:
+            return []
+        return list(self._event_services.values())
 
     def _index_stored_conversation(self, stored: StoredConversation) -> None:
         """Add a freshly started conversation to the lightweight index."""
@@ -1731,6 +1738,10 @@ class ConversationService:
 
         self._lease_renewal_task = asyncio.create_task(self._renew_all_leases_loop())
         self._eviction_task = asyncio.create_task(self._evict_idle_services_loop())
+        from openhands.agent_server.workflow_task_poller import WorkflowTaskPoller
+
+        self._workflow_task_poller = WorkflowTaskPoller(self)
+        self._workflow_task_poller.start()
 
         return self
 
@@ -1907,6 +1918,9 @@ class ConversationService:
         return evicted
 
     async def __aexit__(self, exc_type, exc_value, traceback):
+        if self._workflow_task_poller is not None:
+            await self._workflow_task_poller.stop()
+            self._workflow_task_poller = None
         if self._lease_renewal_task is not None:
             self._lease_renewal_task.cancel()
             with suppress(asyncio.CancelledError):

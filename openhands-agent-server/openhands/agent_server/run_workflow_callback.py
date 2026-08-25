@@ -50,6 +50,10 @@ from openhands.sdk.logger import get_logger
 if TYPE_CHECKING:
     from openhands.sdk.conversation.impl.local_conversation import LocalConversation
     from openhands.sdk.conversation.state import ConversationState
+    from openhands.tools.embodied_data.platform_submit import (
+        EmbodiedTaskAssociation,
+        EmbodiedTaskStore,
+    )
     from openhands.tools.node_signature.definition import NodeSignatureObservation
 
 
@@ -302,6 +306,21 @@ def _lookup_conversation_id_from_broker(task_id: str) -> str | None:
     if registration is None:
         return None
     return registration.conversation_id
+
+
+def _embodied_task_association(
+    task_id: str,
+    conversation_service: ConversationService,
+) -> tuple[EmbodiedTaskStore, EmbodiedTaskAssociation | None]:
+    from openhands.tools.embodied_data.platform_submit import (
+        TASK_ASSOCIATION_DIRNAME,
+        EmbodiedTaskStore,
+    )
+
+    store = EmbodiedTaskStore(
+        conversation_service.conversations_dir / TASK_ASSOCIATION_DIRNAME
+    )
+    return store, store.get_by_task_id(task_id)
 
 
 def _try_resolve_blocked_waiter(
@@ -731,6 +750,9 @@ async def deliver_run_workflow_status(
     deliver_t0 = time.monotonic()
     normalized_status = normalize_platform_status(status)
     service = conversation_service or get_default_conversation_service()
+    embodied_store, embodied_association = _embodied_task_association(task_id, service)
+    if embodied_association is not None:
+        embodied_store.update_status(task_id, normalized_status)
 
     # Step 2: Debug block path — wake broker.wait(), skip async delivery.
     if _try_resolve_blocked_waiter(
@@ -768,6 +790,8 @@ async def deliver_run_workflow_status(
     resolved_conversation_id = conversation_id
     if resolved_conversation_id is None:
         resolved_conversation_id = _lookup_conversation_id_from_broker(task_id)
+    if resolved_conversation_id is None and embodied_association is not None:
+        resolved_conversation_id = embodied_association.conversation_id
     if resolved_conversation_id is None:
         logger.warning(
             "No conversation_id for run_workflow callback task_id=%s", task_id

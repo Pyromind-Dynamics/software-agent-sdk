@@ -91,11 +91,7 @@ from openhands.tools.data_preparation import (
 )
 from openhands.tools.data_preparation.progress import DfCheckProgressExecutor
 from openhands.tools.embodied_data import (
-    BatchCleanLeRobotV21Tool,
-    BuildEmbodiedEpisodePlanTool,
-    InspectEmbodiedDatasetTool,
-    PublishLeRobotV21Tool,
-    ValidateLeRobotV21Tool,
+    RunEmbodiedSandboxTool,
 )
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
@@ -541,6 +537,21 @@ def _build_pyromind_storage_tools(
         Path(skills_path) / "data-preparation" / "scripts"
     )
 
+    embodied_params = {
+        name: cleaning_params[name]
+        for name in ("env", "cluster", "headers", "timeout")
+        if name in cleaning_params
+    }
+    embodied_output_root = extra.get("embodied_cleaning_output_root")
+    if isinstance(embodied_output_root, str) and embodied_output_root:
+        embodied_params["output_root"] = embodied_output_root
+    embodied_runtime_package = extra.get("embodied_runtime_package")
+    if isinstance(embodied_runtime_package, str) and embodied_runtime_package:
+        embodied_params["runtime_package"] = embodied_runtime_package
+    embodied_runtime_wheel = extra.get("embodied_runtime_wheel_storage_path")
+    if isinstance(embodied_runtime_wheel, str) and embodied_runtime_wheel:
+        embodied_params["runtime_wheel_storage_path"] = embodied_runtime_wheel
+
     # Stop-task tool talks to the studio_api portal (APP_ENV-derived URL),
     # not the storage API, so only forward auth headers — no storage_base_url.
     stop_params: dict[str, Any] = {}
@@ -564,7 +575,7 @@ def _build_pyromind_storage_tools(
             ),
             Tool(name=MaterializeStorageFilesTool.name, params=dict(params)),
             Tool(name=UploadFileToPyromindTool.name, params=dict(params)),
-            Tool(name=PublishLeRobotV21Tool.name, params=dict(params)),
+            Tool(name=RunEmbodiedSandboxTool.name, params=embodied_params),
             Tool(name=RunDatasetCleaningTool.name, params=cleaning_params),
             Tool(name=DfSubmitPipelineTool.name, params=preparation_params),
             Tool(name=DfCheckProgressTool.name, params=dict(params)),
@@ -1293,10 +1304,6 @@ async def create_pyromind_conversation(
             Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
             *storage_tools,
             Tool(name="dataset_download"),
-            Tool(name=InspectEmbodiedDatasetTool.name),
-            Tool(name=BuildEmbodiedEpisodePlanTool.name),
-            Tool(name=BatchCleanLeRobotV21Tool.name),
-            Tool(name=ValidateLeRobotV21Tool.name),
             Tool(
                 name="df_run_pipeline",
                 params={

@@ -13,6 +13,11 @@ from openhands.agent_server.run_workflow_callback import (
     deliver_run_workflow_status,
 )
 from openhands.sdk.llm import Message, TextContent
+from openhands.tools.embodied_data.platform_submit import (
+    TASK_ASSOCIATION_DIRNAME,
+    EmbodiedTaskAssociation,
+    EmbodiedTaskStore,
+)
 from openhands.tools.node_signature import (
     NodeSignatureObservation,
 )
@@ -221,6 +226,38 @@ async def test_terminal_callback_removes_active_long_task(tmp_path):
     assert result.outcome == "delivered_async"
     assert task_id not in service.event_service.removed_tasks
     assert service.event_service.run is True
+
+
+@pytest.mark.asyncio
+async def test_embodied_callback_resolves_persisted_conversation_id(tmp_path):
+    conversation_id = uuid4()
+    task_id = f"embodied-task-{uuid4()}"
+    service = _FakeConversationService(tmp_path / "conversations")
+    store = EmbodiedTaskStore(service.conversations_dir / TASK_ASSOCIATION_DIRNAME)
+    store.save(
+        EmbodiedTaskAssociation(
+            task_id=task_id,
+            conversation_id=str(conversation_id),
+            run_id=str(uuid4()),
+            phase="plan",
+            output_dir="/.pyromind-agent/test/embodied_cleaning/run",
+            source_path="/robot/source",
+        )
+    )
+
+    result = await deliver_run_workflow_status(
+        task_id=task_id,
+        status="Succeeded",
+        auto_run=False,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert result.outcome == "delivered_async"
+    assert result.conversation_id == str(conversation_id)
+    assert service.requested_conversation_id == conversation_id
+    association = store.get_by_task_id(task_id)
+    assert association is not None
+    assert association.status == "Succeeded"
 
 
 @pytest.mark.asyncio

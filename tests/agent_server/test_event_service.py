@@ -4086,6 +4086,43 @@ async def test_remove_active_long_task_is_idempotent(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_remove_active_long_task_publishes_finished_status(tmp_path):
+    service = _state_update_service(
+        tmp_path,
+        ConversationExecutionStatus.FINISHED,
+        [ActiveLongTask(task_id="t1", kind="data_preparation")],
+    )
+    received: list[ConversationStateUpdateEvent] = []
+
+    class CaptureSubscriber(Subscriber[Event]):
+        async def __call__(self, event: Event) -> None:
+            if isinstance(event, ConversationStateUpdateEvent):
+                received.append(event)
+
+    await service.subscribe_to_events(CaptureSubscriber())
+    await service.remove_active_long_task("t1")
+
+    assert received
+    assert received[-1].value["execution_status"] == "finished"
+
+
+@pytest.mark.asyncio
+async def test_update_active_long_task_status_publishes_snapshot(tmp_path):
+    service = _state_update_service(
+        tmp_path,
+        ConversationExecutionStatus.FINISHED,
+        [ActiveLongTask(task_id="t1", kind="data_preparation")],
+    )
+
+    await service.update_active_long_task_status("t1", "Running")
+
+    state = cast(LocalConversation, service._conversation)._state
+    assert state.active_long_tasks == [
+        ActiveLongTask(task_id="t1", kind="data_preparation", status="Running")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_remove_active_long_task_inactive_service_raises(tmp_path):
     stored = StoredConversation(
         id=uuid4(),

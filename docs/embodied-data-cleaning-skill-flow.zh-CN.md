@@ -12,9 +12,10 @@ S2 机器人自采数据清洗、对齐并转换为 LeRobotDataset v2.1，供前
 - 最终格式只输出 LeRobotDataset v2.1，不保留 v3 兼容分支；
 - 原始数据只读，所有删除操作先记录为可逆计划；
 - Agent 自动判断是否使用该 Skill，用户不需要说出 Skill 名称；
-- Agent 只检查一个代表计划，全量逐 episode 清洗由可恢复批处理工具内部完成；
+- Agent 只检查 sandbox 生成的一个代表计划，全量逐 episode 清洗由可恢复批处理内部完成；
 - 整个批次使用一个用户确认的训练 task，颜色或形状 prompt 只作为目标元数据；
-- 本地生成只是中间步骤，最终结果必须上传 Pyromind Storage；
+- 原始 payload、checkpoint 和最终数据集全程位于 Pyromind Storage 挂载目录，
+  不进入 Agent 本地会话工作区；
 - LLM 可以理解任务语义，但帧、时间戳、索引和格式必须由确定性工具校验。
 
 ## 2. 用户如何使用
@@ -38,9 +39,10 @@ Pick and place the item on the table，转换为 LeRobot v2.1，发布到
 /workspace/robot/robot_lerobot_v21_cleaned。
 ```
 
-Agent 会先生成一个代表 episode 的计划摘要。用户一次性确认 task、subtask 和
-派生 action 语义后，批处理工具完成全部 episode 的清洗、校验和合并。代表
-episode 不单独发布，只有最终合并数据集上传一次 Storage。
+Agent 会先提交 `mode=plan` 的 sandbox 作业，生成一个代表 episode 的计划摘要。
+用户一次性确认 task、subtask 和派生 action 语义后，Agent 使用相同 `run_id`
+提交 `mode=full`；sandbox 完成全部 episode 的清洗、校验和原子发布。代表 episode
+不单独发布。
 
 ## 3. 输入数据
 
@@ -93,57 +95,39 @@ RGB-only v2.1 数据集。Storage 中存在但因文件过大未被预览下载�
 
 ```mermaid
 flowchart TD
-    A["用户提供 Storage 源路径和目标路径"] --> B["预览目录与物化必要源文件"]
-    B --> C["inspect_embodied_dataset\n检查全部 episode"]
-    C --> D{"必需流可用?"}
-    D -- "否，可恢复" --> E["materialize_storage_files\n拉取完整文件后重检"]
-    E --> C
-    D -- "否，不可恢复" --> X["needs_review 或 rejected\n报告具体阻塞"]
-    D -- "是" --> F["build_embodied_episode_plan\n生成可逆清洗计划"]
-    F --> G["展示一个代表计划\n检查 task、subtask、action 规则"]
-    G --> H{"整个批次是否一次性确认?"}
-    H -- "否" --> I["向用户展示待确认项"]
-    I --> H
-    H -- "是" --> J["batch_clean_le_robot_v21\n计划、终结、物化、隔离拒绝、合并"]
-    J --> K{"存在运行失败?"}
-    K -- "是" --> L["修复原因后 resume=true\n从 checkpoint 继续"]
-    L --> J
-    K -- "否" --> M["validate_le_robot_v21\n只校验最终合并数据集"]
-    M --> N{"valid=true?"}
-    N -- "否" --> X
-    N -- "是" --> O["publish_le_robot_v21\n最终只上传一次"]
-    O --> P{"complete=true?"}
-    P -- "否" --> Q["报告失败文件和部分上传列表\n修复后重试发布"]
-    P -- "是" --> R["preview_dataset\n复核 Storage 最终目录"]
-    R --> S["返回最终 /workspace/... 路径\n本地路径仅作诊断"]
+    A["用户提供 Storage 源路径和目标路径"] --> B["run_embodied_cleaning_sandbox\nmode=plan"]
+    B --> C["sandbox 直挂载 /target-workspace\n检查数据并生成代表计划"]
+    C --> D["callback 或服务端轮询发现终态\npreview report.json 和计划摘要"]
+    D --> E{"整个批次是否一次性确认?"}
+    E -- "否" --> F["向用户展示 task、subtask、action 待确认项"]
+    F --> E
+    E -- "是" --> G["同一 run_id 提交 mode=full"]
+    G --> H["sandbox 批处理、checkpoint、合并和确定性校验"]
+    H --> I{"存在运行失败?"}
+    I -- "是" --> J["同参数提交 mode=resume\n从 checkpoint 继续"]
+    J --> H
+    I -- "否" --> K{"report.complete=true\n且 published=true?"}
+    K -- "否" --> X["needs_review 或 rejected\n报告具体阻塞"]
+    K -- "是" --> L["preview_dataset\n复核 Storage 最终目录"]
+    L --> M["返回最终 /workspace/... 路径"]
 ```
 
 ## 5. 各阶段职责
 
-### 5.1 Storage 预览与源文件物化
+### 5.1 Storage 预览与 sandbox 直挂载
 
-`preview_dataset` 用于了解目录结构和小文件内容。对于超出预览上限的
-`head_depth.u16`，必须使用 `materialize_storage_files` 下载完整对象，不能依赖
-小样本预览，也不能尝试读取 MinIO 凭证。
+`preview_dataset` 只用于 Agent 查看小型报告和最终目录，不下载原始视频、深度文件
+或 Parquet payload。生产链路只向 Pyromind Agent 暴露一个具身清洗工具：
+`run_embodied_cleaning_sandbox`。
 
-这一阶段只解决“文件是否真实存在并可读取”，不决定清洗区间。
+该工具提交 `CustomCommandCPUNode`，节点中的 Storage 根目录为
+`/target-workspace`。例如 Storage 路径 `/robot/raw` 在作业内映射为
+`/target-workspace/robot/raw`。因此不再调用 `materialize_storage_files`，也不在
+Terminal 或会话工作区中执行本地具身清洗工具。
 
-平台会显式向 Agent 暴露以下必要工具，避免 Skill 文档提到工具但运行时出现
-`Tool not found`：
-
-- `materialize_storage_files`；
-- `inspect_embodied_dataset`；
-- `build_embodied_episode_plan`；
-- `batch_clean_le_robot_v21`；
-- `validate_le_robot_v21`；
-- `publish_le_robot_v21`。
-
-`finalize_embodied_episode_plan`、`materialize_le_robot_v21` 和
-`merge_le_robot_v21` 继续保留为底层兼容 API，但不再放入平台 Agent 的默认工具集，
-避免模型绕开批处理又走回逐 episode 的长链路。
-
-其中 Storage 下载和发布工具复用当前会话已有的认证信息，Agent 不需要、也不应
-自行读取或猜测 MinIO 凭证。
+`inspect_embodied_dataset`、`build_embodied_episode_plan`、
+`batch_clean_le_robot_v21`、`validate_le_robot_v21` 和其他底层 API 仍保留给开发者
+本地测试以及固定 sandbox runtime 内部使用，但不加入平台 Agent 默认工具集。
 
 ### 5.2 数据检查
 
@@ -156,19 +140,22 @@ flowchart TD
 
 流状态需区分：
 
-- `available`：本地存在且校验可用；
+- `available`：sandbox 挂载目录中存在且校验可用；
 - `not_materialized`：Storage 已知存在，但尚未下载完整 payload；
 - `missing`：源数据中不存在；
 - `invalid`：空文件、大小不符或无法解析。
 
 ### 5.3 构建可逆清洗计划
 
-`build_embodied_episode_plan` 生成：
+`mode=plan` 作业生成：
 
 ```text
-.agent_tmp/embodied-data-cleaning/<episode_id>/
-├── episode_plan.json
-└── episode_plan.summary.md
+/.pyromind-agent/<conversation_id>/embodied_cleaning/<run_id>/
+├── inspection.json
+├── representative_plan.json
+├── representative_plan.summary.md
+├── plan_report.json
+└── report.json
 ```
 
 `episode_plan.json` 是审计和执行计划，不是训练数据。它记录：
@@ -288,11 +275,12 @@ action[last] = observation.state[last]
 再写成 3 通道 MP4，并在 `info.json` 中记录
 `s2_depth_video_colormap: "jet"`。
 
-### 5.9 可恢复批量清洗与统一 task
+### 5.9 可恢复 sandbox 批量清洗与统一 task
 
-用户完成一次数据集级确认后，正常链路只调用一次
+用户完成一次数据集级确认后，Agent 使用 plan 返回的 `run_id` 提交一次
+`run_embodied_cleaning_sandbox(mode="full")`。固定 runtime 内部只调用一次
 `batch_clean_le_robot_v21`。Agent 不再逐 episode 调用 build、finalize、
-materialize 和 validate，也不再用 terminal heredoc 扫描 joints 文件。
+materialize 和 validate，也不再用 Terminal 扫描 joints 文件。
 
 批处理工具内部执行：
 
@@ -305,8 +293,9 @@ materialize 和 validate，也不再用 terminal heredoc 扫描 joints 文件。
 - 没有运行失败时，自动合并所有 accepted episode。
 
 质量门拒绝是完整的处理结论，不会阻断其他 episode。意外异常计为 `failed`，此时
-不生成可发布的最终目录。修复原因后使用完全相同的参数并设置 `resume=true`，工具
-跳过已经 accepted、needs_review 或 rejected 的 episode，只重试 failed 项。
+不生成可发布的最终目录。修复原因后使用完全相同的参数和 `run_id` 提交
+`mode="resume"`，工具跳过已经 accepted、needs_review 或 rejected 的 episode，
+只重试 failed 项。
 
 合并工具会确定性执行：
 
@@ -331,7 +320,7 @@ Pick and place the item on the table
 不能自动拆成不同训练任务。批处理成功时返回实际发现、接受、复核、拒绝、失败、
 frame 和 video 数量，并提供 checkpoint 与 report 路径。
 
-### 5.10 本地确定性校验
+### 5.10 sandbox 内确定性校验
 
 `validate_le_robot_v21` 检查：
 
@@ -355,29 +344,32 @@ reference_profile_valid = true
 errors = []
 ```
 
-### 5.11 上传平台与远端复核
+### 5.11 Storage 内原子发布与复核
 
-`publish_le_robot_v21` 只接受已经通过本地校验的数据集目录，并且：
+sandbox 先在 run 目录生成并校验合并数据集，只有校验通过后才复制到目标目录对应的
+临时路径，再以目录替换完成发布。目标已存在时，只有内容 SHA-256 完全一致才视为
+幂等成功；否则拒绝覆盖，避免破坏已有数据。
 
-- 只上传标准 `meta/`、`data/`、`videos/` 文件；
-- 不上传原始录像、episode plan、临时文件或凭证；
-- 保持相对目录结构；
-- 最后上传 `meta/info.json`；
-- 使用当前会话已有的 Storage Cookie 和集群信息；
-- 支持 `/workspace/robot/...` 输入，并转换为 Storage 内部路径；
-- 中途失败时返回 `failed_file`、`uploaded_paths` 和
-  `uploaded_file_count`，`complete` 保持 `false`。
-
-上传成功后，还必须调用 `preview_dataset(mode="inspect")` 检查远端目录中的
-文件列表。只有同时满足以下两个条件才允许向用户报告“清洗完成”：
+callback 唤醒会话后，Agent 必须先查看 `output_dir/report.json`，再调用
+`preview_dataset(mode="inspect")` 检查目标目录。只有同时满足以下条件才允许向
+用户报告“清洗完成”：
 
 ```text
-publish_le_robot_v21.complete = true
+report.complete = true
+report.published = true
+report.validation.valid = true
 Storage 文件列表复核成功
 ```
 
-最终对用户返回的是 `/workspace/...` 平台路径。本地
-`workspace/conversations/...` 目录只能作为中间文件或故障诊断路径。
+最终对用户返回的是 `/workspace/...` 平台路径；报告中的路径也使用 Storage 逻辑
+路径，不泄露 sandbox 内部的 `/target-workspace` 前缀。
+
+Kafka callback 是任务终态通知的主通道。agent-server 同时对当前已加载会话中的
+具身清洗任务调用 Studio `get_task` 轮询作为兜底；默认间隔为 10 秒，可通过
+`PYROMIND_WORKFLOW_TASK_POLL_INTERVAL_SECONDS` 调整。轮询发现终态后仍进入同一个
+callback 收口逻辑，确保重复通知只处理一次、移除 `active_long_tasks`、向前端发布
+最终状态，并自动继续 Agent。因此 Kafka 暂时不可达时，任务也不会长期停留在
+`Running`。
 
 ### 5.12 长会话与模型异常恢复
 
@@ -486,24 +478,31 @@ subtask 和派生 action 语义已确认。只有该状态可以物化。
 - 是否包含深度，或省略了哪些可选流；
 - task 文本；
 - action provenance 为 `derived/next_state`；
+- sandbox `run_id` 和固定 runtime revision；
 - 必要的非阻塞警告；
-- 本地路径仅作为诊断补充。
+- Storage 中的 report/checkpoint 路径。
 
 失败时至少返回：
 
 - 当前停在哪个阶段；
-- 是 `needs_review`、`rejected`，还是部分上传；
+- 是 `needs_review`、`rejected`、运行失败，还是原子发布被拒绝；
 - 具体文件、帧区间或字段；
 - 用户需要确认的最小信息；
 - 可以安全重试的下一步。
 
 ## 9. 当前能力边界
 
-- 当前生产主链路是 S2 自采数据；Agent 只编排代表计划、一次批处理、最终校验和
-  发布，不再逐 episode 往返；
+- 当前生产主链路是 S2 自采数据；Agent 只编排 sandbox plan、full/resume 和最终
+  Storage 复核，不再逐 episode 往返；
 - 当前只输出 v2.1；
-- `batch_clean_le_robot_v21` 处理本地已经物化的源目录，不负责从 Storage 下载源文件
-  或发布最终结果；这两个外部阶段保持独立，便于安全重试；
+- sandbox 依赖平台将 Storage 挂载到 `/target-workspace`，不支持没有该挂载的执行环境；
+- 服务端必须配置版本固定的 runtime，推荐
+  `PYROMIND_EMBODIED_RUNTIME_WHEEL_PATH`，也可使用精确版本的
+  `PYROMIND_EMBODIED_RUNTIME_PACKAGE`；未配置时工具会拒绝提交；
+- 主项目继续使用 Python 3.12；sandbox 安装独立的
+  `openhands-embodied-runtime` wheel，并使用 Python 3.10 执行。该 wheel 只包含
+  确定性清洗、校验和发布逻辑，不依赖 OpenHands SDK 或浏览器工具；
+- Agent 不能上传临时脚本替代固定 runtime，也不能将原始 payload 拉入本地会话目录；
 - action 是用户确认的 `derived/next_state`，不是录制的控制指令；
 - `suction_state` 用于边界证据，但不进入固定 24 维向量；
 - MP4 FPS 是输出时钟，不保留相机 CSV 的真实不均匀播放间隔；
@@ -519,12 +518,14 @@ subtask 和派生 action 语义已确认。只有该状态可以物化。
 | 质量门 | `.agents/skills/embodied-data-cleaning/references/quality-gates.md` |
 | v2.1 输出规范 | `.agents/skills/embodied-data-cleaning/references/lerobot-v21.md` |
 | Agent 工具定义 | `openhands-tools/openhands/tools/embodied_data/definition.py` |
-| 数据适配与检查 | `openhands-tools/openhands/tools/embodied_data/adapters.py` |
-| 清洗计划 | `openhands-tools/openhands/tools/embodied_data/planning.py` |
-| 批量清洗与 checkpoint | `openhands-tools/openhands/tools/embodied_data/batch.py` |
-| v2.1 物化与校验 | `openhands-tools/openhands/tools/embodied_data/lerobot_v21.py` |
+| Python 3.10 sandbox runtime | `openhands-embodied-runtime/openhands_embodied_runtime/` |
+| 数据适配与检查 | `openhands-embodied-runtime/openhands_embodied_runtime/adapters.py` |
+| 清洗计划 | `openhands-embodied-runtime/openhands_embodied_runtime/planning.py` |
+| 批量清洗与 checkpoint | `openhands-embodied-runtime/openhands_embodied_runtime/batch.py` |
+| v2.1 物化与校验 | `openhands-embodied-runtime/openhands_embodied_runtime/lerobot_v21.py` |
+| sandbox 提交工具与任务关联 | `openhands-tools/openhands/tools/embodied_data/platform_submit.py` |
+| sandbox 固定运行入口 | `openhands-embodied-runtime/openhands_embodied_runtime/sandbox_runner.py` |
 | 平台工具注入 | `openhands-agent-server/openhands/agent_server/pyromind_router.py` |
-| Storage 大文件物化 | `openhands-tools/openhands/tools/pyromind_dataset/definition.py` |
 | LiteLLM 异常映射 | `openhands-sdk/openhands/sdk/llm/llm.py` |
 | 长会话压缩 | `openhands-sdk/openhands/sdk/context/condenser/llm_summarizing_condenser.py` |
 
@@ -533,15 +534,18 @@ subtask 和派生 action 语义已确认。只有该状态可以物化。
 旧版本生成的 9 episode 数据集通过校验，只能作为基线。部署本轮改动后，应使用
 全新会话和新的目标目录重新执行一次，至少确认：
 
-- 所有上述具身数据和 Storage 工具均可调用，不出现 `Tool not found`；
+- `run_embodied_cleaning_sandbox` 可调用，旧的本地具身清洗工具不在 Agent 默认工具集；
+- `mode=plan` 的任务在 sandbox 读取 Storage，Agent 本地不出现原始视频、深度或
+  Parquet payload；
+- plan/full 使用同一个 `run_id`，报告记录服务端配置的 `runtime_revision`；
 - 源 episode 数来自实际检查结果，不能再次把 13 段汇报为 17 段；
 - accepted 与 rejected episode 的数量、ID 和原因完整；
-- 中断后使用 `resume=true` 只重试 failed episode，不重新处理已完成项；
+- 中断后使用 `mode=resume` 只重试 failed episode，不重新处理已完成项；
 - 合并结果只有一个确认 task，且不把颜色 prompt 拆成多个 task；
 - 合并后的 episode、frame、video 数与工具返回和 metadata 完全一致；
-- `validate_le_robot_v21` 返回 `valid=true`；
-- `publish_le_robot_v21.complete=true`；
-- Storage 最终文件列表与 `uploaded_paths` 一致；
+- `report.validation.valid=true`；
+- `report.complete=true` 且 `report.published=true`；
+- Storage 最终文件列表与报告中的统计一致；
 - 模型偶发返回非法 JSON 时会有限重试，而不是立即终止整个会话。
 
 建议使用新的目标目录，例如：

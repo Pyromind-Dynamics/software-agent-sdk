@@ -11,6 +11,7 @@ from uuid import uuid4
 import imageio_ffmpeg
 import numpy as np
 import pyarrow.parquet as pq
+from openhands_embodied_runtime import batch as batch_module, lerobot_v21
 from pydantic import SecretStr
 from pytest import MonkeyPatch
 
@@ -42,12 +43,10 @@ from openhands.tools.embodied_data import (
     StreamStatus,
     ValidateLeRobotV21Action,
     ValidateLeRobotV21Tool,
-    batch as batch_module,
     batch_clean_lerobot_v21_dataset,
     build_episode_plan,
     detect_source_type,
     finalize_episode_plan,
-    lerobot_v21,
     materialize_lerobot_v21_episode,
     merge_lerobot_v21_datasets,
     plan_episode_cleaning,

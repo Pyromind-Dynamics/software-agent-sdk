@@ -22,6 +22,7 @@ pyromind-sdk = "2026-08-04T00:00:00Z"
 [manifest]
 members = [
     "openhands-agent-server",
+    "openhands-embodied-runtime",
     "openhands-sdk",
     "openhands-tools",
     "openhands-workspace",
@@ -2921,6 +2922,25 @@ requires-dist = [
 ]
 
 [[package]]
+name = "openhands-embodied-runtime"
+version = "1.29.3"
+source = { editable = "openhands-embodied-runtime" }
+dependencies = [
+    { name = "imageio-ffmpeg" },
+    { name = "numpy" },
+    { name = "pyarrow" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "imageio-ffmpeg", specifier = ">=0.6.0" },
+    { name = "numpy", specifier = ">=1.26" },
+    { name = "pyarrow", specifier = ">=17.0" },
+    { name = "pydantic", specifier = ">=2.11.7,<3" },
+]
+
+[[package]]
 name = "openhands-sdk"
 version = "1.29.3"
 source = { editable = "openhands-sdk" }
@@ -2989,6 +3009,7 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "imageio-ffmpeg" },
     { name = "libtmux" },
+    { name = "openhands-embodied-runtime" },
     { name = "openhands-sdk" },
     { name = "openpyxl" },
     { name = "pillow" },
@@ -3011,6 +3032,7 @@ requires-dist = [
     { name = "huggingface-hub", specifier = ">=0.25" },
     { name = "imageio-ffmpeg", specifier = ">=0.6.0" },
     { name = "libtmux", specifier = ">=0.53.0" },
+    { name = "openhands-embodied-runtime", editable = "openhands-embodied-runtime" },
     { name = "openhands-sdk", editable = "openhands-sdk" },
     { name = "openpyxl", specifier = ">=3.1" },
     { name = "pillow", specifier = ">=12.1.1" },

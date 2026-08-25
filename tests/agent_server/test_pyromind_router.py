@@ -60,7 +60,7 @@ from openhands.tools.embodied_data import (
     BatchCleanLeRobotV21Tool,
     BuildEmbodiedEpisodePlanTool,
     InspectEmbodiedDatasetTool,
-    PublishLeRobotV21Tool,
+    RunEmbodiedSandboxTool,
     ValidateLeRobotV21Tool,
 )
 from openhands.tools.pyromind_archive import ExtractArchiveTool
@@ -460,7 +460,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert ValidateWorkflowDslTool.name in tool_names
     assert PreviewDatasetTool.name in tool_names
     assert UploadFileToPyromindTool.name in tool_names
-    assert PublishLeRobotV21Tool.name in tool_names
+    assert RunEmbodiedSandboxTool.name in tool_names
     assert RunDatasetCleaningTool.name in tool_names
     assert _REMOVED_WORKFLOW_TOOL not in tool_names
     terminal_tool = next(
@@ -505,10 +505,10 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         for tool in service.start_request.agent.tools
         if tool.name == UploadFileToPyromindTool.name
     )
-    publish_tool = next(
+    embodied_tool = next(
         tool
         for tool in service.start_request.agent.tools
-        if tool.name == PublishLeRobotV21Tool.name
+        if tool.name == RunEmbodiedSandboxTool.name
     )
     cleaning_tool = next(
         tool
@@ -525,7 +525,14 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         if key != "extract_params"
     } == expected_storage_params
     assert upload_tool.params == expected_storage_params
-    assert publish_tool.params == expected_storage_params
+    assert embodied_tool.params == {
+        "env": "pre",
+        "cluster": "us-west-1",
+        "headers": {
+            "x-cluster": "us-west-1#pre",
+            "request-app": "openhands",
+        },
+    }
     assert cleaning_tool.params == expected_execution_params
     assert "secret_headers" not in cleaning_tool.params
     assert "session-token" not in str(preview_tool.params)
@@ -578,7 +585,7 @@ async def test_pyromind_conversation_registers_skill_runtime_tools(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pyromind_conversation_registers_embodied_data_tools(tmp_path):
+async def test_pyromind_conversation_uses_embodied_sandbox_tool(tmp_path):
     knowledge_base = tmp_path / "knowledge"
     knowledge_base.mkdir()
     service = _FakeConversationService(tmp_path / "conversations")
@@ -599,12 +606,12 @@ async def test_pyromind_conversation_registers_embodied_data_tools(tmp_path):
 
     assert service.start_request is not None
     tool_names = {tool.name for tool in service.start_request.agent.tools}
-    assert InspectEmbodiedDatasetTool.name in tool_names
-    assert BuildEmbodiedEpisodePlanTool.name in tool_names
+    assert RunEmbodiedSandboxTool.name in tool_names
     assert MaterializeStorageFilesTool.name in tool_names
-    assert BatchCleanLeRobotV21Tool.name in tool_names
-    assert ValidateLeRobotV21Tool.name in tool_names
-    assert PublishLeRobotV21Tool.name in tool_names
+    assert InspectEmbodiedDatasetTool.name not in tool_names
+    assert BuildEmbodiedEpisodePlanTool.name not in tool_names
+    assert BatchCleanLeRobotV21Tool.name not in tool_names
+    assert ValidateLeRobotV21Tool.name not in tool_names
     assert "embodied-data-cleaning" in _PYROMIND_SKILL_NAMES
 
 
@@ -997,6 +1004,7 @@ def test_pyromind_storage_tools_use_user_context_headers():
         {
             "storage_base_url": "https://storage.test/api",
             "dataset_cleaning_output_root": "/agentTest/clean-results",
+            "embodied_runtime_wheel_storage_path": "/runtime/openhands-tools.whl",
         },
         "/srv/skills",
     )
@@ -1005,7 +1013,7 @@ def test_pyromind_storage_tools_use_user_context_headers():
         PreviewDatasetTool.name,
         MaterializeStorageFilesTool.name,
         UploadFileToPyromindTool.name,
-        PublishLeRobotV21Tool.name,
+        RunEmbodiedSandboxTool.name,
         RunDatasetCleaningTool.name,
         DfSubmitPipelineTool.name,
         DfCheckProgressTool.name,
@@ -1023,7 +1031,15 @@ def test_pyromind_storage_tools_use_user_context_headers():
     } == expected_storage_params
     assert tools[1].params == expected_storage_params
     assert tools[2].params == expected_storage_params
-    assert tools[3].params == expected_storage_params
+    assert tools[3].params == {
+        "env": "prod",
+        "cluster": "context-cluster",
+        "headers": {
+            "x-cluster": "context-cluster",
+            "request-app": "openhands",
+        },
+        "runtime_wheel_storage_path": "/runtime/openhands-tools.whl",
+    }
     cleaning_params = tools[4].params
     assert cleaning_params == {
         "current_user": CurrentLoginUser(

@@ -1,0 +1,27 @@
+[project]
+name = "openhands-embodied-runtime"
+version = "1.29.3"
+description = "Deterministic embodied-data cleaning runtime for sandbox jobs"
+requires-python = ">=3.10"
+dependencies = [
+    "imageio-ffmpeg>=0.6.0",
+    "numpy>=1.26",
+    "pyarrow>=17.0",
+    "pydantic>=2.11.7,<3",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[tool.setuptools.packages.find]
+include = ["openhands_embodied_runtime*"]
+
+[tool.setuptools.package-data]
+openhands_embodied_runtime = ["py.typed"]

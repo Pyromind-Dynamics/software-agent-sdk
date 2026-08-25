@@ -79,6 +79,14 @@ from openhands.tools.embodied_data.planning import (
     reindex_timeline_mapping,
     validate_episode_plan,
 )
+from openhands.tools.embodied_data.platform_submit import (
+    EmbodiedTaskAssociation,
+    EmbodiedTaskStore,
+    RunEmbodiedSandboxAction,
+    RunEmbodiedSandboxExecutor,
+    RunEmbodiedSandboxObservation,
+    RunEmbodiedSandboxTool,
+)
 from openhands.tools.embodied_data.reporting import render_episode_plan_summary
 
 
@@ -97,6 +105,8 @@ __all__ = [
     "BuildEmbodiedEpisodePlanTool",
     "DatasetInspection",
     "EpisodePlan",
+    "EmbodiedTaskAssociation",
+    "EmbodiedTaskStore",
     "FeatureSpec",
     "FinalizeEmbodiedEpisodePlanAction",
     "FinalizeEmbodiedEpisodePlanExecutor",
@@ -122,6 +132,10 @@ __all__ = [
     "PublishLeRobotV21Tool",
     "QualityReport",
     "QualityStatus",
+    "RunEmbodiedSandboxAction",
+    "RunEmbodiedSandboxExecutor",
+    "RunEmbodiedSandboxObservation",
+    "RunEmbodiedSandboxTool",
     "S2_REFERENCE_JOINT_ORDER",
     "S2_REFERENCE_STATE_ORDER",
     "SelfCollectedAdapter",

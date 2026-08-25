@@ -6,38 +6,45 @@ description: Inspect, clean, align, validate, and convert self-collected S2 robo
 # Embodied Data Cleaning
 
 Build a reversible representative plan, then process the confirmed dataset with
-one resumable deterministic batch call. Do not narrate skill selection to the
-user. Let models interpret physical state changes; let deterministic tools
-calculate frames, timestamps, intervals, output files, and validation results.
+one resumable deterministic sandbox batch. Do not narrate skill selection to the
+user. Let models interpret physical state changes; let deterministic sandbox
+tools calculate frames, timestamps, intervals, output files, and validation
+results. Never materialize robot payloads in the conversation workspace.
 
 ## Workflow
 
-1. Materialize the required Storage files once, then run
-   `inspect_embodied_dataset` with `sample_limit=3`. Resolve every invalid or
-   `not_materialized` required stream before conversion. Treat empty files as
-   invalid; do not call a large Storage object invalid merely because preview
-   skipped its payload.
-2. Read [self-collected source format](references/source-formats.md) and run
-   `build_embodied_episode_plan` for one representative episode. Prefer contiguous
-   `joints.jsonl` subtask runs, then manifest steps as weak fallback labels.
+1. Read [self-collected source format](references/source-formats.md), then call
+   `run_embodied_cleaning_sandbox` with `mode="plan"`, the Storage source path,
+   and no `run_id`. The sandbox mounts Storage directly, inspects at most three
+   summaries, and writes one representative reversible plan. Do not call
+   `materialize_storage_files`, Terminal, or local embodied-data tools.
+2. When the platform callback resumes the conversation, call `preview_dataset`
+   on `<output_dir>/report.json` and the representative plan or summary paths in
+   that report. Resolve every invalid required stream before conversion. Treat
+   empty files as invalid; a bounded preview that skipped a large payload is not
+   evidence that the mounted sandbox payload is invalid.
 3. Ask once for dataset-level confirmation of task text, source-derived subtask
    ranges, and the reference dataset's next-state action convention. Use one task
    for the complete dataset, for example `Pick and place the item on the table`.
    Treat color or shape prompts as target metadata, not separate training tasks.
-4. Read [LeRobot v2.1 output](references/lerobot-v21.md), then call
-   `batch_clean_le_robot_v21` once. It rebuilds and finalizes every plan, isolates
-   quality rejections, materializes accepted episodes, validates each result,
-   checkpoints after each episode, and deterministically merges the batch. Do not
-   repeat per-episode build/finalize/materialize/validate calls in the normal path.
-5. If the batch reports runtime failures, resolve the cause and call it again with
-   the same arguments and `resume=true`. Do not restart accepted or quality-rejected
-   episodes. Read detailed errors from `report_path`; keep tool observations compact.
-6. Call `validate_le_robot_v21` once on the merged local output. Treat the local
-   directory as an intermediate artifact, not the final delivery location.
-7. Call `publish_le_robot_v21` once with an explicit Pyromind Storage dataset path,
-   then run `preview_dataset(mode="inspect")` on that path. Completion requires
-   `complete=true` and a matching remote file listing. Report the `/workspace/...`
-   platform path plus deterministic discovered/accepted/rejected/frame/video counts.
+4. Read [LeRobot v2.1 output](references/lerobot-v21.md), then call the same tool
+   with `mode="full"`, the plan `run_id`, explicit target Storage path, confirmed
+   task, `confirm_subtasks=true`, and `confirm_derived_action=true`. The fixed
+   cleaning thresholds and `robot_type` must match the plan phase. The sandbox
+   runtime rebuilds every plan, isolates quality rejections, materializes accepted
+   episodes, checkpoints each episode, merges, validates, and publishes.
+5. If the full report contains runtime failures, resolve the cause and call the
+   same tool with `mode="resume"`, the same arguments, and the same `run_id`.
+   Never submit another `full` phase for that run. Do not restart accepted or
+   quality-rejected episodes.
+6. After every callback, inspect `<output_dir>/report.json` only with
+   `preview_dataset`. Do not read sandbox artifacts through Terminal or workspace
+   file APIs. Quality rejection is a completed episode decision; runtime failure
+   is resumable.
+7. Completion requires `report.complete=true`, `report.published=true`, a valid
+   final validation block, and `preview_dataset(mode="inspect")` on the target
+   Storage path with matching files. Report the `/workspace/...` target plus
+   deterministic discovered/accepted/rejected/frame/video counts.
 
 ## Invariants
 
@@ -64,14 +71,16 @@ calculate frames, timestamps, intervals, output files, and validation results.
   non-overlapping; report whether visual or execution evidence was checked.
 - Do not use an LLM as the final format or interval validator.
 - Do not use terminal heredocs or ad hoc scripts to iterate episodes. Use the batch
-  tool and its report for timestamp failures and rejected IDs.
+  sandbox tool and its report for timestamp failures and rejected IDs.
 - Treat quality rejection as a completed episode decision. Treat unexpected tool
   exceptions as failures that keep the batch incomplete and resumable.
 - Do not publish a representative sample. Publish only the final merged dataset.
-- Do not present a conversation-local path as a delivered dataset. Completion
-  requires `publish_le_robot_v21.complete=true` and a successful Storage listing.
+- Do not present a conversation-local or sandbox run path as a delivered dataset.
+  Completion requires `report.complete=true` and a successful target Storage listing.
 - Publish only validated LeRobot v2.1 output files. Never upload episode plans,
   raw recordings, temporary files, or credentials with the final dataset.
+- Treat `output_dir` as audit/checkpoint Storage and `target_path` as the only
+  deliverable dataset. Never publish files from the audit directory as training data.
 
 Read [canonical schema](references/canonical-schema.md) when consuming or extending
 `EpisodePlan`. Read [quality gates](references/quality-gates.md) before accepting an
@@ -79,6 +88,9 @@ episode or adding a validator. Read
 [LeRobot v2.1 output](references/lerobot-v21.md) before materialization.
 
 ## Bundled Script
+
+This local inspector is for developer diagnostics only. The platform Agent must
+use `run_embodied_cleaning_sandbox` and must not invoke this script.
 
 Run the deterministic inspector without starting an Agent:
 
