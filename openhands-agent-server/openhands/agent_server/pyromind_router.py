@@ -628,6 +628,10 @@ class PyromindLLMConfig(BaseModel):
     base_url: str | None = Field(
         default_factory=lambda: os.environ.get("LLM_BASE_URL"),
     )
+    timeout: int | None = Field(
+        default=None,
+        description=("LLM request timeout in seconds. Server-default 60s when unset."),
+    )
 
     @field_validator("base_url", mode="before")
     @classmethod
@@ -1200,6 +1204,7 @@ async def create_pyromind_conversation(
         model=request.llm.model,
         api_key=request.llm.api_key,
         base_url=request.llm.base_url,
+        timeout=request.llm.timeout or 60,
         persist_runtime_config=False,
     )
 

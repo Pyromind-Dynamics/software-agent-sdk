@@ -277,6 +277,14 @@ class EventService:
     _lease_task: asyncio.Task | None = field(default=None, init=False)
     _external_lease_renewal: bool = field(default=False, init=False)
     _run_executor: ThreadPoolExecutor | None = field(default=None, init=False)
+    # Dedicated bounded executor for event emission/persistence tasks that
+    # acquire the conversation FIFOLock. When a conversation run is wedged,
+    # these tasks block on lock acquisition; a dedicated pool keeps the
+    # wait contained so it cannot starve the global default executor.
+    _emit_executor: ThreadPoolExecutor | None = field(default=None, init=False)
+    # Monotonic clock of the last successfully emitted event.  Used by the
+    # run watchdog to detect a wedged conversation (no progress).
+    _last_step_activity: float = field(default_factory=time.monotonic, init=False)
     # Background task for a /goal loop that is running inside this conversation.
     _goal_loop_task: asyncio.Task | None = field(default=None, init=False)
     _goal_loop_outcome: GoalOutcome | None = field(default=None, init=False)
@@ -823,7 +831,10 @@ class EventService:
 
     async def _create_state_update_event(self) -> ConversationStateUpdateEvent:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._create_state_update_event_sync)
+        executor = self._emit_executor
+        return await loop.run_in_executor(
+            executor, self._create_state_update_event_sync
+        )
 
     def _derive_execution_status_sync(self) -> ConversationExecutionStatus:
         if not self._conversation:
@@ -846,7 +857,7 @@ class EventService:
         ):
             loop = asyncio.get_running_loop()
             derived = await loop.run_in_executor(
-                None, self._derive_execution_status_sync
+                self._emit_executor, self._derive_execution_status_sync
             )
             raw_value = event.value
             raw_status = (
@@ -1159,10 +1170,11 @@ class EventService:
             def locked_on_event():
                 with conversation._state:
                     conversation._on_event(event)
+                self._last_step_activity = time.monotonic()
 
             # Run the locked callback in an executor to ensure the event is
             # both persisted and sent to WebSocket subscribers
-            main_loop.run_in_executor(None, locked_on_event)
+            main_loop.run_in_executor(self._emit_executor, locked_on_event)
 
     def _setup_llm_log_streaming(self, agent: AgentBase) -> None:
         """Configure LLM log callbacks to stream logs via events."""
@@ -1291,6 +1303,9 @@ class EventService:
     async def start(self):
         # Store the main event loop for cross-thread communication
         self._main_loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+        self._emit_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="event-emit"
+        )
 
         # self.stored contains an Agent configuration we can instantiate
         _ensure_secure_directory(self.conversation_dir)
@@ -1528,7 +1543,9 @@ class EventService:
             # The background task re-sets it inside conversation.run()/arun(),
             # which is a no-op once already RUNNING.
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._mark_running_status_sync)
+            await loop.run_in_executor(
+                self._emit_executor, self._mark_running_status_sync
+            )
 
             # Start run in background
 
@@ -1559,12 +1576,48 @@ class EventService:
                         and type(conversation).arun is not BaseConversation.arun
                         and type(conversation.agent).astep is not AgentBase.astep
                     )
+                    # Watchdog: cancel the run if no event activity is
+                    # detected for WATCHDOG_TIMEOUT seconds.  This is a
+                    # last-resort safety net when the LLM timeout fails
+                    # (e.g. a stuck connection that does not error).
+                    WATCHDOG_TIMEOUT = 1800.0  # 30 minutes
+                    WATCHDOG_INTERVAL = 30.0
+
+                    async def _run_watchdog():
+                        try:
+                            while True:
+                                await asyncio.sleep(WATCHDOG_INTERVAL)
+                                elapsed = time.monotonic() - self._last_step_activity
+                                if elapsed > WATCHDOG_TIMEOUT:
+                                    conversation.interrupt()
+                                    if (
+                                        self._run_task is not None
+                                        and not self._run_task.done()
+                                    ):
+                                        self._run_task.cancel()
+                                    return
+                        except asyncio.CancelledError:
+                            pass
+
+                    watchdog = asyncio.create_task(_run_watchdog())
                     arun_t0 = time.monotonic()
-                    if has_native_arun:
-                        await conversation.arun()
-                    else:
-                        await loop.run_in_executor(self._run_executor, conversation.run)
+                    try:
+                        if has_native_arun:
+                            await conversation.arun()
+                        else:
+                            await loop.run_in_executor(
+                                self._run_executor, conversation.run
+                            )
+                    finally:
+                        watchdog.cancel()
                     arun_ms = (time.monotonic() - arun_t0) * 1000
+                except asyncio.CancelledError:
+                    logger.warning(
+                        "Conversation %s run cancelled (watchdog triggered).",
+                        self.stored.id,
+                    )
+                    self._run_task = None
+                    return
                 except Exception:
                     logger.exception("Error during conversation run")
                     # Backstop: a run that raised before reaching its own error
@@ -1573,7 +1626,9 @@ class EventService:
                     # status at IDLE/RUNNING. Force ERROR so the finally's
                     # _publish_state_update() surfaces the failure instead of a
                     # misleading non-error state.
-                    await loop.run_in_executor(None, self._mark_error_status_sync)
+                    await loop.run_in_executor(
+                        self._emit_executor, self._mark_error_status_sync
+                    )
                 finally:
                     # Wait for all pending events to be published via
                     # AsyncCallbackWrapper before publishing the final state update.
@@ -1589,7 +1644,8 @@ class EventService:
 
                     if not self._rerun_requested:
                         workflow_emitted = await loop.run_in_executor(
-                            None, self._emit_pyromind_workflow_if_dirty_sync
+                            self._emit_executor,
+                            self._emit_pyromind_workflow_if_dirty_sync,
                         )
                         if workflow_emitted and self._callback_wrapper:
                             await loop.run_in_executor(
@@ -2115,6 +2171,10 @@ class EventService:
             self._lease.release(self._lease_generation)
         self._lease_generation = None
         self._lease = None
+
+        if self._emit_executor is not None:
+            self._emit_executor.shutdown(wait=False)
+            self._emit_executor = None
 
     async def generate_title(
         self, llm: "LLM | None" = None, max_length: int = 50
