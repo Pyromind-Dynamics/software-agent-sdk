@@ -2,6 +2,6 @@
 # Add packages here to make them available to every agent terminal
 # (runtime image system python, builder/local uv venvs) without any
 # runtime pip installs. Consumed by: Dockerfile, Makefile make build.
-wandb>=0.19
+wandb==0.16.6
 numpy>=1.26
 pandas>=2.2
