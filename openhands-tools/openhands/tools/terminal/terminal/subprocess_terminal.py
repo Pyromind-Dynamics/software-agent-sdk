@@ -275,8 +275,15 @@ class SubprocessTerminal(TerminalInterface):
 
         # Configure bash: disable history expansion, set up PS1/PS2 prompts
         work_dir = shlex.quote(os.path.abspath(self.work_dir))
+        # RLIMIT_NPROC only limits processes inside a private user namespace
+        # (bwrap --unshare-user-try). There is no /proc/self/uid_map on macOS,
+        # where ``ulimit -u`` would cap the whole shell and break pipelines
+        # that fork several children (e.g. ``du | sort | head``), so treat the
+        # absence of a usable uid_map as a full mapping (no cap).
         nproc_guard = (
-            "map=$(awk 'NR==1{print $3}' /proc/self/uid_map); "
+            "map=4294967295; "
+            "if [ -r /proc/self/uid_map ]; then "
+            "map=$(awk 'NR==1{print $3}' /proc/self/uid_map); fi; "
             '[ "$map" != "4294967295" ] '
             f"&& ulimit -u {_sandbox_nproc_limit()} 2>/dev/null; "
         )

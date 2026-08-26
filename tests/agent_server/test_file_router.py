@@ -1,6 +1,7 @@
 """Tests for file_router.py endpoints."""
 
 import asyncio
+import errno
 import io
 import json
 import subprocess
@@ -13,13 +14,14 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from fastapi import UploadFile
+from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
 
 from openhands.agent_server import file_router as file_router_module
 from openhands.agent_server.api import create_app
 from openhands.agent_server.config import Config
 from openhands.agent_server.file_router import ARCHIVE_MANIFEST_NAME, _upload_file
+from openhands.sdk.utils.fs_errors import CONVERSATION_SPACE_FULL_MESSAGE
 
 
 @pytest.fixture
@@ -523,6 +525,38 @@ async def test_upload_does_not_block_event_loop_on_slow_storage(tmp_path, monkey
         f"upload (expected ≥ {expected_min}); event loop is blocked by "
         f"sync f.write() at file_router.py:65."
     )
+
+
+async def test_upload_full_disk_returns_readable_detail(tmp_path, monkeypatch):
+    # Simulate the XFS project quota hard limit: writes inside the conversation
+    # workspace fail with EDQUOT, and the upload must surface the actionable
+    # "space is full" message instead of the raw OS error.
+    class _FullDiskFile:
+        def write(self, _data):
+            raise OSError(errno.EDQUOT, "Disk quota exceeded")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+    monkeypatch.setattr(
+        file_router_module,
+        "open",
+        lambda *_args, **_kwargs: _FullDiskFile(),
+        raising=False,
+    )
+
+    spooled = tempfile.SpooledTemporaryFile()
+    spooled.write(b"x" * 8192)
+    spooled.seek(0)
+    upload = UploadFile(file=spooled, filename="quota.bin")  # pyright: ignore[reportArgumentType]
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _upload_file(str(tmp_path / "quota.bin"), upload)
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == CONVERSATION_SPACE_FULL_MESSAGE
 
 
 # =============================================================================

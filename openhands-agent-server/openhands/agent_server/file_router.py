@@ -35,6 +35,7 @@ from openhands.sdk.git.utils import (
     validate_git_repository,
 )
 from openhands.sdk.logger import get_logger
+from openhands.sdk.utils.fs_errors import quota_exceeded_reason
 
 
 class SubdirectoryEntry(BaseModel):
@@ -92,9 +93,10 @@ async def _upload_file(path: str, file: UploadFile) -> Success:
         raise
     except Exception as e:
         logger.error(f"Failed to upload file: {e}")
+        reason = quota_exceeded_reason(e) or f"Failed to upload file: {str(e)}"
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to upload file: {str(e)}",
+            detail=reason,
         )
 
 

@@ -1,5 +1,6 @@
 """Tests for error handling in file editor."""
 
+import errno
 import os
 import tempfile
 from pathlib import Path
@@ -7,7 +8,9 @@ from unittest.mock import patch
 
 import pytest
 
+from openhands.sdk.utils.fs_errors import CONVERSATION_SPACE_FULL_MESSAGE
 from openhands.tools.file_editor.editor import FileEditor
+from openhands.tools.file_editor.exceptions import ToolError
 from openhands.tools.file_editor.impl import file_editor
 
 from .conftest import assert_error_result
@@ -196,3 +199,17 @@ def test_view_subdirectory_permission_error_skips_inaccessible_dir():
             result = editor.view(path)
         assert not result.is_error
         assert "visible.txt" in result.text
+
+
+def test_write_full_disk_surfaces_readable_message(tmp_path):
+    """A workspace write hitting the storage quota reports a readable reason."""
+    editor = FileEditor()
+    target = tmp_path / "quota.txt"
+    with patch.object(
+        editor,
+        "_atomic_write",
+        side_effect=OSError(errno.EDQUOT, "Disk quota exceeded"),
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            editor.write_file(target, "hello")
+    assert str(exc_info.value) == CONVERSATION_SPACE_FULL_MESSAGE

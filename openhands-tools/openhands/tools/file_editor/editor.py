@@ -12,6 +12,7 @@ from binaryornot.check import is_binary
 
 from openhands.sdk import ImageContent, TextContent
 from openhands.sdk.logger import get_logger
+from openhands.sdk.utils.fs_errors import quota_exceeded_reason
 from openhands.sdk.utils.path import is_host_absolute_path, to_posix_path
 from openhands.sdk.utils.truncate import maybe_truncate
 from openhands.tools.file_editor.definition import (
@@ -480,7 +481,11 @@ class FileEditor:
         try:
             self._atomic_write(path, file_text, encoding)
         except Exception as e:
-            raise ToolError(f"Ran into {e} while trying to write to {path}") from None
+            reason = (
+                quota_exceeded_reason(e)
+                or f"Ran into {e} while trying to write to {path}"
+            )
+            raise ToolError(reason) from None
 
     def _atomic_write(self, path: Path, file_text: str, encoding: str) -> None:
         """Write file_text to path atomically, never leaving a truncated file.
