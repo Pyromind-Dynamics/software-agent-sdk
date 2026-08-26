@@ -82,7 +82,10 @@ def test_build_dataflow_command_structure() -> None:
         image_utils_api_version="1",
     )
     assert "python3 -m venv /tmp/df-venv" in cmd
-    assert "pip install --use-deprecated=legacy-resolver open-dataflow==1.0.10" in cmd
+    assert (
+        "pip install --quiet --use-deprecated=legacy-resolver open-dataflow==1.0.10"
+    ) in cmd
+    assert "> /tmp/df-venv-install.log 2>&1" in cmd
     assert "mkdir -p" in cmd
     assert "/target-workspace/data/input.jsonl" in cmd
     assert "/target-workspace/output/run1/pipeline.py" in cmd
