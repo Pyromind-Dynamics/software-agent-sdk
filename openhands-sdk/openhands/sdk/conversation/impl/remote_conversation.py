@@ -5,7 +5,8 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from enum import StrEnum
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, SupportsIndex, overload
 from urllib.parse import quote, urlparse
@@ -64,6 +65,21 @@ logger = get_logger(__name__)
 LEGACY_CONVERSATIONS_PATH = "/api/conversations"
 
 
+class WebSocketConnectionState(StrEnum):
+    """Connection state of the event-stream WebSocket client.
+
+    Clients can subscribe to state transitions to surface service
+    availability: ``RECONNECTING`` means the server is unreachable or
+    restarting and the client keeps retrying; ``STOPPED`` means the stream
+    ended (client stopped, or the server closed it deliberately).
+    """
+
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    RECONNECTING = "reconnecting"
+    STOPPED = "stopped"
+
+
 def _agent_kind_mismatch_message(conversation_id: ConversationID) -> str:
     return (
         f"Conversation {conversation_id} was started with a different agent kind. "
@@ -114,6 +130,7 @@ class WebSocketCallbackClient:
     conversation_id: str
     callback: ConversationCallbackType
     api_key: str | None
+    _on_state_change: Callable[[WebSocketConnectionState, str | None], None] | None
     _thread: threading.Thread | None
     _stop: threading.Event
     _ready: threading.Event
@@ -124,14 +141,30 @@ class WebSocketCallbackClient:
         conversation_id: str,
         callback: ConversationCallbackType,
         api_key: str | None = None,
+        on_state_change: (
+            Callable[[WebSocketConnectionState, str | None], None] | None
+        ) = None,
     ):
         self.host = host
         self.conversation_id = conversation_id
         self.callback = callback
         self.api_key = api_key
+        self._on_state_change = on_state_change
+        self._state = WebSocketConnectionState.STOPPED
+        self._last_reason: str | None = None
         self._thread = None
         self._stop = threading.Event()
         self._ready = threading.Event()
+
+    def _notify_state(
+        self, state: WebSocketConnectionState, reason: str | None
+    ) -> None:
+        if (state, reason) == (self._state, self._last_reason):
+            return
+        self._state = state
+        self._last_reason = reason
+        if self._on_state_change is not None:
+            self._on_state_change(state, reason)
 
     def start(self) -> None:
         if self._thread:
@@ -200,7 +233,15 @@ class WebSocketCallbackClient:
             ws_url += f"?session_api_key={quote(self.api_key, safe='')}"
 
         delay = 1.0
+        first_attempt = True
         while not self._stop.is_set():
+            if first_attempt:
+                self._notify_state(WebSocketConnectionState.CONNECTING, None)
+            elif self._state == WebSocketConnectionState.CONNECTED:
+                # A previous stream ended without raising; report that the
+                # client is re-establishing it.
+                self._notify_state(WebSocketConnectionState.RECONNECTING, None)
+            first_attempt = False
             try:
                 async with websockets.connect(ws_url) as ws:
                     delay = 1.0
@@ -212,23 +253,62 @@ class WebSocketCallbackClient:
 
                             # Set ready on first ConversationStateUpdateEvent
                             # The server sends this immediately after subscription
-                            if (
-                                isinstance(event, ConversationStateUpdateEvent)
-                                and not self._ready.is_set()
-                            ):
-                                self._ready.set()
+                            if isinstance(event, ConversationStateUpdateEvent):
+                                if not self._ready.is_set():
+                                    self._ready.set()
+                                self._notify_state(
+                                    WebSocketConnectionState.CONNECTED, None
+                                )
 
                             self.callback(event)
                         except Exception:
                             logger.exception(
                                 "ws_event_processing_error", stack_info=True
                             )
-            except websockets.exceptions.ConnectionClosed:
-                break
-            except Exception:
-                logger.debug("ws_connect_retry", exc_info=True)
+            except websockets.exceptions.ConnectionClosed as e:
+                if self._stop.is_set():
+                    break
+                close_frame = e.rcvd
+                code = (
+                    close_frame.code
+                    if close_frame is not None
+                    else 1006  # abnormal closure: connection died, no close frame
+                )
+                reason = (
+                    close_frame.reason if close_frame is not None else None
+                ) or f"code {code}"
+                # Deliberate closes (1000 normal, 4xxx application refusals)
+                # end the stream; everything else (1006 abnormal, 1012 service
+                # restart, ...) is transient and the client keeps retrying.
+                if code == 1000 or 4000 <= code < 5000:
+                    self._notify_state(WebSocketConnectionState.STOPPED, reason)
+                    break
+                self._notify_state(WebSocketConnectionState.RECONNECTING, reason)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30.0)
+            except websockets.exceptions.InvalidStatus as e:
+                if self._stop.is_set():
+                    break
+                status = e.response.status_code
+                reason = (
+                    "Service temporarily unavailable"
+                    if status == 503
+                    else f"HTTP {status}"
+                )
+                self._notify_state(WebSocketConnectionState.RECONNECTING, reason)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
+            except Exception:
+                if self._stop.is_set():
+                    break
+                logger.debug("ws_connect_retry", exc_info=True)
+                self._notify_state(
+                    WebSocketConnectionState.RECONNECTING, "Connection failed"
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
+        if self._state != WebSocketConnectionState.STOPPED:
+            self._notify_state(WebSocketConnectionState.STOPPED, None)
 
 
 class RemoteEventsList(EventsListBase):
@@ -660,6 +740,9 @@ class RemoteConversation(BaseConversation):
         plugins: list | None = None,
         conversation_id: ConversationID | None = None,
         callbacks: list[ConversationCallbackType] | None = None,
+        on_connection_state_change: (
+            Callable[[WebSocketConnectionState, str | None], None] | None
+        ) = None,
         max_iteration_per_run: int = 500,
         stuck_detection: bool = True,
         stuck_detection_thresholds: (
@@ -688,6 +771,10 @@ class RemoteConversation(BaseConversation):
                     is a PluginSource specifying source, ref, and repo_path.
             conversation_id: Optional existing conversation id to attach to
             callbacks: Optional callbacks to receive events (not yet streamed)
+            on_connection_state_change: Optional callback invoked when the
+                      event-stream WebSocket connection state changes. Receives
+                      the new WebSocketConnectionState and an optional reason
+                      string (e.g. a close code or HTTP status).
             max_iteration_per_run: Max iterations configured on server
             stuck_detection: Whether to enable stuck detection on server
             stuck_detection_thresholds: Optional configuration for stuck detection
@@ -718,6 +805,8 @@ class RemoteConversation(BaseConversation):
         super().__init__()  # Initialize base class with span tracking
         self.agent = agent
         self._callbacks = callbacks or []
+        self._on_connection_state_change = on_connection_state_change
+        self._last_ws_state = WebSocketConnectionState.STOPPED
         self.max_iteration_per_run = max_iteration_per_run
         self.workspace = workspace
         self._client = workspace.client
@@ -945,6 +1034,7 @@ class RemoteConversation(BaseConversation):
             conversation_id=str(self._id),
             callback=composed_callback,
             api_key=self.workspace.api_key,
+            on_state_change=self._on_websocket_state_change,
         )
         self._ws_client.start()
 
@@ -986,6 +1076,25 @@ class RemoteConversation(BaseConversation):
         # All hooks (including SessionStart/SessionEnd) are executed server-side.
         # hook_config is sent in the creation payload.
         self.delete_on_close = delete_on_close
+
+    def _on_websocket_state_change(
+        self, state: WebSocketConnectionState, reason: str | None
+    ) -> None:
+        if (
+            state == WebSocketConnectionState.CONNECTED
+            and self._last_ws_state == WebSocketConnectionState.RECONNECTING
+        ):
+            # Events emitted while the socket was down are pulled from the
+            # server so nothing is missed after an outage or restart.
+            try:
+                self._state.events.reconcile()
+            except Exception:
+                logger.exception(
+                    "Failed to reconcile events after WebSocket reconnection"
+                )
+        self._last_ws_state = state
+        if self._on_connection_state_change is not None:
+            self._on_connection_state_change(state, reason)
 
     def _create_llm_completion_log_callback(self) -> ConversationCallbackType:
         """Create a callback that writes LLM completion logs to client filesystem."""

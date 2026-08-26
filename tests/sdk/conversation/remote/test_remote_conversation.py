@@ -11,7 +11,10 @@ from pydantic import SecretStr
 from openhands.sdk.agent import Agent
 from openhands.sdk.agent.acp_agent import ACPAgent
 from openhands.sdk.conversation.exceptions import ConversationRunError
-from openhands.sdk.conversation.impl.remote_conversation import RemoteConversation
+from openhands.sdk.conversation.impl.remote_conversation import (
+    RemoteConversation,
+    WebSocketConnectionState,
+)
 from openhands.sdk.conversation.secret_registry import SecretValue
 from openhands.sdk.conversation.visualizer import DefaultConversationVisualizer
 from openhands.sdk.event import MessageEvent
@@ -218,6 +221,47 @@ class TestRemoteConversation:
             "Should have made at least one GET call to /events/search "
             "to fetch initial events"
         )
+
+    @patch(
+        "openhands.sdk.conversation.impl.remote_conversation.WebSocketCallbackClient"
+    )
+    def test_remote_conversation_reconciles_events_after_reconnect(
+        self, mock_ws_client
+    ):
+        """Reconnecting after an outage reconciles missed events and forwards
+        connection-state changes to the caller."""
+        conversation_id = str(uuid.uuid4())
+        self.setup_mock_client(conversation_id=conversation_id)
+        mock_ws_instance = Mock()
+        mock_ws_client.return_value = mock_ws_instance
+        mock_ws_instance.wait_until_ready.return_value = True
+
+        state_changes: list[tuple[str, str | None]] = []
+        conversation = RemoteConversation(
+            agent=self.agent,
+            workspace=self.workspace,
+            on_connection_state_change=lambda state, reason: state_changes.append(
+                (state.value, reason)
+            ),
+        )
+
+        with patch.object(conversation._state.events, "reconcile") as mock_reconcile:
+            conversation._on_websocket_state_change(
+                WebSocketConnectionState.RECONNECTING, None
+            )
+            conversation._on_websocket_state_change(
+                WebSocketConnectionState.CONNECTED, None
+            )
+            conversation._on_websocket_state_change(
+                WebSocketConnectionState.CONNECTED, None
+            )
+
+        mock_reconcile.assert_called_once()
+        assert state_changes == [
+            ("reconnecting", None),
+            ("connected", None),
+            ("connected", None),
+        ]
 
     @patch(
         "openhands.sdk.conversation.impl.remote_conversation.WebSocketCallbackClient"

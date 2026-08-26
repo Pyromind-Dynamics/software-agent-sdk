@@ -3,13 +3,20 @@
 import asyncio
 import time
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import websockets
 import websockets.frames
 
-from openhands.sdk.conversation.impl.remote_conversation import WebSocketCallbackClient
+from openhands.sdk.conversation.impl.remote_conversation import (
+    WebSocketCallbackClient,
+    WebSocketConnectionState,
+)
+from openhands.sdk.event.conversation_state import (
+    FULL_STATE_KEY,
+    ConversationStateUpdateEvent,
+)
 from openhands.sdk.event.llm_convertible import MessageEvent
 from openhands.sdk.llm import Message, TextContent
 
@@ -25,6 +32,32 @@ def mock_event():
             role="assistant", content=[TextContent(text="Test message")]
         ),
     )
+
+
+def _state_update_message() -> str:
+    return ConversationStateUpdateEvent(key=FULL_STATE_KEY, value={}).model_dump_json()
+
+
+class _FakeWebSocket:
+    """Async context manager yielding canned messages, then ending cleanly."""
+
+    def __init__(self, messages: list[str]):
+        self._messages = iter(messages)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        try:
+            return next(self._messages)
+        except StopIteration:
+            raise StopAsyncIteration
 
 
 def test_websocket_client_lifecycle():
@@ -167,3 +200,179 @@ def test_websocket_client_url_encodes_api_key():
 
     assert len(captured_urls) == 1
     assert "session_api_key=1%2BFYh%2FSRE%3Dds%208Q" in captured_urls[0]
+
+
+def test_websocket_client_notifies_state_transitions_around_server_restart():
+    """Client surfaces connect/reconnect/stop transitions and keeps retrying
+    after abnormal and service-restart closes instead of dying silently."""
+    states: list[tuple[WebSocketConnectionState, str | None]] = []
+
+    def on_state_change(state, reason):
+        states.append((state, reason))
+
+    client = WebSocketCallbackClient(
+        host="http://localhost:8000",
+        conversation_id="test-conv-id",
+        callback=lambda event: None,
+        on_state_change=on_state_change,
+    )
+
+    abnormal = websockets.exceptions.ConnectionClosed(
+        rcvd=None, sent=None, rcvd_then_sent=None
+    )
+    restart_close = websockets.frames.Close(1012, "Service restarting")
+    restart = websockets.exceptions.ConnectionClosed(
+        rcvd=restart_close,
+        sent=restart_close,
+        rcvd_then_sent=False,
+    )
+    refused_close = websockets.frames.Close(4004, "Conversation not found")
+    refused = websockets.exceptions.ConnectionClosed(
+        rcvd=refused_close,
+        sent=refused_close,
+        rcvd_then_sent=False,
+    )
+
+    with (
+        patch(
+            "openhands.sdk.conversation.impl.remote_conversation.websockets.connect",
+            side_effect=[
+                abnormal,
+                restart,
+                _FakeWebSocket([_state_update_message()]),
+                refused,
+            ],
+        ),
+        patch(
+            "openhands.sdk.conversation.impl.remote_conversation.asyncio.sleep",
+            new=AsyncMock(),
+        ),
+    ):
+        asyncio.run(client._client_loop())
+
+    assert [(state.value, reason) for state, reason in states] == [
+        ("connecting", None),
+        ("reconnecting", "code 1006"),
+        ("reconnecting", "Service restarting"),
+        ("connected", None),
+        ("reconnecting", None),
+        ("stopped", "Conversation not found"),
+    ]
+
+
+def test_websocket_client_reports_http_503_as_temporarily_unavailable():
+    """HTTP 503 during the WS handshake maps to a reconnecting state."""
+    states: list[tuple[WebSocketConnectionState, str | None]] = []
+
+    client = WebSocketCallbackClient(
+        host="http://localhost:8000",
+        conversation_id="test-conv-id",
+        callback=lambda event: None,
+        on_state_change=lambda state, reason: states.append((state, reason)),
+    )
+
+    refused_close = websockets.frames.Close(4004, "Conversation not found")
+    refused = websockets.exceptions.ConnectionClosed(
+        rcvd=refused_close,
+        sent=refused_close,
+        rcvd_then_sent=False,
+    )
+
+    with (
+        patch(
+            "openhands.sdk.conversation.impl.remote_conversation.websockets.connect",
+            side_effect=[
+                websockets.exceptions.InvalidStatus(MagicMock(status_code=503)),
+                _FakeWebSocket([_state_update_message()]),
+                refused,
+            ],
+        ),
+        patch(
+            "openhands.sdk.conversation.impl.remote_conversation.asyncio.sleep",
+            new=AsyncMock(),
+        ),
+    ):
+        asyncio.run(client._client_loop())
+
+    assert [(state.value, reason) for state, reason in states] == [
+        ("connecting", None),
+        ("reconnecting", "Service temporarily unavailable"),
+        ("connected", None),
+        ("reconnecting", None),
+        ("stopped", "Conversation not found"),
+    ]
+
+
+def test_websocket_client_stops_on_deliberate_close_without_retrying():
+    """A 4xxx application close ends the stream after a single attempt."""
+    states: list[tuple[WebSocketConnectionState, str | None]] = []
+
+    client = WebSocketCallbackClient(
+        host="http://localhost:8000",
+        conversation_id="test-conv-id",
+        callback=lambda event: None,
+        on_state_change=lambda state, reason: states.append((state, reason)),
+    )
+
+    refused_close = websockets.frames.Close(4001, "Authentication failed")
+    refused = websockets.exceptions.ConnectionClosed(
+        rcvd=refused_close,
+        sent=refused_close,
+        rcvd_then_sent=False,
+    )
+
+    connect = MagicMock(side_effect=[refused])
+    with (
+        patch(
+            "openhands.sdk.conversation.impl.remote_conversation.websockets.connect",
+            connect,
+        ),
+        patch(
+            "openhands.sdk.conversation.impl.remote_conversation.asyncio.sleep",
+            new=AsyncMock(),
+        ),
+    ):
+        asyncio.run(client._client_loop())
+
+    connect.assert_called_once()
+    assert [(state.value, reason) for state, reason in states] == [
+        ("connecting", None),
+        ("stopped", "Authentication failed"),
+    ]
+
+
+def test_websocket_client_reports_generic_connect_failure_as_reconnecting():
+    """Generic connection failures surface as RECONNECTING with a reason."""
+    states: list[tuple[WebSocketConnectionState, str | None]] = []
+
+    client = WebSocketCallbackClient(
+        host="http://localhost:8000",
+        conversation_id="test-conv-id",
+        callback=lambda event: None,
+        on_state_change=lambda state, reason: states.append((state, reason)),
+    )
+
+    refused_close = websockets.frames.Close(4004, "Conversation not found")
+    refused = websockets.exceptions.ConnectionClosed(
+        rcvd=refused_close,
+        sent=refused_close,
+        rcvd_then_sent=False,
+    )
+
+    with (
+        patch(
+            "openhands.sdk.conversation.impl.remote_conversation.websockets.connect",
+            side_effect=[ConnectionError("server down"), refused],
+        ),
+        patch(
+            "openhands.sdk.conversation.impl.remote_conversation.asyncio.sleep",
+            new=AsyncMock(),
+        ),
+    ):
+        asyncio.run(client._client_loop())
+
+    assert [(state.value, reason) for state, reason in states] == [
+        ("connecting", None),
+        ("reconnecting", "Connection failed"),
+        ("stopped", "Conversation not found"),
+    ]

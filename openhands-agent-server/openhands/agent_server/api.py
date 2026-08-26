@@ -64,7 +64,7 @@ from openhands.agent_server.server_details_router import (
 )
 from openhands.agent_server.settings_router import settings_router
 from openhands.agent_server.skills_router import skills_router
-from openhands.agent_server.sockets import sockets_router
+from openhands.agent_server.sockets import close_client_sockets, sockets_router
 from openhands.agent_server.tool_preload_service import get_tool_preload_service
 from openhands.agent_server.tool_router import tool_router
 from openhands.agent_server.vscode_router import vscode_router
@@ -297,6 +297,7 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
             try:
                 yield
             finally:
+                await close_client_sockets()
                 await init_service.teardown()
                 await stop_stateless_services()
             return
@@ -329,6 +330,7 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
             try:
                 yield
             finally:
+                await close_client_sockets()
                 if retention_task is not None:
                     retention_task.cancel()
                     with suppress(asyncio.CancelledError):

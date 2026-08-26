@@ -67,6 +67,28 @@ conversation_service = get_default_conversation_service()
 bash_event_service = get_default_bash_event_service()
 logger = logging.getLogger(__name__)
 
+# Client-facing WebSocket connections that the server closes explicitly on
+# graceful shutdown so clients can distinguish a restart from a network
+# failure instead of waiting for a keepalive timeout.
+_active_client_sockets: set[WebSocket] = set()
+
+
+def _register_client_socket(websocket: WebSocket) -> None:
+    _active_client_sockets.add(websocket)
+
+
+def _unregister_client_socket(websocket: WebSocket) -> None:
+    _active_client_sockets.discard(websocket)
+
+
+async def close_client_sockets(
+    code: int = 1012, reason: str = "Service restarting"
+) -> None:
+    sockets = list(_active_client_sockets)
+    _active_client_sockets.clear()
+    for websocket in sockets:
+        await _safe_close_websocket(websocket, code=code, reason=reason)
+
 
 def _get_config(websocket: WebSocket) -> Config:
     """Return the Config associated with this FastAPI app instance.
@@ -385,6 +407,7 @@ async def events_socket(
     # The conversation is actively watched while this socket is open; idle
     # eviction must not unload it underneath the subscriber.
     event_service.register_user_connection()
+    _register_client_socket(websocket)
     logger.info(
         "User WebSocket connected for conversation %s; idle eviction paused",
         conversation_id,
@@ -465,6 +488,7 @@ async def events_socket(
                     await _safe_close_websocket(websocket)
                     return
     finally:
+        _unregister_client_socket(websocket)
         await event_service.unsubscribe_from_events(subscriber_id)
         event_service.unregister_user_connection()
         logger.info(
@@ -520,6 +544,7 @@ async def bash_events_socket(
         logger.warning("Subscriber limit reached for bash events")
         await websocket.close(code=1013, reason="Too many bash event connections")
         return
+    _register_client_socket(websocket)
 
     # Determine effective resend mode (handle deprecated resend_all)
     effective_mode = resend_mode
@@ -567,6 +592,7 @@ async def bash_events_socket(
                     await _safe_close_websocket(websocket)
                     return
     finally:
+        _unregister_client_socket(websocket)
         await bash_service.unsubscribe_from_events(subscriber_id)
 
 
