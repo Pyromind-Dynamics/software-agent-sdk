@@ -97,6 +97,7 @@ from openhands.tools.pyromind_dataset.definition import (
 )
 from openhands.tools.pyromind_debug import get_debug_result_broker
 from openhands.tools.pyromind_remote_dataset import PreviewRemoteDatasetTool
+from openhands.tools.training_analysis import TrainingAnalysisTool
 from openhands.tools.utils import PUBLIC_READ_ALIASES
 from openhands.tools.workflow import (
     RunWorkflowTool,
@@ -385,6 +386,29 @@ def _build_analyze_task_failure_tool(
     if secret_headers:
         params["secret_headers"] = secret_headers
     return Tool(name=AnalyzeTaskFailureTool.name, params=params), secrets
+
+
+def _build_training_analysis_tool(
+    http_request: Request,
+    extra: dict[str, Any],
+    skills_path: str | Path,
+) -> tuple[Tool, dict[str, SecretSource]]:
+    """Build ``training_analysis`` with server-only studio auth wiring."""
+    headers, secret_headers, secrets = _build_studio_api_auth(http_request, extra)
+    params: dict[str, Any] = {
+        "runtime_dir": str(Path(skills_path) / "training-analysis" / "scripts")
+    }
+    api_base = extra.get("training_analysis_api_base")
+    if isinstance(api_base, str) and api_base.strip():
+        params["api_base"] = api_base.strip()
+    timeout_seconds = extra.get("training_analysis_timeout_seconds")
+    if isinstance(timeout_seconds, (int, float)) and timeout_seconds > 0:
+        params["timeout_seconds"] = timeout_seconds
+    if headers:
+        params["headers"] = headers
+    if secret_headers:
+        params["secret_headers"] = secret_headers
+    return Tool(name=TrainingAnalysisTool.name, params=params), secrets
 
 
 def _load_env_to_tools(
@@ -1216,6 +1240,9 @@ async def create_pyromind_conversation(
     analysis_tool, analysis_secrets = _build_analyze_task_failure_tool(
         http_request, request.extra
     )
+    training_tool, training_secrets = _build_training_analysis_tool(
+        http_request, request.extra, skills_path
+    )
 
     # run_workflow / workflow_debug reuse validate auth/header wiring
     run_tool, run_secrets = _build_workflow_run_tool(http_request)
@@ -1268,6 +1295,7 @@ async def create_pyromind_conversation(
             Tool(name="df_convert"),
             validation_tool,
             analysis_tool,
+            training_tool,
         ],
     )
 
@@ -1295,6 +1323,7 @@ async def create_pyromind_conversation(
         secrets={
             **validation_secrets,
             **analysis_secrets,
+            **training_secrets,
             **run_secrets,
             **debug_secrets,
             **storage_secrets,

@@ -31,6 +31,7 @@ from openhands.agent_server.pyromind_router import (
     _build_analyze_task_failure_tool,
     _build_debug_context_headers,
     _build_pyromind_storage_tools,
+    _build_training_analysis_tool,
     _build_workflow_run_tool,
     _build_workflow_validation_tool,
     _get_validation_cookie_header,
@@ -65,6 +66,7 @@ from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
 )
 from openhands.tools.pyromind_remote_dataset import PreviewRemoteDatasetTool
+from openhands.tools.training_analysis import TrainingAnalysisTool
 from openhands.tools.workflow import (
     AnalyzeTaskFailureTool,
     RunWorkflowTool,
@@ -418,6 +420,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert SkillsReadTool.__name__ not in tool_names
     assert RunWorkflowTool.name not in tool_names
     assert ValidateWorkflowDslTool.name in tool_names
+    assert TrainingAnalysisTool.name in tool_names
     assert PreviewDatasetTool.name in tool_names
     assert UploadFileToPyromindTool.name in tool_names
     assert RunDatasetCleaningTool.name in tool_names
@@ -432,6 +435,19 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         for tool in service.start_request.agent.tools
         if tool.name == ValidateWorkflowDslTool.name
     )
+    training_tool = next(
+        tool
+        for tool in service.start_request.agent.tools
+        if tool.name == TrainingAnalysisTool.name
+    )
+    assert training_tool.params == {
+        "runtime_dir": str(
+            tmp_path / "missing-skills" / "training-analysis" / "scripts"
+        ),
+        "headers": {"x-cluster": "us-west-1#pre"},
+        "secret_headers": {"cookie": "PYROMIND_VALIDATE_AUTH_COOKIE"},
+    }
+    assert "session-token" not in str(training_tool.params)
     assert validation_tool.params == {
         "headers": {"x-cluster": "us-west-1#pre"},
         "secret_headers": {"cookie": "PYROMIND_VALIDATE_AUTH_COOKIE"},
@@ -453,6 +469,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         service.start_request.secrets["PYROMIND_VALIDATE_AUTH_COOKIE"].get_value()
         == cookie_header
     )
+
 
     preview_tool = next(
         tool
@@ -494,6 +511,44 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert "base_url" not in dumped_agent["llm"]
     assert "api_key" not in dumped_agent["condenser"]["llm"]
     assert "base_url" not in dumped_agent["condenser"]["llm"]
+
+
+def test_training_analysis_tool_reuses_authorization_secret_and_config(tmp_path):
+    request = _make_request(
+        {
+            "cookie": "session-cookie",
+            "authorization": "Bearer authorization-secret",
+            "x-cluster": "us-east-1#prod",
+        }
+    )
+    tool, secrets = _build_training_analysis_tool(
+        request,
+        {
+            "training_analysis_api_base": "https://configured.example/studio/",
+            "training_analysis_timeout_seconds": 12.5,
+        },
+        tmp_path,
+    )
+
+    assert tool.params == {
+        "runtime_dir": str(tmp_path / "training-analysis" / "scripts"),
+        "api_base": "https://configured.example/studio/",
+        "timeout_seconds": 12.5,
+        "headers": {"x-cluster": "us-east-1#prod"},
+        "secret_headers": {
+            "cookie": "PYROMIND_VALIDATE_AUTH_COOKIE",
+            "authorization": "PYROMIND_VALIDATE_AUTHORIZATION",
+        },
+    }
+    assert "session-cookie" not in str(tool.params)
+    assert "authorization-secret" not in str(tool.params)
+    assert (
+        secrets["PYROMIND_VALIDATE_AUTH_COOKIE"].get_value() == "session-cookie"
+    )
+    assert (
+        secrets["PYROMIND_VALIDATE_AUTHORIZATION"].get_value()
+        == "Bearer authorization-secret"
+    )
 
 
 @pytest.mark.asyncio

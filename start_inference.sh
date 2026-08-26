@@ -12,7 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 
-export PYROMIND_HARNESS_BACKEND="pi"
+# export PYROMIND_HARNESS_BACKEND="pi"
 
 # ----------------------------------------------------------
 # LLM Configuration
