@@ -49,6 +49,9 @@ class _ExternalTasks:
     def update_status(self, conversation_id: str, task_id: str, status: str) -> None:
         self.updated.append((conversation_id, task_id, status))
 
+    def register(self, conversation_id: str, payload) -> None:
+        return None
+
 
 def test_external_task_registry_resolves_and_updates_owned_task(tmp_path) -> None:
     root = tmp_path / "conversations"
@@ -236,7 +239,7 @@ async def test_dispatcher_routes_openhands_through_same_runtime_path(tmp_path) -
     assert result.outcome == "delivered_async"
     assert store.load_snapshot().external_tasks[0].status == "succeeded"
     assert adapter.external_task_notifications[0][0] == "conversation-2"
-    assert adapter.external_task_notifications[0][1]["task_id"] == "task-2"
+    assert adapter.external_task_notifications[0][1].task_id == "task-2"
     assert external_tasks.updated == [("conversation-2", "task-2", "succeeded")]
 
     await WorkflowStatusDispatcher(runtime).dispatch(

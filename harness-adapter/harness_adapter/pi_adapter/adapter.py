@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import tempfile
 import time
 from collections.abc import AsyncIterator
@@ -25,7 +26,15 @@ from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
-from pyromind_runtime.ports.harness import SessionHandle, SessionSpec
+from pyromind_runtime.ports.harness import (
+    ExternalTaskNotification,
+    ForkSpec,
+    ProductCheckpoint,
+    RestoreWorkflowResult,
+    RestoreWorkflowSpec,
+    SessionHandle,
+    SessionSpec,
+)
 
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
@@ -54,8 +63,9 @@ PI_CAPABILITIES = HarnessCapabilities(
     cancel=True,
     permission_reply=True,
     partial_message=True,
-    fork=False,
-    workflow_rollback=False,
+    fork=True,
+    workflow_rollback=True,
+    external_task_resume=True,
     native_workspace_tools=frozenset({"read", "write", "edit", "terminal"}),
 )
 _PRODUCTION_ENVS = {"prod", "production", "online"}
@@ -104,6 +114,7 @@ class _PiSession:
     pending_permission: _PendingPermission | None = None
     finished_runs: set[str] = field(default_factory=set)
     active_external_tasks: dict[str, str] = field(default_factory=dict)
+    pending_checkpoint_events: dict[str, list[str]] = field(default_factory=dict)
 
 
 class PiAdapter:
@@ -129,6 +140,8 @@ class PiAdapter:
                 "generate-workflow-dsl",
                 "data-cleaning",
                 "data-preparation",
+                "debug-workflow",
+                "training-analysis",
             )
         }
         configured_roots = list(skill_roots or ())
@@ -275,56 +288,142 @@ class PiAdapter:
                 )
             return {"resolved": True}
         if isinstance(command, RollbackWorkflowCommand):
-            raise ValueError("Pi does not support workflow rollback")
+            raise TypeError("workflow rollback is orchestrated by ConversationRuntime")
         raise TypeError(f"unsupported command: {type(command).__name__}")
 
     async def fork(
         self,
         handle: SessionHandle,
-        snapshot: ConversationSnapshot,
+        spec: ForkSpec,
+        checkpoint: ProductCheckpoint,
         context: RequestContext,
     ) -> SessionHandle:
-        raise NotImplementedError("Pi does not support fork")
+        source = self._session(handle.session_id)
+        if source.running or source.pending_permission is not None:
+            raise ValueError("Pi source conversation is busy")
+        leaf_id = source.files.load_checkpoint_index().get(checkpoint.event_id)
+        if not leaf_id:
+            raise ValueError("Pi checkpoint entry is unavailable")
+        target_root = (self._conversation_root / spec.target_conversation_id).resolve()
+        if target_root.parent != self._conversation_root:
+            raise ValueError("unsafe Pi fork target")
+        _copy_workspace_for_fork(source.workspace_root, target_root)
+        target_workflow = target_root / _WORKFLOW_PATH
+        checkpoint_dsl = checkpoint.workflow.dsl
+        if checkpoint_dsl.strip():
+            _atomic_text(target_workflow, checkpoint_dsl)
+        else:
+            target_workflow.unlink(missing_ok=True)
+        target_files = PiSessionFiles(target_root)
+        target_config = {
+            **source.config,
+            "session_id": spec.target_conversation_id,
+        }
+        target_files.initialize(target_config)
+        await self._ensure_runner(source)
+        assert source.runner is not None
+        branch = await source.runner.request(
+            "fork",
+            {
+                "leaf_id": leaf_id,
+                "target_session_dir": str(target_files.directory),
+                "target_cwd": str(target_root),
+            },
+        )
+        if not isinstance(branch, dict) or not isinstance(
+            branch.get("session_path"), str
+        ):
+            raise RuntimeError("Pi runner did not return a branched session")
+        generated = Path(branch["session_path"]).resolve()
+        if generated.parent != target_files.directory.resolve():
+            raise ValueError("Pi runner returned an unsafe session path")
+        os.replace(generated, target_files.session_log_path)
+        target = _PiSession(
+            spec.target_conversation_id,
+            target_root,
+            target_files,
+            target_config,
+            context,
+            model_configuration=dict(source.model_configuration),
+            extra=dict(source.extra),
+        )
+        await self._register(target)
+        try:
+            await self._start_runner(target, _api_key(source.model_configuration))
+            target.queue.put_nowait(_history_synced(target.session_id))
+            return self._handle(target.session_id)
+        except Exception:
+            await self._remove(target.session_id)
+            raise
+
+    async def restore_workflow(
+        self,
+        handle: SessionHandle,
+        spec: RestoreWorkflowSpec,
+        context: RequestContext,
+    ) -> RestoreWorkflowResult:
+        session = self._session(handle.session_id)
+        session.context = context
+        path = session.workspace_root / _WORKFLOW_PATH
+        dsl = spec.checkpoint.workflow.dsl
+        if dsl.strip():
+            _atomic_text(path, dsl)
+            action = "updated"
+        else:
+            path.unlink(missing_ok=True)
+            action = "removed"
+        await self._ensure_runner(session)
+        assert session.runner is not None
+        append_result = await session.runner.request(
+            "context.append",
+            {
+                "content": (
+                    "<system_reminder>The workflow was restored to Product "
+                    f"checkpoint {spec.checkpoint.event_id}. Treat the workspace "
+                    "workflow file as authoritative.</system_reminder>"
+                ),
+                "details": {
+                    "checkpoint_event_id": spec.checkpoint.event_id,
+                    "workflow_file_action": action,
+                },
+                "trigger_turn": spec.trigger_turn,
+            },
+        )
+        if isinstance(append_result, dict) and isinstance(
+            append_result.get("checkpoint_entry_id"), str
+        ):
+            index = session.files.load_checkpoint_index()
+            index[f"rollback:{spec.command_id}:workflow"] = append_result[
+                "checkpoint_entry_id"
+            ]
+            session.files.save_checkpoint_index(index)
+        return RestoreWorkflowResult(workflow_file_action=action)
 
     async def notify_external_task(
         self,
         handle: SessionHandle,
-        notification: dict[str, Any],
+        notification: ExternalTaskNotification,
         context: RequestContext,
     ) -> JsonObject:
         session = self._session(handle.session_id)
         session.context = context
-        status = _external_task_status(notification.get("status"))
+        status = _external_task_status(notification.status)
         if status in {"succeeded", "failed", "terminated", "stopped"}:
-            session.active_external_tasks.pop(
-                str(notification.get("task_id") or ""), None
-            )
+            session.active_external_tasks.pop(notification.task_id, None)
         if status == "stopped":
             return {"accepted": False, "reason": "user_stopped"}
         await self._ensure_runner(session)
         assert session.runner is not None
-        task_id = str(notification.get("task_id") or "unknown")
-        kind = str(notification.get("kind") or "external_task")
-        run_id = str(notification.get("run_id") or "unknown")
-        output_dir = str(notification.get("output_dir") or "")
-        error = notification.get("error_summary")
-        lines = [
-            "<system_reminder>",
-            f"Pyromind {kind} task {task_id} (run_id={run_id}) is {status}.",
-            f"Output directory: {output_dir}.",
-            "Follow the matching skill's callback contract. Inspect Storage output "
-            "only through preview_dataset; do not assume callback payload contains "
-            "data.",
-        ]
-        if isinstance(error, str) and error:
-            lines.append(f"Controlled error summary: {error[:2000]}")
-        lines.append("</system_reminder>")
+        task_id = notification.task_id
+        if notification.reset_attempt_budget:
+            self._business_tools.reset_attempt_budget(session.workspace_root)
         result = await session.runner.request(
-            "notify",
+            "notify" if notification.trigger_turn else "context.append",
             {
                 "run_id": f"callback:{task_id}:{status}",
-                "content": "\n".join(lines),
-                "details": notification,
+                "content": notification.hidden_text,
+                "details": notification.model_dump(mode="json"),
+                "trigger_turn": notification.trigger_turn,
             },
         )
         return result if isinstance(result, dict) else {"accepted": True}
@@ -507,14 +606,10 @@ class PiAdapter:
                 if not isinstance(task, dict):
                     continue
                 task_id = task.get("task_id") or details.get("task_id")
-                run_id = details.get("run_id")
+                run_id = details.get("run_id") or task_id
                 output_dir = details.get("output_dir")
                 kind = task.get("kind")
                 if not isinstance(task_id, str) or not task_id:
-                    continue
-                if not isinstance(run_id, str) or not run_id:
-                    continue
-                if not isinstance(output_dir, str) or not output_dir:
                     continue
                 if not isinstance(kind, str) or not kind:
                     continue
@@ -528,11 +623,16 @@ class PiAdapter:
                         payload={
                             "task_id": task_id,
                             "kind": kind,
-                            "run_id": run_id,
+                            "run_id": run_id if isinstance(run_id, str) else task_id,
                             "status": _external_task_status(
                                 task.get("status") or details.get("status")
                             ),
-                            "output_dir": output_dir,
+                            "output_dir": (
+                                output_dir if isinstance(output_dir, str) else None
+                            ),
+                            "attempt": details.get("attempt"),
+                            "max_attempts": details.get("max_attempts"),
+                            "keep_ui_lock": bool(details.get("keep_ui_lock", False)),
                             "submitted_at": now,
                             "updated_at": now,
                             "resume_pending": False,
@@ -642,6 +742,16 @@ class PiAdapter:
             session.finished_runs.add(run_id)
             session.running = False
             session.files.clear_inflight()
+            checkpoint_entry_id = payload.get("checkpoint_entry_id")
+            pending_events = getattr(session, "pending_checkpoint_events", {}).pop(
+                run_id, []
+            )
+            if isinstance(checkpoint_entry_id, str) and checkpoint_entry_id:
+                checkpoint_index = session.files.load_checkpoint_index()
+                checkpoint_index.update(
+                    {event_id: checkpoint_entry_id for event_id in pending_events}
+                )
+                session.files.save_checkpoint_index(checkpoint_index)
             logger.info(
                 "pi.run_finished conversation_id=%s run_id=%s outcome=%s",
                 session.session_id,
@@ -660,6 +770,7 @@ class PiAdapter:
                 session,
                 f"{source_event_id}:workflow",
                 source_event_id=source_event_id,
+                run_id=run_id,
             )
 
     def _record_inflight(
@@ -729,7 +840,27 @@ class PiAdapter:
     async def _sync_xyflow(self, session: _PiSession, xyflow: dict[str, Any]) -> None:
         dsl = await asyncio.to_thread(convert_xyflow_to_dsl, xyflow)
         _atomic_text(session.workspace_root / _WORKFLOW_PATH, dsl)
-        await self._emit_workflow(session, uuid4().hex, canvas=xyflow)
+        event_id = uuid4().hex
+        await self._emit_workflow(session, event_id, canvas=xyflow)
+        await self._ensure_runner(session)
+        assert session.runner is not None
+        checkpoint = await session.runner.request(
+            "context.append",
+            {
+                "content": (
+                    "<system_reminder>The workflow canvas supplied by the Product "
+                    "request was synchronized to the workspace.</system_reminder>"
+                ),
+                "details": {"workflow_event_id": event_id},
+                "trigger_turn": False,
+            },
+        )
+        if isinstance(checkpoint, dict) and isinstance(
+            checkpoint.get("checkpoint_entry_id"), str
+        ):
+            index = session.files.load_checkpoint_index()
+            index[event_id] = checkpoint["checkpoint_entry_id"]
+            session.files.save_checkpoint_index(index)
 
     async def _emit_workflow(
         self,
@@ -737,6 +868,7 @@ class PiAdapter:
         event_id: str,
         *,
         source_event_id: str | None = None,
+        run_id: str | None = None,
         canvas: dict[str, Any] | None = None,
     ) -> None:
         path = session.workspace_root / _WORKFLOW_PATH
@@ -774,6 +906,8 @@ class PiAdapter:
                 },
             )
         )
+        if run_id:
+            session.pending_checkpoint_events.setdefault(run_id, []).append(event_id)
 
     @staticmethod
     def _handle(session_id: str) -> SessionHandle:
@@ -825,6 +959,8 @@ def _safe_session_extra(extra: dict[str, Any]) -> dict[str, Any]:
         "storage_api_base_url",
         "dataset_cleaning_output_root",
         "dataset_extraction_output_root",
+        "training_analysis_api_base",
+        "training_analysis_timeout_seconds",
     }
     return {
         key: value
@@ -966,4 +1102,33 @@ def _atomic_text(path: Path, value: str) -> None:
         os.replace(temporary, path)
     except Exception:
         Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def _copy_workspace_for_fork(source: Path, target: Path) -> None:
+    if target.exists():
+        raise FileExistsError(f"Pi fork target already exists: {target.name}")
+    target.mkdir(mode=0o700, parents=False)
+    excluded_roots = {"product", "pi"}
+    sensitive_names = {".env", ".env.local", "credentials.json", "secrets.json"}
+
+    def copy_directory(source_dir: Path, target_dir: Path, *, root: bool) -> None:
+        for item in source_dir.iterdir():
+            if item.is_symlink():
+                continue
+            if root and item.name in excluded_roots:
+                continue
+            if item.name.lower() in sensitive_names:
+                continue
+            destination = target_dir / item.name
+            if item.is_dir():
+                destination.mkdir(mode=0o700)
+                copy_directory(item, destination, root=False)
+            elif item.is_file():
+                shutil.copy2(item, destination, follow_symlinks=False)
+
+    try:
+        copy_directory(source, target, root=True)
+    except Exception:
+        shutil.rmtree(target)
         raise

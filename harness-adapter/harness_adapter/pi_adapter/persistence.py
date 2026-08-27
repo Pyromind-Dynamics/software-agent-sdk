@@ -13,6 +13,8 @@ class PiSessionFiles:
         self.session_path = self.directory / "session.json"
         self.session_log_path = self.directory / "session.jsonl"
         self.inflight_path = self.directory / "inflight.json"
+        self.business_state_path = self.directory / "business-state.json"
+        self.checkpoint_index_path = self.directory / "fork-index.json"
 
     def initialize(self, session: dict[str, Any]) -> None:
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -31,6 +33,27 @@ class PiSessionFiles:
 
     def clear_inflight(self) -> None:
         self.inflight_path.unlink(missing_ok=True)
+
+    def load_business_state(self) -> dict[str, Any]:
+        if not self.business_state_path.is_file():
+            return {}
+        return _load_object(self.business_state_path)
+
+    def save_business_state(self, value: dict[str, Any]) -> None:
+        _atomic_json(self.business_state_path, value)
+
+    def load_checkpoint_index(self) -> dict[str, str]:
+        if not self.checkpoint_index_path.is_file():
+            return {}
+        value = _load_object(self.checkpoint_index_path)
+        return {
+            str(key): str(item)
+            for key, item in value.items()
+            if isinstance(key, str) and isinstance(item, str)
+        }
+
+    def save_checkpoint_index(self, value: dict[str, str]) -> None:
+        _atomic_json(self.checkpoint_index_path, value)
 
 
 def _load_object(path: Path) -> dict[str, Any]:

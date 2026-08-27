@@ -28,15 +28,6 @@ class WorkflowStatusDispatcher:
         auto_run: bool = True,
         from_workflow_debug: bool = False,
     ) -> RunWorkflowCallbackResult:
-        if from_workflow_debug:
-            return await deliver_run_workflow_status(
-                task_id=task_id,
-                status=status,
-                error_log=error_log,
-                conversation_id=conversation_id,
-                auto_run=auto_run,
-                from_workflow_debug=from_workflow_debug,
-            )
         normalized = normalize_platform_status(status)
         owner = self._runtime.resolve_external_task_owner(task_id)
         supplied_conversation_id = (
@@ -83,7 +74,6 @@ class WorkflowStatusDispatcher:
             status=status,
             error_summary=error_log,
             auto_run=auto_run,
-            from_workflow_debug=from_workflow_debug,
         )
         return RunWorkflowCallbackResult(
             outcome="delivered_async",

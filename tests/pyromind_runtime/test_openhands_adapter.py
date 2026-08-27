@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
 from uuid import UUID, uuid4
@@ -12,7 +13,13 @@ from harness_adapter.openhands_adapter.event_translator import (
 )
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
-from pyromind_runtime.ports.harness import SessionHandle
+from pyromind_runtime.domain.snapshot import WorkflowState
+from pyromind_runtime.ports.harness import (
+    ExternalTaskNotification,
+    ForkSpec,
+    ProductCheckpoint,
+    SessionHandle,
+)
 
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.pub_sub import Subscriber
@@ -31,6 +38,7 @@ from openhands.tools.pyromind_cleaning.definition import (
     RunDatasetCleaningObservation,
 )
 from openhands.tools.update_plan import PlanStep, UpdatePlanObservation
+from openhands.tools.workflow_debug import WorkflowDebugObservation
 
 
 def _message(
@@ -50,13 +58,14 @@ def _message(
 
 
 class _EventService:
-    def __init__(self) -> None:
+    def __init__(self, conversation_dir: Path | None = None) -> None:
         self.subscriber: Subscriber[Event] | None = None
         self.subscriber_id = uuid4()
         self.search_count = 0
         self.unsubscribed: list[UUID] = []
         self.removed_tasks: list[str] = []
         self.notification: dict[str, object] | None = None
+        self.conversation_dir = conversation_dir or Path()
 
     async def subscribe_to_events(self, subscriber: Subscriber[Event]) -> UUID:
         self.subscriber = subscriber
@@ -99,13 +108,21 @@ class _ConversationService:
     def __init__(self, conversation_id: UUID, event_service: _EventService) -> None:
         self.conversation_id = conversation_id
         self.event_service = event_service
+        self.fork_target: tuple[UUID, _EventService] | None = None
+        self.fork_calls: list[dict[str, object]] = []
 
     async def get_event_service(
         self, conversation_id: UUID, *, user_id: str | None = None
     ):
         if conversation_id == self.conversation_id and user_id == "42":
             return self.event_service
+        if self.fork_target is not None and conversation_id == self.fork_target[0]:
+            return self.fork_target[1]
         return None
+
+    async def fork_conversation_at_event(self, conversation_id: UUID, **kwargs):
+        self.fork_calls.append({"conversation_id": conversation_id, **kwargs})
+        return SimpleNamespace(id=kwargs["fork_id"]), "workflow-v1"
 
 
 async def test_adapter_subscribes_before_history_and_drains_live_buffer() -> None:
@@ -146,12 +163,15 @@ async def test_adapter_notifies_openhands_through_formal_harness_port() -> None:
 
     result = await adapter.notify_external_task(
         handle,
-        {
-            "task_id": "task-1",
-            "status": "succeeded",
-            "error_summary": None,
-            "auto_run": True,
-        },
+        ExternalTaskNotification(
+            task_id="task-1",
+            kind="data_cleaning",
+            run_id="run-1",
+            status="succeeded",
+            output_dir="/outputs/run-1",
+            visible_text="Task succeeded",
+            hidden_text="<system_reminder>continue</system_reminder>",
+        ),
         RequestContext(user_id="42"),
     )
 
@@ -161,6 +181,62 @@ async def test_adapter_notifies_openhands_through_formal_harness_port() -> None:
     assert event_service.notification["run"] is True
     assert event_service.notification["visible"] is True
     await adapter.close(handle)
+
+
+async def test_adapter_fork_delegates_native_checkpoint_without_backfill(
+    tmp_path,
+) -> None:
+    source_id = uuid4()
+    target_id = uuid4()
+    source_events = _EventService(tmp_path / source_id.hex)
+    target_dir = tmp_path / target_id.hex
+    (target_dir / "product").mkdir(parents=True)
+    (target_dir / "product" / "copied.json").write_text("source product")
+    target_events = _EventService(target_dir)
+    service = _ConversationService(source_id, source_events)
+    service.fork_target = (target_id, target_events)
+    adapter = OpenHandsAdapter(lambda: cast(ConversationService, service))
+    context = RequestContext(user_id="42")
+    source = await adapter.attach_session(source_id.hex, context)
+    checkpoint = ProductCheckpoint(
+        event_id="product-workflow-v1",
+        through_seq=2,
+        adapter_checkpoint_ref="native-workflow-event",
+        workflow=WorkflowState(
+            resource_id="pyromind_workflow",
+            version="v1",
+            dsl="workflow = InputNode()",
+            canvas=None,
+        ),
+    )
+
+    target = await adapter.fork(
+        source,
+        ForkSpec(
+            source_conversation_id=source_id.hex,
+            target_conversation_id=target_id.hex,
+            event_id=checkpoint.event_id,
+            title="Forked",
+        ),
+        checkpoint,
+        context,
+    )
+
+    assert service.fork_calls == [
+        {
+            "conversation_id": source_id,
+            "event_id": "native-workflow-event",
+            "fork_id": target_id,
+            "title": "Forked",
+            "tags": {"pyromind_app": "true"},
+            "user_id": "42",
+        }
+    ]
+    assert not (target_dir / "product").exists()
+    assert target_events.search_count == 0
+    assert (await anext(adapter.subscribe(target))).type == "history.synced"
+    await adapter.close(target)
+    await adapter.close(source)
 
 
 def test_translator_ignores_empty_streaming_delta() -> None:
@@ -323,3 +399,39 @@ def test_translator_projects_openhands_data_cleaning_submission() -> None:
 
     assert translated[1].type == "external_task.submitted"
     assert translated[1].payload["kind"] == "data_cleaning"
+
+
+def test_translator_projects_workflow_debug_without_output_directory() -> None:
+    translated = translate_event(
+        TranslationState(session_id="conversation-1"),
+        ObservationEvent(
+            id="debug-observation",
+            source="environment",
+            action_id="debug-action",
+            tool_name="workflow_debug",
+            tool_call_id="debug-call",
+            observation=WorkflowDebugObservation.from_text(
+                "submitted",
+                status="Pending",
+                task_id="debug-task",
+                attempt=2,
+                max_attempts=10,
+                keep_ui_lock=True,
+            ),
+        ),
+    )
+
+    assert translated[1].type == "external_task.submitted"
+    assert translated[1].payload == {
+        "task_id": "debug-task",
+        "kind": "workflow_debug",
+        "run_id": "debug-task",
+        "status": "pending",
+        "output_dir": None,
+        "attempt": 2,
+        "max_attempts": 10,
+        "keep_ui_lock": True,
+        "submitted_at": translated[1].occurred_at.isoformat(),
+        "updated_at": translated[1].occurred_at.isoformat(),
+        "resume_pending": False,
+    }

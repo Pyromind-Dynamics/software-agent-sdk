@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { setImmediate } from "node:timers";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { PiEventNormalizer } from "./pi-events.js";
 import { PiOutcomeNormalizer } from "./pi-outcome.js";
 import { createPiSession, parsePromptContent, type ParsedPrompt } from "./pi-session.js";
@@ -32,6 +33,8 @@ export class PiAgentRuntime {
     if (method === "steer") return this.prompt(params, true);
     if (method === "cancel") return this.cancel();
     if (method === "notify") return this.notify(params);
+    if (method === "context.append") return this.appendContext(params);
+    if (method === "fork") return this.fork(params);
     if (method === "close") return this.close();
     throw new Error(`unknown runner method: ${method}`);
   }
@@ -95,7 +98,10 @@ export class PiAgentRuntime {
       runId,
       occurredAt: new Date().toISOString(),
       kind: "run.finished",
-      payload: { outcome: JSON.parse(JSON.stringify(outcome)) as JsonObject },
+      payload: {
+        outcome: JSON.parse(JSON.stringify(outcome)) as JsonObject,
+        checkpoint_entry_id: this.session?.sessionManager?.getLeafId() ?? null,
+      },
     };
     this.peer.emit(event);
   }
@@ -122,6 +128,39 @@ export class PiAgentRuntime {
     }
     this.startNotification(runId, message);
     return { accepted: true, queued: false };
+  }
+
+  private async appendContext(params: JsonObject): Promise<JsonValue> {
+    const session = this.requireSession();
+    const content = requiredString(params, "content");
+    const details = isObject(params.details) ? params.details : {};
+    const triggerTurn = params.trigger_turn === true;
+    await session.sendCustomMessage(
+      {
+        customType: "pyromind.context",
+        content,
+        display: false,
+        details,
+      },
+      { triggerTurn },
+    );
+    return {
+      accepted: true,
+      trigger_turn: triggerTurn,
+      checkpoint_entry_id: session.sessionManager.getLeafId(),
+    };
+  }
+
+  private fork(params: JsonObject): JsonValue {
+    const sourceSession = this.requireSession().sessionManager.getSessionFile();
+    if (!sourceSession) throw new Error("Pi source session is not persisted");
+    const leafId = requiredString(params, "leaf_id");
+    const targetSessionDir = requiredString(params, "target_session_dir");
+    const targetCwd = requiredString(params, "target_cwd");
+    const manager = SessionManager.open(sourceSession, targetSessionDir, targetCwd);
+    const sessionPath = manager.createBranchedSession(leafId);
+    if (!sessionPath) throw new Error("Pi branched session was not persisted");
+    return { session_path: sessionPath };
   }
 
   private startNotification(

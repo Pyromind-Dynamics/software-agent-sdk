@@ -3,15 +3,21 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import ProductCommand
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent, HarnessEventType
-from pyromind_runtime.domain.snapshot import ConversationSnapshot
-from pyromind_runtime.ports.harness import SessionHandle, SessionSpec
+from pyromind_runtime.ports.harness import (
+    ExternalTaskNotification,
+    ForkSpec,
+    ProductCheckpoint,
+    RestoreWorkflowResult,
+    RestoreWorkflowSpec,
+    SessionHandle,
+    SessionSpec,
+)
 
 
 class FakeAdapter:
@@ -20,7 +26,9 @@ class FakeAdapter:
         cancel=True,
         permission_reply=True,
         partial_message=True,
+        fork=True,
         workflow_rollback=True,
+        external_task_resume=True,
     )
 
     def __init__(self, harness_id: str = "openhands") -> None:
@@ -30,8 +38,10 @@ class FakeAdapter:
         self.closed: list[str] = []
         self.created_specs: list[SessionSpec] = []
         self.external_task_notifications: list[
-            tuple[str, dict[str, Any], RequestContext]
+            tuple[str, ExternalTaskNotification, RequestContext]
         ] = []
+        self.forks: list[tuple[ForkSpec, ProductCheckpoint]] = []
+        self.restores: list[RestoreWorkflowSpec] = []
 
     async def describe(self):
         return "fake", self.capabilities
@@ -89,15 +99,33 @@ class FakeAdapter:
     async def fork(
         self,
         handle: SessionHandle,
-        snapshot: ConversationSnapshot,
+        spec: ForkSpec,
+        checkpoint: ProductCheckpoint,
         context: RequestContext,
     ) -> SessionHandle:
-        raise NotImplementedError
+        self.forks.append((spec, checkpoint))
+        source = Path(self.created_specs[0].workspace_root)
+        if source.name != spec.source_conversation_id:
+            source /= spec.source_conversation_id
+        target = source.parent / spec.target_conversation_id
+        (target / "public_data").mkdir(parents=True)
+        handle = self._open(spec.target_conversation_id)
+        self.synced(spec.target_conversation_id)
+        return handle
+
+    async def restore_workflow(
+        self,
+        handle: SessionHandle,
+        spec: RestoreWorkflowSpec,
+        context: RequestContext,
+    ) -> RestoreWorkflowResult:
+        self.restores.append(spec)
+        return RestoreWorkflowResult(workflow_file_action="updated")
 
     async def notify_external_task(
         self,
         handle: SessionHandle,
-        notification: dict[str, Any],
+        notification: ExternalTaskNotification,
         context: RequestContext,
     ) -> JsonObject:
         self.external_task_notifications.append(

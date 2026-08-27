@@ -39,6 +39,7 @@ class TranslationState:
     last_status: str | None = None
     last_usage: JsonObject | None = None
     external_tasks: dict[str, JsonObject] = field(default_factory=dict)
+    suppress_workflow_events: int = 0
 
     def begin_command(self, command_id: str) -> None:
         self.run_id = command_id
@@ -304,6 +305,9 @@ def _translate_state_update(
             )
         )
     elif event.key == PYROMIND_WORKFLOW_EVENT_KEY:
+        if state.suppress_workflow_events:
+            state.suppress_workflow_events -= 1
+            return ()
         workflow = _workflow_payload(event.value, event.id)
         if workflow is not None:
             output.append(
@@ -356,27 +360,32 @@ def _external_task_submission(
     kinds = {
         "df_submit_pipeline": "data_preparation",
         "run_dataset_cleaning": "data_cleaning",
+        "workflow_debug": "workflow_debug",
     }
     kind = kinds.get(event.tool_name)
     if kind is None or event.observation.is_error:
         return None
     details = event.observation.model_dump(mode="json")
     task_id = details.get("task_id")
-    run_id = details.get("run_id")
+    run_id = details.get("run_id") or task_id
     output_dir = details.get("output_dir")
-    identifiers = (task_id, run_id, output_dir)
+    identifiers = (task_id, run_id)
     if not all(isinstance(value, str) and value for value in identifiers):
         return None
     assert isinstance(task_id, str)
     assert isinstance(run_id, str)
-    assert isinstance(output_dir, str)
+    if kind != "workflow_debug" and not (isinstance(output_dir, str) and output_dir):
+        return None
     status = _external_task_status(details.get("status"))
     payload: JsonObject = {
         "task_id": task_id,
         "kind": kind,
         "run_id": run_id,
         "status": status,
-        "output_dir": output_dir,
+        "output_dir": output_dir if isinstance(output_dir, str) else None,
+        "attempt": details.get("attempt"),
+        "max_attempts": details.get("max_attempts"),
+        "keep_ui_lock": bool(details.get("keep_ui_lock", False)),
         "submitted_at": event.timestamp,
         "updated_at": event.timestamp,
         "resume_pending": False,

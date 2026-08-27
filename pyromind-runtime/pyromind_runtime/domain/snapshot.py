@@ -120,12 +120,15 @@ class UsageState(ContractModel):
 
 class ExternalTaskState(ContractModel):
     task_id: str = Field(min_length=1)
-    kind: Literal["data_cleaning", "data_preparation"]
-    run_id: str = Field(min_length=1)
+    kind: Literal["data_cleaning", "data_preparation", "workflow_debug"]
+    run_id: str | None = None
     status: Literal[
         "pending", "running", "succeeded", "failed", "terminated", "stopped"
     ]
-    output_dir: str
+    output_dir: str | None = None
+    attempt: int | None = Field(default=None, ge=0)
+    max_attempts: int | None = Field(default=None, ge=1)
+    keep_ui_lock: bool = False
     submitted_at: str
     updated_at: str
     resume_pending: bool = False

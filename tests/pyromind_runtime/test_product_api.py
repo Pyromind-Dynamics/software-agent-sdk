@@ -10,6 +10,7 @@ from pyromind_agent_server.app import create_app
 from pyromind_agent_server.bootstrap import install_product_api
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 
 from openhands.agent_server.config import Config
 from openhands.agent_server.conversation_service import ConversationService
@@ -142,7 +143,9 @@ def test_install_product_api_does_not_modify_openhands_routes() -> None:
     assert app.router.lifespan_context is not original
 
 
-async def test_product_api_creates_pi_metadata_and_rejects_fork(tmp_path) -> None:
+async def test_product_api_creates_pi_metadata_and_reports_missing_checkpoint(
+    tmp_path,
+) -> None:
     conversations = tmp_path / "conversations"
     conversations.mkdir()
     runtime = ConversationRuntime(
@@ -173,6 +176,15 @@ async def test_product_api_creates_pi_metadata_and_rejects_fork(tmp_path) -> Non
             f"/api/v2/pyromind/conversations/{conversation_id}/forks",
             json={"eventId": "event-1"},
         )
+        workflow_event = next(
+            event
+            for event in FileProductStore(conversations / conversation_id).replay()
+            if event.type == "workflow.updated"
+        )
+        valid_fork = await client.post(
+            f"/api/v2/pyromind/conversations/{conversation_id}/forks",
+            json={"eventId": workflow_event.event_id, "title": "Pi fork"},
+        )
     metadata = (conversations / conversation_id / "product" / "meta.json").read_text()
     assert '"harness_id":"pi"' in metadata
     assert "request-secret" not in metadata
@@ -185,5 +197,13 @@ async def test_product_api_creates_pi_metadata_and_rejects_fork(tmp_path) -> Non
     )
     assert workflow.read_text() == "# workflow: Workflow"
     assert created.json()["current_workflow"]["canvas"]["name"] == "Workflow"
-    assert forked.status_code == 409
+    assert forked.status_code == 404
+    assert forked.json()["detail"]["code"] == "checkpoint_not_found"
+    assert valid_fork.status_code == 201
+    target_id = valid_fork.json()["conversation_id"]
+    assert target_id != conversation_id
+    assert valid_fork.json()["current_workflow"]["version"] == (
+        created.json()["current_workflow"]["version"]
+    )
+    assert (conversations / target_id / "pi" / "session.jsonl").is_file()
     await runtime.close()

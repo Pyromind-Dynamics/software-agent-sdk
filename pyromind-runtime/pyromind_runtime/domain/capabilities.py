@@ -10,4 +10,5 @@ class HarnessCapabilities(ContractModel):
     partial_message: bool = False
     fork: bool = False
     workflow_rollback: bool = False
+    external_task_resume: bool = False
     native_workspace_tools: frozenset[str] = frozenset()

@@ -12,6 +12,12 @@ class ExternalTaskRegistry(Protocol):
 
     def resolve(self, conversation_id: str, task_id: str) -> JsonObject | None: ...
 
+    def register(
+        self,
+        conversation_id: str,
+        payload: JsonObject,
+    ) -> None: ...
+
     def update_status(
         self,
         conversation_id: str,

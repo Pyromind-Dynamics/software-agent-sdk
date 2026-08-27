@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import harness_adapter.pi_adapter.adapter as pi_adapter_module
 import httpx
@@ -14,16 +15,26 @@ from harness_adapter.pi_adapter.adapter import (
     _resolve_model,
     _session_config,
 )
-from harness_adapter.pi_adapter.business_tool_host import PyromindBusinessToolHost
+from harness_adapter.pi_adapter.business_tool_host import (
+    PyromindBusinessToolHost,
+    ToolExecutionContext,
+)
 from harness_adapter.pi_adapter.business_tools import (
     execute_validation_tool,
     validation_tool_spec,
 )
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.ports.harness import SessionSpec
+from pyromind_runtime.domain.snapshot import WorkflowState
+from pyromind_runtime.ports.harness import (
+    ExternalTaskNotification,
+    ForkSpec,
+    ProductCheckpoint,
+    RestoreWorkflowSpec,
+    SessionSpec,
+)
 
 from openhands.agent_server.pyromind_router import PyromindLLMConfig
 
@@ -175,7 +186,7 @@ async def test_runner_start_receives_configured_knowledge_root(
         await adapter.close(handle)
 
 
-async def test_runner_loads_three_named_skills_and_eight_business_tools(
+async def test_runner_loads_five_named_skills_and_eleven_business_tools(
     tmp_path, monkeypatch
 ) -> None:
     captured = {}
@@ -208,6 +219,8 @@ async def test_runner_loads_three_named_skills_and_eight_business_tools(
             "generate-workflow-dsl",
             "data-cleaning",
             "data-preparation",
+            "debug-workflow",
+            "training-analysis",
         ]
         assert {item["name"] for item in captured["tools"]} == {
             "validate_workflow_dsl",
@@ -218,6 +231,9 @@ async def test_runner_loads_three_named_skills_and_eight_business_tools(
             "df_submit_pipeline",
             "df_check_progress",
             "df_stop_task",
+            "workflow_debug",
+            "analyze_task_failure",
+            "training_analysis",
         }
     finally:
         await adapter.close(handle)
@@ -228,10 +244,81 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
     roots = [
         repository / ".agents" / "skills" / "data-cleaning",
         repository / ".agents" / "skills" / "data-preparation",
+        repository / ".agents" / "skills" / "training-analysis",
     ]
     specs = PyromindBusinessToolHost(roots).specs()
-    assert len(specs) == 8
+    assert len(specs) == 11
     assert all(spec["input_schema"].get("type") == "object" for spec in specs)
+
+
+async def test_pi_host_synthesizes_debug_task_and_persists_only_attempt_budget(
+    tmp_path,
+) -> None:
+    repository = Path(pi_adapter_module.__file__).parents[3]
+    host = PyromindBusinessToolHost(
+        [
+            repository / ".agents" / "skills" / "data-cleaning",
+            repository / ".agents" / "skills" / "data-preparation",
+            repository / ".agents" / "skills" / "training-analysis",
+        ]
+    )
+
+    class FakeAction(BaseModel):
+        pass
+
+    class FakeObservation:
+        is_error = False
+        to_llm_content = ()
+
+        @staticmethod
+        def model_dump(*_args, **_kwargs):
+            return {
+                "task_id": "debug-task",
+                "status": "Pending",
+                "attempt": 4,
+                "max_attempts": 10,
+                "keep_ui_lock": True,
+            }
+
+    class FakeTool:
+        action_type = FakeAction
+        executor = None
+
+        def __call__(self, _action, facade):
+            facade.state.agent_state["pyromind_workflow_attempts"] = 4
+            facade.state.agent_state["must_not_persist"] = "secret"
+            return FakeObservation()
+
+    host._factories["workflow_debug"] = cast(Any, lambda _context: FakeTool())
+    result = await host.execute(
+        "workflow_debug",
+        {},
+        ToolExecutionContext(
+            conversation_id="conversation-1",
+            workspace_root=tmp_path,
+            request_context=RequestContext(
+                user_id="42",
+                cookie="auth=request-secret",
+                authorization="Bearer request-secret",
+            ),
+            model_configuration={"model": "gpt-5", "api_key": "request-secret"},
+        ),
+    )
+
+    assert result["signals"] == [
+        {
+            "type": "external_task.submitted",
+            "task": {
+                "task_id": "debug-task",
+                "kind": "workflow_debug",
+                "status": "Pending",
+            },
+        }
+    ]
+    persisted = PiSessionFiles(tmp_path).business_state_path.read_text()
+    assert json.loads(persisted) == {"pyromind_workflow_attempts": 4}
+    assert "request-secret" not in persisted
+    assert "must_not_persist" not in persisted
 
 
 def test_model_resolution_rules() -> None:
@@ -323,7 +410,7 @@ def test_session_config_persists_model_api_resolution() -> None:
 
 def test_pyromind_llm_config_rejects_unknown_model_api() -> None:
     with pytest.raises(ValidationError):
-        PyromindLLMConfig(model="gpt-5", api="other")
+        PyromindLLMConfig(model="gpt-5", api=cast(Any, "other"))
 
 
 def test_pyromind_llm_config_rejects_invalid_context_window() -> None:
@@ -353,8 +440,8 @@ async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
         "payload": {"outcome": {"status": "completed", "stop_reason": "stop"}},
     }
 
-    await adapter._runner_event(session, frame)
-    await adapter._runner_event(session, {**frame, "eventId": "e2"})
+    await adapter._runner_event(cast(Any, session), frame)
+    await adapter._runner_event(cast(Any, session), {**frame, "eventId": "e2"})
 
     assert session.queue.qsize() == 1
     assert (await session.queue.get()).payload["status"] == "idle"
@@ -401,7 +488,7 @@ async def test_adapter_projects_generic_write_completion_to_workflow(
         },
     }
 
-    await adapter._runner_event(session, frame)
+    await adapter._runner_event(cast(Any, session), frame)
 
     assert emitted == [("write-event:workflow", "write-event")]
     assert (await session.queue.get()).type == "operation.completed"
@@ -437,3 +524,158 @@ async def test_real_runner_starts_without_persisting_request_api_key(tmp_path) -
         assert event.type == "history.synced"
     finally:
         await adapter.close(handle)
+
+
+async def test_pi_adapter_forks_native_session_and_sanitizes_workspace(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, _config) -> None:
+            return None
+
+        async def request(self, method, params):
+            assert method == "fork"
+            target = Path(params["target_session_dir"]) / "branched.jsonl"
+            target.write_text('{"type":"session"}\n', encoding="utf-8")
+            return {"session_path": str(target)}
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations)
+    context = RequestContext(user_id="42")
+    source_handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="source",
+            user_id="42",
+            workspace_root=str(conversations / "source"),
+            model_configuration={"model": "gpt-5", "api_key": "request-secret"},
+        ),
+        context,
+    )
+    source = conversations / "source"
+    (source / "public_data").mkdir()
+    (source / "public_data" / "artifact.txt").write_text("safe", encoding="utf-8")
+    current_workflow = source / "public_data" / "workflow_canvas" / "workflow.py"
+    current_workflow.parent.mkdir()
+    current_workflow.write_text("workflow = OutputNode()", encoding="utf-8")
+    (source / "product").mkdir()
+    (source / "product" / "snapshot.json").write_text("private", encoding="utf-8")
+    (source / ".env").write_text("TOKEN=secret", encoding="utf-8")
+    PiSessionFiles(source).save_checkpoint_index({"workflow-v1": "leaf-1"})
+    checkpoint = ProductCheckpoint(
+        event_id="workflow-v1",
+        through_seq=2,
+        workflow=WorkflowState(
+            resource_id="pyromind_workflow",
+            version="v1",
+            dsl="workflow = InputNode()",
+            canvas=None,
+        ),
+    )
+
+    target_handle = await adapter.fork(
+        source_handle,
+        ForkSpec(
+            source_conversation_id="source",
+            target_conversation_id="target",
+            event_id="workflow-v1",
+        ),
+        checkpoint,
+        context,
+    )
+
+    target = conversations / "target"
+    assert target_handle.session_id == "target"
+    assert (target / "public_data" / "artifact.txt").read_text() == "safe"
+    assert (target / "public_data" / "workflow_canvas" / "workflow.py").read_text() == (
+        "workflow = InputNode()"
+    )
+    assert not (target / "product").exists()
+    assert not (target / ".env").exists()
+    assert (target / "pi" / "session.jsonl").is_file()
+    assert "request-secret" not in (target / "pi" / "session.json").read_text()
+    await adapter.close(target_handle)
+    await adapter.close(source_handle)
+
+
+async def test_pi_adapter_restores_workflow_and_resets_debug_budget(
+    tmp_path, monkeypatch
+) -> None:
+    requests = []
+
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, _config) -> None:
+            return None
+
+        async def request(self, method, params):
+            requests.append((method, params))
+            return {"accepted": True, "checkpoint_entry_id": "leaf-restored"}
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations)
+    context = RequestContext(user_id="42")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="restore-source",
+            user_id="42",
+            workspace_root=str(conversations / "restore-source"),
+            model_configuration={"model": "gpt-5", "api_key": "request-secret"},
+        ),
+        context,
+    )
+    root = conversations / "restore-source"
+    files = PiSessionFiles(root)
+    files.save_business_state({"pyromind_workflow_attempts": 7})
+    checkpoint = ProductCheckpoint(
+        event_id="workflow-v1",
+        through_seq=2,
+        workflow=WorkflowState(
+            resource_id="pyromind_workflow",
+            version="v1",
+            dsl="workflow = InputNode()",
+            canvas=None,
+        ),
+    )
+
+    restored = await adapter.restore_workflow(
+        handle,
+        RestoreWorkflowSpec(command_id="rollback-1", checkpoint=checkpoint),
+        context,
+    )
+    await adapter.notify_external_task(
+        handle,
+        ExternalTaskNotification(
+            task_id="debug-task",
+            kind="workflow_debug",
+            run_id="debug-task",
+            status="succeeded",
+            hidden_text="<system_reminder>done</system_reminder>",
+            reset_attempt_budget=True,
+        ),
+        context,
+    )
+
+    workflow = root / "public_data" / "workflow_canvas" / "workflow.py"
+    assert restored.workflow_file_action == "updated"
+    assert workflow.read_text() == "workflow = InputNode()"
+    assert files.load_checkpoint_index()["rollback:rollback-1:workflow"] == (
+        "leaf-restored"
+    )
+    assert files.load_business_state() == {"pyromind_workflow_attempts": 0}
+    assert [method for method, _params in requests] == ["context.append", "notify"]
+    await adapter.close(handle)
