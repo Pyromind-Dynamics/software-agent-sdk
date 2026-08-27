@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import ProductCommand
@@ -28,6 +29,9 @@ class FakeAdapter:
         self.sent: list[tuple[str, ProductCommand, RequestContext]] = []
         self.closed: list[str] = []
         self.created_specs: list[SessionSpec] = []
+        self.external_task_notifications: list[
+            tuple[str, dict[str, Any], RequestContext]
+        ] = []
 
     async def describe(self):
         return "fake", self.capabilities
@@ -89,6 +93,17 @@ class FakeAdapter:
         context: RequestContext,
     ) -> SessionHandle:
         raise NotImplementedError
+
+    async def notify_external_task(
+        self,
+        handle: SessionHandle,
+        notification: dict[str, Any],
+        context: RequestContext,
+    ) -> JsonObject:
+        self.external_task_notifications.append(
+            (handle.session_id, notification, context)
+        )
+        return {"accepted": True}
 
     def subscribe(self, handle: SessionHandle) -> AsyncIterator[HarnessEvent]:
         queue = self.queues[handle.session_id]

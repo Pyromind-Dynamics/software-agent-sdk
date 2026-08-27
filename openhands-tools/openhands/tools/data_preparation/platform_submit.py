@@ -38,6 +38,10 @@ from openhands.tools.data_preparation.runner import (
     runtime_public_names,
     validate_managed_image_pipeline,
 )
+from openhands.tools.data_preparation.workspace_paths import (
+    resolve_workspace_file,
+    workspace_relative_path,
+)
 from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_AGENT_STORAGE_ROOT,
     _decode_json_response,
@@ -146,8 +150,8 @@ class DfSubmitPipelineAction(Action):
     script_path: str | None = Field(
         default=None,
         description=(
-            "Local pipeline script for a new run or compatible resume, e.g."
-            " '/workspace/conversations/<id>/public_data/data-preparation/pipeline.py'."
+            "Workspace-relative pipeline script for a new run or compatible resume,"
+            " e.g. 'public_data/data-preparation/pipeline.py'."
             " A strict resume may omit it and reuse the prior frozen script."
         ),
     )
@@ -479,6 +483,7 @@ class DfSubmitPipelineExecutor(
             prior_run: DataPreparationTaskAssociation | None = None
             should_stage_runtime = False
             should_stage_script = False
+            local_script_path: str | None = None
 
             if resumed:
                 if action.resume_run_id is None:
@@ -517,8 +522,10 @@ class DfSubmitPipelineExecutor(
                     runtime_storage_dir = prior_run.runtime_storage_dir
                     image_utils_api_version = prior_run.image_utils_api_version
                 else:
-                    script_path = _validate_local_pipeline(action.script_path)
-                    pipeline_fingerprint = _file_sha256(Path(script_path))
+                    local_script_path, script_path = _validate_local_pipeline(
+                        conversation, action.script_path
+                    )
+                    pipeline_fingerprint = _file_sha256(Path(local_script_path))
                     frozen_script_name = f"pipeline-r{execution_revision}.py"
                     runtime_fingerprint = self._runtime_fingerprint()
                     runtime_dir_name = f"runtime-r{execution_revision}"
@@ -529,7 +536,7 @@ class DfSubmitPipelineExecutor(
                     should_stage_runtime = True
                     should_stage_script = True
                     if output_schema == "vision":
-                        self._preflight_managed_image_pipeline(Path(script_path))
+                        self._preflight_managed_image_pipeline(Path(local_script_path))
                 llm_env = _build_llm_env(conversation, model_profile)
                 model_fingerprint = _model_fingerprint(llm_env)
                 changed_dimensions = _changed_dimensions(
@@ -561,7 +568,9 @@ class DfSubmitPipelineExecutor(
                     raise ValueError("resume_run_id is only valid when mode='resume'.")
                 if action.script_path is None:
                     raise ValueError("script_path is required for a new full run.")
-                script_path = _validate_local_pipeline(action.script_path)
+                local_script_path, script_path = _validate_local_pipeline(
+                    conversation, action.script_path
+                )
                 run_id = uuid.uuid4()
                 output_root = (
                     self._output_root
@@ -574,7 +583,7 @@ class DfSubmitPipelineExecutor(
                 output_schema = action.output_schema
                 prompt_fingerprint = action.prompt_fingerprint
                 frozen_script_name = "pipeline.py"
-                pipeline_fingerprint = _file_sha256(Path(script_path))
+                pipeline_fingerprint = _file_sha256(Path(local_script_path))
                 llm_env = _build_llm_env(conversation, model_profile)
                 model_fingerprint = _model_fingerprint(llm_env)
                 runtime_fingerprint = self._runtime_fingerprint()
@@ -586,7 +595,7 @@ class DfSubmitPipelineExecutor(
                 should_stage_runtime = True
                 should_stage_script = True
                 if output_schema == "vision":
-                    self._preflight_managed_image_pipeline(Path(script_path))
+                    self._preflight_managed_image_pipeline(Path(local_script_path))
                 changed_dimensions = []
 
             command = _build_dataflow_command(
@@ -609,6 +618,17 @@ class DfSubmitPipelineExecutor(
                 ),
             )
             workflow = _build_dataflow_workflow(action, run_id, command)
+        except PipelineResolutionError as exc:
+            return DfSubmitPipelineObservation.from_text(
+                text=(
+                    f"{exc} Use a workspace-relative path such as "
+                    "'public_data/data-preparation/pipeline.py'."
+                ),
+                status="Failed",
+                failure_stage="pipeline_resolution",
+                retryable=False,
+                is_error=True,
+            )
         except ValueError as exc:
             return DfSubmitPipelineObservation.from_text(
                 text=str(exc),
@@ -647,8 +667,10 @@ class DfSubmitPipelineExecutor(
                     raise ValueError("DataFlow runtime cache path is unavailable.")
                 self._stage_runtime_files(runtime_storage_dir, conversation)
             if should_stage_script:
+                if local_script_path is None:
+                    raise ValueError("Resolved pipeline script is unavailable.")
                 self._stage_script(
-                    script_path,
+                    local_script_path,
                     output_dir,
                     conversation,
                     frozen_script_name=frozen_script_name,
@@ -1141,13 +1163,25 @@ def _build_llm_env(
     return build_dataflow_env(conversation, model_profile)
 
 
-def _validate_local_pipeline(script_path: str) -> str:
-    path = Path(script_path)
-    if not path.is_file():
-        raise ValueError(f"Pipeline script not found locally: {script_path}")
+class PipelineResolutionError(ValueError):
+    pass
+
+
+def _validate_local_pipeline(
+    conversation: BaseConversation,
+    script_path: str,
+) -> tuple[str, str]:
+    try:
+        path = resolve_workspace_file(
+            conversation,
+            script_path,
+            allow_virtual_conversation_path=True,
+        )
+    except ValueError as exc:
+        raise PipelineResolutionError(str(exc)) from exc
     if path.suffix.lower() != ".py":
-        raise ValueError("script_path must point to a Python .py file.")
-    return str(path)
+        raise PipelineResolutionError("script_path must point to a Python .py file.")
+    return str(path), workspace_relative_path(conversation, path)
 
 
 def _file_sha256(path: Path) -> str:

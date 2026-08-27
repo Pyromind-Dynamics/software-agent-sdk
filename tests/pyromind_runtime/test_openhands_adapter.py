@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
 from types import SimpleNamespace
-from typing import cast
+from typing import Literal, cast
 from uuid import UUID, uuid4
 
 from harness_adapter.openhands_adapter import OpenHandsAdapter
@@ -10,6 +11,8 @@ from harness_adapter.openhands_adapter.event_translator import (
     translate_event,
 )
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.events import HarnessEvent
+from pyromind_runtime.ports.harness import SessionHandle
 
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.pub_sub import Subscriber
@@ -18,12 +21,24 @@ from openhands.sdk.event import (
     Event,
     MessageEvent,
     ObservationEvent,
+    StreamingDeltaEvent,
 )
 from openhands.sdk.llm import Message, TextContent
+from openhands.tools.data_preparation.platform_submit import (
+    DfSubmitPipelineObservation,
+)
+from openhands.tools.pyromind_cleaning.definition import (
+    RunDatasetCleaningObservation,
+)
 from openhands.tools.update_plan import PlanStep, UpdatePlanObservation
 
 
-def _message(source: str, text: str, *, event_id: str) -> MessageEvent:
+def _message(
+    source: Literal["agent", "user", "environment", "hook"],
+    text: str,
+    *,
+    event_id: str,
+) -> MessageEvent:
     return MessageEvent(
         id=event_id,
         source=source,
@@ -40,6 +55,8 @@ class _EventService:
         self.subscriber_id = uuid4()
         self.search_count = 0
         self.unsubscribed: list[UUID] = []
+        self.removed_tasks: list[str] = []
+        self.notification: dict[str, object] | None = None
 
     async def subscribe_to_events(self, subscriber: Subscriber[Event]) -> UUID:
         self.subscriber = subscriber
@@ -57,6 +74,25 @@ class _EventService:
     async def unsubscribe_from_events(self, subscriber_id: UUID) -> bool:
         self.unsubscribed.append(subscriber_id)
         return True
+
+    async def remove_active_long_task(self, task_id: str):
+        self.removed_tasks.append(task_id)
+        return SimpleNamespace(status="Running")
+
+    async def send_internal_context(
+        self,
+        content,
+        *,
+        run=False,
+        visible=False,
+        extended_content=None,
+    ):
+        self.notification = {
+            "content": content,
+            "run": run,
+            "visible": visible,
+            "extended_content": extended_content,
+        }
 
 
 class _ConversationService:
@@ -80,7 +116,7 @@ async def test_adapter_subscribes_before_history_and_drains_live_buffer() -> Non
     handle = await adapter.attach_session(
         conversation_id.hex, RequestContext(user_id="42")
     )
-    events = adapter.subscribe(handle)
+    events = cast(AsyncGenerator[HarnessEvent], adapter.subscribe(handle))
 
     received = [await anext(events) for _ in range(5)]
     assert [event.type for event in received] == [
@@ -90,11 +126,57 @@ async def test_adapter_subscribes_before_history_and_drains_live_buffer() -> Non
         "message.completed",
         "history.synced",
     ]
-    assert received[0].payload["content"][0]["text"] == "history"
-    assert received[2].payload["content"][0]["text"] == "live"
+    historic_content = cast(list[dict[str, str]], received[0].payload["content"])
+    live_content = cast(list[dict[str, str]], received[2].payload["content"])
+    assert historic_content[0]["text"] == "history"
+    assert live_content[0]["text"] == "live"
     await events.aclose()
     await adapter.close(handle)
     assert event_service.unsubscribed == [event_service.subscriber_id]
+
+
+async def test_adapter_notifies_openhands_through_formal_harness_port() -> None:
+    conversation_id = uuid4()
+    event_service = _EventService()
+    service = _ConversationService(conversation_id, event_service)
+    adapter = OpenHandsAdapter(lambda: cast(ConversationService, service))
+    handle: SessionHandle = await adapter.attach_session(
+        conversation_id.hex, RequestContext(user_id="42")
+    )
+
+    result = await adapter.notify_external_task(
+        handle,
+        {
+            "task_id": "task-1",
+            "status": "succeeded",
+            "error_summary": None,
+            "auto_run": True,
+        },
+        RequestContext(user_id="42"),
+    )
+
+    assert result == {"accepted": True}
+    assert event_service.removed_tasks == ["task-1"]
+    assert event_service.notification is not None
+    assert event_service.notification["run"] is True
+    assert event_service.notification["visible"] is True
+    await adapter.close(handle)
+
+
+def test_translator_ignores_empty_streaming_delta() -> None:
+    state = TranslationState(session_id="conversation-1")
+
+    assert translate_event(state, StreamingDeltaEvent(content=None)) == ()
+    assert translate_event(state, StreamingDeltaEvent(content="")) == ()
+    assert state.streaming_message_id is None
+
+    translated = translate_event(state, StreamingDeltaEvent(content="hello"))
+
+    assert [event.type for event in translated] == [
+        "message.started",
+        "message.delta",
+    ]
+    assert translated[1].payload["text"] == "hello"
 
 
 def test_translator_preserves_workflow_and_usage_from_old_events() -> None:
@@ -174,3 +256,70 @@ def test_translator_preserves_structured_update_plan_steps() -> None:
         ],
         "explanation": "Continue",
     }
+
+
+def test_translator_projects_openhands_external_task_lifecycle() -> None:
+    state = TranslationState(session_id="conversation-1")
+    submitted = translate_event(
+        state,
+        ObservationEvent(
+            id="submit-observation",
+            source="environment",
+            action_id="submit-action",
+            tool_name="df_submit_pipeline",
+            tool_call_id="submit-call",
+            observation=DfSubmitPipelineObservation.from_text(
+                "submitted",
+                status="Running",
+                task_id="task-1",
+                run_id="run-1",
+                output_dir="/outputs/run-1",
+            ),
+        ),
+    )
+    stopped = translate_event(
+        state,
+        ConversationStateUpdateEvent(
+            id="stopped-state",
+            key="active_long_tasks",
+            value=[
+                {
+                    "task_id": "task-1",
+                    "kind": "data_preparation",
+                    "status": "Stopped",
+                }
+            ],
+        ),
+    )
+
+    assert [event.type for event in submitted] == [
+        "operation.completed",
+        "external_task.submitted",
+    ]
+    assert submitted[1].payload["kind"] == "data_preparation"
+    assert submitted[1].payload["run_id"] == "run-1"
+    assert [event.type for event in stopped] == ["external_task.completed"]
+    assert stopped[0].payload["status"] == "stopped"
+
+
+def test_translator_projects_openhands_data_cleaning_submission() -> None:
+    translated = translate_event(
+        TranslationState(session_id="conversation-1"),
+        ObservationEvent(
+            id="cleaning-observation",
+            source="environment",
+            action_id="cleaning-action",
+            tool_name="run_dataset_cleaning",
+            tool_call_id="cleaning-call",
+            observation=RunDatasetCleaningObservation.from_text(
+                "submitted",
+                status="Pending",
+                task_id="task-2",
+                run_id="run-2",
+                output_dir="/outputs/run-2",
+            ),
+        ),
+    )
+
+    assert translated[1].type == "external_task.submitted"
+    assert translated[1].payload["kind"] == "data_cleaning"

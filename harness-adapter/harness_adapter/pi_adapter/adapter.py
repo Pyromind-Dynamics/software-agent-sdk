@@ -286,7 +286,7 @@ class PiAdapter:
     ) -> SessionHandle:
         raise NotImplementedError("Pi does not support fork")
 
-    async def deliver_external_task_status(
+    async def notify_external_task(
         self,
         handle: SessionHandle,
         notification: dict[str, Any],

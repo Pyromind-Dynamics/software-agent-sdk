@@ -39,6 +39,10 @@ from openhands.agent_server.pyromind_router import (
     rollback_pyromind_workflow_at_event,
     send_pyromind_message,
 )
+from openhands.agent_server.run_workflow_callback import (
+    RunWorkflowStatus,
+    resume_conversation_after_workflow,
+)
 from openhands.sdk.event import Event
 
 
@@ -273,6 +277,32 @@ class OpenHandsAdapter:
     ) -> SessionHandle:
         raise NotImplementedError("fork-at-event is exposed by the server façade")
 
+    async def notify_external_task(
+        self,
+        handle: SessionHandle,
+        notification: dict[str, object],
+        context: RequestContext,
+    ) -> JsonObject:
+        del context
+        session = self._session(handle.session_id)
+        task_id = str(notification.get("task_id") or "")
+        if not task_id:
+            raise ValueError("external task_id is required")
+        status = _openhands_task_status(notification.get("status"))
+        removed = await session.event_service.remove_active_long_task(task_id)
+        auto_run = bool(notification.get("auto_run", True))
+        if removed is not None and removed.status == "Stopped":
+            auto_run = False
+        await resume_conversation_after_workflow(
+            event_service=session.event_service,
+            task_id=task_id,
+            status=status,
+            error_log=_optional_string(notification.get("error_summary")),
+            auto_run=auto_run,
+            from_workflow_debug=bool(notification.get("from_workflow_debug", False)),
+        )
+        return {"accepted": True}
+
     def subscribe(self, handle: SessionHandle) -> AsyncIterator[HarnessEvent]:
         queue = self._session(handle.session_id).queue
 
@@ -337,3 +367,18 @@ class OpenHandsAdapter:
             harness_id="openhands",
             capabilities=OPENHANDS_CAPABILITIES,
         )
+
+
+def _openhands_task_status(value: object) -> RunWorkflowStatus:
+    normalized = str(value or "").strip().lower()
+    if normalized == "succeeded":
+        return "Succeeded"
+    if normalized == "failed":
+        return "Failed"
+    if normalized == "terminated":
+        return "Terminated"
+    raise ValueError(f"external task status is not terminal: {value!r}")
+
+
+def _optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None

@@ -10,6 +10,7 @@ from pyromind_runtime.application.conversation_runtime import ConversationRuntim
 from pyromind_runtime.ports.harness import HarnessAdapter
 
 from openhands.agent_server.run_workflow_callback import set_workflow_status_dispatcher
+from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 
 
@@ -38,6 +39,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         service.conversations_dir,
         adapters,
         default_harness_id=backend,
+        external_tasks=WorkflowExternalTaskRegistry(service.conversations_dir),
     )
     set_workflow_status_dispatcher(WorkflowStatusDispatcher(runtime).dispatch)
     app.state.product_runtime = runtime

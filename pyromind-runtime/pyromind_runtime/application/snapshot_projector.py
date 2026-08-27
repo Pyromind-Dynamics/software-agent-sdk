@@ -347,6 +347,12 @@ class SnapshotProjector:
         self, snapshot: ConversationSnapshot, event: ProductEvent
     ) -> ConversationSnapshot:
         task = ExternalTaskState.model_validate(event.payload)
+        existing = next(
+            (item for item in snapshot.external_tasks if item.task_id == task.task_id),
+            None,
+        )
+        if existing is not None and self._terminal_external_task(existing.status):
+            return snapshot
         tasks = tuple(
             existing
             for existing in snapshot.external_tasks
@@ -382,9 +388,19 @@ class SnapshotProjector:
         tasks = list(snapshot.external_tasks)
         for index, existing in enumerate(tasks):
             if existing.task_id == task_id:
+                incoming_status = event.payload.get("status")
+                if (
+                    self._terminal_external_task(existing.status)
+                    and incoming_status != existing.status
+                ):
+                    return snapshot
                 tasks[index] = existing.model_copy(update=dict(event.payload))
                 return snapshot.model_copy(update={"external_tasks": tuple(tasks)})
         return snapshot
+
+    @staticmethod
+    def _terminal_external_task(status: str) -> bool:
+        return status in {"succeeded", "failed", "terminated", "stopped"}
 
     def _notice(
         self,

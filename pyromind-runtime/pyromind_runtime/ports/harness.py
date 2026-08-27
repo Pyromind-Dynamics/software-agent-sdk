@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import Field
 
@@ -59,6 +59,13 @@ class HarnessAdapter(Protocol):
         snapshot: ConversationSnapshot,
         context: RequestContext,
     ) -> SessionHandle: ...
+
+    async def notify_external_task(
+        self,
+        handle: SessionHandle,
+        notification: dict[str, Any],
+        context: RequestContext,
+    ) -> JsonObject: ...
 
     def subscribe(self, handle: SessionHandle) -> AsyncIterator[HarnessEvent]: ...
 

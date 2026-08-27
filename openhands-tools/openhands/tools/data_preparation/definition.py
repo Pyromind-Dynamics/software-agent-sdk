@@ -47,6 +47,7 @@ from openhands.tools.data_preparation.runner import (
     summarize_dataflow_env,
     validate_managed_image_pipeline,
 )
+from openhands.tools.data_preparation.workspace_paths import resolve_workspace_file
 from openhands.tools.utils import default_path_access_policy
 
 
@@ -105,14 +106,7 @@ def _resolve_in_workspace(conversation: Any, path: str) -> Path:
 
 
 def _resolve_workspace_path(conversation: Any, path: str) -> Path:
-    """Resolve an existing readable file inside the workspace."""
-
-    resolved = _resolve_in_workspace(conversation, path)
-    workspace_dir = Path(conversation.workspace.working_dir).resolve()
-    policy = default_path_access_policy(workspace_dir)
-    if not policy.check(resolved, "read") or not resolved.is_file():
-        raise ValueError(f"Missing or unreadable workspace file: {path}")
-    return resolved
+    return resolve_workspace_file(conversation, path)
 
 
 def _resolve_input_path(conversation: Any, path: str) -> Path:

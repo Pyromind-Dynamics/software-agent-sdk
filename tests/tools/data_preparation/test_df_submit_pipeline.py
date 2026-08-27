@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import SecretStr
 
+from openhands.sdk.workspace.workspace import LocalWorkspace
 from openhands.tools.data_preparation.platform_submit import (
     RUNTIME_FILENAMES,
     DataPreparationTaskAssociation,
@@ -22,6 +23,7 @@ from openhands.tools.data_preparation.platform_submit import (
     _model_fingerprint,
     _normalize_storage_path,
     _pod_path,
+    _validate_local_pipeline,
 )
 
 
@@ -171,6 +173,7 @@ def _make_conversation_with_llm(
     api_key: str | SecretStr | None = "sk-123",
     base_url: str | None = "http://my-llm/v1",
     model: str = "openai/gpt-4o",
+    workspace_dir: Path | None = None,
 ) -> Any:
     llm = MagicMock()
     llm.api_key = api_key
@@ -183,6 +186,8 @@ def _make_conversation_with_llm(
 
     conv = MagicMock()
     conv.state = state
+    if workspace_dir is not None:
+        conv.workspace = LocalWorkspace(working_dir=str(workspace_dir))
 
     def _register_task(task: Any) -> None:
         state.active_long_tasks = [*state.active_long_tasks, task]
@@ -364,11 +369,13 @@ def test_executor_invalid_script_ext(tmp_path: Path) -> None:
         script_path=str(script),
         input_path="/data/in.jsonl",
     )
-    conv = _make_conversation_with_llm()
+    conv = _make_conversation_with_llm(workspace_dir=tmp_path)
     conv.id = "conv-1"
     obs = executor(action, conversation=conv)
     assert obs.status == "Failed"
     assert ".py" in obs.text
+    assert obs.failure_stage == "pipeline_resolution"
+    assert obs.retryable is False
 
 
 def test_executor_missing_runtime_dir(tmp_path: Path) -> None:
@@ -379,7 +386,7 @@ def test_executor_missing_runtime_dir(tmp_path: Path) -> None:
         script_path=str(script),
         input_path="/data/in.jsonl",
     )
-    conv = _make_conversation_with_llm()
+    conv = _make_conversation_with_llm(workspace_dir=tmp_path)
     conv.id = "conv-1"
     obs = executor(action, conversation=conv)
     assert obs.status == "Failed"
@@ -395,10 +402,8 @@ def test_executor_submit_failure_omits_progress_fields(
     executor = _make_executor(tmp_path)
     script = tmp_path / "pipeline.py"
     script.write_text("print('hi')")
-    conversation = _make_conversation_with_llm()
+    conversation = _make_conversation_with_llm(workspace_dir=tmp_path)
     conversation.id = "conv-1"
-    conversation.workspace = MagicMock()
-    conversation.workspace.working_dir = str(tmp_path / "conversation")
 
     monkeypatch.setattr(
         executor,
@@ -447,10 +452,8 @@ def test_executor_missing_node_fails_before_upload(
     executor = _make_executor(tmp_path)
     script = tmp_path / "pipeline.py"
     script.write_text("print('hi')")
-    conversation = _make_conversation_with_llm()
+    conversation = _make_conversation_with_llm(workspace_dir=tmp_path)
     conversation.id = "conv-1"
-    conversation.workspace = MagicMock()
-    conversation.workspace.working_dir = str(tmp_path / "conversation")
     stage_runtime = MagicMock()
     stage_script = MagicMock()
     monkeypatch.setattr(executor, "_stage_runtime_files", stage_runtime)
@@ -566,7 +569,7 @@ def test_resume_changed_pipeline_requires_reuse_assessment(
     original.write_text("print('old')")
     changed = tmp_path / "changed.py"
     changed.write_text("print('new')")
-    conversation = _make_conversation_with_llm()
+    conversation = _make_conversation_with_llm(workspace_dir=tmp_path)
     conversation.id = "conv-1"
     _saved_prior_run(tmp_path, conversation=conversation, script=original)
 
@@ -584,6 +587,46 @@ def test_resume_changed_pipeline_requires_reuse_assessment(
     assert "Provide reuse_assessment" in observation.text
 
 
+def test_strict_resume_reuses_legacy_absolute_script_path(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    executor = _make_executor(tmp_path)
+    original = tmp_path / "original.py"
+    original.write_text("print('old')")
+    conversation = _make_conversation_with_llm(workspace_dir=tmp_path)
+    conversation.id = "conv-1"
+    prior = _saved_prior_run(tmp_path, conversation=conversation, script=original)
+    stage_script = MagicMock()
+    monkeypatch.setattr(executor, "_stage_script", stage_script)
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.create_workflow_api_client",
+        lambda **kwargs: object(),
+    )
+    response = MagicMock()
+    response.task_id = "task-strict-resume"
+    response.status = "Pending"
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.submit_workflow_task",
+        lambda **kwargs: response,
+    )
+
+    observation = executor(
+        DfSubmitPipelineAction(
+            mode="resume",
+            resume_run_id=uuid.UUID(prior.run_id),
+            input_path=prior.input_path,
+        ),
+        conversation=conversation,
+    )
+
+    assert not observation.is_error
+    stage_script.assert_not_called()
+    saved = DataPreparationTaskStore(tmp_path / "tasks").get("task-strict-resume")
+    assert saved is not None
+    assert saved.script_path == str(original)
+
+
 def test_compatible_resume_accepts_agent_assessment(
     monkeypatch,
     tmp_path: Path,
@@ -593,10 +636,8 @@ def test_compatible_resume_accepts_agent_assessment(
     original.write_text("print('old')")
     changed = tmp_path / "changed.py"
     changed.write_text("print('new')")
-    conversation = _make_conversation_with_llm()
+    conversation = _make_conversation_with_llm(workspace_dir=tmp_path)
     conversation.id = "conv-1"
-    conversation.workspace = MagicMock()
-    conversation.workspace.working_dir = str(tmp_path / "conversation")
     _saved_prior_run(tmp_path, conversation=conversation, script=original)
 
     staged: list[str] = []
@@ -654,12 +695,11 @@ def test_new_full_run_uses_conversation_scoped_output_root(
     tmp_path: Path,
 ) -> None:
     executor = _make_executor(tmp_path)
-    script = tmp_path / "pipeline.py"
+    script = tmp_path / "public_data" / "data-preparation" / "pipeline.py"
+    script.parent.mkdir(parents=True)
     script.write_text("print('hi')")
-    conversation = _make_conversation_with_llm()
+    conversation = _make_conversation_with_llm(workspace_dir=tmp_path)
     conversation.id = "conv-1"
-    conversation.workspace = MagicMock()
-    conversation.workspace.working_dir = str(tmp_path / "conversation")
 
     monkeypatch.setattr(
         executor,
@@ -685,7 +725,7 @@ def test_new_full_run_uses_conversation_scoped_output_root(
 
     observation = executor(
         DfSubmitPipelineAction(
-            script_path=str(script),
+            script_path="public_data/data-preparation/pipeline.py",
             input_path="/data/in.jsonl",
             output_schema="text",
         ),
@@ -701,9 +741,49 @@ def test_new_full_run_uses_conversation_scoped_output_root(
     saved = DataPreparationTaskStore(tmp_path / "tasks").get("task-new")
     assert saved is not None
     assert saved.output_dir == observation.output_dir
+    assert saved.script_path == "public_data/data-preparation/pipeline.py"
     assert conversation.state.active_long_tasks[0].model_dump() == {
         "task_id": "task-new",
         "kind": "data_preparation",
         "status": "Pending",
     }
     conversation.send_agent_message.assert_not_called()
+
+
+def test_pipeline_path_compatibility_is_normalized(tmp_path: Path) -> None:
+    script = tmp_path / "public_data" / "data-preparation" / "pipeline.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("print('hi')")
+    conversation = _make_conversation_with_llm(workspace_dir=tmp_path)
+    conversation.id = "conversation-1"
+
+    paths = [
+        "public_data/data-preparation/pipeline.py",
+        str(script),
+        "/workspace/conversations/conversation-1/"
+        "public_data/data-preparation/pipeline.py",
+    ]
+
+    resolved = [_validate_local_pipeline(conversation, path) for path in paths]
+
+    assert {local for local, _ in resolved} == {str(script)}
+    assert {relative for _, relative in resolved} == {
+        "public_data/data-preparation/pipeline.py"
+    }
+
+
+def test_pipeline_path_rejects_wrong_conversation_and_workspace_escape(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "pipeline.py"
+    script.write_text("print('hi')")
+    conversation = _make_conversation_with_llm(workspace_dir=tmp_path)
+    conversation.id = "conversation-1"
+
+    with pytest.raises(ValueError, match="another conversation"):
+        _validate_local_pipeline(
+            conversation,
+            "/workspace/conversations/conversation-2/pipeline.py",
+        )
+    with pytest.raises(ValueError, match="outside the conversation workspace"):
+        _validate_local_pipeline(conversation, "../pipeline.py")

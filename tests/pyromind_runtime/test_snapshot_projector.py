@@ -142,3 +142,16 @@ def test_projector_tracks_external_task_lifecycle() -> None:
     assert snapshot.status == "idle"
     assert snapshot.external_tasks[0].status == "succeeded"
     assert snapshot.external_tasks[0].resume_pending is True
+
+    snapshot = projector.reduce(
+        snapshot,
+        _event(3, "external_task.submitted", submitted),
+    )
+    snapshot = projector.reduce(
+        snapshot,
+        _event(4, "external_task.updated", {**submitted, "status": "running"}),
+    )
+
+    assert snapshot.status == "idle"
+    assert snapshot.external_tasks[0].status == "succeeded"
+    assert snapshot.external_tasks[0].resume_pending is True

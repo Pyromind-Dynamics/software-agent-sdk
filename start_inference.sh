@@ -12,7 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 
-# export PYROMIND_HARNESS_BACKEND="pi"
+export PYROMIND_HARNESS_BACKEND="pi"
 
 # ----------------------------------------------------------
 # LLM Configuration
@@ -125,6 +125,51 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # ----------------------------------------------------------
+# Shared DataFlow Runtime
+# ----------------------------------------------------------
+# Keep DataFlow outside the agent-server venv: some native dependencies do not
+# provide Python 3.13 wheels. Every harness inherits the same interpreter via
+# DATAFLOW_PYTHON, so adapters do not need harness-specific setup.
+DATAFLOW_VERSION="${DATAFLOW_VERSION:-1.0.10}"
+DATAFLOW_RUNTIME_DIR="${DATAFLOW_RUNTIME_DIR:-${WORKSPACE_DIR}/runtime/dataflow-venv}"
+
+if [[ -z "${DATAFLOW_PYTHON:-}" ]]; then
+  export DATAFLOW_PYTHON="${DATAFLOW_RUNTIME_DIR}/bin/python"
+  if [[ ! -x "${DATAFLOW_PYTHON}" ]]; then
+    echo "Creating shared DataFlow runtime (Python 3.12)..."
+    uv python install 3.12
+    uv venv --python 3.12 "${DATAFLOW_RUNTIME_DIR}"
+  fi
+elif [[ ! -x "${DATAFLOW_PYTHON}" ]]; then
+  echo "ERROR: DATAFLOW_PYTHON is not executable: ${DATAFLOW_PYTHON}" >&2
+  exit 1
+fi
+export DATAFLOW_PYTHON
+
+if ! "${DATAFLOW_PYTHON}" -c '
+import importlib.metadata
+import sys
+
+import dataflow
+
+sys.exit(importlib.metadata.version("open-dataflow") != sys.argv[1])
+' "${DATAFLOW_VERSION}" 2>/dev/null; then
+  echo "Installing open-dataflow==${DATAFLOW_VERSION} into shared runtime..."
+  uv pip install \
+    --python "${DATAFLOW_PYTHON}" \
+    "open-dataflow==${DATAFLOW_VERSION}"
+fi
+
+"${DATAFLOW_PYTHON}" -c '
+import importlib.metadata
+
+import dataflow
+
+version = importlib.metadata.version("open-dataflow")
+print(f"DataFlow runtime ready: open-dataflow=={version}")
+'
+
+# ----------------------------------------------------------
 # Pi Runtime
 # ----------------------------------------------------------
 PI_RUNTIME_DIR="${SOFTWARE_AGENT_SDK_DIR}/harness-adapter/pi-runtime"
@@ -157,6 +202,7 @@ echo " LLM Base URL:      ${LLM_BASE_URL}"
 echo " Server root:       ${SOFTWARE_AGENT_SDK_DIR}"
 echo " Knowledge Base:    ${PYROMIND_KNOWLEDGE_BASE_PATH}"
 echo " Skills:            ${PYROMIND_SKILLS_PATH}"
+echo " DataFlow Python:   ${DATAFLOW_PYTHON}"
 echo " Workspace root:    ${WORKSPACE_DIR}"
 echo " Conversations:     ${OH_CONVERSATIONS_PATH}"
 echo " Project workspace: ${OH_WORKSPACE_PATH}"

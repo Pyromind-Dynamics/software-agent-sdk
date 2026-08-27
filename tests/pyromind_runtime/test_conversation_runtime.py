@@ -3,9 +3,13 @@ from __future__ import annotations
 import asyncio
 
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.snapshot import ConversationSnapshot
+from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.harness import SessionSpec
 
 from .fake_adapter import FakeAdapter
@@ -139,6 +143,53 @@ async def test_runtime_routes_existing_session_by_persisted_harness(tmp_path) ->
     assert "pi-conversation" in pi.queues
     assert "pi-conversation" not in openhands.queues
     await restarted.close()
+
+
+async def test_runtime_resumes_callback_through_owning_adapter(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversation = conversations / "callback-conversation"
+    conversation.mkdir(parents=True)
+    store = FileProductStore(conversation)
+    store.create(
+        ConversationSnapshot(
+            conversation_id="callback-conversation",
+            capabilities=HarnessCapabilities(cancel=True),
+        ),
+        user_id="42",
+        harness_id="openhands",
+    )
+    store.append(
+        ProductEvent(
+            conversation_id="callback-conversation",
+            type="external_task.submitted",
+            payload={
+                "task_id": "task-1",
+                "kind": "data_cleaning",
+                "run_id": "run-1",
+                "status": "running",
+                "output_dir": "/outputs/run-1",
+                "submitted_at": "2026-08-24T00:00:00+00:00",
+                "updated_at": "2026-08-24T00:00:00+00:00",
+                "resume_pending": False,
+            },
+        )
+    )
+    adapter = FakeAdapter("openhands")
+    runtime = ConversationRuntime(conversations, {"openhands": adapter})
+
+    await runtime.deliver_external_task_status(
+        "callback-conversation", task_id="task-1", status="Succeeded"
+    )
+    assert store.load_snapshot().external_tasks[0].resume_pending is True
+    assert adapter.external_task_notifications == []
+
+    snapshot = await runtime.get_snapshot(
+        "callback-conversation", RequestContext(user_id="42")
+    )
+
+    assert snapshot.external_tasks[0].resume_pending is False
+    assert adapter.external_task_notifications[0][1]["status"] == "succeeded"
+    await runtime.close()
 
 
 async def test_runtime_logs_first_message_latency_metrics(tmp_path, caplog) -> None:
