@@ -19,6 +19,19 @@ class PiSessionFiles:
     def initialize(self, session: dict[str, Any]) -> None:
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         _atomic_json(self.session_path, session)
+        self.ensure_session_log()
+
+    def ensure_session_log(self) -> None:
+        """Create the explicit Pi session file before the Node manager opens it."""
+        try:
+            descriptor = os.open(
+                self.session_log_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            return
+        os.close(descriptor)
 
     def load_session(self) -> dict[str, Any]:
         return _load_object(self.session_path)

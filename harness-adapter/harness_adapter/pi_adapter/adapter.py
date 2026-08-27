@@ -221,6 +221,7 @@ class PiAdapter:
         root = self._safe_conversation_dir(conversation_id)
         files = PiSessionFiles(root)
         config = files.load_session()
+        files.ensure_session_log()
         session = _PiSession(
             conversation_id,
             root,
