@@ -39,7 +39,8 @@ def _ensure_wandb_runtime_dirs(creds: dict[str, str]) -> None:
     只补缓存/日志目录。创建失败时静默跳过,交给 wandb 原生报错。
     """
     base = creds.get("wandb_tmp") or os.environ.get("WANDB_TMP") or "wandb_tmp"
-    path = Path(base).expanduser()
+    # 绝对化,避免相对路径随 cwd 变化落到沙箱不可写位置
+    path = Path(base).expanduser().resolve()
     try:
         path.mkdir(parents=True, exist_ok=True)
         for sub in ("cache", "wandb", "config"):

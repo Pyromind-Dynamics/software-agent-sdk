@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 
 PROGRESS_FILENAME = "progress.json"
-OUTPUT_FILENAME = "processed.jsonl"
+DEFAULT_TAIL_FILENAME = "processed.jsonl"
 DEFAULT_TAIL_LINES = 5
 DEFAULT_TAIL_BYTES = 64 * 1024
 
@@ -56,7 +56,8 @@ progress and verify output quality while the platform job is still running.
 
 Use this when the user asks about the status of a submitted pipeline, or
 proactively between submission and the terminal Kafka callback for
-long-running jobs.
+long-running jobs. Environment-processing runs use the same progress.json
+contract: pass their output_dir plus tail_filename="verdicts.jsonl".
 """
 
 
@@ -80,6 +81,14 @@ class DfCheckProgressAction(Action):
         ge=0,
         le=50,
         description="Number of most recent processed records to show (0 = none).",
+    )
+    tail_filename: str = Field(
+        default=DEFAULT_TAIL_FILENAME,
+        description=(
+            "JSONL file whose last records are shown: 'processed.jsonl' "
+            "(default) for DataFlow pipelines, 'verdicts.jsonl' for "
+            "environment-processing validation runs."
+        ),
     )
 
     @property
@@ -160,7 +169,7 @@ class DfCheckProgressExecutor(
         headers = self._resolved_headers(conversation)
 
         progress_path = f"{output_dir}/{PROGRESS_FILENAME}"
-        processed_path = f"{output_dir}/{OUTPUT_FILENAME}"
+        processed_path = f"{output_dir}/{action.tail_filename}"
 
         progress = self._read_json_file(progress_path, headers)
         latest, tail_error = self._read_tail(processed_path, headers, action.tail_lines)

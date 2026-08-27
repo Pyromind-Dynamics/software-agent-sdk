@@ -8,6 +8,7 @@ Contains:
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -75,6 +76,32 @@ def classify_response(message: Message) -> LLMResponseType:
         return LLMResponseType.REASONING_ONLY
 
     return LLMResponseType.EMPTY
+
+
+# Regexes that flag XML tool-invocation markup. String-serializer models
+# (e.g. ``deepseek``) express tool calls as ``<invoke name="...">`` blocks.
+# When such a block is truncated or malformed it reaches the agent as plain
+# text instead of a parsed ``tool_calls`` entry.
+_ABORTED_TOOL_CALL_PATTERNS = (
+    re.compile(r"<invoke\b"),
+    re.compile(r"<invoke_skill\b"),
+    re.compile(r"<parameter\s+name="),
+)
+
+
+def _visible_text(message: Message) -> str:
+    """Concatenate the visible text content of a message."""
+    return "".join(c.text for c in message.content if isinstance(c, TextContent))
+
+
+def looks_like_aborted_tool_call(text: str) -> bool:
+    """Detect a content response that embeds an aborted tool call.
+
+    Treating such residue as a final answer ends the turn prematurely (see
+    aborted ``<invoke>`` residue reaching ``CONTENT``). Returning True lets
+    the dispatcher route it back to the agent for correction instead.
+    """
+    return any(p.search(text) for p in _ABORTED_TOOL_CALL_PATTERNS)
 
 
 # ---------------------------------------------------------------------------
@@ -287,9 +314,22 @@ class ResponseDispatchMixin:
         state: ConversationState,
         on_event: ConversationCallbackType,
     ) -> None:
-        """Handle LLM response with text content — finishes conversation."""
+        """Handle LLM response with text content.
+
+        Normally finishes the conversation. If the text embeds an aborted
+        tool call (truncated XML invocation from a string-serializer model),
+        send corrective feedback and continue the loop instead of ending the
+        turn.
+        """
         self._emit_message_event(message, llm_response, conversation, on_event)
         self._maybe_emit_vllm_tokens(llm_response, on_event)
+        if looks_like_aborted_tool_call(_visible_text(message)):
+            logger.warning(
+                "LLM response contained an aborted tool call text"
+                " - sending corrective feedback"
+            )
+            self._send_corrective_nudge(on_event)
+            return
         logger.debug("LLM produced a message response - awaits user input")
         state.execution_status = ConversationExecutionStatus.FINISHED
 

@@ -2,10 +2,12 @@
 
 ## 边界
 
-- **本 skill 只负责验证**,产出 `usable` 的 task_id 清单(`verdicts.jsonl`)
-- **格式转换交给 data-cleaning**:纯 Python 字段映射,无环境要求,不进沙箱
-- 转换入口:以 `verdicts.jsonl` 过滤后的清单为输入,调用 data-cleaning 的
-  清洗脚本流程(预览 → 编写 clean_script → 平台执行 → 校验)
+- **本 skill 负责验证 + 轻量转换**:验证产出 `verdicts.jsonl`,经
+  `scripts/convert_to_slime.py` 直接转 slime 三键(纯字段映射,本地跑,
+  不进沙箱、无需平台执行)
+- **复杂清洗仍交 data-cleaning**:去重/PII/语言过滤/内容改写等需要
+  清洗算子的场景,以本转换产物为输入走 data-cleaning 流程
+  (预览 → 编写 clean_script → 平台执行 → 校验)
 
 ## 目标格式(slime jsonl 三键)
 
@@ -29,7 +31,7 @@
 | 原始字段 | 转换后 | 规则 |
 |----------|--------|------|
 | `messages[user]` | `prompt` / `problem_statement` | 去掉 `Please solve this task:` 前缀与 vanillux「Recommended Workflow / 只许一次 bash」尾部 |
-| `messages[system]` | 丢弃 | 面向 vanillux bash tool,slime 用 Claude Code + SWE_PROMPT |
+| `messages[system]` | 丢弃 | 面向 vanillux bash tool,slime 侧另配 coding agent 系统提示 |
 | `env_config.image` | `metadata.image` | 原样 |
 | `env_config.task_id` / `ground_truth` | `label` / `metadata.instance_id` | 原样 |
 | 固定值 | `workdir=/home/user` | Tmax 约定(以 manifest 为准) |
@@ -37,20 +39,29 @@
 | `task-data/.../tests/test.sh` | `metadata.test_sh` | deferred 注入,防偷看 |
 | `task-data/.../setup.sh` | 默认不写 | 已 bake 进镜像 |
 
-## 转换脚本模式(参考 convert_tmax_to_slime.py)
+## 转换脚本(scripts/convert_to_slime.py)
 
-1. 读取 HF `tmax-15k-open-instruct` 数据集(或已有 jsonl)
-2. 按 `task_id` 关联 `tests/test.sh` 全文
-3. 剥离 user 题面的 harness 尾部
-4. 写出 slime 三键
-5. **本流程差异**:只输出 `verdicts.jsonl` 中 `status=usable` 的 task_id
+```
+python scripts/convert_to_slime.py \
+    --manifest run-dir/manifest.jsonl \
+    --verdicts run-dir/verdicts.jsonl \
+    --out slime.jsonl [--protocol tmax]
+```
+
+1. 以 verdicts 过滤 manifest,只保留 `verdict=usable` 记录
+2. 按 SKILL.md 字段映射写出 slime 三键(题面尾部剥离已在 manifest 构造时完成)
+3. reward 不嵌入:rollout 时由 `metadata.test_sh` 实时判定;`usable` 但
+   reward 0 的记录保留(RL 需要 0 分信号)
+
+SFT 侧对应 `scripts/convert_to_sft.py`(输入 traces/ 轨迹 + verdicts,
+默认只转 reward ≥ 1.0 的解题成功轨迹,输出 messages 格式)。
 
 ## 验证后过滤语义
 
-| verdict.status | 转换阶段行为 |
+| verdict | 转换阶段行为 |
 |----------------|--------------|
 | `usable` | 进入转换,写入 slime jsonl |
-| `error` | 排除;reason 汇总进清洗报告,便于溯源 |
+| `error` | 排除;error_category 汇总进清洗报告,便于溯源 |
 
 ## 验题约定(训练侧,不属于本 skill)
 

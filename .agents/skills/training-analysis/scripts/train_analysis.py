@@ -314,14 +314,19 @@ def cmd_resolve_target(args: argparse.Namespace) -> int:
         "env": {k: v for k, v in creds.items() if k != "WANDB_API_KEY"},
     }
     if args.creds_out:
-        creds_path = Path(args.creds_out)
+        # 绝对化,让输出的 creds_file/wandb_tmp 与执行时 cwd 无关,可直接复制使用
+        creds_path = Path(args.creds_out).resolve()
         creds_path.parent.mkdir(parents=True, exist_ok=True)
+        # 创建 wandb_tmp 工作目录,避免后续命令因缺少临时目录失败
+        wandb_tmp = creds_path.parent / "wandb_tmp"
+        wandb_tmp.mkdir(parents=True, exist_ok=True)
         creds_path.write_text(
             json.dumps(
                 {
                     "data_source": source_name,
                     "WANDB_API_KEY": api_key,
                     "api_key": api_key,
+                    "wandb_tmp": str(wandb_tmp),
                     **creds,
                 },
                 ensure_ascii=False,
@@ -329,9 +334,6 @@ def cmd_resolve_target(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
         os.chmod(creds_path, 0o600)
-        # 创建 wandb_tmp 工作目录,避免后续命令因缺少临时目录失败
-        wandb_tmp = creds_path.parent / "wandb_tmp"
-        wandb_tmp.mkdir(parents=True, exist_ok=True)
         result["creds_file"] = str(creds_path)
         result["wandb_tmp"] = str(wandb_tmp)
     print(json.dumps(result, ensure_ascii=False, indent=2))

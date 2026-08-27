@@ -6,7 +6,11 @@ import pytest
 from litellm.types.utils import ModelResponse
 
 from openhands.sdk.agent import Agent
-from openhands.sdk.agent.response_dispatch import LLMResponseType, classify_response
+from openhands.sdk.agent.response_dispatch import (
+    LLMResponseType,
+    classify_response,
+    looks_like_aborted_tool_call,
+)
 from openhands.sdk.conversation import Conversation, LocalConversation
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.event import ActionEvent, Event, MessageEvent
@@ -163,6 +167,48 @@ def test_empty_response(kwargs):
 
 
 # ---------------------------------------------------------------------------
+# looks_like_aborted_tool_call
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(
+            'Let me run it.\n<invoke\n<invoke name="preview_dataset" dataset_path>',
+            id="raw-invoke-unclosed",
+        ),
+        pytest.param(
+            '..<invoke_skill> <invoke name="invoke_skill"> '
+            '<parameter name="invoke_skill>',
+            id="invoke-skill-residue",
+        ),
+        pytest.param(
+            '<parameter name="arg1">',
+            id="parameter-name-residue",
+        ),
+    ],
+)
+def test_looks_like_aborted_tool_call_true(text):
+    """Text containing XML tool-call residue is flagged as aborted."""
+    assert looks_like_aborted_tool_call(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("The answer is 42.", id="plain-answer"),
+        pytest.param("I used <b>bold</b> tags.", id="html-bold-other-tag"),
+        pytest.param("<div>legal</invoke> html only", id="other-tag-words"),
+        pytest.param("", id="empty"),
+    ],
+)
+def test_looks_like_aborted_tool_call_false(text):
+    """Ordinary content without tool-call markup is not flagged."""
+    assert looks_like_aborted_tool_call(text) is False
+
+
+# ---------------------------------------------------------------------------
 # ResponseDispatchMixin (via Agent integration)
 # ---------------------------------------------------------------------------
 
@@ -225,6 +271,29 @@ def test_content_response_sets_finished():
     assert convo.state.execution_status == ConversationExecutionStatus.FINISHED
     assert len(msg_events) == 1
     assert msg_events[0].source == "agent"
+
+
+def test_content_response_with_aborted_tool_call_sends_nudge():
+    """CONTENT carrying aborted XML tool-call residue sends nudge, no finish."""
+    msg = Message(
+        role="assistant",
+        content=[
+            TextContent(
+                text="Let me look at the data.\n<invoke\n"
+                '<invoke name="preview_dataset" dataset_path>'
+            )
+        ],
+    )
+    events, convo = _run_single_step(_make_llm_response(msg))
+    msg_events = [e for e in events if isinstance(e, MessageEvent)]
+
+    assert convo.state.execution_status != ConversationExecutionStatus.FINISHED
+    assert len(msg_events) == 2
+    assert msg_events[0].source == "agent"
+    assert msg_events[1].source == "user"
+    nudge_content = msg_events[1].llm_message.content[0]
+    assert isinstance(nudge_content, TextContent)
+    assert "function call" in nudge_content.text
 
 
 def test_empty_response_sends_nudge():

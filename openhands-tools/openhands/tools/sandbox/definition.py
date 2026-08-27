@@ -17,10 +17,12 @@ from __future__ import annotations
 import base64
 import json
 import re
+import ssl
 import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Self, cast
 
+import certifi
 from pydantic import BaseModel, Field
 from pyromind_sdk import PyroMindAPIClient
 from pyromind_sdk.client.base import resolve_base_url_from_cluster
@@ -380,8 +382,16 @@ class SandboxDeleteExecutor(
         action: SandboxDeleteAction,
         conversation: BaseConversation | None = None,
     ) -> SandboxDeleteObservation:
+        client = self._sandbox_client(conversation)
         try:
-            self._sandbox_client(conversation).delete(action.sandbox_id)
+            try:
+                client.delete(action.sandbox_id)
+            except Exception as exc:  # noqa: BLE001
+                if "can not delete" not in str(exc).lower():
+                    raise
+                # Platform rejects DELETE while running: pause first, then retry.
+                client.pause(action.sandbox_id)
+                client.delete(action.sandbox_id)
             return SandboxDeleteObservation.from_text(
                 text=f"Sandbox {action.sandbox_id} deleted.",
                 sandbox_id=action.sandbox_id,
@@ -653,9 +663,14 @@ def _run_terminal_command(
         sandbox_id=sandbox_id,
         api_key=api_key,
     )
+    # The REST client (requests) verifies TLS with the certifi bundle; the
+    # websockets library defaults to the system CA store, which is empty on
+    # some hosts (e.g. Homebrew OpenSSL without a populated CA file) and
+    # fails with CERTIFICATE_VERIFY_FAILED. Align with the REST path.
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
     buffer = bytearray()
     timed_out = False
-    with connect(url, open_timeout=30, close_timeout=5) as terminal:
+    with connect(url, ssl=ssl_context, open_timeout=30, close_timeout=5) as terminal:
         terminal.send((command + "\r\n").encode("utf-8", "replace"))
         terminal.send(f"echo {_EXIT_MARKER}:$?\r\n".encode("ascii"))
         deadline = time.monotonic() + timeout_seconds

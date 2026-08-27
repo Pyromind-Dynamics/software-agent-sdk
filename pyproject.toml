@@ -76,6 +76,9 @@ extend-select = ["B006", "B008", "B039", "RUF012"]
 "tests/**/*.py" = ["ARG"]
 "openhands-tools/openhands/tools/node_signature/definition.py" = ["E501"]
 "openhands-tools/openhands/tools/node_signature/impl.py" = ["E501"]
+# Skill node scripts run on platform nodes with Python 3.10; UP017 would
+# rewrite timezone.utc back to UTC (3.11+) and break them at import time.
+".agents/skills/environment-data-processing/scripts/*.py" = ["UP017"]
 
 
 # Allowlist safe default calls for flake8-bugbear rules (e.g., FastAPI Depends)

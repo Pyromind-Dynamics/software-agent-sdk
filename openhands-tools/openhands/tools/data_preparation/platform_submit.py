@@ -1031,12 +1031,20 @@ def _build_dataflow_command(
     # Pipeline arguments
     pipeline_args = [shlex.quote(pod_input), shlex.quote(output_file)]
 
-    # Build the full command chain
+    # Build the full command chain. The pip install is quieted and its output
+    # redirected to a log so the pod stdout stays readable; only a failed
+    # install prints the log tail (with the error) before exiting.
+    install_log = "/tmp/df-venv-install.log"
     setup_steps = [
         "python3 -m venv /tmp/df-venv",
-        "/tmp/df-venv/bin/pip install"
-        " --use-deprecated=legacy-resolver "
-        f"open-dataflow=={SUPPORTED_DATAFLOW_VERSION}",
+        (
+            "/tmp/df-venv/bin/pip install --quiet"
+            " --use-deprecated=legacy-resolver "
+            f"open-dataflow=={SUPPORTED_DATAFLOW_VERSION}"
+            f" > {install_log} 2>&1"
+            f" || {{ echo 'open-dataflow install failed; last install log lines:'; "
+            f"tail -n 100 {install_log}; exit 1; }}"
+        ),
         f"mkdir -p {shlex.quote(pod_output_dir)}",
         f"test -f {shlex.quote(frozen_script)}",
         *[

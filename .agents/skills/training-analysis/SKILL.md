@@ -66,15 +66,17 @@ wandb 凭证与 run id **均从平台 API 动态获取,不需要用户提供环�
 > resolve-target 输出的 `wandb_tmp`),**无需手动 export TMPDIR/WANDB_CACHE_DIR**;
 > wandb 网络请求默认 60s 超时(`WANDB_API_TIMEOUT` 可调),超时/失败会打印 error。
 > 网络慢时等待 CLI 报错即可,不要手动 Ctrl-C,更不要绕过 CLI 写自定义 python
-> 调用 wandb SDK(CLI 已封装超时与目录处理)。
+> 调用 wandb SDK(CLI 已封装超时与目录处理)。命令卡住时只等 CLI 自带超时报错,
+> **禁止用空命令轮询或连续 Ctrl-C**(会把管道挂起成死等)。
 
 1. **定位**: `python scripts/train_analysis.py --api-base {api_base} --cookie "$PYROMIND_VALIDATE_AUTH_COOKIE" --cluster "$PYROMIND_X_CLUSTER" resolve-target {task_id} --creds-out public_data/analysis_tmp/creds.json`
    自动探测数据源,输出 `data_source`/`entity`/`project`/`run_id`;凭证写至
    creds 文件(600 权限)。**先把输出的 `creds_file` 值存入环境变量**:
    `export CREDS="<creds_file 值>"`,后续命令一律用 `--creds-file "$CREDS"`
    ——不要每次重抄长路径(手抄会抄错导致 FileNotFoundError / WANDB_API_KEY
-   missing)。输出文件用相对路径(对话工作目录内)。**不要用系统 /tmp
-   存放任何产物**(sandbox 拒绝写入,会报 PermissionError)。
+   missing)。命令一律从对话工作目录根执行,**不要先 `cd public_data` 再拼相对路径**;
+   resolve-target 输出的 `creds_file`/`wandb_tmp` 已是绝对路径,直接复制使用。
+   **不要用系统 /tmp 存放任何产物**(sandbox 拒绝写入,会报 PermissionError)。
    cookie/x-cluster 环境变量由 agent-server 注入;
    若本机调试无注入,改用 `--cookie`/`--cluster` 显式传入。
 2. **探查**: `python scripts/train_analysis.py --creds-file "$CREDS" probe {entity}/{project} --run-id {run_id}`

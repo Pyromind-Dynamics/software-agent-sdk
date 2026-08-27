@@ -83,6 +83,11 @@ from openhands.tools.data_preparation import (
     DfSubmitPipelineTool,
 )
 from openhands.tools.data_preparation.progress import DfCheckProgressExecutor
+from openhands.tools.environment_processing import (
+    EdpAggregateTool,
+    EdpRenderTool,
+    EdpSubmitTool,
+)
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
 from openhands.tools.pyromind_archive import ExtractArchiveTool
@@ -161,6 +166,7 @@ _PYROMIND_SKILL_NAMES = [
     "debug-workflow",
     "data-cleaning",
     "data-preparation",
+    "environment-data-processing",
     "training-analysis",
     "sandbox",
 ]
@@ -560,6 +566,15 @@ def _build_pyromind_storage_tools(
         Path(skills_path) / "data-preparation" / "scripts"
     )
 
+    # Env-validation platform submission tool params (mirrors preparation
+    # pattern; runtime_dir points at the skill's scripts, output_root stays
+    # unset so the tool defaults under PYROMIND_AGENT_STORAGE_ROOT).
+    edp_params: dict[str, Any] = dict(cleaning_params)
+    edp_params.pop("output_root", None)
+    edp_params["runtime_dir"] = str(
+        Path(skills_path) / "environment-data-processing" / "scripts"
+    )
+
     # Stop-task tool talks to the studio_api portal (APP_ENV-derived URL),
     # not the storage API, so only forward auth headers — no storage_base_url.
     stop_params: dict[str, Any] = {}
@@ -589,6 +604,9 @@ def _build_pyromind_storage_tools(
             Tool(name=UploadFileToPyromindTool.name, params=dict(params)),
             Tool(name=RunDatasetCleaningTool.name, params=cleaning_params),
             Tool(name=DfSubmitPipelineTool.name, params=preparation_params),
+            Tool(name=EdpSubmitTool.name, params=edp_params),
+            Tool(name=EdpRenderTool.name, params=edp_params),
+            Tool(name=EdpAggregateTool.name, params=edp_params),
             Tool(name=DfCheckProgressTool.name, params=dict(params)),
             Tool(name=DfStopTaskTool.name, params=stop_params),
             Tool(name=ExtractArchiveTool.name, params=extraction_params),

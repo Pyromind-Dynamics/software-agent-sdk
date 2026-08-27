@@ -14,6 +14,14 @@ from openhands.sdk.profiles.agent_profile_store import (
     AgentProfileStore,
     ProfileLimitExceeded,
 )
+from openhands.sdk.profiles.processing_profile import (
+    PROCESSING_PROFILE_SCHEMA_VERSION,
+    OutputSpec,
+    ProcessingProfile,
+    ProcessingStep,
+    StepName,
+    VerdictRule,
+)
 from openhands.sdk.profiles.profile_refs import (
     ProfileReferenced,
     cascade_rename,
@@ -40,10 +48,16 @@ __all__ = [
     "DanglingMcpServerRef",
     "LaunchedAgentProfile",
     "OpenHandsAgentProfile",
+    "OutputSpec",
+    "PROCESSING_PROFILE_SCHEMA_VERSION",
+    "ProcessingProfile",
+    "ProcessingStep",
     "ProfileLimitExceeded",
     "ProfileNotFound",
     "ProfileReferenced",
     "ProfileVerificationSettings",
+    "StepName",
+    "VerdictRule",
     "cascade_rename",
     "delete_llm_profile",
     "find_referrers",

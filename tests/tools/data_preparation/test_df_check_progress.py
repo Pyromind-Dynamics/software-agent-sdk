@@ -110,3 +110,29 @@ def test_check_progress_tail_lines_zero_returns_no_records() -> None:
 
     assert obs.percent == 100.0
     assert obs.latest_records == []
+
+
+def test_check_progress_custom_tail_filename() -> None:
+    """EDP passes tail_filename="verdicts.jsonl"; the default stays
+    processed.jsonl."""
+    verdicts = "".join(
+        json.dumps({"task_id": f"t-{i}", "verdict": "usable"}) + "\n" for i in range(3)
+    )
+    progress = {"total": 3, "processed": 3, "succeeded": 3, "failed": 0}
+    files = {
+        "/run/progress.json": json.dumps(progress).encode(),
+        "/run/verdicts.jsonl": verdicts.encode(),
+    }
+    executor = _make_executor(files)
+
+    obs = executor(
+        DfCheckProgressAction(output_dir="/run", tail_filename="verdicts.jsonl"),
+        conversation=None,
+    )
+
+    assert obs.percent == 100.0
+    assert [r["task_id"] for r in obs.latest_records] == ["t-0", "t-1", "t-2"]
+
+    # the default tail file stays processed.jsonl (absent here -> no records)
+    obs_default = executor(DfCheckProgressAction(output_dir="/run"), conversation=None)
+    assert obs_default.latest_records == []

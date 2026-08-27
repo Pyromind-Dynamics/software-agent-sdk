@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "name": "tmax-validation",
+  "description": "Tmax 终端任务数据全链路验证（README_tmax 口径）：对每条记录（镜像+题面+verifier）按 env_config.image 启动 custom 沙箱，安装 pi coding agent（镜像未预装；node < 22.19 时自动装官方 Node tarball 到 /opt），pi headless 解题后在同一沙箱写入 test.sh 并执行，按 reward 文件/退出码判定，产出 verdicts（含 reward）。run_pi 以 nohup 后台 + 退出码文件轮询方式执行（exec 单命令上限扛不住长任务），--mode json 轨迹自动拉回到 run 目录 traces/ 下供训练数据转换。verifier 因镜像缺件失败会归入 verifier_env_missing 桶（可修镜像回收，非数据不可用）。manifest 字段契约：task_id / image / workdir（tmax 默认 /home/user）/ prompt（题面）/ test_sh（verifier 全文）。LLM 凭据经 --set 注入（{secret:KEY} 占位符）：install_pi 把网关注册为 ~/.pi/agent/models.json 的 mygw provider（OpenAI chat-completions 协议，baseUrl 自动归一化 /v1），凭据不落 verdicts。",
+  "steps": [
+    {
+      "name": "create_sandbox",
+      "params": {
+        "image": "{image}",
+        "cpu": 4,
+        "memory": "8Gi",
+        "wait_timeout": 600
+      }
+    },
+    {
+      "name": "probe",
+      "params": {
+        "command": "test -d {workdir} && command -v bash",
+        "timeout": 60
+      }
+    },
+    {
+      "name": "write_file",
+      "params": {
+        "path": "/workspace/PROBLEM_STATEMENT.md",
+        "content_field": "prompt"
+      }
+    },
+    {
+      "name": "install_pi",
+      "params": {
+        "timeout": 600,
+        "env": {
+          "LLM_BASE_URL": "{secret:LLM_BASE_URL}",
+          "LLM_AUTH_TOKEN": "{secret:LLM_AUTH_TOKEN}",
+          "LLM_MODEL": "{secret:LLM_MODEL}"
+        }
+      }
+    },
+    {
+      "name": "run_pi",
+      "params": {
+        "prompt_field": "prompt",
+        "workdir": "{workdir}",
+        "run_as_user": "user",
+        "timeout": 1800,
+        "export_trace": true,
+        "env": {
+          "LLM_BASE_URL": "{secret:LLM_BASE_URL}",
+          "LLM_AUTH_TOKEN": "{secret:LLM_AUTH_TOKEN}",
+          "LLM_MODEL": "{secret:LLM_MODEL}"
+        }
+      }
+    },
+    {
+      "name": "write_file",
+      "params": {
+        "path": "/workspace/__tmax_test__.sh",
+        "content_field": "test_sh"
+      }
+    },
+    {
+      "name": "exec",
+      "params": {
+        "command": "cd {workdir} && bash /workspace/__tmax_test__.sh",
+        "timeout": 600
+      }
+    },
+    {
+      "name": "delete_sandbox",
+      "params": {}
+    }
+  ],
+  "verdict": {
+    "kind": "reward_file",
+    "success_codes": [
+      0
+    ],
+    "reward_path": "/logs/verifier/reward.txt"
+  },
+  "output": {
+    "filename": "verdicts.jsonl"
+  }
+}

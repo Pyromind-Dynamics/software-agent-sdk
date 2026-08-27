@@ -282,6 +282,46 @@ def test_sandbox_delete(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not observation.is_error
     assert f"Sandbox {_SANDBOX_ID} deleted" in observation.text
     client.sandboxes.delete.assert_called_once_with(_SANDBOX_ID)
+    client.sandboxes.pause.assert_not_called()
+
+
+def test_sandbox_delete_pauses_running_sandbox_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MagicMock()
+    client.sandboxes.delete.side_effect = [
+        RuntimeError(
+            "INTERNAL_SERVER_ERROR: InstanceService.delete_instance-"
+            "instance`s status is Running, can not delete!"
+        ),
+        None,
+    ]
+    _patch_client(monkeypatch, client)
+
+    observation = SandboxDeleteExecutor(**_executor_kwargs())(
+        SandboxDeleteAction(sandbox_id=_SANDBOX_ID), _fake_conversation()
+    )
+
+    assert not observation.is_error
+    assert f"Sandbox {_SANDBOX_ID} deleted" in observation.text
+    client.sandboxes.pause.assert_called_once_with(_SANDBOX_ID)
+    assert client.sandboxes.delete.call_count == 2
+
+
+def test_sandbox_delete_other_errors_do_not_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MagicMock()
+    client.sandboxes.delete.side_effect = RuntimeError("NOT_FOUND: no such sandbox")
+    _patch_client(monkeypatch, client)
+
+    observation = SandboxDeleteExecutor(**_executor_kwargs())(
+        SandboxDeleteAction(sandbox_id=_SANDBOX_ID), _fake_conversation()
+    )
+
+    assert observation.is_error
+    assert "no such sandbox" in observation.text
+    client.sandboxes.pause.assert_not_called()
 
 
 def test_sandbox_read_file_text(monkeypatch: pytest.MonkeyPatch) -> None:
