@@ -45,3 +45,27 @@ def quota_exceeded_reason(exc: BaseException) -> str | None:
     if any(marker in text for marker in _SPACE_FULL_TEXT):
         return CONVERSATION_SPACE_FULL_MESSAGE
     return None
+
+
+class ConversationStorageFullError(OSError):
+    """Raised when persisting conversation data hits the storage hard limit.
+
+    Kept an ``OSError`` subclass (with the original errno) so existing
+    exception handling keeps working; the message is the user-facing hint
+    instead of the raw ``No space left on device`` text.
+    """
+
+    def __str__(self) -> str:
+        return self.strerror or super().__str__()
+
+
+def raise_if_quota_exceeded(exc: BaseException) -> None:
+    """Re-raise ``exc`` as :class:`ConversationStorageFullError` when it
+    reports a full conversation storage; otherwise do nothing."""
+    reason = quota_exceeded_reason(exc)
+    if reason is None:
+        return
+    errno_value = getattr(exc, "errno", None)
+    if errno_value is None:
+        errno_value = errno.EDQUOT
+    raise ConversationStorageFullError(errno_value, reason) from exc

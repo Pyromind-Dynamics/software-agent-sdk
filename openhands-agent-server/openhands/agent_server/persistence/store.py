@@ -31,6 +31,7 @@ from openhands.sdk.llm.llm_profile_store import LLMProfileStore
 from openhands.sdk.logger import get_logger
 from openhands.sdk.profiles.agent_profile_store import AgentProfileStore
 from openhands.sdk.utils.cipher import Cipher
+from openhands.sdk.utils.fs_errors import raise_if_quota_exceeded
 
 
 # fcntl is Unix-only; on Windows, use msvcrt for file locking
@@ -194,43 +195,47 @@ def _atomic_write_json(path: Path, data: dict) -> None:
         concurrent access, network drives), but provides reasonable
         protection against corruption from interrupted writes.
     """
-    import uuid
-
-    # Use PID, time, and uuid for unique temp filename to prevent collisions
-    # when multiple processes/threads write to the same file concurrently
-    unique_suffix = f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
-    tmp_path = path.with_suffix(unique_suffix)
-    # Create file with secure permissions from the start using os.open
-    # O_EXCL ensures exclusive creation (fails if file exists)
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _FILE_MODE)
-    fdopen_succeeded = False
     try:
-        f = os.fdopen(fd, "w", encoding="utf-8")
-        fdopen_succeeded = True
-        with f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        # Only close fd manually if os.fdopen() didn't take ownership
-        if not fdopen_succeeded:
+        import uuid
+
+        # Use PID, time, and uuid for unique temp filename to prevent collisions
+        # when multiple processes/threads write to the same file concurrently
+        unique_suffix = f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        tmp_path = path.with_suffix(unique_suffix)
+        # Create file with secure permissions from the start using os.open
+        # O_EXCL ensures exclusive creation (fails if file exists)
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _FILE_MODE)
+        fdopen_succeeded = False
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8")
+            fdopen_succeeded = True
+            with f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            # Only close fd manually if os.fdopen() didn't take ownership
+            if not fdopen_succeeded:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            # Clean up temp file on error
             try:
-                os.close(fd)
+                tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
-        # Clean up temp file on error
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+            raise
 
-    # Atomic rename - clean up temp file if replace() fails
-    try:
-        tmp_path.replace(path)  # Atomic on POSIX
-    except Exception:
+        # Atomic rename - clean up temp file if replace() fails
         try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            tmp_path.replace(path)  # Atomic on POSIX
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        raise_if_quota_exceeded(exc)
         raise
 
 

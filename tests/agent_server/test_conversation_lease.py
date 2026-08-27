@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import socket
@@ -14,6 +15,11 @@ from openhands.agent_server.conversation_lease import (
     ConversationLeaseHeldError,
     ConversationOwnershipLostError,
     LeasePayload,
+)
+from openhands.agent_server.persistence.store import _atomic_write_json
+from openhands.sdk.utils.fs_errors import (
+    CONVERSATION_SPACE_FULL_MESSAGE,
+    ConversationStorageFullError,
 )
 
 
@@ -304,3 +310,16 @@ def test_claim_self_pid_match_is_not_treated_as_dead(tmp_path: Path) -> None:
     )
     with pytest.raises(ConversationLeaseHeldError):
         secondary.claim()
+
+
+def test_atomic_write_json_translates_quota_error(tmp_path: Path, monkeypatch) -> None:
+    """Lease writes must surface the friendly space-full message."""
+    lease_path = tmp_path / "owner_lease.json"
+
+    def fail_open(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr("os.open", fail_open)
+    with pytest.raises(ConversationStorageFullError) as exc_info:
+        _atomic_write_json(lease_path, {"owner": "test"})
+    assert str(exc_info.value) == CONVERSATION_SPACE_FULL_MESSAGE

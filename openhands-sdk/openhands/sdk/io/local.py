@@ -7,6 +7,7 @@ from filelock import FileLock, Timeout
 
 from openhands.sdk.io.cache import MemoryLRUCache
 from openhands.sdk.logger import get_logger
+from openhands.sdk.utils.fs_errors import raise_if_quota_exceeded
 from openhands.sdk.utils.path import to_posix_path
 
 from .base import FileStore
@@ -64,19 +65,23 @@ class LocalFileStore(FileStore):
 
     def write(self, path: str, contents: str | bytes) -> None:
         full_path = self.get_full_path(path)
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        os.chmod(os.path.dirname(full_path), _DIRECTORY_MODE)
-        if isinstance(contents, str):
-            with open(full_path, "w", encoding="utf-8") as f:
-                f.write(contents)
-            os.chmod(full_path, _FILE_MODE)
-            self.cache[full_path] = contents
-        else:
-            with open(full_path, "wb") as f:
-                f.write(contents)
-            os.chmod(full_path, _FILE_MODE)
-            # Don't cache binary content - LocalFileStore is meant for JSON data
-            # If binary data is written and then read, it will error on read
+        try:
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            os.chmod(os.path.dirname(full_path), _DIRECTORY_MODE)
+            if isinstance(contents, str):
+                with open(full_path, "w", encoding="utf-8") as f:
+                    f.write(contents)
+                os.chmod(full_path, _FILE_MODE)
+                self.cache[full_path] = contents
+            else:
+                with open(full_path, "wb") as f:
+                    f.write(contents)
+                os.chmod(full_path, _FILE_MODE)
+                # Don't cache binary content - LocalFileStore is meant for JSON data
+                # If binary data is written and then read, it will error on read
+        except OSError as exc:
+            raise_if_quota_exceeded(exc)
+            raise
 
     def read(self, path: str) -> str:
         full_path = self.get_full_path(path)
