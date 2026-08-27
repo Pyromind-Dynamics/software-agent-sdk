@@ -18,7 +18,10 @@ import re
 from urllib.parse import urlparse
 
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+from openhands.agent_server.drain import RESTART_REASON, is_draining
 
 
 _WORKSPACE_SESSION_PATH = "/api/auth/workspace-session"
@@ -107,3 +110,18 @@ class CORSDispatcher:
                 await self._workspace_cors(scope, receive, send)
                 return
         await self._default_cors(scope, receive, send)
+
+
+class DrainingMiddleware:
+    """Return a fast 503 with the restart message while the server drains."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        app = scope.get("app")
+        if scope["type"] == "http" and app is not None and is_draining(app):
+            response = JSONResponse(status_code=503, content={"detail": RESTART_REASON})
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)

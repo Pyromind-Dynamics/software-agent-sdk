@@ -220,7 +220,7 @@ def test_websocket_client_notifies_state_transitions_around_server_restart():
     abnormal = websockets.exceptions.ConnectionClosed(
         rcvd=None, sent=None, rcvd_then_sent=None
     )
-    restart_close = websockets.frames.Close(1012, "Service restarting")
+    restart_close = websockets.frames.Close(1012, "Server is restarting, please wait")
     restart = websockets.exceptions.ConnectionClosed(
         rcvd=restart_close,
         sent=restart_close,
@@ -253,7 +253,7 @@ def test_websocket_client_notifies_state_transitions_around_server_restart():
     assert [(state.value, reason) for state, reason in states] == [
         ("connecting", None),
         ("reconnecting", "code 1006"),
-        ("reconnecting", "Service restarting"),
+        ("reconnecting", "Server is restarting, please wait"),
         ("connected", None),
         ("reconnecting", None),
         ("stopped", "Conversation not found"),

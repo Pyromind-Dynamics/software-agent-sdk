@@ -44,6 +44,7 @@ from openhands.agent_server.dependencies import (
     is_session_api_key_valid,
     verify_pyromind_jwt_token,
 )
+from openhands.agent_server.drain import RESTART_REASON
 from openhands.agent_server.event_router import normalize_datetime_to_server_timezone
 from openhands.agent_server.models import (
     BashError,
@@ -81,9 +82,8 @@ def _unregister_client_socket(websocket: WebSocket) -> None:
     _active_client_sockets.discard(websocket)
 
 
-async def close_client_sockets(
-    code: int = 1012, reason: str = "Service restarting"
-) -> None:
+async def close_client_sockets(code: int = 1012, reason: str = RESTART_REASON) -> None:
+    """Close all registered client sockets with a restart close frame."""
     sockets = list(_active_client_sockets)
     _active_client_sockets.clear()
     for websocket in sockets:

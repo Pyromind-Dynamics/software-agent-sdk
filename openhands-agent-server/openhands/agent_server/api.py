@@ -34,6 +34,7 @@ from openhands.agent_server.dependencies import (
 )
 from openhands.agent_server.desktop_router import desktop_router
 from openhands.agent_server.desktop_service import get_desktop_service
+from openhands.agent_server.drain import mark_draining, reset_draining
 from openhands.agent_server.event_router import event_router
 from openhands.agent_server.file_router import file_router
 from openhands.agent_server.git_router import git_router
@@ -46,7 +47,7 @@ from openhands.agent_server.init_router import (
 from openhands.agent_server.kafka_bus.kafka_bus import kafka_message_bus
 from openhands.agent_server.llm_router import llm_router
 from openhands.agent_server.mcp_router import mcp_router
-from openhands.agent_server.middleware import CORSDispatcher
+from openhands.agent_server.middleware import CORSDispatcher, DrainingMiddleware
 from openhands.agent_server.openai.router import (
     check_openai_api_key,
     openai_router,
@@ -183,6 +184,8 @@ def _cleanup_stale_tmux_sessions() -> None:
 async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
     tmux_tmpdir, tmux_tmpdir_was_defaulted = _ensure_server_tmux_tmpdir()
     try:
+        reset_draining(api)
+
         # Clean up stale tmux sessions from previous server runs
         _cleanup_stale_tmux_sessions()
 
@@ -297,6 +300,7 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
             try:
                 yield
             finally:
+                mark_draining(api)
                 await close_client_sockets()
                 await init_service.teardown()
                 await stop_stateless_services()
@@ -330,6 +334,7 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
             try:
                 yield
             finally:
+                mark_draining(api)
                 await close_client_sockets()
                 if retention_task is not None:
                     retention_task.cancel()
@@ -673,6 +678,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     _add_api_routes(app)
     _setup_static_files(app, config)
+    app.add_middleware(DrainingMiddleware)
     app.add_middleware(
         CORSDispatcher,
         allow_origins=_cors_allow_origins(config),
