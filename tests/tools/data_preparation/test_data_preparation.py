@@ -264,8 +264,9 @@ def test_df_run_pipeline_validates_output_and_writes_local_report(
         Path(__file__).parents[3]
         / ".agents"
         / "skills"
-        / "data-preparation"
+        / "data-processing"
         / "scripts"
+        / "preparation"
     )
     conversation = cast(Any, _fake_conversation(tmp_path))
     conversation.state.agent = _conversation_with_llm().state.agent
@@ -337,8 +338,9 @@ def test_df_run_pipeline_validates_dpo_output(
         Path(__file__).parents[3]
         / ".agents"
         / "skills"
-        / "data-preparation"
+        / "data-processing"
         / "scripts"
+        / "preparation"
     )
     conversation = cast(Any, _fake_conversation(tmp_path))
     conversation.state.agent = _conversation_with_llm().state.agent
@@ -387,8 +389,9 @@ def test_df_run_pipeline_rejects_handwritten_vision_transport(
         Path(__file__).parents[3]
         / ".agents"
         / "skills"
-        / "data-preparation"
+        / "data-processing"
         / "scripts"
+        / "preparation"
     )
     conversation = cast(Any, _fake_conversation(tmp_path))
     conversation.state.agent = _conversation_with_llm().state.agent
@@ -766,7 +769,16 @@ def test_df_convert_vision_sft_flat_rejects_invalid_records(
 
 def _load_skill_reference(name: str, *, stub_dataflow: bool = False):
     root = Path(__file__).parents[3]
-    path = root / ".agents" / "skills" / "data-preparation" / "references" / name
+    path = (
+        root
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "references"
+        / "paradigms"
+        / "llm-pipeline"
+        / name
+    )
     previous_dataflow = sys.modules.get("dataflow")
     if stub_dataflow:
         dataflow = types.ModuleType("dataflow")
@@ -789,7 +801,9 @@ def _load_skill_reference(name: str, *, stub_dataflow: bool = False):
 
 def _load_image_utils() -> Any:
     root = Path(__file__).parents[3]
-    scripts_dir = root / ".agents" / "skills" / "data-preparation" / "scripts"
+    scripts_dir = (
+        root / ".agents" / "skills" / "data-processing" / "scripts" / "preparation"
+    )
     path = scripts_dir / "image_utils.py"
     module_name = "test_data_preparation_image_utils"
     spec = importlib.util.spec_from_file_location(module_name, path)
@@ -812,8 +826,9 @@ def test_data_preparation_runtime_is_python_310_compatible() -> None:
         Path(__file__).parents[3]
         / ".agents"
         / "skills"
-        / "data-preparation"
+        / "data-processing"
         / "scripts"
+        / "preparation"
     )
     for path in sorted(scripts_dir.glob("*.py")):
         source = path.read_text(encoding="utf-8")
@@ -1206,8 +1221,9 @@ def test_managed_image_pipeline_static_contract(tmp_path: Path) -> None:
         Path(__file__).parents[3]
         / ".agents"
         / "skills"
-        / "data-preparation"
+        / "data-processing"
         / "scripts"
+        / "preparation"
         / "image_utils.py"
     )
     public_names = runtime_public_names(image_utils_path)

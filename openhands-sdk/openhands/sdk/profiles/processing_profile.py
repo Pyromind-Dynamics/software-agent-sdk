@@ -4,7 +4,7 @@ A vertical scenario (e.g. tmax terminal-task validation) is expressed as an
 ordered list of sandbox primitives plus a verdict rule and an output spec.
 Control flow — per-record looping, image-dedup caching, resume, sandbox
 cleanup — is intentionally *not* part of the profile; it lives in the frozen
-runtime (``environment-data-processing`` skill's ``sandbox_runner.py``) that
+runtime (``data-processing`` skill's ``scripts/edp/sandbox_runner.py``) that
 interprets the profile, so a mis-authored profile cannot silently corrupt a
 batch run.
 """

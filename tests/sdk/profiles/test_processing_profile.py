@@ -19,7 +19,9 @@ _TMAX_SEED = (
     _REPO_ROOT
     / ".agents"
     / "skills"
-    / "environment-data-processing"
+    / "data-processing"
+    / "scripts"
+    / "edp"
     / "profiles"
     / "tmax-validation.json"
 )

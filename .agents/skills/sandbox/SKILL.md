@@ -7,8 +7,8 @@ description: >-
   sandbox_delete / sandbox_read_file / sandbox_terminal 提供容器生命周期管理、
   文件读取与终端命令执行（sandbox_terminal 与 pyromind terminal 共用同一个
   WebSocket TTY 桥）。数据集可用性验证、逐条起镜像跑任务验题等环境依赖数据处理
-  任务请用 environment-data-processing（声明式 profile + 冻结 runner），
-  不要用本 skill 手工逐条编排数据验证。
+  任务请用 data-processing skill 的 environment-processing 处理范式（声明式
+  profile + 冻结 runner），不要用本 skill 手工逐条编排数据验证。
 triggers:
 - sandbox
 - 沙箱
@@ -58,9 +58,9 @@ WebSocket 桥接（与 `pyromind terminal <sandbox-id> --cluster <集群>` CLI �
 ## 注意事项
 
 - **边界**：本 skill 只提供容器原语。任务是"数据集可用性验证/逐条起镜像跑任务
-  验题/环境依赖数据处理"时，改用 environment-data-processing skill（profile
-  匹配走 sandbox_runner.py 冻结运行时），不要在本 skill 下手工逐条编排沙箱做
-  数据验证
+  验题/环境依赖数据处理"时，改用 data-processing skill 的
+  environment-processing 处理范式（profile 匹配走 sandbox_runner.py 冻结运行时 ），
+  不要在本 skill 下手工逐条编排沙箱做数据验证
 - 创建是异步的：`wait_timeout` 内未 `running` 时以返回状态为准，勿重复创建
 - 平台拒绝删除 Running 状态的沙箱（`status is Running, can not delete!`）；
   `sandbox_delete` 遇此错误会自动先 `pause` 再重试删除，无需手工暂停

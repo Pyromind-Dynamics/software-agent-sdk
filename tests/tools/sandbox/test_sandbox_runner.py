@@ -23,8 +23,9 @@ _RUNNER_PATH = (
     Path(__file__).resolve().parents[3]
     / ".agents"
     / "skills"
-    / "environment-data-processing"
+    / "data-processing"
     / "scripts"
+    / "edp"
     / "sandbox_runner.py"
 )
 
@@ -480,7 +481,7 @@ def test_tmax_profile_declares_llm_env_triple() -> None:
     Without the LLM_MODEL placeholder install_pi fails loudly instead of
     letting pi run against an unintended default model.
     """
-    profile_path = _RUNNER_PATH.parents[1] / "profiles" / "tmax-validation.json"
+    profile_path = _RUNNER_PATH.parent / "profiles" / "tmax-validation.json"
     profile = ProcessingProfile.model_validate_json(
         profile_path.read_text(encoding="utf-8")
     )

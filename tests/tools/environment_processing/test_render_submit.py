@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from openhands.tools.environment_processing.render_submit import (
@@ -76,6 +78,12 @@ def _patch_submission(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     module = sys.modules["openhands.tools.environment_processing.render_submit"]
     upload = MagicMock()
     monkeypatch.setattr(module, "upload_local_file_to_pyromind", upload)
+    # preflight downloads fail open by default so existing tests never hit storage
+    monkeypatch.setattr(
+        module,
+        "download_tail_from_pyromind",
+        MagicMock(side_effect=ValueError("storage unavailable in test")),
+    )
     response = SimpleNamespace(task_id="task-render-1", status="Pending")
     submit = MagicMock(return_value=response)
     monkeypatch.setattr(module, "submit_workflow_task", submit)
@@ -194,3 +202,202 @@ def test_executor_resolves_workspace_relative_template(
 def test_edp_render_tool_rejects_unknown_params() -> None:
     with pytest.raises(ValueError, match="unknown params"):
         EdpRenderTool.create(bogus=1)
+
+
+def _parquet_bytes() -> bytes:
+    table = pa.table(
+        {
+            "task_id": ["t1"],
+            "description": ["do the thing"],
+            "env_config": [{"task_id": "t1"}],
+        }
+    )
+    sink = pa.BufferOutputStream()
+    pq.write_table(table, sink)
+    return sink.getvalue().to_pybytes()
+
+
+def _patch_preflight(
+    monkeypatch: pytest.MonkeyPatch, parquet: bytes | None
+) -> MagicMock:
+    module = sys.modules["openhands.tools.environment_processing.render_submit"]
+
+    def fake_download(**kwargs: Any) -> tuple[bytes, int]:
+        if parquet is None:
+            raise ValueError("storage unavailable in test")
+        return parquet, len(parquet)
+
+    mock = MagicMock(side_effect=fake_download)
+    monkeypatch.setattr(module, "download_tail_from_pyromind", mock)
+    return mock
+
+
+def test_preflight_rejects_missing_column(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """列名写错秒级拦住,不再浪费一轮平台任务(对话 b32487cc)。"""
+    mocks = _patch_submission(monkeypatch)
+    _patch_preflight(monkeypatch, _parquet_bytes())
+    template = tmp_path / "render_template.json"
+    template.write_text(
+        json.dumps({"fields": {"task_id": "task_id", "prompt": "nope"}})
+    )
+    conversation = _conversation_with_secrets({"auth_token": "tok"})
+
+    obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
+        EdpRenderAction(
+            template_path=str(template),
+            data_source="datasets/tmax/data/train.parquet",
+        ),
+        conversation,
+    )
+
+    assert obs.status == "Failed"
+    assert "top-level column 'nope' which does not exist" in obs.text
+    assert "available columns" in obs.text
+    assert "nothing was submitted" in obs.text
+    mocks.submit.assert_not_called()
+    mocks.upload.assert_not_called()
+
+
+def test_preflight_rejects_missing_nested_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mocks = _patch_submission(monkeypatch)
+    _patch_preflight(monkeypatch, _parquet_bytes())
+    template = tmp_path / "render_template.json"
+    template.write_text(json.dumps({"fields": {"task_id": "env_config.missing"}}))
+    conversation = _conversation_with_secrets({"auth_token": "tok"})
+
+    obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
+        EdpRenderAction(
+            template_path=str(template),
+            data_source="datasets/tmax/data/train.parquet",
+        ),
+        conversation,
+    )
+
+    assert obs.status == "Failed"
+    assert "missing nested field" in obs.text
+    mocks.submit.assert_not_called()
+
+
+def test_preflight_accepts_valid_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mocks = _patch_submission(monkeypatch)
+    download = _patch_preflight(monkeypatch, _parquet_bytes())
+    template = tmp_path / "render_template.json"
+    template.write_text(
+        json.dumps(
+            {
+                "fields": {
+                    "task_id": "task_id",
+                    "prompt": "description",
+                    "workdir": {"field": "env_config.task_id"},
+                }
+            }
+        )
+    )
+    conversation = _conversation_with_secrets({"auth_token": "tok"})
+
+    obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
+        EdpRenderAction(
+            template_path=str(template),
+            data_source="datasets/tmax/data/train.parquet",
+        ),
+        conversation,
+    )
+
+    assert obs.status == "Pending"
+    assert mocks.submit.call_count == 1
+    download.assert_called_once()
+
+
+def test_preflight_skips_glob_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_submission(monkeypatch)
+    download = _patch_preflight(monkeypatch, _parquet_bytes())
+    template = tmp_path / "render_template.json"
+    template.write_text(
+        json.dumps({"fields": {"task_id": "task_id", "prompt": "nope"}})
+    )
+    conversation = _conversation_with_secrets({"auth_token": "tok"})
+
+    obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
+        EdpRenderAction(
+            template_path=str(template),
+            data_source="datasets/tmax/data/train-*.parquet",
+        ),
+        conversation,
+    )
+
+    assert obs.status == "Pending"
+    download.assert_not_called()
+
+
+def test_preflight_fails_open_on_storage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """预检自身失败不阻塞提交(节点端渲染仍会 fail fast)。"""
+    mocks = _patch_submission(monkeypatch)
+    _patch_preflight(monkeypatch, None)
+    template = tmp_path / "render_template.json"
+    template.write_text(
+        json.dumps({"fields": {"task_id": "task_id", "prompt": "nope"}})
+    )
+    conversation = _conversation_with_secrets({"auth_token": "tok"})
+
+    obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
+        EdpRenderAction(
+            template_path=str(template),
+            data_source="datasets/tmax/data/train.parquet",
+        ),
+        conversation,
+    )
+
+    assert obs.status == "Pending"
+    assert mocks.submit.call_count == 1
+
+
+def test_preflight_parses_schema_through_sparse_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """大文件场景:tail 只含文件尾部,头部 magic 虚拟提供、中间为稀疏间隙。"""
+    from openhands.tools.environment_processing.render_submit import (
+        _preflight_template,
+    )
+
+    small = _parquet_bytes()
+    # 模拟 10MB 大文件:真实数据块不下载(稀疏零字节),tail 即整个小 parquet
+    total = len(small) + 10 * 1024 * 1024
+
+    def fake_download(**kwargs: Any) -> tuple[bytes, int]:
+        return small, total
+
+    monkeypatch.setattr(
+        sys.modules["openhands.tools.environment_processing.render_submit"],
+        "download_tail_from_pyromind",
+        MagicMock(side_effect=fake_download),
+    )
+
+    assert (
+        _preflight_template(
+            {"fields": {"task_id": "task_id", "prompt": "description"}},
+            "datasets/tmax/data/train.parquet",
+            storage_base_url="http://storage",
+            headers={},
+            timeout=5.0,
+        )
+        is None
+    )
+    message = _preflight_template(
+        {"fields": {"prompt": "nope"}},
+        "datasets/tmax/data/train.parquet",
+        storage_base_url="http://storage",
+        headers={},
+        timeout=5.0,
+    )
+    assert message is not None
+    assert "top-level column 'nope'" in message

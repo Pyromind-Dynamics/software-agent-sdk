@@ -16,8 +16,9 @@ _SKILL_SCRIPTS = (
     Path(__file__).resolve().parents[3]
     / ".agents"
     / "skills"
-    / "environment-data-processing"
+    / "data-processing"
     / "scripts"
+    / "edp"
 )
 
 

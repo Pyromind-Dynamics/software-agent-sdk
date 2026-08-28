@@ -16,8 +16,9 @@ _SCRIPT = (
     Path(__file__).resolve().parents[3]
     / ".agents"
     / "skills"
-    / "environment-data-processing"
+    / "data-processing"
     / "scripts"
+    / "edp"
     / "render_manifest.py"
 )
 

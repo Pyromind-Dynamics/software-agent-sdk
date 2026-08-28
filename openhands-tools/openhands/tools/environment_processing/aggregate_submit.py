@@ -354,7 +354,12 @@ class EdpAggregateExecutor(ToolExecutor[EdpAggregateAction, EdpAggregateObservat
             text=(
                 "Aggregate task submitted. "
                 f"task_id={task_id}, out_dir={out_dir}. "
-                "After the terminal callback, read "
+                "The platform runs it asynchronously and the terminal callback "
+                "will resume this conversation automatically. NOW reply to "
+                "the user with a short status (what was submitted, task_id, "
+                "that the report will follow on completion) and then END your "
+                "turn — do not poll the output dir or sleep-wait. After the "
+                "terminal callback, read "
                 f"{out_dir}/report.json for the verdict distribution and "
                 f"conversion stats; {out_dir}/slime.jsonl and "
                 f"{out_dir}/sft.jsonl are the training files. Rerun with the "

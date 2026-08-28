@@ -86,7 +86,7 @@ storage = storage.step()
 链路。若模型返回无法解析、字段为空或两答案相同，该样本应丢弃并计入
 `scenario_metrics.json`。
 
-推荐从 [`dpo_pipeline.py`](dpo_pipeline.py) 复制模板：它使用
+推荐从 [`dpo_pipeline.py`](../dpo_pipeline.py) 复制模板：它使用
 `LazyFileStorage`、`PandasOperator`、`FormatStrPromptedGenerator`、`GeneralFilter`、
 `ContentNullFilter` 和 `HashDeduplicateFilter` 完成 input-only 到 DPO JSONL 的生成、
 过滤和去重。

@@ -1,4 +1,4 @@
-"""Pyromind environment-validation platform submission (edp_submit / edp_render)."""
+"""Pyromind environment-processing platform submission (edp_submit / edp_render)."""
 
 from openhands.tools.environment_processing.aggregate_submit import (
     EdpAggregateAction,

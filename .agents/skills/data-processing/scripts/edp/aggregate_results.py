@@ -9,7 +9,7 @@ format and high-reward traces to the SFT format. It runs inside a
 CustomCommandCPUNode with pure standard-library code plus the sibling
 convert_to_slime / convert_to_sft scripts staged next to this file.
 
-Checkpoint semantics (data-preparation style): the merged ``verdicts.jsonl``
+Checkpoint semantics: the merged ``verdicts.jsonl``
 under --out-dir doubles as the checkpoint — task_ids already present are
 skipped, so rerunning after an interrupted aggregation, or appending more
 shards later, resumes instead of duplicating. progress.json is rewritten

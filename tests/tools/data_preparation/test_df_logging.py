@@ -15,13 +15,14 @@ SCRIPTS_DIR = (
     Path(__file__).resolve().parents[3]
     / ".agents"
     / "skills"
-    / "data-preparation"
+    / "data-processing"
     / "scripts"
+    / "preparation"
 )
 
 
 def _import_from_scripts(module_name: str) -> Any:
-    """Import a module from the data-preparation scripts directory."""
+    """Import a module from the data-processing preparation scripts dir."""
     path = SCRIPTS_DIR / f"{module_name}.py"
     spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec is not None and spec.loader is not None

@@ -2,7 +2,8 @@
 name: training-analysis
 description: >-
   分析 Pyromind 平台训练工作流的训练数据(数据源自动探测,当前支持 wandb)并给出
-  优化建议,并联动 data-cleaning/data-preparation skill 分析训练数据集质量。
+  优化建议,并联动 data-processing skill(format-conversion/llm-pipeline
+  处理范式)分析训练数据集质量。
   用户说“分析训练效果”、“看看 loss 曲线”、“训练发散/NaN/尖峰了”、
   “对比两次训练”、“优化超参”、“评估这次训练怎么样”、“分析一下{task_id}的执行情况”
   或给出 task_id / 训练 run 链接时使用;负责定位训练 run、探查指标与配置、

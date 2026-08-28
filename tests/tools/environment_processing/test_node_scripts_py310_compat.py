@@ -18,8 +18,9 @@ _SCRIPTS = (
     Path(__file__).resolve().parents[3]
     / ".agents"
     / "skills"
-    / "environment-data-processing"
+    / "data-processing"
     / "scripts"
+    / "edp"
 )
 
 # Modules/symbols that only exist on Python 3.11+ / 3.12+.

@@ -1,4 +1,4 @@
-"""Submit environment-validation batches to Pyromind Studio for async execution.
+"""Submit environment-processing batches to Pyromind Studio for async execution.
 
 Mirrors the data-preparation platform submission pattern (``df_submit_pipeline``):
 stage the frozen runner + profile + pod runtime into a per-run Storage
@@ -94,7 +94,7 @@ LLM_FALLBACK_KEYS = {
 }
 
 TOOL_DESCRIPTION = """\
-Submit environment-validation batches to Pyromind platform execution.
+Submit environment-processing batches to Pyromind platform execution.
 
 Each shard manifest is submitted as its own one-node CustomCommandCPUNode
 workflow: the tool freezes the skill's sandbox_runner.py, the chosen
@@ -131,7 +131,7 @@ by run_id, and its stored verdicts file doubles as the checkpoint.
 
 
 class EdpSubmitAction(Action):
-    """Submit environment-validation shard manifests to Pyromind Studio."""
+    """Submit environment-processing shard manifests to Pyromind Studio."""
 
     manifest: str | None = Field(
         default=None,
@@ -168,8 +168,8 @@ class EdpSubmitAction(Action):
     profile_name: str = Field(
         default=DEFAULT_PROFILE_NAME,
         description=(
-            "ProcessingProfile basename (without .json) from the skill's "
-            "profiles/ directory, e.g. 'tmax-validation'."
+            "ProcessingProfile basename (without .json) from the profiles/ "
+            "directory inside runtime_dir, e.g. 'tmax-validation'."
         ),
     )
     run_id: str | None = Field(
@@ -226,7 +226,7 @@ class EdpSubmitAction(Action):
 
 
 class EdpSubmitObservation(Observation):
-    """Result of environment-validation platform submissions (per shard)."""
+    """Result of environment-processing platform submissions (per shard)."""
 
     status: str = Field(default="Unknown")
     task_ids: list[str] = Field(default_factory=list)
@@ -505,13 +505,13 @@ class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
         runtime_dir = Path(self._runtime_dir)
         runner_path = runtime_dir / RUNNER_FILENAME
         pod_runtime_dir = runtime_dir / POD_RUNTIME_DIR
-        profile_path = runtime_dir.parent / "profiles" / f"{profile_name}.json"
+        profile_path = runtime_dir / "profiles" / f"{profile_name}.json"
         if not runner_path.is_file():
             raise ValueError(f"Runner not found in runtime_dir: {runner_path}")
         if not profile_path.is_file():
             raise ValueError(
                 f"Profile {profile_name!r} not found: {profile_path} "
-                f"(choices under {runtime_dir.parent / 'profiles'})"
+                f"(choices under {runtime_dir / 'profiles'})"
             )
         if not pod_runtime_dir.is_dir():
             raise ValueError(
@@ -683,8 +683,13 @@ class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
 
         text = (
             f"Env-validation batches submitted ({len(task_ids)} shard workflow(s)). "
-            "While they run, resume by resubmitting with the same run_id. "
-            "After the terminal callbacks, inspect each "
+            "The platform runs them asynchronously and the terminal callbacks "
+            "will resume this conversation automatically. NOW reply to the "
+            "user with a short status (what was submitted, how many shards, "
+            "that verdicts will be reported on completion) and then END your "
+            "turn — do not poll output dirs or sleep-wait. While they run, "
+            "resume by resubmitting with the same run_id. After the terminal "
+            "callbacks, inspect each "
             "<output_dir>/run/verdicts.jsonl, then <output_dir>/run/traces/ "
             "for agent traces."
         )
@@ -707,7 +712,7 @@ class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
 
 
 class EdpSubmitTool(ToolDefinition[EdpSubmitAction, EdpSubmitObservation]):
-    """Submit environment-validation shard manifests as Studio tasks."""
+    """Submit environment-processing shard manifests as Studio tasks."""
 
     @classmethod
     def create(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate canonical Pyromind data-preparation JSONL."""
+"""Validate canonical Pyromind data preparation JSONL."""
 
 from __future__ import annotations
 

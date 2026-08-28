@@ -1,4 +1,4 @@
-"""Shared retry and checkpoint helpers for data-preparation pipelines."""
+"""Shared retry and checkpoint helpers for data preparation pipelines."""
 
 from __future__ import annotations
 

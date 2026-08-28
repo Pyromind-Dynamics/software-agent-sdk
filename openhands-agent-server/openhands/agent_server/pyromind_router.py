@@ -164,9 +164,7 @@ _DEFAULT_SKILLS_PATH = os.environ.get(
 _PYROMIND_SKILL_NAMES = [
     "generate-workflow-dsl",
     "debug-workflow",
-    "data-cleaning",
-    "data-preparation",
-    "environment-data-processing",
+    "data-processing",
     "training-analysis",
     "sandbox",
 ]
@@ -214,25 +212,11 @@ Skill usage rules:
   skill, and do not inspect it afterward unless the skill explicitly requires it.
 - For requests that do not involve a current workflow, invoke a matching listed
   skill before searching the knowledge base.
-- Data processing routing (`data-cleaning` vs `data-preparation`):
-  Analyze the task semantics to decide which skill to invoke.
-  * Use `data-cleaning` when the task is about FORMAT/STRUCTURE transformation:
-    converting data to messages or DPO format, field renaming/mapping,
-    dialogue structure parsing, format validation, structural deduplication.
-    Also suitable for simple content filtering (regex, keyword, length) when
-    platform reliability (checkpoint resume, error isolation, report) matters.
-    Key signal: format conversion is the primary goal, or simple filtering
-    needs reliable execution on large Pyromind Storage datasets.
-  * Use `data-preparation` when the task is about CONTENT-level processing:
-    - Rule-based content cleaning: word count filtering, language detection,
-      MinHash/SimHash dedup, PII removal, toxicity filtering, emoji/HTML
-      removal, blocklist, spelling correction.
-    - LLM-intelligent processing: generating QA/CoT/summaries, semantic
-      quality scoring, text rewriting/refinement, multi-field reasoning.
-    Key signal: the data content itself is evaluated, filtered, or transformed.
-  * If the user explicitly names a mode ("DataFlow"/"脚本清洗"/"格式转换"),
-    follow their choice. If the intent is genuinely ambiguous after analysis,
-    ask the user to clarify before invoking either skill.
+- Data processing: invoke the `data-processing` skill for any dataset
+  cleaning, preparation, or environment-dependent processing request; its
+  SKILL.md routing table selects the processing paradigm. If the user explicitly
+  names a mode ("DataFlow"/"脚本清洗"/"格式转换"), follow their choice. If the
+  intent is genuinely ambiguous, ask the user before invoking.
 - Treat any requested node, model, parameter, data, or topology change as a
   `generate-workflow-dsl` request, including phrases such as "换个模型跑一下"
   or "跑下 <model> 的效果". Modify and validate the DSL, then stop; do not
@@ -551,7 +535,7 @@ def _build_pyromind_storage_tools(
     if isinstance(cleaning_output_root, str) and cleaning_output_root:
         cleaning_params["output_root"] = cleaning_output_root
     cleaning_params["runtime_dir"] = str(
-        Path(skills_path) / "data-cleaning" / "scripts"
+        Path(skills_path) / "data-processing" / "scripts" / "cleaning"
     )
     if "storage_base_url" in params:
         cleaning_params["storage_base_url"] = params["storage_base_url"]
@@ -563,7 +547,7 @@ def _build_pyromind_storage_tools(
     # DataFlow platform submission tool params (mirrors cleaning pattern)
     preparation_params: dict[str, Any] = dict(cleaning_params)
     preparation_params["runtime_dir"] = str(
-        Path(skills_path) / "data-preparation" / "scripts"
+        Path(skills_path) / "data-processing" / "scripts" / "preparation"
     )
 
     # Env-validation platform submission tool params (mirrors preparation
@@ -572,7 +556,7 @@ def _build_pyromind_storage_tools(
     edp_params: dict[str, Any] = dict(cleaning_params)
     edp_params.pop("output_root", None)
     edp_params["runtime_dir"] = str(
-        Path(skills_path) / "environment-data-processing" / "scripts"
+        Path(skills_path) / "data-processing" / "scripts" / "edp"
     )
 
     # Stop-task tool talks to the studio_api portal (APP_ENV-derived URL),
@@ -1293,7 +1277,10 @@ async def create_pyromind_conversation(
                 name="df_run_pipeline",
                 params={
                     "runtime_dir": str(
-                        Path(skills_path) / "data-preparation" / "scripts"
+                        Path(skills_path)
+                        / "data-processing"
+                        / "scripts"
+                        / "preparation"
                     )
                 },
             ),

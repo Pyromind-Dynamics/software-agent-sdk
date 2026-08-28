@@ -2011,6 +2011,94 @@ def download_file_from_pyromind(
     return bytes(content)
 
 
+def download_tail_from_pyromind(
+    *,
+    storage_path: str,
+    storage_base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+    tail_bytes: int,
+) -> tuple[bytes, int]:
+    """Range-download the last ``tail_bytes`` of a storage file.
+
+    Uses a suffix byte range (``bytes=-N``) so the caller never needs the
+    file size up front. Returns ``(tail, total_size)``. Raises when storage
+    ignores range requests for files larger than ``tail_bytes``.
+    """
+    if tail_bytes < 1:
+        raise ValueError("tail_bytes must be greater than 0")
+    try:
+        response = httpx.post(
+            f"{storage_base_url.rstrip('/')}/get_url",
+            headers=headers,
+            json={"path": storage_path},
+            timeout=timeout,
+        )
+    except httpx.RequestError as exc:
+        raise ValueError(
+            f"Failed to request Pyromind storage download URL: {exc}"
+        ) from exc
+    payload = _decode_json_response(response, "Pyromind storage get_url API")
+    if isinstance(payload, str):
+        raise ValueError(payload)
+    data = _extract_api_data("get_url", payload)
+    if isinstance(data, str):
+        raise ValueError(data)
+    url = data.get("url")
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("Pyromind storage get_url API response is missing url data.")
+
+    try:
+        with httpx.stream(
+            "GET",
+            url,
+            headers={"range": f"bytes=-{tail_bytes}"},
+            timeout=timeout,
+            follow_redirects=True,
+        ) as download:
+            if download.status_code >= 400:
+                body = download.read().decode("utf-8", errors="replace")
+                raise ValueError(
+                    "Pyromind storage download URL returned HTTP "
+                    f"{download.status_code}: {_truncate_text(body)}"
+                )
+            if download.status_code == 206:
+                total = _parse_content_range_total(
+                    download.headers.get("content-range", "")
+                )
+                if total is None:
+                    raise ValueError(
+                        "Pyromind storage ranged download is missing "
+                        "content-range in its response."
+                    )
+                return download.read(), total
+            length_header = download.headers.get("content-length")
+            if length_header is not None and length_header.isdigit():
+                if int(length_header) > tail_bytes:
+                    raise ValueError(
+                        "Storage ignored the range request (HTTP 200 with "
+                        f"content-length {length_header}); refusing unbounded "
+                        "download."
+                    )
+                return download.read(), int(length_header)
+            body = download.read()
+            if len(body) > tail_bytes:
+                raise ValueError(
+                    "Storage ignored the range request and streamed "
+                    f"{len(body)} bytes; refusing unbounded tail download."
+                )
+            return body, len(body)
+    except httpx.RequestError as exc:
+        raise ValueError(
+            f"Failed to download Pyromind storage file tail: {exc}"
+        ) from exc
+
+
+def _parse_content_range_total(content_range: str) -> int | None:
+    total = content_range.rsplit("/", 1)[-1].strip() if "/" in content_range else ""
+    return int(total) if total.isdigit() else None
+
+
 class UploadFileToPyromindTool(
     ToolDefinition[UploadFileToPyromindAction, UploadFileToPyromindObservation]
 ):

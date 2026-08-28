@@ -5,8 +5,8 @@
 - **本 skill 负责验证 + 轻量转换**:验证产出 `verdicts.jsonl`,经
   `scripts/convert_to_slime.py` 直接转 slime 三键(纯字段映射,本地跑,
   不进沙箱、无需平台执行)
-- **复杂清洗仍交 data-cleaning**:去重/PII/语言过滤/内容改写等需要
-  清洗算子的场景,以本转换产物为输入走 data-cleaning 流程
+- **复杂清洗仍交 format-conversion 处理范式**:去重/PII/语言过滤/内容改写等需要
+  清洗算子的场景,以本转换产物为输入走 format-conversion 流程
   (预览 → 编写 clean_script → 平台执行 → 校验)
 
 ## 目标格式(slime jsonl 三键)

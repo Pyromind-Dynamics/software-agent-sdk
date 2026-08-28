@@ -13,7 +13,10 @@ read the mount.
 
 from __future__ import annotations
 
+import io
+import json
 import shlex
+import struct
 import tempfile
 import uuid
 from collections.abc import Sequence
@@ -37,6 +40,7 @@ from openhands.tools.pyromind_dataset.definition import (
     _default_storage_base_url,
     _resolve_conversation_headers,
     _resolve_secret_headers,
+    download_tail_from_pyromind,
     upload_local_file_to_pyromind,
 )
 from openhands.tools.workflow.task_submission import (
@@ -55,6 +59,9 @@ DATAFLOW_NODE_TYPE = "CustomCommandCPUNode"
 RENDER_FILENAME = "render_manifest.py"
 RENDER_TEMPLATE_FILENAME = "render_template.json"
 RENDER_REQUIREMENTS = "render_requirements.txt"
+
+PREFLIGHT_TAIL_BYTES = 64 * 1024
+PREFLIGHT_MAX_FOOTER_BYTES = 8 * 1024 * 1024
 
 
 class EdpRenderAction(Action):
@@ -123,6 +130,178 @@ class EdpRenderObservation(Observation):
 
 def _pod_path(storage_path: str) -> str:
     return f"/target-workspace{storage_path}"
+
+
+def _spec_column_refs(name: str, spec: Any) -> list[tuple[str, str]]:
+    """Collect (field, column) references a template spec reads from the row."""
+    if isinstance(spec, str):
+        return [(name, spec)]
+    if not isinstance(spec, dict):
+        return []
+    if "field" in spec:
+        return [(name, str(spec["field"]))]
+    kind = spec.get("kind")
+    if kind == "message":
+        return [(name, str(spec.get("source_field", "messages")))]
+    if kind == "pytest_wrapper":
+        source = spec.get("source", spec.get("source_field"))
+        if source is not None:
+            return _spec_column_refs(name, source)
+    return []
+
+
+def _collect_column_refs(fields: dict[str, Any]) -> list[tuple[str, str]]:
+    refs: list[tuple[str, str]] = []
+    for name, spec in fields.items():
+        refs.extend(_spec_column_refs(name, spec))
+    return refs
+
+
+def _check_column_refs(schema: Any, refs: list[tuple[str, str]]) -> list[str]:
+    import pyarrow as pa
+
+    errors: list[str] = []
+    top_names = list(schema.names)
+    for field_name, column in refs:
+        parts = column.split(".")
+        if parts[0] not in top_names:
+            errors.append(
+                f"field {field_name!r} references top-level column "
+                f"{parts[0]!r} which does not exist (available columns: "
+                f"{top_names})"
+            )
+            continue
+        arrow_field = schema.field(parts[0])
+        for depth, part in enumerate(parts[1:], start=1):
+            field_type = arrow_field.type
+            if not pa.types.is_struct(field_type):
+                errors.append(
+                    f"field {field_name!r}: column {column!r} descends into "
+                    f"{part!r} but {parts[depth - 1]!r} is {field_type}, "
+                    "not a struct"
+                )
+                break
+            if part not in field_type.names:
+                errors.append(
+                    f"field {field_name!r}: column {column!r} references "
+                    f"missing nested field {part!r} (struct fields: "
+                    f"{list(field_type.names)})"
+                )
+                break
+            arrow_field = field_type.field(part)
+    return errors
+
+
+class _ParquetTailFile(io.RawIOBase):
+    """Read-only file-like view over [virtual "PAR1" head][gap][tail bytes].
+
+    pyarrow only seeks/reads the footer region at the end of a parquet
+    file, so a suffix-range download plus this view is enough to read the
+    schema without fetching the data blocks.
+    """
+
+    def __init__(self, total_size: int, tail: bytes) -> None:
+        self._size = total_size
+        self._tail = tail
+        self._tail_start = total_size - len(tail)
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_SET:
+            self._pos = offset
+        elif whence == io.SEEK_CUR:
+            self._pos += offset
+        elif whence == io.SEEK_END:
+            self._pos = self._size + offset
+        else:
+            raise ValueError(f"invalid whence: {whence!r}")
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+    def read(self, size: int = -1) -> bytes:
+        end = (
+            self._size
+            if size is None or size < 0
+            else min(self._pos + size, self._size)
+        )
+        chunks = bytearray()
+        pos = self._pos
+        while pos < end:
+            if pos < 4 and pos < self._tail_start:
+                span = min(end - pos, 4 - pos)
+                chunks += b"PAR1"[:span]
+                pos += span
+            elif pos >= self._tail_start:
+                offset = pos - self._tail_start
+                span = min(end - pos, len(self._tail) - offset)
+                chunks += self._tail[offset : offset + span]
+                pos += span
+            else:
+                span = min(end - pos, self._tail_start - pos)
+                chunks += b"\x00" * span
+                pos += span
+        self._pos = end
+        return bytes(chunks)
+
+
+def _preflight_template(
+    template: dict[str, Any],
+    data_source: str,
+    *,
+    storage_base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+) -> str | None:
+    """Best-effort template-vs-schema check before submitting the render.
+
+    Returns a failure message when the template references parquet columns
+    that do not exist, or None when the check passes or cannot run (glob
+    sources, oversized footers, storage errors never block submission —
+    the node-side render still fails fast on the same error).
+    """
+    if any(ch in data_source for ch in "*?["):
+        return None
+    refs = _collect_column_refs(template.get("fields") or {})
+    if not refs:
+        return None
+    try:
+        import pyarrow.parquet as pq
+
+        tail, total = download_tail_from_pyromind(
+            storage_path=data_source,
+            storage_base_url=storage_base_url,
+            headers=headers,
+            timeout=timeout,
+            tail_bytes=PREFLIGHT_TAIL_BYTES,
+        )
+        if len(tail) < 8 or tail[-4:] != b"PAR1":
+            return None
+        footer_len = struct.unpack("<I", tail[-8:-4])[0]
+        if footer_len + 8 > len(tail):
+            if footer_len + 8 > PREFLIGHT_MAX_FOOTER_BYTES:
+                return None
+            tail, total = download_tail_from_pyromind(
+                storage_path=data_source,
+                storage_base_url=storage_base_url,
+                headers=headers,
+                timeout=timeout,
+                tail_bytes=footer_len + 8,
+            )
+        schema = pq.ParquetFile(_ParquetTailFile(total, tail)).schema_arrow
+    except Exception:  # noqa: BLE001
+        return None
+    errors = _check_column_refs(schema, refs)
+    if errors:
+        return "Render template preflight failed: " + "; ".join(errors)
+    return None
 
 
 def build_render_command(
@@ -254,6 +433,38 @@ class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
                 )
             template_path = resolved
 
+        try:
+            template = json.loads(template_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return EdpRenderObservation.from_text(
+                text=f"render template is unreadable or invalid JSON: {exc}",
+                status="Failed",
+                is_error=True,
+            )
+        if not isinstance(template, dict):
+            return EdpRenderObservation.from_text(
+                text="render template must be a JSON object.",
+                status="Failed",
+                is_error=True,
+            )
+
+        preflight = _preflight_template(
+            template,
+            action.data_source,
+            storage_base_url=self._storage_base_url or _default_storage_base_url(),
+            headers=self._storage_headers_for(conversation),
+            timeout=float(self._timeout),
+        )
+        if preflight is not None:
+            return EdpRenderObservation.from_text(
+                text=(
+                    f"{preflight}. Fix the template and resubmit — nothing "
+                    "was submitted to the platform."
+                ),
+                status="Failed",
+                is_error=True,
+            )
+
         run_id = uuid.uuid4()
         output_root = self._output_root or (
             f"/.pyromind-agent/{conversation.id}/edp_render/{run_id}"
@@ -353,6 +564,11 @@ class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
             text=(
                 "Render task submitted. "
                 f"task_id={task_id}, run_id={run_id}, output_dir={output_dir}. "
+                "The platform runs it asynchronously and the terminal "
+                "callback will resume this conversation automatically. NOW "
+                "reply to the user with a short status (what was submitted, "
+                "task_id, that you will report back on completion) and then "
+                "END your turn — do not poll the output dir or sleep-wait. "
                 "After the terminal callback, read "
                 f"{output_dir}/shards.json for the shard list, then roll out "
                 "edp_submit per shard."

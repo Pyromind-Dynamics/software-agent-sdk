@@ -269,7 +269,7 @@ def _runtime_tmp(tmp_path: Path, with_pod_runtime: bool = True) -> Path:
             ""
         )
         (pod / "openhands" / "tools" / "sandbox" / "__init__.py").write_text("")
-    profiles = tmp_path / "profiles"
+    profiles = scripts / "profiles"
     profiles.mkdir()
     (profiles / "tmax-validation.json").write_text('{"name": "tmax-validation"}\n')
     return scripts
