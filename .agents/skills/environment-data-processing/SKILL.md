@@ -112,8 +112,9 @@ HF 数据集镜像:
 **不要**自建沙箱下载全量数据查 schema——那会把全量数据拉回 agent 侧,
 违背三段平台化的控制面原则;正确动作是 AskUserQuestion 向用户说明缺口
 与候选方案,由用户决策。字段来源表达不了时先查下方 spec 能力表
-(`message`/`storage_file` kind 覆盖 chat 格式与逐任务目录形态),仍表达
-不了再问用户,不要绕开平台自行构造 manifest。
+(`message`/`storage_file` kind 与点号嵌套下钻覆盖 chat 格式、逐任务目录
+与 struct 嵌套形态),仍表达不了再问用户,不要绕开平台自行构造 manifest,
+也不要另起 pipeline 先把 parquet 展平再渲染。
 
 **出渲染模板 JSON**(字段映射 + 分片大小,几 KB;**shard_size 需与用户确认**):
 
@@ -146,7 +147,7 @@ chat 格式数据集(open-instruct 形态:prompt 在 `messages` 列、test 资�
     "prompt": {"kind": "message", "source_field": "messages", "role": "user"},
     "test_sh": {"kind": "pytest_wrapper",
                  "source": {"kind": "storage_file",
-                             "path_template": "task-data/{task_id}/tests/test_final_state.py"},
+                             "path_template": "datasets/allenai/tmax/task-data/{task_id}/tests/test_final_state.py"},
                  "target_path": "/workspace/test_final_state.py"}
   },
   "shard_size": 500
@@ -157,11 +158,11 @@ chat 格式数据集(open-instruct 形态:prompt 在 `messages` 列、test 资�
 
 | spec | 语义 |
 | --- | --- |
-| `"col"` 或 `{"field": "col"}` | parquet 列原值(缺列整批报错,不猜) |
+| `"col"` 或 `{"field": "col"}` | parquet 列原值;支持点号下钻 struct 嵌套列(如 `env_config.task_id`,open-instruct 形态 task_id/image 嵌在 struct 里时直接写,不需要先展平)(缺列整批报错,不猜) |
 | `{"fixed": 值}` | 常量 |
 | `{"join": {"source", "on", "column"}}` | 从 storage 映射表(JSONL/CSV)按 task_id 查值;未命中该行进 `render_failures.jsonl` |
 | `{"kind": "message", "source_field": "messages", "role": "user", "index": "first"\|"last"}` | 从 chat 格式 list 列抽指定角色消息文本(open-instruct 形态的 prompt 抽取) |
-| `{"kind": "storage_file", "path_template": "task-data/{task_id}/tests/test.sh"}` | 逐行读 storage 文件全文作字段值;占位符引用已渲染字段(如 `{task_id}`) |
+| `{"kind": "storage_file", "path_template": "datasets/.../task-data/{task_id}/tests/test.sh"}` | 逐行读 storage 文件全文作字段值;**path_template 相对 storage 根解析**(即完整 storage 路径,如 `datasets/allenai/tmax/task-data/...`,不是相对数据集目录);占位符引用已渲染字段(如 `{task_id}`) |
 | `{"kind": "pytest_wrapper", "source": <上述任意 spec>, "target_path": ...}` | 把 source 解析出的 python 源码包装成 pytest verifier 脚本;兼容旧写法 `source_field: <列名>` |
 
 行级问题(join 未命中/文件缺失/消息缺失)只跳过该行并逐条记
@@ -226,6 +227,9 @@ edp_submit(manifest=<render 输出的 batch-001/manifest.jsonl>, limit=3)
   create_failed / probe_failed / pi_install_failed / pi_run_failed /
   verifier_failed / verifier_env_missing),**verifier_env_missing 单独
   分桶**(镜像缺件可修,非数据不可用)
+- smoke 本身就是一个批(单片 3 条):终态后同样自动聚合(见第 3 节),
+  sft/slime 即时产出——用户要看"构建出的数据"零等待,转换层信号
+  (如 reward<1.0 的 usable 记录不进 SFT)在烧全量前就暴露
 
 **2.2 用户决策门禁(硬约束,AskUserQuestion)**
 
@@ -281,7 +285,12 @@ Node 22.19(`.tar.gz` 发行包,不依赖镜像内 xz)到 /opt 并链接
 
 ### 3. 聚合训练文件(edp_aggregate,平台节点)
 
-全部批次完成后,**聚合也在平台执行**,产物即训练文件,无需本地转换:
+**每批片全部终态后 agent 自动聚合**(非用户触发;smoke 单片即首批):
+对本批全部 run_dirs 跑一次增量 `edp_aggregate` 到同一 out_dir,训练文件随批增长;
+聚合幂等(同 out_dir 断点续跑 + task_id 去重),重跑无副作用。
+用户只在**换参数重派生**时才手动指定新 out_dir 重跑——验证(逐条起沙箱)
+贵、转换便宜,`min_reward`/`system_prompt` 等训练侧参数应看完 verdict
+分布后再定,换参数重派生不需要重跑昂贵的沙箱验证:
 
 ```text
 edp_aggregate(run_dirs=[<各片 output_dir>...], out_dir=<聚合输出目录>,

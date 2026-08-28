@@ -28,7 +28,8 @@ Template shape (JSON, Storage or local):
       "shard_size": 500
     }
 
-Every ``fields.*`` entry accepts the same spec forms: a bare column name,
+Every ``fields.*`` entry accepts the same spec forms: a bare column name
+(dotted paths like ``env_config.task_id`` descend into struct columns),
 ``{"field": col}``, ``{"fixed": v}``, ``{"join": {...}}`` (Storage join
 table keyed by task_id), ``{"kind": "message", "source_field": "messages",
 "role": "user"}`` (extract a message from a chat-format list column —
@@ -79,6 +80,11 @@ FAILURES_FILENAME = "render_failures.jsonl"
 PROGRESS_FILENAME = "progress.json"
 REPORT_FILENAME = "report.json"
 
+# Scattered data problems (join misses, a few missing files) never line up
+# this long; only a systematically wrong template does. Aborting there turns
+# a full-dataset wasted render into a few-seconds failure.
+MAX_CONSECUTIVE_SKIPS = 200
+
 
 class RenderSkip(Exception):
     """A row-level data problem; the record goes to render_failures.jsonl."""
@@ -115,14 +121,16 @@ def _pytest_wrapper(script_source: str, target_path: str) -> str:
 
 
 def _row_value(row: Any, column: str, row_index: int) -> Any:
-    """Read one parquet column from the row, failing loudly on a miss."""
-    try:
-        return row[column]
-    except KeyError as exc:
-        raise ValueError(
-            f"row {row_index}: template field references missing column "
-            f"{column!r} (columns: {list(row.keys())})"
-        ) from exc
+    """Read one parquet column; ``a.b`` descends into struct columns."""
+    value: Any = row
+    for part in column.split("."):
+        if not isinstance(value, dict) or part not in value:
+            raise ValueError(
+                f"row {row_index}: template field references missing column "
+                f"{column!r} (columns: {list(row.keys())})"
+            )
+        value = value[part]
+    return value
 
 
 def _resolve_mount_path(path: str) -> str:
@@ -247,7 +255,13 @@ def _resolve_spec(
         try:
             resolved = _resolve_mount_path(path)
         except ValueError as exc:
-            raise RenderSkip(task_id, name, f"storage file missing: {path}") from exc
+            raise RenderSkip(
+                task_id,
+                name,
+                f"storage file missing: {path} "
+                f"(path_template resolves against the storage root; "
+                f"tried {MOUNT_PREFIX}/{path.lstrip('/')})",
+            ) from exc
         try:
             return Path(resolved).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
@@ -401,6 +415,7 @@ def render_product(
     rendered = 0
     failed = 0
     seen_rows = 0
+    consecutive_skips = 0
     shard_index = 1
     shard_records: list[dict[str, str]] = []
     started_at = time.monotonic()
@@ -434,6 +449,14 @@ def render_product(
                         record = render_record(row, fields, row_index, join_indexes)
                     except RenderSkip as skip:
                         failed += 1
+                        consecutive_skips += 1
+                        if consecutive_skips >= MAX_CONSECUTIVE_SKIPS:
+                            raise RuntimeError(
+                                f"aborting after {consecutive_skips} consecutive "
+                                "row failures — the template is systematically "
+                                "wrong (check path_template storage-root paths "
+                                "and join sources), not scattered bad rows"
+                            ) from skip
                         failures.write(
                             json.dumps(
                                 {
@@ -455,6 +478,7 @@ def render_product(
                         continue
                     shard_records.append(record)
                     rendered += 1
+                    consecutive_skips = 0
                     print(
                         f"[{rendered + failed}/{total}] "
                         f"task_id={record['task_id']} -> batch-{shard_index:03d}",

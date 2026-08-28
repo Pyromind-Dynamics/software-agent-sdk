@@ -444,3 +444,144 @@ def test_render_pytest_wrapper_requires_source() -> None:
             },
             0,
         )
+
+
+# ---------------------------------------------------------------------------
+# nested struct columns (dotted-path descent)
+# ---------------------------------------------------------------------------
+
+
+def test_render_nested_struct_dotted_paths_end_to_end(tmp_path: Path) -> None:
+    """env_config struct 形态:task_id/image 嵌在 struct 列里,点号下钻直接
+    渲染——不再需要先另起 pipeline 展平 parquet。"""
+    df = pd.DataFrame(
+        {
+            "messages": [
+                [{"role": "user", "content": f"Solve problem {i}"}] for i in range(2)
+            ],
+            "env_config": [
+                {"task_id": f"task_{i:06d}", "image": f"img:{i}"} for i in range(2)
+            ],
+        }
+    )
+    parquet = tmp_path / "train.parquet"
+    df.to_parquet(parquet)
+    template = {
+        "fields": {
+            "task_id": "env_config.task_id",
+            "image": {"field": "env_config.image"},
+            "prompt": {
+                "kind": "message",
+                "source_field": "messages",
+                "role": "user",
+            },
+            "test_sh": {"fixed": "#!/bin/bash\ntrue\n"},
+        }
+    }
+    out = tmp_path / "out"
+    shards, rendered = render.render_product(
+        str(parquet), template, shard_size=10, local_out=str(out)
+    )
+    assert rendered == 2
+    assert len(shards) == 1
+    records = [
+        json.loads(line)
+        for line in (out / "batch-001" / "manifest.jsonl").read_text().splitlines()
+    ]
+    assert records[0]["task_id"] == "task_000000"
+    assert records[0]["image"] == "img:0"
+    assert records[0]["prompt"] == "Solve problem 0"
+    assert records[1]["image"] == "img:1"
+
+
+def test_render_dotted_path_missing_fails_with_column_list() -> None:
+    row = {"env_config": {"image": "img:1"}, "messages": []}
+    with pytest.raises(ValueError, match="env_config.task_id"):
+        render.render_record(
+            row,
+            {
+                "task_id": "env_config.task_id",
+                "prompt": {"kind": "message"},
+                "test_sh": {"fixed": "#!/bin/bash\ntrue\n"},
+            },
+            0,
+        )
+
+
+def test_render_product_aborts_on_consecutive_failures(tmp_path: Path) -> None:
+    """系统性模板错误(如 path_template 语义错)在几百行内中止,
+    不是烧完全量 14601 条才暴露。"""
+    parquet = _open_instruct_parquet(tmp_path / "train.parquet", rows=250)
+    template = {
+        "fields": {
+            "task_id": "task_id",
+            "prompt": {
+                "kind": "message",
+                "source_field": "messages",
+                "role": "user",
+            },
+            "test_sh": {
+                "kind": "storage_file",
+                "path_template": "wrong-root/task-data/{task_id}/tests/test.sh",
+            },
+        }
+    }
+    with pytest.raises(RuntimeError, match="systematically"):
+        render.render_product(
+            str(parquet), template, shard_size=100, local_out=str(tmp_path / "out")
+        )
+
+
+def test_render_scattered_failures_do_not_abort(tmp_path: Path) -> None:
+    """散布的行级失败(隔行成功)永不触发快速中止。"""
+    parquet = _open_instruct_parquet(tmp_path / "train.parquet", rows=10)
+    for i in range(10):
+        if i % 2 == 0:  # 偶数行有文件,奇数行缺失
+            task_dir = tmp_path / "task-data" / f"task_{i:06d}" / "tests"
+            task_dir.mkdir(parents=True)
+            (task_dir / "test.sh").write_text("#!/bin/bash\ntrue\n")
+    template = {
+        "fields": {
+            "task_id": "task_id",
+            "prompt": {
+                "kind": "message",
+                "source_field": "messages",
+                "role": "user",
+            },
+            "test_sh": {
+                "kind": "storage_file",
+                "path_template": str(
+                    tmp_path / "task-data" / "{task_id}" / "tests" / "test.sh"
+                ),
+            },
+        }
+    }
+    shards, rendered = render.render_product(
+        str(parquet), template, shard_size=100, local_out=str(tmp_path / "out")
+    )
+    assert rendered == 5
+
+
+def test_storage_file_missing_reason_names_mount_prefix(tmp_path: Path) -> None:
+    """失败消息自解释:带上尝试过的挂载路径,agent 一眼看出
+    path_template 该相对 storage 根而不是数据集目录。"""
+    parquet = _open_instruct_parquet(tmp_path / "train.parquet", rows=1)
+    template = {
+        "fields": {
+            "task_id": "task_id",
+            "prompt": {
+                "kind": "message",
+                "source_field": "messages",
+                "role": "user",
+            },
+            "test_sh": {
+                "kind": "storage_file",
+                "path_template": "task-data/{task_id}/tests/test.sh",
+            },
+        }
+    }
+    out = tmp_path / "out"
+    render.render_product(str(parquet), template, shard_size=10, local_out=str(out))
+    failure = json.loads((out / "render_failures.jsonl").read_text().splitlines()[0])
+    assert "storage root" in failure["reason"]
+    assert "/target-workspace/task-data/" in failure["reason"]
