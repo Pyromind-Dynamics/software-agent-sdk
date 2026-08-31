@@ -34,8 +34,6 @@ spec:
         spec:
             containers:
                 - env:
-                      - name: RunMode
-                        value: agent-server
                       - name: workspace_dir
                         value: /workspace
                       - name: SESSION_API_KEY

@@ -25,6 +25,9 @@ COPY --chown=${USERNAME}:${USERNAME} openhands-sdk ./openhands-sdk
 COPY --chown=${USERNAME}:${USERNAME} openhands-tools ./openhands-tools
 COPY --chown=${USERNAME}:${USERNAME} openhands-workspace ./openhands-workspace
 COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server ./openhands-agent-server
+COPY --chown=${USERNAME}:${USERNAME} pyromind-runtime ./pyromind-runtime
+COPY --chown=${USERNAME}:${USERNAME} harness-adapter ./harness-adapter
+COPY --chown=${USERNAME}:${USERNAME} pyromind-agent-server ./pyromind-agent-server
 COPY --chown=${USERNAME}:${USERNAME} .agents ./.agents
 RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
     EXTRA_FLAGS=""; \
@@ -223,15 +226,8 @@ ENV OH_ENABLE_VNC=false
 ENV LOG_JSON=true
 ENV workspace_dir=/workspace
 ENV WORKSPACE_DIR=/workspace
-EXPOSE ${PORT}
-
-
-FROM base-image-minimal AS binary-minimal
-ARG USERNAME
-COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/openhands-agent-server /usr/local/bin/openhands-agent-server
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/.agents /agent-server/.agents
 COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
-RUN chmod +x /usr/local/bin/openhands-agent-server
 # DataFlow venv for df_run_pipeline local trial runs
 # preshed (open-dataflow dep) has no cp313 linux wheel; use Python 3.12
 RUN uv python install 3.12 \
@@ -243,4 +239,18 @@ ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gn
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
 ENV PYROMIND_PUBLIC_READ_PATHS=/agent-server/.agents/skills
 ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
+EXPOSE ${PORT}
+
+
+FROM base-image-minimal AS binary-minimal
+ARG USERNAME
+COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/openhands-agent-server /usr/local/bin/openhands-agent-server
+RUN chmod +x /usr/local/bin/openhands-agent-server
 ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]
+
+
+FROM base-image-minimal AS product
+ARG USERNAME
+COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/.venv /agent-server/.venv
+COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/uv-managed-python /agent-server/uv-managed-python
+ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "pyromind_agent_server"]
