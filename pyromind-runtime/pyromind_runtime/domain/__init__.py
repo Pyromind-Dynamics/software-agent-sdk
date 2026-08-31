@@ -7,6 +7,7 @@ from pyromind_runtime.domain.commands import (
     UserMessageCommand,
 )
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import HarnessEvent, ProductEvent
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 
@@ -19,6 +20,7 @@ __all__ = [
     "PermissionResponseCommand",
     "ProductCommand",
     "ProductEvent",
+    "ProductRuntimeError",
     "RequestContext",
     "RollbackWorkflowCommand",
     "UserMessageCommand",

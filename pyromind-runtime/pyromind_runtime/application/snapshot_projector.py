@@ -9,6 +9,7 @@ from pyromind_runtime.domain.content import ContentBlock, JsonObject, TextConten
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
+    ExternalTaskState,
     PendingPermission,
     PlanState,
     TimelineCompaction,
@@ -28,6 +29,7 @@ _STATUSES = frozenset(
         "running",
         "paused",
         "waiting_for_confirmation",
+        "waiting_for_external_task",
         "finished",
         "error",
         "stuck",
@@ -340,6 +342,65 @@ class SnapshotProjector:
             message=self._string(event.payload, "message", allow_empty=True),
             severity=self._string(event.payload, "severity", default="error"),
         )
+
+    def _on_external_task_submitted(
+        self, snapshot: ConversationSnapshot, event: ProductEvent
+    ) -> ConversationSnapshot:
+        task = ExternalTaskState.model_validate(event.payload)
+        existing = next(
+            (item for item in snapshot.external_tasks if item.task_id == task.task_id),
+            None,
+        )
+        if existing is not None and self._terminal_external_task(existing.status):
+            return snapshot
+        tasks = tuple(
+            existing
+            for existing in snapshot.external_tasks
+            if existing.task_id != task.task_id
+        )
+        return snapshot.model_copy(
+            update={
+                "external_tasks": (*tasks, task),
+                "status": "waiting_for_external_task",
+            }
+        )
+
+    def _on_external_task_updated(
+        self, snapshot: ConversationSnapshot, event: ProductEvent
+    ) -> ConversationSnapshot:
+        return self._update_external_task(snapshot, event)
+
+    def _on_external_task_completed(
+        self, snapshot: ConversationSnapshot, event: ProductEvent
+    ) -> ConversationSnapshot:
+        updated = self._update_external_task(snapshot, event)
+        running = any(
+            task.status in {"pending", "running"} for task in updated.external_tasks
+        )
+        return updated.model_copy(
+            update={"status": "waiting_for_external_task" if running else "idle"}
+        )
+
+    def _update_external_task(
+        self, snapshot: ConversationSnapshot, event: ProductEvent
+    ) -> ConversationSnapshot:
+        task_id = self._string(event.payload, "task_id")
+        tasks = list(snapshot.external_tasks)
+        for index, existing in enumerate(tasks):
+            if existing.task_id == task_id:
+                incoming_status = event.payload.get("status")
+                if (
+                    self._terminal_external_task(existing.status)
+                    and incoming_status != existing.status
+                ):
+                    return snapshot
+                tasks[index] = existing.model_copy(update=dict(event.payload))
+                return snapshot.model_copy(update={"external_tasks": tuple(tasks)})
+        return snapshot
+
+    @staticmethod
+    def _terminal_external_task(status: str) -> bool:
+        return status in {"succeeded", "failed", "terminated", "stopped"}
 
     def _notice(
         self,

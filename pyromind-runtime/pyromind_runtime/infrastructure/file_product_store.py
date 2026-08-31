@@ -37,6 +37,7 @@ class CommandConflictError(ProductStoreError):
 class _Metadata(ContractModel):
     conversation_id: str
     user_id: str
+    harness_id: str = Field(default="openhands", min_length=1)
     capabilities: HarnessCapabilities
     last_sequence: int = Field(default=0, ge=0)
 
@@ -61,7 +62,13 @@ class FileProductStore:
         self._thread_lock = threading.RLock()
         self._projector = SnapshotProjector()
 
-    def create(self, snapshot: ConversationSnapshot, *, user_id: str) -> None:
+    def create(
+        self,
+        snapshot: ConversationSnapshot,
+        *,
+        user_id: str,
+        harness_id: str = "openhands",
+    ) -> None:
         if not self.conversation_dir.is_dir():
             raise ProductStoreError("conversation directory does not exist")
         try:
@@ -78,6 +85,7 @@ class FileProductStore:
         metadata = _Metadata(
             conversation_id=snapshot.conversation_id,
             user_id=user_id,
+            harness_id=harness_id,
             capabilities=snapshot.capabilities,
         )
         try:
@@ -101,6 +109,12 @@ class FileProductStore:
         metadata = self._load_metadata()
         if metadata.user_id != user_id:
             raise PermissionError("conversation does not belong to current user")
+
+    def harness_id(self) -> str:
+        """Return persisted ownership; pre-version-two records are OpenHands."""
+        if not self.metadata_path.is_file():
+            return "openhands"
+        return self._load_metadata().harness_id
 
     def load_snapshot(self) -> ConversationSnapshot:
         with self._lock():
@@ -129,8 +143,14 @@ class FileProductStore:
             events = self._load_events(repair_tail=True)
             metadata = self._reconcile(metadata, events)
             snapshot = self._recover_snapshot(metadata, events)
+            source_identity = self._source_identity(event)
             for persisted in events:
                 if persisted.event_id == event.event_id:
+                    return persisted, snapshot
+                if (
+                    source_identity is not None
+                    and self._source_identity(persisted) == source_identity
+                ):
                     return persisted, snapshot
             persisted = event.model_copy(update={"seq": len(events) + 1})
             updated = self._projector.reduce(snapshot, persisted)
@@ -262,6 +282,7 @@ class FileProductStore:
     def _recover_snapshot(
         self, metadata: _Metadata, events: list[ProductEvent]
     ) -> ConversationSnapshot:
+        duplicate_sources = self._has_duplicate_sources(events)
         try:
             snapshot = ConversationSnapshot.model_validate_json(
                 self.snapshot_path.read_bytes()
@@ -273,17 +294,46 @@ class FileProductStore:
             )
         if snapshot.conversation_id != metadata.conversation_id:
             raise ProductStoreCorruptionError("snapshot conversation mismatch")
-        if snapshot.through_seq > len(events):
+        if snapshot.through_seq > len(events) or duplicate_sources:
             snapshot = ConversationSnapshot(
                 conversation_id=metadata.conversation_id,
                 capabilities=metadata.capabilities,
             )
+        seen_sources = {
+            identity
+            for event in events[: snapshot.through_seq]
+            if (identity := self._source_identity(event)) is not None
+        }
         for event in events[snapshot.through_seq :]:
+            identity = self._source_identity(event)
+            if identity is not None and identity in seen_sources:
+                snapshot = snapshot.model_copy(update={"through_seq": event.seq})
+                continue
             snapshot = self._projector.reduce(snapshot, event)
+            if identity is not None:
+                seen_sources.add(identity)
         if snapshot.through_seq != metadata.last_sequence:
             raise ProductStoreCorruptionError("snapshot recovery did not reach tail")
         self._atomic_write(self.snapshot_path, snapshot.model_dump_json())
         return snapshot
+
+    @classmethod
+    def _has_duplicate_sources(cls, events: list[ProductEvent]) -> bool:
+        seen: set[tuple[str, str]] = set()
+        for event in events:
+            identity = cls._source_identity(event)
+            if identity is None:
+                continue
+            if identity in seen:
+                return True
+            seen.add(identity)
+        return False
+
+    @staticmethod
+    def _source_identity(event: ProductEvent) -> tuple[str, str] | None:
+        if event.source_event_id is None:
+            return None
+        return event.type, event.source_event_id
 
     @staticmethod
     def _fingerprint(command: ProductCommand) -> str:

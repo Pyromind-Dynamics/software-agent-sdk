@@ -4,11 +4,13 @@ import asyncio
 
 import httpx
 from fastapi import FastAPI
+from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.api.router import _resolve_cursor, _sse_stream
 from pyromind_agent_server.app import create_app
 from pyromind_agent_server.bootstrap import install_product_api
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 
 from openhands.agent_server.config import Config
 from openhands.agent_server.conversation_service import ConversationService
@@ -58,7 +60,8 @@ async def test_composed_app_mounts_product_router(tmp_path) -> None:
 async def test_http_create_list_snapshot_and_command(tmp_path) -> None:
     conversations = tmp_path / "conversations"
     conversations.mkdir()
-    runtime = ConversationRuntime(conversations, FakeAdapter())
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter)
     transport = httpx.ASGITransport(app=_app(tmp_path, runtime))
     headers = {"x-pyromind-debug-user-id": "42"}
     async with httpx.AsyncClient(
@@ -95,6 +98,9 @@ async def test_http_create_list_snapshot_and_command(tmp_path) -> None:
     assert snapshot.json()["timeline"][0]["kind"] == "message"
     assert command.status_code == 202
     assert command.json() == retry.json()
+    assert adapter.created_specs[0].workspace_root == str(
+        conversations / conversation_id
+    )
     await runtime.close()
 
 
@@ -115,9 +121,11 @@ async def test_sse_uses_persisted_sequence_as_event_id(tmp_path) -> None:
     )
     stream = _sse_stream(runtime, snapshot.conversation_id, 0, context)
     first = await asyncio.wait_for(anext(stream), timeout=1)
-    assert "id: 1\n" in first
-    assert "event: conversation.created\n" in first
-    assert '"seq":1' in first
+    assert first == ": connected\n\n"
+    event_frame = await asyncio.wait_for(anext(stream), timeout=1)
+    assert "id: 1\n" in event_frame
+    assert "event: conversation.created\n" in event_frame
+    assert '"seq":1' in event_frame
     await stream.aclose()
     await runtime.close()
 
@@ -133,3 +141,69 @@ def test_install_product_api_does_not_modify_openhands_routes() -> None:
     installed = install_product_api(app)
     assert installed is app
     assert app.router.lifespan_context is not original
+
+
+async def test_product_api_creates_pi_metadata_and_reports_missing_checkpoint(
+    tmp_path,
+) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    runtime = ConversationRuntime(
+        conversations,
+        {"openhands": FakeAdapter(), "pi": PiAdapter(conversations)},
+        default_harness_id="pi",
+    )
+    transport = httpx.ASGITransport(app=_app(tmp_path, runtime))
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"x-pyromind-debug-user-id": "42"},
+    ) as client:
+        created = await client.post(
+            "/api/v2/pyromind/conversations",
+            json={
+                "llm": {"model": "gpt-4o", "api_key": "request-secret"},
+                "workflow_xyflow": {
+                    "name": "Workflow",
+                    "nodes": [],
+                    "edges": [],
+                },
+            },
+        )
+        assert created.status_code == 201
+        conversation_id = created.json()["conversation_id"]
+        forked = await client.post(
+            f"/api/v2/pyromind/conversations/{conversation_id}/forks",
+            json={"eventId": "event-1"},
+        )
+        workflow_event = next(
+            event
+            for event in FileProductStore(conversations / conversation_id).replay()
+            if event.type == "workflow.updated"
+        )
+        valid_fork = await client.post(
+            f"/api/v2/pyromind/conversations/{conversation_id}/forks",
+            json={"eventId": workflow_event.event_id, "title": "Pi fork"},
+        )
+    metadata = (conversations / conversation_id / "product" / "meta.json").read_text()
+    assert '"harness_id":"pi"' in metadata
+    assert "request-secret" not in metadata
+    workflow = (
+        conversations
+        / conversation_id
+        / "public_data"
+        / "workflow_canvas"
+        / "workflow.py"
+    )
+    assert workflow.read_text() == "# workflow: Workflow"
+    assert created.json()["current_workflow"]["canvas"]["name"] == "Workflow"
+    assert forked.status_code == 404
+    assert forked.json()["detail"]["code"] == "checkpoint_not_found"
+    assert valid_fork.status_code == 201
+    target_id = valid_fork.json()["conversation_id"]
+    assert target_id != conversation_id
+    assert valid_fork.json()["current_workflow"]["version"] == (
+        created.json()["current_workflow"]["version"]
+    )
+    assert (conversations / target_id / "pi" / "session.jsonl").is_file()
+    await runtime.close()

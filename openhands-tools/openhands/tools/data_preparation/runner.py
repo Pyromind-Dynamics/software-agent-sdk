@@ -12,8 +12,11 @@ from __future__ import annotations
 import ast
 import hashlib
 import os
+import signal
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal
@@ -356,33 +359,89 @@ def run_dataflow_python(
 ) -> tuple[int, str, str]:
     """Run a DataFlow-related subprocess. Returns (rc, stdout, stderr)."""
 
-    env = os.environ.copy()
-    env.update(env_extra)
-    try:
-        result = subprocess.run(
+    return ProcessLocalSampleExecutor().run(
+        python, args, cwd=cwd, env_extra=env_extra, timeout=timeout
+    )
+
+
+class ProcessLocalSampleExecutor:
+    """Observable, cancellable local-process boundary for DataFlow Sample runs."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen[str] | None = None
+
+    def run(
+        self,
+        python: str,
+        args: list[str],
+        *,
+        cwd: str,
+        env_extra: dict[str, str],
+        timeout: int,
+    ) -> tuple[int, str, str]:
+        env = os.environ.copy()
+        env.update(env_extra)
+        process = subprocess.Popen(
             [python, *args],
             cwd=cwd,
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired as exc:
-        stdout, stderr = exc.stdout or "", exc.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode(errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
+        with self._lock:
+            self._process = process
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            self._terminate(process)
+            stdout, stderr = process.communicate()
+            stdout = stdout or _decoded_timeout_stream(exc.stdout)
+            stderr = stderr or _decoded_timeout_stream(exc.stderr)
+            return (
+                124,
+                _redact_subprocess_output(stdout, env_extra),
+                _redact_subprocess_output(
+                    (stderr + f"\nTimed out after {timeout}s").strip(), env_extra
+                ),
+            )
+        finally:
+            with self._lock:
+                if self._process is process:
+                    self._process = None
         return (
-            124,
-            _redact_subprocess_output(stdout, env_extra),
-            _redact_subprocess_output(
-                (stderr + f"\nTimed out after {timeout}s").strip(),
-                env_extra,
-            ),
+            process.returncode,
+            _redact_subprocess_output(stdout or "", env_extra),
+            _redact_subprocess_output(stderr or "", env_extra),
         )
-    return (
-        result.returncode,
-        _redact_subprocess_output(result.stdout or "", env_extra),
-        _redact_subprocess_output(result.stderr or "", env_extra),
-    )
+
+    def interrupt(self) -> None:
+        with self._lock:
+            process = self._process
+        if process is not None:
+            self._terminate(process)
+
+    @staticmethod
+    def _terminate(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            process.terminate()
+        deadline = time.monotonic() + 2
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                process.kill()
+
+
+def _decoded_timeout_stream(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value or ""

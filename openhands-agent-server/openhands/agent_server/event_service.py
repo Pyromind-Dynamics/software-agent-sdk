@@ -31,7 +31,7 @@ from openhands.agent_server.pub_sub import PubSub, Subscriber
 from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
     PYROMIND_APP_TAG_VALUE,
-    PYROMIND_LEGACY_RUNTIME_CONTRACT,
+    PYROMIND_LEGACY_RUNTIME_CONTRACTS,
     PYROMIND_LEGACY_TERMINAL_PARAM_KEYS,
     PYROMIND_RUNTIME_CONTRACT,
     PYROMIND_TERMINAL_PARAMS,
@@ -130,6 +130,7 @@ def _pyromind_runtime_llm(existing: LLM) -> LLM:
             "base_url": _normalize_openai_base_url(
                 os.environ.get("LLM_BASE_URL") or existing.base_url
             ),
+            "stream": True,
             "persist_runtime_config": False,
         }
     )
@@ -203,9 +204,11 @@ def _with_pyromind_runtime_contract(agent: AgentBase) -> AgentBase:
         if not isinstance(custom_instructions, str):
             custom_instructions = ""
         runtime_contract = PYROMIND_RUNTIME_CONTRACT.strip()
-        custom_instructions = custom_instructions.replace(
-            PYROMIND_LEGACY_RUNTIME_CONTRACT.strip(), runtime_contract
-        ).strip()
+        for legacy_contract in PYROMIND_LEGACY_RUNTIME_CONTRACTS:
+            custom_instructions = custom_instructions.replace(
+                legacy_contract.strip(), runtime_contract
+            )
+        custom_instructions = custom_instructions.strip()
         if runtime_contract not in custom_instructions:
             custom_instructions = (
                 f"{custom_instructions.rstrip()}\n\n{runtime_contract}"

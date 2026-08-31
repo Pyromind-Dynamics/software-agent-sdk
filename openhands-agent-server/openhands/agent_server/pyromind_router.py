@@ -56,7 +56,7 @@ from openhands.agent_server.pyromind_subagent import (
 )
 from openhands.agent_server.run_workflow_callback import (
     RunWorkflowCallbackResult,
-    deliver_run_workflow_status,
+    dispatch_run_workflow_status as deliver_run_workflow_status,
 )
 from openhands.agent_server.workflow_canvas_models import WorkflowCanvasEventSnapshot
 from openhands.agent_server.workflow_canvas_store import (
@@ -97,6 +97,7 @@ from openhands.tools.pyromind_dataset.definition import (
 )
 from openhands.tools.pyromind_debug import get_debug_result_broker
 from openhands.tools.pyromind_remote_dataset import PreviewRemoteDatasetTool
+from openhands.tools.training_analysis import TrainingAnalysisTool
 from openhands.tools.utils import PUBLIC_READ_ALIASES
 from openhands.tools.workflow import (
     RunWorkflowTool,
@@ -184,17 +185,18 @@ local files. Read them with `preview_dataset` directly, without searching
 local files. Only `public_data/...` paths are local.
 
 Skill usage rules:
-- A conversation may already contain a workflow at
-  `public_data/workflow_canvas/workflow.py`. Before asking for information or
-  answering any request that may inspect, modify, validate, test, or run the
-  current workflow, read that file in full with `file_editor`. Apply this rule
-  especially to short contextual requests such as "看数据", "改一下", or
-  "换个模型". Reuse dataset/model identifiers and topology already present in
-  the file instead of asking the user to provide them again.
-- Immediately after that single workflow read, invoke the matching listed skill.
-  Then read only the exact `references/` resource that the skill requires. For
-  a local workflow edit, do not inspect general `knowledge/` before invoking the
-  skill, and do not inspect it afterward unless the skill explicitly requires it.
+- Every user turn is preceded by a `<system_reminder>` stating whether
+  `public_data/workflow_canvas/workflow.py` exists. It is authoritative; never
+  run a command or read another file to confirm it. When the workflow exists,
+  read it in full with `file_editor` before asking for information or answering
+  any request that may inspect, modify, validate, test, or run the current
+  workflow, including short contextual requests that presuppose it, and reuse
+  the dataset/model identifiers and topology already in the file instead of
+  asking the user to provide them again.
+- Then invoke the matching listed skill, and read only the exact `references/`
+  resource that the skill requires. For a local workflow edit, do not inspect
+  general `knowledge/` before invoking the skill, and do not inspect it
+  afterward unless the skill explicitly requires it.
 - For requests that do not involve a current workflow, invoke a matching listed
   skill before searching the knowledge base.
 - Data processing routing (`data-cleaning` vs `data-preparation`):
@@ -384,6 +386,29 @@ def _build_analyze_task_failure_tool(
     if secret_headers:
         params["secret_headers"] = secret_headers
     return Tool(name=AnalyzeTaskFailureTool.name, params=params), secrets
+
+
+def _build_training_analysis_tool(
+    http_request: Request,
+    extra: dict[str, Any],
+    skills_path: str | Path,
+) -> tuple[Tool, dict[str, SecretSource]]:
+    """Build ``training_analysis`` with server-only studio auth wiring."""
+    headers, secret_headers, secrets = _build_studio_api_auth(http_request, extra)
+    params: dict[str, Any] = {
+        "runtime_dir": str(Path(skills_path) / "training-analysis" / "scripts")
+    }
+    api_base = extra.get("training_analysis_api_base")
+    if isinstance(api_base, str) and api_base.strip():
+        params["api_base"] = api_base.strip()
+    timeout_seconds = extra.get("training_analysis_timeout_seconds")
+    if isinstance(timeout_seconds, (int, float)) and timeout_seconds > 0:
+        params["timeout_seconds"] = timeout_seconds
+    if headers:
+        params["headers"] = headers
+    if secret_headers:
+        params["secret_headers"] = secret_headers
+    return Tool(name=TrainingAnalysisTool.name, params=params), secrets
 
 
 def _load_env_to_tools(
@@ -628,6 +653,8 @@ class PyromindLLMConfig(BaseModel):
     base_url: str | None = Field(
         default_factory=lambda: os.environ.get("LLM_BASE_URL"),
     )
+    api: Literal["openai-completions", "openai-responses"] | None = None
+    context_window: int | None = Field(default=None, gt=0)
 
     @field_validator("base_url", mode="before")
     @classmethod
@@ -863,24 +890,52 @@ def _empty_workflow_reminder() -> TextContent:
     )
 
 
+def _existing_workflow_reminder() -> TextContent:
+    return TextContent(
+        text=(
+            "<system_reminder>\n"
+            "A workflow already exists at public_data/workflow_canvas/workflow.py. "
+            "Treat it as authoritative context: read the full file with "
+            "file_editor before interpreting this request or asking for dataset, "
+            "model, or topology details already present there.\n"
+            "</system_reminder>"
+        )
+    )
+
+
+def _workflow_state_reminder(working_dir: Path) -> TextContent:
+    """Describe whether workflow.py exists, straight from the workspace.
+
+    The agent's standing instruction is to read workflow.py before touching the
+    current workflow, so every turn must say whether that file is there. This
+    check reads the filesystem rather than the request payload so it also holds
+    for clients that never attach canvas state.
+    """
+    workflow_path = working_dir / WORKFLOW_RELATIVE_PATH
+    if workflow_path.is_file() and _normalize_dsl(
+        workflow_path.read_text(encoding="utf-8")
+    ):
+        return _existing_workflow_reminder()
+    return _empty_workflow_reminder()
+
+
 def _sync_workflow_with_canvas(
     working_dir: Path, workflow_dsl: str | None
-) -> TextContent | None:
+) -> TextContent:
     """Reconcile workflow.py with the DSL converted from the canvas xyflow.
 
     The user can edit the canvas between agent turns, so workflow.py must be
     re-synced from the converted canvas state before each new user message is
-    processed -- otherwise the agent would keep editing a stale version. Returns a
-    ``<system_reminder>`` TextContent to inject into the LLM's context (via
-    ``extended_content``) when workflow.py changed or the attached canvas is
-    confirmed empty, or None when no canvas state was attached.
+    processed -- otherwise the agent would keep editing a stale version. Always
+    returns a ``<system_reminder>`` TextContent to inject into the LLM's context
+    (via ``extended_content``) describing the resulting workflow state.
 
-    `workflow_dsl=None` means the caller attached no xyflow canvas state at all
-    and is a deliberate no-op, distinct from `workflow_dsl=""` which means the
-    canvas is genuinely empty.
+    `workflow_dsl=None` means the caller attached no xyflow canvas state at all,
+    which skips the sync but still reports the workspace's current state; it is
+    distinct from `workflow_dsl=""`, which means the canvas is genuinely empty.
     """
     if workflow_dsl is None:
-        return None
+        return _workflow_state_reminder(working_dir)
 
     workflow_path = working_dir / WORKFLOW_RELATIVE_PATH
     existed = workflow_path.is_file()
@@ -890,7 +945,7 @@ def _sync_workflow_with_canvas(
     normalized_current = _normalize_dsl(current)
     if normalized_canvas == normalized_current:
         if normalized_canvas:
-            return None
+            return _existing_workflow_reminder()
         return _empty_workflow_reminder()
 
     workflow_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1185,6 +1240,9 @@ async def create_pyromind_conversation(
     analysis_tool, analysis_secrets = _build_analyze_task_failure_tool(
         http_request, request.extra
     )
+    training_tool, training_secrets = _build_training_analysis_tool(
+        http_request, request.extra, skills_path
+    )
 
     # run_workflow / workflow_debug reuse validate auth/header wiring
     run_tool, run_secrets = _build_workflow_run_tool(http_request)
@@ -1200,6 +1258,7 @@ async def create_pyromind_conversation(
         model=request.llm.model,
         api_key=request.llm.api_key,
         base_url=request.llm.base_url,
+        stream=True,
         persist_runtime_config=False,
     )
 
@@ -1236,6 +1295,7 @@ async def create_pyromind_conversation(
             Tool(name="df_convert"),
             validation_tool,
             analysis_tool,
+            training_tool,
         ],
     )
 
@@ -1263,6 +1323,7 @@ async def create_pyromind_conversation(
         secrets={
             **validation_secrets,
             **analysis_secrets,
+            **training_secrets,
             **run_secrets,
             **debug_secrets,
             **storage_secrets,
@@ -1293,27 +1354,12 @@ async def create_pyromind_conversation(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Conversation event service not found: {info.id}",
             )
-        if workflow_dsl:
-            initial_reminder = TextContent(
-                text=(
-                    "<system_reminder>\n"
-                    "A workflow from the current canvas is already loaded at "
-                    "public_data/workflow_canvas/workflow.py. Treat it as "
-                    "authoritative context. Read the full file with file_editor "
-                    "before interpreting this request or asking for dataset, "
-                    "model, or topology details already present there.\n"
-                    "</system_reminder>"
-                )
-            )
-        elif request.workflow_xyflow is not None:
-            initial_reminder = _empty_workflow_reminder()
-        else:
-            initial_reminder = None
+        initial_reminder = _workflow_state_reminder(conversation_dir)
 
         await event_service.send_message(
             Message(role="user", content=[TextContent(text=request.message)]),
             run=True,
-            extended_content=[initial_reminder] if initial_reminder else None,
+            extended_content=[initial_reminder],
             workflow_dsl_snapshot=workflow_dsl,
             workflow_xyflow_snapshot=request.workflow_xyflow,
         )
@@ -1360,7 +1406,7 @@ async def send_pyromind_message(
     await event_service.send_message(
         message,
         run=request.run,
-        extended_content=[reminder] if reminder else None,
+        extended_content=[reminder],
         workflow_dsl_snapshot=workflow_dsl,
         workflow_xyflow_snapshot=request.workflow_xyflow,
     )

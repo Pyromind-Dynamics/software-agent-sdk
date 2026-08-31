@@ -31,6 +31,7 @@ from openhands.agent_server.pyromind_router import (
     _build_analyze_task_failure_tool,
     _build_debug_context_headers,
     _build_pyromind_storage_tools,
+    _build_training_analysis_tool,
     _build_workflow_run_tool,
     _build_workflow_validation_tool,
     _get_validation_cookie_header,
@@ -65,6 +66,7 @@ from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
 )
 from openhands.tools.pyromind_remote_dataset import PreviewRemoteDatasetTool
+from openhands.tools.training_analysis import TrainingAnalysisTool
 from openhands.tools.workflow import (
     AnalyzeTaskFailureTool,
     RunWorkflowTool,
@@ -97,7 +99,11 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert len(skill_text.splitlines()) <= 140
     assert "## 资料索引" in skill_text
     assert "## DSL 与资料边界" in skill_text
-    assert 'skills_read(skill_name="generate-workflow-dsl"' in skill_text
+    assert "当前运行时原生的 Skill 读取能力" in skill_text
+    assert "<available_skills>" in skill_text
+    assert 'skills_read(skill_name="generate-workflow-dsl"' not in skill_text
+    assert "单一事实源" not in skill_text
+    assert "不在生成任务中编辑 Skill、reference 或 knowledge" in skill_text
     assert "### 0. 先判定局部修改" in skill_text
     assert "qwen3.5-2b" in skill_text
     assert "不读取 reference 或 `knowledge/`" in skill_text
@@ -115,7 +121,6 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert set(references) == {
         "custom-python-assets.md",
         "data-routing.md",
-        "parameter-decision.md",
         "workflow-contracts.md",
     }
     assert not (skill_root / "references" / "example-workflows.md").exists()
@@ -126,14 +131,15 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert "去掉可选的 `/workspace/` 前缀和开头 `/`" in references["data-routing.md"]
     assert "同一路径已有成功 preview 时复用" in references["data-routing.md"]
     assert "可选统计为空不等于 preview 失败" in references["data-routing.md"]
-    assert "## 监督信号分类" in references["data-routing.md"]
-    assert "即使答案也能程序验证" in references["data-routing.md"]
+    assert "## 训练格式门禁" in references["data-routing.md"]
+    assert "可验证信号" in references["data-routing.md"]
     assert "本文件只识别数据形态" in references["data-routing.md"]
     assert "禁止调用 `run_dataset_cleaning`" in skill_text
     contracts = references["workflow-contracts.md"]
     assert "Benchmark | 数据配置 → 模型入口 → VLLM → Metric → Eval" in contracts
     assert "CloneAndCacheModel | model, target_path" in contracts
-    assert "每个 Metrics Builder 只输出一个 `metrics_config`" in contracts
+    assert "每个 Metrics Builder 只输出一个" in contracts
+    assert "`metrics_config`，Eval 只接一个该端口" in contracts
     assert "NVIDIA-H100-80GB-HBM3" in contracts
     assert "训练阶段由主 Skill 的“选择阶段”唯一决定" in contracts
     assert "有可程序化验证答案或 reward 时选 GRPO" not in contracts
@@ -163,13 +169,13 @@ def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
         working_dir="workspace/conversations/test",
     )
 
-    assert "Immediately after that single workflow read" in rendered
-    assert "Then read only the exact `references/` resource" in rendered
+    assert "Then invoke the matching listed skill" in rendered
+    assert "read only the exact `references/`\n  resource" in rendered
     assert "then `skills_read` only\n  for `SKILL.md`, `references/**`" in rendered
     assert "Treat `scripts/` as executable helpers" in rendered
     assert "Do not read, grep, or summarize\n  `scripts/` source" in rendered
     assert (
-        "do not inspect general `knowledge/` before invoking the\n  skill" in rendered
+        "do not inspect\n  general `knowledge/` before invoking the skill" in rendered
     )
     assert "Treat any requested node, model, parameter" in rendered
     assert "do not\n  invoke `debug-workflow` or `workflow_debug`" in rendered
@@ -177,15 +183,13 @@ def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
     assert "Use dedicated platform tools for preview/upload" in rendered
     assert "never use the local terminal as a substitute" in rendered
     assert "`public_data/` is the writable area" in rendered
-    assert "do not follow terminal cwd" in rendered
-    assert "every created file must use a `public_data/...` path" in rendered
+    assert "every path you write or read starts with `public_data/`" in rendered
     assert "It accepts only the `patch` argument" in rendered
     assert "never pass a separate `path` argument" in rendered
     assert "The separate `file_editor` tool does accept `path`" in rendered
-    assert "terminal session starts at the conversation root" in rendered
-    assert "Make its first command\n`cd public_data`" in rendered
-    assert "reuse the persistent shell's current directory" in rendered
-    assert "conversation-local auxiliary files" in rendered
+    assert "Each terminal call also starts at the conversation root" in rendered
+    assert "never rely on a `cd`" in rendered
+    assert "conversation-local auxiliary" in rendered
     assert "Do not consult `knowledge/` before validation" in rendered
     assert "Whenever a direct question or an intermediate step requires" in rendered
     assert "The parent must not inspect those documents" in rendered
@@ -416,6 +420,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert SkillsReadTool.__name__ not in tool_names
     assert RunWorkflowTool.name not in tool_names
     assert ValidateWorkflowDslTool.name in tool_names
+    assert TrainingAnalysisTool.name in tool_names
     assert PreviewDatasetTool.name in tool_names
     assert UploadFileToPyromindTool.name in tool_names
     assert RunDatasetCleaningTool.name in tool_names
@@ -430,6 +435,19 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         for tool in service.start_request.agent.tools
         if tool.name == ValidateWorkflowDslTool.name
     )
+    training_tool = next(
+        tool
+        for tool in service.start_request.agent.tools
+        if tool.name == TrainingAnalysisTool.name
+    )
+    assert training_tool.params == {
+        "runtime_dir": str(
+            tmp_path / "missing-skills" / "training-analysis" / "scripts"
+        ),
+        "headers": {"x-cluster": "us-west-1#pre"},
+        "secret_headers": {"cookie": "PYROMIND_VALIDATE_AUTH_COOKIE"},
+    }
+    assert "session-token" not in str(training_tool.params)
     assert validation_tool.params == {
         "headers": {"x-cluster": "us-west-1#pre"},
         "secret_headers": {"cookie": "PYROMIND_VALIDATE_AUTH_COOKIE"},
@@ -451,6 +469,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         service.start_request.secrets["PYROMIND_VALIDATE_AUTH_COOKIE"].get_value()
         == cookie_header
     )
+
 
     preview_tool = next(
         tool
@@ -492,6 +511,44 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert "base_url" not in dumped_agent["llm"]
     assert "api_key" not in dumped_agent["condenser"]["llm"]
     assert "base_url" not in dumped_agent["condenser"]["llm"]
+
+
+def test_training_analysis_tool_reuses_authorization_secret_and_config(tmp_path):
+    request = _make_request(
+        {
+            "cookie": "session-cookie",
+            "authorization": "Bearer authorization-secret",
+            "x-cluster": "us-east-1#prod",
+        }
+    )
+    tool, secrets = _build_training_analysis_tool(
+        request,
+        {
+            "training_analysis_api_base": "https://configured.example/studio/",
+            "training_analysis_timeout_seconds": 12.5,
+        },
+        tmp_path,
+    )
+
+    assert tool.params == {
+        "runtime_dir": str(tmp_path / "training-analysis" / "scripts"),
+        "api_base": "https://configured.example/studio/",
+        "timeout_seconds": 12.5,
+        "headers": {"x-cluster": "us-east-1#prod"},
+        "secret_headers": {
+            "cookie": "PYROMIND_VALIDATE_AUTH_COOKIE",
+            "authorization": "PYROMIND_VALIDATE_AUTHORIZATION",
+        },
+    }
+    assert "session-cookie" not in str(tool.params)
+    assert "authorization-secret" not in str(tool.params)
+    assert (
+        secrets["PYROMIND_VALIDATE_AUTH_COOKIE"].get_value() == "session-cookie"
+    )
+    assert (
+        secrets["PYROMIND_VALIDATE_AUTHORIZATION"].get_value()
+        == "Bearer authorization-secret"
+    )
 
 
 @pytest.mark.asyncio
@@ -676,7 +733,7 @@ async def test_pyromind_conversation_initial_message_saves_workflow_snapshot(
     reminder = service.event_service.extended_content[0]
     assert isinstance(reminder, TextContent)
     assert "workflow.py" in reminder.text
-    assert "Read the full file with file_editor" in reminder.text
+    assert "read the full file with " in reminder.text
 
 
 @pytest.mark.asyncio
@@ -704,6 +761,30 @@ async def test_pyromind_conversation_initial_message_marks_empty_canvas(tmp_path
     assert isinstance(reminder, TextContent)
     assert "current canvas is empty" in reminder.text
     assert "invoke the matching skill immediately" in reminder.text
+
+
+@pytest.mark.asyncio
+async def test_pyromind_conversation_reminds_when_no_canvas_attached(tmp_path):
+    """Clients without a canvas still get the workflow-state reminder."""
+    service = _FakeConversationService(tmp_path / "conversations")
+    response = Response()
+
+    await create_pyromind_conversation(
+        _make_request(),
+        PyromindCreateConversationRequest(
+            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            message="直接生成评测工作流",
+            extra={"skills_path": str(tmp_path / "missing-skills")},
+        ),
+        response,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert service.event_service.workflow_xyflow_snapshot is None
+    assert service.event_service.extended_content is not None
+    reminder = service.event_service.extended_content[0]
+    assert isinstance(reminder, TextContent)
+    assert "workflow.py does not exist" in reminder.text
 
 
 def test_workflow_dsl_from_xyflow_treats_empty_xyflow_as_empty_canvas():

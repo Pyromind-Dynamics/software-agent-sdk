@@ -1,4 +1,5 @@
 import re
+import shlex
 import threading
 import time
 from contextlib import suppress
@@ -80,6 +81,7 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         sandbox_mode: TerminalSandboxMode | None = None,
         sandbox_read_only_paths: tuple[str, ...] = (),
         sandbox_read_write_paths: tuple[str, ...] | None = None,
+        reset_cwd_each_command: bool = False,
     ):
         """Initialize TerminalExecutor with auto-detected or specified session type.
 
@@ -96,6 +98,10 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
             full_output_save_dir: Path to directory to save full output
                                   logs and files, used when truncation is needed.
             max_panes: Maximum number of concurrent panes in pool mode.
+            reset_cwd_each_command: Enter ``working_dir`` before every new
+                                   command so the reported working directory is
+                                   the same for every call and a `cd` cannot
+                                   leak into later commands.
         """
         self.shell_path = shell_path
         self._working_dir = working_dir
@@ -110,6 +116,7 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         )
         self._sandbox_read_only_paths = sandbox_read_only_paths
         self._sandbox_read_write_paths = sandbox_read_write_paths
+        self._reset_cwd_each_command = reset_cwd_each_command
         self.full_output_save_dir: str | None = full_output_save_dir
 
         # Pool mode: use TmuxPanePool for parallel execution
@@ -562,6 +569,20 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         if action.reset and action.is_input:
             raise ValueError("Cannot use reset=True with is_input=True")
 
+        original_action = action
+        if (
+            not action.is_input
+            and action.command.strip()
+            and getattr(self, "_reset_cwd_each_command", False)
+        ):
+            action = action.model_copy(
+                update={
+                    "command": (
+                        f"cd -- {shlex.quote(self._working_dir)} && {action.command}"
+                    )
+                }
+            )
+
         # Short-circuit obvious tool-call malformation: Python/JSON literals
         # passed where the model should have sent a shell command. The shell
         # would otherwise echo a confusing `command not found` and the model
@@ -569,9 +590,9 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         # `is_input=True` because that path forwards raw bytes (e.g. keystrokes
         # like `C-c`) to a running process and is not a fresh shell command.
         if not action.is_input:
-            literal_kind = looks_like_python_literal_argument(action.command)
+            literal_kind = looks_like_python_literal_argument(original_action.command)
             if literal_kind is not None:
-                head = action.command.lstrip()[:60]
+                head = original_action.command.lstrip()[:60]
                 logger.warning(
                     "Rejected terminal call: command argument looks like a "
                     "Python/JSON %s (head=%r). Returning structured hint to "
@@ -585,14 +606,28 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                         head=head,
                     ),
                     is_error=True,
-                    command=action.command,
+                    command=original_action.command,
                     exit_code=None,
                 )
 
         if self._pool is not None:
-            return self._execute_pooled(action, conversation)
+            observation = self._execute_pooled(action, conversation)
         else:
-            return self._execute_single_session(action, conversation)
+            observation = self._execute_single_session(action, conversation)
+
+        if action is not original_action:
+            metadata = observation.metadata
+            if metadata is not None:
+                metadata = metadata.model_copy(
+                    update={"working_dir": self._working_dir}
+                )
+            observation = observation.model_copy(
+                update={
+                    "command": original_action.command,
+                    "metadata": metadata,
+                }
+            )
+        return observation
 
     def interrupt(self) -> None:
         """Send Ctrl+C to all active terminal sessions.

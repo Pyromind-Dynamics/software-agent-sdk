@@ -1771,6 +1771,7 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
     manifest = jsonlib.loads(manifest_path.read_text().strip())
     assert manifest["source_path"] == "/dataset/sample-a"
     assert manifest["local_path"].endswith("sample-a")
+    assert manifest["workspace_path"] == observation.local_sample_paths[0]
     assert manifest["images"][0].endswith("diagram.png")
     assert len(manifest["files"]) == 2
     assert (manifest_path.parent / manifest["images"][0]).read_bytes() == image
@@ -1778,6 +1779,10 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
     assert observation.vision_previews[0]["ocr_text"] == "OCR: triangle ABC"
     assert any(item.type == "image" for item in observation.content)
     assert all(item.type == "text" for item in observation.to_llm_content)
+    llm_text = "\n".join(item.text for item in observation.to_llm_content)
+    assert f"sample_manifest_path={observation.sample_manifest_path}" in llm_text
+    assert f"- {observation.local_sample_paths[0]}" in llm_text
+    assert f"df_run_input_path={observation.local_sample_paths[0]}" in llm_text
 
 
 def test_sample_mode_allows_conversation_public_data_workspace(tmp_path) -> None:

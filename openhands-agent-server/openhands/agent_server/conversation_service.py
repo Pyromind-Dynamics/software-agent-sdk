@@ -1421,6 +1421,7 @@ class ConversationService:
         source_id: UUID,
         *,
         event_id: str,
+        fork_id: UUID | None = None,
         title: str | None = None,
         tags: dict[str, str] | None = None,
         user_id: str | None = None,
@@ -1455,7 +1456,7 @@ class ConversationService:
                 f"Workflow snapshot not found for event: {event_id}"
             ) from exc
 
-        fork_id = uuid4()
+        fork_id = fork_id or uuid4()
         fork_workspace = LocalWorkspace(
             working_dir=str(self.conversations_dir / fork_id.hex)
         )

@@ -38,6 +38,8 @@ class TranslationState:
     pending_permission_id: str | None = None
     last_status: str | None = None
     last_usage: JsonObject | None = None
+    external_tasks: dict[str, JsonObject] = field(default_factory=dict)
+    suppress_workflow_events: int = 0
 
     def begin_command(self, command_id: str) -> None:
         self.run_id = command_id
@@ -120,6 +122,9 @@ def translate_event(
                         event_id=f"{event.id}:plan",
                     )
                 )
+        submitted = _external_task_submission(state, event)
+        if submitted is not None:
+            output.append(submitted)
         return tuple(output)
     if isinstance(event, UserRejectObservation):
         state.pending_actions.pop(event.tool_call_id, None)
@@ -243,7 +248,7 @@ def _translate_delta(
     state: TranslationState,
     event: StreamingDeltaEvent,
 ) -> tuple[HarnessEvent, ...]:
-    if event.content is None:
+    if event.content is None or event.content == "":
         return ()
     run_id = state.ensure_run_id()
     message_id = state.streaming_message_id
@@ -278,13 +283,17 @@ def _translate_state_update(
     output: list[HarnessEvent] = []
     status_value: object | None = None
     stats_value: object | None = None
+    external_tasks_value: object | None = None
     if event.key == "full_state" and isinstance(event.value, dict):
         status_value = event.value.get("execution_status")
         stats_value = event.value.get("stats")
+        external_tasks_value = event.value.get("active_long_tasks")
     elif event.key == "execution_status":
         status_value = event.value
     elif event.key == "stats":
         stats_value = event.value
+    elif event.key == "active_long_tasks":
+        external_tasks_value = event.value
     elif event.key == "context_condensation" and isinstance(event.value, dict):
         output.append(
             _event(
@@ -296,6 +305,9 @@ def _translate_state_update(
             )
         )
     elif event.key == PYROMIND_WORKFLOW_EVENT_KEY:
+        if state.suppress_workflow_events:
+            state.suppress_workflow_events -= 1
+            return ()
         workflow = _workflow_payload(event.value, event.id)
         if workflow is not None:
             output.append(
@@ -333,11 +345,115 @@ def _translate_state_update(
                 event_id=f"{event.id}:usage",
             )
         )
+    output.extend(_external_task_updates(state, event, external_tasks_value))
     if str(status_value) == "waiting_for_confirmation":
         permission = _permission_event(state, event)
         if permission is not None:
             output.append(permission)
     return tuple(output)
+
+
+def _external_task_submission(
+    state: TranslationState,
+    event: ObservationEvent,
+) -> HarnessEvent | None:
+    kinds = {
+        "df_submit_pipeline": "data_preparation",
+        "run_dataset_cleaning": "data_cleaning",
+        "workflow_debug": "workflow_debug",
+    }
+    kind = kinds.get(event.tool_name)
+    if kind is None or event.observation.is_error:
+        return None
+    details = event.observation.model_dump(mode="json")
+    task_id = details.get("task_id")
+    run_id = details.get("run_id") or task_id
+    output_dir = details.get("output_dir")
+    identifiers = (task_id, run_id)
+    if not all(isinstance(value, str) and value for value in identifiers):
+        return None
+    assert isinstance(task_id, str)
+    assert isinstance(run_id, str)
+    if kind != "workflow_debug" and not (isinstance(output_dir, str) and output_dir):
+        return None
+    status = _external_task_status(details.get("status"))
+    payload: JsonObject = {
+        "task_id": task_id,
+        "kind": kind,
+        "run_id": run_id,
+        "status": status,
+        "output_dir": output_dir if isinstance(output_dir, str) else None,
+        "attempt": details.get("attempt"),
+        "max_attempts": details.get("max_attempts"),
+        "keep_ui_lock": bool(details.get("keep_ui_lock", False)),
+        "submitted_at": event.timestamp,
+        "updated_at": event.timestamp,
+        "resume_pending": False,
+    }
+    state.external_tasks[task_id] = payload
+    return _event(
+        state,
+        event,
+        "external_task.submitted",
+        payload,
+        event_id=f"{event.id}:external-task:{task_id}:submitted",
+    )
+
+
+def _external_task_updates(
+    state: TranslationState,
+    event: ConversationStateUpdateEvent,
+    value: object,
+) -> tuple[HarnessEvent, ...]:
+    if not isinstance(value, list):
+        return ()
+    output: list[HarnessEvent] = []
+    for item in value:
+        if isinstance(item, BaseModel):
+            item = item.model_dump(mode="json")
+        if not isinstance(item, dict):
+            continue
+        task_id = item.get("task_id")
+        if not isinstance(task_id, str):
+            continue
+        previous = state.external_tasks.get(task_id)
+        if previous is None:
+            continue
+        status = _external_task_status(item.get("status"))
+        if previous.get("status") == status:
+            continue
+        updated: JsonObject = {
+            **previous,
+            "status": status,
+            "updated_at": event.timestamp,
+            "resume_pending": False,
+        }
+        state.external_tasks[task_id] = updated
+        terminal = status in {"succeeded", "failed", "terminated", "stopped"}
+        output.append(
+            _event(
+                state,
+                event,
+                "external_task.completed" if terminal else "external_task.updated",
+                updated,
+                event_id=f"{event.id}:external-task:{task_id}:{status}",
+            )
+        )
+    return tuple(output)
+
+
+def _external_task_status(value: object) -> str:
+    normalized = str(value or "pending").strip().lower()
+    return {
+        "success": "succeeded",
+        "succeeded": "succeeded",
+        "error": "failed",
+        "failed": "failed",
+        "terminated": "terminated",
+        "stopped": "stopped",
+        "running": "running",
+        "pending": "pending",
+    }.get(normalized, "pending")
 
 
 def _permission_event(

@@ -18,9 +18,8 @@ description: >-
 - 数据、模型和训练产物通过输出端口绑定；禁止用 Agent 本地 terminal 替代平台运行时或查找数据副本。
 - Benchmark 最小骨架是数据配置 → 模型入口 → VLLM → Metric → Eval。
 - 每个 `MetricsConfigBuilderNode` 只输出一个 `metrics_config`；契约未声明的组合方式不得猜测。
-- 节点契约的单一事实源是 `knowledge/nodes/<NodeType>/<NodeType>.md`（输入/输出/必填/枚举）；
-  `references/workflow-contracts.md` 是整理后的快速索引。两者冲突以 `knowledge/` 原文为准，并按
-  `validate_workflow_dsl` 实时结果回写 skill 规则。
+- 节点拓扑、输入输出、必填项和枚举先按 `references/workflow-contracts.md` 生成；运行时契约以
+  `validate_workflow_dsl` 的实时结果为准。`knowledge/` 只作为校验暴露未覆盖契约时的定向补充资料。
 - GPU 枚举、必填端口等平台契约会随迭代漂移；不确定时构造最小可验证 DSL 调一次
   `validate_workflow_dsl`，以返回的 `code`/`node_id`/`field` 为准，不要凭经验猜测。
 - Reference 是按缺失事实选择的索引，不是阅读清单；同一轮不得重复读取同一路径。
@@ -33,11 +32,11 @@ description: >-
 |---|---|
 | `references/data-routing.md` | 判断数据源、preview 结果、训练格式、字段映射或训练类型 |
 | `references/workflow-contracts.md` | 完整生成或组合阶段时查拓扑、节点参数、端口、枚举和平台覆盖项 |
-| `references/parameter-decision.md` | 训练数值参数的整组决策或训练 OOM 调整 |
 | `references/custom-python-assets.md` | 内置 Metrics/Reward 不适用，需要生成、上传并回填 Python 入口 |
-| 其他 Skill: `training-analysis` | 分析已有训练效果（loss 异常/对比/优化超参）时，先调该 skill 产出报告与探针实验，再按 `parameter-decision.md` 落参数 |
+| 其他 Skill: `training-analysis` | 分析已有训练效果（loss 异常/对比/优化超参）时，先调该 skill 产出报告与探针实验，再整组落参数 |
 
-调用格式为 `skills_read(skill_name="generate-workflow-dsl", path="references/...")`。
+Reference 路径相对本 `SKILL.md` 所在目录。使用当前运行时原生的 Skill 读取能力打开精确路径；
+Pi 使用 `<available_skills>` 中的 Skill 位置并从该目录解析 reference，不要用 terminal 搜索 Skill。
 
 ## 执行状态机
 
@@ -95,10 +94,11 @@ description: >-
 
 ### 5. 整组配参
 
-阶段锁定后，需要自动决定或调整训练数值时读取 `parameter-decision.md`，一次性确定 max sequence length、
-batch、grad accumulation、learning rate、epoch、LoRA rank、max steps 和 num generations。
+阶段锁定后，结合数据规模、P95 长度、模型规模和可用资源，一次性整组决定 max sequence length、
+batch、grad accumulation、learning rate、epoch、LoRA rank 和 GRPO 的 max steps、num generations
+与生成长度。平台默认值与 DSL 字段约束以 `workflow-contracts.md` 为准，其余调参自行推理。
 
-参数优先级：**用户明确要求 > 修改任务中已有有效值 > 数据与资源决策 > 模板兜底值**。
+参数优先级：**用户明确要求 > 修改任务中已有有效值 > 数据与资源决策 > 模型兜底**。
 不要只改一个相互依赖参数，也不要用模板覆盖无关配置。
 
 ### 6. 准备自定义资产
@@ -118,13 +118,12 @@ batch、grad accumulation、learning rate、epoch、LoRA rank、max steps 和 nu
 
 ### 8. 校验闭环
 
-每次写入后立即调用
-`validate_workflow_dsl(dsl_path="public_data/workflow_canvas/workflow.py")`；不要传 DSL 全文：
+每次写入后立即调用 `validate_workflow_dsl()`（缺省即校验工作区 `workflow.py`）；不要传 DSL 全文：
 
 1. `valid=true`：结束；warnings 只在最终回复简述。
 2. `valid=false`：按 `code`、`node_id`、`field` 和 `detail.*_node_code` 做唯一片段最小修改。
    平台契约漂移（如 `MISSING_REQUIRED_INPUT`、`ENUM_VALUE_INVALID`）以校验返回为准，不得照搬
-   skill 旧表格；修正后顺带回写 `references/workflow-contracts.md` 对应行。
+   skill 旧表格；只修改当前 DSL，不在生成任务中编辑 Skill、reference 或 knowledge。
 3. `retryable=false`（包括 401）：立即停止，不重复校验，也不得用 terminal 探测凭证。
 4. `retryable=true`：最多重试两次；仍失败则停止并说明平台校验未完成。
 5. 最多修改五轮；同一错误连续两轮不消失时停止并报告。

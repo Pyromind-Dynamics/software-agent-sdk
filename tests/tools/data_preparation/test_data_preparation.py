@@ -2,6 +2,8 @@ import ast
 import importlib.util
 import json
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 from typing import Any, cast
@@ -20,8 +22,10 @@ from openhands.tools.data_preparation.definition import (
     DfConvertObservation,
     DfRunPipelineAction,
     DfRunPipelineExecutor,
+    DfRunPipelineObservation,
 )
 from openhands.tools.data_preparation.runner import (
+    ProcessLocalSampleExecutor,
     build_dataflow_env,
     openai_compatible_model_name,
     run_dataflow_python,
@@ -33,6 +37,30 @@ from openhands.tools.utils.dataflow_config import (
     DEFAULT_DATAFLOW_API_BASE_URL,
     DEFAULT_DATAFLOW_MODEL_NAME,
 )
+
+
+def test_process_local_sample_executor_interrupts_process_group(tmp_path: Path) -> None:
+    executor = ProcessLocalSampleExecutor()
+    result: list[tuple[int, str, str]] = []
+    thread = threading.Thread(
+        target=lambda: result.append(
+            executor.run(
+                sys.executable,
+                ["-c", "import time; time.sleep(60)"],
+                cwd=str(tmp_path),
+                env_extra={},
+                timeout=120,
+            )
+        )
+    )
+    thread.start()
+    deadline = time.monotonic() + 5
+    while executor._process is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    executor.interrupt()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert result and result[0][0] != 0
 
 
 def _fake_conversation(
@@ -370,6 +398,127 @@ def test_df_run_pipeline_validates_dpo_output(
             "rejected_answer": "rejected answer",
         }
     ]
+
+
+def test_df_run_pipeline_exposes_structured_missing_input_error(
+    tmp_path: Path,
+) -> None:
+    pipeline_dir = tmp_path / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    (pipeline_dir / "pipeline.py").write_text("print('not executed')\n")
+    conversation = cast(Any, _fake_conversation(tmp_path))
+
+    observation = DfRunPipelineExecutor()(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "datasets/storage/source.jsonl",
+                "public_data/data-preparation/processed.sample.jsonl",
+            ],
+            output_schema="dpo",
+        ),
+        conversation,
+    )
+
+    assert observation.is_error
+    assert observation.failure_stage == "input_resolution"
+    assert observation.error_code == "workspace_input_not_found"
+    assert observation.error_message is not None
+    assert "Missing or unreadable workspace input" in observation.error_message
+    llm_text = "\n".join(item.text for item in observation.to_llm_content)
+    assert "failure_stage=input_resolution" in llm_text
+    assert "error_code=workspace_input_not_found" in llm_text
+    assert "datasets/storage/source.jsonl" in llm_text
+    assert "stdout (tail)" not in llm_text
+
+
+def test_df_run_pipeline_observation_keeps_from_text_diagnostic() -> None:
+    observation = DfRunPipelineObservation.from_text(
+        text="controlled diagnostic",
+        is_error=True,
+        exit_code=2,
+        failure_stage="pipeline_resolution",
+        error_code="workspace_pipeline_not_found",
+        error_message="controlled diagnostic",
+    )
+
+    llm_text = "\n".join(item.text for item in observation.to_llm_content)
+    assert "error_message=controlled diagnostic" in llm_text
+    assert "error_code=workspace_pipeline_not_found" in llm_text
+
+
+def test_df_run_pipeline_classifies_pipeline_execution_failure(
+    tmp_path: Path,
+) -> None:
+    pipeline_dir = tmp_path / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    (pipeline_dir / "pipeline.py").write_text("raise SystemExit(7)\n")
+    (pipeline_dir / "input.jsonl").write_text("{}\n")
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-preparation"
+        / "scripts"
+    )
+    conversation = cast(Any, _fake_conversation(tmp_path))
+    conversation.state.agent = _conversation_with_llm().state.agent
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/processed.sample.jsonl",
+            ],
+            output_schema="dpo",
+        ),
+        conversation,
+    )
+
+    assert observation.is_error
+    assert observation.failure_stage == "pipeline_execution"
+    assert observation.error_code == "dataflow_pipeline_failed"
+    assert observation.exit_code == 7
+
+
+def test_df_run_pipeline_classifies_schema_validation_failure(
+    tmp_path: Path,
+) -> None:
+    pipeline_dir = tmp_path / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    (pipeline_dir / "pipeline.py").write_text(
+        "import json, sys\n"
+        "with open(sys.argv[2], 'w', encoding='utf-8') as f:\n"
+        "    f.write(json.dumps({'id': 'missing-dpo-fields'}) + '\\n')\n"
+    )
+    (pipeline_dir / "input.jsonl").write_text("{}\n")
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-preparation"
+        / "scripts"
+    )
+    conversation = cast(Any, _fake_conversation(tmp_path))
+    conversation.state.agent = _conversation_with_llm().state.agent
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/processed.sample.jsonl",
+            ],
+            output_schema="dpo",
+        ),
+        conversation,
+    )
+
+    assert observation.is_error
+    assert observation.failure_stage == "schema_validation"
+    assert observation.error_code == "dataflow_schema_validation_failed"
+    assert "schema validation" in (observation.error_message or "")
 
 
 def test_df_run_pipeline_rejects_handwritten_vision_transport(

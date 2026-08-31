@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from uuid import UUID
@@ -17,8 +19,15 @@ from pyromind_runtime.domain.commands import (
 from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
-from pyromind_runtime.domain.snapshot import ConversationSnapshot
-from pyromind_runtime.ports.harness import SessionHandle, SessionSpec
+from pyromind_runtime.ports.harness import (
+    ExternalTaskNotification,
+    ForkSpec,
+    ProductCheckpoint,
+    RestoreWorkflowResult,
+    RestoreWorkflowSpec,
+    SessionHandle,
+    SessionSpec,
+)
 
 from harness_adapter.openhands_adapter.event_translator import (
     TranslationState,
@@ -39,6 +48,8 @@ from openhands.agent_server.pyromind_router import (
     send_pyromind_message,
 )
 from openhands.sdk.event import Event
+from openhands.sdk.llm import TextContent as OpenHandsTextContent
+from openhands.tools.workflow.run_workflow import WORKFLOW_ATTEMPT_STATE_KEY
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +61,7 @@ OPENHANDS_CAPABILITIES = HarnessCapabilities(
     partial_message=True,
     fork=True,
     workflow_rollback=True,
+    external_task_resume=True,
     native_workspace_tools=frozenset(
         {"terminal", "file_editor", "grep", "apply_patch"}
     ),
@@ -95,8 +107,14 @@ class OpenHandsAdapter:
         spec: SessionSpec,
         context: RequestContext,
     ) -> SessionHandle:
+        started_at = time.perf_counter()
         conversation_id, event_service = await self._session_factory.create(
             spec, context
+        )
+        logger.info(
+            "openhands.start_event_service_ms=%.3f conversation_id=%s",
+            (time.perf_counter() - started_at) * 1000,
+            conversation_id,
         )
         return await self._attach(conversation_id, event_service)
 
@@ -123,7 +141,10 @@ class OpenHandsAdapter:
         self,
         conversation_id: str,
         event_service: EventService,
+        *,
+        backfill: bool = True,
     ) -> SessionHandle:
+        backfill_started_at = time.perf_counter()
         queue: asyncio.Queue[HarnessEvent | None] = asyncio.Queue()
         translation = TranslationState(session_id=conversation_id)
         live_buffer: list[Event] = []
@@ -139,18 +160,19 @@ class OpenHandsAdapter:
             _QueueSubscriber(on_event)
         )
         try:
-            page_id: str | None = None
-            while True:
-                page = await event_service.search_events(
-                    page_id=page_id,
-                    limit=100,
-                    sort_order=EventSortOrder.TIMESTAMP,
-                )
-                for source_event in page.items:
-                    self._translate_into(queue, translation, source_event)
-                page_id = page.next_page_id
-                if page_id is None:
-                    break
+            if backfill:
+                page_id: str | None = None
+                while True:
+                    page = await event_service.search_events(
+                        page_id=page_id,
+                        limit=100,
+                        sort_order=EventSortOrder.TIMESTAMP,
+                    )
+                    for source_event in page.items:
+                        self._translate_into(queue, translation, source_event)
+                    page_id = page.next_page_id
+                    if page_id is None:
+                        break
             backfilling = False
             for source_event in live_buffer:
                 self._translate_into(queue, translation, source_event)
@@ -160,6 +182,12 @@ class OpenHandsAdapter:
                     session_id=conversation_id,
                     type="history.synced",
                 )
+            )
+            logger.info(
+                "adapter.history_backfill_ms=%.3f conversation_id=%s "
+                "harness_id=openhands",
+                (time.perf_counter() - backfill_started_at) * 1000,
+                conversation_id,
             )
         except Exception:
             await event_service.unsubscribe_from_events(subscriber_id)
@@ -242,22 +270,105 @@ class OpenHandsAdapter:
             )
             return {"resolved": True}
         if isinstance(command, RollbackWorkflowCommand):
-            result = await rollback_pyromind_workflow_at_event(
-                request_from_context(context),
-                UUID(handle.adapter_session_ref),
-                PyromindWorkflowRollbackRequest(eventId=command.event_id),
-                session.event_service,
-            )
-            return result.model_dump(mode="json", by_alias=True)
+            raise TypeError("workflow rollback is orchestrated by ConversationRuntime")
         raise TypeError(f"unsupported command: {type(command).__name__}")
 
     async def fork(
         self,
         handle: SessionHandle,
-        snapshot: ConversationSnapshot,
+        spec: ForkSpec,
+        checkpoint: ProductCheckpoint,
         context: RequestContext,
     ) -> SessionHandle:
-        raise NotImplementedError("fork-at-event is exposed by the server façade")
+        native_event_id = checkpoint.adapter_checkpoint_ref
+        if not native_event_id:
+            raise ValueError("OpenHands checkpoint reference is missing")
+        service = self._conversation_service_provider()
+        await service.fork_conversation_at_event(
+            UUID(handle.adapter_session_ref),
+            event_id=native_event_id,
+            fork_id=UUID(spec.target_conversation_id),
+            title=spec.title,
+            tags={"pyromind_app": "true"},
+            user_id=None if context.user_id == "anonymous" else context.user_id,
+        )
+        target_service = await service.get_event_service(
+            UUID(spec.target_conversation_id),
+            user_id=None if context.user_id == "anonymous" else context.user_id,
+        )
+        if target_service is None:
+            raise RuntimeError("forked OpenHands conversation is unavailable")
+        product_dir = target_service.conversation_dir / "product"
+        if product_dir.is_dir():
+            shutil.rmtree(product_dir)
+        return await self._attach(
+            spec.target_conversation_id, target_service, backfill=False
+        )
+
+    async def restore_workflow(
+        self,
+        handle: SessionHandle,
+        spec: RestoreWorkflowSpec,
+        context: RequestContext,
+    ) -> RestoreWorkflowResult:
+        native_event_id = spec.checkpoint.adapter_checkpoint_ref
+        if not native_event_id:
+            raise ValueError("OpenHands checkpoint reference is missing")
+        session = self._session(handle.session_id)
+        session.translation.suppress_workflow_events += 1
+        try:
+            result = await rollback_pyromind_workflow_at_event(
+                request_from_context(context),
+                UUID(handle.adapter_session_ref),
+                PyromindWorkflowRollbackRequest(
+                    eventId=native_event_id,
+                    run=spec.trigger_turn,
+                ),
+                session.event_service,
+            )
+        except Exception:
+            session.translation.suppress_workflow_events = max(
+                0, session.translation.suppress_workflow_events - 1
+            )
+            raise
+        return RestoreWorkflowResult(
+            workflow_file_action=result.workflow_file_action or "updated",
+            adapter_event_ref=result.rolled_back_to_event_id,
+        )
+
+    async def notify_external_task(
+        self,
+        handle: SessionHandle,
+        notification: ExternalTaskNotification,
+        context: RequestContext,
+    ) -> JsonObject:
+        del context
+        session = self._session(handle.session_id)
+        removed = await session.event_service.remove_active_long_task(
+            notification.task_id
+        )
+        trigger_turn = notification.trigger_turn
+        if removed is not None and removed.status == "Stopped":
+            trigger_turn = False
+        if notification.reset_attempt_budget:
+            await session.event_service.update_agent_state(
+                {WORKFLOW_ATTEMPT_STATE_KEY: 0}
+            )
+        visible = notification.visible_text is not None
+        content = OpenHandsTextContent(
+            text=notification.visible_text or notification.hidden_text
+        )
+        await session.event_service.send_internal_context(
+            [content],
+            run=trigger_turn,
+            visible=visible,
+            extended_content=(
+                [OpenHandsTextContent(text=notification.hidden_text)]
+                if visible
+                else None
+            ),
+        )
+        return {"accepted": True}
 
     def subscribe(self, handle: SessionHandle) -> AsyncIterator[HarnessEvent]:
         queue = self._session(handle.session_id).queue
@@ -320,5 +431,6 @@ class OpenHandsAdapter:
         return SessionHandle(
             session_id=conversation_id,
             adapter_session_ref=conversation_id,
+            harness_id="openhands",
             capabilities=OPENHANDS_CAPABILITIES,
         )

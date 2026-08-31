@@ -49,9 +49,10 @@ Merge、推理与评测｜平台边界。
 | ModelConfigBuilderNode | model_path | model_type | `model_config` |
 
 Text 的 assistant 默认 `gt`，rejected 默认 `rejected_answer`；Message 的 `messages_field` 必填、
-rejected 默认 `rejected_messages`；Vision 的 image_field 可选（文档标记可选，实际按 preview
-是否有图片字段为准）。字段名一律以 preview 真实列名为准，禁止按常见名猜测。`model_type` 只用
-`auto`、`qwen3vl`、`qwen3.5`。
+rejected 默认 `rejected_messages`；Vision 的 `image_field` 必填，填 preview 中的真实图片列名。
+字段名一律以 preview 真实列名为准，禁止按常见名猜测。`model_type` 只用
+`auto`、`qwen3vl`、`qwen3.5`。`max_seq_length` 默认取 `min(P95, 4096)`；P95 未知时用 4096
+并在最终回复声明该假设。
 
 ## 训练配置与阶段
 
@@ -67,6 +68,10 @@ SFT/DPO/GRPO 的 `wandb_config` 平台当前按必填校验：必须连接 `Wand
 `WandbConfigBuilderNode.wandb_api_key` 只填 Secret 名，不填明文 Key；`wandb_project` 必填，
 `wandb_name` 可选。`accelerate_config` 同样按必填连接，缺省会被校验拦截。
 
+`GRPOTrainingExtraConfigBuilderNode` 平台默认：`max_steps=200`、`num_generations=8`、
+`temperature=0.7`、`max_prompt_length`/`max_completion_length=2048`；用户未指定时可不写这些
+端口。`max_prompt_length + max_completion_length` 不应超过 `max_seq_length`。
+
 | 训练节点 | 必填输入 | 常用可选输入 | 输出 |
 |---|---|---|---|
 | ModelTrainSFTNode | output_path, dataset_config, training_config, model_config, accelerate_config, wandb_config, gpu_count, gpu_product | lora_config, thinking_as_input_ratio | `model_output_path` |
@@ -74,8 +79,7 @@ SFT/DPO/GRPO 的 `wandb_config` 平台当前按必填校验：必须连接 `Wand
 | ModelTrainGRPONode | SFT 必填项 + reward_config | grpo_extra_config, lora_config, thinking_as_input_ratio | `model_output_path` |
 
 单卡 LoRA 显式使用 `zero_stage=0`。scheduler 只用 `linear`、`cosine`、
-`cosine_with_restarts`、`polynomial`、`constant`、`constant_with_warmup`。数值参数整组决策查
-`parameter-decision.md`。
+`cosine_with_restarts`、`polynomial`、`constant`、`constant_with_warmup`。
 
 ## Reward 与 Metric
 
@@ -102,9 +106,9 @@ Reward 按 `custom-python-assets.md` 生成、上传并回填 Custom 节点。
 
 | NodeType | 必填输入 | 常用可选输入 | 输出 |
 |---|---|---|---|
-| ModelMergeLoraNode | lora_path, output_path | model_path, model_type | `merged_model_path` |
+| ModelMergeLoraNode | lora_path, output_path, model_path, gpu_count, gpu_product | model_type | `merged_model_path` |
 | VLLMInference | model_path, port, gpu_count, gpu_product | environment, max_model_len | `endpoint` |
-| ModelEvalApiNode | endpoint, output_path, dataset_config, metrics_config | endpoint_api_key, endpoint_model, max_samples, max_tokens, temperature | `benchmark_output_path` |
+| ModelEvalApiNode | endpoint, endpoint_api_key, endpoint_model, output_path, dataset_config, metrics_config | max_samples, max_tokens, temperature | `benchmark_output_path` |
 
 | 场景 | 必须绑定的模型路径 |
 |---|---|
@@ -114,18 +118,22 @@ Reward 按 `custom-python-assets.md` 生成、上传并回填 Custom 节点。
 | LoRA 训后评测 | `VLLMInference.model_path=merge.merged_model_path` |
 | Full 训后评测 | `VLLMInference.model_path=training.model_output_path` |
 
-`ModelEvalApiNode.endpoint` 必须绑定 `vllm.endpoint`。VLLM 默认 `port=3000`；Eval 默认
-`max_samples=0`（全部）、`max_tokens=256`、`temperature=0.01`，用户已有有效值时不得覆盖。
+`ModelEvalApiNode.endpoint` 必须绑定 `vllm.endpoint`；`endpoint_api_key`、`endpoint_model`
+必填，默认分别为 `empty`、`default`（对接自建 VLLM 端点时通常保持默认）。VLLM 默认
+`port=3000`；Eval 默认 `max_samples=0`（全部）、`max_tokens=256`、`temperature=0.01`，
+用户已有有效值时不得覆盖。
 
 ## 平台边界
 
-- 训练阶段 `gpu_product` 当前平台允许值为 `NVIDIA-H100-NVL`、`NVIDIA-L40S`；训练节点
-  （SFT/DPO/GRPO）的 `gpu_count`、`gpu_product` 端口必填。Merge LoRA 节点端口未暴露 GPU 字段，
-  按单卡合并处理。
+- 训练节点（SFT/DPO/GRPO）的 `accelerate_config`、`gpu_count`、`gpu_product` 端口必填。训练
+  `gpu_product` 此前平台实测仅放行 `NVIDIA-H100-NVL`、`NVIDIA-L40S`，节点文档现统一标注
+  `NVIDIA-H200`、`NVIDIA-H100-80GB-HBM3`；两者冲突时以 `validate_workflow_dsl` 实测为准。
+- Merge LoRA 的 `model_path`、`gpu_count`、`gpu_product` 同为必填；`gpu_product` 文档枚举同推理
+  （`NVIDIA-H200`、`NVIDIA-H100-80GB-HBM3`），默认单卡合并。
 - 推理（VLLM/Inference）`gpu_product` 枚举为 `NVIDIA-H200`、`NVIDIA-H100-80GB-HBM3`，以部署
   环境实际可用显卡为准；不要从推理枚举反推训练枚举。
 - 训练和推理 `gpu_count` 为 1～8（推理节点端口标 `gpu_count`、`gpu_product` 均必填）。
 - `WandbConfigBuilderNode.wandb_api_key` 只填 Secret 名，不填 Secret 值。
 - DatasetValidator、DatasetToJsonl、DataPreprocess 不是训练生成默认阶段；格式不合规时停止，
   不自动插入清洗节点。
-- GPU 枚举随平台迭代漂移；生成后以 `validate_workflow_dsl` 的 `ENUM_VALUE_INVALID` 为准回写。
+- GPU 枚举随平台迭代漂移；生成后按 `validate_workflow_dsl` 的 `ENUM_VALUE_INVALID` 修正当前 DSL。

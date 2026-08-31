@@ -29,6 +29,9 @@ description: >-
 
 1. `preview_dataset(mode="inspect")` 确认结构；目录输入先读取
    `directory_summary`，再决定继续 inspect、sample 哪些路径，或向用户确认格式意图。
+   随后调用 `preview_dataset(mode="sample", n<=3)`；本地 Pipeline 的输入直接使用返回的
+   `df_run_input_path`，多输入时使用 `local_sample_paths`。Storage `source_path` 只用于全量
+   提交，不得作为本地路径，也不得复制 Sample 到另一个文件。
 2. 根据下表只读取相关场景 reference，同时读取
    [通用约定](references/dataflow-common.md) 和
    [输出契约](references/schema-conventions.md)。
@@ -74,6 +77,12 @@ description: >-
 
 ## 运行与完成条件
 
+- 只读取需求匹配的场景 reference 及其模板；例如 DPO 不读取文本清洗等相邻模板。
+- 按 `failure_stage` 修复：`input_resolution` 只改用工具返回的本地路径，
+  `pipeline_resolution` 只修正工作区相对路径，`pipeline_execution` 根据 stderr/report
+  修脚本；仅 `runtime_dependency` 可检查运行环境，且不得浏览 SDK 仓库源码。
+- 相同参数得到相同 `error_code` 后不得原样重试；本地输入、输出和报告路径均使用工具
+  返回值，不用 terminal 搜索。
 - 文本任务使用 `model_profile="text"`；图片任务使用 `model_profile="vision"`。
 - 图片 Pipeline 只配置 `ImagePipelineConfig`，不得自行实现 HTTP、Base64、重试或
   Checkpoint。

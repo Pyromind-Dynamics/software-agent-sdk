@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from typing import Annotated
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from harness_adapter.openhands_adapter.session_factory import request_from_context
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
 from pyromind_runtime.domain.content import TextContent
+from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 from pyromind_runtime.infrastructure.file_product_store import (
     CommandConflictError,
@@ -20,10 +20,6 @@ from pyromind_runtime.ports.harness import SessionSpec
 
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import check_session_api_key
-from openhands.agent_server.pyromind_router import (
-    PyromindForkAtEventRequest,
-    fork_pyromind_conversation_at_event,
-)
 from pyromind_agent_server.api.schemas import (
     CreateConversationRequest,
     ForkConversationRequest,
@@ -68,10 +64,12 @@ def create_product_router() -> APIRouter:
         request: Request,
     ) -> ConversationSnapshot:
         context = request_context(request)
+        conversation_id = uuid4().hex
+        conversations_dir = get_conversation_service(request).conversations_dir
         spec = SessionSpec(
-            conversation_id=uuid4().hex,
+            conversation_id=conversation_id,
             user_id=context.user_id,
-            workspace_root=str(get_conversation_service(request).conversations_dir),
+            workspace_root=str(conversations_dir / conversation_id),
             initial_message=((TextContent(text=body.message),) if body.message else ()),
             workflow_xyflow=body.workflow_xyflow,
             model_configuration=body.llm.model_dump(mode="json"),
@@ -115,7 +113,12 @@ def create_product_router() -> APIRouter:
                 conversation_id, command, request_context(request)
             )
         except CommandConflictError as exc:
-            raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={"code": "command_conflict", "message": str(exc)},
+            ) from exc
+        except ProductRuntimeError as exc:
+            raise _product_error(exc) from exc
         except (
             FileNotFoundError,
             PermissionError,
@@ -165,19 +168,21 @@ def create_product_router() -> APIRouter:
         request: Request,
     ) -> ConversationSnapshot:
         context = request_context(request)
-        legacy_request = request_from_context(context)
-        result = await fork_pyromind_conversation_at_event(
-            legacy_request,
-            UUID(conversation_id),
-            PyromindForkAtEventRequest(
-                eventId=body.event_id,
+        try:
+            return await get_product_runtime(request).fork_conversation(
+                conversation_id,
+                event_id=body.event_id,
                 title=body.title,
-            ),
-            get_conversation_service(request),
-        )
-        return await get_product_runtime(request).get_snapshot(
-            result.conversation_id.hex, context
-        )
+                context=context,
+            )
+        except ProductRuntimeError as exc:
+            raise _product_error(exc) from exc
+        except (
+            FileNotFoundError,
+            PermissionError,
+            ProductStoreError,
+        ) as exc:
+            raise _not_found(conversation_id) from exc
 
     return router
 
@@ -186,6 +191,18 @@ def _not_found(conversation_id: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail=f"Conversation not found: {conversation_id}",
+    )
+
+
+def _product_error(error: ProductRuntimeError) -> HTTPException:
+    status_code = {
+        "conversation_not_found": status.HTTP_404_NOT_FOUND,
+        "checkpoint_not_found": status.HTTP_404_NOT_FOUND,
+        "harness_operation_failed": status.HTTP_502_BAD_GATEWAY,
+    }.get(error.code, status.HTTP_409_CONFLICT)
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": error.code, "message": error.message},
     )
 
 
@@ -216,6 +233,10 @@ async def _sse_stream(
     context,
 ) -> AsyncGenerator[str]:
     events = runtime.stream_events(conversation_id, after_seq, context)
+    # Flush the HTTP response immediately, even when the cursor is already at
+    # the latest persisted event. This lets clients establish the SSE channel
+    # before submitting the first command without waiting for a heartbeat.
+    yield ": connected\n\n"
     pending = asyncio.ensure_future(anext(events))
     try:
         while True:

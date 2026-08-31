@@ -117,5 +117,10 @@ def _current_user(context: RequestContext) -> CurrentLoginUser | None:
     )
 
 
+def current_user_from_context(context: RequestContext) -> CurrentLoginUser | None:
+    """Build the ephemeral tool user shared by harness adapters."""
+    return _current_user(context)
+
+
 def _service_user_id(context: RequestContext) -> str | None:
     return None if context.user_id == "anonymous" else context.user_id
