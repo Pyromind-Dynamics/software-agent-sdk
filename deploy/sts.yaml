@@ -36,6 +36,8 @@ spec:
                 - env:
                       - name: workspace_dir
                         value: /workspace
+                      - name: PYROMIND_HARNESS_BACKEND
+                        value: pi
                       - name: SESSION_API_KEY
                         valueFrom:
                             secretKeyRef:

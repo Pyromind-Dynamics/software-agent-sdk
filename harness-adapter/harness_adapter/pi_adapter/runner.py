@@ -40,7 +40,10 @@ class PiRunnerProcess:
         exit_handler: ExitHandler,
         entrypoint: Path | None = None,
     ) -> None:
-        runtime = Path(__file__).parents[2] / "pi-runtime" / "dist" / "index.js"
+        runtime = Path(
+            os.getenv("PYROMIND_PI_RUNTIME")
+            or Path(__file__).parents[2] / "pi-runtime" / "dist" / "index.js"
+        )
         self._entrypoint = entrypoint or runtime
         self._request_handler = request_handler
         self._event_handler = event_handler

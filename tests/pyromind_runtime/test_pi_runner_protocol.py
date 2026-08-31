@@ -8,6 +8,7 @@ from harness_adapter.pi_adapter.protocol import (
     decode_frame,
     encode_frame,
 )
+from harness_adapter.pi_adapter.runner import PiRunnerProcess
 
 
 def test_protocol_round_trip_and_frame_limit() -> None:
@@ -21,6 +22,23 @@ def test_protocol_round_trip_and_frame_limit() -> None:
     assert decode_frame(encode_frame(frame).rstrip()) == frame
     with pytest.raises(PiProtocolError, match="size limit"):
         decode_frame(b"x" * (1024 * 1024 + 1))
+
+
+def test_runner_entrypoint_resolves_from_env(monkeypatch, tmp_path) -> None:
+    entrypoint = tmp_path / "dist" / "index.js"
+    entrypoint.parent.mkdir()
+    entrypoint.touch()
+    monkeypatch.setenv("PYROMIND_PI_RUNTIME", str(entrypoint))
+
+    async def noop(*_: object) -> None:
+        pass
+
+    runner = PiRunnerProcess(
+        request_handler=noop,
+        event_handler=noop,
+        exit_handler=noop,
+    )
+    assert runner._entrypoint == entrypoint
 
 
 def test_runner_tool_event_has_product_operation_shape_and_object_details() -> None:

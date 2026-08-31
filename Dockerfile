@@ -79,6 +79,17 @@ RUN set -eux; \
     }
 
 ####################################################################################
+# Pi runtime (Node) - compiled TS runner plus production dependencies
+####################################################################################
+FROM node:22-bookworm-slim AS pi-runtime-builder
+WORKDIR /pi-runtime
+COPY harness-adapter/pi-runtime/package.json harness-adapter/pi-runtime/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY harness-adapter/pi-runtime/tsconfig.json ./
+COPY harness-adapter/pi-runtime/src ./src
+RUN npm run build && npm prune --omit=dev --no-audit --no-fund
+
+####################################################################################
 FROM ${BASE_IMAGE} AS base-image-minimal
 ARG USERNAME UID GID PORT
 
@@ -253,4 +264,6 @@ FROM base-image-minimal AS product
 ARG USERNAME
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/.venv /agent-server/.venv
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/uv-managed-python /agent-server/uv-managed-python
+COPY --from=pi-runtime-builder /pi-runtime /agent-server/pi-runtime
+ENV PYROMIND_PI_RUNTIME=/agent-server/pi-runtime/dist/index.js
 ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "pyromind_agent_server"]
