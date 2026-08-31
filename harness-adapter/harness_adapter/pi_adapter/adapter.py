@@ -133,7 +133,9 @@ class PiAdapter:
             )
         repository = Path(__file__).parents[3]
         self._conversation_root = Path(conversation_root).resolve()
-        skills_directory = repository / ".agents" / "skills"
+        skills_directory = Path(
+            os.getenv("PYROMIND_SKILLS_PATH") or repository / ".agents" / "skills"
+        )
         default_skill_roots = {
             name: skills_directory / name
             for name in (

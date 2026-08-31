@@ -150,6 +150,22 @@ def test_adapter_resolves_available_knowledge_root(tmp_path, monkeypatch) -> Non
     )
 
 
+def test_adapter_resolves_skill_roots_from_env(tmp_path, monkeypatch) -> None:
+    skills = tmp_path / "skills"
+    names = (
+        "generate-workflow-dsl",
+        "data-cleaning",
+        "data-preparation",
+        "debug-workflow",
+        "training-analysis",
+    )
+    for name in names:
+        (skills / name).mkdir(parents=True)
+    monkeypatch.setenv("PYROMIND_SKILLS_PATH", str(skills))
+    adapter = PiAdapter(tmp_path / "conversations")
+    assert adapter._skill_roots == [skills.resolve() / name for name in names]
+
+
 async def test_runner_start_receives_configured_knowledge_root(
     tmp_path, monkeypatch
 ) -> None:
