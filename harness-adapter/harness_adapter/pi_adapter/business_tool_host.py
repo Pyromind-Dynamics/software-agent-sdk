@@ -56,6 +56,7 @@ _READ_ONLY_TOOLS = frozenset(
         AnalyzeTaskFailureTool.name,
     }
 )
+_DEFAULT_PREVIEW_TIMEOUT_SECONDS = 60.0
 logger = logging.getLogger(__name__)
 
 
@@ -297,7 +298,30 @@ class PyromindBusinessToolHost:
             ).as_dict()
 
         if name in _READ_ONLY_TOOLS:
-            response = await invoke()
+            if name == PreviewDatasetTool.name:
+                timeout = _preview_timeout_seconds(context)
+                try:
+                    response = await asyncio.wait_for(invoke(), timeout=timeout)
+                except TimeoutError:
+                    response = BusinessToolResult(
+                        is_error=True,
+                        content=[
+                            {
+                                "type": "text",
+                                "text": (
+                                    "preview_dataset timed out after "
+                                    f"{timeout:g} seconds. Narrow dataset_path to a "
+                                    "specific file or a smaller directory."
+                                ),
+                            }
+                        ],
+                        details={
+                            "error_code": "tool_timeout",
+                            "timeout_seconds": timeout,
+                        },
+                    ).as_dict()
+            else:
+                response = await invoke()
             self._log_execution(name, context, started_at, response)
             return response
         lock = self._locks.setdefault(context.conversation_id, asyncio.Lock())
@@ -433,9 +457,7 @@ class PyromindBusinessToolHost:
         return params
 
     @classmethod
-    def _training_analysis_params(
-        cls, context: ToolExecutionContext
-    ) -> dict[str, Any]:
+    def _training_analysis_params(cls, context: ToolExecutionContext) -> dict[str, Any]:
         params = cls._analysis_params(context)
         timeout = context.extra.get("training_analysis_timeout_seconds")
         if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
@@ -456,6 +478,13 @@ def _forward_headers(
         )
         if value
     }
+
+
+def _preview_timeout_seconds(context: ToolExecutionContext) -> float:
+    value = context.extra.get("preview_dataset_timeout_seconds")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    return _DEFAULT_PREVIEW_TIMEOUT_SECONDS
 
 
 def _auth_token(context: RequestContext) -> str | None:

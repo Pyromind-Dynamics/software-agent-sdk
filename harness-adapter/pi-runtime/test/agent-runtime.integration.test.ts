@@ -68,6 +68,7 @@ test("AgentSession completes the workflow-generation tool loop over chat complet
   await runtime.handle("start", {
     session_id: "integration-session",
     workspace_root: workspace,
+    terminal_backend: "local",
     session_path: join(workspace, "pi", "session.jsonl"),
     skill_root: skill,
     knowledge_root: knowledge,
@@ -171,6 +172,7 @@ test("a persistent length stop finishes as output_truncated, never completed", a
   await runtime.handle("start", {
     session_id: "length-session",
     workspace_root: workspace,
+    terminal_backend: "local",
     session_path: join(workspace, "pi", "session.jsonl"),
     skill_root: workspace,
     system_prompt: "Answer the user.",

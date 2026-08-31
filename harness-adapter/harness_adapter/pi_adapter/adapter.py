@@ -45,6 +45,7 @@ from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.protocol import PROTOCOL_VERSION
 from harness_adapter.pi_adapter.runner import PiRunnerProcess
+from harness_adapter.pi_adapter.terminal_backend import validate_pi_terminal_backend
 from openhands.agent_server.workflow_canvas_models import (
     SaveWorkflowCanvasEventSnapshotRequest,
 )
@@ -68,21 +69,21 @@ PI_CAPABILITIES = HarnessCapabilities(
     external_task_resume=True,
     native_workspace_tools=frozenset({"read", "write", "edit", "terminal"}),
 )
-_PRODUCTION_ENVS = {"prod", "production", "online"}
 _WORKFLOW_PATH = Path("public_data/workflow_canvas/workflow.py")
 _SYSTEM_PROMPT = """You are a coding agent inside one conversation workspace.
 Use read, write, edit, and terminal for workspace operations. Keep generated files
 in this workspace. The terminal already starts at the workspace root (`.`); do not
 run pwd, ls, or cd to locate it. Workspace files use workspace-relative paths.
-Pi advertises skills in <available_skills>; read the advertised skill location
-and resolve its references against the skill directory. Shared Pyromind knowledge
-is read-only at logical paths under knowledge/. Use read rather than terminal or
-repository search for skill and knowledge resources. For Pyromind workflow requests,
-read the matching
+Pi advertises skills in <available_skills>; their absolute locations are read-only
+resource addresses, not workspace locations. Read the exact advertised skill path
+and resolve its references against that skill directory, but never derive a workspace
+path from it. Shared Pyromind knowledge is read-only at logical paths under knowledge/.
+Use read rather than terminal or repository search for skill and knowledge resources.
+For Pyromind workflow requests, read the matching
 skill before editing exactly
-public_data/workflow_canvas/workflow.py, then call validate_workflow_dsl with
-that relative dsl_path. Do not inspect credentials or work around failed
-validation authentication.
+public_data/workflow_canvas/workflow.py, then call validate_workflow_dsl without
+dsl_path; pass it only when validating another workspace file. Do not inspect
+credentials or work around failed validation authentication.
 
 Route dataset work before acting. Use data-cleaning for deterministic field,
 format, structure, regex, keyword, and length transformations. Use
@@ -122,16 +123,13 @@ class PiAdapter:
         self,
         conversation_root: Path | str,
         *,
+        terminal_backend: str,
         skill_root: Path | None = None,
         skill_roots: list[Path] | None = None,
         knowledge_root: Path | None = None,
     ) -> None:
-        if os.getenv("APP_ENV", "dev").strip().lower() in _PRODUCTION_ENVS:
-            raise RuntimeError(
-                "Pi local execution is disabled in production until sk-sandbox "
-                "is integrated"
-            )
         repository = Path(__file__).parents[3]
+        self._terminal_backend = validate_pi_terminal_backend(terminal_backend)
         self._conversation_root = Path(conversation_root).resolve()
         skills_directory = Path(
             os.getenv("PYROMIND_SKILLS_PATH") or repository / ".agents" / "skills"
@@ -520,6 +518,7 @@ class PiAdapter:
             {
                 "session_id": session.session_id,
                 "workspace_root": str(session.workspace_root),
+                "terminal_backend": self._terminal_backend,
                 "session_path": str(session.files.session_log_path),
                 "skill_roots": [
                     {"name": path.name, "path": str(path)} for path in self._skill_roots
@@ -962,6 +961,7 @@ def _safe_session_extra(extra: dict[str, Any]) -> dict[str, Any]:
         "storage_api_base_url",
         "dataset_cleaning_output_root",
         "dataset_extraction_output_root",
+        "preview_dataset_timeout_seconds",
         "training_analysis_api_base",
         "training_analysis_timeout_seconds",
     }

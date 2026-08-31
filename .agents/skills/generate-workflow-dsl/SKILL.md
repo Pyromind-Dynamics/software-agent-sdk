@@ -69,7 +69,7 @@ Pi 使用 `<available_skills>` 中的 Skill 位置并从该目录解析 referenc
 
 - Storage 相对路径：按 `data-routing.md` 获取或复用数据画像。
 - 平台预置或外部数据集标识：选择 Clone/Download，不调用 `preview_dataset`。
-- 未提供数据：先索要 Storage 路径；只有用户明确要求演示/模板时才使用测试集。
+- 未提供数据：先索要 Storage 路径；用户明确要求演示/模板时直接使用公开测试集标识，不枚举用户 Storage。
 - 内部记录数据源、实际训练文件、N、P95 长度 L、字段、模态和样本形态，不向用户展示冗长清单。
 
 若数据不满足 `data-routing.md` 的训练格式，停止生成，指出缺失字段并给目标 JSONL 样例。
@@ -109,8 +109,8 @@ batch、grad accumulation、learning rate、epoch、LoRA rank 和 GRPO 的 max s
 
 ### 7. 写入或局部修改
 
-- 文件固定为 `public_data/workflow_canvas/workflow.py`；新建或整体生成使用 `apply_patch`。
-- 修改前先读取现有文件，列出内部“需求验收项”和“图差分”，仅替换相关节点与连线。
+- 文件固定为 `public_data/workflow_canvas/workflow.py`；新建或整体生成直接写入该工作区相对路径。
+- 仅局部修改时先读取现有文件，列出内部“需求验收项”和“图差分”，仅替换相关节点与连线；文件不存在时直接停止并说明。
 - 所有上游产物都通过输出端口绑定。不得把 SFT、Merge、GRPO、Inference 之间的模型路径写死。
 - SFT/DPO/GRPO 的 `wandb_config`、`accelerate_config` 平台当前按必填校验：必须由对应 Builder
   的输出端口连接，不得省略或写空串。WandB 仅写 Secret 名；不得把 API Key、Cookie、集群凭证或

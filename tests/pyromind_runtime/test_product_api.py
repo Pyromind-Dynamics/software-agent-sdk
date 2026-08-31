@@ -150,7 +150,10 @@ async def test_product_api_creates_pi_metadata_and_reports_missing_checkpoint(
     conversations.mkdir()
     runtime = ConversationRuntime(
         conversations,
-        {"openhands": FakeAdapter(), "pi": PiAdapter(conversations)},
+        {
+            "openhands": FakeAdapter(),
+            "pi": PiAdapter(conversations, terminal_backend="local"),
+        },
         default_harness_id="pi",
     )
     transport = httpx.ASGITransport(app=_app(tmp_path, runtime))

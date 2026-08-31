@@ -7,12 +7,18 @@
 #   ./start_inference.sh
 # ============================================================
 
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 
 export PYROMIND_HARNESS_BACKEND="pi"
+export APP_ENV="${APP_ENV:-dev}"
+export PYROMIND_PI_TERMINAL_BACKEND="local"
 
 # ----------------------------------------------------------
 # LLM Configuration
@@ -27,14 +33,10 @@ export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 #export LLM_MODEL="openai/deepseek-v4-pro"
 #export LLM_BASE_URL="https://api.deepseek.com"
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-  echo "ERROR: OPENAI_API_KEY is required. Export it before running start.sh." >&2
+  echo "ERROR: OPENAI_API_KEY is required. Export it before running start_inference.sh." >&2
   exit 1
 fi
 export LLM_MODEL="${LLM_MODEL:-openai/deepseek-v4-flash-0731}"
-if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-  echo "ERROR: OPENAI_API_KEY is required. Set it in start_inference.sh." >&2
-  exit 1
-fi
 export OPENAI_API_KEY
 
 export DF_API_BASE_URL="https://openrouter.ai/api/v1"

@@ -29,6 +29,52 @@ interface WorkspaceSandboxDependencies {
   userHome?: string;
 }
 
+export type PiTerminalBackend = "local" | "os-sandbox";
+
+interface WorkspaceSandboxHandle {
+  operations: BashOperations;
+  initialize(): Promise<void>;
+}
+
+export async function createWorkspaceBashOperations(
+  backend: PiTerminalBackend,
+  workspaceRoot: string,
+  dependencies: WorkspaceSandboxDependencies = {},
+): Promise<BashOperations> {
+  if (backend === "local") {
+    return createWorkspaceLocalBashOperations(workspaceRoot, dependencies);
+  }
+  const sandbox = createWorkspaceSandbox(workspaceRoot, dependencies);
+  await sandbox.initialize();
+  return sandbox.operations;
+}
+
+export function createWorkspaceLocalBashOperations(
+  workspaceRoot: string,
+  dependencies: WorkspaceSandboxDependencies = {},
+): BashOperations {
+  const workspace = resolve(workspaceRoot);
+  const localOperations =
+    dependencies.localOperations ?? createLocalBashOperations();
+  return {
+    async exec(command, cwd, options) {
+      assertWorkspaceCwd(cwd, workspace);
+      assertNoDirectoryChange(command);
+      const temporary = join(workspace, ".tmp");
+      await mkdir(temporary, { recursive: true });
+      return localOperations.exec(command, workspace, {
+        ...options,
+        env: {
+          ...options.env,
+          TMPDIR: temporary,
+          TMP: temporary,
+          TEMP: temporary,
+        },
+      });
+    },
+  };
+}
+
 /**
  * Run Pi terminal commands with OS-enforced workspace write and user-data read
  * isolation. System executables and libraries remain readable so workspace
@@ -38,6 +84,13 @@ export function createWorkspaceSandboxedBashOperations(
   workspaceRoot: string,
   dependencies: WorkspaceSandboxDependencies = {},
 ): BashOperations {
+  return createWorkspaceSandbox(workspaceRoot, dependencies).operations;
+}
+
+function createWorkspaceSandbox(
+  workspaceRoot: string,
+  dependencies: WorkspaceSandboxDependencies,
+): WorkspaceSandboxHandle {
   const workspace = resolve(workspaceRoot);
   const controller = dependencies.controller ?? SandboxManager;
   const localOperations =
@@ -85,14 +138,19 @@ export function createWorkspaceSandboxedBashOperations(
     return config;
   }
 
+  const initialize = async (): Promise<void> => {
+    try {
+      await prepare();
+    } catch (error) {
+      throw sandboxUnavailable(error);
+    }
+  };
+
   return {
+    initialize,
+    operations: {
     async exec(command, cwd, options) {
-      const resolvedCwd = resolve(cwd);
-      if (!inside(resolvedCwd, workspace)) {
-        throw new Error(
-          "WORKSPACE_SCOPE_ERROR: terminal cwd must remain inside the conversation workspace",
-        );
-      }
+      assertWorkspaceCwd(cwd, workspace);
       assertNoDirectoryChange(command);
       try {
         const config = await prepare();
@@ -120,11 +178,31 @@ export function createWorkspaceSandboxedBashOperations(
         ) {
           throw error;
         }
-        const reason = error instanceof Error ? error.message : "unknown error";
-        throw new Error(`WORKSPACE_SANDBOX_UNAVAILABLE: ${reason}`);
+        throw sandboxUnavailable(error);
       }
     },
+    },
   };
+}
+
+function assertWorkspaceCwd(cwd: string, workspace: string): void {
+  const resolvedCwd = resolve(cwd);
+  if (!inside(resolvedCwd, workspace)) {
+    throw new Error(
+      "WORKSPACE_SCOPE_ERROR: terminal cwd must remain inside the conversation workspace",
+    );
+  }
+}
+
+function sandboxUnavailable(error: unknown): Error {
+  if (
+    error instanceof Error &&
+    error.message.startsWith("WORKSPACE_SANDBOX_UNAVAILABLE:")
+  ) {
+    return error;
+  }
+  const reason = error instanceof Error ? error.message : "unknown error";
+  return new Error(`WORKSPACE_SANDBOX_UNAVAILABLE: ${reason}`);
 }
 
 export function assertNoDirectoryChange(command: string): void {

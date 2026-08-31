@@ -33,3 +33,12 @@ def test_pyromind_start_scripts_use_composed_server_entrypoint() -> None:
         script = (ROOT / script_name).read_text(encoding="utf-8")
         assert "python -m pyromind_agent_server" in script
         assert "python -m openhands.agent_server" not in script
+
+
+def test_inference_start_uses_local_pi_terminal_without_sandbox_dependencies() -> None:
+    script = (ROOT / "start_inference.sh").read_text(encoding="utf-8")
+
+    assert 'export APP_ENV="${APP_ENV:-dev}"' in script
+    assert 'export PYROMIND_PI_TERMINAL_BACKEND="local"' in script
+    assert "check_workspace_sandbox_dependencies" not in script
+    assert "required_commands=(rg" not in script

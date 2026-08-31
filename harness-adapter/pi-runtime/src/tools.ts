@@ -17,7 +17,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { isRecord, type JsonObject } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
-import { createWorkspaceSandboxedBashOperations } from "./workspace-sandbox.js";
+import {
+  createWorkspaceBashOperations,
+  type PiTerminalBackend,
+} from "./workspace-sandbox.js";
 
 export interface BusinessToolConfig {
   name: string;
@@ -30,14 +33,15 @@ export interface SkillRootConfig {
   path: string;
 }
 
-export function createTools(
+export async function createTools(
   peer: JsonlRpcPeer,
   env: ExecutionEnv,
   workspaceRoot: string,
+  terminalBackend: PiTerminalBackend,
   skillRoots: SkillRootConfig[],
   knowledgeRoot: string | undefined,
   businessTools: BusinessToolConfig[],
-): AgentTool[] {
+): Promise<AgentTool[]> {
   const terminalOutputTemp = join(
     resolve(workspaceRoot),
     "pi",
@@ -50,8 +54,12 @@ export function createTools(
   const read = createReadTool();
   const write = createWriteTool();
   const edit = createEditTool();
+  const terminalOperations = await createWorkspaceBashOperations(
+    terminalBackend,
+    workspaceRoot,
+  );
   const bash = createBashTool(workspaceRoot, {
-    operations: createWorkspaceSandboxedBashOperations(workspaceRoot),
+    operations: terminalOperations,
     exposeSessionEnvironment: false,
     spawnHook: ({ command }) => ({
       command,
@@ -116,8 +124,17 @@ function bindPathTool(
   allowReadOnlyResources: boolean,
 ): AgentTool<any, any> {
   const bound = bindNative(tool, env);
+  const pathScope = allowReadOnlyResources
+    ? "Workspace files must use paths relative to the conversation root (for example public_data/file.py). Use an absolute path only when it is the exact location of an advertised skill; never derive a workspace path from a skill location."
+    : "Paths must be relative to the conversation root (for example public_data/file.py). Skill and knowledge files are read-only.";
+  const parameters = structuredClone(bound.parameters);
+  if (isRecord(parameters.properties) && isRecord(parameters.properties.path)) {
+    parameters.properties.path.description = pathScope;
+  }
   return {
     ...bound,
+    description: `${bound.description}\n\n${pathScope}`,
+    parameters,
     async execute(callId, params: any, signal, onUpdate) {
       if (!isRecord(params) || typeof params.path !== "string") throw new Error("path must be a string");
       const safe = {
@@ -218,7 +235,7 @@ export async function safePath(
       );
     }
     throw new Error(
-      "PATH_SCOPE_ERROR: read paths must be workspace-relative, knowledge/..., or an absolute skill location advertised by Pi",
+      "PATH_SCOPE_ERROR: workspace paths start at the conversation root (.) and must be relative; absolute reads are allowed only for an exact skill location advertised by Pi or the configured knowledge root",
     );
   }
 

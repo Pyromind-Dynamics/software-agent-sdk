@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -9,7 +10,7 @@ from typing import Any, cast
 import harness_adapter.pi_adapter.adapter as pi_adapter_module
 import httpx
 import pytest
-from harness_adapter.pi_adapter import PiAdapter
+from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.pi_adapter.adapter import (
     _is_workflow_mutation,
     _resolve_model,
@@ -43,6 +44,7 @@ def test_validation_schema_is_generated_and_only_exposes_dsl_path() -> None:
     schema = validation_tool_spec()["input_schema"]
     assert "dsl_path" in schema["properties"]
     assert "dsl" not in schema["properties"]
+    assert "dsl_path" not in schema.get("required", [])
 
 
 async def test_validation_reads_conversation_file_and_forwards_request_context(
@@ -72,7 +74,7 @@ async def test_validation_reads_conversation_file_and_forwards_request_context(
     monkeypatch.setattr(httpx, "post", fake_post)
     result = await execute_validation_tool(
         tmp_path,
-        {"dsl_path": "public_data/workflow_canvas/workflow.py"},
+        {},
         RequestContext(
             user_id="42",
             cookie="auth=secret",
@@ -111,6 +113,17 @@ async def test_validation_projects_401_without_retry(tmp_path, monkeypatch) -> N
     assert "401" in json.dumps(result)
 
 
+async def test_validation_path_errors_are_returned_as_tool_results(tmp_path) -> None:
+    result = await execute_validation_tool(
+        tmp_path,
+        {"dsl_path": "../workflow.py"},
+        RequestContext(user_id="42"),
+    )
+
+    assert result["is_error"] is True
+    assert "must stay inside the workspace" in json.dumps(result)
+
+
 def test_terminal_only_confirms_high_risk_commands() -> None:
     policy = TerminalPermissionPolicy()
     assert not policy.requires_confirmation("safe", {"command": "pwd"})
@@ -133,11 +146,12 @@ def test_adapter_resolves_available_knowledge_root(tmp_path, monkeypatch) -> Non
     explicit = tmp_path / "knowledge"
     explicit.mkdir()
     assert PiAdapter(
-        tmp_path / "explicit", knowledge_root=explicit
+        tmp_path / "explicit", terminal_backend="local", knowledge_root=explicit
     )._knowledge_root == (explicit.resolve())
     assert (
         PiAdapter(
             tmp_path / "missing-adapter",
+            terminal_backend="local",
             knowledge_root=tmp_path / "missing-knowledge",
         )._knowledge_root
         is None
@@ -145,7 +159,7 @@ def test_adapter_resolves_available_knowledge_root(tmp_path, monkeypatch) -> Non
 
     repository = Path(pi_adapter_module.__file__).parents[3]
     assert (
-        PiAdapter(tmp_path / "default")._knowledge_root
+        PiAdapter(tmp_path / "default", terminal_backend="local")._knowledge_root
         == (repository / "knowledge").resolve()
     )
 
@@ -162,7 +176,7 @@ def test_adapter_resolves_skill_roots_from_env(tmp_path, monkeypatch) -> None:
     for name in names:
         (skills / name).mkdir(parents=True)
     monkeypatch.setenv("PYROMIND_SKILLS_PATH", str(skills))
-    adapter = PiAdapter(tmp_path / "conversations")
+    adapter = PiAdapter(tmp_path / "conversations", terminal_backend="local")
     assert adapter._skill_roots == [skills.resolve() / name for name in names]
 
 
@@ -186,7 +200,9 @@ async def test_runner_start_receives_configured_knowledge_root(
     conversations.mkdir()
     knowledge = tmp_path / "knowledge"
     knowledge.mkdir()
-    adapter = PiAdapter(conversations, knowledge_root=knowledge)
+    adapter = PiAdapter(
+        conversations, terminal_backend="local", knowledge_root=knowledge
+    )
     handle = await adapter.create_session(
         SessionSpec(
             conversation_id="conversation-1",
@@ -220,7 +236,7 @@ async def test_runner_loads_five_named_skills_and_eleven_business_tools(
     monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
     conversations = tmp_path / "conversations"
     conversations.mkdir()
-    adapter = PiAdapter(conversations)
+    adapter = PiAdapter(conversations, terminal_backend="local")
     handle = await adapter.create_session(
         SessionSpec(
             conversation_id="conversation-skills",
@@ -265,6 +281,48 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
     specs = PyromindBusinessToolHost(roots).specs()
     assert len(specs) == 11
     assert all(spec["input_schema"].get("type") == "object" for spec in specs)
+
+
+async def test_preview_dataset_timeout_returns_a_tool_error(tmp_path) -> None:
+    repository = Path(pi_adapter_module.__file__).parents[3]
+    host = PyromindBusinessToolHost(
+        [
+            repository / ".agents" / "skills" / "data-cleaning",
+            repository / ".agents" / "skills" / "data-preparation",
+            repository / ".agents" / "skills" / "training-analysis",
+        ]
+    )
+
+    class FakeAction(BaseModel):
+        dataset_path: str
+
+    class SlowPreviewTool:
+        action_type = FakeAction
+        executor = None
+
+        def __call__(self, _action, _facade):
+            time.sleep(0.05)
+            return object()
+
+    host._factories["preview_dataset"] = cast(Any, lambda _context: SlowPreviewTool())
+    result = await host.execute(
+        "preview_dataset",
+        {"dataset_path": "datasets/large"},
+        ToolExecutionContext(
+            conversation_id="conversation-timeout",
+            workspace_root=tmp_path,
+            request_context=RequestContext(user_id="42"),
+            model_configuration={"model": "gpt-5"},
+            extra={"preview_dataset_timeout_seconds": 0.01},
+        ),
+    )
+
+    assert result["is_error"] is True
+    assert result["details"] == {
+        "error_code": "tool_timeout",
+        "timeout_seconds": 0.01,
+    }
+    assert "Narrow dataset_path" in result["content"][0]["text"]
 
 
 async def test_pi_host_synthesizes_debug_task_and_persists_only_attempt_budget(
@@ -423,6 +481,20 @@ def test_session_config_persists_model_api_resolution() -> None:
         {"model": "gpt-5", "base_url": "https://api.openai.com/v1"}
     )
 
+    config = _session_config(
+        SessionSpec(
+            conversation_id="conversation-timeout",
+            user_id="42",
+            workspace_root="/tmp/conversation-timeout",
+            model_configuration={"model": "gpt-5"},
+            extra={
+                "preview_dataset_timeout_seconds": 45,
+                "untrusted_extra": "ignored",
+            },
+        )
+    )
+    assert config["extra"] == {"preview_dataset_timeout_seconds": 45}
+
 
 def test_pyromind_llm_config_rejects_unknown_model_api() -> None:
     with pytest.raises(ValidationError):
@@ -435,7 +507,7 @@ def test_pyromind_llm_config_rejects_invalid_context_window() -> None:
 
 
 async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
-    adapter = PiAdapter(tmp_path)
+    adapter = PiAdapter(tmp_path, terminal_backend="local")
     files = PiSessionFiles(tmp_path / "conversation-1")
     files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
     session = SimpleNamespace(
@@ -466,7 +538,7 @@ async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
 async def test_adapter_projects_generic_write_completion_to_workflow(
     tmp_path, monkeypatch
 ) -> None:
-    adapter = PiAdapter(tmp_path)
+    adapter = PiAdapter(tmp_path, terminal_backend="local")
     workspace = tmp_path / "conversation-1"
     files = PiSessionFiles(workspace)
     files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
@@ -520,7 +592,7 @@ async def test_adapter_projects_generic_write_completion_to_workflow(
 async def test_real_runner_starts_without_persisting_request_api_key(tmp_path) -> None:
     conversations = tmp_path / "conversations"
     conversations.mkdir()
-    adapter = PiAdapter(conversations)
+    adapter = PiAdapter(conversations, terminal_backend="local")
     handle = await adapter.create_session(
         SessionSpec(
             conversation_id="conversation-1",
@@ -564,7 +636,7 @@ async def test_pi_adapter_forks_native_session_and_sanitizes_workspace(
     monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
     conversations = tmp_path / "conversations"
     conversations.mkdir()
-    adapter = PiAdapter(conversations)
+    adapter = PiAdapter(conversations, terminal_backend="local")
     context = RequestContext(user_id="42")
     source_handle = await adapter.create_session(
         SessionSpec(
@@ -643,7 +715,7 @@ async def test_pi_adapter_restores_workflow_and_resets_debug_budget(
     monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
     conversations = tmp_path / "conversations"
     conversations.mkdir()
-    adapter = PiAdapter(conversations)
+    adapter = PiAdapter(conversations, terminal_backend="local")
     context = RequestContext(user_id="42")
     handle = await adapter.create_session(
         SessionSpec(
