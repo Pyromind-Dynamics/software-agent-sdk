@@ -1,11 +1,13 @@
-# 特定环境数据处理(environment-processing)
+# 编排式场景数据处理(environment-processing)
 
-- **基底**:沙箱编排——`edp_render` 渲染分片 → `edp_submit` 逐条执行 →
+- **定位**:编排类的具体场景数据处理——单条数据的处理要在数据自带的
+  特定环境(镜像)中执行复杂流程(跑命令/跑测试/判定),因此编排为
+  多阶段链路:`edp_render` 渲染分片 → `edp_submit` 逐条执行 →
   `edp_aggregate` 聚合训练文件(CustomCommandCPUNode 平台任务,agent 只走
   控制面,不持有全量数据);冻结运行时 = `sandbox_runner.py` +
   ProcessingProfile(`scripts/edp/profiles/`),支持断点续跑与强制清理
-- **适用**:任务对运行环境有硬性要求(JDK 版本、特定工具链、批量逐条
-  判定/验证/筛选等)
+- **适用**:编排复杂度超出单算子/单次转换——批量逐条判定/验证/筛选,
+  且执行需要特定环境(JDK 版本、特定工具链、数据自带镜像)
 - **不适用**:纯格式转换/字段映射/简单过滤 → format-conversion 处理范式;
   抽样/清洗/生成/评分等平台 DataFlow 处理 → llm-pipeline 处理范式;
   仅创建/管理单个沙箱容器 → sandbox skill
@@ -100,6 +102,14 @@ agent 不需要做任何事。
 case 文档补看关键路径);一次 preview 拿到的列名与嵌套结构直接记下来
 写模板,**禁止反复 preview 同一文件调 n**;本地 terminal 不参与 storage
 探查(storage 路径本地不可见,白绕一步)。
+
+**大规模探查委派**:当数据集**无 case 文档**且预计需要 **>10 次
+preview** 才能摸清结构时,改用 `subagent(type=data_explorer)` 委派
+批量探查——主 agent 只接收四段式交接(数据集结构/逐字 schema/一条
+原始样本/注意点),探查噪声不进入主链路;任务描述写清要摸清哪些路径、
+回答哪些问题。有 case 文档或 8 次以内能完成的验证型探查**不委派**,主
+agent 直接查更快。拿到的 schema 用于写模板,列名以交接报告逐字内容
+为准,渲染预检报错时再定向回看。
 
 **出渲染模板 JSON**(字段映射 + 分片大小,几 KB;**shard_size 需与用户
 确认**)。最小示例:

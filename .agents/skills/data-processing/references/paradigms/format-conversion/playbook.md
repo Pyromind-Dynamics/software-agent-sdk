@@ -6,7 +6,7 @@
   格式校验、SHA-256 去重；mapper 可写简单内容过滤（regex/关键词/长度）；
   断点续跑、错误隔离、report 统计
 - **不适用**：复杂内容清洗（去重/PII/语言/毒性/评分/生成）→ llm-pipeline；
-  依赖真实运行环境的处理（验证/筛选/执行判定）→ environment-processing
+  需在特定环境执行复杂流程的编排式处理（验证/筛选/执行判定）→ environment-processing
 
 所有读取数据、执行清洗、格式校验和查看产物的动作都必须发生在 Pyromind 平台。
 本地工作区只用于编写或修改 `clean_script.py`，不得下载数据或本地运行 cleaner、

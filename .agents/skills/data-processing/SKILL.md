@@ -5,8 +5,9 @@ description: >-
   细分场景 case）：格式转换/字段映射/简单过滤（format-conversion，无 LLM）；
   DataFlow 抽样/清洗/生成/评分/格式化（llm-pipeline，覆盖 SFT、DPO、推理、
   代码、RAG、多轮对话、Function Call、质量评估、Text2SQL、多模态标注等
-  case）；依赖真实运行环境的处理（environment-processing，按数据自带
-  镜像起沙箱执行任务并判定，当前以 tmax 可用性验证为代表 case）。
+  case）；编排式场景数据处理（environment-processing：单条数据的处理
+  需在数据自带镜像的特定环境中执行复杂流程，编排"渲染分片→逐条
+  执行→聚合"多阶段链路，以 tmax 终端任务验证为代表编排 case）。
   统一 SOP：预览探查→范式选型→小样试跑→用户确认→平台全量→回调分诊→交付。
   仅创建/管理单个沙箱容器用 sandbox；训练效果分析用
   training-analysis；生成训练/评测工作流用 generate-workflow-dsl。
@@ -20,6 +21,7 @@ triggers:
   - 可用性验证
   - 可行性验证
   - 环境数据处理
+  - 环境编排
 license: MIT
 ---
 
@@ -35,8 +37,8 @@ license: MIT
 |---|---|---|
 | 格式转换/字段映射/简单过滤，无 LLM、无跨行操作 | format-conversion | references/paradigms/format-conversion/playbook.md |
 | 内容级清洗/抽样/生成/评分，用 DataFlow 算子或 LLM | llm-pipeline | references/paradigms/llm-pipeline/playbook.md |
-| 逐条依赖真实运行环境（docker 镜像、工具链、判定/执行） | environment-processing | references/paradigms/environment-processing/playbook.md |
-| 环境依赖任务但无匹配 ProcessingProfile | environment-processing（模式 B） | 同上 |
+| 单条数据要在特定环境（数据自带镜像）执行复杂流程（跑命令/测试/判定），需多阶段编排 | environment-processing | references/paradigms/environment-processing/playbook.md |
+| 编排任务无匹配 ProcessingProfile（一次性/探索性） | environment-processing（模式 B） | 同上 |
 
 负向边界：仅创建/管理单个沙箱容器 → sandbox；训练效果/loss 分析 →
 training-analysis；生成训练工作流 → generate-workflow-dsl；工作流调试 →

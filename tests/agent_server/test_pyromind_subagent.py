@@ -9,6 +9,8 @@ from unittest.mock import MagicMock
 from pydantic import SecretStr
 
 from openhands.agent_server.pyromind_subagent import (
+    DATA_EXPLORER_AGENT_NAME,
+    DATA_EXPLORER_AGENT_PROMPT,
     GENERAL_PURPOSE_AGENT_NAME,
     GENERAL_PURPOSE_AGENT_PROMPT,
     SEARCH_AGENT_NAME,
@@ -25,6 +27,7 @@ from openhands.agent_server.pyromind_subagent import (
     SubAgentExecutor,
     SubAgentObservation,
     SubAgentType,
+    _data_explorer_agent_factory,
     _general_purpose_agent_factory,
     _search_agent_factory,
     _subagent_factories,
@@ -256,6 +259,72 @@ def test_subagent_executor_selects_conversation_scoped_profile(caplog):
     assert "task='DPO 有哪些关键参数？'" in caplog.text
     assert "event=delegation_completed" in caplog.text
     assert "task_id=task_00000001" in caplog.text
+
+
+def test_data_explorer_agent_has_only_preview_dataset_tool():
+    factory = _data_explorer_agent_factory({"headers": {"x-cluster": "cluster-a"}})
+
+    assert factory.definition.name == DATA_EXPLORER_AGENT_NAME
+    assert factory.definition.tools == ["preview_dataset"]
+    assert factory.definition.max_iteration_per_run == 20
+    assert "verbatim" in DATA_EXPLORER_AGENT_PROMPT
+    assert "data_explorer" in SUBAGENT_TOOL_DESCRIPTION
+
+    llm = LLM(model="gpt-4o", api_key=SecretStr("test-key"))
+    agent = factory.factory_func(llm)
+
+    assert [tool.name for tool in agent.tools] == ["preview_dataset"]
+    assert agent.tools[0].params["headers"] == {"x-cluster": "cluster-a"}
+
+
+def test_subagent_executor_builds_data_explorer_with_parent_storage_context():
+    manager = MagicMock()
+    manager.start_task_with_factory.return_value = SimpleNamespace(
+        id="task_00000001",
+        conversation_id="child-conversation",
+        status=TaskStatus.COMPLETED,
+        result="## Schema (verbatim)\ntask_id",
+        error=None,
+    )
+    executor = SubAgentExecutor(manager, _subagent_factories())
+    parent = MagicMock(spec=LocalConversation)
+    parent.state.id = "parent-conversation"
+    parent.state.agent.tools = [
+        Tool(
+            name="preview_dataset",
+            params={
+                "storage_base_url": "https://portal.test/storage_api",
+                "headers": {"x-cluster": "cluster-a"},
+                "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
+                "extract_params": {"runtime_dir": "/tmp/runtime"},
+            },
+        )
+    ]
+    parent.state.agent_state = {"pyromind_storage_headers": {"x-cluster": "cluster-b"}}
+    parent.state.secret_registry.get_secret_value.return_value = "cookie-value"
+
+    result = executor(
+        SubAgentAction(
+            type=SubAgentType.DATA_EXPLORER,
+            task="Survey datasets/allenai/tmax structure and schema.",
+        ),
+        conversation=parent,
+    )
+
+    assert not result.is_error
+    assert result.type == SubAgentType.DATA_EXPLORER
+    call = manager.start_task_with_factory.call_args.kwargs
+    factory = call["factory"]
+    assert factory.definition.name == DATA_EXPLORER_AGENT_NAME
+
+    llm = LLM(model="gpt-4o", api_key=SecretStr("test-key"))
+    agent = factory.factory_func(llm)
+    params = agent.tools[0].params
+    assert params["storage_base_url"] == "https://portal.test/storage_api"
+    # Fresh conversation state wins over the tool-config header snapshot.
+    assert params["headers"] == {"x-cluster": "cluster-b", "cookie": "cookie-value"}
+    assert "secret_headers" not in params
+    assert "extract_params" not in params
 
 
 def test_search_subagent_reads_index_then_source_end_to_end(tmp_path, caplog):

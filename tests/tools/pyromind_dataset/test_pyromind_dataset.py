@@ -1382,6 +1382,72 @@ def test_storage_directory_lists_folders(monkeypatch, tmp_path):
     assert observation.directory_summary["top_level_file_count"] == 1
 
 
+def test_storage_directory_truncates_large_entry_lists(monkeypatch, tmp_path):
+    """Listings above the cap show a bounded list, pattern hint, and summary."""
+    _patch_shared_empty(monkeypatch)
+    names = [f"task_{i:06d}_{i:08x}" for i in range(60)]
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            path = json["path"]
+            if path == "big/":
+                return _Response(
+                    200,
+                    {
+                        "success": True,
+                        "data": {
+                            "list": [
+                                {
+                                    "name": name,
+                                    "path": f"big/{name}",
+                                    "type": "Folder",
+                                    "size": None,
+                                }
+                                for name in names
+                            ]
+                        },
+                    },
+                )
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "list": [
+                            {
+                                "name": "instruction.md",
+                                "path": f"{path}instruction.md",
+                                "type": "File",
+                                "size": 10,
+                            }
+                        ]
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected POST URL: {url}")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="big/"),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    text = observation.text
+    assert "60 entries" in text
+    assert "(showing first 50 of 60)" in text
+    assert "... and 10 more entries" in text
+    assert "share pattern: task_*" in text
+    assert "big/task_000049" in text
+    assert "big/task_000050" not in text
+    # The sampled directory summary survives truncation.
+    assert "Directory summary:" in text
+    assert "instruction.md" in text
+    # Structured fields stay complete for non-LLM consumers.
+    assert len(observation.entries) == 60
+
+
 def test_storage_directory_summary_detects_repeated_sample_folders(
     monkeypatch,
     tmp_path,

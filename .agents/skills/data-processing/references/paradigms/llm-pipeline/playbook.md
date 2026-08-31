@@ -7,7 +7,7 @@
   Agentic RAG、多轮对话、Function Call、质量评估、Text2SQL、化学抽取和
   多模态标注
 - **不适用**：纯格式转换/字段映射/简单过滤 → format-conversion；
-  依赖真实运行环境的处理（验证/筛选/执行判定）→ environment-processing
+  需在特定环境执行复杂流程的编排式处理（验证/筛选/执行判定）→ environment-processing
 
 先在本地验证最多 3 条 Sample；用户明确确认后，才提交 Pyromind 全量任务。
 

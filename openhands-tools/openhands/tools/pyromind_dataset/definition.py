@@ -96,6 +96,25 @@ _MAX_VISION_PREVIEW_IMAGES = 12
 _MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
 _VISION_RETRYABLE_STATUS_CODES = {408, 409, 425, 429}
 _MAX_DIRECTORY_CHILD_SAMPLES = 3
+_DIRECTORY_LIST_LIMIT = 50
+
+
+def _name_pattern_hint(names: list[str]) -> str | None:
+    """Best-effort shared-name pattern for truncated directory listings."""
+    if len(names) < 2:
+        return None
+    tokens_list = [name.split("_") for name in names]
+    first = tokens_list[0]
+    common = 0
+    for index, token in enumerate(first):
+        if not all(
+            index < len(tokens) and tokens[index] == token for tokens in tokens_list
+        ):
+            break
+        common = index + 1
+    if common == 0 or common == len(first):
+        return None
+    return "_".join(first[:common]) + "_*"
 
 
 @dataclass(frozen=True)
@@ -1384,16 +1403,31 @@ class PreviewDatasetExecutor(
         if len(entries) == 1 and len(file_paths) == 1:
             return file_paths, file_paths[0]
 
+        listed_entries = entries[:_DIRECTORY_LIST_LIMIT]
         file_list_text = "\n".join(
             f"  - {entry.path}"
             f" ({'folder' if entry.is_dir else _human_size(entry.size)}"
             + (f", modified {entry.last_modified}" if entry.last_modified else "")
             + ")"
-            for entry in entries
+            for entry in listed_entries
+        )
+        truncated_list = len(entries) > _DIRECTORY_LIST_LIMIT
+        if truncated_list:
+            omitted = len(entries) - _DIRECTORY_LIST_LIMIT
+            pattern = _name_pattern_hint([entry.name for entry in entries])
+            pattern_note = (
+                f" (omitted names share pattern: {pattern})" if pattern else ""
+            )
+            file_list_text += f"\n  ... and {omitted} more entries{pattern_note}"
+        shown_note = (
+            f" (showing first {_DIRECTORY_LIST_LIMIT} of {len(entries)})"
+            if truncated_list
+            else ""
         )
         if len(file_infos) == len(entries):
             summary = (
-                f"Directory '{dataset_path}' contains {len(file_paths)} files. "
+                f"Directory '{dataset_path}' contains {len(file_paths)} files"
+                f"{shown_note}. "
                 "Ask the user which file to preview, then call this tool again "
                 "with the exact file path, or use mode='sample' to materialize "
                 "selected files."
@@ -1401,7 +1435,8 @@ class PreviewDatasetExecutor(
             list_label = "Available files"
         else:
             summary = (
-                f"Directory '{dataset_path}' contains {len(entries)} entries. "
+                f"Directory '{dataset_path}' contains {len(entries)} entries"
+                f"{shown_note}. "
                 "Call this tool again with an exact file path to preview content, "
                 "or use mode='sample' with selected sample_paths to materialize "
                 "files or folders."

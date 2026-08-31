@@ -5,7 +5,7 @@ import re
 from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,6 +24,11 @@ from openhands.sdk.tool import (
 )
 from openhands.tools.file_editor import FileEditorTool
 from openhands.tools.grep import GrepTool
+from openhands.tools.pyromind_dataset import PreviewDatasetTool
+from openhands.tools.pyromind_dataset.definition import (
+    PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
+    PYROMIND_STORAGE_HEADERS_STATE_KEY,
+)
 from openhands.tools.task.manager import TaskManager, TaskStatus
 from openhands.tools.task_tracker import TaskTrackerTool
 from openhands.tools.terminal import TerminalTool
@@ -41,6 +46,7 @@ _TEXT_SUFFIXES = frozenset({".json", ".md", ".mdx", ".py", ".txt", ".yaml", ".ym
 
 SEARCH_AGENT_NAME = "search"
 GENERAL_PURPOSE_AGENT_NAME = "general-purpose"
+DATA_EXPLORER_AGENT_NAME = "data-explorer"
 
 logger = get_logger(__name__)
 
@@ -81,6 +87,39 @@ Do not include a play-by-play, full command output, or large file contents unles
 the parent explicitly requests them.
 """
 
+DATA_EXPLORER_AGENT_PROMPT = """\
+You are the Pyromind storage dataset explorer. You answer questions about
+datasets on Pyromind storage using only the read-only `preview_dataset` tool.
+
+For every request:
+1. Plan the smallest set of previews that answers the request: inspect
+   directories top-down, then preview representative files.
+2. Keep your own working notes; do not re-preview paths you have already seen.
+3. Stop as soon as the answer is complete.
+
+Your final handoff must use exactly this template:
+
+## Dataset structure
+<directory layout / dataset composition, concise>
+
+## Schema (verbatim)
+<column names and types copied character-for-character from preview output;
+include nested struct fields with dotted paths>
+
+## Sample
+<one representative raw record, truncated to 500 characters>
+
+## Notes
+<anomalies, empty fields, naming traps, anything the parent must double-check>
+
+Hard rules:
+- Copy column names, file paths, and field names verbatim. Never paraphrase,
+  abbreviate, or translate them.
+- Attach the source path to every key fact so the parent can verify.
+- Do not guess values you did not observe; state explicitly what you could not
+  access.
+"""
+
 SUBAGENT_TOOL_DESCRIPTION = """\
 Run a complex task in an isolated, blocking subagent conversation and return only
 its final handoff. Supported types:
@@ -95,6 +134,11 @@ its final handoff. Supported types:
 - `general_purpose`: multi-step workspace work with read/write tools, shell
   commands, and tests. Use it when delegating the work keeps the main context
   smaller; do not use it for a trivial single read or edit.
+- `data_explorer`: read-only Pyromind storage dataset exploration returning a
+  fixed handoff (structure, verbatim schema, one sample, notes). Use it for a
+  broad multi-file survey of an unfamiliar dataset (no case doc, more than
+  ~10 previews expected, findings consumed once). Do not use it for quick
+  verification previews the parent can run directly.
 
 Pass a self-contained task. The call blocks until the subagent finishes, fails,
 or reaches its run limit. Intermediate subagent events are logged separately and
@@ -107,6 +151,7 @@ class SubAgentType(StrEnum):
 
     SEARCH = "search"
     GENERAL_PURPOSE = "general_purpose"
+    DATA_EXPLORER = "data_explorer"
 
 
 def _log_excerpt(value: str, limit: int = 200) -> str:
@@ -538,6 +583,78 @@ def _general_purpose_agent_factory() -> AgentFactory:
     return AgentFactory(factory_func=create_agent, definition=definition)
 
 
+def _data_explorer_storage_params(
+    conversation: "LocalConversation",
+) -> dict[str, Any]:
+    """Resolve the parent's preview_dataset wiring for a subagent session.
+
+    The child conversation starts with an empty agent state and secret
+    registry, so storage auth the parent resolves per conversation (forwarded
+    headers, cookie) must be copied into the tool params up front. The cookie
+    is resolved to a plain header because the child cannot look up the
+    parent's secret registry by name.
+    """
+    params: dict[str, Any] = {}
+    for tool in conversation.state.agent.tools:
+        if tool.name == PreviewDatasetTool.name and isinstance(tool.params, dict):
+            params = {
+                key: value
+                for key, value in tool.params.items()
+                if key != "extract_params"
+            }
+            break
+
+    headers = {
+        str(name): str(value) for name, value in (params.get("headers") or {}).items()
+    }
+    state_headers = conversation.state.agent_state.get(
+        PYROMIND_STORAGE_HEADERS_STATE_KEY
+    )
+    if isinstance(state_headers, dict):
+        headers.update(
+            {str(k): str(v) for k, v in state_headers.items() if v is not None}
+        )
+    cookie = conversation.state.secret_registry.get_secret_value(
+        PYROMIND_STORAGE_AUTH_COOKIE_SECRET
+    )
+    if cookie:
+        headers.setdefault("cookie", cookie)
+    if headers:
+        params["headers"] = headers
+        params.pop("secret_headers", None)
+    return params
+
+
+def _data_explorer_agent_factory(params: dict[str, Any]) -> AgentFactory:
+    """Build a storage explorer bound to the parent's storage context."""
+    definition = AgentDefinition(
+        name=DATA_EXPLORER_AGENT_NAME,
+        description=(
+            "Read-only Pyromind storage explorer for dataset structure, schema, "
+            "and sample summarization with verbatim column names."
+        ),
+        model="inherit",
+        tools=[PreviewDatasetTool.name],
+        system_prompt=DATA_EXPLORER_AGENT_PROMPT,
+        permission_mode="never_confirm",
+        max_iteration_per_run=20,
+    )
+
+    def create_agent(llm: LLM) -> Agent:
+        return Agent(
+            llm=llm,
+            tools=[Tool(name=PreviewDatasetTool.name, params=dict(params))],
+            agent_context=AgentContext(
+                system_message_suffix=DATA_EXPLORER_AGENT_PROMPT
+            ),
+            condenser=default_condenser(
+                llm.model_copy(update={"usage_id": "subagent-data-explorer-condenser"})
+            ),
+        )
+
+    return AgentFactory(factory_func=create_agent, definition=definition)
+
+
 def _subagent_factories() -> dict[SubAgentType, AgentFactory]:
     return {
         SubAgentType.SEARCH: _search_agent_factory(),
@@ -585,7 +702,12 @@ class SubAgentExecutor(ToolExecutor[SubAgentAction, SubAgentObservation]):
                 type=action.type,
                 is_error=True,
             )
-        factory = self.factories[action.type]
+        if action.type is SubAgentType.DATA_EXPLORER:
+            factory = _data_explorer_agent_factory(
+                _data_explorer_storage_params(conversation)
+            )
+        else:
+            factory = self.factories[action.type]
         parent_conversation_id = conversation.state.id
         logger.info(
             "[pyromind-subagent] event=delegation_started "
