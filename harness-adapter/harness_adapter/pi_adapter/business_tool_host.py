@@ -162,8 +162,8 @@ class PyromindBusinessToolHost:
 
     def __init__(self, skill_roots: Sequence[Path]) -> None:
         roots = {path.name: path.resolve() for path in skill_roots}
-        self._cleaning_runtime = roots["data-cleaning"] / "scripts"
-        self._preparation_runtime = roots["data-preparation"] / "scripts"
+        self._cleaning_runtime = roots["data-processing"] / "scripts" / "cleaning"
+        self._preparation_runtime = roots["data-processing"] / "scripts" / "preparation"
         self._training_runtime = roots["training-analysis"] / "scripts"
         self._locks: dict[str, asyncio.Lock] = {}
         self._active_executors: dict[tuple[str, str], Any] = {}
@@ -433,9 +433,7 @@ class PyromindBusinessToolHost:
         return params
 
     @classmethod
-    def _training_analysis_params(
-        cls, context: ToolExecutionContext
-    ) -> dict[str, Any]:
+    def _training_analysis_params(cls, context: ToolExecutionContext) -> dict[str, Any]:
         params = cls._analysis_params(context)
         timeout = context.extra.get("training_analysis_timeout_seconds")
         if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):

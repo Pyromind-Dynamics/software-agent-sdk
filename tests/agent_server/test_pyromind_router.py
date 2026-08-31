@@ -460,7 +460,9 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
             "x-cluster": "us-west-1#pre",
             "request-app": "openhands",
         },
-        "runtime_dir": str(tmp_path / "missing-skills" / "data-cleaning" / "scripts"),
+        "runtime_dir": str(
+            tmp_path / "missing-skills" / "data-processing" / "scripts" / "cleaning"
+        ),
         "storage_headers": {"x-cluster": "us-west-1#pre"},
         "storage_secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
@@ -469,7 +471,6 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         service.start_request.secrets["PYROMIND_VALIDATE_AUTH_COOKIE"].get_value()
         == cookie_header
     )
-
 
     preview_tool = next(
         tool
@@ -542,9 +543,7 @@ def test_training_analysis_tool_reuses_authorization_secret_and_config(tmp_path)
     }
     assert "session-cookie" not in str(tool.params)
     assert "authorization-secret" not in str(tool.params)
-    assert (
-        secrets["PYROMIND_VALIDATE_AUTH_COOKIE"].get_value() == "session-cookie"
-    )
+    assert secrets["PYROMIND_VALIDATE_AUTH_COOKIE"].get_value() == "session-cookie"
     assert (
         secrets["PYROMIND_VALIDATE_AUTHORIZATION"].get_value()
         == "Bearer authorization-secret"
@@ -1034,7 +1033,7 @@ def test_pyromind_storage_tools_use_user_context_headers():
             "request-app": "openhands",
         },
         "output_root": "/agentTest/clean-results",
-        "runtime_dir": "/srv/skills/data-cleaning/scripts",
+        "runtime_dir": "/srv/skills/data-processing/scripts/cleaning",
         "storage_base_url": "https://storage.test/api",
         "storage_headers": {"x-cluster": "context-cluster"},
         "storage_secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},

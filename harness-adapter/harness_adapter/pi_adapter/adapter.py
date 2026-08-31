@@ -84,10 +84,12 @@ public_data/workflow_canvas/workflow.py, then call validate_workflow_dsl with
 that relative dsl_path. Do not inspect credentials or work around failed
 validation authentication.
 
-Route dataset work before acting. Use data-cleaning for deterministic field,
-format, structure, regex, keyword, and length transformations. Use
-data-preparation for content assessment, DataFlow operators, LLM processing,
-images, and multimodal work. If the intent is ambiguous, ask the user first.
+Route dataset work before acting. Use the data-processing skill for any
+dataset request; its SKILL.md routing table selects the paradigm:
+format-conversion for deterministic field, format, structure, regex, keyword,
+and length transformations; llm-pipeline for content assessment, DataFlow
+operators, LLM processing, images, and multimodal work. If the intent is
+ambiguous, ask the user first.
 Never start both full-run paths for one request. Read only the matching SKILL.md
 and its explicitly referenced files before using the business tools."""
 
@@ -138,8 +140,7 @@ class PiAdapter:
             name: skills_directory / name
             for name in (
                 "generate-workflow-dsl",
-                "data-cleaning",
-                "data-preparation",
+                "data-processing",
                 "debug-workflow",
                 "training-analysis",
             )

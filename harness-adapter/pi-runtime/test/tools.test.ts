@@ -77,23 +77,30 @@ test("safePath rejects symlink escape", async () => {
 test("safePath accepts each named skill root but keeps them read-only", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-tools-skills-"));
   const workspace = join(root, "conversation");
-  const cleaning = join(root, "data-cleaning");
-  const preparation = join(root, "data-preparation");
+  const dataProcessing = join(root, "data-processing");
+  const trainingAnalysis = join(root, "training-analysis");
   await mkdir(workspace);
-  await mkdir(cleaning);
-  await mkdir(preparation);
-  await writeFile(join(cleaning, "SKILL.md"), "cleaning");
-  await writeFile(join(preparation, "SKILL.md"), "preparation");
+  await mkdir(dataProcessing);
+  await mkdir(trainingAnalysis);
+  await writeFile(join(dataProcessing, "SKILL.md"), "data-processing");
+  await writeFile(join(trainingAnalysis, "SKILL.md"), "training-analysis");
   const skills = [
-    { name: "data-cleaning", path: cleaning },
-    { name: "data-preparation", path: preparation },
+    { name: "data-processing", path: dataProcessing },
+    { name: "training-analysis", path: trainingAnalysis },
   ];
   assert.equal(
-    await safePath(join(preparation, "SKILL.md"), workspace, skills, undefined, true),
-    join(preparation, "SKILL.md"),
+    await safePath(
+      join(dataProcessing, "SKILL.md"),
+      workspace,
+      skills,
+      undefined,
+      true,
+    ),
+    join(dataProcessing, "SKILL.md"),
   );
   await assert.rejects(
-    () => safePath(join(cleaning, "SKILL.md"), workspace, skills, undefined, false),
+    () =>
+      safePath(join(trainingAnalysis, "SKILL.md"), workspace, skills, undefined, false),
     /read-only/,
   );
 });

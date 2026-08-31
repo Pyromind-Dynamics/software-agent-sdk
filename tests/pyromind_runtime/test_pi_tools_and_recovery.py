@@ -217,8 +217,7 @@ async def test_runner_loads_five_named_skills_and_eleven_business_tools(
     try:
         assert [item["name"] for item in captured["skill_roots"]] == [
             "generate-workflow-dsl",
-            "data-cleaning",
-            "data-preparation",
+            "data-processing",
             "debug-workflow",
             "training-analysis",
         ]
@@ -242,8 +241,7 @@ async def test_runner_loads_five_named_skills_and_eleven_business_tools(
 def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
     repository = Path(pi_adapter_module.__file__).parents[3]
     roots = [
-        repository / ".agents" / "skills" / "data-cleaning",
-        repository / ".agents" / "skills" / "data-preparation",
+        repository / ".agents" / "skills" / "data-processing",
         repository / ".agents" / "skills" / "training-analysis",
     ]
     specs = PyromindBusinessToolHost(roots).specs()
@@ -257,8 +255,7 @@ async def test_pi_host_synthesizes_debug_task_and_persists_only_attempt_budget(
     repository = Path(pi_adapter_module.__file__).parents[3]
     host = PyromindBusinessToolHost(
         [
-            repository / ".agents" / "skills" / "data-cleaning",
-            repository / ".agents" / "skills" / "data-preparation",
+            repository / ".agents" / "skills" / "data-processing",
             repository / ".agents" / "skills" / "training-analysis",
         ]
     )
