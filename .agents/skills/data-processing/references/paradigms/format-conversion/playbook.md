@@ -1,14 +1,12 @@
----
-name: data-cleaning
-description: >-
-  将 Pyromind Storage 中的数据集转换为平台训练格式（messages/DPO）：字段映射、
-  对话结构解析、格式校验、SHA-256 去重。提供断点续跑、错误隔离和 report 统计。
-  mapper 中可写简单内容过滤（regex/关键词/长度），但无预置算子、无 LLM、无跨行操作。
-  适用于“格式转换”“字段映射”“简单过滤+可靠执行”；
-  复杂内容清洗（去重/PII/语言/毒性/评分/生成）请用 data-preparation。
----
+# 格式转换（format-conversion）
 
-# 数据清洗
+- **基底**：平台 Pod（`run_dataset_cleaning` 冻结 `cleaning_utils.py` +
+  `validate_format.py`）
+- **适用**：数据集转平台训练格式（messages/DPO）、字段映射、对话结构解析、
+  格式校验、SHA-256 去重；mapper 可写简单内容过滤（regex/关键词/长度）；
+  断点续跑、错误隔离、report 统计
+- **不适用**：复杂内容清洗（去重/PII/语言/毒性/评分/生成）→ llm-pipeline；
+  需在特定环境执行复杂流程的编排式处理（验证/筛选/执行判定）→ environment-processing
 
 所有读取数据、执行清洗、格式校验和查看产物的动作都必须发生在 Pyromind 平台。
 本地工作区只用于编写或修改 `clean_script.py`，不得下载数据或本地运行 cleaner、
@@ -18,10 +16,10 @@ validator。平台产物只能用 `preview_dataset` 查看。
 
 1. 用 `preview_dataset` 查看用户给出的 Storage 路径。目录包含多个候选文件时，先让
    用户确认输入；确认字段语义、对话分组、过滤规则、system prompt 和有损转换。
-2. 只使用 [target-formats.md](references/target-formats.md) 定义的格式。完整的
+2. 只使用 [target-formats.md](target-formats.md) 定义的格式。完整的
    prompt/chosen/rejected 自动按 DPO 清洗，不丢弃任一分支；其他数据输出 messages。
-3. [cleaning-utils-api.md](references/cleaning-utils-api.md) 是正常清洗任务中唯一的
-   Utils 契约。读取它和 [example_clean_script.py](references/example_clean_script.py)
+3. [cleaning-utils-api.md](cleaning-utils-api.md) 是正常清洗任务中唯一的
+   Utils 契约。读取它和 [example_clean_script.py](example_clean_script.py)
    后编写字段映射；不要查看、搜索或反复读取 `cleaning_utils.py` 实现。只有用户明确
    要求维护 Skill/运行时，或平台行为与 API 契约矛盾时，才检查实现。
 4. 用 `upload_file_to_pyromind` 上传脚本，再调用 `run_dataset_cleaning`，传

@@ -1,0 +1,2 @@
+pyromind-sdk>=0.1.9
+httpx>=0.24

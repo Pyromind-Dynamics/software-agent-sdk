@@ -1,12 +1,13 @@
----
-name: data-preparation
-description: >-
-  使用 DataFlow 对文本或图片数据进行抽样、清洗、生成、评分和格式化，覆盖 SFT、
-  推理、代码、知识问答、Agentic RAG、多轮对话、Function Call、质量评估、
-  Text2SQL、化学抽取和多模态标注；本地验证后提交 Pyromind 全量处理。
----
+# 数据准备（llm-pipeline）
 
-# 数据准备
+- **基底**：本地 Sample（`df_run_pipeline` 隔离子进程执行 DataFlow 算子）→
+  用户确认后平台全量（`df_submit_pipeline`）
+- **适用**：内容级处理——规则清洗（词数/语言/MinHash 去重/PII/毒性/HTML）、
+  LLM 生成与改写、质量评分、格式化；覆盖 SFT、推理、代码、知识问答、
+  Agentic RAG、多轮对话、Function Call、质量评估、Text2SQL、化学抽取和
+  多模态标注
+- **不适用**：纯格式转换/字段映射/简单过滤 → format-conversion；
+  需在特定环境执行复杂流程的编排式处理（验证/筛选/执行判定）→ environment-processing
 
 先在本地验证最多 3 条 Sample；用户明确确认后，才提交 Pyromind 全量任务。
 
@@ -32,11 +33,11 @@ description: >-
    随后调用 `preview_dataset(mode="sample", n<=3)`；本地 Pipeline 的输入直接使用返回的
    `df_run_input_path`，多输入时使用 `local_sample_paths`。Storage `source_path` 只用于全量
    提交，不得作为本地路径，也不得复制 Sample 到另一个文件。
-2. 根据下表只读取相关场景 reference，同时读取
-   [通用约定](references/dataflow-common.md) 和
-   [输出契约](references/schema-conventions.md)。
-3. 优先从场景 reference 的 DataFlow 算子模板修改 Pipeline；只有图片任务使用
-   [图片模板](references/multimodal_pipeline.py)。场景 reference 中的算子链负责处理中间
+2. 按下表（运行规则）只读取相关场景 case 文档，同时读取
+   [通用约定](dataflow-common.md) 和
+   [输出契约](schema-conventions.md)。
+3. 优先从 case 文档的 DataFlow 算子模板修改 Pipeline；只有图片任务使用
+   [图片模板](multimodal_pipeline.py)。case 文档中的算子链负责处理中间
    字段，Pipeline 末尾负责映射正式 Schema。
 4. 调用 `df_run_pipeline`，显式设置 `model_profile` 和 `output_schema`，检查
    `processed.sample.jsonl`、`validation.json` 和 `report.json`。
@@ -56,28 +57,32 @@ description: >-
    若用户预览后发现不符合预期、要介入调整，**先调用 `df_stop_task`**（传 `task_id`，
    或 `df_submit_pipeline` 返回的 `run_id` / `output_dir`）停掉平台任务，再修改
    pipeline 并重新提交，避免旧任务继续消耗资源或覆盖输出目录。
-## 运行规则
+## 运行规则（范式内 case 路由）
 
-| 需求 | Reference | `output_schema` |
+| 需求 | case 文档 | `output_schema` |
 |---|---|---|
-| 规则清洗、语言/长度过滤、去重 | [文本规则清洗](references/text-cleaning.md) | 下游 Schema |
-| 通用生成、改写、打分、过滤 | [通用 LLM 处理](references/generic-llm-processing.md) | `text` |
-| SFT 合成与筛选 | [SFT 数据](references/sft-data.md) | `text` |
-| DPO 偏好对清洗或生成 | [DPO 数据](references/dpo-data.md) | `dpo` |
-| 推理问题和答案合成 | [Reasoning 数据](references/reasoning-data.md) | `text` |
-| 代码指令和代码生成 | [Code 数据](references/code-data.md) | `text` |
-| 文本/Markdown 清洗并生成 QA | [知识库与 QA](references/knowledge-qa.md) | `text` |
-| Agentic RAG 任务与 QA | [Agentic RAG](references/agentic-rag.md) | `text` |
-| 多轮对话生成或整理 | [多轮对话](references/multiturn-data.md) | `multiturn` |
-| 工具定义和调用轨迹 | [Function Call](references/function-call-data.md) | `function_call` |
-| 样本质量评分、保留、改写或丢弃 | [质量评估](references/quality-evaluation.md) | `quality_evaluation` |
-| 已有 SQLite Text2SQL 数据精炼 | [Text2SQL](references/text2sql-data.md) | `text2sql` |
-| 图片 OCR、理解和多图语义标注 | [多模态标注](references/multimodal-labeling.md) | `vision` |
-| 从文本抽取 SMILES | [化学数据](references/chemistry-data.md) | `text` |
+| 规则清洗、语言/长度过滤、去重 | [文本规则清洗](cases/text-cleaning.md) | 下游 Schema |
+| 通用生成、改写、打分、过滤 | [通用 LLM 处理](cases/generic-llm-processing.md) | `text` |
+| SFT 合成与筛选 | [SFT 数据](cases/sft-data.md) | `text` |
+| DPO 偏好对清洗或生成 | [DPO 数据](cases/dpo-data.md) | `dpo` |
+| 推理问题和答案合成 | [Reasoning 数据](cases/reasoning-data.md) | `text` |
+| 代码指令和代码生成 | [Code 数据](cases/code-data.md) | `text` |
+| 文本/Markdown 清洗并生成 QA | [通用 LLM 处理](cases/generic-llm-processing.md)（暂无专属 case） | `text` |
+| Agentic RAG 任务与 QA | [通用 LLM 处理](cases/generic-llm-processing.md)（暂无专属 case） | `text` |
+| 多轮对话生成或整理 | [通用 LLM 处理](cases/generic-llm-processing.md)（暂无专属 case） | `multiturn` |
+| 工具定义和调用轨迹 | [通用 LLM 处理](cases/generic-llm-processing.md)（暂无专属 case） | `function_call` |
+| 样本质量评分、保留、改写或丢弃 | [通用 LLM 处理](cases/generic-llm-processing.md)（暂无专属 case） | `quality_evaluation` |
+| 已有 SQLite Text2SQL 数据精炼 | [通用 LLM 处理](cases/generic-llm-processing.md)（暂无专属 case） | `text2sql` |
+| 图片 OCR、理解和多图语义标注 | [多模态标注](cases/multimodal-labeling.md) | `vision` |
+| 从文本抽取 SMILES | [通用 LLM 处理](cases/generic-llm-processing.md)（暂无专属 case） | `text` |
+
+标注“暂无专属 case”的场景按[通用 LLM 处理](cases/generic-llm-processing.md)
+的流程执行，输出格式严格以[输出契约](schema-conventions.md)中对应
+schema 为准；专属 case 文档待补充。
 
 ## 运行与完成条件
 
-- 只读取需求匹配的场景 reference 及其模板；例如 DPO 不读取文本清洗等相邻模板。
+- 只读取需求匹配的场景 case 及其模板；例如 DPO 不读取文本清洗等相邻模板。
 - 按 `failure_stage` 修复：`input_resolution` 只改用工具返回的本地路径，
   `pipeline_resolution` 只修正工作区相对路径，`pipeline_execution` 根据 stderr/report
   修脚本；仅 `runtime_dependency` 可检查运行环境，且不得浏览 SDK 仓库源码。
@@ -103,5 +108,5 @@ description: >-
 
 ## 图片补充参考
 
-- [image_utils API](references/image-utils-api.md)
-- [AVI Manifest 适配器](references/avi_manifest_adapter.py)
+- [image_utils API](image-utils-api.md)
+- [AVI Manifest 适配器](avi_manifest_adapter.py)

@@ -2,8 +2,8 @@
 
 图片 Pipeline 只声明 `ImagePipelineConfig`，不要生成循环、HTTP、OpenAI Client、
 Base64、重试或 Checkpoint。完整字段见
-[image_utils API](image-utils-api.md)，起始脚本见
-[配置模板](multimodal_pipeline.py)。
+[image_utils API](../image-utils-api.md)，起始脚本见
+[配置模板](../multimodal_pipeline.py)。
 
 ## 输入
 
