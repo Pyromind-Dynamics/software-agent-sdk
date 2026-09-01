@@ -57,6 +57,12 @@ export async function createTools(
     terminalBackend,
     workspaceRoot,
   );
+  // sandbox-runtime creates Linux bridge sockets under os.tmpdir(). Initialize
+  // it before pointing process temp variables at the conversation's much longer
+  // terminal-output path, which can exceed sockaddr_un.sun_path's 108-byte limit.
+  process.env.TMPDIR = terminalOutputTemp;
+  process.env.TMP = terminalOutputTemp;
+  process.env.TEMP = terminalOutputTemp;
   const bash = createBashTool(workspaceRoot, {
     operations: terminalOperations,
     exposeSessionEnvironment: false,
