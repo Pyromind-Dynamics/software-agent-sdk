@@ -52,8 +52,12 @@ class NodeSignatureAction(Action):
         ),
     )
     include_source: bool = Field(
-        default=True,
-        description="Whether to include full source code (default: True)",
+        default=False,
+        description=(
+            "Whether to fetch full source code in addition to the signature "
+            "(default: False). Source is server-side only: it is returned in the "
+            "results but never rendered into the LLM-visible output."
+        ),
     )
 
 
@@ -84,7 +88,10 @@ class NodeSignatureObservation(Observation):
     )
     source_code: str | None = Field(
         default=None,
-        description="Full source code if include_source=True was requested.",
+        description=(
+            "Full source code when include_source=True. Server-side only: never "
+            "included in to_llm_content."
+        ),
     )
     error_message: str | None = Field(
         default=None,
@@ -92,7 +99,7 @@ class NodeSignatureObservation(Observation):
     )
 
     @staticmethod
-    def _format_entry(entry: dict) -> str:
+    def _format_entry(entry: dict, *, include_source: bool = False) -> str:
         node_name = entry.get("node_name", "?")
         if not entry.get("success"):
             return f"Node: {node_name}\nError: {entry.get('error_message') or 'Unknown error'}"
@@ -116,18 +123,19 @@ class NodeSignatureObservation(Observation):
                     f"  - {p['name']} ({p.get('type', 'STRING')}, {req}{default})"
                 )
 
-        if entry.get("source_code"):
+        if include_source and entry.get("source_code"):
             parts.append(f"\nSource Code:\n```python\n{entry['source_code']}\n```")
 
         return "\n".join(parts)
 
-    @property
-    def to_llm_content(self) -> Sequence[TextContent | ImageContent]:
-        """Format observation data into text for the LLM."""
+    def _render(self, *, include_source: bool) -> Sequence[TextContent | ImageContent]:
         if self.results:
             return [
                 TextContent(
-                    text="\n\n".join(self._format_entry(e) for e in self.results)
+                    text="\n\n".join(
+                        self._format_entry(e, include_source=include_source)
+                        for e in self.results
+                    )
                 )
             ]
 
@@ -144,20 +152,35 @@ class NodeSignatureObservation(Observation):
                         "docstring": self.docstring,
                         "parameters": self.parameters,
                         "source_code": self.source_code,
-                    }
+                    },
+                    include_source=include_source,
                 )
             )
         ]
 
+    @property
+    def to_llm_content(self) -> Sequence[TextContent | ImageContent]:
+        """Format observation data into source-free text for the LLM."""
+        return self._render(include_source=False)
 
-_NODE_SIGNATURE_DESCRIPTION = """Retrieve the entry function signature, docstring, and source code of one or more workflow nodes.
+    def to_summary_content(self) -> Sequence[TextContent | ImageContent]:
+        """Source-full render for server-side LLM condensation only.
+
+        Never return this into agent-observable context: the node source body is
+        sensitive. Callers must condense it (without reproducing the source)
+        before injecting anything derived from it back into the conversation.
+        """
+        return self._render(include_source=True)
+
+
+_NODE_SIGNATURE_DESCRIPTION = """Retrieve the entry function signature, docstring, and parameter spec of one or more workflow nodes.
 
 Use this when you need to understand what parameters a node expects.
-Returns the function signature, parameter types/defaults, docstring, and full
-source code for each requested node.
+Returns the function signature, parameter types/defaults, and docstring for each
+requested node. Full source code is never shown to you.
 
-The goal is to help you understand what parameters the node expects and how it
-processes them, so you can fix workflow.py accordingly.
+The goal is to help you understand what parameters the node expects, so you can
+fix workflow.py accordingly.
 
 Args:
     node_names: List of node type names to query in one call
@@ -167,7 +190,6 @@ Args:
         query. Only used when node_names is empty.
     node_type: Optional filter - "system", "share", or "user". If omitted,
         same-name candidates are tried by priority system > share > user.
-    include_source: Set to False if you only need the signature without source code
 """
 
 

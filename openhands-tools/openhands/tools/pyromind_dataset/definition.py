@@ -3022,16 +3022,53 @@ def _vision_content_type(path: str) -> str:
     }.get(suffix, "application/octet-stream")
 
 
+_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
+_VISION_PLACEHOLDER_MODEL_NAMES = frozenset(
+    {"router", "<model>", "{model}", "{{model}}"}
+)
+
+
+def _is_vision_placeholder_model(value: str) -> bool:
+    """Return True for DF_MODEL_NAME values run environments inject when
+    template substitution fails (e.g. ``router``, ``{{model}}``)."""
+
+    stripped = value.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    return (
+        lowered in _VISION_PLACEHOLDER_MODEL_NAMES
+        or "{{" in stripped
+        or stripped.startswith("${")
+    )
+
+
 def _vision_api_config() -> tuple[str, str, str | None]:
-    api_url = os.environ.get(ENV_DF_API_URL, "").strip()
+    base_url = (
+        os.environ.get(ENV_DF_API_BASE_URL, "").strip().rstrip("/")
+        or os.environ.get(ENV_LLM_BASE_URL, "").strip().rstrip("/")
+        or DEFAULT_DATAFLOW_API_BASE_URL
+    )
+    api_url = os.environ.get(ENV_DF_API_URL, "").strip().rstrip("/")
     if not api_url:
-        base_url = (
-            os.environ.get(ENV_DF_API_BASE_URL, "").strip().rstrip("/")
-            or os.environ.get(ENV_LLM_BASE_URL, "").strip().rstrip("/")
-            or DEFAULT_DATAFLOW_API_BASE_URL
+        api_url = f"{base_url}{_CHAT_COMPLETIONS_SUFFIX}"
+    elif not api_url.endswith(_CHAT_COMPLETIONS_SUFFIX):
+        raise ValueError(
+            "DF_API_URL must be an OpenAI-compatible chat completions endpoint "
+            f"ending in '{_CHAT_COMPLETIONS_SUFFIX}'; got {api_url!r}. Pass the "
+            "full endpoint (e.g. https://host/v1/chat/completions), not the "
+            "bare base URL — this runtime uses DF_API_URL verbatim."
         )
-        api_url = f"{base_url}/chat/completions"
-    model = os.environ.get(ENV_DF_MODEL_NAME, "").strip() or DEFAULT_DATAFLOW_MODEL_NAME
+    env_model_name = os.environ.get(ENV_DF_MODEL_NAME, "").strip()
+    if env_model_name and _is_vision_placeholder_model(env_model_name):
+        raise ValueError(
+            "DF_MODEL_NAME is still an unsubstituted placeholder "
+            f"({env_model_name!r}) — the run environment did not substitute "
+            "the template value. Set a concrete model name such as "
+            f"{DEFAULT_DATAFLOW_MODEL_NAME!r} or fix the environment "
+            "injection."
+        )
+    model = env_model_name or DEFAULT_DATAFLOW_MODEL_NAME
     api_key = os.environ.get(ENV_DF_API_KEY)
     return api_url, model, api_key
 

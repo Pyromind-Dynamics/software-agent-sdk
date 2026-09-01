@@ -1871,6 +1871,27 @@ def test_vision_api_config_uses_defaults_when_unset(monkeypatch) -> None:
     assert api_key is None
 
 
+def test_vision_api_config_rejects_bare_base_url(monkeypatch) -> None:
+    """DF_API_URL is used verbatim by the runtime, so a bare base URL would
+    hit a web page instead of the API and fail with a confusing JSON decode
+    error; reject it up front."""
+    _clear_vision_env(monkeypatch)
+    monkeypatch.setenv("DF_API_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("DF_MODEL_NAME", "vision-model")
+
+    with pytest.raises(ValueError, match="/chat/completions"):
+        _vision_api_config()
+
+
+def test_vision_api_config_rejects_placeholder_model(monkeypatch) -> None:
+    _clear_vision_env(monkeypatch)
+    monkeypatch.setenv("DF_API_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("DF_MODEL_NAME", "router")
+
+    with pytest.raises(ValueError, match="unsubstituted placeholder"):
+        _vision_api_config()
+
+
 def test_vision_api_config_falls_back_to_llm_base_url(monkeypatch) -> None:
     _clear_vision_env(monkeypatch)
     monkeypatch.setenv("LLM_BASE_URL", "https://llm.example/v1/")
