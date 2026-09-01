@@ -187,7 +187,7 @@ async def test_runner_start_receives_configured_knowledge_root(
         await adapter.close(handle)
 
 
-async def test_runner_loads_five_named_skills_and_eleven_business_tools(
+async def test_runner_loads_five_named_skills_and_fourteen_business_tools(
     tmp_path, monkeypatch
 ) -> None:
     captured = {}
@@ -231,6 +231,9 @@ async def test_runner_loads_five_named_skills_and_eleven_business_tools(
             "df_submit_pipeline",
             "df_check_progress",
             "df_stop_task",
+            "edp_render",
+            "edp_submit",
+            "edp_aggregate",
             "workflow_debug",
             "analyze_task_failure",
             "training_analysis",
@@ -246,7 +249,10 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
         repository / ".agents" / "skills" / "training-analysis",
     ]
     specs = PyromindBusinessToolHost(roots).specs()
-    assert len(specs) == 11
+    assert len(specs) == 14
+    assert {"edp_render", "edp_submit", "edp_aggregate"} <= {
+        spec["name"] for spec in specs
+    }
     assert all(spec["input_schema"].get("type") == "object" for spec in specs)
 
 

@@ -29,6 +29,11 @@ from openhands.tools.data_preparation import (
     DfStopTaskTool,
     DfSubmitPipelineTool,
 )
+from openhands.tools.environment_processing import (
+    EdpAggregateTool,
+    EdpRenderTool,
+    EdpSubmitTool,
+)
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
@@ -184,6 +189,7 @@ class PyromindBusinessToolHost:
         roots = {path.name: path.resolve() for path in skill_roots}
         self._cleaning_runtime = roots["data-processing"] / "scripts" / "cleaning"
         self._preparation_runtime = roots["data-processing"] / "scripts" / "preparation"
+        self._edp_runtime = roots["data-processing"] / "scripts" / "edp"
         self._training_runtime = roots["training-analysis"] / "scripts"
         self._locks: dict[str, asyncio.Lock] = {}
         self._active_executors: dict[tuple[str, str], Any] = {}
@@ -210,6 +216,15 @@ class PyromindBusinessToolHost:
             DfStopTaskTool.name: lambda context: DfStopTaskTool.create(
                 **self._stop_params(context)
             )[0],
+            EdpRenderTool.name: lambda context: EdpRenderTool.create(
+                **self._edp_params(context)
+            )[0],
+            EdpSubmitTool.name: lambda context: EdpSubmitTool.create(
+                **self._edp_params(context)
+            )[0],
+            EdpAggregateTool.name: lambda context: EdpAggregateTool.create(
+                **self._edp_params(context)
+            )[0],
             WorkflowDebugTool.name: lambda context: WorkflowDebugTool.create(
                 **self._workflow_debug_params(context)
             )[0],
@@ -232,6 +247,9 @@ class PyromindBusinessToolHost:
             DfSubmitPipelineTool,
             DfCheckProgressTool,
             DfStopTaskTool,
+            EdpRenderTool,
+            EdpSubmitTool,
+            EdpAggregateTool,
             WorkflowDebugTool,
             AnalyzeTaskFailureTool,
             TrainingAnalysisTool,
@@ -410,6 +428,11 @@ class PyromindBusinessToolHost:
     def _preparation_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         params = self._execution_params(context)
         params["runtime_dir"] = str(self._preparation_runtime)
+        return params
+
+    def _edp_params(self, context: ToolExecutionContext) -> dict[str, Any]:
+        params = self._execution_params(context)
+        params["runtime_dir"] = str(self._edp_runtime)
         return params
 
     def _extraction_params(self, context: ToolExecutionContext) -> dict[str, Any]:
