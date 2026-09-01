@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -19,6 +20,20 @@ from openhands.tools.utils import resolve_workspace_subpath
 
 
 logger = get_logger(__name__)
+
+
+def parse_memory_limit(text: str) -> int:
+    """Parse a human readable memory limit (``512M``, ``1G``) into bytes."""
+    match = re.fullmatch(
+        r"(?P<number>\d+)\s*(?P<unit>[kmgtp]?)", text.strip(), re.IGNORECASE
+    )
+    if match is None:
+        raise ValueError(f"invalid memory limit: {text!r}")
+    number = int(match.group("number"))
+    unit = match.group("unit").lower()
+    multiplier = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}[unit]
+    return number * multiplier
+
 
 TerminalSandboxMode = Literal["off", "auto", "required"]
 TERMINAL_SANDBOX_ENV = "OH_TERMINAL_SANDBOX"

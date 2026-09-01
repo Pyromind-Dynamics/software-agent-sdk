@@ -21,6 +21,7 @@ from openhands.tools.terminal.definition import (
     TerminalObservation,
     looks_like_python_literal_argument,
 )
+from openhands.tools.terminal.pod_memory import pod_memory_gate_allowed
 from openhands.tools.terminal.sandbox import (
     TerminalSandboxMode,
     terminal_sandbox_enabled,
@@ -57,6 +58,16 @@ _TMUX_RECOVERABLE_ERROR_MARKERS = (
     "can't find session",
     "could not find window_id",
     "could not find pane_id",
+)
+
+_POD_MEMORY_HINT_TEMPLATE = (
+    "[Memory-pressure] This pod is at {usage_pct}% of its memory high-water "
+    "mark ({high_water_pct}%), so the terminal blocked the command to protect "
+    "the server (all conversations share the pod). The terminal session is "
+    "preserved and this is temporary.\n\n"
+    "Wait a moment and retry the same command, or ask the user to reduce "
+    "concurrent heavy workloads (downloads, parallel agents) so memory can be "
+    "reclaimed."
 )
 
 logger = get_logger(__name__)
@@ -607,6 +618,26 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                     ),
                     is_error=True,
                     command=original_action.command,
+                    exit_code=None,
+                )
+
+        if not action.is_input:
+            allowed, memory_stats, high_water = pod_memory_gate_allowed()
+            if not allowed:
+                usage_pct = round(memory_stats.usage_ratio * 100) if memory_stats else 0
+                logger.warning(
+                    "Refusing terminal command under pod memory pressure "
+                    "(usage=%d%%, high-water=%.0f%%)",
+                    usage_pct,
+                    high_water * 100,
+                )
+                return TerminalObservation.from_text(
+                    _POD_MEMORY_HINT_TEMPLATE.format(
+                        usage_pct=usage_pct,
+                        high_water_pct=round(high_water * 100),
+                    ),
+                    is_error=True,
+                    command=action.command,
                     exit_code=None,
                 )
 
