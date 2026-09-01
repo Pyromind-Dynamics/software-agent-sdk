@@ -259,6 +259,15 @@ class SubprocessTerminal(TerminalInterface):
         flags = fcntl.fcntl(self._pty_master_fd, fcntl.F_GETFL)
         fcntl.fcntl(self._pty_master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
+        # Pin the shell process tree into the session memory cgroup when one
+        # is active. RuntimeError means the limit did not take effect; do not
+        # keep an unconstrained sandbox running.
+        try:
+            self.sandbox.attach_memory_cgroup(self.process.pid)
+        except RuntimeError:
+            self.close()
+            raise
+
         # Start output reader thread
         self.reader_thread = threading.Thread(
             target=self._read_output_continuously_pty, daemon=True

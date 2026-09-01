@@ -6,10 +6,13 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
+import time
+import uuid
 from functools import lru_cache
 from importlib import import_module
 from pathlib import Path
@@ -33,6 +36,240 @@ def parse_memory_limit(text: str) -> int:
     unit = match.group("unit").lower()
     multiplier = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}[unit]
     return number * multiplier
+
+
+OH_SANDBOX_MEMORY_LIMIT_ENV = "OH_SANDBOX_MEMORY_LIMIT"
+OH_SANDBOX_MEMORY_REQUIRED_ENV = "OH_SANDBOX_MEMORY_REQUIRED"
+OH_SANDBOX_UNSHARE_USER_ENV = "OH_SANDBOX_UNSHARE_USER"
+_DEFAULT_SANDBOX_MEMORY_LIMIT = "500M"
+_ATTACH_SETTLE_ATTEMPTS = 5
+_ATTACH_SETTLE_DELAY = 0.15
+_CGROUP_MEMORY_ROOT = Path("/sys/fs/cgroup")
+
+
+@lru_cache(maxsize=1)
+def userns_mounts_supported() -> bool:
+    """Probe whether a new user namespace can mount inside this environment.
+
+    ``bwrap --unshare-user-try`` mounts proc/tmpfs from inside a fresh user
+    namespace. Restricted pod kernels deny those mounts, which makes bwrap
+    abort before the sandbox shell ever starts (every later terminal command
+    times out with no output). Probe once per process so the sandbox can fall
+    back to a plain (non-user-namespace) bwrap on such nodes.
+    ``OH_SANDBOX_UNSHARE_USER`` overrides the probe result.
+    """
+    override = os.environ.get(OH_SANDBOX_UNSHARE_USER_ENV, "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    if shutil.which("unshare") is None:
+        return False
+    probe = f"/tmp/openhands-userns-probe-{os.getpid()}"
+    try:
+        os.makedirs(probe, exist_ok=True)
+        result = subprocess.run(
+            [
+                "unshare",
+                "-Urm",
+                "sh",
+                "-c",
+                f"mount -t proc proc {shlex.quote(probe)} && umount {probe}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+    return result.returncode == 0
+
+
+def _format_bytes(value: int) -> str:
+    """Format a byte count into a compact label (e.g. 524288000 -> 512 MiB)."""
+    units = ("B", "KiB", "MiB", "GiB")
+    size = float(value)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.0f} {unit}"
+        size /= 1024
+    return f"{size:.0f} {units[-1]}"
+
+
+def _memory_limit_required() -> bool:
+    """Whether the sandbox memory limit must be enforced or startup must fail."""
+    return os.environ.get(OH_SANDBOX_MEMORY_REQUIRED_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _descendant_pids(root_pid: int) -> list[int]:
+    pids: list[int] = []
+    frontier = [root_pid]
+    while frontier:
+        next_frontier: list[int] = []
+        for pid in frontier:
+            children_file = Path(f"/proc/{pid}/task/{pid}/children")
+            try:
+                children = children_file.read_text().split()
+            except OSError:
+                continue
+            for child in children:
+                child_pid = int(child)
+                pids.append(child_pid)
+                next_frontier.append(child_pid)
+        frontier = next_frontier
+    return pids
+
+
+def _move_pid_to_cgroup(procs_path: Path, pid: int) -> None:
+    """Write one pid into a cgroup v2 ``cgroup.procs`` stream.
+
+    One pid per write avoids the multi-pid EINVAL behavior; ``w`` mode is used
+    because some kernels reject append-style opens of cgroup files.
+    """
+    with procs_path.open("w") as stream:
+        stream.write(f"{pid}\n")
+
+
+class SandboxMemoryCgroup:
+    """Pin a sandbox process tree into a cgroup with a hard memory cap.
+
+    Requires writable cgroup v2 delegation (``/sys/fs/cgroup`` mounted rw and
+    memory controller delegated); otherwise creation degrades to unlimited
+    unless ``required`` turns an unenforced limit into a startup error.
+    """
+
+    def __init__(
+        self,
+        limit_bytes: int,
+        *,
+        root: Path = _CGROUP_MEMORY_ROOT,
+        required: bool = False,
+    ):
+        self._limit_bytes = limit_bytes
+        self._root = root
+        self._required = required
+        self._path: Path | None = None
+
+    @property
+    def path(self) -> Path | None:
+        return self._path
+
+    def create(self) -> bool:
+        """Create the child cgroup and set memory limits; False when unwritable."""
+        path = self._root / f"openhands-sandbox-{uuid.uuid4().hex[:12]}"
+        try:
+            path.mkdir()
+            (path / "memory.max").write_text(str(self._limit_bytes))
+            (path / "memory.high").write_text(str(self._limit_bytes * 3 // 4))
+            try:
+                (path / "memory.swap.max").write_text("0")
+            except OSError:
+                pass
+        except OSError as exc:
+            logger.warning("sandbox memory cgroup unavailable: %s", exc)
+            return False
+        self._path = path
+        logger.info(
+            "sandbox memory cgroup active: path=%s limit=%s",
+            path,
+            _format_bytes(self._limit_bytes),
+        )
+        return True
+
+    def attach(self, root_pid: int) -> int:
+        """Move the sandbox process tree into this cgroup; return attached count.
+
+        The sweep re-enumerates the tree a few times because sandbox launchers
+        such as ``bwrap --unshare-pid`` spawn the interactive shell only after
+        Popen returns. A one-shot snapshot would leave the shell (and every
+        process it forks later) outside the cgroup.
+        """
+        if self._path is None:
+            return 0
+        procs = self._path / "cgroup.procs"
+        attached: list[int] = []
+        seen: set[int] = set()
+        for _ in range(_ATTACH_SETTLE_ATTEMPTS):
+            pids = (root_pid, *_descendant_pids(root_pid))
+            moved_any = False
+            for pid in pids:
+                if pid in seen:
+                    continue
+                try:
+                    _move_pid_to_cgroup(procs, pid)
+                except OSError as exc:
+                    logger.warning(
+                        "failed to attach pid %s to sandbox memory cgroup: %s",
+                        pid,
+                        exc,
+                    )
+                else:
+                    attached.append(pid)
+                    moved_any = True
+                seen.add(pid)
+            if not moved_any:
+                break
+            time.sleep(_ATTACH_SETTLE_DELAY)
+        if not attached:
+            message = (
+                f"sandbox memory cgroup {self._path} empty after attach "
+                f"(root_pid={root_pid}); memory limit is not enforced"
+            )
+            if self._required:
+                raise RuntimeError(message)
+            logger.error(message)
+            return 0
+        logger.info(
+            "sandbox memory cgroup enforced on %d process(es) (limit=%s)",
+            len(attached),
+            _format_bytes(self._limit_bytes),
+        )
+        return len(attached)
+
+    def cleanup(self) -> None:
+        if self._path is None:
+            return
+        shutil.rmtree(self._path, ignore_errors=True)
+        self._path = None
+
+
+def sandbox_memory_cgroup_from_env() -> SandboxMemoryCgroup | None:
+    """Build a memory cgroup from ``OH_SANDBOX_MEMORY_LIMIT`` (default 500M).
+
+    With ``OH_SANDBOX_MEMORY_REQUIRED=1`` the limit is mandatory: startup
+    refuses to run unconstrained when the cgroup cannot be created.
+    """
+    value = os.environ.get(OH_SANDBOX_MEMORY_LIMIT_ENV, _DEFAULT_SANDBOX_MEMORY_LIMIT)
+    if not value.strip():
+        return None
+    required = _memory_limit_required()
+    try:
+        limit = parse_memory_limit(value)
+    except ValueError as exc:
+        logger.warning("invalid %s=%r: %s", OH_SANDBOX_MEMORY_LIMIT_ENV, value, exc)
+        if required:
+            raise RuntimeError(
+                f"invalid sandbox memory limit {value!r}; refusing to start "
+                f"because {OH_SANDBOX_MEMORY_REQUIRED_ENV}=1"
+            ) from exc
+        return None
+    memory_cgroup = SandboxMemoryCgroup(limit, required=required)
+    if not memory_cgroup.create():
+        if required:
+            raise RuntimeError(
+                "sandbox memory limit is required "
+                f"({OH_SANDBOX_MEMORY_REQUIRED_ENV}=1) but the memory cgroup "
+                "could not be created; refusing to start an unconstrained sandbox"
+            )
+        return None
+    return memory_cgroup
 
 
 TerminalSandboxMode = Literal["off", "auto", "required"]
@@ -183,6 +420,7 @@ class TerminalSandbox:
         self.work_dir = resolved_work_dir
         self.mode: TerminalSandboxMode = mode
         self._tmp_dir = resolved_work_dir / ".openhands-tmp"
+        self._sandbox_tmp = self._tmp_dir / "sandbox-tmp"
         self.read_only_paths = tuple(
             resolve_workspace_subpath(p, resolved_work_dir) for p in read_only_paths
         )
@@ -192,10 +430,14 @@ class TerminalSandbox:
         self.read_write_paths = tuple(
             resolve_workspace_subpath(p, resolved_work_dir) for p in rw_paths
         )
+        self.has_conversation_policy = bool(
+            self.read_only_paths or self.read_write_paths != (self.work_dir,)
+        )
         self._backend = None
         self._landlock_wrapper: Path | None = None
         self._seatbelt_profile: Path | None = None
         self._apparmor_available: bool = False
+        self._memory_cgroup: SandboxMemoryCgroup | None = None
 
     def prepare(self) -> None:
         """Probe available sandbox backends and prepare the chosen one."""
@@ -228,9 +470,7 @@ class TerminalSandbox:
         #
         # Without a per-conversation policy, the default order stands:
         #   AppArmor (no capability / namespace) > bwrap > Landlock.
-        has_conversation_policy = bool(
-            self.read_only_paths or self.read_write_paths != (self.work_dir,)
-        )
+        has_conversation_policy = self.has_conversation_policy
         backend_chosen = False
 
         # Conversation-scoped policy needs per-workspace mount semantics. Prefer
@@ -301,6 +541,16 @@ class TerminalSandbox:
 
         if self._backend == "landlock":
             self._write_landlock_wrapper()
+        self._memory_cgroup = sandbox_memory_cgroup_from_env()
+
+    def attach_memory_cgroup(self, root_pid: int) -> int:
+        """Move the sandbox process tree into the session memory cgroup.
+
+        Returns the number of processes attached (0 when no cgroup is active).
+        """
+        if self._memory_cgroup is None:
+            return 0
+        return self._memory_cgroup.attach(root_pid)
 
     def _write_landlock_wrapper(self) -> None:
         """Generate a wrapper script that applies landlock then execs the command.
@@ -416,6 +666,9 @@ class TerminalSandbox:
 
     def cleanup(self) -> None:
         """Remove the generated sandbox profile/wrapper after the shell exits."""
+        if self._memory_cgroup is not None:
+            self._memory_cgroup.cleanup()
+            self._memory_cgroup = None
         if self._seatbelt_profile is not None:
             self._seatbelt_profile.unlink(missing_ok=True)
         if self._landlock_wrapper is not None:
@@ -424,8 +677,12 @@ class TerminalSandbox:
             policy.unlink(missing_ok=True)
 
     def _build_bwrap_args(self) -> list[str]:
-        args = ["bwrap", "--unshare-ipc", "--unshare-uts"]
-        if os.geteuid() != 0:
+        args = ["bwrap", "--unshare-ipc", "--unshare-uts", "--unshare-pid"]
+        # A private user namespace keeps the per-sandbox RLIMIT_NPROC scoped
+        # to the sandbox. Some pod kernels reject mounts inside a nested user
+        # namespace; bwrap then aborts before bash starts, so only enable the
+        # namespace when this node actually supports the mounts.
+        if userns_mounts_supported():
             args.append("--unshare-user-try")
         for path in ("/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"):
             if Path(path).exists():
@@ -433,13 +690,23 @@ class TerminalSandbox:
         for path in PUBLIC_READ_ROOTS:
             if Path(path).exists():
                 args.extend(["--ro-bind", path, path])
-        args.extend(["--bind", str(self._tmp_dir), str(self._tmp_dir)])
         for path in self.read_write_paths:
             args.extend(["--bind", str(path), str(path)])
         for path in self.read_only_paths:
             if path.exists():
                 args.extend(["--ro-bind", str(path), str(path)])
-        args.extend(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"])
+        args.extend(["--dev", "/dev", "--proc", "/proc"])
+        if self.has_conversation_policy:
+            # Whitelist-only view: without a root bind, paths outside the
+            # bound system/public/conversation directories do not exist in the
+            # sandbox at all, so sibling conversations and configs are not
+            # readable. A private tmpfs keeps transient command output away
+            # from the host filesystem.
+            args.extend(["--tmpfs", "/tmp"])
+        else:
+            args.extend(["--bind", str(self._tmp_dir), str(self._tmp_dir)])
+            self._sandbox_tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
+            args.extend(["--bind", str(self._sandbox_tmp), "/tmp"])
         return args
 
     def _build_seatbelt_profile(self) -> str:

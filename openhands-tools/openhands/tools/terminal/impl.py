@@ -1,3 +1,4 @@
+import errno
 import re
 import shlex
 import threading
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
 from openhands.tools.terminal.constants import CMD_OUTPUT_PS1_END
 from openhands.tools.terminal.definition import (
     _LITERAL_ARG_HINT_TEMPLATE,
+    _SANDBOX_IO_ERROR_HINT_TEMPLATE,
     TerminalAction,
     TerminalObservation,
     looks_like_python_literal_argument,
@@ -641,10 +643,29 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                     exit_code=None,
                 )
 
-        if self._pool is not None:
-            observation = self._execute_pooled(action, conversation)
-        else:
-            observation = self._execute_single_session(action, conversation)
+        try:
+            if self._pool is not None:
+                observation = self._execute_pooled(action, conversation)
+            else:
+                observation = self._execute_single_session(action, conversation)
+        except OSError as exc:
+            if exc.errno not in (errno.EIO, errno.EAGAIN):
+                raise
+            logger.warning(
+                "Terminal backend I/O failure (errno=%s); returning structured "
+                "hint instead of a raw error",
+                exc.errno,
+                exc_info=True,
+            )
+            return TerminalObservation.from_text(
+                _SANDBOX_IO_ERROR_HINT_TEMPLATE.format(
+                    errno=exc.errno,
+                    strerror=exc.strerror or str(exc),
+                ),
+                is_error=True,
+                command=action.command,
+                exit_code=-1,
+            )
 
         if action is not original_action:
             metadata = observation.metadata

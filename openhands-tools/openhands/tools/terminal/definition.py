@@ -43,6 +43,17 @@ from openhands.tools.utils import (
 )
 
 
+_SANDBOX_IO_ERROR_HINT_TEMPLATE = (
+    "[Terminal-unavailable] The terminal backend hit an I/O error (errno "
+    "{errno}: {strerror}) — usually the sandbox is out of processes/PTYs or "
+    "the shell session died, not a problem with this specific command, so "
+    "retrying the same command immediately is unlikely to help.\n\n"
+    "Prefer creating and editing files with file_editor/apply_patch, and "
+    "running commands through dedicated execution tools (for example dataflow "
+    "or task runners) that execute in their own subprocesses. If you do retry "
+    "the terminal, start from a fresh session with reset=true."
+)
+
 _LITERAL_ARG_HINT_TEMPLATE = (
     "[Tool-argument error] The `command` argument looks like a Python/JSON "
     "{literal_kind}, not a shell command. It starts with: {head!r}\n\n"
