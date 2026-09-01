@@ -59,3 +59,12 @@ def test_pre_deployment_uses_os_sandbox_for_pi_terminal() -> None:
     assert environment["PYROMIND_HARNESS_BACKEND"] == "pi"
     assert environment["APP_ENV"] == "pre"
     assert environment["PYROMIND_PI_TERMINAL_BACKEND"] == "os-sandbox"
+
+
+def test_product_image_defaults_to_os_sandbox_for_pi_terminal() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    product_stage = dockerfile.split("FROM base-image-minimal AS product", maxsplit=1)[
+        1
+    ]
+
+    assert "ENV PYROMIND_PI_TERMINAL_BACKEND=os-sandbox" in product_stage

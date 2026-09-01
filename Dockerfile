@@ -269,4 +269,5 @@ COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/.venv /agent-s
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/uv-managed-python /agent-server/uv-managed-python
 COPY --from=pi-runtime-builder /pi-runtime /agent-server/pi-runtime
 ENV PYROMIND_PI_RUNTIME=/agent-server/pi-runtime/dist/index.js
+ENV PYROMIND_PI_TERMINAL_BACKEND=os-sandbox
 ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "pyromind_agent_server"]
