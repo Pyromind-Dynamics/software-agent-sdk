@@ -11,13 +11,14 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Literal, Self, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from rich.text import Text
 
+from openhands.sdk.llm import LLM, Message, TextContent
 from openhands.sdk.tool.registry import register_tool
 from openhands.sdk.tool.tool import (
     Action,
@@ -26,7 +27,11 @@ from openhands.sdk.tool.tool import (
     ToolDefinition,
     ToolExecutor,
 )
-from openhands.tools.utils.pyromind_api_client import _build_access_key_request_headers
+from openhands.sdk.utils.deprecation import handle_deprecated_model_fields
+from openhands.tools.utils.pyromind_api_client import (
+    _build_access_key_request_headers,
+    decompress_gzip_base64_data,
+)
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
@@ -68,6 +73,15 @@ _FAILURE_MARKERS = ("fail", "error", "exception")
 
 # Function-signature API secret name, same as get_node_function_signature.
 PYROMIND_AUTH_TOKEN_SECRET = "auth_token"
+
+# Source is fetched server-side and condensed into a source-free diagnosis so
+# the agent can analyze operator-internal failures without the source body ever
+# entering its observable context.
+_FAILURE_DIAGNOSIS_PROMPT = """\
+你是一个 Pyromind 工作流调试助手。下面是一次失败任务中相关节点的源码与运行日志尾部。
+请结合两者定位最可能的失败根因（参数错配、跨节点连线/类型不符、算子内部异常、资源或环境问题等），
+并给出修复 workflow DSL 的具体建议。只输出精简结论：根因 + 修复建议。不要复述源码，
+不要使用 markdown 标题或前言，直接用中文输出。"""
 
 
 def _default_api_base() -> str:
@@ -116,8 +130,9 @@ class AnalyzeTaskFailureAction(Action):
     include_source: bool = Field(
         default=True,
         description=(
-            "Whether to also fetch each analyzed node's operator source code "
-            "from the function-signature API, alongside the log tail."
+            "Whether to fetch each analyzed node's operator source server-side "
+            "to condense a failure diagnosis. The source body itself is never "
+            "returned to the agent."
         ),
     )
     source_lines: int = Field(
@@ -153,6 +168,11 @@ class TaskNodeInfo(BaseModel):
 class AnalyzeTaskFailureObservation(Observation):
     """Result of a task failure analysis."""
 
+    # ``node_sources`` was removed as a security fix: raw operator source must
+    # not reach agent-observable context. Kept for backward-compatible loading
+    # of older persisted observations.
+    _DEPRECATED_FIELDS: ClassVar[tuple[str, ...]] = ("node_sources",)
+
     task_status: str | None = Field(
         default=None, description="task_status from the task workflow result."
     )
@@ -170,11 +190,11 @@ class AnalyzeTaskFailureObservation(Observation):
         default_factory=dict,
         description="node_id -> trailing log text fetched for each analyzed node.",
     )
-    node_sources: dict[str, str] = Field(
-        default_factory=dict,
+    diagnosis: str | None = Field(
+        default=None,
         description=(
-            "node_id -> operator source code fetched from the function-signature "
-            "API when include_source=true and an auth token is available."
+            "Source-informed, source-free failure diagnosis condensed by the "
+            "server-side LLM from the node source and log tail."
         ),
     )
     source: Literal["explicit", "status", "all"] = Field(
@@ -187,6 +207,11 @@ class AnalyzeTaskFailureObservation(Observation):
     error_message: str | None = Field(
         default=None, description="API or parse error detail, when the call failed."
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_fields(cls, data: Any) -> Any:
+        return handle_deprecated_model_fields(data, cls._DEPRECATED_FIELDS)
 
     @property
     def visualize(self) -> Text:
@@ -202,8 +227,8 @@ class AnalyzeTaskFailureObservation(Observation):
             content.append(f" task_status={self.task_status}")
         if self.failed_nodes:
             content.append(f" failed={len(self.failed_nodes)}")
-        if self.node_sources:
-            content.append(f" sources={len(self.node_sources)}")
+        if self.diagnosis:
+            content.append(" diagnosis")
         return content
 
 
@@ -421,7 +446,7 @@ class AnalyzeTaskFailureExecutor(
         auth_token = self._auth_token(conversation)
         node_by_id = {node.node_id: node for node in nodes}
         logs: dict[str, str] = {}
-        node_sources: dict[str, str] = {}
+        diagnosis_entries: list[tuple[str, str | None, str, str]] = []
         for target in target_ids:
             raw = self._get_json(
                 "internal/logs/node/raw",
@@ -435,9 +460,8 @@ class AnalyzeTaskFailureExecutor(
                 _extract_log_text(raw), action.tail_lines, action.max_log_chars
             )
             if not log_text:
-                logs[target] = "<empty node log>"
-            else:
-                logs[target] = log_text
+                log_text = "<empty node log>"
+            logs[target] = log_text
             if not action.include_source or auth_token is None:
                 continue
             node = node_by_id.get(target)
@@ -448,7 +472,9 @@ class AnalyzeTaskFailureExecutor(
                 node_type, auth_token, action.source_lines
             )
             if source_code:
-                node_sources[target] = source_code
+                diagnosis_entries.append((target, node_type, log_text, source_code))
+
+        diagnosis = self._condense_failure_diagnosis(conversation, diagnosis_entries)
 
         failed_nodes = (
             [node for node in nodes if node.node_id in target_ids]
@@ -456,7 +482,7 @@ class AnalyzeTaskFailureExecutor(
             else [node for node in nodes if _looks_failed(node.status)]
         )
         text = _format_observation_text(
-            task_status, nodes, failed_nodes, logs, node_sources, source
+            task_status, nodes, failed_nodes, logs, diagnosis, source
         )
         return AnalyzeTaskFailureObservation.from_text(
             text=text,
@@ -464,7 +490,7 @@ class AnalyzeTaskFailureExecutor(
             nodes=nodes,
             failed_nodes=failed_nodes,
             logs=logs,
-            node_sources=node_sources,
+            diagnosis=diagnosis,
             source=source,
         )
 
@@ -544,6 +570,7 @@ class AnalyzeTaskFailureExecutor(
                     "node_type": None,
                     "include_source": True,
                     "max_source_lines": source_lines,
+                    "compressed": True,
                 },
                 headers=headers,
                 timeout=self._timeout,
@@ -559,6 +586,11 @@ class AnalyzeTaskFailureExecutor(
         if not isinstance(payload, dict) or payload.get("success") is not True:
             return None
         data = payload.get("data")
+        if isinstance(data, str):
+            try:
+                data = decompress_gzip_base64_data(data)
+            except Exception:
+                return None
         if not isinstance(data, dict):
             return None
         entry = data.get(node_type)
@@ -569,6 +601,49 @@ class AnalyzeTaskFailureExecutor(
             return None
         source = entry_data.get("source_code")
         return str(source) if isinstance(source, str) and source else None
+
+    def _condense_failure_diagnosis(
+        self,
+        conversation: BaseConversation | None,
+        entries: Sequence[tuple[str, str | None, str, str]],
+    ) -> str | None:
+        """Condense node source + log into a source-free diagnosis via the LLM.
+
+        Each entry is ``(node_id, node_type, log_text, source_code)``. The source
+        body is sent only to the conversation's LLM here, never returned to the
+        agent; the result is a concise diagnosis. Never raises.
+        """
+        if not entries or conversation is None:
+            return None
+        state = cast("ConversationState", conversation.state)
+        llm: LLM | None = getattr(getattr(state, "agent", None), "llm", None)
+        if llm is None:
+            return None
+        parts: list[str] = []
+        for node_id, node_type, log_text, source_code in entries:
+            label = f"{node_id} ({node_type})" if node_type else node_id
+            parts.append(f"--- node {label} log tail ---\n{log_text}")
+            parts.append(f"--- node {label} operator source ---\n{source_code}")
+        try:
+            response = llm.completion(
+                messages=[
+                    Message(
+                        role="system",
+                        content=[TextContent(text=_FAILURE_DIAGNOSIS_PROMPT)],
+                    ),
+                    Message(
+                        role="user", content=[TextContent(text="\n\n".join(parts))]
+                    ),
+                ]
+            )
+            diagnosis = "\n".join(
+                content.text
+                for content in response.message.content
+                if isinstance(content, TextContent)
+            ).strip()
+            return diagnosis or None
+        except Exception:
+            return None
 
     def _get_json(
         self, path: str, params: dict[str, str], headers: dict[str, str]
@@ -621,7 +696,7 @@ def _format_observation_text(
     nodes: list[TaskNodeInfo],
     failed_nodes: list[TaskNodeInfo],
     logs: dict[str, str],
-    node_sources: dict[str, str],
+    diagnosis: str | None,
     source: Literal["explicit", "status", "all"],
 ) -> str:
     parts: list[str] = []
@@ -631,23 +706,11 @@ def _format_observation_text(
     if failed_nodes:
         ids = ", ".join(node.node_id for node in failed_nodes)
         parts.append(f"failed nodes (status-based): {ids}")
-    if node_sources or logs:
-        type_by_id = {node.node_id: node.node_type for node in nodes}
-        # Source blocks come first: short operator code is the primary
-        # signal, while log tails are long evidence that would crowd it out.
-        for node_id in dict.fromkeys((*node_sources, *logs)):
-            source_code = node_sources.get(node_id)
-            if source_code:
-                label = type_by_id.get(node_id)
-                marker = (
-                    f"--- node {node_id} operator source code ({label}) ---"
-                    if label
-                    else f"--- node {node_id} operator source code ---"
-                )
-                parts.append(f"{marker}\n{source_code}")
-            log_text = logs.get(node_id)
-            if log_text:
-                parts.append(f"--- node {node_id} (last log tail) ---\n{log_text}")
+    if logs or diagnosis:
+        for node_id, log_text in logs.items():
+            parts.append(f"--- node {node_id} (last log tail) ---\n{log_text}")
+        if diagnosis:
+            parts.append(f"--- failure diagnosis ---\n{diagnosis}")
     elif source == "all":
         parts.append(
             "No failed node could be identified from the task result (the payload "
@@ -681,13 +744,13 @@ node failed and why. The tool:
    `tail_lines` lines (default 100, max 1000).
 
 The observation returns task_status, all nodes, failed_nodes, logs
-(node_id -> trailing log text), and node_sources (node_id -> operator source
-code, fetched from the function-signature API when include_source=true and an
-auth token is available). Diagnose the failure by comparing the failing log
-lines against the operator source (parameter mismatch, operator-internal
-exceptions, etc.); fix the workflow DSL if the error is deterministic, then
-re-run via workflow_debug. Source fetching is best-effort: a failed source
-fetch never fails the whole analysis.
+(node_id -> trailing log text), and diagnosis (a source-free failure diagnosis
+condensed server-side from the node source and log tail when include_source=true
+and an auth token is available). Operator source is never returned to you;
+instead the tool condenses it into a concise root-cause + fix suggestion. Fix
+the workflow DSL if the error is deterministic, then re-run via workflow_debug.
+Source fetching and diagnosis are best-effort: a failed source fetch or failed
+diagnosis never fails the whole analysis (the log tail is always returned).
 
 Auth mirrors validate_workflow_dsl: cookie / x-cluster / authorization headers
 are forwarded, and the request carries a browser-style User-Agent (the platform
