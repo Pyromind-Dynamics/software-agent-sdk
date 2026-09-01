@@ -69,7 +69,7 @@ import glob as globlib
 import json
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -374,7 +374,7 @@ def _progress_payload(
         "elapsed_ms": elapsed_ms,
         "records_per_second": rate,
         "eta_ms": int(remaining / rate * 1000) if rate > 0 else None,
-        "updated_at": datetime.now(UTC).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
 

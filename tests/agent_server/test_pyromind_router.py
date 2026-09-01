@@ -55,6 +55,11 @@ from openhands.tools.data_preparation import (
     DfStopTaskTool,
     DfSubmitPipelineTool,
 )
+from openhands.tools.environment_processing import (
+    EdpAggregateTool,
+    EdpRenderTool,
+    EdpSubmitTool,
+)
 from openhands.tools.pyromind_archive import ExtractArchiveTool
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
@@ -1007,6 +1012,9 @@ def test_pyromind_storage_tools_use_user_context_headers():
         UploadFileToPyromindTool.name,
         RunDatasetCleaningTool.name,
         DfSubmitPipelineTool.name,
+        EdpSubmitTool.name,
+        EdpRenderTool.name,
+        EdpAggregateTool.name,
         DfCheckProgressTool.name,
         DfStopTaskTool.name,
         ExtractArchiveTool.name,
