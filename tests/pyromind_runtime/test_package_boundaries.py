@@ -1,6 +1,8 @@
 import ast
 from pathlib import Path
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -42,3 +44,18 @@ def test_inference_start_uses_local_pi_terminal_without_sandbox_dependencies() -
     assert 'export PYROMIND_PI_TERMINAL_BACKEND="local"' in script
     assert "check_workspace_sandbox_dependencies" not in script
     assert "required_commands=(rg" not in script
+
+
+def test_pre_deployment_uses_os_sandbox_for_pi_terminal() -> None:
+    documents = yaml.safe_load_all(
+        (ROOT / "deploy" / "sts.yaml").read_text(encoding="utf-8")
+    )
+    stateful_set = next(
+        document for document in documents if document.get("kind") == "StatefulSet"
+    )
+    container = stateful_set["spec"]["template"]["spec"]["containers"][0]
+    environment = {item["name"]: item.get("value") for item in container["env"]}
+
+    assert environment["PYROMIND_HARNESS_BACKEND"] == "pi"
+    assert environment["APP_ENV"] == "pre"
+    assert environment["PYROMIND_PI_TERMINAL_BACKEND"] == "os-sandbox"
