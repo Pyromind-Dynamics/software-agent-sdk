@@ -967,6 +967,21 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
         except Exception as exc:
             logger.warning("Error closing executor for tool '%s': %s", tool.name, exc)
 
+    def recycle_terminal(self) -> None:
+        """Release the terminal sandbox shell after a run finishes.
+
+        The sandbox shell and any of its child processes (for example a
+        model download started via the terminal) keep consuming memory until
+        the shell exits. Closing the terminal executor releases the process
+        group immediately; the next terminal call lazily recreates the sandbox
+        through the executor's closed-session reset path.
+        """
+        if not self._initialized:
+            return
+        terminal_tool = self._tools.get("terminal")
+        if terminal_tool is not None:
+            self._close_tool_executor(terminal_tool)
+
     def add_runtime_tools(self, tools: Sequence[ToolDefinition]) -> None:
         if not self._initialized:
             logger.warning(

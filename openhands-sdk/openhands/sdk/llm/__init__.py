@@ -19,7 +19,7 @@ from openhands.sdk.llm.message import (
     ThinkingBlock,
     content_to_str,
 )
-from openhands.sdk.llm.router import RouterLLM
+from openhands.sdk.llm.router import FailoverRouter, RouterLLM
 from openhands.sdk.llm.streaming import (
     AsyncTokenCallbackType,
     LLMStreamChunk,
@@ -47,6 +47,7 @@ __all__ = [
     "LLMRegistry",
     "LLMProfileStore",
     "RouterLLM",
+    "FailoverRouter",
     "RegistryEvent",
     # Messages
     "Message",

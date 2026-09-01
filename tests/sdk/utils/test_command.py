@@ -34,6 +34,9 @@ def test_sanitized_env_strips_sensitive_vars(tmp_path):
         "ANTHROPIC_API_KEY": "sk-ant",
         "AZURE_OPENAI_API_KEY": "sk-azure",
         "SESSION_API_KEY": "sk-session",
+        "OH_SECRET_KEY": "secret",
+        "DF_API_KEY": "df-secret",
+        "OPENROUTER_API_KEY": "sk-or",
         "GPG_KEY": "7169605F62C751356D054A26A821E680E5FA6305",
         "OPENHANDS_BUILD_GIT_REF": "refs/heads/main",
         "OPENHANDS_BUILD_GIT_SHA": "abc123",
@@ -44,6 +47,9 @@ def test_sanitized_env_strips_sensitive_vars(tmp_path):
     assert "ANTHROPIC_API_KEY" not in result
     assert "AZURE_OPENAI_API_KEY" not in result
     assert "SESSION_API_KEY" not in result
+    assert "OH_SECRET_KEY" not in result
+    assert "DF_API_KEY" not in result
+    assert "OPENROUTER_API_KEY" not in result
     assert "GPG_KEY" not in result
     assert "OPENHANDS_BUILD_GIT_REF" not in result
     assert "OPENHANDS_BUILD_GIT_SHA" not in result

@@ -22,6 +22,8 @@ logger = get_logger(__name__)
 _SENSITIVE_ENV_VARS: frozenset[str] = frozenset(
     {
         "SESSION_API_KEY",
+        "OH_SECRET_KEY",
+        "DF_API_KEY",
         "GPG_KEY",
         "OPENHANDS_BUILD_GIT_REF",
         "OPENHANDS_BUILD_GIT_SHA",
@@ -36,6 +38,7 @@ _SENSITIVE_ENV_VARS: frozenset[str] = frozenset(
         "TOGETHER_API_KEY",
         "PERPLEXITY_API_KEY",
         "COHERE_API_KEY",
+        "OPENROUTER_API_KEY",
         # LLM provider endpoints (may contain internal host info)
         "OPENAI_BASE_URL",
         "AZURE_OPENAI_ENDPOINT",
