@@ -21,6 +21,9 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
+
+from openhands.sdk.llm import RouterLLM
 from openhands.sdk.utils.redact import redact_text_secrets
 from openhands.tools.utils.dataflow_config import (
     DEFAULT_DATAFLOW_API_BASE_URL,
@@ -215,10 +218,73 @@ def validate_managed_image_pipeline(
         raise ValueError("Managed image pipeline must import: " + ", ".join(missing))
 
 
-def openai_compatible_model_name(model: str) -> str:
-    """Strip the LiteLLM provider prefix (``openai/glm-5`` -> ``glm-5``)."""
+_LITELLM_PROVIDER_PREFIXES = frozenset(
+    {
+        "anthropic",
+        "azure",
+        "bedrock",
+        "deepseek",
+        "fireworks",
+        "gemini",
+        "groq",
+        "litellm_proxy",
+        "mistral",
+        "ollama",
+        "openai",
+        "openhands",
+        "openrouter",
+        "together",
+        "vertex_ai",
+        "vllm",
+    }
+)
 
-    return model.split("/", 1)[1] if "/" in model else model
+
+def openai_compatible_model_name(model: str) -> str:
+    """Strip a known LiteLLM provider prefix (``openai/glm-5`` -> ``glm-5``).
+
+    Vendor-prefixed model IDs with an unknown first segment (for example the
+    OpenRouter-native ``google/gemma-4-31b-it``) are kept intact instead of
+    having their vendor segment stripped.
+    """
+
+    provider, sep, rest = model.partition("/")
+    if sep and provider in _LITELLM_PROVIDER_PREFIXES:
+        return rest
+    return model
+
+
+def _concrete_llm(llm: Any) -> Any:
+    """Return the concrete LLM behind a router, or *llm* unchanged.
+
+    A :class:`~openhands.sdk.llm.RouterLLM` carries a placeholder ``model`` and
+    ``None`` ``base_url``/``api_key`` fields; its real per-provider values live
+    on the providers in ``llms_for_routing``. Resolve the primary provider so
+    DataFlow uses one coherent (model, endpoint, key) triple.
+    """
+
+    if isinstance(llm, RouterLLM):
+        return next(iter(llm.llms_for_routing.values()))
+    return llm
+
+
+_PLACEHOLDER_MODEL_NAMES = frozenset({"router", "<model>", "{model}", "{{model}}"})
+
+
+def _is_unsubstituted_placeholder_model(value: str) -> bool:
+    """Return True for values run environments inject when template
+    substitution fails (e.g. ``router``, ``{{model}}``) instead of a real
+    model name."""
+
+    stripped = value.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    return (
+        lowered in _PLACEHOLDER_MODEL_NAMES
+        or "{{" in stripped
+        or stripped.startswith("${")
+    )
 
 
 def _nonempty_env(name: str) -> str | None:
@@ -282,7 +348,7 @@ def build_dataflow_env(
         ValueError: If the resolved configuration is incomplete or inconsistent.
     """
 
-    llm = conversation.state.agent.llm
+    llm = _concrete_llm(conversation.state.agent.llm)
     if llm.api_key is None:
         llm_api_key = None
     elif hasattr(llm.api_key, "get_secret_value"):
@@ -292,7 +358,18 @@ def build_dataflow_env(
     fallback_base_url = (llm.base_url or DEFAULT_DATAFLOW_API_BASE_URL).rstrip("/")
     if model_profile == "vision":
         api_key = _nonempty_env(ENV_DF_API_KEY) or llm_api_key
-        model_name = _nonempty_env(ENV_DF_MODEL_NAME) or DEFAULT_DATAFLOW_MODEL_NAME
+        env_model_name = _nonempty_env(ENV_DF_MODEL_NAME)
+        if env_model_name is not None and _is_unsubstituted_placeholder_model(
+            env_model_name
+        ):
+            raise ValueError(
+                f"{ENV_DF_MODEL_NAME} is still an unsubstituted placeholder "
+                f"({env_model_name!r}) — the run environment did not substitute "
+                "the template value. Set a concrete model name such as "
+                f"{DEFAULT_DATAFLOW_MODEL_NAME!r} or fix the environment "
+                "injection."
+            )
+        model_name = env_model_name or DEFAULT_DATAFLOW_MODEL_NAME
         base_url, api_url = _resolve_dataflow_urls(
             _nonempty_env(ENV_DF_API_BASE_URL),
             _nonempty_env(ENV_DF_API_URL),
@@ -301,6 +378,14 @@ def build_dataflow_env(
     else:
         api_key = llm_api_key
         model_name = openai_compatible_model_name(str(llm.model))
+        if _is_unsubstituted_placeholder_model(model_name):
+            raise ValueError(
+                "Conversation LLM model is an unsubstituted placeholder "
+                f"({model_name!r}) — the LLM routing config did not provide a "
+                "real model name. Check the conversation LLM model setting "
+                "(DF_MODEL_NAME comes from the conversation model, not from "
+                "this process environment)."
+            )
         base_url, api_url = _resolve_dataflow_urls(
             None,
             None,
@@ -329,6 +414,63 @@ def build_dataflow_env(
     if api_key:
         resolved[ENV_DF_API_KEY] = api_key
     return resolved
+
+
+def preflight_dataflow_llm(env: dict[str, str], *, timeout: float = 30.0) -> None:
+    """Verify DataFlow LLM connectivity with one minimal request.
+
+    The runtime fans out the whole batch immediately, so a broken model name,
+    endpoint, or key would fail every item identically. One cheap request
+    catches configuration-class failures up front and raises an actionable
+    error instead. Set ``DF_SKIP_PREFLIGHT`` to opt out.
+    """
+
+    if os.environ.get("DF_SKIP_PREFLIGHT"):
+        return
+    api_url = env[ENV_DF_API_URL]
+    model = env[ENV_DF_MODEL_NAME]
+    headers = {"content-type": "application/json"}
+    api_key = env.get(ENV_DF_API_KEY)
+    if api_key:
+        headers["authorization"] = f"Bearer {api_key}"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    }
+    try:
+        response = httpx.post(api_url, headers=headers, json=payload, timeout=timeout)
+    except httpx.RequestError as exc:
+        raise ValueError(
+            f"DataFlow LLM preflight could not reach {api_url!r}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    body = response.text[:300]
+    content_type = response.headers.get("content-type", "")
+    if "text/html" in content_type or not body.lstrip().startswith(("{", "[")):
+        raise ValueError(
+            "DataFlow LLM preflight got a non-JSON response "
+            f"(HTTP {response.status_code}, content-type {content_type!r}). "
+            "DF_API_URL likely points at a web page rather than a "
+            "chat-completions endpoint; it must end in '/chat/completions' "
+            f"(resolved {api_url!r})."
+        )
+    if response.status_code == 200:
+        return
+    if response.status_code in (401, 403):
+        raise ValueError(
+            f"DataFlow LLM preflight auth failed (HTTP {response.status_code}); "
+            "check DF_API_KEY."
+        )
+    if response.status_code in (400, 404):
+        raise ValueError(
+            f"DataFlow LLM preflight rejected model {model!r} "
+            f"(HTTP {response.status_code}: {body}). It may be an unsubstituted "
+            "placeholder or unknown to the provider; check DF_MODEL_NAME."
+        )
+    raise ValueError(
+        f"DataFlow LLM preflight failed (HTTP {response.status_code}): {body}"
+    )
 
 
 def summarize_dataflow_env(env: dict[str, str]) -> str:

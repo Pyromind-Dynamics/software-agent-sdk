@@ -14,13 +14,14 @@ These tools implement the local data-preparation loop:
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
 from collections.abc import Sequence
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Final, Literal, Self
 
 import httpx
 from pydantic import Field, field_validator, model_validator
@@ -41,6 +42,7 @@ from openhands.tools.data_preparation.runner import (
     build_dataflow_env,
     check_dataflow_installed,
     check_dataflow_version,
+    preflight_dataflow_llm,
     resolve_dataflow_python,
     runtime_bundle_fingerprint,
     runtime_public_names,
@@ -129,6 +131,86 @@ def _resolve_output_path(conversation: Any, path: str) -> Path:
     if not policy.check(resolved, "write"):
         raise ValueError(f"Path is not writable by the agent: {path}")
     return resolved
+
+
+# Local sample cap for ``df_run_pipeline``. Local runs validate a small sample
+# before a full ``df_submit_pipeline``; cap the input so an agent-authored
+# pipeline without its own ``--limit`` cannot silently process the whole file.
+DF_SAMPLE_LIMIT_ENV: Final[str] = "DF_SAMPLE_LIMIT"
+DEFAULT_SAMPLE_LIMIT: Final[int] = 3
+
+
+def _sample_limit() -> int:
+    """Return the local sample row cap (``DF_SAMPLE_LIMIT``, default 3)."""
+    raw = os.environ.get(DF_SAMPLE_LIMIT_ENV, str(DEFAULT_SAMPLE_LIMIT))
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_SAMPLE_LIMIT
+
+
+def _truncate_sample_input(input_path: Path, limit: int) -> Path | None:
+    """Return a copy of *input_path* capped to ``limit`` records, or ``None``.
+
+    Only single text files (``.csv`` with a header, or newline-delimited
+    JSONL/text) are truncated. Directories (multimodal samples) and inputs with
+    ``limit`` or fewer records are left untouched. A copy is written next to the
+    original so the pipeline receives an unambiguously sized sample.
+    """
+
+    if not input_path.is_file() or limit <= 0:
+        return None
+
+    if input_path.suffix.lower() == ".csv":
+        with input_path.open(encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle)
+            try:
+                header = next(reader)
+            except StopIteration:
+                return None
+            rows = list(reader)
+        if len(rows) <= limit:
+            return None
+        sample_path = input_path.with_name(f"{input_path.stem}.sample.csv")
+        with sample_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(header)
+            writer.writerows(rows[:limit])
+        return sample_path
+
+    with input_path.open(encoding="utf-8", errors="replace") as handle:
+        lines = [line for _, line in zip(range(limit + 1), handle)]
+    if len(lines) <= limit:
+        return None
+    sample_path = input_path.with_name(f"{input_path.stem}.sample{input_path.suffix}")
+    sample_path.write_text("".join(lines[:limit]), encoding="utf-8")
+    return sample_path
+
+
+def _resolve_legacy_input_arg(
+    conversation: Any, arg: str, pipeline: Path
+) -> tuple[Path, Path] | None:
+    """Resolve a legacy pipeline input argument.
+
+    Legacy arguments were historically interpreted by the child process
+    relative to the pipeline script directory, which is inconsistent with the
+    workspace-root resolution used everywhere else in this tool family. Resolve
+    ``arg`` from the workspace root when it exists there, otherwise fall back to
+    the pipeline directory. Returns the resolved input and the base directory
+    used to anchor the matching output argument, or ``None`` when neither exists
+    so script-defined non-path arguments pass through unchanged.
+    """
+    try:
+        input_path = _resolve_input_path(conversation, arg)
+    except ValueError:
+        input_path = None
+    if input_path is not None:
+        return input_path, Path(conversation.workspace.working_dir)
+    base = pipeline.parent
+    candidate = base / arg
+    if candidate.exists():
+        return candidate.resolve(), base
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -678,10 +760,30 @@ class DfRunPipelineExecutor(ToolExecutor):
                 )
             process_args[0] = str(standard_input_path)
             process_args[1] = str(output_path)
+            # Local sample cap: limit the input so an agent-authored pipeline
+            # without its own --limit can't silently process the whole file.
+            sample_input = _truncate_sample_input(standard_input_path, _sample_limit())
+            if sample_input is not None:
+                process_args[0] = str(sample_input)
         elif len(process_args) >= 2:
-            output_path = Path(process_args[1])
-            if not output_path.is_absolute():
-                output_path = pipeline.parent / output_path
+            # Legacy mode: the child process runs with cwd=pipeline.parent, but
+            # the rest of this tool family resolves arguments from the workspace
+            # root. Resolve args[0] from the workspace root when the input
+            # exists there (falling back to the historical pipeline-relative
+            # interpretation) and anchor the relative output at the same base so
+            # both stay consistent.
+            legacy_paths = _resolve_legacy_input_arg(
+                conversation, process_args[0], pipeline
+            )
+            if legacy_paths is not None:
+                input_path, base = legacy_paths
+                process_args[0] = str(input_path)
+                output_path = base / process_args[1]
+                process_args[1] = str(output_path)
+            else:
+                output_path = Path(process_args[1])
+                if not output_path.is_absolute():
+                    output_path = pipeline.parent / output_path
 
         python = resolve_dataflow_python(action.python)
         ok, detail = check_dataflow_installed(python)
@@ -722,6 +824,14 @@ class DfRunPipelineExecutor(ToolExecutor):
                 stage="model_configuration",
                 code="dataflow_model_configuration_invalid",
                 message=f"Invalid DataFlow model configuration: {exc}",
+            )
+        try:
+            preflight_dataflow_llm(env_extra)
+        except ValueError as exc:
+            return _df_failure(
+                stage="model_configuration",
+                code="dataflow_llm_preflight_failed",
+                message=f"DataFlow LLM preflight failed: {exc}",
             )
 
         if output_path is not None:

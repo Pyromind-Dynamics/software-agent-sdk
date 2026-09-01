@@ -14,8 +14,11 @@ from PIL import Image
 from pydantic import SecretStr
 
 from openhands.sdk.conversation.secret_registry import SecretRegistry
+from openhands.sdk.llm import LLM, FailoverRouter
 from openhands.sdk.workspace.workspace import LocalWorkspace
 from openhands.tools.data_preparation.definition import (
+    DEFAULT_SAMPLE_LIMIT,
+    DF_SAMPLE_LIMIT_ENV,
     RUNTIME_FILENAMES,
     DfConvertAction,
     DfConvertExecutor,
@@ -23,11 +26,15 @@ from openhands.tools.data_preparation.definition import (
     DfRunPipelineAction,
     DfRunPipelineExecutor,
     DfRunPipelineObservation,
+    _sample_limit,
+    _truncate_sample_input,
 )
 from openhands.tools.data_preparation.runner import (
     ProcessLocalSampleExecutor,
+    _concrete_llm,
     build_dataflow_env,
     openai_compatible_model_name,
+    preflight_dataflow_llm,
     run_dataflow_python,
     runtime_public_names,
     summarize_dataflow_env,
@@ -265,7 +272,9 @@ def test_run_dataflow_python_redacts_api_key(tmp_path: Path) -> None:
 
 def test_df_run_pipeline_validates_output_and_writes_local_report(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
     pipeline_dir = tmp_path / "public_data" / "data-preparation"
     pipeline_dir.mkdir(parents=True)
     pipeline = pipeline_dir / "pipeline.py"
@@ -340,7 +349,9 @@ def test_df_run_pipeline_validates_output_and_writes_local_report(
 
 def test_df_run_pipeline_validates_dpo_output(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
     pipeline_dir = tmp_path / "public_data" / "data-preparation"
     pipeline_dir.mkdir(parents=True)
     pipeline = pipeline_dir / "pipeline.py"
@@ -451,7 +462,9 @@ def test_df_run_pipeline_observation_keeps_from_text_diagnostic() -> None:
 
 def test_df_run_pipeline_classifies_pipeline_execution_failure(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
     pipeline_dir = tmp_path / "public_data" / "data-preparation"
     pipeline_dir.mkdir(parents=True)
     (pipeline_dir / "pipeline.py").write_text("raise SystemExit(7)\n")
@@ -487,7 +500,9 @@ def test_df_run_pipeline_classifies_pipeline_execution_failure(
 
 def test_df_run_pipeline_classifies_schema_validation_failure(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
     pipeline_dir = tmp_path / "public_data" / "data-preparation"
     pipeline_dir.mkdir(parents=True)
     (pipeline_dir / "pipeline.py").write_text(
@@ -1431,3 +1446,401 @@ def test_avi_manifest_adapter_is_only_a_boundary_example(tmp_path: Path) -> None
         "note": "same as reference",
     }
     assert record["metadata"]["part"] == "part-1"
+
+
+class _FakePreflightResponse:
+    def __init__(self, status_code: int, text: str, content_type: str) -> None:
+        self.status_code = status_code
+        self.text = text
+        self.headers = {"content-type": content_type}
+
+
+def test_preflight_passes_on_200(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.runner.httpx.post",
+        lambda *args, **kwargs: _FakePreflightResponse(
+            200, '{"choices": [{"message": {"content": "p"}}]}', "application/json"
+        ),
+    )
+
+    preflight_dataflow_llm(
+        {
+            "DF_API_URL": "https://openrouter.ai/api/v1/chat/completions",
+            "DF_MODEL_NAME": "google/gemma-4-31b-it",
+        }
+    )
+
+
+def test_preflight_rejects_unknown_model(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.runner.httpx.post",
+        lambda *args, **kwargs: _FakePreflightResponse(
+            404,
+            '{"error": {"message": "No endpoints found for router"}}',
+            "application/json",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="rejected model 'router'"):
+        preflight_dataflow_llm(
+            {
+                "DF_API_URL": "https://openrouter.ai/api/v1/chat/completions",
+                "DF_MODEL_NAME": "router",
+            }
+        )
+
+
+def test_preflight_detects_html_endpoint_hit(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.runner.httpx.post",
+        lambda *args, **kwargs: _FakePreflightResponse(
+            200, "<html><body>home</body></html>", "text/html; charset=utf-8"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="non-JSON"):
+        preflight_dataflow_llm(
+            {
+                "DF_API_URL": "https://openrouter.ai/api/v1",
+                "DF_MODEL_NAME": "google/gemma-4-31b-it",
+            }
+        )
+
+
+def test_preflight_reports_auth_failure(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.runner.httpx.post",
+        lambda *args, **kwargs: _FakePreflightResponse(
+            401, '{"error": "unauthorized"}', "application/json"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="auth failed"):
+        preflight_dataflow_llm(
+            {
+                "DF_API_URL": "https://openrouter.ai/api/v1/chat/completions",
+                "DF_MODEL_NAME": "google/gemma-4-31b-it",
+            }
+        )
+
+
+def test_preflight_can_be_skipped(monkeypatch) -> None:
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.runner.httpx.post",
+        lambda *args, **kwargs: pytest.fail("preflight should be skipped"),
+    )
+
+    preflight_dataflow_llm(
+        {
+            "DF_API_URL": "https://openrouter.ai/api/v1/chat/completions",
+            "DF_MODEL_NAME": "google/gemma-4-31b-it",
+        }
+    )
+
+
+def test_preflight_reports_connection_failure(monkeypatch) -> None:
+    import httpx as _httpx
+
+    def _raise(*args, **kwargs):
+        raise _httpx.ConnectError("unreachable")
+
+    monkeypatch.setattr("openhands.tools.data_preparation.runner.httpx.post", _raise)
+
+    with pytest.raises(ValueError, match="could not reach"):
+        preflight_dataflow_llm(
+            {
+                "DF_API_URL": "https://openrouter.ai/api/v1/chat/completions",
+                "DF_MODEL_NAME": "google/gemma-4-31b-it",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    ["router", "{{model}}", "{model}", "<model>", "${MODEL_NAME}", "x{{y}}"],
+)
+def test_build_dataflow_env_rejects_unsubstituted_placeholder_model(
+    monkeypatch,
+    placeholder: str,
+) -> None:
+    monkeypatch.setenv("DF_API_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("DF_MODEL_NAME", placeholder)
+
+    with pytest.raises(ValueError, match="unsubstituted placeholder"):
+        build_dataflow_env(_conversation_with_llm())
+
+
+def test_build_dataflow_env_empty_model_falls_back_to_default(monkeypatch) -> None:
+    for name in ("DF_MODEL_NAME", "DF_API_BASE_URL", "DF_API_URL"):
+        monkeypatch.delenv(name, raising=False)
+
+    env = build_dataflow_env(_conversation_with_llm(base_url="https://x.example"))
+
+    assert env["DF_MODEL_NAME"] == DEFAULT_DATAFLOW_MODEL_NAME
+
+
+def test_build_dataflow_env_text_profile_rejects_placeholder_llm_model(
+    monkeypatch,
+) -> None:
+    """Text profile takes the model from the conversation LLM, so a routing
+    placeholder there (e.g. ``router``) must be caught even when the process
+    env names a real model."""
+    for name in ("DF_API_KEY", "DF_MODEL_NAME", "DF_API_BASE_URL", "DF_API_URL"):
+        monkeypatch.delenv(name, raising=False)
+    conversation = _conversation_with_llm()
+    conversation.state.agent.llm.model = "router"
+
+    with pytest.raises(ValueError, match="unsubstituted placeholder"):
+        build_dataflow_env(conversation, "text")
+
+
+def test_build_dataflow_env_text_profile_uses_primary_router_provider(
+    monkeypatch,
+) -> None:
+    """A RouterLLM (no real ``model``) must resolve the primary provider's
+    model for DataFlow instead of failing on the ``router`` placeholder."""
+    for name in ("DF_API_KEY", "DF_MODEL_NAME", "DF_API_BASE_URL", "DF_API_URL"):
+        monkeypatch.delenv(name, raising=False)
+
+    router = FailoverRouter(
+        llms_for_routing={
+            "deepseek": LLM(
+                model="openai/deepseek-v4-flash-0731",
+                base_url="http://208.64.254.187:8000/v1",
+                api_key=SecretStr("first-key"),
+            ),
+            "openrouter": LLM(
+                model="openai/deepseek-v4-flash-0731",
+                base_url="https://openrouter.ai/api/v1",
+                api_key=SecretStr("second-key"),
+            ),
+        },
+    )
+    conversation = _conversation_with_llm()
+    conversation.state.agent.llm = router
+
+    env = build_dataflow_env(conversation, "text")
+
+    assert env["DF_MODEL_NAME"] == "deepseek-v4-flash-0731"
+    assert env["DF_API_BASE_URL"] == "http://208.64.254.187:8000/v1"
+    assert env["DF_API_KEY"] == "first-key"
+
+
+def test_concrete_llm_delegates_to_router_primary() -> None:
+    router = FailoverRouter(
+        llms_for_routing={
+            "deepseek": LLM(model="openai/deepseek-v4-flash-0731"),
+            "openrouter": LLM(model="openai/deepseek-v4-flash-0731"),
+        },
+    )
+    assert _concrete_llm(router).model == "openai/deepseek-v4-flash-0731"
+    plain = LLM(model="openai/gpt-x")
+    assert _concrete_llm(plain) is plain
+
+
+def test_truncate_sample_input_csv_caps_rows(tmp_path: Path) -> None:
+    input_path = tmp_path / "testdata_3.csv"
+    input_path.write_text(
+        "qid,question_text\n"
+        + "\n".join(f"id{i},question {i}" for i in range(1, 8))  # 7 data rows
+        + "\n",
+        encoding="utf-8",
+    )
+
+    sample = _truncate_sample_input(input_path, 3)
+
+    assert sample is not None
+    content = sample.read_text(encoding="utf-8").splitlines()
+    assert content[0] == "qid,question_text"  # header preserved
+    assert len(content) == 1 + 3  # header + 3 data rows
+
+
+def test_truncate_sample_input_jsonl_caps_rows(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_text("".join(f'{{"id": {i}}}\n' for i in range(5)))
+
+    sample = _truncate_sample_input(input_path, 3)
+
+    assert sample is not None
+    assert len(sample.read_text(encoding="utf-8").splitlines()) == 3
+
+
+def test_truncate_sample_input_skips_within_limit(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_text('{"id": 1}\n{"id": 2}\n')
+
+    assert _truncate_sample_input(input_path, 3) is None
+
+
+def test_truncate_sample_input_skips_directory(tmp_path: Path) -> None:
+    directory = tmp_path / "images"
+    directory.mkdir()
+
+    assert _truncate_sample_input(directory, 3) is None
+
+
+def test_sample_limit_env_and_default(monkeypatch) -> None:
+    monkeypatch.delenv(DF_SAMPLE_LIMIT_ENV, raising=False)
+    assert _sample_limit() == DEFAULT_SAMPLE_LIMIT
+    monkeypatch.setenv(DF_SAMPLE_LIMIT_ENV, "10")
+    assert _sample_limit() == 10
+    monkeypatch.setenv(DF_SAMPLE_LIMIT_ENV, "garbage")
+    assert _sample_limit() == DEFAULT_SAMPLE_LIMIT
+
+
+def test_df_run_pipeline_caps_local_sample_rows(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A pipeline without ``--limit`` must still only see a 3-row local sample."""
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    monkeypatch.setenv("DF_SAMPLE_LIMIT", "3")
+    pipeline_dir = tmp_path / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    pipeline = pipeline_dir / "pipeline.py"
+    # Copied input lines verbatim into text-schema records, so output rows ==
+    # input rows the pipeline actually received.
+    pipeline.write_text(
+        "\n".join(
+            [
+                "import json, sys",
+                "inp = sys.argv[1]",
+                "out = sys.argv[2]",
+                "rows = [l for l in open(inp, encoding='utf-8') if l.strip()]",
+                "with open(out, 'w', encoding='utf-8') as f:",
+                "    for i, l in enumerate(rows):",
+                "        f.write(json.dumps({'id': f'text-{i}',",
+                "            'system_prompt': 's', 'user_prompt': l.strip(),",
+                "            'gt': 'a'}) + '\\n')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (pipeline_dir / "input.jsonl").write_text(
+        "".join(f"q{i}\n" for i in range(5)), encoding="utf-8"
+    )
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+    conversation = cast(Any, _fake_conversation(tmp_path))
+    conversation.state.agent = _conversation_with_llm().state.agent
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/sample3.jsonl",
+            ],
+            output_schema="text",
+            model_profile="text",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.record_count == 3  # capped at DF_SAMPLE_LIMIT, not 5
+
+
+def _write_legacy_copy_pipeline(pipeline: Path) -> None:
+    """Write a minimal legacy pipeline that copies input lines to the output."""
+    pipeline.write_text(
+        "\n".join(
+            [
+                "import sys",
+                "with open(sys.argv[1], encoding='utf-8') as src:",
+                "    lines = src.readlines()",
+                "with open(sys.argv[2], 'w', encoding='utf-8') as dst:",
+                "    dst.writelines(lines)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_df_run_pipeline_legacy_accepts_workspace_relative_args(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Legacy runs (no output_schema) must accept workspace-relative args.
+
+    The child process runs with cwd=pipeline.parent, so passing
+    ``public_data/...`` used to double-prefix the path and fail with
+    FileNotFoundError; args[0] is now resolved from the workspace root first.
+    """
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    pipeline_dir = tmp_path / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    _write_legacy_copy_pipeline(pipeline_dir / "pipeline.py")
+    (pipeline_dir / "input.jsonl").write_text("{'a': 1}\n", encoding="utf-8")
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+    conversation = cast(Any, _fake_conversation(tmp_path))
+    conversation.state.agent = _conversation_with_llm().state.agent
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/filtered.sample.jsonl",
+            ],
+            model_profile="text",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.exit_code == 0
+    assert (pipeline_dir / "filtered.sample.jsonl").is_file()
+    # Regression guard: the input must not be double-prefixed against the
+    # pipeline directory.
+    assert not (tmp_path / "public_data" / "public_data").exists()
+
+
+def test_df_run_pipeline_legacy_keeps_pipeline_relative_args(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Legacy args relative to the pipeline directory keep working."""
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    pipeline_dir = tmp_path / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    _write_legacy_copy_pipeline(pipeline_dir / "pipeline.py")
+    (pipeline_dir / "input.jsonl").write_text("{'a': 1}\n", encoding="utf-8")
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+    conversation = cast(Any, _fake_conversation(tmp_path))
+    conversation.state.agent = _conversation_with_llm().state.agent
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=["input.jsonl", "filtered.sample.jsonl"],
+            model_profile="text",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.exit_code == 0
+    assert (pipeline_dir / "filtered.sample.jsonl").is_file()
+    assert not (tmp_path / "filtered.sample.jsonl").exists()
