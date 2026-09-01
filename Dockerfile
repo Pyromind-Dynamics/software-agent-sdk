@@ -5,10 +5,11 @@ ARG UID=10001
 ARG GID=10001
 ARG PORT=8000
 ARG ENABLE_VERTEX=0
+ARG ENABLE_TERMINAL_EXTRAS=1
 
 ####################################################################################
 FROM python:3.13-bookworm AS builder
-ARG USERNAME UID GID ENABLE_VERTEX
+ARG USERNAME UID GID ENABLE_VERTEX ENABLE_TERMINAL_EXTRAS
 ENV UV_PROJECT_ENVIRONMENT=/agent-server/.venv
 ENV UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python
 
@@ -26,12 +27,16 @@ COPY --chown=${USERNAME}:${USERNAME} openhands-tools ./openhands-tools
 COPY --chown=${USERNAME}:${USERNAME} openhands-workspace ./openhands-workspace
 COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server ./openhands-agent-server
 COPY --chown=${USERNAME}:${USERNAME} .agents ./.agents
+COPY --chown=${USERNAME}:${USERNAME} requirements-terminal.txt ./
 RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
     EXTRA_FLAGS=""; \
     if [ "$ENABLE_VERTEX" = "1" ]; then EXTRA_FLAGS="--extra vertex"; fi; \
     uv python install 3.13 && \
     uv venv --python-preference only-managed --python 3.13 .venv && \
     uv sync --frozen --no-editable --managed-python --extra boto3 $EXTRA_FLAGS && \
+    if [ "$ENABLE_TERMINAL_EXTRAS" = "1" ]; then \
+        uv pip install --python .venv/bin/python -r requirements-terminal.txt; \
+    fi; \
     readlink -f .venv/bin/python | grep -q '^/agent-server/uv-managed-python/'
 
 ####################################################################################
@@ -97,7 +102,7 @@ RUN set -eux; \
         apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
             bash ca-certificates curl wget sudo apt-utils git jq tmux tar \
             build-essential coreutils util-linux procps findutils grep sed \
-            tini apt-transport-https gnupg lsb-release xz-utils \
+            tini apt-transport-https gnupg lsb-release xz-utils xfsprogs \
             apparmor apparmor-utils bubblewrap; \
         rm -rf /var/lib/apt/lists/*; \
     elif command -v apk >/dev/null 2>&1; then \
@@ -213,6 +218,15 @@ RUN set -ux; \
 RUN mkdir -p /etc/claude-code && \
     echo '{"permissions":{"allow":["Edit","Read","Bash"]}}' > /etc/claude-code/managed-settings.json
 
+# The runtime image does not carry the builder's /agent-server/.venv, and agent
+# terminals resolve `python` to the base image's system interpreter, so install
+# the terminal environment extras there directly (see requirements-terminal.txt).
+ARG ENABLE_TERMINAL_EXTRAS
+COPY requirements-terminal.txt /tmp/requirements-terminal.txt
+RUN if [ "$ENABLE_TERMINAL_EXTRAS" = "1" ]; then \
+        python3 -m pip install --no-cache-dir --disable-pip-version-check -r /tmp/requirements-terminal.txt; \
+    fi
+
 COPY --from=ghcr.io/astral-sh/uv:0.11.6 /uv /uvx /bin/
 
 USER ${USERNAME}
@@ -238,6 +252,11 @@ RUN uv python install 3.12 \
     && uv venv --python 3.12 ${HOME}/dataflow-venv \
     && uv pip install --python ${HOME}/dataflow-venv/bin/python open-dataflow==1.0.10
 ENV DATAFLOW_PYTHON=/home/openhands/dataflow-venv/bin/python
+# DataFlow LLM defaults (overridden per-run by build_dataflow_env when a
+# conversation supplies its own model/endpoint)
+ENV DF_API_URL=https://openrouter.ai/api/v1/chat/completions
+ENV DF_API_BASE_URL=https://openrouter.ai/api/v1
+ENV DF_MODEL_NAME=google/gemma-4-31b-it
 # Fix library path to use system GCC libraries instead of bundled ones
 ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge

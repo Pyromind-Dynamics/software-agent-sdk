@@ -37,6 +37,10 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_TERMINAL_PARAMS,
     PYROMIND_WORKFLOW_EVENT_KEY,
 )
+from openhands.agent_server.storage_quota import (
+    quota_from_env,
+    storage_quota_required,
+)
 from openhands.agent_server.workflow_canvas_snapshot_hook import (
     WorkflowCanvasSnapshotHook,
 )
@@ -1278,12 +1282,28 @@ class EventService:
                 "Failed to initialize git repository at %s: %s", working_dir, e
             )
 
+    def _apply_storage_quota(self) -> None:
+        """Apply the configured storage quota (fail closed when required)."""
+        quota = quota_from_env()
+        if quota.limit_bytes is None:
+            return
+        if quota.apply(self.conversation_dir, self.stored.id):
+            return
+        detail = quota.last_error or "unknown error"
+        if storage_quota_required():
+            raise RuntimeError(
+                f"storage quota {quota.limit_bytes} bytes could not be "
+                f"enforced for conversation {self.stored.id}: {detail}"
+            )
+        logger.warning("storage quota not enforced for %s: %s", self.stored.id, detail)
+
     async def start(self):
         # Store the main event loop for cross-thread communication
         self._main_loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
 
         # self.stored contains an Agent configuration we can instantiate
         _ensure_secure_directory(self.conversation_dir)
+        self._apply_storage_quota()
         # lease_ttl_seconds=0 disables leasing for single-instance deployments
         # where shared-storage stale leases would otherwise block pod restarts.
         if self.lease_ttl_seconds > 0:
