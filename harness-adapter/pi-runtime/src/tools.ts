@@ -48,9 +48,6 @@ export async function createTools(
     "terminal-output",
   );
   mkdirSync(terminalOutputTemp, { recursive: true, mode: 0o700 });
-  process.env.TMPDIR = terminalOutputTemp;
-  process.env.TMP = terminalOutputTemp;
-  process.env.TEMP = terminalOutputTemp;
   const read = createReadTool();
   const write = createWriteTool();
   const edit = createEditTool();
@@ -58,6 +55,12 @@ export async function createTools(
     terminalBackend,
     workspaceRoot,
   );
+  // sandbox-runtime creates Linux bridge sockets under os.tmpdir(). Initialize
+  // it before pointing process temp variables at the conversation's much longer
+  // terminal-output path, which can exceed sockaddr_un.sun_path's 108-byte limit.
+  process.env.TMPDIR = terminalOutputTemp;
+  process.env.TMP = terminalOutputTemp;
+  process.env.TEMP = terminalOutputTemp;
   const bash = createBashTool(workspaceRoot, {
     operations: terminalOperations,
     exposeSessionEnvironment: false,

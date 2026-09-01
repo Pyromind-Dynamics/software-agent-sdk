@@ -68,3 +68,13 @@ def test_product_image_defaults_to_os_sandbox_for_pi_terminal() -> None:
     ]
 
     assert "ENV PYROMIND_PI_TERMINAL_BACKEND=os-sandbox" in product_stage
+
+
+def test_pi_sandbox_initializes_before_using_conversation_temp_path() -> None:
+    tools_source = (
+        ROOT / "harness-adapter" / "pi-runtime" / "src" / "tools.ts"
+    ).read_text(encoding="utf-8")
+
+    sandbox_initialization = tools_source.index("await createWorkspaceBashOperations(")
+    conversation_tmpdir = tools_source.index("process.env.TMPDIR = terminalOutputTemp")
+    assert sandbox_initialization < conversation_tmpdir
