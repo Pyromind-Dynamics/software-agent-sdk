@@ -75,6 +75,7 @@ spec:
                       capabilities:
                           add:
                               - SYS_ADMIN
+                              - NET_ADMIN
                       seccompProfile:
                           type: Unconfined
             initContainers:

@@ -1,5 +1,6 @@
 import { lstat } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   createEditTool,
@@ -42,15 +43,13 @@ export async function createTools(
   knowledgeRoot: string | undefined,
   businessTools: BusinessToolConfig[],
 ): Promise<AgentTool[]> {
-  const terminalOutputTemp = join(
-    resolve(workspaceRoot),
-    "pi",
-    "terminal-output",
-  );
-  mkdirSync(terminalOutputTemp, { recursive: true, mode: 0o700 });
-  process.env.TMPDIR = terminalOutputTemp;
-  process.env.TMP = terminalOutputTemp;
-  process.env.TEMP = terminalOutputTemp;
+  // Keep the runtime temp path short: the sandbox's Unix bridge sockets must
+  // stay under the 108-char sun_path limit even with long conversation ids.
+  const runtimeTmp = join(tmpdir(), "pi-terminal");
+  mkdirSync(runtimeTmp, { recursive: true, mode: 0o700 });
+  process.env.TMPDIR = runtimeTmp;
+  process.env.TMP = runtimeTmp;
+  process.env.TEMP = runtimeTmp;
   const read = createReadTool();
   const write = createWriteTool();
   const edit = createEditTool();
