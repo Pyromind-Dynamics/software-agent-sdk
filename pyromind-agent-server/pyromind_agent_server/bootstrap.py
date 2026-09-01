@@ -40,6 +40,9 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         adapters,
         default_harness_id=backend,
         external_tasks=WorkflowExternalTaskRegistry(service.conversations_dir),
+        idle_eviction_seconds=int(
+            os.getenv("PYROMIND_IDLE_CONVERSATION_EVICTION_SECONDS", "1800")
+        ),
     )
     set_workflow_status_dispatcher(WorkflowStatusDispatcher(runtime).dispatch)
     app.state.product_runtime = runtime

@@ -466,3 +466,98 @@ async def test_runtime_owns_workflow_debug_callback_policy(tmp_path) -> None:
     assert succeeded.reset_attempt_budget is True
     assert "do not submit workflow_debug again" in succeeded.hidden_text
     await runtime.close()
+
+
+async def test_idle_conversation_is_evicted_and_reactivated(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, idle_eviction_seconds=3600)
+    context = RequestContext(user_id="42")
+    snapshot = await runtime.create_conversation(
+        SessionSpec(
+            conversation_id="conversation-evict",
+            user_id="42",
+            workspace_root=str(conversations),
+        ),
+        context,
+    )
+
+    active = runtime._active[snapshot.conversation_id]
+    active.last_access -= 7200
+    await runtime._evict_idle()
+
+    assert snapshot.conversation_id not in runtime._active
+    assert adapter.closed == [snapshot.conversation_id]
+
+    await runtime.submit_command(
+        snapshot.conversation_id,
+        UserMessageCommand(
+            command_id="command-retry",
+            content=(TextContent(text="again"),),
+        ),
+        context,
+    )
+    assert snapshot.conversation_id in runtime._active
+    assert runtime._active[snapshot.conversation_id].last_access > 0
+    await runtime.close()
+
+
+async def test_eviction_skips_running_or_subscribed_conversations(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, idle_eviction_seconds=3600)
+    context = RequestContext(user_id="42")
+    snapshot = await runtime.create_conversation(
+        SessionSpec(
+            conversation_id="conversation-guard",
+            user_id="42",
+            workspace_root=str(conversations),
+        ),
+        context,
+    )
+    active = runtime._active[snapshot.conversation_id]
+    active.last_access -= 7200
+
+    async for _ in runtime.stream_events(snapshot.conversation_id, 0, context):
+        break
+
+    await runtime._evict_idle()
+    assert snapshot.conversation_id in runtime._active
+    await runtime.close()
+
+
+async def test_subscriber_queue_sheds_deltas_but_keeps_state_events() -> None:
+    runtime = ConversationRuntime("/tmp/unused", FakeAdapter())
+    queue: asyncio.Queue[ProductEvent] = asyncio.Queue(3)  # type: ignore[assignment]
+    runtime._subscribers["c1"] = {queue}
+
+    def delta(index: int) -> ProductEvent:
+        return ProductEvent(
+            event_id=f"d{index}",
+            conversation_id="c1",
+            seq=index,
+            type="message.delta",
+            payload={},
+        )
+
+    for index in range(3):
+        runtime._publish(delta(index))
+    assert queue.full()
+
+    runtime._publish(delta(99))
+    assert queue.qsize() == 3
+
+    state_event = ProductEvent(
+        event_id="s1",
+        conversation_id="c1",
+        seq=100,
+        type="status.changed",
+        payload={},
+    )
+    runtime._publish(state_event)
+    assert queue.qsize() == 3
+    assert queue.get_nowait().seq == 1
+    assert queue.get_nowait().seq == 2
+    assert queue.get_nowait().seq == 100

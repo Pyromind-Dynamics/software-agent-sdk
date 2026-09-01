@@ -5,7 +5,7 @@ import logging
 import shutil
 import time
 from collections.abc import AsyncGenerator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -60,6 +60,12 @@ _FORK_EVENT_TYPES = frozenset(
     }
 )
 
+# Statuses from which a conversation can be lazily re-activated on next
+# access; anything else (running / waiting_*) means work is in flight.
+_EVICTABLE_STATUSES = frozenset({"idle", "finished", "error", "stuck", "paused"})
+_SUBSCRIBER_QUEUE_MAX = 2000
+_DELTA_EVENT_TYPES = frozenset({"message.delta"})
+
 
 @dataclass(slots=True)
 class _ActiveConversation:
@@ -68,6 +74,10 @@ class _ActiveConversation:
     task: asyncio.Task[None]
     ready: asyncio.Event
     context: RequestContext
+    last_access: float = field(default_factory=time.monotonic)
+
+    def touch(self) -> None:
+        self.last_access = time.monotonic()
 
 
 class ConversationRuntime:
@@ -78,6 +88,7 @@ class ConversationRuntime:
         *,
         default_harness_id: str = "openhands",
         external_tasks: ExternalTaskRegistry | None = None,
+        idle_eviction_seconds: int = 1800,
     ) -> None:
         self.conversation_root = Path(conversation_root)
         self.adapters = (
@@ -90,6 +101,8 @@ class ConversationRuntime:
         self.default_harness_id = default_harness_id
         self._external_tasks = external_tasks
         self._projector = ProductEventProjector()
+        self._idle_eviction_seconds = max(0, int(idle_eviction_seconds))
+        self._evictor: asyncio.Task[None] | None = None
         self._active: dict[str, _ActiveConversation] = {}
         self._activation_locks: dict[str, asyncio.Lock] = {}
         self._subscribers: dict[str, set[asyncio.Queue[ProductEvent]]] = {}
@@ -311,7 +324,7 @@ class ConversationRuntime:
             if isinstance(exc, ProductRuntimeError):
                 raise
             logger.exception(
-                "Harness fork failed source_conversation_id=%s target_conversation_id=%s",
+                "Harness fork failed source=%s target=%s",
                 conversation_id,
                 target_id,
             )
@@ -461,7 +474,7 @@ class ConversationRuntime:
     ) -> AsyncGenerator[ProductEvent]:
         store = await self._ensure_active(conversation_id, context)
         store.authorize(context.user_id)
-        queue: asyncio.Queue[ProductEvent] = asyncio.Queue()
+        queue: asyncio.Queue[ProductEvent] = asyncio.Queue(_SUBSCRIBER_QUEUE_MAX)
         self._subscribers.setdefault(conversation_id, set()).add(queue)
         cursor = after_seq
         try:
@@ -482,6 +495,9 @@ class ConversationRuntime:
                     self._subscribers.pop(conversation_id, None)
 
     async def close(self) -> None:
+        if self._evictor is not None:
+            self._evictor.cancel()
+            self._evictor = None
         active = tuple(self._active.values())
         self._active.clear()
         self._first_command_pending.clear()
@@ -519,8 +535,10 @@ class ConversationRuntime:
         conversation_id: str,
         context: RequestContext,
     ) -> FileProductStore:
+        self._ensure_evictor()
         existing = self._active.get(conversation_id)
         if existing is not None:
+            existing.touch()
             await existing.ready.wait()
             return self._store(conversation_id)
         lock = self._activation_locks.setdefault(conversation_id, asyncio.Lock())
@@ -679,7 +697,62 @@ class ConversationRuntime:
 
     def _publish(self, event: ProductEvent) -> None:
         for queue in tuple(self._subscribers.get(event.conversation_id, ())):
+            if queue.full():
+                if event.type in _DELTA_EVENT_TYPES:
+                    # Stream chunks are recoverable via cursor replay; never
+                    # let a slow subscriber back-pressure the publisher.
+                    continue
+                queue.get_nowait()
             queue.put_nowait(event)
+
+    def _ensure_evictor(self) -> None:
+        if self._idle_eviction_seconds <= 0 or self._evictor is not None:
+            return
+        self._evictor = asyncio.create_task(self._eviction_loop())
+
+    async def _eviction_loop(self) -> None:
+        interval = min(60.0, float(self._idle_eviction_seconds))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self._evict_idle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Idle conversation eviction sweep failed")
+
+    async def _evict_idle(self) -> None:
+        now = time.monotonic()
+        for conversation_id, active in tuple(self._active.items()):
+            if now - active.last_access < self._idle_eviction_seconds:
+                continue
+            if self._subscribers.get(conversation_id):
+                continue
+            try:
+                status = self._store(conversation_id).load_snapshot().status
+            except (OSError, ProductStoreError):
+                continue
+            if status not in _EVICTABLE_STATUSES:
+                continue
+            self._active.pop(conversation_id, None)
+            stale_timings = [
+                key for key in self._first_delta_started_at if key[0] == conversation_id
+            ]
+            for key in stale_timings:
+                self._first_delta_started_at.pop(key, None)
+            logger.info(
+                "evicting idle conversation %s (harness=%s)",
+                conversation_id,
+                active.handle.harness_id,
+            )
+            active.task.cancel()
+            try:
+                await active.adapter.close(active.handle)
+            except Exception:
+                logger.exception(
+                    "Failed to close adapter for evicted conversation %s",
+                    conversation_id,
+                )
 
     def _store(self, conversation_id: str) -> FileProductStore:
         if not conversation_id or "/" in conversation_id or "\\" in conversation_id:
