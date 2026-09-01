@@ -58,6 +58,26 @@ _READ_ONLY_TOOLS = frozenset(
 )
 logger = logging.getLogger(__name__)
 
+# Runner frames are capped at 1MiB; keep tool text well under it so the
+# JSON envelope (details, signals) still fits.
+_MAX_RESPONSE_TEXT_CHARS = 250_000
+_TRUNCATED_SUFFIX = "\n\n[output truncated: exceeded the runner frame budget]"
+
+
+def _cap_response_text(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    remaining = _MAX_RESPONSE_TEXT_CHARS
+    capped: list[dict[str, Any]] = []
+    for block in content:
+        text = block.get("text")
+        if not isinstance(text, str) or len(text) <= remaining:
+            if isinstance(text, str):
+                remaining -= len(text)
+            capped.append(block)
+            continue
+        capped.append({**block, "text": text[:remaining] + _TRUNCATED_SUFFIX})
+        remaining = 0
+    return capped
+
 
 @dataclass(frozen=True, slots=True)
 class BusinessToolSpec:
@@ -283,9 +303,9 @@ class PyromindBusinessToolHost:
                     else 0
                 }
             )
-            content = [
-                block.model_dump(mode="json") for block in observation.to_llm_content
-            ]
+            content = _cap_response_text(
+                [block.model_dump(mode="json") for block in observation.to_llm_content]
+            )
             details = observation.model_dump(
                 mode="json", exclude={"content", "is_error"}
             )

@@ -214,7 +214,28 @@ class PiRunnerProcess:
                     "message": str(exc),
                 },
             }
-        await self._write(response)
+        try:
+            await self._write(response)
+        except PiProtocolError:
+            # The Node side has no timeout on pending requests: an
+            # undeliverable response must still resolve it, or the session
+            # wedges waiting on this requestId forever.
+            logger.warning(
+                "pi runner response for request %s exceeded the JSONL frame "
+                "limit; replying with an error",
+                request_id,
+            )
+            await self._write(
+                {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "type": "response",
+                    "requestId": request_id,
+                    "error": {
+                        "code": "response_too_large",
+                        "message": "runner response exceeded the JSONL frame limit",
+                    },
+                }
+            )
 
     async def _write(self, frame: dict[str, Any]) -> None:
         process = self._process

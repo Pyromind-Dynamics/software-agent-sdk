@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+from typing import Any, cast
+
 import pytest
 from harness_adapter.pi_adapter.event_translator import translate_runner_event
 from harness_adapter.pi_adapter.protocol import (
@@ -8,6 +12,7 @@ from harness_adapter.pi_adapter.protocol import (
     decode_frame,
     encode_frame,
 )
+from harness_adapter.pi_adapter.runner import PiRunnerProcess
 
 
 def test_protocol_round_trip_and_frame_limit() -> None:
@@ -84,3 +89,50 @@ def test_run_finished_is_the_only_harness_terminal_mapping(
     assert all("stop_reason" not in event.payload for event in events)
     if status == "future-outcome":
         assert events[0].payload["code"] == "unknown_pi_outcome"
+
+
+async def test_oversized_response_still_resolves_the_node_request() -> None:
+    sent: list[dict] = []
+
+    class _FakeStdin:
+        def write(self, data: bytes) -> None:
+            sent.append(json.loads(data))
+
+        async def drain(self) -> None:
+            return None
+
+    async def huge_result(_method: str, _params: dict) -> str:
+        return "x" * (1024 * 1024 + 1)
+
+    runner = PiRunnerProcess(
+        request_handler=huge_result,
+        event_handler=_async_noop,
+        exit_handler=_async_noop,
+    )
+    runner._process = cast(Any, SimpleNamespace(stdin=_FakeStdin()))
+
+    await runner._answer_request(
+        {
+            "protocolVersion": PROTOCOL_VERSION,
+            "type": "request",
+            "requestId": "r1",
+            "method": "tool.execute",
+            "params": {},
+        }
+    )
+
+    assert sent == [
+        {
+            "protocolVersion": PROTOCOL_VERSION,
+            "type": "response",
+            "requestId": "r1",
+            "error": {
+                "code": "response_too_large",
+                "message": "runner response exceeded the JSONL frame limit",
+            },
+        }
+    ]
+
+
+async def _async_noop(*_args) -> None:
+    return None

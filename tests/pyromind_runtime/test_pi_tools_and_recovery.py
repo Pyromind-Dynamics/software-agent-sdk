@@ -18,6 +18,7 @@ from harness_adapter.pi_adapter.adapter import (
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,
+    _cap_response_text,
 )
 from harness_adapter.pi_adapter.business_tools import (
     execute_validation_tool,
@@ -247,6 +248,29 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
     specs = PyromindBusinessToolHost(roots).specs()
     assert len(specs) == 11
     assert all(spec["input_schema"].get("type") == "object" for spec in specs)
+
+
+def test_tool_response_text_is_capped_to_runner_frame_budget() -> None:
+    image_block = {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}
+    capped = _cap_response_text(
+        [
+            {"type": "text", "text": "a" * 300_000},
+            {"type": "text", "text": "tail"},
+            image_block,
+        ]
+    )
+    assert capped[0]["text"].endswith(
+        "[output truncated: exceeded the runner frame budget]"
+    )
+    assert len(capped[0]["text"]) < 250_000 + 100
+    assert capped[1] == {
+        "type": "text",
+        "text": "\n\n[output truncated: exceeded the runner frame budget]",
+    }
+    assert capped[2] == image_block
+    assert _cap_response_text([{"type": "text", "text": "ok"}]) == [
+        {"type": "text", "text": "ok"}
+    ]
 
 
 async def test_pi_host_synthesizes_debug_task_and_persists_only_attempt_budget(
