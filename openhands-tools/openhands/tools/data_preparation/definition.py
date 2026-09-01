@@ -477,6 +477,26 @@ def _read_output_records(
     return records, total
 
 
+def _read_report_failure(report_path: Path | None) -> dict[str, Any]:
+    """Read the runtime failure captured in ``report.json`` when available."""
+
+    if report_path is None or not report_path.is_file():
+        return {}
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(report, dict):
+        return {}
+    failure = report.get("failure")
+    if not isinstance(failure, dict):
+        return {}
+    # generate_report.py currently preserves the complete failure.json payload,
+    # whose actionable fields live under its own ``failure`` key.
+    nested = failure.get("failure")
+    return nested if isinstance(nested, dict) else failure
+
+
 class DfRunPipelineObservation(Observation):
     exit_code: int = Field(default=-1)
     stdout_tail: str = Field(default="")
@@ -835,6 +855,9 @@ class DfRunPipelineExecutor(ToolExecutor):
         failure_stage: str | None = None
         error_code: str | None = None
         error_message: str | None = None
+        report_failure = _read_report_failure(report_path) if rc != 0 else {}
+        reported_stage = report_failure.get("stage")
+        reported_error = report_failure.get("error")
         if rc != 0:
             if rc == 124:
                 failure_stage = "timeout"
@@ -854,9 +877,17 @@ class DfRunPipelineExecutor(ToolExecutor):
                 error_code = "dataflow_pipeline_cancelled"
                 error_message = "DataFlow local Sample execution was cancelled."
             elif pipeline_rc != 0:
-                failure_stage = "pipeline_execution"
+                failure_stage = (
+                    reported_stage
+                    if isinstance(reported_stage, str) and reported_stage.strip()
+                    else "pipeline_execution"
+                )
                 error_code = "dataflow_pipeline_failed"
-                error_message = f"DataFlow pipeline exited with code {pipeline_rc}."
+                error_message = (
+                    reported_error
+                    if isinstance(reported_error, str) and reported_error.strip()
+                    else f"DataFlow pipeline exited with code {pipeline_rc}."
+                )
             elif validation_rc is not None and validation_rc != 0:
                 failure_stage = "schema_validation"
                 error_code = "dataflow_schema_validation_failed"

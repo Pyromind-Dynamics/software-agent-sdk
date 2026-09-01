@@ -479,7 +479,59 @@ def test_df_run_pipeline_classifies_pipeline_execution_failure(
     assert observation.is_error
     assert observation.failure_stage == "pipeline_execution"
     assert observation.error_code == "dataflow_pipeline_failed"
+    assert observation.error_message == "DataFlow pipeline exited with code 7."
     assert observation.exit_code == 7
+
+
+def test_df_run_pipeline_uses_reported_failure_details(tmp_path: Path) -> None:
+    pipeline_dir = tmp_path / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    (pipeline_dir / "pipeline.py").write_text(
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "failure = {\n"
+        "    'status': 'failed',\n"
+        "    'failure': {\n"
+        "        'stage': 'input_validation',\n"
+        "        'error': 'missing configured reference field label',\n"
+        "        'attempts': 0,\n"
+        "    },\n"
+        "}\n"
+        "state_dir = Path(os.environ['DF_STATE_DIR'])\n"
+        "(state_dir / 'failure.json').write_text(json.dumps(failure))\n"
+        "raise SystemExit(7)\n"
+    )
+    (pipeline_dir / "input.jsonl").write_text("{}\n")
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-preparation"
+        / "scripts"
+    )
+    conversation = cast(Any, _fake_conversation(tmp_path))
+    conversation.state.agent = _conversation_with_llm().state.agent
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/processed.sample.jsonl",
+            ],
+            output_schema="dpo",
+        ),
+        conversation,
+    )
+
+    assert observation.is_error
+    assert observation.failure_stage == "input_validation"
+    assert observation.error_code == "dataflow_pipeline_failed"
+    assert observation.error_message == "missing configured reference field label"
+    assert observation.exit_code == 7
+    llm_text = "\n".join(item.text for item in observation.to_llm_content)
+    assert "failure_stage=input_validation" in llm_text
+    assert "error_message=missing configured reference field label" in llm_text
 
 
 def test_df_run_pipeline_classifies_schema_validation_failure(
