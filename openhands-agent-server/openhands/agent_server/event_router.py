@@ -3,6 +3,7 @@ Local Event router for OpenHands SDK.
 """
 
 import logging
+from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Annotated
 
@@ -11,6 +12,7 @@ from fastapi import (
     Depends,
     HTTPException,
     Query,
+    Request,
     status,
 )
 
@@ -25,10 +27,23 @@ from openhands.agent_server.models import (
 )
 from openhands.sdk import Message
 from openhands.sdk.event import Event
+from openhands.sdk.logger import conversation_log_context
+
+
+async def _bind_conversation_log_context(request: Request) -> AsyncIterator[None]:
+    """Bind log records during the request to its ``conversation_id`` path value."""
+    conversation_id = request.path_params.get("conversation_id")
+    if not conversation_id:
+        yield
+        return
+    with conversation_log_context(str(conversation_id)):
+        yield
 
 
 event_router = APIRouter(
-    prefix="/conversations/{conversation_id}/events", tags=["Events"]
+    prefix="/conversations/{conversation_id}/events",
+    tags=["Events"],
+    dependencies=[Depends(_bind_conversation_log_context)],
 )
 logger = logging.getLogger(__name__)
 

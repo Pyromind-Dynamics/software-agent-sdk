@@ -36,6 +36,7 @@ from openhands.agent_server.models import (
 from openhands.agent_server.persistence.store import _ensure_secure_directory
 from openhands.agent_server.pub_sub import Subscriber
 from openhands.agent_server.server_details_router import update_last_execution_time
+from openhands.agent_server.storage_quota import quota_from_env
 from openhands.agent_server.utils import safe_rmtree, utc_now
 from openhands.agent_server.workflow_canvas_models import (
     SaveWorkflowCanvasEventSnapshotRequest,
@@ -1293,6 +1294,7 @@ class ConversationService:
             event_service.conversation_dir,
             f"conversation directory for {conversation_id}",
         )
+        quota_from_env().remove(event_service.conversation_dir, conversation_id)
 
         logger.info(f"Successfully deleted conversation {conversation_id}")
         return True

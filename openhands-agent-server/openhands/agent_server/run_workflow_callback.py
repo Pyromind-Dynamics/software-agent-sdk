@@ -32,7 +32,6 @@ from __future__ import annotations
 import re
 import threading
 import time
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -120,7 +119,6 @@ _PLATFORM_STATUS_MAP: dict[str, RunWorkflowStatus] = {
 # 进程内终态去重，避免 Kafka 重复消息多次 auto_run。
 _delivered_terminal_lock = threading.Lock()
 _delivered_terminal_task_ids: set[str] = set()
-_status_dispatcher: Callable[..., Awaitable[RunWorkflowCallbackResult]] | None = None
 
 
 @dataclass(frozen=True)
@@ -131,19 +129,6 @@ class RunWorkflowCallbackResult:
     task_id: str
     normalized_status: RunWorkflowStatus | None
     conversation_id: str | None
-
-
-def set_workflow_status_dispatcher(
-    dispatcher: Callable[..., Awaitable[RunWorkflowCallbackResult]] | None,
-) -> None:
-    global _status_dispatcher
-    _status_dispatcher = dispatcher
-
-
-async def dispatch_run_workflow_status(**kwargs) -> RunWorkflowCallbackResult:
-    if _status_dispatcher is not None:
-        return await _status_dispatcher(**kwargs)
-    return await deliver_run_workflow_status(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -468,11 +453,14 @@ def _env_from_x_cluster(x_cluster: str | None) -> str | None:
 def _fetch_node_signatures_text(
     conversation: LocalConversation,
     node_names: list[str],
-) -> str | None:
-    """Fetch raw signature text for all requested nodes via the middleware API.
+) -> tuple[str, str] | None:
+    """Fetch signature text for all requested nodes via the middleware API.
 
-    Returns None when nothing usable was fetched. Headers and auth token come
-    from the conversation state, mirroring the workflow tools' wiring.
+    Returns ``(source_full, source_free)`` or None when nothing usable was
+    fetched. ``source_full`` includes the node source body and is intended only
+    for server-side LLM condensation; ``source_free`` drops the source body and
+    is safe to expose to the agent. Headers and auth token come from the
+    conversation state, mirroring the workflow tools' wiring.
     """
     from openhands.tools.node_signature.definition import NodeSignatureAction
     from openhands.tools.node_signature.impl import NodeSignatureExecutor
@@ -498,11 +486,17 @@ def _fetch_node_signatures_text(
         return None
     if not any(result.get("success") for result in observation.results):
         return None
-    return "\n".join(
+    source_full = "\n".join(
+        content.text
+        for content in observation.to_summary_content()
+        if isinstance(content, TextContent)
+    )
+    source_free = "\n".join(
         content.text
         for content in observation.to_llm_content
         if isinstance(content, TextContent)
     )
+    return source_full, source_free
 
 
 async def build_node_signature_guidance(
@@ -520,10 +514,13 @@ async def build_node_signature_guidance(
     concise fix guidance. When the error log does not identify any node, all
     nodes are used instead.
 
-    Degradation policy: when LLM summarization fails, the raw signature text is
-    returned instead; when no workflow file exists or signatures cannot be
-    fetched, None is returned and the callback keeps today's error-log-only
-    behavior. Never raises — failures must not break terminal delivery.
+    Degradation policy: the node source body is only ever sent to the
+    summarization LLM (whose prompt forbids reproducing it). When summarization
+    fails or no LLM is available, the source-free signature/parameter text is
+    returned instead — never the raw source. When no workflow file exists or
+    signatures cannot be fetched, None is returned and the callback keeps
+    today's error-log-only behavior. Never raises — failures must not break
+    terminal delivery.
     """
     try:
         conversation = event_service.get_conversation()
@@ -547,7 +544,7 @@ async def build_node_signature_guidance(
             "Resolved nodes for failed workflow callback: %s",
             ", ".join(node_names),
         )
-        raw_text = _fetch_node_signatures_text(conversation, node_names)
+        signature_texts = _fetch_node_signatures_text(conversation, node_names)
     except Exception:
         logger.warning(
             "Failed to fetch node signatures for debug callback; skipping "
@@ -555,14 +552,17 @@ async def build_node_signature_guidance(
             exc_info=True,
         )
         return None
-    if raw_text is None:
+    if signature_texts is None:
+        return None
+    source_full, source_free = signature_texts
+    if not source_free:
         return None
 
     effective_llm = llm or getattr(
         getattr(conversation.state, "agent", None), "llm", None
     )
     if effective_llm is None:
-        return raw_text
+        return source_free
     try:
         response = await effective_llm.acompletion(
             messages=[
@@ -570,7 +570,7 @@ async def build_node_signature_guidance(
                     role="system",
                     content=[TextContent(text=_NODE_SIGNATURE_SUMMARY_PROMPT)],
                 ),
-                Message(role="user", content=[TextContent(text=raw_text)]),
+                Message(role="user", content=[TextContent(text=source_full)]),
             ]
         )
         summary = "\n".join(
@@ -582,11 +582,11 @@ async def build_node_signature_guidance(
             return summary
     except Exception:
         logger.warning(
-            "LLM node signature summarization failed; falling back to raw "
-            "node signatures",
+            "LLM node signature summarization failed; falling back to "
+            "source-free node signatures",
             exc_info=True,
         )
-    return raw_text
+    return source_free
 
 
 async def resume_conversation_after_workflow(

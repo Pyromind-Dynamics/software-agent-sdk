@@ -267,6 +267,7 @@ class EventService:
         default_factory=lambda: PubSub[Event](max_subscribers=50), init=False
     )
     _run_task: asyncio.Task | None = field(default=None, init=False)
+    _last_step_activity: float = field(default_factory=time.monotonic, init=False)
     # Set when a send_message(run=True) is rejected because a run is still
     # wrapping up; consumed by _run_and_publish to re-run the stranded message.
     _rerun_requested: bool = field(default=False, init=False)
@@ -1168,6 +1169,7 @@ class EventService:
             def locked_on_event():
                 with conversation._state:
                     conversation._on_event(event)
+                self._last_step_activity = time.monotonic()
 
             # Run the locked callback in an executor to ensure the event is
             # both persisted and sent to WebSocket subscribers
@@ -1572,11 +1574,38 @@ class EventService:
                         and type(conversation).arun is not BaseConversation.arun
                         and type(conversation.agent).astep is not AgentBase.astep
                     )
+                    # Last-resort safety net when the LLM timeout fails
+                    # (e.g. a stuck connection that does not error).
+                    WATCHDOG_TIMEOUT = 1800.0  # 30 minutes
+                    WATCHDOG_INTERVAL = 30.0
+
+                    async def _run_watchdog():
+                        try:
+                            while True:
+                                await asyncio.sleep(WATCHDOG_INTERVAL)
+                                elapsed = time.monotonic() - self._last_step_activity
+                                if elapsed > WATCHDOG_TIMEOUT:
+                                    conversation.interrupt()
+                                    if (
+                                        self._run_task is not None
+                                        and not self._run_task.done()
+                                    ):
+                                        self._run_task.cancel()
+                                    return
+                        except asyncio.CancelledError:
+                            pass
+
+                    watchdog = asyncio.create_task(_run_watchdog())
                     arun_t0 = time.monotonic()
-                    if has_native_arun:
-                        await conversation.arun()
-                    else:
-                        await loop.run_in_executor(self._run_executor, conversation.run)
+                    try:
+                        if has_native_arun:
+                            await conversation.arun()
+                        else:
+                            await loop.run_in_executor(
+                                self._run_executor, conversation.run
+                            )
+                    finally:
+                        watchdog.cancel()
                     arun_ms = (time.monotonic() - arun_t0) * 1000
                 except Exception:
                     logger.exception("Error during conversation run")
