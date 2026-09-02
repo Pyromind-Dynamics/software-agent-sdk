@@ -199,6 +199,75 @@ def test_executor_resolves_workspace_relative_template(
     )
 
 
+def test_executor_env_falls_back_to_app_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_submission(monkeypatch)
+    monkeypatch.delenv("APP_ENV", raising=False)
+    client_factory = MagicMock(return_value=MagicMock())
+    module = sys.modules["openhands.tools.environment_processing.render_submit"]
+    monkeypatch.setattr(module, "create_workflow_api_client", client_factory)
+    template = tmp_path / "render_template.json"
+    template.write_text(json.dumps({"fields": {"task_id": "task_id"}}))
+    conversation = _conversation_with_secrets({"auth_token": "tok"})
+
+    executor = RenderExecutor(
+        env=None,
+        cluster="us-west-1",
+        headers={},
+        runtime_dir=str(_render_runtime(tmp_path)),
+        output_root=None,
+        storage_base_url=None,
+        storage_headers={},
+        storage_secret_headers={},
+        timeout=10,
+    )
+    obs = executor(
+        EdpRenderAction(
+            template_path=str(template),
+            data_source="datasets/tmax/data/train.parquet",
+            shard_size=100,
+        ),
+        conversation,
+    )
+
+    assert obs.status == "Pending"
+    assert client_factory.call_args.kwargs["env"] == "pre"
+    assert client_factory.call_args.kwargs["cluster"] == "us-west-1"
+
+
+def test_executor_missing_cluster_still_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_submission(monkeypatch)
+    template = tmp_path / "render_template.json"
+    template.write_text(json.dumps({"fields": {"task_id": "task_id"}}))
+    conversation = _conversation_with_secrets({"auth_token": "tok"})
+
+    executor = RenderExecutor(
+        env=None,
+        cluster="",
+        headers={},
+        runtime_dir=str(_render_runtime(tmp_path)),
+        output_root=None,
+        storage_base_url=None,
+        storage_headers={},
+        storage_secret_headers={},
+        timeout=10,
+    )
+    obs = executor(
+        EdpRenderAction(
+            template_path=str(template),
+            data_source="datasets/tmax/data/train.parquet",
+            shard_size=100,
+        ),
+        conversation,
+    )
+
+    assert obs.status == "Failed"
+    assert "cluster not wired" in obs.text
+
+
 def test_edp_render_tool_rejects_unknown_params() -> None:
     with pytest.raises(ValueError, match="unknown params"):
         EdpRenderTool.create(bogus=1)
