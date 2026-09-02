@@ -155,3 +155,34 @@ def test_projector_tracks_external_task_lifecycle() -> None:
     assert snapshot.status == "idle"
     assert snapshot.external_tasks[0].status == "succeeded"
     assert snapshot.external_tasks[0].resume_pending is True
+
+
+def test_projector_accepts_environment_processing_kinds() -> None:
+    projector = SnapshotProjector()
+    for kind in (
+        "environment_processing",
+        "environment_processing_render",
+        "environment_processing_aggregate",
+    ):
+        submitted = {
+            "task_id": f"task-{kind}",
+            "kind": kind,
+            "status": "running",
+            "output_dir": f"/agent/conv/edp/{kind}",
+            "submitted_at": "2026-09-02T06:28:56+00:00",
+            "updated_at": "2026-09-02T06:28:56+00:00",
+        }
+        snapshot = projector.reduce(
+            _snapshot(), _event(1, "external_task.submitted", submitted)
+        )
+        assert snapshot.status == "waiting_for_external_task"
+        assert snapshot.external_tasks[0].kind == kind
+        completed = projector.reduce(
+            snapshot,
+            _event(
+                2,
+                "external_task.completed",
+                {**submitted, "status": "succeeded", "resume_pending": True},
+            ),
+        )
+        assert completed.status == "idle"

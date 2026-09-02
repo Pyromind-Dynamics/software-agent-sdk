@@ -120,7 +120,14 @@ class UsageState(ContractModel):
 
 class ExternalTaskState(ContractModel):
     task_id: str = Field(min_length=1)
-    kind: Literal["data_cleaning", "data_preparation", "workflow_debug"]
+    kind: Literal[
+        "data_cleaning",
+        "data_preparation",
+        "workflow_debug",
+        "environment_processing",
+        "environment_processing_render",
+        "environment_processing_aggregate",
+    ]
     run_id: str | None = None
     status: Literal[
         "pending", "running", "succeeded", "failed", "terminated", "stopped"
