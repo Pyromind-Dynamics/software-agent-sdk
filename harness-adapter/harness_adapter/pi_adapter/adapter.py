@@ -75,14 +75,17 @@ Use read, write, edit, and terminal for workspace operations. Keep generated fil
 in this workspace. The terminal already starts at the workspace root (`.`); do not
 run pwd, ls, or cd to locate it. Workspace files use workspace-relative paths.
 Pi advertises skills in <available_skills>; read the advertised skill location
-and resolve its references against the skill directory. Shared Pyromind knowledge
-is read-only at logical paths under knowledge/. Use read rather than terminal or
-repository search for skill and knowledge resources. For Pyromind workflow requests,
-read the matching
-skill before editing exactly
-public_data/workflow_canvas/workflow.py, then call validate_workflow_dsl with
-that relative dsl_path. Do not inspect credentials or work around failed
-validation authentication.
+and resolve its references against the skill directory. Paths referenced inside
+skill documents (playbooks, case docs, profiles, scripts) are relative to that
+skill's root directory, not to the referencing document; for example
+scripts/edp/profiles/tmax-validation.json in the data-processing skill resolves
+to .agents/skills/data-processing/scripts/edp/profiles/tmax-validation.json.
+Shared Pyromind knowledge is read-only at logical paths under knowledge/. Use
+read rather than terminal or repository search for skill and knowledge
+resources. For Pyromind workflow requests, read the matching skill before
+editing exactly public_data/workflow_canvas/workflow.py, then call
+validate_workflow_dsl with that relative dsl_path. Do not inspect credentials
+or work around failed validation authentication.
 
 Route dataset work before acting. Use the data-processing skill for any
 dataset request; its SKILL.md routing table selects the paradigm:

@@ -3,7 +3,20 @@ import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { safePath } from "../src/tools.js";
+import { safePath, toolErrorText } from "../src/tools.js";
+
+test("toolErrorText keeps the full Python error chain, not just the header", () => {
+  const blocks = [
+    { type: "text", text: "[An error occurred during execution.]\n" },
+    { type: "text", text: "Failed to materialize storage samples: Storage file exceeds the 26214400-byte preflight limit." },
+    { type: "image", data: "x", mimeType: "image/png" },
+  ] as const;
+  assert.equal(
+    toolErrorText([...blocks]),
+    "[An error occurred during execution.]\nFailed to materialize storage samples: Storage file exceeds the 26214400-byte preflight limit.",
+  );
+  assert.equal(toolErrorText([]), "");
+});
 
 test("safePath resolves workspace, skill, and knowledge paths by scope", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-tools-"));

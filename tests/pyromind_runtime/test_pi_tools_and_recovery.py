@@ -18,6 +18,7 @@ from harness_adapter.pi_adapter.adapter import (
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,
+    _cap_details_size,
     _cap_response_text,
 )
 from harness_adapter.pi_adapter.business_tools import (
@@ -279,6 +280,41 @@ def test_tool_response_text_is_capped_to_runner_frame_budget() -> None:
     ]
 
 
+def test_details_are_capped_to_runner_frame_budget() -> None:
+    oversized_entries = [
+        {"path": f"datasets/allenai/tmax/task-data/task_{index:06d}", "size": 1}
+        for index in range(30_000)
+    ]
+    capped = _cap_details_size(
+        {"entries": oversized_entries, "dataset_path": "datasets/allenai/tmax/"}
+    )
+    assert len(capped["entries"]) == 50
+    assert capped["entries_truncated"] == {"shown": 50, "total": 30_000}
+    assert capped["dataset_path"] == "datasets/allenai/tmax/"
+
+    pasted = _cap_details_size({"blob": "x" * 300_000})
+    assert pasted["blob"].endswith(
+        "[output truncated: exceeded the runner frame budget]"
+    )
+
+    def _deep_value(size: int) -> list[dict[str, list[str]]]:
+        return [{"nested": ["y" * size]}]
+
+    irreducible = _cap_details_size(
+        {
+            "entries": _deep_value(150_000),
+            "directory_summary": {"sampled_child_folders": _deep_value(150_000)},
+        }
+    )
+    assert irreducible == {
+        "truncated": True,
+        "keys": ["directory_summary", "entries"],
+    }
+
+    untouched = {"entries": [{"path": "a"}], "n": 1}
+    assert _cap_details_size(untouched) is untouched
+
+
 async def test_pi_host_synthesizes_debug_task_and_persists_only_attempt_budget(
     tmp_path,
 ) -> None:
@@ -346,6 +382,61 @@ async def test_pi_host_synthesizes_debug_task_and_persists_only_attempt_budget(
     assert json.loads(persisted) == {"pyromind_workflow_attempts": 4}
     assert "request-secret" not in persisted
     assert "must_not_persist" not in persisted
+
+
+async def test_facade_registers_session_llm_credentials(tmp_path) -> None:
+    """resolve_llm_env must see the session's own working key, not DF_API_KEY."""
+    repository = Path(pi_adapter_module.__file__).parents[3]
+    host = PyromindBusinessToolHost(
+        [
+            repository / ".agents" / "skills" / "data-processing",
+            repository / ".agents" / "skills" / "training-analysis",
+        ]
+    )
+    seen: dict[str, str | None] = {}
+
+    class FakeAction(BaseModel):
+        pass
+
+    class FakeTool:
+        action_type = FakeAction
+        executor = None
+
+        def __call__(self, _action, facade):
+            registry = facade.state.secret_registry
+            for name in ("LLM_AUTH_TOKEN", "LLM_BASE_URL", "LLM_MODEL"):
+                seen[name] = registry.get_secret_value(name)
+            return SimpleNamespace(
+                is_error=False,
+                to_llm_content=(),
+                details={},
+                model_dump=lambda mode=None, exclude=None: {},
+            )
+
+    host._factories["edp_render"] = cast(Any, lambda _context: FakeTool())
+    monkeypatch_invalid_df_key = "sk-or-v1-should-never-be-used"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("DF_API_KEY", monkeypatch_invalid_df_key)
+        await host.execute(
+            "edp_render",
+            {},
+            ToolExecutionContext(
+                conversation_id="conversation-1",
+                workspace_root=tmp_path,
+                request_context=RequestContext(user_id="42"),
+                model_configuration={
+                    "model": "openai/deepseek-v4-flash-0731",
+                    "api_key": "sk-session-key",
+                    "base_url": "http://208.64.254.189:8000/v1",
+                },
+            ),
+        )
+
+    assert seen == {
+        "LLM_AUTH_TOKEN": "sk-session-key",
+        "LLM_BASE_URL": "http://208.64.254.189:8000/v1",
+        "LLM_MODEL": "openai/deepseek-v4-flash-0731",
+    }
 
 
 def test_model_resolution_rules() -> None:

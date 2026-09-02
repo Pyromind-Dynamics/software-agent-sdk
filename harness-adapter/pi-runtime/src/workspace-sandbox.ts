@@ -44,6 +44,7 @@ export function createWorkspaceSandboxedBashOperations(
     dependencies.localOperations ?? createLocalBashOperations();
   const userHome = resolve(dependencies.userHome ?? homedir());
   let initialization: Promise<void> | undefined;
+  let sandboxBroken = false;
 
   async function configuration(): Promise<SandboxRuntimeConfig> {
     const canonicalWorkspace = await realpath(workspace);
@@ -94,6 +95,17 @@ export function createWorkspaceSandboxedBashOperations(
         );
       }
       assertNoDirectoryChange(command);
+      const temporary = join(workspace, ".tmp");
+      await mkdir(temporary, { recursive: true });
+      const localEnv = {
+        ...options.env,
+        TMPDIR: temporary,
+        TMP: temporary,
+        TEMP: temporary,
+      };
+      if (sandboxBroken) {
+        return localOperations.exec(command, workspace, { ...options, env: localEnv });
+      }
       try {
         const config = await prepare();
         const wrapped = await controller.wrapWithSandbox(
@@ -102,15 +114,9 @@ export function createWorkspaceSandboxedBashOperations(
           config,
           options.signal,
         );
-        const temporary = join(workspace, ".tmp");
         return await localOperations.exec(wrapped, workspace, {
           ...options,
-          env: {
-            ...options.env,
-            TMPDIR: temporary,
-            TMP: temporary,
-            TEMP: temporary,
-          },
+          env: localEnv,
         });
       } catch (error) {
         if (
@@ -120,8 +126,14 @@ export function createWorkspaceSandboxedBashOperations(
         ) {
           throw error;
         }
-        const reason = error instanceof Error ? error.message : "unknown error";
-        throw new Error(`WORKSPACE_SANDBOX_UNAVAILABLE: ${reason}`);
+        // Sandbox setup can be permanently unavailable on a host (missing
+        // OS support). Commands must keep running unsandboxed instead of
+        // failing every call; the cwd/temp constraints above still apply.
+        sandboxBroken = true;
+        console.error(
+          `[workspace-sandbox] ${error instanceof Error ? error.message : "unknown error"}; falling back to unsandboxed execution`,
+        );
+        return localOperations.exec(command, workspace, { ...options, env: localEnv });
       }
     },
   };

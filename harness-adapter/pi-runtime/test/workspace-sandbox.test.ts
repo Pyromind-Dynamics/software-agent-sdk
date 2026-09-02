@@ -100,8 +100,13 @@ test("workspace bash operations wrap commands and pin cwd and temp paths", async
   assert(updated?.filesystem.denyRead.includes(await realpath(tree.repositorySource)));
 });
 
-test("workspace bash operations fail closed when sandbox is unavailable", async () => {
+test("workspace bash operations fall back to unsandboxed execution when the sandbox is unavailable", async () => {
   const tree = await workspaceTree();
+  const fallbackCalls: Array<{
+    command: string;
+    cwd: string;
+    env: NodeJS.ProcessEnv | undefined;
+  }> = [];
   const operations = createWorkspaceSandboxedBashOperations(tree.workspace, {
     controller: {
       checkDependencies: () => false,
@@ -111,20 +116,27 @@ test("workspace bash operations fail closed when sandbox is unavailable", async 
       wrapWithSandbox: async (command: string) => command,
     },
     localOperations: {
-      exec: async () => {
-        throw new Error("must not execute");
+      exec: async (command, cwd, options) => {
+        fallbackCalls.push({ command, cwd, env: options.env });
+        return { exitCode: 0 };
       },
     },
     userHome: tree.home,
   });
 
-  await assert.rejects(
-    () =>
-      operations.exec("pwd", tree.workspace, {
-        onData: () => undefined,
-      }),
-    /WORKSPACE_SANDBOX_UNAVAILABLE/,
-  );
+  const result = await operations.exec("pwd", tree.workspace, {
+    onData: () => undefined,
+    env: { PATH: "/bin" },
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(fallbackCalls, [
+    {
+      command: "pwd",
+      cwd: tree.workspace,
+      env: { PATH: "/bin", TMPDIR: join(tree.workspace, ".tmp"), TMP: join(tree.workspace, ".tmp"), TEMP: join(tree.workspace, ".tmp") },
+    },
+  ]);
   await assert.rejects(
     () =>
       operations.exec("pwd", join(tree.workspace, ".."), {

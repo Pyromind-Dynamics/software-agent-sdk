@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -67,6 +69,12 @@ logger = logging.getLogger(__name__)
 # JSON envelope (details, signals) still fits.
 _MAX_RESPONSE_TEXT_CHARS = 250_000
 _TRUNCATED_SUFFIX = "\n\n[output truncated: exceeded the runner frame budget]"
+# Observation details (e.g. directory entries) are only machine-readable
+# context; cap them well below the frame budget so the full response frame
+# stays deliverable even when a storage listing holds thousands of entries.
+_MAX_DETAILS_BYTES = 200_000
+_MAX_DETAIL_ITEMS = 50
+_MAX_DETAIL_TEXT_CHARS = 20_000
 
 
 def _cap_response_text(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -82,6 +90,30 @@ def _cap_response_text(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
         capped.append({**block, "text": text[:remaining] + _TRUNCATED_SUFFIX})
         remaining = 0
     return capped
+
+
+def _encoded_len(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+
+
+def _cap_details_size(details: dict[str, Any]) -> dict[str, Any]:
+    if _encoded_len(details) <= _MAX_DETAILS_BYTES:
+        return details
+    capped: dict[str, Any] = {}
+    for key, value in details.items():
+        if isinstance(value, list) and len(value) > _MAX_DETAIL_ITEMS:
+            capped[key] = value[:_MAX_DETAIL_ITEMS]
+            capped[f"{key}_truncated"] = {
+                "shown": _MAX_DETAIL_ITEMS,
+                "total": len(value),
+            }
+        elif isinstance(value, str) and len(value) > _MAX_DETAIL_TEXT_CHARS:
+            capped[key] = value[:_MAX_DETAIL_TEXT_CHARS] + _TRUNCATED_SUFFIX
+        else:
+            capped[key] = value
+    if _encoded_len(capped) <= _MAX_DETAILS_BYTES:
+        return capped
+    return {"truncated": True, "keys": sorted(details)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +155,32 @@ class BusinessToolResult:
         }
 
 
+def _llm_credential_secrets(context: ToolExecutionContext) -> dict[str, StaticSecret]:
+    """Expose the session's own LLM config under the canonical edp names.
+
+    ``resolve_llm_env`` checks the session secret registry first and only then
+    falls back to process env (``LLM_AUTH_TOKEN`` -> ``DF_API_KEY`` ->
+    ``ANTHROPIC_AUTH_TOKEN``). Without a registry entry the ``DF_API_KEY``
+    fallback can win with a key that belongs to a different gateway, so seed
+    the registry from the model configuration this conversation already runs
+    on (mirroring the pi runner's own ``_api_key`` fallbacks).
+    """
+    model = context.model_configuration
+    api_key = model.get("api_key")
+    resolved = {
+        "LLM_BASE_URL": model.get("base_url") or os.getenv("LLM_BASE_URL"),
+        "LLM_AUTH_TOKEN": (api_key if isinstance(api_key, str) and api_key else None)
+        or os.getenv("LLM_API_KEY")
+        or os.getenv("OPENAI_API_KEY"),
+        "LLM_MODEL": model.get("model") or os.getenv("LLM_MODEL"),
+    }
+    return {
+        name: StaticSecret(value=SecretStr(value))
+        for name, value in resolved.items()
+        if isinstance(value, str) and value.strip()
+    }
+
+
 class _ToolConversationFacade:
     """The deliberately small OpenHands compatibility boundary used by Pi."""
 
@@ -150,6 +208,7 @@ class _ToolConversationFacade:
             secrets[PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET] = StaticSecret(
                 value=SecretStr(auth_token)
             )
+        secrets.update(_llm_credential_secrets(context))
         registry.secret_sources.update(secrets)
         model = context.model_configuration
         api_key = model.get("api_key")
@@ -324,8 +383,8 @@ class PyromindBusinessToolHost:
             content = _cap_response_text(
                 [block.model_dump(mode="json") for block in observation.to_llm_content]
             )
-            details = observation.model_dump(
-                mode="json", exclude={"content", "is_error"}
+            details = _cap_details_size(
+                observation.model_dump(mode="json", exclude={"content", "is_error"})
             )
             return BusinessToolResult(
                 is_error=bool(observation.is_error),

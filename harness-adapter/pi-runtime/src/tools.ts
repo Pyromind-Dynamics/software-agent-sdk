@@ -159,10 +159,19 @@ function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig): AgentTool
           content.push({ type: "image", data: block.data, mimeType: block.mime_type });
         }
       }
-      if (response.is_error) throw new Error(content.find((block) => block.type === "text")?.text ?? "tool failed");
+      if (response.is_error) throw new Error(toolErrorText(content) || "tool failed");
       return { content, details: isRecord(response.details) ? response.details : undefined };
     },
   };
+}
+
+/** Python error observations put a generic header first and the diagnostic
+ * text in following blocks; dropping any of them blinds the model. */
+export function toolErrorText(blocks: Array<TextContent | ImageContent>): string {
+  return blocks
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("");
 }
 
 export async function safePath(
