@@ -32,6 +32,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -129,6 +130,22 @@ class RunWorkflowCallbackResult:
     task_id: str
     normalized_status: RunWorkflowStatus | None
     conversation_id: str | None
+
+
+_status_dispatcher: Callable[..., Awaitable[RunWorkflowCallbackResult]] | None = None
+
+
+def set_workflow_status_dispatcher(
+    dispatcher: Callable[..., Awaitable[RunWorkflowCallbackResult]] | None,
+) -> None:
+    global _status_dispatcher
+    _status_dispatcher = dispatcher
+
+
+async def dispatch_run_workflow_status(**kwargs) -> RunWorkflowCallbackResult:
+    if _status_dispatcher is not None:
+        return await _status_dispatcher(**kwargs)
+    return await deliver_run_workflow_status(**kwargs)
 
 
 # ---------------------------------------------------------------------------
