@@ -137,8 +137,8 @@ function parseConfig(value: JsonObject): PiSessionConfig {
 
 function terminalBackend(value: JsonObject): PiTerminalBackend {
   const backend = requiredString(value, "terminal_backend");
-  if (backend !== "local" && backend !== "os-sandbox") {
-    throw new Error("invalid terminal_backend; expected local or os-sandbox");
+  if (backend !== "os-sandbox") {
+    throw new Error("invalid terminal_backend; expected os-sandbox");
   }
   return backend;
 }

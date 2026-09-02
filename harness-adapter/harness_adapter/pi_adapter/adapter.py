@@ -72,8 +72,9 @@ PI_CAPABILITIES = HarnessCapabilities(
 _WORKFLOW_PATH = Path("public_data/workflow_canvas/workflow.py")
 _SYSTEM_PROMPT = """You are a coding agent inside one conversation workspace.
 Use read, write, edit, and terminal for workspace operations. Keep generated files
-in this workspace. The terminal already starts at the workspace root (`.`); do not
-run pwd, ls, or cd to locate it. Workspace files use workspace-relative paths.
+under public_data/. Every terminal call starts at the workspace root (`.`). You may
+use cd within one command, but never rely on a directory change from an earlier call.
+Workspace files use public_data/... paths; authorized absolute paths are also accepted.
 Pi advertises skills in <available_skills>; their absolute locations are read-only
 resource addresses, not workspace locations. Read the exact advertised skill path
 and resolve its references against that skill directory, but never derive a workspace
@@ -177,30 +178,37 @@ class PiAdapter:
     async def create_session(
         self, spec: SessionSpec, context: RequestContext
     ) -> SessionHandle:
-        root = Path(spec.workspace_root).resolve()
-        expected = (self._conversation_root / spec.conversation_id).resolve()
+        root = Path(os.path.abspath(spec.workspace_root))
+        expected = self._conversation_root / spec.conversation_id
         if root != expected:
             raise ValueError(
                 "Pi SessionSpec.workspace_root must be the conversation directory"
             )
-        root.mkdir(mode=0o700, parents=True, exist_ok=False)
-        files = PiSessionFiles(root)
-        config = _session_config(spec)
-        files.initialize(config)
-        session = _PiSession(
-            spec.conversation_id,
-            root,
-            files,
-            config,
-            context,
-            model_configuration=dict(spec.model_configuration),
-            extra=dict(spec.extra),
-        )
-        await self._register(session)
+        session: _PiSession | None = None
         try:
-            await self._start_runner(session, _api_key(spec.model_configuration))
+            _prepare_workspace(root, create=True)
+            _prepare_pi_runtime_directories(root)
+            files = PiSessionFiles(root)
+            config = _session_config(spec)
+            files.initialize(config)
+            session = _PiSession(
+                spec.conversation_id,
+                root,
+                files,
+                config,
+                context,
+                model_configuration=dict(spec.model_configuration),
+                extra=dict(spec.extra),
+            )
+            await self._register(session)
+            workflow_event_id = None
             if spec.workflow_xyflow is not None:
-                await self._sync_xyflow(session, dict(spec.workflow_xyflow))
+                workflow_event_id = await self._stage_xyflow(
+                    session, dict(spec.workflow_xyflow)
+                )
+            await self._start_runner(session, _api_key(spec.model_configuration))
+            if workflow_event_id is not None:
+                await self._append_workflow_context(session, workflow_event_id)
             session.queue.put_nowait(_history_synced(session.session_id))
             if spec.initial_message:
                 await self._prompt(
@@ -208,7 +216,17 @@ class PiAdapter:
                 )
             return self._handle(session.session_id)
         except Exception:
-            await self._remove(session.session_id)
+            if session is not None:
+                await self._remove(session.session_id)
+                if session.runner is not None:
+                    try:
+                        await session.runner.close()
+                    finally:
+                        _remove_created_workspace(root, self._conversation_root)
+                else:
+                    _remove_created_workspace(root, self._conversation_root)
+            else:
+                _remove_created_workspace(root, self._conversation_root)
             raise
 
     async def attach_session(
@@ -219,6 +237,8 @@ class PiAdapter:
             existing.context = context
             return self._handle(conversation_id)
         root = self._safe_conversation_dir(conversation_id)
+        _prepare_workspace(root, create=False)
+        _prepare_pi_runtime_directories(root)
         files = PiSessionFiles(root)
         config = files.load_session()
         files.ensure_session_log()
@@ -240,6 +260,8 @@ class PiAdapter:
             return self._handle(conversation_id)
         except Exception:
             await self._remove(conversation_id)
+            if session.runner is not None:
+                await session.runner.close()
             raise
 
     async def send(
@@ -308,53 +330,65 @@ class PiAdapter:
         target_root = (self._conversation_root / spec.target_conversation_id).resolve()
         if target_root.parent != self._conversation_root:
             raise ValueError("unsafe Pi fork target")
-        _copy_workspace_for_fork(source.workspace_root, target_root)
-        target_workflow = target_root / _WORKFLOW_PATH
-        checkpoint_dsl = checkpoint.workflow.dsl
-        if checkpoint_dsl.strip():
-            _atomic_text(target_workflow, checkpoint_dsl)
-        else:
-            target_workflow.unlink(missing_ok=True)
-        target_files = PiSessionFiles(target_root)
-        target_config = {
-            **source.config,
-            "session_id": spec.target_conversation_id,
-        }
-        target_files.initialize(target_config)
-        await self._ensure_runner(source)
-        assert source.runner is not None
-        branch = await source.runner.request(
-            "fork",
-            {
-                "leaf_id": leaf_id,
-                "target_session_dir": str(target_files.directory),
-                "target_cwd": str(target_root),
-            },
-        )
-        if not isinstance(branch, dict) or not isinstance(
-            branch.get("session_path"), str
-        ):
-            raise RuntimeError("Pi runner did not return a branched session")
-        generated = Path(branch["session_path"]).resolve()
-        if generated.parent != target_files.directory.resolve():
-            raise ValueError("Pi runner returned an unsafe session path")
-        os.replace(generated, target_files.session_log_path)
-        target = _PiSession(
-            spec.target_conversation_id,
-            target_root,
-            target_files,
-            target_config,
-            context,
-            model_configuration=dict(source.model_configuration),
-            extra=dict(source.extra),
-        )
-        await self._register(target)
+        _copy_public_data_for_fork(source.workspace_root, target_root)
+        target: _PiSession | None = None
         try:
+            target_workflow = target_root / _WORKFLOW_PATH
+            checkpoint_dsl = checkpoint.workflow.dsl
+            if checkpoint_dsl.strip():
+                _atomic_text(target_workflow, checkpoint_dsl)
+            else:
+                target_workflow.unlink(missing_ok=True)
+            _prepare_pi_runtime_directories(target_root)
+            target_files = PiSessionFiles(target_root)
+            target_config = {
+                **source.config,
+                "session_id": spec.target_conversation_id,
+            }
+            target_files.initialize(target_config)
+            await self._ensure_runner(source)
+            assert source.runner is not None
+            branch = await source.runner.request(
+                "fork",
+                {
+                    "leaf_id": leaf_id,
+                    "target_session_dir": str(target_files.directory),
+                    "target_cwd": str(target_root),
+                },
+            )
+            if not isinstance(branch, dict) or not isinstance(
+                branch.get("session_path"), str
+            ):
+                raise RuntimeError("Pi runner did not return a branched session")
+            generated = Path(branch["session_path"]).resolve()
+            if generated.parent != target_files.directory.resolve():
+                raise ValueError("Pi runner returned an unsafe session path")
+            os.replace(generated, target_files.session_log_path)
+            target = _PiSession(
+                spec.target_conversation_id,
+                target_root,
+                target_files,
+                target_config,
+                context,
+                model_configuration=dict(source.model_configuration),
+                extra=dict(source.extra),
+            )
+            await self._register(target)
             await self._start_runner(target, _api_key(source.model_configuration))
             target.queue.put_nowait(_history_synced(target.session_id))
             return self._handle(target.session_id)
         except Exception:
-            await self._remove(target.session_id)
+            if target is not None:
+                await self._remove(target.session_id)
+                if target.runner is not None:
+                    try:
+                        await target.runner.close()
+                    finally:
+                        _remove_created_workspace(target_root, self._conversation_root)
+                else:
+                    _remove_created_workspace(target_root, self._conversation_root)
+            else:
+                _remove_created_workspace(target_root, self._conversation_root)
             raise
 
     async def restore_workflow(
@@ -365,6 +399,7 @@ class PiAdapter:
     ) -> RestoreWorkflowResult:
         session = self._session(handle.session_id)
         session.context = context
+        _prepare_workspace(session.workspace_root, create=False)
         path = session.workspace_root / _WORKFLOW_PATH
         dsl = spec.checkpoint.workflow.dsl
         if dsl.strip():
@@ -474,6 +509,10 @@ class PiAdapter:
         if not conversation_id or "/" in conversation_id or "\\" in conversation_id:
             raise ValueError("unsafe conversation id")
         root = self._conversation_root / conversation_id
+        if root.is_symlink():
+            raise RuntimeError(
+                "PI_WORKSPACE_INVALID: conversation root must not be a symbolic link"
+            )
         if not root.is_dir():
             raise FileNotFoundError(f"Pi conversation not found: {conversation_id}")
         return root
@@ -840,11 +879,21 @@ class PiAdapter:
         session.files.clear_inflight()
 
     async def _sync_xyflow(self, session: _PiSession, xyflow: dict[str, Any]) -> None:
+        event_id = await self._stage_xyflow(session, xyflow)
+        await self._ensure_runner(session)
+        await self._append_workflow_context(session, event_id)
+
+    async def _stage_xyflow(self, session: _PiSession, xyflow: dict[str, Any]) -> str:
+        _prepare_workspace(session.workspace_root, create=False)
         dsl = await asyncio.to_thread(convert_xyflow_to_dsl, xyflow)
         _atomic_text(session.workspace_root / _WORKFLOW_PATH, dsl)
         event_id = uuid4().hex
         await self._emit_workflow(session, event_id, canvas=xyflow)
-        await self._ensure_runner(session)
+        return event_id
+
+    async def _append_workflow_context(
+        self, session: _PiSession, event_id: str
+    ) -> None:
         assert session.runner is not None
         checkpoint = await session.runner.request(
             "context.append",
@@ -1108,30 +1157,94 @@ def _atomic_text(path: Path, value: str) -> None:
         raise
 
 
-def _copy_workspace_for_fork(source: Path, target: Path) -> None:
+def _prepare_workspace(root: Path, *, create: bool) -> Path:
+    if create:
+        root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError(
+            f"PI_WORKSPACE_INVALID: conversation root must be a real directory: {root}"
+        )
+    canonical_root = root.resolve(strict=True)
+    if canonical_root != root:
+        raise RuntimeError(
+            f"PI_WORKSPACE_INVALID: conversation root resolves outside itself: {root}"
+        )
+    root.chmod(0o700)
+
+    public_data = root / "public_data"
+    if public_data.is_symlink():
+        raise RuntimeError(
+            "PI_WORKSPACE_INVALID: public_data must not be a symbolic link"
+        )
+    try:
+        public_data.mkdir(mode=0o700, exist_ok=True)
+    except FileExistsError as exc:
+        raise RuntimeError(
+            "PI_WORKSPACE_INVALID: public_data must be a directory"
+        ) from exc
+    if not public_data.is_dir() or public_data.resolve(strict=True).parent != root:
+        raise RuntimeError(
+            "PI_WORKSPACE_INVALID: public_data must stay inside the conversation root"
+        )
+    public_data.chmod(0o700)
+    return public_data
+
+
+def _prepare_pi_runtime_directories(root: Path) -> None:
+    pi_directory = root / "pi"
+    if pi_directory.is_symlink():
+        raise RuntimeError("PI_WORKSPACE_INVALID: pi must not be a symbolic link")
+    try:
+        pi_directory.mkdir(mode=0o700, exist_ok=True)
+    except FileExistsError as exc:
+        raise RuntimeError("PI_WORKSPACE_INVALID: pi must be a directory") from exc
+    if not pi_directory.is_dir() or pi_directory.resolve(strict=True).parent != root:
+        raise RuntimeError(
+            "PI_WORKSPACE_INVALID: pi must stay inside the conversation root"
+        )
+    pi_directory.chmod(0o700)
+
+    terminal_output = pi_directory / "terminal-output"
+    if terminal_output.is_symlink():
+        raise RuntimeError(
+            "PI_WORKSPACE_INVALID: terminal-output must not be a symbolic link"
+        )
+    try:
+        terminal_output.mkdir(mode=0o700, exist_ok=True)
+    except FileExistsError as exc:
+        raise RuntimeError(
+            "PI_WORKSPACE_INVALID: terminal-output must be a directory"
+        ) from exc
+    if (
+        not terminal_output.is_dir()
+        or terminal_output.resolve(strict=True).parent != pi_directory
+    ):
+        raise RuntimeError("PI_WORKSPACE_INVALID: terminal-output must stay inside pi")
+    terminal_output.chmod(0o700)
+
+
+def _copy_public_data_for_fork(source: Path, target: Path) -> None:
     if target.exists():
         raise FileExistsError(f"Pi fork target already exists: {target.name}")
-    target.mkdir(mode=0o700, parents=False)
-    excluded_roots = {"product", "pi"}
-    sensitive_names = {".env", ".env.local", "credentials.json", "secrets.json"}
-
-    def copy_directory(source_dir: Path, target_dir: Path, *, root: bool) -> None:
-        for item in source_dir.iterdir():
-            if item.is_symlink():
-                continue
-            if root and item.name in excluded_roots:
-                continue
-            if item.name.lower() in sensitive_names:
-                continue
-            destination = target_dir / item.name
-            if item.is_dir():
-                destination.mkdir(mode=0o700)
-                copy_directory(item, destination, root=False)
-            elif item.is_file():
-                shutil.copy2(item, destination, follow_symlinks=False)
-
+    source_public = _prepare_workspace(source, create=False)
     try:
-        copy_directory(source, target, root=True)
+        _prepare_workspace(target, create=True)
+        shutil.copytree(
+            source_public,
+            target / "public_data",
+            dirs_exist_ok=True,
+            symlinks=False,
+            ignore=lambda directory, names: [
+                name for name in names if (Path(directory) / name).is_symlink()
+            ],
+        )
     except Exception:
-        shutil.rmtree(target)
+        if target.exists() and not target.is_symlink():
+            shutil.rmtree(target)
         raise
+
+
+def _remove_created_workspace(root: Path, conversation_root: Path) -> None:
+    if root.parent != conversation_root or root.is_symlink() or not root.exists():
+        return
+    shutil.rmtree(root)

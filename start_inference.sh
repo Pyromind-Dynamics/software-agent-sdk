@@ -18,7 +18,28 @@ export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 
 export PYROMIND_HARNESS_BACKEND="pi"
 export APP_ENV="${APP_ENV:-dev}"
-export PYROMIND_PI_TERMINAL_BACKEND="local"
+export PYROMIND_PI_TERMINAL_BACKEND="os-sandbox"
+
+case "$(uname -s)" in
+  Darwin)
+    if [[ ! -x /usr/bin/sandbox-exec ]]; then
+      echo "ERROR: Pi os-sandbox requires /usr/bin/sandbox-exec on macOS." >&2
+      exit 1
+    fi
+    ;;
+  Linux)
+    for sandbox_dependency in rg bwrap socat; do
+      if ! command -v "${sandbox_dependency}" >/dev/null 2>&1; then
+        echo "ERROR: Pi os-sandbox requires ${sandbox_dependency} on Linux." >&2
+        exit 1
+      fi
+    done
+    ;;
+  *)
+    echo "ERROR: Pi os-sandbox supports only Linux and macOS." >&2
+    exit 1
+    ;;
+esac
 
 # ----------------------------------------------------------
 # LLM Configuration

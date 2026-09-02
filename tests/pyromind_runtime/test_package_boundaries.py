@@ -37,13 +37,11 @@ def test_pyromind_start_scripts_use_composed_server_entrypoint() -> None:
         assert "python -m openhands.agent_server" not in script
 
 
-def test_inference_start_uses_local_pi_terminal_without_sandbox_dependencies() -> None:
+def test_inference_start_requires_os_sandbox_for_pi_terminal() -> None:
     script = (ROOT / "start_inference.sh").read_text(encoding="utf-8")
 
     assert 'export APP_ENV="${APP_ENV:-dev}"' in script
-    assert 'export PYROMIND_PI_TERMINAL_BACKEND="local"' in script
-    assert "check_workspace_sandbox_dependencies" not in script
-    assert "required_commands=(rg" not in script
+    assert 'export PYROMIND_PI_TERMINAL_BACKEND="os-sandbox"' in script
 
 
 def test_pre_deployment_uses_os_sandbox_for_pi_terminal() -> None:
@@ -68,6 +66,13 @@ def test_product_image_defaults_to_os_sandbox_for_pi_terminal() -> None:
     ]
 
     assert "ENV PYROMIND_PI_TERMINAL_BACKEND=os-sandbox" in product_stage
+
+
+def test_local_startup_checks_platform_specific_sandbox_dependencies() -> None:
+    script = (ROOT / "start_inference.sh").read_text(encoding="utf-8")
+
+    assert "[[ ! -x /usr/bin/sandbox-exec ]]" in script
+    assert "for sandbox_dependency in rg bwrap socat" in script
 
 
 def test_pi_sandbox_initializes_before_using_conversation_temp_path() -> None:

@@ -1,85 +1,146 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { safePath } from "../src/tools.js";
 
-test("safePath resolves workspace, skill, and knowledge paths by scope", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-tools-"));
+async function workspaceLayout(prefix = "pi-tools-") {
+  const root = await mkdtemp(join(tmpdir(), prefix));
   const workspace = join(root, "conversation");
   const skill = join(root, "skill");
   const knowledge = join(root, "knowledge");
-  await mkdir(workspace);
+  await mkdir(join(workspace, "public_data"), { recursive: true });
+  await mkdir(join(workspace, "pi", "terminal-output"), { recursive: true });
   await mkdir(join(skill, "references"), { recursive: true });
   await mkdir(join(knowledge, "nodes", "InputNode"), { recursive: true });
   await writeFile(join(skill, "SKILL.md"), "skill");
   await writeFile(join(skill, "references", "workflow-contracts.md"), "contracts");
   await writeFile(join(knowledge, "nodes", "InputNode", "InputNode.md"), "node");
+  const canonicalRoot = await realpath(root);
+  return {
+    root: canonicalRoot,
+    workspace: join(canonicalRoot, "conversation"),
+    skill: join(canonicalRoot, "skill"),
+    knowledge: join(canonicalRoot, "knowledge"),
+  };
+}
+
+test("safePath resolves relative, absolute, normalized, and missing public paths", async () => {
+  const { workspace, skill, knowledge } = await workspaceLayout();
+  const workflow = join(workspace, "public_data", "workflow.py");
 
   assert.equal(
     await safePath("public_data/workflow.py", workspace, skill, knowledge, false),
-    join(workspace, "public_data/workflow.py"),
+    workflow,
+  );
+  assert.equal(
+    await safePath(workflow, workspace, skill, knowledge, false),
+    workflow,
+  );
+  assert.equal(
+    await safePath(
+      "public_data/generated/../workflow.py",
+      workspace,
+      skill,
+      knowledge,
+      true,
+    ),
+    workflow,
+  );
+  assert.equal(
+    await safePath(
+      "public_data/new/nested/output.jsonl",
+      workspace,
+      skill,
+      knowledge,
+      false,
+    ),
+    join(workspace, "public_data", "new", "nested", "output.jsonl"),
   );
   assert.equal(
     await safePath(join(skill, "SKILL.md"), workspace, skill, knowledge, true),
     join(skill, "SKILL.md"),
   );
   assert.equal(
-    await safePath("knowledge/nodes/InputNode/InputNode.md", workspace, skill, knowledge, true),
+    await safePath(
+      "knowledge/nodes/InputNode/InputNode.md",
+      workspace,
+      skill,
+      knowledge,
+      true,
+    ),
     join(knowledge, "nodes", "InputNode", "InputNode.md"),
   );
-  assert.equal(
-    await safePath(join(knowledge, "nodes", "InputNode", "InputNode.md"), workspace, skill, knowledge, true),
-    join(knowledge, "nodes", "InputNode", "InputNode.md"),
+});
+
+test("safePath denies private, read-only, and out-of-scope paths", async () => {
+  const { root, workspace, skill, knowledge } = await workspaceLayout();
+  await assert.rejects(
+    () => safePath("pi/session.jsonl", workspace, skill, knowledge, true),
+    /PATH_SCOPE_ERROR/,
   );
   await assert.rejects(
-    () => safePath(join(workspace, "public_data/workflow.py"), workspace, skill, knowledge, true),
-    /use public_data\/workflow\.py/,
+    () => safePath("product/snapshot.json", workspace, skill, knowledge, true),
+    /PATH_SCOPE_ERROR/,
   );
   await assert.rejects(
-    () => safePath(join(skill, "references", "workflow-contracts.md"), workspace, skill, knowledge, false),
-    /read-only/,
+    () => safePath(join(skill, "SKILL.md"), workspace, skill, knowledge, false),
+    /public_data/,
   );
   await assert.rejects(
     () => safePath("knowledge/nodes/InputNode/InputNode.md", workspace, skill, knowledge, false),
-    /knowledge is read-only/,
+    /public_data/,
   );
   await assert.rejects(
     () => safePath(join(root, "unknown.md"), workspace, skill, knowledge, true),
     /PATH_SCOPE_ERROR/,
   );
   await assert.rejects(
-    () => safePath("knowledge/nodes/InputNode/InputNode.md", workspace, skill, undefined, true),
-    /knowledge\/ is not configured/,
+    () => safePath("../escape", workspace, skill, knowledge, false),
+    /PATH_SCOPE_ERROR/,
   );
   await assert.rejects(
-    () => safePath("../escape", workspace, skill, knowledge, false),
-    /unsafe path/,
+    () => safePath("knowledge/file.md", workspace, skill, undefined, true),
+    /knowledge\/ is not configured/,
   );
 });
 
-test("safePath rejects symlink escape", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-tools-"));
-  const workspace = join(root, "conversation");
-  const skill = join(root, "skill");
-  const knowledge = join(root, "knowledge");
-  await mkdir(workspace);
-  await mkdir(skill);
-  await mkdir(knowledge);
-  await symlink(skill, join(workspace, "linked"));
+test("safePath permits contained symlinks and rejects canonical escapes", async () => {
+  const { root, workspace, skill, knowledge } = await workspaceLayout();
+  const contained = join(workspace, "public_data", "contained");
+  const outside = join(root, "outside");
+  await mkdir(contained);
+  await mkdir(outside);
+  await symlink(contained, join(workspace, "public_data", "inside-link"));
+  await symlink(outside, join(workspace, "public_data", "escape-link"));
+
+  assert.equal(
+    await safePath(
+      "public_data/inside-link/new.txt",
+      workspace,
+      skill,
+      knowledge,
+      false,
+    ),
+    join(contained, "new.txt"),
+  );
   await assert.rejects(
-    () => safePath("linked/SKILL.md", workspace, skill, knowledge, true),
-    /symlink/,
+    () => safePath(
+      "public_data/escape-link/new.txt",
+      workspace,
+      skill,
+      knowledge,
+      false,
+    ),
+    /PATH_SCOPE_ERROR/,
   );
 });
 
 test("safePath accepts each named skill root but keeps them read-only", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-tools-skills-"));
-  const workspace = join(root, "conversation");
+  const { root, workspace } = await workspaceLayout("pi-tools-skills-");
   const cleaning = join(root, "data-cleaning");
   const preparation = join(root, "data-preparation");
-  await mkdir(workspace);
   await mkdir(cleaning);
   await mkdir(preparation);
   await writeFile(join(cleaning, "SKILL.md"), "cleaning");
@@ -94,6 +155,6 @@ test("safePath accepts each named skill root but keeps them read-only", async ()
   );
   await assert.rejects(
     () => safePath(join(cleaning, "SKILL.md"), workspace, skills, undefined, false),
-    /read-only/,
+    /public_data/,
   );
 });

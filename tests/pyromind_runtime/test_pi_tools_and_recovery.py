@@ -130,6 +130,14 @@ def test_terminal_only_confirms_high_risk_commands() -> None:
     assert policy.requires_confirmation("danger", {"command": "rm -rf /tmp/example"})
 
 
+def test_pi_terminal_backend_requires_os_sandbox(monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("PYROMIND_PI_TERMINAL_BACKEND", "os-sandbox")
+    assert resolve_pi_terminal_backend() == "os-sandbox"
+    with pytest.raises(RuntimeError, match="expected one of: os-sandbox"):
+        resolve_pi_terminal_backend(terminal_backend="local")
+
+
 def test_session_metadata_is_non_secret_and_uses_pi_jsonl(tmp_path) -> None:
     files = PiSessionFiles(tmp_path)
     files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
@@ -146,12 +154,12 @@ def test_adapter_resolves_available_knowledge_root(tmp_path, monkeypatch) -> Non
     explicit = tmp_path / "knowledge"
     explicit.mkdir()
     assert PiAdapter(
-        tmp_path / "explicit", terminal_backend="local", knowledge_root=explicit
+        tmp_path / "explicit", terminal_backend="os-sandbox", knowledge_root=explicit
     )._knowledge_root == (explicit.resolve())
     assert (
         PiAdapter(
             tmp_path / "missing-adapter",
-            terminal_backend="local",
+            terminal_backend="os-sandbox",
             knowledge_root=tmp_path / "missing-knowledge",
         )._knowledge_root
         is None
@@ -159,7 +167,7 @@ def test_adapter_resolves_available_knowledge_root(tmp_path, monkeypatch) -> Non
 
     repository = Path(pi_adapter_module.__file__).parents[3]
     assert (
-        PiAdapter(tmp_path / "default", terminal_backend="local")._knowledge_root
+        PiAdapter(tmp_path / "default", terminal_backend="os-sandbox")._knowledge_root
         == (repository / "knowledge").resolve()
     )
 
@@ -176,7 +184,7 @@ def test_adapter_resolves_skill_roots_from_env(tmp_path, monkeypatch) -> None:
     for name in names:
         (skills / name).mkdir(parents=True)
     monkeypatch.setenv("PYROMIND_SKILLS_PATH", str(skills))
-    adapter = PiAdapter(tmp_path / "conversations", terminal_backend="local")
+    adapter = PiAdapter(tmp_path / "conversations", terminal_backend="os-sandbox")
     assert adapter._skill_roots == [skills.resolve() / name for name in names]
 
 
@@ -190,6 +198,9 @@ async def test_runner_start_receives_configured_knowledge_root(
             self.running = True
 
         async def start(self, config) -> None:
+            workspace = Path(config["workspace_root"])
+            assert (workspace / "public_data").is_dir()
+            assert (workspace / "pi" / "terminal-output").is_dir()
             captured.update(config)
 
         async def close(self) -> None:
@@ -201,7 +212,7 @@ async def test_runner_start_receives_configured_knowledge_root(
     knowledge = tmp_path / "knowledge"
     knowledge.mkdir()
     adapter = PiAdapter(
-        conversations, terminal_backend="local", knowledge_root=knowledge
+        conversations, terminal_backend="os-sandbox", knowledge_root=knowledge
     )
     handle = await adapter.create_session(
         SessionSpec(
@@ -216,6 +227,168 @@ async def test_runner_start_receives_configured_knowledge_root(
         assert captured["knowledge_root"] == str(knowledge.resolve())
     finally:
         await adapter.close(handle)
+
+
+async def test_create_stages_public_data_and_workflow_before_runner(
+    tmp_path, monkeypatch
+) -> None:
+    expected_dsl = "workflow = InputNode()"
+
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, config) -> None:
+            workflow = (
+                Path(config["workspace_root"])
+                / "public_data"
+                / "workflow_canvas"
+                / "workflow.py"
+            )
+            assert workflow.read_text(encoding="utf-8") == expected_dsl
+
+        async def request(self, method, _params):
+            assert method == "context.append"
+            return {"checkpoint_entry_id": "initial-workflow"}
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    monkeypatch.setattr(
+        pi_adapter_module, "convert_xyflow_to_dsl", lambda _canvas: expected_dsl
+    )
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="workflow-first",
+            user_id="42",
+            workspace_root=str(conversations / "workflow-first"),
+            workflow_xyflow={"nodes": [], "edges": []},
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    try:
+        root = conversations / "workflow-first"
+        assert (root / "public_data").is_dir()
+        assert (root / "pi" / "terminal-output").is_dir()
+    finally:
+        await adapter.close(handle)
+
+
+async def test_create_failure_removes_only_new_workspace(tmp_path, monkeypatch) -> None:
+    class FailingRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, _config) -> None:
+            raise RuntimeError("sandbox unavailable")
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FailingRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+
+    with pytest.raises(RuntimeError, match="sandbox unavailable"):
+        await adapter.create_session(
+            SessionSpec(
+                conversation_id="failed-create",
+                user_id="42",
+                workspace_root=str(conversations / "failed-create"),
+                model_configuration={"model": "gpt-5", "api_key": "test-key"},
+            ),
+            RequestContext(user_id="42"),
+        )
+
+    assert not (conversations / "failed-create").exists()
+
+
+async def test_attach_repairs_missing_public_data_before_runner(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, config) -> None:
+            assert (Path(config["workspace_root"]) / "public_data").is_dir()
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    conversations = tmp_path / "conversations"
+    root = conversations / "attach-source"
+    root.mkdir(parents=True)
+    PiSessionFiles(root).initialize(
+        {
+            "session_id": "attach-source",
+            "model": {"provider": "openai", "id": "gpt-5"},
+        }
+    )
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.attach_session("attach-source", RequestContext(user_id="42"))
+    try:
+        assert (root / "public_data").is_dir()
+    finally:
+        await adapter.close(handle)
+
+
+async def test_attach_rejects_symlinked_public_data(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    root = conversations / "unsafe-attach"
+    outside = tmp_path / "outside"
+    root.mkdir(parents=True)
+    outside.mkdir()
+    (root / "public_data").symlink_to(outside, target_is_directory=True)
+    PiSessionFiles(root).initialize(
+        {
+            "session_id": "unsafe-attach",
+            "model": {"provider": "openai", "id": "gpt-5"},
+        }
+    )
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+
+    with pytest.raises(RuntimeError, match="public_data must not be a symbolic link"):
+        await adapter.attach_session("unsafe-attach", RequestContext(user_id="42"))
+
+
+async def test_attach_rejects_symlinked_conversation_root(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    outside = tmp_path / "outside-conversation"
+    conversations.mkdir()
+    outside.mkdir()
+    (conversations / "unsafe-root").symlink_to(outside, target_is_directory=True)
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+
+    with pytest.raises(RuntimeError, match="conversation root must not be"):
+        await adapter.attach_session("unsafe-root", RequestContext(user_id="42"))
+
+
+async def test_attach_rejects_symlinked_pi_before_loading_state(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    root = conversations / "unsafe-pi"
+    outside = tmp_path / "outside-pi"
+    root.mkdir(parents=True)
+    (root / "public_data").mkdir()
+    outside.mkdir()
+    (outside / "session.json").write_text(
+        '{"session_id":"unsafe-pi","model":{"provider":"openai","id":"gpt-5"}}',
+        encoding="utf-8",
+    )
+    (outside / "session.jsonl").write_text("", encoding="utf-8")
+    (root / "pi").symlink_to(outside, target_is_directory=True)
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+
+    with pytest.raises(RuntimeError, match="pi must not be a symbolic link"):
+        await adapter.attach_session("unsafe-pi", RequestContext(user_id="42"))
 
 
 async def test_runner_loads_five_named_skills_and_eleven_business_tools(
@@ -236,7 +409,7 @@ async def test_runner_loads_five_named_skills_and_eleven_business_tools(
     monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
     conversations = tmp_path / "conversations"
     conversations.mkdir()
-    adapter = PiAdapter(conversations, terminal_backend="local")
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
     handle = await adapter.create_session(
         SessionSpec(
             conversation_id="conversation-skills",
@@ -507,7 +680,7 @@ def test_pyromind_llm_config_rejects_invalid_context_window() -> None:
 
 
 async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
-    adapter = PiAdapter(tmp_path, terminal_backend="local")
+    adapter = PiAdapter(tmp_path, terminal_backend="os-sandbox")
     files = PiSessionFiles(tmp_path / "conversation-1")
     files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
     session = SimpleNamespace(
@@ -538,7 +711,7 @@ async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
 async def test_adapter_projects_generic_write_completion_to_workflow(
     tmp_path, monkeypatch
 ) -> None:
-    adapter = PiAdapter(tmp_path, terminal_backend="local")
+    adapter = PiAdapter(tmp_path, terminal_backend="os-sandbox")
     workspace = tmp_path / "conversation-1"
     files = PiSessionFiles(workspace)
     files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
@@ -589,10 +762,23 @@ async def test_adapter_projects_generic_write_completion_to_workflow(
     )
 
 
-async def test_real_runner_starts_without_persisting_request_api_key(tmp_path) -> None:
+async def test_runner_start_does_not_persist_request_api_key(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, _config) -> None:
+            return None
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
     conversations = tmp_path / "conversations"
     conversations.mkdir()
-    adapter = PiAdapter(conversations, terminal_backend="local")
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
     handle = await adapter.create_session(
         SessionSpec(
             conversation_id="conversation-1",
@@ -636,7 +822,7 @@ async def test_pi_adapter_forks_native_session_and_sanitizes_workspace(
     monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
     conversations = tmp_path / "conversations"
     conversations.mkdir()
-    adapter = PiAdapter(conversations, terminal_backend="local")
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
     context = RequestContext(user_id="42")
     source_handle = await adapter.create_session(
         SessionSpec(
@@ -648,7 +834,6 @@ async def test_pi_adapter_forks_native_session_and_sanitizes_workspace(
         context,
     )
     source = conversations / "source"
-    (source / "public_data").mkdir()
     (source / "public_data" / "artifact.txt").write_text("safe", encoding="utf-8")
     current_workflow = source / "public_data" / "workflow_canvas" / "workflow.py"
     current_workflow.parent.mkdir()
@@ -656,6 +841,7 @@ async def test_pi_adapter_forks_native_session_and_sanitizes_workspace(
     (source / "product").mkdir()
     (source / "product" / "snapshot.json").write_text("private", encoding="utf-8")
     (source / ".env").write_text("TOKEN=secret", encoding="utf-8")
+    (source / "public_data" / "secret-link").symlink_to(source / ".env")
     PiSessionFiles(source).save_checkpoint_index({"workflow-v1": "leaf-1"})
     checkpoint = ProductCheckpoint(
         event_id="workflow-v1",
@@ -687,6 +873,7 @@ async def test_pi_adapter_forks_native_session_and_sanitizes_workspace(
     )
     assert not (target / "product").exists()
     assert not (target / ".env").exists()
+    assert not (target / "public_data" / "secret-link").exists()
     assert (target / "pi" / "session.jsonl").is_file()
     assert "request-secret" not in (target / "pi" / "session.json").read_text()
     await adapter.close(target_handle)
@@ -715,7 +902,7 @@ async def test_pi_adapter_restores_workflow_and_resets_debug_budget(
     monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
     conversations = tmp_path / "conversations"
     conversations.mkdir()
-    adapter = PiAdapter(conversations, terminal_backend="local")
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
     context = RequestContext(user_id="42")
     handle = await adapter.create_session(
         SessionSpec(

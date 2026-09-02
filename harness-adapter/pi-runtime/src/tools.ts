@@ -1,6 +1,3 @@
-import { lstat } from "node:fs/promises";
-import { mkdirSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   createEditTool,
   createReadTool,
@@ -21,6 +18,10 @@ import {
   createWorkspaceBashOperations,
   type PiTerminalBackend,
 } from "./workspace-sandbox.js";
+import {
+  WorkspaceAccessPolicy,
+  type WorkspacePathOperation,
+} from "./workspace-policy.js";
 
 export interface BusinessToolConfig {
   name: string;
@@ -42,18 +43,18 @@ export async function createTools(
   knowledgeRoot: string | undefined,
   businessTools: BusinessToolConfig[],
 ): Promise<AgentTool[]> {
-  const terminalOutputTemp = join(
-    resolve(workspaceRoot),
-    "pi",
-    "terminal-output",
-  );
-  mkdirSync(terminalOutputTemp, { recursive: true, mode: 0o700 });
+  const policy = await WorkspaceAccessPolicy.create({
+    workspaceRoot,
+    readOnlyRoots: skillRoots.map((root) => root.path),
+    knowledgeRoot,
+  });
+  const terminalOutputTemp = policy.terminalTempRoot;
   const read = createReadTool();
   const write = createWriteTool();
   const edit = createEditTool();
   const terminalOperations = await createWorkspaceBashOperations(
     terminalBackend,
-    workspaceRoot,
+    policy,
   );
   // sandbox-runtime creates Linux bridge sockets under os.tmpdir(). Initialize
   // it before pointing process temp variables at the conversation's much longer
@@ -71,9 +72,9 @@ export async function createTools(
     }),
   });
   return [
-    bindPathTool(read, env, workspaceRoot, skillRoots, knowledgeRoot, true),
-    bindPathTool(write, env, workspaceRoot, skillRoots, knowledgeRoot, false),
-    bindPathTool(edit, env, workspaceRoot, skillRoots, knowledgeRoot, false),
+    bindPathTool(read, env, policy, "read"),
+    bindPathTool(write, env, policy, "write"),
+    bindPathTool(edit, env, policy, "write"),
     {
       ...bash,
       name: "terminal",
@@ -121,15 +122,13 @@ function bindNative(
 function bindPathTool(
   tool: AgentHarnessTool<ExecutionToolContext, any, any>,
   env: ExecutionEnv,
-  workspaceRoot: string,
-  skillRoots: SkillRootConfig[],
-  knowledgeRoot: string | undefined,
-  allowReadOnlyResources: boolean,
+  policy: WorkspaceAccessPolicy,
+  operation: WorkspacePathOperation,
 ): AgentTool<any, any> {
   const bound = bindNative(tool, env);
-  const pathScope = allowReadOnlyResources
-    ? "Workspace files must use paths relative to the conversation root (for example public_data/file.py). Use an absolute path only when it is the exact location of an advertised skill; never derive a workspace path from a skill location."
-    : "Paths must be relative to the conversation root (for example public_data/file.py). Skill and knowledge files are read-only.";
+  const pathScope = operation === "read"
+    ? "Conversation files are read from public_data/. Advertised skill paths and knowledge/ are read-only. Relative paths start at the conversation root; authorized absolute paths are also accepted."
+    : "Write and edit paths must stay within public_data/. Relative paths start at the conversation root; authorized absolute paths are also accepted.";
   const parameters = structuredClone(bound.parameters);
   if (isRecord(parameters.properties) && isRecord(parameters.properties.path)) {
     parameters.properties.path.description = pathScope;
@@ -142,13 +141,7 @@ function bindPathTool(
       if (!isRecord(params) || typeof params.path !== "string") throw new Error("path must be a string");
       const safe = {
         ...params,
-        path: await safePath(
-          params.path,
-          workspaceRoot,
-          skillRoots,
-          knowledgeRoot,
-          allowReadOnlyResources,
-        ),
+        path: await policy.resolvePath(params.path, operation),
       };
       return tool.execute(callId, safe, signal, onUpdate, { env });
     },
@@ -192,80 +185,15 @@ export async function safePath(
   knowledgeRoot: string | undefined,
   allowReadOnlyResources: boolean,
 ): Promise<string> {
-  if (!input || input.split(/[\\/]/).includes("..")) throw new Error(`unsafe path: ${input}`);
-  const workspace = resolve(workspaceRoot);
   const skills = (typeof skillRoots === "string"
     ? [{ name: "skill", path: skillRoots }]
-    : skillRoots).map((root) => ({ ...root, path: resolve(root.path) }));
-  const knowledge = knowledgeRoot ? resolve(knowledgeRoot) : undefined;
-
-  if (!isAbsolute(input) && input.split(/[\\/]/)[0] === "knowledge") {
-    if (!allowReadOnlyResources) {
-      throw new Error(
-        "PATH_SCOPE_ERROR: knowledge is read-only; write and edit only workspace-relative paths",
-      );
-    }
-    if (!knowledge) {
-      throw new Error("PATH_SCOPE_ERROR: knowledge/ is not configured for this Pi session");
-    }
-    const parts = input.split(/[\\/]/).filter(Boolean).slice(1);
-    const target = resolve(knowledge, ...parts);
-    if (!inside(target, knowledge)) throw new Error(`unsafe path: ${input}`);
-    await rejectSymlinks(knowledge, target);
-    return target;
-  }
-
-  if (isAbsolute(input)) {
-    const target = resolve(input);
-    if (!allowReadOnlyResources) {
-      throw new Error(
-        "PATH_SCOPE_ERROR: write and edit paths must be workspace-relative; skill and knowledge files are read-only",
-      );
-    }
-    const matchingSkill = skills.find((root) => inside(target, root.path));
-    if (matchingSkill) {
-      await rejectSymlinks(matchingSkill.path, target);
-      return target;
-    }
-    if (knowledge && inside(target, knowledge)) {
-      await rejectSymlinks(knowledge, target);
-      return target;
-    }
-    if (inside(target, workspace)) {
-      const suggested = relative(workspace, target) || ".";
-      throw new Error(
-        `PATH_SCOPE_ERROR: workspace files must use workspace-relative paths; use ${suggested}`,
-      );
-    }
-    throw new Error(
-      "PATH_SCOPE_ERROR: workspace paths start at the conversation root (.) and must be relative; absolute reads are allowed only for an exact skill location advertised by Pi or the configured knowledge root",
-    );
-  }
-
-  const target = resolve(workspace, input);
-  if (!inside(target, workspace)) throw new Error(`unsafe path: ${input}`);
-  await rejectSymlinks(workspace, target);
-  return target;
-}
-
-function inside(target: string, root: string): boolean {
-  const rel = relative(root, target);
-  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
-}
-
-async function rejectSymlinks(root: string, target: string): Promise<void> {
-  if ((await lstat(root)).isSymbolicLink()) throw new Error(`allowed root must not be a symlink: ${root}`);
-  const parts = relative(root, target).split(sep).filter(Boolean);
-  let current = root;
-  for (const part of parts) {
-    current = resolve(current, part);
-    try {
-      if ((await lstat(current)).isSymbolicLink()) throw new Error(`symlink paths are not allowed: ${current}`);
-    } catch (error) {
-      if (isRecord(error) && error.code === "ENOENT") return;
-      throw error;
-    }
-  }
+    : skillRoots);
+  const policy = await WorkspaceAccessPolicy.create({
+    workspaceRoot,
+    readOnlyRoots: skills.map((root) => root.path),
+    knowledgeRoot,
+  });
+  return policy.resolvePath(input, allowReadOnlyResources ? "read" : "write");
 }
 
 function safeShellEnvironment(): Record<string, string> {

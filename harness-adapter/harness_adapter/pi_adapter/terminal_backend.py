@@ -3,8 +3,7 @@ from __future__ import annotations
 import os
 
 
-LOCAL_APP_ENVS = frozenset({"dev", "development", "local", "test"})
-PI_TERMINAL_BACKENDS = frozenset({"local", "os-sandbox"})
+PI_TERMINAL_BACKENDS = frozenset({"os-sandbox"})
 
 
 def validate_pi_terminal_backend(value: str) -> str:
@@ -26,8 +25,6 @@ def resolve_pi_terminal_backend(
     raw_app_env = os.getenv("APP_ENV") if app_env is None else app_env
     if not raw_app_env or not raw_app_env.strip():
         raise RuntimeError("APP_ENV is required when PYROMIND_HARNESS_BACKEND=pi")
-    normalized_app_env = raw_app_env.strip().lower()
-
     raw_backend = (
         os.getenv("PYROMIND_PI_TERMINAL_BACKEND")
         if terminal_backend is None
@@ -35,13 +32,7 @@ def resolve_pi_terminal_backend(
     )
     if not raw_backend or not raw_backend.strip():
         raise RuntimeError(
-            "PYROMIND_PI_TERMINAL_BACKEND is required when "
-            "PYROMIND_HARNESS_BACKEND=pi"
+            "PYROMIND_PI_TERMINAL_BACKEND is required when PYROMIND_HARNESS_BACKEND=pi"
         )
     backend = validate_pi_terminal_backend(raw_backend)
-    if normalized_app_env not in LOCAL_APP_ENVS and backend == "local":
-        raise RuntimeError(
-            "PYROMIND_PI_TERMINAL_BACKEND=local is allowed only for local "
-            f"development environments; APP_ENV={normalized_app_env}"
-        )
     return backend
