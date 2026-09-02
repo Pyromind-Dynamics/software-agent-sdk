@@ -23,6 +23,8 @@ import {
   type WorkspacePathOperation,
 } from "./workspace-policy.js";
 
+const OPENHANDS_ERROR_HEADER = "[An error occurred during execution.]";
+
 export interface BusinessToolConfig {
   name: string;
   description: string;
@@ -172,7 +174,14 @@ function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig): AgentTool
           content.push({ type: "image", data: block.data, mimeType: block.mime_type });
         }
       }
-      if (response.is_error) throw new Error(content.find((block) => block.type === "text")?.text ?? "tool failed");
+      if (response.is_error) {
+        const message = content
+          .filter((block): block is TextContent => block.type === "text")
+          .map((block) => block.text.trim())
+          .filter((text) => text && text !== OPENHANDS_ERROR_HEADER)
+          .join("\n");
+        throw new Error(message || "tool failed");
+      }
       return { content, details: isRecord(response.details) ? response.details : undefined };
     },
   };

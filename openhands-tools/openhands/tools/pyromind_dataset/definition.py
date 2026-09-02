@@ -155,16 +155,18 @@ class PreviewDatasetAction(Action):
         default="inspect",
         description=(
             "Use 'inspect' for the existing bounded preview behavior. Use "
-            "'sample' to materialize up to n selected user-storage files or "
-            "folders in the conversation workspace and create a JSONL manifest."
+            "'sample' to materialize explicitly selected user-storage files or "
+            "folders (up to n) in the conversation workspace and create a JSONL "
+            "manifest. Automatic selection is limited to min(n, 3) entries."
         ),
     )
     sample_paths: list[str] = Field(
         default_factory=list,
         description=(
             "Optional exact user-storage file or folder paths to materialize in "
-            "sample mode. When omitted, up to n entries are selected from "
-            "dataset_path in stable path order."
+            "sample mode. Explicit selections may contain up to n entries. When "
+            "omitted, up to min(n, 3) entries are selected from dataset_path in "
+            "stable path order."
         ),
     )
     vision_ocr: bool = Field(
@@ -812,11 +814,30 @@ class PreviewDatasetExecutor(
         headers: dict[str, str],
         conversation: BaseConversation | None,
     ) -> PreviewDatasetObservation:
+        if action.sample_paths and len(action.sample_paths) > action.n:
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    f"sample_paths 有 {len(action.sample_paths)} 项，"
+                    f"超过 n={action.n}。\n"
+                    "请减少路径数量，或增大 n。\n"
+                    "错误码：sample_selection_limit"
+                ),
+                is_error=True,
+                dataset_path=dataset_path,
+                source="storage",
+                error_code="sample_selection_limit",
+            )
+
         try:
+            selection_limit = (
+                action.n
+                if action.sample_paths
+                else min(action.n, _DEFAULT_SAMPLE_COUNT)
+            )
             selected_paths, entries = self._select_storage_samples(
                 dataset_path,
                 action.sample_paths,
-                min(action.n, _DEFAULT_SAMPLE_COUNT),
+                selection_limit,
                 headers,
             )
             workspace_dir = _resolve_workspace_dir(conversation)
