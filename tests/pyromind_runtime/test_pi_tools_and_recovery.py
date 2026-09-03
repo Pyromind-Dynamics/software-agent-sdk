@@ -756,6 +756,55 @@ async def test_pi_host_synthesizes_debug_task_and_persists_only_attempt_budget(
     assert "must_not_persist" not in persisted
 
 
+def _business_tool_host() -> PyromindBusinessToolHost:
+    repository = Path(pi_adapter_module.__file__).parents[3]
+    return PyromindBusinessToolHost(
+        [
+            repository / ".agents" / "skills" / "data-processing",
+            repository / ".agents" / "skills" / "training-analysis",
+        ]
+    )
+
+
+def test_workflow_debug_params_fall_back_to_deployment_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APP_ENV", "pre2")
+    monkeypatch.delenv("PYROMIND_ENV", raising=False)
+    monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
+    host = _business_tool_host()
+    params = host._workflow_debug_params(
+        ToolExecutionContext(
+            conversation_id="conversation-env-fallback",
+            workspace_root=tmp_path,
+            request_context=RequestContext(user_id="42"),
+            model_configuration={"model": "gpt-5"},
+            extra={},
+        )
+    )
+    assert params["env"] == "pre2"
+    assert params["cluster"] == "default"
+
+
+def test_workflow_debug_params_prefer_session_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APP_ENV", "pre2")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "sdk-cluster")
+    host = _business_tool_host()
+    params = host._workflow_debug_params(
+        ToolExecutionContext(
+            conversation_id="conversation-env-context",
+            workspace_root=tmp_path,
+            request_context=RequestContext(user_id="42", x_cluster="req-cluster"),
+            model_configuration={"model": "gpt-5"},
+            extra={"env": "pre"},
+        )
+    )
+    assert params["env"] == "pre"
+    assert params["cluster"] == "req-cluster"
+
+
 def test_model_resolution_rules() -> None:
     assert _resolve_model("deepseek/deepseek-chat", "https://openrouter.ai/api/v1") == (
         "openrouter",

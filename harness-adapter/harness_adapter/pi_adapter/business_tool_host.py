@@ -533,10 +533,28 @@ class PyromindBusinessToolHost:
             params["secret_headers"] = {"cookie": _STORAGE_COOKIE_SECRET}
         return params
 
+    @staticmethod
+    def _resolve_workflow_env(context: ToolExecutionContext) -> str | None:
+        env = context.extra.get("env")
+        if isinstance(env, str) and env:
+            return env
+        # Deployment fallback: APP_ENV doubles as the workflow execution
+        # environment (e.g. pre2) when the session context omits it.
+        return os.getenv("PYROMIND_ENV") or os.getenv("APP_ENV")
+
+    @staticmethod
+    def _resolve_workflow_cluster(context: ToolExecutionContext) -> str | None:
+        # "default" mirrors the pyromind-sdk client's own cluster default.
+        return (
+            context.request_context.x_cluster
+            or os.getenv("PYROMIND_CLUSTER")
+            or "default"
+        )
+
     def _workflow_debug_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         return {
-            "cluster": context.request_context.x_cluster,
-            "env": context.extra.get("env"),
+            "cluster": self._resolve_workflow_cluster(context),
+            "env": self._resolve_workflow_env(context),
             "current_user": current_user_from_context(context.request_context),
             "headers": _forward_headers(context.request_context, include_cookie=False),
         }
