@@ -24,6 +24,7 @@ import {
 } from "./workspace-policy.js";
 
 const OPENHANDS_ERROR_HEADER = "[An error occurred during execution.]";
+const OMITTED_IMAGE_TEXT = "[Image omitted: Pi only accepts inline base64 image data.]";
 
 export interface BusinessToolConfig {
   name: string;
@@ -166,14 +167,7 @@ function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig): AgentTool
       if (!isRecord(response) || typeof response.is_error !== "boolean" || !Array.isArray(response.content)) {
         throw new Error("invalid Python tool response");
       }
-      const content: Array<TextContent | ImageContent> = [];
-      for (const block of response.content) {
-        if (!isRecord(block)) continue;
-        if (block.type === "text" && typeof block.text === "string") content.push({ type: "text", text: block.text });
-        else if (block.type === "image" && typeof block.data === "string" && typeof block.mime_type === "string") {
-          content.push({ type: "image", data: block.data, mimeType: block.mime_type });
-        }
-      }
+      const content = normalizeBusinessToolContent(response.content);
       if (response.is_error) {
         const message = content
           .filter((block): block is TextContent => block.type === "text")
@@ -185,6 +179,62 @@ function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig): AgentTool
       return { content, details: isRecord(response.details) ? response.details : undefined };
     },
   };
+}
+
+export function normalizeBusinessToolContent(
+  blocks: unknown[],
+): Array<TextContent | ImageContent> {
+  const content: Array<TextContent | ImageContent> = [];
+  for (const block of blocks) {
+    if (!isRecord(block)) continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      content.push({ type: "text", text: block.text });
+      continue;
+    }
+    if (block.type !== "image") continue;
+
+    if (Array.isArray(block.image_urls)) {
+      if (block.image_urls.length === 0) {
+        content.push({ type: "text", text: OMITTED_IMAGE_TEXT });
+        continue;
+      }
+      for (const url of block.image_urls) {
+        const image = typeof url === "string" ? inlineImageContent(url) : undefined;
+        content.push(image ?? { type: "text", text: OMITTED_IMAGE_TEXT });
+      }
+      continue;
+    }
+
+    const mimeType = typeof block.mime_type === "string"
+      ? block.mime_type
+      : typeof block.mimeType === "string" ? block.mimeType : undefined;
+    if (typeof block.data === "string" && block.data && mimeType) {
+      content.push({ type: "image", data: block.data, mimeType });
+    } else {
+      content.push({ type: "text", text: OMITTED_IMAGE_TEXT });
+    }
+  }
+  return content;
+}
+
+function inlineImageContent(url: string): ImageContent | undefined {
+  const separator = url.indexOf(",");
+  if (separator < 0) return undefined;
+  const metadata = url.slice(0, separator);
+  const data = url.slice(separator + 1);
+  const match = /^data:(image\/[^;,\s]+);base64$/i.exec(metadata);
+  if (!match || !data || !isBase64(data)) return undefined;
+  return { type: "image", data, mimeType: match[1]! };
+}
+
+function isBase64(value: string): boolean {
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
+  try {
+    const normalized = value.replace(/=+$/, "");
+    return Buffer.from(value, "base64").toString("base64").replace(/=+$/, "") === normalized;
+  } catch {
+    return false;
+  }
 }
 
 export async function safePath(

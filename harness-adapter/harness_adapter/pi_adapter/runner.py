@@ -4,9 +4,11 @@ import asyncio
 import contextlib
 import logging
 import os
+import signal
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from harness_adapter.pi_adapter.protocol import (
@@ -22,7 +24,17 @@ logger = logging.getLogger(__name__)
 _STREAM_LIMIT = MAX_FRAME_BYTES + 2
 RequestHandler = Callable[[str, dict[str, Any]], Awaitable[Any]]
 EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
-ExitHandler = Callable[[int | None], Awaitable[None]]
+PiRunnerExitReason = Literal["shutdown", "restart", "unexpected"]
+PlannedPiRunnerExitReason = Literal["shutdown", "restart"]
+
+
+@dataclass(frozen=True, slots=True)
+class PiRunnerExit:
+    returncode: int | None
+    reason: PiRunnerExitReason
+
+
+ExitHandler = Callable[[PiRunnerExit], Awaitable[None]]
 
 
 class PiRunnerError(RuntimeError):
@@ -53,11 +65,18 @@ class PiRunnerProcess:
         self._stderr_task: asyncio.Task[None] | None = None
         self._pending: dict[str, asyncio.Future[Any]] = {}
         self._write_lock = asyncio.Lock()
-        self._closing = False
+        self._planned_exit_reason: PlannedPiRunnerExitReason | None = None
+        self._exit_notified = False
+        self._owns_process_group = False
+        self._pid: int | None = None
 
     @property
     def running(self) -> bool:
         return self._process is not None and self._process.returncode is None
+
+    @property
+    def pid(self) -> int | None:
+        return self._pid
 
     async def start(self, config: dict[str, Any]) -> None:
         if self.running:
@@ -66,7 +85,12 @@ class PiRunnerProcess:
             raise PiRunnerError(
                 f"Pi runner is not built: {self._entrypoint}; run npm run build"
             )
-        self._closing = False
+        self._planned_exit_reason = None
+        self._exit_notified = False
+        self._owns_process_group = os.name == "posix"
+        process_options: dict[str, Any] = {}
+        if self._owns_process_group:
+            process_options["start_new_session"] = True
         self._process = await asyncio.create_subprocess_exec(
             "node",
             str(self._entrypoint),
@@ -75,13 +99,15 @@ class PiRunnerProcess:
             stderr=asyncio.subprocess.PIPE,
             env=_runner_environment(),
             limit=_STREAM_LIMIT,
+            **process_options,
         )
+        self._pid = self._process.pid
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
         try:
             await self.request("start", config)
         except Exception:
-            await self.terminate()
+            await self.terminate(reason="shutdown")
             raise
 
     async def request(self, method: str, params: dict[str, Any]) -> Any:
@@ -105,24 +131,26 @@ class PiRunnerProcess:
         finally:
             self._pending.pop(request_id, None)
 
-    async def close(self) -> None:
+    async def close(self, *, reason: PlannedPiRunnerExitReason = "shutdown") -> None:
+        self._mark_planned_exit(reason)
         if not self.running:
-            await self.terminate()
+            await self.terminate(reason=reason)
             return
-        self._closing = True
         with contextlib.suppress(Exception):
             await self.request("close", {})
-        await self.terminate()
+        await self.terminate(reason=reason)
 
-    async def terminate(self) -> None:
-        self._closing = True
+    async def terminate(
+        self, *, reason: PlannedPiRunnerExitReason = "shutdown"
+    ) -> None:
+        self._mark_planned_exit(reason)
         process = self._process
         if process is not None and process.returncode is None:
-            process.terminate()
+            self._signal_process(process, signal.SIGTERM)
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(process.wait(), 5)
             if process.returncode is None:
-                process.kill()
+                self._signal_process(process, signal.SIGKILL)
                 await process.wait()
         current = asyncio.current_task()
         tasks = tuple(
@@ -133,9 +161,36 @@ class PiRunnerProcess:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if process is not None:
+            await self._notify_exit(process.returncode)
         self._process = None
         self._reader_task = None
         self._stderr_task = None
+
+    def _mark_planned_exit(self, reason: PlannedPiRunnerExitReason) -> None:
+        if self._planned_exit_reason is None:
+            self._planned_exit_reason = reason
+
+    def _signal_process(
+        self, process: asyncio.subprocess.Process, requested_signal: signal.Signals
+    ) -> None:
+        if self._owns_process_group:
+            try:
+                os.killpg(process.pid, requested_signal)
+                return
+            except OSError:
+                logger.debug(
+                    "Could not signal Pi runner process group; falling back to the "
+                    "runner process",
+                    exc_info=True,
+                )
+        try:
+            if requested_signal == signal.SIGTERM:
+                process.terminate()
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
 
     async def _read_stdout(self) -> None:
         assert self._process is not None and self._process.stdout is not None
@@ -148,15 +203,25 @@ class PiRunnerProcess:
             error = exc
             logger.exception("Pi runner protocol failed")
             if self._process.returncode is None:
-                self._process.terminate()
+                self._signal_process(self._process, signal.SIGTERM)
         finally:
             code = await self._process.wait()
             failure = error or PiRunnerError(f"Pi runner exited with code {code}")
             for future in self._pending.values():
                 if not future.done():
                     future.set_exception(failure)
-            if not self._closing:
-                await self._exit_handler(code)
+            await self._notify_exit(code)
+
+    async def _notify_exit(self, code: int | None) -> None:
+        if self._exit_notified:
+            return
+        self._exit_notified = True
+        await self._exit_handler(
+            PiRunnerExit(
+                returncode=code,
+                reason=self._planned_exit_reason or "unexpected",
+            )
+        )
 
     async def _read_stderr(self) -> None:
         assert self._process is not None and self._process.stderr is not None

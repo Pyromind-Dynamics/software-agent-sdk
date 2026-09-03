@@ -3,7 +3,49 @@ import { mkdtemp, mkdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { safePath } from "../src/tools.js";
+import { normalizeBusinessToolContent, safePath } from "../src/tools.js";
+
+test("business tool content converts OpenHands inline image URLs for Pi", () => {
+  assert.deepEqual(normalizeBusinessToolContent([
+    { type: "text", text: "preview" },
+    {
+      type: "image",
+      image_urls: [
+        "data:image/png;base64,aGVsbG8=",
+        "data:image/jpeg;base64,d29ybGQ=",
+      ],
+    },
+  ]), [
+    { type: "text", text: "preview" },
+    { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+    { type: "image", data: "d29ybGQ=", mimeType: "image/jpeg" },
+  ]);
+});
+
+test("business tool content accepts Pi MIME aliases", () => {
+  assert.deepEqual(normalizeBusinessToolContent([
+    { type: "image", data: "aGVsbG8=", mime_type: "image/png" },
+    { type: "image", data: "d29ybGQ=", mimeType: "image/jpeg" },
+  ]), [
+    { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+    { type: "image", data: "d29ybGQ=", mimeType: "image/jpeg" },
+  ]);
+});
+
+test("business tool content makes unsupported image URLs visible", () => {
+  assert.deepEqual(normalizeBusinessToolContent([
+    {
+      type: "image",
+      image_urls: [
+        "https://example.com/image.png",
+        "data:image/png;base64,not base64",
+      ],
+    },
+  ]), [
+    { type: "text", text: "[Image omitted: Pi only accepts inline base64 image data.]" },
+    { type: "text", text: "[Image omitted: Pi only accepts inline base64 image data.]" },
+  ]);
+});
 
 async function workspaceLayout(prefix = "pi-tools-") {
   const root = await mkdtemp(join(tmpdir(), prefix));

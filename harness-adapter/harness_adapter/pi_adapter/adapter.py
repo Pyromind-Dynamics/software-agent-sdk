@@ -44,7 +44,7 @@ from harness_adapter.pi_adapter.event_translator import translate_runner_event
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.protocol import PROTOCOL_VERSION
-from harness_adapter.pi_adapter.runner import PiRunnerProcess
+from harness_adapter.pi_adapter.runner import PiRunnerExit, PiRunnerProcess
 from harness_adapter.pi_adapter.terminal_backend import validate_pi_terminal_backend
 from openhands.agent_server.workflow_canvas_models import (
     SaveWorkflowCanvasEventSnapshotRequest,
@@ -518,16 +518,41 @@ class PiAdapter:
         return root
 
     async def _start_runner(self, session: _PiSession, api_key: str) -> None:
+        runner: PiRunnerProcess
+
         async def on_request(method: str, params: dict[str, Any]) -> Any:
             return await self._runner_request(session, method, params)
 
         async def on_event(frame: dict[str, Any]) -> None:
             await self._runner_event(session, frame)
 
-        async def on_exit(code: int | None) -> None:
+        async def on_exit(exit_result: PiRunnerExit) -> None:
+            inflight = session.files.load_inflight()
+            stale_callback = session.runner is not runner
+            logger.info(
+                "pi.runner_exit conversation_id=%s pid=%s returncode=%s "
+                "exit_reason=%s has_inflight=%s stale_callback=%s",
+                session.session_id,
+                runner.pid,
+                exit_result.returncode,
+                exit_result.reason,
+                inflight is not None,
+                stale_callback,
+            )
+            if stale_callback:
+                return
             session.runner = None
-            inflight = session.files.load_inflight() or {}
-            run_id = str(inflight.get("run_id") or f"runner-exit-{uuid4().hex}")
+            if exit_result.reason != "unexpected" or inflight is None:
+                return
+            run_id_value = inflight.get("run_id")
+            if not isinstance(run_id_value, str) or not run_id_value:
+                logger.error(
+                    "Ignoring unexpected Pi runner exit with invalid inflight state "
+                    "conversation_id=%s pid=%s",
+                    session.session_id,
+                    runner.pid,
+                )
+                return
             await self._runner_event(
                 session,
                 {
@@ -535,14 +560,17 @@ class PiAdapter:
                     "type": "pi.event",
                     "eventId": uuid4().hex,
                     "sessionId": session.session_id,
-                    "runId": run_id,
+                    "runId": run_id_value,
                     "occurredAt": datetime.now().astimezone().isoformat(),
                     "kind": "run.finished",
                     "payload": {
                         "outcome": {
                             "status": "failed",
                             "error_code": "pi_runner_exited",
-                            "message": (f"Pi runner exited unexpectedly (code {code})"),
+                            "message": (
+                                "Pi runner exited unexpectedly "
+                                f"(code {exit_result.returncode})"
+                            ),
                         }
                     },
                 },

@@ -5,7 +5,7 @@ import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import harness_adapter.pi_adapter.adapter as pi_adapter_module
 import httpx
@@ -26,6 +26,7 @@ from harness_adapter.pi_adapter.business_tools import (
 )
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
+from harness_adapter.pi_adapter.runner import PiRunnerExit, PlannedPiRunnerExitReason
 from pydantic import BaseModel, ValidationError
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.snapshot import WorkflowState
@@ -38,6 +39,28 @@ from pyromind_runtime.ports.harness import (
 )
 
 from openhands.agent_server.pyromind_router import PyromindLLMConfig
+
+
+class _LifecycleFakeRunner:
+    instances: ClassVar[list[_LifecycleFakeRunner]] = []
+
+    def __init__(self, **kwargs) -> None:
+        self.exit_handler = kwargs["exit_handler"]
+        self.running = True
+        self.pid = 7000 + len(self.instances)
+        self.instances.append(self)
+
+    async def start(self, _config) -> None:
+        return None
+
+    async def request(self, _method, _params):
+        return {"accepted": True}
+
+    async def close(self, *, reason: PlannedPiRunnerExitReason = "shutdown") -> None:
+        if not self.running:
+            return
+        self.running = False
+        await self.exit_handler(PiRunnerExit(returncode=0, reason=reason))
 
 
 def test_validation_schema_is_generated_and_only_exposes_dsl_path() -> None:
@@ -227,6 +250,170 @@ async def test_runner_start_receives_configured_knowledge_root(
         assert captured["knowledge_root"] == str(knowledge.resolve())
     finally:
         await adapter.close(handle)
+
+
+async def test_idle_unexpected_runner_exit_is_silent_and_restarts_lazily(
+    tmp_path, monkeypatch
+) -> None:
+    _LifecycleFakeRunner.instances.clear()
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="idle-exit",
+            user_id="42",
+            workspace_root=str(conversations / "idle-exit"),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    session = adapter._session(handle.session_id)
+    original = _LifecycleFakeRunner.instances[0]
+    history = await session.queue.get()
+    assert history is not None
+    assert history.type == "history.synced"
+
+    original.running = False
+    await original.exit_handler(PiRunnerExit(returncode=-2, reason="unexpected"))
+
+    assert session.runner is None
+    assert session.queue.empty()
+    assert session.files.load_inflight() is None
+
+    await adapter._ensure_runner(session)
+    assert len(_LifecycleFakeRunner.instances) == 2
+    assert session.runner is _LifecycleFakeRunner.instances[1]
+    await adapter.close(handle)
+
+
+async def test_busy_unexpected_runner_exit_fails_original_run_once(
+    tmp_path, monkeypatch
+) -> None:
+    _LifecycleFakeRunner.instances.clear()
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="busy-exit",
+            user_id="42",
+            workspace_root=str(conversations / "busy-exit"),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    session = adapter._session(handle.session_id)
+    runner = _LifecycleFakeRunner.instances[0]
+    history = await session.queue.get()
+    assert history is not None
+    assert history.type == "history.synced"
+    session.files.save_inflight({"run_id": "run-active"})
+
+    runner.running = False
+    exit_result = PiRunnerExit(returncode=-9, reason="unexpected")
+    await runner.exit_handler(exit_result)
+    await runner.exit_handler(exit_result)
+
+    events = []
+    while not session.queue.empty():
+        events.append(session.queue.get_nowait())
+    notices = [event for event in events if event.type == "notice.raised"]
+    assert len(notices) == 1
+    assert notices[0].run_id == "run-active"
+    assert notices[0].payload["code"] == "pi_runner_exited"
+    assert session.files.load_inflight() is None
+    await adapter.close(handle)
+
+
+async def test_stale_runner_exit_does_not_clear_replacement_or_emit_error(
+    tmp_path, monkeypatch
+) -> None:
+    _LifecycleFakeRunner.instances.clear()
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="stale-exit",
+            user_id="42",
+            workspace_root=str(conversations / "stale-exit"),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    session = adapter._session(handle.session_id)
+    original = _LifecycleFakeRunner.instances[0]
+    history = await session.queue.get()
+    assert history is not None
+    assert history.type == "history.synced"
+
+    await adapter._start_runner(session, "test-key")
+    replacement = _LifecycleFakeRunner.instances[1]
+    original.running = False
+    await original.exit_handler(PiRunnerExit(returncode=-2, reason="unexpected"))
+
+    assert session.runner is replacement
+    assert session.queue.empty()
+    await adapter.close(handle)
+
+
+async def test_planned_shutdown_preserves_inflight_for_attach_recovery(
+    tmp_path, monkeypatch
+) -> None:
+    _LifecycleFakeRunner.instances.clear()
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="shutdown-recovery",
+            user_id="42",
+            workspace_root=str(conversations / "shutdown-recovery"),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    session = adapter._session(handle.session_id)
+    runner = _LifecycleFakeRunner.instances[0]
+    history = await session.queue.get()
+    assert history is not None
+    assert history.type == "history.synced"
+    session.files.save_inflight(
+        {"run_id": "run-interrupted", "operation_id": "tool-interrupted"}
+    )
+
+    runner.running = False
+    await runner.exit_handler(PiRunnerExit(returncode=0, reason="shutdown"))
+
+    assert session.runner is None
+    assert session.queue.empty()
+    assert session.files.load_inflight() == {
+        "run_id": "run-interrupted",
+        "operation_id": "tool-interrupted",
+    }
+    await adapter.close(handle)
+
+    restarted = PiAdapter(conversations, terminal_backend="os-sandbox")
+    restarted_handle = await restarted.attach_session(
+        "shutdown-recovery", RequestContext(user_id="42")
+    )
+    restarted_session = restarted._session(restarted_handle.session_id)
+    recovered = []
+    while not restarted_session.queue.empty():
+        recovered.append(restarted_session.queue.get_nowait())
+
+    failures = [event for event in recovered if event.type == "operation.failed"]
+    assert len(failures) == 1
+    assert failures[0].run_id == "run-interrupted"
+    assert failures[0].payload["error_code"] == "runner_restarted"
+    assert restarted_session.files.load_inflight() is None
+    await restarted.close(restarted_handle)
 
 
 async def test_create_stages_public_data_and_workflow_before_runner(
