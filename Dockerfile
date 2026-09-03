@@ -84,6 +84,17 @@ RUN set -eux; \
     }
 
 ####################################################################################
+# Pi runtime (Node) - compiled TS runner plus production dependencies
+####################################################################################
+FROM node:22-bookworm-slim AS pi-runtime-builder
+WORKDIR /pi-runtime
+COPY harness-adapter/pi-runtime/package.json harness-adapter/pi-runtime/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY harness-adapter/pi-runtime/tsconfig.json ./
+COPY harness-adapter/pi-runtime/src ./src
+RUN npm run build && npm prune --omit=dev --no-audit --no-fund
+
+####################################################################################
 FROM ${BASE_IMAGE} AS base-image-minimal
 ARG USERNAME UID GID PORT
 
@@ -104,43 +115,46 @@ RUN set -eux; \
         apt-get -o Acquire::Retries=5 update; \
         apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
             bash ca-certificates curl wget sudo apt-utils git jq tmux tar \
-            build-essential coreutils util-linux procps findutils grep sed \
-            tini apt-transport-https gnupg lsb-release xz-utils xfsprogs \
+            build-essential coreutils util-linux procps findutils grep ripgrep sed \
+            socat tini apt-transport-https gnupg lsb-release xz-utils xfsprogs \
             apparmor apparmor-utils bubblewrap; \
         rm -rf /var/lib/apt/lists/*; \
     elif command -v apk >/dev/null 2>&1; then \
         apk add --no-cache \
             bash ca-certificates curl wget sudo git jq tmux tar build-base \
-            coreutils util-linux procps findutils grep sed tini gnupg shadow xz \
-            bubblewrap; \
+            coreutils util-linux procps findutils grep ripgrep sed socat tini \
+            gnupg shadow xz bubblewrap; \
     elif command -v microdnf >/dev/null 2>&1; then \
         microdnf install -y \
             bash ca-certificates curl wget sudo git jq tmux tar make gcc gcc-c++ \
-            coreutils util-linux procps-ng findutils grep sed shadow-utils \
-            gnupg2 xz bubblewrap; \
+            coreutils util-linux procps-ng findutils grep ripgrep sed socat \
+            shadow-utils gnupg2 xz bubblewrap; \
         microdnf clean all; \
     elif command -v dnf >/dev/null 2>&1; then \
         dnf install -y \
             bash ca-certificates curl wget sudo git jq tmux tar make gcc gcc-c++ \
-            coreutils util-linux procps-ng findutils grep sed shadow-utils \
-            gnupg2 xz bubblewrap; \
+            coreutils util-linux procps-ng findutils grep ripgrep sed socat \
+            shadow-utils gnupg2 xz bubblewrap; \
         dnf clean all; \
     elif command -v yum >/dev/null 2>&1; then \
         yum install -y \
             bash ca-certificates curl wget sudo git jq tmux tar make gcc gcc-c++ \
-            coreutils util-linux procps-ng findutils grep sed shadow-utils \
-            gnupg2 xz bubblewrap; \
+            coreutils util-linux procps-ng findutils grep ripgrep sed socat \
+            shadow-utils gnupg2 xz bubblewrap; \
         yum clean all; \
     elif command -v zypper >/dev/null 2>&1; then \
         zypper --non-interactive install --no-recommends \
             bash ca-certificates curl wget sudo git jq tmux tar make gcc gcc-c++ \
-            coreutils util-linux procps findutils grep sed shadow gpg2 xz \
-            bubblewrap; \
+            coreutils util-linux procps findutils grep ripgrep sed socat shadow \
+            gpg2 xz bubblewrap; \
         zypper clean --all; \
     else \
         echo "Unsupported base image: no known package manager found" >&2; \
         exit 1; \
     fi; \
+    command -v bwrap; \
+    command -v rg; \
+    command -v socat; \
     grep -Eq "^[^:]*:[^:]*:${GID}:" /etc/group || groupadd -g "${GID}" "${USERNAME}"; \
     grep -Eq "^${USERNAME}:" /etc/passwd || \
         useradd -m -u "${UID}" -g "${GID}" -s /bin/bash "${USERNAME}"; \
@@ -240,15 +254,8 @@ ENV OH_ENABLE_VNC=false
 ENV LOG_JSON=true
 ENV workspace_dir=/workspace
 ENV WORKSPACE_DIR=/workspace
-EXPOSE ${PORT}
-
-
-FROM base-image-minimal AS binary-minimal
-ARG USERNAME
-COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/openhands-agent-server /usr/local/bin/openhands-agent-server
 COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/.agents /agent-server/.agents
 COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agent-server/knowledge
-RUN chmod +x /usr/local/bin/openhands-agent-server
 # DataFlow venv for df_run_pipeline local trial runs
 # preshed (open-dataflow dep) has no cp313 linux wheel; use Python 3.12
 RUN uv python install 3.12 \
@@ -265,17 +272,26 @@ ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gn
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
 ENV PYROMIND_PUBLIC_READ_PATHS=/agent-server/.agents/skills
 ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
-# Pi runtime (Node) for the Pi harness backend, opt-in at deploy time via
-# PYROMIND_HARNESS_BACKEND=pi. Built here so node_modules match this image;
-# the runner entrypoint is resolved through PI_RUNTIME_ENTRYPOINT (see
-# harness_adapter/pi_adapter/runner.py).
-COPY --chown=${USERNAME}:${USERNAME} harness-adapter/pi-runtime /opt/pi-runtime
-RUN set -eux; \
-    node -e 'const [maj, min] = process.versions.node.split(".").map(Number); if (maj < 22 || (maj === 22 && min < 19)) { console.error("pi-runtime requires node >= 22.19.0, got " + process.versions.node); process.exit(1); }'; \
-    cd /opt/pi-runtime \
-    && npm ci \
-    && npm run build \
-    && npm prune --omit=dev \
-    && test -f dist/index.js
-ENV PI_RUNTIME_ENTRYPOINT=/opt/pi-runtime/dist/index.js
+EXPOSE ${PORT}
+
+
+FROM base-image-minimal AS binary-minimal
+ARG USERNAME
+COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/openhands-agent-server /usr/local/bin/openhands-agent-server
+RUN chmod +x /usr/local/bin/openhands-agent-server
+# Same Pi runtime as the product stage: the binary image is the deployed
+# target, so PYROMIND_HARNESS_BACKEND=pi must work here too.
+COPY --from=pi-runtime-builder /pi-runtime /agent-server/pi-runtime
+ENV PYROMIND_PI_RUNTIME=/agent-server/pi-runtime/dist/index.js
+ENV PYROMIND_PI_TERMINAL_BACKEND=os-sandbox
 ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]
+
+
+FROM base-image-minimal AS product
+ARG USERNAME
+COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/.venv /agent-server/.venv
+COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/uv-managed-python /agent-server/uv-managed-python
+COPY --from=pi-runtime-builder /pi-runtime /agent-server/pi-runtime
+ENV PYROMIND_PI_RUNTIME=/agent-server/pi-runtime/dist/index.js
+ENV PYROMIND_PI_TERMINAL_BACKEND=os-sandbox
+ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "pyromind_agent_server"]

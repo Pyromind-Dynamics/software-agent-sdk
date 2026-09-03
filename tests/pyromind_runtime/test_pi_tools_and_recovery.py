@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import harness_adapter.pi_adapter.adapter as pi_adapter_module
 import httpx
 import pytest
-from harness_adapter.pi_adapter import PiAdapter
+from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.pi_adapter.adapter import (
     _is_workflow_mutation,
     _resolve_model,
@@ -18,8 +19,6 @@ from harness_adapter.pi_adapter.adapter import (
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,
-    _cap_details_size,
-    _cap_response_text,
 )
 from harness_adapter.pi_adapter.business_tools import (
     execute_validation_tool,
@@ -27,6 +26,7 @@ from harness_adapter.pi_adapter.business_tools import (
 )
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
+from harness_adapter.pi_adapter.runner import PiRunnerExit, PlannedPiRunnerExitReason
 from pydantic import BaseModel, ValidationError
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.snapshot import WorkflowState
@@ -41,10 +41,33 @@ from pyromind_runtime.ports.harness import (
 from openhands.agent_server.pyromind_router import PyromindLLMConfig
 
 
+class _LifecycleFakeRunner:
+    instances: ClassVar[list[_LifecycleFakeRunner]] = []
+
+    def __init__(self, **kwargs) -> None:
+        self.exit_handler = kwargs["exit_handler"]
+        self.running = True
+        self.pid = 7000 + len(self.instances)
+        self.instances.append(self)
+
+    async def start(self, _config) -> None:
+        return None
+
+    async def request(self, _method, _params):
+        return {"accepted": True}
+
+    async def close(self, *, reason: PlannedPiRunnerExitReason = "shutdown") -> None:
+        if not self.running:
+            return
+        self.running = False
+        await self.exit_handler(PiRunnerExit(returncode=0, reason=reason))
+
+
 def test_validation_schema_is_generated_and_only_exposes_dsl_path() -> None:
     schema = validation_tool_spec()["input_schema"]
     assert "dsl_path" in schema["properties"]
     assert "dsl" not in schema["properties"]
+    assert "dsl_path" not in schema.get("required", [])
 
 
 async def test_validation_reads_conversation_file_and_forwards_request_context(
@@ -74,7 +97,7 @@ async def test_validation_reads_conversation_file_and_forwards_request_context(
     monkeypatch.setattr(httpx, "post", fake_post)
     result = await execute_validation_tool(
         tmp_path,
-        {"dsl_path": "public_data/workflow_canvas/workflow.py"},
+        {},
         RequestContext(
             user_id="42",
             cookie="auth=secret",
@@ -113,10 +136,29 @@ async def test_validation_projects_401_without_retry(tmp_path, monkeypatch) -> N
     assert "401" in json.dumps(result)
 
 
+async def test_validation_path_errors_are_returned_as_tool_results(tmp_path) -> None:
+    result = await execute_validation_tool(
+        tmp_path,
+        {"dsl_path": "../workflow.py"},
+        RequestContext(user_id="42"),
+    )
+
+    assert result["is_error"] is True
+    assert "must stay inside the workspace" in json.dumps(result)
+
+
 def test_terminal_only_confirms_high_risk_commands() -> None:
     policy = TerminalPermissionPolicy()
     assert not policy.requires_confirmation("safe", {"command": "pwd"})
     assert policy.requires_confirmation("danger", {"command": "rm -rf /tmp/example"})
+
+
+def test_pi_terminal_backend_requires_os_sandbox(monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("PYROMIND_PI_TERMINAL_BACKEND", "os-sandbox")
+    assert resolve_pi_terminal_backend() == "os-sandbox"
+    with pytest.raises(RuntimeError, match="expected one of: os-sandbox"):
+        resolve_pi_terminal_backend(terminal_backend="local")
 
 
 def test_session_metadata_is_non_secret_and_uses_pi_jsonl(tmp_path) -> None:
@@ -135,11 +177,12 @@ def test_adapter_resolves_available_knowledge_root(tmp_path, monkeypatch) -> Non
     explicit = tmp_path / "knowledge"
     explicit.mkdir()
     assert PiAdapter(
-        tmp_path / "explicit", knowledge_root=explicit
+        tmp_path / "explicit", terminal_backend="os-sandbox", knowledge_root=explicit
     )._knowledge_root == (explicit.resolve())
     assert (
         PiAdapter(
             tmp_path / "missing-adapter",
+            terminal_backend="os-sandbox",
             knowledge_root=tmp_path / "missing-knowledge",
         )._knowledge_root
         is None
@@ -147,9 +190,24 @@ def test_adapter_resolves_available_knowledge_root(tmp_path, monkeypatch) -> Non
 
     repository = Path(pi_adapter_module.__file__).parents[3]
     assert (
-        PiAdapter(tmp_path / "default")._knowledge_root
+        PiAdapter(tmp_path / "default", terminal_backend="os-sandbox")._knowledge_root
         == (repository / "knowledge").resolve()
     )
+
+
+def test_adapter_resolves_skill_roots_from_env(tmp_path, monkeypatch) -> None:
+    skills = tmp_path / "skills"
+    names = (
+        "generate-workflow-dsl",
+        "data-processing",
+        "debug-workflow",
+        "training-analysis",
+    )
+    for name in names:
+        (skills / name).mkdir(parents=True)
+    monkeypatch.setenv("PYROMIND_SKILLS_PATH", str(skills))
+    adapter = PiAdapter(tmp_path / "conversations", terminal_backend="os-sandbox")
+    assert adapter._skill_roots == [skills.resolve() / name for name in names]
 
 
 async def test_runner_start_receives_configured_knowledge_root(
@@ -162,6 +220,9 @@ async def test_runner_start_receives_configured_knowledge_root(
             self.running = True
 
         async def start(self, config) -> None:
+            workspace = Path(config["workspace_root"])
+            assert (workspace / "public_data").is_dir()
+            assert (workspace / "pi" / "terminal-output").is_dir()
             captured.update(config)
 
         async def close(self) -> None:
@@ -172,7 +233,9 @@ async def test_runner_start_receives_configured_knowledge_root(
     conversations.mkdir()
     knowledge = tmp_path / "knowledge"
     knowledge.mkdir()
-    adapter = PiAdapter(conversations, knowledge_root=knowledge)
+    adapter = PiAdapter(
+        conversations, terminal_backend="os-sandbox", knowledge_root=knowledge
+    )
     handle = await adapter.create_session(
         SessionSpec(
             conversation_id="conversation-1",
@@ -188,7 +251,333 @@ async def test_runner_start_receives_configured_knowledge_root(
         await adapter.close(handle)
 
 
-async def test_runner_loads_five_named_skills_and_fourteen_business_tools(
+async def test_idle_unexpected_runner_exit_is_silent_and_restarts_lazily(
+    tmp_path, monkeypatch
+) -> None:
+    _LifecycleFakeRunner.instances.clear()
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="idle-exit",
+            user_id="42",
+            workspace_root=str(conversations / "idle-exit"),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    session = adapter._session(handle.session_id)
+    original = _LifecycleFakeRunner.instances[0]
+    history = await session.queue.get()
+    assert history is not None
+    assert history.type == "history.synced"
+
+    original.running = False
+    await original.exit_handler(PiRunnerExit(returncode=-2, reason="unexpected"))
+
+    assert session.runner is None
+    assert session.queue.empty()
+    assert session.files.load_inflight() is None
+
+    await adapter._ensure_runner(session)
+    assert len(_LifecycleFakeRunner.instances) == 2
+    assert session.runner is _LifecycleFakeRunner.instances[1]
+    await adapter.close(handle)
+
+
+async def test_busy_unexpected_runner_exit_fails_original_run_once(
+    tmp_path, monkeypatch
+) -> None:
+    _LifecycleFakeRunner.instances.clear()
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="busy-exit",
+            user_id="42",
+            workspace_root=str(conversations / "busy-exit"),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    session = adapter._session(handle.session_id)
+    runner = _LifecycleFakeRunner.instances[0]
+    history = await session.queue.get()
+    assert history is not None
+    assert history.type == "history.synced"
+    session.files.save_inflight({"run_id": "run-active"})
+
+    runner.running = False
+    exit_result = PiRunnerExit(returncode=-9, reason="unexpected")
+    await runner.exit_handler(exit_result)
+    await runner.exit_handler(exit_result)
+
+    events = []
+    while not session.queue.empty():
+        events.append(session.queue.get_nowait())
+    notices = [event for event in events if event.type == "notice.raised"]
+    assert len(notices) == 1
+    assert notices[0].run_id == "run-active"
+    assert notices[0].payload["code"] == "pi_runner_exited"
+    assert session.files.load_inflight() is None
+    await adapter.close(handle)
+
+
+async def test_stale_runner_exit_does_not_clear_replacement_or_emit_error(
+    tmp_path, monkeypatch
+) -> None:
+    _LifecycleFakeRunner.instances.clear()
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="stale-exit",
+            user_id="42",
+            workspace_root=str(conversations / "stale-exit"),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    session = adapter._session(handle.session_id)
+    original = _LifecycleFakeRunner.instances[0]
+    history = await session.queue.get()
+    assert history is not None
+    assert history.type == "history.synced"
+
+    await adapter._start_runner(session, "test-key")
+    replacement = _LifecycleFakeRunner.instances[1]
+    original.running = False
+    await original.exit_handler(PiRunnerExit(returncode=-2, reason="unexpected"))
+
+    assert session.runner is replacement
+    assert session.queue.empty()
+    await adapter.close(handle)
+
+
+async def test_planned_shutdown_preserves_inflight_for_attach_recovery(
+    tmp_path, monkeypatch
+) -> None:
+    _LifecycleFakeRunner.instances.clear()
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="shutdown-recovery",
+            user_id="42",
+            workspace_root=str(conversations / "shutdown-recovery"),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    session = adapter._session(handle.session_id)
+    runner = _LifecycleFakeRunner.instances[0]
+    history = await session.queue.get()
+    assert history is not None
+    assert history.type == "history.synced"
+    session.files.save_inflight(
+        {"run_id": "run-interrupted", "operation_id": "tool-interrupted"}
+    )
+
+    runner.running = False
+    await runner.exit_handler(PiRunnerExit(returncode=0, reason="shutdown"))
+
+    assert session.runner is None
+    assert session.queue.empty()
+    assert session.files.load_inflight() == {
+        "run_id": "run-interrupted",
+        "operation_id": "tool-interrupted",
+    }
+    await adapter.close(handle)
+
+    restarted = PiAdapter(conversations, terminal_backend="os-sandbox")
+    restarted_handle = await restarted.attach_session(
+        "shutdown-recovery", RequestContext(user_id="42")
+    )
+    restarted_session = restarted._session(restarted_handle.session_id)
+    recovered = []
+    while not restarted_session.queue.empty():
+        recovered.append(restarted_session.queue.get_nowait())
+
+    failures = [event for event in recovered if event.type == "operation.failed"]
+    assert len(failures) == 1
+    assert failures[0].run_id == "run-interrupted"
+    assert failures[0].payload["error_code"] == "runner_restarted"
+    assert restarted_session.files.load_inflight() is None
+    await restarted.close(restarted_handle)
+
+
+async def test_create_stages_public_data_and_workflow_before_runner(
+    tmp_path, monkeypatch
+) -> None:
+    expected_dsl = "workflow = InputNode()"
+
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, config) -> None:
+            workflow = (
+                Path(config["workspace_root"])
+                / "public_data"
+                / "workflow_canvas"
+                / "workflow.py"
+            )
+            assert workflow.read_text(encoding="utf-8") == expected_dsl
+
+        async def request(self, method, _params):
+            assert method == "context.append"
+            return {"checkpoint_entry_id": "initial-workflow"}
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    monkeypatch.setattr(
+        pi_adapter_module, "convert_xyflow_to_dsl", lambda _canvas: expected_dsl
+    )
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="workflow-first",
+            user_id="42",
+            workspace_root=str(conversations / "workflow-first"),
+            workflow_xyflow={"nodes": [], "edges": []},
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    try:
+        root = conversations / "workflow-first"
+        assert (root / "public_data").is_dir()
+        assert (root / "pi" / "terminal-output").is_dir()
+    finally:
+        await adapter.close(handle)
+
+
+async def test_create_failure_removes_only_new_workspace(tmp_path, monkeypatch) -> None:
+    class FailingRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, _config) -> None:
+            raise RuntimeError("sandbox unavailable")
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FailingRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+
+    with pytest.raises(RuntimeError, match="sandbox unavailable"):
+        await adapter.create_session(
+            SessionSpec(
+                conversation_id="failed-create",
+                user_id="42",
+                workspace_root=str(conversations / "failed-create"),
+                model_configuration={"model": "gpt-5", "api_key": "test-key"},
+            ),
+            RequestContext(user_id="42"),
+        )
+
+    assert not (conversations / "failed-create").exists()
+
+
+async def test_attach_repairs_missing_public_data_before_runner(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, config) -> None:
+            assert (Path(config["workspace_root"]) / "public_data").is_dir()
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    conversations = tmp_path / "conversations"
+    root = conversations / "attach-source"
+    root.mkdir(parents=True)
+    PiSessionFiles(root).initialize(
+        {
+            "session_id": "attach-source",
+            "model": {"provider": "openai", "id": "gpt-5"},
+        }
+    )
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.attach_session("attach-source", RequestContext(user_id="42"))
+    try:
+        assert (root / "public_data").is_dir()
+    finally:
+        await adapter.close(handle)
+
+
+async def test_attach_rejects_symlinked_public_data(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    root = conversations / "unsafe-attach"
+    outside = tmp_path / "outside"
+    root.mkdir(parents=True)
+    outside.mkdir()
+    (root / "public_data").symlink_to(outside, target_is_directory=True)
+    PiSessionFiles(root).initialize(
+        {
+            "session_id": "unsafe-attach",
+            "model": {"provider": "openai", "id": "gpt-5"},
+        }
+    )
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+
+    with pytest.raises(RuntimeError, match="public_data must not be a symbolic link"):
+        await adapter.attach_session("unsafe-attach", RequestContext(user_id="42"))
+
+
+async def test_attach_rejects_symlinked_conversation_root(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    outside = tmp_path / "outside-conversation"
+    conversations.mkdir()
+    outside.mkdir()
+    (conversations / "unsafe-root").symlink_to(outside, target_is_directory=True)
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+
+    with pytest.raises(RuntimeError, match="conversation root must not be"):
+        await adapter.attach_session("unsafe-root", RequestContext(user_id="42"))
+
+
+async def test_attach_rejects_symlinked_pi_before_loading_state(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    root = conversations / "unsafe-pi"
+    outside = tmp_path / "outside-pi"
+    root.mkdir(parents=True)
+    (root / "public_data").mkdir()
+    outside.mkdir()
+    (outside / "session.json").write_text(
+        '{"session_id":"unsafe-pi","model":{"provider":"openai","id":"gpt-5"}}',
+        encoding="utf-8",
+    )
+    (outside / "session.jsonl").write_text("", encoding="utf-8")
+    (root / "pi").symlink_to(outside, target_is_directory=True)
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+
+    with pytest.raises(RuntimeError, match="pi must not be a symbolic link"):
+        await adapter.attach_session("unsafe-pi", RequestContext(user_id="42"))
+
+
+async def test_runner_loads_five_named_skills_and_eleven_business_tools(
     tmp_path, monkeypatch
 ) -> None:
     captured = {}
@@ -206,7 +595,7 @@ async def test_runner_loads_five_named_skills_and_fourteen_business_tools(
     monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
     conversations = tmp_path / "conversations"
     conversations.mkdir()
-    adapter = PiAdapter(conversations)
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
     handle = await adapter.create_session(
         SessionSpec(
             conversation_id="conversation-skills",
@@ -257,62 +646,45 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
     assert all(spec["input_schema"].get("type") == "object" for spec in specs)
 
 
-def test_tool_response_text_is_capped_to_runner_frame_budget() -> None:
-    image_block = {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}
-    capped = _cap_response_text(
+async def test_preview_dataset_timeout_returns_a_tool_error(tmp_path) -> None:
+    repository = Path(pi_adapter_module.__file__).parents[3]
+    host = PyromindBusinessToolHost(
         [
-            {"type": "text", "text": "a" * 300_000},
-            {"type": "text", "text": "tail"},
-            image_block,
+            repository / ".agents" / "skills" / "data-processing",
+            repository / ".agents" / "skills" / "training-analysis",
         ]
     )
-    assert capped[0]["text"].endswith(
-        "[output truncated: exceeded the runner frame budget]"
+
+    class FakeAction(BaseModel):
+        dataset_path: str
+
+    class SlowPreviewTool:
+        action_type = FakeAction
+        executor = None
+
+        def __call__(self, _action, _facade):
+            time.sleep(0.05)
+            return object()
+
+    host._factories["preview_dataset"] = cast(Any, lambda _context: SlowPreviewTool())
+    result = await host.execute(
+        "preview_dataset",
+        {"dataset_path": "datasets/large"},
+        ToolExecutionContext(
+            conversation_id="conversation-timeout",
+            workspace_root=tmp_path,
+            request_context=RequestContext(user_id="42"),
+            model_configuration={"model": "gpt-5"},
+            extra={"preview_dataset_timeout_seconds": 0.01},
+        ),
     )
-    assert len(capped[0]["text"]) < 250_000 + 100
-    assert capped[1] == {
-        "type": "text",
-        "text": "\n\n[output truncated: exceeded the runner frame budget]",
+
+    assert result["is_error"] is True
+    assert result["details"] == {
+        "error_code": "tool_timeout",
+        "timeout_seconds": 0.01,
     }
-    assert capped[2] == image_block
-    assert _cap_response_text([{"type": "text", "text": "ok"}]) == [
-        {"type": "text", "text": "ok"}
-    ]
-
-
-def test_details_are_capped_to_runner_frame_budget() -> None:
-    oversized_entries = [
-        {"path": f"datasets/allenai/tmax/task-data/task_{index:06d}", "size": 1}
-        for index in range(30_000)
-    ]
-    capped = _cap_details_size(
-        {"entries": oversized_entries, "dataset_path": "datasets/allenai/tmax/"}
-    )
-    assert len(capped["entries"]) == 50
-    assert capped["entries_truncated"] == {"shown": 50, "total": 30_000}
-    assert capped["dataset_path"] == "datasets/allenai/tmax/"
-
-    pasted = _cap_details_size({"blob": "x" * 300_000})
-    assert pasted["blob"].endswith(
-        "[output truncated: exceeded the runner frame budget]"
-    )
-
-    def _deep_value(size: int) -> list[dict[str, list[str]]]:
-        return [{"nested": ["y" * size]}]
-
-    irreducible = _cap_details_size(
-        {
-            "entries": _deep_value(150_000),
-            "directory_summary": {"sampled_child_folders": _deep_value(150_000)},
-        }
-    )
-    assert irreducible == {
-        "truncated": True,
-        "keys": ["directory_summary", "entries"],
-    }
-
-    untouched = {"entries": [{"path": "a"}], "n": 1}
-    assert _cap_details_size(untouched) is untouched
+    assert "Narrow dataset_path" in result["content"][0]["text"]
 
 
 async def test_pi_host_synthesizes_debug_task_and_persists_only_attempt_budget(
@@ -382,61 +754,6 @@ async def test_pi_host_synthesizes_debug_task_and_persists_only_attempt_budget(
     assert json.loads(persisted) == {"pyromind_workflow_attempts": 4}
     assert "request-secret" not in persisted
     assert "must_not_persist" not in persisted
-
-
-async def test_facade_registers_session_llm_credentials(tmp_path) -> None:
-    """resolve_llm_env must see the session's own working key, not DF_API_KEY."""
-    repository = Path(pi_adapter_module.__file__).parents[3]
-    host = PyromindBusinessToolHost(
-        [
-            repository / ".agents" / "skills" / "data-processing",
-            repository / ".agents" / "skills" / "training-analysis",
-        ]
-    )
-    seen: dict[str, str | None] = {}
-
-    class FakeAction(BaseModel):
-        pass
-
-    class FakeTool:
-        action_type = FakeAction
-        executor = None
-
-        def __call__(self, _action, facade):
-            registry = facade.state.secret_registry
-            for name in ("LLM_AUTH_TOKEN", "LLM_BASE_URL", "LLM_MODEL"):
-                seen[name] = registry.get_secret_value(name)
-            return SimpleNamespace(
-                is_error=False,
-                to_llm_content=(),
-                details={},
-                model_dump=lambda mode=None, exclude=None: {},
-            )
-
-    host._factories["edp_render"] = cast(Any, lambda _context: FakeTool())
-    monkeypatch_invalid_df_key = "sk-or-v1-should-never-be-used"
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("DF_API_KEY", monkeypatch_invalid_df_key)
-        await host.execute(
-            "edp_render",
-            {},
-            ToolExecutionContext(
-                conversation_id="conversation-1",
-                workspace_root=tmp_path,
-                request_context=RequestContext(user_id="42"),
-                model_configuration={
-                    "model": "openai/deepseek-v4-flash-0731",
-                    "api_key": "sk-session-key",
-                    "base_url": "http://208.64.254.189:8000/v1",
-                },
-            ),
-        )
-
-    assert seen == {
-        "LLM_AUTH_TOKEN": "sk-session-key",
-        "LLM_BASE_URL": "http://208.64.254.189:8000/v1",
-        "LLM_MODEL": "openai/deepseek-v4-flash-0731",
-    }
 
 
 def test_model_resolution_rules() -> None:
@@ -525,6 +842,20 @@ def test_session_config_persists_model_api_resolution() -> None:
         {"model": "gpt-5", "base_url": "https://api.openai.com/v1"}
     )
 
+    config = _session_config(
+        SessionSpec(
+            conversation_id="conversation-timeout",
+            user_id="42",
+            workspace_root="/tmp/conversation-timeout",
+            model_configuration={"model": "gpt-5"},
+            extra={
+                "preview_dataset_timeout_seconds": 45,
+                "untrusted_extra": "ignored",
+            },
+        )
+    )
+    assert config["extra"] == {"preview_dataset_timeout_seconds": 45}
+
 
 def test_pyromind_llm_config_rejects_unknown_model_api() -> None:
     with pytest.raises(ValidationError):
@@ -537,7 +868,7 @@ def test_pyromind_llm_config_rejects_invalid_context_window() -> None:
 
 
 async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
-    adapter = PiAdapter(tmp_path)
+    adapter = PiAdapter(tmp_path, terminal_backend="os-sandbox")
     files = PiSessionFiles(tmp_path / "conversation-1")
     files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
     session = SimpleNamespace(
@@ -568,7 +899,7 @@ async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
 async def test_adapter_projects_generic_write_completion_to_workflow(
     tmp_path, monkeypatch
 ) -> None:
-    adapter = PiAdapter(tmp_path)
+    adapter = PiAdapter(tmp_path, terminal_backend="os-sandbox")
     workspace = tmp_path / "conversation-1"
     files = PiSessionFiles(workspace)
     files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
@@ -619,10 +950,23 @@ async def test_adapter_projects_generic_write_completion_to_workflow(
     )
 
 
-async def test_real_runner_starts_without_persisting_request_api_key(tmp_path) -> None:
+async def test_runner_start_does_not_persist_request_api_key(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, _config) -> None:
+            return None
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
     conversations = tmp_path / "conversations"
     conversations.mkdir()
-    adapter = PiAdapter(conversations)
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
     handle = await adapter.create_session(
         SessionSpec(
             conversation_id="conversation-1",
@@ -666,7 +1010,7 @@ async def test_pi_adapter_forks_native_session_and_sanitizes_workspace(
     monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
     conversations = tmp_path / "conversations"
     conversations.mkdir()
-    adapter = PiAdapter(conversations)
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
     context = RequestContext(user_id="42")
     source_handle = await adapter.create_session(
         SessionSpec(
@@ -678,7 +1022,6 @@ async def test_pi_adapter_forks_native_session_and_sanitizes_workspace(
         context,
     )
     source = conversations / "source"
-    (source / "public_data").mkdir()
     (source / "public_data" / "artifact.txt").write_text("safe", encoding="utf-8")
     current_workflow = source / "public_data" / "workflow_canvas" / "workflow.py"
     current_workflow.parent.mkdir()
@@ -686,6 +1029,7 @@ async def test_pi_adapter_forks_native_session_and_sanitizes_workspace(
     (source / "product").mkdir()
     (source / "product" / "snapshot.json").write_text("private", encoding="utf-8")
     (source / ".env").write_text("TOKEN=secret", encoding="utf-8")
+    (source / "public_data" / "secret-link").symlink_to(source / ".env")
     PiSessionFiles(source).save_checkpoint_index({"workflow-v1": "leaf-1"})
     checkpoint = ProductCheckpoint(
         event_id="workflow-v1",
@@ -717,6 +1061,7 @@ async def test_pi_adapter_forks_native_session_and_sanitizes_workspace(
     )
     assert not (target / "product").exists()
     assert not (target / ".env").exists()
+    assert not (target / "public_data" / "secret-link").exists()
     assert (target / "pi" / "session.jsonl").is_file()
     assert "request-secret" not in (target / "pi" / "session.json").read_text()
     await adapter.close(target_handle)
@@ -745,7 +1090,7 @@ async def test_pi_adapter_restores_workflow_and_resets_debug_budget(
     monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
     conversations = tmp_path / "conversations"
     conversations.mkdir()
-    adapter = PiAdapter(conversations)
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
     context = RequestContext(user_id="42")
     handle = await adapter.create_session(
         SessionSpec(

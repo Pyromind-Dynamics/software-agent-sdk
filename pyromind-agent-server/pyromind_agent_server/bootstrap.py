@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from harness_adapter.openhands_adapter import OpenHandsAdapter
-from harness_adapter.pi_adapter import PiAdapter
+from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.ports.harness import HarnessAdapter
 
@@ -27,13 +27,11 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     adapters: dict[str, HarnessAdapter] = {
         "openhands": OpenHandsAdapter(lambda: app.state.conversation_service),
     }
-    app_env = os.getenv("APP_ENV", "dev").strip().lower()
-    if app_env not in {"prod", "production", "online"}:
-        adapters["pi"] = PiAdapter(service.conversations_dir)
-    elif backend == "pi":
-        raise RuntimeError(
-            "Pi local execution is disabled in production until sk-sandbox "
-            "is integrated"
+    if backend == "pi":
+        terminal_backend = resolve_pi_terminal_backend()
+        adapters["pi"] = PiAdapter(
+            service.conversations_dir,
+            terminal_backend=terminal_backend,
         )
     runtime = ConversationRuntime(
         service.conversations_dir,

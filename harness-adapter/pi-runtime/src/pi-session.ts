@@ -18,12 +18,14 @@ import {
   type BusinessToolConfig,
   type SkillRootConfig,
 } from "./tools.js";
+import type { PiTerminalBackend } from "./workspace-sandbox.js";
 
 interface PiSessionConfig extends PiModelConfig {
   sessionId: string;
   systemPrompt: string;
   thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   workspaceRoot: string;
+  terminalBackend: PiTerminalBackend;
   sessionPath: string;
   skillRoots: SkillRootConfig[];
   knowledgeRoot?: string;
@@ -42,10 +44,11 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
   const config = parseConfig(params);
   const { modelRuntime, model } = await createPiModelRuntime(config);
   const env = new NodeExecutionEnv({ cwd: config.workspaceRoot, shellEnv: safeShellEnvironment() });
-  const tools = createTools(
+  const tools = await createTools(
     peer,
     env,
     config.workspaceRoot,
+    config.terminalBackend,
     config.skillRoots,
     config.knowledgeRoot,
     config.tools,
@@ -124,11 +127,20 @@ function parseConfig(value: JsonObject): PiSessionConfig {
     systemPrompt: typeof value.system_prompt === "string" ? value.system_prompt : "You are a coding agent.",
     thinkingLevel: thinking as PiSessionConfig["thinkingLevel"],
     workspaceRoot: requiredString(value, "workspace_root"),
+    terminalBackend: terminalBackend(value),
     sessionPath: requiredString(value, "session_path"),
     skillRoots: parseSkillRoots(value),
     knowledgeRoot: optionalString(value, "knowledge_root"),
     tools: parseTools(value.tools),
   };
+}
+
+function terminalBackend(value: JsonObject): PiTerminalBackend {
+  const backend = requiredString(value, "terminal_backend");
+  if (backend !== "os-sandbox") {
+    throw new Error("invalid terminal_backend; expected os-sandbox");
+  }
+  return backend;
 }
 
 function parseSkillRoots(value: JsonObject): SkillRootConfig[] {

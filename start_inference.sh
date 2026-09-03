@@ -7,12 +7,39 @@
 #   ./start_inference.sh
 # ============================================================
 
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 
 export PYROMIND_HARNESS_BACKEND="pi"
+export APP_ENV="${APP_ENV:-dev}"
+export PYROMIND_PI_TERMINAL_BACKEND="os-sandbox"
+
+case "$(uname -s)" in
+  Darwin)
+    if [[ ! -x /usr/bin/sandbox-exec ]]; then
+      echo "ERROR: Pi os-sandbox requires /usr/bin/sandbox-exec on macOS." >&2
+      exit 1
+    fi
+    ;;
+  Linux)
+    for sandbox_dependency in rg bwrap socat; do
+      if ! command -v "${sandbox_dependency}" >/dev/null 2>&1; then
+        echo "ERROR: Pi os-sandbox requires ${sandbox_dependency} on Linux." >&2
+        exit 1
+      fi
+    done
+    ;;
+  *)
+    echo "ERROR: Pi os-sandbox supports only Linux and macOS." >&2
+    exit 1
+    ;;
+esac
 
 # ----------------------------------------------------------
 # LLM Configuration
@@ -27,14 +54,10 @@ export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 #export LLM_MODEL="openai/deepseek-v4-pro"
 #export LLM_BASE_URL="https://api.deepseek.com"
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-  echo "ERROR: OPENAI_API_KEY is required. Export it before running start.sh." >&2
+  echo "ERROR: OPENAI_API_KEY is required. Export it before running start_inference.sh." >&2
   exit 1
 fi
 export LLM_MODEL="${LLM_MODEL:-openai/deepseek-v4-flash-0731}"
-if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-  echo "ERROR: OPENAI_API_KEY is required. Set it in start_inference.sh." >&2
-  exit 1
-fi
 export OPENAI_API_KEY
 
 export DF_API_BASE_URL="https://openrouter.ai/api/v1"

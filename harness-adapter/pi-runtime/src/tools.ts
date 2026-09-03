@@ -1,5 +1,6 @@
 import { lstat } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   createEditTool,
@@ -17,7 +18,17 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { isRecord, type JsonObject } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
-import { createWorkspaceSandboxedBashOperations } from "./workspace-sandbox.js";
+import {
+  createWorkspaceBashOperations,
+  type PiTerminalBackend,
+} from "./workspace-sandbox.js";
+import {
+  WorkspaceAccessPolicy,
+  type WorkspacePathOperation,
+} from "./workspace-policy.js";
+
+const OPENHANDS_ERROR_HEADER = "[An error occurred during execution.]";
+const OMITTED_IMAGE_TEXT = "[Image omitted: Pi only accepts inline base64 image data.]";
 
 export interface BusinessToolConfig {
   name: string;
@@ -30,28 +41,45 @@ export interface SkillRootConfig {
   path: string;
 }
 
-export function createTools(
+export async function createTools(
   peer: JsonlRpcPeer,
   env: ExecutionEnv,
   workspaceRoot: string,
+  terminalBackend: PiTerminalBackend,
   skillRoots: SkillRootConfig[],
   knowledgeRoot: string | undefined,
   businessTools: BusinessToolConfig[],
-): AgentTool[] {
-  const terminalOutputTemp = join(
-    resolve(workspaceRoot),
-    "pi",
-    "terminal-output",
-  );
-  mkdirSync(terminalOutputTemp, { recursive: true, mode: 0o700 });
-  process.env.TMPDIR = terminalOutputTemp;
-  process.env.TMP = terminalOutputTemp;
-  process.env.TEMP = terminalOutputTemp;
+): Promise<AgentTool[]> {
+  const policy = await WorkspaceAccessPolicy.create({
+    workspaceRoot,
+    readOnlyRoots: skillRoots.map((root) => root.path),
+    knowledgeRoot,
+  });
+  // Keep this binding explicit: the sandbox switches the process temp directory
+  // to the conversation-scoped terminal output directory after initialization.
+  const { terminalTempRoot: terminalOutputTemp } = policy;
+  // Keep the runtime temp path short: the sandbox's Unix bridge sockets must
+  // stay under the 108-char sun_path limit even with long conversation ids.
+  const runtimeTmp = join(tmpdir(), "pi-terminal");
+  mkdirSync(runtimeTmp, { recursive: true, mode: 0o700 });
+  process.env.TMPDIR = runtimeTmp;
+  process.env.TMP = runtimeTmp;
+  process.env.TEMP = runtimeTmp;
   const read = createReadTool();
   const write = createWriteTool();
   const edit = createEditTool();
+  const terminalOperations = await createWorkspaceBashOperations(
+    terminalBackend,
+    policy,
+  );
+  // sandbox-runtime creates Linux bridge sockets under os.tmpdir(). Initialize
+  // it before pointing process temp variables at the conversation's much longer
+  // terminal-output path, which can exceed sockaddr_un.sun_path's 108-byte limit.
+  process.env.TMPDIR = terminalOutputTemp;
+  process.env.TMP = terminalOutputTemp;
+  process.env.TEMP = terminalOutputTemp;
   const bash = createBashTool(workspaceRoot, {
-    operations: createWorkspaceSandboxedBashOperations(workspaceRoot),
+    operations: terminalOperations,
     exposeSessionEnvironment: false,
     spawnHook: ({ command }) => ({
       command,
@@ -60,9 +88,9 @@ export function createTools(
     }),
   });
   return [
-    bindPathTool(read, env, workspaceRoot, skillRoots, knowledgeRoot, true),
-    bindPathTool(write, env, workspaceRoot, skillRoots, knowledgeRoot, false),
-    bindPathTool(edit, env, workspaceRoot, skillRoots, knowledgeRoot, false),
+    bindPathTool(read, env, policy, "read"),
+    bindPathTool(write, env, policy, "write"),
+    bindPathTool(edit, env, policy, "write"),
     {
       ...bash,
       name: "terminal",
@@ -110,25 +138,26 @@ function bindNative(
 function bindPathTool(
   tool: AgentHarnessTool<ExecutionToolContext, any, any>,
   env: ExecutionEnv,
-  workspaceRoot: string,
-  skillRoots: SkillRootConfig[],
-  knowledgeRoot: string | undefined,
-  allowReadOnlyResources: boolean,
+  policy: WorkspaceAccessPolicy,
+  operation: WorkspacePathOperation,
 ): AgentTool<any, any> {
   const bound = bindNative(tool, env);
+  const pathScope = operation === "read"
+    ? "Conversation files are read from public_data/. Advertised skill paths and knowledge/ are read-only. Relative paths start at the conversation root; authorized absolute paths are also accepted."
+    : "Write and edit paths must stay within public_data/. Relative paths start at the conversation root; authorized absolute paths are also accepted.";
+  const parameters = structuredClone(bound.parameters);
+  if (isRecord(parameters.properties) && isRecord(parameters.properties.path)) {
+    parameters.properties.path.description = pathScope;
+  }
   return {
     ...bound,
+    description: `${bound.description}\n\n${pathScope}`,
+    parameters,
     async execute(callId, params: any, signal, onUpdate) {
       if (!isRecord(params) || typeof params.path !== "string") throw new Error("path must be a string");
       const safe = {
         ...params,
-        path: await safePath(
-          params.path,
-          workspaceRoot,
-          skillRoots,
-          knowledgeRoot,
-          allowReadOnlyResources,
-        ),
+        path: await policy.resolvePath(params.path, operation),
       };
       return tool.execute(callId, safe, signal, onUpdate, { env });
     },
@@ -151,27 +180,74 @@ function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig): AgentTool
       if (!isRecord(response) || typeof response.is_error !== "boolean" || !Array.isArray(response.content)) {
         throw new Error("invalid Python tool response");
       }
-      const content: Array<TextContent | ImageContent> = [];
-      for (const block of response.content) {
-        if (!isRecord(block)) continue;
-        if (block.type === "text" && typeof block.text === "string") content.push({ type: "text", text: block.text });
-        else if (block.type === "image" && typeof block.data === "string" && typeof block.mime_type === "string") {
-          content.push({ type: "image", data: block.data, mimeType: block.mime_type });
-        }
+      const content = normalizeBusinessToolContent(response.content);
+      if (response.is_error) {
+        const message = content
+          .filter((block): block is TextContent => block.type === "text")
+          .map((block) => block.text.trim())
+          .filter((text) => text && text !== OPENHANDS_ERROR_HEADER)
+          .join("\n");
+        throw new Error(message || "tool failed");
       }
-      if (response.is_error) throw new Error(toolErrorText(content) || "tool failed");
       return { content, details: isRecord(response.details) ? response.details : undefined };
     },
   };
 }
 
-/** Python error observations put a generic header first and the diagnostic
- * text in following blocks; dropping any of them blinds the model. */
-export function toolErrorText(blocks: Array<TextContent | ImageContent>): string {
-  return blocks
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("");
+export function normalizeBusinessToolContent(
+  blocks: unknown[],
+): Array<TextContent | ImageContent> {
+  const content: Array<TextContent | ImageContent> = [];
+  for (const block of blocks) {
+    if (!isRecord(block)) continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      content.push({ type: "text", text: block.text });
+      continue;
+    }
+    if (block.type !== "image") continue;
+
+    if (Array.isArray(block.image_urls)) {
+      if (block.image_urls.length === 0) {
+        content.push({ type: "text", text: OMITTED_IMAGE_TEXT });
+        continue;
+      }
+      for (const url of block.image_urls) {
+        const image = typeof url === "string" ? inlineImageContent(url) : undefined;
+        content.push(image ?? { type: "text", text: OMITTED_IMAGE_TEXT });
+      }
+      continue;
+    }
+
+    const mimeType = typeof block.mime_type === "string"
+      ? block.mime_type
+      : typeof block.mimeType === "string" ? block.mimeType : undefined;
+    if (typeof block.data === "string" && block.data && mimeType) {
+      content.push({ type: "image", data: block.data, mimeType });
+    } else {
+      content.push({ type: "text", text: OMITTED_IMAGE_TEXT });
+    }
+  }
+  return content;
+}
+
+function inlineImageContent(url: string): ImageContent | undefined {
+  const separator = url.indexOf(",");
+  if (separator < 0) return undefined;
+  const metadata = url.slice(0, separator);
+  const data = url.slice(separator + 1);
+  const match = /^data:(image\/[^;,\s]+);base64$/i.exec(metadata);
+  if (!match || !data || !isBase64(data)) return undefined;
+  return { type: "image", data, mimeType: match[1]! };
+}
+
+function isBase64(value: string): boolean {
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
+  try {
+    const normalized = value.replace(/=+$/, "");
+    return Buffer.from(value, "base64").toString("base64").replace(/=+$/, "") === normalized;
+  } catch {
+    return false;
+  }
 }
 
 export async function safePath(
@@ -181,80 +257,15 @@ export async function safePath(
   knowledgeRoot: string | undefined,
   allowReadOnlyResources: boolean,
 ): Promise<string> {
-  if (!input || input.split(/[\\/]/).includes("..")) throw new Error(`unsafe path: ${input}`);
-  const workspace = resolve(workspaceRoot);
   const skills = (typeof skillRoots === "string"
     ? [{ name: "skill", path: skillRoots }]
-    : skillRoots).map((root) => ({ ...root, path: resolve(root.path) }));
-  const knowledge = knowledgeRoot ? resolve(knowledgeRoot) : undefined;
-
-  if (!isAbsolute(input) && input.split(/[\\/]/)[0] === "knowledge") {
-    if (!allowReadOnlyResources) {
-      throw new Error(
-        "PATH_SCOPE_ERROR: knowledge is read-only; write and edit only workspace-relative paths",
-      );
-    }
-    if (!knowledge) {
-      throw new Error("PATH_SCOPE_ERROR: knowledge/ is not configured for this Pi session");
-    }
-    const parts = input.split(/[\\/]/).filter(Boolean).slice(1);
-    const target = resolve(knowledge, ...parts);
-    if (!inside(target, knowledge)) throw new Error(`unsafe path: ${input}`);
-    await rejectSymlinks(knowledge, target);
-    return target;
-  }
-
-  if (isAbsolute(input)) {
-    const target = resolve(input);
-    if (!allowReadOnlyResources) {
-      throw new Error(
-        "PATH_SCOPE_ERROR: write and edit paths must be workspace-relative; skill and knowledge files are read-only",
-      );
-    }
-    const matchingSkill = skills.find((root) => inside(target, root.path));
-    if (matchingSkill) {
-      await rejectSymlinks(matchingSkill.path, target);
-      return target;
-    }
-    if (knowledge && inside(target, knowledge)) {
-      await rejectSymlinks(knowledge, target);
-      return target;
-    }
-    if (inside(target, workspace)) {
-      const suggested = relative(workspace, target) || ".";
-      throw new Error(
-        `PATH_SCOPE_ERROR: workspace files must use workspace-relative paths; use ${suggested}`,
-      );
-    }
-    throw new Error(
-      "PATH_SCOPE_ERROR: read paths must be workspace-relative, knowledge/..., or an absolute skill location advertised by Pi",
-    );
-  }
-
-  const target = resolve(workspace, input);
-  if (!inside(target, workspace)) throw new Error(`unsafe path: ${input}`);
-  await rejectSymlinks(workspace, target);
-  return target;
-}
-
-function inside(target: string, root: string): boolean {
-  const rel = relative(root, target);
-  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
-}
-
-async function rejectSymlinks(root: string, target: string): Promise<void> {
-  if ((await lstat(root)).isSymbolicLink()) throw new Error(`allowed root must not be a symlink: ${root}`);
-  const parts = relative(root, target).split(sep).filter(Boolean);
-  let current = root;
-  for (const part of parts) {
-    current = resolve(current, part);
-    try {
-      if ((await lstat(current)).isSymbolicLink()) throw new Error(`symlink paths are not allowed: ${current}`);
-    } catch (error) {
-      if (isRecord(error) && error.code === "ENOENT") return;
-      throw error;
-    }
-  }
+    : skillRoots);
+  const policy = await WorkspaceAccessPolicy.create({
+    workspaceRoot,
+    readOnlyRoots: skills.map((root) => root.path),
+    knowledgeRoot,
+  });
+  return policy.resolvePath(input, allowReadOnlyResources ? "read" : "write");
 }
 
 function safeShellEnvironment(): Record<string, string> {

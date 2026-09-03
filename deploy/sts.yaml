@@ -34,10 +34,14 @@ spec:
         spec:
             containers:
                 - env:
-                      - name: RunMode
-                        value: agent-server
                       - name: workspace_dir
                         value: /workspace
+                      - name: PYROMIND_HARNESS_BACKEND
+                        value: pi
+                      - name: APP_ENV
+                        value: pre
+                      - name: PYROMIND_PI_TERMINAL_BACKEND
+                        value: os-sandbox
                       - name: OH_CONVERSATION_STORAGE_QUOTA
                         value: 500M
                       - name: OH_STORAGE_QUOTA_REQUIRED
@@ -83,6 +87,7 @@ spec:
                       capabilities:
                           add:
                               - SYS_ADMIN
+                              - NET_ADMIN
                       seccompProfile:
                           type: Unconfined
             initContainers:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
+import harness_adapter.pi_adapter.adapter as pi_adapter_module
 import httpx
 from fastapi import FastAPI
 from harness_adapter.pi_adapter import PiAdapter
@@ -144,13 +146,36 @@ def test_install_product_api_does_not_modify_openhands_routes() -> None:
 
 
 async def test_product_api_creates_pi_metadata_and_reports_missing_checkpoint(
-    tmp_path,
+    tmp_path, monkeypatch
 ) -> None:
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, _config) -> None:
+            return None
+
+        async def request(self, method, params):
+            if method == "context.append":
+                return {"checkpoint_entry_id": "workflow-checkpoint"}
+            if method == "fork":
+                target = Path(params["target_session_dir"]) / "branched.jsonl"
+                target.write_text('{"type":"session"}\n', encoding="utf-8")
+                return {"session_path": str(target)}
+            raise AssertionError(f"unexpected runner request: {method}")
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
     conversations = tmp_path / "conversations"
     conversations.mkdir()
     runtime = ConversationRuntime(
         conversations,
-        {"openhands": FakeAdapter(), "pi": PiAdapter(conversations)},
+        {
+            "openhands": FakeAdapter(),
+            "pi": PiAdapter(conversations, terminal_backend="os-sandbox"),
+        },
         default_harness_id="pi",
     )
     transport = httpx.ASGITransport(app=_app(tmp_path, runtime))
@@ -202,8 +227,9 @@ async def test_product_api_creates_pi_metadata_and_reports_missing_checkpoint(
     assert valid_fork.status_code == 201
     target_id = valid_fork.json()["conversation_id"]
     assert target_id != conversation_id
-    assert valid_fork.json()["current_workflow"]["version"] == (
-        created.json()["current_workflow"]["version"]
+    assert (
+        valid_fork.json()["current_workflow"]["version"]
+        == (created.json()["current_workflow"]["version"])
     )
     assert (conversations / target_id / "pi" / "session.jsonl").is_file()
     await runtime.close()

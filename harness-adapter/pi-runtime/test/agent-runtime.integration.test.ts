@@ -10,9 +10,12 @@ import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 import { PiAgentRuntime } from "../src/agent-runtime.js";
 
 test("AgentSession completes the workflow-generation tool loop over chat completions", async (context) => {
-  const workspace = await mkdtemp(join(tmpdir(), "pi-runtime-test-"));
-  const skill = join(workspace, "generate-workflow-dsl");
-  const knowledge = join(workspace, "knowledge-resource");
+  const root = await mkdtemp(join(tmpdir(), "pi-runtime-test-"));
+  const workspace = join(root, "conversation");
+  const skill = join(root, "generate-workflow-dsl");
+  const knowledge = join(root, "knowledge-resource");
+  await mkdir(join(workspace, "public_data"), { recursive: true });
+  await mkdir(join(workspace, "pi", "terminal-output"), { recursive: true });
   await mkdir(join(skill, "references"), { recursive: true });
   await mkdir(knowledge);
   await writeFile(join(skill, "SKILL.md"), [
@@ -68,6 +71,7 @@ test("AgentSession completes the workflow-generation tool loop over chat complet
   await runtime.handle("start", {
     session_id: "integration-session",
     workspace_root: workspace,
+    terminal_backend: "os-sandbox",
     session_path: join(workspace, "pi", "session.jsonl"),
     skill_root: skill,
     knowledge_root: knowledge,
@@ -155,7 +159,20 @@ test("a persistent length stop finishes as output_truncated, never completed", a
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   context.after(() => server.close());
   const address = server.address() as AddressInfo;
-  const workspace = await mkdtemp(join(tmpdir(), "pi-runtime-length-"));
+  const root = await mkdtemp(join(tmpdir(), "pi-runtime-length-"));
+  const workspace = join(root, "conversation");
+  const skill = join(root, "skill");
+  await mkdir(join(workspace, "public_data"), { recursive: true });
+  await mkdir(join(workspace, "pi", "terminal-output"), { recursive: true });
+  await mkdir(skill);
+  await writeFile(join(skill, "SKILL.md"), [
+    "---",
+    "name: test-skill",
+    "description: Test skill.",
+    "---",
+    "Test instructions.",
+    "",
+  ].join("\n"), "utf8");
   const events: RunnerEvent[] = [];
   let resolveFinished: (() => void) | undefined;
   const finished = new Promise<void>((resolve) => { resolveFinished = resolve; });
@@ -171,8 +188,9 @@ test("a persistent length stop finishes as output_truncated, never completed", a
   await runtime.handle("start", {
     session_id: "length-session",
     workspace_root: workspace,
+    terminal_backend: "os-sandbox",
     session_path: join(workspace, "pi", "session.jsonl"),
-    skill_root: workspace,
+    skill_root: skill,
     system_prompt: "Answer the user.",
     model: {
       provider: "openai",

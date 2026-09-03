@@ -1785,6 +1785,82 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
     assert f"df_run_input_path={observation.local_sample_paths[0]}" in llm_text
 
 
+def test_sample_mode_explicit_paths_allow_up_to_n() -> None:
+    executor = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )
+    requested = [f"/dataset/sample-{index}" for index in range(4)]
+
+    selected, entries = executor._select_storage_samples(
+        "/dataset/",
+        requested,
+        10,
+        {},
+    )
+
+    assert selected == requested
+    assert entries == []
+
+
+def test_sample_mode_rejects_explicit_paths_over_n(tmp_path) -> None:
+    executor = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )
+    observation = executor._storage_sample(
+        PreviewDatasetAction(
+            dataset_path="/dataset/",
+            mode="sample",
+            n=10,
+            sample_paths=[f"/dataset/sample-{index}" for index in range(11)],
+        ),
+        "/dataset/",
+        {},
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert observation.is_error
+    assert observation.error_code == "sample_selection_limit"
+    assert observation.text == (
+        "sample_paths 有 11 项，超过 n=10。\n"
+        "请减少路径数量，或增大 n。\n"
+        "错误码：sample_selection_limit"
+    )
+
+
+def test_sample_mode_auto_selection_uses_default_limit_of_three(monkeypatch) -> None:
+    executor = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )
+    monkeypatch.setattr(
+        executor,
+        "_list_entries",
+        lambda _path, _headers: [
+            MagicMock(
+                path=f"/dataset/sample-{index}",
+                name=f"sample-{index}",
+                is_dir=True,
+                size=None,
+                last_modified=None,
+            )
+            for index in range(5)
+        ],
+    )
+
+    selected, entries = executor._select_storage_samples(
+        "/dataset/",
+        [],
+        3,
+        {},
+    )
+
+    assert selected == [
+        "/dataset/sample-0",
+        "/dataset/sample-1",
+        "/dataset/sample-2",
+    ]
+    assert len(entries) == 5
+
+
 def test_sample_mode_allows_conversation_public_data_workspace(tmp_path) -> None:
     workspace = tmp_path / "workspace" / "conversations" / "conversation-id"
     (workspace / "events").mkdir(parents=True)
