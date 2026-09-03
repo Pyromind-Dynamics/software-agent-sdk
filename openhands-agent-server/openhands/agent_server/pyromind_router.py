@@ -659,6 +659,10 @@ class PyromindLLMConfig(BaseModel):
     )
     api: Literal["openai-completions", "openai-responses"] | None = None
     context_window: int | None = Field(default=None, gt=0)
+    timeout: int | None = Field(
+        default=None,
+        description=("LLM request timeout in seconds. Server-default 60s when unset."),
+    )
 
     @field_validator("base_url", mode="before")
     @classmethod
@@ -1263,6 +1267,7 @@ async def create_pyromind_conversation(
         api_key=request.llm.api_key,
         base_url=request.llm.base_url,
         stream=True,
+        timeout=request.llm.timeout or 60,
         persist_runtime_config=False,
     )
 
