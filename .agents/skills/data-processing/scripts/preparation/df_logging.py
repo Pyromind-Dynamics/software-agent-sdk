@@ -19,7 +19,10 @@ import json
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+)
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -50,6 +53,13 @@ class LoggingLLMServing:
         self._log_file = open(self._log_path, "a", encoding="utf-8")
         self._lock = threading.Lock()
         self._seq = 0
+        # Per-item wall-clock budget covering all internal retry attempts.
+        # The serving gateway keeps hung connections alive, which defeats
+        # socket read_timeout, so wall-clock is the only enforceable limit;
+        # a cut item is logged with status="deadline" and its output slot
+        # surfaces as None for the pipeline to ledger and skip.
+        self._request_deadline = float(os.environ.get("DF_REQUEST_DEADLINE", "600"))
+        self._slow_warn_seconds = float(os.environ.get("DF_SLOW_WARN_SECONDS", "120"))
         self._stats = {
             "total": 0,
             "success": 0,
@@ -102,6 +112,7 @@ class LoggingLLMServing:
                 self._inc_stats(success=False, latency_ms=latency_ms)
             record["latency_ms"] = latency_ms
             self._write_record(record)
+            self._warn_if_slow(id, latency_ms)
             return result_id, response
         except Exception as e:
             latency_ms = round((time.time() - start) * 1000)
@@ -117,20 +128,32 @@ class LoggingLLMServing:
     # ------------------------------------------------------------------
 
     def _run_threadpool(self, task_args_list: list[dict], desc: str = "") -> list:  # noqa: ARG002
-        """Replicate inner threadpool but use wrapper's logging method."""
+        """Replicate inner threadpool but use wrapper's logging method.
+
+        Each item gets a wall-clock budget (``DF_REQUEST_DEADLINE``) covering
+        all of its internal retry attempts, so a hung gateway connection
+        cannot stall the whole batch. ``shutdown(wait=False)`` matters:
+        joining abandoned hung threads would reintroduce the stall this
+        deadline exists to prevent.
+        """
         responses: list[Any] = [None] * len(task_args_list)
         max_workers = getattr(self._inner, "max_workers", 8)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(self._api_chat_id_retry, **task_args)
-                for task_args in task_args_list
-            ]
-            for future in as_completed(futures):
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        futures = [
+            (task_args["id"], executor.submit(self._api_chat_id_retry, **task_args))
+            for task_args in task_args_list
+        ]
+        try:
+            for task_id, future in futures:
                 try:
-                    result_id, response = future.result()
+                    result_id, response = future.result(timeout=self._request_deadline)
                     responses[result_id] = response
+                except FuturesTimeoutError:
+                    self._record_deadline(task_id)
                 except Exception:
                     pass
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
         return responses
 
     # ------------------------------------------------------------------
@@ -240,6 +263,31 @@ class LoggingLLMServing:
             else:
                 self._stats["failed"] += 1
             self._stats["total_latency_ms"] += latency_ms
+
+    def _record_deadline(self, task_id: int) -> None:
+        record: dict[str, Any] = {
+            "seq": self._next_seq(),
+            "batch_id": task_id,
+            "timestamp": datetime.now(_UTC).isoformat(),
+            "model": getattr(self._inner, "model_name", None),
+            "status": "deadline",
+            "error": f"exceeded DF_REQUEST_DEADLINE={self._request_deadline:g}s",
+            "latency_ms": round(self._request_deadline * 1000),
+        }
+        self._write_record(record)
+        self._inc_stats(success=False, latency_ms=self._request_deadline * 1000)
+        print(
+            f"[df_logging] WARN deadline id={task_id} "
+            f"after {self._request_deadline:g}s",
+            flush=True,
+        )
+
+    def _warn_if_slow(self, task_id: int, latency_ms: float) -> None:
+        if latency_ms >= self._slow_warn_seconds * 1000:
+            print(
+                f"[df_logging] WARN slow id={task_id} cost={latency_ms / 1000:.1f}s",
+                flush=True,
+            )
 
     def _write_record(self, record: dict[str, Any]) -> None:
         line = json.dumps(record, ensure_ascii=False, default=str)

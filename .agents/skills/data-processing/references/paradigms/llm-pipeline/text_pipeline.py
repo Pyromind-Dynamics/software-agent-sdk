@@ -150,11 +150,14 @@ def main(input_path: str, output_path: str) -> None:
         key_name_of_api_key="DF_API_KEY",
         temperature=0.0,
         max_workers=8,
+        max_retries=int(os.environ.get("DF_LLM_MAX_RETRIES", "2")),
+        read_timeout=float(os.environ.get("DF_READ_TIMEOUT", "300")),
     )
     llm = LoggingLLMServing(raw_llm)
 
     # 4. Process in batches, write progress after each batch
     progress_path = output_file.parent / "progress.json"
+    failures_file = output_file.parent / "failures.jsonl"
     start_time = time.monotonic()
     succeeded = already_done
     failed = 0
@@ -188,17 +191,37 @@ def main(input_path: str, output_path: str) -> None:
                 file=sys.stderr,
             )
             failed += len(batch)
+            with failures_file.open("a", encoding="utf-8") as failures:
+                for record in batch:
+                    failures.write(
+                        json.dumps(
+                            {
+                                "reason": "batch_error",
+                                "error": err_msg[:200],
+                                "input": record,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
 
         if responses is not None:
             # Open and close per batch so FUSE uploads chunks promptly
-            with output_file.open("a", encoding="utf-8") as out:
+            with (
+                output_file.open("a", encoding="utf-8") as out,
+                failures_file.open("a", encoding="utf-8") as failures,
+            ):
                 for record, response in zip(batch, responses):
-                    if response is None:
-                        failed += 1
-                        continue
-                    answer = response.strip()
+                    answer = (response or "").strip()
                     if not answer:
                         failed += 1
+                        failures.write(
+                            json.dumps(
+                                {"reason": "no_response", "input": record},
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
                         continue
                     out.write(
                         json.dumps(
@@ -243,6 +266,9 @@ def main(input_path: str, output_path: str) -> None:
         f"Done. total={total} succeeded={succeeded} failed={failed} "
         f"output={output_file}"
     )
+    failed_entries = _count_existing_lines(failures_file)
+    if failed_entries:
+        print(f"Failures ledger: {failed_entries} entries at {failures_file}")
 
 
 if __name__ == "__main__":

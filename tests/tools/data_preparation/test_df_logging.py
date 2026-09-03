@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +65,6 @@ class _FakeInnerLLM:
         self.model_name = "test-model"
         self.api_url = "http://test/v1"
         self._responses = responses or []
-        self._call_count = 0
 
     def _api_chat_id_retry(
         self,
@@ -74,10 +74,8 @@ class _FakeInnerLLM:
         is_embedding: bool = False,
         json_schema: dict | None = None,
     ) -> tuple[int, str | None]:
-        idx = self._call_count
-        self._call_count += 1
-        if idx < len(self._responses):
-            return id, self._responses[idx]
+        if id < len(self._responses):
+            return id, self._responses[id]
         return id, f"response-{id}"
 
     def _run_threadpool(self, task_args_list: list[dict], desc: str = "") -> list[str]:
@@ -182,6 +180,76 @@ def test_logging_attr_passthrough(df_logging: Any, tmp_path: Path) -> None:
     assert llm.model_name == "test-model"
     assert llm.api_url == "http://test/v1"
     llm.close()
+
+
+def test_logging_deadline_cuts_hung_call(
+    df_logging: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _HungLLM(_FakeInnerLLM):
+        def _api_chat_id_retry(self, *args: Any, **kwargs: Any) -> Any:
+            time.sleep(1.0)
+            return 0, "never"
+
+    monkeypatch.setenv("DF_REQUEST_DEADLINE", "0.1")
+    inner = _HungLLM()
+    llm = df_logging.LoggingLLMServing(inner, log_dir=str(tmp_path))
+
+    start = time.monotonic()
+    results = llm.generate_from_input(["q1"], "system")
+    elapsed = time.monotonic() - start
+
+    assert results == [None]
+    assert elapsed < 0.9
+    llm.close()
+    lines = (tmp_path / "llm_calls.jsonl").read_text().strip().splitlines()
+    record = json.loads(lines[0])
+    assert record["status"] == "deadline"
+    assert "DF_REQUEST_DEADLINE" in record["error"]
+    assert llm.stats["failed"] == 1
+
+
+def test_logging_deadline_keeps_healthy_calls(
+    df_logging: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DF_REQUEST_DEADLINE", "0.5")
+    inner = _FakeInnerLLM(["a", "b", "c"])
+    llm = df_logging.LoggingLLMServing(inner, log_dir=str(tmp_path))
+
+    results = llm.generate_from_input(["q1", "q2", "q3"], "system")
+
+    assert results == ["a", "b", "c"]
+    llm.close()
+    lines = (tmp_path / "llm_calls.jsonl").read_text().strip().splitlines()
+    assert [json.loads(line)["status"] for line in lines] == [
+        "success",
+        "success",
+        "success",
+    ]
+
+
+def test_logging_slow_call_warns(
+    df_logging: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _SlowLLM(_FakeInnerLLM):
+        def _api_chat_id_retry(self, *args: Any, **kwargs: Any) -> Any:
+            time.sleep(0.05)
+            return 0, "ok"
+
+    monkeypatch.setenv("DF_SLOW_WARN_SECONDS", "0.01")
+    inner = _SlowLLM()
+    llm = df_logging.LoggingLLMServing(inner, log_dir=str(tmp_path))
+
+    llm.generate_from_input(["q1"], "system")
+    llm.close()
+
+    assert "WARN slow" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +415,45 @@ def test_report_all_failed(generate_report_mod: Any, tmp_path: Path) -> None:
     assert report["status"] == "failed"
     assert report["llm_calls"]["success"] == 0
     assert report["llm_calls"]["failed"] == 2
+
+
+def test_report_includes_failures_ledger(
+    generate_report_mod: Any,
+    tmp_path: Path,
+) -> None:
+    calls = [
+        {
+            "seq": 0,
+            "status": "success",
+            "latency_ms": 10,
+            "timestamp": "2025-01-01T00:00:00+00:00",
+        },
+    ]
+    _write_jsonl(tmp_path / "llm_calls.jsonl", calls)
+    _write_jsonl(
+        tmp_path / "failures.jsonl",
+        [
+            {"reason": "no_response", "input": {"id": "a"}},
+            {"reason": "no_response", "input": {"id": "b"}},
+            {"reason": "batch_error", "input": {"id": "c"}},
+        ],
+    )
+
+    report = generate_report_mod.generate_report(str(tmp_path))
+
+    assert report["failures"] == {
+        "count": 3,
+        "by_reason": {"no_response": 2, "batch_error": 1},
+        "artifact": "failures.jsonl",
+    }
+
+
+def test_report_without_failures_ledger_has_empty_section(
+    generate_report_mod: Any,
+    tmp_path: Path,
+) -> None:
+    report = generate_report_mod.generate_report(str(tmp_path))
+    assert report["failures"] == {"count": 0, "by_reason": {}, "artifact": None}
 
 
 def test_report_merges_checkpoint_validation_and_revision(

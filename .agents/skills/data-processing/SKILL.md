@@ -56,4 +56,7 @@ debug-workflow。路由不确定时 AskUserQuestion，不要猜。
    需介入时先 df_stop_task 停任务，再修改再提交。
 6. **分诊**：回调后先看 report.json / validation / verdicts，按失败分类决定
    resume 还是新 run；终止/失败不自动重提交，交用户决策。
+   report.failures 非空时（failures.jsonl：无响应/截止/解析失败的记录），
+   把其中的 input 行重组为子集输入补跑同一 pipeline 并合并产出，单条挂起
+   不再阻塞整轮（墙钟截止见 dataflow-common.md）。
 7. **交付**：展示产物与统计；场景内的产物契约与失败分类学以 playbook 为准。

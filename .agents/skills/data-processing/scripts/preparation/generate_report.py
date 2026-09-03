@@ -17,6 +17,7 @@ from __future__ import annotations  # noqa: I001
 import argparse
 import json
 import sys
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -200,6 +201,24 @@ def generate_report(
     # Count output records
     output_records = _count_jsonl_lines(processed_file)
 
+    # Failures ledger written by the pipeline (skipped/timed-out records)
+    failures_rows: list[dict] = []
+    failures_path = log_path / "failures.jsonl"
+    if failures_path.is_file():
+        with open(failures_path, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict):
+                    failures_rows.append(row)
+    failures_by_reason = dict(
+        Counter(str(row.get("reason", "unknown")) for row in failures_rows)
+    )
+
     validation = _read_json_object(log_path / "validation.json")
     scenario_metrics = _read_json_object(log_path / "scenario_metrics.json")
     runtime_metadata = _read_json_object(log_path / "runtime_metadata.json")
@@ -275,6 +294,11 @@ def generate_report(
         },
         "duration_seconds": duration_seconds,
         "error_samples": errors,
+        "failures": {
+            "count": len(failures_rows),
+            "by_reason": failures_by_reason,
+            "artifact": "failures.jsonl" if failures_rows else None,
+        },
         "dataflow_version": dataflow_version,
         "runtime_fingerprint": (
             runtime_fingerprint or (runtime_metadata or {}).get("runtime_fingerprint")
@@ -344,7 +368,8 @@ def main() -> None:
         f"calls={report['llm_calls']['total']} "
         f"success={report['llm_calls']['success']} "
         f"failed={report['llm_calls']['failed']} "
-        f"output_records={report['total_records_output']}"
+        f"output_records={report['total_records_output']} "
+        f"failures={report['failures']['count']}"
     )
 
 

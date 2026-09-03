@@ -23,9 +23,25 @@ raw_llm = APILLMServing_request(
     model_name=os.environ["DF_MODEL_NAME"],
     key_name_of_api_key="DF_API_KEY",
     max_workers=8,
+    max_retries=int(os.environ.get("DF_LLM_MAX_RETRIES", "2")),
+    read_timeout=float(os.environ.get("DF_READ_TIMEOUT", "300")),
 )
 llm = LoggingLLMServing(raw_llm)
 ```
+
+## 单条硬截止与失败账本（必读）
+
+serving 网关会让挂起的连接一直保持（socket `read_timeout` 不触发，实测单请求
+可挂 20–30 分钟），所以 `LoggingLLMServing` 对每条数据强制墙钟截止
+`DF_REQUEST_DEADLINE`（默认 600s，覆盖该条的全部内部重试）：到点即记
+`status="deadline"`（`llm_calls.jsonl`）并放弃等待，其余数据继续。截止无法
+区分"挂起"与"慢而活着"（非流式请求无进度信号）——误杀的慢记录进失败账本，
+由补跑轮重试，不会丢数据。旋钮：`DF_REQUEST_DEADLINE`（截止）、
+`DF_SLOW_WARN_SECONDS`（慢调用 WARN 阈值，默认 120s）。
+
+pipeline 必须把无响应/解析失败的记录写入 `failures.jsonl`（`reason` +
+完整 `input` 行），`generate_report.py` 会汇总进 `report.json.failures`。
+交付/分诊时若 `failures` 非空，提取 `input` 行重组子集输入补跑并合并产出。
 
 直接导入 `dataflow.serving` 可能加载无关重依赖；复制
 [`text_pipeline.py`](text_pipeline.py) 中的 importlib shim。
