@@ -193,6 +193,7 @@ $RECYCLE.BIN/
 *.log
 .coverage
 .pytest_cache/
+**/node_modules
 
 workspace/
 .client

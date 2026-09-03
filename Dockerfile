@@ -26,6 +26,9 @@ COPY --chown=${USERNAME}:${USERNAME} openhands-sdk ./openhands-sdk
 COPY --chown=${USERNAME}:${USERNAME} openhands-tools ./openhands-tools
 COPY --chown=${USERNAME}:${USERNAME} openhands-workspace ./openhands-workspace
 COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server ./openhands-agent-server
+COPY --chown=${USERNAME}:${USERNAME} pyromind-runtime ./pyromind-runtime
+COPY --chown=${USERNAME}:${USERNAME} harness-adapter ./harness-adapter
+COPY --chown=${USERNAME}:${USERNAME} pyromind-agent-server ./pyromind-agent-server
 COPY --chown=${USERNAME}:${USERNAME} .agents ./.agents
 COPY --chown=${USERNAME}:${USERNAME} requirements-terminal.txt ./
 RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
