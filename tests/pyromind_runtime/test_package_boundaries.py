@@ -80,6 +80,9 @@ def test_pi_sandbox_initializes_before_using_conversation_temp_path() -> None:
         ROOT / "harness-adapter" / "pi-runtime" / "src" / "tools.ts"
     ).read_text(encoding="utf-8")
 
+    terminal_tmp_declaration = tools_source.index(
+        "const terminalOutputTemp = policy.terminalTempRoot"
+    )
     sandbox_initialization = tools_source.index("await createWorkspaceBashOperations(")
     conversation_tmpdir = tools_source.index("process.env.TMPDIR = terminalOutputTemp")
-    assert sandbox_initialization < conversation_tmpdir
+    assert terminal_tmp_declaration < sandbox_initialization < conversation_tmpdir
