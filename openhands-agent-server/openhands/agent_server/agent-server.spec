@@ -67,10 +67,14 @@ PATHEX = [
     project_root / "openhands-sdk",
     project_root / "openhands-tools",
     project_root / "openhands-workspace",
+    project_root / "pyromind-runtime",
+    project_root / "harness-adapter",
+    project_root / "pyromind-agent-server",
 ]
 
-# Entry script for the agent server package (namespace: openhands/agent_server/__main__.py)
-ENTRY = str(project_root / "openhands-agent-server" / "openhands" / "agent_server" / "__main__.py")
+# Entry script for the pyromind composition server: pyromind_agent_server wraps
+# the OpenHands app with the product API (e.g. /api/v2/pyromind) and harness routing.
+ENTRY = str(project_root / "pyromind-agent-server" / "pyromind_agent_server" / "__main__.py")
 
 # Find fakeredis package location to get commands.json with correct path
 def get_fakeredis_data():
@@ -103,6 +107,24 @@ def get_fakeredis_data():
     
     return data_files
 
+# PiAdapter resolves its skill roots from Path(__file__).parents[3], which is
+# sys._MEIPASS inside the frozen binary, so the Pi skill roots must ship as
+# bundle datas at .agents/skills/<name> (see harness_adapter/pi_adapter/adapter.py).
+def get_pi_skill_datas():
+    data_files = []
+    skills_dir = project_root / ".agents" / "skills"
+    for skill_name in (
+        "generate-workflow-dsl",
+        "data-processing",
+        "debug-workflow",
+        "training-analysis",
+    ):
+        for path in sorted((skills_dir / skill_name).rglob("*")):
+            if path.is_file() and "__pycache__" not in path.parts:
+                rel = path.relative_to(skills_dir).as_posix()
+                data_files.append((str(path), f".agents/skills/{rel}"))
+    return data_files
+
 a = Analysis(
     [ENTRY],
     pathex=PATHEX,
@@ -111,6 +133,8 @@ a = Analysis(
         *_vertex_binaries,
     ],
     datas=[
+        # Pi skill roots required by PiAdapter startup validation
+        *get_pi_skill_datas(),
         # Third-party packages that ship data
         *collect_data_files("tiktoken"),
         *collect_data_files("tiktoken_ext"),
@@ -152,6 +176,9 @@ a = Analysis(
         *copy_metadata("openhands-sdk"),
         *copy_metadata("openhands-tools"),
         *copy_metadata("openhands-workspace"),
+        *copy_metadata("pyromind-runtime"),
+        *copy_metadata("harness-adapter"),
+        *copy_metadata("pyromind-agent-server"),
         *copy_metadata("fastmcp"),
         *copy_metadata("litellm"),
 
@@ -164,6 +191,11 @@ a = Analysis(
         *collect_submodules("openhands.tools"),
         *collect_submodules("openhands.workspace"),
         *collect_submodules("openhands.agent_server"),
+
+        # Pyromind workspace members (composition layer + harness adapters)
+        *collect_submodules("pyromind_runtime"),
+        *collect_submodules("harness_adapter"),
+        *collect_submodules("pyromind_agent_server"),
 
         # Third-party dynamic imports
         *collect_submodules("tiktoken"),

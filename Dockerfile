@@ -265,4 +265,17 @@ ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gn
 ENV PYROMIND_KNOWLEDGE_BASE_PATH=/agent-server/knowledge
 ENV PYROMIND_PUBLIC_READ_PATHS=/agent-server/.agents/skills
 ENV PYROMIND_SKILLS_PATH=/agent-server/.agents/skills
+# Pi runtime (Node) for the Pi harness backend, opt-in at deploy time via
+# PYROMIND_HARNESS_BACKEND=pi. Built here so node_modules match this image;
+# the runner entrypoint is resolved through PI_RUNTIME_ENTRYPOINT (see
+# harness_adapter/pi_adapter/runner.py).
+COPY --chown=${USERNAME}:${USERNAME} harness-adapter/pi-runtime /opt/pi-runtime
+RUN set -eux; \
+    node -e 'const [maj, min] = process.versions.node.split(".").map(Number); if (maj < 22 || (maj === 22 && min < 19)) { console.error("pi-runtime requires node >= 22.19.0, got " + process.versions.node); process.exit(1); }'; \
+    cd /opt/pi-runtime \
+    && npm ci \
+    && npm run build \
+    && npm prune --omit=dev \
+    && test -f dist/index.js
+ENV PI_RUNTIME_ENTRYPOINT=/opt/pi-runtime/dist/index.js
 ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]

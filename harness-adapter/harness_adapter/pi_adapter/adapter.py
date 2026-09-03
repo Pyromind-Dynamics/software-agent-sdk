@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import shutil
+import sys
 import tempfile
 import time
 from collections.abc import AsyncIterator
@@ -136,7 +137,13 @@ class PiAdapter:
                 "Pi local execution is disabled in production until sk-sandbox "
                 "is integrated"
             )
-        repository = Path(__file__).parents[3]
+        if getattr(sys, "frozen", False):
+            # PyInstaller: __file__ lives under the _MEIPASS extraction dir, so
+            # parents[3] would escape the bundle; bundled skill datas sit at
+            # _MEIPASS/.agents/skills (see agent-server.spec).
+            repository = Path(getattr(sys, "_MEIPASS", ""))
+        else:
+            repository = Path(__file__).parents[3]
         self._conversation_root = Path(conversation_root).resolve()
         skills_directory = repository / ".agents" / "skills"
         default_skill_roots = {

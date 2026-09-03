@@ -29,6 +29,15 @@ class PiRunnerError(RuntimeError):
     pass
 
 
+def _default_entrypoint() -> Path:
+    # The monorepo-relative default only exists in a source checkout; deployed
+    # images install pi-runtime elsewhere and point PI_RUNTIME_ENTRYPOINT at it.
+    override = os.environ.get("PI_RUNTIME_ENTRYPOINT", "")
+    if override:
+        return Path(override)
+    return Path(__file__).parents[2] / "pi-runtime" / "dist" / "index.js"
+
+
 class PiRunnerProcess:
     """One private Node runner connected by bounded stdin/stdout JSONL."""
 
@@ -40,8 +49,7 @@ class PiRunnerProcess:
         exit_handler: ExitHandler,
         entrypoint: Path | None = None,
     ) -> None:
-        runtime = Path(__file__).parents[2] / "pi-runtime" / "dist" / "index.js"
-        self._entrypoint = entrypoint or runtime
+        self._entrypoint = entrypoint or _default_entrypoint()
         self._request_handler = request_handler
         self._event_handler = event_handler
         self._exit_handler = exit_handler

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import harness_adapter.pi_adapter.runner as runner_module
 import pytest
 from harness_adapter.pi_adapter.event_translator import translate_runner_event
 from harness_adapter.pi_adapter.protocol import (
@@ -132,6 +134,30 @@ async def test_oversized_response_still_resolves_the_node_request() -> None:
             },
         }
     ]
+
+
+def test_runner_entrypoint_prefers_pi_runtime_entrypoint_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    entrypoint = tmp_path / "dist" / "index.js"
+    monkeypatch.setenv("PI_RUNTIME_ENTRYPOINT", str(entrypoint))
+    runner = PiRunnerProcess(
+        request_handler=_async_noop, event_handler=_async_noop, exit_handler=_async_noop
+    )
+    assert runner._entrypoint == entrypoint
+
+
+def test_runner_entrypoint_defaults_to_repo_relative_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PI_RUNTIME_ENTRYPOINT", raising=False)
+    runner = PiRunnerProcess(
+        request_handler=_async_noop, event_handler=_async_noop, exit_handler=_async_noop
+    )
+    expected = (
+        Path(runner_module.__file__).parents[2] / "pi-runtime" / "dist" / "index.js"
+    )
+    assert runner._entrypoint == expected
 
 
 async def _async_noop(*_args) -> None:
