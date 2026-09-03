@@ -55,7 +55,9 @@ export async function createTools(
     readOnlyRoots: skillRoots.map((root) => root.path),
     knowledgeRoot,
   });
-  const terminalOutputTemp = policy.terminalTempRoot;
+  // Keep this binding explicit: the sandbox switches the process temp directory
+  // to the conversation-scoped terminal output directory after initialization.
+  const { terminalTempRoot: terminalOutputTemp } = policy;
   // Keep the runtime temp path short: the sandbox's Unix bridge sockets must
   // stay under the 108-char sun_path limit even with long conversation ids.
   const runtimeTmp = join(tmpdir(), "pi-terminal");

@@ -81,7 +81,7 @@ def test_pi_sandbox_initializes_before_using_conversation_temp_path() -> None:
     ).read_text(encoding="utf-8")
 
     terminal_tmp_declaration = tools_source.index(
-        "const terminalOutputTemp = policy.terminalTempRoot"
+        "const { terminalTempRoot: terminalOutputTemp } = policy"
     )
     sandbox_initialization = tools_source.index("await createWorkspaceBashOperations(")
     conversation_tmpdir = tools_source.index("process.env.TMPDIR = terminalOutputTemp")
