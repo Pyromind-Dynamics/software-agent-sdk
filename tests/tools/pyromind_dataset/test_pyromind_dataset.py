@@ -15,6 +15,7 @@ from openhands.tools.pyromind_archive.definition import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
 )
 from openhands.tools.pyromind_dataset.definition import (
+    _MAX_LISTED_ENTRIES,
     _PREVIEW_DATASET_DESCRIPTION,
     PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
@@ -1989,3 +1990,83 @@ def test_vision_api_config_prefers_df_env(monkeypatch) -> None:
 
     assert api_url == "https://vision.example/v1/chat/completions"
     assert model == "vision-model"
+
+
+def _storage_listing_executor_observation(
+    monkeypatch, tmp_path, total: int, **action_kwargs: Any
+):
+    """Preview a storage directory listing with `total` file entries."""
+    _patch_shared_empty(monkeypatch)
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "list": [
+                            {
+                                "name": f"part_{i:04d}.jsonl",
+                                "path": f"agentTest/part_{i:04d}.jsonl",
+                                "type": "File",
+                                "size": 1024,
+                                "last_modified": "2026-07-20 03:55:34",
+                            }
+                            for i in range(total)
+                        ]
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected POST URL: {url}")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    conversation = _fake_conversation(tmp_path)
+
+    return PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="agentTest/", n=5, **action_kwargs),
+        cast(Any, conversation),
+    )
+
+
+def test_storage_directory_listing_capped(monkeypatch, tmp_path) -> None:
+    """Huge directory listings are capped in the text with a refine hint."""
+    total = _MAX_LISTED_ENTRIES + 30
+    observation = _storage_listing_executor_observation(monkeypatch, tmp_path, total)
+
+    assert not observation.is_error
+    assert f"contains {total} files" in observation.text
+    assert f"Listing capped at {_MAX_LISTED_ENTRIES} of {total}" in observation.text
+    assert f"and {total - _MAX_LISTED_ENTRIES} more entries" in observation.text
+    assert "use path_filter" in observation.text
+    assert "agentTest/part_0099.jsonl" in observation.text
+    assert "agentTest/part_0100.jsonl" not in observation.text
+    assert len(observation.entries) == total
+
+
+def test_storage_directory_path_filter_narrows(monkeypatch, tmp_path) -> None:
+    """path_filter narrows the listing before the cap applies."""
+    total = _MAX_LISTED_ENTRIES + 30
+    observation = _storage_listing_executor_observation(
+        monkeypatch, tmp_path, total, path_filter="PART_010"
+    )
+
+    assert not observation.is_error
+    assert "contains 10 files" in observation.text
+    assert "Listing capped" not in observation.text
+    assert "agentTest/part_0105.jsonl" in observation.text
+    assert "agentTest/part_0099.jsonl" not in observation.text
+    assert len(observation.entries) == 10
+
+
+def test_storage_directory_path_filter_no_match(monkeypatch, tmp_path) -> None:
+    observation = _storage_listing_executor_observation(
+        monkeypatch, tmp_path, 5, path_filter="zzz"
+    )
+
+    assert not observation.is_error
+    assert "No entries under agentTest/ match path_filter 'zzz'" in observation.text
+    assert observation.is_dir is True
+    assert observation.entries == []

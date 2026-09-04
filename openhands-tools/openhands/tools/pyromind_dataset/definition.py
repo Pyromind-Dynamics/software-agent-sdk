@@ -61,6 +61,7 @@ _LARGE_FILE_RANGE_COUNT = 3
 _DEFAULT_PREVIEW_BYTES = _LARGE_FILE_RANGE_BYTES * _LARGE_FILE_RANGE_COUNT
 _MAX_PREVIEW_BYTES = _DEFAULT_PREVIEW_BYTES
 _MAX_REQUESTED_SAMPLES = 100
+_MAX_LISTED_ENTRIES = 100
 _DELIMITED_HEADER_BYTES = 4096
 _MAX_XLSX_BYTES = 10 * 1024 * 1024
 _MAX_SAMPLE_STRING_CHARS = 2000
@@ -126,6 +127,24 @@ def _default_storage_base_url() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _cap_entry_listing(lines: list[str]) -> str:
+    """Join listing lines, capping the text so huge directories stay small.
+
+    The listing is what enters the LLM context; without a cap a directory
+    with tens of thousands of entries dominates the whole conversation.
+    Structured stats over the full entry set are computed separately.
+    """
+    omitted = len(lines) - _MAX_LISTED_ENTRIES
+    text = "\n".join(lines[:_MAX_LISTED_ENTRIES])
+    if omitted > 0:
+        text += (
+            f"\n  … and {omitted} more entries (listing capped at "
+            f"{_MAX_LISTED_ENTRIES}; use path_filter to locate specific "
+            "entries, or mode='sample' to materialize selected paths)."
+        )
+    return text
+
+
 class PreviewDatasetAction(Action):
     """Preview a dataset from shared space or user storage."""
 
@@ -167,6 +186,15 @@ class PreviewDatasetAction(Action):
             "sample mode. Explicit selections may contain up to n entries. When "
             "omitted, up to min(n, 3) entries are selected from dataset_path in "
             "stable path order."
+        ),
+    )
+    path_filter: str = Field(
+        default="",
+        description=(
+            "Optional case-insensitive substring filter applied to entry paths "
+            "in directory listings; a single match is previewed automatically. "
+            "Use it to locate specific entries in large directories instead of "
+            "scanning a truncated listing."
         ),
     )
     vision_ocr: bool = Field(
@@ -424,7 +452,9 @@ class PreviewDatasetExecutor(
             return self._storage_sample(action, dataset_path, headers, conversation)
 
         # Option C: try shared dataset space first
-        shared_result = self._try_shared_preview(dataset_path, action.n, headers)
+        shared_result = self._try_shared_preview(
+            dataset_path, action.n, headers, path_filter=action.path_filter
+        )
         if shared_result is not None:
             return shared_result
 
@@ -448,6 +478,7 @@ class PreviewDatasetExecutor(
             action.n,
             headers,
             vision_ocr=action.vision_ocr,
+            path_filter=action.path_filter,
         )
 
     # ------------------------------------------------------------------
@@ -459,6 +490,8 @@ class PreviewDatasetExecutor(
         dataset_path: str,
         n: int,
         headers: dict[str, str],
+        *,
+        path_filter: str = "",
     ) -> PreviewDatasetObservation | None:
         """Attempt shared space preview. Returns None if not a shared dataset."""
         datasets = self._shared_list_datasets(headers)
@@ -472,7 +505,9 @@ class PreviewDatasetExecutor(
         dataset_name, file_path = match
 
         if not file_path:
-            return self._shared_resolve_and_preview(dataset_name, n, headers)
+            return self._shared_resolve_and_preview(
+                dataset_name, n, headers, path_filter=path_filter
+            )
 
         return self._shared_preview_file(dataset_name, file_path, n, headers)
 
@@ -481,18 +516,26 @@ class PreviewDatasetExecutor(
         dataset_name: str,
         n: int,
         headers: dict[str, str],
+        *,
+        path_filter: str = "",
     ) -> PreviewDatasetObservation:
         """List files in a shared dataset and preview the first previewable one."""
         files_result = self._shared_list_files(dataset_name, headers)
         if isinstance(files_result, PreviewDatasetObservation):
             return files_result
 
+        filter_term = path_filter.strip().lower()
+        if filter_term:
+            files_result = [
+                f for f in files_result if filter_term in str(f["path"]).lower()
+            ]
+
         file_paths = [f["path"] for f in files_result]
         preview_file = _select_preview_file(file_paths)
 
         if not preview_file:
-            file_list_text = "\n".join(
-                f"  - {f['path']} ({f.get('human_size', '?')})" for f in files_result
+            file_list_text = _cap_entry_listing(
+                [f"  - {f['path']} ({f.get('human_size', '?')})" for f in files_result]
             )
             return PreviewDatasetObservation.from_text(
                 text=(
@@ -506,8 +549,8 @@ class PreviewDatasetExecutor(
             )
 
         if len(files_result) > 1:
-            file_list_text = "\n".join(
-                f"  - {f['path']} ({f.get('human_size', '?')})" for f in files_result
+            file_list_text = _cap_entry_listing(
+                [f"  - {f['path']} ({f.get('human_size', '?')})" for f in files_result]
             )
             preview_result = self._shared_preview_file(
                 dataset_name, preview_file, n, headers
@@ -1150,13 +1193,16 @@ class PreviewDatasetExecutor(
         headers: dict[str, str],
         *,
         vision_ocr: bool,
+        path_filter: str = "",
     ) -> PreviewDatasetObservation:
         files: list[str] = []
         preview_path = dataset_path
         metadata: dict[str, Any] | None = None
 
         if _looks_like_directory(dataset_path):
-            dir_result = self._resolve_storage_directory(dataset_path, n, headers)
+            dir_result = self._resolve_storage_directory(
+                dataset_path, n, headers, path_filter=path_filter
+            )
             if isinstance(dir_result, PreviewDatasetObservation):
                 return dir_result
             files, preview_path = dir_result
@@ -1165,7 +1211,9 @@ class PreviewDatasetExecutor(
         if isinstance(metadata_result, PreviewDatasetObservation):
             # Storage backends may not expose metadata for virtual folders.
             # Fall back to file_list so callers need not add a trailing slash.
-            dir_result = self._resolve_storage_directory(dataset_path, n, headers)
+            dir_result = self._resolve_storage_directory(
+                dataset_path, n, headers, path_filter=path_filter
+            )
             if isinstance(dir_result, PreviewDatasetObservation):
                 return dir_result
             files, preview_path = dir_result
@@ -1175,7 +1223,9 @@ class PreviewDatasetExecutor(
         metadata = metadata_result
 
         if metadata.get("is_dir") is True:
-            dir_result = self._resolve_storage_directory(dataset_path, n, headers)
+            dir_result = self._resolve_storage_directory(
+                dataset_path, n, headers, path_filter=path_filter
+            )
             if isinstance(dir_result, PreviewDatasetObservation):
                 return dir_result
             files, preview_path = dir_result
@@ -1388,6 +1438,8 @@ class PreviewDatasetExecutor(
         dataset_path: str,
         n: int,  # noqa: ARG002
         headers: dict[str, str],
+        *,
+        path_filter: str = "",
     ) -> tuple[list[str], str] | PreviewDatasetObservation:
         """Resolve a storage directory into a concrete preview file.
 
@@ -1400,6 +1452,21 @@ class PreviewDatasetExecutor(
             return list_result
 
         entries = list_result
+        filter_term = path_filter.strip().lower()
+        if filter_term:
+            entries = [entry for entry in entries if filter_term in entry.path.lower()]
+            if not entries:
+                return PreviewDatasetObservation.from_text(
+                    text=(
+                        f"No entries under {dataset_path} match "
+                        f"path_filter '{path_filter}'."
+                    ),
+                    dataset_path=dataset_path,
+                    files=[],
+                    is_dir=True,
+                    source="storage",
+                    directory_summary=_empty_directory_summary(),
+                )
         file_infos = [entry for entry in entries if not entry.is_dir]
         file_paths = [f.path for f in file_infos]
 
@@ -1416,27 +1483,37 @@ class PreviewDatasetExecutor(
         if len(entries) == 1 and len(file_paths) == 1:
             return file_paths, file_paths[0]
 
-        file_list_text = "\n".join(
-            f"  - {entry.path}"
-            f" ({'folder' if entry.is_dir else _human_size(entry.size)}"
-            + (f", modified {entry.last_modified}" if entry.last_modified else "")
-            + ")"
-            for entry in entries
+        file_list_text = _cap_entry_listing(
+            [
+                f"  - {entry.path}"
+                f" ({'folder' if entry.is_dir else _human_size(entry.size)}"
+                + (f", modified {entry.last_modified}" if entry.last_modified else "")
+                + ")"
+                for entry in entries
+            ]
+        )
+        listing_note = (
+            f" Listing capped at {_MAX_LISTED_ENTRIES} of {len(entries)} "
+            "entries; use path_filter to narrow it down."
+            if len(entries) > _MAX_LISTED_ENTRIES
+            else ""
         )
         if len(file_infos) == len(entries):
             summary = (
-                f"Directory '{dataset_path}' contains {len(file_paths)} files. "
-                "Ask the user which file to preview, then call this tool again "
-                "with the exact file path, or use mode='sample' to materialize "
-                "selected files."
+                f"Directory '{dataset_path}' contains {len(file_paths)} files."
+                + listing_note
+                + " Ask the user which file to preview, then call this tool "
+                "again with the exact file path, or use mode='sample' to "
+                "materialize selected files."
             )
             list_label = "Available files"
         else:
             summary = (
-                f"Directory '{dataset_path}' contains {len(entries)} entries. "
-                "Call this tool again with an exact file path to preview content, "
-                "or use mode='sample' with selected sample_paths to materialize "
-                "files or folders."
+                f"Directory '{dataset_path}' contains {len(entries)} entries."
+                + listing_note
+                + " Call this tool again with an exact file path to preview "
+                "content, or use mode='sample' with selected sample_paths to "
+                "materialize files or folders."
             )
             list_label = "Available entries"
         directory_summary = self._build_directory_summary(entries, headers)

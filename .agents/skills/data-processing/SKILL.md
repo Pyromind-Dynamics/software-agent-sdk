@@ -47,6 +47,8 @@ debug-workflow。路由不确定时 AskUserQuestion，不要猜。
 ## 通用 SOP（所有场景共享的控制面骨架）
 
 1. **探查**：preview_dataset 先行；storage 路径本地不可见，不要先在本地找。
+   目录列表超 100 条会被截断——用 `path_filter` 子串精确定位条目，不要反复
+   翻页重预览；每个数据集的结构确认一次完成（列表 + schema + 样例）。
 2. **选型**：按上表读取范式 playbook；范式内按 case 路由表只读取当前场景
    相关 reference。
 3. **小样**：按 playbook 规定的试跑形态先小样（limit=3 / sample / smoke 片），
