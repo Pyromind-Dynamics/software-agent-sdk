@@ -2070,3 +2070,121 @@ def test_storage_directory_path_filter_no_match(monkeypatch, tmp_path) -> None:
     assert "No entries under agentTest/ match path_filter 'zzz'" in observation.text
     assert observation.is_dir is True
     assert observation.entries == []
+
+
+_STORAGE_RETRY_PATCH = "openhands.tools.pyromind_dataset.definition.time.sleep"
+
+
+def test_post_json_retries_connect_error_then_succeeds(monkeypatch) -> None:
+    """Transient ConnectError blips retry in-tool instead of burning a whole
+    agent turn on a manual retry."""
+    calls: list[int] = []
+    sleeps: list[float] = []
+
+    def fake_post(url, *, headers, json, timeout):
+        calls.append(1)
+        if len(calls) < 3:
+            raise httpx.ConnectError("EOF occurred in violation of protocol")
+        return _Response(200, {"success": True, "data": {"list": []}})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(_STORAGE_RETRY_PATCH, sleeps.append)
+
+    result = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )._post_json("get_file_metadata", {"path": "x"}, {})
+
+    assert isinstance(result, dict)
+    assert len(calls) == 3
+    assert len(sleeps) == 2
+    assert sleeps[1] > sleeps[0]
+
+
+def test_post_json_gives_up_after_bounded_retries(monkeypatch) -> None:
+    def fake_post(url, *, headers, json, timeout):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(_STORAGE_RETRY_PATCH, lambda seconds: None)
+
+    result = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )._post_json("get_url", {"path": "x"}, {})
+
+    assert isinstance(result, str)
+    assert "get_url" in result
+    assert "ConnectError" in result
+
+
+def test_download_range_retries_connect_error_and_resets_partial_bytes(
+    monkeypatch,
+) -> None:
+    """A mid-stream failure must not concatenate the partial bytes of the
+    first attempt onto the retried download."""
+    image = b"chosen-part"
+
+    class _FlakyStream:
+        def __init__(self, content: bytes) -> None:
+            self._content = content
+            self.status_code = 200
+            self.headers: dict[str, str] = {}
+
+        def __enter__(self) -> "_FlakyStream":
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        def iter_bytes(self):
+            yield self._content
+
+    class _PartialThenFailStream(_FlakyStream):
+        def iter_bytes(self):
+            yield b"stale-"
+            raise httpx.ConnectError("EOF occurred in violation of protocol")
+
+    attempts: list[int] = []
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        attempts.append(1)
+        if len(attempts) == 1:
+            return _PartialThenFailStream(image)
+        return _FlakyStream(image)
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    monkeypatch.setattr(_STORAGE_RETRY_PATCH, lambda seconds: None)
+
+    result = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )._download_range("https://download.test/file", "data/file.txt", 0, 99)
+
+    assert result == image
+    assert len(attempts) == 2
+
+
+def test_directory_listing_hint_points_at_file_modes(monkeypatch, tmp_path) -> None:
+    """Listing a file path tells the agent what to do instead of guessing."""
+    _patch_shared_empty(monkeypatch)
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            return _Response(200, {"success": True, "data": {"list": []}})
+        if url.endswith("/get_file_metadata"):
+            return _Response(
+                200,
+                {"success": True, "data": {"is_dir": True, "metadata": {}}},
+            )
+        raise AssertionError(f"unexpected POST URL: {url}")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="agentTest/dataset.jsonl"),
+        cast(Any, conversation),
+    )
+
+    assert "No files or folders found under agentTest/dataset.jsonl" in observation.text
+    assert "mode=inspect or mode=sample" in observation.text

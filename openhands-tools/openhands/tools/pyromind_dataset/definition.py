@@ -96,6 +96,10 @@ _MAX_SAMPLE_DIRECTORY_DEPTH = 6
 _MAX_VISION_PREVIEW_IMAGES = 12
 _MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
 _VISION_RETRYABLE_STATUS_CODES = {408, 409, 425, 429}
+# Transient SSL/connection blips against storage were previously retried
+# manually by agents across whole turns; a bounded in-tool retry removes that
+# round trip. Timeouts stay non-retryable: each one costs a full 30s read.
+_STORAGE_CONNECT_RETRY_ATTEMPTS = 2
 _MAX_DIRECTORY_CHILD_SAMPLES = 3
 
 
@@ -1095,7 +1099,11 @@ class PreviewDatasetExecutor(
             sorted_entries = visible_entries
         selected_entries = sorted_entries[:limit]
         if not selected_entries:
-            raise ValueError(f"No files or folders found under {dataset_path}.")
+            raise ValueError(
+                f"No files or folders found under {dataset_path}. "
+                "The path may point to a single file: pass it directly with "
+                "mode=inspect or mode=sample, or list its parent folder."
+            )
         return (
             [entry.path for entry in selected_entries],
             [_storage_entry_dict(entry) for entry in sorted_entries],
@@ -1472,7 +1480,12 @@ class PreviewDatasetExecutor(
 
         if not entries:
             return PreviewDatasetObservation.from_text(
-                text=f"No files or folders found under {dataset_path}.",
+                text=(
+                    f"No files or folders found under {dataset_path}. "
+                    "The path may point to a single file: pass it directly "
+                    "with mode=inspect or mode=sample, or list its parent "
+                    "folder."
+                ),
                 dataset_path=dataset_path,
                 files=file_paths,
                 is_dir=True,
@@ -1693,19 +1706,30 @@ class PreviewDatasetExecutor(
         body: dict[str, Any],
         headers: dict[str, str],
     ) -> dict[str, Any] | str:
-        try:
-            response = httpx.post(
-                f"{self._storage_base_url}/{route}",
-                headers=headers,
-                json=body,
-                timeout=self._timeout,
-            )
-        except httpx.RequestError as exc:
-            return (
-                f"Failed to call Pyromind storage {route} API: "
-                f"{type(exc).__name__}: {exc}"
-            )
-        return _decode_json_response(response, f"Pyromind storage {route} API")
+        attempt = 0
+        while True:
+            try:
+                response = httpx.post(
+                    f"{self._storage_base_url}/{route}",
+                    headers=headers,
+                    json=body,
+                    timeout=self._timeout,
+                )
+            except httpx.ConnectError as exc:
+                if attempt >= _STORAGE_CONNECT_RETRY_ATTEMPTS:
+                    return (
+                        f"Failed to call Pyromind storage {route} API: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                attempt += 1
+                time.sleep((2 ** (attempt - 1)) + random.random())
+                continue
+            except httpx.RequestError as exc:
+                return (
+                    f"Failed to call Pyromind storage {route} API: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            return _decode_json_response(response, f"Pyromind storage {route} API")
 
     def _download_preview(
         self,
@@ -1766,45 +1790,60 @@ class PreviewDatasetExecutor(
         start: int,
         end: int,
     ) -> bytes | PreviewDatasetObservation:
-        chunks = bytearray()
         max_bytes = end - start + 1
         headers = {"range": f"bytes={start}-{end}"}
-        try:
-            with httpx.stream(
-                "GET",
-                url,
-                headers=headers,
-                timeout=self._timeout,
-                follow_redirects=True,
-            ) as response:
-                if response.status_code >= 400:
-                    body = response.read().decode("utf-8", errors="replace")
+        attempt = 0
+        while True:
+            chunks = bytearray()
+            try:
+                with httpx.stream(
+                    "GET",
+                    url,
+                    headers=headers,
+                    timeout=self._timeout,
+                    follow_redirects=True,
+                ) as response:
+                    if response.status_code >= 400:
+                        body = response.read().decode("utf-8", errors="replace")
+                        return PreviewDatasetObservation.from_text(
+                            text=(
+                                "Pyromind storage download URL returned HTTP "
+                                f"{response.status_code}: {_truncate_text(body)}"
+                            ),
+                            is_error=True,
+                            dataset_path=dataset_path,
+                        )
+                    for chunk in response.iter_bytes():
+                        remaining = max_bytes - len(chunks)
+                        if remaining <= 0:
+                            break
+                        if len(chunk) > remaining:
+                            chunks.extend(chunk[:remaining])
+                            break
+                        chunks.extend(chunk)
+            except httpx.ConnectError as exc:
+                if attempt >= _STORAGE_CONNECT_RETRY_ATTEMPTS:
                     return PreviewDatasetObservation.from_text(
                         text=(
-                            "Pyromind storage download URL returned HTTP "
-                            f"{response.status_code}: {_truncate_text(body)}"
+                            "Failed to download Pyromind storage preview bytes: "
+                            f"{type(exc).__name__}: {exc}"
                         ),
                         is_error=True,
                         dataset_path=dataset_path,
                     )
-                for chunk in response.iter_bytes():
-                    remaining = max_bytes - len(chunks)
-                    if remaining <= 0:
-                        break
-                    if len(chunk) > remaining:
-                        chunks.extend(chunk[:remaining])
-                        break
-                    chunks.extend(chunk)
-        except httpx.RequestError as exc:
-            return PreviewDatasetObservation.from_text(
-                text=(
-                    "Failed to download Pyromind storage preview bytes: "
-                    f"{type(exc).__name__}: {exc}"
-                ),
-                is_error=True,
-                dataset_path=dataset_path,
-            )
-        return bytes(chunks)
+                attempt += 1
+                time.sleep((2 ** (attempt - 1)) + random.random())
+                continue
+            except httpx.RequestError as exc:
+                return PreviewDatasetObservation.from_text(
+                    text=(
+                        "Failed to download Pyromind storage preview bytes: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    is_error=True,
+                    dataset_path=dataset_path,
+                )
+            return bytes(chunks)
 
     def _resolve_headers(
         self,
