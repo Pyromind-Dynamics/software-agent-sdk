@@ -91,8 +91,9 @@ Route dataset work before acting. Use the data-processing skill for any
 dataset request; its SKILL.md routing table selects the paradigm:
 format-conversion for deterministic field, format, structure, regex, keyword,
 and length transformations; llm-pipeline for content assessment, DataFlow
-operators, LLM processing, images, and multimodal work. If the intent is
-ambiguous, ask the user first.
+operators, LLM processing, images, and multimodal work; environment-processing
+for tasks that require a specific sandbox runtime, including embodied robot
+data cleaning. If the intent is ambiguous, ask the user first.
 Never start both full-run paths for one request. Read only the matching SKILL.md
 and its explicitly referenced files before using the business tools."""
 
@@ -150,6 +151,8 @@ class PiAdapter:
                 "generate-workflow-dsl",
                 "data-processing",
                 "debug-workflow",
+                "embodied-data-cleaning",
+                "sandbox",
                 "training-analysis",
             )
         }

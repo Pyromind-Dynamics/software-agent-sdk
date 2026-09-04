@@ -36,10 +36,21 @@ from openhands.tools.environment_processing import (
     EdpRenderTool,
     EdpSubmitTool,
 )
+from openhands.tools.environment_processing.platform_env import resolve_platform_env
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
     UploadFileToPyromindTool,
+)
+from openhands.tools.sandbox import (
+    SandboxCreateTool,
+    SandboxDeleteFileTool,
+    SandboxDeleteTool,
+    SandboxDownloadTool,
+    SandboxReadFileTool,
+    SandboxTerminalTool,
+    SandboxUploadTool,
+    SandboxWriteFileTool,
 )
 from openhands.tools.training_analysis import TrainingAnalysisTool
 from openhands.tools.workflow.analyze_task_failure import AnalyzeTaskFailureTool
@@ -60,6 +71,7 @@ _READ_ONLY_TOOLS = frozenset(
     {
         "preview_dataset",
         "df_check_progress",
+        SandboxReadFileTool.name,
         AnalyzeTaskFailureTool.name,
     }
 )
@@ -285,6 +297,30 @@ class PyromindBusinessToolHost:
             EdpAggregateTool.name: lambda context: EdpAggregateTool.create(
                 **self._edp_params(context)
             )[0],
+            SandboxCreateTool.name: lambda context: SandboxCreateTool.create(
+                **self._sandbox_params(context, include_default_image=True)
+            )[0],
+            SandboxDeleteTool.name: lambda context: SandboxDeleteTool.create(
+                **self._sandbox_params(context)
+            )[0],
+            SandboxReadFileTool.name: lambda context: SandboxReadFileTool.create(
+                **self._sandbox_params(context)
+            )[0],
+            SandboxWriteFileTool.name: lambda context: SandboxWriteFileTool.create(
+                **self._sandbox_params(context)
+            )[0],
+            SandboxDeleteFileTool.name: lambda context: SandboxDeleteFileTool.create(
+                **self._sandbox_params(context)
+            )[0],
+            SandboxTerminalTool.name: lambda context: SandboxTerminalTool.create(
+                **self._sandbox_params(context)
+            )[0],
+            SandboxUploadTool.name: lambda context: SandboxUploadTool.create(
+                **self._sandbox_storage_params(context)
+            )[0],
+            SandboxDownloadTool.name: lambda context: SandboxDownloadTool.create(
+                **self._sandbox_storage_params(context)
+            )[0],
             WorkflowDebugTool.name: lambda context: WorkflowDebugTool.create(
                 **self._workflow_debug_params(context)
             )[0],
@@ -310,6 +346,14 @@ class PyromindBusinessToolHost:
             EdpRenderTool,
             EdpSubmitTool,
             EdpAggregateTool,
+            SandboxCreateTool,
+            SandboxDeleteTool,
+            SandboxReadFileTool,
+            SandboxWriteFileTool,
+            SandboxDeleteFileTool,
+            SandboxTerminalTool,
+            SandboxUploadTool,
+            SandboxDownloadTool,
             WorkflowDebugTool,
             AnalyzeTaskFailureTool,
             TrainingAnalysisTool,
@@ -482,12 +526,10 @@ class PyromindBusinessToolHost:
         return params
 
     def _execution_params(self, context: ToolExecutionContext) -> dict[str, Any]:
-        params: dict[str, Any] = {}
-        if context.request_context.x_cluster:
-            params["cluster"] = context.request_context.x_cluster
-        env = context.extra.get("env")
-        if isinstance(env, str) and env:
-            params["env"] = env
+        env, cluster = _execution_target(context)
+        params: dict[str, Any] = {"env": env}
+        if cluster:
+            params["cluster"] = cluster
         params["headers"] = _forward_headers(
             context.request_context, include_cookie=False
         )
@@ -518,6 +560,43 @@ class PyromindBusinessToolHost:
         params["runtime_dir"] = str(self._edp_runtime)
         return params
 
+    def _sandbox_params(
+        self,
+        context: ToolExecutionContext,
+        *,
+        include_default_image: bool = False,
+    ) -> dict[str, Any]:
+        env, cluster = _execution_target(context)
+        params: dict[str, Any] = {
+            "current_user": current_user_from_context(context.request_context),
+            "env": env,
+            "headers": _forward_headers(
+                context.request_context,
+                include_cookie=False,
+            ),
+        }
+        if cluster:
+            params["cluster"] = cluster
+        default_image = context.extra.get("sandbox_default_image")
+        if include_default_image and isinstance(default_image, str) and default_image:
+            params["default_image"] = default_image
+        return params
+
+    def _sandbox_storage_params(
+        self,
+        context: ToolExecutionContext,
+    ) -> dict[str, Any]:
+        params = self._sandbox_params(context)
+        params.pop("default_image", None)
+        storage = self._storage_params(context)
+        if "storage_base_url" in storage:
+            params["storage_base_url"] = storage["storage_base_url"]
+        if "headers" in storage:
+            params["storage_headers"] = storage["headers"]
+        if "secret_headers" in storage:
+            params["storage_secret_headers"] = storage["secret_headers"]
+        return params
+
     def _extraction_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         params = self._execution_params(context)
         output_root = context.extra.get("dataset_extraction_output_root")
@@ -542,19 +621,21 @@ class PyromindBusinessToolHost:
         # environment (e.g. pre2) when the session context omits it.
         return os.getenv("PYROMIND_ENV") or os.getenv("APP_ENV")
 
-    @staticmethod
-    def _resolve_workflow_cluster(context: ToolExecutionContext) -> str | None:
-        # "default" mirrors the pyromind-sdk client's own cluster default.
-        return (
-            context.request_context.x_cluster
-            or os.getenv("PYROMIND_CLUSTER")
-            or "default"
-        )
-
     def _workflow_debug_params(self, context: ToolExecutionContext) -> dict[str, Any]:
+        route = (context.request_context.x_cluster or "").strip()
+        cluster, separator, routed_env = route.partition("#")
+        if separator and routed_env.strip():
+            # Routed requests carry the target env inline as "cluster#env".
+            env = routed_env.strip().lower()
+        elif isinstance(context.extra.get("env"), str) and context.extra["env"].strip():
+            env = context.extra["env"].strip()
+        elif route:
+            env = "prod"
+        else:
+            env = self._resolve_workflow_env(context)
         return {
-            "cluster": self._resolve_workflow_cluster(context),
-            "env": self._resolve_workflow_env(context),
+            "cluster": cluster.strip() or os.getenv("PYROMIND_CLUSTER") or "default",
+            "env": env,
             "current_user": current_user_from_context(context.request_context),
             "headers": _forward_headers(context.request_context, include_cookie=False),
         }
@@ -598,6 +679,24 @@ def _forward_headers(
         )
         if value
     }
+
+
+def _execution_target(
+    context: ToolExecutionContext,
+) -> tuple[str, str | None]:
+    request_route = (context.request_context.x_cluster or "").strip()
+    if request_route:
+        cluster, separator, routed_env = request_route.partition("#")
+        env = routed_env.strip().lower() if separator else "prod"
+        return env or "prod", cluster.strip() or None
+
+    configured_route = os.getenv("PYROMIND_CLUSTER", "").strip()
+    cluster, separator, routed_env = configured_route.partition("#")
+    explicit_env = context.extra.get("env")
+    env = explicit_env.strip() if isinstance(explicit_env, str) else None
+    if separator and routed_env.strip():
+        env = routed_env.strip().lower()
+    return resolve_platform_env(env), cluster.strip() or None
 
 
 def _preview_timeout_seconds(context: ToolExecutionContext) -> float:

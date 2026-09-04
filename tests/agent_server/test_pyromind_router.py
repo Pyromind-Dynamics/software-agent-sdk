@@ -31,6 +31,7 @@ from openhands.agent_server.pyromind_router import (
     _build_analyze_task_failure_tool,
     _build_debug_context_headers,
     _build_pyromind_storage_tools,
+    _build_sandbox_tools,
     _build_training_analysis_tool,
     _build_workflow_run_tool,
     _build_workflow_validation_tool,
@@ -71,6 +72,16 @@ from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
 )
 from openhands.tools.pyromind_remote_dataset import PreviewRemoteDatasetTool
+from openhands.tools.sandbox import (
+    SandboxCreateTool,
+    SandboxDeleteFileTool,
+    SandboxDeleteTool,
+    SandboxDownloadTool,
+    SandboxReadFileTool,
+    SandboxTerminalTool,
+    SandboxUploadTool,
+    SandboxWriteFileTool,
+)
 from openhands.tools.training_analysis import TrainingAnalysisTool
 from openhands.tools.workflow import (
     AnalyzeTaskFailureTool,
@@ -429,6 +440,16 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert PreviewDatasetTool.name in tool_names
     assert UploadFileToPyromindTool.name in tool_names
     assert RunDatasetCleaningTool.name in tool_names
+    assert {
+        SandboxCreateTool.name,
+        SandboxDeleteTool.name,
+        SandboxReadFileTool.name,
+        SandboxWriteFileTool.name,
+        SandboxDeleteFileTool.name,
+        SandboxTerminalTool.name,
+        SandboxUploadTool.name,
+        SandboxDownloadTool.name,
+    }.issubset(tool_names)
     assert _REMOVED_WORKFLOW_TOOL not in tool_names
     terminal_tool = next(
         tool for tool in service.start_request.agent.tools if tool.name == "terminal"
@@ -1019,6 +1040,8 @@ def test_pyromind_storage_tools_use_user_context_headers():
         DfStopTaskTool.name,
         ExtractArchiveTool.name,
         PreviewRemoteDatasetTool.name,
+        SandboxUploadTool.name,
+        SandboxDownloadTool.name,
     ]
     expected_storage_params = {
         "storage_base_url": "https://storage.test/api",
@@ -1057,6 +1080,35 @@ def test_pyromind_storage_tools_use_user_context_headers():
         secrets["PYROMIND_STORAGE_AUTH_COOKIE"].get_value()
         == f"{PYROMIND_AUTH_COOKIE_NAME}=context-token; other=value"
     )
+    assert secrets["auth_token"].get_value() == "request-token"
+
+
+def test_build_sandbox_tools_uses_platform_auth_context():
+    request = _make_request(
+        {
+            "cookie": f"{PYROMIND_AUTH_COOKIE_NAME}=request-token",
+            "x-cluster": "us-west-1#pre",
+        }
+    )
+    load_base_env(request)
+
+    tools, secrets = _build_sandbox_tools(
+        request,
+        {"sandbox_default_image": "registry.test/sandbox:latest"},
+    )
+
+    assert [tool.name for tool in tools] == [
+        SandboxCreateTool.name,
+        SandboxDeleteTool.name,
+        SandboxReadFileTool.name,
+        SandboxWriteFileTool.name,
+        SandboxDeleteFileTool.name,
+        SandboxTerminalTool.name,
+    ]
+    assert all(tool.params["cluster"] == "us-west-1" for tool in tools)
+    assert all(tool.params["env"] == "pre" for tool in tools)
+    assert tools[0].params["default_image"] == "registry.test/sandbox:latest"
+    assert all("default_image" not in tool.params for tool in tools[1:])
     assert secrets["auth_token"].get_value() == "request-token"
 
 

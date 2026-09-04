@@ -1,0 +1,5 @@
+---
+interface:
+    display_name: Embodied Data Cleaning
+    short_description: Clean local or Storage robot data to LeRobot v2.1
+    default_prompt: Use $embodied-data-cleaning to inspect and batch-clean this robot dataset into validated LeRobot v2.1.

@@ -201,6 +201,8 @@ def test_adapter_resolves_skill_roots_from_env(tmp_path, monkeypatch) -> None:
         "generate-workflow-dsl",
         "data-processing",
         "debug-workflow",
+        "embodied-data-cleaning",
+        "sandbox",
         "training-analysis",
     )
     for name in names:
@@ -577,7 +579,7 @@ async def test_attach_rejects_symlinked_pi_before_loading_state(tmp_path) -> Non
         await adapter.attach_session("unsafe-pi", RequestContext(user_id="42"))
 
 
-async def test_runner_loads_five_named_skills_and_eleven_business_tools(
+async def test_runner_loads_sandbox_skills_and_business_tools(
     tmp_path, monkeypatch
 ) -> None:
     captured = {}
@@ -610,6 +612,8 @@ async def test_runner_loads_five_named_skills_and_eleven_business_tools(
             "generate-workflow-dsl",
             "data-processing",
             "debug-workflow",
+            "embodied-data-cleaning",
+            "sandbox",
             "training-analysis",
         ]
         assert {item["name"] for item in captured["tools"]} == {
@@ -624,6 +628,14 @@ async def test_runner_loads_five_named_skills_and_eleven_business_tools(
             "edp_render",
             "edp_submit",
             "edp_aggregate",
+            "sandbox_create",
+            "sandbox_delete",
+            "sandbox_read_file",
+            "sandbox_write_file",
+            "sandbox_delete_file",
+            "sandbox_terminal",
+            "sandbox_upload",
+            "sandbox_download",
             "workflow_debug",
             "analyze_task_failure",
             "training_analysis",
@@ -639,11 +651,71 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
         repository / ".agents" / "skills" / "training-analysis",
     ]
     specs = PyromindBusinessToolHost(roots).specs()
-    assert len(specs) == 14
+    assert len(specs) == 22
     assert {"edp_render", "edp_submit", "edp_aggregate"} <= {
         spec["name"] for spec in specs
     }
     assert all(spec["input_schema"].get("type") == "object" for spec in specs)
+
+
+@pytest.mark.parametrize(
+    ("x_cluster", "expected_env", "expected_cluster"),
+    [
+        ("us-west-1#pre", "pre", "us-west-1"),
+        ("us-west-2#pre2", "pre2", "us-west-2"),
+        ("us-east-1", "prod", "us-east-1"),
+    ],
+)
+def test_pi_tool_params_parse_request_cluster_route(
+    tmp_path,
+    x_cluster,
+    expected_env,
+    expected_cluster,
+) -> None:
+    repository = Path(pi_adapter_module.__file__).parents[3]
+    host = PyromindBusinessToolHost(
+        [
+            repository / ".agents" / "skills" / "data-processing",
+            repository / ".agents" / "skills" / "training-analysis",
+        ]
+    )
+    context = ToolExecutionContext(
+        conversation_id="conversation-routing",
+        workspace_root=tmp_path,
+        request_context=RequestContext(user_id="42", x_cluster=x_cluster),
+        model_configuration={"model": "gpt-5"},
+    )
+
+    for params in (host._execution_params(context), host._sandbox_params(context)):
+        assert params["env"] == expected_env
+        assert params["cluster"] == expected_cluster
+
+    debug_params = host._workflow_debug_params(context)
+    assert debug_params["env"] == expected_env
+    assert debug_params["cluster"] == expected_cluster
+
+
+def test_pi_tool_params_fall_back_to_deployment_target(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENV", "pre")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1")
+    repository = Path(pi_adapter_module.__file__).parents[3]
+    host = PyromindBusinessToolHost(
+        [
+            repository / ".agents" / "skills" / "data-processing",
+            repository / ".agents" / "skills" / "training-analysis",
+        ]
+    )
+    context = ToolExecutionContext(
+        conversation_id="conversation-deployment-routing",
+        workspace_root=tmp_path,
+        request_context=RequestContext(user_id="42"),
+        model_configuration={"model": "gpt-5"},
+    )
+
+    params = host._sandbox_params(context)
+
+    assert params["env"] == "pre"
+    assert params["cluster"] == "us-west-1"
 
 
 async def test_preview_dataset_timeout_returns_a_tool_error(tmp_path) -> None:
