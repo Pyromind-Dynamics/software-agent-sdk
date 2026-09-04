@@ -21,6 +21,7 @@ case 文档(case 文档描述数据形态、字段映射与解题链路细节,�
 | 数据形态 / 任务 | case 文档 | 执行模式 |
 | --- | --- | --- |
 | 成批记录,每条含镜像引用 + 题面 + verifier(tmax 类终端任务可用性/可行性验证) | [tmax 批量验证](cases/tmax.md)(profile: `scripts/edp/profiles/tmax-validation.json`) | 模式 A |
+| S2 自采集或 LeRobot v2.1 数据的多模态对齐、静止帧清理、转换和校验 | [具身数据清洗](cases/embodied-data-cleaning.md) | 模式 B（固定 runtime） |
 | 无匹配 case | 无;按本 playbook 通用流程(模式 B 面向一次性/探索性任务) | 见"执行模式选择" |
 
 ## 执行模式选择

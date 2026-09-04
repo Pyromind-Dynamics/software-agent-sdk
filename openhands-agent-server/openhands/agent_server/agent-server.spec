@@ -117,6 +117,8 @@ def get_pi_skill_datas():
         "generate-workflow-dsl",
         "data-processing",
         "debug-workflow",
+        "embodied-data-cleaning",
+        "sandbox",
         "training-analysis",
     ):
         for path in sorted((skills_dir / skill_name).rglob("*")):

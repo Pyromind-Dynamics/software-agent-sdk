@@ -102,6 +102,16 @@ from openhands.tools.pyromind_dataset.definition import (
 )
 from openhands.tools.pyromind_debug import get_debug_result_broker
 from openhands.tools.pyromind_remote_dataset import PreviewRemoteDatasetTool
+from openhands.tools.sandbox import (
+    SandboxCreateTool,
+    SandboxDeleteFileTool,
+    SandboxDeleteTool,
+    SandboxDownloadTool,
+    SandboxReadFileTool,
+    SandboxTerminalTool,
+    SandboxUploadTool,
+    SandboxWriteFileTool,
+)
 from openhands.tools.training_analysis import TrainingAnalysisTool
 from openhands.tools.utils import PUBLIC_READ_ALIASES
 from openhands.tools.workflow import (
@@ -156,6 +166,8 @@ _PYROMIND_SKILL_NAMES = [
     "generate-workflow-dsl",
     "debug-workflow",
     "data-processing",
+    "embodied-data-cleaning",
+    "sandbox",
     "training-analysis",
 ]
 _PYROMIND_VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
@@ -484,6 +496,45 @@ def _build_workflow_debug_tool(
     return Tool(name=WorkflowDebugTool.name, params=params), secrets
 
 
+_SANDBOX_TOOL_TYPES = (
+    SandboxCreateTool,
+    SandboxDeleteTool,
+    SandboxReadFileTool,
+    SandboxWriteFileTool,
+    SandboxDeleteFileTool,
+    SandboxTerminalTool,
+)
+
+
+def _build_sandbox_tools(
+    http_request: Request,
+    extra: dict[str, Any],
+) -> tuple[list[Tool], dict[str, SecretSource]]:
+    """Build the Pyromind sandbox tools with deployment and auth wiring."""
+    params: dict[str, Any] = {}
+    secrets: dict[str, SecretSource] = {}
+    params, secrets = _load_env_to_tools(
+        http_request=http_request,
+        params=params,
+        secrets=secrets,
+    )
+    secrets = _load_auth_token(http_request=http_request, secrets=secrets)
+    default_image = extra.get("sandbox_default_image") or os.environ.get(
+        "PYROMIND_SANDBOX_DEFAULT_IMAGE"
+    )
+    sandbox_tools = []
+    for tool_type in _SANDBOX_TOOL_TYPES:
+        tool_params = dict(params)
+        if (
+            tool_type is SandboxCreateTool
+            and isinstance(default_image, str)
+            and default_image
+        ):
+            tool_params["default_image"] = default_image
+        sandbox_tools.append(Tool(name=tool_type.name, params=tool_params))
+    return sandbox_tools, secrets
+
+
 def _build_pyromind_storage_tools(
     http_request: Request,
     extra: dict[str, Any],
@@ -564,6 +615,9 @@ def _build_pyromind_storage_tools(
     if isinstance(extraction_output_root, str) and extraction_output_root:
         extraction_params["output_root"] = extraction_output_root
 
+    sandbox_storage_params: dict[str, Any] = dict(extraction_params)
+    sandbox_storage_params.pop("output_root", None)
+
     return (
         [
             Tool(
@@ -580,6 +634,8 @@ def _build_pyromind_storage_tools(
             Tool(name=DfStopTaskTool.name, params=stop_params),
             Tool(name=ExtractArchiveTool.name, params=extraction_params),
             Tool(name=PreviewRemoteDatasetTool.name, params={}),
+            Tool(name=SandboxUploadTool.name, params=sandbox_storage_params),
+            Tool(name=SandboxDownloadTool.name, params=sandbox_storage_params),
         ],
         secrets,
     )
@@ -1251,6 +1307,10 @@ async def create_pyromind_conversation(
     # run_workflow / workflow_debug reuse validate auth/header wiring
     run_tool, run_secrets = _build_workflow_run_tool(http_request)
     debug_tool, debug_secrets = _build_workflow_debug_tool(http_request)
+    sandbox_tools, sandbox_secrets = _build_sandbox_tools(
+        http_request,
+        request.extra,
+    )
     # storage
     storage_tools, storage_secrets = _build_pyromind_storage_tools(
         http_request, request.extra, skills_path
@@ -1286,6 +1346,7 @@ async def create_pyromind_conversation(
             Tool(name="file_editor"),
             Tool(name=PyromindSubAgentTool.name),
             Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
+            *sandbox_tools,
             *storage_tools,
             Tool(name="dataset_download"),
             Tool(
@@ -1333,6 +1394,7 @@ async def create_pyromind_conversation(
             **training_secrets,
             **run_secrets,
             **debug_secrets,
+            **sandbox_secrets,
             **storage_secrets,
         },
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},

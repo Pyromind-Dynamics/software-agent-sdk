@@ -41,6 +41,16 @@ from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
     UploadFileToPyromindTool,
 )
+from openhands.tools.sandbox import (
+    SandboxCreateTool,
+    SandboxDeleteFileTool,
+    SandboxDeleteTool,
+    SandboxDownloadTool,
+    SandboxReadFileTool,
+    SandboxTerminalTool,
+    SandboxUploadTool,
+    SandboxWriteFileTool,
+)
 from openhands.tools.training_analysis import TrainingAnalysisTool
 from openhands.tools.workflow.analyze_task_failure import AnalyzeTaskFailureTool
 from openhands.tools.workflow.run_workflow import WORKFLOW_ATTEMPT_STATE_KEY
@@ -60,6 +70,7 @@ _READ_ONLY_TOOLS = frozenset(
     {
         "preview_dataset",
         "df_check_progress",
+        SandboxReadFileTool.name,
         AnalyzeTaskFailureTool.name,
     }
 )
@@ -285,6 +296,30 @@ class PyromindBusinessToolHost:
             EdpAggregateTool.name: lambda context: EdpAggregateTool.create(
                 **self._edp_params(context)
             )[0],
+            SandboxCreateTool.name: lambda context: SandboxCreateTool.create(
+                **self._sandbox_params(context, include_default_image=True)
+            )[0],
+            SandboxDeleteTool.name: lambda context: SandboxDeleteTool.create(
+                **self._sandbox_params(context)
+            )[0],
+            SandboxReadFileTool.name: lambda context: SandboxReadFileTool.create(
+                **self._sandbox_params(context)
+            )[0],
+            SandboxWriteFileTool.name: lambda context: SandboxWriteFileTool.create(
+                **self._sandbox_params(context)
+            )[0],
+            SandboxDeleteFileTool.name: lambda context: SandboxDeleteFileTool.create(
+                **self._sandbox_params(context)
+            )[0],
+            SandboxTerminalTool.name: lambda context: SandboxTerminalTool.create(
+                **self._sandbox_params(context)
+            )[0],
+            SandboxUploadTool.name: lambda context: SandboxUploadTool.create(
+                **self._sandbox_storage_params(context)
+            )[0],
+            SandboxDownloadTool.name: lambda context: SandboxDownloadTool.create(
+                **self._sandbox_storage_params(context)
+            )[0],
             WorkflowDebugTool.name: lambda context: WorkflowDebugTool.create(
                 **self._workflow_debug_params(context)
             )[0],
@@ -310,6 +345,14 @@ class PyromindBusinessToolHost:
             EdpRenderTool,
             EdpSubmitTool,
             EdpAggregateTool,
+            SandboxCreateTool,
+            SandboxDeleteTool,
+            SandboxReadFileTool,
+            SandboxWriteFileTool,
+            SandboxDeleteFileTool,
+            SandboxTerminalTool,
+            SandboxUploadTool,
+            SandboxDownloadTool,
             WorkflowDebugTool,
             AnalyzeTaskFailureTool,
             TrainingAnalysisTool,
@@ -516,6 +559,44 @@ class PyromindBusinessToolHost:
     def _edp_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         params = self._execution_params(context)
         params["runtime_dir"] = str(self._edp_runtime)
+        return params
+
+    def _sandbox_params(
+        self,
+        context: ToolExecutionContext,
+        *,
+        include_default_image: bool = False,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "current_user": current_user_from_context(context.request_context),
+            "headers": _forward_headers(
+                context.request_context,
+                include_cookie=False,
+            ),
+        }
+        if context.request_context.x_cluster:
+            params["cluster"] = context.request_context.x_cluster
+        env = context.extra.get("env")
+        if isinstance(env, str) and env:
+            params["env"] = env
+        default_image = context.extra.get("sandbox_default_image")
+        if include_default_image and isinstance(default_image, str) and default_image:
+            params["default_image"] = default_image
+        return params
+
+    def _sandbox_storage_params(
+        self,
+        context: ToolExecutionContext,
+    ) -> dict[str, Any]:
+        params = self._sandbox_params(context)
+        params.pop("default_image", None)
+        storage = self._storage_params(context)
+        if "storage_base_url" in storage:
+            params["storage_base_url"] = storage["storage_base_url"]
+        if "headers" in storage:
+            params["storage_headers"] = storage["headers"]
+        if "secret_headers" in storage:
+            params["storage_secret_headers"] = storage["secret_headers"]
         return params
 
     def _extraction_params(self, context: ToolExecutionContext) -> dict[str, Any]:

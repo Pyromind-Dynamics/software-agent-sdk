@@ -201,6 +201,8 @@ def test_adapter_resolves_skill_roots_from_env(tmp_path, monkeypatch) -> None:
         "generate-workflow-dsl",
         "data-processing",
         "debug-workflow",
+        "embodied-data-cleaning",
+        "sandbox",
         "training-analysis",
     )
     for name in names:
@@ -577,7 +579,7 @@ async def test_attach_rejects_symlinked_pi_before_loading_state(tmp_path) -> Non
         await adapter.attach_session("unsafe-pi", RequestContext(user_id="42"))
 
 
-async def test_runner_loads_five_named_skills_and_eleven_business_tools(
+async def test_runner_loads_sandbox_skills_and_business_tools(
     tmp_path, monkeypatch
 ) -> None:
     captured = {}
@@ -610,6 +612,8 @@ async def test_runner_loads_five_named_skills_and_eleven_business_tools(
             "generate-workflow-dsl",
             "data-processing",
             "debug-workflow",
+            "embodied-data-cleaning",
+            "sandbox",
             "training-analysis",
         ]
         assert {item["name"] for item in captured["tools"]} == {
@@ -624,6 +628,14 @@ async def test_runner_loads_five_named_skills_and_eleven_business_tools(
             "edp_render",
             "edp_submit",
             "edp_aggregate",
+            "sandbox_create",
+            "sandbox_delete",
+            "sandbox_read_file",
+            "sandbox_write_file",
+            "sandbox_delete_file",
+            "sandbox_terminal",
+            "sandbox_upload",
+            "sandbox_download",
             "workflow_debug",
             "analyze_task_failure",
             "training_analysis",
@@ -639,7 +651,7 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
         repository / ".agents" / "skills" / "training-analysis",
     ]
     specs = PyromindBusinessToolHost(roots).specs()
-    assert len(specs) == 14
+    assert len(specs) == 22
     assert {"edp_render", "edp_submit", "edp_aggregate"} <= {
         spec["name"] for spec in specs
     }
