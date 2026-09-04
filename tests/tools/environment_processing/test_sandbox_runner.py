@@ -234,19 +234,60 @@ def test_run_pi_launch_guards_duplicate_start(runner: Any) -> None:
     assert "echo 9 > /workspace/.pi_exit.txt" in launch
 
 
-def test_delete_sandbox_kills_processes_then_pause_retries(runner: Any) -> None:
+def test_delete_sandbox_pauses_before_delete(runner: Any) -> None:
+    order: list[str] = []
     client: Any = FakeClient()
 
-    def flaky_delete(sandbox_id: str) -> None:
-        client.deleted.append(sandbox_id)
-        if len(client.deleted) == 1:
-            raise RuntimeError("status is Running, can not delete")
+    def pause(sandbox_id: str) -> None:
+        order.append("pause")
 
-    client.delete = flaky_delete
+    def delete(sandbox_id: str) -> None:
+        order.append("delete")
+
+    client.pause = pause
+    client.delete = delete
     runner._delete_sandbox(client, "sb-1")
-    assert client.paused == ["sb-1"]
-    assert len(client.deleted) == 2
+    assert order == ["pause", "delete"]
     joined = " ".join(command for command, _ in client.calls)
     assert "pkill -9 -f node_modules/.bin/pi" in joined
     assert f"pkill -9 -f {shlex.quote('npm install')}" in joined
     assert "pkill -9 -f .pi_run.sh" in joined
+
+
+def test_delete_sandbox_retries_after_pause_race(
+    runner: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(runner.time, "sleep", lambda seconds: sleeps.append(seconds))
+    order: list[str] = []
+    client: Any = FakeClient()
+
+    def pause(sandbox_id: str) -> None:
+        order.append("pause")
+
+    def delete(sandbox_id: str) -> None:
+        order.append("delete")
+        if order.count("delete") == 1:
+            raise RuntimeError("status is Running, can not delete")
+
+    client.pause = pause
+    client.delete = delete
+    runner._delete_sandbox(client, "sb-1")
+    assert sleeps == [2]
+    assert order == ["pause", "delete", "pause", "delete"]
+
+
+def test_delete_sandbox_leak_is_loud_but_not_fatal(
+    runner: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    client: Any = FakeClient()
+
+    def delete(sandbox_id: str) -> None:
+        client.deleted.append(sandbox_id)
+        raise RuntimeError("storage exploded")
+
+    client.delete = delete
+    with caplog.at_level(logging.WARNING, logger="sandbox_runner"):
+        runner._delete_sandbox(client, "sb-1")
+    assert client.deleted == ["sb-1"]
+    assert "failed to delete sandbox sb-1" in caplog.text

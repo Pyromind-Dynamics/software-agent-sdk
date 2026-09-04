@@ -677,18 +677,31 @@ def _stderr_tail(client: SandboxClient, sandbox_id: str, err_path: str) -> str:
 
 
 def _delete_sandbox(client: SandboxClient, sandbox_id: str) -> None:
-    # Background processes (agent, npm) keep the instance Running and make
-    # the platform refuse DELETE; kill them best-effort before pausing.
+    """Tear the record's sandbox down: kill leftovers, pause, then delete.
+
+    The platform keeps instances Running after their workloads finish and
+    rejects DELETE on Running instances with a 400, so pausing first is the
+    normal path, not error recovery; direct-delete only covers instances
+    that already stopped on their own.
+    """
+    # Background processes (agent, npm) keep the instance Running and would
+    # also wedge the pause, so kill them best-effort first.
     _remote_kill(client, sandbox_id, "node_modules/.bin/pi")
     _remote_kill(client, sandbox_id, "npm install")
     _remote_kill(client, sandbox_id, ".pi_run.sh")
     try:
         try:
+            client.pause(sandbox_id)
+        except Exception as exc:  # noqa: BLE001
+            # Already stopped or pause unsupported — let the delete decide.
+            logger.info("pause before delete skipped for %s: %s", sandbox_id, exc)
+        try:
             client.delete(sandbox_id)
         except Exception as exc:  # noqa: BLE001
             if "can not delete" not in str(exc).lower():
                 raise
-            # Platform rejects DELETE while running: pause first, then retry.
+            # The pause raced the state transition; one beat, then retry.
+            time.sleep(2)
             client.pause(sandbox_id)
             client.delete(sandbox_id)
     except Exception as exc:  # noqa: BLE001
