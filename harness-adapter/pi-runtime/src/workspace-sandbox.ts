@@ -8,6 +8,7 @@ import {
   resolve,
   sep,
 } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   SandboxManager,
   type SandboxRuntimeConfig,
@@ -365,7 +366,7 @@ function commonAncestor(left: string, right: string): string {
   return candidate;
 }
 
-async function configuredRuntimeReadRoots(): Promise<string[]> {
+export async function configuredRuntimeReadRoots(): Promise<string[]> {
   const pathRoots = (process.env.PATH ?? "")
     .split(delimiter)
     .filter(Boolean)
@@ -376,7 +377,24 @@ async function configuredRuntimeReadRoots(): Promise<string[]> {
     ...["SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"]
       .map((name) => process.env[name])
       .filter((value): value is string => Boolean(value)),
+    ...piRuntimeReadRoots(),
   ]);
+}
+
+/**
+ * The pi-runtime installation holds sandbox-runtime's apply-seccomp binary,
+ * which the sandboxed command itself must exec inside the bwrap namespace.
+ * Compiled deny rules mount tmpfs over unapproved read paths, so without this
+ * root the namespace hides the very binary the wrapper then fails to exec
+ * (ENOENT, exit 127) — every terminal command would fail.
+ */
+export function piRuntimeReadRoots(): string[] {
+  const configured = process.env.PYROMIND_PI_RUNTIME?.trim();
+  if (configured) {
+    return [resolve(dirname(dirname(configured)))];
+  }
+  // Local development layout: <pi-runtime>/src|dist/workspace-sandbox.js
+  return [resolve(dirname(dirname(fileURLToPath(import.meta.url))))];
 }
 
 function runtimeRootForBinDirectory(path: string): string {

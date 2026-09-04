@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   SandboxManager,
@@ -10,7 +10,9 @@ import {
 } from "@anthropic-ai/sandbox-runtime";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import {
+  configuredRuntimeReadRoots,
   createWorkspaceSandboxedBashOperations,
+  piRuntimeReadRoots,
   workspacePolicyDenyPaths,
   workspacePolicyDenyWritePaths,
 } from "../src/workspace-sandbox.js";
@@ -320,3 +322,90 @@ test(
     }
   },
 );
+
+/**
+ * Reproduces the pod layout that broke every terminal command: the pi-runtime
+ * install sits under the protected home boundary (HOME=/agent-server) next to
+ * the conversations tree, and sandbox-runtime must still be able to exec its
+ * own apply-seccomp binary inside the bwrap namespace.
+ */
+async function podLikeTree() {
+  const base = await realpath(await mkdtemp(join(tmpdir(), "pi-runtime-root-")));
+  const home = join(base, "agent-server");
+  const runtimeRoot = join(home, "pi-runtime");
+  const vendor = join(
+    runtimeRoot,
+    "node_modules",
+    "@anthropic-ai",
+    "sandbox-runtime",
+    "vendor",
+    "seccomp",
+    "x64",
+  );
+  const conversations = join(home, "conversations");
+  const workspace = join(conversations, "current");
+  await mkdir(join(workspace, "public_data"), { recursive: true });
+  await mkdir(join(workspace, "pi", "terminal-output"), { recursive: true });
+  await mkdir(vendor, { recursive: true });
+  await writeFile(join(vendor, "apply-seccomp"), "binary");
+  await mkdir(join(conversations, "other"), { recursive: true });
+  const policy = await WorkspaceAccessPolicy.create({
+    workspaceRoot: workspace,
+    readOnlyRoots: [],
+  });
+  return { home, runtimeRoot, conversations};
+}
+
+test("piRuntimeReadRoots derives the runtime root from PYROMIND_PI_RUNTIME", async () => {
+  const tree = await podLikeTree();
+  process.env.PYROMIND_PI_RUNTIME = join(tree.runtimeRoot, "dist", "index.js");
+  try {
+    assert.deepEqual(piRuntimeReadRoots(), [resolve(tree.runtimeRoot)]);
+  } finally {
+    delete process.env.PYROMIND_PI_RUNTIME;
+  }
+});
+
+test("configuredRuntimeReadRoots includes the env-derived runtime root", async () => {
+  const tree = await podLikeTree();
+  process.env.PYROMIND_PI_RUNTIME = join(tree.runtimeRoot, "dist", "index.js");
+  try {
+    assert.ok(
+      (await configuredRuntimeReadRoots()).includes(resolve(tree.runtimeRoot)),
+    );
+  } finally {
+    delete process.env.PYROMIND_PI_RUNTIME;
+  }
+});
+
+test("deny rules never hide the sandbox's own apply-seccomp binary", async () => {
+  const tree = await podLikeTree();
+  process.env.PYROMIND_PI_RUNTIME = join(tree.runtimeRoot, "dist", "index.js");
+  try {
+    const policy = await WorkspaceAccessPolicy.create({
+      workspaceRoot: join(tree.conversations, "current"),
+      readOnlyRoots: [],
+    });
+    const denied = await workspacePolicyDenyPaths(
+      policy,
+      tree.home,
+      await configuredRuntimeReadRoots(),
+    );
+    const sandboxRoot = join(
+      tree.runtimeRoot,
+      "node_modules",
+      "@anthropic-ai",
+      "sandbox-runtime",
+    );
+    assert.ok(
+      !denied.some((rule) => resolve(sandboxRoot).startsWith(rule)),
+      "the sandbox runtime tree must stay readable inside the namespace",
+    );
+    // Workspace isolation is preserved: sibling conversations stay denied.
+    assert(
+      denied.some((rule) => join(tree.conversations, "other").startsWith(rule)),
+    );
+  } finally {
+    delete process.env.PYROMIND_PI_RUNTIME;
+  }
+});
