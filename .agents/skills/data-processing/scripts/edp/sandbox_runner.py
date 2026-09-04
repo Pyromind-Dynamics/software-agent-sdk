@@ -85,6 +85,11 @@ PI_RUN_SCRIPT = "/workspace/.pi_run.sh"
 PI_INSTALL_LOG = "/workspace/.pi_install.log"
 PI_EXIT_FILE = "/workspace/.pi_exit.txt"
 PI_MODELS_REL = ".pi/agent/models.json"  # under $HOME
+PI_INSTALL_EXIT_FILE = "/workspace/.pi_install_exit.txt"
+PI_INSTALL_DONE = "/workspace/.pi_install.done"
+PI_INSTALL_LOCK = "/opt/.pi_install.lock"
+PI_RUN_LOCK = "/workspace/.pi_run.lock"
+HEARTBEAT_SECONDS = 60.0
 
 _SECRET_PLACEHOLDER = re.compile(r"\{secret:([A-Za-z0-9_]+)\}")
 
@@ -290,11 +295,26 @@ def _exec(
     if not command:
         raise StepError(CATEGORY_EXEC_FAILED, "exec requires 'command'")
     timeout = int(params.get("timeout", DEFAULT_EXEC_TIMEOUT))
+    marker = str(params.get("marker") or "")
+    if marker:
+        # Step-level idempotency: a retried run skips a step whose marker
+        # already exists instead of re-executing the command inside the
+        # sandbox (markers live and die with the sandbox).
+        probe = f"test -f {shlex.quote(marker)} && echo yes || echo no"
+        marked = client.exec_command(sandbox_id, probe, timeout=PROBE_TIMEOUT)
+        if (marked.output or "").strip() == "yes":
+            logger.info("exec marker %s present; skipping step", marker)
+            return 0, ""
     try:
         result = client.exec_command(sandbox_id, str(command), timeout=timeout)
     except Exception as exc:  # noqa: BLE001
         raise StepError(CATEGORY_EXEC_FAILED, f"exec failed: {exc}")
-    return int(result.returncode), result.output or ""
+    returncode = int(result.returncode)
+    if marker and returncode == 0:
+        client.exec_command(
+            sandbox_id, f"touch {shlex.quote(marker)}", timeout=PROBE_TIMEOUT
+        )
+    return returncode, result.output or ""
 
 
 def _install_pi(
@@ -322,6 +342,7 @@ def _install_pi(
         )
     base_v1 = base if base.endswith("/v1") else base + "/v1"
     timeout = int(params.get("timeout", DEFAULT_AGENT_TIMEOUT))
+    poll_interval = float(params.get("poll_interval", DEFAULT_POLL_INTERVAL))
     # models.json must land where run_pi reads it: run_pi executes the agent
     # as the workspace user with HOME={workdir}, so the install shell targets
     # the same HOME instead of the root exec shell's (/root). The chmod keeps
@@ -371,20 +392,68 @@ done
 ls /opt/pi/node_modules/.bin/pi >/dev/null
 cat "$HOME/{PI_MODELS_REL}" >/dev/null
 node --version
+touch {PI_INSTALL_DONE}
 """
     script = (
         f"{{ {inner}}} >{shlex.quote(PI_INSTALL_LOG)} 2>&1 "
         f"|| {{ tail -30 {shlex.quote(PI_INSTALL_LOG)}; exit 1; }}"
     )
+    # Detached install: the exec channel caps a single command well below a
+    # cold npm install, so run the script with an exit-code file and poll it
+    # with heartbeats instead of one blocking exec. The mkdir lock makes a
+    # duplicated launch (HTTP-level retry) exit 9 instead of double-running
+    # npm install in the same sandbox.
+    cleanup = (
+        f"rc=$?; rmdir {shlex.quote(PI_INSTALL_LOCK)} 2>/dev/null; "
+        f"echo $rc > {shlex.quote(PI_INSTALL_EXIT_FILE)}"
+    )
+    launch = (
+        f"rm -f {shlex.quote(PI_INSTALL_EXIT_FILE)} {shlex.quote(PI_INSTALL_DONE)}; "
+        f"if mkdir {shlex.quote(PI_INSTALL_LOCK)} 2>/dev/null; then "
+        f"nohup bash -c {shlex.quote(script + chr(10) + cleanup)} "
+        ">/dev/null 2>&1 & echo launched; else "
+        f"echo 9 > {shlex.quote(PI_INSTALL_EXIT_FILE)}; fi"
+    )
     try:
-        result = client.exec_command(sandbox_id, script, timeout=timeout)
+        marked = client.exec_command(
+            sandbox_id,
+            f"test -f {shlex.quote(PI_INSTALL_DONE)} && echo yes || echo no",
+            timeout=PROBE_TIMEOUT,
+        )
+        if (marked.output or "").strip() == "yes":
+            logger.info("pi already installed in %s; skipping install", sandbox_id)
+            return
+        client.exec_command(sandbox_id, launch, timeout=60)
+        exit_code = _poll_exit_file(
+            client,
+            sandbox_id,
+            exit_file=PI_INSTALL_EXIT_FILE,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            label="pi install",
+            progress_file=PI_INSTALL_LOG,
+            kill_pattern="npm install",
+        )
+    except StepError:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise StepError(CATEGORY_PI_INSTALL_FAILED, f"pi install failed: {exc}")
-    if result.returncode != 0:
+    if exit_code is None:
         raise StepError(
             CATEGORY_PI_INSTALL_FAILED,
-            f"pi install exited {result.returncode}: "
-            f"{(result.output or '').strip()[:200]}",
+            f"pi install timed out after {timeout}s: "
+            f"{_remote_tail(client, sandbox_id, PI_INSTALL_LOG, limit=600)}",
+        )
+    if exit_code == 9:
+        raise StepError(
+            CATEGORY_PI_INSTALL_FAILED,
+            "pi install is already running in this sandbox (install lock held)",
+        )
+    if exit_code != 0:
+        raise StepError(
+            CATEGORY_PI_INSTALL_FAILED,
+            f"pi install exited {exit_code}: "
+            f"{_remote_tail(client, sandbox_id, PI_INSTALL_LOG, limit=600)}",
         )
 
 
@@ -451,13 +520,29 @@ def _run_pi(
             )
         else:
             wrap = f"bash {PI_RUN_SCRIPT}"
+        agent_cmd = (
+            f"{wrap}; rc=$?; rmdir {shlex.quote(PI_RUN_LOCK)} 2>/dev/null; "
+            f"echo $rc > {shlex.quote(PI_EXIT_FILE)}"
+        )
         launch = (
-            f"chmod 644 {PI_TASK_FILE} {PI_RUN_SCRIPT}; rm -f {PI_EXIT_FILE}; "
-            f"nohup bash -c {shlex.quote(f'{wrap}; echo $? > {PI_EXIT_FILE}')} "
-            ">/dev/null 2>&1 & echo launched"
+            f"chmod 644 {PI_TASK_FILE} {PI_RUN_SCRIPT}; "
+            f"rm -f {shlex.quote(PI_EXIT_FILE)}; "
+            f"if mkdir {shlex.quote(PI_RUN_LOCK)} 2>/dev/null; then "
+            f"nohup bash -c {shlex.quote(agent_cmd)} >/dev/null 2>&1 & "
+            "echo launched; else "
+            f"echo 9 > {shlex.quote(PI_EXIT_FILE)}; fi"
         )
         client.exec_command(sandbox_id, launch, timeout=60)
-        exit_code = _poll_agent_exit(client, sandbox_id, timeout, poll_interval)
+        exit_code = _poll_exit_file(
+            client,
+            sandbox_id,
+            exit_file=PI_EXIT_FILE,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            label="pi agent",
+            progress_file=trace_path,
+            kill_pattern="node_modules/.bin/pi",
+        )
     except StepError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -479,31 +564,83 @@ def _run_pi(
         )
 
 
-def _poll_agent_exit(
+def _remote_tail(
+    client: SandboxClient, sandbox_id: str, path: str, limit: int = 300
+) -> str:
+    """Best-effort tail of a file inside the sandbox, flattened to one line."""
+    try:
+        result = client.exec_command(
+            sandbox_id, f"tail -c {limit} {shlex.quote(path)}", timeout=30
+        )
+    except Exception:  # noqa: BLE001
+        return "unavailable"
+    text = " ".join((result.output or "").split())
+    return text[:200] or "empty"
+
+
+def _remote_kill(client: SandboxClient, sandbox_id: str, pattern: str) -> None:
+    try:
+        client.exec_command(
+            sandbox_id,
+            f"pkill -9 -f {shlex.quote(pattern)} 2>/dev/null; true",
+            timeout=30,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("failed to kill %r in %s", pattern, sandbox_id)
+
+
+def _poll_exit_file(
     client: SandboxClient,
     sandbox_id: str,
+    *,
+    exit_file: str,
     timeout: int,
     poll_interval: float,
+    label: str,
+    progress_file: str | None = None,
+    kill_pattern: str | None = None,
 ) -> int | None:
-    """Poll the detached agent's exit-code file; None on timeout."""
-    probe = f"test -f {PI_EXIT_FILE} && cat {PI_EXIT_FILE} || echo {RUNNING_MARK}"
+    """Poll a detached command's exit-code file; None on timeout.
+
+    The exec channel streams no output while a detached stage runs, so a
+    heartbeat (elapsed + best-effort progress tail) is logged every
+    HEARTBEAT_SECONDS to keep long installs/solves visible in the platform
+    log instead of a multi-minute silent gap.
+    """
+    probe = (
+        f"test -f {shlex.quote(exit_file)} && cat {shlex.quote(exit_file)} "
+        f"|| echo {RUNNING_MARK}"
+    )
     deadline = time.monotonic() + timeout
+    next_beat = time.monotonic() + HEARTBEAT_SECONDS
     while True:
         result = client.exec_command(sandbox_id, probe, timeout=PROBE_TIMEOUT)
         out = (result.output or "").strip()
         if out.isdigit():
             return int(out)
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if progress_file is not None and now >= next_beat and now < deadline:
+            logger.info(
+                "%s still running in %s: elapsed=%ds tail=%s",
+                label,
+                sandbox_id,
+                int(timeout - (deadline - now)),
+                _remote_tail(client, sandbox_id, progress_file),
+            )
+            next_beat = now + HEARTBEAT_SECONDS
+        if now >= deadline:
             break
         time.sleep(poll_interval)
-    try:
-        client.exec_command(
+    if progress_file is not None:
+        logger.warning(
+            "%s timed out in %s after %ds; last output: %s",
+            label,
             sandbox_id,
-            "pkill -f node_modules/.bin/pi 2>/dev/null; true",
-            timeout=30,
+            timeout,
+            _remote_tail(client, sandbox_id, progress_file, limit=600),
         )
-    except Exception:  # noqa: BLE001
-        logger.warning("failed to kill timed-out agent in %s", sandbox_id)
+    if kill_pattern is not None:
+        _remote_kill(client, sandbox_id, kill_pattern)
     return None
 
 
@@ -540,6 +677,11 @@ def _stderr_tail(client: SandboxClient, sandbox_id: str, err_path: str) -> str:
 
 
 def _delete_sandbox(client: SandboxClient, sandbox_id: str) -> None:
+    # Background processes (agent, npm) keep the instance Running and make
+    # the platform refuse DELETE; kill them best-effort before pausing.
+    _remote_kill(client, sandbox_id, "node_modules/.bin/pi")
+    _remote_kill(client, sandbox_id, "npm install")
+    _remote_kill(client, sandbox_id, ".pi_run.sh")
     try:
         try:
             client.delete(sandbox_id)
