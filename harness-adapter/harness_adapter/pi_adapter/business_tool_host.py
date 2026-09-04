@@ -36,6 +36,7 @@ from openhands.tools.environment_processing import (
     EdpRenderTool,
     EdpSubmitTool,
 )
+from openhands.tools.environment_processing.platform_env import resolve_platform_env
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
@@ -525,12 +526,10 @@ class PyromindBusinessToolHost:
         return params
 
     def _execution_params(self, context: ToolExecutionContext) -> dict[str, Any]:
-        params: dict[str, Any] = {}
-        if context.request_context.x_cluster:
-            params["cluster"] = context.request_context.x_cluster
-        env = context.extra.get("env")
-        if isinstance(env, str) and env:
-            params["env"] = env
+        env, cluster = _execution_target(context)
+        params: dict[str, Any] = {"env": env}
+        if cluster:
+            params["cluster"] = cluster
         params["headers"] = _forward_headers(
             context.request_context, include_cookie=False
         )
@@ -567,18 +566,17 @@ class PyromindBusinessToolHost:
         *,
         include_default_image: bool = False,
     ) -> dict[str, Any]:
+        env, cluster = _execution_target(context)
         params: dict[str, Any] = {
             "current_user": current_user_from_context(context.request_context),
+            "env": env,
             "headers": _forward_headers(
                 context.request_context,
                 include_cookie=False,
             ),
         }
-        if context.request_context.x_cluster:
-            params["cluster"] = context.request_context.x_cluster
-        env = context.extra.get("env")
-        if isinstance(env, str) and env:
-            params["env"] = env
+        if cluster:
+            params["cluster"] = cluster
         default_image = context.extra.get("sandbox_default_image")
         if include_default_image and isinstance(default_image, str) and default_image:
             params["default_image"] = default_image
@@ -615,9 +613,10 @@ class PyromindBusinessToolHost:
         return params
 
     def _workflow_debug_params(self, context: ToolExecutionContext) -> dict[str, Any]:
+        env, cluster = _execution_target(context)
         return {
-            "cluster": context.request_context.x_cluster,
-            "env": context.extra.get("env"),
+            "cluster": cluster,
+            "env": env,
             "current_user": current_user_from_context(context.request_context),
             "headers": _forward_headers(context.request_context, include_cookie=False),
         }
@@ -661,6 +660,24 @@ def _forward_headers(
         )
         if value
     }
+
+
+def _execution_target(
+    context: ToolExecutionContext,
+) -> tuple[str, str | None]:
+    request_route = (context.request_context.x_cluster or "").strip()
+    if request_route:
+        cluster, separator, routed_env = request_route.partition("#")
+        env = routed_env.strip().lower() if separator else "prod"
+        return env or "prod", cluster.strip() or None
+
+    configured_route = os.getenv("PYROMIND_CLUSTER", "").strip()
+    cluster, separator, routed_env = configured_route.partition("#")
+    explicit_env = context.extra.get("env")
+    env = explicit_env.strip() if isinstance(explicit_env, str) else None
+    if separator and routed_env.strip():
+        env = routed_env.strip().lower()
+    return resolve_platform_env(env), cluster.strip() or None
 
 
 def _preview_timeout_seconds(context: ToolExecutionContext) -> float:

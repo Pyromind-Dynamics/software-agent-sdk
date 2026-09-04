@@ -658,6 +658,66 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
     assert all(spec["input_schema"].get("type") == "object" for spec in specs)
 
 
+@pytest.mark.parametrize(
+    ("x_cluster", "expected_env", "expected_cluster"),
+    [
+        ("us-west-1#pre", "pre", "us-west-1"),
+        ("us-west-2#pre2", "pre2", "us-west-2"),
+        ("us-east-1", "prod", "us-east-1"),
+    ],
+)
+def test_pi_tool_params_parse_request_cluster_route(
+    tmp_path,
+    x_cluster,
+    expected_env,
+    expected_cluster,
+) -> None:
+    repository = Path(pi_adapter_module.__file__).parents[3]
+    host = PyromindBusinessToolHost(
+        [
+            repository / ".agents" / "skills" / "data-processing",
+            repository / ".agents" / "skills" / "training-analysis",
+        ]
+    )
+    context = ToolExecutionContext(
+        conversation_id="conversation-routing",
+        workspace_root=tmp_path,
+        request_context=RequestContext(user_id="42", x_cluster=x_cluster),
+        model_configuration={"model": "gpt-5"},
+    )
+
+    for params in (host._execution_params(context), host._sandbox_params(context)):
+        assert params["env"] == expected_env
+        assert params["cluster"] == expected_cluster
+
+    debug_params = host._workflow_debug_params(context)
+    assert debug_params["env"] == expected_env
+    assert debug_params["cluster"] == expected_cluster
+
+
+def test_pi_tool_params_fall_back_to_deployment_target(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENV", "pre")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1")
+    repository = Path(pi_adapter_module.__file__).parents[3]
+    host = PyromindBusinessToolHost(
+        [
+            repository / ".agents" / "skills" / "data-processing",
+            repository / ".agents" / "skills" / "training-analysis",
+        ]
+    )
+    context = ToolExecutionContext(
+        conversation_id="conversation-deployment-routing",
+        workspace_root=tmp_path,
+        request_context=RequestContext(user_id="42"),
+        model_configuration={"model": "gpt-5"},
+    )
+
+    params = host._sandbox_params(context)
+
+    assert params["env"] == "pre"
+    assert params["cluster"] == "us-west-1"
+
+
 async def test_preview_dataset_timeout_returns_a_tool_error(tmp_path) -> None:
     repository = Path(pi_adapter_module.__file__).parents[3]
     host = PyromindBusinessToolHost(
