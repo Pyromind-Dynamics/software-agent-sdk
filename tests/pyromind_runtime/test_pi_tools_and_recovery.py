@@ -589,7 +589,7 @@ async def test_sync_xyflow_dedupes_unchanged_workflow(tmp_path, monkeypatch) -> 
             conversation_id="workflow-dedupe",
             user_id="42",
             workspace_root=str(conversations / "workflow-dedupe"),
-            workflow_xyflow={"name": "Alpha", "nodes": [], "edges": []},
+            workflow_xyflow={"name": "Alpha", "nodes": [{"id": "n1"}], "edges": []},
             model_configuration={"model": "gpt-5", "api_key": "test-key"},
         ),
         RequestContext(user_id="42"),
@@ -616,7 +616,11 @@ async def test_sync_xyflow_dedupes_unchanged_workflow(tmp_path, monkeypatch) -> 
                 UserMessageCommand(
                     command_id=uuid4().hex,
                     content=(TextContent(text="hi"),),
-                    workflow_xyflow={"name": "Alpha", "nodes": [], "edges": []},
+                    workflow_xyflow={
+                        "name": "Alpha",
+                        "nodes": [{"id": "n1"}],
+                        "edges": [],
+                    },
                 ),
                 RequestContext(user_id="42"),
             )
@@ -628,7 +632,7 @@ async def test_sync_xyflow_dedupes_unchanged_workflow(tmp_path, monkeypatch) -> 
             UserMessageCommand(
                 command_id=uuid4().hex,
                 content=(TextContent(text="hi"),),
-                workflow_xyflow={"name": "Beta", "nodes": [], "edges": []},
+                workflow_xyflow={"name": "Beta", "nodes": [{"id": "n1"}], "edges": []},
             ),
             RequestContext(user_id="42"),
         )
@@ -636,6 +640,98 @@ async def test_sync_xyflow_dedupes_unchanged_workflow(tmp_path, monkeypatch) -> 
         assert len(events) == 1
         assert events[0].payload["dsl"] == "workflow = Beta()"
         assert FakeRunner.context_appends == 2
+    finally:
+        await adapter.close(handle)
+
+
+async def test_sync_xyflow_skips_empty_canvas_until_content_exists(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeRunner:
+        context_appends: ClassVar[int] = 0
+
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, _config) -> None:
+            return None
+
+        async def request(self, method, _params):
+            if method == "context.append":
+                FakeRunner.context_appends += 1
+                return {
+                    "checkpoint_entry_id": f"checkpoint-{FakeRunner.context_appends}"
+                }
+            return {"accepted": True}
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    monkeypatch.setattr(
+        pi_adapter_module,
+        "convert_xyflow_to_dsl",
+        lambda canvas: f"workflow = {canvas['name']}()",
+    )
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="workflow-empty",
+            user_id="42",
+            workspace_root=str(conversations / "workflow-empty"),
+            workflow_xyflow={"name": "Draft", "nodes": [], "edges": []},
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    try:
+        session = adapter._sessions["workflow-empty"]
+
+        def workflow_events() -> list[Any]:
+            drained = []
+            while not session.queue.empty():
+                drained.append(session.queue.get_nowait())
+            return [
+                event
+                for event in drained
+                if getattr(event, "type", None) == "workflow.updated"
+            ]
+
+        async def send_canvas(canvas: dict[str, Any]) -> None:
+            await adapter.send(
+                handle,
+                UserMessageCommand(
+                    command_id=uuid4().hex,
+                    content=(TextContent(text="hi"),),
+                    workflow_xyflow=canvas,
+                ),
+                RequestContext(user_id="42"),
+            )
+
+        # Empty canvas handshake: file is staged, but no event is broadcast.
+        assert len(workflow_events()) == 0
+        assert FakeRunner.context_appends == 0
+        assert (
+            conversations
+            / "workflow-empty"
+            / "public_data"
+            / "workflow_canvas"
+            / "workflow.py"
+        ).is_file()
+
+        await send_canvas({"name": "Draft", "nodes": [], "edges": []})
+        assert len(workflow_events()) == 0
+
+        await send_canvas({"name": "Draft", "nodes": [{"id": "n1"}], "edges": []})
+        events = workflow_events()
+        assert len(events) == 1
+        assert events[0].payload["dsl"] == "workflow = Draft()"
+
+        # Clearing back to empty after real content is a real change.
+        await send_canvas({"name": "Draft", "nodes": [], "edges": []})
+        assert len(workflow_events()) == 1
     finally:
         await adapter.close(handle)
 

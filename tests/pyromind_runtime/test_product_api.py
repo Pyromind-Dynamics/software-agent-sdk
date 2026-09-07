@@ -190,7 +190,9 @@ async def test_product_api_creates_pi_metadata_and_reports_missing_checkpoint(
                 "llm": {"model": "gpt-4o", "api_key": "request-secret"},
                 "workflow_xyflow": {
                     "name": "Workflow",
-                    "nodes": [],
+                    "nodes": [
+                        {"id": "n1", "data": {"nodeType": "CloneAndCacheDataset"}}
+                    ],
                     "edges": [],
                 },
             },
@@ -220,7 +222,9 @@ async def test_product_api_creates_pi_metadata_and_reports_missing_checkpoint(
         / "workflow_canvas"
         / "workflow.py"
     )
-    assert workflow.read_text() == "# workflow: Workflow"
+    workflow_text = workflow.read_text()
+    assert workflow_text.startswith("# workflow: Workflow")
+    assert 'CloneAndCacheDataset(id="n1")' in workflow_text
     assert created.json()["current_workflow"]["canvas"]["name"] == "Workflow"
     assert forked.status_code == 404
     assert forked.json()["detail"]["code"] == "checkpoint_not_found"

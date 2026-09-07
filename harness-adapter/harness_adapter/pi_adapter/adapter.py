@@ -427,12 +427,15 @@ class PiAdapter:
         if dsl.strip():
             _atomic_text(path, dsl)
             action = "updated"
+            # Restore bypasses _emit_workflow; seed the dedupe signature with
+            # the restored state so an unchanged next sync stays silent.
+            session.last_workflow_signature = _workflow_signature(
+                dsl, spec.checkpoint.workflow.canvas
+            )
         else:
             path.unlink(missing_ok=True)
             action = "removed"
-        # Restore bypasses _emit_workflow, so the dedupe signature must be
-        # invalidated to force a re-sync on the next workflow update.
-        session.last_workflow_signature = None
+            session.last_workflow_signature = None
         await self._ensure_runner(session)
         assert session.runner is not None
         append_result = await session.runner.request(
@@ -987,6 +990,11 @@ class PiAdapter:
         signature = _workflow_signature(dsl, canvas)
         if signature == session.last_workflow_signature:
             return None
+        # An empty canvas is only a handshake, not workflow content: stay
+        # silent until real content exists. Once content has been emitted,
+        # clearing back to empty is a real change and is broadcast.
+        if session.last_workflow_signature is None and _is_empty_canvas(canvas):
+            return None
         request = SaveWorkflowCanvasEventSnapshotRequest(
             sessionId=session.session_id,
             eventId=event_id,
@@ -1137,6 +1145,10 @@ def _workflow_signature(dsl: str, canvas: dict[str, Any] | None) -> str:
         {"canvas": canvas, "dsl": dsl}, ensure_ascii=False, sort_keys=True
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _is_empty_canvas(canvas: dict[str, Any] | None) -> bool:
+    return canvas is not None and not canvas.get("nodes") and not canvas.get("edges")
 
 
 def _is_workflow_mutation(workspace_root: Path, payload: dict[str, Any]) -> bool:
