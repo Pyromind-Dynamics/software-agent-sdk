@@ -260,3 +260,7 @@ docs/
 !README.md
 .pre-commit-config.yaml
 .python-version
+
+# Pinned sandbox runtime wheels ship inside the skill bundle
+!.agents/skills/data-processing/scripts/edp/wheels/
+!.agents/skills/data-processing/scripts/edp/wheels/*.whl

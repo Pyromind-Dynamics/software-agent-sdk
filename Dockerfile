@@ -24,6 +24,7 @@ WORKDIR /agent-server
 COPY --chown=${USERNAME}:${USERNAME} pyproject.toml uv.lock README.md LICENSE ./
 COPY --chown=${USERNAME}:${USERNAME} openhands-sdk ./openhands-sdk
 COPY --chown=${USERNAME}:${USERNAME} openhands-tools ./openhands-tools
+COPY --chown=${USERNAME}:${USERNAME} openhands-embodied-runtime ./openhands-embodied-runtime
 COPY --chown=${USERNAME}:${USERNAME} openhands-workspace ./openhands-workspace
 COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server ./openhands-agent-server
 COPY --chown=${USERNAME}:${USERNAME} pyromind-runtime ./pyromind-runtime
