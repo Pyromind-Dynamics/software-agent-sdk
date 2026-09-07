@@ -282,3 +282,32 @@ def preflight_storage_quota(*, workspace_root: Path | None = None) -> list[str]:
     if not quota._run(mount_point, "report -p"):
         problems.append(f"xfs_quota cannot open device: {quota.last_error}")
     return problems
+
+
+def ensure_conversation_quota(directory: Path, conversation_id: UUID | str) -> None:
+    """Apply the configured per-conversation quota, failing closed when required."""
+    quota = quota_from_env()
+    if quota.limit_bytes is None:
+        return
+    if isinstance(conversation_id, str):
+        conversation_id = UUID(conversation_id)
+    if quota.apply(directory, conversation_id):
+        return
+    detail = quota.last_error or "unknown error"
+    if storage_quota_required():
+        raise RuntimeError(
+            f"storage quota {quota.limit_bytes} bytes could not be enforced "
+            f"for {directory}: {detail}"
+        )
+    logger.warning("storage quota not enforced for %s: %s", directory, detail)
+
+
+def enforce_storage_quota_preflight() -> None:
+    """Verify quota prerequisites, logging problems and failing when required."""
+    problems = preflight_storage_quota()
+    for problem in problems:
+        logger.error("storage quota preflight: %s", problem)
+    if problems and storage_quota_required():
+        raise RuntimeError(
+            "storage quota is required but unavailable: " + "; ".join(problems)
+        )

@@ -10,6 +10,7 @@ from pyromind_runtime.application.conversation_runtime import ConversationRuntim
 from pyromind_runtime.ports.harness import HarnessAdapter
 
 from openhands.agent_server.run_workflow_callback import set_workflow_status_dispatcher
+from openhands.agent_server.storage_quota import ensure_conversation_quota
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 
@@ -32,6 +33,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         adapters["pi"] = PiAdapter(
             service.conversations_dir,
             terminal_backend=terminal_backend,
+            apply_workspace_quota=ensure_conversation_quota,
         )
     runtime = ConversationRuntime(
         service.conversations_dir,

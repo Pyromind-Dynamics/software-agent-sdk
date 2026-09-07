@@ -28,10 +28,7 @@ import uvicorn
 from uvicorn import Config
 
 from openhands.agent_server.logging_config import LOGGING_CONFIG
-from openhands.agent_server.storage_quota import (
-    preflight_storage_quota,
-    storage_quota_required,
-)
+from openhands.agent_server.storage_quota import enforce_storage_quota_preflight
 from openhands.sdk.logger import DEBUG, get_logger
 
 
@@ -201,17 +198,6 @@ def _setup_crash_diagnostics() -> None:
         logger.info("Process exiting via atexit handler")
 
 
-def _preflight_storage_quota() -> None:
-    """Verify storage-quota prerequisites and fail fast when required."""
-    problems = preflight_storage_quota()
-    for problem in problems:
-        logger.error("storage quota preflight: %s", problem)
-    if problems and storage_quota_required():
-        raise RuntimeError(
-            "storage quota is required but unavailable: " + "; ".join(problems)
-        )
-
-
 def main() -> None:
     # Set up crash diagnostics early, before any other initialization
     _setup_crash_diagnostics()
@@ -270,7 +256,7 @@ def main() -> None:
 
     # Import user modules after early-exit checks
     preload_modules(args.import_modules)
-    _preflight_storage_quota()
+    enforce_storage_quota_preflight()
 
     os.environ[_INTERNAL_SERVER_URL_ENV] = _get_internal_server_url(
         args.host, args.port

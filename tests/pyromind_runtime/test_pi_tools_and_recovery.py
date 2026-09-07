@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, cast
+from uuid import uuid4
 
 import harness_adapter.pi_adapter.adapter as pi_adapter_module
 import httpx
@@ -28,6 +29,8 @@ from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.runner import PiRunnerExit, PlannedPiRunnerExitReason
 from pydantic import BaseModel, ValidationError
+from pyromind_runtime.domain.commands import UserMessageCommand
+from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.snapshot import WorkflowState
 from pyromind_runtime.ports.harness import (
@@ -253,6 +256,90 @@ async def test_runner_start_receives_configured_knowledge_root(
         await adapter.close(handle)
 
 
+async def test_create_session_applies_workspace_quota_hook(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, config) -> None:
+            pass
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    calls: list[tuple[Path, str]] = []
+
+    def quota_hook(root: Path, conversation_id: str) -> None:
+        assert (root / "public_data").is_dir()
+        calls.append((root, conversation_id))
+
+    adapter = PiAdapter(
+        conversations,
+        terminal_backend="os-sandbox",
+        apply_workspace_quota=quota_hook,
+    )
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="af3258e46542408aba431c6f8ee37821",
+            user_id="42",
+            workspace_root=str(conversations / "af3258e46542408aba431c6f8ee37821"),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    try:
+        assert calls == [
+            (
+                conversations / "af3258e46542408aba431c6f8ee37821",
+                "af3258e46542408aba431c6f8ee37821",
+            )
+        ]
+    finally:
+        await adapter.close(handle)
+
+
+async def test_create_session_quota_hook_failure_aborts_session(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, config) -> None:
+            pass
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    conversation_id = "af3258e46542408aba431c6f8ee37821"
+    adapter = PiAdapter(
+        conversations,
+        terminal_backend="os-sandbox",
+        apply_workspace_quota=lambda root, _id: (_ for _ in ()).throw(
+            RuntimeError("quota unavailable")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="quota unavailable"):
+        await adapter.create_session(
+            SessionSpec(
+                conversation_id=conversation_id,
+                user_id="42",
+                workspace_root=str(conversations / conversation_id),
+                model_configuration={"model": "gpt-5", "api_key": "test-key"},
+            ),
+            RequestContext(user_id="42"),
+        )
+    assert not (conversations / conversation_id).exists()
+
+
 async def test_idle_unexpected_runner_exit_is_silent_and_restarts_lazily(
     tmp_path, monkeypatch
 ) -> None:
@@ -463,6 +550,92 @@ async def test_create_stages_public_data_and_workflow_before_runner(
         root = conversations / "workflow-first"
         assert (root / "public_data").is_dir()
         assert (root / "pi" / "terminal-output").is_dir()
+    finally:
+        await adapter.close(handle)
+
+
+async def test_sync_xyflow_dedupes_unchanged_workflow(tmp_path, monkeypatch) -> None:
+    class FakeRunner:
+        context_appends: ClassVar[int] = 0
+
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, _config) -> None:
+            return None
+
+        async def request(self, method, _params):
+            if method == "context.append":
+                FakeRunner.context_appends += 1
+                return {
+                    "checkpoint_entry_id": f"checkpoint-{FakeRunner.context_appends}"
+                }
+            return {"accepted": True}
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    monkeypatch.setattr(
+        pi_adapter_module,
+        "convert_xyflow_to_dsl",
+        lambda canvas: f"workflow = {canvas['name']}()",
+    )
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="workflow-dedupe",
+            user_id="42",
+            workspace_root=str(conversations / "workflow-dedupe"),
+            workflow_xyflow={"name": "Alpha", "nodes": [], "edges": []},
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    try:
+        session = adapter._sessions["workflow-dedupe"]
+
+        def workflow_events() -> list[Any]:
+            drained = []
+            while not session.queue.empty():
+                drained.append(session.queue.get_nowait())
+            return [
+                event
+                for event in drained
+                if getattr(event, "type", None) == "workflow.updated"
+            ]
+
+        assert len(workflow_events()) == 1
+        assert FakeRunner.context_appends == 1
+
+        for _ in range(2):
+            await adapter.send(
+                handle,
+                UserMessageCommand(
+                    command_id=uuid4().hex,
+                    content=(TextContent(text="hi"),),
+                    workflow_xyflow={"name": "Alpha", "nodes": [], "edges": []},
+                ),
+                RequestContext(user_id="42"),
+            )
+        assert len(workflow_events()) == 0
+        assert FakeRunner.context_appends == 1
+
+        await adapter.send(
+            handle,
+            UserMessageCommand(
+                command_id=uuid4().hex,
+                content=(TextContent(text="hi"),),
+                workflow_xyflow={"name": "Beta", "nodes": [], "edges": []},
+            ),
+            RequestContext(user_id="42"),
+        )
+        events = workflow_events()
+        assert len(events) == 1
+        assert events[0].payload["dsl"] == "workflow = Beta()"
+        assert FakeRunner.context_appends == 2
     finally:
         await adapter.close(handle)
 

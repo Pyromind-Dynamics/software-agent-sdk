@@ -5,6 +5,7 @@ import argparse
 import uvicorn
 
 from openhands.agent_server.logging_config import LOGGING_CONFIG
+from openhands.agent_server.storage_quota import enforce_storage_quota_preflight
 from openhands.sdk.logger import DEBUG
 
 
@@ -24,6 +25,7 @@ def main() -> None:
     parser.add_argument("--port", default=8000, type=int)
     parser.add_argument("--reload", action="store_true")
     args = parser.parse_args()
+    enforce_storage_quota_preflight()
     uvicorn.run(
         "pyromind_agent_server.app:api",
         host=args.host,

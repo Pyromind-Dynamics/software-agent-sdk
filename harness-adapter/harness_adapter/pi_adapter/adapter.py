@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import shutil
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -121,6 +123,7 @@ class _PiSession:
     finished_runs: set[str] = field(default_factory=set)
     active_external_tasks: dict[str, str] = field(default_factory=dict)
     pending_checkpoint_events: dict[str, list[str]] = field(default_factory=dict)
+    last_workflow_signature: str | None = None
 
 
 class PiAdapter:
@@ -132,6 +135,7 @@ class PiAdapter:
         skill_root: Path | None = None,
         skill_roots: list[Path] | None = None,
         knowledge_root: Path | None = None,
+        apply_workspace_quota: Callable[[Path, str], None] | None = None,
     ) -> None:
         if getattr(sys, "frozen", False):
             # PyInstaller: __file__ lives under the _MEIPASS extraction dir, so
@@ -182,6 +186,11 @@ class PiAdapter:
         self._sessions: dict[str, _PiSession] = {}
         self._permissions = TerminalPermissionPolicy()
         self._lock = asyncio.Lock()
+        self._apply_workspace_quota = apply_workspace_quota
+
+    def _apply_quota(self, root: Path, conversation_id: str) -> None:
+        if self._apply_workspace_quota is not None:
+            self._apply_workspace_quota(root, conversation_id)
 
     async def describe(self) -> tuple[str, HarnessCapabilities]:
         return "pi", PI_CAPABILITIES
@@ -198,6 +207,7 @@ class PiAdapter:
         session: _PiSession | None = None
         try:
             _prepare_workspace(root, create=True)
+            self._apply_quota(root, spec.conversation_id)
             _prepare_pi_runtime_directories(root)
             files = PiSessionFiles(root)
             config = _session_config(spec)
@@ -351,6 +361,7 @@ class PiAdapter:
             else:
                 target_workflow.unlink(missing_ok=True)
             _prepare_pi_runtime_directories(target_root)
+            self._apply_quota(target_root, spec.target_conversation_id)
             target_files = PiSessionFiles(target_root)
             target_config = {
                 **source.config,
@@ -419,6 +430,9 @@ class PiAdapter:
         else:
             path.unlink(missing_ok=True)
             action = "removed"
+        # Restore bypasses _emit_workflow, so the dedupe signature must be
+        # invalidated to force a re-sync on the next workflow update.
+        session.last_workflow_signature = None
         await self._ensure_runner(session)
         assert session.runner is not None
         append_result = await session.runner.request(
@@ -920,15 +934,17 @@ class PiAdapter:
     async def _sync_xyflow(self, session: _PiSession, xyflow: dict[str, Any]) -> None:
         event_id = await self._stage_xyflow(session, xyflow)
         await self._ensure_runner(session)
+        if event_id is None:
+            return
         await self._append_workflow_context(session, event_id)
 
-    async def _stage_xyflow(self, session: _PiSession, xyflow: dict[str, Any]) -> str:
+    async def _stage_xyflow(
+        self, session: _PiSession, xyflow: dict[str, Any]
+    ) -> str | None:
         _prepare_workspace(session.workspace_root, create=False)
         dsl = await asyncio.to_thread(convert_xyflow_to_dsl, xyflow)
         _atomic_text(session.workspace_root / _WORKFLOW_PATH, dsl)
-        event_id = uuid4().hex
-        await self._emit_workflow(session, event_id, canvas=xyflow)
-        return event_id
+        return await self._emit_workflow(session, uuid4().hex, canvas=xyflow)
 
     async def _append_workflow_context(
         self, session: _PiSession, event_id: str
@@ -960,7 +976,7 @@ class PiAdapter:
         source_event_id: str | None = None,
         run_id: str | None = None,
         canvas: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> str | None:
         path = session.workspace_root / _WORKFLOW_PATH
         dsl = path.read_text(encoding="utf-8")
         if canvas is None:
@@ -968,6 +984,9 @@ class PiAdapter:
                 canvas = await asyncio.to_thread(convert_dsl_to_xyflow, dsl)
             except Exception:
                 canvas = None
+        signature = _workflow_signature(dsl, canvas)
+        if signature == session.last_workflow_signature:
+            return None
         request = SaveWorkflowCanvasEventSnapshotRequest(
             sessionId=session.session_id,
             eventId=event_id,
@@ -998,6 +1017,8 @@ class PiAdapter:
         )
         if run_id:
             session.pending_checkpoint_events.setdefault(run_id, []).append(event_id)
+        session.last_workflow_signature = signature
+        return event_id
 
     @staticmethod
     def _handle(session_id: str) -> SessionHandle:
@@ -1109,6 +1130,13 @@ def _resolve_context_window(
     if base_url and (urlparse(base_url).hostname or "").lower() != "api.openai.com":
         return 128_000
     return None
+
+
+def _workflow_signature(dsl: str, canvas: dict[str, Any] | None) -> str:
+    payload = json.dumps(
+        {"canvas": canvas, "dsl": dsl}, ensure_ascii=False, sort_keys=True
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _is_workflow_mutation(workspace_root: Path, payload: dict[str, Any]) -> bool:
