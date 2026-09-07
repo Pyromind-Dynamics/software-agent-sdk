@@ -19,6 +19,7 @@ from openhands_embodied_runtime.planning import (
     plan_episode_cleaning,
 )
 from openhands_embodied_runtime.reporting import render_episode_plan_summary
+from openhands_embodied_runtime.worker import run_episode, run_merge
 
 
 def run_plan(
@@ -283,12 +284,13 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=("plan", "full", "resume"),
+        choices=("plan", "full", "resume", "episode", "merge"),
         required=True,
     )
-    parser.add_argument("--source", type=Path, required=True)
-    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--source", type=Path)
+    parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--target", type=Path)
+    parser.add_argument("--episode-id")
     parser.add_argument("--task-text")
     parser.add_argument("--representative-episode-id")
     parser.add_argument("--robot-type", default="s2")
@@ -298,12 +300,139 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--confirm-subtasks", action="store_true")
     parser.add_argument("--confirm-derived-action", action="store_true")
     parser.add_argument("--runtime-revision")
+    parser.add_argument("--reward-file", type=Path)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help=(
+            "JSON config file alternative to flags (episode/merge modes); "
+            "read from the mounted work root so record payloads never pass "
+            "through shell interpretation"
+        ),
+    )
     return parser
+
+
+def _episode_args_from_config(path: Path) -> argparse.Namespace:
+    """Load episode/merge args from a mounted config file."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return argparse.Namespace(
+        mode=payload.get("mode", "episode"),
+        source=Path(payload["source"]) if payload.get("source") else None,
+        run_dir=Path(payload["work_root"]),
+        target=Path(payload["target"]) if payload.get("target") else None,
+        episode_id=payload.get("episode_id"),
+        task_text=payload.get("task_text"),
+        robot_type=payload.get("robot_type", "s2"),
+        motion_speed_threshold=float(payload.get("motion_speed_threshold", 0.02)),
+        idle_min_duration_s=float(payload.get("idle_min_duration_s", 1.5)),
+        context_s=float(payload.get("context_s", 0.5)),
+        expected_episode_ids=payload.get("expected_episode_ids"),
+        reward_file=(
+            Path(payload["reward_file"]) if payload.get("reward_file") else None
+        ),
+        runtime_revision=None,
+        config=None,
+    )
+
+
+def _episode_report_path(run_dir: Path, mode: str) -> Path:
+    return run_dir / f"{mode}.report.json"
+
+
+def _run_episode_cli(args: argparse.Namespace) -> int:
+    """One episode per record; failures exit non-zero with a stub report."""
+    if args.source is None or args.episode_id is None or args.task_text is None:
+        raise ValueError(
+            "episode mode requires --source, --episode-id, and --task-text"
+        )
+    report: dict[str, Any] = {}
+    try:
+        report = run_episode(
+            args.source,
+            args.run_dir,
+            episode_id=args.episode_id,
+            task_text=args.task_text,
+            robot_type=args.robot_type,
+            motion_speed_threshold=args.motion_speed_threshold,
+            idle_min_duration_s=args.idle_min_duration_s,
+            context_s=args.context_s,
+            reward_path=args.reward_file,
+        )
+    except Exception as exc:  # noqa: BLE001 - CLI boundary
+        print(
+            json.dumps(
+                {
+                    "phase": "episode",
+                    "complete": False,
+                    "episode_id": args.episode_id,
+                    "runtime_error": f"{type(exc).__name__}: {exc}",
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return 1
+    if report.get("status") == "failed":
+        print(
+            json.dumps(
+                {
+                    "phase": "episode",
+                    "complete": False,
+                    "episode_id": args.episode_id,
+                    "episode_status": "failed",
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return 1
+    print(
+        json.dumps(
+            {
+                "phase": "episode",
+                "complete": True,
+                "episode_id": args.episode_id,
+                "episode_status": report.get("status"),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    return 0
+
+
+def _run_merge_cli(args: argparse.Namespace) -> int:
+    if args.task_text is None:
+        raise ValueError("merge mode requires --task-text")
+    report = run_merge(
+        args.run_dir,
+        args.target or (args.run_dir / "published_lerobot_v21"),
+        task_text=args.task_text,
+        expected_episode_ids=getattr(args, "expected_episode_ids", None),
+    )
+    return 0 if report.get("complete") else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    mode = args.mode
+    if args.config is not None and mode in ("episode", "merge"):
+        if any(
+            getattr(args, name) is not None
+            for name in ("source", "episode_id", "target", "task_text", "reward_file")
+        ):
+            raise SystemExit("--config is mutually exclusive with episode flags")
+        args = _episode_args_from_config(args.config)
     try:
+        if mode == "episode":
+            return _run_episode_cli(args)
+        if mode == "merge":
+            return _run_merge_cli(args)
+        if args.source is None or args.run_dir is None:
+            raise ValueError(
+                "--source and --run-dir are required for this mode (or use --config)"
+            )
         if args.mode == "plan":
             report = run_plan(
                 args.source,
@@ -336,9 +465,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         report = {
             "schema_version": 1,
-            "phase": args.mode,
+            "phase": mode,
             "complete": False,
-            "source_path": _display_path(args.source.resolve()),
+            "source_path": (
+                _display_path(args.source.resolve())
+                if args.source is not None
+                else None
+            ),
             "target_path": (
                 _display_path(args.target.resolve())
                 if args.target is not None
@@ -347,12 +480,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "runtime_revision": args.runtime_revision,
             "runtime_error": str(exc),
         }
-        _write_phase_report(args.run_dir.resolve(), args.mode, report)
+        if args.run_dir is not None:
+            _write_phase_report(args.run_dir.resolve(), mode, report)
         print(json.dumps(report, ensure_ascii=False))
         return 1
     print(
         json.dumps(
-            {"complete": bool(report.get("complete")), "phase": args.mode},
+            {"complete": bool(report.get("complete")), "phase": mode},
             ensure_ascii=False,
         )
     )

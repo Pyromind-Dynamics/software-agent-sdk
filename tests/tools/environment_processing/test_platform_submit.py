@@ -534,3 +534,107 @@ def test_executor_shard_batch_stops_on_first_failure(
     assert "Failed to submit shard" in observation.text
     assert "boom" in observation.text
     assert conversation.register_active_long_task.call_count == 1
+
+
+def test_executor_stages_runtime_wheel_and_rewrites_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = sys.modules["openhands.tools.environment_processing.platform_submit"]
+    captured: dict[str, bytes] = {}
+
+    def _capture_upload(*args: Any, **kwargs: Any) -> MagicMock:
+        local = Path(kwargs["local_path"])
+        captured[f"{kwargs['target_dir']}/{local.name}"] = local.read_bytes()
+        return MagicMock()
+
+    monkeypatch.setattr(
+        module, "upload_local_file_to_pyromind", MagicMock(side_effect=_capture_upload)
+    )
+    monkeypatch.setattr(
+        module,
+        "submit_workflow_task",
+        MagicMock(side_effect=[SimpleNamespace(task_id="task-99", status="Pending")]),
+    )
+    monkeypatch.setattr(
+        module, "create_workflow_api_client", MagicMock(return_value=MagicMock())
+    )
+    conversation = _conversation_with_secrets(
+        {
+            "auth_token": "platform-tok",
+            "LLM_BASE_URL": "https://gw.example",
+            "LLM_AUTH_TOKEN": "sk-secret",
+            "LLM_MODEL": "model-x",
+        }
+    )
+    scripts = _runtime_tmp(tmp_path)
+    wheel_name = "openhands_embodied_runtime-1.29.5-py3-none-any.whl"
+    (scripts / "profiles" / "tmax-validation.json").write_text(
+        json.dumps(
+            {
+                "name": "tmax-validation",
+                "steps": [
+                    {
+                        "name": "exec",
+                        "params": {
+                            "command": (
+                                "python3.10 -m pip install --quiet "
+                                f"'{{edp_run_dir}}/wheels/{wheel_name}'"
+                            )
+                        },
+                    }
+                ],
+            }
+        )
+    )
+    wheels = scripts / "wheels"
+    wheels.mkdir()
+    (wheels / wheel_name).write_bytes(b"PK-wheel-bytes")
+
+    executor = _executor(runtime_dir=str(scripts))
+    observation = executor(
+        EdpSubmitAction(manifest="edp/batch-001/manifest.jsonl"), conversation
+    )
+
+    assert observation.status == "Pending"
+    output_dir = observation.output_dirs[0]
+    assert captured[f"{output_dir}/wheels/{wheel_name}"] == b"PK-wheel-bytes"
+    staged_profile = json.loads(captured[f"{output_dir}/tmax-validation.json"])
+    command = staged_profile["steps"][0]["params"]["command"]
+    assert f"/target-workspace{output_dir}/wheels/{wheel_name}" in command
+    assert "{edp_run_dir}" not in command
+
+
+def test_executor_missing_wheel_bundle_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_submission(monkeypatch)
+    conversation = _conversation_with_secrets(
+        {
+            "auth_token": "platform-tok",
+            "LLM_BASE_URL": "https://gw.example",
+            "LLM_AUTH_TOKEN": "sk-secret",
+            "LLM_MODEL": "model-x",
+        }
+    )
+    scripts = _runtime_tmp(tmp_path)
+    (scripts / "profiles" / "tmax-validation.json").write_text(
+        json.dumps(
+            {
+                "name": "tmax-validation",
+                "steps": [
+                    {
+                        "name": "exec",
+                        "params": {
+                            "command": "pip install '{edp_run_dir}/wheels/x.whl'"
+                        },
+                    }
+                ],
+            }
+        )
+    )
+    executor = _executor(runtime_dir=str(scripts))
+    observation = executor(
+        EdpSubmitAction(manifest="edp/batch-001/manifest.jsonl"), conversation
+    )
+    assert observation.status == "Failed"
+    assert "wheel bundle is missing" in observation.text

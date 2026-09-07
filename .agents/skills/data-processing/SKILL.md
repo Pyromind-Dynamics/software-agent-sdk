@@ -59,9 +59,9 @@ debug-workflow。路由不确定时 AskUserQuestion，不要猜。
 3. **小样**：按 playbook 规定的试跑形态先小样（limit=3 / sample / smoke 片），
    迭代过程不向用户展示，只展示符合预期的结果。
 4. **门禁**：小样通过后必须获得用户明确确认才提交全量；禁止 agent 默认全量。
-5. **全量**：按场景 case 的执行约定提交。DataFlow/EDP 平台任务等待终态回调，
-   运行中用 df_check_progress 观察；具身 Sandbox case 按其 PID、日志和
-   report.json 约定轮询。需介入平台任务时先 df_stop_task 停任务。
+5. **全量**：按场景 case 的执行约定提交。DataFlow/EDP 平台任务（含具身
+   case 的逐 episode 执行）等待终态回调，运行中用 df_check_progress 观察。
+   需介入平台任务时先 df_stop_task 停任务。
 6. **分诊**：回调后先看 report.json / validation / verdicts，按失败分类决定
    resume 还是新 run；终止/失败不自动重提交，交用户决策。
    report.failures 非空时（failures.jsonl：无响应/截止/解析失败的记录），

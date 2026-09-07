@@ -196,6 +196,27 @@ def build_join_indexes(template: dict[str, Any]) -> dict[str, dict[str, str]]:
     return indexes
 
 
+def _json_config_value(
+    key: str,
+    value_spec: Any,
+    row: Any,
+    row_index: int,
+    task_id: str,
+    record: dict[str, str],
+    joins: dict[str, dict[str, str]],
+) -> Any:
+    """One inner value of a json_config field: keep fixed values typed."""
+    if isinstance(value_spec, dict):
+        if "fixed" in value_spec:
+            return value_spec["fixed"]
+        if not value_spec.keys() & {"field", "join", "kind"}:
+            # A plain nested dict is a literal JSON object, not a field spec
+            # (e.g. thresholds: {"motion_speed_threshold": 0.02}).
+            return value_spec
+    value = _resolve_spec(key, value_spec, row, row_index, task_id, record, joins)
+    return value
+
+
 def _resolve_spec(
     name: str,
     spec: Any,
@@ -224,6 +245,13 @@ def _resolve_spec(
             raise JoinMiss(task_id, name)
         return str(value)
     kind = spec.get("kind")
+    if kind == "json_config":
+        inner: dict[str, Any] = {}
+        for key, value_spec in spec.get("fields", {}).items():
+            inner[key] = _json_config_value(
+                key, value_spec, row, row_index, task_id, record, joins
+            )
+        return json.dumps(inner, ensure_ascii=False)
     if kind == "message":
         source_field = str(spec.get("source_field", "messages"))
         messages = _row_value(row, source_field, row_index)
@@ -304,10 +332,7 @@ def render_record(
 
     test_sh_spec = template_fields.get("test_sh")
     if not test_sh_spec:
-        raise ValueError(
-            f"row {row_index}: template requires a test_sh field "
-            "(pytest_wrapper or a plain spec)"
-        )
+        return record
     if isinstance(test_sh_spec, dict) and test_sh_spec.get("kind") == "pytest_wrapper":
         source = test_sh_spec.get("source", test_sh_spec.get("source_field"))
         if source is None:
@@ -395,12 +420,8 @@ def render_product(
     import pyarrow.parquet as pq
 
     fields = template.get("fields")
-    if (
-        not isinstance(fields, dict)
-        or "task_id" not in fields
-        or "prompt" not in fields
-    ):
-        raise ValueError("template.fields requires at least task_id and prompt")
+    if not isinstance(fields, dict) or "task_id" not in fields:
+        raise ValueError("template.fields requires at least task_id")
 
     out_root = Path(local_out) if local_out else Path("/out")
     out_root.mkdir(parents=True, exist_ok=True)

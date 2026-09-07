@@ -83,6 +83,13 @@ SHARDS_INDEX_MAX_BYTES = 4 * 1024 * 1024  # shards.json is a small path index
 POD_RUNTIME_DIR = "pod_runtime"
 POD_REQUIREMENTS_FILENAME = "pod_requirements.txt"
 
+# Sandbox-side runtime wheels shipped inside the skill bundle: staged into the
+# run directory so the sandbox's /target-workspace mount resolves them without
+# any agent- or user-side provisioning. Profiles reference them via
+# EDP_RUN_DIR_TOKEN, rewritten at staging time to the pod-visible run path.
+RUNTIME_WHEELS_DIRNAME = "wheels"
+EDP_RUN_DIR_TOKEN = "{edp_run_dir}"
+
 LLM_ENV_KEYS = (
     "LLM_BASE_URL",
     "LLM_AUTH_TOKEN",
@@ -299,6 +306,16 @@ def resolve_llm_env(conversation: BaseConversation) -> dict[str, str]:
 
 def _pod_path(storage_path: str) -> str:
     return f"/target-workspace{storage_path}"
+
+
+def _replace_run_dir_token(doc: Any, pod_run_dir: str) -> Any:
+    if isinstance(doc, dict):
+        return {k: _replace_run_dir_token(v, pod_run_dir) for k, v in doc.items()}
+    if isinstance(doc, list):
+        return [_replace_run_dir_token(item, pod_run_dir) for item in doc]
+    if isinstance(doc, str):
+        return doc.replace(EDP_RUN_DIR_TOKEN, pod_run_dir)
+    return doc
 
 
 def build_edp_command(
@@ -522,7 +539,9 @@ class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
                 f"{POD_RUNTIME_DIR} under the skill scripts directory)"
             )
         self._stage_file(conversation, runner_path, output_dir, RUNNER_FILENAME)
-        self._stage_file(conversation, profile_path, output_dir, f"{profile_name}.json")
+        self._stage_profile(
+            conversation, runtime_dir, profile_path, profile_name, output_dir
+        )
         # pod_runtime is uploaded preserving its relative tree so the pod's
         # PYTHONPATH=<output_dir> resolves the openhands namespace shim.
         for path in sorted(pod_runtime_dir.rglob("*")):
@@ -533,6 +552,53 @@ class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
                 output_dir if rel.parent == Path(".") else f"{output_dir}/{rel.parent}"
             )
             self._stage_file(conversation, path, target_dir, rel.name)
+
+    def _stage_profile(
+        self,
+        conversation: BaseConversation,
+        runtime_dir: Path,
+        profile_path: Path,
+        profile_name: str,
+        output_dir: str,
+    ) -> None:
+        """Stage the profile, rewriting EDP_RUN_DIR_TOKEN to the pod path.
+
+        Profiles that reference runtime wheels via {edp_run_dir} require the
+        skill bundle's wheels/ directory; stage it next to the profile so the
+        sandbox's /target-workspace mount resolves the wheel without any
+        agent-side provisioning.
+        """
+        profile_doc = json.loads(profile_path.read_text())
+        wheels_dir = runtime_dir / RUNTIME_WHEELS_DIRNAME
+        wheel_files = sorted(wheels_dir.glob("*.whl")) if wheels_dir.is_dir() else []
+        uses_run_dir = EDP_RUN_DIR_TOKEN in json.dumps(profile_doc)
+        if uses_run_dir:
+            if not wheel_files:
+                raise ValueError(
+                    f"Profile {profile_name!r} references {EDP_RUN_DIR_TOKEN} but "
+                    f"the runtime wheel bundle is missing: expected *.whl under "
+                    f"{wheels_dir}"
+                )
+            for wheel_path in wheel_files:
+                self._stage_file(
+                    conversation,
+                    wheel_path,
+                    f"{output_dir}/{RUNTIME_WHEELS_DIRNAME}",
+                    wheel_path.name,
+                )
+            profile_doc = _replace_run_dir_token(profile_doc, _pod_path(output_dir))
+            with tempfile.TemporaryDirectory(prefix="edp-stage-") as tmp:
+                staged = Path(tmp) / f"{profile_name}.json"
+                staged.write_text(
+                    json.dumps(profile_doc, ensure_ascii=False, indent=2) + "\n"
+                )
+                self._stage_file(
+                    conversation, staged, output_dir, f"{profile_name}.json"
+                )
+        else:
+            self._stage_file(
+                conversation, profile_path, output_dir, f"{profile_name}.json"
+            )
 
     def _resolve_manifest_specs(
         self, action: EdpSubmitAction, conversation: BaseConversation

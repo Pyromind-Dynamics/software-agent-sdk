@@ -41,7 +41,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from pyromind_sdk.client.models import ResourceConfig, SandboxRequest, SandboxType
+from pyromind_sdk.client.models import (
+    ResourceConfig,
+    SandboxRequest,
+    SandboxType,
+    VolumeMount,
+)
 
 from openhands.sdk.profiles.processing_profile import (
     ProcessingProfile,
@@ -191,9 +196,37 @@ class RunSummary:
     errors: list[str] = field(default_factory=list)
 
 
+class SandboxLease:
+    """Shared-sandbox handle for ``execution.sandbox_reuse == 'per_shard'``."""
+
+    def __init__(self) -> None:
+        self.id: str | None = None
+
+    def release(self, client: SandboxClient) -> None:
+        if self.id is not None:
+            _delete_sandbox(client, self.id)
+            self.id = None
+
+
 # ---------------------------------------------------------------------------
 # Step primitives
 # ---------------------------------------------------------------------------
+
+
+def _volume_mounts(raw: Any) -> list[VolumeMount]:
+    """Build requested volume mounts; record data must be mounted to persist."""
+    if not raw:
+        return []
+    mounts: list[VolumeMount] = []
+    for item in raw:
+        mounts.append(
+            VolumeMount(
+                host_path=item["host_path"],
+                mount_path=item["mount_path"],
+                read_only=bool(item.get("read_only", False)),
+            )
+        )
+    return mounts
 
 
 def _create_sandbox(
@@ -214,6 +247,7 @@ def _create_sandbox(
         sandbox_type=SandboxType.CUSTOM,
         resources=ResourceConfig(cpu=str(cpu), memory=str(memory)),
         image=str(image),
+        volume_mounts=_volume_mounts(params.get("volume_mounts")),
     )
     try:
         created = client.create(request)
@@ -754,9 +788,16 @@ def validate_record(
     client: SandboxClient,
     secrets: dict[str, str] | None = None,
     trace_dir: Path | None = None,
+    lease: SandboxLease | None = None,
 ) -> VerdictEntry:
-    """Run one manifest record through the profile steps inside a sandbox."""
-    sandbox_id: str | None = None
+    """Run one manifest record through the profile steps inside a sandbox.
+
+    With a ``lease`` (``execution.sandbox_reuse == 'per_shard'``) the sandbox
+    is created once and reused across records; the runner's finalizer deletes
+    it. Sandbox-lifecycle failures clear the lease so the next record starts
+    from a fresh create instead of failing in cascade.
+    """
+    sandbox_id: str | None = lease.id if lease is not None else None
     exit_code: int | None = None
     error_category: str | None = None
     reward: float | None = None
@@ -766,10 +807,14 @@ def validate_record(
         for step in profile.steps:
             if step.name == "create_sandbox":
                 if sandbox_id is not None:
-                    raise StepError(
-                        CATEGORY_CREATE_FAILED, "duplicate create_sandbox step"
-                    )
+                    if lease is None:
+                        raise StepError(
+                            CATEGORY_CREATE_FAILED, "duplicate create_sandbox step"
+                        )
+                    continue  # reuse the shard-shared sandbox
                 sandbox_id = _create_sandbox(step, record, client)
+                if lease is not None:
+                    lease.id = sandbox_id
             elif step.name == "probe":
                 _probe(step, record, client, _require_sandbox(sandbox_id, step))
             elif step.name == "write_file":
@@ -809,8 +854,15 @@ def validate_record(
         # deleted in the finally block, so step-level detail (e.g. the agent
         # stderr tail) would otherwise be lost for offline diagnosis.
         failure_note = error_detail
+        if lease is not None and exc.category in (
+            CATEGORY_CREATE_FAILED,
+            CATEGORY_PROBE_FAILED,
+        ):
+            # The shared sandbox is likely dead; force a fresh create for the
+            # next record instead of failing the whole shard in cascade.
+            lease.id = None
     finally:
-        if sandbox_id is not None:
+        if sandbox_id is not None and lease is None:
             _delete_sandbox(client, sandbox_id)
 
     verdict, category = decide_verdict(
@@ -894,58 +946,68 @@ def run_batch(
     summary = RunSummary()
     records = list(records)
     total = len(records)
+    lease = SandboxLease() if profile.execution.sandbox_reuse == "per_shard" else None
 
-    with open(verdicts_path, "a", encoding="utf-8") as out:
-        for record in records:
-            if limit is not None and summary.total >= limit:
-                break
-            summary.total += 1
-            task_id = str(record.get("task_id", ""))
-            if task_id in completed:
-                summary.resumed += 1
-                continue
+    try:
+        with open(verdicts_path, "a", encoding="utf-8") as out:
+            for record in records:
+                if limit is not None and summary.total >= limit:
+                    break
+                summary.total += 1
+                task_id = str(record.get("task_id", ""))
+                if task_id in completed:
+                    summary.resumed += 1
+                    continue
 
-            cached = (
-                image_cache.get(str(record.get("image", "")))
-                if dedup_by_image
-                else None
-            )
-            if cached is not None:
-                entry = VerdictEntry(
-                    task_id=task_id,
-                    image=cached.image,
-                    verdict=cached.verdict,
-                    exit_code=cached.exit_code,
-                    error_category=cached.error_category,
-                    cached=True,
-                    reward=cached.reward,
+                cached = (
+                    image_cache.get(str(record.get("image", "")))
+                    if dedup_by_image
+                    else None
                 )
-                summary.cached += 1
-            else:
-                entry = validate_record(
-                    profile, record, client, secrets, trace_dir=output_dir / "traces"
-                )
-                if entry.image:
-                    image_cache[entry.image] = entry
+                if cached is not None:
+                    entry = VerdictEntry(
+                        task_id=task_id,
+                        image=cached.image,
+                        verdict=cached.verdict,
+                        exit_code=cached.exit_code,
+                        error_category=cached.error_category,
+                        cached=True,
+                        reward=cached.reward,
+                    )
+                    summary.cached += 1
+                else:
+                    entry = validate_record(
+                        profile,
+                        record,
+                        client,
+                        secrets,
+                        trace_dir=output_dir / "traces",
+                        lease=lease,
+                    )
+                    if entry.image:
+                        image_cache[entry.image] = entry
 
-            out.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")
-            out.flush()
-            logger.info(
-                "[%d/%d] task_id=%s verdict=%s reward=%s%s",
-                summary.total,
-                total,
-                task_id,
-                entry.verdict,
-                entry.reward,
-                " (cached)" if entry.cached else "",
-            )
-            completed.add(task_id)
-            if entry.verdict == "usable":
-                summary.usable += 1
-            else:
-                summary.error += 1
-                if entry.error_category:
-                    summary.errors.append(f"{task_id}: {entry.error_category}")
+                out.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")
+                out.flush()
+                logger.info(
+                    "[%d/%d] task_id=%s verdict=%s reward=%s%s",
+                    summary.total,
+                    total,
+                    task_id,
+                    entry.verdict,
+                    entry.reward,
+                    " (cached)" if entry.cached else "",
+                )
+                completed.add(task_id)
+                if entry.verdict == "usable":
+                    summary.usable += 1
+                else:
+                    summary.error += 1
+                    if entry.error_category:
+                        summary.errors.append(f"{task_id}: {entry.error_category}")
+    finally:
+        if lease is not None:
+            lease.release(client)
 
     return summary
 

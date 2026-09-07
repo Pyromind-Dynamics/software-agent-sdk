@@ -82,6 +82,28 @@ class OutputSpec(BaseModel):
     )
 
 
+class ExecutionPolicy(BaseModel):
+    """How sandboxes map onto records.
+
+    ``per_record`` (default) creates one sandbox per manifest record: required
+    when records carry different images or need hard isolation (tmax).
+    ``per_shard`` reuses one sandbox across the shard's records: right when
+    every record shares one image and the runtime is deterministic and
+    idempotent (embodied cleaning); the runner deletes the shared sandbox in
+    its finalizer, so profiles must not ship a delete_sandbox step.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sandbox_reuse: Literal["per_record", "per_shard"] = Field(
+        default="per_record",
+        description=(
+            "'per_record' = one sandbox per record; "
+            "'per_shard' = one shared sandbox for all records in the shard."
+        ),
+    )
+
+
 class ProcessingProfile(BaseModel):
     """Declarative vertical-scenario profile interpreted by the frozen runtime."""
 
@@ -104,3 +126,7 @@ class ProcessingProfile(BaseModel):
         description="Rule mapping the run outcome to usable/error.",
     )
     output: OutputSpec = Field(default_factory=OutputSpec)
+    execution: ExecutionPolicy = Field(
+        default_factory=lambda: ExecutionPolicy(),
+        description="Sandbox lifecycle strategy for this scenario.",
+    )

@@ -1033,3 +1033,151 @@ def test_finalization_rejects_drop_interval_over_suction_transition(
 
     assert finalized.quality.status == QualityStatus.REJECTED
     assert any("suction transition" in error for error in finalized.quality.errors)
+
+
+def test_episode_worker_emits_reward_and_result(
+    lerobot_v21_online_path: Path, tmp_path: Path
+) -> None:
+    """One EDP record = one episode; accepted maps to reward 1.0 and a
+    result json lands in the shared work root."""
+    from openhands_embodied_runtime.worker import run_episode
+
+    work_root = tmp_path / "work"
+    reward_path = tmp_path / "logs" / "verifier" / "reward.txt"
+
+    report = run_episode(
+        lerobot_v21_online_path,
+        work_root,
+        episode_id="648649",
+        task_text="Pickup items in the supermarket",
+        idle_min_duration_s=10,
+        reward_path=reward_path,
+    )
+
+    assert report["status"] == "accepted"
+    assert reward_path.read_text().strip() == "1.0"
+    stored = json.loads(
+        (work_root / "results" / "648649.json").read_text(encoding="utf-8")
+    )
+    assert stored["episode_id"] == "648649"
+    assert stored["dataset_path"]
+
+
+def test_episode_worker_is_idempotent_across_retries(
+    lerobot_v21_online_path: Path,
+    tmp_path: Path,
+) -> None:
+    from openhands_embodied_runtime.worker import run_episode
+
+    work_root = tmp_path / "work"
+    first = run_episode(
+        lerobot_v21_online_path,
+        work_root,
+        episode_id="648649",
+        task_text="Pickup items in the supermarket",
+        idle_min_duration_s=10,
+        reward_path=tmp_path / "r.txt",
+    )
+    second = run_episode(
+        lerobot_v21_online_path,
+        work_root,
+        episode_id="648649",
+        task_text="Pickup items in the supermarket",
+        idle_min_duration_s=10,
+        reward_path=tmp_path / "r.txt",
+    )
+
+    assert first["status"] == second["status"] == "accepted"
+    assert first["dataset_path"] == second["dataset_path"]
+
+
+def test_merge_only_merges_accepted_episodes(
+    lerobot_v21_online_path: Path, tmp_path: Path
+) -> None:
+    """Rejected/failed fragments must never leak into the published dataset."""
+    from openhands_embodied_runtime.worker import run_episode, run_merge
+
+    work_root = tmp_path / "work"
+    results = work_root / "results"
+    results.mkdir(parents=True)
+    accepted_report = run_episode(
+        lerobot_v21_online_path,
+        work_root,
+        episode_id="648649",
+        task_text="Pickup items in the supermarket",
+        idle_min_duration_s=10,
+        reward_path=tmp_path / "r.txt",
+    )
+    assert accepted_report["status"] == "accepted"
+    (results / "e2.json").write_text(
+        json.dumps(
+            {
+                "episode_id": "e2",
+                "status": "rejected",
+                "plan_path": str(tmp_path / "plans" / "e2"),
+                "rejection_diagnostics": [
+                    {
+                        "episode_id": "e2",
+                        "stage": "quality",
+                        "error_code": "X",
+                        "message": "m",
+                        "details": {},
+                        "suggestion": "n",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    target = tmp_path / "published"
+
+    report = run_merge(
+        work_root,
+        target,
+        task_text="Pickup items in the supermarket",
+        expected_episode_ids=["648649", "e2"],
+    )
+
+    assert report["all_rejected"] is False
+    assert report["accepted_episode_count"] == 1
+    assert validate_lerobot_v21_dataset(target).valid
+    assert not any("e2" in str(p) for p in target.rglob("*"))
+
+
+def test_merge_all_rejected_is_terminal(tmp_path: Path) -> None:
+    from openhands_embodied_runtime.worker import run_merge
+
+    work_root = tmp_path / "work"
+    results = work_root / "results"
+    results.mkdir(parents=True)
+    (results / "e1.json").write_text(
+        json.dumps(
+            {
+                "episode_id": "e1",
+                "status": "rejected",
+                "plan_path": str(tmp_path / "p"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = run_merge(work_root, tmp_path / "out", task_text="t")
+
+    assert report["all_rejected"] is True
+    assert report["published"] is False
+    assert report["rejected_episode_count"] == 1
+
+
+def test_merge_missing_episode_results_raise(tmp_path: Path) -> None:
+    from openhands_embodied_runtime.worker import run_merge
+
+    work_root = tmp_path / "work"
+    (work_root / "results").mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="missing for"):
+        run_merge(
+            work_root,
+            tmp_path / "out",
+            task_text="t",
+            expected_episode_ids=["e1", "e2"],
+        )

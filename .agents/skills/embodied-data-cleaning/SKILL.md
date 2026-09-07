@@ -13,13 +13,18 @@ Agent tools, or per-episode ad hoc scripts.
 ## Runtime Contract
 
 - Sandbox Python: 3.10.
-- Sandbox image: `pyrominddynamics/jupyter-lab-with-ssh:v0.9`. Pass this exact
-  image to `sandbox_create`; do not substitute an example, local, or inferred
-  registry image.
-- Runtime: `openhands-embodied-runtime==1.29.5`, centrally provisioned by the
-  deployment package index or a deployment-mounted wheel. A platform user must
-  not upload a wheel.
-- Storage mount: host `/workspace` to sandbox `/target-workspace`.
+- Sandbox image: `pyrominddynamics/jupyter-lab-with-ssh:v0.9`. This image is
+  the manifest `image` field for every episode record; do not substitute an
+  example, local, or inferred registry image.
+- Runtime: `openhands-embodied-runtime==1.29.5`, shipped inside the skill
+  bundle (`edp/wheels/`) and staged into the run directory by `edp_submit`;
+  the profile exec installs it from the run dir on the Storage mount
+  (third-party deps resolve from public PyPI). No agent-side wheel
+  provisioning; a missing wheel bundle fails at submit time. Image preinstall
+  remains the productized end state.
+- Storage mount: host `/workspace` is mounted read-write into the sandbox at
+  `/target-workspace` (declared by the profile's `volume_mounts`); per-episode
+  outputs and result JSONs land there and outlive the sandbox.
 - Source and target paths are under `/target-workspace`; normalize an input such
   as `workspace/robot/x` or `/workspace/robot/x` to `/target-workspace/robot/x`.
 - The source is always read-only at the application level. Output and audit
@@ -28,56 +33,43 @@ Agent tools, or per-episode ad hoc scripts.
 If the pinned runtime cannot be imported or installed, stop and report a
 deployment configuration error. Do not ask an end user for a wheel path.
 
-## Batch Workflow
+## Batch Workflow (EDP orchestration)
 
-1. Read [supported source formats](references/source-formats.md). Call
-   `sandbox_create` with
-   `image="pyrominddynamics/jupyter-lab-with-ssh:v0.9"`, create one CUSTOM
-   sandbox with the Storage mount, and wait for `running`. Record its
-   `sandbox_id`.
-2. Use `sandbox_terminal` to verify `python3.10` and the exact runtime version.
-   If the image does not include it, install the pinned package from the
-   deployment package index:
+Execution mirrors the tmax case: the platform runs every episode through
+`edp_render` / `edp_submit`; the agent submits and reads verdicts, it never
+drives long-running commands. Profiles:
+`data-processing/scripts/edp/profiles/embodied-cleaning.json` (per-episode)
+and `embodied-cleaning-merge.json` (aggregate publish).
 
-   ```bash
-   python3.10 -m pip install 'openhands-embodied-runtime==1.29.5'
-   ```
+1. Read [supported source formats](references/source-formats.md). Confirm the
+   source shape with `preview_dataset` (Storage paths only; no local reads).
+2. Render the episode shards: write a render template pointing
+   `data_source` at `meta/episodes/chunk-*.parquet`; every record carries
+   `episode_id`, the pinned `image`, and a `config_json` blob (source,
+   work_root, task text, thresholds). Run `edp_render`.
+3. Plan stage: run `--mode plan` for one representative episode (smoke-sized
+   sandbox or a small `edp_submit` batch) and show the user the representative
+   plan plus inspection summary.
+4. Confirm once with the user: dataset-wide task text, subtask ranges,
+   next-state action convention, thresholds, and target path. No render or
+   submit before this gate.
+5. `edp_submit(manifest=..., limit=3, profile_name="embodied-cleaning")`
+   smoke (always pass profile_name explicitly; the tool defaults to
+   tmax-validation), then triage verdicts
+   (`reward` 1.0 accepted / 0.5 needs-review / 0.0 rejected; errors split out
+   by `error_category`, image-missing failures get their own bucket).
+6. After user confirmation submit the remaining shards in batches; observe
+   with `df_check_progress`. Resume is shard-based: failed episodes are the
+   only records worth resubmitting.
+7. When every episode reached a terminal state, submit the single merge
+   record with `embodied-cleaning-merge`. It merges accepted fragments only,
+   validates LeRobot v2.1, and publishes to the target. Verify the published
+   dataset and merge report with `preview_dataset`.
 
-3. Choose one UUID `run_id` and create an audit directory
-   `/target-workspace/.pyromind-agent/<conversation-id>/embodied-cleaning/<run-id>`.
-   Submit the representative plan with `sandbox_terminal`:
-
-   ```bash
-   python3.10 -m openhands_embodied_runtime.sandbox_runner \
-     --mode plan --source <source> --run-dir <audit-dir> \
-     --robot-type s2 --motion-speed-threshold 0.02 \
-     --idle-min-duration-s 1.5 --context-s 0.5 \
-     --runtime-revision 'openhands-embodied-runtime==1.29.5'
-   ```
-
-4. Read `<audit-dir>/report.json` with `sandbox_read_file`. Delete the plan
-   sandbox in a finally-style cleanup step, even when planning fails. Ask once
-   for the dataset-wide task text, source-derived subtask confirmation, target
-   path, and next-state action convention.
-5. Create a fresh sandbox with the same mount, verify the pinned runtime, and
-   run `--mode full` with the same audit directory, thresholds, `run_id`, target,
-   task text, `--confirm-subtasks`, and `--confirm-derived-action`.
-6. For a long full run, start the command with `nohup`, redirect stdout/stderr to
-   `<audit-dir>/full.log`, save `$!` to `<audit-dir>/full.pid`, and poll with
-   `sandbox_terminal` (`kill -0 $(cat <pid>)`) while reading the tail of the log.
-   Do not infer completion from silence. Completion is the process exit plus a
-   parseable `<audit-dir>/report.json`.
-7. If and only if `failed_episode_count > 0`, fix the runtime cause and run the
-   same command once with `--mode resume`. Resume retries only `failed` episodes.
-   It never reprocesses accepted, needs-review, or rejected episodes.
-8. Always delete the sandbox after reading the report. Verify the target with a
-   new read-only inspection or Storage preview.
-
-There is no repair phase. Do not retry a quality-rejected episode automatically.
-The batch publishes the validated accepted subset when at least one episode is
-accepted and there are no runtime failures.
-If every episode is rejected, `processing_complete=true` and `published=false`:
-report the terminal all-rejected conclusion and do not call resume.
+There is no repair phase. Do not retry a quality-rejected episode
+automatically. If every episode is rejected, `processing_complete=true` and
+`published=false`: report the terminal all-rejected conclusion and do not
+resubmit.
 
 ## Alignment and Rejection Policy
 

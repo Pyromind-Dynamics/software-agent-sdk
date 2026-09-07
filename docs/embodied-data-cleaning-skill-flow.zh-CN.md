@@ -3,10 +3,10 @@
 ## 目标
 
 具身数据清洗是 `data-processing` 下的一个环境型 case。Agent 负责路由、确认和
-报告；通用 Sandbox 工具负责容器生命周期；Python 3.10 的
-`openhands-embodied-runtime` 负责确定性数据处理。
-
-该流程不通过 Studio 工作流提交具身清洗任务，也没有具身专用的提交 Tool。
+报告；平台 EDP 编排（`edp_render` / `edp_submit`）负责逐 episode 执行，
+与 tmax 批量验证同构；Python 3.10 的 `openhands-embodied-runtime` 负责确定性
+数据处理。该流程不通过 Studio 工作流提交具身清洗任务，也没有具身专用的提交
+Tool——episode 级执行复用通用的 `edp_submit` + ProcessingProfile。
 
 ## 分层架构
 
@@ -18,18 +18,17 @@ data-processing（统一入口）
     ├── embodied-data-cleaning（Python 3.10、LeRobot v2.1）
     └── 其他 case（JDK、编译器、GUI 等）
 
-通用执行层
-├── sandbox_create / sandbox_delete
-├── sandbox_terminal
-├── sandbox_read_file / sandbox_write_file / sandbox_delete_file
-└── sandbox_upload / sandbox_download
+通用执行层（EDP 编排，与 tmax 同构）
+├── edp_render（episode 分片渲染，CustomCommandCPUNode 平台任务）
+├── edp_submit（逐 episode 执行：冻结 runner + profile + 节点 shim）
+└── merge 记录（accepted 片段合并、校验、发布）
 
-具身确定性 runtime
+具身确定性 runtime（沙箱内 CLI）
 ├── source adapter 与格式探测
 ├── 多模态时间对齐
 ├── 静止段检测与可逆 plan
-├── episode 级质量隔离与 checkpoint
-├── LeRobot v2.1 生成、合并与校验
+├── episode 级质量隔离（--mode episode 单条 worker）
+├── LeRobot v2.1 生成、合并与校验（--mode merge 聚合发布）
 └── 结构化 batch/reject report
 ```
 
@@ -37,23 +36,32 @@ data-processing（统一入口）
 
 1. `data-processing` 根据数据结构和任务语义路由到
    `embodied-data-cleaning`。
-2. Agent 使用 `pyrominddynamics/jupyter-lab-with-ssh:v0.9` 创建 Python 3.10
-   CUSTOM Sandbox，并将平台 Storage 的 `/workspace` 挂载到容器
-   `/target-workspace`。具身 case 不使用示例或临时 registry 镜像。
-3. Sandbox 验证 `openhands-embodied-runtime==1.29.5`；若标准镜像未预装，
-   则从部署包源或部署挂载的 wheel 安装。普通用户不需要上传 wheel。
-4. 运行 `mode=plan`，检查代表 episode、源结构、流状态和可逆清洗计划。
-5. Agent 一次性向用户确认全数据集 task text、子任务区间、next-state 动作约定和
-   target path。
-6. 新建 Sandbox，使用相同 run ID 和参数执行 `mode=full`。长任务用后台进程、PID
-   和日志轮询判断进度。
-7. runtime 逐 episode 处理并在每条完成后写 checkpoint。一个 episode 出错不会
-   否定整个批次。
-8. 没有 runtime failure 时，所有 accepted episode 被合并、校验并发布；rejected
-   episode 留在审计报告，不进入训练目录。
-9. 仅当存在 `failed`（运行时异常）时使用 `mode=resume`。resume 只重试 failed，
-   不重新处理 accepted 或 rejected。
-10. Agent 读取最终报告、校验目标 `meta/data/videos`，并删除 Sandbox。
+2. 写渲染模板：`data_source` 指向 LeRobot 源的 `meta/episodes/chunk-*.parquet`，
+   每条记录 = 一个 episode（`episode_id` + 钉死镜像 + `config_json` 组合配置），
+   `edp_render` 分片落 Storage。
+3. plan 阶段：对代表 episode 跑 `--mode plan`（小样沙箱或 smoke 片），向用户
+   展示 representative plan + inspection 摘要。
+4. 用户一次性确认全数据集 task text、子任务区间、next-state 动作约定、阈值
+   和 target path（门禁，确认前禁止渲染/提交）。
+5. `edp_submit` 提交验证：平台节点按分片拉起 CUSTOM 沙箱
+   （`/workspace` 读写挂载到 `/target-workspace`；profile 声明
+   `execution.sandbox_reuse=per_shard`，同一分片的 episode 共享一个沙箱内
+   串行执行，探针失败自动重建），runtime 执行 `--mode episode --config
+   <挂载配置>`，episode 输出与结果 JSON 直接落在共享 work_root；runner
+   冻结了硬截止/心跳/账本，长任务不占用 agent。
+6. verdicts 语义：accepted=reward 1.0 / needs_review=0.5 / rejected=0.0
+   （均为 usable），failed 无 reward 归 error 桶；镜像缺件类 error 单独分桶。
+   断点续跑用 `edp_submit` 的 shards offset，只重跑 failed。
+平台约束：沙箱 exec 单命令上限 600s，profile exec 步骤设 590s（单 episode
+清洗必须 fits；超限会被 `SandboxExecRequest` 校验拒绝）；`edp_submit`
+必须显式传 `profile_name="embodied-cleaning"`（默认会冻结 tmax profile）。
+
+7. 全部 episode 终态后提交单条 merge 记录（profile `embodied-cleaning-merge`）：
+   runtime `--mode merge` 只合并 accepted 片段，执行 LeRobot v2.1 校验后发布
+   到 target。全部 rejected 为 `processing_complete=true` / `published=false`
+   的终态结论。
+8. Kafka 回调后用 `preview_dataset` 校验 target 发布物与聚合 report；agent 不
+   持有任何沙箱生命周期（runner finally 保证删除）。
 
 ## 对齐质量门
 
@@ -104,7 +112,10 @@ needs_review、failed、frame 和 video 统计，并逐条解释拒绝原因。
 
 ## Runtime 交付
 
-开发时 wheel 可用于本地或预发布验证；平台正式部署应采用以下任一方式：
+当前交付方式：固定版本 wheel 内置于 skill bundle（`edp/wheels/`），由
+`edp_submit` 随冻结包自动暂存进 run 目录，profile exec 从 Storage 挂载路径
+安装（第三方依赖由公网 PyPI 解析）；agent 侧零预置，bundle 缺 wheel 时提交
+即报错。平台正式部署应演进为以下任一方式：
 
 1. 在 Sandbox 基础镜像中预装固定版本 runtime；或
 2. 将固定版本发布到平台内部 Python 包源，由 Sandbox 安装。
@@ -123,6 +134,6 @@ target/
 └── videos/
 ```
 
-plan、checkpoint、日志、reject 报告和中间 episode 输出保存在 audit 目录，不发布到
-训练目录。完成条件是 `report.complete=true`、`published=true`、最终 validation
-有效，且目标目录结构与统计一致。
+plan、episode 结果 JSON、reject 报告和中间 episode 输出保存在共享 work_root
+（挂载持久），不发布到训练目录。完成条件是 merge 阶段 `complete=true`、
+`published=true`、最终 validation 有效，且目标目录结构与统计一致。

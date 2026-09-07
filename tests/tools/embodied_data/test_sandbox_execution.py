@@ -158,4 +158,6 @@ def test_full_sandbox_run_requires_plan_artifacts(
 
 def test_sandbox_runner_has_no_repair_mode() -> None:
     choices = _parser()._option_string_actions["--mode"].choices
-    assert choices == ("plan", "full", "resume")
+    assert choices is not None
+    assert choices == ("plan", "full", "resume", "episode", "merge")
+    assert not any("repair" in choice for choice in choices)

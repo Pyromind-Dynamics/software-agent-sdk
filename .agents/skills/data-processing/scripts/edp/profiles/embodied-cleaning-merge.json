@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "name": "embodied-cleaning-merge",
+  "description": "具身清洗的聚合阶段（edp_aggregate 等价步骤）：在 episode 全部跑完后\"单独一条记录\"提交本 profile，沙箱内确定性 runtime 扫描共享 work_root 的 results/*.json（episode worker 写出的状态：accepted / needs_review / rejected / failed），由此只 merge accepted episode 片段（与 batch 全量语义一致），执行 LeRobot v2.1 校验后发布到 target；若没有任何 accepted episode 则 processing_complete=true / published=false（全拒结论）。manifest 字段契约：task_id（固定一个代号，如 merge-<run-id>）/ work_root（与 episode profile 同一挂载工作目录）/ target（发布目录绝对路径）/ task_text / expected_episode_ids（可选，校验每条 manifest 记录的结果都已回填）。exit code 0 = 聚合成功（verdict 通道 kind=exit_code）。",
+  "steps": [
+    {
+      "name": "create_sandbox",
+      "params": {
+        "image": "{image}",
+        "cpu": 4,
+        "memory": "8Gi",
+        "wait_timeout": 600,
+        "volume_mounts": [
+          {
+            "host_path": "/workspace",
+            "mount_path": "/target-workspace",
+            "read_only": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "probe",
+      "params": {
+        "command": "command -v python3.10 && test -d /target-workspace",
+        "timeout": 60
+      }
+    },
+    {
+      "name": "write_file",
+      "params": {
+        "path": "/target-workspace/.agents-embodied-config/{task_id}-merge.json",
+        "content_field": "config_json"
+      }
+    },
+    {
+      "name": "exec",
+      "params": {
+        "command": "python3.10 -c \"import openhands_embodied_runtime\" 2>/dev/null || python3.10 -m pip install --quiet '{edp_run_dir}/wheels/openhands_embodied_runtime-1.29.5-py3-none-any.whl'; python3.10 -m openhands_embodied_runtime.sandbox_runner --mode merge --config /target-workspace/.agents-embodied-config/{task_id}-merge.json",
+        "timeout": 590
+      }
+    }
+  ],
+  "verdict": {
+    "kind": "exit_code",
+    "success_codes": [
+      0
+    ]
+  },
+  "output": {
+    "filename": "verdicts.jsonl"
+  },
+  "execution": {
+    "sandbox_reuse": "per_shard"
+  }
+}

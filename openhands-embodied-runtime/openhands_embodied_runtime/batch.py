@@ -183,7 +183,7 @@ def batch_clean_lerobot_v21_dataset(
         should_process = previous is None or previous.status == "failed"
         if not should_process:
             continue
-        episode_result = _clean_one_episode(
+        episode_result = clean_one_episode(
             source,
             episode_id=episode_id,
             plans_root=plans_root,
@@ -231,7 +231,7 @@ def batch_clean_lerobot_v21_dataset(
     return result
 
 
-def _clean_one_episode(
+def clean_one_episode(
     source: Path,
     *,
     episode_id: str,

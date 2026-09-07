@@ -231,3 +231,7 @@ tests/integration/api_compliance/outputs/
 #knowledge/jupyterlab/
 #knowledge/sdk/
 #knowledge/studio/
+
+# Pinned sandbox runtime wheels are intentional source artifacts, not builds
+!.agents/skills/data-processing/scripts/edp/wheels/
+!.agents/skills/data-processing/scripts/edp/wheels/*.whl

@@ -586,3 +586,64 @@ def test_storage_file_missing_reason_names_mount_prefix(tmp_path: Path) -> None:
     failure = json.loads((out / "render_failures.jsonl").read_text().splitlines()[0])
     assert "storage root" in failure["reason"]
     assert "/target-workspace/task-data/" in failure["reason"]
+
+
+def test_template_without_prompt_is_accepted(tmp_path: Path) -> None:
+    render = _load()
+    template = {
+        "schema_version": 1,
+        "name": "embodied-render",
+        "fields": {
+            "task_id": "task_id",
+            "image": "env_config_image",
+            "config_json": {
+                "kind": "json_config",
+                "fields": {
+                    "episode_id": "task_id",
+                    "task_text": {"fixed": "Pickup items"},
+                },
+            },
+        },
+        "shard_size": 4,
+    }
+
+    shards, rendered = render.render_product(
+        str(_parquet_tmp(tmp_path)), template, local_out=str(tmp_path / "out")
+    )
+
+    assert rendered == 6
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "batch-001" / "manifest.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert records[0]["task_id"] == "t-000"
+    assert json.loads(records[0]["config_json"])["task_text"] == "Pickup items"
+
+
+def test_json_config_nested_literal_dict_is_typed(tmp_path: Path) -> None:
+    render = _load()
+    row = {"task_id": "t-001"}
+    fields = {
+        "task_id": "task_id",
+        "config_json": {
+            "kind": "json_config",
+            "fields": {
+                "task_text": {"fixed": "Pickup items"},
+                "thresholds": {
+                    "motion_speed_threshold": 0.02,
+                    "idle_min_duration_s": 1.5,
+                },
+            },
+        },
+    }
+
+    rec = render.render_record(row, fields, 0)
+
+    config = json.loads(rec["config_json"])
+    assert config["thresholds"] == {
+        "motion_speed_threshold": 0.02,
+        "idle_min_duration_s": 1.5,
+    }
+    assert config["thresholds"]["motion_speed_threshold"] == 0.02
