@@ -13,6 +13,7 @@ import {
   configuredRuntimeReadRoots,
   createWorkspaceSandboxedBashOperations,
   piRuntimeReadRoots,
+  sandboxVmemKb,
   workspacePolicyDenyPaths,
   workspacePolicyDenyWritePaths,
 } from "../src/workspace-sandbox.js";
@@ -94,6 +95,8 @@ test("write deny rules preserve only public_data and terminal temp branches", as
 
 test("sandboxed commands allow cd within one call and reset cwd for every call", async () => {
   const tree = await workspaceTree();
+  const previousVmemLimit = process.env.OH_SANDBOX_VMEM_LIMIT;
+  delete process.env.OH_SANDBOX_VMEM_LIMIT;
   let initialized: SandboxRuntimeConfig | undefined;
   let updated: SandboxRuntimeConfig | undefined;
   let checkedRipgrep: { command: string; args?: string[] } | undefined;
@@ -138,10 +141,16 @@ test("sandboxed commands allow cd within one call and reset cwd for every call",
     env: { PATH: "/bin" },
   });
 
-  assert.deepEqual(localCalls.map((call) => call.command), [
-    "sandboxed:cd public_data && pwd",
-    "sandboxed:pwd",
-  ]);
+  const vmemPrefix = process.platform === "linux"
+    ? "ulimit -v 512000 2>/dev/null; "
+    : "";
+  assert.deepEqual(
+    localCalls.map((call) => call.command),
+    [
+      `sandboxed:${vmemPrefix}cd public_data && pwd`,
+      `sandboxed:${vmemPrefix}pwd`,
+    ],
+  );
   assert(localCalls.every((call) => call.cwd === tree.policy.workspaceRoot));
   assert(localCalls.every((call) => call.env?.TMPDIR === tree.policy.terminalTempRoot));
   assert.deepEqual(initialized?.network.allowedDomains, []);
@@ -155,6 +164,79 @@ test("sandboxed commands allow cd within one call and reset cwd for every call",
   ]);
   assert(updated?.filesystem.denyWrite.includes(`${tree.policy.workspaceRoot}/*`));
   assert(updated?.filesystem.denyRead.includes(await realpath(tree.repositorySource)));
+  if (previousVmemLimit === undefined) delete process.env.OH_SANDBOX_VMEM_LIMIT;
+  else process.env.OH_SANDBOX_VMEM_LIMIT = previousVmemLimit;
+});
+
+test("sandbox vmem cap parses OH_SANDBOX_VMEM_LIMIT on Linux", async () => {
+  const original = process.env.OH_SANDBOX_VMEM_LIMIT;
+  const platform = process.platform;
+  try {
+    Object.defineProperty(process, "platform", { value: "linux" });
+
+    delete process.env.OH_SANDBOX_VMEM_LIMIT;
+    assert.equal(sandboxVmemKb(), 512000);
+
+    process.env.OH_SANDBOX_VMEM_LIMIT = "1G";
+    assert.equal(sandboxVmemKb(), 1024 * 1024);
+
+    process.env.OH_SANDBOX_VMEM_LIMIT = "256k";
+    assert.equal(sandboxVmemKb(), 256);
+
+    process.env.OH_SANDBOX_VMEM_LIMIT = "garbage";
+    assert.equal(sandboxVmemKb(), null);
+
+    Object.defineProperty(process, "platform", { value: "darwin" });
+    delete process.env.OH_SANDBOX_VMEM_LIMIT;
+    assert.equal(sandboxVmemKb(), null);
+  } finally {
+    Object.defineProperty(process, "platform", { value: platform });
+    if (original === undefined) delete process.env.OH_SANDBOX_VMEM_LIMIT;
+    else process.env.OH_SANDBOX_VMEM_LIMIT = original;
+  }
+});
+
+test("sandboxed commands carry the RLIMIT_AS cap on Linux", async () => {
+  const tree = await workspaceTree();
+  const localCalls: string[] = [];
+  const controller = {
+    checkDependencies: () => true,
+    initialize: async () => undefined,
+    isSandboxingEnabled: () => true,
+    updateConfig: () => undefined,
+    wrapWithSandbox: async (command: string) => `sandboxed:${command}`,
+  };
+  const operations = createWorkspaceSandboxedBashOperations(tree.policy, {
+    controller,
+    localOperations: {
+      exec: async (command: string) => {
+        localCalls.push(command);
+        return { exitCode: 0 };
+      },
+    },
+    userHome: tree.home,
+    runtimeReadRoots: [],
+  });
+
+  const previousPlatform = process.platform;
+  const previousLimit = process.env.OH_SANDBOX_VMEM_LIMIT;
+  try {
+    Object.defineProperty(process, "platform", { value: "linux" });
+    delete process.env.OH_SANDBOX_VMEM_LIMIT;
+    await operations.exec("cd public_data && pwd", tree.workspace, {
+      onData: () => undefined,
+      env: { PATH: "/bin" },
+    });
+  } finally {
+    Object.defineProperty(process, "platform", { value: previousPlatform });
+    if (previousLimit === undefined) delete process.env.OH_SANDBOX_VMEM_LIMIT;
+    else process.env.OH_SANDBOX_VMEM_LIMIT = previousLimit;
+  }
+
+  assert.equal(
+    localCalls[0],
+    "sandboxed:ulimit -v 512000 2>/dev/null; cd public_data && pwd",
+  );
 });
 
 test("workspace bash operations fail closed when sandbox is unavailable", async () => {

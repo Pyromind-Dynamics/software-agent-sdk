@@ -39,7 +39,37 @@ interface WorkspaceSandboxDependencies {
   runtimeReadRoots?: string[];
 }
 
+const OH_SANDBOX_VMEM_LIMIT_ENV = "OH_SANDBOX_VMEM_LIMIT";
+const DEFAULT_SANDBOX_VMEM_LIMIT = "500M";
+
 export type PiTerminalBackend = "os-sandbox";
+
+/**
+ * Per-command address-space cap in KiB (RLIMIT_AS for `ulimit -v`).
+ *
+ * Mirrors the OpenHands backend: RLIMIT_AS is a process-level soft limit
+ * inherited by every forked command, so one runaway sandbox command cannot
+ * exhaust the shared pod. Linux only — on macOS the shell address space is
+ * huge by design and `ulimit -v` kills bash outright.
+ */
+export function sandboxVmemKb(): number | null {
+  if (process.platform !== "linux") return null;
+  const raw = (process.env[OH_SANDBOX_VMEM_LIMIT_ENV] ?? DEFAULT_SANDBOX_VMEM_LIMIT)
+    .trim();
+  const match = /^(\d+)\s*([kmg]?)/i.exec(raw);
+  if (!match) return null;
+  const multiplier = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 } as
+    Record<string, number>;
+  const bytes = Number(match[1]) * multiplier[match[2].toLowerCase()];
+  if (!Number.isFinite(bytes) || bytes <= 0) return null;
+  return Math.floor(bytes / 1024);
+}
+
+function commandWithVmemCap(command: string): string {
+  const vmemKb = sandboxVmemKb();
+  if (vmemKb === null) return command;
+  return `ulimit -v ${vmemKb} 2>/dev/null; ${command}`;
+}
 
 interface WorkspaceSandboxHandle {
   operations: BashOperations;
@@ -149,7 +179,7 @@ function createWorkspaceSandbox(
           const config = await prepare();
           const wrapped = await wrapWithPrivateTemp(
             controller,
-            command,
+            commandWithVmemCap(command),
             config,
             policy.terminalTempRoot,
             options.signal,
