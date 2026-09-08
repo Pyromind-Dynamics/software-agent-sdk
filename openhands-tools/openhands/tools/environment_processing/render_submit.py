@@ -265,10 +265,10 @@ def _preflight_template(
 ) -> str | None:
     """Best-effort template-vs-schema check before submitting the render.
 
-    Returns a failure message when the template references parquet columns
-    that do not exist, or None when the check passes or cannot run (glob
-    sources, oversized footers, storage errors never block submission —
-    the node-side render still fails fast on the same error).
+    Returns a failure message when the data source is not a parquet file or
+    the template references parquet columns that do not exist, or None when
+    the check passes or cannot run (glob sources, storage errors never block
+    submission — the node-side render still fails fast on the same error).
     """
     if any(ch in data_source for ch in "*?["):
         return None
@@ -276,8 +276,6 @@ def _preflight_template(
     if not refs:
         return None
     try:
-        import pyarrow.parquet as pq
-
         tail, total = download_tail_from_pyromind(
             storage_path=data_source,
             storage_base_url=storage_base_url,
@@ -285,8 +283,19 @@ def _preflight_template(
             timeout=timeout,
             tail_bytes=PREFLIGHT_TAIL_BYTES,
         )
-        if len(tail) < 8 or tail[-4:] != b"PAR1":
-            return None
+    except Exception:  # noqa: BLE001
+        return None
+    if len(tail) < 8 or tail[-4:] != b"PAR1":
+        # The storage download succeeded, so the source exists but is not
+        # parquet (JSONL/CSV land here); reject before wasting a node run.
+        return (
+            f"data_source must be a Parquet file, but {data_source!r} has no "
+            "PAR1 magic bytes. Build an index parquet first, upload it to "
+            "Storage, and point data_source at the parquet index."
+        )
+    try:
+        import pyarrow.parquet as pq
+
         footer_len = struct.unpack("<I", tail[-8:-4])[0]
         if footer_len + 8 > len(tail):
             if footer_len + 8 > PREFLIGHT_MAX_FOOTER_BYTES:

@@ -470,3 +470,67 @@ def test_preflight_parses_schema_through_sparse_gap(
     )
     assert message is not None
     assert "top-level column 'nope'" in message
+
+
+def test_preflight_rejects_non_parquet_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """data_source 指向 JSONL 等非 Parquet 文件时提交前拦截(对话 c66d335f)。"""
+    mocks = _patch_submission(monkeypatch)
+    _patch_preflight(
+        monkeypatch,
+        b'{"episode_index": 0}\n{"episode_index": 1}\n',
+    )
+    template = tmp_path / "render_template.json"
+    template.write_text(json.dumps({"fields": {"task_id": "episode_index"}}))
+    conversation = _conversation_with_secrets({"auth_token": "tok"})
+
+    obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
+        EdpRenderAction(
+            template_path=str(template),
+            data_source="test_data/pick_and_place_data/meta/episodes.jsonl",
+        ),
+        conversation,
+    )
+
+    assert obs.status == "Failed"
+    assert "data_source must be a Parquet file" in obs.text
+    assert "PAR1 magic bytes" in obs.text
+    assert "nothing was submitted" in obs.text
+    mocks.submit.assert_not_called()
+
+
+def test_preflight_par1_check_survives_missing_pyarrow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """本地缺 pyarrow 时 PAR1 拦截仍生效；合法 parquet 则放行提交。"""
+    from openhands.tools.environment_processing.render_submit import (
+        _preflight_template,
+    )
+
+    monkeypatch.setitem(sys.modules, "pyarrow.parquet", None)
+    _patch_preflight(
+        monkeypatch,
+        b'{"episode_index": 0}\n{"episode_index": 1}\n',
+    )
+    message = _preflight_template(
+        {"fields": {"task_id": "episode_index"}},
+        "test_data/pick_and_place_data/meta/episodes.jsonl",
+        storage_base_url="http://storage",
+        headers={},
+        timeout=5.0,
+    )
+    assert message is not None
+    assert "data_source must be a Parquet file" in message
+
+    _patch_preflight(monkeypatch, _parquet_bytes())
+    assert (
+        _preflight_template(
+            {"fields": {"task_id": "task_id", "prompt": "description"}},
+            "datasets/tmax/data/train.parquet",
+            storage_base_url="http://storage",
+            headers={},
+            timeout=5.0,
+        )
+        is None
+    )

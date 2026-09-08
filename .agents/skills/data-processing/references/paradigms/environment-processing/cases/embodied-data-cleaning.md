@@ -52,6 +52,10 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
 **S2 自采集源没有 episode 索引**——先用 Terminal 从 episode 目录清单构建一个
 索引 parquet（列：episode_id）并 `upload_file_to_pyromind` 到 Storage
 （如 `episodes_index/episodes_index.parquet`），渲染 `data_source` 指向它。
+构建 parquet 需要 pyarrow；本地默认 Python 没有且无外网时，改用
+`$DATAFLOW_PYTHON`（即 `/home/openhands/dataflow-venv/bin/python`，镜像内
+自带 pyarrow）。`data_source` 必须指向 Parquet 文件，指向 JSONL 会在
+提交侧被 `PAR1` 预检拦截。
 模板 `fields` 只强制 `task_id`；`prompt` 仅 tmax 需要。
 
 ```json
