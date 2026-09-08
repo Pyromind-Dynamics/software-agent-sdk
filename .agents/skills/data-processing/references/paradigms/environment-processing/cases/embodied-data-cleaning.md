@@ -119,6 +119,7 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
    target path。
 5. `edp_submit(manifest=..., limit=3, profile_name="embodied-cleaning")`
    smoke → verdicts 分诊（镜像缺件类 error 单独分桶，可修镜像回收）。
-6. 用户确认后分批/全量提交；`df_check_progress` 观察进度。
+6. 用户确认后默认串行全量提交（每次一片，终态后再提交下一片）；仅当
+   用户明确要求时才并发 2-5 片。`df_check_progress` 观察进度。
 7. 全部 episode 终态后提交 merge 记录（`embodied-cleaning-merge`），
    Kafka 回调后用 `preview_dataset` 校验 target 发布物与聚合 report。

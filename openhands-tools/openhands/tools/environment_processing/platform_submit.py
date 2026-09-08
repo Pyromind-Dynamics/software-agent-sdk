@@ -122,15 +122,14 @@ Two modes (exactly one required):
   manifest.jsonl'). The smoke path: submit a single shard first and check
   the verdict distribution before committing to the full run.
 - `shards` + optional `shard_offset`/`shard_count`: the render step's
-  shards.json index. Submit N shards at once, each as an independent
-  workflow with its own output_dir and terminal callback. The batch size
-  (shard_count) and any full-run submission MUST be confirmed by the user
-  via an explicit question — never decide batch capacity yourself.
+  shards.json index. Submit one shard by default; only submit multiple
+  concurrently when the user explicitly requests it, and never exceed
+  shard_count=5. Each shard is an independent workflow with its own
+  output_dir and terminal callback.
 
 Execution is asynchronous. Terminal Kafka callbacks resume the
-conversation per shard; the agent must check whether every shard of the
-batch reached a terminal state before asking about the next batch. After
-the callbacks, inspect artefacts exclusively with `preview_dataset` under
+conversation per shard; after the callbacks, inspect artefacts exclusively
+with `preview_dataset` under
 the returned output_dirs:
 - <output_dir>/run/verdicts.jsonl : per-record usable/error + reward
 - <output_dir>/run/traces/<task_id>.pi_trace.jsonl : agent json traces
@@ -156,9 +155,9 @@ class EdpSubmitAction(Action):
         default=None,
         description=(
             "Storage path of the shards.json index written by edp_render. "
-            "Submit multiple shard manifests at once, each as an independent "
-            "workflow with its own output_dir. Mutually exclusive with "
-            "manifest. shard_count must be confirmed by the user."
+            "Submit one shard by default; use shard_count only after the "
+            "user explicitly requests concurrent shards. Mutually exclusive "
+            "with manifest."
         ),
     )
     shard_offset: int = Field(
@@ -166,13 +165,13 @@ class EdpSubmitAction(Action):
         ge=0,
         description="First shard index to submit from the shards.json list.",
     )
-    shard_count: int | None = Field(
-        default=None,
+    shard_count: int = Field(
+        default=1,
         ge=1,
+        le=5,
         description=(
-            "Number of shards to submit this call (default: all remaining "
-            "from shard_offset). The batch capacity — confirm it with the "
-            "user, never decide it yourself."
+            "Number of shards to submit concurrently. Default 1; only use "
+            "more when the user explicitly requests it (maximum 5)."
         ),
     )
     profile_name: str = Field(
@@ -625,17 +624,12 @@ class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
         if not isinstance(shards, list) or not shards:
             raise ValueError(f"shards index {index_path} has no 'shards' list")
         end = len(shards)
-        if action.shard_count is not None:
-            end = min(end, action.shard_offset + action.shard_count)
+        end = min(end, action.shard_offset + action.shard_count)
         selected = shards[action.shard_offset : end]
         if not selected:
             raise ValueError(
                 f"shard_offset={action.shard_offset}"
-                + (
-                    f" shard_count={action.shard_count}"
-                    if action.shard_count is not None
-                    else ""
-                )
+                + (f" shard_count={action.shard_count}")
                 + f" selects no shards from {len(shards)} in {index_path}"
             )
         return [str(PurePosixPath("/" + str(s).lstrip("/"))) for s in selected]

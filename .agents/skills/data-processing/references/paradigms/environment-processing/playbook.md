@@ -205,10 +205,10 @@ edp_submit(manifest=<render 输出的 batch-001/manifest.jsonl>, limit=3)
 smoke 终态回调并汇报 verdict 分布 + 单条均时后,**必须 AskUserQuestion
 让用户三选一,禁止 agent 默认走全量**:
 
-- ① **直接全量**(单批提交剩余全部片)
-- ② **分批**(本次提交 N 片 = 批容量;agent 给推荐值与推算依据:单条均时 ×
-  片内条数 vs 12h 任务配额、同镜像拉取风暴约束——3 条样本不符合预期的
-  全量成本很高,批容量由用户拍板)
+- ① **串行全量**(默认;每次提交一片,终态回调后检查再提交下一片)
+- ② **显式并发批**(仅当用户明确要求;N=2-5。agent 给推荐值与推算依据:
+  单条均时 × 片内条数 vs 12h 任务配额、同镜像拉取风暴约束——3 条样本
+  不符合预期的全量成本很高,并发容量由用户拍板)
 - ③ **先停**(修模板/镜像/join 源后再来)
 
 **2.3 多片提交(分批与全量统一形态)**
@@ -218,16 +218,18 @@ edp_submit(shards=<shards.json 路径>, shard_offset=<起始片>, shard_count=<�
 ```
 
 - 一次提交 N 片:每片独立 workflow/output_dir/终态回调,注册 N 个
-  ActiveLongTask;`shard_count` 省略 = 从 `shard_offset` 提交到末尾(全量)
+  ActiveLongTask;`shard_count` 省略 = 1。只有用户明确要求并发时才能传
+  2-5,工具会拒绝超过 5 的并发片数
 - 片 run 目录嵌套在片 manifest 目录下(`<root>/batch-XXX/<run_id>/run/`),
   checkpoint 与 manifest 同片共存;某片中断,同 `run_id` 重提交该片即续跑
   (verdicts.jsonl 为 checkpoint,自动跳过已判条目)
-- N 个回调会逐个唤醒会话;agent 每次被唤醒先判断"**本批是否全部片终态**"
-  (对照本次提交的 task_ids),未到齐就只汇报进度继续等,到齐才进 2.4
+- 每个回调会唤醒会话。串行模式(`shard_count=1`)检查该片并提交下一片;
+  并发模式先判断"**本批是否全部片终态**"(对照本次提交的 task_ids),
+  未到齐就只汇报进度继续等,到齐才进 2.4
 
 **2.4 批间确认(硬约束)**
 
-本批全部片终态后:汇报本批统计(usable/error 分布、与前批对比、单条均时)
+并发批全部片终态后:汇报本批统计(usable/error 分布、与前批对比、单条均时)
 → **再次 AskUserQuestion:继续下一批 / 调整批容量 / 停止**。不自动推进
 下一批。与既有 `Terminated` 回调约定一致:终止/失败不得自动重提交,
 交用户决策;需介入时先 `df_stop_task(task_id)` 停平台任务,再改再提交。

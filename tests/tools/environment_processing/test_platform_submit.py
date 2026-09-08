@@ -431,6 +431,15 @@ def test_edp_submit_action_requires_exactly_one_manifest_source() -> None:
         EdpSubmitAction(manifest="edp/b/manifest.jsonl", shards="/edp/shards.json")
 
 
+def test_edp_submit_action_defaults_to_serial_shard_submission() -> None:
+    assert EdpSubmitAction(shards="/edp/shards.json").shard_count == 1
+
+
+def test_edp_submit_action_limits_concurrent_shards() -> None:
+    with pytest.raises(ValueError):
+        EdpSubmitAction(shards="/edp/shards.json", shard_count=6)
+
+
 def _patch_shards_index(
     monkeypatch: pytest.MonkeyPatch, shards: list[str]
 ) -> MagicMock:
@@ -495,7 +504,7 @@ def test_executor_submits_shard_batch_with_offset_and_count(
 def test_executor_shard_batch_resume_shares_run_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _patch_submission(monkeypatch, task_ids=("task-1", "task-2", "task-3"))
+    _patch_submission(monkeypatch, task_ids=("task-1",))
     _patch_shards_index(monkeypatch, _SHARDS)
     conversation = _full_conversation()
     run_id = "3f9a6c1d-4f5e-4a6b-8c7d-9e0f1a2b3c4d"
@@ -507,12 +516,8 @@ def test_executor_shard_batch_resume_shares_run_id(
 
     assert observation.resumed is True
     # all shards share the run id so each resume skips its own checkpoint
-    assert observation.run_ids == [run_id, run_id, run_id]
-    assert observation.output_dirs == [
-        f"/edp/batch-001/{run_id}",
-        f"/edp/batch-002/{run_id}",
-        f"/edp/batch-003/{run_id}",
-    ]
+    assert observation.run_ids == [run_id]
+    assert observation.output_dirs == [f"/edp/batch-001/{run_id}"]
 
 
 def test_executor_shard_batch_stops_on_first_failure(
@@ -526,7 +531,10 @@ def test_executor_shard_batch_stops_on_first_failure(
     _patch_shards_index(monkeypatch, _SHARDS)
     conversation = _full_conversation()
     executor = _executor(runtime_dir=str(_runtime_tmp(tmp_path)))
-    observation = executor(EdpSubmitAction(shards="/edp/shards.json"), conversation)
+    observation = executor(
+        EdpSubmitAction(shards="/edp/shards.json", shard_count=2),
+        conversation,
+    )
 
     # the first shard keeps running; the batch stops before the third
     assert observation.task_ids == ["task-1"]
