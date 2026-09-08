@@ -1,4 +1,4 @@
-from pyromind_runtime.domain.capabilities import HarnessCapabilities
+from pyromind_runtime.domain.capabilities import HarnessCapabilities, ResourceLimits
 from pyromind_runtime.domain.commands import (
     CancelCommand,
     PermissionResponseCommand,
@@ -21,6 +21,7 @@ __all__ = [
     "ProductCommand",
     "ProductEvent",
     "ProductRuntimeError",
+    "ResourceLimits",
     "RequestContext",
     "RollbackWorkflowCommand",
     "UserMessageCommand",

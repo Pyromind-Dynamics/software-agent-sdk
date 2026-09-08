@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from pyromind_runtime.application.event_projection import ProductEventProjector
+from pyromind_runtime.domain.capabilities import ResourceLimits
 from pyromind_runtime.domain.commands import (
     CommandReceipt,
     ProductCommand,
@@ -89,6 +90,7 @@ class ConversationRuntime:
         default_harness_id: str = "openhands",
         external_tasks: ExternalTaskRegistry | None = None,
         idle_eviction_seconds: int = 1800,
+        resource_limits: ResourceLimits | None = None,
     ) -> None:
         self.conversation_root = Path(conversation_root)
         self.adapters = (
@@ -99,6 +101,7 @@ class ConversationRuntime:
         if default_harness_id not in self.adapters:
             raise ValueError(f"default harness is not registered: {default_harness_id}")
         self.default_harness_id = default_harness_id
+        self._resource_limits = resource_limits
         self._external_tasks = external_tasks
         self._projector = ProductEventProjector()
         self._idle_eviction_seconds = max(0, int(idle_eviction_seconds))
@@ -117,6 +120,8 @@ class ConversationRuntime:
         total_started_at = time.perf_counter()
         adapter = self._adapter(self.default_harness_id)
         adapter_started_at = time.perf_counter()
+        if self._resource_limits is not None:
+            spec = spec.model_copy(update={"resource_limits": self._resource_limits})
         handle = await adapter.create_session(spec, context)
         self._log_timing(
             "adapter.create_session_ms",

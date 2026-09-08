@@ -18,7 +18,10 @@ import {
   type BusinessToolConfig,
   type SkillRootConfig,
 } from "./tools.js";
-import type { PiTerminalBackend } from "./workspace-sandbox.js";
+import type {
+  PiTerminalBackend,
+  ResourceLimitsConfig,
+} from "./workspace-sandbox.js";
 
 interface PiSessionConfig extends PiModelConfig {
   sessionId: string;
@@ -29,6 +32,7 @@ interface PiSessionConfig extends PiModelConfig {
   sessionPath: string;
   skillRoots: SkillRootConfig[];
   knowledgeRoot?: string;
+  resourceLimits?: ResourceLimitsConfig;
   tools: BusinessToolConfig[];
 }
 
@@ -51,6 +55,7 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
     config.terminalBackend,
     config.skillRoots,
     config.knowledgeRoot,
+    config.resourceLimits,
     config.tools,
   );
   const settingsManager = SettingsManager.inMemory({
@@ -131,8 +136,34 @@ function parseConfig(value: JsonObject): PiSessionConfig {
     sessionPath: requiredString(value, "session_path"),
     skillRoots: parseSkillRoots(value),
     knowledgeRoot: optionalString(value, "knowledge_root"),
+    resourceLimits: parseResourceLimits(value.resource_limits),
     tools: parseTools(value.tools),
   };
+}
+
+function parseResourceLimits(
+  value: JsonValue | undefined,
+): ResourceLimitsConfig | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new Error("resource_limits must be an object");
+  const resourceLimits = {
+    memoryLimitBytes: requiredInteger(
+      value.memory_limit_bytes,
+      "resource_limits.memory_limit_bytes",
+    ),
+    nprocLimit: requiredInteger(value.nproc_limit, "resource_limits.nproc_limit"),
+  };
+  if (resourceLimits.nprocLimit < 2) {
+    throw new Error("resource_limits.nproc_limit must be at least 2");
+  }
+  return resourceLimits;
+}
+
+function requiredInteger(value: unknown, name: string): number {
+  if (!Number.isInteger(value) || (value as number) <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value as number;
 }
 
 function terminalBackend(value: JsonObject): PiTerminalBackend {

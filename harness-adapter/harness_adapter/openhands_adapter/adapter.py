@@ -65,6 +65,7 @@ OPENHANDS_CAPABILITIES = HarnessCapabilities(
     native_workspace_tools=frozenset(
         {"terminal", "file_editor", "grep", "apply_patch"}
     ),
+    enforced_limits=frozenset({"memory", "nproc"}),
 )
 
 

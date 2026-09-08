@@ -21,6 +21,7 @@ import type { JsonlRpcPeer } from "./rpc-peer.js";
 import {
   createWorkspaceBashOperations,
   type PiTerminalBackend,
+  type ResourceLimitsConfig,
 } from "./workspace-sandbox.js";
 import {
   WorkspaceAccessPolicy,
@@ -48,6 +49,7 @@ export async function createTools(
   terminalBackend: PiTerminalBackend,
   skillRoots: SkillRootConfig[],
   knowledgeRoot: string | undefined,
+  resourceLimits: ResourceLimitsConfig | undefined,
   businessTools: BusinessToolConfig[],
 ): Promise<AgentTool[]> {
   const policy = await WorkspaceAccessPolicy.create({
@@ -71,6 +73,7 @@ export async function createTools(
   const terminalOperations = await createWorkspaceBashOperations(
     terminalBackend,
     policy,
+    { resourceLimits },
   );
   // sandbox-runtime creates Linux bridge sockets under os.tmpdir(). Initialize
   // it before pointing process temp variables at the conversation's much longer

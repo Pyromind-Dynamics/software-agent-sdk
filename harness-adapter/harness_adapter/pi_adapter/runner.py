@@ -301,5 +301,7 @@ def _runner_environment() -> dict[str, str]:
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
         "NODE_EXTRA_CA_CERTS",
+        "OH_SANDBOX_VMEM_LIMIT",
+        "OH_SANDBOX_NPROC_LIMIT",
     )
     return {name: os.environ[name] for name in allowed if name in os.environ}

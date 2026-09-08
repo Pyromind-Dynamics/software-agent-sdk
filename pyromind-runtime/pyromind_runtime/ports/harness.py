@@ -6,7 +6,7 @@ from typing import Protocol
 from pydantic import Field
 
 from pyromind_runtime.domain.base import ContractModel
-from pyromind_runtime.domain.capabilities import HarnessCapabilities
+from pyromind_runtime.domain.capabilities import HarnessCapabilities, ResourceLimits
 from pyromind_runtime.domain.commands import ProductCommand
 from pyromind_runtime.domain.content import ContentBlock, JsonObject
 from pyromind_runtime.domain.context import RequestContext
@@ -21,6 +21,7 @@ class SessionSpec(ContractModel):
     initial_message: tuple[ContentBlock, ...] = ()
     workflow_xyflow: JsonObject | None = None
     model_configuration: JsonObject = Field(default_factory=dict)
+    resource_limits: ResourceLimits | None = None
     extra: JsonObject = Field(default_factory=dict)
 
 

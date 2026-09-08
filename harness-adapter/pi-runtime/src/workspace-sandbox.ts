@@ -37,10 +37,18 @@ interface WorkspaceSandboxDependencies {
   localOperations?: BashOperations;
   userHome?: string;
   runtimeReadRoots?: string[];
+  resourceLimits?: ResourceLimitsConfig;
 }
 
 const OH_SANDBOX_VMEM_LIMIT_ENV = "OH_SANDBOX_VMEM_LIMIT";
 const DEFAULT_SANDBOX_VMEM_LIMIT = "500M";
+const OH_SANDBOX_NPROC_LIMIT_ENV = "OH_SANDBOX_NPROC_LIMIT";
+const DEFAULT_SANDBOX_NPROC_LIMIT = 2;
+
+export interface ResourceLimitsConfig {
+  memoryLimitBytes: number;
+  nprocLimit: number;
+}
 
 export type PiTerminalBackend = "os-sandbox";
 
@@ -52,8 +60,14 @@ export type PiTerminalBackend = "os-sandbox";
  * exhaust the shared pod. Linux only — on macOS the shell address space is
  * huge by design and `ulimit -v` kills bash outright.
  */
-export function sandboxVmemKb(): number | null {
+export function sandboxVmemKb(memoryLimitBytes?: number): number | null {
   if (process.platform !== "linux") return null;
+  if (memoryLimitBytes !== undefined) {
+    if (!Number.isInteger(memoryLimitBytes) || memoryLimitBytes <= 0) {
+      return null;
+    }
+    return Math.floor(memoryLimitBytes / 1024);
+  }
   const raw = (process.env[OH_SANDBOX_VMEM_LIMIT_ENV] ?? DEFAULT_SANDBOX_VMEM_LIMIT)
     .trim();
   const match = /^(\d+)\s*([kmg]?)/i.exec(raw);
@@ -65,10 +79,32 @@ export function sandboxVmemKb(): number | null {
   return Math.floor(bytes / 1024);
 }
 
-function commandWithVmemCap(command: string): string {
-  const vmemKb = sandboxVmemKb();
-  if (vmemKb === null) return command;
-  return `ulimit -v ${vmemKb} 2>/dev/null; ${command}`;
+export function sandboxNprocLimit(nprocLimit?: number): number | null {
+  if (process.platform !== "linux") return null;
+  if (nprocLimit !== undefined) return nprocLimit;
+  const raw = (process.env[OH_SANDBOX_NPROC_LIMIT_ENV] ?? DEFAULT_SANDBOX_NPROC_LIMIT)
+    .toString()
+    .trim();
+  const limit = Number(raw);
+  return Number.isInteger(limit) && limit >= 2 ? limit : null;
+}
+
+function commandWithResourceCaps(
+  command: string,
+  limits?: ResourceLimitsConfig,
+): string {
+  const vmemKb = sandboxVmemKb(limits?.memoryLimitBytes);
+  const nprocLimit = sandboxNprocLimit(limits?.nprocLimit);
+  if (vmemKb === null && nprocLimit === null) return command;
+  const nprocGuard = nprocLimit === null ? "" : [
+    "map=$(awk 'NR==1{print $3}' /proc/self/uid_map);",
+    `[ \"$map\" != \"4294967295\" ]`,
+    `&& ulimit -u ${nprocLimit} 2>/dev/null; `,
+  ].join(" ");
+  const vmemGuard = vmemKb === null
+    ? ""
+    : `ulimit -v ${vmemKb} 2>/dev/null; `;
+  return `${nprocGuard}${vmemGuard}${command}`;
 }
 
 interface WorkspaceSandboxHandle {
@@ -179,7 +215,7 @@ function createWorkspaceSandbox(
           const config = await prepare();
           const wrapped = await wrapWithPrivateTemp(
             controller,
-            commandWithVmemCap(command),
+            commandWithResourceCaps(command, dependencies.resourceLimits),
             config,
             policy.terminalTempRoot,
             options.signal,

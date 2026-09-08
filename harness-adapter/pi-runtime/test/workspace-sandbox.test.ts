@@ -13,6 +13,7 @@ import {
   configuredRuntimeReadRoots,
   createWorkspaceSandboxedBashOperations,
   piRuntimeReadRoots,
+  sandboxNprocLimit,
   sandboxVmemKb,
   workspacePolicyDenyPaths,
   workspacePolicyDenyWritePaths,
@@ -22,6 +23,19 @@ import { WorkspaceAccessPolicy } from "../src/workspace-policy.js";
 const osSandboxAvailable = process.platform === "darwin"
   ? existsSync("/usr/bin/sandbox-exec")
   : SandboxManager.checkDependencies();
+
+function resourceCapPrefix(
+  nprocLimit: number,
+  vmemKb: number,
+): string {
+  if (process.platform !== "linux") return "";
+  return [
+    "map=$(awk 'NR==1{print $3}' /proc/self/uid_map);",
+    `[ \"$map\" != \"4294967295\" ]`,
+    `&& ulimit -u ${nprocLimit} 2>/dev/null;`,
+    `ulimit -v ${vmemKb} 2>/dev/null;`,
+  ].join(" ") + " ";
+}
 
 async function workspaceTree() {
   const root = await mkdtemp(join(tmpdir(), "pi-workspace-sandbox-"));
@@ -141,9 +155,7 @@ test("sandboxed commands allow cd within one call and reset cwd for every call",
     env: { PATH: "/bin" },
   });
 
-  const vmemPrefix = process.platform === "linux"
-    ? "ulimit -v 512000 2>/dev/null; "
-    : "";
+  const vmemPrefix = resourceCapPrefix(2, 512000);
   assert.deepEqual(
     localCalls.map((call) => call.command),
     [
@@ -196,6 +208,26 @@ test("sandbox vmem cap parses OH_SANDBOX_VMEM_LIMIT on Linux", async () => {
   }
 });
 
+test("sandbox caps prefer explicit resource limits over environment", async () => {
+  const originalVmem = process.env.OH_SANDBOX_VMEM_LIMIT;
+  const originalNproc = process.env.OH_SANDBOX_NPROC_LIMIT;
+  const platform = process.platform;
+  try {
+    Object.defineProperty(process, "platform", { value: "linux" });
+    process.env.OH_SANDBOX_VMEM_LIMIT = "1G";
+    process.env.OH_SANDBOX_NPROC_LIMIT = "8";
+
+    assert.equal(sandboxVmemKb(256 * 1024 * 1024), 256 * 1024);
+    assert.equal(sandboxNprocLimit(4), 4);
+  } finally {
+    Object.defineProperty(process, "platform", { value: platform });
+    if (originalVmem === undefined) delete process.env.OH_SANDBOX_VMEM_LIMIT;
+    else process.env.OH_SANDBOX_VMEM_LIMIT = originalVmem;
+    if (originalNproc === undefined) delete process.env.OH_SANDBOX_NPROC_LIMIT;
+    else process.env.OH_SANDBOX_NPROC_LIMIT = originalNproc;
+  }
+});
+
 test("sandboxed commands carry the RLIMIT_AS cap on Linux", async () => {
   const tree = await workspaceTree();
   const localCalls: string[] = [];
@@ -216,12 +248,18 @@ test("sandboxed commands carry the RLIMIT_AS cap on Linux", async () => {
     },
     userHome: tree.home,
     runtimeReadRoots: [],
+    resourceLimits: {
+      memoryLimitBytes: 500 * 1024 * 1024,
+      nprocLimit: 2,
+    },
   });
 
   const previousPlatform = process.platform;
   const previousLimit = process.env.OH_SANDBOX_VMEM_LIMIT;
+  let expectedPrefix: string;
   try {
     Object.defineProperty(process, "platform", { value: "linux" });
+    expectedPrefix = resourceCapPrefix(2, 512000);
     delete process.env.OH_SANDBOX_VMEM_LIMIT;
     await operations.exec("cd public_data && pwd", tree.workspace, {
       onData: () => undefined,
@@ -235,7 +273,7 @@ test("sandboxed commands carry the RLIMIT_AS cap on Linux", async () => {
 
   assert.equal(
     localCalls[0],
-    "sandboxed:ulimit -v 512000 2>/dev/null; cd public_data && pwd",
+    `sandboxed:${expectedPrefix}cd public_data && pwd`,
   );
 });
 

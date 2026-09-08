@@ -71,6 +71,7 @@ PI_CAPABILITIES = HarnessCapabilities(
     workflow_rollback=True,
     external_task_resume=True,
     native_workspace_tools=frozenset({"read", "write", "edit", "terminal"}),
+    enforced_limits=frozenset({"memory", "nproc"}),
 )
 _WORKFLOW_PATH = Path("public_data/workflow_canvas/workflow.py")
 _SYSTEM_PROMPT = """You are a coding agent inside one conversation workspace.
@@ -626,6 +627,11 @@ class PiAdapter:
                 "system_prompt": _SYSTEM_PROMPT,
                 "model": {**session.config["model"], "api_key": api_key},
                 "tools": self._business_tools.specs(),
+                **(
+                    {"resource_limits": session.config["resource_limits"]}
+                    if "resource_limits" in session.config
+                    else {}
+                ),
             }
         )
         logger.info(
@@ -1067,6 +1073,11 @@ def _session_config(spec: SessionSpec) -> dict[str, Any]:
             **({"api": api} if api is not None else {}),
             **({"context_window": context_window} if context_window else {}),
         },
+        **(
+            {"resource_limits": spec.resource_limits.model_dump(mode="json")}
+            if spec.resource_limits is not None
+            else {}
+        ),
         "extra": _safe_session_extra(spec.extra),
     }
 
