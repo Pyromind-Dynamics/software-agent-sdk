@@ -894,6 +894,12 @@ async def test_runner_loads_sandbox_skills_and_business_tools(
             "df_submit_pipeline",
             "df_check_progress",
             "df_stop_task",
+            "run_dataset_analysis",
+            "submit_dataset_analysis",
+            "run_data_synthesis",
+            "submit_data_synthesis",
+            "check_dataset_task",
+            "stop_dataset_task",
             "edp_render",
             "edp_submit",
             "edp_aggregate",
@@ -920,7 +926,7 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
         repository / ".agents" / "skills" / "training-analysis",
     ]
     specs = PyromindBusinessToolHost(roots).specs()
-    assert len(specs) == 22
+    assert len(specs) == 28
     assert {"edp_render", "edp_submit", "edp_aggregate"} <= {
         spec["name"] for spec in specs
     }

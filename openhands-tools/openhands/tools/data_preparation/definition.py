@@ -54,10 +54,13 @@ from openhands.tools.utils import default_path_access_policy
 
 
 RUNTIME_FILENAMES = (
+    "avi_pcb_runtime.py",
+    "dataset_job_runtime.py",
     "df_logging.py",
     "generate_report.py",
     "image_utils.py",
     "preparation_runtime.py",
+    "source_fingerprint.py",
     "validate_prepared_data.py",
 )
 

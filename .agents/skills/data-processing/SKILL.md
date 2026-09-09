@@ -1,31 +1,9 @@
 ---
 name: data-processing
 description: >-
-  Pyromind 数据处理统一入口，含三种处理范式（按执行基底划分，每种范式下
-  细分场景 case）：格式转换/字段映射/简单过滤（format-conversion，无 LLM）；
-  DataFlow 抽样/清洗/生成/评分/格式化（llm-pipeline，覆盖 SFT、DPO、推理、
-  代码、RAG、多轮对话、Function Call、质量评估、Text2SQL、多模态标注等
-  case）；编排式场景数据处理（environment-processing：单条数据的处理
-  需在数据自带镜像的特定环境中执行复杂流程，编排"渲染分片→逐条
-  执行→聚合"多阶段链路，覆盖 tmax 终端任务验证和具身机器人数据清洗
-  等编排 case）。
-  统一 SOP：预览探查→范式选型→小样试跑→用户确认→平台全量→回调分诊→交付。
-  仅创建/管理单个沙箱容器用 sandbox；训练效果分析用
-  training-analysis；生成训练/评测工作流用 generate-workflow-dsl。
-triggers:
-  - 数据清洗
-  - 数据准备
-  - 数据处理
-  - 格式转换
-  - 字段映射
-  - tmax
-  - 可用性验证
-  - 可行性验证
-  - 环境数据处理
-  - 环境编排
-  - 具身智能数据清洗
-  - LeRobot
-  - S2机器人数据
+  Pyromind 数据处理统一入口。用于格式转换、DataFlow 内容处理、从源数据分析
+  标签分布、按已确认 Gap 合成文本或 AVI/PCB 图片，以及数据自带镜像中的
+  环境编排处理。统一执行预览、小样、人工确认、异步全量和报告校验。
 license: MIT
 ---
 
@@ -41,6 +19,8 @@ license: MIT
 |---|---|---|
 | 格式转换/字段映射/简单过滤，无 LLM、无跨行操作 | format-conversion | references/paradigms/format-conversion/playbook.md |
 | 内容级清洗/抽样/生成/评分，用 DataFlow 算子或 LLM | llm-pipeline | references/paradigms/llm-pipeline/playbook.md |
+| 从源数据统计/推断标签分布并提出 Gap，不依赖 eval | distribution-analysis | references/paradigms/distribution-analysis.md |
+| 按已确认 Gap 合成文本或 AVI/PCB 图片数据 | gap-driven-synthesis | references/paradigms/gap-driven-synthesis.md |
 | 单条数据要在特定环境（数据自带镜像）执行复杂流程（跑命令/测试/判定），需多阶段编排 | environment-processing | references/paradigms/environment-processing/playbook.md |
 | S2/LeRobot 机器人数据的多模态对齐、静止帧清理、批量转换与校验 | environment-processing（embodied case） | references/paradigms/environment-processing/cases/embodied-data-cleaning.md |
 | 编排任务无匹配 ProcessingProfile（一次性/探索性） | environment-processing（模式 B） | 同上 |
@@ -68,3 +48,7 @@ debug-workflow。路由不确定时 AskUserQuestion，不要猜。
    把其中的 input 行重组为子集输入补跑同一 pipeline 并合并产出，单条挂起
    不再阻塞整轮（墙钟截止见 dataflow-common.md）。
 7. **交付**：展示产物与统计；场景内的产物契约与失败分类学以 playbook 为准。
+
+一期边界：分布分析不读取 eval/rubric/badcase；不注册 Dataset Version 或
+SQLite 元数据；不处理音视频。通用图片只分析或生成图文答案，生成新像素必须
+命中显式场景策略。

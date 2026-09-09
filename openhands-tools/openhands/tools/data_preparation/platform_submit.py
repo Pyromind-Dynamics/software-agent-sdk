@@ -70,10 +70,13 @@ if TYPE_CHECKING:
 
 
 RUNTIME_FILENAMES = (
+    "avi_pcb_runtime.py",
+    "dataset_job_runtime.py",
     "df_logging.py",
     "generate_report.py",
     "image_utils.py",
     "preparation_runtime.py",
+    "source_fingerprint.py",
     "validate_prepared_data.py",
 )
 IMAGE_UTILS_API_VERSION = "2"
@@ -87,6 +90,7 @@ OutputSchema = Literal[
     "quality_evaluation",
     "text2sql",
 ]
+DatasetTaskKind = Literal["data_preparation", "dataset_analysis", "data_synthesis"]
 
 TOOL_DESCRIPTION = """\
 Submit a DataFlow pipeline for asynchronous execution on Pyromind platform.
@@ -156,6 +160,14 @@ class DfSubmitPipelineAction(Action):
         ),
     )
     input_path: str = Field(description="Source data path in Pyromind Storage.")
+    support_file_path: str | None = Field(
+        default=None,
+        description=(
+            "Optional workspace JSON contract staged beside the frozen script and "
+            "passed as its third positional argument. Dataset tools use this for "
+            "analysis_spec.json or augmentation_plan.json."
+        ),
+    )
     mode: Literal["full", "resume"] = Field(default="full")
     resume_run_id: uuid.UUID | None = Field(
         default=None,
@@ -277,6 +289,9 @@ class DataPreparationTaskAssociation:
         runtime_dir_name: str = "",
         runtime_storage_dir: str | None = None,
         image_utils_api_version: str | None = None,
+        task_kind: DatasetTaskKind = "data_preparation",
+        support_file_name: str | None = None,
+        support_file_fingerprint: str | None = None,
         resumed: bool = False,
         reuse_assessment: dict[str, Any] | None = None,
         status: str = "Pending",
@@ -299,6 +314,9 @@ class DataPreparationTaskAssociation:
         self.runtime_dir_name = runtime_dir_name
         self.runtime_storage_dir = runtime_storage_dir
         self.image_utils_api_version = image_utils_api_version
+        self.task_kind: DatasetTaskKind = task_kind
+        self.support_file_name = support_file_name
+        self.support_file_fingerprint = support_file_fingerprint
         self.resumed = resumed
         self.reuse_assessment = reuse_assessment
         self.status = status
@@ -325,6 +343,9 @@ class DataPreparationTaskAssociation:
             "runtime_dir_name": self.runtime_dir_name,
             "runtime_storage_dir": self.runtime_storage_dir,
             "image_utils_api_version": self.image_utils_api_version,
+            "task_kind": self.task_kind,
+            "support_file_name": self.support_file_name,
+            "support_file_fingerprint": self.support_file_fingerprint,
             "resumed": self.resumed,
             "reuse_assessment": self.reuse_assessment,
             "status": self.status,
@@ -337,6 +358,9 @@ class DataPreparationTaskAssociation:
         model_profile = data.get("model_profile", "text")
         if model_profile not in {"text", "vision"}:
             raise ValueError(f"Invalid persisted model_profile: {model_profile}")
+        task_kind = data.get("task_kind", "data_preparation")
+        if task_kind not in {"data_preparation", "dataset_analysis", "data_synthesis"}:
+            raise ValueError(f"Invalid persisted task_kind: {task_kind}")
         assoc = cls(
             task_id=data["task_id"],
             conversation_id=data["conversation_id"],
@@ -355,6 +379,9 @@ class DataPreparationTaskAssociation:
             runtime_dir_name=data.get("runtime_dir_name", ""),
             runtime_storage_dir=data.get("runtime_storage_dir"),
             image_utils_api_version=data.get("image_utils_api_version"),
+            task_kind=cast(DatasetTaskKind, task_kind),
+            support_file_name=data.get("support_file_name"),
+            support_file_fingerprint=data.get("support_file_fingerprint"),
             resumed=bool(data.get("resumed", False)),
             reuse_assessment=data.get("reuse_assessment"),
             status=data.get("status", "Pending"),
@@ -451,6 +478,11 @@ class DfSubmitPipelineExecutor(
         storage_secret_headers: dict[str, str] | None = None,
         task_store_dir: str | None = None,
         timeout: int = 30,
+        task_kind: DatasetTaskKind = "data_preparation",
+        output_namespace: str = "data_preparation",
+        output_filename: str = "processed.jsonl",
+        python_packages: tuple[str, ...] | None = None,
+        requires_llm: bool = True,
     ) -> None:
         self._env = env
         self._cluster = cluster
@@ -468,6 +500,11 @@ class DfSubmitPipelineExecutor(
         self._storage_secret_headers = dict(storage_secret_headers or {})
         self._task_store_dir = Path(task_store_dir) if task_store_dir else None
         self._timeout = timeout
+        self._task_kind = task_kind
+        self._output_namespace = output_namespace.strip("/")
+        self._output_filename = output_filename
+        self._python_packages = python_packages
+        self._requires_llm = requires_llm
 
     def __call__(
         self,
@@ -483,7 +520,9 @@ class DfSubmitPipelineExecutor(
             prior_run: DataPreparationTaskAssociation | None = None
             should_stage_runtime = False
             should_stage_script = False
+            should_stage_support_file = False
             local_script_path: str | None = None
+            local_support_file_path: str | None = None
 
             if resumed:
                 if action.resume_run_id is None:
@@ -493,6 +532,10 @@ class DfSubmitPipelineExecutor(
                 if prior_run is None:
                     raise ValueError(
                         f"Cannot resume unknown data-preparation run {run_id}."
+                    )
+                if prior_run.task_kind != self._task_kind:
+                    raise ValueError(
+                        f"Cannot resume {prior_run.task_kind} as {self._task_kind}."
                     )
                 if input_path != prior_run.input_path:
                     raise ValueError(
@@ -537,7 +580,23 @@ class DfSubmitPipelineExecutor(
                     should_stage_script = True
                     if output_schema == "vision":
                         self._preflight_managed_image_pipeline(Path(local_script_path))
-                llm_env = _build_llm_env(conversation, model_profile)
+                if action.support_file_path is None:
+                    support_file_name = prior_run.support_file_name
+                    support_file_fingerprint = prior_run.support_file_fingerprint
+                else:
+                    local_support_file_path, _ = _validate_local_support_file(
+                        conversation, action.support_file_path
+                    )
+                    support_file_name = f"job-spec-r{execution_revision}.json"
+                    support_file_fingerprint = _file_sha256(
+                        Path(local_support_file_path)
+                    )
+                    should_stage_support_file = True
+                llm_env = (
+                    _build_llm_env(conversation, model_profile)
+                    if self._requires_llm
+                    else {}
+                )
                 model_fingerprint = _model_fingerprint(llm_env)
                 changed_dimensions = _changed_dimensions(
                     prior_run=prior_run,
@@ -547,6 +606,7 @@ class DfSubmitPipelineExecutor(
                     model_fingerprint=model_fingerprint,
                     output_schema=output_schema,
                     runtime_fingerprint=runtime_fingerprint,
+                    support_file_fingerprint=support_file_fingerprint,
                 )
                 if changed_dimensions and action.reuse_assessment is None:
                     raise ValueError(
@@ -575,7 +635,7 @@ class DfSubmitPipelineExecutor(
                 output_root = (
                     self._output_root
                     or f"{PYROMIND_AGENT_STORAGE_ROOT}/{conversation.id}/"
-                    "data_preparation"
+                    + self._output_namespace
                 )
                 output_dir = str(PurePosixPath(output_root) / str(run_id))
                 execution_revision = 1
@@ -584,7 +644,11 @@ class DfSubmitPipelineExecutor(
                 prompt_fingerprint = action.prompt_fingerprint
                 frozen_script_name = "pipeline.py"
                 pipeline_fingerprint = _file_sha256(Path(local_script_path))
-                llm_env = _build_llm_env(conversation, model_profile)
+                llm_env = (
+                    _build_llm_env(conversation, model_profile)
+                    if self._requires_llm
+                    else {}
+                )
                 model_fingerprint = _model_fingerprint(llm_env)
                 runtime_fingerprint = self._runtime_fingerprint()
                 runtime_dir_name = "runtime-r1"
@@ -592,6 +656,17 @@ class DfSubmitPipelineExecutor(
                     conversation, runtime_fingerprint
                 )
                 image_utils_api_version = IMAGE_UTILS_API_VERSION
+                support_file_name = None
+                support_file_fingerprint = None
+                if action.support_file_path is not None:
+                    local_support_file_path, _ = _validate_local_support_file(
+                        conversation, action.support_file_path
+                    )
+                    support_file_name = "job-spec.json"
+                    support_file_fingerprint = _file_sha256(
+                        Path(local_support_file_path)
+                    )
+                    should_stage_support_file = True
                 should_stage_runtime = True
                 should_stage_script = True
                 if output_schema == "vision":
@@ -616,6 +691,10 @@ class DfSubmitPipelineExecutor(
                     if action.reuse_assessment is not None
                     else None
                 ),
+                output_filename=self._output_filename,
+                python_packages=self._python_packages,
+                support_file_name=support_file_name,
+                task_kind=self._task_kind,
             )
             workflow = _build_dataflow_workflow(action, run_id, command)
         except PipelineResolutionError as exc:
@@ -675,6 +754,15 @@ class DfSubmitPipelineExecutor(
                     conversation,
                     frozen_script_name=frozen_script_name,
                 )
+            if should_stage_support_file:
+                if local_support_file_path is None or support_file_name is None:
+                    raise ValueError("Resolved dataset job spec is unavailable.")
+                self._stage_script(
+                    local_support_file_path,
+                    output_dir,
+                    conversation,
+                    frozen_script_name=support_file_name,
+                )
             response = submit_workflow_task(
                 client=client,
                 workflow=workflow,
@@ -708,6 +796,9 @@ class DfSubmitPipelineExecutor(
             runtime_dir_name=runtime_dir_name,
             runtime_storage_dir=runtime_storage_dir,
             image_utils_api_version=image_utils_api_version,
+            task_kind=self._task_kind,
+            support_file_name=support_file_name,
+            support_file_fingerprint=support_file_fingerprint,
             resumed=resumed,
             reuse_assessment=(
                 action.reuse_assessment.model_dump()
@@ -739,7 +830,7 @@ class DfSubmitPipelineExecutor(
         conversation.register_active_long_task(
             ActiveLongTask(
                 task_id=task_id,
-                kind="data_preparation",
+                kind=self._task_kind,
                 status=response.status,
             )
         )
@@ -748,10 +839,10 @@ class DfSubmitPipelineExecutor(
                 "DataFlow pipeline submitted. "
                 f"task_id={task_id}, run_id={run_id}, "
                 f"revision={execution_revision}, output_dir={output_dir}. "
-                "While the job runs, call df_check_progress with this "
+                "While the job runs, check its progress with this "
                 "output_dir to report live progress, ETA, and recent output "
                 "records. After the terminal callback, preview "
-                f"{output_dir}/report.json, then processed.jsonl."
+                f"{output_dir}/report.json, then {self._output_filename}."
             ),
             status=response.status,
             task_id=task_id,
@@ -1004,6 +1095,10 @@ def _build_dataflow_command(
     image_utils_api_version: str | None = None,
     output_schema: str | None = None,
     reuse_assessment: dict[str, Any] | None = None,
+    output_filename: str = "processed.jsonl",
+    python_packages: tuple[str, ...] | None = None,
+    support_file_name: str | None = None,
+    task_kind: DatasetTaskKind = "data_preparation",
 ) -> str:
     """Assemble the shell command executed inside the CustomCommandNode Pod."""
     pod_input = _pod_path(input_path)
@@ -1017,7 +1112,7 @@ def _build_dataflow_command(
             else pod_output_dir
         )
     frozen_script = f"{pod_output_dir}/{frozen_script_name}"
-    output_file = f"{pod_output_dir}/processed.jsonl"
+    output_file = f"{pod_output_dir}/{output_filename}"
     venv_python = "/tmp/df-venv/bin/python"
     required_runtime_files = (
         RUNTIME_FILENAMES
@@ -1052,13 +1147,15 @@ def _build_dataflow_command(
 
     # Pipeline arguments
     pipeline_args = [shlex.quote(pod_input), shlex.quote(output_file)]
+    if support_file_name:
+        pipeline_args.append(shlex.quote(f"{pod_output_dir}/{support_file_name}"))
 
     # Build the full command chain
+    packages = python_packages or (f"open-dataflow=={SUPPORTED_DATAFLOW_VERSION}",)
+    package_args = " ".join(shlex.quote(item) for item in packages)
     setup_steps = [
         "python3 -m venv /tmp/df-venv",
-        "/tmp/df-venv/bin/pip install"
-        " --use-deprecated=legacy-resolver "
-        f"open-dataflow=={SUPPORTED_DATAFLOW_VERSION}",
+        "/tmp/df-venv/bin/pip install --use-deprecated=legacy-resolver " + package_args,
         f"mkdir -p {shlex.quote(pod_output_dir)}",
         f"test -f {shlex.quote(frozen_script)}",
         *[
@@ -1066,6 +1163,23 @@ def _build_dataflow_command(
             for filename in required_runtime_files
         ],
     ]
+    source_integrity_step = "source_integrity_rc=0"
+    if task_kind != "data_preparation":
+        fingerprint_tool = f"{pod_runtime_dir}/source_fingerprint.py"
+        setup_steps.append(
+            "source_fingerprint_before=$("
+            f"{venv_python} {shlex.quote(fingerprint_tool)} "
+            f"{shlex.quote(pod_input)})"
+        )
+        source_integrity_step = (
+            "source_integrity_rc=0; "
+            "source_fingerprint_after=$("
+            f"{venv_python} {shlex.quote(fingerprint_tool)} "
+            f"{shlex.quote(pod_input)}) || source_integrity_rc=$?; "
+            'if [ "$source_integrity_rc" -eq 0 ] && '
+            '[ "$source_fingerprint_before" != "$source_fingerprint_after" ]; '
+            "then source_integrity_rc=90; fi"
+        )
     pipeline_step = (
         f"{env_prefix} {venv_python} {shlex.quote(frozen_script)}"
         f" {' '.join(pipeline_args)}"
@@ -1108,14 +1222,35 @@ def _build_dataflow_command(
             json.dumps(reuse_assessment, ensure_ascii=False)
         )
     report_step += " || true"
+    dataset_validation_step = "dataset_validation_rc=0"
+    if task_kind != "data_preparation":
+        if support_file_name is None:
+            raise ValueError(f"{task_kind} requires a staged JSON spec")
+        finalizer = f"{pod_runtime_dir}/dataset_job_runtime.py"
+        spec_file = f"{pod_output_dir}/{support_file_name}"
+        dataset_validation_step = (
+            "dataset_validation_rc=0; "
+            'if [ "$pipeline_rc" -eq 0 ] && '
+            '[ "$source_integrity_rc" -eq 0 ]; then '
+            f"{venv_python} {shlex.quote(finalizer)} "
+            f"--kind {shlex.quote(task_kind)} "
+            f"--output-dir {shlex.quote(pod_output_dir)} "
+            f"--primary {shlex.quote(output_file)} "
+            f"--spec {shlex.quote(spec_file)} "
+            f"--input {shlex.quote(pod_input)}"
+            " || dataset_validation_rc=$?; fi"
+        )
     final_step = (
         'if [ "$pipeline_rc" -ne 0 ]; then exit "$pipeline_rc"; fi; '
-        'exit "$validation_rc"'
+        'if [ "$validation_rc" -ne 0 ]; then exit "$validation_rc"; fi; '
+        'if [ "$source_integrity_rc" -ne 0 ]; then '
+        'exit "$source_integrity_rc"; fi; '
+        'exit "$dataset_validation_rc"'
     )
     return (
         " && ".join([*setup_steps, pipeline_step])
-        + f"; pipeline_rc=$?; {validation_step}; "
-        + f"{report_step}; {final_step}"
+        + f"; pipeline_rc=$?; {validation_step}; {report_step}; "
+        + f"{source_integrity_step}; {dataset_validation_step}; {final_step}"
     )
 
 
@@ -1184,6 +1319,23 @@ def _validate_local_pipeline(
     return str(path), workspace_relative_path(conversation, path)
 
 
+def _validate_local_support_file(
+    conversation: BaseConversation,
+    support_file_path: str,
+) -> tuple[str, str]:
+    try:
+        path = resolve_workspace_file(
+            conversation,
+            support_file_path,
+            allow_virtual_conversation_path=True,
+        )
+    except ValueError as exc:
+        raise PipelineResolutionError(str(exc)) from exc
+    if path.suffix.lower() != ".json":
+        raise PipelineResolutionError("support_file_path must point to a JSON file.")
+    return str(path), workspace_relative_path(conversation, path)
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -1209,6 +1361,7 @@ def _changed_dimensions(
     model_fingerprint: str,
     output_schema: str | None,
     runtime_fingerprint: str | None,
+    support_file_fingerprint: str | None = None,
 ) -> list[str]:
     changed: list[str] = []
     if (
@@ -1227,6 +1380,12 @@ def _changed_dimensions(
         changed.append("schema")
     if runtime_fingerprint != prior_run.runtime_fingerprint:
         changed.append("runtime")
+    if (
+        prior_run.support_file_fingerprint is not None
+        and support_file_fingerprint != prior_run.support_file_fingerprint
+        and "schema" not in changed
+    ):
+        changed.append("schema")
     return changed
 
 

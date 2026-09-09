@@ -31,6 +31,14 @@ from openhands.tools.data_preparation import (
     DfStopTaskTool,
     DfSubmitPipelineTool,
 )
+from openhands.tools.dataset_ops.tools import (
+    CheckDatasetTaskTool,
+    RunDatasetAnalysisTool,
+    RunDataSynthesisTool,
+    StopDatasetTaskTool,
+    SubmitDatasetAnalysisTool,
+    SubmitDataSynthesisTool,
+)
 from openhands.tools.environment_processing import (
     EdpAggregateTool,
     EdpRenderTool,
@@ -71,6 +79,7 @@ _READ_ONLY_TOOLS = frozenset(
     {
         "preview_dataset",
         "df_check_progress",
+        "check_dataset_task",
         SandboxReadFileTool.name,
         AnalyzeTaskFailureTool.name,
     }
@@ -282,10 +291,28 @@ class PyromindBusinessToolHost:
             DfSubmitPipelineTool.name: lambda context: DfSubmitPipelineTool.create(
                 **self._preparation_params(context)
             )[0],
+            RunDatasetAnalysisTool.name: lambda _context: RunDatasetAnalysisTool.create(
+                runtime_dir=str(self._preparation_runtime)
+            )[0],
+            RunDataSynthesisTool.name: lambda _context: RunDataSynthesisTool.create(
+                runtime_dir=str(self._preparation_runtime)
+            )[0],
+            SubmitDatasetAnalysisTool.name: lambda context: (
+                SubmitDatasetAnalysisTool.create(**self._preparation_params(context))[0]
+            ),
+            SubmitDataSynthesisTool.name: lambda context: (
+                SubmitDataSynthesisTool.create(**self._preparation_params(context))[0]
+            ),
             DfCheckProgressTool.name: lambda context: DfCheckProgressTool.create(
                 **self._storage_params(context)
             )[0],
+            CheckDatasetTaskTool.name: lambda context: CheckDatasetTaskTool.create(
+                **self._storage_params(context)
+            )[0],
             DfStopTaskTool.name: lambda context: DfStopTaskTool.create(
+                **self._stop_params(context)
+            )[0],
+            StopDatasetTaskTool.name: lambda context: StopDatasetTaskTool.create(
                 **self._stop_params(context)
             )[0],
             EdpRenderTool.name: lambda context: EdpRenderTool.create(
@@ -341,8 +368,14 @@ class PyromindBusinessToolHost:
             RunDatasetCleaningTool,
             DfRunPipelineTool,
             DfSubmitPipelineTool,
+            RunDatasetAnalysisTool,
+            RunDataSynthesisTool,
+            SubmitDatasetAnalysisTool,
+            SubmitDataSynthesisTool,
             DfCheckProgressTool,
+            CheckDatasetTaskTool,
             DfStopTaskTool,
+            StopDatasetTaskTool,
             EdpRenderTool,
             EdpSubmitTool,
             EdpAggregateTool,

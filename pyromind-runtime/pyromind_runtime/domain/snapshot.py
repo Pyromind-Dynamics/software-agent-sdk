@@ -123,6 +123,8 @@ class ExternalTaskState(ContractModel):
     kind: Literal[
         "data_cleaning",
         "data_preparation",
+        "dataset_analysis",
+        "data_synthesis",
         "workflow_debug",
         "environment_processing",
         "environment_processing_render",

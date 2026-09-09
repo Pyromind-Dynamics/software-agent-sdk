@@ -68,7 +68,7 @@ class WorkflowExternalTaskRegistry:
             return None
         return {
             "task_id": task_id,
-            "kind": "data_preparation",
+            "kind": preparation.task_kind,
             "run_id": preparation.run_id,
             "status": _task_status(preparation.status),
             "output_dir": preparation.output_dir,

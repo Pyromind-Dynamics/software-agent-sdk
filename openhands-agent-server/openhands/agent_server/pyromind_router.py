@@ -83,6 +83,14 @@ from openhands.tools.data_preparation import (
     DfSubmitPipelineTool,
 )
 from openhands.tools.data_preparation.progress import DfCheckProgressExecutor
+from openhands.tools.dataset_ops.tools import (
+    CheckDatasetTaskTool,
+    RunDatasetAnalysisTool,
+    RunDataSynthesisTool,
+    StopDatasetTaskTool,
+    SubmitDatasetAnalysisTool,
+    SubmitDataSynthesisTool,
+)
 from openhands.tools.environment_processing import (
     EdpAggregateTool,
     EdpRenderTool,
@@ -627,11 +635,15 @@ def _build_pyromind_storage_tools(
             Tool(name=UploadFileToPyromindTool.name, params=dict(params)),
             Tool(name=RunDatasetCleaningTool.name, params=cleaning_params),
             Tool(name=DfSubmitPipelineTool.name, params=preparation_params),
+            Tool(name=SubmitDatasetAnalysisTool.name, params=preparation_params),
+            Tool(name=SubmitDataSynthesisTool.name, params=preparation_params),
             Tool(name=EdpSubmitTool.name, params=edp_params),
             Tool(name=EdpRenderTool.name, params=edp_params),
             Tool(name=EdpAggregateTool.name, params=edp_params),
             Tool(name=DfCheckProgressTool.name, params=dict(params)),
+            Tool(name=CheckDatasetTaskTool.name, params=dict(params)),
             Tool(name=DfStopTaskTool.name, params=stop_params),
+            Tool(name=StopDatasetTaskTool.name, params=stop_params),
             Tool(name=ExtractArchiveTool.name, params=extraction_params),
             Tool(name=PreviewRemoteDatasetTool.name, params={}),
             Tool(name=SandboxUploadTool.name, params=sandbox_storage_params),
@@ -1366,6 +1378,28 @@ async def create_pyromind_conversation(
                 },
             ),
             Tool(name="df_convert"),
+            Tool(
+                name=RunDatasetAnalysisTool.name,
+                params={
+                    "runtime_dir": str(
+                        Path(skills_path)
+                        / "data-processing"
+                        / "scripts"
+                        / "preparation"
+                    )
+                },
+            ),
+            Tool(
+                name=RunDataSynthesisTool.name,
+                params={
+                    "runtime_dir": str(
+                        Path(skills_path)
+                        / "data-processing"
+                        / "scripts"
+                        / "preparation"
+                    )
+                },
+            ),
             validation_tool,
             analysis_tool,
             training_tool,

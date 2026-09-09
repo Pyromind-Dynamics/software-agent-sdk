@@ -140,6 +140,7 @@ class DfCheckProgressExecutor(
         secret_headers: dict[str, str] | None = None,
         timeout: float = 30.0,
         tail_bytes: int = DEFAULT_TAIL_BYTES,
+        output_filename: str = OUTPUT_FILENAME,
     ) -> None:
         self._storage_base_url = (
             storage_base_url or _default_storage_base_url()
@@ -148,6 +149,7 @@ class DfCheckProgressExecutor(
         self._secret_headers = dict(secret_headers or {})
         self._timeout = timeout
         self._tail_bytes = tail_bytes
+        self._output_filename = output_filename
 
     def __call__(
         self,
@@ -160,7 +162,7 @@ class DfCheckProgressExecutor(
         headers = self._resolved_headers(conversation)
 
         progress_path = f"{output_dir}/{PROGRESS_FILENAME}"
-        processed_path = f"{output_dir}/{OUTPUT_FILENAME}"
+        processed_path = f"{output_dir}/{self._output_filename}"
 
         progress = self._read_json_file(progress_path, headers)
         latest, tail_error = self._read_tail(processed_path, headers, action.tail_lines)
