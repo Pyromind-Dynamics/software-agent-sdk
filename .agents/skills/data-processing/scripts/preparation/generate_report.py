@@ -222,6 +222,7 @@ def generate_report(
     validation = _read_json_object(log_path / "validation.json")
     scenario_metrics = _read_json_object(log_path / "scenario_metrics.json")
     runtime_metadata = _read_json_object(log_path / "runtime_metadata.json")
+    source_integrity = _read_json_object(log_path / "source_integrity.json")
     checkpoint = _read_json_object(log_path / "checkpoint.json")
     if checkpoint is None:
         checkpoint = _read_dataflow_checkpoint(
@@ -241,7 +242,9 @@ def generate_report(
         correction_artifact = None
 
     # Determine overall status
-    if pipeline_exit_code != 0:
+    if source_integrity is not None and source_integrity.get("unchanged") is False:
+        overall = "failed"
+    elif pipeline_exit_code != 0:
         overall = "failed"
     elif validation is not None and validation.get("status") != "passed":
         overall = "failed"
@@ -309,6 +312,7 @@ def generate_report(
             or (runtime_metadata or {}).get("image_utils_api_version")
         ),
         "runtime_metadata": runtime_metadata,
+        "source_integrity": source_integrity,
         "checkpoint": checkpoint,
         "failure": runtime_failure,
         "validation": validation,

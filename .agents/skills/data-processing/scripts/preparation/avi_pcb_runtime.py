@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import shutil
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -22,10 +23,15 @@ import matplotlib.pyplot as plt  # noqa: E402
 SUPPORTED = frozenset({"scratch", "dot", "small_object", "pad", "hole"})
 
 
-def run_avi_pcb_plan(input_dir: Path, output_file: Path, plan_file: Path) -> int:
+def execute_plan(
+    input_path: str | Path, output_path: str | Path, plan_path: str | Path
+) -> int:
+    """Execute an approved AVI/PCB plan without owning task orchestration."""
+
+    input_dir = Path(input_path)
+    output_file = Path(output_path)
+    plan_file = Path(plan_path)
     plan = _load_object(plan_file)
-    if plan.get("adapter") != "avi_pcb":
-        raise ValueError("AVI runtime requires adapter='avi_pcb'")
     output_dir = output_file.parent
     if output_dir.resolve().is_relative_to(input_dir.resolve()):
         raise ValueError("output must not be inside the source directory")
@@ -60,11 +66,19 @@ def run_avi_pcb_plan(input_dir: Path, output_file: Path, plan_file: Path) -> int
         raise ValueError("requested children exceed bounded host capacity")
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    frozen_plan = output_dir / "augmentation_plan.json"
+    if plan_file.resolve() != frozen_plan.resolve():
+        shutil.copy2(plan_file, frozen_plan)
     provenance_file = output_dir / "provenance.jsonl"
     failure_file = output_dir / "failures.jsonl"
     failure_file.touch(exist_ok=True)
     uses: Counter[str] = Counter()
     generated_count = 0
+    validations: list[dict[str, Any]] = []
+    _write_json(
+        output_dir / "progress.json",
+        {"status": "running", "processed": 0, "total": requested},
+    )
     with (
         output_file.open("w", encoding="utf-8") as synthesized,
         provenance_file.open("w", encoding="utf-8") as provenance,
@@ -105,6 +119,7 @@ def run_avi_pcb_plan(input_dir: Path, output_file: Path, plan_file: Path) -> int
                     raise
                 uses[host_id] += 1
                 generated_count += 1
+                validations.append(validation)
                 synthesized.write(json.dumps(annotation, ensure_ascii=False) + "\n")
                 provenance.write(
                     json.dumps(
@@ -122,12 +137,59 @@ def run_avi_pcb_plan(input_dir: Path, output_file: Path, plan_file: Path) -> int
                     )
                     + "\n"
                 )
+                _write_json(
+                    output_dir / "progress.json",
+                    {
+                        "status": "running",
+                        "processed": generated_count,
+                        "total": requested,
+                    },
+                )
+    _write_json(
+        output_dir / "validation.json",
+        {
+            "status": "passed",
+            "rows": generated_count,
+            "pixel_changes_valid": all(
+                item.get("pixel_change_count", 0) > 0 for item in validations
+            ),
+            "bbox_valid": all(item.get("bbox_valid") for item in validations),
+            "diff_nonempty": all(item.get("diff_nonempty") for item in validations),
+            "label_consistent": all(
+                item.get("label_consistent") for item in validations
+            ),
+        },
+    )
+    _write_json(
+        output_dir / "runtime_metadata.json",
+        {
+            "kind": "avi_pcb",
+            "record_count": generated_count,
+            "requested_count": requested,
+            "strategies": [str(item.get("strategy_id")) for item in requests],
+        },
+    )
+    _write_json(
+        output_dir / "progress.json",
+        {"status": "succeeded", "processed": generated_count, "total": requested},
+    )
+    (output_dir / "report.html").write_text(
+        "<!doctype html><meta charset='utf-8'><title>AVI/PCB synthesis</title>"
+        f"<h1>AVI/PCB synthesis</h1><p>Generated: {generated_count}</p>",
+        encoding="utf-8",
+    )
     return generated_count
+
+
+# Compatibility for already-authored local pipelines. New pipelines use execute_plan.
+run_avi_pcb_plan = execute_plan
 
 
 def _hosts(source: Path) -> list[tuple[Path, dict[str, Any]]]:
     candidates = (
-        [source] if (source / "meta.json").is_file() else sorted(source.iterdir())
+        [source]
+        if (source / "meta.json").is_file()
+        else sorted({item.parent for item in source.rglob("meta.json")})
     )
     hosts = []
     for candidate in candidates:
@@ -182,6 +244,12 @@ def _generate(
         "image": f"assets/{sample_id}/defect.jpg",
         "diff": f"assets/{sample_id}/diff.jpg",
         "gt": f"assets/{sample_id}/gt.jpg",
+        "artifacts": [
+            {"role": "image", "path": f"assets/{sample_id}/defect.jpg"},
+            {"role": "diff", "path": f"assets/{sample_id}/diff.jpg"},
+            {"role": "gt", "path": f"assets/{sample_id}/gt.jpg"},
+            {"role": "review", "path": f"assets/{sample_id}/review.png"},
+        ],
     }
     _review(original, generated, difference, bbox, asset_dir / "review.png")
     return annotation, {
@@ -275,3 +343,7 @@ def _load_object(path: Path) -> dict[str, Any]:
 def _append_jsonl(path: Path, value: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(value, ensure_ascii=False) + "\n")
+
+
+def _write_json(path: Path, value: dict[str, Any]) -> None:
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")

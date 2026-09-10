@@ -13,14 +13,19 @@
 
 ## 执行契约
 
-Taxonomy 确认后，`N <= 200` 全量标注；否则按 `sample_id`、固定 seed 做稳定
-哈希抽样，严格取 200 个唯一训练样本。文本选 DataFlow PromptedGenerator /
+先用 `preview_dataset` 探查 schema。已有标签且源文件在 materialize 安全上限内
+时，完整拉取后生成纯 Python Pipeline，并以 `model_profile=none` 调用
+`df_run_pipeline` 做全量聚合；超过本地上限时先对 sample 的逻辑小样验证
+同一脚本，再用 `df_submit_pipeline` 对 Storage 源路径全量执行。
+
+Taxonomy 确认后，`N <= 1000` 全量标注；否则按 `sample_id`、固定 seed 做稳定
+哈希抽样，严格取 1000 个唯一训练样本。文本选 DataFlow PromptedGenerator /
 FormatStrPromptedGenerator；图像或混合数据选 managed image runtime。模型输出
 必须符合严格 JSON Schema，解析失败、超时、unknown 写入 `failures.jsonl`。
 
-用 `run_dataset_analysis` 做本地 3 条小样；确认后才调用
-`submit_dataset_analysis`。只可选 `dataflow_text`、`dataflow_vision`、
-`avi_pcb_cpu`，不得传 pip 依赖。
+无标签的 3 条试标由 `preview_dataset(mode="sample", n=3)` 选择输入，不由
+`df_run_pipeline` 截断。Taxonomy 确认后，业务抽样中的全部记录都应进入打标。
+文本用 `model_profile=text`，图像用 `vision`；工具不接受 requirements。
 
 精确报告写 count/ratio；抽样报告同时写样本 count/ratio、总体数量估算和 95%
 Wilson 区间，并标记 `sampled_estimate`。多标签比例允许总和超过 100%。
@@ -31,6 +36,6 @@ Agent 基于报告和业务上下文起草 `gap_plan.json`；工具不硬编码�
 抽样时 `current_count` 是样本实测，`estimated_total_count` 才是总体估计。
 用户确认目标数量后将 Gap 状态改为 `approved`。
 
-核心产物：`taxonomy.json`、`analysis_spec.json`、`labels.jsonl`、
+核心产物：`processed.jsonl`、`taxonomy.json`、`analysis_spec.json`、`labels.jsonl`、
 `distribution_report.json`、`gap_plan.json`、`progress.json`、
 `failures.jsonl`、`validation.json`、`report.json`、`report.html`。

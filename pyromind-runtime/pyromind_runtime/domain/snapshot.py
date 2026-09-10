@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import Field, JsonValue
+from pydantic import Field, JsonValue, field_validator
 
 from pyromind_runtime.domain.base import ContractModel
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
@@ -123,8 +123,6 @@ class ExternalTaskState(ContractModel):
     kind: Literal[
         "data_cleaning",
         "data_preparation",
-        "dataset_analysis",
-        "data_synthesis",
         "workflow_debug",
         "environment_processing",
         "environment_processing_render",
@@ -138,6 +136,14 @@ class ExternalTaskState(ContractModel):
     attempt: int | None = Field(default=None, ge=0)
     max_attempts: int | None = Field(default=None, ge=1)
     keep_ui_lock: bool = False
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def normalize_legacy_data_task_kind(cls, value: object) -> object:
+        if value in {"dataset_analysis", "data_synthesis"}:
+            return "data_preparation"
+        return value
+
     submitted_at: str
     updated_at: str
     resume_pending: bool = False

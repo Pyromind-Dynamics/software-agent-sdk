@@ -40,9 +40,11 @@ def test_check_progress_full_snapshot() -> None:
         "updated_at": "2026-07-28T10:00:00Z",
     }
     processed = "".join(json.dumps({"id": i}) + "\n" for i in range(5))
+    report = {"status": "running", "source_integrity": {"unchanged": True}}
     files = {
         "/run/progress.json": json.dumps(progress).encode(),
         "/run/processed.jsonl": processed.encode(),
+        "/run/report.json": json.dumps(report).encode(),
     }
     executor = _make_executor(files)
 
@@ -58,6 +60,9 @@ def test_check_progress_full_snapshot() -> None:
     assert obs.eta_ms == 30000
     assert len(obs.latest_records) == 5
     assert obs.latest_records[-1] == {"id": 4}
+    assert obs.report_found is True
+    assert obs.report == report
+    assert "report.status=running" in obs.text
 
 
 def test_check_progress_missing_progress_file() -> None:
@@ -69,6 +74,8 @@ def test_check_progress_missing_progress_file() -> None:
     assert obs.percent is None
     assert obs.total is None
     assert obs.latest_records == []
+    assert obs.report_found is False
+    assert obs.report is None
 
 
 def test_check_progress_tail_drops_partial_first_line() -> None:

@@ -174,20 +174,22 @@ class PreviewDatasetAction(Action):
         le=_MAX_REQUESTED_SAMPLES,
         validation_alias=AliasChoices("n", "max_samples"),
     )
-    mode: Literal["inspect", "sample"] = Field(
+    mode: Literal["inspect", "sample", "materialize"] = Field(
         default="inspect",
         description=(
             "Use 'inspect' for the existing bounded preview behavior. Use "
-            "'sample' to materialize explicitly selected user-storage files or "
-            "folders (up to n) in the conversation workspace and create a JSONL "
-            "manifest. Automatic selection is limited to min(n, 3) entries."
+            "'sample' to materialize up to n complete logical rows or selected "
+            "sample folders. Use 'materialize' to copy selected files/folders "
+            "in full for exact local analysis. Automatic directory selection "
+            "is limited to min(n, 3) entries."
         ),
     )
     sample_paths: list[str] = Field(
         default_factory=list,
         description=(
             "Optional exact user-storage file or folder paths to materialize in "
-            "sample mode. Explicit selections may contain up to n entries. When "
+            "sample/materialize mode. Explicit selections may contain up to n "
+            "entries. When "
             "omitted, up to min(n, 3) entries are selected from dataset_path in "
             "stable path order."
         ),
@@ -379,9 +381,11 @@ When only a dataset/folder name is given (no specific file):
   with the exact file path. If the folder has exactly one file, it is
   previewed directly.
 
-Use mode='sample' for user storage after inspection. It materializes at most
-three selected files or folders inside the conversation workspace, preserves
-their storage-relative layout, and returns workspace-relative
+Use mode='sample' for user storage after inspection. Row-oriented files are
+materialized as up to n complete logical rows; directories materialize at most
+three selected sample folders. Use mode='materialize' to copy selected inputs
+in full for exact local analysis. Both modes preserve storage-relative layout and return
+workspace-relative
 local_sample_paths plus a sample_manifest_path. Pass the returned
 df_run_input_path (single input) or selected local_sample_paths entry directly
 to df_run_pipeline; storage source paths are not local workspace inputs. Image
@@ -452,7 +456,7 @@ class PreviewDatasetExecutor(
                 dataset_path=dataset_path,
             )
 
-        if action.mode == "sample":
+        if action.mode in {"sample", "materialize"}:
             return self._storage_sample(action, dataset_path, headers, conversation)
 
         # Option C: try shared dataset space first
@@ -876,23 +880,28 @@ class PreviewDatasetExecutor(
             )
 
         try:
-            selection_limit = (
-                action.n
-                if action.sample_paths
-                else min(action.n, _DEFAULT_SAMPLE_COUNT)
-            )
-            selected_paths, entries = self._select_storage_samples(
-                dataset_path,
-                action.sample_paths,
-                selection_limit,
-                headers,
-            )
+            if action.mode == "materialize" and not action.sample_paths:
+                selected_paths, entries = [dataset_path], []
+            else:
+                selection_limit = (
+                    action.n
+                    if action.sample_paths
+                    else min(action.n, _DEFAULT_SAMPLE_COUNT)
+                )
+                selected_paths, entries = self._select_storage_samples(
+                    dataset_path,
+                    action.sample_paths,
+                    selection_limit,
+                    headers,
+                )
             workspace_dir = _resolve_workspace_dir(conversation)
             preview_key = hashlib.sha256(
                 json.dumps(
                     {
                         "dataset_path": dataset_path,
                         "sample_paths": selected_paths,
+                        "mode": action.mode,
+                        "n": action.n,
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -929,13 +938,41 @@ class PreviewDatasetExecutor(
                             "Sample selection exceeds the "
                             f"{_MAX_SAMPLE_FILES}-file limit."
                         )
-                    content = download_file_from_pyromind(
-                        storage_path=storage_file.path,
-                        storage_base_url=self._storage_base_url,
-                        headers=headers,
-                        timeout=self._timeout,
-                        max_bytes=_MAX_SAMPLE_FILE_BYTES,
+                    row_sample = (
+                        action.mode == "sample"
+                        and len(storage_files) == 1
+                        and _is_row_sample_path(storage_file.path)
                     )
+                    if (
+                        _is_range_sample_path(storage_file.path)
+                        and storage_file.size is not None
+                        and storage_file.size > _MAX_SAMPLE_FILE_BYTES
+                    ):
+                        url_result = self._get_download_url(storage_file.path, headers)
+                        if isinstance(url_result, PreviewDatasetObservation):
+                            raise ValueError(url_result.text)
+                        content_result = self._download_range(
+                            url_result,
+                            storage_file.path,
+                            0,
+                            _MAX_SAMPLE_FILE_BYTES - 1,
+                        )
+                        if isinstance(content_result, PreviewDatasetObservation):
+                            raise ValueError(content_result.text)
+                        content = content_result
+                    else:
+                        content = download_file_from_pyromind(
+                            storage_path=storage_file.path,
+                            storage_base_url=self._storage_base_url,
+                            headers=headers,
+                            timeout=self._timeout,
+                            max_bytes=_MAX_SAMPLE_FILE_BYTES,
+                        )
+
+                    if row_sample:
+                        content = _sample_logical_rows(
+                            content, storage_file.path, action.n
+                        )
                     total_bytes += len(content)
                     if total_bytes > _MAX_SAMPLE_TOTAL_BYTES:
                         raise ValueError(
@@ -2597,6 +2634,84 @@ def _parse_preview_chunks(
         parsed = _parse_raw_text_lines(lines, max_samples, truncated)
     parsed["format_hint"] = _preview_format_hint(kind, chunks)
     return parsed
+
+
+def _sample_logical_rows(content: bytes, file_path: str, limit: int) -> bytes:
+    """Materialize complete logical rows for row-oriented sample files."""
+
+    suffix = PurePosixPath(file_path).suffix.lower()
+    if suffix in {".csv", ".tsv"}:
+        from io import StringIO
+
+        text = content.decode("utf-8-sig", errors="replace")
+        source = StringIO(text)
+        target = StringIO()
+        delimiter = "\t" if suffix == ".tsv" else ","
+        reader = csv.reader(source, delimiter=delimiter)
+        writer = csv.writer(target, delimiter=delimiter, lineterminator="\n")
+        try:
+            writer.writerow(next(reader))
+        except StopIteration:
+            return content
+        for index, row in enumerate(reader):
+            if index >= limit:
+                break
+            writer.writerow(row)
+        return target.getvalue().encode("utf-8")
+    if suffix in {".jsonl", ".jsonlines", ".txt"}:
+        lines = content.decode("utf-8", errors="replace").splitlines()
+        selected = lines[:limit]
+        return (("\n".join(selected) + "\n") if selected else "").encode("utf-8")
+    if suffix in {".xlsx", ".xlsm"}:
+        try:
+            from io import BytesIO
+
+            from openpyxl import Workbook, load_workbook
+
+            source_book = load_workbook(
+                BytesIO(content), read_only=True, data_only=True
+            )
+            source_sheet = source_book.active
+            if source_sheet is None:
+                source_book.close()
+                return content
+            target_book = Workbook()
+            target_sheet = target_book.active
+            assert target_sheet is not None
+            for index, row in enumerate(source_sheet.iter_rows(values_only=True)):
+                if index > limit:
+                    break
+                target_sheet.append(list(row))
+            source_book.close()
+            buffer = BytesIO()
+            target_book.save(buffer)
+            target_book.close()
+            return buffer.getvalue()
+        except Exception:
+            return content
+    return content
+
+
+def _is_row_sample_path(file_path: str) -> bool:
+    return PurePosixPath(file_path).suffix.lower() in {
+        ".csv",
+        ".tsv",
+        ".jsonl",
+        ".jsonlines",
+        ".txt",
+        ".xlsx",
+        ".xlsm",
+    }
+
+
+def _is_range_sample_path(file_path: str) -> bool:
+    return PurePosixPath(file_path).suffix.lower() in {
+        ".csv",
+        ".tsv",
+        ".jsonl",
+        ".jsonlines",
+        ".txt",
+    }
 
 
 def _parse_excel_bytes(

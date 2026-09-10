@@ -1,5 +1,6 @@
 """Tests for the DataFlow platform submission tool."""
 
+import subprocess
 import uuid
 from pathlib import Path
 from typing import Any
@@ -83,7 +84,9 @@ def test_build_dataflow_command_structure() -> None:
         image_utils_api_version="1",
     )
     assert "python3 -m venv /tmp/df-venv" in cmd
-    assert "pip install --use-deprecated=legacy-resolver open-dataflow==1.0.10" in cmd
+    assert "open-dataflow==1.0.10" in cmd
+    assert "opencv-python-headless==4.10.0.84" in cmd
+    assert "source_fingerprint.py" in cmd
     assert "mkdir -p" in cmd
     assert "/target-workspace/data/input.jsonl" in cmd
     assert "/target-workspace/output/run1/pipeline.py" in cmd
@@ -98,6 +101,46 @@ def test_build_dataflow_command_structure() -> None:
     assert "--image-utils-api-version 1" in cmd
     assert " && " in cmd
     assert "cp " not in cmd
+
+
+def test_none_profile_is_public_and_command_has_no_model_credentials() -> None:
+    action = DfSubmitPipelineAction(
+        script_path="pipeline.py",
+        input_path="/data/input.jsonl",
+        model_profile="none",
+        output_schema="artifacts",
+    )
+    command = _build_dataflow_command(
+        input_path="/data/input.jsonl",
+        output_dir="/output/run-none",
+        llm_env={},
+        convert_format="none",
+        runtime_dir_name="runtime-r1",
+        output_schema="artifacts",
+    )
+
+    assert action.model_profile == "none"
+    assert "DF_API_KEY=" not in command
+    assert "processed.jsonl --schema artifacts" in command
+
+
+def test_resume_command_rejects_a_changed_source_fingerprint() -> None:
+    command = _build_dataflow_command(
+        input_path="/data/input.jsonl",
+        output_dir="/output/run-resume",
+        llm_env={},
+        convert_format="none",
+        runtime_dir_name="runtime-r1",
+        resumed=True,
+    )
+
+    assert "--expected-report" in command
+    assert "/output/run-resume/source_integrity.json" in command
+    assert "resume_source_guard_rc" in command
+    syntax = subprocess.run(
+        ["bash", "-n"], input=command, text=True, capture_output=True, check=False
+    )
+    assert syntax.returncode == 0, syntax.stderr
 
 
 def test_build_dataflow_command_validates_dpo_schema() -> None:

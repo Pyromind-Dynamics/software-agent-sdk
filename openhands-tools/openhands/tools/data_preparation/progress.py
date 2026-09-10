@@ -1,4 +1,4 @@
-"""Check live progress of an async DataFlow pipeline run on Pyromind Storage.
+"""Check live progress of an asynchronous Python pipeline on Pyromind Storage.
 
 Reads the ``progress.json`` snapshot (written by the pipeline after each
 batch) plus the tail of ``processed.jsonl`` from a run's output directory,
@@ -47,12 +47,12 @@ DEFAULT_TAIL_LINES = 5
 DEFAULT_TAIL_BYTES = 64 * 1024
 
 TOOL_DESCRIPTION = """\
-Check the live progress of an asynchronous DataFlow pipeline run.
+Check the live progress of an asynchronous data-processing pipeline run.
 
 Pass the `output_dir` returned by `df_submit_pipeline`. The tool reads the
 run's `progress.json` snapshot (total / processed / succeeded / failed /
-ETA) and the most recent records from `processed.jsonl`, so you can report
-progress and verify output quality while the platform job is still running.
+ETA), the most recent records from `processed.jsonl`, and `report.json` when
+available, so you can report progress and verify output quality.
 
 Use this when the user asks about the status of a submitted pipeline, or
 proactively between submission and the terminal Kafka callback for
@@ -112,6 +112,12 @@ class DfCheckProgressObservation(Observation):
         default_factory=list,
         description="Most recent successfully processed records.",
     )
+    report_found: bool = Field(
+        default=False, description="Whether the generic report.json was available."
+    )
+    report: dict[str, Any] | None = Field(
+        default=None, description="Generic terminal or partial pipeline report."
+    )
 
     @property
     def visualize(self) -> Text:
@@ -163,13 +169,17 @@ class DfCheckProgressExecutor(
 
         progress_path = f"{output_dir}/{PROGRESS_FILENAME}"
         processed_path = f"{output_dir}/{self._output_filename}"
+        report_path = f"{output_dir}/report.json"
 
         progress = self._read_json_file(progress_path, headers)
+        report = self._read_json_file(report_path, headers)
         latest, tail_error = self._read_tail(processed_path, headers, action.tail_lines)
 
         fields: dict[str, Any] = {
             "output_dir": output_dir,
             "latest_records": latest,
+            "report_found": isinstance(report, dict),
+            "report": report if isinstance(report, dict) else None,
         }
         percent: float | None = None
         if isinstance(progress, dict):
@@ -396,6 +406,11 @@ class DfCheckProgressExecutor(
             if fields.get("updated_at"):
                 parts.append(f"updated_at={fields['updated_at']}")
 
+        report = fields.get("report")
+        if isinstance(report, dict):
+            status = report.get("status") or report.get("overall_status")
+            parts.append(f"report.status={status or 'unknown'}")
+
         records = fields.get("latest_records") or []
         if records:
             parts.append("")
@@ -416,7 +431,7 @@ class DfCheckProgressExecutor(
 class DfCheckProgressTool(
     ToolDefinition[DfCheckProgressAction, DfCheckProgressObservation]
 ):
-    """Tool definition for checking DataFlow pipeline progress."""
+    """Tool definition for checking data-processing pipeline progress."""
 
     @classmethod
     def create(

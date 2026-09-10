@@ -11,7 +11,8 @@ license: MIT
 
 数据处理任务统一从本 skill 进入：先按路由表选定处理范式并读取对应 playbook
 （范式内按 case 路由表读取场景 case 文档），再按通用 SOP 执行。storage 数据
-只能用 `preview_dataset` 查看，不得本地下载或用本地文件工具读取。
+先用 `preview_dataset` 探查；需要执行本地 Pipeline 时再用 `sample` 或
+`materialize` 模式将明确范围的数据放入会话工作区。
 
 ## 范式路由（先做这一步）
 
@@ -36,10 +37,12 @@ debug-workflow。路由不确定时 AskUserQuestion，不要猜。
    翻页重预览；每个数据集的结构确认一次完成（列表 + schema + 样例）。
 2. **选型**：按上表读取范式 playbook；范式内按 case 路由表只读取当前场景
    相关 reference。
-3. **小样**：按 playbook 规定的试跑形态先小样（limit=3 / sample / smoke 片），
-   迭代过程不向用户展示，只展示符合预期的结果。
-4. **门禁**：小样通过后必须获得用户明确确认才提交全量；禁止 agent 默认全量。
-5. **全量**：按场景 case 的执行约定提交。DataFlow/EDP 平台任务（含具身
+3. **本地执行**：Agent 按真实 schema 写 Python Pipeline。`df_run_pipeline`
+   完整处理传入的本地输入，不负责抽样；清洗/合成小样由 preview 选择的输入
+   和计划控制，精确分布统计可处理完整 materialize 文件。
+4. **门禁**：Taxonomy 与合成小样通过后必须获得用户明确确认才提交后续全量；
+   已有标签的确定性全量统计不设人工门禁，且模型调用必须为零。
+5. **全量**：需要平台执行时统一用 `df_submit_pipeline`。DataFlow/EDP 平台任务（含具身
    case 的逐 episode 执行）等待终态回调，运行中用 df_check_progress 观察。
    需介入平台任务时先 df_stop_task 停任务。
 6. **分诊**：回调后先看 report.json / validation / verdicts，按失败分类决定
