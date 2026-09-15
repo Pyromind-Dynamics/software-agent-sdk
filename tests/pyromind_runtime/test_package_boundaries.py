@@ -1,10 +1,42 @@
 import ast
+from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
+from pyromind_runtime.application.event_projection import ProductEventProjector
+from pyromind_runtime.application.snapshot_projector import SnapshotProjector
+from pyromind_runtime.domain.capabilities import HarnessCapabilities
+from pyromind_runtime.domain.events import HarnessEvent
+from pyromind_runtime.domain.snapshot import ConversationSnapshot
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_activity_timestamp_flows_through_generic_event_contract() -> None:
+    occurred_at = datetime(2026, 9, 15, tzinfo=UTC)
+    event = ProductEventProjector().project(
+        "conversation-1",
+        HarnessEvent(
+            session_id="native-session-1",
+            type="status.changed",
+            payload={"status": "running"},
+            occurred_at=occurred_at,
+        ),
+    )
+    assert event is not None
+    projector = SnapshotProjector()
+    snapshot = projector.reduce(
+        ConversationSnapshot(
+            conversation_id="conversation-1", capabilities=HarnessCapabilities()
+        ),
+        event.model_copy(update={"seq": 1}),
+    )
+    assert snapshot.updated_at == occurred_at
+    delayed = event.model_copy(
+        update={"seq": 2, "occurred_at": datetime(2026, 9, 14, tzinfo=UTC)}
+    )
+    assert projector.reduce(snapshot, delayed).updated_at == occurred_at
 
 
 def _imports(package_root: Path) -> set[str]:
