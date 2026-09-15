@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, realpath, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { normalizeBusinessToolContent, safePath } from "../src/tools.js";
+import { WorkspaceAccessPolicy } from "../src/workspace-policy.js";
 
 test("business tool content converts OpenHands inline image URLs for Pi", () => {
   assert.deepEqual(normalizeBusinessToolContent([
@@ -67,6 +68,62 @@ async function workspaceLayout(prefix = "pi-tools-") {
     knowledge: join(canonicalRoot, "knowledge"),
   };
 }
+
+test("skills directory grants recursive read access independently of skill discovery", async (context) => {
+  const { root, workspace, skill, knowledge } = await workspaceLayout();
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const skills = join(root, "all-skills");
+  await mkdir(skills);
+  const policy = await WorkspaceAccessPolicy.create({
+    workspaceRoot: workspace,
+    readOnlyRoots: [skill],
+    skillsDirectory: skills,
+    knowledgeRoot: knowledge,
+  });
+  // New files inherit the directory rule without recreating the policy.
+  for (const suffix of [
+    "inference-evaluation/SKILL.md",
+    "inference-evaluation/references/deep/contracts.md",
+    "ordinary/scripts/helper.py",
+    ".hidden/config.txt",
+  ]) {
+    const target = join(skills, suffix);
+    await mkdir(join(target, ".."), { recursive: true });
+    await writeFile(target, suffix);
+    for (const input of [target, `.agents/skills/${suffix}`, `./.agents/skills/${suffix}`]) {
+      assert.equal(await readFile(await policy.resolvePath(input, "read"), "utf8"), suffix);
+      await assert.rejects(() => policy.resolvePath(input, "write"), /PATH_SCOPE_ERROR/);
+    }
+  }
+  assert.equal(await policy.resolvePath(".agents/skills/", "read"), skills);
+  assert.equal(await policy.resolvePath(join(skill, "SKILL.md"), "read"), join(skill, "SKILL.md"));
+  assert(policy.terminalReadRoots.includes(skills));
+  assert(!policy.terminalWriteRoots.includes(skills));
+  await assert.rejects(
+    async () => readFile(await policy.resolvePath(".agents/skills/missing/SKILL.md", "read")),
+    { code: "ENOENT" },
+  );
+
+  const outside = join(root, "all-skills-private");
+  await mkdir(outside);
+  await writeFile(join(outside, "private.txt"), "private");
+  await symlink(outside, join(skills, "escape"));
+  await symlink(join(skills, "ordinary"), join(skills, "contained"));
+  assert.equal(
+    await policy.resolvePath(".agents/skills/contained/scripts/helper.py", "read"),
+    join(skills, "ordinary/scripts/helper.py"),
+  );
+  for (const path of [
+    join(outside, "private.txt"),
+    ".agents/skills/../all-skills-private/private.txt",
+    "./.agents/skills/escape/private.txt",
+    ".agents/skills/escape/missing.txt",
+    "pi/session.jsonl",
+    "../other-conversation/public_data/data.txt",
+  ]) {
+    await assert.rejects(() => policy.resolvePath(path, "read"), /PATH_SCOPE_ERROR/);
+  }
+});
 
 test("safePath resolves relative, absolute, normalized, and missing public paths", async () => {
   const { workspace, skill, knowledge } = await workspaceLayout();

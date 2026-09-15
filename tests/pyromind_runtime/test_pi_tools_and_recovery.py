@@ -198,25 +198,57 @@ def test_adapter_resolves_available_knowledge_root(tmp_path, monkeypatch) -> Non
     )
 
 
-def test_adapter_resolves_skill_roots_from_env(tmp_path, monkeypatch) -> None:
+@pytest.fixture
+def configured_skills_directory(tmp_path) -> Path:
     skills = tmp_path / "skills"
-    names = (
-        "generate-workflow-dsl",
-        "data-processing",
-        "debug-workflow",
-        "embodied-data-cleaning",
-        "sandbox",
-        "training-analysis",
-    )
-    for name in names:
-        (skills / name).mkdir(parents=True)
+    for resource in (
+        "data-processing/scripts/cleaning",
+        "data-processing/scripts/preparation",
+        "data-processing/scripts/edp",
+        "training-analysis/scripts",
+    ):
+        (skills / resource).mkdir(parents=True)
+    return skills
+
+
+def test_adapter_resolves_skill_roots_from_env(
+    tmp_path, monkeypatch, configured_skills_directory
+) -> None:
+    skills = configured_skills_directory
     monkeypatch.setenv("PYROMIND_SKILLS_PATH", str(skills))
     adapter = PiAdapter(tmp_path / "conversations", terminal_backend="os-sandbox")
-    assert adapter._skill_roots == [skills.resolve() / name for name in names]
+    assert adapter._skills_directory == skills.resolve()
+    assert adapter._skill_roots == []
+    assert adapter._business_tools._cleaning_runtime == (
+        skills / "data-processing/scripts/cleaning"
+    )
 
 
-async def test_runner_start_receives_configured_knowledge_root(
-    tmp_path, monkeypatch
+def test_adapter_preserves_explicit_business_resource_override(tmp_path) -> None:
+    override = tmp_path / "training-analysis"
+    (override / "scripts").mkdir(parents=True)
+    extra = tmp_path / "extra-skill"
+    extra.mkdir()
+    adapter = PiAdapter(
+        tmp_path / "conversations",
+        terminal_backend="os-sandbox",
+        skill_root=override,
+        skill_roots=[extra],
+    )
+    assert adapter._skill_roots == [override.resolve(), extra.resolve()]
+    assert adapter._business_tools._training_runtime == override.resolve() / "scripts"
+
+
+def test_adapter_reports_missing_business_resources(tmp_path, monkeypatch) -> None:
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    monkeypatch.setenv("PYROMIND_SKILLS_PATH", str(skills))
+    with pytest.raises(ValueError, match="business tool resource directory missing"):
+        PiAdapter(tmp_path / "conversations", terminal_backend="os-sandbox")
+
+
+async def test_runner_resources_remain_deployment_config_across_session_restore(
+    tmp_path, monkeypatch, configured_skills_directory
 ) -> None:
     captured = {}
 
@@ -252,8 +284,27 @@ async def test_runner_start_receives_configured_knowledge_root(
     )
     try:
         assert captured["knowledge_root"] == str(knowledge.resolve())
+        assert captured["skills_directory"] == str(adapter._skills_directory)
     finally:
         await adapter.close(handle)
+
+    files = PiSessionFiles(conversations / handle.session_id)
+    persisted = files.load_session()
+    assert {"skills_directory", "skill_roots", "knowledge_root"}.isdisjoint(persisted)
+    monkeypatch.setenv("PYROMIND_SKILLS_PATH", str(configured_skills_directory))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    restarted = PiAdapter(conversations, terminal_backend="os-sandbox")
+    restored = await restarted.attach_session(
+        handle.session_id, RequestContext(user_id="42")
+    )
+    try:
+        assert captured["skills_directory"] == str(
+            configured_skills_directory.resolve()
+        )
+        assert captured["skill_roots"] == []
+        assert files.load_session() == persisted
+    finally:
+        await restarted.close(restored)
 
 
 async def test_create_session_applies_workspace_quota_hook(
@@ -887,14 +938,8 @@ async def test_runner_loads_sandbox_skills_and_business_tools(
         RequestContext(user_id="42"),
     )
     try:
-        assert [item["name"] for item in captured["skill_roots"]] == [
-            "generate-workflow-dsl",
-            "data-processing",
-            "debug-workflow",
-            "embodied-data-cleaning",
-            "sandbox",
-            "training-analysis",
-        ]
+        assert captured["skills_directory"] == str(adapter._skills_directory)
+        assert captured["skill_roots"] == []
         assert {item["name"] for item in captured["tools"]} == {
             "validate_workflow_dsl",
             "preview_dataset",

@@ -79,11 +79,8 @@ Use read, write, edit, and terminal for workspace operations. Keep generated fil
 under public_data/. Every terminal call starts at the workspace root (`.`). You may
 use cd within one command, but never rely on a directory change from an earlier call.
 Workspace files use public_data/... paths; authorized absolute paths are also accepted.
-Pi advertises skills in <available_skills>; their absolute locations are read-only
-resource addresses, not workspace locations. Read the exact advertised skill path
-and resolve its references against that skill directory, but never derive a workspace
-path from it. Shared Pyromind knowledge is read-only at logical paths under knowledge/.
-Use read rather than terminal or repository search for skill and knowledge resources.
+The read tool maps .agents/skills/ and knowledge/ to shared read-only resource
+directories outside the workspace; terminal commands use their absolute paths.
 For Pyromind workflow requests, read the matching
 skill before editing exactly
 public_data/workflow_canvas/workflow.py, then call validate_workflow_dsl without
@@ -97,8 +94,7 @@ and length transformations; llm-pipeline for content assessment, DataFlow
 operators, LLM processing, images, and multimodal work; environment-processing
 for tasks that require a specific sandbox runtime, including embodied robot
 data cleaning. If the intent is ambiguous, ask the user first.
-Never start both full-run paths for one request. Read only the matching SKILL.md
-and its explicitly referenced files before using the business tools."""
+Never start both full-run paths for one request."""
 
 
 @dataclass(slots=True)
@@ -146,34 +142,23 @@ class PiAdapter:
             repository = Path(__file__).parents[3]
         self._terminal_backend = validate_pi_terminal_backend(terminal_backend)
         self._conversation_root = Path(conversation_root).resolve()
-        skills_directory = Path(
+        self._skills_directory = Path(
             os.getenv("PYROMIND_SKILLS_PATH") or repository / ".agents" / "skills"
-        )
-        default_skill_roots = {
-            name: skills_directory / name
-            for name in (
-                "generate-workflow-dsl",
-                "data-processing",
-                "debug-workflow",
-                "embodied-data-cleaning",
-                "sandbox",
-                "training-analysis",
-            )
-        }
+        ).resolve()
         configured_roots = list(skill_roots or ())
         if skill_root is not None:
             configured_roots.insert(0, skill_root)
-        configured_names = {Path(path).name for path in configured_roots}
-        configured_roots.extend(
-            path
-            for name, path in default_skill_roots.items()
-            if name not in configured_names
-        )
         self._skill_roots = [Path(path).resolve() for path in configured_roots]
-        missing = [str(path) for path in self._skill_roots if not path.is_dir()]
+        missing = [
+            str(path)
+            for path in [self._skills_directory, *self._skill_roots]
+            if not path.is_dir()
+        ]
         if missing:
             raise ValueError(f"Pi skill roots do not exist: {', '.join(missing)}")
-        self._business_tools = PyromindBusinessToolHost(self._skill_roots)
+        self._business_tools = PyromindBusinessToolHost(
+            self._skill_roots, skills_directory=self._skills_directory
+        )
         configured_knowledge = knowledge_root or os.getenv(
             "PYROMIND_KNOWLEDGE_BASE_PATH"
         )
@@ -615,6 +600,7 @@ class PiAdapter:
                 "workspace_root": str(session.workspace_root),
                 "terminal_backend": self._terminal_backend,
                 "session_path": str(session.files.session_log_path),
+                "skills_directory": str(self._skills_directory),
                 "skill_roots": [
                     {"name": path.name, "path": str(path)} for path in self._skill_roots
                 ],
