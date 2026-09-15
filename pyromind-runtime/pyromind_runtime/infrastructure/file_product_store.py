@@ -8,13 +8,13 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from pydantic import Field, ValidationError
+from pydantic import Field, TypeAdapter, ValidationError
 
 from pyromind_runtime.application.snapshot_projector import SnapshotProjector
 from pyromind_runtime.domain.base import ContractModel
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
-from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.events import ProductEvent, WorkflowRunState
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 
 
@@ -109,6 +109,27 @@ class FileProductStore:
         metadata = self._load_metadata()
         if metadata.user_id != user_id:
             raise PermissionError("conversation does not belong to current user")
+
+    def load_workflow_runs(self) -> dict[str, WorkflowRunState]:
+        with self._lock():
+            return self._load_workflow_runs()
+
+    def _load_workflow_runs(self) -> dict[str, WorkflowRunState]:
+        path = self.directory / "workflow-runs.json"
+        if not path.exists():
+            return {}
+        return TypeAdapter(dict[str, WorkflowRunState]).validate_json(
+            path.read_text(encoding="utf-8")
+        )
+
+    def save_workflow_run(self, state: WorkflowRunState) -> None:
+        with self._lock():
+            runs = self._load_workflow_runs()
+            runs[state.run_id] = state
+            self._atomic_write(
+                self.directory / "workflow-runs.json",
+                TypeAdapter(dict[str, WorkflowRunState]).dump_json(runs).decode(),
+            )
 
     def harness_id(self) -> str:
         """Return persisted ownership; pre-version-two records are OpenHands."""

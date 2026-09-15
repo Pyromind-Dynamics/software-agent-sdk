@@ -408,10 +408,11 @@ async def test_busy_unexpected_runner_exit_fails_original_run_once(
     events = []
     while not session.queue.empty():
         events.append(session.queue.get_nowait())
-    notices = [event for event in events if event.type == "notice.raised"]
-    assert len(notices) == 1
-    assert notices[0].run_id == "run-active"
-    assert notices[0].payload["code"] == "pi_runner_exited"
+    completions = [event for event in events if event.type == "run.finished"]
+    assert len(completions) == 1
+    assert completions[0].run_id == "run-active"
+    assert completions[0].payload["error"]["code"] == "pi_runner_exited"
+    await adapter.finalize_run(handle, completions[0], None)
     assert session.files.load_inflight() is None
     await adapter.close(handle)
 
@@ -500,6 +501,11 @@ async def test_planned_shutdown_preserves_inflight_for_attach_recovery(
     assert len(failures) == 1
     assert failures[0].run_id == "run-interrupted"
     assert failures[0].payload["error_code"] == "runner_restarted"
+    completion = next(event for event in recovered if event.type == "run.finished")
+    assert completion.payload["status"] == "paused"
+    inflight = restarted_session.files.load_inflight()
+    assert inflight is not None and inflight["completion"]
+    await restarted.finalize_run(restarted_handle, completion, None)
     assert restarted_session.files.load_inflight() is None
     await restarted.close(restarted_handle)
 
@@ -607,7 +613,7 @@ async def test_sync_xyflow_dedupes_unchanged_workflow(tmp_path, monkeypatch) -> 
                 if getattr(event, "type", None) == "workflow.updated"
             ]
 
-        assert len(workflow_events()) == 1
+        assert len(workflow_events()) == 0
         assert FakeRunner.context_appends == 1
 
         for _ in range(2):
@@ -637,8 +643,10 @@ async def test_sync_xyflow_dedupes_unchanged_workflow(tmp_path, monkeypatch) -> 
             RequestContext(user_id="42"),
         )
         events = workflow_events()
-        assert len(events) == 1
-        assert events[0].payload["dsl"] == "workflow = Beta()"
+        assert len(events) == 0
+        assert (
+            session.workspace_root / "public_data/workflow_canvas/workflow.py"
+        ).read_text() == "workflow = Beta()"
         assert FakeRunner.context_appends == 2
     finally:
         await adapter.close(handle)
@@ -726,12 +734,14 @@ async def test_sync_xyflow_skips_empty_canvas_until_content_exists(
 
         await send_canvas({"name": "Draft", "nodes": [{"id": "n1"}], "edges": []})
         events = workflow_events()
-        assert len(events) == 1
-        assert events[0].payload["dsl"] == "workflow = Draft()"
+        assert len(events) == 0
+        assert (
+            session.workspace_root / "public_data/workflow_canvas/workflow.py"
+        ).read_text() == "workflow = Draft()"
 
-        # Clearing back to empty after real content is a real change.
+        # Input snapshots and context updates never generate agent outputs.
         await send_canvas({"name": "Draft", "nodes": [], "edges": []})
-        assert len(workflow_events()) == 1
+        assert len(workflow_events()) == 0
     finally:
         await adapter.close(handle)
 
@@ -1263,6 +1273,7 @@ async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
     files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
     session = SimpleNamespace(
         session_id="conversation-1",
+        workspace_root=tmp_path / "conversation-1",
         finished_runs=set(),
         running=True,
         files=files,
@@ -1286,9 +1297,7 @@ async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
     assert (await session.queue.get()).payload["status"] == "idle"
 
 
-async def test_adapter_projects_generic_write_completion_to_workflow(
-    tmp_path, monkeypatch
-) -> None:
+async def test_adapter_projects_generic_write_completion_to_workflow(tmp_path) -> None:
     adapter = PiAdapter(tmp_path, terminal_backend="os-sandbox")
     workspace = tmp_path / "conversation-1"
     files = PiSessionFiles(workspace)
@@ -1301,12 +1310,6 @@ async def test_adapter_projects_generic_write_completion_to_workflow(
         files=files,
         queue=asyncio.Queue(),
     )
-    emitted = []
-
-    async def capture_workflow(_session, event_id, **kwargs) -> None:
-        emitted.append((event_id, kwargs.get("source_event_id")))
-
-    monkeypatch.setattr(adapter, "_emit_workflow", capture_workflow)
     frame = {
         "protocolVersion": 2,
         "type": "pi.event",
@@ -1329,8 +1332,12 @@ async def test_adapter_projects_generic_write_completion_to_workflow(
 
     await adapter._runner_event(cast(Any, session), frame)
 
-    assert emitted == [("write-event:workflow", "write-event")]
     assert (await session.queue.get()).type == "operation.completed"
+    modified = await session.queue.get()
+    assert modified.type == "workflow.modified"
+    assert modified.run_id == "run-1"
+    assert session.files.load_inflight()["workflow_modified"] is True
+    assert session.queue.empty()
     assert not _is_workflow_mutation(
         workspace,
         {

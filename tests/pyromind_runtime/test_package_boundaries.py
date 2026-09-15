@@ -86,3 +86,22 @@ def test_pi_sandbox_initializes_before_using_conversation_temp_path() -> None:
     sandbox_initialization = tools_source.index("await createWorkspaceBashOperations(")
     conversation_tmpdir = tools_source.index("process.env.TMPDIR = terminalOutputTemp")
     assert terminal_tmp_declaration < sandbox_initialization < conversation_tmpdir
+
+
+def test_internal_workflow_lifecycle_events_never_enter_public_protocol() -> None:
+    from typing import get_args
+
+    from pyromind_runtime.application.event_projection import ProductEventProjector
+    from pyromind_runtime.domain.events import HarnessEvent, ProductEventType
+
+    for kind in ("workflow.modified", "run.finished"):
+        assert kind not in get_args(ProductEventType.__value__)
+        event = HarnessEvent.model_validate(
+            {
+                "session_id": "conversation",
+                "run_id": "run",
+                "type": kind,
+                "payload": {},
+            }
+        )
+        assert ProductEventProjector().project("conversation", event) is None

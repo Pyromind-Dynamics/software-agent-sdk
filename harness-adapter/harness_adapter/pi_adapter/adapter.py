@@ -28,7 +28,7 @@ from pyromind_runtime.domain.commands import (
 from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
-from pyromind_runtime.domain.snapshot import ConversationSnapshot
+from pyromind_runtime.domain.snapshot import ConversationSnapshot, WorkflowState
 from pyromind_runtime.ports.harness import (
     ExternalTaskNotification,
     ForkSpec,
@@ -123,7 +123,6 @@ class _PiSession:
     pending_permission: _PendingPermission | None = None
     finished_runs: set[str] = field(default_factory=set)
     active_external_tasks: dict[str, str] = field(default_factory=dict)
-    pending_checkpoint_events: dict[str, list[str]] = field(default_factory=dict)
     last_workflow_signature: str | None = None
 
 
@@ -428,7 +427,7 @@ class PiAdapter:
         if dsl.strip():
             _atomic_text(path, dsl)
             action = "updated"
-            # Restore bypasses _emit_workflow; seed the dedupe signature with
+            # Restore bypasses input synchronization; seed the dedupe signature with
             # the restored state so an unchanged next sync stays silent.
             session.last_workflow_signature = _workflow_signature(
                 dsl, spec.checkpoint.workflow.canvas
@@ -844,23 +843,29 @@ class PiAdapter:
                 return
             session.finished_runs.add(run_id)
             session.running = False
-            session.files.clear_inflight()
-            checkpoint_entry_id = payload.get("checkpoint_entry_id")
-            pending_events = getattr(session, "pending_checkpoint_events", {}).pop(
-                run_id, []
+            completion = self._completion_event(session, frame)
+            inflight = session.files.load_inflight() or {"run_id": run_id}
+            session.files.save_pending_completion(
+                run_id,
+                {
+                    "completion": completion.model_dump(mode="json"),
+                    "workflow_modified": bool(inflight.get("workflow_modified")),
+                },
             )
-            if isinstance(checkpoint_entry_id, str) and checkpoint_entry_id:
-                checkpoint_index = session.files.load_checkpoint_index()
-                checkpoint_index.update(
-                    {event_id: checkpoint_entry_id for event_id in pending_events}
-                )
-                session.files.save_checkpoint_index(checkpoint_index)
+            session.files.save_inflight(
+                {
+                    **inflight,
+                    "completion": completion.model_dump(mode="json"),
+                }
+            )
+            session.queue.put_nowait(completion)
             logger.info(
                 "pi.run_finished conversation_id=%s run_id=%s outcome=%s",
                 session.session_id,
                 run_id,
                 payload.get("outcome"),
             )
+            return
         else:
             self._record_inflight(session, kind, payload, run_id)
         for event in translate_runner_event(frame):
@@ -869,12 +874,56 @@ class PiAdapter:
             session.workspace_root, payload
         ):
             source_event_id = str(frame.get("eventId") or uuid4().hex)
-            await self._emit_workflow(
-                session,
-                f"{source_event_id}:workflow",
-                source_event_id=source_event_id,
-                run_id=run_id,
+            inflight = session.files.load_inflight() or {"run_id": run_id}
+            session.files.save_inflight({**inflight, "workflow_modified": True})
+            session.queue.put_nowait(
+                HarnessEvent(
+                    session_id=session.session_id,
+                    run_id=run_id,
+                    event_id=f"{source_event_id}:workflow-modified",
+                    type="workflow.modified",
+                    payload={},
+                )
             )
+
+    def _completion_event(
+        self, session: _PiSession, frame: dict[str, Any]
+    ) -> HarnessEvent:
+        payload = frame.get("payload") or {}
+        path = session.workspace_root / _WORKFLOW_PATH
+        # New runners freeze the file before starting queued follow-ups. The
+        # fallback is for interrupted/recovered runs without a native finish.
+        snapshot_error = bool(payload.get("workflow_snapshot_error"))
+        try:
+            dsl = (
+                payload["workflow_dsl"]
+                if "workflow_dsl" in payload
+                else path.read_text(encoding="utf-8")
+                if path.is_file()
+                else None
+            )
+        except (OSError, UnicodeError):
+            dsl = None
+            snapshot_error = True
+        normalized: JsonObject = {
+            "dsl": dsl,
+            "snapshot_error": snapshot_error,
+            "checkpoint_entry_id": payload.get("checkpoint_entry_id"),
+        }
+        for event in translate_runner_event(frame):
+            if event.type == "status.changed":
+                normalized["status"] = event.payload["status"]
+            elif event.type == "notice.raised":
+                normalized["error"] = dict(event.payload)
+        run_id = str(frame["runId"])
+        return HarnessEvent(
+            session_id=session.session_id,
+            run_id=run_id,
+            event_id=f"{session.session_id}:{run_id}:finished",
+            source_event_id=str(frame.get("eventId") or run_id),
+            type="run.finished",
+            payload=normalized,
+        )
 
     def _record_inflight(
         self, session: _PiSession, kind: Any, payload: dict[str, Any], run_id: str
@@ -891,10 +940,38 @@ class PiAdapter:
         session.files.save_inflight(inflight)
 
     def _recover_inflight(self, session: _PiSession) -> None:
+        pending = session.files.load_pending_completions()
+        for run_id, record in pending.items():
+            if record.get("workflow_modified"):
+                session.queue.put_nowait(
+                    HarnessEvent(
+                        session_id=session.session_id,
+                        run_id=run_id,
+                        type="workflow.modified",
+                        payload={},
+                    )
+                )
+            session.queue.put_nowait(HarnessEvent.model_validate(record["completion"]))
         inflight = session.files.load_inflight()
         if inflight is None:
             return
         run_id = str(inflight.get("run_id") or "")
+        if run_id in pending:
+            return
+        if inflight.get("workflow_modified"):
+            session.queue.put_nowait(
+                HarnessEvent(
+                    session_id=session.session_id,
+                    run_id=run_id,
+                    event_id=f"{run_id}:recovered-workflow-modified",
+                    type="workflow.modified",
+                    payload={},
+                )
+            )
+        saved_completion = inflight.get("completion")
+        if isinstance(saved_completion, dict):
+            session.queue.put_nowait(HarnessEvent.model_validate(saved_completion))
+            return
         message_id = inflight.get("message_id")
         if isinstance(message_id, str):
             session.queue.put_nowait(
@@ -930,15 +1007,20 @@ class PiAdapter:
                     payload={"permission_id": permission_id, "decision": "deny"},
                 )
             )
-        session.queue.put_nowait(
-            HarnessEvent(
-                session_id=session.session_id,
-                type="status.changed",
-                run_id=run_id,
-                payload={"status": "paused"},
-            )
+        completion = self._completion_event(
+            session,
+            {
+                "runId": run_id,
+                "eventId": f"{run_id}:recovered",
+                "kind": "run.finished",
+                "sessionId": session.session_id,
+                "payload": {"outcome": {"status": "suspended"}},
+            },
         )
-        session.files.clear_inflight()
+        session.files.save_inflight(
+            {**inflight, "completion": completion.model_dump(mode="json")}
+        )
+        session.queue.put_nowait(completion)
 
     async def _sync_xyflow(self, session: _PiSession, xyflow: dict[str, Any]) -> None:
         event_id = await self._stage_xyflow(session, xyflow)
@@ -953,7 +1035,7 @@ class PiAdapter:
         _prepare_workspace(session.workspace_root, create=False)
         dsl = await asyncio.to_thread(convert_xyflow_to_dsl, xyflow)
         _atomic_text(session.workspace_root / _WORKFLOW_PATH, dsl)
-        return await self._emit_workflow(session, uuid4().hex, canvas=xyflow)
+        return await self._save_input_workflow(session, uuid4().hex, canvas=xyflow)
 
     async def _append_workflow_context(
         self, session: _PiSession, event_id: str
@@ -977,22 +1059,11 @@ class PiAdapter:
             index[event_id] = checkpoint["checkpoint_entry_id"]
             session.files.save_checkpoint_index(index)
 
-    async def _emit_workflow(
-        self,
-        session: _PiSession,
-        event_id: str,
-        *,
-        source_event_id: str | None = None,
-        run_id: str | None = None,
-        canvas: dict[str, Any] | None = None,
+    async def _save_input_workflow(
+        self, session: _PiSession, event_id: str, *, canvas: dict[str, Any]
     ) -> str | None:
         path = session.workspace_root / _WORKFLOW_PATH
         dsl = path.read_text(encoding="utf-8")
-        if canvas is None:
-            try:
-                canvas = await asyncio.to_thread(convert_dsl_to_xyflow, dsl)
-            except Exception:
-                canvas = None
         signature = _workflow_signature(dsl, canvas)
         if signature == session.last_workflow_signature:
             return None
@@ -1004,35 +1075,65 @@ class PiAdapter:
         request = SaveWorkflowCanvasEventSnapshotRequest(
             sessionId=session.session_id,
             eventId=event_id,
-            snapshotRole="out",
+            snapshotRole="in",
             workflowDslData=dsl,
             workflowXyflowData=canvas,
-            eventType="pi.workflow.updated",
         )
-        snapshot = await asyncio.to_thread(
+        await asyncio.to_thread(
             FileWorkflowCanvasStore(
                 session.workspace_root, session.session_id
             ).save_event_snapshot,
             request,
         )
-        session.queue.put_nowait(
-            HarnessEvent(
-                event_id=event_id,
-                source_event_id=source_event_id,
-                session_id=session.session_id,
-                type="workflow.updated",
-                payload={
-                    "resource_id": "pyromind_workflow",
-                    "version": snapshot.version_id,
-                    "dsl": dsl,
-                    "canvas": canvas,
-                },
-            )
-        )
-        if run_id:
-            session.pending_checkpoint_events.setdefault(run_id, []).append(event_id)
         session.last_workflow_signature = signature
         return event_id
+
+    async def finalize_run(
+        self,
+        handle: SessionHandle,
+        completion: HarnessEvent,
+        workflow_event_id: str | None,
+    ) -> WorkflowState | None:
+        session = self._session(handle.session_id)
+        dsl = completion.payload.get("dsl")
+        workflow = None
+        if workflow_event_id is not None and completion.payload.get("snapshot_error"):
+            raise OSError("The final workflow file could not be read")
+        if workflow_event_id is not None and isinstance(dsl, str):
+            try:
+                canvas = await asyncio.to_thread(convert_dsl_to_xyflow, dsl)
+            except Exception:
+                canvas = None
+            snapshot = await asyncio.to_thread(
+                FileWorkflowCanvasStore(
+                    session.workspace_root, session.session_id
+                ).save_event_snapshot,
+                SaveWorkflowCanvasEventSnapshotRequest(
+                    sessionId=session.session_id,
+                    eventId=workflow_event_id,
+                    snapshotRole="out",
+                    workflowDslData=dsl,
+                    workflowXyflowData=canvas,
+                    eventType="pi.workflow.updated",
+                ),
+            )
+            checkpoint = completion.payload.get("checkpoint_entry_id")
+            if isinstance(checkpoint, str) and checkpoint:
+                index = session.files.load_checkpoint_index()
+                index[workflow_event_id] = checkpoint
+                session.files.save_checkpoint_index(index)
+            workflow = WorkflowState(
+                resource_id="pyromind_workflow",
+                version=snapshot.version_id,
+                dsl=dsl,
+                canvas=canvas,
+            )
+        inflight = session.files.load_inflight()
+        if inflight and inflight.get("run_id") == completion.run_id:
+            session.files.clear_inflight()
+        if completion.run_id:
+            session.files.clear_pending_completion(completion.run_id)
+        return workflow
 
     @staticmethod
     def _handle(session_id: str) -> SessionHandle:

@@ -19,6 +19,7 @@ from pyromind_runtime.domain.commands import (
 from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
+from pyromind_runtime.domain.snapshot import WorkflowState
 from pyromind_runtime.ports.harness import (
     ExternalTaskNotification,
     ForkSpec,
@@ -235,6 +236,7 @@ class OpenHandsAdapter:
                     if page_id is None:
                         break
             backfilling = False
+            translation.workflow_completion_hook = True
             for source_event in live_buffer:
                 self._translate_into(queue, translation, source_event)
             queue.put_nowait(
@@ -333,6 +335,18 @@ class OpenHandsAdapter:
         if isinstance(command, RollbackWorkflowCommand):
             raise TypeError("workflow rollback is orchestrated by ConversationRuntime")
         raise TypeError(f"unsupported command: {type(command).__name__}")
+
+    async def finalize_run(
+        self,
+        handle: SessionHandle,
+        completion: HarnessEvent,
+        workflow_event_id: str | None,
+    ) -> WorkflowState | None:
+        del handle
+        workflow = completion.payload.get("workflow")
+        if workflow_event_id is None or not isinstance(workflow, dict):
+            return None
+        return WorkflowState.model_validate(workflow)
 
     async def fork(
         self,

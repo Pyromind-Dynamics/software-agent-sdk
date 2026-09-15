@@ -109,6 +109,17 @@ test("AgentSession completes the workflow-generation tool loop over chat complet
 
   const finishedEvents = events.filter((event) => event.kind === "run.finished");
   assert.equal(finishedEvents.length, 1, JSON.stringify({ events, requests }, null, 2));
+  assert.equal(finishedEvents[0]!.payload.workflow_dsl, "workflow = SFTWorkflow()\n");
+  assert.equal(typeof finishedEvents[0]!.payload.checkpoint_entry_id, "string");
+  const assistantStarts = events.filter((event) => event.kind === "message.started" && event.payload.role === "assistant");
+  assert.equal(new Set(assistantStarts.map((event) => event.payload.message_id)).size, assistantStarts.length);
+  for (const start of assistantStarts) {
+    const deltas = events.filter((event) => event.kind === "message.delta" && event.payload.message_id === start.payload.message_id);
+    const completed = events.find((event) => event.kind === "message.completed" && event.payload.message_id === start.payload.message_id);
+    assert.ok(completed);
+    const blocks = completed.payload.content as Array<{ type: string; text?: string }>;
+    assert.equal(deltas.map((event) => event.payload.text).join(""), blocks.filter((block) => block.type === "text").map((block) => block.text).join(""));
+  }
   assert.equal(finishedEvents[0]!.payload.outcome &&
     typeof finishedEvents[0]!.payload.outcome === "object" &&
     !Array.isArray(finishedEvents[0]!.payload.outcome)

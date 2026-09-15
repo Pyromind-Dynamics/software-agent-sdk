@@ -479,3 +479,68 @@ def test_translator_projects_workflow_debug_without_output_directory() -> None:
         "updated_at": translated[1].occurred_at.isoformat(),
         "resume_pending": False,
     }
+
+
+async def test_live_workflow_hook_uses_product_completion_and_keeps_native_checkpoint(
+    tmp_path,
+):
+    from pyromind_runtime.application.workflow_completion import WorkflowCompletionHook
+    from pyromind_runtime.domain.snapshot import ConversationSnapshot
+    from pyromind_runtime.infrastructure.file_product_store import FileProductStore
+
+    state = TranslationState(
+        session_id="conversation-1", run_id="run-1", workflow_completion_hook=True
+    )
+    source = ConversationStateUpdateEvent(
+        id="native-final",
+        key="pyromind_workflow",
+        value={"workflow": "workflow = Final()", "xyflow": {"nodes": []}},
+    )
+    translated = translate_event(state, source)
+    assert [event.type for event in translated] == ["workflow.modified", "run.finished"]
+
+    def unused_service_provider():
+        raise AssertionError("Finalization must use the captured snapshot")
+
+    adapter = OpenHandsAdapter(unused_service_provider)
+    handle = adapter._handle("conversation-1")
+    store = FileProductStore(tmp_path)
+    store.create(
+        ConversationSnapshot(
+            conversation_id="conversation-1", capabilities=handle.capabilities
+        ),
+        user_id="42",
+    )
+    hook = WorkflowCompletionHook(store, adapter, handle)
+    for event in translated:
+        await hook.accept(event)
+    for event in translated:
+        await hook.accept(event)
+    events = store.replay()
+    assert len(events) == 1
+    assert events[0].type == "workflow.updated"
+    assert events[0].event_id == "native-final:workflow"
+    assert events[0].source_event_id == "native-final"
+    assert events[0].run_id == "run-1"
+    # Legacy history replays preserve the exact same public event identity.
+    legacy = translate_event(TranslationState(session_id="conversation-1"), source)[0]
+    assert legacy.event_id == events[0].event_id
+
+
+def test_live_terminal_hint_waits_for_post_hook_full_state():
+    state = TranslationState(session_id="conversation-1", workflow_completion_hook=True)
+    assert (
+        translate_event(
+            state,
+            ConversationStateUpdateEvent(key="execution_status", value="finished"),
+        )
+        == ()
+    )
+    final = translate_event(
+        state,
+        ConversationStateUpdateEvent(
+            key="full_state", value={"execution_status": "finished"}
+        ),
+    )
+    assert final[0].type == "status.changed"
+    assert final[0].payload["status"] == "finished"
