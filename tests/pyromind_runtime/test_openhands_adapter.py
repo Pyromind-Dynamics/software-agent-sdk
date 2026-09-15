@@ -66,6 +66,10 @@ class _EventService:
         self.removed_tasks: list[str] = []
         self.notification: dict[str, object] | None = None
         self.conversation_dir = conversation_dir or Path()
+        self.closed = False
+
+    def is_open(self) -> bool:
+        return not self.closed
 
     async def subscribe_to_events(self, subscriber: Subscriber[Event]) -> UUID:
         self.subscriber = subscriber
@@ -150,6 +154,46 @@ async def test_adapter_subscribes_before_history_and_drains_live_buffer() -> Non
     await events.aclose()
     await adapter.close(handle)
     assert event_service.unsubscribed == [event_service.subscriber_id]
+
+
+async def test_attach_session_reactivates_service_reclaimed_by_idle_eviction() -> None:
+    """The harness unloads idle conversations without telling the product layer.
+
+    Re-attaching must re-subscribe the replacement service onto the *same* queue
+    so the product pump keeps working, instead of replaying commands into a dead
+    service and failing terminally with ``inactive_service``.
+    """
+    conversation_id = uuid4()
+    reclaimed = _EventService()
+    reclaimed.closed = True
+    service = _ConversationService(conversation_id, reclaimed)
+    adapter = OpenHandsAdapter(lambda: cast(ConversationService, service))
+    handle = await adapter.attach_session(
+        conversation_id.hex, RequestContext(user_id="42")
+    )
+    events = cast(AsyncGenerator[HarnessEvent], adapter.subscribe(handle))
+    while (await anext(events)).type != "history.synced":
+        pass
+
+    # The harness re-activates the conversation on next access, exactly as
+    # ConversationService.get_event_service() does through its lazy reload.
+    replacement = _EventService()
+    service.event_service = replacement
+    reattached = await adapter.attach_session(
+        conversation_id.hex, RequestContext(user_id="42")
+    )
+
+    assert reattached == handle
+    assert reclaimed.unsubscribed == [reclaimed.subscriber_id]
+    assert replacement.subscriber is not None
+
+    # The product pump keeps observing the healed service via the original queue.
+    await replacement.subscriber(_message("agent", "healed", event_id="healed"))
+    healed = await anext(events)
+    healed_content = cast(list[dict[str, str]], healed.payload["content"])
+    assert healed_content[0]["text"] == "healed"
+    await events.aclose()
+    await adapter.close(handle)
 
 
 async def test_adapter_notifies_openhands_through_formal_harness_port() -> None:

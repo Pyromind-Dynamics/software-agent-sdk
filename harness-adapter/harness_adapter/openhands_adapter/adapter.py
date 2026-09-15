@@ -126,6 +126,12 @@ class OpenHandsAdapter:
     ) -> SessionHandle:
         existing = self._sessions.get(conversation_id)
         if existing is not None:
+            if existing.event_service.is_open():
+                return self._handle(conversation_id)
+            # The harness reclaims idle conversations on its own timer and tears
+            # the EventService down when it does, without notifying us. Re-attach
+            # it in place so the product-side pump keeps the same queue/handle.
+            await self._reactivate(conversation_id, existing, context)
             return self._handle(conversation_id)
         service = self._conversation_service_provider()
         event_service = await service.get_event_service(
@@ -137,6 +143,60 @@ class OpenHandsAdapter:
                 f"OpenHands conversation not found: {conversation_id}"
             )
         return await self._attach(conversation_id, event_service)
+
+    async def _reactivate(
+        self,
+        conversation_id: str,
+        session: _ActiveSession,
+        context: RequestContext,
+    ) -> None:
+        """Re-subscribe an evicted EventService onto the existing session queue.
+
+        ``get_event_service`` lazily re-activates a conversation that idle
+        eviction unloaded. Subscribing the replacement service to the *same*
+        queue keeps the product pump and its handle valid, so callers observe a
+        healed session instead of a permanently dead one. No history backfill is
+        needed: the conversation was reclaimed while idle, so the product store
+        already holds everything up to now.
+        """
+        service = self._conversation_service_provider()
+        event_service = await service.get_event_service(
+            UUID(conversation_id),
+            user_id=None if context.user_id == "anonymous" else context.user_id,
+        )
+        if event_service is None:
+            raise FileNotFoundError(
+                f"OpenHands conversation not found: {conversation_id}"
+            )
+
+        async def on_event(event: Event) -> None:
+            self._translate_into(session.queue, session.translation, event)
+
+        subscriber_id = await event_service.subscribe_to_events(
+            _QueueSubscriber(on_event)
+        )
+        async with self._lock:
+            if self._sessions.get(conversation_id) is not session:
+                # Lost a race with another re-activation or with close().
+                await event_service.unsubscribe_from_events(subscriber_id)
+                return
+            stale = session.event_service
+            stale_subscriber_id = session.subscriber_id
+            session.event_service = event_service
+            session.subscriber_id = subscriber_id
+        if stale is not event_service:
+            try:
+                await stale.unsubscribe_from_events(stale_subscriber_id)
+            except Exception:
+                logger.warning(
+                    "Failed to unsubscribe stale OpenHands subscriber for %s",
+                    conversation_id,
+                    exc_info=True,
+                )
+        logger.info(
+            "Re-activated OpenHands conversation %s after idle eviction",
+            conversation_id,
+        )
 
     async def _attach(
         self,

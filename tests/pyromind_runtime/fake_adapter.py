@@ -35,6 +35,7 @@ class FakeAdapter:
         self.harness_id = harness_id
         self.queues: dict[str, asyncio.Queue[HarnessEvent | None]] = {}
         self.sent: list[tuple[str, ProductCommand, RequestContext]] = []
+        self.attached: list[str] = []
         self.closed: list[str] = []
         self.created_specs: list[SessionSpec] = []
         self.external_task_notifications: list[
@@ -83,6 +84,7 @@ class FakeAdapter:
     async def attach_session(
         self, conversation_id: str, context: RequestContext
     ) -> SessionHandle:
+        self.attached.append(conversation_id)
         handle = self._open(conversation_id)
         self.synced(conversation_id)
         return handle

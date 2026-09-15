@@ -550,17 +550,25 @@ class ConversationRuntime:
         if existing is not None:
             existing.touch()
             await existing.ready.wait()
+            await self._heal_active(existing, context)
             return self._store(conversation_id)
         lock = self._activation_locks.setdefault(conversation_id, asyncio.Lock())
         async with lock:
             existing = self._active.get(conversation_id)
             if existing is not None:
                 await existing.ready.wait()
+                await self._heal_active(existing, context)
                 return self._store(conversation_id)
             store = self._store(conversation_id)
             if store.metadata_path.is_file():
                 store.authorize(context.user_id)
             harness_id = store.harness_id()
+            logger.info(
+                "harness attach: conversation_id=%s harness=%s product_meta=%s",
+                conversation_id,
+                harness_id,
+                "present" if store.metadata_path.is_file() else "missing",
+            )
             adapter = self._adapter(harness_id)
             handle = await adapter.attach_session(conversation_id, context)
             if handle.harness_id != harness_id:
@@ -582,6 +590,27 @@ class ConversationRuntime:
             await active.ready.wait()
             await self._resume_pending_external_tasks(active, store)
             return store
+
+    async def _heal_active(
+        self,
+        active: _ActiveConversation,
+        context: RequestContext,
+    ) -> None:
+        """Re-attach a cached session whose harness service was reclaimed.
+
+        Harnesses drop idle conversations from memory on their own timer without
+        telling the product layer. ``attach_session`` is idempotent and cheap
+        while the harness session is live, and re-activates it when it is not —
+        calling it on every cache hit closes the window where commands would
+        otherwise be replayed into a dead service and fail terminally.
+        """
+        handle = await active.adapter.attach_session(active.handle.session_id, context)
+        if handle != active.handle:
+            logger.warning(
+                "Harness returned a different handle for conversation %s; "
+                "the product pump may no longer observe it",
+                active.handle.session_id,
+            )
 
     async def _resume_pending_external_tasks(
         self, active: _ActiveConversation, store: FileProductStore
