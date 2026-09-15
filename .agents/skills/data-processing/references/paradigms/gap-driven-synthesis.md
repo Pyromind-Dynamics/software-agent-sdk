@@ -1,7 +1,9 @@
 # Gap 驱动合成
 
-只从已确认的 `gap_plan.json` 生成 `augmentation_plan.json`。计划须声明每个
-Gap、策略 ID、数量、宿主筛选、seed、单宿主最大复用次数和输出 schema。
+从已确认的 `gap_plan.json` 生成 `augmentation_plan.json`。计划声明目标类别、
+数量、策略及适用依据、输入角色、宿主/模板筛选、参数、seed、单源复用上限、
+输出 schema 和检查方案。只有训练指标时，先交分布分析核查源数据，不能据此
+直接认定某类别缺样；已有明确目标可直接形成 Gap，不强制重做分析。
 
 ## 选型
 
@@ -9,21 +11,66 @@ Gap、策略 ID、数量、宿主筛选、seed、单宿主最大复用次数和�
 - SFT：CondorGenerator → CondorRefiner → AlpagasusFilter。
 - 推理、代码、多轮、Function Call：选 DataFlow 1.0.10 对应 Generator/Filter。
 - 图片输入生成问答、描述或回答：managed image runtime。
-- AVI/PCB 新像素：仅 `avi_pcb.*` 插件；`model_profile=none` 的普通 Python
-  Pipeline 调用 staged `avi_pcb_runtime.execute_plan`，不从兄弟仓库导入。
-- 其他图片新像素：报告 `missing synthesis strategy`，不猜绘图规则。
+- 图片新像素：根据正常底图、真实异常、标注及业务定义，复用、组合或编写
+  Python 策略。无现成策略不等于不能合成；缺少业务依据也不能靠绘图猜类别。
 
-所有模型调用保留 LoggingLLMServing 的分批、墙钟截止、失败账本和断点状态。
-AVI/PCB 策略必须在一次调用内同时生成图片、diff、bbox/类别与血缘；校验图片
-有变化、bbox 合法、标签一致、diff 非空，同 seed 可复现。验证/测试/eval 样本
-不能作为宿主；split 不明确时停止。
+有真实缺陷区域和适用正常底图时，优先考虑模板合成：
 
-先用 `preview_dataset(mode="sample", n=3)` 准备输入，并用
-`df_run_pipeline` 执行小样。文本展示记录，图片展示
-before/after/diff/annotation 复核图。用户明确确认后才调用
-`df_submit_pipeline`。运行中用 `df_check_progress`，介入时用
-`df_stop_task`。执行器不截断输入；AVI 小样数量由小样输入和派生的小样计划控制。
+**实拍/GT/标注 → 配准 → 提取局部缺陷、将 GT 转为实拍色调 → 候选位置与变形 →
+结构规则校验 → 注入 → 整组翻转/旋转 → 重算高通 diff 与标注 → 可见性检查 →
+模板/合成视觉复核 → 导出候选。**
+
+GT 提供正常结构，实拍可信区域提供材料色调与纹理，标注异常提供缺陷像素。
+默认使用样本自身的配对 GT，转换色调后作为正常底图；不修复或继续使用异常
+实拍图作为底图。正常材料区域用于材质采样，不能当缺陷模板。其他类型的标签
+掩码须明确其几何与材质映射，不能只改角色名称。
+
+模板同时保留源区域的材料占比与边界关系，默认在迁移中保持；跨材料或改变
+局部结构关系须有策略依据。材料命名不明可用区域 A/B，颜色和配准成功不能
+证明其业务含义。关系由源数据计算、独立校验，不能只检验策略自填的允许区。
+
+默认 diff 为合成图灰度减自身高斯平滑的高通残差，显示其幅度并保留有符号
+数据；它不是与 GT 的像素相减，正常线路边缘也会响应。修改范围另以掩码检查。
+
+辅助函数、打包执行和接口见 [模板合成](template-synthesis.md)；仅 PCB 场景读取
+[PCB 模板案例](template-synthesis-pcb.md)。业务允许区域、材质、变形幅度和类别
+规则由 Pipeline 明确提供，不默认套用 PCB 规则。旧 `avi_pcb_runtime` 的随机
+绘图与 `gt` 修改掩码语义不等同于本链路，不能作为真实缺陷类别的证明。
+
+## 执行与复核
+
+沿用通用 SOP 和已有执行工具。小样输入通过 `preview_dataset(mode="sample")`
+准备，覆盖计划采用的策略和目标类别；数量由输入和派生小样计划控制，执行器
+不截断输入。`df_run_pipeline` 运行纯图片生成时使用 `model_profile=none`；
+视觉复核使用 [固定入口](../../scripts/preparation/image_synthesis_review.py)
+（managed image runtime，`model_profile=vision`），保留分批、
+墙钟截止、失败账本和断点状态，不自行构造模型认证或传输代码。
+
+- 每份结果执行程序检查：角色/尺寸、缺陷面积、结构规则、图片变化、bbox 和
+  差分可见性。几何通过不代表业务类别正确。
+- 模板单独检查源图标注、GT、提取像素与掩码，确认没有把正常线路/孔/背景
+  一起复制。提取不明确时待复核，不能以最大材料连通块代替异常。
+- 小样全部视觉盲审：提供合成图、正常参考图、差分、源缺陷上下文及类别定义，不提供预期
+  类别、注入框或泄露答案的文件名/说明。模型独立给出类别、位置、额外异常、
+  真实性、关系一致性及理由，再由 Pipeline 与生成标注比对；unknown 不算通过。
+- 展示原始模板来源、正常底图、合成图、差分和标注复核图，用户确认后再调用
+  `df_submit_pipeline`。在同一次确认中固定全量抽检数量、按策略/类别分层的
+  固定 seed 抽样、通过标准和失败处置。全量逐份程序检查，视觉抽检。
+- 程序失败记录原因并剔除；视觉调用失败标记 `review_failed`，不一致/不确定
+  标记 `needs_review`，不能改用颜色统计声称通过。抽检失败的分组
+  标为待复核，不自动宣称训练就绪；未抽检样本标为 `not_reviewed`。
+
+复核前冻结输入、产物和策略版本；复核后用[固定汇总入口](template-synthesis.md#固定视觉复核路径)
+生成质量状态，交付结论引用该状态。调用成功不代表质量通过；定位不一致须
+验证坐标转换后重审，不能推测原因而放行。修改图片或策略使旧复核失效。
+
+模板与底图都必须来自明确的 train split，不能使用 validation/test/eval。
+二者来源不同则分别记录血缘及复用次数，子样本不能跨父源分组泄漏到验证集。
+同 seed、输入、代码与配置应复现像素和标注；设定候选尝试上限，未达目标数量
+如实报告，不无限重试。任务观察和停止沿用 `df_check_progress` / `df_stop_task`。
 
 独立交付包包含：`augmentation_plan.json`、`processed.jsonl`、`assets/`、
 `provenance.jsonl`、`validation.json`、`progress.json`、`failures.jsonl`、
-`report.json`、`report.html`。不改源数据、不合并父数据集、不创建版本记录。
+`report.json`、`report.html`。图片记录明确正常参考图、异常图、缺陷掩码和差分
+的角色及差分定义；血缘记录源 ID、策略/代码版本、参数、seed 和复核状态。
+程序检查与视觉复核分开记录；不改源数据、不合并父数据集、不创建版本记录。

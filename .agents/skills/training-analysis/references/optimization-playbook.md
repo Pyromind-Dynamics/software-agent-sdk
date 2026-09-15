@@ -34,5 +34,6 @@
 - 修改 `batch_size` 时同步调整 `grad_accumulation_steps`,保持有效 batch
   (= batch × accum × gpu_count)不变,避免混淆变量。
 - 若某机制的两个探针都无效,放弃该机制,回到异常表选下一个候选。
-- 涉及模型/数据规模类变更(如换模型、扩数据)超出 wandb 数据分析范围,
-  转交 `generate-workflow-dsl` 完整流程处理。
+- 数据补充交给 `data-processing` 验证缺口并选择合成方法；训练指标仅作为
+  待验证假设，不直接推断缺陷类别或扩增数量。新数据确认后的训练编排，以及
+  换模型等训练配置变更，交给 `generate-workflow-dsl`。

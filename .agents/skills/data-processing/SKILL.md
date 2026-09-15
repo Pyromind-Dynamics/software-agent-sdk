@@ -2,7 +2,7 @@
 name: data-processing
 description: >-
   Pyromind 数据处理统一入口。用于格式转换、DataFlow 内容处理、从源数据分析
-  标签分布、按已确认 Gap 合成文本或 AVI/PCB 图片，以及数据自带镜像中的
+  标签分布、按已确认 Gap 合成文本或图片，以及数据自带镜像中的
   环境编排处理。统一执行预览、小样、人工确认、异步全量和报告校验。
 license: MIT
 ---
@@ -21,7 +21,7 @@ license: MIT
 | 格式转换/字段映射/简单过滤，无 LLM、无跨行操作 | format-conversion | references/paradigms/format-conversion/playbook.md |
 | 内容级清洗/抽样/生成/评分，用 DataFlow 算子或 LLM | llm-pipeline | references/paradigms/llm-pipeline/playbook.md |
 | 从源数据统计/推断标签分布并提出 Gap，不依赖 eval | distribution-analysis | references/paradigms/distribution-analysis.md |
-| 按已确认 Gap 合成文本或 AVI/PCB 图片数据 | gap-driven-synthesis | references/paradigms/gap-driven-synthesis.md |
+| 按已确认 Gap 合成文本或图片数据 | gap-driven-synthesis | references/paradigms/gap-driven-synthesis.md |
 | 单条数据要在特定环境（数据自带镜像）执行复杂流程（跑命令/测试/判定），需多阶段编排 | environment-processing | references/paradigms/environment-processing/playbook.md |
 | S2/LeRobot 机器人数据的多模态对齐、静止帧清理、批量转换与校验 | environment-processing（embodied case） | references/paradigms/environment-processing/cases/embodied-data-cleaning.md |
 | 编排任务无匹配 ProcessingProfile（一次性/探索性） | environment-processing（模式 B） | 同上 |
@@ -40,6 +40,10 @@ debug-workflow。路由不确定时 AskUserQuestion，不要猜。
 3. **本地执行**：Agent 按真实 schema 写 Python Pipeline。`df_run_pipeline`
    完整处理传入的本地输入，不负责抽样；清洗/合成小样由 preview 选择的输入
    和计划控制，精确分布统计可处理完整 materialize 文件。
+   依赖第三方库的探索性检查也通过该工具执行；通常不传 `python`，由工具使用
+   服务端配置的解释器（`DATAFLOW_PYTHON` 或服务端自身 Python）。terminal 的
+   Python、依赖和沙箱权限与之不同，不能用终端导入失败判定 Pipeline 不可用。
+   环境缺失以工具实际预检/执行结果为准，再处理运行环境配置。
 4. **门禁**：Taxonomy 与合成小样通过后必须获得用户明确确认才提交后续全量；
    已有标签的确定性全量统计不设人工门禁，且模型调用必须为零。
 5. **全量**：需要平台执行时统一用 `df_submit_pipeline`。DataFlow/EDP 平台任务（含具身
@@ -53,5 +57,6 @@ debug-workflow。路由不确定时 AskUserQuestion，不要猜。
 7. **交付**：展示产物与统计；场景内的产物契约与失败分类学以 playbook 为准。
 
 一期边界：分布分析不读取 eval/rubric/badcase；不注册 Dataset Version 或
-SQLite 元数据；不处理音视频。通用图片只分析或生成图文答案，生成新像素必须
-命中显式场景策略。
+SQLite 元数据；不处理音视频。图片合成可复用、组合或编写策略；适用条件、
+业务规则和验证依据写入合成计划，详见 gap-driven-synthesis，不默认沿用
+其他场景的像素或类别规则。

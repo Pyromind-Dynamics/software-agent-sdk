@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import UTC, datetime
 
 import pytest
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
@@ -18,6 +20,39 @@ from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.harness import SessionSpec
 
 from .fake_adapter import FakeAdapter
+
+
+def test_list_orders_by_activity_and_recovers_legacy_timestamps(tmp_path) -> None:
+    runtime = ConversationRuntime(tmp_path, FakeAdapter())
+    context = RequestContext(user_id="42")
+    for conversation_id, day, count in [("old", 1, 3), ("recent", 2, 1)]:
+        directory = tmp_path / conversation_id
+        directory.mkdir()
+        store = FileProductStore(directory)
+        store.create(
+            ConversationSnapshot(
+                conversation_id=conversation_id,
+                capabilities=HarnessCapabilities(),
+            ),
+            user_id="42",
+        )
+        for index in range(count):
+            store.append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    type="status.changed",
+                    payload={"status": "idle"},
+                    occurred_at=datetime(2026, 9, day, tzinfo=UTC),
+                )
+            )
+        legacy = json.loads(store.snapshot_path.read_text())
+        legacy.pop("updated_at")
+        store.snapshot_path.write_text(json.dumps(legacy))
+
+    snapshots = runtime.list_snapshots(context)
+    assert [item.conversation_id for item in snapshots] == ["recent", "old"]
+    assert snapshots[0].updated_at == datetime(2026, 9, 2, tzinfo=UTC)
+    assert runtime.list_snapshots(context) == snapshots
 
 
 async def test_runtime_keeps_product_data_inside_conversation(tmp_path) -> None:
