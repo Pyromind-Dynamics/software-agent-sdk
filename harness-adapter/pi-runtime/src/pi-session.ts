@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
@@ -12,6 +13,7 @@ import {
 import { createPiModelRuntime, type PiModelConfig } from "./pi-model.js";
 import { isRecord, type JsonObject, type JsonValue } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
+import { inside } from "./workspace-policy.js";
 import {
   createTerminalPermissionExtension,
   createTools,
@@ -31,6 +33,7 @@ interface PiSessionConfig extends PiModelConfig {
   terminalBackend: PiTerminalBackend;
   sessionPath: string;
   skillRoots: SkillRootConfig[];
+  skillsDirectory?: string;
   knowledgeRoot?: string;
   resourceLimits?: ResourceLimitsConfig;
   tools: BusinessToolConfig[];
@@ -57,6 +60,7 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
     config.knowledgeRoot,
     config.resourceLimits,
     config.tools,
+    config.skillsDirectory,
   );
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 20_000 },
@@ -64,13 +68,29 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
     defaultThinkingLevel: config.thinkingLevel,
   });
   const agentDir = join(config.workspaceRoot, "pi", "agent");
+  const skillPaths = [
+    ...config.skillRoots.map((root) => root.path),
+    ...(config.skillsDirectory ? [config.skillsDirectory] : []),
+  ].map((path) => realpathSync(path));
   const resourceLoader = new DefaultResourceLoader({
     cwd: config.workspaceRoot,
     agentDir,
     settingsManager,
     systemPrompt: config.systemPrompt,
     extensionFactories: [createTerminalPermissionExtension(peer)],
-    additionalSkillPaths: config.skillRoots.map((root) => root.path),
+    additionalSkillPaths: skillPaths,
+    skillsOverride: ({ skills, diagnostics }) => ({
+      skills: skills.filter((skill) => {
+        try {
+          const path = realpathSync(skill.filePath);
+          return skillPaths.some((root) => inside(path, root));
+        } catch {
+          return false;
+        }
+      }),
+      diagnostics,
+    }),
+    noSkills: true,
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
@@ -135,6 +155,7 @@ function parseConfig(value: JsonObject): PiSessionConfig {
     terminalBackend: terminalBackend(value),
     sessionPath: requiredString(value, "session_path"),
     skillRoots: parseSkillRoots(value),
+    skillsDirectory: optionalString(value, "skills_directory"),
     knowledgeRoot: optionalString(value, "knowledge_root"),
     resourceLimits: parseResourceLimits(value.resource_limits),
     tools: parseTools(value.tools),
@@ -176,7 +197,9 @@ function terminalBackend(value: JsonObject): PiTerminalBackend {
 
 function parseSkillRoots(value: JsonObject): SkillRootConfig[] {
   if (Array.isArray(value.skill_roots)) {
-    if (value.skill_roots.length === 0) throw new Error("skill_roots must not be empty");
+    if (value.skill_roots.length === 0 && !optionalString(value, "skills_directory")) {
+      throw new Error("skill_roots must not be empty without skills_directory");
+    }
     const names = new Set<string>();
     return value.skill_roots.map((item) => {
       if (!isRecord(item)) throw new Error("invalid skill root configuration");
@@ -186,6 +209,7 @@ function parseSkillRoots(value: JsonObject): SkillRootConfig[] {
       return { name, path: requiredString(item, "path") };
     });
   }
+  if (value.skill_root === undefined && optionalString(value, "skills_directory")) return [];
   return [{ name: "skill", path: requiredString(value, "skill_root") }];
 }
 

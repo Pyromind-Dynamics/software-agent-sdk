@@ -40,6 +40,7 @@ class TranslationState:
     last_usage: JsonObject | None = None
     external_tasks: dict[str, JsonObject] = field(default_factory=dict)
     suppress_workflow_events: int = 0
+    workflow_completion_hook: bool = False
 
     def begin_command(self, command_id: str) -> None:
         self.run_id = command_id
@@ -51,6 +52,32 @@ class TranslationState:
 
 
 def translate_event(
+    state: TranslationState,
+    event: Event,
+) -> tuple[HarnessEvent, ...]:
+    translated = _translate_event(state, event)
+    if state.workflow_completion_hook and not (
+        isinstance(event, ConversationStateUpdateEvent) and event.key == "full_state"
+    ):
+        return tuple(
+            item
+            for item in translated
+            if not (
+                item.type == "status.changed"
+                and item.payload.get("status")
+                in {
+                    "finished",
+                    "idle",
+                    "paused",
+                    "error",
+                    "stuck",
+                }
+            )
+        )
+    return translated
+
+
+def _translate_event(
     state: TranslationState,
     event: Event,
 ) -> tuple[HarnessEvent, ...]:
@@ -310,6 +337,26 @@ def _translate_state_update(
             return ()
         workflow = _workflow_payload(event.value, event.id)
         if workflow is not None:
+            if state.workflow_completion_hook:
+                state.ensure_run_id()
+                # The legacy hook already captures only dirty, finalized runs.
+                # Keep its native event as the rollback reference, but let the
+                # shared Product hook own publication and durable deduplication.
+                return (
+                    _event(
+                        state,
+                        event,
+                        "workflow.modified",
+                        {"completion_id": event.id},
+                        event_id=f"{event.id}:modified",
+                    ),
+                    _event(
+                        state,
+                        event,
+                        "run.finished",
+                        {"completion_id": event.id, "workflow": workflow},
+                    ),
+                )
             output.append(
                 _event(
                     state,
@@ -322,6 +369,12 @@ def _translate_state_update(
 
     if status_value is not None:
         status = str(status_value)
+        if (
+            state.workflow_completion_hook
+            and event.key != "full_state"
+            and status in {"finished", "idle", "paused", "error", "stuck"}
+        ):
+            status = state.last_status
         if status != state.last_status:
             state.last_status = status
             output.append(

@@ -257,12 +257,38 @@ ToolFactory = Callable[[ToolExecutionContext], ToolDefinition[Any, Any]]
 class PyromindBusinessToolHost:
     """Expose tested OpenHands business executors through Pi's JSONL bridge."""
 
-    def __init__(self, skill_roots: Sequence[Path]) -> None:
-        roots = {path.name: path.resolve() for path in skill_roots}
+    def __init__(
+        self,
+        skill_roots: Sequence[Path],
+        *,
+        skills_directory: Path | None = None,
+    ) -> None:
+        roots = (
+            {
+                name: skills_directory / name
+                for name in ("data-processing", "training-analysis")
+            }
+            if skills_directory is not None
+            else {}
+        )
+        roots.update({path.name: path.resolve() for path in skill_roots})
+        missing = {"data-processing", "training-analysis"} - roots.keys()
+        if missing:
+            raise ValueError(
+                f"Pi business tool resources not configured: {sorted(missing)}"
+            )
         self._cleaning_runtime = roots["data-processing"] / "scripts" / "cleaning"
         self._preparation_runtime = roots["data-processing"] / "scripts" / "preparation"
         self._edp_runtime = roots["data-processing"] / "scripts" / "edp"
         self._training_runtime = roots["training-analysis"] / "scripts"
+        for path in (
+            self._cleaning_runtime,
+            self._preparation_runtime,
+            self._edp_runtime,
+            self._training_runtime,
+        ):
+            if not path.is_dir():
+                raise ValueError(f"Pi business tool resource directory missing: {path}")
         self._locks: dict[str, asyncio.Lock] = {}
         self._active_executors: dict[tuple[str, str], Any] = {}
         self._factories: dict[str, ToolFactory] = {

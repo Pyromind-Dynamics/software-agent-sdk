@@ -9,6 +9,7 @@ from pyromind_runtime.domain.commands import ProductCommand
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent, HarnessEventType
+from pyromind_runtime.domain.snapshot import WorkflowState
 from pyromind_runtime.ports.harness import (
     ExternalTaskNotification,
     ForkSpec,
@@ -46,6 +47,17 @@ class FakeAdapter:
 
     async def describe(self):
         return "fake", self.capabilities
+
+    async def finalize_run(
+        self,
+        handle: SessionHandle,
+        completion: HarnessEvent,
+        workflow_event_id: str | None,
+    ) -> WorkflowState | None:
+        workflow = completion.payload.get("workflow")
+        if workflow_event_id is None or workflow is None:
+            return None
+        return WorkflowState.model_validate(workflow)
 
     async def create_session(
         self, spec: SessionSpec, context: RequestContext

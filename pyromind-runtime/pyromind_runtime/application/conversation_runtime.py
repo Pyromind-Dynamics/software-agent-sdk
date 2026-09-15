@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from pyromind_runtime.application.event_projection import ProductEventProjector
+from pyromind_runtime.application.workflow_completion import WorkflowCompletionHook
 from pyromind_runtime.domain.capabilities import ResourceLimits
 from pyromind_runtime.domain.commands import (
     CommandReceipt,
@@ -662,10 +663,17 @@ class ConversationRuntime:
         store: FileProductStore,
         ready: asyncio.Event,
     ) -> None:
+        workflow_hook = WorkflowCompletionHook(store, adapter, handle)
         try:
+            for recovered in await workflow_hook.recover():
+                self._publish(recovered)
             async for harness_event in adapter.subscribe(handle):
                 if harness_event.type == "history.synced":
                     ready.set()
+                    continue
+                if harness_event.type in {"workflow.modified", "run.finished"}:
+                    for completed in await workflow_hook.accept(harness_event):
+                        self._publish(completed)
                     continue
                 if harness_event.type == "message.delta" and harness_event.run_id:
                     started_at = self._first_delta_started_at.pop(

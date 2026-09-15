@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,18 +9,29 @@ import type { JsonObject, JsonValue, RunnerEvent } from "../src/protocol.js";
 import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 import { PiAgentRuntime } from "../src/agent-runtime.js";
 
-test("AgentSession completes the workflow-generation tool loop over chat completions", async (context) => {
-  const root = await mkdtemp(join(tmpdir(), "pi-runtime-test-"));
+test("AgentSession discovers directory skills and reads skill aliases in the workflow tool loop", async (context) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "pi-runtime-test-")));
   const workspace = join(root, "conversation");
-  const skill = join(root, "generate-workflow-dsl");
+  const skillsDirectory = join(root, "configured-skills");
+  const skill = join(skillsDirectory, "custom-workflow");
+  const extraSkill = join(root, "extra-skill");
   const knowledge = join(root, "knowledge-resource");
   await mkdir(join(workspace, "public_data"), { recursive: true });
   await mkdir(join(workspace, "pi", "terminal-output"), { recursive: true });
   await mkdir(join(skill, "references"), { recursive: true });
   await mkdir(knowledge);
+  await mkdir(extraSkill);
+  await writeFile(join(extraSkill, "SKILL.md"), "---\nname: extra-skill\ndescription: An explicitly configured skill.\n---\nExtra skill.\n");
+  const shadowedSkill = join(skillsDirectory, "extra-skill");
+  await mkdir(shadowedSkill);
+  await writeFile(join(shadowedSkill, "SKILL.md"), "---\nname: extra-skill\ndescription: base-shadowed-description\n---\nBase skill.\n");
+  const escapedSkill = join(root, "escaped-skill");
+  await mkdir(escapedSkill);
+  await writeFile(join(escapedSkill, "SKILL.md"), "---\nname: escaped-skill\ndescription: escaped-skill-description\n---\nOutside skill.\n");
+  await symlink(escapedSkill, join(skillsDirectory, "escaped-skill"));
   await writeFile(join(skill, "SKILL.md"), [
     "---",
-    "name: generate-workflow-dsl",
+    "name: custom-workflow",
     "description: Generate and validate a workflow DSL.",
     "---",
     "Read references/workflow-contracts.md, generate and validate the workflow.",
@@ -32,8 +43,8 @@ test("AgentSession completes the workflow-generation tool loop over chat complet
   const server = createServer(async (request, response) => {
     const body = await readJson(request);
     requests.push({ url: request.url ?? "", body });
-    if (requests.length === 1) sendToolCall(response, "read", { path: join(skill, "SKILL.md") }, "call-skill");
-    else if (requests.length === 2) sendToolCall(response, "read", { path: join(skill, "references", "workflow-contracts.md") }, "call-contract");
+    if (requests.length === 1) sendToolCall(response, "read", { path: ".agents/skills/custom-workflow/SKILL.md" }, "call-skill");
+    else if (requests.length === 2) sendToolCall(response, "read", { path: "./.agents/skills/custom-workflow/references/workflow-contracts.md" }, "call-contract");
     else if (requests.length === 3) sendToolCall(response, "write", {
       path: "public_data/workflow_canvas/workflow.py",
       content: "workflow = SFTWorkflow()\n",
@@ -73,7 +84,8 @@ test("AgentSession completes the workflow-generation tool loop over chat complet
     workspace_root: workspace,
     terminal_backend: "os-sandbox",
     session_path: join(workspace, "pi", "session.jsonl"),
-    skill_root: skill,
+    skills_directory: skillsDirectory,
+    skill_roots: [{ name: "extra-skill", path: extraSkill }],
     knowledge_root: knowledge,
     system_prompt: "Generate an SFT workflow by following the skill, then validate it.",
     model: {
@@ -109,6 +121,17 @@ test("AgentSession completes the workflow-generation tool loop over chat complet
 
   const finishedEvents = events.filter((event) => event.kind === "run.finished");
   assert.equal(finishedEvents.length, 1, JSON.stringify({ events, requests }, null, 2));
+  assert.equal(finishedEvents[0]!.payload.workflow_dsl, "workflow = SFTWorkflow()\n");
+  assert.equal(typeof finishedEvents[0]!.payload.checkpoint_entry_id, "string");
+  const assistantStarts = events.filter((event) => event.kind === "message.started" && event.payload.role === "assistant");
+  assert.equal(new Set(assistantStarts.map((event) => event.payload.message_id)).size, assistantStarts.length);
+  for (const start of assistantStarts) {
+    const deltas = events.filter((event) => event.kind === "message.delta" && event.payload.message_id === start.payload.message_id);
+    const completed = events.find((event) => event.kind === "message.completed" && event.payload.message_id === start.payload.message_id);
+    assert.ok(completed);
+    const blocks = completed.payload.content as Array<{ type: string; text?: string }>;
+    assert.equal(deltas.map((event) => event.payload.text).join(""), blocks.filter((block) => block.type === "text").map((block) => block.text).join(""));
+  }
   assert.equal(finishedEvents[0]!.payload.outcome &&
     typeof finishedEvents[0]!.payload.outcome === "object" &&
     !Array.isArray(finishedEvents[0]!.payload.outcome)
@@ -149,6 +172,11 @@ test("AgentSession completes the workflow-generation tool loop over chat complet
   const firstRequest = JSON.stringify(requests[0]!.body);
   assert.equal(firstRequest.includes("<available_skills>"), true);
   assert.equal(firstRequest.includes(join(skill, "SKILL.md")), true);
+  assert.equal(firstRequest.includes(join(extraSkill, "SKILL.md")), true);
+  assert.equal(firstRequest.includes("base-shadowed-description"), false);
+  assert.equal(firstRequest.includes("escaped-skill-description"), false);
+  assert.equal(JSON.stringify(requests[1]!.body).includes("Read references/workflow-contracts.md"), true);
+  assert.equal(JSON.stringify(requests[2]!.body).includes("A workflow is valid when it defines workflow."), true);
 });
 
 test("a persistent length stop finishes as output_truncated, never completed", async (context) => {

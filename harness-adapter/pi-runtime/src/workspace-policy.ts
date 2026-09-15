@@ -6,13 +6,14 @@ export type WorkspacePathOperation = "read" | "write";
 export interface WorkspacePolicyInput {
   workspaceRoot: string;
   readOnlyRoots: string[];
+  skillsDirectory?: string;
   knowledgeRoot?: string;
 }
 
 /**
  * One canonical path policy shared by Pi's native file tools and terminal.
- * Relative paths always start at the conversation root. Only public_data is
- * writable; configured skills and knowledge are additional read-only roots.
+ * Relative workspace paths start at the conversation root; skill and knowledge
+ * aliases address shared read-only resources. Only public_data is writable.
  */
 export class WorkspaceAccessPolicy {
   private constructor(
@@ -21,6 +22,7 @@ export class WorkspaceAccessPolicy {
     readonly terminalTempRoot: string,
     readonly readOnlyRoots: readonly string[],
     readonly knowledgeRoot: string | undefined,
+    readonly skillsDirectory: string | undefined,
   ) {}
 
   static async create(input: WorkspacePolicyInput): Promise<WorkspaceAccessPolicy> {
@@ -51,8 +53,12 @@ export class WorkspaceAccessPolicy {
     const knowledge = input.knowledgeRoot
       ? await canonicalDirectory(input.knowledgeRoot, "knowledge root")
       : undefined;
+    const skills = input.skillsDirectory
+      ? await canonicalDirectory(input.skillsDirectory, "skills directory")
+      : undefined;
     const allReadOnlyRoots = [...new Set([
       ...readOnlyRoots,
+      ...(skills ? [skills] : []),
       ...(knowledge ? [knowledge] : []),
     ])];
     return new WorkspaceAccessPolicy(
@@ -61,6 +67,7 @@ export class WorkspaceAccessPolicy {
       terminalTemp,
       allReadOnlyRoots,
       knowledge,
+      skills,
     );
   }
 
@@ -86,6 +93,17 @@ export class WorkspaceAccessPolicy {
   }
 
   private resolveInput(input: string): string {
+    if (!isAbsolute(input)) {
+      const parts = input.split(/[\\/]/).filter((part) => part !== "" && part !== ".");
+      if (parts[0] === ".agents" && parts[1] === "skills") {
+        if (!this.skillsDirectory) {
+          throw new Error(
+            "PATH_SCOPE_ERROR: .agents/skills/ is not configured for this Pi session",
+          );
+        }
+        return resolve(this.skillsDirectory, ...parts.slice(2));
+      }
+    }
     if (!isAbsolute(input) && input.split(/[\\/]/)[0] === "knowledge") {
       if (!this.knowledgeRoot) {
         throw new Error(
@@ -155,6 +173,6 @@ function isMissing(error: unknown): boolean {
 function pathScopeError(operation: WorkspacePathOperation): Error {
   const scope = operation === "write"
     ? "write and edit paths must stay within public_data/"
-    : "read paths must stay within public_data/, an advertised skill, or knowledge/";
+    : "read paths must stay within public_data/, configured skill directories, or knowledge/";
   return new Error(`PATH_SCOPE_ERROR: ${scope}`);
 }

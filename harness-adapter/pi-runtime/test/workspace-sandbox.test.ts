@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -46,7 +46,8 @@ async function workspaceTree() {
   const publicData = join(workspace, "public_data");
   const terminalTemp = join(workspace, "pi", "terminal-output");
   const repositorySource = join(repository, "src");
-  const skill = join(repository, ".agents", "skills", "data-cleaning");
+  const skillsDirectory = join(repository, ".agents", "skills");
+  const skill = join(skillsDirectory, "data-cleaning");
   const knowledge = join(repository, "knowledge");
   const otherConversation = join(conversations, "other");
   await mkdir(publicData, { recursive: true });
@@ -60,7 +61,8 @@ async function workspaceTree() {
   await mkdir(join(home, ".ssh"), { recursive: true });
   const policy = await WorkspaceAccessPolicy.create({
     workspaceRoot: workspace,
-    readOnlyRoots: [skill],
+    readOnlyRoots: [],
+    skillsDirectory,
     knowledgeRoot: knowledge,
   });
   return {
@@ -70,6 +72,7 @@ async function workspaceTree() {
     terminalTemp,
     repositorySource,
     skill,
+    skillsDirectory,
     knowledge,
     otherConversation,
     policy,
@@ -316,10 +319,24 @@ test(
     const workspaceFile = join(tree.publicData, "input.txt");
     const repositoryFile = join(tree.repositorySource, "dependency.py");
     const skillFile = join(tree.skill, "SKILL.md");
+    const ordinaryFile = join(tree.skillsDirectory, ".shared-reference.txt");
+    const script = join(tree.skill, "scripts", "helper.py");
     const otherConversationFile = join(tree.otherConversation, "private.txt");
     await writeFile(workspaceFile, "workspace-data");
     await writeFile(repositoryFile, "repository-secret");
     await writeFile(skillFile, "skill-reference");
+    await writeFile(ordinaryFile, "shared-reference");
+    await mkdir(join(tree.skill, "scripts"));
+    const scriptSource = [
+      "#!/usr/bin/env python3",
+      "from pathlib import Path",
+      "import sys",
+      "Path(sys.argv[1]).write_text('script-output')",
+      "print('script-executed')",
+      "",
+    ].join("\n");
+    await writeFile(script, scriptSource);
+    await chmod(script, 0o755);
     await writeFile(otherConversationFile, "other-conversation-secret");
     const operations = createWorkspaceSandboxedBashOperations(tree.policy, {
       userHome: tree.home,
@@ -339,6 +356,29 @@ test(
       );
       assert.equal(allowed.exitCode, 0);
       assert.match(output, /workspace-data/);
+
+      output = "";
+      const skillRead = await operations.exec(
+        `cat '${skillFile}' '${ordinaryFile}'`,
+        tree.workspace,
+        { onData: (data) => { output += data.toString(); } },
+      );
+      assert.equal(skillRead.exitCode, 0, output);
+      assert.match(output, /skill-reference/);
+      assert.match(output, /shared-reference/);
+
+      for (const command of [`python3 -B '${script}'`, `'${script}'`]) {
+        output = "";
+        const scriptRun = await operations.exec(
+          `${command} public_data/script-result.txt`,
+          tree.workspace,
+          { onData: (data) => { output += data.toString(); } },
+        );
+        assert.equal(scriptRun.exitCode, 0, output);
+        assert.match(output, /script-executed/);
+        assert.equal(await readFile(join(tree.publicData, "script-result.txt"), "utf8"), "script-output");
+        assert.equal(await readFile(script, "utf8"), scriptSource);
+      }
 
       output = "";
       const changedDirectory = await operations.exec(

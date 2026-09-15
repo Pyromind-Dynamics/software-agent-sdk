@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { setImmediate } from "node:timers";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -17,6 +19,7 @@ import type { JsonlRpcPeer } from "./rpc-peer.js";
 export class PiAgentRuntime {
   private session: AgentSession | undefined;
   private sessionId: string | undefined;
+  private workspaceRoot: string | undefined;
   private normalizer: PiEventNormalizer | undefined;
   private readonly outcome = new PiOutcomeNormalizer();
   private readonly finishedRuns = new Set<string>();
@@ -49,6 +52,7 @@ export class PiAgentRuntime {
     });
     this.session = session;
     this.sessionId = sessionId;
+    this.workspaceRoot = requiredString(params, "workspace_root");
     return { ready: true };
   }
 
@@ -101,9 +105,18 @@ export class PiAgentRuntime {
       payload: {
         outcome: JSON.parse(JSON.stringify(outcome)) as JsonObject,
         checkpoint_entry_id: this.session?.sessionManager?.getLeafId() ?? null,
+        ...this.captureWorkflow(),
       },
     };
     this.peer.emit(event);
+  }
+
+  private captureWorkflow(): JsonObject {
+    try {
+      return { workflow_dsl: readFileSync(join(this.workspaceRoot!, "public_data/workflow_canvas/workflow.py"), "utf8") };
+    } catch (error) {
+      return { workflow_dsl: null, workflow_snapshot_error: (error as NodeJS.ErrnoException).code !== "ENOENT" };
+    }
   }
 
   private async cancel(): Promise<JsonValue> {

@@ -12,6 +12,8 @@ from pyromind_runtime.domain.content import JsonObject
 
 type HarnessEventType = Literal[
     "history.synced",
+    "workflow.modified",
+    "run.finished",
     "status.changed",
     "message.started",
     "message.delta",
@@ -75,3 +77,10 @@ class ProductEvent(ContractModel):
     run_id: str | None = None
     payload: JsonObject = Field(default_factory=dict)
     source_event_id: str | None = None
+
+
+class WorkflowRunState(ContractModel):
+    run_id: str
+    modified: bool = False
+    completion: HarnessEvent | None = None
+    completed: bool = False

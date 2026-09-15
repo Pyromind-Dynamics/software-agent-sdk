@@ -119,6 +119,25 @@ Directory-related startup variables:
 | `PYROMIND_KNOWLEDGE_BASE_PATH` | `${SOFTWARE_AGENT_SDK_DIR}/knowledge` |
 | `PYROMIND_SKILLS_PATH` | `${SOFTWARE_AGENT_SDK_DIR}/.agents/skills` |
 
+For the Pi backend, `PYROMIND_SKILLS_PATH` grants recursive read-only access to
+the entire directory, including ordinary reference files, scripts, and hidden
+files. New files do not require individual allowlist entries. The `read` tool
+accepts absolute paths and maps `.agents/skills/` (including `./.agents/skills/`)
+to this directory. Writes and symlink escapes remain restricted.
+Read-only access still permits running helper scripts through `terminal`, using
+the absolute script path and the interpreter specified by the skill. Script
+outputs belong under `public_data/`; execution does not load source into the
+model context. Skill usage follows Pi's native conventions.
+
+Pi discovers skills in this directory using its native skill loader when a
+session starts or reloads. Explicitly configured extra skill paths remain
+available and take precedence over same-name skills in the base directory.
+After changing the environment variable, restart the server; restored sessions
+use the current deployment paths without migrating stored conversation data.
+The directory must still contain the business tool resources under
+`data-processing/scripts/{cleaning,preparation,edp}` and
+`training-analysis/scripts`, unless those skill paths are explicitly overridden.
+
 See [`knowledge/README.md`](knowledge/README.md) for knowledge layout and Docker build notes.
 
 ## Documentation

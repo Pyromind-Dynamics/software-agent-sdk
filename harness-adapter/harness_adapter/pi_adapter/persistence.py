@@ -15,6 +15,7 @@ class PiSessionFiles:
         self.inflight_path = self.directory / "inflight.json"
         self.business_state_path = self.directory / "business-state.json"
         self.checkpoint_index_path = self.directory / "fork-index.json"
+        self.completions_path = self.directory / "run-completions.json"
 
     def initialize(self, session: dict[str, Any]) -> None:
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -46,6 +47,22 @@ class PiSessionFiles:
 
     def clear_inflight(self) -> None:
         self.inflight_path.unlink(missing_ok=True)
+
+    def load_pending_completions(self) -> dict[str, Any]:
+        if not self.completions_path.is_file():
+            return {}
+        return _load_object(self.completions_path)
+
+    def save_pending_completion(self, run_id: str, value: dict[str, Any]) -> None:
+        pending = self.load_pending_completions()
+        pending[run_id] = value
+        _atomic_json(self.completions_path, pending)
+
+    def clear_pending_completion(self, run_id: str) -> None:
+        pending = self.load_pending_completions()
+        if run_id in pending:
+            del pending[run_id]
+            _atomic_json(self.completions_path, pending)
 
     def load_business_state(self) -> dict[str, Any]:
         if not self.business_state_path.is_file():

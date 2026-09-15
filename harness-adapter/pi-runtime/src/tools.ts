@@ -51,10 +51,12 @@ export async function createTools(
   knowledgeRoot: string | undefined,
   resourceLimits: ResourceLimitsConfig | undefined,
   businessTools: BusinessToolConfig[],
+  skillsDirectory?: string,
 ): Promise<AgentTool[]> {
   const policy = await WorkspaceAccessPolicy.create({
     workspaceRoot,
     readOnlyRoots: skillRoots.map((root) => root.path),
+    skillsDirectory,
     knowledgeRoot,
   });
   // Keep this binding explicit: the sandbox switches the process temp directory
@@ -146,7 +148,7 @@ function bindPathTool(
 ): AgentTool<any, any> {
   const bound = bindNative(tool, env);
   const pathScope = operation === "read"
-    ? "Conversation files are read from public_data/. Advertised skill paths and knowledge/ are read-only. Relative paths start at the conversation root; authorized absolute paths are also accepted."
+    ? "Conversation files are read from public_data/. Configured skill directories and knowledge are read-only. .agents/skills/ and knowledge/ address their configured resource directories. Other relative paths start at the conversation root; authorized absolute paths are also accepted."
     : "Write and edit paths must stay within public_data/. Relative paths start at the conversation root; authorized absolute paths are also accepted.";
   const parameters = structuredClone(bound.parameters);
   if (isRecord(parameters.properties) && isRecord(parameters.properties.path)) {

@@ -3,11 +3,15 @@ from __future__ import annotations
 from typing import Protocol
 
 from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
-from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.events import ProductEvent, WorkflowRunState
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 
 
 class ProductStore(Protocol):
+    def load_workflow_runs(self) -> dict[str, WorkflowRunState]: ...
+
+    def save_workflow_run(self, state: WorkflowRunState) -> None: ...
+
     def create(self, snapshot: ConversationSnapshot, *, user_id: str) -> None: ...
 
     def load_snapshot(self) -> ConversationSnapshot: ...

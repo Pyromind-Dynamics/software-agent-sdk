@@ -203,6 +203,44 @@ async def test_product_api_creates_pi_metadata_and_reports_missing_checkpoint(
             f"/api/v2/pyromind/conversations/{conversation_id}/forks",
             json={"eventId": "event-1"},
         )
+        assert created.json()["current_workflow"] is None
+        adapter = runtime.adapters["pi"]
+        assert isinstance(adapter, PiAdapter)
+        session = adapter._session(conversation_id)
+        frame = {
+            "protocolVersion": 2,
+            "type": "pi.event",
+            "sessionId": conversation_id,
+            "runId": "edited-run",
+            "eventId": "edit-final",
+            "kind": "tool.completed",
+            "payload": {
+                "tool_call_id": "edit",
+                "tool_name": "edit",
+                "arguments": {"path": "public_data/workflow_canvas/workflow.py"},
+                "content": [],
+            },
+        }
+        await adapter._runner_event(session, frame)
+        await adapter._runner_event(
+            session,
+            {
+                **frame,
+                "eventId": "finish-final",
+                "kind": "run.finished",
+                "payload": {
+                    "outcome": {"status": "completed"},
+                    "checkpoint_entry_id": "workflow-checkpoint",
+                },
+            },
+        )
+        async with asyncio.timeout(2):
+            while (
+                not FileProductStore(conversations / conversation_id)
+                .load_snapshot()
+                .current_workflow
+            ):
+                await asyncio.sleep(0.01)
         workflow_event = next(
             event
             for event in FileProductStore(conversations / conversation_id).replay()
@@ -225,7 +263,8 @@ async def test_product_api_creates_pi_metadata_and_reports_missing_checkpoint(
     workflow_text = workflow.read_text()
     assert workflow_text.startswith("# workflow: Workflow")
     assert 'CloneAndCacheDataset(id="n1")' in workflow_text
-    assert created.json()["current_workflow"]["canvas"]["name"] == "Workflow"
+    canvas = workflow_event.payload["canvas"]
+    assert isinstance(canvas, dict) and canvas["nodes"]
     assert forked.status_code == 404
     assert forked.json()["detail"]["code"] == "checkpoint_not_found"
     assert valid_fork.status_code == 201
@@ -233,7 +272,7 @@ async def test_product_api_creates_pi_metadata_and_reports_missing_checkpoint(
     assert target_id != conversation_id
     assert (
         valid_fork.json()["current_workflow"]["version"]
-        == (created.json()["current_workflow"]["version"])
+        == workflow_event.payload["version"]
     )
     assert (conversations / target_id / "pi" / "session.jsonl").is_file()
     await runtime.close()

@@ -71,6 +71,13 @@ class ExternalTaskNotification(ContractModel):
 
 
 class HarnessAdapter(Protocol):
+    async def finalize_run(
+        self,
+        handle: SessionHandle,
+        completion: HarnessEvent,
+        workflow_event_id: str | None,
+    ) -> WorkflowState | None: ...
+
     async def describe(self) -> tuple[str, HarnessCapabilities]: ...
 
     async def create_session(
