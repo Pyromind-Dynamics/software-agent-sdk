@@ -45,6 +45,37 @@ async def test_runtime_keeps_product_data_inside_conversation(tmp_path) -> None:
     await runtime.close()
 
 
+async def test_cached_session_reattaches_to_survive_harness_eviction(
+    tmp_path,
+) -> None:
+    """Harnesses reclaim idle conversations behind the product layer's back.
+
+    ``_ensure_active`` must re-attach on cache hits so an evicted harness service
+    is re-activated rather than replayed into, which used to surface as a
+    terminal ``inactive_service`` conflict on every later command.
+    """
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter)
+    context = RequestContext(user_id="42")
+    await runtime.create_conversation(
+        SessionSpec(
+            conversation_id="conversation-evicted",
+            user_id="42",
+            workspace_root=str(conversations),
+        ),
+        context,
+    )
+    assert adapter.attached == []
+
+    await runtime.get_snapshot("conversation-evicted", context)
+    await runtime.get_snapshot("conversation-evicted", context)
+
+    assert adapter.attached == ["conversation-evicted", "conversation-evicted"]
+    await runtime.close()
+
+
 async def test_command_forwards_ephemeral_cookie_and_cluster(tmp_path) -> None:
     conversations = tmp_path / "conversations"
     conversations.mkdir()
