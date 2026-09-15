@@ -108,6 +108,7 @@ all Pyromind artifacts exclusively with `preview_dataset`; never use Terminal,
 workspace file APIs, or local filesystem reads for these Storage paths:
 - report.json: execution summary, LLM call stats, error samples
 - failure.json / validation.json: detailed failure evidence when present
+- failures.jsonl: retry ledger for skipped records; rows carry the source input
 - llm_calls.jsonl: per-attempt audit; invalid model output includes a redacted preview
 - label_corrections.jsonl: human-label corrections with reasons and visual evidence
 - processed.jsonl: pipeline output data

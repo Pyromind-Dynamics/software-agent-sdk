@@ -66,5 +66,7 @@ debug-workflow。路由不确定时 AskUserQuestion，不要猜。
    resume 还是新 run；终止/失败不自动重提交，交用户决策。
    report.failures 非空时（failures.jsonl：无响应/截止/解析失败的记录），
    把其中的 input 行重组为子集输入补跑同一 pipeline 并合并产出，单条挂起
-   不再阻塞整轮（墙钟截止见 dataflow-common.md）。
+   不再阻塞整轮（墙钟截止见 dataflow-common.md）。子集文件须与原 source
+   放在**同一目录** —— input 行保留的是相对图片路径，只有同目录才能解析
+   回原图（绝对路径会被 pipeline 以"必须是相对 POSIX 路径"拒绝）。
 7. **交付**：展示产物与统计；场景内的产物契约与失败分类学以 playbook 为准。

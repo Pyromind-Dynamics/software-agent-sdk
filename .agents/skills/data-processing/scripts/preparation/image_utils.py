@@ -16,6 +16,10 @@ import shutil
 import sys
 import time
 import types
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+)
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -48,12 +52,31 @@ NATIVE_VLM_SUFFIXES = {".jpg", ".jpeg", ".png"}
 CONVERTIBLE_VLM_SUFFIXES = {".gif", ".webp", ".bmp"}
 IMAGE_SUFFIXES = NATIVE_VLM_SUFFIXES | CONVERTIBLE_VLM_SUFFIXES
 
+# Run-level failure summary, read back by generate_report.py as ``runtime_failure``
+# and by the host tool as ``report.json.failure``.
+FAILURE_FILENAME = "failure.json"
+# Record-level ledger that the retry run rebuilds a subset input from. The name
+# must stay plural: generate_report.py reads exactly this file, and a singular
+# spelling here silently zeroes out ``report.failures``.
+FAILURES_FILENAME = "failures.jsonl"
+
 __all__ = [
     "ImagePipelineConfig",
     "MultiImageSemanticLabelOperator",
+    "PartialPipelineFailure",
     "run_image_pipeline",
     "run_image_pipeline_from_cli",
 ]
+
+
+class PartialPipelineFailure(RuntimeError):
+    """Some records were skipped, but the batch still wrote its good output.
+
+    Raised after the output has been materialized so the host tool sees a
+    non-zero exit code (it keys off the exit code alone) while the records
+    that did validate survive in the output file. Details live in
+    ``failures.jsonl``.
+    """
 
 
 def _default_response_schema() -> dict[str, Any]:
@@ -160,6 +183,27 @@ class ImagePipelineConfig:
 
 def _valid_dotted_path(value: str) -> bool:
     return bool(value.strip()) and all(part.strip() for part in value.split("."))
+
+
+@dataclass(frozen=True)
+class _VlmOutcome:
+    """What one VLM round produced for a record.
+
+    ``status`` is ``"ok"`` with ``raw_response`` populated, or the failure
+    reason (``"deadline"`` / ``"error"``) with ``error`` populated. A batch
+    call that times out or raises yields the same outcome for every record it
+    covered.
+    """
+
+    status: str
+    raw_response: str | None = None
+    error: str | None = None
+    latency_ms: float = 0.0
+
+
+def _request_deadline() -> float:
+    """Per-record wall-clock budget, shared with the text pipeline knob."""
+    return float(os.environ.get("DF_REQUEST_DEADLINE", "600"))
 
 
 class ManagedStreamBatchedFileStorage(StreamBatchedFileStorage):
@@ -273,8 +317,10 @@ class MultiImageSemanticLabelOperator(OperatorABC):
         self.state_dir = state_dir
         self.llm_serving = serving or _create_vlm_serving(config)
         self._progress_path = state_dir / "progress.json"
+        self._request_deadline = _request_deadline()
         self._total = self._read_total_records()
-        self._processed = self._count_committed_records()
+        self._succeeded = self._count_committed_records()
+        self._failed = _count_jsonl_lines(state_dir / FAILURES_FILENAME)
         self._attempted_this_run = 0
         self._started_at = time.monotonic()
         self._write_progress_snapshot()
@@ -289,10 +335,12 @@ class MultiImageSemanticLabelOperator(OperatorABC):
         rows = [
             _canonical_output(sample, response, self.config)
             for sample, response in zip(prepared, responses, strict=True)
+            if response is not None
         ]
         storage.write(rows)
-        self._processed += len(rows)
-        self._attempted_this_run += len(rows)
+        self._succeeded += len(rows)
+        self._failed += len(prepared) - len(rows)
+        self._attempted_this_run += len(prepared)
         self._write_progress_snapshot()
 
     def _read_total_records(self) -> int:
@@ -321,9 +369,9 @@ class MultiImageSemanticLabelOperator(OperatorABC):
         write_progress(
             self._progress_path,
             total=self._total,
-            processed=self._processed,
-            succeeded=self._processed,
-            failed=0,
+            processed=self._succeeded + self._failed,
+            succeeded=self._succeeded,
+            failed=self._failed,
             started_at=self._started_at,
             attempted_this_run=self._attempted_this_run,
         )
@@ -331,49 +379,44 @@ class MultiImageSemanticLabelOperator(OperatorABC):
     def _generate_validated(
         self,
         samples: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, Any] | None]:
+        """Label every sample, ledgering the ones that never validate.
+
+        Returns a list aligned with ``samples`` whose entries are ``None``
+        where the record was given up on. A record that exhausts
+        ``max_attempts`` is written to ``failures.jsonl`` and skipped rather
+        than raised on, so one unparseable sample cannot destroy the records
+        in the same batch that did validate.
+        """
         results: list[dict[str, Any] | None] = [None] * len(samples)
         pending = list(range(len(samples)))
         prompts = [sample["_model_prompt"] for sample in samples]
         last_errors: dict[int, str] = {}
+        last_status: dict[int, str] = {}
 
         for attempt in range(1, self.config.max_attempts + 1):
+            if not pending:
+                break
             request_indices = list(pending)
-            try:
-                raw_responses = self.llm_serving.generate_from_input_multi_images(
-                    [samples[index]["_local_images"] for index in request_indices],
-                    [samples[index]["_image_labels"] for index in request_indices],
-                    system_prompt="",
-                    user_prompts=[prompts[index] for index in request_indices],
-                    timeout=self.config.timeout,
-                    json_schema=_effective_response_schema(self.config),
-                )
-                if len(raw_responses) != len(request_indices):
-                    raise ValueError(
-                        "DataFlow VLM returned a response count that does not "
-                        "match the request count"
-                    )
-            except Exception as exc:
-                error = _safe_error(exc)
-                for index in request_indices:
-                    last_errors[index] = error
+            outcomes = self._call_vlm(request_indices, samples, prompts)
+
+            pending = []
+            for index in request_indices:
+                outcome = outcomes[index]
+                if outcome.status != "ok":
+                    last_errors[index] = outcome.error or "unknown VLM failure"
+                    last_status[index] = outcome.status
+                    pending.append(index)
                     _log_attempt(
                         self.state_dir,
                         samples[index],
                         attempt=attempt,
-                        status="error",
-                        error=error,
+                        status=outcome.status,
+                        error=outcome.error,
+                        latency_ms=outcome.latency_ms,
                     )
-                if attempt == self.config.max_attempts:
-                    break
-                continue
-
-            pending = []
-            for index, raw_response in zip(
-                request_indices,
-                raw_responses,
-                strict=True,
-            ):
+                    continue
+                raw_response = outcome.raw_response or ""
                 try:
                     parsed, parse_mode = _validate_response(
                         raw_response,
@@ -383,6 +426,7 @@ class MultiImageSemanticLabelOperator(OperatorABC):
                 except (TypeError, ValueError, json.JSONDecodeError) as exc:
                     error = _safe_error(exc)
                     last_errors[index] = error
+                    last_status[index] = "invalid_output"
                     prompts[index] = (
                         f"{samples[index]['_model_prompt']}\n\n"
                         "The previous response failed validation: "
@@ -397,6 +441,7 @@ class MultiImageSemanticLabelOperator(OperatorABC):
                         error=error,
                         raw_response=raw_response,
                         parse_mode=_response_parse_mode(raw_response),
+                        latency_ms=outcome.latency_ms,
                     )
                     continue
                 results[index] = parsed
@@ -406,29 +451,91 @@ class MultiImageSemanticLabelOperator(OperatorABC):
                     attempt=attempt,
                     status="success",
                     parse_mode=parse_mode,
+                    latency_ms=outcome.latency_ms,
                     reconciliation=_reconciliation_log_record(
                         samples[index],
                         parsed,
                         self.config,
                     ),
                 )
-            if not pending:
-                return [value for value in results if value is not None]
 
-        failed_index = pending[0] if pending else next(iter(last_errors), 0)
-        failed = samples[failed_index]
-        error = last_errors.get(failed_index, "unknown VLM failure")
-        _write_failure(
-            self.state_dir,
-            failed,
-            stage="image_label",
-            error=error,
-            attempts=self.config.max_attempts,
+        for index in pending:
+            _record_failure(
+                self.state_dir,
+                samples[index],
+                stage="image_label",
+                reason=last_status.get(index, "no_response"),
+                error=last_errors.get(index, "unknown VLM failure"),
+                attempts=self.config.max_attempts,
+            )
+        return results
+
+    def _call_vlm(
+        self,
+        indices: list[int],
+        samples: list[dict[str, Any]],
+        prompts: list[str],
+    ) -> dict[int, _VlmOutcome]:
+        """Run the batch's VLM call under a wall-clock budget.
+
+        ``generate_from_input_multi_images`` fans out across its own thread
+        pool but calls ``future.result()`` without a timeout, so one hung
+        gateway connection stalls the whole batch forever -- the socket
+        ``read_timeout`` never fires because the gateway keeps the connection
+        alive. Owning the submission here is what makes the batch abandonable
+        at ``DF_REQUEST_DEADLINE``, the same budget the text pipeline's
+        ``LoggingLLMServing`` enforces per record. A cut batch is ledgered by
+        the caller and retried by the follow-up run, so its slow records are
+        not lost.
+        """
+        deadline = self._request_deadline
+        started_at = time.monotonic()
+
+        def elapsed_ms() -> float:
+            return (time.monotonic() - started_at) * 1000
+
+        def batch_outcome(status: str, error: str) -> dict[int, _VlmOutcome]:
+            return {
+                index: _VlmOutcome(status=status, error=error, latency_ms=elapsed_ms())
+                for index in indices
+            }
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            self.llm_serving.generate_from_input_multi_images,
+            [samples[index]["_local_images"] for index in indices],
+            [samples[index]["_image_labels"] for index in indices],
+            system_prompt="",
+            user_prompts=[prompts[index] for index in indices],
+            timeout=self.config.timeout,
+            json_schema=_effective_response_schema(self.config),
         )
-        raise ValueError(
-            f"image sample {failed['id']!r} failed after "
-            f"{self.config.max_attempts} attempts: {error}"
-        )
+        try:
+            raw_responses = future.result(timeout=deadline)
+        except FuturesTimeoutError:
+            return batch_outcome(
+                "deadline", f"exceeded DF_REQUEST_DEADLINE={deadline:g}s"
+            )
+        except Exception as exc:
+            return batch_outcome("error", _safe_error(exc))
+        finally:
+            # Joining an abandoned hung thread would reintroduce the stall this
+            # deadline exists to prevent; df_logging.py shuts down the same way.
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        if not isinstance(raw_responses, list) or len(raw_responses) != len(indices):
+            return batch_outcome(
+                "error",
+                "DataFlow VLM returned a response count that does not "
+                "match the request count",
+            )
+        latency_ms = elapsed_ms()
+        return {
+            index: _VlmOutcome(
+                status="ok", raw_response=response, latency_ms=latency_ms
+            )
+            for index, response in zip(indices, raw_responses, strict=True)
+        }
 
 
 def run_image_pipeline(
@@ -505,7 +612,7 @@ def run_image_pipeline(
             resume_from_last=True,
         )
     except Exception as exc:
-        if not (state_dir / "failure.json").is_file():
+        if not (state_dir / FAILURE_FILENAME).is_file():
             _write_failure(
                 state_dir,
                 {"id": None, "_source_index": None, "_source_path": str(source)},
@@ -515,9 +622,32 @@ def run_image_pipeline(
             )
         storage.materialize_output()
         raise
+    except BaseException:
+        # A cancellation is not a pipeline failure, but the parts already
+        # written should still reach the output file before it propagates.
+        storage.materialize_output()
+        raise
     else:
         storage.materialize_output()
-        (state_dir / "failure.json").unlink(missing_ok=True)
+        (state_dir / FAILURE_FILENAME).unlink(missing_ok=True)
+        skipped = _count_jsonl_lines(state_dir / FAILURES_FILENAME)
+        if skipped:
+            # The validated records are already materialized above, so fail
+            # only after writing the summary. A non-zero exit is how the host
+            # tool learns a retry run is needed; it reads the exit code alone.
+            _write_failure(
+                state_dir,
+                {"id": None, "_source_index": None, "_source_path": str(source)},
+                stage="record_skipped",
+                error=(
+                    f"{skipped} record(s) skipped after {config.max_attempts} attempts"
+                ),
+                attempts=config.max_attempts,
+            )
+            raise PartialPipelineFailure(
+                f"{skipped} record(s) failed after {config.max_attempts} "
+                f"attempts; see {FAILURES_FILENAME}"
+            )
     finally:
         serving = (
             getattr(pipeline.label, "llm_serving", None)
@@ -536,7 +666,8 @@ def _reset_run_audit(state_dir: Path) -> None:
         "llm_calls.jsonl",
         "label_corrections.jsonl",
         "report.json",
-        "failure.json",
+        FAILURE_FILENAME,
+        FAILURES_FILENAME,
         "validation.json",
         "progress.json",
     ):
@@ -1250,6 +1381,7 @@ def _log_attempt(
     raw_response: Any = None,
     parse_mode: str | None = None,
     reconciliation: dict[str, Any] | None = None,
+    latency_ms: float = 0.0,
 ) -> None:
     path = state_dir / "llm_calls.jsonl"
     record = {
@@ -1258,7 +1390,7 @@ def _log_attempt(
         "model": os.environ.get("DF_MODEL_NAME"),
         "status": status,
         "timestamp": datetime.now(_UTC).isoformat(),
-        "latency_ms": 0,
+        "latency_ms": round(latency_ms),
         "request_payload": {
             "id": sample.get("id"),
             "prompt": str(sample.get("_user_prompt") or "")[:1000],
@@ -1342,7 +1474,53 @@ def _write_failure(
             "attempts": attempts,
         },
     }
-    _write_json_atomic(state_dir / "failure.json", payload)
+    _write_json_atomic(state_dir / FAILURE_FILENAME, payload)
+
+
+def _record_failure(
+    state_dir: Path,
+    sample: dict[str, Any],
+    *,
+    stage: str,
+    reason: str,
+    error: str,
+    attempts: int,
+) -> None:
+    """Append one skipped record to ``failures.jsonl``.
+
+    ``generate_report.py`` summarizes this ledger into ``report.failures``, and
+    the retry run rebuilds a subset input from the ``input`` rows, so each line
+    has to carry the record's own source fields rather than the ``_``-prefixed
+    scratch keys the operator adds.
+    """
+    record = {
+        "reason": reason,
+        "stage": stage,
+        "error": error,
+        "attempts": attempts,
+        "source_index": sample.get("_source_index"),
+        "source_id": sample.get("id"),
+        "input": _source_record(sample),
+    }
+    path = state_dir / FAILURES_FILENAME
+    with path.open("a", encoding="utf-8") as target:
+        target.write(json.dumps(record, ensure_ascii=False) + "\n")
+        target.flush()
+
+
+def _source_record(sample: dict[str, Any]) -> dict[str, Any]:
+    """Strip the operator's internal scratch keys from a prepared sample."""
+    return {key: value for key, value in sample.items() if not key.startswith("_")}
+
+
+def _count_jsonl_lines(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    try:
+        with path.open("rb") as handle:
+            return sum(1 for line in handle if line.strip())
+    except OSError:
+        return 0
 
 
 def _safe_error(error: BaseException | str) -> str:

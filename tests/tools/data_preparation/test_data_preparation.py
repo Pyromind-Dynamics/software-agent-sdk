@@ -1043,6 +1043,32 @@ def _load_image_utils() -> Any:
     return module
 
 
+def _load_preparation_module(module_name: str) -> Any:
+    """Load a sibling runtime script from the preparation scripts directory."""
+
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+    spec = importlib.util.spec_from_file_location(
+        module_name, scripts_dir / f"{module_name}.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    # Sibling scripts import each other by bare name, as they do at runtime.
+    sys.path.insert(0, str(scripts_dir))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(scripts_dir))
+    return module
+
+
 def test_data_preparation_runtime_is_python_310_compatible() -> None:
     scripts_dir = (
         Path(__file__).parents[3]
@@ -1345,14 +1371,17 @@ def test_image_utils_dataflow_checkpoint_resume_without_duplicates(
         encoding="utf-8",
     )
 
-    class FailingServing:
+    class InterruptingServing:
+        """中断第 2 批。用 ``KeyboardInterrupt`` 是因为记录级失败现在会被
+        兜底成 ``failures.jsonl`` 账本，只有真正的取消才会中止整轮。"""
+
         calls = 0
 
         def generate_from_input_multi_images(self, *args, **kwargs):
             del args, kwargs
             self.calls += 1
             if self.calls == 2:
-                raise RuntimeError("boundary failure")
+                raise KeyboardInterrupt
             return ['{"reasoning":"ok","answer":"A"}']
 
         def cleanup(self):
@@ -1371,9 +1400,9 @@ def test_image_utils_dataflow_checkpoint_resume_without_duplicates(
     monkeypatch.setattr(
         image_utils,
         "_create_vlm_serving",
-        lambda config: FailingServing(),
+        lambda config: InterruptingServing(),
     )
-    with pytest.raises(ValueError, match="boundary failure"):
+    with pytest.raises(KeyboardInterrupt):
         image_utils.run_image_pipeline(config, str(manifest), str(output))
 
     first_rows = [json.loads(line) for line in output.read_text().splitlines()]
@@ -1402,6 +1431,150 @@ def test_image_utils_dataflow_checkpoint_resume_without_duplicates(
         "Inspect first.",
         "Inspect second.",
     ]
+
+
+def test_image_utils_record_failure_is_ledgered_without_losing_good_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单条坏记录不再销毁同批好数据，且账本让补跑闭环真的成立。
+
+    回归事故形态（会话 938a / 平台任务 8599）：``calls=18 success=7
+    failed=11 output_records=0`` —— 11 条坏数据把 7 条已成功的数据一起销毁；
+    且 ``failure.json``（单数）与 ``generate_report.py`` 读取的
+    ``failures.jsonl``（复数）文件名对不上，``report.failures.count``
+    恒为 0，补跑拿不到 ``input`` 行。
+    """
+
+    image_utils = _load_image_utils()
+    generate_report = _load_preparation_module("generate_report")
+
+    for index in (1, 2, 3):
+        _write_image(tmp_path / f"s{index}.jpg", (index, 2, 3))
+    source = tmp_path / "source.jsonl"
+    source.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "id": f"s{index}",
+                    "images": [f"s{index}.jpg"],
+                    "user_prompt": f"Inspect {index}.",
+                }
+            )
+            for index in (1, 2, 3)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    class PartlyBadServing:
+        """s2 永远返回截断 JSON —— 与事故现场同源的失败（Unterminated string）。"""
+
+        def __init__(self) -> None:
+            self.request_sizes: list[int] = []
+
+        def generate_from_input_multi_images(
+            self, list_of_image_paths: Any, *args: Any, **kwargs: Any
+        ) -> list[str]:
+            del args, kwargs
+            self.request_sizes.append(len(list_of_image_paths))
+            time.sleep(0.05)
+            responses = []
+            for paths in list_of_image_paths:
+                stem = Path(paths[0]).stem
+                if stem == "s2":
+                    responses.append('{"reasoning": "truncated ...')
+                else:
+                    responses.append(
+                        json.dumps({"reasoning": "ok", "answer": f"label-{stem}"})
+                    )
+            return responses
+
+        def cleanup(self) -> None:
+            return None
+
+    serving = PartlyBadServing()
+    state_dir = tmp_path / "state"
+    output = tmp_path / "processed.jsonl"
+    config = image_utils.ImagePipelineConfig(
+        labeling_system_prompt="Label.",
+        training_system_prompt="Train.",
+        user_prompt_template="Inspect.",
+        batch_size=3,
+        max_attempts=2,
+    )
+    monkeypatch.setenv("DF_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("DF_RESUME", "0")
+    monkeypatch.setattr(image_utils, "_create_vlm_serving", lambda config: serving)
+
+    with pytest.raises(image_utils.PartialPipelineFailure):
+        image_utils.run_image_pipeline(config, str(source), str(output))
+
+    # 批量调用是契约：整批 3 条一次请求，随后只重试失败的那 1 条。
+    assert serving.request_sizes == [3, 1]
+
+    # 好数据落盘 —— 修复前这里是 0 行。
+    rows = [
+        json.loads(line) for line in output.read_text().splitlines() if line.strip()
+    ]
+    assert [row["messages"][1]["content"][-1]["value"] for row in rows] == [
+        "Inspect 1.",
+        "Inspect 3.",
+    ]
+
+    # 记录级账本写在 failures.jsonl —— generate_report.py 读的就是这个文件名。
+    ledger = [
+        json.loads(line)
+        for line in (state_dir / "failures.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert len(ledger) == 1
+    assert ledger[0]["source_id"] == "s2"
+    assert ledger[0]["reason"] == "invalid_output"
+
+    # input 行可直接重组为补跑输入：保留源记录字段，剥离算子内部 _ 键。
+    retry_input = ledger[0]["input"]
+    assert retry_input["id"] == "s2"
+    assert retry_input["images"] == ["s2.jpg"]
+    assert retry_input["user_prompt"] == "Inspect 2."
+    assert not [key for key in retry_input if key.startswith("_")]
+
+    # run 级 failure.json 保留（宿主 _read_report_failure 依赖它），
+    # 可操作字段嵌在 failure 键下。
+    failure = json.loads((state_dir / "failure.json").read_text())
+    assert failure["status"] == "failed"
+    assert failure["failure"]["stage"] == "record_skipped"
+    assert failure["failure"]["attempts"] == config.max_attempts
+
+    # 端到端：report.failures 不再是 0（修复前恒为 0，补跑无法发起）。
+    report = generate_report.generate_report(str(state_dir))
+    assert report["failures"]["count"] == 1
+    assert report["failures"]["by_reason"] == {"invalid_output": 1}
+    assert report["failures"]["artifact"] == "failures.jsonl"
+
+    # progress 不再硬编码 failed=0。
+    progress = json.loads((state_dir / "progress.json").read_text())
+    assert progress["failed"] == 1
+    assert progress["succeeded"] == 2
+    assert progress["processed"] == 3
+
+    # latency_ms 有真实测量（修复前恒为 0）。
+    calls = [
+        json.loads(line)
+        for line in (state_dir / "llm_calls.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert calls
+    assert all(call["latency_ms"] > 0 for call in calls)
+
+    # 补跑闭环：账本 input 行重建的子集能被 pipeline 重新接受。
+    # image_utils 只接受相对 POSIX 图片路径（防目录穿越），所以子集必须与
+    # 原 source 同目录，相对 images 才能解析。
+    subset = tmp_path / "retry.jsonl"
+    subset.write_text(json.dumps(retry_input) + "\n", encoding="utf-8")
+    retried, _ = image_utils._load_source_records(subset, config, None)
+    assert [record["id"] for record in retried] == ["s2"]
+    assert all(Path(path).is_file() for path in retried[0]["_local_images"])
 
 
 def test_image_utils_converts_webp_for_dataflow(
