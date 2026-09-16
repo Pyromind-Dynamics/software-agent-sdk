@@ -154,6 +154,9 @@ When reviewing or modifying code, read the closest AGENTS file for the
 package(s) containing the changed files. If a PR spans multiple packages,
 consult each relevant package-level AGENTS.md.
 
+Changes involving the Pyromind Product Runtime, harness adapters, or product
+server must also follow [rule.md](rule.md).
+
 - SDK: [openhands-sdk/openhands/sdk/AGENTS.md](openhands-sdk/openhands/sdk/AGENTS.md)
 - Subagents: [openhands-sdk/openhands/sdk/subagent/AGENTS.md](openhands-sdk/openhands/sdk/subagent/AGENTS.md)
 - Tools: [openhands-tools/openhands/tools/AGENTS.md](openhands-tools/openhands/tools/AGENTS.md)

@@ -197,7 +197,18 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
         self, action: DfStopTaskAction, conversation: BaseConversation | None
     ) -> str | None:
         if action.task_id and action.task_id.strip():
-            return action.task_id.strip()
+            task_id = action.task_id.strip()
+            if conversation is None:
+                return task_id
+            store = self._task_store(conversation)
+            if store is None:
+                return None
+            association = store.get(task_id)
+            if association is None:
+                return None
+            if str(association.conversation_id) != str(conversation.id):
+                return None
+            return task_id
 
         store = self._task_store(conversation)
         if store is None:

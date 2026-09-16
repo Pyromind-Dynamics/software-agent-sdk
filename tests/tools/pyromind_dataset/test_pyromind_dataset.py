@@ -25,6 +25,7 @@ from openhands.tools.pyromind_dataset.definition import (
     UploadFileToPyromindExecutor,
     _match_shared_dataset,
     _resolve_workspace_dir,
+    _sample_logical_rows,
     _vision_api_config,
     download_file_from_pyromind,
 )
@@ -36,6 +37,25 @@ def test_preview_description_mentions_shared_and_storage() -> None:
     assert "storage" in _PREVIEW_DATASET_DESCRIPTION.lower()
     assert "openai/gsm8k" in _PREVIEW_DATASET_DESCRIPTION
     assert "auto-selects" in _PREVIEW_DATASET_DESCRIPTION
+
+
+def test_sample_logical_rows_preserves_csv_header_and_requested_rows() -> None:
+    content = b"text,label\na,x\nb,y\nc,z\nd,w\n"
+
+    sampled = _sample_logical_rows(content, "/dataset/train.csv", 3)
+
+    assert sampled.decode().splitlines() == [
+        "text,label",
+        "a,x",
+        "b,y",
+        "c,z",
+    ]
+
+
+def test_materialize_mode_is_part_of_public_action_schema() -> None:
+    assert PreviewDatasetAction(dataset_path="/dataset", mode="materialize").mode == (
+        "materialize"
+    )
 
 
 def test_match_shared_dataset_exact() -> None:

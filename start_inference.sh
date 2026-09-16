@@ -45,9 +45,11 @@ esac
 # LLM Configuration
 # ----------------------------------------------------------
 # LiteLLM requires a provider prefix (e.g. openai/) for custom OpenAI-compatible endpoints.
-export LLM_MODEL="openai/deepseek-v4-flash-0731"
+# export LLM_MODEL="glm-5.3-flash"
+# export LLM_BASE_URL="http://208.64.254.189:8001/v1"
+export LLM_MODEL="deepseek/deepseek-v4-flash-0731"
 export LLM_BASE_URL="http://208.64.254.189:8000/v1"
-# export LLM_MODEL="deepseek/deepseek-v4-flash-0731"
+# export LLM_MODEL="z-ai/glm-5.3-flash"
 # export LLM_BASE_URL="https://openrouter.ai/api/v1"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
@@ -154,6 +156,14 @@ fi
 # provide Python 3.13 wheels. Every harness inherits the same interpreter via
 # DATAFLOW_PYTHON, so adapters do not need harness-specific setup.
 DATAFLOW_VERSION="${DATAFLOW_VERSION:-1.0.10}"
+DATAFLOW_PACKAGES=(
+  "open-dataflow==${DATAFLOW_VERSION}"
+  "numpy==1.26.4"
+  "Pillow==12.1.1"
+  "pandas==2.2.3"
+  "opencv-python-headless==4.10.0.84"
+  "matplotlib==3.9.4"
+)
 DATAFLOW_RUNTIME_DIR="${DATAFLOW_RUNTIME_DIR:-${WORKSPACE_DIR}/runtime/dataflow-venv}"
 
 if [[ -z "${DATAFLOW_PYTHON:-}" ]]; then
@@ -175,22 +185,42 @@ import sys
 
 import dataflow
 
-sys.exit(importlib.metadata.version("open-dataflow") != sys.argv[1])
-' "${DATAFLOW_VERSION}" 2>/dev/null; then
-  echo "Installing open-dataflow==${DATAFLOW_VERSION} into shared runtime..."
+for requirement in sys.argv[1:]:
+    package, version = requirement.split("==", 1)
+    if importlib.metadata.version(package) != version:
+        sys.exit(1)
+' "${DATAFLOW_PACKAGES[@]}" 2>/dev/null; then
+  echo "Installing DataFlow and image-processing dependencies into shared runtime..."
   uv pip install \
     --python "${DATAFLOW_PYTHON}" \
-    "open-dataflow==${DATAFLOW_VERSION}"
+    "${DATAFLOW_PACKAGES[@]}"
 fi
 
 "${DATAFLOW_PYTHON}" -c '
 import importlib.metadata
 
+import cv2
 import dataflow
+import matplotlib
+import numpy
+import pandas
+from PIL import Image
 
 version = importlib.metadata.version("open-dataflow")
 print(f"DataFlow runtime ready: open-dataflow=={version}")
 '
+
+# uv venvs do not include pip by default. Seed the matching interpreter's pip,
+# rather than letting terminal commands fall through to a system installation.
+"${DATAFLOW_PYTHON}" -m ensurepip --upgrade --default-pip
+"${DATAFLOW_PYTHON}" -m pip --version
+
+TERMINAL_PYTHON_BIN="$(cd "$(dirname "${DATAFLOW_PYTHON}")" && pwd)"
+TERMINAL_PYTHON_BASE="$("${DATAFLOW_PYTHON}" -c 'import sys; print(sys.base_prefix)')"
+TERMINAL_UV_PYTHON_ROOT="$(uv python dir)"
+# Pi discovers read-only runtime roots from PATH. A venv alone does not cover
+# uv's base interpreter, version-alias symlinks and standard library.
+export TERMINAL_RUNTIME_PATH="${TERMINAL_PYTHON_BIN}:${TERMINAL_UV_PYTHON_ROOT}:${TERMINAL_PYTHON_BASE}:${PATH}"
 
 # ----------------------------------------------------------
 # Pi Runtime
@@ -226,6 +256,7 @@ echo " Server root:       ${SOFTWARE_AGENT_SDK_DIR}"
 echo " Knowledge Base:    ${PYROMIND_KNOWLEDGE_BASE_PATH}"
 echo " Skills:            ${PYROMIND_SKILLS_PATH}"
 echo " DataFlow Python:   ${DATAFLOW_PYTHON}"
+echo " Terminal Python:   ${TERMINAL_PYTHON_BIN}/python3"
 echo " Workspace root:    ${WORKSPACE_DIR}"
 echo " Conversations:     ${OH_CONVERSATIONS_PATH}"
 echo " Project workspace: ${OH_WORKSPACE_PATH}"
@@ -243,7 +274,13 @@ echo " Auto-reload:       enabled"
 echo "============================================"
 echo ""
 
-uv run python -m pyromind_agent_server \
+# Preserve uv's server interpreter while exposing the shared Python to terminals.
+uv run bash -c '
+  set -euo pipefail
+  server_python="$(command -v python)"
+  export PATH="${TERMINAL_RUNTIME_PATH}"
+  exec "${server_python}" -m pyromind_agent_server "$@"
+' pyromind-agent-server \
   --host 127.0.0.1 \
   --port 8000 \
   --reload

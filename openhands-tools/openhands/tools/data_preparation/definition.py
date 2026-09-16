@@ -1,12 +1,12 @@
-"""Data preparation tools: download, run DataFlow pipelines, convert formats.
+"""Data preparation tools: download, run Python pipelines, convert formats.
 
 These tools implement the local data-preparation loop:
 
 1. ``dataset_download`` materializes a HuggingFace dataset (or a sample of
    it) into the conversation workspace as JSONL.
-2. ``df_run_pipeline`` executes an agent-authored DataFlow pipeline script in
-   an isolated subprocess, injecting LLM credentials from the conversation's
-   own LLM config (never hardcoded in the script).
+2. ``df_run_pipeline`` executes an agent-authored Python pipeline in an
+   isolated subprocess. DataFlow and the managed AVI runtime are optional
+   libraries selected by the script.
 3. ``df_convert`` turns processed JSONL into Pyromind-supported ``messages``,
    ``preference`` (DPO), embedded TRL vision SFT, or flat path-based vision
    SFT format, ready for upload.
@@ -14,14 +14,15 @@ These tools implement the local data-preparation loop:
 
 from __future__ import annotations
 
-import csv
+import hashlib
 import json
 import logging
 import os
+import shutil
 from collections.abc import Sequence
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Final, Literal, Self
+from typing import Any, Literal, Self
 
 import httpx
 from pydantic import Field, field_validator, model_validator
@@ -54,10 +55,12 @@ from openhands.tools.utils import default_path_access_policy
 
 
 RUNTIME_FILENAMES = (
+    "avi_pcb_runtime.py",
     "df_logging.py",
     "generate_report.py",
     "image_utils.py",
     "preparation_runtime.py",
+    "source_fingerprint.py",
     "validate_prepared_data.py",
 )
 
@@ -75,6 +78,7 @@ OutputSchema = Literal[
     "function_call",
     "quality_evaluation",
     "text2sql",
+    "artifacts",
 ]
 
 
@@ -133,58 +137,23 @@ def _resolve_output_path(conversation: Any, path: str) -> Path:
     return resolved
 
 
-# Local sample cap for ``df_run_pipeline``. Local runs validate a small sample
-# before a full ``df_submit_pipeline``; cap the input so an agent-authored
-# pipeline without its own ``--limit`` cannot silently process the whole file.
-DF_SAMPLE_LIMIT_ENV: Final[str] = "DF_SAMPLE_LIMIT"
-DEFAULT_SAMPLE_LIMIT: Final[int] = 3
+def _source_fingerprint(path: Path) -> str:
+    """Return a stable byte fingerprint for a source file or directory."""
 
-
-def _sample_limit() -> int:
-    """Return the local sample row cap (``DF_SAMPLE_LIMIT``, default 3)."""
-    raw = os.environ.get(DF_SAMPLE_LIMIT_ENV, str(DEFAULT_SAMPLE_LIMIT))
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return DEFAULT_SAMPLE_LIMIT
-
-
-def _truncate_sample_input(input_path: Path, limit: int) -> Path | None:
-    """Return a copy of *input_path* capped to ``limit`` records, or ``None``.
-
-    Only single text files (``.csv`` with a header, or newline-delimited
-    JSONL/text) are truncated. Directories (multimodal samples) and inputs with
-    ``limit`` or fewer records are left untouched. A copy is written next to the
-    original so the pipeline receives an unambiguously sized sample.
-    """
-
-    if not input_path.is_file() or limit <= 0:
-        return None
-
-    if input_path.suffix.lower() == ".csv":
-        with input_path.open(encoding="utf-8", newline="") as handle:
-            reader = csv.reader(handle)
-            try:
-                header = next(reader)
-            except StopIteration:
-                return None
-            rows = list(reader)
-        if len(rows) <= limit:
-            return None
-        sample_path = input_path.with_name(f"{input_path.stem}.sample.csv")
-        with sample_path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(header)
-            writer.writerows(rows[:limit])
-        return sample_path
-
-    with input_path.open(encoding="utf-8", errors="replace") as handle:
-        lines = [line for _, line in zip(range(limit + 1), handle)]
-    if len(lines) <= limit:
-        return None
-    sample_path = input_path.with_name(f"{input_path.stem}.sample{input_path.suffix}")
-    sample_path.write_text("".join(lines[:limit]), encoding="utf-8")
-    return sample_path
+    if not path.exists():
+        raise FileNotFoundError(path)
+    digest = hashlib.sha256()
+    files = (
+        [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
+    )
+    for item in files:
+        if path.is_dir():
+            digest.update(item.relative_to(path).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+        with item.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _resolve_legacy_input_arg(
@@ -495,7 +464,7 @@ class DatasetDownloadTool(
 class DfRunPipelineAction(Action):
     pipeline_path: str = Field(
         description=(
-            "Workspace-relative path of the DataFlow pipeline script to run, "
+            "Workspace-relative path of the Python pipeline script to run, "
             "e.g. 'public_data/data-preparation/pipeline.py'."
         )
     )
@@ -503,10 +472,18 @@ class DfRunPipelineAction(Action):
         default_factory=list,
         description=(
             "Positional arguments forwarded to the pipeline script. Their meaning "
-            "is defined by that script; multimodal templates use input path, "
-            "output path, and optional limit. When output_schema is set, args[0] "
+            "is defined by that script; standard pipelines use input path and "
+            "output path. Sampling is determined by the prepared input, never "
+            "by this executor. When output_schema is set, args[0] "
             "and args[1] are workspace-relative input/output paths and are "
             "normalized before execution."
+        ),
+    )
+    support_file_path: str | None = Field(
+        default=None,
+        description=(
+            "Optional workspace JSON file frozen into the local run directory "
+            "and passed to the pipeline as its third positional argument."
         ),
     )
     timeout: int = Field(default=3600, ge=60, le=7200, description="Timeout seconds.")
@@ -514,23 +491,25 @@ class DfRunPipelineAction(Action):
         default=None,
         description=(
             "Python interpreter override. Defaults to $DATAFLOW_PYTHON or the "
-            "current interpreter. Must have `open-dataflow` installed."
+            "current interpreter. text/vision profiles require `open-dataflow`; "
+            "the none profile does not."
         ),
     )
     output_schema: OutputSchema | None = Field(
         default=None,
         description=(
             "Canonical JSONL schema to validate after a successful run: text, dpo, "
-            "vision, multiturn, function_call, quality_evaluation, or text2sql. "
+            "vision, multiturn, function_call, quality_evaluation, text2sql, or "
+            "artifacts. "
             "For the standard pipeline contract, args[1] is treated as the output "
             "path. Omit only for legacy pipelines with non-standard outputs."
         ),
     )
-    model_profile: Literal["text", "vision"] = Field(
+    model_profile: Literal["none", "text", "vision"] = Field(
         default="text",
         description=(
-            "Use the conversation's main model for text, or the server-configured "
-            "DF vision model (normally Gemma) for image labeling."
+            "Use none for pure Python/AVI work without model credentials, text "
+            "for the conversation model, or vision for the managed image model."
         ),
     )
 
@@ -743,7 +722,9 @@ class DfRunPipelineExecutor(ToolExecutor):
         process_args = list(action.args)
         standard_input_path: Path | None = None
         output_path: Path | None = None
+        support_file_path: Path | None = None
         state_dir: Path | None = None
+        log_dir: Path | None = None
         if action.output_schema is not None:
             if len(process_args) < 2:
                 return _df_failure(
@@ -780,11 +761,6 @@ class DfRunPipelineExecutor(ToolExecutor):
                 )
             process_args[0] = str(standard_input_path)
             process_args[1] = str(output_path)
-            # Local sample cap: limit the input so an agent-authored pipeline
-            # without its own --limit can't silently process the whole file.
-            sample_input = _truncate_sample_input(standard_input_path, _sample_limit())
-            if sample_input is not None:
-                process_args[0] = str(sample_input)
         elif len(process_args) >= 2:
             # Legacy mode: the child process runs with cwd=pipeline.parent, but
             # the rest of this tool family resolves arguments from the workspace
@@ -797,6 +773,7 @@ class DfRunPipelineExecutor(ToolExecutor):
             )
             if legacy_paths is not None:
                 input_path, base = legacy_paths
+                standard_input_path = input_path
                 process_args[0] = str(input_path)
                 output_path = base / process_args[1]
                 process_args[1] = str(output_path)
@@ -805,19 +782,91 @@ class DfRunPipelineExecutor(ToolExecutor):
                 if not output_path.is_absolute():
                     output_path = pipeline.parent / output_path
 
-        python = resolve_dataflow_python(action.python)
-        ok, detail = check_dataflow_installed(python)
-        if not ok:
+        if action.support_file_path is not None:
+            if len(process_args) < 2:
+                return _df_failure(
+                    stage="input_resolution",
+                    code="standard_pipeline_args_missing",
+                    message="support_file_path requires input and output arguments.",
+                )
+            if len(process_args) > 2:
+                return _df_failure(
+                    stage="input_resolution",
+                    code="support_file_argument_conflict",
+                    message=(
+                        "Do not pass a third positional argument when "
+                        "support_file_path is set; the tool appends it."
+                    ),
+                )
+            try:
+                support_file_path = _resolve_workspace_path(
+                    conversation, action.support_file_path
+                )
+            except ValueError as exc:
+                return _df_failure(
+                    stage="input_resolution",
+                    code="workspace_support_file_not_found",
+                    message=f"Invalid support file: {exc}",
+                )
+            if support_file_path.suffix.lower() != ".json":
+                return _df_failure(
+                    stage="input_resolution",
+                    code="support_file_not_json",
+                    message="support_file_path must point to a JSON file.",
+                )
+            try:
+                json.loads(support_file_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                return _df_failure(
+                    stage="input_resolution",
+                    code="support_file_invalid_json",
+                    message=f"support_file_path is not valid JSON: {exc}",
+                )
+            try:
+                json.loads(support_file_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                return _df_failure(
+                    stage="input_resolution",
+                    code="support_file_invalid_json",
+                    message=f"support_file_path is not valid JSON: {exc}",
+                )
+
+        if (
+            standard_input_path is not None
+            and standard_input_path.is_dir()
+            and output_path is not None
+            and output_path.resolve().is_relative_to(standard_input_path.resolve())
+        ):
             return _df_failure(
-                stage="runtime_dependency",
-                code="dataflow_not_installed",
-                message=(
-                    f"DataFlow is not installed for interpreter `{python}`.\n"
-                    "Install it with `uv pip install open-dataflow` (preferably "
-                    "in a dedicated venv) or set DATAFLOW_PYTHON to an "
-                    f"interpreter that has it.\nImport check: {detail or 'failed'}"
-                ),
+                stage="output_resolution",
+                code="output_inside_source",
+                message="Pipeline output must be outside the source directory.",
             )
+
+        if action.output_schema == "vision":
+            try:
+                self._preflight_managed_image_pipeline(pipeline)
+            except ValueError as exc:
+                return _df_failure(
+                    stage="pipeline_resolution",
+                    code="managed_image_pipeline_invalid",
+                    message=f"Invalid managed image pipeline: {exc}",
+                )
+
+        python = resolve_dataflow_python(action.python)
+        if action.model_profile != "none":
+            ok, detail = check_dataflow_installed(python)
+            if not ok:
+                return _df_failure(
+                    stage="runtime_dependency",
+                    code="dataflow_not_installed",
+                    message=(
+                        f"DataFlow is not installed for interpreter `{python}`.\n"
+                        "Install it with `uv pip install open-dataflow` (preferably "
+                        "in a dedicated venv) or set DATAFLOW_PYTHON to an "
+                        f"interpreter that has it.\nImport check: {detail or 'failed'}"
+                    ),
+                )
         if action.output_schema == "vision":
             version_ok, version_detail = check_dataflow_version(python)
             if not version_ok:
@@ -828,37 +877,31 @@ class DfRunPipelineExecutor(ToolExecutor):
                         f"Local DataFlow version must match Pyromind: {version_detail}"
                     ),
                 )
+        env_extra: dict[str, str] = {}
+        if action.model_profile != "none":
             try:
-                self._preflight_managed_image_pipeline(pipeline)
+                env_extra = build_dataflow_env(conversation, action.model_profile)
             except ValueError as exc:
                 return _df_failure(
-                    stage="pipeline_resolution",
-                    code="managed_image_pipeline_invalid",
-                    message=f"Invalid managed image pipeline: {exc}",
+                    stage="model_configuration",
+                    code="dataflow_model_configuration_invalid",
+                    message=f"Invalid DataFlow model configuration: {exc}",
                 )
-
-        try:
-            env_extra = build_dataflow_env(conversation, action.model_profile)
-        except ValueError as exc:
-            return _df_failure(
-                stage="model_configuration",
-                code="dataflow_model_configuration_invalid",
-                message=f"Invalid DataFlow model configuration: {exc}",
-            )
-        try:
-            preflight_dataflow_llm(env_extra)
-        except ValueError as exc:
-            return _df_failure(
-                stage="model_configuration",
-                code="dataflow_llm_preflight_failed",
-                message=f"DataFlow LLM preflight failed: {exc}",
-            )
+            try:
+                preflight_dataflow_llm(env_extra)
+            except ValueError as exc:
+                return _df_failure(
+                    stage="model_configuration",
+                    code="dataflow_llm_preflight_failed",
+                    message=f"DataFlow LLM preflight failed: {exc}",
+                )
 
         if output_path is not None:
             state_dir = output_path.parent / f".{output_path.stem}.state"
             state_dir.mkdir(parents=True, exist_ok=True)
-            env_extra["DF_LOG_DIR"] = str(state_dir)
-            env_extra["DF_STATE_DIR"] = str(state_dir)
+            log_dir = output_path.parent
+            env_extra["DF_LOG_DIR"] = str(log_dir)
+            env_extra["DF_STATE_DIR"] = str(log_dir)
             env_extra["DF_RESUME"] = "0"
             env_extra["DF_EXECUTION_REVISION"] = "1"
             if self._runtime_dir is not None:
@@ -876,13 +919,29 @@ class DfRunPipelineExecutor(ToolExecutor):
         elif self._runtime_dir is not None:
             state_dir = pipeline.parent / f".{pipeline.stem}.state"
             state_dir.mkdir(parents=True, exist_ok=True)
+            log_dir = state_dir
 
         if self._runtime_dir is not None:
             assert state_dir is not None
             runtime_stage_dir = self._stage_runtime_files(state_dir / "runtime")
             if runtime_stage_dir is not None:
                 self._add_runtime_pythonpath(env_extra, runtime_stage_dir)
-        config_summary = summarize_dataflow_env(env_extra)
+        if support_file_path is not None:
+            assert state_dir is not None
+            frozen_support = state_dir / "support" / support_file_path.name
+            frozen_support.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(support_file_path, frozen_support)
+            process_args.append(str(frozen_support))
+        source_fingerprint_before = (
+            _source_fingerprint(standard_input_path)
+            if standard_input_path is not None
+            else None
+        )
+        config_summary = (
+            "model=none api_key_configured=no"
+            if action.model_profile == "none"
+            else summarize_dataflow_env(env_extra)
+        )
         validation_rc: int | None = None
         report_rc: int | None = None
         rc, stdout, stderr = self._sample_executor.run(
@@ -893,6 +952,43 @@ class DfRunPipelineExecutor(ToolExecutor):
             timeout=action.timeout,
         )
         pipeline_rc = rc
+        source_fingerprint_error: str | None = None
+        try:
+            source_fingerprint_after = (
+                _source_fingerprint(standard_input_path)
+                if standard_input_path is not None
+                else None
+            )
+        except OSError as exc:
+            # Deleting or otherwise making the source unreadable is itself an
+            # integrity violation. Keep returning a structured tool failure.
+            source_fingerprint_after = None
+            source_fingerprint_error = str(exc)
+        source_integrity_rc = 0
+        if (
+            source_fingerprint_before is not None
+            and source_fingerprint_before != source_fingerprint_after
+        ):
+            source_integrity_rc = 90
+            if rc == 0:
+                rc = source_integrity_rc
+            stderr = (
+                f"{stderr}\nSource data changed during pipeline execution; "
+                "the source must remain read-only."
+            )
+        if log_dir is not None and source_fingerprint_before is not None:
+            (log_dir / "source_integrity.json").write_text(
+                json.dumps(
+                    {
+                        "before": source_fingerprint_before,
+                        "after": source_fingerprint_after,
+                        "unchanged": source_integrity_rc == 0,
+                        "error": source_fingerprint_error,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
         if rc == 0 and action.output_schema is not None:
             assert output_path is not None
             assert state_dir is not None
@@ -907,7 +1003,7 @@ class DfRunPipelineExecutor(ToolExecutor):
                 "--schema",
                 action.output_schema,
                 "--report",
-                str(state_dir / "validation.json"),
+                str((log_dir or state_dir) / "validation.json"),
             ]
             if action.output_schema == "vision":
                 assert standard_input_path is not None
@@ -928,7 +1024,7 @@ class DfRunPipelineExecutor(ToolExecutor):
             rc = validation_rc
         report_path: Path | None = None
         if output_path is not None and state_dir is not None:
-            report_path = state_dir / "report.json"
+            report_path = (log_dir or state_dir) / "report.json"
             report_script = (
                 state_dir / "runtime" / "generate_report.py"
                 if self._runtime_dir is not None
@@ -937,7 +1033,7 @@ class DfRunPipelineExecutor(ToolExecutor):
             report_args = [
                 str(report_script),
                 "--log-dir",
-                str(state_dir),
+                str(log_dir or state_dir),
                 "--pipeline-exit-code",
                 str(pipeline_rc),
                 "--execution-revision",
@@ -998,6 +1094,10 @@ class DfRunPipelineExecutor(ToolExecutor):
                     if isinstance(reported_error, str) and reported_error.strip()
                     else f"DataFlow pipeline exited with code {pipeline_rc}."
                 )
+            elif source_integrity_rc != 0:
+                failure_stage = "source_integrity"
+                error_code = "source_data_modified"
+                error_message = "Pipeline modified its source data."
             elif validation_rc is not None and validation_rc != 0:
                 failure_stage = "schema_validation"
                 error_code = "dataflow_schema_validation_failed"
@@ -1017,7 +1117,7 @@ class DfRunPipelineExecutor(ToolExecutor):
                 error_message = f"DataFlow pipeline exited with code {rc}."
         return DfRunPipelineObservation.from_text(
             text=(
-                f"DataFlow model: {config_summary}\n"
+                f"Pipeline model: {config_summary}\n"
                 f"exit_code={rc}\n"
                 f"--- stdout (tail) ---\n{stdout[-_LOG_TAIL_CHARS:]}\n"
                 f"--- stderr (tail) ---\n{stderr[-_LOG_TAIL_CHARS:]}"
@@ -1051,11 +1151,13 @@ class DfRunPipelineTool(ToolDefinition[DfRunPipelineAction, DfRunPipelineObserva
         return [
             cls(
                 description=(
-                    "Run an agent-authored DataFlow pipeline script in an "
-                    "isolated subprocess. LLM credentials from the conversation's "
-                    "own LLM config are injected as DF_API_KEY / DF_API_URL / "
-                    "DF_MODEL_NAME environment variables — the script must read "
-                    "them, never hardcode secrets. Logging, retry, checkpoint, "
+                    "Run an agent-authored DataFlow-compatible Python pipeline in "
+                    "an isolated subprocess. The exact local input is processed; "
+                    "this tool never samples or truncates it. model_profile=none "
+                    "injects no model credentials and does not require DataFlow. "
+                    "text/vision inject the conversation or managed vision model "
+                    "configuration; scripts must never hardcode secrets. Logging, "
+                    "retry, checkpoint, "
                     "report, and canonical JSONL validation helpers are "
                     "auto-staged next to the pipeline — "
                     "the agent must NOT create or copy them manually. For standard "

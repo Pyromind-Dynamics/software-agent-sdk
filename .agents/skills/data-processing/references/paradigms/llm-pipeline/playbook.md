@@ -40,7 +40,7 @@
    [图片模板](multimodal_pipeline.py)。case 文档中的算子链负责处理中间
    字段，Pipeline 末尾负责映射正式 Schema。
 4. 调用 `df_run_pipeline`，显式设置 `model_profile` 和 `output_schema`，检查
-   `processed.sample.jsonl`、`validation.json` 和 `report.json`。
+   `processed.jsonl`、`validation.json` 和 `report.json`。
 5. Sample 结果不符合预期（质量、格式、字段映射等问题）时，直接修正 pipeline 并
    重新试跑，直到结果符合预期；迭代过程不向用户展示。
 6. 展示符合预期的 Sample 结果并等待用户明确确认。
@@ -109,4 +109,3 @@ schema 为准；专属 case 文档待补充。
 ## 图片补充参考
 
 - [image_utils API](image-utils-api.md)
-- [AVI Manifest 适配器](avi_manifest_adapter.py)

@@ -1,4 +1,4 @@
-"""Submit DataFlow pipeline scripts to Pyromind Studio for async execution.
+"""Submit DataFlow-compatible Python pipelines for async Pyromind execution.
 
 Mirrors the data-cleaning platform submission pattern: upload script →
 build CustomCommandNode workflow → submit → Kafka callback on completion.
@@ -70,10 +70,12 @@ if TYPE_CHECKING:
 
 
 RUNTIME_FILENAMES = (
+    "avi_pcb_runtime.py",
     "df_logging.py",
     "generate_report.py",
     "image_utils.py",
     "preparation_runtime.py",
+    "source_fingerprint.py",
     "validate_prepared_data.py",
 )
 IMAGE_UTILS_API_VERSION = "2"
@@ -86,18 +88,28 @@ OutputSchema = Literal[
     "function_call",
     "quality_evaluation",
     "text2sql",
+    "artifacts",
 ]
+PersistedTaskKind = Literal["data_preparation", "dataset_analysis", "data_synthesis"]
+
+DATA_PROCESSING_PACKAGES = (
+    f"open-dataflow=={SUPPORTED_DATAFLOW_VERSION}",
+    "numpy==1.26.4",
+    "Pillow==12.1.1",
+    "opencv-python-headless==4.10.0.84",
+    "matplotlib==3.9.4",
+)
 
 TOOL_DESCRIPTION = """\
-Submit a DataFlow pipeline for asynchronous execution on Pyromind platform.
+Submit an agent-authored Python pipeline for asynchronous execution on Pyromind.
 
 Call mode='full' only after the user confirms a successful local
-df_run_pipeline Sample. The tool freezes the local script and shared runtime
+df_run_pipeline result. The tool freezes the local script and shared runtime
 in a per-run Storage directory. Set model_profile and output_schema explicitly
 for new standard runs.
 
 The tool creates a one-node CustomCommandNode workflow that:
-1. Creates a venv and installs open-dataflow
+1. Creates a venv with the server-locked data-processing dependencies
 2. Runs pipeline.py <input_path> <processed.jsonl>
 3. Validates the selected canonical JSONL schema when output_schema is set
 4. Always generates report.json, including failure and checkpoint state
@@ -119,9 +131,10 @@ changes, locally regression-test the failed boundary and submit a structured
 reuse_assessment; the tool records a new execution revision while preserving
 the committed prefix. Use a new full run when prior output is not reusable.
 
-The pipeline receives DF_API_KEY, DF_API_URL, DF_API_BASE_URL, DF_MODEL_NAME,
-DF_LOG_DIR, DF_STATE_DIR, DF_RESUME, DF_EXECUTION_REVISION, and
-DF_RUNTIME_FINGERPRINT. Managed vision pipelines import the staged
+All pipelines receive DF_LOG_DIR, DF_STATE_DIR, DF_RESUME,
+DF_EXECUTION_REVISION, and DF_RUNTIME_FINGERPRINT. text/vision profiles also
+receive the DF model variables; none receives no model credentials. Managed
+vision pipelines import the staged
 image_utils.py; text and legacy pipelines may continue using
 preparation_runtime.py.
 """
@@ -146,7 +159,7 @@ class ReuseAssessment(BaseModel):
 
 
 class DfSubmitPipelineAction(Action):
-    """Submit a DataFlow pipeline to Pyromind Studio."""
+    """Submit a DataFlow-compatible Python pipeline to Pyromind Studio."""
 
     script_path: str | None = Field(
         default=None,
@@ -157,6 +170,14 @@ class DfSubmitPipelineAction(Action):
         ),
     )
     input_path: str = Field(description="Source data path in Pyromind Storage.")
+    support_file_path: str | None = Field(
+        default=None,
+        description=(
+            "Optional workspace JSON contract staged beside the frozen script and "
+            "passed as its third positional argument, for example taxonomy.json, "
+            "analysis_spec.json, or augmentation_plan.json."
+        ),
+    )
     mode: Literal["full", "resume"] = Field(default="full")
     resume_run_id: uuid.UUID | None = Field(
         default=None,
@@ -175,18 +196,19 @@ class DfSubmitPipelineAction(Action):
             "Optional stable hash/version for prompts loaded outside the script."
         ),
     )
-    model_profile: Literal["text", "vision"] | None = Field(
+    model_profile: Literal["none", "text", "vision"] | None = Field(
         default=None,
         description=(
-            "Model profile for a new run. Resume inherits the prior profile when "
-            "omitted."
+            "Use none for pure Python/AVI work without model credentials, text "
+            "for the conversation model, or vision for managed image work. "
+            "Resume inherits the prior profile when omitted."
         ),
     )
     output_schema: OutputSchema | None = Field(
         default=None,
         description=(
             "Canonical output schema: text, dpo, vision, multiturn, function_call, "
-            "quality_evaluation, or text2sql. New data-preparation runs should "
+            "quality_evaluation, text2sql, or artifacts. New standard runs should "
             "always set this; None is retained only for legacy pipelines."
         ),
     )
@@ -218,7 +240,7 @@ class DfSubmitPipelineAction(Action):
     @property
     def visualize(self) -> Text:
         content = Text()
-        content.append("Submit DataFlow pipeline: ", style="bold blue")
+        content.append("Submit Python pipeline: ", style="bold blue")
         content.append(self.script_path or str(self.resume_run_id or "resume"))
         return content
 
@@ -269,7 +291,7 @@ class DataPreparationTaskAssociation:
         script_path: str,
         frozen_script_name: str = "pipeline.py",
         execution_revision: int = 1,
-        model_profile: Literal["text", "vision"] = "text",
+        model_profile: Literal["none", "text", "vision"] = "text",
         output_schema: str | None = None,
         pipeline_fingerprint: str | None = None,
         prompt_fingerprint: str | None = None,
@@ -278,6 +300,9 @@ class DataPreparationTaskAssociation:
         runtime_dir_name: str = "",
         runtime_storage_dir: str | None = None,
         image_utils_api_version: str | None = None,
+        task_kind: PersistedTaskKind = "data_preparation",
+        support_file_name: str | None = None,
+        support_file_fingerprint: str | None = None,
         resumed: bool = False,
         reuse_assessment: dict[str, Any] | None = None,
         status: str = "Pending",
@@ -291,7 +316,7 @@ class DataPreparationTaskAssociation:
         self.script_path = script_path
         self.frozen_script_name = frozen_script_name
         self.execution_revision = execution_revision
-        self.model_profile: Literal["text", "vision"] = model_profile
+        self.model_profile: Literal["none", "text", "vision"] = model_profile
         self.output_schema = output_schema
         self.pipeline_fingerprint = pipeline_fingerprint
         self.prompt_fingerprint = prompt_fingerprint
@@ -300,6 +325,9 @@ class DataPreparationTaskAssociation:
         self.runtime_dir_name = runtime_dir_name
         self.runtime_storage_dir = runtime_storage_dir
         self.image_utils_api_version = image_utils_api_version
+        self.task_kind: PersistedTaskKind = task_kind
+        self.support_file_name = support_file_name
+        self.support_file_fingerprint = support_file_fingerprint
         self.resumed = resumed
         self.reuse_assessment = reuse_assessment
         self.status = status
@@ -326,6 +354,9 @@ class DataPreparationTaskAssociation:
             "runtime_dir_name": self.runtime_dir_name,
             "runtime_storage_dir": self.runtime_storage_dir,
             "image_utils_api_version": self.image_utils_api_version,
+            "task_kind": self.task_kind,
+            "support_file_name": self.support_file_name,
+            "support_file_fingerprint": self.support_file_fingerprint,
             "resumed": self.resumed,
             "reuse_assessment": self.reuse_assessment,
             "status": self.status,
@@ -336,8 +367,11 @@ class DataPreparationTaskAssociation:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DataPreparationTaskAssociation:
         model_profile = data.get("model_profile", "text")
-        if model_profile not in {"text", "vision"}:
+        if model_profile not in {"none", "text", "vision"}:
             raise ValueError(f"Invalid persisted model_profile: {model_profile}")
+        task_kind = data.get("task_kind", "data_preparation")
+        if task_kind not in {"data_preparation", "dataset_analysis", "data_synthesis"}:
+            raise ValueError(f"Invalid persisted task_kind: {task_kind}")
         assoc = cls(
             task_id=data["task_id"],
             conversation_id=data["conversation_id"],
@@ -347,7 +381,7 @@ class DataPreparationTaskAssociation:
             script_path=data["script_path"],
             frozen_script_name=data.get("frozen_script_name", "pipeline.py"),
             execution_revision=int(data.get("execution_revision", 1)),
-            model_profile=cast(Literal["text", "vision"], model_profile),
+            model_profile=cast(Literal["none", "text", "vision"], model_profile),
             output_schema=data.get("output_schema"),
             pipeline_fingerprint=data.get("pipeline_fingerprint"),
             prompt_fingerprint=data.get("prompt_fingerprint"),
@@ -356,6 +390,9 @@ class DataPreparationTaskAssociation:
             runtime_dir_name=data.get("runtime_dir_name", ""),
             runtime_storage_dir=data.get("runtime_storage_dir"),
             image_utils_api_version=data.get("image_utils_api_version"),
+            task_kind=cast(PersistedTaskKind, task_kind),
+            support_file_name=data.get("support_file_name"),
+            support_file_fingerprint=data.get("support_file_fingerprint"),
             resumed=bool(data.get("resumed", False)),
             reuse_assessment=data.get("reuse_assessment"),
             status=data.get("status", "Pending"),
@@ -437,7 +474,7 @@ class DataPreparationTaskStore:
 class DfSubmitPipelineExecutor(
     ToolExecutor[DfSubmitPipelineAction, DfSubmitPipelineObservation]
 ):
-    """Build and submit a DataFlow pipeline workflow to Pyromind Studio."""
+    """Build and submit a Python pipeline workflow to Pyromind Studio."""
 
     def __init__(
         self,
@@ -484,7 +521,9 @@ class DfSubmitPipelineExecutor(
             prior_run: DataPreparationTaskAssociation | None = None
             should_stage_runtime = False
             should_stage_script = False
+            should_stage_support_file = False
             local_script_path: str | None = None
+            local_support_file_path: str | None = None
 
             if resumed:
                 if action.resume_run_id is None:
@@ -494,6 +533,11 @@ class DfSubmitPipelineExecutor(
                 if prior_run is None:
                     raise ValueError(
                         f"Cannot resume unknown data-preparation run {run_id}."
+                    )
+                if prior_run.task_kind != "data_preparation":
+                    raise ValueError(
+                        "Legacy dataset-specific runs cannot be resumed; submit "
+                        "a new data-preparation pipeline."
                     )
                 if input_path != prior_run.input_path:
                     raise ValueError(
@@ -538,7 +582,23 @@ class DfSubmitPipelineExecutor(
                     should_stage_script = True
                     if output_schema == "vision":
                         self._preflight_managed_image_pipeline(Path(local_script_path))
-                llm_env = _build_llm_env(conversation, model_profile)
+                if action.support_file_path is None:
+                    support_file_name = prior_run.support_file_name
+                    support_file_fingerprint = prior_run.support_file_fingerprint
+                else:
+                    local_support_file_path, _ = _validate_local_support_file(
+                        conversation, action.support_file_path
+                    )
+                    support_file_name = f"job-spec-r{execution_revision}.json"
+                    support_file_fingerprint = _file_sha256(
+                        Path(local_support_file_path)
+                    )
+                    should_stage_support_file = True
+                llm_env = (
+                    _build_llm_env(conversation, model_profile)
+                    if model_profile != "none"
+                    else {}
+                )
                 model_fingerprint = _model_fingerprint(llm_env)
                 changed_dimensions = _changed_dimensions(
                     prior_run=prior_run,
@@ -548,6 +608,7 @@ class DfSubmitPipelineExecutor(
                     model_fingerprint=model_fingerprint,
                     output_schema=output_schema,
                     runtime_fingerprint=runtime_fingerprint,
+                    support_file_fingerprint=support_file_fingerprint,
                 )
                 if changed_dimensions and action.reuse_assessment is None:
                     raise ValueError(
@@ -576,7 +637,7 @@ class DfSubmitPipelineExecutor(
                 output_root = (
                     self._output_root
                     or f"{PYROMIND_AGENT_STORAGE_ROOT}/{conversation.id}/"
-                    "data_preparation"
+                    + "data_preparation"
                 )
                 output_dir = str(PurePosixPath(output_root) / str(run_id))
                 execution_revision = 1
@@ -585,7 +646,11 @@ class DfSubmitPipelineExecutor(
                 prompt_fingerprint = action.prompt_fingerprint
                 frozen_script_name = "pipeline.py"
                 pipeline_fingerprint = _file_sha256(Path(local_script_path))
-                llm_env = _build_llm_env(conversation, model_profile)
+                llm_env = (
+                    _build_llm_env(conversation, model_profile)
+                    if model_profile != "none"
+                    else {}
+                )
                 model_fingerprint = _model_fingerprint(llm_env)
                 runtime_fingerprint = self._runtime_fingerprint()
                 runtime_dir_name = "runtime-r1"
@@ -593,6 +658,17 @@ class DfSubmitPipelineExecutor(
                     conversation, runtime_fingerprint
                 )
                 image_utils_api_version = IMAGE_UTILS_API_VERSION
+                support_file_name = None
+                support_file_fingerprint = None
+                if action.support_file_path is not None:
+                    local_support_file_path, _ = _validate_local_support_file(
+                        conversation, action.support_file_path
+                    )
+                    support_file_name = "job-spec.json"
+                    support_file_fingerprint = _file_sha256(
+                        Path(local_support_file_path)
+                    )
+                    should_stage_support_file = True
                 should_stage_runtime = True
                 should_stage_script = True
                 if output_schema == "vision":
@@ -617,6 +693,7 @@ class DfSubmitPipelineExecutor(
                     if action.reuse_assessment is not None
                     else None
                 ),
+                support_file_name=support_file_name,
             )
             workflow = _build_dataflow_workflow(action, run_id, command)
         except PipelineResolutionError as exc:
@@ -676,6 +753,15 @@ class DfSubmitPipelineExecutor(
                     conversation,
                     frozen_script_name=frozen_script_name,
                 )
+            if should_stage_support_file:
+                if local_support_file_path is None or support_file_name is None:
+                    raise ValueError("Resolved dataset job spec is unavailable.")
+                self._stage_script(
+                    local_support_file_path,
+                    output_dir,
+                    conversation,
+                    frozen_script_name=support_file_name,
+                )
             response = submit_workflow_task(
                 client=client,
                 workflow=workflow,
@@ -685,7 +771,7 @@ class DfSubmitPipelineExecutor(
             task_id = response.task_id
         except Exception as exc:
             return DfSubmitPipelineObservation.from_text(
-                text=f"Failed to submit DataFlow pipeline: {exc}",
+                text=f"Failed to submit Python pipeline: {exc}",
                 status="Failed",
                 is_error=True,
             )
@@ -709,6 +795,9 @@ class DfSubmitPipelineExecutor(
             runtime_dir_name=runtime_dir_name,
             runtime_storage_dir=runtime_storage_dir,
             image_utils_api_version=image_utils_api_version,
+            task_kind="data_preparation",
+            support_file_name=support_file_name,
+            support_file_fingerprint=support_file_fingerprint,
             resumed=resumed,
             reuse_assessment=(
                 action.reuse_assessment.model_dump()
@@ -746,10 +835,10 @@ class DfSubmitPipelineExecutor(
         )
         return DfSubmitPipelineObservation.from_text(
             text=(
-                "DataFlow pipeline submitted. "
+                "Python pipeline submitted. "
                 f"task_id={task_id}, run_id={run_id}, "
                 f"revision={execution_revision}, output_dir={output_dir}. "
-                "While the job runs, call df_check_progress with this "
+                "While the job runs, check its progress with this "
                 "output_dir to report live progress, ETA, and recent output "
                 "records. After the terminal callback, preview "
                 f"{output_dir}/report.json, then processed.jsonl."
@@ -916,7 +1005,7 @@ class DfSubmitPipelineExecutor(
 class DfSubmitPipelineTool(
     ToolDefinition[DfSubmitPipelineAction, DfSubmitPipelineObservation]
 ):
-    """Tool definition for async DataFlow pipeline submissions."""
+    """Tool definition for asynchronous Python pipeline submissions."""
 
     @classmethod
     def create(
@@ -1005,6 +1094,7 @@ def _build_dataflow_command(
     image_utils_api_version: str | None = None,
     output_schema: str | None = None,
     reuse_assessment: dict[str, Any] | None = None,
+    support_file_name: str | None = None,
 ) -> str:
     """Assemble the shell command executed inside the CustomCommandNode Pod."""
     pod_input = _pod_path(input_path)
@@ -1053,13 +1143,15 @@ def _build_dataflow_command(
 
     # Pipeline arguments
     pipeline_args = [shlex.quote(pod_input), shlex.quote(output_file)]
+    if support_file_name:
+        pipeline_args.append(shlex.quote(f"{pod_output_dir}/{support_file_name}"))
 
     # Build the full command chain
+    packages = DATA_PROCESSING_PACKAGES
+    package_args = " ".join(shlex.quote(item) for item in packages)
     setup_steps = [
         "python3 -m venv /tmp/df-venv",
-        "/tmp/df-venv/bin/pip install"
-        " --use-deprecated=legacy-resolver "
-        f"open-dataflow=={SUPPORTED_DATAFLOW_VERSION}",
+        "/tmp/df-venv/bin/pip install --use-deprecated=legacy-resolver " + package_args,
         f"mkdir -p {shlex.quote(pod_output_dir)}",
         f"test -f {shlex.quote(frozen_script)}",
         *[
@@ -1067,6 +1159,39 @@ def _build_dataflow_command(
             for filename in required_runtime_files
         ],
     ]
+    fingerprint_tool = f"{pod_runtime_dir}/source_fingerprint.py"
+    setup_steps.append(
+        "source_fingerprint_before=$("
+        f"{venv_python} {shlex.quote(fingerprint_tool)} "
+        f"{shlex.quote(pod_input)})"
+    )
+    if resumed:
+        setup_steps.append(
+            "{ resume_source_guard_rc=0; "
+            f"{venv_python} {shlex.quote(fingerprint_tool)} "
+            f"{shlex.quote(pod_input)} --expected-report "
+            f"{shlex.quote(f'{pod_output_dir}/source_integrity.json')} "
+            ">/dev/null || resume_source_guard_rc=$?; "
+            '[ "$resume_source_guard_rc" -eq 0 ]; }'
+        )
+    compare_source_integrity_step = (
+        "source_fingerprint_after=$("
+        f"{venv_python} {shlex.quote(fingerprint_tool)} "
+        f"{shlex.quote(pod_input)}) || source_integrity_rc=$?; "
+        f'printf \'{{"before":"%s","after":"%s","unchanged":%s}}\' '
+        '"$source_fingerprint_before" "$source_fingerprint_after" '
+        '"$(if [ "$source_fingerprint_before" = "$source_fingerprint_after" ]; '
+        'then printf true; else printf false; fi)" '
+        f"> {shlex.quote(f'{pod_output_dir}/source_integrity.json')}; "
+        'if [ "$source_integrity_rc" -eq 0 ] && '
+        '[ "$source_fingerprint_before" != "$source_fingerprint_after" ]; '
+        "then source_integrity_rc=90; fi"
+    )
+    source_integrity_step = (
+        'if [ "${resume_source_guard_rc:-0}" -ne 0 ]; then '
+        'source_integrity_rc="$resume_source_guard_rc"; else '
+        f"source_integrity_rc=0; {compare_source_integrity_step}; fi"
+    )
     pipeline_step = (
         f"{env_prefix} {venv_python} {shlex.quote(frozen_script)}"
         f" {' '.join(pipeline_args)}"
@@ -1110,12 +1235,15 @@ def _build_dataflow_command(
         )
     report_step += " || true"
     final_step = (
+        'if [ "$source_integrity_rc" -ne 0 ]; then '
+        'exit "$source_integrity_rc"; fi; '
         'if [ "$pipeline_rc" -ne 0 ]; then exit "$pipeline_rc"; fi; '
-        'exit "$validation_rc"'
+        'if [ "$validation_rc" -ne 0 ]; then exit "$validation_rc"; fi; '
+        "exit 0"
     )
     return (
         " && ".join([*setup_steps, pipeline_step])
-        + f"; pipeline_rc=$?; {validation_step}; "
+        + f"; pipeline_rc=$?; {validation_step}; {source_integrity_step}; "
         + f"{report_step}; {final_step}"
     )
 
@@ -1134,7 +1262,7 @@ def _build_dataflow_workflow(
                 "type": "default",
                 "position": {"x": 0, "y": 0},
                 "data": {
-                    "display_name": "DataFlow Pipeline",
+                    "display_name": "Data Processing Pipeline",
                     "nodeType": DATAFLOW_NODE_TYPE,
                     "config": {
                         "command": command,
@@ -1185,6 +1313,29 @@ def _validate_local_pipeline(
     return str(path), workspace_relative_path(conversation, path)
 
 
+def _validate_local_support_file(
+    conversation: BaseConversation,
+    support_file_path: str,
+) -> tuple[str, str]:
+    try:
+        path = resolve_workspace_file(
+            conversation,
+            support_file_path,
+            allow_virtual_conversation_path=True,
+        )
+    except ValueError as exc:
+        raise PipelineResolutionError(str(exc)) from exc
+    if path.suffix.lower() != ".json":
+        raise PipelineResolutionError("support_file_path must point to a JSON file.")
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PipelineResolutionError(
+            f"support_file_path is not valid JSON: {exc}"
+        ) from exc
+    return str(path), workspace_relative_path(conversation, path)
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -1206,10 +1357,11 @@ def _changed_dimensions(
     prior_run: DataPreparationTaskAssociation,
     pipeline_fingerprint: str | None,
     prompt_fingerprint: str | None,
-    model_profile: Literal["text", "vision"],
+    model_profile: Literal["none", "text", "vision"],
     model_fingerprint: str,
     output_schema: str | None,
     runtime_fingerprint: str | None,
+    support_file_fingerprint: str | None = None,
 ) -> list[str]:
     changed: list[str] = []
     if (
@@ -1228,6 +1380,12 @@ def _changed_dimensions(
         changed.append("schema")
     if runtime_fingerprint != prior_run.runtime_fingerprint:
         changed.append("runtime")
+    if (
+        prior_run.support_file_fingerprint is not None
+        and support_file_fingerprint != prior_run.support_file_fingerprint
+        and "schema" not in changed
+    ):
+        changed.append("schema")
     return changed
 
 
