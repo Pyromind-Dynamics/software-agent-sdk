@@ -149,11 +149,10 @@ Use operation='get' to load a project, 'status' to inspect import and task count
 annotations back to PyroMind samples in user storage.
 
 Use operation='refresh_media' to re-sign the image URLs stored inside task data.
-Label Studio keeps whichever URL the import produced and never renews it, so a
-project that outlives that URL shows broken images to annotators; the tool
-reports the deadline as media_urls_expire_at, and warns with media_urls_expiring
-or media_urls_expired once refreshing is due. Refreshing keeps task IDs,
-annotations, and predictions, and is safe to run again.
+Label Studio keeps whichever URL the import produced and never renews it, but the
+portal serves that URL for as long as the account it names can still act, so the
+images do not go stale on their own. Refreshing keeps task IDs, annotations, and
+predictions, and is safe to run again.
 
 Do not pass user IDs, API tokens, or credentials. Do not call Label Studio REST
 APIs with terminal or HTTP tools; this tool owns server-side auth and format

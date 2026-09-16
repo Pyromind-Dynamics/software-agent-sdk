@@ -15,6 +15,8 @@ from openhands.tools.pyromind_archive.definition import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
 )
 from openhands.tools.pyromind_dataset.definition import (
+    _DIRECTORY_CHILD_SAMPLES_CEILING,
+    _DIRECTORY_CHILD_SAMPLES_FLOOR,
     _MAX_LISTED_ENTRIES,
     _PREVIEW_DATASET_DESCRIPTION,
     PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
@@ -1658,6 +1660,184 @@ def test_storage_directory_summary_detects_repeated_sample_folders(
         "meta.json",
     ]
     assert "share files" in observation.directory_summary["layout_evidence"]
+
+
+def test_storage_directory_child_sampling_is_sorted_and_follows_n(
+    monkeypatch,
+    tmp_path,
+):
+    """The child-folder sample used to be the first three folders storage
+    happened to return, so a directory holding one folder per label class was
+    described from an arbitrary sliver that storage, not the caller, chose.
+    It must be the sorted head, sized by ``n``."""
+    _patch_shared_empty(monkeypatch)
+
+    folder_names = [f"cls-{index:02d}" for index in range(1, 9)]
+
+    def folder_list(names: list[str]) -> _Response:
+        return _Response(
+            200,
+            {
+                "success": True,
+                "data": {
+                    "list": [
+                        {"name": name, "path": f"labels/{name}", "type": "Folder"}
+                        for name in names
+                    ]
+                },
+            },
+        )
+
+    def file_list(path: str) -> _Response:
+        return _Response(
+            200,
+            {
+                "success": True,
+                "data": {
+                    "list": [
+                        {
+                            "name": name,
+                            "path": f"{path}/{name}",
+                            "type": "File",
+                            "size": 10,
+                        }
+                        for name in ("meta.json", "defect.jpg")
+                    ]
+                },
+            },
+        )
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            path = json["path"]
+            if path == "labels/":
+                # Deliberately reversed, so an unsorted sample takes the tail.
+                return folder_list(list(reversed(folder_names)))
+            if path.startswith("labels/cls-"):
+                return file_list(path)
+        raise AssertionError(f"unexpected POST URL/path: {url} {json}")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    def summarize(**action_fields):
+        return PreviewDatasetExecutor(
+            storage_base_url="https://portal.test/storage_api",
+        )(
+            PreviewDatasetAction(dataset_path="labels/", **action_fields),
+            cast(Any, _fake_conversation(tmp_path)),
+        )
+
+    def sampled_paths(observation):
+        return [
+            folder["path"]
+            for folder in observation.directory_summary["sampled_child_folders"]
+        ]
+
+    expected = [f"labels/{name}" for name in folder_names]
+
+    default = summarize()
+    assert not default.is_error
+    # The old fixed limit of three would have sampled three of eight here.
+    assert sampled_paths(default) == expected
+    assert default.directory_summary["child_sample_limit"] == 10
+    assert (
+        "8/8 sampled child folders share files"
+        in (default.directory_summary["layout_evidence"])
+    )
+
+    narrowed = summarize(n=4)
+    assert sampled_paths(narrowed) == expected[:4]
+    assert narrowed.directory_summary["child_sample_limit"] == 4
+    assert (
+        "of 8 folders in the directory"
+        in (narrowed.directory_summary["layout_evidence"])
+    )
+
+    assert (
+        summarize(n=1).directory_summary["child_sample_limit"]
+        == _DIRECTORY_CHILD_SAMPLES_FLOOR
+    )
+    assert (
+        summarize(n=100).directory_summary["child_sample_limit"]
+        == _DIRECTORY_CHILD_SAMPLES_CEILING
+    )
+
+
+def test_storage_directory_summary_accepts_majority_shared_structure(
+    monkeypatch,
+    tmp_path,
+):
+    """A single extra file inside one folder used to erase a file set that every
+    other folder shared, and the whole directory was then reported as having no
+    recognisable structure."""
+    _patch_shared_empty(monkeypatch)
+
+    shared_files = ["defect.jpg", "diff.jpg", "gt.jpg"]
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            path = json["path"]
+            if path == "classes/":
+                return _Response(
+                    200,
+                    {
+                        "success": True,
+                        "data": {
+                            "list": [
+                                {
+                                    "name": name,
+                                    "path": f"classes/{name}",
+                                    "type": "Folder",
+                                }
+                                for name in ("cls-a", "cls-b", "cls-c")
+                            ]
+                        },
+                    },
+                )
+            if path == "classes/cls-a":
+                files = shared_files
+            elif path == "classes/cls-b":
+                files = shared_files
+            elif path == "classes/cls-c":
+                files = [*shared_files, "notes.txt"]
+            else:
+                raise AssertionError(f"unexpected child path: {path}")
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "list": [
+                            {
+                                "name": name,
+                                "path": f"{path}/{name}",
+                                "type": "File",
+                                "size": 10,
+                            }
+                            for name in files
+                        ]
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected POST URL/path: {url} {json}")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="classes/"),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    summary = observation.directory_summary
+    assert not observation.is_error
+    assert summary["repeated_file_name_set"] == shared_files
+    assert summary["repeated_file_name_votes"] == 2
+    assert summary["detected_layout"] == "repeated_sample_folders"
+    assert summary["layout_confidence"] == "high"
+    # The evidence must report the votes that produced the value, not the
+    # sample size: under the majority rule the two differ.
+    assert "2/3 sampled child folders share files" in summary["layout_evidence"]
 
 
 def test_storage_directory_summary_detects_flat_file_collection(
