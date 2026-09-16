@@ -64,3 +64,14 @@ user 文本前，路径是相对 POSIX 路径；assistant 文本含一组非空 
 
 数据库 Schema 至少包含表、列、类型、主键和外键字段。执行结果、错误和难度进入
 `scenario_metrics.json`，不进入训练行。
+
+## structured：直接标注对象
+
+图片预标注使用 `output_schema="structured"` 和
+`ImagePipelineConfig.output_format="structured"`。每行是响应 Schema 校验后的对象，
+再由运行时注入源样本 `id`，不含训练 messages 包装。业务字段由任务的
+`response_json_schema` 定义，模型不能返回或覆盖 id。[PCB 场景](cases/pcb-inspection.md) 给出的字段仅是引导案例，不是校验协议。
+
+structured 不使用固定产物校验器；响应由图片执行链按任务配置的 Schema 处理。
+Manifest 保留原始图片路径及角色映射；不能因输出跳过失败样本而按行号关联。
+Label Studio 与训练格式转换在后续按需进行。

@@ -11,6 +11,12 @@ description: >-
 将用户 Storage 中的数据集导入 Label Studio 进行人工标注。
 认证由服务端管理，不需要用户提供 Token 或 UID。
 
+理解 PCB 裸板 AVI/AOI 的标签含义和复判要求时，按需读取共享的
+领域参考：向文件读取工具传入 `knowledge/business-domain/pcb-avi-aoi.md`。
+这是运行时知识库逻辑路径，不相对于本 skill 目录，无需拼接路径或查询环境变量。
+保留源标签，
+不将现场判定约定直接用作所有项目的分类或放行规则。读取参考不触发其他 skill 流程。
+
 ## 固定流程
 
 1. **理解数据**：调用 preview_dataset(dataset_path=...) 分析目录结构、

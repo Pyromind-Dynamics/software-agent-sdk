@@ -78,12 +78,13 @@ RUNTIME_FILENAMES = (
     "source_fingerprint.py",
     "validate_prepared_data.py",
 )
-IMAGE_UTILS_API_VERSION = "2"
+IMAGE_UTILS_API_VERSION = "3"
 DATAFLOW_NODE_TYPE = "CustomCommandCPUNode"
 OutputSchema = Literal[
     "text",
     "dpo",
     "vision",
+    "structured",
     "multiturn",
     "function_call",
     "quality_evaluation",
@@ -207,9 +208,13 @@ class DfSubmitPipelineAction(Action):
     output_schema: OutputSchema | None = Field(
         default=None,
         description=(
-            "Canonical output schema: text, dpo, vision, multiturn, function_call, "
+            "Canonical output schema: text, dpo, vision, structured, multiturn, "
+            "function_call, "
             "quality_evaluation, text2sql, or artifacts. New standard runs should "
-            "always set this; None is retained only for legacy pipelines."
+            "always set this; None is retained only for legacy pipelines. "
+            "Use structured for direct image annotations, vision for training "
+            "messages; "
+            "match ImagePipelineConfig.output_format."
         ),
     )
     convert_format: Literal["messages", "preference", "none"] = Field(
@@ -553,6 +558,14 @@ class DfSubmitPipelineExecutor(
                     if action.output_schema is not None
                     else prior_run.output_schema
                 )
+                if output_schema != prior_run.output_schema and "structured" in {
+                    output_schema,
+                    prior_run.output_schema,
+                }:
+                    raise ValueError(
+                        "Cannot change structured output contract on resume; "
+                        "start a new full run."
+                    )
                 prompt_fingerprint = (
                     action.prompt_fingerprint
                     if action.prompt_fingerprint is not None
@@ -580,7 +593,7 @@ class DfSubmitPipelineExecutor(
                     image_utils_api_version = IMAGE_UTILS_API_VERSION
                     should_stage_runtime = True
                     should_stage_script = True
-                    if output_schema == "vision":
+                    if output_schema in {"vision", "structured"}:
                         self._preflight_managed_image_pipeline(Path(local_script_path))
                 if action.support_file_path is None:
                     support_file_name = prior_run.support_file_name
@@ -671,7 +684,7 @@ class DfSubmitPipelineExecutor(
                     should_stage_support_file = True
                 should_stage_runtime = True
                 should_stage_script = True
-                if output_schema == "vision":
+                if output_schema in {"vision", "structured"}:
                     self._preflight_managed_image_pipeline(Path(local_script_path))
                 changed_dimensions = []
 
@@ -1129,6 +1142,8 @@ def _build_dataflow_command(
             env_parts.append(f"{key}={shlex.quote(value)}")
     env_parts.append(f"DF_LOG_DIR={shlex.quote(pod_output_dir)}")
     env_parts.append(f"DF_STATE_DIR={shlex.quote(pod_output_dir)}")
+    if output_schema is not None:
+        env_parts.append(f"DF_OUTPUT_SCHEMA={shlex.quote(output_schema)}")
     env_parts.append(f"DF_RESUME={'1' if resumed else '0'}")
     env_parts.append(f"DF_EXECUTION_REVISION={execution_revision}")
     env_parts.append(f"PYTHONPATH={shlex.quote(pod_runtime_dir)}")
@@ -1197,7 +1212,7 @@ def _build_dataflow_command(
         f" {' '.join(pipeline_args)}"
     )
     validation_step = "validation_rc=0"
-    if output_schema is not None:
+    if output_schema is not None and output_schema != "structured":
         validator = f"{pod_runtime_dir}/validate_prepared_data.py"
         validation_report = f"{pod_output_dir}/validation.json"
         image_root_arg = (

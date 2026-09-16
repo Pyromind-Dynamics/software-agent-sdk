@@ -77,7 +77,17 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
     agentDir,
     settingsManager,
     systemPrompt: config.systemPrompt,
-    extensionFactories: [createTerminalPermissionExtension(peer)],
+    extensionFactories: [
+      createTerminalPermissionExtension(peer),
+      (pi) => {
+        pi.on("before_agent_start", (event) => ({
+          systemPrompt: event.systemPrompt.replace(
+            "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+            "Paths starting with knowledge/ or .agents/skills/ are runtime resource aliases: pass them unchanged to file tools, without prepending the skill directory. For other relative paths referenced by a skill file, resolve them against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+          ),
+        }));
+      },
+    ],
     additionalSkillPaths: skillPaths,
     skillsOverride: ({ skills, diagnostics }) => ({
       skills: skills.filter((skill) => {

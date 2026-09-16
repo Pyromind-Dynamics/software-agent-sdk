@@ -37,7 +37,7 @@
    [通用约定](dataflow-common.md) 和
    [输出契约](schema-conventions.md)。
 3. 优先从 case 文档的 DataFlow 算子模板修改 Pipeline；只有图片任务使用
-   [图片模板](multimodal_pipeline.py)。case 文档中的算子链负责处理中间
+   [图片模板](multimodal_pipeline.py)，PCB 预标注使用其场景模板。case 文档中的算子链负责处理中间
    字段，Pipeline 末尾负责映射正式 Schema。
 4. 调用 `df_run_pipeline`，显式设置 `model_profile` 和 `output_schema`，检查
    `processed.jsonl`、`validation.json` 和 `report.json`。
@@ -74,11 +74,16 @@
 | 样本质量评分、保留、改写或丢弃 | [通用 LLM 处理](cases/generic-llm-processing.md)（暂无专属 case） | `quality_evaluation` |
 | 已有 SQLite Text2SQL 数据精炼 | [通用 LLM 处理](cases/generic-llm-processing.md)（暂无专属 case） | `text2sql` |
 | 图片 OCR、理解和多图语义标注 | [多模态标注](cases/multimodal-labeling.md) | `vision` |
+| PCB AVI/AOI 真点/假点预判、问题分类及区域定位 | [PCB 预打标](cases/pcb-inspection.md) | `structured` |
 | 从文本抽取 SMILES | [通用 LLM 处理](cases/generic-llm-processing.md)（暂无专属 case） | `text` |
 
 标注“暂无专属 case”的场景按[通用 LLM 处理](cases/generic-llm-processing.md)
 的流程执行，输出格式严格以[输出契约](schema-conventions.md)中对应
 schema 为准；专属 case 文档待补充。
+
+PCB 预标注直接输出可读的标注 JSONL，具体结构按任务确定，使用 `output_format="structured"` 与
+`output_schema="structured"`；用户指定其他格式时调整响应 Schema。只有准备训练
+messages 时选择 `vision`。具体完成标准见 PCB 场景文档。
 
 ## 运行与完成条件
 

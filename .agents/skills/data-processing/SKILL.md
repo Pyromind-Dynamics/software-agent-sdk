@@ -2,7 +2,7 @@
 name: data-processing
 description: >-
   Pyromind 数据处理统一入口。用于格式转换、DataFlow 内容处理、从源数据分析
-  标签分布、按已确认 Gap 合成文本或图片，以及数据自带镜像中的
+  标签分布、PCB AVI/AOI 图片预打标、按已确认 Gap 合成文本或图片，以及数据自带镜像中的
   环境编排处理。统一执行预览、小样、人工确认、异步全量和报告校验。
 license: MIT
 ---
@@ -14,12 +14,18 @@ license: MIT
 先用 `preview_dataset` 探查；需要执行本地 Pipeline 时再用 `sample` 或
 `materialize` 模式将明确范围的数据放入会话工作区。
 
+PCB 裸板 AVI/AOI 的数据理解、标签分析、预打标、清洗与合成，按需读取共享的
+领域参考：向文件读取工具传入 `knowledge/business-domain/pcb-avi-aoi.md`。
+这是运行时知识库逻辑路径，不相对于本 skill 目录，无需拼接路径或查询环境变量。
+区分结构缺陷、外观因素与业务处置；现场阈值和标签约定不默认迁移至其他产线。
+
 ## 范式路由（先做这一步）
 
 | 需求特征 | 处理范式 | playbook |
 |---|---|---|
 | 格式转换/字段映射/简单过滤，无 LLM、无跨行操作 | format-conversion | references/paradigms/format-conversion/playbook.md |
 | 内容级清洗/抽样/生成/评分，用 DataFlow 算子或 LLM | llm-pipeline | references/paradigms/llm-pipeline/playbook.md |
+| PCB AVI/AOI 真点/假点预判、问题分类及区域定位 | llm-pipeline（PCB 预打标，默认 structured JSONL） | references/paradigms/llm-pipeline/playbook.md → cases/pcb-inspection.md |
 | 从源数据统计/推断标签分布并提出 Gap，不依赖 eval | distribution-analysis | references/paradigms/distribution-analysis.md |
 | 按已确认 Gap 合成文本或图片数据 | gap-driven-synthesis | references/paradigms/gap-driven-synthesis.md |
 | 单条数据要在特定环境（数据自带镜像）执行复杂流程（跑命令/测试/判定），需多阶段编排 | environment-processing | references/paradigms/environment-processing/playbook.md |

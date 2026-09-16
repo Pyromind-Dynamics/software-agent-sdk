@@ -12,7 +12,12 @@ from image_utils import ImagePipelineConfig, run_image_pipeline_from_cli
 必填：
 
 - `labeling_system_prompt`：发送给 VLM 的任务规则。
-- `training_system_prompt`：写入最终训练数据 system 消息的 text block。
+- `output_format="vision"`（默认）：生成训练 messages，必须填写
+  `training_system_prompt`（system 消息 text block）。
+- `output_format="structured"`：直接输出响应对象，运行时注入源样本 `id`；
+  不需要 `training_system_prompt`、`reasoning_key`、`answer_key`、`answer_is_json`。
+  `response_json_schema` 必须描述对象且不包含保留字段 `id`；模型返回 id 会触发重试。
+  该模式不使用训练标签纠错配置 `allow_reference_correction`。
 
 常用字段映射：
 
@@ -33,7 +38,13 @@ Prompt 优先读取样本的 `user_prompt_key`；为空时使用
 - `answer_key="answer"`
 - `answer_is_json=False`
 
-已有人工标签的数据需要补 CoT 时，配置：
+`structured` 使用原始 JSON 对象响应；不解析自然语言或 `<answer>`，不生成消息包装。
+工具参数 `output_schema` 必须与 `output_format` 一致；图片模型仍用
+`model_profile="vision"`。PCB 预打标默认采用 structured，参见其场景模板。
+
+响应 Schema 按任务或下游契约配置，PCB 案例不构成固定字段或坐标校验要求。
+
+已有人工标签的数据需要补 CoT 时，使用 vision 并配置：
 
 - `metadata_filename`：可选 sidecar 文件名，例如 `meta.json`。
 - `reference_label_path`：人工标签的 dotted path，例如 `metadata.label` 或
@@ -43,7 +54,7 @@ Prompt 优先读取样本的 `user_prompt_key`；为空时使用
 - `allow_reference_correction=True`：默认保留人工标签；只有模型声明 `correct` 并提供
   非空纠错原因和具体视觉证据时才采用新标签。纠错审计不进入训练 JSONL。
 
-共享运行时会把严格 Schema 传给 VLM，并兼容响应整体为单个
+共享运行时会把严格 Schema 传给 VLM；vision 模式兼容响应整体为单个
 ```` ```json ... ``` ```` 或 ```` ``` ... ``` ```` 代码块。Pipeline 不得自行增加
 JSON fence 解析、响应修复或日志逻辑。
 
@@ -75,3 +86,13 @@ run_image_pipeline(CONFIG, input_path, output_path, limit)
 
 `MultiImageSemanticLabelOperator` 是底层 DataFlow Operator，主要用于测试或受控扩展；
 常规 Agent Pipeline 不直接实例化。
+
+## 来源与恢复
+
+`source_manifest.jsonl` 完整保留样本 ID、原始图片路径、角色和输入元数据。structured
+要求源 ID 唯一，结果仅注入源 ID，不按输出行号关联（失败记录可能跳过）。交付时保留
+Manifest 及其路径基准，供后续 Label Studio 等转换使用；模型预标注不改写人工标签。
+
+`runtime_metadata.json` 冻结输出模式和 structured 响应 Schema。恢复时契约不一致
+立即拒绝；旧运行缺少 output_format 时按 vision 处理。不同契约应创建新 run。
+structured 不使用固定产物校验器；响应按任务配置的 Schema 在执行时处理。

@@ -74,6 +74,7 @@ OutputSchema = Literal[
     "text",
     "dpo",
     "vision",
+    "structured",
     "multiturn",
     "function_call",
     "quality_evaluation",
@@ -499,8 +500,10 @@ class DfRunPipelineAction(Action):
         default=None,
         description=(
             "Canonical JSONL schema to validate after a successful run: text, dpo, "
-            "vision, multiturn, function_call, quality_evaluation, text2sql, or "
-            "artifacts. "
+            "vision, structured, multiturn, function_call, quality_evaluation, "
+            "text2sql, or artifacts. Use structured for direct image annotations "
+            "and vision for training messages; match "
+            "ImagePipelineConfig.output_format. "
             "For the standard pipeline contract, args[1] is treated as the output "
             "path. Omit only for legacy pipelines with non-standard outputs."
         ),
@@ -843,7 +846,7 @@ class DfRunPipelineExecutor(ToolExecutor):
                 message="Pipeline output must be outside the source directory.",
             )
 
-        if action.output_schema == "vision":
+        if action.output_schema in {"vision", "structured"}:
             try:
                 self._preflight_managed_image_pipeline(pipeline)
             except ValueError as exc:
@@ -867,7 +870,7 @@ class DfRunPipelineExecutor(ToolExecutor):
                         f"interpreter that has it.\nImport check: {detail or 'failed'}"
                     ),
                 )
-        if action.output_schema == "vision":
+        if action.output_schema in {"vision", "structured"}:
             version_ok, version_detail = check_dataflow_version(python)
             if not version_ok:
                 return _df_failure(
@@ -896,6 +899,8 @@ class DfRunPipelineExecutor(ToolExecutor):
                     message=f"DataFlow LLM preflight failed: {exc}",
                 )
 
+        if action.output_schema is not None:
+            env_extra["DF_OUTPUT_SCHEMA"] = action.output_schema
         if output_path is not None:
             state_dir = output_path.parent / f".{output_path.stem}.state"
             state_dir.mkdir(parents=True, exist_ok=True)
@@ -989,7 +994,7 @@ class DfRunPipelineExecutor(ToolExecutor):
                 ),
                 encoding="utf-8",
             )
-        if rc == 0 and action.output_schema is not None:
+        if rc == 0 and action.output_schema not in {None, "structured"}:
             assert output_path is not None
             assert state_dir is not None
             validator = (
