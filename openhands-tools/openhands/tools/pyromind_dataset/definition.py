@@ -127,7 +127,20 @@ _VISION_RETRYABLE_STATUS_CODES = {408, 409, 425, 429}
 # manually by agents across whole turns; a bounded in-tool retry removes that
 # round trip. Timeouts stay non-retryable: each one costs a full 30s read.
 _STORAGE_CONNECT_RETRY_ATTEMPTS = 2
-_MAX_DIRECTORY_CHILD_SAMPLES = 3
+# A directory listing describes its layout by expanding a few child folders.
+# The count used to be the fixed 3 below, which sampled whichever folders
+# storage happened to return first: a directory holding one folder per label
+# class was described from an arbitrary sliver, and the sliver alone decided
+# whether the layout was recognised at all. The count now follows the caller's
+# ``n`` between these bounds, so a wide collection can be described from the
+# whole first page while one preview still cannot become an unbounded walk.
+_DIRECTORY_CHILD_SAMPLES_FLOOR = 3
+_DIRECTORY_CHILD_SAMPLES_CEILING = 20
+# Share of sampled child folders that must agree before their common value is
+# reported as the repeated structure. Below this, one odd folder out is enough
+# to hide a structure every other folder shares.
+_CHILD_AGREEMENT_DIVISOR = 3
+_CHILD_AGREEMENT_NUMERATOR = 2
 
 
 @dataclass(frozen=True)
@@ -206,7 +219,11 @@ class PreviewDatasetAction(Action):
         default=10,
         description=(
             "Maximum number of sample rows or text lines to return (1-100). "
-            "Defaults to 10; large truncated files may return fewer."
+            "Defaults to 10; large truncated files may return fewer. For a "
+            "directory it also bounds how many child folders the layout "
+            "summary expands (between 3 and 20), so raise it to describe a "
+            "directory of many same-shaped folders from all of them instead "
+            "of the first few."
         ),
         ge=1,
         le=_MAX_REQUESTED_SAMPLES,
@@ -1594,7 +1611,7 @@ class PreviewDatasetExecutor(
     def _resolve_storage_directory(
         self,
         dataset_path: str,
-        n: int,  # noqa: ARG002
+        n: int,
         headers: dict[str, str],
         *,
         path_filter: str = "",
@@ -1604,6 +1621,10 @@ class PreviewDatasetExecutor(
         When the directory contains multiple files, returns an observation
         listing file details so the agent asks the user which file to
         preview. When exactly one file exists, auto-selects it.
+
+        ``n`` bounds how many child folders the layout summary expands, so a
+        directory of many same-shaped folders can be described from all of them
+        instead of an arbitrary few.
         """
         list_result = self._list_entries(dataset_path, headers)
         if isinstance(list_result, PreviewDatasetObservation):
@@ -1679,7 +1700,11 @@ class PreviewDatasetExecutor(
                 "materialize files or folders."
             )
             list_label = "Available entries"
-        directory_summary = self._build_directory_summary(entries, headers)
+        directory_summary = self._build_directory_summary(
+            entries,
+            headers,
+            child_sample_limit=_directory_child_sample_limit(n),
+        )
         directory_summary.update(_infer_directory_layout(entries, directory_summary))
         summary_text = (
             f"{summary}\n{list_label}:\n{file_list_text}\n\n"
@@ -1699,14 +1724,22 @@ class PreviewDatasetExecutor(
         self,
         entries: list[_StorageFileInfo],
         headers: dict[str, str],
+        *,
+        child_sample_limit: int,
     ) -> dict[str, Any]:
         files = [entry for entry in entries if not entry.is_dir]
-        folders = [entry for entry in entries if entry.is_dir]
+        # Sorted so the sampled sliver is the same on every call: storage makes
+        # no ordering promise, so the arbitrary first three used to decide how
+        # the whole directory was described.
+        folders = sorted(
+            (entry for entry in entries if entry.is_dir),
+            key=lambda entry: entry.path,
+        )
         top_suffix_counts = _suffix_counts(files)
         sampled_child_folders: list[dict[str, Any]] = []
         child_listing_errors: list[dict[str, str]] = []
 
-        for folder in folders[:_MAX_DIRECTORY_CHILD_SAMPLES]:
+        for folder in folders[:child_sample_limit]:
             child_result = self._list_entries(folder.path, headers)
             if isinstance(child_result, PreviewDatasetObservation):
                 child_listing_errors.append(
@@ -1725,19 +1758,24 @@ class PreviewDatasetExecutor(
                 }
             )
 
+        repeated_file_name_set, repeated_file_name_votes = _shared_child_value(
+            sampled_child_folders, "file_names"
+        )
+        repeated_suffix_set, repeated_suffix_votes = _shared_child_value(
+            sampled_child_folders, "suffix_counts"
+        )
         return {
             "top_level_folder_count": len(folders),
             "top_level_file_count": len(files),
             "top_level_suffix_counts": top_suffix_counts,
             "top_level_type_counts": _type_counts(top_suffix_counts),
             "sampled_child_folders": sampled_child_folders,
+            "child_sample_limit": child_sample_limit,
             "child_listing_errors": child_listing_errors,
-            "repeated_file_name_set": _shared_child_value(
-                sampled_child_folders, "file_names"
-            ),
-            "repeated_suffix_set": _shared_child_value(
-                sampled_child_folders, "suffix_counts"
-            ),
+            "repeated_file_name_set": repeated_file_name_set,
+            "repeated_file_name_votes": repeated_file_name_votes,
+            "repeated_suffix_set": repeated_suffix_set,
+            "repeated_suffix_votes": repeated_suffix_votes,
         }
 
     def _get_metadata(
@@ -3398,9 +3436,12 @@ def _empty_directory_summary() -> dict[str, Any]:
             "other": 0,
         },
         "sampled_child_folders": [],
+        "child_sample_limit": _DIRECTORY_CHILD_SAMPLES_FLOOR,
         "child_listing_errors": [],
         "repeated_file_name_set": None,
+        "repeated_file_name_votes": 0,
         "repeated_suffix_set": None,
+        "repeated_suffix_votes": 0,
         "detected_layout": "unknown",
         "layout_confidence": "low",
         "layout_evidence": "directory is empty",
@@ -3440,17 +3481,41 @@ def _type_counts(suffix_counts: dict[str, int]) -> dict[str, int]:
     return result
 
 
+def _directory_child_sample_limit(n: int) -> int:
+    """How many child folders one directory listing may expand."""
+    return min(
+        max(n, _DIRECTORY_CHILD_SAMPLES_FLOOR),
+        _DIRECTORY_CHILD_SAMPLES_CEILING,
+    )
+
+
+def _child_agreement_threshold(total: int) -> int:
+    """Votes a child-folder value needs before it is called the shared one."""
+    numerator = total * _CHILD_AGREEMENT_NUMERATOR + _CHILD_AGREEMENT_DIVISOR - 1
+    return max(2, numerator // _CHILD_AGREEMENT_DIVISOR)
+
+
 def _shared_child_value(
     sampled_child_folders: list[dict[str, Any]],
     key: str,
-) -> Any | None:
+) -> tuple[Any | None, int]:
+    """The value a majority of sampled child folders agree on, and its votes.
+
+    Equality rather than identity: ``file_names`` lists and ``suffix_counts``
+    dicts are unhashable, so the tally walks the values. Requiring unanimity let
+    a single unrelated file inside one folder erase a structure that every other
+    folder shared. The vote count comes back with the value because a majority
+    is no longer the same thing as every sampled folder.
+    """
     values = [folder.get(key) for folder in sampled_child_folders]
     if not values:
-        return None
-    first = values[0]
-    if all(value == first for value in values):
-        return first
-    return None
+        return None, 0
+    threshold = _child_agreement_threshold(len(values))
+    for candidate in values:
+        votes = sum(1 for value in values if value == candidate)
+        if votes >= threshold:
+            return candidate, votes
+    return None, 0
 
 
 def _infer_directory_layout(
@@ -3463,24 +3528,27 @@ def _infer_directory_layout(
     repeated_names = directory_summary.get("repeated_file_name_set")
     repeated_suffixes = directory_summary.get("repeated_suffix_set")
     top_type_counts = directory_summary.get("top_level_type_counts") or {}
+    repeated_name_votes = directory_summary.get("repeated_file_name_votes") or 0
+    repeated_suffix_votes = directory_summary.get("repeated_suffix_votes") or 0
 
     if folders and len(sampled_folders) >= 2 and (repeated_names or repeated_suffixes):
-        sampled_count = min(len(folders), _MAX_DIRECTORY_CHILD_SAMPLES)
         if repeated_names:
-            evidence = (
-                f"{len(sampled_folders)}/{sampled_count} "
-                "sampled child folders share files: "
-                f"{', '.join(repeated_names)}"
-            )
+            votes = repeated_name_votes
+            shared = f"share files: {', '.join(repeated_names)}"
         else:
             assert repeated_suffixes is not None
+            votes = repeated_suffix_votes
             suffix_text = ", ".join(
                 f"{suffix}:{count}" for suffix, count in repeated_suffixes.items()
             )
-            evidence = (
-                f"{len(sampled_folders)}/{sampled_count} "
-                f"sampled child folders share suffix counts: {suffix_text}"
-            )
+            shared = f"share suffix counts: {suffix_text}"
+        # Report the votes that produced the value rather than the sample size:
+        # under the majority rule the two are no longer the same number. Say so
+        # when the directory holds more folders than were sampled, so a layout
+        # inferred from a sliver is not read as the whole directory.
+        evidence = f"{votes}/{len(sampled_folders)} sampled child folders {shared}"
+        if len(folders) > len(sampled_folders):
+            evidence += f" (of {len(folders)} folders in the directory)"
         return {
             "detected_layout": "repeated_sample_folders",
             "layout_confidence": "high",

@@ -73,7 +73,7 @@ description: >-
 入口用工具返回的 `open_url`（SSO 直连），`project_url` 作为备用。
 `project_ref`、`dataset_path` 这类**标识符**继续用行内代码 —— 它们不是给人点的。
 
-交付时一并报出：项目名、导入样本数、`media_urls_expire_at`。
+交付时一并报出：项目名、导入样本数。
 
 ## 数据集适配器（adapter）
 
@@ -108,13 +108,15 @@ label_studio_project(operation="update_config", ...)。
 调用 label_studio_project(operation="export", project_ref=...)。
 Tool 自动将标注结果转回 PyroMind 格式并保存到用户 Storage。
 
-## 图片链接到期
+## 图片链接
 
-任务数据里的图片地址是**导入时签发的**，Label Studio 不会自动续签。项目返回的
-`media_urls_expire_at` 是它的失效时间；当返回值出现 `media_urls_expiring` 或
-`media_urls_expired` 时，说明标注员即将（或已经）看不到图，此时调用
-label_studio_project(operation="refresh_media", project_ref=...) 原地重签即可 ——
-任务 ID、标注与预测都不受影响，重复执行也安全。
+任务数据里的图片地址是**导入时签发的**，Label Studio 不会重签。但 portal 对已签发的
+地址**不设到期时间**：只要该地址指向的账号仍然可用，旧项目里的图就一直能渲染，
+标注员不会因为项目放久了而看到裂图。
+
+因此**不要**向用户提"图片有效期""多久后失效""需要刷新"这类内容 —— 不存在这件事。
+`refresh_media` 仍然保留（原地重签，任务 ID、标注与预测都不受影响，重复执行也安全），
+但它是可选的维护动作，不必按期执行。
 
 ## 没有删除操作
 

@@ -1219,7 +1219,8 @@ def test_refresh_media_resigns_the_urls_and_keeps_the_rest_of_the_data(conversat
     assert "refreshed=1/1" in obs.text
 
 
-def test_refresh_media_records_the_new_expiry(conversation):
+def test_refresh_media_records_the_window_without_reporting_a_deadline(conversation):
+    """The signature window is bookkeeping; the portal does not enforce it."""
     executor = _create_executor(portal_base_url=PORTAL)
     signer = _mock_media_signer(expires_in=604800)
     ls_api = _mock_ls_api()
@@ -1231,9 +1232,7 @@ def test_refresh_media_records_the_new_expiry(conversation):
     obs = _refresh(executor, conversation, state, ls_api, signer)
 
     assert state.media_expires_at is not None
-    assert "media_urls_expire_at=" in obs.text
-    # A URL signed for a week is not reported as running out.
-    assert "media_urls_expiring" not in obs.text
+    assert "media_urls_expire" not in obs.text
 
 
 def test_refresh_media_signs_each_path_once(conversation):
@@ -1333,45 +1332,22 @@ def test_refresh_media_rejects_a_project_without_media_paths(conversation):
     assert "cannot be re-signed" in obs.text
 
 
-def test_get_warns_while_the_media_urls_are_about_to_expire(conversation):
+@pytest.mark.parametrize(
+    "remaining",
+    [timedelta(days=6), timedelta(hours=2), timedelta(hours=-1)],
+)
+def test_get_never_reports_a_media_deadline(conversation, remaining):
+    """However old the recorded window looks, there is no deadline to warn about."""
     executor = _create_executor()
-    state = _ready_state(
-        media_expires_at=(datetime.now(UTC) + timedelta(hours=2)).isoformat()
-    )
+    state = _ready_state(media_expires_at=(datetime.now(UTC) + remaining).isoformat())
 
     with patch.object(executor, "_load_state", return_value=state):
         obs = executor(_action(operation="get", project_ref="abc"), conversation)
 
-    assert "media_urls_expiring" in obs.text
-    assert "refresh_media" in obs.text
+    assert "media_urls_expire" not in obs.text
 
 
-def test_get_reports_media_urls_that_already_expired(conversation):
-    executor = _create_executor()
-    state = _ready_state(
-        media_expires_at=(datetime.now(UTC) - timedelta(hours=1)).isoformat()
-    )
-
-    with patch.object(executor, "_load_state", return_value=state):
-        obs = executor(_action(operation="get", project_ref="abc"), conversation)
-
-    assert "media_urls_expired" in obs.text
-
-
-def test_get_does_not_warn_while_the_media_urls_are_fresh(conversation):
-    executor = _create_executor()
-    state = _ready_state(
-        media_expires_at=(datetime.now(UTC) + timedelta(days=6)).isoformat()
-    )
-
-    with patch.object(executor, "_load_state", return_value=state):
-        obs = executor(_action(operation="get", project_ref="abc"), conversation)
-
-    assert "media_urls_expire_at=" in obs.text
-    assert "media_urls_expiring" not in obs.text
-
-
-def test_create_records_when_the_imported_media_urls_expire(conversation):
+def test_create_records_the_window_the_portal_reported(conversation):
     executor = _create_executor(portal_base_url=PORTAL)
     signer = _mock_media_signer(expires_in=604800)
     mock_ls = _mock_ls_api()
@@ -1402,7 +1378,7 @@ def test_create_records_when_the_imported_media_urls_expire(conversation):
     assert not obs.is_error
     saved = [call.args[1] for call in save_state.call_args_list]
     assert saved[-1].media_expires_at is not None
-    assert "media_urls_expire_at=" in obs.text
+    assert "media_urls_expire" not in obs.text
 
 
 def test_export_keeps_working_when_the_description_write_fails(conversation):

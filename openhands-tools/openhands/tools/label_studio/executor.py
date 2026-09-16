@@ -61,8 +61,6 @@ _MEDIA_PATH_SUFFIX = "_path"
 # Label Studio has no bulk task update, so refreshing re-signs one media URL per
 # task data field and writes each task back on its own request.
 _MEDIA_REFRESH_WORKERS = 8
-# Warn while there is still time to re-sign before annotators see broken images.
-_MEDIA_EXPIRY_WARNING = timedelta(days=1)
 
 # The Label Studio deployment's export button pushes the project export to this
 # object, and the portal only accepts a write to that exact key. All three sides
@@ -865,7 +863,6 @@ class LabelStudioProjectExecutor(
             )
             if state.last_error:
                 summary += f" last_error={state.last_error}"
-        summary += _media_expiry_note(state)
         return LabelStudioProjectObservation.from_text(
             text=summary,
             operation=operation,
@@ -954,6 +951,13 @@ def _resigned_data(
 
 
 def _media_expiry_iso(expires_in: int | None) -> str | None:
+    """Record the window the portal reported, for diagnostics only.
+
+    The portal keeps serving a media token past its own `exp` claim -- Label
+    Studio cannot re-mint the URL it stored, so the token is bound to one user
+    and object instead of a deadline. Nothing warns on this window, and
+    refresh_media remains available for callers that want a fresh signature.
+    """
     if expires_in is None:
         return None
     return (datetime.now(UTC) + timedelta(seconds=expires_in)).isoformat()
@@ -989,23 +993,6 @@ def _project_description(
             f"samples={annotated}/{total}"
         )
     return "\n".join(lines)
-
-
-def _media_expiry_note(state: ProjectState) -> str:
-    """Say when the media URLs in task data stop rendering, and what to do."""
-    if not state.media_expires_at:
-        return ""
-    try:
-        expires_at = datetime.fromisoformat(state.media_expires_at)
-    except ValueError:
-        return ""
-    note = f" media_urls_expire_at={state.media_expires_at}"
-    remaining = expires_at - datetime.now(UTC)
-    if remaining <= timedelta(0):
-        return note + " media_urls_expired: refresh_media"
-    if remaining <= _MEDIA_EXPIRY_WARNING:
-        return note + " media_urls_expiring: refresh_media"
-    return note
 
 
 def _normalize_storage_path(value: str, field_name: str) -> str:

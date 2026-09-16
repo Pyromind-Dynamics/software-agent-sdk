@@ -42,6 +42,41 @@ spec:
                         value: pre
                       - name: PYROMIND_PI_TERMINAL_BACKEND
                         value: os-sandbox
+                      # Runtime mode and LLM configuration, mirroring what the
+                      # pre cluster currently runs with.
+                      - name: RunMode
+                        value: agent-server
+                      - name: POD_NAME
+                        valueFrom:
+                            fieldRef:
+                                apiVersion: v1
+                                fieldPath: metadata.name
+                      - name: LLM_CONFIG_PATH
+                        value: /etc/llm-config/llm_config.json
+                      - name: LLM_MODEL
+                        value: deepseek/deepseek-v4-flash-0731
+                      - name: LLM_BASE_URL
+                        value: https://openrouter.ai/api/v1
+                      - name: OPENROUTER_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                key: OPENROUTER_API_KEY
+                                name: software-agent-sdk-secret
+                      - name: DEEPSEEK_API_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                key: DEEPSEEK_API_KEY
+                                name: software-agent-sdk-secret
+                      # Label Studio integration. BASE_URL is the LS REST API the
+                      # server calls; PORTAL_BASE_URL is the browser-facing half
+                      # that owns the SSO entry point and signs media URLs. The
+                      # portal issues per-caller tokens, so no API token is
+                      # configured here. Both fall back to production defaults
+                      # when unset, so they must be pinned per environment.
+                      - name: LABEL_STUDIO_BASE_URL
+                        value: https://pre-label-studio.pyromind.ai
+                      - name: LABEL_STUDIO_PORTAL_BASE_URL
+                        value: https://pre-api-portal.pyromind.ai
                       - name: OH_CONVERSATION_STORAGE_QUOTA
                         value: 500M
                       - name: OH_STORAGE_QUOTA_REQUIRED
