@@ -30,12 +30,14 @@ from openhands.agent_server.pyromind_router import (
     PyromindWorkflowRollbackRequest,
     _build_analyze_task_failure_tool,
     _build_debug_context_headers,
+    _build_label_studio_tool,
     _build_pyromind_storage_tools,
     _build_sandbox_tools,
     _build_training_analysis_tool,
     _build_workflow_run_tool,
     _build_workflow_validation_tool,
     _get_validation_cookie_header,
+    _load_agent_skills,
     _workflow_dsl_from_xyflow,
     apply_pyromind_validation_context,
     create_pyromind_conversation,
@@ -223,6 +225,61 @@ def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
     assert "workspace-discovery commands are rejected" not in rendered
     assert "exact, already-known conversation-local script" not in rendered
     assert "workspace/conversations/test" not in rendered
+
+
+def test_load_agent_skills_missing_dir_returns_empty() -> None:
+    assert _load_agent_skills("/nonexistent/skills/path") == []
+
+
+def test_load_agent_skills_returns_skill_objects(tmp_path) -> None:
+    """AgentSkills-format SKILL.md directories load as invocable Skill objects."""
+    skill_dir = tmp_path / "generate-workflow-dsl"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: generate-workflow-dsl\n"
+        "description: Generate a workflow DSL.\n---\n\nBody.\n",
+        encoding="utf-8",
+    )
+
+    skills = _load_agent_skills(str(tmp_path), allow_list=["generate-workflow-dsl"])
+
+    assert len(skills) == 1
+    skill = skills[0]
+    assert skill.name == "generate-workflow-dsl"
+    # Must be model-invocable so the SDK auto-attaches InvokeSkillTool.
+    assert skill.is_agentskills_format is True
+    assert skill.disable_model_invocation is False
+
+
+def test_load_agent_skills_respects_allow_list(tmp_path) -> None:
+    for name in ("generate-workflow-dsl", "unrelated-skill"):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {name}.\n---\n\nBody.\n",
+            encoding="utf-8",
+        )
+
+    skills = _load_agent_skills(str(tmp_path), allow_list=["generate-workflow-dsl"])
+
+    assert [s.name for s in skills] == ["generate-workflow-dsl"]
+
+
+def test_pyromind_kb_instructions_keep_the_documented_knowledge_paths() -> None:
+    """The KB instructions must keep pointing at the documented knowledge paths.
+
+    Carried over from the stale duplicate that sat inside the source package
+    (openhands-agent-server/tests/agent_server/test_pyromind_router.py), which
+    no CI job ever ran. Its other content assertions had already rotted.
+    """
+    rendered = PYROMIND_KB_INSTRUCTIONS.format(
+        knowledge_alias="knowledge",
+        skills_alias=".agents/skills",
+        working_dir="workspace/conversations/abc123",
+    )
+
+    assert "nodes/<NodeType>/<NodeType>.md" in rendered
+    assert "dataset_processing_workflow.py" in rendered
 
 
 def test_pyromind_llm_config_normalizes_chat_completions_base_url() -> None:
@@ -538,6 +595,34 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert "base_url" not in dumped_agent["llm"]
     assert "api_key" not in dumped_agent["condenser"]["llm"]
     assert "base_url" not in dumped_agent["condenser"]["llm"]
+
+
+def test_label_studio_tool_only_needs_a_portal_base_url(tmp_path):
+    """Each caller's token comes from the portal, so none is configured here."""
+    tool, secrets = _build_label_studio_tool(
+        _make_request({"cookie": "session-cookie"}),
+        {"label_studio_portal_base_url": "https://pre-api-portal.pyromind.ai"},
+    )
+
+    assert tool is not None
+    assert tool.params["portal_base_url"] == "https://pre-api-portal.pyromind.ai"
+    assert "LABEL_STUDIO_TOKEN" not in secrets
+
+
+def test_label_studio_tool_stays_off_without_a_portal_or_a_token():
+    tool, secrets = _build_label_studio_tool(_make_request(), {})
+
+    assert tool is None
+    assert secrets == {}
+
+
+def test_label_studio_tool_still_accepts_a_configured_token():
+    tool, secrets = _build_label_studio_tool(
+        _make_request(), {"label_studio_token": "static-token"}
+    )
+
+    assert tool is not None
+    assert "LABEL_STUDIO_TOKEN" in secrets
 
 
 def test_training_analysis_tool_reuses_authorization_secret_and_config(tmp_path):

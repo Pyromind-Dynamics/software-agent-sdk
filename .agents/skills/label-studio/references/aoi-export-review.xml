@@ -1,0 +1,29 @@
+<View>
+  <Header value="AOI 整图判定"/>
+  <View style="display:flex; gap:8px;">
+    <View style="flex:1;">
+      <Header value="缺陷图"/>
+      <Image name="defect_image" value="$defect_image" maxWidth="600"/>
+    </View>
+    <View style="flex:1;">
+      <Header value="差分图"/>
+      <Image name="diff_image" value="$diff_image" maxWidth="600"/>
+    </View>
+    <View style="flex:1;">
+      <Header value="GT"/>
+      <Image name="gt_image" value="$gt_image" maxWidth="600"/>
+    </View>
+  </View>
+  <View style="margin-top:16px;">
+    <Header value="整图判定"/>
+    <Choices name="quality_label" toName="defect_image" choice="single">
+      <Choice value="ok"/>
+      <Choice value="defect"/>
+    </Choices>
+  </View>
+  <View style="margin-top:16px;">
+    <Header value="备注"/>
+    <TextArea name="overall_note" toName="defect_image"
+              placeholder="补充说明整图判定依据" maxRows="3" editable="true"/>
+  </View>
+</View>
