@@ -533,7 +533,12 @@ class ConversationRuntime:
                 snapshots.append(store.load_snapshot())
             except (PermissionError, OSError, ProductStoreError):
                 continue
-        snapshots.sort(key=lambda item: item.through_seq, reverse=True)
+        snapshots.sort(
+            key=lambda item: (
+                item.updated_at.timestamp() if item.updated_at is not None else 0
+            ),
+            reverse=True,
+        )
         return tuple(snapshots)
 
     async def _ensure_active(

@@ -315,7 +315,11 @@ class FileProductStore:
             )
         if snapshot.conversation_id != metadata.conversation_id:
             raise ProductStoreCorruptionError("snapshot conversation mismatch")
-        if snapshot.through_seq > len(events) or duplicate_sources:
+        if (
+            snapshot.through_seq > len(events)
+            or duplicate_sources
+            or snapshot.updated_at is None
+        ):
             snapshot = ConversationSnapshot(
                 conversation_id=metadata.conversation_id,
                 capabilities=metadata.capabilities,

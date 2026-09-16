@@ -62,7 +62,12 @@ class SnapshotProjector:
 
         handler = getattr(self, f"_on_{event.type.replace('.', '_')}", None)
         updated = handler(snapshot, event) if handler is not None else snapshot
-        return updated.model_copy(update={"through_seq": event.seq})
+        updated_at = event.occurred_at
+        if snapshot.updated_at is not None:
+            updated_at = max(snapshot.updated_at, updated_at)
+        return updated.model_copy(
+            update={"through_seq": event.seq, "updated_at": updated_at}
+        )
 
     def _on_conversation_created(
         self, snapshot: ConversationSnapshot, _event: ProductEvent
