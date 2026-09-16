@@ -88,6 +88,7 @@ from openhands.tools.environment_processing import (
     EdpRenderTool,
     EdpSubmitTool,
 )
+from openhands.tools.label_studio import LabelStudioProjectTool
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
 from openhands.tools.pyromind_archive import ExtractArchiveTool
@@ -166,14 +167,69 @@ _PYROMIND_SKILL_NAMES = [
     "generate-workflow-dsl",
     "debug-workflow",
     "data-processing",
-    "embodied-data-cleaning",
     "sandbox",
     "training-analysis",
+    "label-studio",
 ]
+_LABEL_STUDIO_TOKEN_SECRET = "LABEL_STUDIO_TOKEN"
 _PYROMIND_VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
 _PYROMIND_VALIDATE_FORWARD_HEADERS = ("x-cluster", "accept-language")
 _PYROMIND_DEBUG_URL_TIMEOUT_SECONDS = 30.0
 _PYROMIND_DEBUG_RESPONSE_BODY_LIMIT = 20000
+
+
+def _build_label_studio_tool(
+    http_request: Request,
+    extra: dict[str, Any],
+) -> tuple[Tool | None, dict[str, SecretSource]]:
+    """Build label_studio_project when a token or a portal can reach one."""
+    ls_token = extra.get("label_studio_token") or os.getenv("LABEL_STUDIO_API_TOKEN")
+    if not isinstance(ls_token, str):
+        ls_token = ""
+
+    params: dict[str, Any] = {}
+    ls_base_url = extra.get("label_studio_base_url")
+    if isinstance(ls_base_url, str) and ls_base_url.strip():
+        params["ls_base_url"] = ls_base_url.strip()
+    portal_base_url = (
+        extra.get("label_studio_portal_base_url")
+        or extra.get("label_studio_sso_base_url")
+        or os.getenv("LABEL_STUDIO_PORTAL_BASE_URL")
+    )
+    if isinstance(portal_base_url, str) and portal_base_url.strip():
+        params["portal_base_url"] = portal_base_url.strip()
+
+    # The portal issues each caller their own token, so a configured portal is
+    # enough to offer the tool; only a deployment without one needs a token here.
+    if not params.get("portal_base_url") and not ls_token.strip():
+        return None, {}
+
+    params["ls_token_secret"] = _LABEL_STUDIO_TOKEN_SECRET
+    secrets: dict[str, SecretSource] = {}
+    headers = {
+        name: value
+        for name in _PYROMIND_VALIDATE_FORWARD_HEADERS
+        if name != "x-cluster" and (value := http_request.headers.get(name))
+    }
+    if cluster := _get_validation_cluster_header(http_request, extra):
+        headers["x-cluster"] = cluster
+        # The portal signs media against the storage service of this cluster.
+        params["cluster"] = cluster
+    if headers:
+        params["headers"] = headers
+    secret_headers: dict[str, str] = {}
+    cookie_header = _get_validation_cookie_header(http_request)
+    if cookie_header:
+        secret_headers["cookie"] = PYROMIND_STORAGE_AUTH_COOKIE_SECRET
+        secrets[PYROMIND_STORAGE_AUTH_COOKIE_SECRET] = StaticSecret(
+            value=SecretStr(cookie_header)
+        )
+    if secret_headers:
+        params["secret_headers"] = secret_headers
+    if ls_token.strip():
+        secrets[_LABEL_STUDIO_TOKEN_SECRET] = StaticSecret(value=SecretStr(ls_token))
+    return Tool(name=LabelStudioProjectTool.name, params=params), secrets
+
 
 # Knowledge-base retrieval guidance layered on top of the codex base prompt via
 # get_codex_agent(custom_instructions=...). Match the Codex flow: prefer the
@@ -1319,6 +1375,9 @@ async def create_pyromind_conversation(
     storage_tools, storage_secrets = _build_pyromind_storage_tools(
         http_request, request.extra, skills_path
     )
+    label_studio_tool, label_studio_secrets = _build_label_studio_tool(
+        http_request, request.extra
+    )
 
     # 4. Build LLM config
     llm = LLM(
@@ -1369,6 +1428,7 @@ async def create_pyromind_conversation(
             validation_tool,
             analysis_tool,
             training_tool,
+            *([label_studio_tool] if label_studio_tool is not None else []),
         ],
     )
 
@@ -1401,6 +1461,7 @@ async def create_pyromind_conversation(
             **debug_secrets,
             **sandbox_secrets,
             **storage_secrets,
+            **label_studio_secrets,
         },
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
         user_id=user_id,

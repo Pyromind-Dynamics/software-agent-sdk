@@ -308,6 +308,106 @@ def test_preview_dataset_strips_workspace_prefix(monkeypatch, tmp_path, dataset_
     assert metadata_calls[0]["path"] == "proto.jsonl"
 
 
+def test_preview_batch_covers_every_requested_path(monkeypatch, tmp_path):
+    """Sampling a directory of samples must not cost one call per sample."""
+    _patch_shared_empty(monkeypatch)
+    requested: list[str] = []
+    jsonl = b'{"prompt":"p1"}\n'
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            requested.append(json["path"])
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": json["path"],
+                        "bucket_name": "1001",
+                        "size": len(jsonl),
+                        "content_type": "application/jsonl",
+                        "is_dir": False,
+                        "metadata": {},
+                    },
+                },
+            )
+        if url.endswith("/get_url"):
+            return _Response(
+                200,
+                {"success": True, "data": {"url": "https://download.test/sample"}},
+            )
+        raise AssertionError(f"unexpected URL: {url}")
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        return _StreamResponse(jsonl)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    conversation = _fake_conversation(
+        tmp_path,
+        secret_registry=_secret_registry(),
+        agent_state={PYROMIND_STORAGE_HEADERS_STATE_KEY: {"x-cluster": "pre"}},
+    )
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+        timeout=5.0,
+    )(
+        PreviewDatasetAction.model_validate(
+            {
+                "dataset_path": "samples/10_B1/meta.json",
+                "dataset_paths": [
+                    "samples/10_B2/meta.json",
+                    "samples/11_B1/meta.json",
+                ],
+            }
+        ),
+        cast(Any, conversation),
+    )
+
+    assert requested == [
+        "samples/10_B1/meta.json",
+        "samples/10_B2/meta.json",
+        "samples/11_B1/meta.json",
+    ]
+    assert observation.previewed_paths == requested
+    assert not observation.is_error
+    for path in requested:
+        assert f"### {path}" in observation.text
+
+
+def test_preview_batch_rejects_more_paths_than_one_call_previews():
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api"
+    )(
+        PreviewDatasetAction.model_validate(
+            {"dataset_paths": [f"samples/{index}/meta.json" for index in range(21)]}
+        ),
+        cast(Any, None),
+    )
+
+    assert observation.is_error
+    assert "at most 20" in observation.text
+
+
+def test_preview_batch_leaves_sample_mode_to_sample_paths():
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api"
+    )(
+        PreviewDatasetAction.model_validate(
+            {
+                "dataset_path": "samples/",
+                "dataset_paths": ["other/"],
+                "mode": "sample",
+            }
+        ),
+        cast(Any, None),
+    )
+
+    assert observation.is_error
+    assert "sample_paths" in observation.text
+
+
 def test_preview_dataset_reports_archive_with_extract_hint(monkeypatch, tmp_path):
     _patch_shared_empty(monkeypatch)
     url_calls: list[dict[str, Any]] = []
@@ -627,15 +727,12 @@ def test_upload_file_to_pyromind_posts_workspace_file(
     local_file.write_text("def acc():\n    return 1\n", encoding="utf-8")
     calls: dict[str, Any] = {}
 
-    def fake_post(url, *, headers, data, files, timeout):
-        uploaded_file = files["file"]
+    def fake_post(url, *, headers, json, timeout):
         calls.update(
             {
                 "url": url,
                 "headers": headers,
-                "data": data,
-                "filename": uploaded_file[0],
-                "content": uploaded_file[1].read(),
+                "body": json,
                 "timeout": timeout,
             }
         )
@@ -644,16 +741,23 @@ def test_upload_file_to_pyromind_posts_workspace_file(
             {
                 "success": True,
                 "data": {
-                    "uploaded": True,
-                    "success_count": 1,
-                    "failed_count": 0,
-                    "success_files": [{"filename": "metric.py"}],
-                    "failed_files": [],
+                    "multipart": False,
+                    "upload_url": "https://upload.test/presigned",
+                    "method": "PUT",
+                    "headers": {},
                 },
             },
         )
 
+    def fake_request(method, url, *, content, headers, timeout):
+        calls["upload_method"] = method
+        calls["upload_url"] = url
+        calls["content"] = content.read()
+        calls["upload_timeout"] = timeout
+        return _Response(200, {})
+
     monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "request", fake_request)
     conversation = _fake_conversation(
         tmp_path,
         secret_registry=_secret_registry(),
@@ -672,13 +776,20 @@ def test_upload_file_to_pyromind_posts_workspace_file(
     assert observation.storage_path == (
         f"/.pyromind-agent/{_CONVERSATION_ID}/metric.py"
     )
-    assert calls["url"] == "https://portal.test/storage_api/upload_file"
+    assert calls["url"] == "https://portal.test/storage_api/presigned_upload_url"
     assert calls["headers"]["cookie"] == "auth_token=session-token"
     assert calls["headers"]["x-cluster"] == "pre"
-    assert calls["data"]["path"] == f"/.pyromind-agent/{_CONVERSATION_ID}"
-    assert calls["filename"] == "metric.py"
+    assert calls["body"] == {
+        "filename": "metric.py",
+        "path": f"/.pyromind-agent/{_CONVERSATION_ID}",
+        "content_type": "application/octet-stream",
+        "size": len(b"def acc():\n    return 1\n"),
+    }
+    assert calls["upload_method"] == "PUT"
+    assert calls["upload_url"] == "https://upload.test/presigned"
     assert calls["content"] == b"def acc():\n    return 1\n"
     assert calls["timeout"] == 7.0
+    assert calls["upload_timeout"] == 7.0
 
 
 def test_upload_file_to_pyromind_explicit_target_dir_wins(
@@ -689,23 +800,27 @@ def test_upload_file_to_pyromind_explicit_target_dir_wins(
     local_file.write_text("def acc():\n    return 1\n", encoding="utf-8")
     posted_path: dict[str, str] = {}
 
-    def fake_post(url, *, headers, data, files, timeout):
-        posted_path["path"] = data["path"]
+    def fake_post(url, *, headers, json, timeout):
+        posted_path["path"] = json["path"]
         return _Response(
             200,
             {
                 "success": True,
                 "data": {
-                    "uploaded": True,
-                    "success_count": 1,
-                    "failed_count": 0,
-                    "success_files": [{"filename": "metric.py"}],
-                    "failed_files": [],
+                    "multipart": False,
+                    "upload_url": "https://upload.test/presigned",
+                    "method": "PUT",
+                    "headers": {},
                 },
             },
         )
 
+    def fake_request(method, url, *, content, headers, timeout):
+        content.read()
+        return _Response(200, {})
+
     monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "request", fake_request)
     conversation = _fake_conversation(tmp_path, secret_registry=_secret_registry())
 
     observation = UploadFileToPyromindExecutor(
@@ -721,6 +836,75 @@ def test_upload_file_to_pyromind_explicit_target_dir_wins(
     assert not observation.is_error
     assert observation.storage_path == "/custom/dir/metric.py"
     assert posted_path["path"] == "/custom/dir"
+
+
+def test_upload_file_to_pyromind_multipart_uploads_parts_and_completes(
+    monkeypatch,
+    tmp_path,
+):
+    local_file = tmp_path / "big.bin"
+    content = b"a" * 50 + b"b" * 10
+    local_file.write_bytes(content)
+    put_calls: dict[str, bytes] = {}
+    complete_calls: list[dict[str, Any]] = []
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/presigned_upload_url"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "multipart": True,
+                        "upload_url": None,
+                        "method": "PUT",
+                        "headers": {},
+                        "upload_id": "mp-123",
+                        "part_size": 50,
+                        "part_count": 2,
+                        "part_urls": [
+                            "https://upload.test/part1",
+                            "https://upload.test/part2",
+                        ],
+                    },
+                },
+            )
+        assert url.endswith("/multipart_complete")
+        complete_calls.append(json)
+        return _Response(200, {"success": True, "data": {"etag": "etag-1"}})
+
+    def fake_request(method, url, *, content, headers, timeout):
+        chunk = content if isinstance(content, bytes) else content.read()
+        put_calls.setdefault(url, b"")
+        put_calls[url] += chunk
+        return _Response(200, {})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "request", fake_request)
+    conversation = _fake_conversation(tmp_path, secret_registry=_secret_registry())
+
+    observation = UploadFileToPyromindExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        UploadFileToPyromindAction(file_path="big.bin"),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.storage_path == (f"/.pyromind-agent/{_CONVERSATION_ID}/big.bin")
+    assert put_calls == {
+        "https://upload.test/part1": b"a" * 50,
+        "https://upload.test/part2": b"b" * 10,
+    }
+    assert complete_calls == [
+        {
+            "path": f"/.pyromind-agent/{_CONVERSATION_ID}",
+            "filename": "big.bin",
+            "size": len(content),
+            "upload_id": "mp-123",
+            "part_count": 2,
+        }
+    ]
 
 
 def test_download_file_from_pyromind_returns_bounded_script(monkeypatch):

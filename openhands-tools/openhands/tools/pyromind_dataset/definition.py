@@ -50,6 +50,29 @@ PYROMIND_STORAGE_AUTH_COOKIE_SECRET = "PYROMIND_STORAGE_AUTH_COOKIE"
 PYROMIND_STORAGE_HEADERS_STATE_KEY = "pyromind_storage_headers"
 PYROMIND_AGENT_STORAGE_ROOT = "/.pyromind-agent"
 
+_UPLOAD_ATTEMPTS = 3
+_UPLOAD_BACKOFF_SECONDS = 1.0
+# Presigned upload URLs are short-lived, so a 403 is worth retrying: the retry
+# mints a fresh URL. 404 and other 4xx mean the request itself is wrong.
+_TRANSIENT_STORAGE_STATUSES = frozenset({403, 408, 425, 429})
+
+
+class StorageFileNotFoundError(ValueError):
+    """Raised when a Storage object genuinely does not exist.
+
+    Callers use this to tell "absent" apart from a transient or server-side
+    failure; those must never be mistaken for a missing file.
+    """
+
+
+class _TransientStorageError(ValueError):
+    """Internal marker for a Storage failure that is worth retrying."""
+
+
+def _is_transient_storage_status(status_code: int) -> bool:
+    return status_code >= 500 or status_code in _TRANSIENT_STORAGE_STATUSES
+
+
 _WORKSPACE_PATH_PREFIXES = ("/workspace/", "workspace/")
 _ARCHIVE_SUFFIXES = {".zip", ".tar", ".tar.gz", ".tgz"}
 _ARCHIVE_CONTENT_TYPE_HINTS = ("zip", "tar", "gzip", "x-compress", "x-tar")
@@ -62,6 +85,10 @@ _DEFAULT_PREVIEW_BYTES = _LARGE_FILE_RANGE_BYTES * _LARGE_FILE_RANGE_COUNT
 _MAX_PREVIEW_BYTES = _DEFAULT_PREVIEW_BYTES
 _MAX_REQUESTED_SAMPLES = 100
 _MAX_LISTED_ENTRIES = 100
+# One call may cover several paths so a caller sampling a directory of samples
+# does not spend a request per file. The previews stay individually bounded, so
+# the ceiling keeps one observation from growing without limit.
+_MAX_PREVIEW_PATHS = 20
 _DELIMITED_HEADER_BYTES = 4096
 _MAX_XLSX_BYTES = 10 * 1024 * 1024
 _MAX_SAMPLE_STRING_CHARS = 2000
@@ -153,6 +180,7 @@ class PreviewDatasetAction(Action):
     """Preview a dataset from shared space or user storage."""
 
     dataset_path: str = Field(
+        default="",
         description=(
             "Path of the dataset to preview. Can be a shared dataset name "
             "(e.g. 'openai/gsm8k'), a shared dataset with file path "
@@ -161,7 +189,17 @@ class PreviewDatasetAction(Action):
             "'datasets/my_data/train.jsonl'). A leading '/workspace/' or "
             "'workspace/' prefix (platform workspace path) is stripped "
             "automatically and the remainder is treated as a user storage "
-            "relative path."
+            "relative path. Pass a single path here, or add paths to "
+            "'dataset_paths' to preview several in one call."
+        ),
+    )
+    dataset_paths: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Further paths previewed in the same call, after 'dataset_path'. "
+            "Use it to compare samples or files side by side instead of calling "
+            f"once per path, up to {_MAX_PREVIEW_PATHS} paths per call. Inspect "
+            "mode only; sample mode takes one path with 'sample_paths'."
         ),
     )
     n: int = Field(
@@ -215,14 +253,26 @@ class PreviewDatasetAction(Action):
     def visualize(self) -> Text:
         content = Text()
         content.append("Preview dataset: ", style="bold blue")
-        content.append(self.dataset_path)
+        content.append(", ".join(path for path in self.requested_paths))
         return content
+
+    @property
+    def requested_paths(self) -> list[str]:
+        """Every path this action names, in the order it names them."""
+        return [path for path in (self.dataset_path, *self.dataset_paths) if path]
 
 
 class PreviewDatasetObservation(Observation):
     """Statistics and sample rows of a storage dataset."""
 
     dataset_path: str = Field(description="The storage path that was previewed.")
+    previewed_paths: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Every path covered by this observation when the call previewed "
+            "several; empty when it previewed one path."
+        ),
+    )
     files: list[str] = Field(
         default_factory=list,
         description="Data files found under the path (relative to it).",
@@ -439,12 +489,75 @@ class PreviewDatasetExecutor(
         action: PreviewDatasetAction,
         conversation: BaseConversation | None = None,
     ) -> PreviewDatasetObservation:
-        dataset_path = _strip_workspace_prefix(action.dataset_path.strip())
+        paths = [
+            stripped
+            for stripped in (
+                _strip_workspace_prefix(candidate.strip())
+                for candidate in action.requested_paths
+            )
+            if stripped
+        ]
+        if not paths:
+            return PreviewDatasetObservation.from_text(
+                text="dataset_path or dataset_paths must name at least one path.",
+                is_error=True,
+                dataset_path=action.dataset_path,
+            )
+        if len(paths) > _MAX_PREVIEW_PATHS:
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    f"{len(paths)} paths requested, but one call previews at most "
+                    f"{_MAX_PREVIEW_PATHS}. Narrow the selection."
+                ),
+                is_error=True,
+                dataset_path=action.dataset_path,
+            )
+        if len(paths) == 1:
+            return self._preview_path(action, paths[0], conversation)
+        if action.mode == "sample":
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    "sample mode previews one path. Name the files to materialize "
+                    "in sample_paths instead."
+                ),
+                is_error=True,
+                dataset_path=action.dataset_path,
+            )
+        return self._preview_paths(action, paths, conversation)
+
+    def _preview_paths(
+        self,
+        action: PreviewDatasetAction,
+        paths: list[str],
+        conversation: BaseConversation | None,
+    ) -> PreviewDatasetObservation:
+        sections: list[str] = []
+        failures = 0
+        for path in paths:
+            result = self._preview_path(action, path, conversation)
+            if result.is_error:
+                failures += 1
+            sections.append(f"### {path}\n{result.text}")
+        return PreviewDatasetObservation.from_text(
+            text="\n\n".join(sections),
+            # A partial batch still reported every path it could, and the text
+            # above carries the per-path errors.
+            is_error=failures == len(paths),
+            dataset_path=", ".join(paths),
+            previewed_paths=paths,
+        )
+
+    def _preview_path(
+        self,
+        action: PreviewDatasetAction,
+        dataset_path: str,
+        conversation: BaseConversation | None = None,
+    ) -> PreviewDatasetObservation:
         if not dataset_path:
             return PreviewDatasetObservation.from_text(
                 text="dataset_path must be a non-empty path.",
                 is_error=True,
-                dataset_path=action.dataset_path,
+                dataset_path=dataset_path,
             )
 
         try:
@@ -2099,43 +2212,205 @@ def upload_local_file_to_pyromind(
     timeout: float,
 ) -> str:
     """Upload a trusted local runtime file and return its Storage path."""
-    filename = local_path.name
-    storage_path = str(PurePosixPath(target_dir) / filename)
-    try:
-        with local_path.open("rb") as file_obj:
-            response = httpx.post(
-                f"{storage_base_url.rstrip('/')}/upload_file",
+    last_error: _TransientStorageError | None = None
+    for attempt in range(1, _UPLOAD_ATTEMPTS + 1):
+        try:
+            return _upload_local_file_once(
+                local_path=local_path,
+                target_dir=target_dir,
+                storage_base_url=storage_base_url,
                 headers=headers,
-                data={"name": filename, "path": target_dir, "bucket": ""},
-                files={"file": (filename, file_obj, "application/octet-stream")},
                 timeout=timeout,
             )
+        except _TransientStorageError as exc:
+            last_error = exc
+            if attempt < _UPLOAD_ATTEMPTS:
+                time.sleep(_UPLOAD_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+    raise ValueError(f"{last_error} (after {_UPLOAD_ATTEMPTS} attempts)") from None
+
+
+def _upload_local_file_once(
+    *,
+    local_path: Path,
+    target_dir: str,
+    storage_base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+) -> str:
+    filename = local_path.name
+    storage_path = str(PurePosixPath(target_dir) / filename)
+    file_size = local_path.stat().st_size
+    try:
+        response = httpx.post(
+            f"{storage_base_url.rstrip('/')}/presigned_upload_url",
+            headers=headers,
+            json={
+                "filename": filename,
+                "path": target_dir,
+                "content_type": "application/octet-stream",
+                "size": file_size,
+            },
+            timeout=timeout,
+        )
     except httpx.RequestError as exc:
-        raise ValueError(
-            "Failed to call Pyromind storage upload_file API: "
+        raise _TransientStorageError(
+            "Failed to call Pyromind storage presigned_upload_url API: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
 
-    payload_result = _decode_json_response(response, "Pyromind storage upload_file API")
+    if _is_transient_storage_status(response.status_code):
+        raise _TransientStorageError(
+            "Pyromind storage presigned_upload_url API returned HTTP "
+            f"{response.status_code}: {_truncate_text(response.text)}"
+        )
+
+    payload_result = _decode_json_response(
+        response, "Pyromind storage presigned_upload_url API"
+    )
     if isinstance(payload_result, str):
         raise ValueError(payload_result)
-    data_result = _extract_api_data("upload_file", payload_result)
+    data_result = _extract_api_data("presigned_upload_url", payload_result)
     if isinstance(data_result, str):
         raise ValueError(data_result)
 
-    failed_files = data_result.get("failed_files")
-    if isinstance(failed_files, list) and failed_files:
-        detail = _truncate_text(json.dumps(failed_files, ensure_ascii=False))
-        raise ValueError(
-            f"Pyromind storage upload_file API reported failed files: {detail}"
+    if data_result.get("multipart") is True:
+        _upload_local_file_multipart(
+            local_path=local_path,
+            data_result=data_result,
+            target_dir=target_dir,
+            filename=filename,
+            file_size=file_size,
+            storage_base_url=storage_base_url,
+            headers=headers,
+            timeout=timeout,
         )
-    if data_result.get("success_count") != 1:
-        detail = json.dumps(data_result, ensure_ascii=False)
+        return storage_path
+
+    upload_url = data_result.get("upload_url")
+    if not isinstance(upload_url, str) or not upload_url.strip():
         raise ValueError(
-            "Pyromind storage upload_file API did not report one uploaded "
-            f"file: {detail}"
+            "Pyromind storage presigned_upload_url API response is missing "
+            "upload_url data."
         )
+    _presigned_put(
+        upload_url,
+        content=local_path.open("rb"),
+        method=str(data_result.get("method") or "PUT").upper(),
+        extra_headers=data_result.get("headers"),
+        timeout=timeout,
+        error_label="Pyromind storage presigned upload",
+    )
     return storage_path
+
+
+def _presigned_put(
+    url: str,
+    *,
+    content: Any,
+    method: str,
+    extra_headers: Any,
+    timeout: float,
+    error_label: str,
+) -> None:
+    """PUT bytes/file-object to one presigned upload URL, raising ValueError."""
+    upload_headers = extra_headers if isinstance(extra_headers, dict) else {}
+    try:
+        upload_response = httpx.request(
+            method, url, content=content, headers=upload_headers, timeout=timeout
+        )
+    except httpx.RequestError as exc:
+        raise _TransientStorageError(
+            f"Failed to upload file via {error_label}: {type(exc).__name__}: {exc}"
+        ) from exc
+    if upload_response.status_code >= 400:
+        message = (
+            f"{error_label} returned HTTP {upload_response.status_code}: "
+            f"{_truncate_text(upload_response.text)}"
+        )
+        if _is_transient_storage_status(upload_response.status_code):
+            raise _TransientStorageError(message)
+        raise ValueError(message)
+
+
+def _upload_local_file_multipart(
+    *,
+    local_path: Path,
+    data_result: dict[str, Any],
+    target_dir: str,
+    filename: str,
+    file_size: int,
+    storage_base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+) -> None:
+    """Upload a presigned multipart payload part-by-part, then complete it."""
+    upload_id = data_result.get("upload_id")
+    part_size = data_result.get("part_size")
+    part_count = data_result.get("part_count")
+    part_urls = data_result.get("part_urls")
+    if not isinstance(upload_id, str) or not upload_id:
+        raise ValueError(
+            "Pyromind storage presigned_upload_url API multipart response is "
+            "missing upload_id data."
+        )
+    if not isinstance(part_size, int) or part_size < 1:
+        raise ValueError(
+            "Pyromind storage presigned_upload_url API multipart response is "
+            "missing part_size data."
+        )
+    if not isinstance(part_count, int) or part_count < 1:
+        raise ValueError(
+            "Pyromind storage presigned_upload_url API multipart response is "
+            "missing part_count data."
+        )
+    if not isinstance(part_urls, list) or len(part_urls) != part_count:
+        raise ValueError(
+            "Pyromind storage presigned_upload_url API multipart response "
+            f"has {len(part_urls) if isinstance(part_urls, list) else 0} "
+            f"part_urls, expected {part_count}."
+        )
+
+    part_label = "Pyromind storage multipart part upload"
+    with local_path.open("rb") as file_obj:
+        for part_url in part_urls:
+            chunk = file_obj.read(part_size)
+            if not chunk:
+                break
+            _presigned_put(
+                str(part_url),
+                content=chunk,
+                method="PUT",
+                extra_headers=None,
+                timeout=timeout,
+                error_label=part_label,
+            )
+
+    try:
+        complete_response = httpx.post(
+            f"{storage_base_url.rstrip('/')}/multipart_complete",
+            headers=headers,
+            json={
+                "path": target_dir,
+                "filename": filename,
+                "size": file_size,
+                "upload_id": upload_id,
+                "part_count": part_count,
+            },
+            timeout=timeout,
+        )
+    except httpx.RequestError as exc:
+        raise ValueError(
+            "Failed to call Pyromind storage multipart_complete API: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    payload_result = _decode_json_response(
+        complete_response, "Pyromind storage multipart_complete API"
+    )
+    if isinstance(payload_result, str):
+        raise ValueError(payload_result)
+    complete_result = _extract_api_data("multipart_complete", payload_result)
+    if isinstance(complete_result, str):
+        raise ValueError(complete_result)
 
 
 def download_file_from_pyromind(
@@ -2175,10 +2450,16 @@ def download_file_from_pyromind(
         with httpx.stream(
             "GET",
             url,
-            headers={},
+            # Signed-URL GETs are CDN-cached; bypass so freshly written
+            # control-plane files are visible immediately.
+            headers={"cache-control": "no-cache", "pragma": "no-cache"},
             timeout=timeout,
             follow_redirects=True,
         ) as download:
+            if download.status_code == 404:
+                raise StorageFileNotFoundError(
+                    f"Pyromind storage object not found: {storage_path}"
+                )
             if download.status_code >= 400:
                 body = download.read().decode("utf-8", errors="replace")
                 raise ValueError(

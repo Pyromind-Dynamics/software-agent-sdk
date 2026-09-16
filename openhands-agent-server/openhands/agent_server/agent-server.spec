@@ -117,9 +117,9 @@ def get_pi_skill_datas():
         "generate-workflow-dsl",
         "data-processing",
         "debug-workflow",
-        "embodied-data-cleaning",
         "sandbox",
         "training-analysis",
+        "label-studio",
     ):
         for path in sorted((skills_dir / skill_name).rglob("*")):
             if path.is_file() and "__pycache__" not in path.parts:

@@ -37,6 +37,10 @@ from openhands.tools.environment_processing import (
     EdpSubmitTool,
 )
 from openhands.tools.environment_processing.platform_env import resolve_platform_env
+from openhands.tools.label_studio import (
+    LABEL_STUDIO_TOKEN_SECRET,
+    LabelStudioProjectTool,
+)
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
@@ -221,6 +225,13 @@ class _ToolConversationFacade:
             secrets[PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET] = StaticSecret(
                 value=SecretStr(auth_token)
             )
+        label_studio_token = context.extra.get("label_studio_token")
+        if not isinstance(label_studio_token, str) or not label_studio_token.strip():
+            label_studio_token = os.getenv("LABEL_STUDIO_API_TOKEN", "")
+        if label_studio_token.strip():
+            secrets[LABEL_STUDIO_TOKEN_SECRET] = StaticSecret(
+                value=SecretStr(label_studio_token)
+            )
         secrets.update(_llm_credential_secrets(context))
         registry.secret_sources.update(secrets)
         model = context.model_configuration
@@ -357,6 +368,9 @@ class PyromindBusinessToolHost:
                 runtime_dir=str(self._training_runtime),
                 **self._training_analysis_params(context),
             )[0],
+            LabelStudioProjectTool.name: lambda context: LabelStudioProjectTool.create(
+                **self._label_studio_params(context)
+            )[0],
         }
 
     def specs(self) -> list[dict[str, Any]]:
@@ -383,6 +397,7 @@ class PyromindBusinessToolHost:
             WorkflowDebugTool,
             AnalyzeTaskFailureTool,
             TrainingAnalysisTool,
+            LabelStudioProjectTool,
         ):
             tool = tool_type.create()[0]
             definition = tool.to_mcp_tool()
@@ -549,6 +564,21 @@ class PyromindBusinessToolHost:
             params["headers"] = headers
         if context.request_context.cookie:
             params["secret_headers"] = {"cookie": _STORAGE_COOKIE_SECRET}
+        return params
+
+    def _label_studio_params(self, context: ToolExecutionContext) -> dict[str, Any]:
+        params = self._storage_params(context)
+        for key, legacy_key in (
+            ("ls_base_url", None),
+            ("portal_base_url", "sso_base_url"),
+        ):
+            value = context.extra.get(f"label_studio_{key}")
+            if not (isinstance(value, str) and value.strip()) and legacy_key:
+                value = context.extra.get(f"label_studio_{legacy_key}")
+            if isinstance(value, str) and value.strip():
+                params[key] = value.strip()
+        if cluster := _cluster_route(context):
+            params["cluster"] = cluster
         return params
 
     def _execution_params(self, context: ToolExecutionContext) -> dict[str, Any]:
@@ -723,6 +753,16 @@ def _execution_target(
     if separator and routed_env.strip():
         env = routed_env.strip().lower()
     return resolve_platform_env(env), cluster.strip() or None
+
+
+def _cluster_route(context: ToolExecutionContext) -> str:
+    """Raw cluster route (``us-west-1#pre``) this conversation is served from.
+
+    Only the conversation's own routing is used. A process-wide default would
+    hide a session that never carried a cluster, and Storage is replicated per
+    cluster, so falling back to the wrong one reads another cluster's objects.
+    """
+    return (context.request_context.x_cluster or "").strip()
 
 
 def _preview_timeout_seconds(context: ToolExecutionContext) -> float:
