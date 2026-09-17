@@ -29,7 +29,7 @@
       <Label value="缺口" background="#45B7D1"/>
       <Label value="毛刺" background="#FFA07A"/>
       <Label value="针孔" background="#F7DC6F"/>
-      <Label value="铜渣" background="#98D8C8"/>
+      <Label value="其他" background="#98D8C8"/>
     </RectangleLabels>
     <TextArea name="finding_observation" toName="defect_image"
               placeholder="描述缺陷现象" maxRows="3" editable="true"
