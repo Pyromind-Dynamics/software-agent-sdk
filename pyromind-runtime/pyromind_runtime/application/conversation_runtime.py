@@ -641,13 +641,14 @@ class ConversationRuntime:
             )
             notification = task.model_dump(mode="json")
             notification["resume_pending"] = False
-            persisted, _ = store.append(
+            persisted, _ = await asyncio.to_thread(
+                store.append,
                 ProductEvent(
                     event_id=f"external-task:{task.task_id}:{task.status}:resumed",
                     conversation_id=active.handle.session_id,
                     type="external_task.updated",
                     payload=notification,
-                )
+                ),
             )
             self._publish(persisted)
 
@@ -715,7 +716,10 @@ class ConversationRuntime:
                 )
                 if product_event is None:
                     continue
-                persisted, _ = store.append(product_event)
+                # Persisting an event rewrites state on disk. Left inline it blocks
+                # the single event loop for every subscriber in the process, so hand
+                # it to a worker thread and keep the loop free to serve them.
+                persisted, _ = await asyncio.to_thread(store.append, product_event)
                 if (
                     product_event.type == "external_task.submitted"
                     and self._external_tasks is not None
@@ -745,7 +749,7 @@ class ConversationRuntime:
                 },
             )
             try:
-                persisted, _ = store.append(notice)
+                persisted, _ = await asyncio.to_thread(store.append, notice)
                 self._publish(persisted)
             except Exception:
                 logger.exception("Could not persist Product event pump failure")
