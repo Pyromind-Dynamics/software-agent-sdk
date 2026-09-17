@@ -22,6 +22,20 @@
     </Choices>
   </View>
   <View style="margin-top:16px;">
+    <Header value="缺陷区域标注"/>
+    <RectangleLabels name="finding_category" toName="defect_image">
+      <Label value="断路" background="#FF6B6B"/>
+      <Label value="短路" background="#4ECDC4"/>
+      <Label value="缺口" background="#45B7D1"/>
+      <Label value="毛刺" background="#FFA07A"/>
+      <Label value="针孔" background="#F7DC6F"/>
+      <Label value="铜渣" background="#98D8C8"/>
+    </RectangleLabels>
+    <TextArea name="finding_observation" toName="defect_image"
+              placeholder="描述缺陷现象" maxRows="3" editable="true"
+              perRegion="true"/>
+  </View>
+  <View style="margin-top:16px;">
     <Header value="备注"/>
     <TextArea name="overall_note" toName="defect_image"
               placeholder="补充说明整图判定依据" maxRows="3" editable="true"/>
