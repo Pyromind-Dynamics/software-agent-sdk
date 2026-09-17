@@ -261,3 +261,74 @@ def test_missing_harness_metadata_defaults_to_openhands(tmp_path: Path) -> None:
     metadata = store.metadata_path.read_text()
     store.metadata_path.write_text(metadata.replace('"harness_id":"openhands",', ""))
     assert store.harness_id() == "openhands"
+
+
+def _status_event(event_id: str, status: str) -> ProductEvent:
+    return ProductEvent(
+        event_id=event_id,
+        conversation_id="conversation-1",
+        type="status.changed",
+        payload={"status": status},
+    )
+
+
+def _reject_full_read(*args: object, **kwargs: object) -> None:
+    raise AssertionError("append must not read the whole log")
+
+
+def test_append_reads_only_the_trailing_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    for index in range(3):
+        store.append(_status_event(f"event-{index}", "running"))
+
+    monkeypatch.setattr(store, "_load_events", _reject_full_read)
+    persisted, snapshot = store.append(_status_event("event-3", "running"))
+
+    assert persisted.seq == 4
+    assert snapshot.through_seq == 4
+
+
+def test_append_deduplicates_within_the_trailing_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    first, _ = store.append(_status_event("stable-event", "running"))
+
+    monkeypatch.setattr(store, "_load_events", _reject_full_read)
+    repeated, snapshot = store.append(_status_event("stable-event", "running"))
+
+    assert repeated == first
+    assert snapshot.through_seq == 1
+
+
+def test_append_falls_back_when_the_log_outruns_the_watermark(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.append(_status_event("event-1", "running"))
+    extra = _status_event("event-2", "paused").model_copy(update={"seq": 2})
+    with store.events_path.open("a", encoding="utf-8") as stream:
+        stream.write(extra.model_dump_json())
+        stream.write("\n")
+
+    persisted, snapshot = store.append(_status_event("event-3", "running"))
+
+    assert persisted.seq == 3
+    assert snapshot.status == "running"
+    assert [event.event_id for event in store.replay()] == [
+        "event-1",
+        "event-2",
+        "event-3",
+    ]
+
+
+def test_append_recovers_when_the_tail_record_is_truncated(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.append(_status_event("event-1", "running"))
+    with store.events_path.open("a", encoding="utf-8") as stream:
+        stream.write('{"event_id": "truncated')
+
+    persisted, _ = store.append(_status_event("event-2", "running"))
+
+    assert persisted.seq == 2
+    assert [event.event_id for event in store.replay()] == ["event-1", "event-2"]
