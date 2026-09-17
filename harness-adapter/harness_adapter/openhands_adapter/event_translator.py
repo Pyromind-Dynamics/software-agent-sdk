@@ -6,6 +6,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from pydantic import BaseModel, JsonValue
+from pyromind_runtime.domain.base import as_utc
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.events import HarnessEvent
 
@@ -439,8 +440,8 @@ def _external_task_submission(
         "attempt": details.get("attempt"),
         "max_attempts": details.get("max_attempts"),
         "keep_ui_lock": bool(details.get("keep_ui_lock", False)),
-        "submitted_at": event.timestamp,
-        "updated_at": event.timestamp,
+        "submitted_at": _normalized_timestamp(event.timestamp),
+        "updated_at": _normalized_timestamp(event.timestamp),
         "resume_pending": False,
     }
     state.external_tasks[task_id] = payload
@@ -478,7 +479,7 @@ def _external_task_updates(
         updated: JsonObject = {
             **previous,
             "status": status,
-            "updated_at": event.timestamp,
+            "updated_at": _normalized_timestamp(event.timestamp),
             "resume_pending": False,
         }
         state.external_tasks[task_id] = updated
@@ -552,6 +553,19 @@ def _workflow_payload(value: object, version: str) -> JsonObject | None:
         "dsl": workflow,
         "canvas": _json_value(canvas) if isinstance(canvas, dict) else None,
     }
+
+
+def _normalized_timestamp(timestamp: str) -> str:
+    """Return a harness timestamp as an aware UTC string.
+
+    Harness events persisted before the timestamp normalization carry no
+    offset. Storing those verbatim would make clients read them as local time,
+    so normalize them the same way ``HarnessEvent.occurred_at`` is normalized.
+    """
+    try:
+        return as_utc(datetime.fromisoformat(timestamp)).isoformat()
+    except ValueError:
+        return timestamp
 
 
 def _event(

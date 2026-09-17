@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import ast
+from datetime import datetime
 from typing import Literal, cast
 
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
+from pyromind_runtime.domain.base import as_utc
 from pyromind_runtime.domain.content import ContentBlock, JsonObject, TextContent
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.snapshot import (
@@ -47,6 +49,18 @@ class SnapshotProjectionError(RuntimeError):
     pass
 
 
+def _latest(current: datetime | None, candidate: datetime) -> datetime:
+    """Return the later of two instants, tolerating timestamps without an offset.
+
+    Domain models normalize timestamps on validation, but ``model_copy`` and
+    direct ``reduce`` calls skip that step, so normalize again before comparing
+    aware and legacy naive values.
+    """
+    if current is None:
+        return candidate
+    return max(as_utc(current), as_utc(candidate))
+
+
 class SnapshotProjector:
     def reduce(
         self,
@@ -62,11 +76,11 @@ class SnapshotProjector:
 
         handler = getattr(self, f"_on_{event.type.replace('.', '_')}", None)
         updated = handler(snapshot, event) if handler is not None else snapshot
-        updated_at = event.occurred_at
-        if snapshot.updated_at is not None:
-            updated_at = max(snapshot.updated_at, updated_at)
         return updated.model_copy(
-            update={"through_seq": event.seq, "updated_at": updated_at}
+            update={
+                "through_seq": event.seq,
+                "updated_at": _latest(snapshot.updated_at, event.occurred_at),
+            }
         )
 
     def _on_conversation_created(

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Literal
 from uuid import uuid4
 
 from pydantic import Field
 
-from pyromind_runtime.domain.base import ContractModel, utc_now
+from pyromind_runtime.domain.base import AwareDatetime, ContractModel, utc_now
 from pyromind_runtime.domain.content import JsonObject
 
 
@@ -60,7 +59,7 @@ type ProductEventType = Literal[
 class HarnessEvent(ContractModel):
     event_id: str = Field(default_factory=lambda: uuid4().hex)
     session_id: str = Field(min_length=1)
-    occurred_at: datetime = Field(default_factory=utc_now)
+    occurred_at: AwareDatetime = Field(default_factory=utc_now)
     type: HarnessEventType
     run_id: str | None = None
     payload: JsonObject = Field(default_factory=dict)
@@ -72,7 +71,7 @@ class ProductEvent(ContractModel):
     event_id: str = Field(default_factory=lambda: uuid4().hex)
     conversation_id: str = Field(min_length=1)
     seq: int = Field(default=0, ge=0)
-    occurred_at: datetime = Field(default_factory=utc_now)
+    occurred_at: AwareDatetime = Field(default_factory=utc_now)
     type: ProductEventType
     run_id: str | None = None
     payload: JsonObject = Field(default_factory=dict)
