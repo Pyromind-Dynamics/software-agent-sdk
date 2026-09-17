@@ -1287,14 +1287,14 @@ class ConversationService:
                 f"Failed to close event service for conversation {conversation_id}: {e}"
             )
 
-            # Safely remove only the conversation directory (workspace is preserved).
-            # This operation may fail due to permission issues, but we don't want that
-            # to prevent the conversation from being marked as deleted.
-            quota_from_env().remove(event_service.conversation_dir, conversation_id)
-            safe_rmtree(
-                event_service.conversation_dir,
-                f"conversation directory for {conversation_id}",
-            )
+        # Safely remove only the conversation directory (workspace is preserved).
+        # This operation may fail due to permission issues, but we don't want that
+        # to prevent the conversation from being marked as deleted.
+        quota_from_env().remove(event_service.conversation_dir, conversation_id)
+        safe_rmtree(
+            event_service.conversation_dir,
+            f"conversation directory for {conversation_id}",
+        )
 
         logger.info(f"Successfully deleted conversation {conversation_id}")
         return True
@@ -1423,6 +1423,7 @@ class ConversationService:
         source_id: UUID,
         *,
         event_id: str,
+        fork_id: UUID | None = None,
         title: str | None = None,
         tags: dict[str, str] | None = None,
         user_id: str | None = None,
@@ -1457,7 +1458,7 @@ class ConversationService:
                 f"Workflow snapshot not found for event: {event_id}"
             ) from exc
 
-        fork_id = uuid4()
+        fork_id = fork_id or uuid4()
         fork_workspace = LocalWorkspace(
             working_dir=str(self.conversations_dir / fork_id.hex)
         )

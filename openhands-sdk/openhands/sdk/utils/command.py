@@ -39,6 +39,7 @@ _SENSITIVE_ENV_VARS: frozenset[str] = frozenset(
         "TOGETHER_API_KEY",
         "PERPLEXITY_API_KEY",
         "COHERE_API_KEY",
+        "OPENROUTER_API_KEY",
         # LLM provider endpoints (may contain internal host info)
         "OPENAI_BASE_URL",
         "AZURE_OPENAI_ENDPOINT",

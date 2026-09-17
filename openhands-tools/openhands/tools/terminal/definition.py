@@ -43,6 +43,17 @@ from openhands.tools.utils import (
 )
 
 
+_SANDBOX_IO_ERROR_HINT_TEMPLATE = (
+    "[Terminal-unavailable] The terminal backend hit an I/O error (errno "
+    "{errno}: {strerror}) — usually the sandbox is out of processes/PTYs or "
+    "the shell session died, not a problem with this specific command, so "
+    "retrying the same command immediately is unlikely to help.\n\n"
+    "Prefer creating and editing files with file_editor/apply_patch, and "
+    "running commands through dedicated execution tools (for example dataflow "
+    "or task runners) that execute in their own subprocesses. If you do retry "
+    "the terminal, start from a fresh session with reset=true."
+)
+
 _LITERAL_ARG_HINT_TEMPLATE = (
     "[Tool-argument error] The `command` argument looks like a Python/JSON "
     "{literal_kind}, not a shell command. It starts with: {head!r}\n\n"
@@ -300,6 +311,7 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
         terminal_type: Literal["tmux", "subprocess", "powershell"] | None = None,
         shell_path: str | None = None,
         sandbox_mode: TerminalSandboxMode | None = None,
+        reset_cwd_each_command: bool = False,
         executor: ToolExecutor | None = None,
     ) -> Sequence["TerminalTool"]:
         """Initialize TerminalTool with executor parameters.
@@ -320,6 +332,9 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
                        PowerShell executable.
             sandbox_mode: Optional filesystem sandbox mode for the terminal
                        executor. If omitted, the configured default is used.
+            reset_cwd_each_command: Enter the workspace root before every new
+                       command so the shell's current directory never drifts
+                       between calls.
         """
         # Import here to avoid circular imports
         from openhands.tools.terminal.impl import TerminalExecutor
@@ -364,6 +379,7 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
                 sandbox_mode=sandbox_mode,
                 sandbox_read_only_paths=sandbox_read_only_paths,
                 sandbox_read_write_paths=sandbox_read_write_paths,
+                reset_cwd_each_command=reset_cwd_each_command,
             )
 
         tool_description = (

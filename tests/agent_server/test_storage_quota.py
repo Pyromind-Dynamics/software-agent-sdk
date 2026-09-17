@@ -9,6 +9,8 @@ from openhands.agent_server.storage_quota import (
     OH_STORAGE_QUOTA_DEVICE_ENV,
     OH_STORAGE_QUOTA_REQUIRED_ENV,
     ConversationStorageQuota,
+    enforce_storage_quota_preflight,
+    ensure_conversation_quota,
     parse_storage_size,
     preflight_storage_quota,
     project_id_for,
@@ -374,3 +376,105 @@ def test_preflight_unknown_mountpoint(monkeypatch, tmp_path):
     )
     problems = preflight_storage_quota(workspace_root=tmp_path)
     assert problems and "mountpoint" in problems[0]
+
+
+def _patch_running_quota_env(monkeypatch, tmp_path, calls):
+    monkeypatch.setenv(OH_CONVERSATION_STORAGE_QUOTA_ENV, "500M")
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.shutil.which",
+        lambda _: "/usr/bin/xfs_quota",
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+    )
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("openhands.agent_server.storage_quota.subprocess.run", fake_run)
+
+
+def test_ensure_conversation_quota_accepts_hex_id(monkeypatch, tmp_path):
+    directory = tmp_path / "conv"
+    directory.mkdir()
+    calls = []
+    _patch_running_quota_env(monkeypatch, tmp_path, calls)
+
+    conversation_id = "af3258e46542408aba431c6f8ee37821"
+    ensure_conversation_quota(directory, conversation_id)
+
+    project_id = project_id_for(UUID("af3258e4-6542-408a-ba43-1c6f8ee37821"))
+    assert [args[3] for args in calls] == [
+        f"project -s -p {directory} {project_id}",
+        f"limit -p bhard={500 * 1024 * 1024} {project_id}",
+    ]
+
+
+def test_ensure_conversation_quota_noop_when_unconfigured(monkeypatch, tmp_path):
+    monkeypatch.delenv(OH_CONVERSATION_STORAGE_QUOTA_ENV, raising=False)
+    ensure_conversation_quota(tmp_path, UUID(int=8))
+
+
+def test_ensure_conversation_quota_fails_closed_when_required(monkeypatch, tmp_path):
+    directory = tmp_path / "conv"
+    directory.mkdir()
+    monkeypatch.setenv(OH_CONVERSATION_STORAGE_QUOTA_ENV, "500M")
+    monkeypatch.setenv(OH_STORAGE_QUOTA_REQUIRED_ENV, "1")
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.shutil.which",
+        lambda _: "/usr/bin/xfs_quota",
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr="operation not permitted"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="could not be enforced"):
+        ensure_conversation_quota(directory, UUID(int=6))
+
+
+def test_ensure_conversation_quota_warns_when_not_required(monkeypatch, tmp_path):
+    directory = tmp_path / "conv"
+    directory.mkdir()
+    monkeypatch.setenv(OH_CONVERSATION_STORAGE_QUOTA_ENV, "500M")
+    monkeypatch.delenv(OH_STORAGE_QUOTA_REQUIRED_ENV, raising=False)
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.shutil.which",
+        lambda _: "/usr/bin/xfs_quota",
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.storage_quota.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr="operation not permitted"
+        ),
+    )
+
+    ensure_conversation_quota(directory, UUID(int=7))
+
+
+def test_enforce_preflight_fails_when_required(monkeypatch, tmp_path):
+    _preflight_mount(
+        monkeypatch, tmp_path, fs_type="ext4", options=("rw",), report_ok=False
+    )
+    monkeypatch.setenv(OH_STORAGE_QUOTA_REQUIRED_ENV, "1")
+
+    with pytest.raises(RuntimeError, match="storage quota is required"):
+        enforce_storage_quota_preflight()
+
+
+def test_enforce_preflight_only_warns_when_not_required(monkeypatch, tmp_path):
+    _preflight_mount(
+        monkeypatch, tmp_path, fs_type="ext4", options=("rw",), report_ok=False
+    )
+    monkeypatch.delenv(OH_STORAGE_QUOTA_REQUIRED_ENV, raising=False)
+
+    enforce_storage_quota_preflight()

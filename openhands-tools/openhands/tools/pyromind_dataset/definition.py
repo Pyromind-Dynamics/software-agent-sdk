@@ -28,6 +28,15 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.utils import default_path_access_policy
+from openhands.tools.utils.dataflow_config import (
+    DEFAULT_DATAFLOW_API_BASE_URL,
+    DEFAULT_DATAFLOW_MODEL_NAME,
+    ENV_DF_API_BASE_URL,
+    ENV_DF_API_KEY,
+    ENV_DF_API_URL,
+    ENV_DF_MODEL_NAME,
+    ENV_LLM_BASE_URL,
+)
 
 
 if TYPE_CHECKING:
@@ -52,6 +61,7 @@ _LARGE_FILE_RANGE_COUNT = 3
 _DEFAULT_PREVIEW_BYTES = _LARGE_FILE_RANGE_BYTES * _LARGE_FILE_RANGE_COUNT
 _MAX_PREVIEW_BYTES = _DEFAULT_PREVIEW_BYTES
 _MAX_REQUESTED_SAMPLES = 100
+_MAX_LISTED_ENTRIES = 100
 _DELIMITED_HEADER_BYTES = 4096
 _MAX_XLSX_BYTES = 10 * 1024 * 1024
 _MAX_SAMPLE_STRING_CHARS = 2000
@@ -86,6 +96,10 @@ _MAX_SAMPLE_DIRECTORY_DEPTH = 6
 _MAX_VISION_PREVIEW_IMAGES = 12
 _MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
 _VISION_RETRYABLE_STATUS_CODES = {408, 409, 425, 429}
+# Transient SSL/connection blips against storage were previously retried
+# manually by agents across whole turns; a bounded in-tool retry removes that
+# round trip. Timeouts stay non-retryable: each one costs a full 30s read.
+_STORAGE_CONNECT_RETRY_ATTEMPTS = 2
 _MAX_DIRECTORY_CHILD_SAMPLES = 3
 
 
@@ -117,6 +131,24 @@ def _default_storage_base_url() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _cap_entry_listing(lines: list[str]) -> str:
+    """Join listing lines, capping the text so huge directories stay small.
+
+    The listing is what enters the LLM context; without a cap a directory
+    with tens of thousands of entries dominates the whole conversation.
+    Structured stats over the full entry set are computed separately.
+    """
+    omitted = len(lines) - _MAX_LISTED_ENTRIES
+    text = "\n".join(lines[:_MAX_LISTED_ENTRIES])
+    if omitted > 0:
+        text += (
+            f"\n  … and {omitted} more entries (listing capped at "
+            f"{_MAX_LISTED_ENTRIES}; use path_filter to locate specific "
+            "entries, or mode='sample' to materialize selected paths)."
+        )
+    return text
+
+
 class PreviewDatasetAction(Action):
     """Preview a dataset from shared space or user storage."""
 
@@ -146,16 +178,27 @@ class PreviewDatasetAction(Action):
         default="inspect",
         description=(
             "Use 'inspect' for the existing bounded preview behavior. Use "
-            "'sample' to materialize up to n selected user-storage files or "
-            "folders in the conversation workspace and create a JSONL manifest."
+            "'sample' to materialize explicitly selected user-storage files or "
+            "folders (up to n) in the conversation workspace and create a JSONL "
+            "manifest. Automatic selection is limited to min(n, 3) entries."
         ),
     )
     sample_paths: list[str] = Field(
         default_factory=list,
         description=(
             "Optional exact user-storage file or folder paths to materialize in "
-            "sample mode. When omitted, up to n entries are selected from "
-            "dataset_path in stable path order."
+            "sample mode. Explicit selections may contain up to n entries. When "
+            "omitted, up to min(n, 3) entries are selected from dataset_path in "
+            "stable path order."
+        ),
+    )
+    path_filter: str = Field(
+        default="",
+        description=(
+            "Optional case-insensitive substring filter applied to entry paths "
+            "in directory listings; a single match is previewed automatically. "
+            "Use it to locate specific entries in large directories instead of "
+            "scanning a truncated listing."
         ),
     )
     vision_ocr: bool = Field(
@@ -338,8 +381,11 @@ When only a dataset/folder name is given (no specific file):
 
 Use mode='sample' for user storage after inspection. It materializes at most
 three selected files or folders inside the conversation workspace, preserves
-their storage-relative layout, and returns a sample_manifest_path for
-df_run_pipeline. Image samples are sent to the configured DF vision model
+their storage-relative layout, and returns workspace-relative
+local_sample_paths plus a sample_manifest_path. Pass the returned
+df_run_input_path (single input) or selected local_sample_paths entry directly
+to df_run_pipeline; storage source paths are not local workspace inputs. Image
+samples are sent to the configured DF vision model
 (normally Gemma) for OCR and a short visual summary.
 
 Returns:
@@ -410,7 +456,9 @@ class PreviewDatasetExecutor(
             return self._storage_sample(action, dataset_path, headers, conversation)
 
         # Option C: try shared dataset space first
-        shared_result = self._try_shared_preview(dataset_path, action.n, headers)
+        shared_result = self._try_shared_preview(
+            dataset_path, action.n, headers, path_filter=action.path_filter
+        )
         if shared_result is not None:
             return shared_result
 
@@ -434,6 +482,7 @@ class PreviewDatasetExecutor(
             action.n,
             headers,
             vision_ocr=action.vision_ocr,
+            path_filter=action.path_filter,
         )
 
     # ------------------------------------------------------------------
@@ -445,6 +494,8 @@ class PreviewDatasetExecutor(
         dataset_path: str,
         n: int,
         headers: dict[str, str],
+        *,
+        path_filter: str = "",
     ) -> PreviewDatasetObservation | None:
         """Attempt shared space preview. Returns None if not a shared dataset."""
         datasets = self._shared_list_datasets(headers)
@@ -458,7 +509,9 @@ class PreviewDatasetExecutor(
         dataset_name, file_path = match
 
         if not file_path:
-            return self._shared_resolve_and_preview(dataset_name, n, headers)
+            return self._shared_resolve_and_preview(
+                dataset_name, n, headers, path_filter=path_filter
+            )
 
         return self._shared_preview_file(dataset_name, file_path, n, headers)
 
@@ -467,18 +520,26 @@ class PreviewDatasetExecutor(
         dataset_name: str,
         n: int,
         headers: dict[str, str],
+        *,
+        path_filter: str = "",
     ) -> PreviewDatasetObservation:
         """List files in a shared dataset and preview the first previewable one."""
         files_result = self._shared_list_files(dataset_name, headers)
         if isinstance(files_result, PreviewDatasetObservation):
             return files_result
 
+        filter_term = path_filter.strip().lower()
+        if filter_term:
+            files_result = [
+                f for f in files_result if filter_term in str(f["path"]).lower()
+            ]
+
         file_paths = [f["path"] for f in files_result]
         preview_file = _select_preview_file(file_paths)
 
         if not preview_file:
-            file_list_text = "\n".join(
-                f"  - {f['path']} ({f.get('human_size', '?')})" for f in files_result
+            file_list_text = _cap_entry_listing(
+                [f"  - {f['path']} ({f.get('human_size', '?')})" for f in files_result]
             )
             return PreviewDatasetObservation.from_text(
                 text=(
@@ -492,8 +553,8 @@ class PreviewDatasetExecutor(
             )
 
         if len(files_result) > 1:
-            file_list_text = "\n".join(
-                f"  - {f['path']} ({f.get('human_size', '?')})" for f in files_result
+            file_list_text = _cap_entry_listing(
+                [f"  - {f['path']} ({f.get('human_size', '?')})" for f in files_result]
             )
             preview_result = self._shared_preview_file(
                 dataset_name, preview_file, n, headers
@@ -800,11 +861,30 @@ class PreviewDatasetExecutor(
         headers: dict[str, str],
         conversation: BaseConversation | None,
     ) -> PreviewDatasetObservation:
+        if action.sample_paths and len(action.sample_paths) > action.n:
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    f"sample_paths 有 {len(action.sample_paths)} 项，"
+                    f"超过 n={action.n}。\n"
+                    "请减少路径数量，或增大 n。\n"
+                    "错误码：sample_selection_limit"
+                ),
+                is_error=True,
+                dataset_path=dataset_path,
+                source="storage",
+                error_code="sample_selection_limit",
+            )
+
         try:
+            selection_limit = (
+                action.n
+                if action.sample_paths
+                else min(action.n, _DEFAULT_SAMPLE_COUNT)
+            )
             selected_paths, entries = self._select_storage_samples(
                 dataset_path,
                 action.sample_paths,
-                min(action.n, _DEFAULT_SAMPLE_COUNT),
+                selection_limit,
                 headers,
             )
             workspace_dir = _resolve_workspace_dir(conversation)
@@ -919,6 +999,7 @@ class PreviewDatasetExecutor(
                 manifest_row: dict[str, Any] = {
                     "id": f"sample-{index}",
                     "source_path": selected_path,
+                    "workspace_path": selected_workspace_path,
                     "local_path": selected_manifest_path,
                     "files": row_files,
                     "images": row_images,
@@ -935,11 +1016,18 @@ class PreviewDatasetExecutor(
                     )
 
             manifest_relative = manifest_path.relative_to(workspace_dir).as_posix()
-            summary_text = (
-                f"Materialized {len(manifest_rows)} sample unit(s), "
-                f"{total_files} file(s), {_human_size(total_bytes)}. "
-                f"Manifest: {manifest_relative}"
-            )
+            summary_lines = [
+                (
+                    f"Materialized {len(manifest_rows)} sample unit(s), "
+                    f"{total_files} file(s), {_human_size(total_bytes)}."
+                ),
+                f"sample_manifest_path={manifest_relative}",
+                "local_sample_paths:",
+                *(f"- {path}" for path in local_paths),
+            ]
+            if len(local_paths) == 1:
+                summary_lines.append(f"df_run_input_path={local_paths[0]}")
+            summary_text = "\n".join(summary_lines)
             for preview in vision_previews:
                 summary_text += (
                     f"\n\n--- vision preview: {preview['source_path']} ---\n"
@@ -1011,7 +1099,11 @@ class PreviewDatasetExecutor(
             sorted_entries = visible_entries
         selected_entries = sorted_entries[:limit]
         if not selected_entries:
-            raise ValueError(f"No files or folders found under {dataset_path}.")
+            raise ValueError(
+                f"No files or folders found under {dataset_path}. "
+                "The path may point to a single file: pass it directly with "
+                "mode=inspect or mode=sample, or list its parent folder."
+            )
         return (
             [entry.path for entry in selected_entries],
             [_storage_entry_dict(entry) for entry in sorted_entries],
@@ -1109,13 +1201,16 @@ class PreviewDatasetExecutor(
         headers: dict[str, str],
         *,
         vision_ocr: bool,
+        path_filter: str = "",
     ) -> PreviewDatasetObservation:
         files: list[str] = []
         preview_path = dataset_path
         metadata: dict[str, Any] | None = None
 
         if _looks_like_directory(dataset_path):
-            dir_result = self._resolve_storage_directory(dataset_path, n, headers)
+            dir_result = self._resolve_storage_directory(
+                dataset_path, n, headers, path_filter=path_filter
+            )
             if isinstance(dir_result, PreviewDatasetObservation):
                 return dir_result
             files, preview_path = dir_result
@@ -1124,7 +1219,9 @@ class PreviewDatasetExecutor(
         if isinstance(metadata_result, PreviewDatasetObservation):
             # Storage backends may not expose metadata for virtual folders.
             # Fall back to file_list so callers need not add a trailing slash.
-            dir_result = self._resolve_storage_directory(dataset_path, n, headers)
+            dir_result = self._resolve_storage_directory(
+                dataset_path, n, headers, path_filter=path_filter
+            )
             if isinstance(dir_result, PreviewDatasetObservation):
                 return dir_result
             files, preview_path = dir_result
@@ -1134,7 +1231,9 @@ class PreviewDatasetExecutor(
         metadata = metadata_result
 
         if metadata.get("is_dir") is True:
-            dir_result = self._resolve_storage_directory(dataset_path, n, headers)
+            dir_result = self._resolve_storage_directory(
+                dataset_path, n, headers, path_filter=path_filter
+            )
             if isinstance(dir_result, PreviewDatasetObservation):
                 return dir_result
             files, preview_path = dir_result
@@ -1347,6 +1446,8 @@ class PreviewDatasetExecutor(
         dataset_path: str,
         n: int,  # noqa: ARG002
         headers: dict[str, str],
+        *,
+        path_filter: str = "",
     ) -> tuple[list[str], str] | PreviewDatasetObservation:
         """Resolve a storage directory into a concrete preview file.
 
@@ -1359,12 +1460,32 @@ class PreviewDatasetExecutor(
             return list_result
 
         entries = list_result
+        filter_term = path_filter.strip().lower()
+        if filter_term:
+            entries = [entry for entry in entries if filter_term in entry.path.lower()]
+            if not entries:
+                return PreviewDatasetObservation.from_text(
+                    text=(
+                        f"No entries under {dataset_path} match "
+                        f"path_filter '{path_filter}'."
+                    ),
+                    dataset_path=dataset_path,
+                    files=[],
+                    is_dir=True,
+                    source="storage",
+                    directory_summary=_empty_directory_summary(),
+                )
         file_infos = [entry for entry in entries if not entry.is_dir]
         file_paths = [f.path for f in file_infos]
 
         if not entries:
             return PreviewDatasetObservation.from_text(
-                text=f"No files or folders found under {dataset_path}.",
+                text=(
+                    f"No files or folders found under {dataset_path}. "
+                    "The path may point to a single file: pass it directly "
+                    "with mode=inspect or mode=sample, or list its parent "
+                    "folder."
+                ),
                 dataset_path=dataset_path,
                 files=file_paths,
                 is_dir=True,
@@ -1375,27 +1496,37 @@ class PreviewDatasetExecutor(
         if len(entries) == 1 and len(file_paths) == 1:
             return file_paths, file_paths[0]
 
-        file_list_text = "\n".join(
-            f"  - {entry.path}"
-            f" ({'folder' if entry.is_dir else _human_size(entry.size)}"
-            + (f", modified {entry.last_modified}" if entry.last_modified else "")
-            + ")"
-            for entry in entries
+        file_list_text = _cap_entry_listing(
+            [
+                f"  - {entry.path}"
+                f" ({'folder' if entry.is_dir else _human_size(entry.size)}"
+                + (f", modified {entry.last_modified}" if entry.last_modified else "")
+                + ")"
+                for entry in entries
+            ]
+        )
+        listing_note = (
+            f" Listing capped at {_MAX_LISTED_ENTRIES} of {len(entries)} "
+            "entries; use path_filter to narrow it down."
+            if len(entries) > _MAX_LISTED_ENTRIES
+            else ""
         )
         if len(file_infos) == len(entries):
             summary = (
-                f"Directory '{dataset_path}' contains {len(file_paths)} files. "
-                "Ask the user which file to preview, then call this tool again "
-                "with the exact file path, or use mode='sample' to materialize "
-                "selected files."
+                f"Directory '{dataset_path}' contains {len(file_paths)} files."
+                + listing_note
+                + " Ask the user which file to preview, then call this tool "
+                "again with the exact file path, or use mode='sample' to "
+                "materialize selected files."
             )
             list_label = "Available files"
         else:
             summary = (
-                f"Directory '{dataset_path}' contains {len(entries)} entries. "
-                "Call this tool again with an exact file path to preview content, "
-                "or use mode='sample' with selected sample_paths to materialize "
-                "files or folders."
+                f"Directory '{dataset_path}' contains {len(entries)} entries."
+                + listing_note
+                + " Call this tool again with an exact file path to preview "
+                "content, or use mode='sample' with selected sample_paths to "
+                "materialize files or folders."
             )
             list_label = "Available entries"
         directory_summary = self._build_directory_summary(entries, headers)
@@ -1575,19 +1706,30 @@ class PreviewDatasetExecutor(
         body: dict[str, Any],
         headers: dict[str, str],
     ) -> dict[str, Any] | str:
-        try:
-            response = httpx.post(
-                f"{self._storage_base_url}/{route}",
-                headers=headers,
-                json=body,
-                timeout=self._timeout,
-            )
-        except httpx.RequestError as exc:
-            return (
-                f"Failed to call Pyromind storage {route} API: "
-                f"{type(exc).__name__}: {exc}"
-            )
-        return _decode_json_response(response, f"Pyromind storage {route} API")
+        attempt = 0
+        while True:
+            try:
+                response = httpx.post(
+                    f"{self._storage_base_url}/{route}",
+                    headers=headers,
+                    json=body,
+                    timeout=self._timeout,
+                )
+            except httpx.ConnectError as exc:
+                if attempt >= _STORAGE_CONNECT_RETRY_ATTEMPTS:
+                    return (
+                        f"Failed to call Pyromind storage {route} API: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                attempt += 1
+                time.sleep((2 ** (attempt - 1)) + random.random())
+                continue
+            except httpx.RequestError as exc:
+                return (
+                    f"Failed to call Pyromind storage {route} API: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            return _decode_json_response(response, f"Pyromind storage {route} API")
 
     def _download_preview(
         self,
@@ -1648,45 +1790,60 @@ class PreviewDatasetExecutor(
         start: int,
         end: int,
     ) -> bytes | PreviewDatasetObservation:
-        chunks = bytearray()
         max_bytes = end - start + 1
         headers = {"range": f"bytes={start}-{end}"}
-        try:
-            with httpx.stream(
-                "GET",
-                url,
-                headers=headers,
-                timeout=self._timeout,
-                follow_redirects=True,
-            ) as response:
-                if response.status_code >= 400:
-                    body = response.read().decode("utf-8", errors="replace")
+        attempt = 0
+        while True:
+            chunks = bytearray()
+            try:
+                with httpx.stream(
+                    "GET",
+                    url,
+                    headers=headers,
+                    timeout=self._timeout,
+                    follow_redirects=True,
+                ) as response:
+                    if response.status_code >= 400:
+                        body = response.read().decode("utf-8", errors="replace")
+                        return PreviewDatasetObservation.from_text(
+                            text=(
+                                "Pyromind storage download URL returned HTTP "
+                                f"{response.status_code}: {_truncate_text(body)}"
+                            ),
+                            is_error=True,
+                            dataset_path=dataset_path,
+                        )
+                    for chunk in response.iter_bytes():
+                        remaining = max_bytes - len(chunks)
+                        if remaining <= 0:
+                            break
+                        if len(chunk) > remaining:
+                            chunks.extend(chunk[:remaining])
+                            break
+                        chunks.extend(chunk)
+            except httpx.ConnectError as exc:
+                if attempt >= _STORAGE_CONNECT_RETRY_ATTEMPTS:
                     return PreviewDatasetObservation.from_text(
                         text=(
-                            "Pyromind storage download URL returned HTTP "
-                            f"{response.status_code}: {_truncate_text(body)}"
+                            "Failed to download Pyromind storage preview bytes: "
+                            f"{type(exc).__name__}: {exc}"
                         ),
                         is_error=True,
                         dataset_path=dataset_path,
                     )
-                for chunk in response.iter_bytes():
-                    remaining = max_bytes - len(chunks)
-                    if remaining <= 0:
-                        break
-                    if len(chunk) > remaining:
-                        chunks.extend(chunk[:remaining])
-                        break
-                    chunks.extend(chunk)
-        except httpx.RequestError as exc:
-            return PreviewDatasetObservation.from_text(
-                text=(
-                    "Failed to download Pyromind storage preview bytes: "
-                    f"{type(exc).__name__}: {exc}"
-                ),
-                is_error=True,
-                dataset_path=dataset_path,
-            )
-        return bytes(chunks)
+                attempt += 1
+                time.sleep((2 ** (attempt - 1)) + random.random())
+                continue
+            except httpx.RequestError as exc:
+                return PreviewDatasetObservation.from_text(
+                    text=(
+                        "Failed to download Pyromind storage preview bytes: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    is_error=True,
+                    dataset_path=dataset_path,
+                )
+            return bytes(chunks)
 
     def _resolve_headers(
         self,
@@ -2000,6 +2157,94 @@ def download_file_from_pyromind(
     except httpx.RequestError as exc:
         raise ValueError(f"Failed to download Pyromind storage file: {exc}") from exc
     return bytes(content)
+
+
+def download_tail_from_pyromind(
+    *,
+    storage_path: str,
+    storage_base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+    tail_bytes: int,
+) -> tuple[bytes, int]:
+    """Range-download the last ``tail_bytes`` of a storage file.
+
+    Uses a suffix byte range (``bytes=-N``) so the caller never needs the
+    file size up front. Returns ``(tail, total_size)``. Raises when storage
+    ignores range requests for files larger than ``tail_bytes``.
+    """
+    if tail_bytes < 1:
+        raise ValueError("tail_bytes must be greater than 0")
+    try:
+        response = httpx.post(
+            f"{storage_base_url.rstrip('/')}/get_url",
+            headers=headers,
+            json={"path": storage_path},
+            timeout=timeout,
+        )
+    except httpx.RequestError as exc:
+        raise ValueError(
+            f"Failed to request Pyromind storage download URL: {exc}"
+        ) from exc
+    payload = _decode_json_response(response, "Pyromind storage get_url API")
+    if isinstance(payload, str):
+        raise ValueError(payload)
+    data = _extract_api_data("get_url", payload)
+    if isinstance(data, str):
+        raise ValueError(data)
+    url = data.get("url")
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("Pyromind storage get_url API response is missing url data.")
+
+    try:
+        with httpx.stream(
+            "GET",
+            url,
+            headers={"range": f"bytes=-{tail_bytes}"},
+            timeout=timeout,
+            follow_redirects=True,
+        ) as download:
+            if download.status_code >= 400:
+                body = download.read().decode("utf-8", errors="replace")
+                raise ValueError(
+                    "Pyromind storage download URL returned HTTP "
+                    f"{download.status_code}: {_truncate_text(body)}"
+                )
+            if download.status_code == 206:
+                total = _parse_content_range_total(
+                    download.headers.get("content-range", "")
+                )
+                if total is None:
+                    raise ValueError(
+                        "Pyromind storage ranged download is missing "
+                        "content-range in its response."
+                    )
+                return download.read(), total
+            length_header = download.headers.get("content-length")
+            if length_header is not None and length_header.isdigit():
+                if int(length_header) > tail_bytes:
+                    raise ValueError(
+                        "Storage ignored the range request (HTTP 200 with "
+                        f"content-length {length_header}); refusing unbounded "
+                        "download."
+                    )
+                return download.read(), int(length_header)
+            body = download.read()
+            if len(body) > tail_bytes:
+                raise ValueError(
+                    "Storage ignored the range request and streamed "
+                    f"{len(body)} bytes; refusing unbounded tail download."
+                )
+            return body, len(body)
+    except httpx.RequestError as exc:
+        raise ValueError(
+            f"Failed to download Pyromind storage file tail: {exc}"
+        ) from exc
+
+
+def _parse_content_range_total(content_range: str) -> int | None:
+    total = content_range.rsplit("/", 1)[-1].strip() if "/" in content_range else ""
+    return int(total) if total.isdigit() else None
 
 
 class UploadFileToPyromindTool(
@@ -2914,8 +3159,6 @@ def _vision_content_type(path: str) -> str:
     }.get(suffix, "application/octet-stream")
 
 
-_DEFAULT_DATAFLOW_API_BASE_URL = "https://openrouter.ai/api/v1"
-_DEFAULT_DATAFLOW_MODEL_NAME = "openai/gpt-5.6-luna"
 _CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 _VISION_PLACEHOLDER_MODEL_NAMES = frozenset(
     {"router", "<model>", "{model}", "{{model}}"}
@@ -2939,11 +3182,11 @@ def _is_vision_placeholder_model(value: str) -> bool:
 
 def _vision_api_config() -> tuple[str, str, str | None]:
     base_url = (
-        os.environ.get("DF_API_BASE_URL", "").strip().rstrip("/")
-        or os.environ.get("LLM_BASE_URL", "").strip().rstrip("/")
-        or _DEFAULT_DATAFLOW_API_BASE_URL
+        os.environ.get(ENV_DF_API_BASE_URL, "").strip().rstrip("/")
+        or os.environ.get(ENV_LLM_BASE_URL, "").strip().rstrip("/")
+        or DEFAULT_DATAFLOW_API_BASE_URL
     )
-    api_url = os.environ.get("DF_API_URL", "").strip().rstrip("/")
+    api_url = os.environ.get(ENV_DF_API_URL, "").strip().rstrip("/")
     if not api_url:
         api_url = f"{base_url}{_CHAT_COMPLETIONS_SUFFIX}"
     elif not api_url.endswith(_CHAT_COMPLETIONS_SUFFIX):
@@ -2953,17 +3196,17 @@ def _vision_api_config() -> tuple[str, str, str | None]:
             "full endpoint (e.g. https://host/v1/chat/completions), not the "
             "bare base URL — this runtime uses DF_API_URL verbatim."
         )
-    env_model_name = os.environ.get("DF_MODEL_NAME", "").strip()
+    env_model_name = os.environ.get(ENV_DF_MODEL_NAME, "").strip()
     if env_model_name and _is_vision_placeholder_model(env_model_name):
         raise ValueError(
             "DF_MODEL_NAME is still an unsubstituted placeholder "
             f"({env_model_name!r}) — the run environment did not substitute "
             "the template value. Set a concrete model name such as "
-            f"{_DEFAULT_DATAFLOW_MODEL_NAME!r} or fix the environment "
+            f"{DEFAULT_DATAFLOW_MODEL_NAME!r} or fix the environment "
             "injection."
         )
-    model = env_model_name or _DEFAULT_DATAFLOW_MODEL_NAME
-    api_key = os.environ.get("DF_API_KEY")
+    model = env_model_name or DEFAULT_DATAFLOW_MODEL_NAME
+    api_key = os.environ.get(ENV_DF_API_KEY)
     return api_url, model, api_key
 
 

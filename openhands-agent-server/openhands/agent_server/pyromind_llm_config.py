@@ -184,6 +184,7 @@ def _provider_llm(existing: LLM, entry: dict[str, Any], primary: bool) -> LLM:
             "base_url": normalize_openai_base_url(
                 entry.get("base_url") or existing.base_url
             ),
+            "stream": True,
             "persist_runtime_config": False,
             "usage_id": usage_id,
             "num_retries": int(entry.get("num_retries", 2)),
@@ -237,6 +238,7 @@ def build_runtime_llm(existing: LLM) -> LLM:
             "base_url": normalize_openai_base_url(
                 os.environ.get("LLM_BASE_URL") or existing.base_url
             ),
+            "stream": True,
             "persist_runtime_config": False,
         }
     )

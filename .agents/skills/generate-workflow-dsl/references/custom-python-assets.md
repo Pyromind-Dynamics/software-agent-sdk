@@ -68,18 +68,5 @@ def business_reward(
 
 ## DSL 回填
 
-```python
-metrics = MetricsConfigBuilderCustomNode(
-    id="40",
-    entry="/returned/path/metric.py:business_metric",
-    name="business_metric",
-)
-reward = RewardItemBuilderCustomNode(
-    id="41",
-    entry="/returned/path/reward.py:business_reward",
-    name="business_reward",
-    weight=1.0,
-)
-```
-
-路径必须与工具 observation 完全一致；不要把 Agent 工作区本地文件路径填入节点。
+`entry` 填 `<storage_path>:<function_name>`，节点签名查 `workflow-contracts.md` 的 Reward 与
+Metric 节。路径必须与工具 observation 返回值完全一致；不要把 Agent 工作区本地文件路径填入节点。

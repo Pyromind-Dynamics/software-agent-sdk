@@ -9,7 +9,7 @@ from openhands.agent_server.kafka_bus.kafka_handler import MessageHandler
 from openhands.agent_server.kafka_bus.kafka_topic import KafkaTopic
 from openhands.agent_server.kafka_bus.message_event import MessageEvent
 from openhands.agent_server.run_workflow_callback import (
-    deliver_run_workflow_status,
+    dispatch_run_workflow_status as deliver_run_workflow_status,
 )
 from openhands.sdk.logger import get_logger
 from openhands.sdk.utils import env_util

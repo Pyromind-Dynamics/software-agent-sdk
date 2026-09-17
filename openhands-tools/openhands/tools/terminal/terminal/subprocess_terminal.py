@@ -75,8 +75,8 @@ def _sandbox_vmem_kb() -> int:
 
 
 # Process cap (RLIMIT_NPROC) applied to each sandbox shell. It only counts
-# processes inside the sandbox's own user namespace (bwrap --unshare-user-try),
-# so one runaway sandbox cannot spawn an army of parallel commands.
+# processes inside the sandbox's own user namespace, so one runaway sandbox
+# cannot spawn an army of parallel commands.
 OH_SANDBOX_NPROC_LIMIT_ENV = "OH_SANDBOX_NPROC_LIMIT"
 _DEFAULT_SANDBOX_NPROC_LIMIT = 2
 
@@ -100,7 +100,7 @@ def _sandbox_nproc_limit() -> int:
         ) from exc
     if limit < 2:
         raise RuntimeError(
-            f"{OH_SANDBOX_NPROC_LIMIT_ENV} must be at least 2 (bash + 1 child)"
+            f"invalid {OH_SANDBOX_NPROC_LIMIT_ENV}={value!r}: must be >= 2"
         )
     return limit
 
@@ -266,6 +266,15 @@ class SubprocessTerminal(TerminalInterface):
         flags = fcntl.fcntl(self._pty_master_fd, fcntl.F_GETFL)
         fcntl.fcntl(self._pty_master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
+        # Pin the shell process tree into the session memory cgroup when one
+        # is active. RuntimeError means the limit did not take effect; do not
+        # keep an unconstrained sandbox running.
+        try:
+            self.sandbox.attach_memory_cgroup(self.process.pid)
+        except RuntimeError:
+            self.close()
+            raise
+
         # Start output reader thread
         self.reader_thread = threading.Thread(
             target=self._read_output_continuously_pty, daemon=True
@@ -275,19 +284,30 @@ class SubprocessTerminal(TerminalInterface):
 
         # Configure bash: disable history expansion, set up PS1/PS2 prompts
         work_dir = shlex.quote(os.path.abspath(self.work_dir))
-        nproc_guard = (
-            "map=$(awk 'NR==1{print $3}' /proc/self/uid_map); "
-            '[ "$map" != "4294967295" ] '
-            f"&& ulimit -u {_sandbox_nproc_limit()} 2>/dev/null; "
-        )
-        # Max out the OOM score so, if the pod ever hits its kubelet memory
-        # limit, the kernel prefers killing sandbox shells over the server.
-        # Raising one's own score needs no privilege and children inherit it.
+        # RLIMIT_AS/RLIMIT_NPROC hardening is Linux-only: on macOS the shell
+        # address space is huge by design (ulimit -v kills bash outright) and
+        # /proc does not exist. /proc/self/uid_map doubles as the marker for
+        # "running inside a Linux user namespace", which is where the nproc
+        # cap is meaningful.
+        if os.path.isfile("/proc/self/uid_map"):
+            nproc_guard = (
+                "map=$(awk 'NR==1{print $3}' /proc/self/uid_map); "
+                '[ "$map" != "4294967295" ] '
+                f"&& ulimit -u {_sandbox_nproc_limit()} 2>/dev/null; "
+            )
+            # Max out the OOM score so, if the pod ever hits its kubelet
+            # memory limit, the kernel prefers killing sandbox shells over
+            # the server. Raising one's own score needs no privilege and
+            # children inherit it.
+            hardening = (
+                "echo 1000 > /proc/self/oom_score_adj 2>/dev/null; "
+                + nproc_guard
+                + f"ulimit -v {_sandbox_vmem_kb()} 2>/dev/null; "
+            )
+        else:
+            hardening = ""
         init_cmd = (
-            "echo 1000 > /proc/self/oom_score_adj 2>/dev/null; "
-            + nproc_guard
-            + f"ulimit -v {_sandbox_vmem_kb()} 2>/dev/null; "
-            + f"export {MARKER_ENV}={self.session_marker}; "
+            hardening + f"export {MARKER_ENV}={self.session_marker}; "
             "set +H; "
             f"export PROMPT_COMMAND='export PS1=\"{self.PS1}\"'; "
             f'export PS2=""; cd -- {work_dir}'

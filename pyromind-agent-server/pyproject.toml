@@ -1,0 +1,25 @@
+[project]
+name = "pyromind-agent-server"
+version = "0.1.0"
+description = "Pyromind HTTP, authentication, and composition layer"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.104",
+    "harness-adapter[openhands]",
+    "openhands-agent-server",
+    "pyromind-runtime",
+]
+
+[project.scripts]
+pyromind-agent-server = "pyromind_agent_server.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[tool.setuptools.packages.find]
+include = ["pyromind_agent_server*"]
+namespaces = true

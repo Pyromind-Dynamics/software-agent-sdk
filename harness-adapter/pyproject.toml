@@ -1,0 +1,20 @@
+[project]
+name = "harness-adapter"
+version = "0.1.0"
+description = "Harness adapters for the Pyromind runtime"
+requires-python = ">=3.12"
+dependencies = ["pyromind-runtime"]
+
+[project.optional-dependencies]
+openhands = ["openhands-agent-server"]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[tool.setuptools.packages.find]
+include = ["harness_adapter*"]
+namespaces = true

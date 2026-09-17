@@ -124,6 +124,38 @@ def test_terminal_sandbox_override_preserves_persistent_working_directory():
         assert "getcwd" not in first.text + second.text
 
 
+def test_terminal_reset_cwd_each_command_pins_working_directory():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        public_data = Path(temp_dir) / "public_data"
+        public_data.mkdir()
+        conv_state = _create_test_conv_state(temp_dir)
+        tool = TerminalTool.create(
+            conv_state,
+            terminal_type="subprocess",
+            sandbox_mode="off",
+            reset_cwd_each_command=True,
+        )[0]
+        executor = tool.executor
+        assert isinstance(executor, TerminalExecutor)
+
+        try:
+            first = tool(TerminalAction(command="cd public_data"))
+            second = tool(TerminalAction(command="pwd"))
+        finally:
+            executor.close()
+
+        assert isinstance(first, TerminalObservation)
+        assert isinstance(second, TerminalObservation)
+        # The injected `cd` prefix stays invisible to the model, and a `cd` from
+        # an earlier call cannot shift the baseline of the next one.
+        assert first.command == "cd public_data"
+        assert second.command == "pwd"
+        assert Path(second.text.strip()).resolve() == Path(temp_dir).resolve()
+        assert second.metadata is not None
+        assert second.metadata.working_dir is not None
+        assert Path(second.metadata.working_dir).resolve() == Path(temp_dir).resolve()
+
+
 def test_bash_tool_to_openai_tool():
     """Test that TerminalTool can be converted to OpenAI tool format."""
     with tempfile.TemporaryDirectory() as temp_dir:

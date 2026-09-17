@@ -1,0 +1,17 @@
+[project]
+name = "pyromind-runtime"
+version = "0.1.0"
+description = "Harness-neutral runtime contracts and product event projection for Pyromind"
+requires-python = ">=3.12"
+dependencies = ["pydantic>=2.12.5"]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[tool.setuptools.packages.find]
+include = ["pyromind_runtime*"]
+namespaces = true

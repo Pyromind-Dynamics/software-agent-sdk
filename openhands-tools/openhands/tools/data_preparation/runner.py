@@ -12,8 +12,11 @@ from __future__ import annotations
 import ast
 import hashlib
 import os
+import signal
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal
@@ -22,18 +25,15 @@ import httpx
 
 from openhands.sdk.llm import RouterLLM
 from openhands.sdk.utils.redact import redact_text_secrets
-
-
-# DataFlow LLM env vars (a contract with the open-dataflow runtime in the
-# pipeline pod) and DataFlow fallback defaults.
-ENV_DF_API_BASE_URL = "DF_API_BASE_URL"
-ENV_DF_API_URL = "DF_API_URL"
-ENV_DF_MODEL_NAME = "DF_MODEL_NAME"
-ENV_DF_API_KEY = "DF_API_KEY"
-ENV_LLM_BASE_URL = "LLM_BASE_URL"
-DEFAULT_DATAFLOW_API_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_DATAFLOW_API_URL = f"{DEFAULT_DATAFLOW_API_BASE_URL}/chat/completions"
-DEFAULT_DATAFLOW_MODEL_NAME = "openai/gpt-5.6-luna"
+from openhands.tools.utils.dataflow_config import (
+    DEFAULT_DATAFLOW_API_BASE_URL,
+    DEFAULT_DATAFLOW_MODEL_NAME,
+    ENV_DF_API_BASE_URL,
+    ENV_DF_API_KEY,
+    ENV_DF_API_URL,
+    ENV_DF_MODEL_NAME,
+    ENV_LLM_BASE_URL,
+)
 
 
 SUPPORTED_DATAFLOW_VERSION = "1.0.10"
@@ -380,7 +380,7 @@ def build_dataflow_env(
         model_name = openai_compatible_model_name(str(llm.model))
         if _is_unsubstituted_placeholder_model(model_name):
             raise ValueError(
-                f"Conversation LLM model is an unsubstituted placeholder "
+                "Conversation LLM model is an unsubstituted placeholder "
                 f"({model_name!r}) — the LLM routing config did not provide a "
                 "real model name. Check the conversation LLM model setting "
                 "(DF_MODEL_NAME comes from the conversation model, not from "
@@ -414,16 +414,6 @@ def build_dataflow_env(
     if api_key:
         resolved[ENV_DF_API_KEY] = api_key
     return resolved
-
-
-def summarize_dataflow_env(env: dict[str, str]) -> str:
-    """Return a secret-free summary suitable for logs and observations."""
-
-    return (
-        f"model={env[ENV_DF_MODEL_NAME]} "
-        f"base_url={env[ENV_DF_API_BASE_URL]} "
-        f"api_key_configured={'yes' if env.get(ENV_DF_API_KEY) else 'no'}"
-    )
 
 
 def preflight_dataflow_llm(env: dict[str, str], *, timeout: float = 30.0) -> None:
@@ -483,6 +473,16 @@ def preflight_dataflow_llm(env: dict[str, str], *, timeout: float = 30.0) -> Non
     )
 
 
+def summarize_dataflow_env(env: dict[str, str]) -> str:
+    """Return a secret-free summary suitable for logs and observations."""
+
+    return (
+        f"model={env[ENV_DF_MODEL_NAME]} "
+        f"base_url={env[ENV_DF_API_BASE_URL]} "
+        f"api_key_configured={'yes' if env.get(ENV_DF_API_KEY) else 'no'}"
+    )
+
+
 def _redact_subprocess_output(text: str, env_extra: dict[str, str]) -> str:
     redacted = text
     api_key = env_extra.get(ENV_DF_API_KEY)
@@ -501,33 +501,89 @@ def run_dataflow_python(
 ) -> tuple[int, str, str]:
     """Run a DataFlow-related subprocess. Returns (rc, stdout, stderr)."""
 
-    env = os.environ.copy()
-    env.update(env_extra)
-    try:
-        result = subprocess.run(
+    return ProcessLocalSampleExecutor().run(
+        python, args, cwd=cwd, env_extra=env_extra, timeout=timeout
+    )
+
+
+class ProcessLocalSampleExecutor:
+    """Observable, cancellable local-process boundary for DataFlow Sample runs."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen[str] | None = None
+
+    def run(
+        self,
+        python: str,
+        args: list[str],
+        *,
+        cwd: str,
+        env_extra: dict[str, str],
+        timeout: int,
+    ) -> tuple[int, str, str]:
+        env = os.environ.copy()
+        env.update(env_extra)
+        process = subprocess.Popen(
             [python, *args],
             cwd=cwd,
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired as exc:
-        stdout, stderr = exc.stdout or "", exc.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode(errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
+        with self._lock:
+            self._process = process
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            self._terminate(process)
+            stdout, stderr = process.communicate()
+            stdout = stdout or _decoded_timeout_stream(exc.stdout)
+            stderr = stderr or _decoded_timeout_stream(exc.stderr)
+            return (
+                124,
+                _redact_subprocess_output(stdout, env_extra),
+                _redact_subprocess_output(
+                    (stderr + f"\nTimed out after {timeout}s").strip(), env_extra
+                ),
+            )
+        finally:
+            with self._lock:
+                if self._process is process:
+                    self._process = None
         return (
-            124,
-            _redact_subprocess_output(stdout, env_extra),
-            _redact_subprocess_output(
-                (stderr + f"\nTimed out after {timeout}s").strip(),
-                env_extra,
-            ),
+            process.returncode,
+            _redact_subprocess_output(stdout or "", env_extra),
+            _redact_subprocess_output(stderr or "", env_extra),
         )
-    return (
-        result.returncode,
-        _redact_subprocess_output(result.stdout or "", env_extra),
-        _redact_subprocess_output(result.stderr or "", env_extra),
-    )
+
+    def interrupt(self) -> None:
+        with self._lock:
+            process = self._process
+        if process is not None:
+            self._terminate(process)
+
+    @staticmethod
+    def _terminate(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            process.terminate()
+        deadline = time.monotonic() + 2
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                process.kill()
+
+
+def _decoded_timeout_stream(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value or ""

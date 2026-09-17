@@ -81,6 +81,8 @@ export OH_CONVERSATION_STORAGE_QUOTA="${OH_CONVERSATION_STORAGE_QUOTA:-500M}"
 export OH_SANDBOX_MEMORY_LIMIT="${OH_SANDBOX_MEMORY_LIMIT:-500M}"
 export OH_WORKSPACE_PATH="${OH_WORKSPACE_PATH:-${WORKSPACE_DIR}/project}"
 export OH_BASH_EVENTS_DIR="${OH_BASH_EVENTS_DIR:-${WORKSPACE_DIR}/bash_events}"
+export OH_CONVERSATION_STORAGE_QUOTA="${OH_CONVERSATION_STORAGE_QUOTA:-500M}"
+export OH_SANDBOX_MEMORY_LIMIT="${OH_SANDBOX_MEMORY_LIMIT:-500M}"
 mkdir -p \
   "${OPENHANDS_CONFIG_DIR}" \
   "${OH_CONVERSATIONS_PATH}" \
@@ -178,7 +180,7 @@ echo " Auto-reload:       enabled"
 echo "============================================"
 echo ""
 
-uv run python -m openhands.agent_server \
+uv run python -m pyromind_agent_server \
   --host 127.0.0.1 \
   --port 8000 \
   --reload

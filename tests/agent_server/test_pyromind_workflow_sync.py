@@ -2,7 +2,8 @@
 
 Covers the "工作流同步链路" cases from the debug-loop plan: from-scratch
 (empty reminder), canvas edited (overwrite + reminder), canvas cleared (remove
-file + reminder), already-in-sync (no-op), and no canvas attached (no-op).
+file + reminder), already-in-sync, and no canvas attached. Every case reports the
+resulting workflow state, so the agent never has to probe the filesystem for it.
 """
 
 from __future__ import annotations
@@ -21,9 +22,22 @@ from openhands.agent_server.run_workflow_callback import RunWorkflowCallbackResu
 from openhands.tools.pyromind_debug.broker import get_debug_result_broker
 
 
-def test_no_workflow_dsl_is_a_noop(tmp_path):
-    assert _sync_workflow_with_canvas(tmp_path, None) is None
+def test_no_workflow_dsl_reports_missing_workflow(tmp_path):
+    reminder = _sync_workflow_with_canvas(tmp_path, None)
+
+    assert "workflow.py does not exist" in reminder.text
     assert not (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").exists()
+
+
+def test_no_workflow_dsl_reports_existing_workflow(tmp_path):
+    wf = tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
+    wf.parent.mkdir(parents=True, exist_ok=True)
+    wf.write_text("# workflow: demo\nx = 1\n", encoding="utf-8")
+
+    reminder = _sync_workflow_with_canvas(tmp_path, None)
+
+    assert "A workflow already exists" in reminder.text
+    assert wf.read_text(encoding="utf-8") == "# workflow: demo\nx = 1\n"
 
 
 def test_from_scratch_both_empty_returns_authoritative_reminder(tmp_path):
@@ -36,14 +50,14 @@ def test_from_scratch_both_empty_returns_authoritative_reminder(tmp_path):
     assert not (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").exists()
 
 
-def test_already_in_sync_is_a_noop(tmp_path):
+def test_already_in_sync_reports_existing_workflow(tmp_path):
     wf = tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
     wf.parent.mkdir(parents=True, exist_ok=True)
     wf.write_text("# workflow: demo\nx = 1\n", encoding="utf-8")
 
     reminder = _sync_workflow_with_canvas(tmp_path, "# workflow: demo\nx = 1\n")
 
-    assert reminder is None
+    assert "A workflow already exists" in reminder.text
     assert wf.read_text(encoding="utf-8") == ("# workflow: demo\nx = 1\n")
 
 
@@ -82,14 +96,15 @@ def test_canvas_cleared_removes_file_and_reminds(tmp_path):
     assert not wf.exists()
 
 
-def test_whitespace_only_diff_is_a_noop(tmp_path):
+def test_whitespace_only_diff_does_not_rewrite_file(tmp_path):
     wf = tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
     wf.parent.mkdir(parents=True, exist_ok=True)
     wf.write_text("# workflow: demo\nx = 1\n", encoding="utf-8")
 
     reminder = _sync_workflow_with_canvas(tmp_path, "# workflow: demo\nx = 1\n\n\n  ")
 
-    assert reminder is None
+    assert "A workflow already exists" in reminder.text
+    assert wf.read_text(encoding="utf-8") == "# workflow: demo\nx = 1\n"
 
 
 @pytest.mark.asyncio

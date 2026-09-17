@@ -563,16 +563,13 @@ class TerminalSandbox:
         executable_paths = [
             path for path in ("/usr", "/bin", "/sbin") if Path(path).exists()
         ]
-        writable_paths = [str(p) for p in self.read_write_paths]
-        if not self.has_conversation_policy:
-            writable_paths.insert(0, str(self._tmp_dir))
         policy = {
             "system_read_paths": system_read_paths,
             "public_read_paths": public_read_paths,
             "read_only_paths": [str(p) for p in self.read_only_paths],
             "executable_paths": executable_paths,
             "tmp_dir": str(self._tmp_dir),
-            "read_write_paths": writable_paths,
+            "read_write_paths": [str(p) for p in self.read_write_paths],
             "mode": self.mode,
         }
         policy_path = self._tmp_dir / ".openhands-landlock-policy.json"
@@ -600,7 +597,9 @@ class TerminalSandbox:
             "        )\n"
             "        .allow_write('/dev/null', '/dev/tty')\n"
             "        .allow_execute(*policy['executable_paths'])\n"
-            "        .allow_read_write(*policy['read_write_paths'])\n"
+            "        .allow_read_write(\n"
+            "            policy['tmp_dir'], *policy['read_write_paths']\n"
+            "        )\n"
             "        .apply()\n"
             "    )\n"
             "except Exception as exc:\n"
@@ -675,6 +674,7 @@ class TerminalSandbox:
         """Remove the generated sandbox profile/wrapper after the shell exits."""
         if self._memory_cgroup is not None:
             self._memory_cgroup.cleanup()
+            self._memory_cgroup = None
         if self._seatbelt_profile is not None:
             self._seatbelt_profile.unlink(missing_ok=True)
         if self._landlock_wrapper is not None:
@@ -731,11 +731,15 @@ class TerminalSandbox:
                 "(version 1)",
                 "(allow default)",
                 f'(deny file-read* (subpath "{parent}"))',
-                # Directory metadata is required to traverse an absolute path
-                # into an allowed child. This does not expose sibling contents.
+                # Reading each directory object lets getcwd() resolve the
+                # absolute path without granting access to sibling contents.
                 *(
                     f'(allow file-read-metadata (literal "'
                     f'{self._seatbelt_path(path)}"))'
+                    for path in sorted(traversal_paths, key=lambda item: str(item))
+                ),
+                *(
+                    f'(allow file-read-data (literal "{self._seatbelt_path(path)}"))'
                     for path in sorted(traversal_paths, key=lambda item: str(item))
                 ),
                 *(

@@ -1,0 +1,571 @@
+import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { chmod, mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import test from "node:test";
+import {
+  SandboxManager,
+  type SandboxRuntimeConfig,
+} from "@anthropic-ai/sandbox-runtime";
+import type { BashOperations } from "@earendil-works/pi-coding-agent";
+import {
+  configuredRuntimeReadRoots,
+  createWorkspaceSandboxedBashOperations,
+  piRuntimeReadRoots,
+  sandboxNprocLimit,
+  sandboxVmemKb,
+  workspacePolicyDenyPaths,
+  workspacePolicyDenyWritePaths,
+} from "../src/workspace-sandbox.js";
+import { WorkspaceAccessPolicy } from "../src/workspace-policy.js";
+
+const osSandboxAvailable = process.platform === "darwin"
+  ? existsSync("/usr/bin/sandbox-exec")
+  : SandboxManager.checkDependencies();
+
+function resourceCapPrefix(
+  nprocLimit: number,
+  vmemKb: number,
+): string {
+  if (process.platform !== "linux") return "";
+  return [
+    "map=$(awk 'NR==1{print $3}' /proc/self/uid_map);",
+    `[ \"$map\" != \"4294967295\" ]`,
+    `&& ulimit -u ${nprocLimit} 2>/dev/null;`,
+    `ulimit -v ${vmemKb} 2>/dev/null;`,
+  ].join(" ") + " ";
+}
+
+async function workspaceTree() {
+  const root = await mkdtemp(join(tmpdir(), "pi-workspace-sandbox-"));
+  const home = join(root, "home");
+  const repository = join(home, "Desktop", "repo");
+  const conversations = join(repository, "workspace", "conversations");
+  const workspace = join(conversations, "current");
+  const publicData = join(workspace, "public_data");
+  const terminalTemp = join(workspace, "pi", "terminal-output");
+  const repositorySource = join(repository, "src");
+  const skillsDirectory = join(repository, ".agents", "skills");
+  const skill = join(skillsDirectory, "data-cleaning");
+  const knowledge = join(repository, "knowledge");
+  const otherConversation = join(conversations, "other");
+  await mkdir(publicData, { recursive: true });
+  await mkdir(terminalTemp, { recursive: true });
+  await mkdir(join(workspace, "product"), { recursive: true });
+  await writeFile(join(workspace, "pi", "session.jsonl"), "private");
+  await mkdir(repositorySource, { recursive: true });
+  await mkdir(skill, { recursive: true });
+  await mkdir(knowledge, { recursive: true });
+  await mkdir(otherConversation, { recursive: true });
+  await mkdir(join(home, ".ssh"), { recursive: true });
+  const policy = await WorkspaceAccessPolicy.create({
+    workspaceRoot: workspace,
+    readOnlyRoots: [],
+    skillsDirectory,
+    knowledgeRoot: knowledge,
+  });
+  return {
+    home,
+    workspace,
+    publicData,
+    terminalTemp,
+    repositorySource,
+    skill,
+    skillsDirectory,
+    knowledge,
+    otherConversation,
+    policy,
+  };
+}
+
+test("policy deny rules hide private state, repository source, and sibling conversations", async () => {
+  const tree = await workspaceTree();
+  const denied = await workspacePolicyDenyPaths(
+    tree.policy,
+    tree.home,
+    [tree.home],
+  );
+
+  assert(denied.includes(await realpath(join(tree.home, ".ssh"))));
+  assert(denied.includes(await realpath(tree.repositorySource)));
+  assert(denied.includes(await realpath(tree.otherConversation)));
+  assert(denied.includes(await realpath(join(tree.workspace, "product"))));
+  assert(denied.includes(await realpath(join(tree.workspace, "pi", "session.jsonl"))));
+  assert(!denied.includes(await realpath(tree.publicData)));
+  assert(!denied.includes(await realpath(tree.terminalTemp)));
+  assert(!denied.includes(await realpath(tree.skill)));
+  assert(!denied.includes(await realpath(tree.knowledge)));
+});
+
+test("write deny rules preserve only public_data and terminal temp branches", async () => {
+  const tree = await workspaceTree();
+  const denied = await workspacePolicyDenyWritePaths(tree.policy, tree.home);
+
+  assert(denied.includes(`${tree.policy.workspaceRoot}/*`));
+  assert(denied.includes(`${join(tree.policy.workspaceRoot, "pi")}/*`));
+  assert(denied.includes(await realpath(join(tree.workspace, "product"))));
+  assert(denied.includes(await realpath(join(tree.workspace, "pi", "session.jsonl"))));
+  assert(!denied.includes(await realpath(tree.publicData)));
+  assert(!denied.includes(await realpath(tree.terminalTemp)));
+});
+
+test("sandboxed commands allow cd within one call and reset cwd for every call", async () => {
+  const tree = await workspaceTree();
+  const previousVmemLimit = process.env.OH_SANDBOX_VMEM_LIMIT;
+  delete process.env.OH_SANDBOX_VMEM_LIMIT;
+  let initialized: SandboxRuntimeConfig | undefined;
+  let updated: SandboxRuntimeConfig | undefined;
+  let checkedRipgrep: { command: string; args?: string[] } | undefined;
+  const localCalls: Array<{
+    command: string;
+    cwd: string;
+    env: NodeJS.ProcessEnv | undefined;
+  }> = [];
+  const controller = {
+    checkDependencies: (ripgrepConfig?: { command: string; args?: string[] }) => {
+      checkedRipgrep = ripgrepConfig;
+      return true;
+    },
+    initialize: async (config: SandboxRuntimeConfig) => {
+      initialized = config;
+    },
+    isSandboxingEnabled: () => true,
+    updateConfig: (config: SandboxRuntimeConfig) => {
+      updated = config;
+    },
+    wrapWithSandbox: async (command: string) => `sandboxed:${command}`,
+  };
+  const localOperations: BashOperations = {
+    exec: async (command, cwd, options) => {
+      localCalls.push({ command, cwd, env: options.env });
+      return { exitCode: 0 };
+    },
+  };
+  const operations = createWorkspaceSandboxedBashOperations(tree.policy, {
+    controller,
+    localOperations,
+    userHome: tree.home,
+    runtimeReadRoots: [],
+  });
+
+  await operations.exec("cd public_data && pwd", tree.workspace, {
+    onData: () => undefined,
+    env: { PATH: "/bin" },
+  });
+  await operations.exec("pwd", tree.workspace, {
+    onData: () => undefined,
+    env: { PATH: "/bin" },
+  });
+
+  const vmemPrefix = resourceCapPrefix(2, 512000);
+  assert.deepEqual(
+    localCalls.map((call) => call.command),
+    [
+      `sandboxed:${vmemPrefix}cd public_data && pwd`,
+      `sandboxed:${vmemPrefix}pwd`,
+    ],
+  );
+  assert(localCalls.every((call) => call.cwd === tree.policy.workspaceRoot));
+  assert(localCalls.every((call) => call.env?.TMPDIR === tree.policy.terminalTempRoot));
+  assert.deepEqual(initialized?.network.allowedDomains, []);
+  assert.deepEqual(
+    checkedRipgrep,
+    process.platform === "darwin" ? { command: "rg" } : undefined,
+  );
+  assert.deepEqual(updated?.filesystem.allowWrite, [
+    tree.policy.publicDataRoot,
+    tree.policy.terminalTempRoot,
+  ]);
+  assert(updated?.filesystem.denyWrite.includes(`${tree.policy.workspaceRoot}/*`));
+  assert(updated?.filesystem.denyRead.includes(await realpath(tree.repositorySource)));
+  if (previousVmemLimit === undefined) delete process.env.OH_SANDBOX_VMEM_LIMIT;
+  else process.env.OH_SANDBOX_VMEM_LIMIT = previousVmemLimit;
+});
+
+test("sandbox vmem cap parses OH_SANDBOX_VMEM_LIMIT on Linux", async () => {
+  const original = process.env.OH_SANDBOX_VMEM_LIMIT;
+  const platform = process.platform;
+  try {
+    Object.defineProperty(process, "platform", { value: "linux" });
+
+    delete process.env.OH_SANDBOX_VMEM_LIMIT;
+    assert.equal(sandboxVmemKb(), 512000);
+
+    process.env.OH_SANDBOX_VMEM_LIMIT = "1G";
+    assert.equal(sandboxVmemKb(), 1024 * 1024);
+
+    process.env.OH_SANDBOX_VMEM_LIMIT = "256k";
+    assert.equal(sandboxVmemKb(), 256);
+
+    process.env.OH_SANDBOX_VMEM_LIMIT = "garbage";
+    assert.equal(sandboxVmemKb(), null);
+
+    Object.defineProperty(process, "platform", { value: "darwin" });
+    delete process.env.OH_SANDBOX_VMEM_LIMIT;
+    assert.equal(sandboxVmemKb(), null);
+  } finally {
+    Object.defineProperty(process, "platform", { value: platform });
+    if (original === undefined) delete process.env.OH_SANDBOX_VMEM_LIMIT;
+    else process.env.OH_SANDBOX_VMEM_LIMIT = original;
+  }
+});
+
+test("sandbox caps prefer explicit resource limits over environment", async () => {
+  const originalVmem = process.env.OH_SANDBOX_VMEM_LIMIT;
+  const originalNproc = process.env.OH_SANDBOX_NPROC_LIMIT;
+  const platform = process.platform;
+  try {
+    Object.defineProperty(process, "platform", { value: "linux" });
+    process.env.OH_SANDBOX_VMEM_LIMIT = "1G";
+    process.env.OH_SANDBOX_NPROC_LIMIT = "8";
+
+    assert.equal(sandboxVmemKb(256 * 1024 * 1024), 256 * 1024);
+    assert.equal(sandboxNprocLimit(4), 4);
+  } finally {
+    Object.defineProperty(process, "platform", { value: platform });
+    if (originalVmem === undefined) delete process.env.OH_SANDBOX_VMEM_LIMIT;
+    else process.env.OH_SANDBOX_VMEM_LIMIT = originalVmem;
+    if (originalNproc === undefined) delete process.env.OH_SANDBOX_NPROC_LIMIT;
+    else process.env.OH_SANDBOX_NPROC_LIMIT = originalNproc;
+  }
+});
+
+test("sandboxed commands carry the RLIMIT_AS cap on Linux", async () => {
+  const tree = await workspaceTree();
+  const localCalls: string[] = [];
+  const controller = {
+    checkDependencies: () => true,
+    initialize: async () => undefined,
+    isSandboxingEnabled: () => true,
+    updateConfig: () => undefined,
+    wrapWithSandbox: async (command: string) => `sandboxed:${command}`,
+  };
+  const operations = createWorkspaceSandboxedBashOperations(tree.policy, {
+    controller,
+    localOperations: {
+      exec: async (command: string) => {
+        localCalls.push(command);
+        return { exitCode: 0 };
+      },
+    },
+    userHome: tree.home,
+    runtimeReadRoots: [],
+    resourceLimits: {
+      memoryLimitBytes: 500 * 1024 * 1024,
+      nprocLimit: 2,
+    },
+  });
+
+  const previousPlatform = process.platform;
+  const previousLimit = process.env.OH_SANDBOX_VMEM_LIMIT;
+  let expectedPrefix: string;
+  try {
+    Object.defineProperty(process, "platform", { value: "linux" });
+    expectedPrefix = resourceCapPrefix(2, 512000);
+    delete process.env.OH_SANDBOX_VMEM_LIMIT;
+    await operations.exec("cd public_data && pwd", tree.workspace, {
+      onData: () => undefined,
+      env: { PATH: "/bin" },
+    });
+  } finally {
+    Object.defineProperty(process, "platform", { value: previousPlatform });
+    if (previousLimit === undefined) delete process.env.OH_SANDBOX_VMEM_LIMIT;
+    else process.env.OH_SANDBOX_VMEM_LIMIT = previousLimit;
+  }
+
+  assert.equal(
+    localCalls[0],
+    `sandboxed:${expectedPrefix}cd public_data && pwd`,
+  );
+});
+
+test("workspace bash operations fail closed when sandbox is unavailable", async () => {
+  const tree = await workspaceTree();
+  const operations = createWorkspaceSandboxedBashOperations(tree.policy, {
+    controller: {
+      checkDependencies: () => false,
+      initialize: async () => undefined,
+      isSandboxingEnabled: () => false,
+      updateConfig: () => undefined,
+      wrapWithSandbox: async (command: string) => command,
+    },
+    localOperations: {
+      exec: async () => {
+        throw new Error("must not execute");
+      },
+    },
+    userHome: tree.home,
+    runtimeReadRoots: [],
+  });
+
+  await assert.rejects(
+    () => operations.exec("pwd", tree.workspace, { onData: () => undefined }),
+    /WORKSPACE_SANDBOX_UNAVAILABLE/,
+  );
+  await assert.rejects(
+    () => operations.exec("pwd", join(tree.workspace, "public_data"), {
+      onData: () => undefined,
+    }),
+    /WORKSPACE_SCOPE_ERROR/,
+  );
+});
+
+test(
+  "OS sandbox reads public_data but denies repository source files",
+  { skip: !osSandboxAvailable },
+  async () => {
+    const tree = await workspaceTree();
+    const workspaceFile = join(tree.publicData, "input.txt");
+    const repositoryFile = join(tree.repositorySource, "dependency.py");
+    const skillFile = join(tree.skill, "SKILL.md");
+    const ordinaryFile = join(tree.skillsDirectory, ".shared-reference.txt");
+    const script = join(tree.skill, "scripts", "helper.py");
+    const otherConversationFile = join(tree.otherConversation, "private.txt");
+    await writeFile(workspaceFile, "workspace-data");
+    await writeFile(repositoryFile, "repository-secret");
+    await writeFile(skillFile, "skill-reference");
+    await writeFile(ordinaryFile, "shared-reference");
+    await mkdir(join(tree.skill, "scripts"));
+    const scriptSource = [
+      "#!/usr/bin/env python3",
+      "from pathlib import Path",
+      "import sys",
+      "Path(sys.argv[1]).write_text('script-output')",
+      "print('script-executed')",
+      "",
+    ].join("\n");
+    await writeFile(script, scriptSource);
+    await chmod(script, 0o755);
+    await writeFile(otherConversationFile, "other-conversation-secret");
+    const operations = createWorkspaceSandboxedBashOperations(tree.policy, {
+      userHome: tree.home,
+      runtimeReadRoots: [],
+    });
+    let output = "";
+
+    try {
+      const allowed = await operations.exec(
+        "cd public_data && cat input.txt",
+        tree.workspace,
+        {
+          onData: (data) => {
+            output += data.toString();
+          },
+        },
+      );
+      assert.equal(allowed.exitCode, 0);
+      assert.match(output, /workspace-data/);
+
+      output = "";
+      const skillRead = await operations.exec(
+        `cat '${skillFile}' '${ordinaryFile}'`,
+        tree.workspace,
+        { onData: (data) => { output += data.toString(); } },
+      );
+      assert.equal(skillRead.exitCode, 0, output);
+      assert.match(output, /skill-reference/);
+      assert.match(output, /shared-reference/);
+
+      for (const command of [`python3 -B '${script}'`, `'${script}'`]) {
+        output = "";
+        const scriptRun = await operations.exec(
+          `${command} public_data/script-result.txt`,
+          tree.workspace,
+          { onData: (data) => { output += data.toString(); } },
+        );
+        assert.equal(scriptRun.exitCode, 0, output);
+        assert.match(output, /script-executed/);
+        assert.equal(await readFile(join(tree.publicData, "script-result.txt"), "utf8"), "script-output");
+        assert.equal(await readFile(script, "utf8"), scriptSource);
+      }
+
+      output = "";
+      const changedDirectory = await operations.exec(
+        "cd public_data && printf generated > generated.txt && pwd",
+        tree.workspace,
+        {
+          onData: (data) => {
+            output += data.toString();
+          },
+        },
+      );
+      assert.equal(changedDirectory.exitCode, 0);
+      assert.equal(output.trim(), tree.policy.publicDataRoot);
+      assert.equal(
+        await readFile(join(tree.publicData, "generated.txt"), "utf8"),
+        "generated",
+      );
+
+      output = "";
+      const resetDirectory = await operations.exec("pwd", tree.workspace, {
+        onData: (data) => {
+          output += data.toString();
+        },
+      });
+      assert.equal(resetDirectory.exitCode, 0);
+      assert.equal(output.trim(), tree.policy.workspaceRoot);
+
+      output = "";
+      const temporaryWrite = await operations.exec(
+        'printf temporary > "$TMPDIR/scratch.txt"',
+        tree.workspace,
+        {
+          onData: (data) => {
+            output += data.toString();
+          },
+        },
+      );
+      assert.equal(temporaryWrite.exitCode, 0, output);
+      assert.equal(
+        await readFile(join(tree.terminalTemp, "scratch.txt"), "utf8"),
+        "temporary",
+      );
+
+      output = "";
+      const runtime = await operations.exec(
+        `${JSON.stringify(process.execPath)} -e "process.stdout.write('runtime-ok')"`,
+        tree.workspace,
+        {
+          onData: (data) => {
+            output += data.toString();
+          },
+        },
+      );
+      assert.equal(runtime.exitCode, 0);
+      assert.equal(output, "runtime-ok");
+
+      const privateSession = join(tree.workspace, "pi", "session.jsonl");
+      const deniedWrite = await operations.exec(
+        `printf hacked > ${JSON.stringify(privateSession)}`,
+        tree.workspace,
+        { onData: () => undefined },
+      );
+      assert.notEqual(deniedWrite.exitCode, 0);
+      assert.equal(await readFile(privateSession, "utf8"), "private");
+
+      const deniedSkillWrite = await operations.exec(
+        `printf hacked > ${JSON.stringify(skillFile)}`,
+        tree.workspace,
+        { onData: () => undefined },
+      );
+      assert.notEqual(deniedSkillWrite.exitCode, 0);
+      assert.equal(await readFile(skillFile, "utf8"), "skill-reference");
+
+      output = "";
+      const deniedOtherConversation = await operations.exec(
+        `cat ${JSON.stringify(otherConversationFile)}`,
+        tree.workspace,
+        {
+          onData: (data) => {
+            output += data.toString();
+          },
+        },
+      );
+      assert.notEqual(deniedOtherConversation.exitCode, 0);
+      assert.doesNotMatch(output, /other-conversation-secret/);
+
+      output = "";
+      const denied = await operations.exec(
+        `cat ${JSON.stringify(repositoryFile)}`,
+        tree.workspace,
+        {
+          onData: (data) => {
+            output += data.toString();
+          },
+        },
+      );
+      assert.notEqual(denied.exitCode, 0);
+      assert.doesNotMatch(output, /repository-secret/);
+    } finally {
+      await SandboxManager.reset();
+    }
+  },
+);
+
+/**
+ * Reproduces the pod layout that broke every terminal command: the pi-runtime
+ * install sits under the protected home boundary (HOME=/agent-server) next to
+ * the conversations tree, and sandbox-runtime must still be able to exec its
+ * own apply-seccomp binary inside the bwrap namespace.
+ */
+async function podLikeTree() {
+  const base = await realpath(await mkdtemp(join(tmpdir(), "pi-runtime-root-")));
+  const home = join(base, "agent-server");
+  const runtimeRoot = join(home, "pi-runtime");
+  const vendor = join(
+    runtimeRoot,
+    "node_modules",
+    "@anthropic-ai",
+    "sandbox-runtime",
+    "vendor",
+    "seccomp",
+    "x64",
+  );
+  const conversations = join(home, "conversations");
+  const workspace = join(conversations, "current");
+  await mkdir(join(workspace, "public_data"), { recursive: true });
+  await mkdir(join(workspace, "pi", "terminal-output"), { recursive: true });
+  await mkdir(vendor, { recursive: true });
+  await writeFile(join(vendor, "apply-seccomp"), "binary");
+  await mkdir(join(conversations, "other"), { recursive: true });
+  const policy = await WorkspaceAccessPolicy.create({
+    workspaceRoot: workspace,
+    readOnlyRoots: [],
+  });
+  return { home, runtimeRoot, conversations};
+}
+
+test("piRuntimeReadRoots derives the runtime root from PYROMIND_PI_RUNTIME", async () => {
+  const tree = await podLikeTree();
+  process.env.PYROMIND_PI_RUNTIME = join(tree.runtimeRoot, "dist", "index.js");
+  try {
+    assert.deepEqual(piRuntimeReadRoots(), [resolve(tree.runtimeRoot)]);
+  } finally {
+    delete process.env.PYROMIND_PI_RUNTIME;
+  }
+});
+
+test("configuredRuntimeReadRoots includes the env-derived runtime root", async () => {
+  const tree = await podLikeTree();
+  process.env.PYROMIND_PI_RUNTIME = join(tree.runtimeRoot, "dist", "index.js");
+  try {
+    assert.ok(
+      (await configuredRuntimeReadRoots()).includes(resolve(tree.runtimeRoot)),
+    );
+  } finally {
+    delete process.env.PYROMIND_PI_RUNTIME;
+  }
+});
+
+test("deny rules never hide the sandbox's own apply-seccomp binary", async () => {
+  const tree = await podLikeTree();
+  process.env.PYROMIND_PI_RUNTIME = join(tree.runtimeRoot, "dist", "index.js");
+  try {
+    const policy = await WorkspaceAccessPolicy.create({
+      workspaceRoot: join(tree.conversations, "current"),
+      readOnlyRoots: [],
+    });
+    const denied = await workspacePolicyDenyPaths(
+      policy,
+      tree.home,
+      await configuredRuntimeReadRoots(),
+    );
+    const sandboxRoot = join(
+      tree.runtimeRoot,
+      "node_modules",
+      "@anthropic-ai",
+      "sandbox-runtime",
+    );
+    assert.ok(
+      !denied.some((rule) => resolve(sandboxRoot).startsWith(rule)),
+      "the sandbox runtime tree must stay readable inside the namespace",
+    );
+    // Workspace isolation is preserved: sibling conversations stay denied.
+    assert(
+      denied.some((rule) => join(tree.conversations, "other").startsWith(rule)),
+    );
+  } finally {
+    delete process.env.PYROMIND_PI_RUNTIME;
+  }
+});

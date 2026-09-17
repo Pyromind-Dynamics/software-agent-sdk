@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "name": "embodied-cleaning",
+  "description": "具身 S2/LeRobot 数据逐 episode 清洗（EDP 编排形态）：每条 manifest 记录 = 一个 episode，平台节点拉起 CUSTOM 沙箱（记录自带镜像，默认 pyrominddynamics/jupyter-lab-with-ssh:v0.9），/workspace 以读写挂载进容器 /target-workspace，沙箱内确定性 runtime（openhands-embodied-runtime==1.29.5，缺则从部署包源安装）执行单条清洗（plan 级可逆清洗规划 + 清理 + LeRobot v2.1 校验），episode 输出与结果 JSON 直接落在挂载的 work_root（沙箱销毁后仍持久）。本 profile 无 LLM 链路：verdict 走 reward_file（accepted=1.0 / needs_review=0.5 / rejected=0.0），failed episode 不写 reward 且退出码 1，由 runner 归入 error 桶。manifest 字段契约：task_id（episode id 代号，同时驱动 config 文件隔离路径）/ episode_id / config_json（runtime 配置 JSON 字符串，含 episode_id / source / work_root / task_text / thresholds）/ robot_type / thresholds（motion_speed_threshold / idle_min_duration_s / context_s）。状态语义沿用 runtime：accepted / needs_review / rejected / failed；rejected 是数据质量结论（写入 result.json 的诊断），不等于 runner 执行错误。",
+  "steps": [
+    {
+      "name": "create_sandbox",
+      "params": {
+        "image": "{image}",
+        "cpu": 4,
+        "memory": "8Gi",
+        "wait_timeout": 600,
+        "volume_mounts": [
+          {
+            "host_path": "/workspace",
+            "mount_path": "/target-workspace",
+            "read_only": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "probe",
+      "params": {
+        "command": "command -v python3.10 && test -d /target-workspace",
+        "timeout": 60
+      }
+    },
+    {
+      "name": "write_file",
+      "params": {
+        "path": "/target-workspace/.agents-embodied-config/{task_id}.json",
+        "content_field": "config_json"
+      }
+    },
+    {
+      "name": "exec",
+      "params": {
+        "command": "python3.10 -c \"import openhands_embodied_runtime\" 2>/dev/null || python3.10 -m pip install --quiet '{edp_run_dir}/wheels/openhands_embodied_runtime-1.29.5-py3-none-any.whl'; python3.10 -m openhands_embodied_runtime.sandbox_runner --mode episode --config /target-workspace/.agents-embodied-config/{task_id}.json",
+        "timeout": 590
+      }
+    }
+  ],
+  "verdict": {
+    "kind": "reward_file",
+    "success_codes": [
+      0
+    ],
+    "reward_path": "/logs/verifier/reward.txt"
+  },
+  "output": {
+    "filename": "verdicts.jsonl"
+  },
+  "execution": {
+    "sandbox_reuse": "per_shard"
+  }
+}

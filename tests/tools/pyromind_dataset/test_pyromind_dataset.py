@@ -11,14 +11,11 @@ from pyromind_sdk.client.models import TrainingTaskCreateResponse
 
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.secret import StaticSecret
-from openhands.tools.data_preparation.runner import (
-    DEFAULT_DATAFLOW_API_URL,
-    DEFAULT_DATAFLOW_MODEL_NAME,
-)
 from openhands.tools.pyromind_archive.definition import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
 )
 from openhands.tools.pyromind_dataset.definition import (
+    _MAX_LISTED_ENTRIES,
     _PREVIEW_DATASET_DESCRIPTION,
     PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
@@ -30,6 +27,10 @@ from openhands.tools.pyromind_dataset.definition import (
     _resolve_workspace_dir,
     _vision_api_config,
     download_file_from_pyromind,
+)
+from openhands.tools.utils.dataflow_config import (
+    DEFAULT_DATAFLOW_API_URL,
+    DEFAULT_DATAFLOW_MODEL_NAME,
 )
 
 
@@ -1774,6 +1775,7 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
     manifest = jsonlib.loads(manifest_path.read_text().strip())
     assert manifest["source_path"] == "/dataset/sample-a"
     assert manifest["local_path"].endswith("sample-a")
+    assert manifest["workspace_path"] == observation.local_sample_paths[0]
     assert manifest["images"][0].endswith("diagram.png")
     assert len(manifest["files"]) == 2
     assert (manifest_path.parent / manifest["images"][0]).read_bytes() == image
@@ -1781,6 +1783,86 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
     assert observation.vision_previews[0]["ocr_text"] == "OCR: triangle ABC"
     assert any(item.type == "image" for item in observation.content)
     assert all(item.type == "text" for item in observation.to_llm_content)
+    llm_text = "\n".join(item.text for item in observation.to_llm_content)
+    assert f"sample_manifest_path={observation.sample_manifest_path}" in llm_text
+    assert f"- {observation.local_sample_paths[0]}" in llm_text
+    assert f"df_run_input_path={observation.local_sample_paths[0]}" in llm_text
+
+
+def test_sample_mode_explicit_paths_allow_up_to_n() -> None:
+    executor = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )
+    requested = [f"/dataset/sample-{index}" for index in range(4)]
+
+    selected, entries = executor._select_storage_samples(
+        "/dataset/",
+        requested,
+        10,
+        {},
+    )
+
+    assert selected == requested
+    assert entries == []
+
+
+def test_sample_mode_rejects_explicit_paths_over_n(tmp_path) -> None:
+    executor = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )
+    observation = executor._storage_sample(
+        PreviewDatasetAction(
+            dataset_path="/dataset/",
+            mode="sample",
+            n=10,
+            sample_paths=[f"/dataset/sample-{index}" for index in range(11)],
+        ),
+        "/dataset/",
+        {},
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert observation.is_error
+    assert observation.error_code == "sample_selection_limit"
+    assert observation.text == (
+        "sample_paths 有 11 项，超过 n=10。\n"
+        "请减少路径数量，或增大 n。\n"
+        "错误码：sample_selection_limit"
+    )
+
+
+def test_sample_mode_auto_selection_uses_default_limit_of_three(monkeypatch) -> None:
+    executor = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )
+    monkeypatch.setattr(
+        executor,
+        "_list_entries",
+        lambda _path, _headers: [
+            MagicMock(
+                path=f"/dataset/sample-{index}",
+                name=f"sample-{index}",
+                is_dir=True,
+                size=None,
+                last_modified=None,
+            )
+            for index in range(5)
+        ],
+    )
+
+    selected, entries = executor._select_storage_samples(
+        "/dataset/",
+        [],
+        3,
+        {},
+    )
+
+    assert selected == [
+        "/dataset/sample-0",
+        "/dataset/sample-1",
+        "/dataset/sample-2",
+    ]
+    assert len(entries) == 5
 
 
 def test_sample_mode_allows_conversation_public_data_workspace(tmp_path) -> None:
@@ -1869,6 +1951,27 @@ def test_vision_api_config_uses_defaults_when_unset(monkeypatch) -> None:
     assert api_key is None
 
 
+def test_vision_api_config_rejects_bare_base_url(monkeypatch) -> None:
+    """DF_API_URL is used verbatim by the runtime, so a bare base URL would
+    hit a web page instead of the API and fail with a confusing JSON decode
+    error; reject it up front."""
+    _clear_vision_env(monkeypatch)
+    monkeypatch.setenv("DF_API_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("DF_MODEL_NAME", "vision-model")
+
+    with pytest.raises(ValueError, match="/chat/completions"):
+        _vision_api_config()
+
+
+def test_vision_api_config_rejects_placeholder_model(monkeypatch) -> None:
+    _clear_vision_env(monkeypatch)
+    monkeypatch.setenv("DF_API_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("DF_MODEL_NAME", "router")
+
+    with pytest.raises(ValueError, match="unsubstituted placeholder"):
+        _vision_api_config()
+
+
 def test_vision_api_config_falls_back_to_llm_base_url(monkeypatch) -> None:
     _clear_vision_env(monkeypatch)
     monkeypatch.setenv("LLM_BASE_URL", "https://llm.example/v1/")
@@ -1892,22 +1995,199 @@ def test_vision_api_config_prefers_df_env(monkeypatch) -> None:
     assert model == "vision-model"
 
 
-def test_vision_api_config_rejects_bare_base_url(monkeypatch) -> None:
-    """DF_API_URL is used verbatim by the runtime, so a bare base URL would
-    hit a web page instead of the API and fail with a confusing JSON decode
-    error; reject it up front."""
-    _clear_vision_env(monkeypatch)
-    monkeypatch.setenv("DF_API_URL", "https://openrouter.ai/api/v1")
-    monkeypatch.setenv("DF_MODEL_NAME", "vision-model")
+def _storage_listing_executor_observation(
+    monkeypatch, tmp_path, total: int, **action_kwargs: Any
+):
+    """Preview a storage directory listing with `total` file entries."""
+    _patch_shared_empty(monkeypatch)
 
-    with pytest.raises(ValueError, match="/chat/completions"):
-        _vision_api_config()
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "list": [
+                            {
+                                "name": f"part_{i:04d}.jsonl",
+                                "path": f"agentTest/part_{i:04d}.jsonl",
+                                "type": "File",
+                                "size": 1024,
+                                "last_modified": "2026-07-20 03:55:34",
+                            }
+                            for i in range(total)
+                        ]
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected POST URL: {url}")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    conversation = _fake_conversation(tmp_path)
+
+    return PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="agentTest/", n=5, **action_kwargs),
+        cast(Any, conversation),
+    )
 
 
-def test_vision_api_config_rejects_placeholder_model(monkeypatch) -> None:
-    _clear_vision_env(monkeypatch)
-    monkeypatch.setenv("DF_API_BASE_URL", "https://openrouter.ai/api/v1")
-    monkeypatch.setenv("DF_MODEL_NAME", "router")
+def test_storage_directory_listing_capped(monkeypatch, tmp_path) -> None:
+    """Huge directory listings are capped in the text with a refine hint."""
+    total = _MAX_LISTED_ENTRIES + 30
+    observation = _storage_listing_executor_observation(monkeypatch, tmp_path, total)
 
-    with pytest.raises(ValueError, match="unsubstituted placeholder"):
-        _vision_api_config()
+    assert not observation.is_error
+    assert f"contains {total} files" in observation.text
+    assert f"Listing capped at {_MAX_LISTED_ENTRIES} of {total}" in observation.text
+    assert f"and {total - _MAX_LISTED_ENTRIES} more entries" in observation.text
+    assert "use path_filter" in observation.text
+    assert "agentTest/part_0099.jsonl" in observation.text
+    assert "agentTest/part_0100.jsonl" not in observation.text
+    assert len(observation.entries) == total
+
+
+def test_storage_directory_path_filter_narrows(monkeypatch, tmp_path) -> None:
+    """path_filter narrows the listing before the cap applies."""
+    total = _MAX_LISTED_ENTRIES + 30
+    observation = _storage_listing_executor_observation(
+        monkeypatch, tmp_path, total, path_filter="PART_010"
+    )
+
+    assert not observation.is_error
+    assert "contains 10 files" in observation.text
+    assert "Listing capped" not in observation.text
+    assert "agentTest/part_0105.jsonl" in observation.text
+    assert "agentTest/part_0099.jsonl" not in observation.text
+    assert len(observation.entries) == 10
+
+
+def test_storage_directory_path_filter_no_match(monkeypatch, tmp_path) -> None:
+    observation = _storage_listing_executor_observation(
+        monkeypatch, tmp_path, 5, path_filter="zzz"
+    )
+
+    assert not observation.is_error
+    assert "No entries under agentTest/ match path_filter 'zzz'" in observation.text
+    assert observation.is_dir is True
+    assert observation.entries == []
+
+
+_STORAGE_RETRY_PATCH = "openhands.tools.pyromind_dataset.definition.time.sleep"
+
+
+def test_post_json_retries_connect_error_then_succeeds(monkeypatch) -> None:
+    """Transient ConnectError blips retry in-tool instead of burning a whole
+    agent turn on a manual retry."""
+    calls: list[int] = []
+    sleeps: list[float] = []
+
+    def fake_post(url, *, headers, json, timeout):
+        calls.append(1)
+        if len(calls) < 3:
+            raise httpx.ConnectError("EOF occurred in violation of protocol")
+        return _Response(200, {"success": True, "data": {"list": []}})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(_STORAGE_RETRY_PATCH, sleeps.append)
+
+    result = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )._post_json("get_file_metadata", {"path": "x"}, {})
+
+    assert isinstance(result, dict)
+    assert len(calls) == 3
+    assert len(sleeps) == 2
+    assert sleeps[1] > sleeps[0]
+
+
+def test_post_json_gives_up_after_bounded_retries(monkeypatch) -> None:
+    def fake_post(url, *, headers, json, timeout):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(_STORAGE_RETRY_PATCH, lambda seconds: None)
+
+    result = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )._post_json("get_url", {"path": "x"}, {})
+
+    assert isinstance(result, str)
+    assert "get_url" in result
+    assert "ConnectError" in result
+
+
+def test_download_range_retries_connect_error_and_resets_partial_bytes(
+    monkeypatch,
+) -> None:
+    """A mid-stream failure must not concatenate the partial bytes of the
+    first attempt onto the retried download."""
+    image = b"chosen-part"
+
+    class _FlakyStream:
+        def __init__(self, content: bytes) -> None:
+            self._content = content
+            self.status_code = 200
+            self.headers: dict[str, str] = {}
+
+        def __enter__(self) -> "_FlakyStream":
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        def iter_bytes(self):
+            yield self._content
+
+    class _PartialThenFailStream(_FlakyStream):
+        def iter_bytes(self):
+            yield b"stale-"
+            raise httpx.ConnectError("EOF occurred in violation of protocol")
+
+    attempts: list[int] = []
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        attempts.append(1)
+        if len(attempts) == 1:
+            return _PartialThenFailStream(image)
+        return _FlakyStream(image)
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    monkeypatch.setattr(_STORAGE_RETRY_PATCH, lambda seconds: None)
+
+    result = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )._download_range("https://download.test/file", "data/file.txt", 0, 99)
+
+    assert result == image
+    assert len(attempts) == 2
+
+
+def test_directory_listing_hint_points_at_file_modes(monkeypatch, tmp_path) -> None:
+    """Listing a file path tells the agent what to do instead of guessing."""
+    _patch_shared_empty(monkeypatch)
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            return _Response(200, {"success": True, "data": {"list": []}})
+        if url.endswith("/get_file_metadata"):
+            return _Response(
+                200,
+                {"success": True, "data": {"is_dir": True, "metadata": {}}},
+            )
+        raise AssertionError(f"unexpected POST URL: {url}")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="agentTest/dataset.jsonl"),
+        cast(Any, conversation),
+    )
+
+    assert "No files or folders found under agentTest/dataset.jsonl" in observation.text
+    assert "mode=inspect or mode=sample" in observation.text

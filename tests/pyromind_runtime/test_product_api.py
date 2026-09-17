@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import harness_adapter.pi_adapter.adapter as pi_adapter_module
+import httpx
+from fastapi import FastAPI
+from harness_adapter.pi_adapter import PiAdapter
+from pyromind_agent_server.api.router import _resolve_cursor, _sse_stream
+from pyromind_agent_server.app import create_app
+from pyromind_agent_server.bootstrap import install_product_api
+from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.infrastructure.file_product_store import FileProductStore
+
+from openhands.agent_server.config import Config
+from openhands.agent_server.conversation_service import ConversationService
+
+from .fake_adapter import FakeAdapter
+
+
+def _app(tmp_path, runtime: ConversationRuntime) -> FastAPI:
+    app = FastAPI()
+    app.state.config = Config(
+        conversations_path=tmp_path / "conversations",
+        workspace_path=tmp_path / "workspace",
+        enable_session_api_key_auth=False,
+        enable_pyromind_jwt_auth=False,
+    )
+    app.state.conversation_service = ConversationService(
+        conversations_dir=tmp_path / "conversations"
+    )
+    app.state.product_runtime = runtime
+    from pyromind_agent_server.api.router import create_product_router
+
+    app.include_router(create_product_router())
+    return app
+
+
+async def test_composed_app_mounts_product_router(tmp_path) -> None:
+    app = create_app(
+        Config(
+            conversations_path=tmp_path / "conversations",
+            workspace_path=tmp_path / "workspace",
+            enable_session_api_key_auth=False,
+            enable_pyromind_jwt_auth=False,
+        )
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/api/v2/pyromind/conversations",
+            headers={"x-pyromind-debug-user-id": "42"},
+        )
+
+    # Lifespan is intentionally not entered, so the runtime is unavailable;
+    # 503 proves the composed app matched the Product route instead of 404.
+    assert response.status_code == 503
+
+
+async def test_http_create_list_snapshot_and_command(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter)
+    transport = httpx.ASGITransport(app=_app(tmp_path, runtime))
+    headers = {"x-pyromind-debug-user-id": "42"}
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers=headers
+    ) as client:
+        created = await client.post(
+            "/api/v2/pyromind/conversations",
+            json={"llm": {"model": "test-model"}, "message": "hello"},
+        )
+        assert created.status_code == 201
+        conversation_id = created.json()["conversation_id"]
+        listed = await client.get("/api/v2/pyromind/conversations")
+        snapshot = await client.get(
+            f"/api/v2/pyromind/conversations/{conversation_id}/snapshot"
+        )
+        command = await client.post(
+            f"/api/v2/pyromind/conversations/{conversation_id}/commands",
+            json={
+                "command_id": "command-1",
+                "type": "user_message",
+                "content": [{"type": "text", "text": "continue"}],
+            },
+        )
+        retry = await client.post(
+            f"/api/v2/pyromind/conversations/{conversation_id}/commands",
+            json={
+                "command_id": "command-1",
+                "type": "user_message",
+                "content": [{"type": "text", "text": "continue"}],
+            },
+        )
+
+    assert [item["conversation_id"] for item in listed.json()] == [conversation_id]
+    assert snapshot.json()["timeline"][0]["kind"] == "message"
+    assert command.status_code == 202
+    assert command.json() == retry.json()
+    assert adapter.created_specs[0].workspace_root == str(
+        conversations / conversation_id
+    )
+    await runtime.close()
+
+
+async def test_sse_uses_persisted_sequence_as_event_id(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    runtime = ConversationRuntime(conversations, FakeAdapter())
+    context = RequestContext(user_id="42")
+    from pyromind_runtime.ports.harness import SessionSpec
+
+    snapshot = await runtime.create_conversation(
+        SessionSpec(
+            conversation_id="conversation-sse",
+            user_id="42",
+            workspace_root=str(conversations),
+        ),
+        context,
+    )
+    stream = _sse_stream(runtime, snapshot.conversation_id, 0, context)
+    first = await asyncio.wait_for(anext(stream), timeout=1)
+    assert first == ": connected\n\n"
+    event_frame = await asyncio.wait_for(anext(stream), timeout=1)
+    assert "id: 1\n" in event_frame
+    assert "event: conversation.created\n" in event_frame
+    assert '"seq":1' in event_frame
+    await stream.aclose()
+    await runtime.close()
+
+
+def test_sse_cursor_prefers_after_seq_and_validates_last_event_id() -> None:
+    assert _resolve_cursor(4, "2") == 4
+    assert _resolve_cursor(None, "2") == 2
+
+
+def test_install_product_api_does_not_modify_openhands_routes() -> None:
+    app = FastAPI()
+    original = app.router.lifespan_context
+    installed = install_product_api(app)
+    assert installed is app
+    assert app.router.lifespan_context is not original
+
+
+async def test_product_api_creates_pi_metadata_and_reports_missing_checkpoint(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, _config) -> None:
+            return None
+
+        async def request(self, method, params):
+            if method == "context.append":
+                return {"checkpoint_entry_id": "workflow-checkpoint"}
+            if method == "fork":
+                target = Path(params["target_session_dir"]) / "branched.jsonl"
+                target.write_text('{"type":"session"}\n', encoding="utf-8")
+                return {"session_path": str(target)}
+            raise AssertionError(f"unexpected runner request: {method}")
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    runtime = ConversationRuntime(
+        conversations,
+        {
+            "openhands": FakeAdapter(),
+            "pi": PiAdapter(conversations, terminal_backend="os-sandbox"),
+        },
+        default_harness_id="pi",
+    )
+    transport = httpx.ASGITransport(app=_app(tmp_path, runtime))
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"x-pyromind-debug-user-id": "42"},
+    ) as client:
+        created = await client.post(
+            "/api/v2/pyromind/conversations",
+            json={
+                "llm": {"model": "gpt-4o", "api_key": "request-secret"},
+                "workflow_xyflow": {
+                    "name": "Workflow",
+                    "nodes": [
+                        {"id": "n1", "data": {"nodeType": "CloneAndCacheDataset"}}
+                    ],
+                    "edges": [],
+                },
+            },
+        )
+        assert created.status_code == 201
+        conversation_id = created.json()["conversation_id"]
+        forked = await client.post(
+            f"/api/v2/pyromind/conversations/{conversation_id}/forks",
+            json={"eventId": "event-1"},
+        )
+        assert created.json()["current_workflow"] is None
+        adapter = runtime.adapters["pi"]
+        assert isinstance(adapter, PiAdapter)
+        session = adapter._session(conversation_id)
+        frame = {
+            "protocolVersion": 2,
+            "type": "pi.event",
+            "sessionId": conversation_id,
+            "runId": "edited-run",
+            "eventId": "edit-final",
+            "kind": "tool.completed",
+            "payload": {
+                "tool_call_id": "edit",
+                "tool_name": "edit",
+                "arguments": {"path": "public_data/workflow_canvas/workflow.py"},
+                "content": [],
+            },
+        }
+        await adapter._runner_event(session, frame)
+        await adapter._runner_event(
+            session,
+            {
+                **frame,
+                "eventId": "finish-final",
+                "kind": "run.finished",
+                "payload": {
+                    "outcome": {"status": "completed"},
+                    "checkpoint_entry_id": "workflow-checkpoint",
+                },
+            },
+        )
+        async with asyncio.timeout(2):
+            while (
+                not FileProductStore(conversations / conversation_id)
+                .load_snapshot()
+                .current_workflow
+            ):
+                await asyncio.sleep(0.01)
+        workflow_event = next(
+            event
+            for event in FileProductStore(conversations / conversation_id).replay()
+            if event.type == "workflow.updated"
+        )
+        valid_fork = await client.post(
+            f"/api/v2/pyromind/conversations/{conversation_id}/forks",
+            json={"eventId": workflow_event.event_id, "title": "Pi fork"},
+        )
+    metadata = (conversations / conversation_id / "product" / "meta.json").read_text()
+    assert '"harness_id":"pi"' in metadata
+    assert "request-secret" not in metadata
+    workflow = (
+        conversations
+        / conversation_id
+        / "public_data"
+        / "workflow_canvas"
+        / "workflow.py"
+    )
+    workflow_text = workflow.read_text()
+    assert workflow_text.startswith("# workflow: Workflow")
+    assert 'CloneAndCacheDataset(id="n1")' in workflow_text
+    canvas = workflow_event.payload["canvas"]
+    assert isinstance(canvas, dict) and canvas["nodes"]
+    assert forked.status_code == 404
+    assert forked.json()["detail"]["code"] == "checkpoint_not_found"
+    assert valid_fork.status_code == 201
+    target_id = valid_fork.json()["conversation_id"]
+    assert target_id != conversation_id
+    assert (
+        valid_fork.json()["current_workflow"]["version"]
+        == workflow_event.payload["version"]
+    )
+    assert (conversations / target_id / "pi" / "session.jsonl").is_file()
+    await runtime.close()

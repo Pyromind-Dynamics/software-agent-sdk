@@ -12,7 +12,7 @@ import pytest
 
 
 _ROOT = Path(__file__).parents[3]
-_SCRIPTS = _ROOT / ".agents" / "skills" / "data-cleaning" / "scripts"
+_SCRIPTS = _ROOT / ".agents" / "skills" / "data-processing" / "scripts" / "cleaning"
 
 
 def _load_module(name: str, path: Path) -> ModuleType:
@@ -574,9 +574,16 @@ def test_validator_always_writes_report_and_rejects_empty_output(
 
 
 def test_skill_requires_platform_sample_and_user_confirmation():
-    skill = (_ROOT / ".agents" / "skills" / "data-cleaning" / "SKILL.md").read_text(
-        encoding="utf-8"
-    )
+    skill = (
+        _ROOT
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "references"
+        / "paradigms"
+        / "format-conversion"
+        / "playbook.md"
+    ).read_text(encoding="utf-8")
 
     assert "limit=3" in skill
     assert "等待用户明确确认" in skill
@@ -610,8 +617,10 @@ def test_example_cleaner_only_imports_public_utils(runtime_modules):
         _ROOT
         / ".agents"
         / "skills"
-        / "data-cleaning"
+        / "data-processing"
         / "references"
+        / "paradigms"
+        / "format-conversion"
         / "example_clean_script.py"
     )
     tree = ast.parse(example.read_text(encoding="utf-8"))

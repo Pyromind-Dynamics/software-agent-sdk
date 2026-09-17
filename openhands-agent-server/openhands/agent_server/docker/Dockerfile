@@ -52,6 +52,10 @@ COPY --chown=${USERNAME}:${USERNAME} openhands-sdk ./openhands-sdk
 COPY --chown=${USERNAME}:${USERNAME} openhands-tools ./openhands-tools
 COPY --chown=${USERNAME}:${USERNAME} openhands-workspace ./openhands-workspace
 COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server ./openhands-agent-server
+COPY --chown=${USERNAME}:${USERNAME} openhands-embodied-runtime ./openhands-embodied-runtime
+COPY --chown=${USERNAME}:${USERNAME} pyromind-runtime ./pyromind-runtime
+COPY --chown=${USERNAME}:${USERNAME} harness-adapter ./harness-adapter
+COPY --chown=${USERNAME}:${USERNAME} pyromind-agent-server ./pyromind-agent-server
 RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
     EXTRA_FLAGS=""; \
     if [ "$ENABLE_VERTEX" = "1" ]; then EXTRA_FLAGS="--extra vertex"; fi; \

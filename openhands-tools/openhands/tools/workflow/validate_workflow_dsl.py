@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from pydantic.json_schema import SkipJsonSchema
 from rich.text import Text
 
 from openhands.sdk.tool.registry import register_tool
@@ -35,6 +36,7 @@ PROD_VALIDATE_URL = (
 PYROMIND_VALIDATE_AUTH_COOKIE_SECRET = "PYROMIND_VALIDATE_AUTH_COOKIE"
 PYROMIND_VALIDATE_HEADERS_STATE_KEY = "pyromind_validate_workflow_dsl_headers"
 _PROD_APP_ENVS = {"prod", "production", "online"}
+_MAX_DSL_FILE_BYTES = 2 * 1024 * 1024
 
 
 def _default_validate_url() -> str:
@@ -127,17 +129,26 @@ class WorkflowValidationIssue(BaseModel):
 
 
 class ValidateWorkflowDslAction(Action):
-    dsl: str | None = Field(
+    dsl_path: str | None = Field(
         default=None,
         description=(
-            "Pyromind workflow Python DSL source code to validate (not a file path). "
-            "Pass the declarative workflow script text the agent generated or "
-            "edited. If omitted, the tool reads the saved "
-            "`public_data/workflow_canvas/workflow.py` contents "
-            "from the active conversation workspace."
+            "Optional workspace-relative path to the Pyromind workflow Python DSL "
+            f"file. Defaults to `{WORKFLOW_RELATIVE_PATH}`, the canonical "
+            "conversation workflow, so omit it unless validating another file. "
+            "Absolute paths, parent traversal, and symlinks are rejected."
         ),
     )
+    # Kept out of the generated tool schema. This only allows persisted legacy
+    # actions and old executor tests to deserialize while agents see dsl_path as
+    # the sole DSL input.
+    dsl: SkipJsonSchema[str | None] = Field(default=None, exclude=True)
     name: str = Field(default="workflow", description="Workflow name.")
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "ValidateWorkflowDslAction":
+        if self.dsl_path is not None and self.dsl is not None:
+            raise ValueError("pass at most one of dsl_path or legacy dsl")
+        return self
 
     @property
     def visualize(self) -> Text:
@@ -375,19 +386,44 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
     ) -> str:
         if action.dsl is not None:
             return action.dsl
+        dsl_path = action.dsl_path or WORKFLOW_RELATIVE_PATH
         if conversation is None:
             raise ValueError(
-                "Cannot read workflow.py without an active conversation. "
-                "Pass `dsl` explicitly or call this tool from a conversation."
+                "Cannot read a workflow DSL path without an active conversation "
+                "workspace."
             )
 
         workspace = cast(Any, conversation).workspace
-        workflow_path = Path(workspace.working_dir) / WORKFLOW_RELATIVE_PATH
+        workspace_root = Path(workspace.working_dir).resolve()
+        relative_path = Path(dsl_path)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError(
+                f"Workflow DSL path must stay inside the workspace: {dsl_path!r}"
+            )
+        current = workspace_root
+        for part in relative_path.parts:
+            current /= part
+            if current.is_symlink():
+                raise ValueError(
+                    f"Workflow DSL path must not contain symlinks: {dsl_path!r}"
+                )
+        workflow_path = (workspace_root / relative_path).resolve()
+        if not workflow_path.is_relative_to(workspace_root):
+            raise ValueError(
+                f"Workflow DSL path must stay inside the workspace: {dsl_path!r}"
+            )
         if not workflow_path.is_file():
             raise ValueError(
-                f"Cannot validate workflow DSL: {workflow_path} does not exist."
+                f"Cannot read workflow DSL file: {dsl_path!r} does not exist."
             )
-        return workflow_path.read_text(encoding="utf-8")
+        if workflow_path.stat().st_size > _MAX_DSL_FILE_BYTES:
+            raise ValueError(
+                f"Workflow DSL file exceeds {_MAX_DSL_FILE_BYTES} bytes: {dsl_path!r}"
+            )
+        try:
+            return workflow_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Workflow DSL file must be UTF-8: {dsl_path!r}") from exc
 
     def _resolve_secret_headers(
         self,

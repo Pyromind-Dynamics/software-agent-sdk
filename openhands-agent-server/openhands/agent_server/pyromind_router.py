@@ -56,7 +56,7 @@ from openhands.agent_server.pyromind_subagent import (
 )
 from openhands.agent_server.run_workflow_callback import (
     RunWorkflowCallbackResult,
-    deliver_run_workflow_status,
+    dispatch_run_workflow_status as deliver_run_workflow_status,
 )
 from openhands.agent_server.workflow_canvas_models import WorkflowCanvasEventSnapshot
 from openhands.agent_server.workflow_canvas_store import (
@@ -83,6 +83,11 @@ from openhands.tools.data_preparation import (
     DfSubmitPipelineTool,
 )
 from openhands.tools.data_preparation.progress import DfCheckProgressExecutor
+from openhands.tools.environment_processing import (
+    EdpAggregateTool,
+    EdpRenderTool,
+    EdpSubmitTool,
+)
 from openhands.tools.preset.codex import get_codex_agent
 from openhands.tools.preset.default import register_default_tools
 from openhands.tools.pyromind_archive import ExtractArchiveTool
@@ -97,6 +102,17 @@ from openhands.tools.pyromind_dataset.definition import (
 )
 from openhands.tools.pyromind_debug import get_debug_result_broker
 from openhands.tools.pyromind_remote_dataset import PreviewRemoteDatasetTool
+from openhands.tools.sandbox import (
+    SandboxCreateTool,
+    SandboxDeleteFileTool,
+    SandboxDeleteTool,
+    SandboxDownloadTool,
+    SandboxReadFileTool,
+    SandboxTerminalTool,
+    SandboxUploadTool,
+    SandboxWriteFileTool,
+)
+from openhands.tools.training_analysis import TrainingAnalysisTool
 from openhands.tools.utils import PUBLIC_READ_ALIASES
 from openhands.tools.workflow import (
     RunWorkflowTool,
@@ -149,8 +165,9 @@ _DEFAULT_SKILLS_PATH = os.environ.get(
 _PYROMIND_SKILL_NAMES = [
     "generate-workflow-dsl",
     "debug-workflow",
-    "data-cleaning",
-    "data-preparation",
+    "data-processing",
+    "embodied-data-cleaning",
+    "sandbox",
     "training-analysis",
 ]
 _PYROMIND_VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
@@ -184,38 +201,27 @@ local files. Read them with `preview_dataset` directly, without searching
 local files. Only `public_data/...` paths are local.
 
 Skill usage rules:
-- A conversation may already contain a workflow at
-  `public_data/workflow_canvas/workflow.py`. Before asking for information or
-  answering any request that may inspect, modify, validate, test, or run the
-  current workflow, read that file in full with `file_editor`. Apply this rule
-  especially to short contextual requests such as "看数据", "改一下", or
-  "换个模型". Reuse dataset/model identifiers and topology already present in
-  the file instead of asking the user to provide them again.
-- Immediately after that single workflow read, invoke the matching listed skill.
-  Then read only the exact `references/` resource that the skill requires. For
-  a local workflow edit, do not inspect general `knowledge/` before invoking the
-  skill, and do not inspect it afterward unless the skill explicitly requires it.
+- Every user turn is preceded by a `<system_reminder>` stating whether
+  `public_data/workflow_canvas/workflow.py` exists. It is authoritative; never
+  run a command or read another file to confirm it. When the workflow exists,
+  read it in full with `file_editor` before asking for information or answering
+  any request that may inspect, modify, validate, test, or run the current
+  workflow, including short contextual requests that presuppose it, and reuse
+  the dataset/model identifiers and topology already in the file instead of
+  asking the user to provide them again.
+- Then invoke the matching listed skill, and read only the exact `references/`
+  resource that the skill requires. For a local workflow edit, do not inspect
+  general `knowledge/` before invoking the skill, and do not inspect it
+  afterward unless the skill explicitly requires it.
 - For requests that do not involve a current workflow, invoke a matching listed
   skill before searching the knowledge base.
-- Data processing routing (`data-cleaning` vs `data-preparation`):
-  Analyze the task semantics to decide which skill to invoke.
-  * Use `data-cleaning` when the task is about FORMAT/STRUCTURE transformation:
-    converting data to messages or DPO format, field renaming/mapping,
-    dialogue structure parsing, format validation, structural deduplication.
-    Also suitable for simple content filtering (regex, keyword, length) when
-    platform reliability (checkpoint resume, error isolation, report) matters.
-    Key signal: format conversion is the primary goal, or simple filtering
-    needs reliable execution on large Pyromind Storage datasets.
-  * Use `data-preparation` when the task is about CONTENT-level processing:
-    - Rule-based content cleaning: word count filtering, language detection,
-      MinHash/SimHash dedup, PII removal, toxicity filtering, emoji/HTML
-      removal, blocklist, spelling correction.
-    - LLM-intelligent processing: generating QA/CoT/summaries, semantic
-      quality scoring, text rewriting/refinement, multi-field reasoning.
-    Key signal: the data content itself is evaluated, filtered, or transformed.
-  * If the user explicitly names a mode ("DataFlow"/"脚本清洗"/"格式转换"),
-    follow their choice. If the intent is genuinely ambiguous after analysis,
-    ask the user to clarify before invoking either skill.
+- Data processing: invoke the `data-processing` skill for any dataset
+  cleaning, preparation, or environment-dependent processing request; its
+  SKILL.md routing table selects the processing paradigm (format-conversion
+  for deterministic format/structure transformation, llm-pipeline for
+  content-level processing with DataFlow operators or LLM). If the user
+  explicitly names a mode ("DataFlow"/"脚本清洗"/"格式转换"), follow their
+  choice. If the intent is genuinely ambiguous, ask the user before invoking.
 - Treat any requested node, model, parameter, data, or topology change as a
   `generate-workflow-dsl` request, including phrases such as "换个模型跑一下"
   or "跑下 <model> 的效果". Modify and validate the DSL, then stop; do not
@@ -386,6 +392,29 @@ def _build_analyze_task_failure_tool(
     return Tool(name=AnalyzeTaskFailureTool.name, params=params), secrets
 
 
+def _build_training_analysis_tool(
+    http_request: Request,
+    extra: dict[str, Any],
+    skills_path: str | Path,
+) -> tuple[Tool, dict[str, SecretSource]]:
+    """Build ``training_analysis`` with server-only studio auth wiring."""
+    headers, secret_headers, secrets = _build_studio_api_auth(http_request, extra)
+    params: dict[str, Any] = {
+        "runtime_dir": str(Path(skills_path) / "training-analysis" / "scripts")
+    }
+    api_base = extra.get("training_analysis_api_base")
+    if isinstance(api_base, str) and api_base.strip():
+        params["api_base"] = api_base.strip()
+    timeout_seconds = extra.get("training_analysis_timeout_seconds")
+    if isinstance(timeout_seconds, (int, float)) and timeout_seconds > 0:
+        params["timeout_seconds"] = timeout_seconds
+    if headers:
+        params["headers"] = headers
+    if secret_headers:
+        params["secret_headers"] = secret_headers
+    return Tool(name=TrainingAnalysisTool.name, params=params), secrets
+
+
 def _load_env_to_tools(
     http_request: Request, params: dict[str, Any], secrets: dict[str, SecretSource]
 ) -> tuple[dict[str, Any], dict[str, SecretSource]]:
@@ -467,6 +496,45 @@ def _build_workflow_debug_tool(
     return Tool(name=WorkflowDebugTool.name, params=params), secrets
 
 
+_SANDBOX_TOOL_TYPES = (
+    SandboxCreateTool,
+    SandboxDeleteTool,
+    SandboxReadFileTool,
+    SandboxWriteFileTool,
+    SandboxDeleteFileTool,
+    SandboxTerminalTool,
+)
+
+
+def _build_sandbox_tools(
+    http_request: Request,
+    extra: dict[str, Any],
+) -> tuple[list[Tool], dict[str, SecretSource]]:
+    """Build the Pyromind sandbox tools with deployment and auth wiring."""
+    params: dict[str, Any] = {}
+    secrets: dict[str, SecretSource] = {}
+    params, secrets = _load_env_to_tools(
+        http_request=http_request,
+        params=params,
+        secrets=secrets,
+    )
+    secrets = _load_auth_token(http_request=http_request, secrets=secrets)
+    default_image = extra.get("sandbox_default_image") or os.environ.get(
+        "PYROMIND_SANDBOX_DEFAULT_IMAGE"
+    )
+    sandbox_tools = []
+    for tool_type in _SANDBOX_TOOL_TYPES:
+        tool_params = dict(params)
+        if (
+            tool_type is SandboxCreateTool
+            and isinstance(default_image, str)
+            and default_image
+        ):
+            tool_params["default_image"] = default_image
+        sandbox_tools.append(Tool(name=tool_type.name, params=tool_params))
+    return sandbox_tools, secrets
+
+
 def _build_pyromind_storage_tools(
     http_request: Request,
     extra: dict[str, Any],
@@ -508,7 +576,7 @@ def _build_pyromind_storage_tools(
     if isinstance(cleaning_output_root, str) and cleaning_output_root:
         cleaning_params["output_root"] = cleaning_output_root
     cleaning_params["runtime_dir"] = str(
-        Path(skills_path) / "data-cleaning" / "scripts"
+        Path(skills_path) / "data-processing" / "scripts" / "cleaning"
     )
     if "storage_base_url" in params:
         cleaning_params["storage_base_url"] = params["storage_base_url"]
@@ -520,7 +588,16 @@ def _build_pyromind_storage_tools(
     # DataFlow platform submission tool params (mirrors cleaning pattern)
     preparation_params: dict[str, Any] = dict(cleaning_params)
     preparation_params["runtime_dir"] = str(
-        Path(skills_path) / "data-preparation" / "scripts"
+        Path(skills_path) / "data-processing" / "scripts" / "preparation"
+    )
+
+    # Env-validation platform submission tool params (mirrors preparation
+    # pattern; runtime_dir points at the skill's scripts, output_root stays
+    # unset so the tool defaults under PYROMIND_AGENT_STORAGE_ROOT).
+    edp_params: dict[str, Any] = dict(cleaning_params)
+    edp_params.pop("output_root", None)
+    edp_params["runtime_dir"] = str(
+        Path(skills_path) / "data-processing" / "scripts" / "edp"
     )
 
     # Stop-task tool talks to the studio_api portal (APP_ENV-derived URL),
@@ -538,6 +615,9 @@ def _build_pyromind_storage_tools(
     if isinstance(extraction_output_root, str) and extraction_output_root:
         extraction_params["output_root"] = extraction_output_root
 
+    sandbox_storage_params: dict[str, Any] = dict(extraction_params)
+    sandbox_storage_params.pop("output_root", None)
+
     return (
         [
             Tool(
@@ -547,10 +627,15 @@ def _build_pyromind_storage_tools(
             Tool(name=UploadFileToPyromindTool.name, params=dict(params)),
             Tool(name=RunDatasetCleaningTool.name, params=cleaning_params),
             Tool(name=DfSubmitPipelineTool.name, params=preparation_params),
+            Tool(name=EdpSubmitTool.name, params=edp_params),
+            Tool(name=EdpRenderTool.name, params=edp_params),
+            Tool(name=EdpAggregateTool.name, params=edp_params),
             Tool(name=DfCheckProgressTool.name, params=dict(params)),
             Tool(name=DfStopTaskTool.name, params=stop_params),
             Tool(name=ExtractArchiveTool.name, params=extraction_params),
             Tool(name=PreviewRemoteDatasetTool.name, params={}),
+            Tool(name=SandboxUploadTool.name, params=sandbox_storage_params),
+            Tool(name=SandboxDownloadTool.name, params=sandbox_storage_params),
         ],
         secrets,
     )
@@ -627,6 +712,12 @@ class PyromindLLMConfig(BaseModel):
     )
     base_url: str | None = Field(
         default_factory=lambda: os.environ.get("LLM_BASE_URL"),
+    )
+    api: Literal["openai-completions", "openai-responses"] | None = None
+    context_window: int | None = Field(default=None, gt=0)
+    timeout: int | None = Field(
+        default=None,
+        description=("LLM request timeout in seconds. Server-default 60s when unset."),
     )
 
     @field_validator("base_url", mode="before")
@@ -863,24 +954,52 @@ def _empty_workflow_reminder() -> TextContent:
     )
 
 
+def _existing_workflow_reminder() -> TextContent:
+    return TextContent(
+        text=(
+            "<system_reminder>\n"
+            "A workflow already exists at public_data/workflow_canvas/workflow.py. "
+            "Treat it as authoritative context: read the full file with "
+            "file_editor before interpreting this request or asking for dataset, "
+            "model, or topology details already present there.\n"
+            "</system_reminder>"
+        )
+    )
+
+
+def _workflow_state_reminder(working_dir: Path) -> TextContent:
+    """Describe whether workflow.py exists, straight from the workspace.
+
+    The agent's standing instruction is to read workflow.py before touching the
+    current workflow, so every turn must say whether that file is there. This
+    check reads the filesystem rather than the request payload so it also holds
+    for clients that never attach canvas state.
+    """
+    workflow_path = working_dir / WORKFLOW_RELATIVE_PATH
+    if workflow_path.is_file() and _normalize_dsl(
+        workflow_path.read_text(encoding="utf-8")
+    ):
+        return _existing_workflow_reminder()
+    return _empty_workflow_reminder()
+
+
 def _sync_workflow_with_canvas(
     working_dir: Path, workflow_dsl: str | None
-) -> TextContent | None:
+) -> TextContent:
     """Reconcile workflow.py with the DSL converted from the canvas xyflow.
 
     The user can edit the canvas between agent turns, so workflow.py must be
     re-synced from the converted canvas state before each new user message is
-    processed -- otherwise the agent would keep editing a stale version. Returns a
-    ``<system_reminder>`` TextContent to inject into the LLM's context (via
-    ``extended_content``) when workflow.py changed or the attached canvas is
-    confirmed empty, or None when no canvas state was attached.
+    processed -- otherwise the agent would keep editing a stale version. Always
+    returns a ``<system_reminder>`` TextContent to inject into the LLM's context
+    (via ``extended_content``) describing the resulting workflow state.
 
-    `workflow_dsl=None` means the caller attached no xyflow canvas state at all
-    and is a deliberate no-op, distinct from `workflow_dsl=""` which means the
-    canvas is genuinely empty.
+    `workflow_dsl=None` means the caller attached no xyflow canvas state at all,
+    which skips the sync but still reports the workspace's current state; it is
+    distinct from `workflow_dsl=""`, which means the canvas is genuinely empty.
     """
     if workflow_dsl is None:
-        return None
+        return _workflow_state_reminder(working_dir)
 
     workflow_path = working_dir / WORKFLOW_RELATIVE_PATH
     existed = workflow_path.is_file()
@@ -890,7 +1009,7 @@ def _sync_workflow_with_canvas(
     normalized_current = _normalize_dsl(current)
     if normalized_canvas == normalized_current:
         if normalized_canvas:
-            return None
+            return _existing_workflow_reminder()
         return _empty_workflow_reminder()
 
     workflow_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1185,10 +1304,17 @@ async def create_pyromind_conversation(
     analysis_tool, analysis_secrets = _build_analyze_task_failure_tool(
         http_request, request.extra
     )
+    training_tool, training_secrets = _build_training_analysis_tool(
+        http_request, request.extra, skills_path
+    )
 
     # run_workflow / workflow_debug reuse validate auth/header wiring
     run_tool, run_secrets = _build_workflow_run_tool(http_request)
     debug_tool, debug_secrets = _build_workflow_debug_tool(http_request)
+    sandbox_tools, sandbox_secrets = _build_sandbox_tools(
+        http_request,
+        request.extra,
+    )
     # storage
     storage_tools, storage_secrets = _build_pyromind_storage_tools(
         http_request, request.extra, skills_path
@@ -1200,6 +1326,8 @@ async def create_pyromind_conversation(
         model=request.llm.model,
         api_key=request.llm.api_key,
         base_url=request.llm.base_url,
+        stream=True,
+        timeout=request.llm.timeout or 60,
         persist_runtime_config=False,
     )
 
@@ -1223,19 +1351,24 @@ async def create_pyromind_conversation(
             Tool(name="file_editor"),
             Tool(name=PyromindSubAgentTool.name),
             Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
+            *sandbox_tools,
             *storage_tools,
             Tool(name="dataset_download"),
             Tool(
                 name="df_run_pipeline",
                 params={
                     "runtime_dir": str(
-                        Path(skills_path) / "data-preparation" / "scripts"
+                        Path(skills_path)
+                        / "data-processing"
+                        / "scripts"
+                        / "preparation"
                     )
                 },
             ),
             Tool(name="df_convert"),
             validation_tool,
             analysis_tool,
+            training_tool,
         ],
     )
 
@@ -1263,8 +1396,10 @@ async def create_pyromind_conversation(
         secrets={
             **validation_secrets,
             **analysis_secrets,
+            **training_secrets,
             **run_secrets,
             **debug_secrets,
+            **sandbox_secrets,
             **storage_secrets,
         },
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
@@ -1293,27 +1428,12 @@ async def create_pyromind_conversation(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Conversation event service not found: {info.id}",
             )
-        if workflow_dsl:
-            initial_reminder = TextContent(
-                text=(
-                    "<system_reminder>\n"
-                    "A workflow from the current canvas is already loaded at "
-                    "public_data/workflow_canvas/workflow.py. Treat it as "
-                    "authoritative context. Read the full file with file_editor "
-                    "before interpreting this request or asking for dataset, "
-                    "model, or topology details already present there.\n"
-                    "</system_reminder>"
-                )
-            )
-        elif request.workflow_xyflow is not None:
-            initial_reminder = _empty_workflow_reminder()
-        else:
-            initial_reminder = None
+        initial_reminder = _workflow_state_reminder(conversation_dir)
 
         await event_service.send_message(
             Message(role="user", content=[TextContent(text=request.message)]),
             run=True,
-            extended_content=[initial_reminder] if initial_reminder else None,
+            extended_content=[initial_reminder],
             workflow_dsl_snapshot=workflow_dsl,
             workflow_xyflow_snapshot=request.workflow_xyflow,
         )
@@ -1360,7 +1480,7 @@ async def send_pyromind_message(
     await event_service.send_message(
         message,
         run=request.run,
-        extended_content=[reminder] if reminder else None,
+        extended_content=[reminder],
         workflow_dsl_snapshot=workflow_dsl,
         workflow_xyflow_snapshot=request.workflow_xyflow,
     )

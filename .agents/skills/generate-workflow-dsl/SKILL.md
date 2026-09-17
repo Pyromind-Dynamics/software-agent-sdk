@@ -18,6 +18,10 @@ description: >-
 - 数据、模型和训练产物通过输出端口绑定；禁止用 Agent 本地 terminal 替代平台运行时或查找数据副本。
 - Benchmark 最小骨架是数据配置 → 模型入口 → VLLM → Metric → Eval。
 - 每个 `MetricsConfigBuilderNode` 只输出一个 `metrics_config`；契约未声明的组合方式不得猜测。
+- 节点拓扑、输入输出、必填项和枚举先按 `references/workflow-contracts.md` 生成；运行时契约以
+  `validate_workflow_dsl` 的实时结果为准。`knowledge/` 只作为校验暴露未覆盖契约时的定向补充资料。
+- GPU 枚举、必填端口等平台契约会随迭代漂移；不确定时构造最小可验证 DSL 调一次
+  `validate_workflow_dsl`，以返回的 `code`/`node_id`/`field` 为准，不要凭经验猜测。
 - Reference 是按缺失事实选择的索引，不是阅读清单；同一轮不得重复读取同一路径。
 - Skill 与 reference 足以生成初稿时不查 `knowledge/`。只有校验明确暴露未覆盖的平台契约时，
   才能围绕该错误定向查询一次。
@@ -28,11 +32,11 @@ description: >-
 |---|---|
 | `references/data-routing.md` | 判断数据源、preview 结果、训练格式、字段映射或训练类型 |
 | `references/workflow-contracts.md` | 完整生成或组合阶段时查拓扑、节点参数、端口、枚举和平台覆盖项 |
-| `references/parameter-decision.md` | 训练数值参数的整组决策或训练 OOM 调整 |
 | `references/custom-python-assets.md` | 内置 Metrics/Reward 不适用，需要生成、上传并回填 Python 入口 |
-| 其他 Skill: `training-analysis` | 分析已有训练效果（loss 异常/对比/优化超参）时，先调该 skill 产出报告与探针实验，再按 `parameter-decision.md` 落参数 |
+| 其他 Skill: `training-analysis` | 分析已有训练效果（loss 异常/对比/优化超参）时，先调该 skill 产出报告与探针实验，再整组落参数 |
 
-调用格式为 `skills_read(skill_name="generate-workflow-dsl", path="references/...")`。
+Reference 路径相对本 `SKILL.md` 所在目录。使用当前运行时原生的 Skill 读取能力打开精确路径；
+Pi 使用 `<available_skills>` 中的 Skill 位置并从该目录解析 reference，不要用 terminal 搜索 Skill。
 
 ## 执行状态机
 
@@ -65,7 +69,7 @@ description: >-
 
 - Storage 相对路径：按 `data-routing.md` 获取或复用数据画像。
 - 平台预置或外部数据集标识：选择 Clone/Download，不调用 `preview_dataset`。
-- 未提供数据：先索要 Storage 路径；只有用户明确要求演示/模板时才使用测试集。
+- 未提供数据：先索要 Storage 路径；用户明确要求演示/模板时直接使用公开测试集标识，不枚举用户 Storage。
 - 内部记录数据源、实际训练文件、N、P95 长度 L、字段、模态和样本形态，不向用户展示冗长清单。
 
 若数据不满足 `data-routing.md` 的训练格式，停止生成，指出缺失字段并给目标 JSONL 样例。
@@ -90,10 +94,11 @@ description: >-
 
 ### 5. 整组配参
 
-阶段锁定后，需要自动决定或调整训练数值时读取 `parameter-decision.md`，一次性确定 max sequence length、
-batch、grad accumulation、learning rate、epoch、LoRA rank、max steps 和 num generations。
+阶段锁定后，结合数据规模、P95 长度、模型规模和可用资源，一次性整组决定 max sequence length、
+batch、grad accumulation、learning rate、epoch、LoRA rank 和 GRPO 的 max steps、num generations
+与生成长度。平台默认值与 DSL 字段约束以 `workflow-contracts.md` 为准，其余调参自行推理。
 
-参数优先级：**用户明确要求 > 修改任务中已有有效值 > 数据与资源决策 > 模板兜底值**。
+参数优先级：**用户明确要求 > 修改任务中已有有效值 > 数据与资源决策 > 模型兜底**。
 不要只改一个相互依赖参数，也不要用模板覆盖无关配置。
 
 ### 6. 准备自定义资产
@@ -104,20 +109,26 @@ batch、grad accumulation、learning rate、epoch、LoRA rank、max steps 和 nu
 
 ### 7. 写入或局部修改
 
-- 文件固定为 `public_data/workflow_canvas/workflow.py`；新建或整体生成使用 `apply_patch`。
-- 修改前先读取现有文件，列出内部“需求验收项”和“图差分”，仅替换相关节点与连线。
+- 文件固定为 `public_data/workflow_canvas/workflow.py`；新建或整体生成直接写入该工作区相对路径。
+- 仅局部修改时先读取现有文件，列出内部“需求验收项”和“图差分”，仅替换相关节点与连线；文件不存在时直接停止并说明。
 - 所有上游产物都通过输出端口绑定。不得把 SFT、Merge、GRPO、Inference 之间的模型路径写死。
-- WandB 仅写 Secret 名；不得把 API Key、Cookie、集群凭证或其他明文 Secret 写入 DSL。
+- SFT/DPO/GRPO 的 `wandb_config`、`accelerate_config` 平台当前按必填校验：必须由对应 Builder
+  的输出端口连接，不得省略或写空串。WandB 仅写 Secret 名；不得把 API Key、Cookie、集群凭证或
+  其他明文 Secret 写入 DSL。
 
 ### 8. 校验闭环
 
-每次写入后立即调用 `validate_workflow_dsl`，不传 `dsl` 参数：
+每次写入后立即调用 `validate_workflow_dsl()`（缺省即校验工作区 `workflow.py`）；不要传 DSL 全文：
 
 1. `valid=true`：结束；warnings 只在最终回复简述。
 2. `valid=false`：按 `code`、`node_id`、`field` 和 `detail.*_node_code` 做唯一片段最小修改。
+   平台契约漂移（如 `MISSING_REQUIRED_INPUT`、`ENUM_VALUE_INVALID`）以校验返回为准，不得照搬
+   skill 旧表格；只修改当前 DSL，不在生成任务中编辑 Skill、reference 或 knowledge。
 3. `retryable=false`（包括 401）：立即停止，不重复校验，也不得用 terminal 探测凭证。
 4. `retryable=true`：最多重试两次；仍失败则停止并说明平台校验未完成。
 5. 最多修改五轮；同一错误连续两轮不消失时停止并报告。
+6. 对 GPU 枚举、必填端口等不确定契约，可构造只含目标节点和最小依赖的最小 DSL 单独调一次校验
+   探测，再据此生成正式工作流；不得用 `run_workflow` 探测。
 
 生成 Skill 不调用 `workflow_debug`、`run_workflow` 或 `run_dataset_cleaning`。只有不含配置修改的
 显式调试请求才转用 `debug-workflow`；“换模型/改参数后跑或看效果”本轮只修改并校验 DSL，正式

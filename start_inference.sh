@@ -7,10 +7,39 @@
 #   ./start_inference.sh
 # ============================================================
 
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
+
+export PYROMIND_HARNESS_BACKEND="pi"
+export APP_ENV="${APP_ENV:-dev}"
+export PYROMIND_PI_TERMINAL_BACKEND="os-sandbox"
+
+case "$(uname -s)" in
+  Darwin)
+    if [[ ! -x /usr/bin/sandbox-exec ]]; then
+      echo "ERROR: Pi os-sandbox requires /usr/bin/sandbox-exec on macOS." >&2
+      exit 1
+    fi
+    ;;
+  Linux)
+    for sandbox_dependency in rg bwrap socat; do
+      if ! command -v "${sandbox_dependency}" >/dev/null 2>&1; then
+        echo "ERROR: Pi os-sandbox requires ${sandbox_dependency} on Linux." >&2
+        exit 1
+      fi
+    done
+    ;;
+  *)
+    echo "ERROR: Pi os-sandbox supports only Linux and macOS." >&2
+    exit 1
+    ;;
+esac
 
 # ----------------------------------------------------------
 # LLM Configuration
@@ -26,8 +55,8 @@ export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 # Keys are never stored in the config file: staging/production deployment
 # manifests (e.g. Kubernetes Secret + secretKeyRef) inject the env vars above.
 # LiteLLM requires a provider prefix (e.g. openai/) for custom OpenAI-compatible endpoints.
-export LLM_BASE_URL="${LLM_BASE_URL:-https://openrouter.ai/api/v1}"
 export LLM_MODEL="${LLM_MODEL:-openai/deepseek-v4-flash-0731}"
+export LLM_BASE_URL="${LLM_BASE_URL:-http://208.64.254.189:8000/v1}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
 #export LLM_MODEL="openai/deepseek-v4-pro"
@@ -162,6 +191,72 @@ PY
 fi
 
 # ----------------------------------------------------------
+# Shared DataFlow Runtime
+# ----------------------------------------------------------
+# Keep DataFlow outside the agent-server venv: some native dependencies do not
+# provide Python 3.13 wheels. Every harness inherits the same interpreter via
+# DATAFLOW_PYTHON, so adapters do not need harness-specific setup.
+DATAFLOW_VERSION="${DATAFLOW_VERSION:-1.0.10}"
+DATAFLOW_RUNTIME_DIR="${DATAFLOW_RUNTIME_DIR:-${WORKSPACE_DIR}/runtime/dataflow-venv}"
+
+if [[ -z "${DATAFLOW_PYTHON:-}" ]]; then
+  export DATAFLOW_PYTHON="${DATAFLOW_RUNTIME_DIR}/bin/python"
+  if [[ ! -x "${DATAFLOW_PYTHON}" ]]; then
+    echo "Creating shared DataFlow runtime (Python 3.12)..."
+    uv python install 3.12
+    uv venv --python 3.12 "${DATAFLOW_RUNTIME_DIR}"
+  fi
+elif [[ ! -x "${DATAFLOW_PYTHON}" ]]; then
+  echo "ERROR: DATAFLOW_PYTHON is not executable: ${DATAFLOW_PYTHON}" >&2
+  exit 1
+fi
+export DATAFLOW_PYTHON
+
+if ! "${DATAFLOW_PYTHON}" -c '
+import importlib.metadata
+import sys
+
+import dataflow
+
+sys.exit(importlib.metadata.version("open-dataflow") != sys.argv[1])
+' "${DATAFLOW_VERSION}" 2>/dev/null; then
+  echo "Installing open-dataflow==${DATAFLOW_VERSION} into shared runtime..."
+  uv pip install \
+    --python "${DATAFLOW_PYTHON}" \
+    "open-dataflow==${DATAFLOW_VERSION}"
+fi
+
+"${DATAFLOW_PYTHON}" -c '
+import importlib.metadata
+
+import dataflow
+
+version = importlib.metadata.version("open-dataflow")
+print(f"DataFlow runtime ready: open-dataflow=={version}")
+'
+
+# ----------------------------------------------------------
+# Pi Runtime
+# ----------------------------------------------------------
+PI_RUNTIME_DIR="${SOFTWARE_AGENT_SDK_DIR}/harness-adapter/pi-runtime"
+
+if ! command -v npm >/dev/null 2>&1; then
+  echo "Error: npm is required to install and build the Pi runtime." >&2
+  exit 127
+fi
+
+if [[ ! -f "${PI_RUNTIME_DIR}/package.json" || ! -f "${PI_RUNTIME_DIR}/package-lock.json" ]]; then
+  echo "ERROR: Pi runtime package is incomplete: ${PI_RUNTIME_DIR}" >&2
+  exit 1
+fi
+
+echo "Installing Pi runtime dependencies..."
+npm --prefix "${PI_RUNTIME_DIR}" ci
+
+echo "Building Pi runtime..."
+npm --prefix "${PI_RUNTIME_DIR}" run build
+
+# ----------------------------------------------------------
 # Start Agent Server
 # ----------------------------------------------------------
 cd "${SOFTWARE_AGENT_SDK_DIR}"
@@ -178,6 +273,7 @@ fi
 echo " Server root:       ${SOFTWARE_AGENT_SDK_DIR}"
 echo " Knowledge Base:    ${PYROMIND_KNOWLEDGE_BASE_PATH}"
 echo " Skills:            ${PYROMIND_SKILLS_PATH}"
+echo " DataFlow Python:   ${DATAFLOW_PYTHON}"
 echo " Workspace root:    ${WORKSPACE_DIR}"
 echo " Conversations:     ${OH_CONVERSATIONS_PATH}"
 echo " Project workspace: ${OH_WORKSPACE_PATH}"
@@ -195,7 +291,7 @@ echo " Auto-reload:       enabled"
 echo "============================================"
 echo ""
 
-uv run python -m openhands.agent_server \
+uv run python -m pyromind_agent_server \
   --host 127.0.0.1 \
   --port 8000 \
   --reload

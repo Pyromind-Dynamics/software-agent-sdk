@@ -1,14 +1,12 @@
 import asyncio
 import contextlib
 import json
-import logging
 import shutil
 import threading
 import time
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -36,8 +34,9 @@ from openhands.agent_server.pub_sub import Subscriber
 from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
     PYROMIND_APP_TAG_VALUE,
-    PYROMIND_LEGACY_RUNTIME_CONTRACT,
+    PYROMIND_LEGACY_RUNTIME_CONTRACTS,
     PYROMIND_RUNTIME_CONTRACT,
+    PYROMIND_TERMINAL_PARAMS,
     PYROMIND_WORKFLOW_EVENT_KEY,
 )
 from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
@@ -283,6 +282,7 @@ def test_pyromind_runtime_llm_is_rehydrated_from_server_env(monkeypatch):
     )
 
     updated = _with_pyromind_runtime_llm(agent)
+    assert updated.llm.stream is True
 
     assert updated.llm.base_url == "https://llm.example.test/v1"
     assert updated.llm.api_key is not None
@@ -418,7 +418,8 @@ def test_pyromind_runtime_skills_refresh_valid_persisted_skill(tmp_path):
     assert updated.agent_context.skills[0].content == "# Fresh runtime skill"
 
 
-def test_pyromind_runtime_contract_refreshes_persisted_agent_once():
+@pytest.mark.parametrize("legacy_contract", PYROMIND_LEGACY_RUNTIME_CONTRACTS)
+def test_pyromind_runtime_contract_refreshes_persisted_agent_once(legacy_contract):
     agent = Agent(
         llm=LLM(model="gpt-4o", usage_id="pyromind-agent"),
         tools=[
@@ -433,9 +434,7 @@ def test_pyromind_runtime_contract_refreshes_persisted_agent_once():
         ],
         system_prompt_filename="system_prompt_codex.j2",
         system_prompt_kwargs={
-            "custom_instructions": (
-                f"old instructions\n\n{PYROMIND_LEGACY_RUNTIME_CONTRACT.strip()}"
-            )
+            "custom_instructions": f"old instructions\n\n{legacy_contract.strip()}"
         },
     )
 
@@ -443,12 +442,15 @@ def test_pyromind_runtime_contract_refreshes_persisted_agent_once():
     updated_again = _with_pyromind_runtime_contract(updated)
 
     terminal = next(tool for tool in updated_again.tools if tool.name == "terminal")
-    assert terminal.params == {"terminal_type": "subprocess"}
+    assert terminal.params == {
+        "terminal_type": "subprocess",
+        **PYROMIND_TERMINAL_PARAMS,
+    }
     custom_instructions = cast(
         str, updated_again.system_prompt_kwargs["custom_instructions"]
     )
     assert custom_instructions.count(PYROMIND_RUNTIME_CONTRACT.strip()) == 1
-    assert PYROMIND_LEGACY_RUNTIME_CONTRACT.strip() not in custom_instructions
+    assert legacy_contract.strip() not in custom_instructions
     assert "never use the local terminal as a substitute" in custom_instructions
 
 
@@ -4098,34 +4100,13 @@ async def test_remove_active_long_task_inactive_service_raises(tmp_path):
         await service.remove_active_long_task("t1")
 
 
-def test_apply_storage_quota_fails_closed_when_required(event_service, monkeypatch):
-    fake_quota = SimpleNamespace(
-        limit_bytes=500 * 1024 * 1024,
-        apply=lambda *args, **kwargs: False,
-        last_error="No such device or address",
-    )
+def test_apply_storage_quota_delegates_to_shared_helper(event_service, monkeypatch):
+    calls = []
     monkeypatch.setattr(
-        "openhands.agent_server.event_service.quota_from_env", lambda: fake_quota
+        "openhands.agent_server.event_service.ensure_conversation_quota",
+        lambda directory, conversation_id: calls.append((directory, conversation_id)),
     )
-    monkeypatch.setenv("OH_STORAGE_QUOTA_REQUIRED", "1")
-    with pytest.raises(RuntimeError, match="storage quota .* could not be enforced"):
-        event_service._apply_storage_quota()
 
+    event_service._apply_storage_quota()
 
-def test_apply_storage_quota_warns_when_not_required(
-    event_service, monkeypatch, caplog
-):
-    fake_quota = SimpleNamespace(
-        limit_bytes=500 * 1024 * 1024,
-        apply=lambda *args, **kwargs: False,
-        last_error="No such device or address",
-    )
-    monkeypatch.setattr(
-        "openhands.agent_server.event_service.quota_from_env", lambda: fake_quota
-    )
-    monkeypatch.delenv("OH_STORAGE_QUOTA_REQUIRED", raising=False)
-    with caplog.at_level(
-        logging.WARNING, logger="openhands.agent_server.event_service"
-    ):
-        event_service._apply_storage_quota()
-    assert "storage quota not enforced" in caplog.text
+    assert calls == [(event_service.conversation_dir, event_service.stored.id)]
