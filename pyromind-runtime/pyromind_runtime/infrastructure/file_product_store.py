@@ -149,6 +149,9 @@ class FileProductStore:
     def load_snapshot(self) -> ConversationSnapshot:
         with self._lock():
             metadata = self._load_metadata()
+            current = self._current_snapshot(metadata)
+            if current is not None:
+                return current
             events = self._load_events(repair_tail=True)
             metadata = self._reconcile(metadata, events)
             return self._recover_snapshot(metadata, events)
@@ -157,11 +160,48 @@ class FileProductStore:
         if after_seq < 0:
             raise ValueError("after_seq must be non-negative")
         with self._lock():
+            marker = self._tail_marker()
+            if marker is not None and marker.seq <= after_seq:
+                # The log ends at or before the caller's cursor, so there is
+                # nothing left to send. Proving that from the tail alone keeps
+                # a reconnect from re-parsing a multi-megabyte log.
+                return ()
             return tuple(
                 event
                 for event in self._load_events(repair_tail=True)
                 if event.seq > after_seq
             )
+
+    def _current_snapshot(self, metadata: _Metadata) -> ConversationSnapshot | None:
+        """Return the on-disk snapshot when replaying the log could not change it.
+
+        Reads only the tail marker and the snapshot file, so listing and opening
+        conversations stay proportional to the snapshot rather than to the whole
+        event log. This is the read-side counterpart of ``_append_within_window``
+        and trusts the same invariant: once a record's seq matches the watermark
+        and the snapshot already covers that watermark, no record outside the
+        window can influence the projection.
+
+        Returns ``None`` when the tail cannot be trusted or the snapshot is
+        missing, stale, or half-written, handing the caller the full
+        self-healing read instead of guessing.
+        """
+        marker = self._tail_marker()
+        if marker is None or marker.seq != metadata.last_sequence:
+            return None
+        snapshot = self._read_snapshot(metadata)
+        if (
+            snapshot is None
+            or snapshot.through_seq != metadata.last_sequence
+            or snapshot.updated_at is None
+        ):
+            return None
+        return snapshot
+
+    def _tail_marker(self) -> ProductEvent | None:
+        """Return the last persisted event by reading only the log's tail."""
+        records = self._load_events_tail(1)
+        return records[-1] if records else None
 
     def append(self, event: ProductEvent) -> tuple[ProductEvent, ConversationSnapshot]:
         if event.seq != 0:
