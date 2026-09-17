@@ -54,11 +54,30 @@ description: >-
 - **不要改名**。create 会直接拒绝并报
   `does not match the '<adapter>' prediction contract`
 - `quality_label` 的 `<Choice>` 至少要有 `ok` 和 `defect`，这是 meta 判定值的映射目标
-- `avi_train` 的 `quality` 会按同义词归一化（`NG`/`BAD`→`defect`，`PASS`/`GOOD`→`ok`，忽略大小写）。
-  归一化不了的值会**原样写进预标注**，并在 create 返回里带一句
-  `warning=unmapped_quality:<值>` —— 看到它就把对应的 `<Choice value="...">` 补上，
-  否则那条预标注在界面上不会显示。
+- 两个 adapter 的判定值都按同一张同义词表归一化（`NG`/`BAD`/`FAULT`/`TRUE`→`defect`，
+  `PASS`/`GOOD`/`FALSE_POSITIVE`→`ok`，忽略大小写）。认不出时的处理不同：
+  - `avi_train` 读的是自家 VLM 的产物，认不出就**原样写进预标注**，并在 create 返回里带一句
+    `warning=unmapped_quality:<值>` —— 看到它就把对应的 `<Choice value="...">` 补上，
+    否则那条预标注在界面上不会显示。
+  - `aoi_export` 读的是外部检测系统的判定，认不出说明确实不知道，**留空**给人工标注。
 - 用户强烈要求自定义控件名时：那些名字拿不到预标注，要说明这会是纯人工标注项目
+
+### 区域预标注（框）
+
+两个 adapter 都会把 meta 里的坐标转成框预标注，写到 `finding_category`（矩形），
+该区域的说明写到 `finding_observation`（`perRegion` 文字）。
+
+- 坐标接受这几种写法，混用也行：`bbox` 的 `x_min_norm`/`y_min_norm`/`x_max_norm`/`y_max_norm`
+  （norm1000）、`value` 或 finding 顶层平铺的 `x`/`y`/`width`/`height`（0-100 百分比，
+  也兼容 0-1 归一化）、以及 `[x1,y1,x2,y2]` 列表（norm1000）
+- 每个区域必须有 `category`。只有坐标没有类别时**该区域会被跳过** ——
+  Label Studio 不渲染没有标签的矩形，写进去也看不见
+- 坐标超出画面会被裁到边界，零面积的框直接丢弃
+
+`aoi_export` 的 `meta.json` 通常**不含图内坐标**（`vrs_xy`/`map_xy` 是机台坐标，
+不能当框用），这类项目就是纯人工标注。若 meta 里出现 `boxes`（norm1000 的
+`[x1,y1,x2,y2]` 列表，配 `category`/`vlm_category`）或 `findings`，就会一并生成框预标注 ——
+**这时配置里必须有 `finding_category` 和 `finding_observation`**，否则框不会显示。
 
 ## 回复用户的链接格式
 

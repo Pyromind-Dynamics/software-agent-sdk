@@ -62,8 +62,18 @@
 
 ## 坐标转换
 
-PyroMind meta 中的 bbox 使用 norm1000 坐标（0-1000）。
-Label Studio 使用百分比坐标（0-100）。
+Label Studio 使用百分比坐标（0-100）。导入时按下面的形状读 meta，
+第一个能解析出来的就算数 —— 不同管线的产出形状确实不一样，所以都兼容：
+
+| meta 里的写法 | 量纲 | 换算 |
+|---|---|---|
+| `bbox.x_min_norm` / `y_min_norm` / `x_max_norm` / `y_max_norm` | norm1000（0-1000） | 各除以 10 |
+| `value.{x,y,width,height}`，或 finding 顶层平铺的同名键 | 百分比（0-100） | 直接用 |
+| 同上，但值落在 0-1 之间 | 归一化 | 乘以 100 |
+| `bbox` / `box` / `value` 是 `[x1, y1, x2, y2]` 列表 | norm1000 | 各除以 10 再算宽高 |
+| `x1/y1/x2/y2` 或 `x_min/y_min/x_max/y_max` 键 | 按数值大小判断 | 同上 |
+
+norm1000 转百分比：
 
 ```
 x = x_min_norm / 10
@@ -71,6 +81,9 @@ y = y_min_norm / 10
 width = (x_max_norm - x_min_norm) / 10
 height = (y_max_norm - y_min_norm) / 10
 ```
+
+超出画面的框裁到边界；**零面积、没有 `category`、或解析不出来的区域会被跳过** ——
+Label Studio 不渲染没有标签的矩形，写进去也看不见。
 
 ## Region ID 关联
 

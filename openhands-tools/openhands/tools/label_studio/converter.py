@@ -9,7 +9,13 @@ Two dataset adapters are supported for the forward conversion:
 - ``avi_train``: sample directories containing ``meta_vlm.json`` with
   ``quality``/``findings`` pre-annotation fields.
 - ``aoi_export``: AOI inspection export directories containing ``meta.json``
-  with whole-sample ``vlm_verdict``/``label``/``note`` fields and no bboxes.
+  with whole-sample ``vlm_verdict``/``label``/``note`` fields. Regions are
+  pre-annotated too whenever the export carries coordinates.
+
+Region geometry is accepted in every shape our producers emit (see
+``_geometry_from``): a mismatch between the converter's expectation and what a
+pipeline actually wrote is silent -- Label Studio renders no box and raises no
+error -- so the converter reads the shapes it can and logs the ones it cannot.
 """
 
 from __future__ import annotations
@@ -17,8 +23,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import time
 from collections import defaultdict
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePosixPath
 from typing import Any, Protocol
@@ -60,12 +68,152 @@ _QUALITY_CHOICE_SYNONYMS = {
     "true": "defect",
     "bad": "defect",
     "ng": "defect",
+    "fault": "defect",
+    "faulty": "defect",
     "ok": "ok",
     "good": "ok",
     "pass": "ok",
     "false_positive": "ok",
     "false": "ok",
 }
+
+# Where a region's geometry may live inside a finding. The first key that holds
+# something readable wins; a finding may also carry x/y/width/height flat.
+_REGION_GEOMETRY_KEYS = ("bbox", "box", "value")
+
+# Label Studio stores region coordinates as percentages of the image. The scale
+# of an incoming candidate is inferred from its magnitude, which is what lets
+# one parser read norm1000 corners, percent boxes, and unit-normalised boxes.
+_UNIT_MAX = 1.0 + 1e-6
+_PERCENT_MAX = 100.0 + 1e-6
+_NORM1000_MAX = 1000.0 + 1e-6
+
+
+def _named_numbers(
+    source: dict[str, Any], keys: tuple[str, ...]
+) -> tuple[float, ...] | None:
+    """Return the named values as floats, or None when any of them is missing."""
+    values: list[float] = []
+    for key in keys:
+        value = source.get(key)
+        if value is None:
+            return None
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            return None
+    return tuple(values)
+
+
+def _percent_geometry(
+    x: float, y: float, width: float, height: float
+) -> tuple[float, float, float, float] | None:
+    """Clip one rectangle into percent space, or drop it when degenerate.
+
+    An out-of-range box is clipped rather than dropped: a box that is partly off
+    the image still tells the annotator where to look, and Label Studio would
+    otherwise refuse to render the region at all.
+    """
+    if not all(math.isfinite(value) for value in (x, y, width, height)):
+        return None
+    x = min(max(x, 0.0), 100.0)
+    y = min(max(y, 0.0), 100.0)
+    width = min(width, 100.0 - x)
+    height = min(height, 100.0 - y)
+    if width <= 0 or height <= 0:
+        return None
+    return round(x, 2), round(y, 2), round(width, 2), round(height, 2)
+
+
+def _scaled_geometry(
+    x: float, y: float, width: float, height: float
+) -> tuple[float, float, float, float] | None:
+    """Infer a rectangle's coordinate scale from its magnitude.
+
+    Producers are inconsistent about units -- the same field has arrived as
+    norm1000, as percent, and as a 0-1 fraction -- and none of them announce
+    which. Magnitude is the only signal available, and it is unambiguous as long
+    as the box stays inside its own coordinate space.
+    """
+    largest = max(abs(x), abs(y), abs(x + width), abs(y + height))
+    if largest <= _UNIT_MAX:
+        factor = 100.0
+    elif largest <= _PERCENT_MAX:
+        factor = 1.0
+    elif largest <= _NORM1000_MAX:
+        factor = 0.1
+    else:
+        return None
+    return _percent_geometry(x * factor, y * factor, width * factor, height * factor)
+
+
+def _geometry_from(candidate: Any) -> tuple[float, float, float, float] | None:
+    """Parse one geometry candidate into percent ``(x, y, width, height)``.
+
+    Understood shapes, all of which have been seen in real datasets:
+
+    - ``{"x_min_norm": 400, ...}`` -- the documented contract (norm1000 corners)
+    - ``{"x": 40.0, "y": 38.0, "width": 20.0, "height": 24.0}`` -- percent
+    - ``{"x": 0.4, "y": 0.38, ...}`` -- unit-normalised
+    - ``[400, 380, 600, 620]`` -- norm1000 ``x1y1x2y2`` corners
+    - ``{"x1": ..., "y1": ..., "x2": ..., "y2": ...}`` / ``x_min``/``y_min``
+    """
+    if isinstance(candidate, (list, tuple)):
+        if len(candidate) < 4:
+            return None
+        try:
+            x1, y1, x2, y2 = (float(value) for value in candidate[:4])
+        except (TypeError, ValueError):
+            return None
+        return _scaled_geometry(x1, y1, x2 - x1, y2 - y1)
+
+    if not isinstance(candidate, dict) or not candidate:
+        return None
+
+    # A "*_norm" key states its own unit, so its magnitude must not be used to
+    # guess: norm1000 corners can be small enough to look like percentages.
+    corners = _named_numbers(
+        candidate, ("x_min_norm", "y_min_norm", "x_max_norm", "y_max_norm")
+    )
+    if corners is not None:
+        x1, y1, x2, y2 = corners
+        return _percent_geometry(
+            x1 / 10.0, y1 / 10.0, (x2 - x1) / 10.0, (y2 - y1) / 10.0
+        )
+
+    for keys in (
+        ("x_min", "y_min", "x_max", "y_max"),
+        ("x1", "y1", "x2", "y2"),
+    ):
+        corners = _named_numbers(candidate, keys)
+        if corners is not None:
+            x1, y1, x2, y2 = corners
+            return _scaled_geometry(x1, y1, x2 - x1, y2 - y1)
+
+    for keys in (("x", "y", "width", "height"), ("x", "y", "w", "h")):
+        box = _named_numbers(candidate, keys)
+        if box is not None:
+            return _scaled_geometry(*box)
+    return None
+
+
+def _region_geometry(
+    finding: dict[str, Any],
+) -> tuple[float, float, float, float] | None:
+    """Return a finding's percent geometry, whichever shape it was written in."""
+    for key in _REGION_GEOMETRY_KEYS:
+        candidate = finding.get(key)
+        if not candidate:
+            continue
+        geometry = _geometry_from(candidate)
+        if geometry is not None:
+            return geometry
+        logger.warning(
+            "Finding carries a %r field the converter cannot read: %r",
+            key,
+            candidate,
+        )
+    return _geometry_from(finding)
 
 
 class ConversionError(ValueError):
@@ -288,48 +436,7 @@ class AVITrainToLabelStudioConverter:
                 }
             )
 
-        for i, finding in enumerate(meta.get("findings", [])):
-            if not isinstance(finding, dict):
-                continue
-            region_id = f"finding_{i + 1}"
-            bbox = finding.get("bbox", {})
-            if isinstance(bbox, dict) and bbox:
-                x_min = float(bbox.get("x_min_norm", 0))
-                y_min = float(bbox.get("y_min_norm", 0))
-                x_max = float(bbox.get("x_max_norm", 0))
-                y_max = float(bbox.get("y_max_norm", 0))
-                x = round(x_min / 10.0, 2)
-                y = round(y_min / 10.0, 2)
-                w = round((x_max - x_min) / 10.0, 2)
-                h = round((y_max - y_min) / 10.0, 2)
-                category = str(finding.get("category", ""))
-                if category:
-                    results.append(
-                        {
-                            "id": region_id,
-                            "from_name": "finding_category",
-                            "to_name": "defect_image",
-                            "type": "rectanglelabels",
-                            "value": {
-                                "x": x,
-                                "y": y,
-                                "width": w,
-                                "height": h,
-                                "rectanglelabels": [category],
-                            },
-                        }
-                    )
-            observation = finding.get("observation", "")
-            if observation:
-                results.append(
-                    {
-                        "id": region_id,
-                        "from_name": "finding_observation",
-                        "to_name": "defect_image",
-                        "type": "textarea",
-                        "value": {"text": [str(observation)]},
-                    }
-                )
+        results.extend(self._region_results(meta.get("findings") or []))
 
         if not results:
             return None
@@ -355,6 +462,8 @@ class AVITrainToLabelStudioConverter:
                 }
             )
 
+        results.extend(self._region_results(self._aoi_findings(meta)))
+
         note = str(meta.get("note") or "").strip()
         if note:
             results.append(
@@ -373,6 +482,80 @@ class AVITrainToLabelStudioConverter:
             "score": float(meta.get("vlm_confidence", 0.95)),
             "result": results,
         }
+
+    def _aoi_findings(self, meta: dict[str, Any]) -> list[dict[str, Any]]:
+        """Region sources for an aoi export.
+
+        An AOI export is a whole-sample verdict, so many exports carry no
+        coordinates at all and this returns nothing -- the sample is annotated
+        by hand, as before. Two shapes are honoured when coordinates do appear:
+        an explicit ``findings`` list (the ``avi_train`` layout), and the flat
+        ``boxes`` list together with the sample's category.
+        """
+        findings = meta.get("findings")
+        if isinstance(findings, list) and findings:
+            return [finding for finding in findings if isinstance(finding, dict)]
+
+        boxes = meta.get("boxes")
+        if not isinstance(boxes, list):
+            return []
+        category = str(meta.get("category") or meta.get("vlm_category") or "").strip()
+        return [{"bbox": box, "category": category} for box in boxes if box]
+
+    def _region_results(self, findings: Iterable[Any]) -> list[dict[str, Any]]:
+        """Build the region controls both adapters pre-annotate against.
+
+        A region needs geometry *and* a category. Label Studio draws a
+        rectanglelabels prediction only when its label list is non-empty, so a
+        region with coordinates but no category is skipped and logged rather
+        than written as a box that cannot render.
+        """
+        results: list[dict[str, Any]] = []
+        for index, finding in enumerate(findings):
+            if not isinstance(finding, dict):
+                continue
+            region_id = f"finding_{index + 1}"
+
+            geometry = _region_geometry(finding)
+            category = str(finding.get("category") or "").strip()
+            if geometry is not None:
+                if category:
+                    x, y, width, height = geometry
+                    results.append(
+                        {
+                            "id": region_id,
+                            "from_name": "finding_category",
+                            "to_name": "defect_image",
+                            "type": "rectanglelabels",
+                            "value": {
+                                "x": x,
+                                "y": y,
+                                "width": width,
+                                "height": height,
+                                "rectanglelabels": [category],
+                            },
+                        }
+                    )
+                else:
+                    logger.warning(
+                        "Region %s has usable geometry but no category; Label "
+                        "Studio would render an unlabelled rectangle, so it is "
+                        "skipped",
+                        region_id,
+                    )
+
+            observation = finding.get("observation")
+            if observation:
+                results.append(
+                    {
+                        "id": region_id,
+                        "from_name": "finding_observation",
+                        "to_name": "defect_image",
+                        "type": "textarea",
+                        "value": {"text": [str(observation)]},
+                    }
+                )
+        return results
 
     def _resolve_media_urls(self, paths: list[str]) -> dict[str, str]:
         """Resolve a media URL for every requested object path.

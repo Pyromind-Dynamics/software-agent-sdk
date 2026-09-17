@@ -79,7 +79,13 @@ def test_avi_quality_synonyms_are_normalised(monkeypatch):
     <Choice> list, and it raises no error while doing so -- the pre-annotation
     just disappears, taking the verdict with it.
     """
-    cases = (("NG", "defect"), ("PASS", "ok"), ("Good", "ok"), ("bad", "defect"))
+    cases = (
+        ("NG", "defect"),
+        ("PASS", "ok"),
+        ("Good", "ok"),
+        ("bad", "defect"),
+        ("FAULT", "defect"),
+    )
     for raw, expected in cases:
         meta = dict(SAMPLE_META, quality=raw)
         converter = _mock_converter(
@@ -305,6 +311,225 @@ def test_aoi_export_skips_dirs_without_meta(monkeypatch):
         "/datasets/aoi-001/10_B1/meta.json",
         "/datasets/aoi-001/11_B2/meta.json",
     ]
+
+
+@pytest.mark.parametrize(
+    ("label", "finding", "expected"),
+    [
+        (
+            "documented_contract",
+            {
+                "bbox": {
+                    "x_min_norm": 400,
+                    "y_min_norm": 380,
+                    "x_max_norm": 600,
+                    "y_max_norm": 620,
+                }
+            },
+            (40.0, 38.0, 20.0, 24.0),
+        ),
+        (
+            "norm_keys_keep_their_own_unit",
+            {
+                "bbox": {
+                    "x_min_norm": 40,
+                    "y_min_norm": 30,
+                    "x_max_norm": 60,
+                    "y_max_norm": 70,
+                }
+            },
+            (4.0, 3.0, 2.0, 4.0),
+        ),
+        (
+            "vlm_pipeline_value_percent",
+            {"value": {"x": 40.0, "y": 38.0, "width": 20.0, "height": 24.0}},
+            (40.0, 38.0, 20.0, 24.0),
+        ),
+        (
+            "flat_percent",
+            {"x": 40.0, "y": 38.0, "width": 20.0, "height": 24.0},
+            (40.0, 38.0, 20.0, 24.0),
+        ),
+        (
+            "unit_normalised",
+            {"value": {"x": 0.4, "y": 0.38, "width": 0.2, "height": 0.24}},
+            (40.0, 38.0, 20.0, 24.0),
+        ),
+        (
+            "norm1000_corner_list",
+            {"bbox": [400, 380, 600, 620]},
+            (40.0, 38.0, 20.0, 24.0),
+        ),
+        (
+            "norm1000_in_plain_keys",
+            {"value": {"x": 400.0, "y": 380.0, "width": 200.0, "height": 240.0}},
+            (40.0, 38.0, 20.0, 24.0),
+        ),
+        (
+            "corner_keys",
+            {"value": {"x1": 400.0, "y1": 380.0, "x2": 600.0, "y2": 620.0}},
+            (40.0, 38.0, 20.0, 24.0),
+        ),
+    ],
+)
+def test_region_geometry_reads_every_shape_our_producers_write(
+    label: str, finding: dict, expected: tuple[float, float, float, float]
+):
+    """A shape the converter cannot read is silent: no box, and no error.
+
+    Every shape here was produced by a real producer -- the documented contract,
+    our own VLM pipeline, an ad-hoc export script, and unit-normalised model
+    output -- which is why all of them have to be read rather than one.
+    """
+    converter = _converter()
+    predictions = converter._build_predictions(
+        {"quality": "defect", "findings": [{**finding, "category": "断路"}]}
+    )
+    assert predictions is not None, label
+    box = next(r for r in predictions["result"] if r["type"] == "rectanglelabels")
+    value = box["value"]
+    got = (value["x"], value["y"], value["width"], value["height"])
+    assert got == expected, label
+
+
+def test_region_without_a_category_is_skipped():
+    """Label Studio renders nothing for an empty label list, so it is dropped."""
+    converter = _converter()
+    predictions = converter._build_predictions(
+        {
+            "quality": "defect",
+            "findings": [
+                {
+                    "bbox": {
+                        "x_min_norm": 100,
+                        "y_min_norm": 100,
+                        "x_max_norm": 200,
+                        "y_max_norm": 200,
+                    }
+                }
+            ],
+        }
+    )
+    assert predictions is not None
+    assert [r["type"] for r in predictions["result"]] == ["choices"]
+
+
+def test_degenerate_region_is_skipped():
+    """A zero-area box is not a region; writing it would add a no-op annotation."""
+    converter = _converter()
+    predictions = converter._build_predictions(
+        {
+            "quality": "defect",
+            "findings": [
+                {
+                    "category": "断路",
+                    "bbox": {
+                        "x_min_norm": 100,
+                        "y_min_norm": 100,
+                        "x_max_norm": 100,
+                        "y_max_norm": 200,
+                    },
+                }
+            ],
+        }
+    )
+    assert predictions is not None
+    assert [r["type"] for r in predictions["result"]] == ["choices"]
+
+
+def test_out_of_range_region_is_clipped_rather_than_dropped():
+    """A box hanging off the edge still tells the annotator where to look."""
+    converter = _converter()
+    predictions = converter._build_predictions(
+        {
+            "quality": "defect",
+            "findings": [
+                {
+                    "category": "断路",
+                    "bbox": {
+                        "x_min_norm": 900,
+                        "y_min_norm": 900,
+                        "x_max_norm": 1200,
+                        "y_max_norm": 1200,
+                    },
+                }
+            ],
+        }
+    )
+    assert predictions is not None
+    box = next(r for r in predictions["result"] if r["type"] == "rectanglelabels")
+    assert box["value"]["x"] == 90.0
+    assert box["value"]["y"] == 90.0
+    assert box["value"]["width"] == 10.0
+    assert box["value"]["height"] == 10.0
+
+
+def test_aoi_export_renders_boxes_when_the_export_carries_them(monkeypatch):
+    """Most AOI exports are coordinate-free, but a boxes list is honoured."""
+    meta = dict(AOI_META, boxes=[[400, 380, 600, 620]], vlm_category="图电")
+    converter, _ = _aoi_converter(
+        monkeypatch,
+        ["/datasets/aoi-001/10_B1"],
+        {"/datasets/aoi-001/10_B1": meta},
+    )
+    task = json.loads(converter.convert().batch_payloads[0][1])[0]
+    results = task["predictions"][0]["result"]
+    box = next(r for r in results if r["type"] == "rectanglelabels")
+    assert box["from_name"] == "finding_category"
+    assert box["to_name"] == "defect_image"
+    assert box["value"]["rectanglelabels"] == ["图电"]
+    assert box["value"]["x"] == 40.0
+    assert box["value"]["width"] == 20.0
+
+
+def test_aoi_export_prefers_explicit_findings_over_flat_boxes(monkeypatch):
+    meta = dict(
+        AOI_META,
+        findings=[
+            {
+                "value": {"x": 10.0, "y": 10.0, "width": 5.0, "height": 5.0},
+                "category": "阻焊",
+            }
+        ],
+        boxes=[[0, 0, 1000, 1000]],
+    )
+    converter, _ = _aoi_converter(
+        monkeypatch,
+        ["/datasets/aoi-001/10_B1"],
+        {"/datasets/aoi-001/10_B1": meta},
+    )
+    task = json.loads(converter.convert().batch_payloads[0][1])[0]
+    boxes = [
+        r for r in task["predictions"][0]["result"] if r["type"] == "rectanglelabels"
+    ]
+    assert len(boxes) == 1
+    assert boxes[0]["value"]["rectanglelabels"] == ["阻焊"]
+
+
+def test_aoi_export_without_coordinates_still_has_no_regions(monkeypatch):
+    converter, _ = _aoi_converter(
+        monkeypatch,
+        ["/datasets/aoi-001/10_B1"],
+        {"/datasets/aoi-001/10_B1": dict(AOI_META)},
+    )
+    task = json.loads(converter.convert().batch_payloads[0][1])[0]
+    assert [r["type"] for r in task["predictions"][0]["result"]] == [
+        "choices",
+        "textarea",
+    ]
+
+
+def test_aoi_fault_verdict_maps_to_defect(monkeypatch):
+    """Real AOI exports say "fault"; unmapped, the sample kept no verdict at all."""
+    meta = dict(AOI_META, vlm_verdict="fault", note="")
+    converter, _ = _aoi_converter(
+        monkeypatch,
+        ["/datasets/aoi-001/10_B1"],
+        {"/datasets/aoi-001/10_B1": meta},
+    )
+    task = json.loads(converter.convert().batch_payloads[0][1])[0]
+    choice = next(r for r in task["predictions"][0]["result"] if r["type"] == "choices")
+    assert choice["value"]["choices"] == ["defect"]
 
 
 def test_convert_preserves_sample_order_under_concurrency(monkeypatch):
