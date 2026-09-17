@@ -332,3 +332,56 @@ def test_append_recovers_when_the_tail_record_is_truncated(tmp_path: Path) -> No
 
     assert persisted.seq == 2
     assert [event.event_id for event in store.replay()] == ["event-1", "event-2"]
+
+
+def test_load_snapshot_reads_only_the_tail_when_the_snapshot_is_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    for index in range(3):
+        store.append(_status_event(f"event-{index}", "running"))
+
+    monkeypatch.setattr(store, "_load_events", _reject_full_read)
+    snapshot = store.load_snapshot()
+
+    assert snapshot.through_seq == 3
+    assert snapshot.status == "running"
+
+
+def test_load_snapshot_replays_when_the_log_outruns_the_watermark(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store.append(_status_event("event-1", "running"))
+    extra = _status_event("event-2", "paused").model_copy(update={"seq": 2})
+    with store.events_path.open("a", encoding="utf-8") as stream:
+        stream.write(extra.model_dump_json())
+        stream.write("\n")
+
+    snapshot = store.load_snapshot()
+
+    assert snapshot.through_seq == 2
+    assert snapshot.status == "paused"
+
+
+def test_replay_stops_at_the_tail_without_reading_the_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    for index in range(3):
+        store.append(_status_event(f"event-{index}", "running"))
+
+    monkeypatch.setattr(store, "_load_events", _reject_full_read)
+
+    assert store.replay(3) == ()
+    assert store.replay(99) == ()
+
+
+def test_replay_returns_events_when_the_cursor_precedes_the_tail(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    for index in range(3):
+        store.append(_status_event(f"event-{index}", "running"))
+
+    assert [event.seq for event in store.replay(1)] == [2, 3]
