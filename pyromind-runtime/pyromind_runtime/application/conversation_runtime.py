@@ -530,8 +530,18 @@ class ConversationRuntime:
                 continue
             try:
                 store.authorize(context.user_id)
-                snapshots.append(store.load_snapshot())
             except (PermissionError, OSError, ProductStoreError):
+                continue
+            try:
+                snapshots.append(store.load_snapshot())
+            except Exception:
+                # A single unreadable conversation must not take down the
+                # whole listing: callers only ever see the healthy subset.
+                logger.warning(
+                    "skipping unreadable conversation %s",
+                    conversation_dir.name,
+                    exc_info=True,
+                )
                 continue
         snapshots.sort(
             key=lambda item: (

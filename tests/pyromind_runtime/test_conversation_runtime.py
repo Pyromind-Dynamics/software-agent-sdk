@@ -55,6 +55,91 @@ def test_list_orders_by_activity_and_recovers_legacy_timestamps(tmp_path) -> Non
     assert runtime.list_snapshots(context) == snapshots
 
 
+def _write_event_without_offset(path, index: int) -> None:
+    """Rewrite one persisted event the way pre-backfill releases wrote it."""
+    lines = path.read_text().splitlines()
+    event = json.loads(lines[index])
+    event["occurred_at"] = event["occurred_at"].removesuffix("Z")
+    lines[index] = json.dumps(event)
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_list_recovers_legacy_naive_event_timestamps(tmp_path) -> None:
+    """Events persisted without an offset must not abort the whole listing.
+
+    ``max(snapshot.updated_at, event.occurred_at)`` compared an aware and a
+    naive datetime and raised ``TypeError`` while replaying the legacy event,
+    which surfaced as a 500 on ``GET /conversations``.
+    """
+    runtime = ConversationRuntime(tmp_path, FakeAdapter())
+    context = RequestContext(user_id="42")
+    directory = tmp_path / "legacy"
+    directory.mkdir()
+    store = FileProductStore(directory)
+    store.create(
+        ConversationSnapshot(
+            conversation_id="legacy",
+            capabilities=HarnessCapabilities(),
+        ),
+        user_id="42",
+    )
+    for day in (1, 2):
+        store.append(
+            ProductEvent(
+                conversation_id="legacy",
+                type="status.changed",
+                payload={"status": "idle"},
+                occurred_at=datetime(2026, 9, day, tzinfo=UTC),
+            )
+        )
+    _write_event_without_offset(store.events_path, 1)
+    legacy = json.loads(store.snapshot_path.read_text())
+    legacy.pop("updated_at")
+    store.snapshot_path.write_text(json.dumps(legacy))
+
+    snapshots = runtime.list_snapshots(context)
+
+    assert [item.conversation_id for item in snapshots] == ["legacy"]
+    assert snapshots[0].updated_at == datetime(2026, 9, 2, tzinfo=UTC)
+
+
+def test_list_skips_conversation_that_fails_to_load(tmp_path, monkeypatch) -> None:
+    """A single unreadable conversation must not take the listing down."""
+    runtime = ConversationRuntime(tmp_path, FakeAdapter())
+    context = RequestContext(user_id="42")
+    for conversation_id in ("healthy", "broken"):
+        directory = tmp_path / conversation_id
+        directory.mkdir()
+        store = FileProductStore(directory)
+        store.create(
+            ConversationSnapshot(
+                conversation_id=conversation_id,
+                capabilities=HarnessCapabilities(),
+            ),
+            user_id="42",
+        )
+        store.append(
+            ProductEvent(
+                conversation_id=conversation_id,
+                type="status.changed",
+                payload={"status": "idle"},
+                occurred_at=datetime(2026, 9, 1, tzinfo=UTC),
+            )
+        )
+    load_snapshot = FileProductStore.load_snapshot
+
+    def flaky(self: FileProductStore) -> ConversationSnapshot:
+        if self.conversation_dir.name == "broken":
+            raise RuntimeError("corrupted snapshot")
+        return load_snapshot(self)
+
+    monkeypatch.setattr(FileProductStore, "load_snapshot", flaky)
+
+    snapshots = runtime.list_snapshots(context)
+
+    assert [item.conversation_id for item in snapshots] == ["healthy"]
+
+
 async def test_runtime_keeps_product_data_inside_conversation(tmp_path) -> None:
     conversations = tmp_path / "workspace" / "conversations"
     conversations.mkdir(parents=True)

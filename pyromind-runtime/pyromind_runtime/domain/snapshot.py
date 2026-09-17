@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import Field, JsonValue
 
-from pyromind_runtime.domain.base import ContractModel
+from pyromind_runtime.domain.base import AwareDatetime, ContractModel
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.content import ContentBlock, JsonObject
 
@@ -147,7 +146,7 @@ class ConversationSnapshot(ContractModel):
     schema_version: int = Field(default=1, ge=1)
     conversation_id: str = Field(min_length=1)
     through_seq: int = Field(default=0, ge=0)
-    updated_at: datetime | None = None
+    updated_at: AwareDatetime | None = None
     status: ConversationStatus = "idle"
     capabilities: HarnessCapabilities
     timeline: tuple[TimelineItem, ...] = ()
