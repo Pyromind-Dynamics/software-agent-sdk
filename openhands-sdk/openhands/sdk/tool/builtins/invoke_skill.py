@@ -134,19 +134,23 @@ class InvokeSkillExecutor(ToolExecutor):
     ) -> str:
         if not source:
             return rendered
+        source_path = Path(source).expanduser()
         try:
-            skill_md = Path(source).expanduser().resolve(strict=True)
+            skill_md = source_path.resolve(strict=True)
         except (OSError, RuntimeError, ValueError):
             return rendered
         if not skill_md.is_file():
             return rendered
-        skill_dir = skill_md.parent
-        display: Path = skill_dir
-        if working_dir is not None:
-            try:
-                display = skill_dir.relative_to(working_dir.resolve())
-            except (ValueError, OSError):
-                pass
+        if source_path.is_absolute():
+            skill_dir = skill_md.parent
+            display = skill_dir
+            if working_dir is not None:
+                try:
+                    display = skill_dir.relative_to(working_dir.resolve())
+                except (ValueError, OSError):
+                    pass
+        else:
+            display = source_path.parent
         footer = (
             f"\n\n---\n"
             f"This skill is located at `{to_posix_path(display)}`. "

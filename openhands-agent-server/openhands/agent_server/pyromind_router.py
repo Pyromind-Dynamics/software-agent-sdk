@@ -163,6 +163,7 @@ _DEFAULT_SKILLS_PATH = os.environ.get(
 
 # Only load these skills for Pyromind (avoids loading unrelated SDK skills)
 _PYROMIND_SKILL_NAMES = [
+    "inference-evaluation",
     "generate-workflow-dsl",
     "debug-workflow",
     "data-processing",
@@ -222,6 +223,13 @@ Skill usage rules:
   content-level processing with DataFlow operators or LLM). If the user
   explicitly names a mode ("DataFlow"/"脚本清洗"/"格式转换"), follow their
   choice. If the intent is genuinely ambiguous, ask the user before invoking.
+- Every inference evaluation request uses the `inference-evaluation` skill and
+  Agent-authored Rubric scoring, regardless of dataset modality or whether the
+  user explicitly asks for Rubric. Run the generated evaluation script through
+  the platform-provided `CustomCommandNode` for a Storage model or
+  `CustomCommandCPUNode` for an existing endpoint. Do not replace this route
+  with `VLLMInference`, `ModelEvalApiNode`, or a MetricsConfigBuilder node, and
+  do not create or register a new node type.
 - Treat any requested node, model, parameter, data, or topology change as a
   `generate-workflow-dsl` request, including phrases such as "换个模型跑一下"
   or "跑下 <model> 的效果". Modify and validate the DSL, then stop; do not

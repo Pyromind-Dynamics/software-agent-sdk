@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from openhands.agent_server.pyromind_router import (
+    _PYROMIND_SKILL_NAMES,
     PYROMIND_KB_INSTRUCTIONS,
     _load_agent_skills,
 )
@@ -13,6 +14,10 @@ _REMOVED_WORKFLOW_TOOL = "publish" + "_workflow"
 
 def test_load_agent_skills_missing_dir_returns_empty() -> None:
     assert _load_agent_skills("/nonexistent/skills/path") == []
+
+
+def test_inference_evaluation_is_available_to_pyromind_agents() -> None:
+    assert "inference-evaluation" in _PYROMIND_SKILL_NAMES
 
 
 def test_load_agent_skills_returns_skill_objects(tmp_path) -> None:

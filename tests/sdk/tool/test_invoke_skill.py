@@ -208,6 +208,27 @@ def test_footer_uses_relative_path_when_inside_working_dir(tmp_path):
     assert str(workspace.resolve()) not in obs.text
 
 
+def test_footer_preserves_advertised_logical_path(tmp_path, monkeypatch):
+    skill_dir = tmp_path / ".agents" / "skills" / "pdf-analyst"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("placeholder")
+    monkeypatch.chdir(tmp_path)
+    skill = Skill(
+        name="pdf-analyst",
+        content="body",
+        description="desc",
+        source=".agents/skills/pdf-analyst/SKILL.md",
+        is_agentskills_format=True,
+    )
+    conv = _make_conv([skill], working_dir=str(tmp_path / "conversation"))
+
+    obs = _run("pdf-analyst", conv)
+
+    assert obs.is_error is False
+    assert "`.agents/skills/pdf-analyst`" in obs.text
+    assert str(tmp_path.resolve()) not in obs.text
+
+
 def test_footer_omitted_when_skill_has_no_source():
     """Programmatic skills (source=None) should not get a footer."""
     skill = Skill(

@@ -1,0 +1,5 @@
+---
+interface:
+    display_name: Inference Evaluation
+    short_description: 配置带 GT 和 Agent Rubric 的推理评测工作流
+    default_prompt: 使用 $inference-evaluation 预览测试集、制定可执行 Rubric，并用平台命令节点生成推理评测流程。
