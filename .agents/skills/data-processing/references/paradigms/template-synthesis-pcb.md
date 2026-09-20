@@ -1,7 +1,8 @@
 # PCB 配对参考模板案例
 
 理解缺陷类别、材料关系及验收语义时，通过文件读取工具读取共享领域参考
-`knowledge/business-domain/pcb-avi-aoi.md`（运行时知识库逻辑路径）。
+`knowledge/business-domain/pcb-avi-aoi.md`（运行时知识库逻辑路径，直接传给文件
+读取工具，不要相对本 skill 目录拼接或查询环境变量）。
 其中的现场经验不自动成为合成参数或目标标签。
 
 ## 材料与异常的来源

@@ -16,6 +16,9 @@
 - 工作区中间文件放在 `public_data/data-preparation/`。
 - Storage 数据和平台产物只能用 `preview_dataset` 查看，不得用本地文件工具读取。
 - `df_run_pipeline` 只运行本地 Sample；用户确认前不得调用 `df_submit_pipeline`。
+- 平台全量输入必须已经存在于 Storage：`df_submit_pipeline` 不接受工作区路径。
+  工作区写好的 Manifest 用 `upload_file_to_pyromind` 落到图片所在的 Storage 目录
+  （见[平台全量输入](#平台全量输入)），不要用 sandbox 搬运。
 - Sample 结果不符合预期时自行修正并重跑，迭代过程不向用户展示；只展示符合预期的结果。
 - 新链路直接生成规范 JSONL，不以 `df_convert` 或 Parquet 作为正式产物。
 - 新链路优先复用 DataFlow Storage 和 Operator 编排；生成、打分、过滤、去重等已有
@@ -25,6 +28,23 @@
   （append 模式，每批 flush 落盘）、每批更新 `progress.json`（供
   `df_check_progress` 观测），并内置断点续跑（启动时统计已处理行数并跳过）；
   否则全量运行无法观测进度、中断后只能从头重跑。
+
+## 平台全量输入
+
+本地试跑只验证链路是否打通，正式批量和正规化执行在平台侧完成。`df_submit_pipeline`
+的 `input_path` 是 Pyromind Storage 路径（平台 pod 把 Storage 挂载到
+`/target-workspace`），工作区文件不会自动上传。按输入形态二选一：
+
+- **目录输入**：数据都在同一 Storage 目录时可直接传该目录。目录输入按**直接子项**
+  划分样本：每个子目录算一个样本（递归收集其中的图片），散落的单张图片各算一个
+  样本。同目录多组图对（如 PCB 待检图 + CAM 参考图）两种划分都不对，必须用 Manifest。
+- **Manifest 输入**：Manifest 必须与它引用的图片处于同一 Storage 目录树内 —— 运行时
+  按 Manifest 所在目录解析其中的相对图片路径，越出该目录的路径会被拒绝。
+
+工作区写好的 Manifest 用
+`upload_file_to_pyromind(file_path=..., target_dir=<图片所在的 Storage 目录>)` 上传，
+把返回的 Storage 路径直接作为 `input_path`。源数据本来就在 Storage 时，只需要落一个
+Manifest 小文件；不要为此创建 sandbox。
 
 ## 执行流程
 
@@ -44,7 +64,8 @@
 5. Sample 结果不符合预期（质量、格式、字段映射等问题）时，直接修正 pipeline 并
    重新试跑，直到结果符合预期；迭代过程不向用户展示。
 6. 展示符合预期的 Sample 结果并等待用户明确确认。
-7. 调用 `df_submit_pipeline(mode="full")`。收到 Kafka callback 后，调用
+7. 确认输入已按[平台全量输入](#平台全量输入)落到 Storage 后，调用
+   `df_submit_pipeline(mode="full")`。收到 Kafka callback 后，调用
    `preview_dataset` 查看 `<output_dir>/report.json`；如失败，再查看同目录的
    `failure.json`、`validation.json` 和必要的 `llm_calls.jsonl`。
    图片任务若 `report.json.label_reconciliation.corrected > 0`，继续查看

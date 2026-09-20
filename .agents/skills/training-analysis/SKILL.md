@@ -15,7 +15,7 @@ description: >-
 
 1. **探查**：调用 `training_analysis(operation="probe", task_id="...")`，确认
    目标 run、可用指标键和配置键。
-2. **分析**：调用 `training_analysis(operation="analyze", task_id="...")`。
+2. **分析**：调用 `training_analysis(operation="analyze", task_id="...")`。[train.jsonl](../../../../../Downloads/sft_aoi/train.jsonl)
    用 `metric` 指定主指标，需要同时查看多个指标时用 `keys`（最多 20 个）。
 3. **报告**：需要可复用的 Markdown 结论时调用
    `training_analysis(operation="report", task_id="...")`。可选的

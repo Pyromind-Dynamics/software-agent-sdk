@@ -14,10 +14,9 @@ license: MIT
 先用 `preview_dataset` 探查；需要执行本地 Pipeline 时再用 `sample` 或
 `materialize` 模式将明确范围的数据放入会话工作区。
 
-PCB 裸板 AVI/AOI 的数据理解、标签分析、预打标、清洗与合成，按需读取共享的
-领域参考：向文件读取工具传入 `knowledge/business-domain/pcb-avi-aoi.md`。
-这是运行时知识库逻辑路径，不相对于本 skill 目录，无需拼接路径或查询环境变量。
-区分结构缺陷、外观因素与业务处置；现场阈值和标签约定不默认迁移至其他产线。
+领域参考（如 PCB AVI/AOI）不内联在本文件：由对应 case 文档按需引入，并在那里
+给出运行时知识库逻辑路径的读取方式。本地试跑只用于验证链路是否打通；正式批量
+与正规化执行统一在平台侧用 `df_submit_pipeline` 完成。
 
 ## 范式路由（先做这一步）
 
@@ -34,7 +33,8 @@ PCB 裸板 AVI/AOI 的数据理解、标签分析、预打标、清洗与合成�
 
 负向边界：仅创建/管理单个沙箱容器 → sandbox；训练效果/loss 分析 →
 training-analysis；生成训练工作流 → generate-workflow-dsl；工作流调试 →
-debug-workflow。路由不确定时 AskUserQuestion，不要猜。
+debug-workflow。sandbox 不得用来搬运或组装 Pipeline 的 Storage 输入。路由不确定
+时 AskUserQuestion，不要猜。
 
 ## 通用 SOP（所有场景共享的控制面骨架）
 
@@ -42,7 +42,7 @@ debug-workflow。路由不确定时 AskUserQuestion，不要猜。
    目录列表超 100 条会被截断——用 `path_filter` 子串精确定位条目，不要反复
    翻页重预览；每个数据集的结构确认一次完成（列表 + schema + 样例）。
 2. **选型**：按上表读取范式 playbook；范式内按 case 路由表只读取当前场景
-   相关 reference。
+   相关 reference；领域参考由 case 文档按需引入。
 3. **本地执行**：Agent 按真实 schema 写 Python Pipeline。`df_run_pipeline`
    完整处理传入的本地输入，不负责抽样；清洗/合成小样由 preview 选择的输入
    和计划控制，精确分布统计可处理完整 materialize 文件。
@@ -52,7 +52,9 @@ debug-workflow。路由不确定时 AskUserQuestion，不要猜。
    环境缺失以工具实际预检/执行结果为准，再处理运行环境配置。
 4. **门禁**：Taxonomy 与合成小样通过后必须获得用户明确确认才提交后续全量；
    已有标签的确定性全量统计不设人工门禁，且模型调用必须为零。
-5. **全量**：需要平台执行时统一用 `df_submit_pipeline`。DataFlow/EDP 平台任务（含具身
+5. **全量**：需要平台执行时统一用 `df_submit_pipeline`；提交前先按
+   llm-pipeline playbook 的「平台全量输入」确认 `input_path` 已指向 Storage 输入，
+   工作区文件用 `upload_file_to_pyromind` 落位。DataFlow/EDP 平台任务（含具身
    case 的逐 episode 执行）等待终态回调，运行中用 df_check_progress 观察。
    需介入平台任务时先 df_stop_task 停任务。
 6. **分诊**：回调后先看 report.json / validation / verdicts，按失败分类决定

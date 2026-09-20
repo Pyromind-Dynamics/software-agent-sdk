@@ -16,16 +16,18 @@ Region geometry is accepted in every shape our producers emit (see
 ``_geometry_from``): a mismatch between the converter's expectation and what a
 pipeline actually wrote is silent -- Label Studio renders no box and raises no
 error -- so the converter reads the shapes it can and logs the ones it cannot.
+A ``FieldMap`` binding may declare the coordinate unit; doing so replaces the
+magnitude guess with a check, so an out-of-range value fails loudly.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import logging
 import math
 import time
-from collections import defaultdict
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePosixPath
@@ -33,6 +35,15 @@ from typing import Any, Protocol
 
 import httpx
 
+from openhands.tools.label_studio.field_map import (
+    EXPORT_FIELD_MAP,
+    FieldMap,
+    ImageBinding,
+    RegionBinding,
+    SampleFieldBinding,
+    default_field_map,
+    is_glob,
+)
 from openhands.tools.label_studio.models import ManifestBatch, ManifestData
 
 
@@ -45,54 +56,30 @@ _META_FETCH_CONCURRENCY = 8
 
 _SUPPORTED_ADAPTERS = frozenset({"avi_train", "aoi_export"})
 
-# Task data field name and source image file name for each rendered view.
-_MEDIA_FIELDS = (
-    ("defect_image", "defect.jpg"),
-    ("diff_image", "diff.jpg"),
-    ("gt_image", "gt.jpg"),
-)
-
-# Maps upstream verdict/label spellings onto the quality_label choices used by
-# the generated label configs ("defect"/"ok"). Both adapters share this table,
-# but they treat a miss differently because their sources differ in kind:
-#   * aoi_export reads an *external* inspection system's vlm_verdict/label, so an
-#     unrecognised spelling means we genuinely do not know -- no prediction is
-#     emitted and the choice is left to the human annotator.
-#   * avi_train reads meta_vlm.json from *our own* VLM pipeline, so an
-#     unrecognised spelling is still our own verdict -- it is kept verbatim and
-#     recorded in the manifest rather than silently dropped.
-# The self-mapping entries ("defect"/"ok") are what keep an already-normalised
-# meta value from being counted as a miss.
-_QUALITY_CHOICE_SYNONYMS = {
-    "defect": "defect",
-    "true": "defect",
-    "bad": "defect",
-    "ng": "defect",
-    "fault": "defect",
-    "faulty": "defect",
-    "ok": "ok",
-    "good": "ok",
-    "pass": "ok",
-    "false_positive": "ok",
-    "false": "ok",
-}
-
 # Where a region's geometry may live inside a finding. The first key that holds
 # something readable wins; a finding may also carry x/y/width/height flat.
 _REGION_GEOMETRY_KEYS = ("bbox", "box", "value")
 
-# Label Studio stores region coordinates as percentages of the image. The scale
-# of an incoming candidate is inferred from its magnitude, which is what lets
-# one parser read norm1000 corners, percent boxes, and unit-normalised boxes.
+# Label Studio stores region coordinates as percentages of the image. When a
+# binding declares no unit, the scale of an incoming candidate is inferred from
+# its magnitude, which is what lets one parser read norm1000 corners, percent
+# boxes, and unit-normalised boxes without being told which is which.
 _UNIT_MAX = 1.0 + 1e-6
 _PERCENT_MAX = 100.0 + 1e-6
 _NORM1000_MAX = 1000.0 + 1e-6
 
+_UNIT_FACTOR = {"unit": 100.0, "percent": 1.0, "norm1000": 0.1}
+_UNIT_MAXIMUM = {
+    "unit": _UNIT_MAX,
+    "percent": _PERCENT_MAX,
+    "norm1000": _NORM1000_MAX,
+}
+
 
 def _named_numbers(
-    source: dict[str, Any], keys: tuple[str, ...]
-) -> tuple[float, ...] | None:
-    """Return the named values as floats, or None when any of them is missing."""
+    source: dict[str, Any], keys: tuple[str, str, str, str]
+) -> tuple[float, float, float, float] | None:
+    """Return the four named values as floats, or None when any is missing."""
     values: list[float] = []
     for key in keys:
         value = source.get(key)
@@ -102,7 +89,7 @@ def _named_numbers(
             values.append(float(value))
         except (TypeError, ValueError):
             return None
-    return tuple(values)
+    return values[0], values[1], values[2], values[3]
 
 
 def _percent_geometry(
@@ -126,15 +113,37 @@ def _percent_geometry(
 
 
 def _scaled_geometry(
-    x: float, y: float, width: float, height: float
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    unit: str = "auto",
 ) -> tuple[float, float, float, float] | None:
-    """Infer a rectangle's coordinate scale from its magnitude.
+    """Turn a rectangle in any coordinate scale into percent geometry.
 
     Producers are inconsistent about units -- the same field has arrived as
     norm1000, as percent, and as a 0-1 fraction -- and none of them announce
-    which. Magnitude is the only signal available, and it is unambiguous as long
-    as the box stays inside its own coordinate space.
+    which. With ``unit="auto"`` magnitude is the only signal available, and it is
+    unambiguous as long as the box stays inside its own coordinate space.
+
+    A binding that declares its unit replaces that guess with a check: a value
+    outside the declared scale raises instead of being read at whichever scale
+    its magnitude happened to suggest, because a silently misplaced box looks
+    exactly like a correct one.
     """
+    if unit != "auto":
+        largest = max(abs(x), abs(y), abs(x + width), abs(y + height))
+        if largest > _UNIT_MAXIMUM[unit]:
+            raise ConversionError(
+                f"Region coordinate {largest:g} is outside the declared "
+                f"{unit!r} scale (max {_UNIT_MAXIMUM[unit]:g}). Fix the unit in "
+                f"the field map, or set unit='auto' to infer it from magnitude."
+            )
+        factor = _UNIT_FACTOR[unit]
+        return _percent_geometry(
+            x * factor, y * factor, width * factor, height * factor
+        )
+
     largest = max(abs(x), abs(y), abs(x + width), abs(y + height))
     if largest <= _UNIT_MAX:
         factor = 100.0
@@ -147,7 +156,10 @@ def _scaled_geometry(
     return _percent_geometry(x * factor, y * factor, width * factor, height * factor)
 
 
-def _geometry_from(candidate: Any) -> tuple[float, float, float, float] | None:
+def _geometry_from(
+    candidate: Any,
+    unit: str = "auto",
+) -> tuple[float, float, float, float] | None:
     """Parse one geometry candidate into percent ``(x, y, width, height)``.
 
     Understood shapes, all of which have been seen in real datasets:
@@ -157,6 +169,11 @@ def _geometry_from(candidate: Any) -> tuple[float, float, float, float] | None:
     - ``{"x": 0.4, "y": 0.38, ...}`` -- unit-normalised
     - ``[400, 380, 600, 620]`` -- norm1000 ``x1y1x2y2`` corners
     - ``{"x1": ..., "y1": ..., "x2": ..., "y2": ...}`` / ``x_min``/``y_min``
+
+    ``unit`` is the scale a binding declared. Only the magnitude guess is
+    replaced: the key names keep deciding whether the numbers are corners or a
+    width/height pair. The ``*_norm`` keys state their own unit, so a declared
+    unit overrides them rather than being overridden by them.
     """
     if isinstance(candidate, (list, tuple)):
         if len(candidate) < 4:
@@ -165,21 +182,26 @@ def _geometry_from(candidate: Any) -> tuple[float, float, float, float] | None:
             x1, y1, x2, y2 = (float(value) for value in candidate[:4])
         except (TypeError, ValueError):
             return None
-        return _scaled_geometry(x1, y1, x2 - x1, y2 - y1)
+        return _scaled_geometry(x1, y1, x2 - x1, y2 - y1, unit)
 
     if not isinstance(candidate, dict) or not candidate:
         return None
 
-    # A "*_norm" key states its own unit, so its magnitude must not be used to
-    # guess: norm1000 corners can be small enough to look like percentages.
+    # A "*_norm" key states its own unit, so under "auto" its magnitude must not
+    # be consulted to guess: norm1000 corners can be small enough to look like
+    # percentages. A declared unit is applied to the numbers as written, so a
+    # source that means norm1000 and a map that says norm1000 agree, and a map
+    # that says anything else is reported rather than quietly reinterpreted.
     corners = _named_numbers(
         candidate, ("x_min_norm", "y_min_norm", "x_max_norm", "y_max_norm")
     )
     if corners is not None:
         x1, y1, x2, y2 = corners
-        return _percent_geometry(
-            x1 / 10.0, y1 / 10.0, (x2 - x1) / 10.0, (y2 - y1) / 10.0
-        )
+        if unit == "auto":
+            return _percent_geometry(
+                x1 / 10.0, y1 / 10.0, (x2 - x1) / 10.0, (y2 - y1) / 10.0
+            )
+        return _scaled_geometry(x1, y1, x2 - x1, y2 - y1, unit)
 
     for keys in (
         ("x_min", "y_min", "x_max", "y_max"),
@@ -188,24 +210,28 @@ def _geometry_from(candidate: Any) -> tuple[float, float, float, float] | None:
         corners = _named_numbers(candidate, keys)
         if corners is not None:
             x1, y1, x2, y2 = corners
-            return _scaled_geometry(x1, y1, x2 - x1, y2 - y1)
+            return _scaled_geometry(x1, y1, x2 - x1, y2 - y1, unit)
 
     for keys in (("x", "y", "width", "height"), ("x", "y", "w", "h")):
         box = _named_numbers(candidate, keys)
         if box is not None:
-            return _scaled_geometry(*box)
+            return _scaled_geometry(*box, unit)
     return None
 
 
 def _region_geometry(
     finding: dict[str, Any],
+    binding: RegionBinding,
 ) -> tuple[float, float, float, float] | None:
     """Return a finding's percent geometry, whichever shape it was written in."""
-    for key in _REGION_GEOMETRY_KEYS:
+    keys: Iterable[str] = (
+        (binding.geometry,) if binding.geometry else _REGION_GEOMETRY_KEYS
+    )
+    for key in keys:
         candidate = finding.get(key)
         if not candidate:
             continue
-        geometry = _geometry_from(candidate)
+        geometry = _geometry_from(candidate, binding.unit)
         if geometry is not None:
             return geometry
         logger.warning(
@@ -213,7 +239,7 @@ def _region_geometry(
             key,
             candidate,
         )
-    return _geometry_from(finding)
+    return _geometry_from(finding, binding.unit)
 
 
 class ConversionError(ValueError):
@@ -246,6 +272,8 @@ class ConvertedManifest:
         batches: list[tuple[str, bytes, int]],
         total_tasks: int,
         unmapped_quality: tuple[str, ...] = (),
+        field_map_hash: str = "",
+        field_map_path: str | None = None,
     ) -> None:
         self.project_ref = project_ref
         self.dataset_path = dataset_path
@@ -256,6 +284,8 @@ class ConvertedManifest:
         # Verdicts kept verbatim because no synonym matched. Surfaced through the
         # manifest so a pre-annotation that will not render is visible, not silent.
         self.unmapped_quality = unmapped_quality
+        self.field_map_hash = field_map_hash
+        self.field_map_path = field_map_path
 
     def to_manifest_data(self) -> ManifestData:
         manifest_batches = []
@@ -273,6 +303,8 @@ class ConvertedManifest:
             dataset_path=self.dataset_path,
             converter=self.converter_name,
             config_hash=self.config_hash,
+            field_map_hash=self.field_map_hash,
+            field_map_path=self.field_map_path,
             total_tasks=self.total_tasks,
             batches=manifest_batches,
             unmapped_quality=list(self.unmapped_quality),
@@ -288,6 +320,12 @@ class AVITrainToLabelStudioConverter:
     pre-annotations (predictions). ``adapter`` selects the meta layout:
     ``avi_train`` reads ``meta_vlm.json`` (``quality``/``findings``),
     ``aoi_export`` reads ``meta.json`` (whole-sample ``vlm_verdict``/``note``).
+
+    Where those values go is decided by ``field_map``, which defaults to the
+    adapter's built-in bindings: the control names, image slots, and region
+    source are declarations, not constants, so a caller can bind a renamed
+    control, an optional fourth image, or a region list the adapter never
+    looked at.
     """
 
     def __init__(
@@ -302,6 +340,9 @@ class AVITrainToLabelStudioConverter:
         timeout: float = 30.0,
         adapter: str = "avi_train",
         media_signer: MediaSigner | None = None,
+        field_map: FieldMap | None = None,
+        field_map_hash: str = "",
+        field_map_path: str | None = None,
     ) -> None:
         if adapter not in _SUPPORTED_ADAPTERS:
             raise ConversionError(
@@ -312,6 +353,11 @@ class AVITrainToLabelStudioConverter:
         self._meta_filename = (
             "meta.json" if adapter == "aoi_export" else "meta_vlm.json"
         )
+        self._field_map = (
+            field_map if field_map is not None else default_field_map(adapter)
+        )
+        self._field_map_hash = field_map_hash
+        self._field_map_path = field_map_path
         self._dataset_path = dataset_path.rstrip("/")
         self._storage_base_url = storage_base_url.rstrip("/")
         self._storage_headers = dict(storage_headers)
@@ -326,6 +372,11 @@ class AVITrainToLabelStudioConverter:
         self._unmapped_quality: set[str] = set()
 
     @property
+    def field_map(self) -> FieldMap:
+        """Bindings this conversion writes through."""
+        return self._field_map
+
+    @property
     def unmapped_quality_values(self) -> tuple[str, ...]:
         """Raw quality values no synonym matched, sorted for stable output."""
         return tuple(sorted(self._unmapped_quality))
@@ -338,18 +389,17 @@ class AVITrainToLabelStudioConverter:
                 f"Expected subdirectories containing {self._meta_filename}."
             )
 
+        bound_files = self._bind_sample_images(sample_dirs)
         media_urls = self._resolve_media_urls(
-            [
-                f"{sample_dir}/{filename}"
-                for sample_dir in sample_dirs
-                for filename in ("defect.jpg", "diff.jpg", "gt.jpg")
-            ]
+            [path for files in bound_files.values() for path in files.values()]
         )
 
         tasks: list[dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=_META_FETCH_CONCURRENCY) as pool:
             for task in pool.map(
-                lambda sample_dir: self._build_task(sample_dir, media_urls),
+                lambda sample_dir: self._build_task(
+                    sample_dir, media_urls, bound_files[sample_dir]
+                ),
                 sample_dirs,
             ):
                 if task is not None:
@@ -370,6 +420,8 @@ class AVITrainToLabelStudioConverter:
             batches=batches,
             total_tasks=len(tasks),
             unmapped_quality=self.unmapped_quality_values,
+            field_map_hash=self._field_map_hash,
+            field_map_path=self._field_map_path,
         )
 
     def _list_sample_dirs(self) -> list[str]:
@@ -377,10 +429,68 @@ class AVITrainToLabelStudioConverter:
         entries = self._list_entries(self._dataset_path)
         return [entry["path"] for entry in entries if entry.get("is_dir")]
 
+    def _bind_sample_images(self, sample_dirs: list[str]) -> dict[str, dict[str, str]]:
+        """Resolve every sample's bound image files to Storage object paths.
+
+        A binding that names one required file is taken at its word and the path
+        is built directly, which is exactly what the converter did before field
+        maps existed. Only a binding naming a pattern, or one marked optional,
+        needs the directory listing -- only then is "which file" or "is it even
+        there" a question at all -- so the built-in maps keep the old single pass
+        and do not pay for a listing per sample.
+        """
+        bindings = self._field_map.images
+        needs_listing = any(
+            is_glob(binding.source) or not binding.required for binding in bindings
+        )
+        bound: dict[str, dict[str, str]] = {}
+        for sample_dir in sample_dirs:
+            listing = self._sample_files(sample_dir) if needs_listing else {}
+            files: dict[str, str] = {}
+            for binding in bindings:
+                path = self._bind_one_image(sample_dir, binding, listing)
+                if path is None:
+                    if binding.required:
+                        raise ConversionError(
+                            f"No file matching {binding.source!r} for image field "
+                            f"{binding.field!r} in {sample_dir}"
+                        )
+                    continue
+                files[binding.field] = path
+            bound[sample_dir] = files
+        return bound
+
+    def _bind_one_image(
+        self,
+        sample_dir: str,
+        binding: ImageBinding,
+        listing: dict[str, str],
+    ) -> str | None:
+        """Return the object path one image binding resolves to, or None."""
+        if is_glob(binding.source):
+            matches = sorted(
+                path
+                for name, path in listing.items()
+                if fnmatch.fnmatch(name, binding.source)
+            )
+            return matches[0] if matches else None
+        if not binding.required:
+            return listing.get(binding.source)
+        return f"{sample_dir}/{binding.source}"
+
+    def _sample_files(self, sample_dir: str) -> dict[str, str]:
+        """Return ``{file name: object path}`` for a sample directory's files."""
+        return {
+            entry["name"]: entry["path"]
+            for entry in self._list_entries(sample_dir)
+            if entry.get("name") and not entry.get("is_dir")
+        }
+
     def _build_task(
         self,
         sample_dir: str,
         media_urls: dict[str, str],
+        bound_files: dict[str, str],
     ) -> dict[str, Any] | None:
         meta = self._read_json_file(f"{sample_dir}/{self._meta_filename}")
         if meta is None:
@@ -391,15 +501,18 @@ class AVITrainToLabelStudioConverter:
         data: dict[str, Any] = {
             "sample_id": str(meta.get("sample_id", PurePosixPath(sample_dir).name)),
         }
-        for field, filename in _MEDIA_FIELDS:
-            object_path = f"{sample_dir}/{filename}"
+        for binding in self._field_map.images:
+            object_path = bound_files.get(binding.field)
+            if object_path is None:
+                # Only an optional binding can be absent here.
+                continue
             url = media_urls.get(object_path)
             if not url:
                 raise ConversionError(f"No media URL resolved for {object_path}")
             # The URL is what Label Studio renders; the path is what a later
             # refresh or export round-trip needs, since URLs are short-lived.
-            data[field] = url
-            data[f"{field}_path"] = object_path
+            data[binding.field] = url
+            data[f"{binding.field}_path"] = object_path
 
         if self._adapter == "aoi_export":
             predictions = self._build_aoi_predictions(meta)
@@ -410,34 +523,72 @@ class AVITrainToLabelStudioConverter:
             task["predictions"] = [predictions]
         return task
 
-    def _build_predictions(self, meta: dict[str, Any]) -> dict[str, Any] | None:
-        results: list[dict[str, Any]] = []
+    def _sample_values(self, meta: dict[str, Any]) -> dict[str, Any]:
+        """Return the whole-sample values this adapter's bindings read.
 
-        quality = meta.get("quality")
-        if quality:
-            raw = str(quality)
-            mapped = _QUALITY_CHOICE_SYNONYMS.get(raw.strip().lower())
+        The field names a map declares are shared, but where each adapter finds
+        them is not: an aoi export carries its verdict under one of two spellings
+        and a note, while an avi sample carries a quality. That extraction stays
+        here rather than becoming a fallback chain in the map, so the declaration
+        describes bindings instead of restating each source's quirks.
+        """
+        if self._adapter == "aoi_export":
+            return {
+                "vlm_verdict": meta.get("vlm_verdict") or meta.get("label"),
+                "note": meta.get("note"),
+            }
+        return {"quality": meta.get("quality")}
+
+    def _sample_result(
+        self,
+        binding: SampleFieldBinding,
+        values: dict[str, Any],
+        to_name: str,
+    ) -> dict[str, Any] | None:
+        """Build the prediction one whole-sample binding produces, if any."""
+        raw = values.get(binding.field)
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text:
+            return None
+
+        mapped = text
+        if binding.synonyms:
+            # A binding only normalises when it declares a table; free text such
+            # as a note has nothing to map from, so it is written through.
+            mapped = binding.synonyms.get(text.lower())
             if mapped is None:
-                # Keep our own verdict instead of dropping it, but record it: a
-                # value outside the config's <Choice> list will not render, and
-                # that failure has to be visible somewhere.
-                self._unmapped_quality.add(raw)
+                if binding.on_unmapped == "drop":
+                    # The source is a foreign system's verdict, so an unknown
+                    # spelling means we do not know -- leave it to the annotator.
+                    return None
+                # Our own pipeline's verdict: keep it, but record it, because a
+                # value outside the config's <Choice> list does not render and
+                # that has to be visible somewhere.
+                self._unmapped_quality.add(text)
                 logger.warning(
-                    "avi_train quality %r matched no synonym; written verbatim to "
-                    "quality_label, where it may not render",
-                    raw,
+                    "%s value %r matched no synonym; written verbatim to control "
+                    "%r, where it may not render",
+                    binding.field,
+                    text,
+                    binding.control,
                 )
-            results.append(
-                {
-                    "from_name": "quality_label",
-                    "to_name": "defect_image",
-                    "type": "choices",
-                    "value": {"choices": [mapped or raw]},
-                }
-            )
+                mapped = text
 
-        results.extend(self._region_results(meta.get("findings") or []))
+        value = (
+            {"choices": [mapped]} if binding.type == "choices" else {"text": [mapped]}
+        )
+        return {
+            "from_name": binding.control,
+            "to_name": to_name,
+            "type": binding.type,
+            "value": value,
+        }
 
+    def _build_predictions(self, meta: dict[str, Any]) -> dict[str, Any] | None:
+        results = self._whole_sample_results(meta)
+        results.extend(self._region_results(meta))
         if not results:
             return None
         return {
@@ -447,34 +598,8 @@ class AVITrainToLabelStudioConverter:
         }
 
     def _build_aoi_predictions(self, meta: dict[str, Any]) -> dict[str, Any] | None:
-        verdict = str(meta.get("vlm_verdict") or meta.get("label") or "")
-        verdict = verdict.strip().lower()
-        results: list[dict[str, Any]] = []
-
-        quality = _QUALITY_CHOICE_SYNONYMS.get(verdict)
-        if quality:
-            results.append(
-                {
-                    "from_name": "quality_label",
-                    "to_name": "defect_image",
-                    "type": "choices",
-                    "value": {"choices": [quality]},
-                }
-            )
-
-        results.extend(self._region_results(self._aoi_findings(meta)))
-
-        note = str(meta.get("note") or "").strip()
-        if note:
-            results.append(
-                {
-                    "from_name": "overall_note",
-                    "to_name": "defect_image",
-                    "type": "textarea",
-                    "value": {"text": [note]},
-                }
-            )
-
+        results = self._whole_sample_results(meta)
+        results.extend(self._region_results(meta))
         if not results:
             return None
         return {
@@ -483,78 +608,115 @@ class AVITrainToLabelStudioConverter:
             "result": results,
         }
 
-    def _aoi_findings(self, meta: dict[str, Any]) -> list[dict[str, Any]]:
-        """Region sources for an aoi export.
+    def _whole_sample_results(self, meta: dict[str, Any]) -> list[dict[str, Any]]:
+        """Pre-annotate every whole-sample control the map declares."""
+        values = self._sample_values(meta)
+        to_name = self._field_map.to_name_for()
+        results: list[dict[str, Any]] = []
+        for binding in self._field_map.samples:
+            result = self._sample_result(binding, values, to_name)
+            if result is not None:
+                results.append(result)
+        return results
 
-        An AOI export is a whole-sample verdict, so many exports carry no
-        coordinates at all and this returns nothing -- the sample is annotated
-        by hand, as before. Two shapes are honoured when coordinates do appear:
-        an explicit ``findings`` list (the ``avi_train`` layout), and the flat
-        ``boxes`` list together with the sample's category.
+    def _region_sources(self, meta: dict[str, Any]) -> dict[str, list[Any]]:
+        """Return each region list an adapter can offer, keyed by meta field.
+
+        An AOI export is a whole-sample verdict, so many carry no coordinates at
+        all and nothing is returned -- the sample is annotated by hand, as
+        before. When coordinates do appear, an explicit ``findings`` list wins
+        over the flat ``boxes`` plus the sample's category, which is why only one
+        of the two is ever offered.
         """
         findings = meta.get("findings")
-        if isinstance(findings, list) and findings:
-            return [finding for finding in findings if isinstance(finding, dict)]
+        sources: dict[str, list[Any]] = {
+            "findings": [item for item in findings if isinstance(item, dict)]
+            if isinstance(findings, list)
+            else []
+        }
+        if self._adapter != "aoi_export" or sources["findings"]:
+            return sources
 
         boxes = meta.get("boxes")
         if not isinstance(boxes, list):
-            return []
+            return sources
         category = str(meta.get("category") or meta.get("vlm_category") or "").strip()
-        return [{"bbox": box, "category": category} for box in boxes if box]
+        sources["boxes"] = [{"bbox": box, "category": category} for box in boxes if box]
+        return sources
 
-    def _region_results(self, findings: Iterable[Any]) -> list[dict[str, Any]]:
-        """Build the region controls both adapters pre-annotate against.
+    def _region_results(self, meta: dict[str, Any]) -> list[dict[str, Any]]:
+        """Pre-annotate every region control the map declares.
 
-        A region needs geometry *and* a category. Label Studio draws a
+        A region needs geometry *and* a label. Label Studio draws a
         rectanglelabels prediction only when its label list is non-empty, so a
-        region with coordinates but no category is skipped and logged rather
-        than written as a box that cannot render.
+        region with coordinates but no label is skipped and logged rather than
+        written as a box that cannot render.
         """
+        sources = self._region_sources(meta)
+        to_name = self._field_map.to_name_for()
         results: list[dict[str, Any]] = []
-        for index, finding in enumerate(findings):
-            if not isinstance(finding, dict):
-                continue
-            region_id = f"finding_{index + 1}"
+        numbered = 0
+        for binding in self._field_map.regions:
+            for finding in sources.get(binding.source) or []:
+                if not isinstance(finding, dict):
+                    continue
+                numbered += 1
+                region_id = f"finding_{numbered}"
+                results.extend(
+                    self._region_result(binding, finding, region_id, to_name)
+                )
+        return results
 
-            geometry = _region_geometry(finding)
-            category = str(finding.get("category") or "").strip()
-            if geometry is not None:
-                if category:
-                    x, y, width, height = geometry
-                    results.append(
-                        {
-                            "id": region_id,
-                            "from_name": "finding_category",
-                            "to_name": "defect_image",
-                            "type": "rectanglelabels",
-                            "value": {
-                                "x": x,
-                                "y": y,
-                                "width": width,
-                                "height": height,
-                                "rectanglelabels": [category],
-                            },
-                        }
-                    )
-                else:
-                    logger.warning(
-                        "Region %s has usable geometry but no category; Label "
-                        "Studio would render an unlabelled rectangle, so it is "
-                        "skipped",
-                        region_id,
-                    )
-
-            observation = finding.get("observation")
-            if observation:
+    def _region_result(
+        self,
+        binding: RegionBinding,
+        finding: dict[str, Any],
+        region_id: str,
+        to_name: str,
+    ) -> list[dict[str, Any]]:
+        """Build the controls one region produces: its box and its text."""
+        results: list[dict[str, Any]] = []
+        geometry = _region_geometry(finding, binding)
+        label = str(finding.get(binding.label) or "").strip()
+        if geometry is not None:
+            if label:
+                if binding.label_synonyms:
+                    label = binding.label_synonyms.get(label.lower(), label)
+                x, y, width, height = geometry
                 results.append(
                     {
                         "id": region_id,
-                        "from_name": "finding_observation",
-                        "to_name": "defect_image",
-                        "type": "textarea",
-                        "value": {"text": [str(observation)]},
+                        "from_name": binding.control,
+                        "to_name": to_name,
+                        "type": "rectanglelabels",
+                        "value": {
+                            "x": x,
+                            "y": y,
+                            "width": width,
+                            "height": height,
+                            "rectanglelabels": [label],
+                        },
                     }
                 )
+            else:
+                logger.warning(
+                    "Region %s has usable geometry but no %r label; Label Studio "
+                    "would render an unlabelled rectangle, so it is skipped",
+                    region_id,
+                    binding.label,
+                )
+
+        observation = finding.get(binding.observation) if binding.observation else None
+        if observation and binding.observation_control:
+            results.append(
+                {
+                    "id": region_id,
+                    "from_name": binding.observation_control,
+                    "to_name": to_name,
+                    "type": "textarea",
+                    "value": {"text": [str(observation)]},
+                }
+            )
         return results
 
     def _resolve_media_urls(self, paths: list[str]) -> dict[str, str]:
@@ -733,8 +895,25 @@ class AVITrainToLabelStudioConverter:
         return payload
 
 
+def _result_value(control_type: str, value: dict[str, Any]) -> str | None:
+    """Return the first value an export wrote for one whole-sample control."""
+    written = value.get("choices" if control_type == "choices" else "text")
+    if isinstance(written, list) and written:
+        return str(written[0])
+    return None
+
+
 class LabelStudioToAVITrainConverter:
-    """Convert Label Studio export JSON back into PyroMind AVI Train samples."""
+    """Convert Label Studio export JSON back into PyroMind AVI Train samples.
+
+    The bindings are looked up by control name in the same ``FieldMap`` the
+    forward conversion wrote through. Renaming a control in a declaration would
+    otherwise import pre-annotations cleanly and then export empty fields, so
+    both directions read one map rather than each hard-coding its own names.
+    """
+
+    def __init__(self, field_map: FieldMap | None = None) -> None:
+        self._field_map = field_map if field_map is not None else EXPORT_FIELD_MAP
 
     def convert(self, export_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         samples: list[dict[str, Any]] = []
@@ -753,19 +932,32 @@ class LabelStudioToAVITrainConverter:
         latest = annotations[-1]
         sample: dict[str, Any] = {
             "sample_id": data.get("sample_id", ""),
-            # Prefer the stored object path so exports stay usable after the
-            # rendered media URLs expire; fall back for tasks imported before
-            # paths were recorded.
-            "defect_image_path": data.get("defect_image_path")
-            or data.get("defect_image", ""),
-            "diff_image_path": data.get("diff_image_path")
-            or data.get("diff_image", ""),
-            "gt_image_path": data.get("gt_image_path") or data.get("gt_image", ""),
-            "quality": None,
-            "findings": [],
+        }
+        # Prefer the stored object path so exports stay usable after the rendered
+        # media URLs expire; fall back for tasks imported before paths were
+        # recorded. Every bound image gets a key, blank when the sample had none.
+        for image in self._field_map.images:
+            sample[f"{image.field}_path"] = data.get(f"{image.field}_path") or data.get(
+                image.field, ""
+            )
+
+        region_bindings = {
+            binding.control: binding for binding in self._field_map.regions
+        }
+        observation_bindings = {
+            binding.observation_control: binding
+            for binding in self._field_map.regions
+            if binding.observation_control
+        }
+        sample_bindings = {
+            binding.control: binding for binding in self._field_map.samples
+        }
+        # Regions land in the list their binding reads from, so a map pointed at
+        # another meta key exports that key instead of a hard-coded "findings".
+        grouped: dict[str, dict[str, dict[str, Any]]] = {
+            binding.source: {} for binding in self._field_map.regions
         }
 
-        findings_by_region: dict[str, dict[str, Any]] = defaultdict(dict)
         for result in latest.get("result", []):
             from_name = result.get("from_name", "")
             region_id = result.get("id", "")
@@ -773,36 +965,41 @@ class LabelStudioToAVITrainConverter:
             if not isinstance(value, dict):
                 continue
 
-            if from_name == "quality_label":
-                choices = value.get("choices", [])
-                if choices:
-                    sample["quality"] = choices[0]
-            elif from_name == "finding_category":
+            binding = sample_bindings.get(from_name)
+            if binding is not None:
+                text = _result_value(binding.type, value)
+                if text is not None:
+                    sample[binding.field] = text
+                continue
+
+            region_binding = region_bindings.get(from_name)
+            if region_binding is not None:
+                regions = grouped.setdefault(region_binding.source, {})
+                region = regions.setdefault(region_id, {})
                 labels = value.get("rectanglelabels", [])
                 if labels:
-                    findings_by_region[region_id]["category"] = labels[0]
+                    region[region_binding.label] = labels[0]
                 x = float(value.get("x", 0))
                 y = float(value.get("y", 0))
                 w = float(value.get("width", 0))
                 h = float(value.get("height", 0))
-                findings_by_region[region_id]["bbox"] = {
+                region["bbox"] = {
                     "x_min_norm": round(x * 10, 1),
                     "y_min_norm": round(y * 10, 1),
                     "x_max_norm": round((x + w) * 10, 1),
                     "y_max_norm": round((y + h) * 10, 1),
                 }
-            elif from_name == "finding_observation":
-                texts = value.get("text", [])
-                if texts:
-                    findings_by_region[region_id]["observation"] = texts[0]
-            elif from_name == "overall_note":
-                # aoi_export has no regions, so its free text is a whole-sample note
-                # rather than a finding. Keyed the way meta.json spells it, which is
-                # what the forward converter reads back; avi_train configs have no
-                # such control, so their samples keep the shape they always had.
-                texts = value.get("text", [])
-                if texts:
-                    sample["note"] = texts[0]
+                continue
 
-        sample["findings"] = list(findings_by_region.values())
+            observation_binding = observation_bindings.get(from_name)
+            if observation_binding is not None and observation_binding.observation:
+                texts = value.get("text", [])
+                if texts:
+                    regions = grouped.setdefault(observation_binding.source, {})
+                    regions.setdefault(region_id, {})[
+                        observation_binding.observation
+                    ] = texts[0]
+
+        for source, regions in grouped.items():
+            sample[source] = list(regions.values())
         return sample

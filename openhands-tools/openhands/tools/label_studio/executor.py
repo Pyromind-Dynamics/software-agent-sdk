@@ -29,6 +29,12 @@ from openhands.tools.label_studio.definition import (
     LabelStudioProjectObservation,
 )
 from openhands.tools.label_studio.export_ticket import PortalExportTicketProvider
+from openhands.tools.label_studio.field_map import (
+    FieldMap,
+    default_field_map,
+    field_map_digest,
+    parse_field_map,
+)
 from openhands.tools.label_studio.media_signer import PortalMediaSigner
 from openhands.tools.label_studio.models import ProjectState
 from openhands.tools.label_studio.skill_helpers import (
@@ -76,6 +82,7 @@ def _project_ref(
     adapter: str,
     config_hash: str,
     idempotency_key: str | None,
+    field_map_hash: str = "",
 ) -> str:
     """Derive a stable project ref so a retried create resumes, not duplicates.
 
@@ -84,6 +91,9 @@ def _project_ref(
     ``cluster`` is part of the seed because Storage is replicated per cluster: the
     same path names different objects in us-west-1 and us-west-2, and one shared
     Label Studio would otherwise adopt the other cluster's project by title.
+    ``field_map_hash`` is part of it because bindings decide where each value
+    lands: reusing a project across two different maps would keep serving the
+    first one, since the reuse check only looks at status.
     ``idempotency_key`` lets a caller ask for a distinct project over otherwise
     identical inputs.
     """
@@ -94,6 +104,7 @@ def _project_ref(
             dataset_path,
             adapter,
             config_hash,
+            field_map_hash,
             idempotency_key or "",
         )
     )
@@ -171,10 +182,14 @@ class LabelStudioProjectExecutor(
                 f"label_config.xml not found in workspace: {action.label_config_path}"
             )
 
+        # Both halves of the contract are read before anything is uploaded: the
+        # XML says which controls exist, the field map says which values land on
+        # them, and a mismatch between the two is cheapest to catch right here.
+        field_map, field_map_hash = self._resolve_field_map(action, conversation)
         xml_text = xml_content.decode("utf-8")
-        # Local checks catch a malformed document; the adapter contract catches a
+        # Local checks catch a malformed document; the binding contract catches a
         # well-formed one the converter could not pre-annotate against.
-        validate_label_config_xml(xml_text, adapter=action.adapter)
+        validate_label_config_xml(xml_text, adapter=action.adapter, field_map=field_map)
         config_hash = hashlib.sha256(xml_content).hexdigest()
         project_ref = _project_ref(
             self._ls_base_url,
@@ -183,6 +198,7 @@ class LabelStudioProjectExecutor(
             action.adapter,
             config_hash,
             action.idempotency_key,
+            field_map_hash,
         )
         artifact_dir = f"{PYROMIND_AGENT_STORAGE_ROOT}/label-studio/{project_ref}"
 
@@ -212,6 +228,8 @@ class LabelStudioProjectExecutor(
                 xml_content=xml_content,
                 media_signer=self._build_media_signer(conversation),
                 conversation=conversation,
+                field_map=field_map,
+                field_map_hash=field_map_hash,
             )
 
         ls_api = self._build_ls_api(conversation)
@@ -274,6 +292,41 @@ class LabelStudioProjectExecutor(
                 f"Label Studio rejected label_config.xml: {exc}"
             ) from exc
 
+    def _resolve_field_map(
+        self,
+        action: LabelStudioProjectAction,
+        conversation: BaseConversation | None,
+    ) -> tuple[FieldMap, str]:
+        """Load the caller's bindings, or the adapter's built-in ones.
+
+        A declared map is read and validated before anything is converted, so an
+        unknown key or a mistyped control fails in one request rather than after
+        the dataset has been converted and every media URL signed. The digest is
+        empty for built-in bindings, which keeps an existing project resumable
+        across a deploy that did not change them.
+        """
+        if not action.field_map_path:
+            return default_field_map(action.adapter), ""
+
+        raw = self._read_workspace_file(action.field_map_path, conversation)
+        if raw is None:
+            raise ValueError(
+                f"field map not found in workspace: {action.field_map_path}"
+            )
+        try:
+            declared = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError(
+                f"field map is not readable JSON: {action.field_map_path}: {exc}"
+            ) from exc
+        try:
+            field_map = parse_field_map(declared, adapter=action.adapter)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid field map {action.field_map_path}: {exc}"
+            ) from exc
+        return field_map, field_map_digest(field_map)
+
     def _create_project(
         self,
         *,
@@ -285,6 +338,8 @@ class LabelStudioProjectExecutor(
         xml_content: bytes,
         media_signer: PortalMediaSigner | None,
         conversation: BaseConversation | None,
+        field_map: FieldMap,
+        field_map_hash: str,
     ) -> tuple[ConvertedManifest, ProjectState]:
         """Convert the dataset, persist its artifacts, and create the LS project."""
         self._upload_to_storage(
@@ -302,6 +357,9 @@ class LabelStudioProjectExecutor(
             timeout=float(self._timeout),
             adapter=action.adapter,
             media_signer=media_signer,
+            field_map=field_map,
+            field_map_hash=field_map_hash,
+            field_map_path=action.field_map_path,
         )
         manifest = converter.convert()
         self._upload_manifest(artifact_dir, manifest, conversation)
@@ -340,6 +398,11 @@ class LabelStudioProjectExecutor(
             total_tasks=manifest.total_tasks,
             total_batches=len(manifest.batch_payloads),
             config_hash=config_hash,
+            field_map_hash=field_map_hash,
+            # Kept verbatim rather than re-read from field_map_path: export has
+            # to read controls back through the names that produced the tasks,
+            # and the file may have been edited or deleted since.
+            field_map=field_map.model_dump() if field_map_hash else None,
             idempotency_key=action.idempotency_key,
             created_at=datetime.now(UTC).isoformat(),
             media_expires_at=_media_expiry_iso(
@@ -417,6 +480,10 @@ class LabelStudioProjectExecutor(
         new_xml = xml_content.decode("utf-8")
 
         ls_api = self._build_ls_api(conversation)
+        # A project keeps the bindings it was converted through, so a new config
+        # still has to satisfy them: renaming or dropping a control here would
+        # silently stop the stored pre-annotations from landing anywhere.
+        validate_label_config_xml(new_xml, field_map=self._bindings_for(state))
         ls_api.validate_config(project_id=state.project_id, label_config=new_xml)
 
         existing_from_names = ls_api.get_annotation_from_names(state.project_id)
@@ -451,7 +518,7 @@ class LabelStudioProjectExecutor(
 
         ls_api = self._build_ls_api(conversation)
         export_data = ls_api.export_annotations(state.project_id)
-        converter = LabelStudioToAVITrainConverter()
+        converter = LabelStudioToAVITrainConverter(self._export_field_map(state))
         samples = converter.convert(export_data)
 
         output_path = (
@@ -494,6 +561,27 @@ class LabelStudioProjectExecutor(
             annotation_count=len(samples),
             export_path=f"{output_path}/annotations.json",
         )
+
+    def _export_field_map(self, state: ProjectState) -> FieldMap | None:
+        """Bindings to read a project's annotations back through.
+
+        A declared map is rebuilt from the state that created the tasks, so
+        export looks controls up under exactly the names the import wrote them
+        with. Built-in bindings return None, which lets the converter fall back
+        to the default reverse index that spans every adapter.
+        """
+        if not state.field_map:
+            return None
+        return FieldMap.model_validate(state.field_map)
+
+    def _bindings_for(self, state: ProjectState) -> FieldMap:
+        """The bindings a project's tasks were converted through.
+
+        Unlike export's reverse index, this always names a concrete map, so a
+        caller checking a config against a project does not have to treat the
+        built-in bindings as a separate case.
+        """
+        return self._export_field_map(state) or default_field_map(state.adapter)
 
     def _handle_refresh_media(
         self,

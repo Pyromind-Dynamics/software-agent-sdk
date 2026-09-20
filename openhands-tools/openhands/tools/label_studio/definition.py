@@ -42,6 +42,16 @@ class LabelStudioProjectAction(Action):
             "operation='create' and 'update_config'."
         ),
     )
+    field_map_path: str | None = Field(
+        default=None,
+        description=(
+            "Optional workspace-relative JSON path declaring how meta fields and "
+            "image files bind to the label config's controls. Omit to use the "
+            "adapter's built-in bindings; declare one to rename a control, bind "
+            "an extra or optional image, or pin a coordinate unit. Only for "
+            "operation='create'."
+        ),
+    )
     project_ref: str | None = Field(
         default=None,
         description=(
@@ -117,17 +127,18 @@ class LabelStudioProjectObservation(Observation):
         default=None,
         description=(
             "Portal SSO URL that signs the browser in to Label Studio and lands "
-            "on the project. Send this one when the user has to be able to open "
-            "the project: a Label Studio session cannot be established any other "
-            "way, and the accounts have no password the user could type."
+            "on the project. This is the canonical link to give the user. It also "
+            "recovers from an expired Label Studio session by returning through "
+            "the platform login."
         ),
     )
     project_url: str | None = Field(
         default=None,
         description=(
-            "Direct Label Studio project URL. Use it to name the project in text, "
-            "not to get the user in: it renders only while the browser already "
-            "holds the Label Studio session that open_url establishes."
+            "Direct Label Studio project URL. It is also safe to give or save: "
+            "an anonymous or expired-session page load is redirected through "
+            "portal SSO and returns to this project. open_url remains the "
+            "preferred entry point."
         ),
     )
     export_path: str | None = Field(
@@ -141,8 +152,22 @@ Use operation='create' to import a user-storage dataset after preview_dataset an
 after generating a validated label_config.xml in the workspace. The tool converts
 the dataset deterministically, imports tasks in batches, and returns a PyroMind
 project_ref, Label Studio project_id, manifest_path, open_url, and project_url.
-open_url is the link to give the user; project_url is the same project's own Label
-Studio address, which only renders once that link has opened it.
+open_url is the preferred link to give the user; project_url is the same project's
+own Label Studio address. Both recover from an expired Label Studio session by
+returning through portal SSO.
+
+Pre-annotations are written through bindings: each adapter has built-in ones, and
+an optional field_map_path JSON replaces any of them (control names, image slots,
+region sources, coordinate units). What the converter can write is limited, and
+this list is the whole of it: a whole-sample Choices verdict; rectangles plus
+per-region text, when a sample carries coordinates and a category; and, for
+aoi_export, a whole-sample TextArea note. It does not write brushes, polygons, or
+keypoints, and it cannot give different samples different control sets. When a
+request needs something outside that list, say which capability is missing rather
+than probing schema after schema -- every probe re-uploads the media and rebuilds
+the project, and a feature the converter does not have will not start working.
+The label-studio skill carries the full capability matrix and a runnable example
+per adapter.
 
 Use operation='get' to load a project, 'status' to inspect import and task counts,
 'update_config' to safely update label XML, and 'export' to convert Label Studio

@@ -395,7 +395,7 @@ Note: This is separate from `persistence_dir` which is used for conversation sta
 - Python namespace is `openhands.*` across packages; keep new modules within the matching package and mirror test paths under `tests/`.
 </PROJECT_STRUCTURE>
 
-<QUICK_COMMANDS>
+<QUICK_COMMANDS>[train.jsonl](../../Downloads/sft_aoi/train.jsonl)
 - Set up the dev environment: `make build` (runs `uv sync --dev` and installs pre-commit; requires uv >= 0.8.13)
 - Lint/format: `make lint`, `make format`
 - Run tests: `uv run pytest`

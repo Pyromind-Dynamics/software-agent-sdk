@@ -1,0 +1,68 @@
+{
+  "model_version": "vlm-v1",
+  "score": 0.93,
+  "result": [
+    {
+      "from_name": "quality_label",
+      "to_name": "defect_image",
+      "type": "choices",
+      "value": {
+        "choices": [
+          "defect"
+        ]
+      }
+    },
+    {
+      "id": "finding_1",
+      "from_name": "finding_category",
+      "to_name": "defect_image",
+      "type": "rectanglelabels",
+      "value": {
+        "x": 12.0,
+        "y": 34.0,
+        "width": 34.0,
+        "height": 27.0,
+        "rectanglelabels": [
+          "开路"
+        ]
+      }
+    },
+    {
+      "id": "finding_1",
+      "from_name": "finding_observation",
+      "to_name": "defect_image",
+      "type": "textarea",
+      "value": {
+        "text": [
+          "线路断开，断口有毛刺"
+        ]
+      }
+    },
+    {
+      "id": "finding_2",
+      "from_name": "finding_category",
+      "to_name": "defect_image",
+      "type": "rectanglelabels",
+      "value": {
+        "x": 70.0,
+        "y": 20.0,
+        "width": 18.0,
+        "height": 13.0,
+        "rectanglelabels": [
+          "异物"
+        ]
+      }
+    },
+    {
+      "id": "finding_2",
+      "from_name": "finding_observation",
+      "to_name": "defect_image",
+      "type": "textarea",
+      "value": {
+        "text": [
+          "残留锡渣"
+        ]
+      }
+    }
+  ]
+}

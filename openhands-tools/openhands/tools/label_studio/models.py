@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -24,6 +24,17 @@ class ManifestData(BaseModel):
     converter: str = Field(description="Converter adapter name, e.g. avi_train.")
     converter_version: int = Field(default=1)
     config_hash: str = Field(description="SHA-256 hash of label_config.xml.")
+    field_map_hash: str = Field(
+        default="",
+        description=(
+            "SHA-256 hash of the bindings this import was converted through. "
+            "Empty means the adapter's built-in bindings."
+        ),
+    )
+    field_map_path: str | None = Field(
+        default=None,
+        description="Workspace-relative path of the declared field map, if any.",
+    )
     total_tasks: int = Field(description="Total number of tasks across all batches.")
     batches: list[ManifestBatch] = Field(default_factory=list)
     unmapped_quality: list[str] = Field(
@@ -50,6 +61,15 @@ class ProjectState(BaseModel):
     total_tasks: int = 0
     total_batches: int = 0
     config_hash: str = ""
+    field_map_hash: str = ""
+    field_map: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "The bindings this project's tasks were converted through, kept "
+            "verbatim so export reads controls back through the same names. "
+            "None means the adapter's built-in bindings."
+        ),
+    )
     last_error: str | None = None
     idempotency_key: str | None = None
     created_at: str = ""

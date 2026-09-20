@@ -525,6 +525,85 @@ class TestUpdateConfig:
         assert "removed_control" in obs.text
         assert not mock_ls.update_project_config.called
 
+    def test_config_dropping_a_bound_control_rejected(
+        self,
+        executor: LabelStudioProjectExecutor,
+        conversation: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        # pre-annotations are written through quality_label, so a config that
+        # leaves it out would import with that field silently empty.
+        stripped = tmp_path / "stripped.xml"
+        stripped.write_text(
+            '<View><Image name="defect_image" value="$defect_image"/>'
+            '<TextArea name="finding_observation" toName="defect_image"/>'
+            "</View>",
+            encoding="utf-8",
+        )
+        state = ProjectState(
+            project_ref="abc", project_id=42, dataset_path="/d", adapter="avi_train"
+        )
+        mock_ls = _mock_ls_api()
+        with (
+            patch.object(executor, "_load_state", return_value=state),
+            patch.object(executor, "_build_ls_api", return_value=mock_ls),
+        ):
+            obs = executor(
+                _action(
+                    operation="update_config",
+                    project_ref="abc",
+                    label_config_path="stripped.xml",
+                    expected_config_version=1,
+                ),
+                conversation,
+            )
+        assert obs.is_error
+        assert "quality_label" in obs.text
+        assert not mock_ls.update_project_config.called
+
+    def test_declared_bindings_override_the_defaults(
+        self,
+        executor: LabelStudioProjectExecutor,
+        conversation: MagicMock,
+    ) -> None:
+        from openhands.tools.label_studio.field_map import parse_field_map
+
+        # The project was converted through a map that renamed the quality
+        # control, so the default name no longer satisfies its own config.
+        declared = parse_field_map(
+            {
+                "samples": [
+                    {"field": "quality", "control": "my_verdict", "type": "choices"}
+                ]
+            },
+            adapter="avi_train",
+        )
+        state = ProjectState(
+            project_ref="abc",
+            project_id=42,
+            dataset_path="/d",
+            adapter="avi_train",
+            field_map_hash="deadbeef",
+            field_map=declared.model_dump(),
+        )
+        mock_ls = _mock_ls_api()
+        with (
+            patch.object(executor, "_load_state", return_value=state),
+            patch.object(executor, "_build_ls_api", return_value=mock_ls),
+        ):
+            obs = executor(
+                _action(
+                    operation="update_config",
+                    project_ref="abc",
+                    label_config_path="label_config.xml",
+                    expected_config_version=1,
+                ),
+                conversation,
+            )
+        assert obs.is_error
+        assert "my_verdict" in obs.text
+        assert not mock_ls.update_project_config.called
+
 
 class TestExport:
     def test_export_success(

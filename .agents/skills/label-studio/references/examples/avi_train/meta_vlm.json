@@ -1,0 +1,28 @@
+{
+  "sample_id": "10_B1",
+  "model_version": "vlm-v1",
+  "score": 0.93,
+  "quality": "defect",
+  "findings": [
+    {
+      "category": "开路",
+      "observation": "线路断开，断口有毛刺",
+      "bbox": {
+        "x_min_norm": 120,
+        "y_min_norm": 340,
+        "x_max_norm": 460,
+        "y_max_norm": 610
+      }
+    },
+    {
+      "category": "异物",
+      "observation": "残留锡渣",
+      "value": {
+        "x": 70.0,
+        "y": 20.0,
+        "width": 18.0,
+        "height": 13.0
+      }
+    }
+  ]
+}

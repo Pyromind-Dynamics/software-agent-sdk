@@ -10,11 +10,21 @@ the two places where the server's check is looser than its own runtime:
 - the server only requires ``toName`` to name *something*; a control whose
   ``toName`` points at another control is accepted and then renders with no data,
   so objects are required here.
+
+The adapter contract is checked against the same ``FieldMap`` the converter
+writes through. Its bindings decide which controls have to exist and what kind
+they have to be, so a renamed control is fine as long as the declaration and the
+XML agree -- what is rejected is a binding that cannot land anywhere.
 """
 
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
+
+from openhands.tools.label_studio.field_map import (
+    DEFAULT_FIELD_MAPS,
+    FieldMap,
+)
 
 
 _OBJECT_TAGS = {"Image", "Text", "Audio", "Video", "HyperText", "TimeSeries"}
@@ -29,26 +39,16 @@ _CONTROL_TAG_TO_TYPE = {
 }
 _TYPE_TO_TAG = {value: tag for tag, value in _CONTROL_TAG_TO_TYPE.items()}
 
+# Objects a region control can legally draw on. Label Studio draws rectangles on
+# images and video frames alike.
+_MEDIA_TAGS = {"Image", "Video"}
+
 # Label Studio treats a label config as a document rooted at <View>.
 _ROOT_TAG = "View"
 
-# The dataset converter writes predictions against these exact names and reads
-# the same names back on export, so a config that renames any of them imports
-# cleanly and then silently drops every pre-annotation. Keep this table in step
-# with converter.AVITrainToLabelStudioConverter; the test named
-# test_required_controls_matches_converter fails when the two drift apart.
+# The image object the built-in maps bind every control to. Kept as a module
+# constant because it names the media object in the default bindings' errors.
 REQUIRED_MEDIA_OBJECT = "defect_image"
-_REQUIRED_CONTROLS: dict[str, dict[str, str]] = {
-    "avi_train": {
-        "quality_label": "choices",
-        "finding_category": "rectanglelabels",
-        "finding_observation": "textarea",
-    },
-    "aoi_export": {
-        "quality_label": "choices",
-        "overall_note": "textarea",
-    },
-}
 
 
 class LabelConfigValidationError(ValueError):
@@ -56,8 +56,27 @@ class LabelConfigValidationError(ValueError):
 
 
 def required_controls(adapter: str) -> dict[str, str]:
-    """Return the ``{control name: type}`` an adapter's predictions rely on."""
-    return dict(_REQUIRED_CONTROLS.get(adapter, {}))
+    """Return the ``{control name: type}`` an adapter's predictions rely on.
+
+    Only bindings marked required count: an adapter may declare a control for
+    data only some of its samples carry, and demanding it of every config would
+    force a control onto projects that never use it.
+    """
+    field_map = DEFAULT_FIELD_MAPS.get(adapter)
+    if field_map is None:
+        return {}
+    controls = {
+        binding.control: binding.type
+        for binding in field_map.samples
+        if binding.required
+    }
+    for binding in field_map.regions:
+        if not binding.required:
+            continue
+        controls[binding.control] = "rectanglelabels"
+        if binding.observation_control:
+            controls[binding.observation_control] = "textarea"
+    return controls
 
 
 def extract_control_names(xml_content: str) -> set[str]:
@@ -69,6 +88,7 @@ def validate_label_config_xml(
     xml_content: str,
     *,
     adapter: str | None = None,
+    field_map: FieldMap | None = None,
 ) -> list[dict[str, str]]:
     """Validate a Label Studio label config and return control triplets.
 
@@ -76,8 +96,9 @@ def validate_label_config_xml(
     control tag found in the XML. ``to_name`` keeps the attribute verbatim, which
     may list several comma-separated objects.
 
-    Pass ``adapter`` to also require the controls that adapter's converter
-    pre-annotates against.
+    Pass ``adapter`` to also require the controls that adapter's built-in
+    bindings pre-annotate against, or ``field_map`` to check a caller's own
+    bindings instead. A declared map wins over the adapter's default.
 
     Raises:
         LabelConfigValidationError: If the XML is malformed or structurally
@@ -134,64 +155,97 @@ def validate_label_config_xml(
             }
         )
 
-    if adapter is not None:
-        _check_adapter_contract(adapter, objects, controls)
+    bindings = field_map
+    if bindings is None and adapter is not None:
+        # An unknown adapter is left alone: the converter rejects it outright,
+        # and duplicating that check would only produce two error messages.
+        bindings = DEFAULT_FIELD_MAPS.get(adapter)
+    if bindings is not None:
+        check_field_map(bindings, objects, controls)
     return controls
 
 
-def _check_adapter_contract(
-    adapter: str,
+def check_field_map(
+    field_map: FieldMap,
     objects: dict[str, str],
     controls: list[dict[str, str]],
 ) -> None:
-    """Reject a config the adapter's converter could not write predictions to.
+    """Reject a config these bindings could not write predictions through.
 
-    An unknown adapter is left alone here: the converter rejects it outright, and
-    duplicating that check would only produce two different error messages.
+    Every problem names the binding that failed rather than a name that has to
+    exist: the caller chose the names when they declared the map, and what is
+    checked here is that each one reaches a control of the declared kind.
     """
-    required = _REQUIRED_CONTROLS.get(adapter)
-    if not required:
-        return
-
     problems: list[str] = []
-    media_tag = objects.get(REQUIRED_MEDIA_OBJECT)
-    if media_tag is None:
-        problems.append(f'missing <Image name="{REQUIRED_MEDIA_OBJECT}" value="$..."/>')
-    elif media_tag != "Image":
-        problems.append(
-            f"'{REQUIRED_MEDIA_OBJECT}' is <{media_tag}> but must be <Image>"
-        )
-
+    primary = field_map.to_name_for() if field_map.images else None
     by_name = {control["from_name"]: control for control in controls}
-    for name, expected_type in required.items():
+
+    # Every control points its toName at the primary image, so that object has to
+    # exist or nothing renders at all. The other bound images only feed task data:
+    # a config that leaves one out shows fewer views rather than losing
+    # pre-annotations, so it is checked only when it is declared.
+    for image in field_map.images:
+        tag = objects.get(image.field)
+        if tag is None:
+            if image.field == primary:
+                problems.append(f'missing <Image name="{image.field}" value="$..."/>')
+        elif tag not in _MEDIA_TAGS:
+            problems.append(f"'{image.field}' is <{tag}> but must be <Image>")
+
+    def check_control(name: str, expected_type: str, required: bool, bound_by: str):
         expected_tag = _TYPE_TO_TAG[expected_type]
         control = by_name.get(name)
         if control is None:
-            problems.append(
-                f'missing <{expected_tag} name="{name}" '
-                f'toName="{REQUIRED_MEDIA_OBJECT}">'
-            )
-            continue
+            if required:
+                problems.append(
+                    f'missing <{expected_tag} name="{name}" toName="{primary}"> '
+                    f"({bound_by} is pre-annotated)"
+                )
+            return
         if control["type"] != expected_type:
             problems.append(
                 f"'{name}' is <{_TYPE_TO_TAG[control['type']]}> "
                 f"but must be <{expected_tag}>"
             )
-            continue
+            return
         targets = [
             target.strip() for target in control["to_name"].split(",") if target.strip()
         ]
-        if REQUIRED_MEDIA_OBJECT not in targets:
+        if primary is not None and primary not in targets:
             problems.append(
-                f"'{name}' must have toName=\"{REQUIRED_MEDIA_OBJECT}\", "
-                f'found "{control["to_name"]}"'
+                f'\'{name}\' must have toName="{primary}", found "{control["to_name"]}"'
+            )
+
+    for binding in field_map.samples:
+        check_control(
+            binding.control,
+            binding.type,
+            binding.required,
+            f"meta field '{binding.field}'",
+        )
+
+    for binding in field_map.regions:
+        check_control(
+            binding.control,
+            "rectanglelabels",
+            binding.required,
+            f"regions in '{binding.source}'",
+        )
+        if binding.observation_control:
+            # Per-region text rides on the same regions as the box, so it is
+            # only required where the box is.
+            check_control(
+                binding.observation_control,
+                "textarea",
+                binding.required,
+                f"'{binding.observation}' in '{binding.source}'",
             )
 
     if problems:
         raise LabelConfigValidationError(
-            f"label_config.xml does not match the '{adapter}' prediction contract: "
+            "label_config.xml does not match the prediction contract declared for "
+            "this project: "
             + "; ".join(problems)
-            + ". These control names, types, and toName targets are fixed by the "
-            "converter; a config that renames them imports with no pre-annotations "
-            "and exports empty fields."
+            + ". A config that omits or renames one of these imports with no "
+            "pre-annotations and exports empty fields."
         )

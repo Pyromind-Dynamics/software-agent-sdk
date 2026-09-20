@@ -2157,12 +2157,20 @@ class UploadFileToPyromindObservation(Observation):
 
 _UPLOAD_FILE_DESCRIPTION = """Upload a workspace file to Pyromind storage.
 
-Use this when a workflow node needs a server-side file path, most commonly a
-custom evaluation metric or reward script for MetricsConfigBuilderCustomNode:
-write the Python file locally first, upload it with this tool, then use the
-returned storage path in the node's `entry` parameter as
-`<storage_path>:<function_name>`
-(e.g. /.pyromind-agent/<conversation_id>/acc.py:acc_func).
+Use this when a server-side process needs a file that only exists in the
+conversation workspace. Two common cases:
+
+- A workflow node parameter that takes a server-side path, most commonly a
+  custom evaluation metric or reward script for MetricsConfigBuilderCustomNode:
+  write the Python file locally first, upload it with this tool, then use the
+  returned storage path in the node's `entry` parameter as
+  `<storage_path>:<function_name>`
+  (e.g. /.pyromind-agent/<conversation_id>/acc.py:acc_func).
+- A pipeline input sidecar for `df_submit_pipeline`, for example an image
+  manifest. Pass target_dir=<the storage directory that holds the data> so the
+  manifest lands beside the files it references, then pass the returned storage
+  path as `input_path`. Without target_dir the file goes to the conversation
+  directory.
 
 Returns the absolute storage path of the uploaded file.
 """
