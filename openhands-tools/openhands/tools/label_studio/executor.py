@@ -19,6 +19,8 @@ from openhands.tools.label_studio.api_client import (
     LabelStudioAPIError,
 )
 from openhands.tools.label_studio.converter import (
+    DATASET_FILE_MAX_BYTES,
+    FILE_ADAPTERS,
     AVITrainToLabelStudioConverter,
     ConversionError,
     ConvertedManifest,
@@ -83,6 +85,7 @@ def _project_ref(
     config_hash: str,
     idempotency_key: str | None,
     field_map_hash: str = "",
+    dataset_digest: str = "",
 ) -> str:
     """Derive a stable project ref so a retried create resumes, not duplicates.
 
@@ -94,6 +97,10 @@ def _project_ref(
     ``field_map_hash`` is part of it because bindings decide where each value
     lands: reusing a project across two different maps would keep serving the
     first one, since the reuse check only looks at status.
+    ``dataset_digest`` is part of it for a dataset that lives in one file: such a
+    file is rewritten in place, so the path alone cannot tell a re-export from
+    the revision already imported. A directory dataset gets a new path per
+    export, which is why its content is not read here.
     ``idempotency_key`` lets a caller ask for a distinct project over otherwise
     identical inputs.
     """
@@ -105,6 +112,7 @@ def _project_ref(
             adapter,
             config_hash,
             field_map_hash,
+            dataset_digest,
             idempotency_key or "",
         )
     )
@@ -191,6 +199,9 @@ class LabelStudioProjectExecutor(
         # well-formed one the converter could not pre-annotate against.
         validate_label_config_xml(xml_text, adapter=action.adapter, field_map=field_map)
         config_hash = hashlib.sha256(xml_content).hexdigest()
+        dataset_content = self._read_dataset_file(
+            action.adapter, dataset_path, conversation
+        )
         project_ref = _project_ref(
             self._ls_base_url,
             self._cluster,
@@ -199,6 +210,7 @@ class LabelStudioProjectExecutor(
             config_hash,
             action.idempotency_key,
             field_map_hash,
+            hashlib.sha256(dataset_content).hexdigest() if dataset_content else "",
         )
         artifact_dir = f"{PYROMIND_AGENT_STORAGE_ROOT}/label-studio/{project_ref}"
 
@@ -230,6 +242,7 @@ class LabelStudioProjectExecutor(
                 conversation=conversation,
                 field_map=field_map,
                 field_map_hash=field_map_hash,
+                dataset_content=dataset_content,
             )
 
         ls_api = self._build_ls_api(conversation)
@@ -269,6 +282,13 @@ class LabelStudioProjectExecutor(
                 + ",".join(manifest.unmapped_quality)
                 + " (written to predictions verbatim, so they may not render -- "
                 "make sure the config's <Choice> values cover them)"
+            )
+        if manifest is not None and manifest.unmatched_regions:
+            summary += (
+                " warning=unmatched_regions:"
+                + ",".join(manifest.unmatched_regions)
+                + " (no sample carries these region fields, so no rectangles were "
+                "built -- fix the binding's source or the upstream row contract)"
             )
         return self._state_to_observation("create", state, summary=summary)
 
@@ -327,6 +347,25 @@ class LabelStudioProjectExecutor(
             ) from exc
         return field_map, field_map_digest(field_map)
 
+    def _read_dataset_file(
+        self,
+        adapter: str,
+        dataset_path: str,
+        conversation: BaseConversation | None,
+    ) -> bytes | None:
+        """Read a file dataset, so its content can seed the project ref.
+
+        The file is read here rather than by the converter alone because the ref
+        has to be known before any artifact is written, and a file dataset is
+        edited in place: hashing what it holds is the only way a re-export lands
+        on a new project instead of resuming the one built from the old rows.
+        """
+        if adapter not in FILE_ADAPTERS:
+            return None
+        return self._download_from_storage(
+            dataset_path, conversation, max_bytes=DATASET_FILE_MAX_BYTES
+        )
+
     def _create_project(
         self,
         *,
@@ -340,6 +379,7 @@ class LabelStudioProjectExecutor(
         conversation: BaseConversation | None,
         field_map: FieldMap,
         field_map_hash: str,
+        dataset_content: bytes | None,
     ) -> tuple[ConvertedManifest, ProjectState]:
         """Convert the dataset, persist its artifacts, and create the LS project."""
         self._upload_to_storage(
@@ -360,6 +400,7 @@ class LabelStudioProjectExecutor(
             field_map=field_map,
             field_map_hash=field_map_hash,
             field_map_path=action.field_map_path,
+            dataset_content=dataset_content,
         )
         manifest = converter.convert()
         self._upload_manifest(artifact_dir, manifest, conversation)
@@ -774,13 +815,15 @@ class LabelStudioProjectExecutor(
         self,
         storage_path: str,
         conversation: BaseConversation | None,
+        *,
+        max_bytes: int = _MANIFEST_BATCH_MAX_BYTES,
     ) -> bytes:
         return download_file_from_pyromind(
             storage_path=storage_path,
             storage_base_url=self._storage_base_url,
             headers=self._resolved_storage_headers(conversation),
             timeout=float(self._timeout),
-            max_bytes=_MANIFEST_BATCH_MAX_BYTES,
+            max_bytes=max_bytes,
         )
 
     def _build_ls_api(

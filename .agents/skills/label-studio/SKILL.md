@@ -22,10 +22,11 @@ description: >-
 
 | 源数据 / 需求 | 走向 | 读取 |
 |---|---|---|
+| 预处理/清洗产出的 JSONL（一行一个样本、行内自带图片路径，如 data-processing 的 `source_images`） | `adapter=jsonl` 直接导入，不再做格式转换 | references/adapters.md |
 | 样本目录含 `meta_vlm.json`（`quality` / `findings`） | `adapter=avi_train`（内置绑定） | references/adapters.md |
 | 样本目录含 `meta.json`（`vlm_verdict` / `note`，无 bbox） | `adapter=aoi_export`（内置绑定） | references/adapters.md |
 | 形状命中上表，但要改控件名、图片槽位或坐标量纲 | 自定义绑定（`field_map_path`） | references/custom-bindings.md |
-| 形状不在上表（源是 JSONL、混合布局、要第 4 张图等） | 先物化再路由；能力表外的直接说缺什么 | references/custom-bindings.md |
+| 形状不在上表（混合布局、要第 4 张图、行内字段名与内置绑定不同） | 先自定义绑定；能力表外的直接说缺什么 | references/custom-bindings.md |
 | 改已有项目的配置，或取回标注结果 | `update_config` / `export` | references/operations.md |
 
 负向边界：领域标签语义与预打标产出（如 PCB AVI/AOI）→ data-processing，
@@ -37,17 +38,19 @@ Label Studio 后需要回看。
 ## 能力边界（先看这张表）
 
 转换器**能写进预标注的东西就下面这些**，表外的一律不生成 ——
-Label Studio 本身支持的控件（画笔、多边形、关键点）转换器不写预标注：
+Label Studio 本身支持的控件（画笔、多边形、关键点）转换器不写预标注。
+下表说的是**内置绑定**的产出；`jsonl` 的字段名本来就靠声明决定，它那一列
+只是不写 `field_map` 时的默认行为：
 
-| 能力 | avi_train | aoi_export | 落到哪个控件 |
-|---|---|---|---|
-| 整图判定 | ✓ | ✓ | `quality_label`（Choices） |
-| 区域矩形 | ✓ | 有坐标时 ✓ | `finding_category`（RectangleLabels） |
-| 区域文字（perRegion） | ✓ | 有坐标时 ✓ | `finding_observation`（TextArea） |
-| 整图备注 | ✗ | ✓ | `overall_note`（TextArea） |
-| 非矩形区域（brush/polygon/keypoint） | ✗ | ✗ | Label Studio 支持，**转换器不生成** |
-| 每样本一套不同控件 | ✗ | ✗ | 一次导入一套配置 |
-| 第 4 张及更多图 | ✗ | ✗ | 用 field_map 声明即可加 |
+| 能力 | avi_train | aoi_export | jsonl | 落到哪个控件 |
+|---|---|---|---|---|
+| 整图判定 | ✓ | ✓ | ✓ | `quality_label`（Choices） |
+| 区域矩形 | ✓ | 有坐标时 ✓ | 有坐标时 ✓ | `finding_category`（RectangleLabels） |
+| 区域文字（perRegion） | ✓ | 有坐标时 ✓ | 有坐标时 ✓ | `finding_observation`（TextArea） |
+| 整图备注 | ✗ | ✓ | ✗（声明即可加） | `overall_note`（TextArea） |
+| 非矩形区域（brush/polygon/keypoint） | ✗ | ✗ | ✗ | Label Studio 支持，**转换器不生成** |
+| 每样本一套不同控件 | ✗ | ✗ | ✗ | 一次导入一套配置 |
+| 第 4 张及更多图 | ✗ | ✗ | ✗ | 用 field_map 声明即可加 |
 
 **用户要的东西不在这张表里时：直接说明当前不支持、缺哪个能力**，不要造探测
 样本反复试探。每次试探都要重传素材、重建项目，而且表外的东西试多少轮都不会
@@ -55,9 +58,9 @@ Label Studio 本身支持的控件（画笔、多边形、关键点）转换器�
 
 ## 控制面 SOP
 
-1. **探查**：`preview_dataset(dataset_path=...)` 先看清样本目录、图片文件和
-   meta 字段；需要对比多个样本时，把其余路径放进 `dataset_paths` 一次看完，
-   不要一个样本调一次。
+1. **探查**：`preview_dataset(dataset_path=...)` 先看清数据结构（样本目录 +
+   meta 字段，或 JSONL 行内字段和图片路径）；需要对比多个样本时，把其余路径
+   放进 `dataset_paths` 一次看完，不要一个样本调一次。
 2. **路由**：按上表命中一条 reference 并读取；不命中则进入自定义绑定分支。
    数据形状与 `references/examples/` 不一致时，先核对字段名和坐标写法。
 3. **生成配置**：按样本结构生成 `label_config.xml`；需要改绑定时同一层再写
@@ -88,5 +91,8 @@ Label Studio 本身支持的控件（画笔、多边形、关键点）转换器�
 - 用 terminal/curl 直接调用 Label Studio API
 - 由 Agent 遍历完整数据集或生成 Manifest —— 批量由 create 负责
 - 造探测样本反复试 meta 写法 —— 表里没有的能力试也不会出现
+- 手工拼接或重塑上游产出（合并 `source_manifest.jsonl`、改字段名、摊平区域）来凑行
+  契约 —— 形状对不上就用 `field_map` 声明绑定；行内确实缺字段就是上游契约缺口，
+  回到 data-processing 补，不在这一侧写转换脚本
 - 把交付给用户的 URL 包进反引号或代码块
 - 试图"删了重建"：工具没有删除项目，参数写错就用同参数重跑 create

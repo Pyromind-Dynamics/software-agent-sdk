@@ -5,12 +5,15 @@ Studio API. ``AVITrainToLabelStudioConverter`` reads user Storage and produces
 Task Manifest batches, while ``LabelStudioToAVITrainConverter`` turns Label
 Studio export JSON back into PyroMind sample dicts.
 
-Two dataset adapters are supported for the forward conversion:
+Three dataset adapters are supported for the forward conversion:
 - ``avi_train``: sample directories containing ``meta_vlm.json`` with
   ``quality``/``findings`` pre-annotation fields.
 - ``aoi_export``: AOI inspection export directories containing ``meta.json``
   with whole-sample ``vlm_verdict``/``label``/``note`` fields. Regions are
   pre-annotated too whenever the export carries coordinates.
+- ``jsonl``: one JSON Lines object carrying both its own metadata and its image
+  object paths, so a pipeline's output file is imported as written instead of
+  being materialised into sample directories first.
 
 Region geometry is accepted in every shape our producers emit (see
 ``_geometry_from``): a mismatch between the converter's expectation and what a
@@ -28,7 +31,6 @@ import json
 import logging
 import math
 import time
-from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePosixPath
 from typing import Any, Protocol
@@ -54,11 +56,28 @@ BATCH_SIZE_LIMIT = 10 * 1024 * 1024  # 10 MB per batch file
 _STORAGE_CONNECT_RETRIES = 2
 _META_FETCH_CONCURRENCY = 8
 
-_SUPPORTED_ADAPTERS = frozenset({"avi_train", "aoi_export"})
+_SUPPORTED_ADAPTERS = frozenset({"avi_train", "aoi_export", "jsonl"})
+
+# Adapters whose ``dataset_path`` names one JSON Lines object instead of a
+# directory of sample directories.
+FILE_ADAPTERS = frozenset({"jsonl"})
+
+# The metadata file each directory adapter reads inside one sample directory.
+_META_FILENAMES = {"avi_train": "meta_vlm.json", "aoi_export": "meta.json"}
+
+# A dataset file is read into memory whole, so it is capped at the size one
+# import is expected to handle; a larger export has to be split upstream.
+DATASET_FILE_MAX_BYTES = 64 * 1024 * 1024
+
+# Adapters whose coordinates are optional by design. An AOI export is a
+# whole-sample verdict and most of them carry no boxes at all, so a region
+# binding that matches nothing there is the documented normal case rather than
+# a declaration that missed the data.
+_REGION_SOURCE_OPTIONAL_ADAPTERS = frozenset({"aoi_export"})
 
 # Where a region's geometry may live inside a finding. The first key that holds
 # something readable wins; a finding may also carry x/y/width/height flat.
-_REGION_GEOMETRY_KEYS = ("bbox", "box", "value")
+_REGION_GEOMETRY_KEYS = ("bbox", "boxes", "box", "value")
 
 # Label Studio stores region coordinates as percentages of the image. When a
 # binding declares no unit, the scale of an incoming candidate is inferred from
@@ -219,31 +238,84 @@ def _geometry_from(
     return None
 
 
-def _region_geometry(
+def _geometry_candidates(candidate: Any) -> list[Any]:
+    """Split one geometry field into the boxes it holds.
+
+    A field holds several boxes when every element is itself a box
+    (``[[x1, y1, x2, y2], ...]`` or ``[{...}, {...}]``) rather than a coordinate
+    (``[x1, y1, x2, y2]``). Readings that name one box keep reaching
+    ``_geometry_from`` unchanged.
+    """
+    if (
+        isinstance(candidate, (list, tuple))
+        and candidate
+        and all(isinstance(item, (list, tuple, dict)) for item in candidate)
+    ):
+        return list(candidate)
+    return [candidate]
+
+
+def _region_geometries(
     finding: dict[str, Any],
     binding: RegionBinding,
-) -> tuple[float, float, float, float] | None:
-    """Return a finding's percent geometry, whichever shape it was written in."""
-    keys: Iterable[str] = (
-        (binding.geometry,) if binding.geometry else _REGION_GEOMETRY_KEYS
-    )
+) -> list[tuple[float, float, float, float]]:
+    """Return every percent geometry a finding carries, in order.
+
+    One finding may name one box or several -- a defect seen in two places is
+    still one finding -- and Label Studio can only render one rectangle per
+    result, so each box becomes its own rectangle downstream.
+
+    A declared ``geometry`` key is read first rather than instead of the
+    documented ones: an adapter that rewraps a row can store the coordinates
+    under a name other than the row-level field a binding was written against,
+    and a rectangle that silently never renders reads exactly like a region with
+    no coordinates.
+    """
+    keys: list[str] = [binding.geometry] if binding.geometry else []
+    keys.extend(key for key in _REGION_GEOMETRY_KEYS if key not in keys)
     for key in keys:
         candidate = finding.get(key)
         if not candidate:
             continue
-        geometry = _geometry_from(candidate, binding.unit)
-        if geometry is not None:
-            return geometry
+        geometries = [
+            geometry
+            for item in _geometry_candidates(candidate)
+            if (geometry := _geometry_from(item, binding.unit)) is not None
+        ]
+        if geometries:
+            return geometries
         logger.warning(
             "Finding carries a %r field the converter cannot read: %r",
             key,
             candidate,
         )
-    return _geometry_from(finding, binding.unit)
+    geometry = _geometry_from(finding, binding.unit)
+    return [] if geometry is None else [geometry]
 
 
 class ConversionError(ValueError):
     """Raised when dataset conversion fails."""
+
+
+def _row_sample_id(row: dict[str, Any], index: int) -> str:
+    """Return a row's sample id, falling back to its one-based position."""
+    for key in ("sample_id", "id"):
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return str(value)
+    return f"line-{index + 1}"
+
+
+def _row_path(row: dict[str, Any], source: str) -> str | None:
+    """Return the non-empty string at a dotted path inside a row, or None."""
+    current: Any = row
+    for part in source.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    if isinstance(current, str) and current.strip():
+        return current.strip()
+    return None
 
 
 class MediaSigner(Protocol):
@@ -272,6 +344,7 @@ class ConvertedManifest:
         batches: list[tuple[str, bytes, int]],
         total_tasks: int,
         unmapped_quality: tuple[str, ...] = (),
+        unmatched_regions: tuple[str, ...] = (),
         field_map_hash: str = "",
         field_map_path: str | None = None,
     ) -> None:
@@ -284,6 +357,9 @@ class ConvertedManifest:
         # Verdicts kept verbatim because no synonym matched. Surfaced through the
         # manifest so a pre-annotation that will not render is visible, not silent.
         self.unmapped_quality = unmapped_quality
+        # Region fields no sample carries: the binding names something the data
+        # does not have, which otherwise shows up only as an empty editor.
+        self.unmatched_regions = unmatched_regions
         self.field_map_hash = field_map_hash
         self.field_map_path = field_map_path
 
@@ -308,6 +384,7 @@ class ConvertedManifest:
             total_tasks=self.total_tasks,
             batches=manifest_batches,
             unmapped_quality=list(self.unmapped_quality),
+            unmatched_regions=list(self.unmatched_regions),
         )
 
 
@@ -319,7 +396,9 @@ class AVITrainToLabelStudioConverter:
     for rendering plus the underlying object path. Meta fields become
     pre-annotations (predictions). ``adapter`` selects the meta layout:
     ``avi_train`` reads ``meta_vlm.json`` (``quality``/``findings``),
-    ``aoi_export`` reads ``meta.json`` (whole-sample ``vlm_verdict``/``note``).
+    ``aoi_export`` reads ``meta.json`` (whole-sample ``vlm_verdict``/``note``),
+    and ``jsonl`` reads one task per line of a JSON Lines file whose rows carry
+    their own image paths.
 
     Where those values go is decided by ``field_map``, which defaults to the
     adapter's built-in bindings: the control names, image slots, and region
@@ -343,6 +422,7 @@ class AVITrainToLabelStudioConverter:
         field_map: FieldMap | None = None,
         field_map_hash: str = "",
         field_map_path: str | None = None,
+        dataset_content: bytes | None = None,
     ) -> None:
         if adapter not in _SUPPORTED_ADAPTERS:
             raise ConversionError(
@@ -350,9 +430,9 @@ class AVITrainToLabelStudioConverter:
                 f"expected one of {sorted(_SUPPORTED_ADAPTERS)}."
             )
         self._adapter = adapter
-        self._meta_filename = (
-            "meta.json" if adapter == "aoi_export" else "meta_vlm.json"
-        )
+        self._meta_filename = _META_FILENAMES.get(adapter, "")
+        # A file dataset the caller already read, so it is not fetched twice.
+        self._dataset_content = dataset_content
         self._field_map = (
             field_map if field_map is not None else default_field_map(adapter)
         )
@@ -370,6 +450,8 @@ class AVITrainToLabelStudioConverter:
         # set and convert() touches it once per sample from a thread pool; a lone
         # add() on a set is atomic under the GIL, so no lock is needed.
         self._unmapped_quality: set[str] = set()
+        # Same, for the region fields the samples actually carry.
+        self._region_source_hits: set[str] = set()
 
     @property
     def field_map(self) -> FieldMap:
@@ -381,7 +463,47 @@ class AVITrainToLabelStudioConverter:
         """Raw quality values no synonym matched, sorted for stable output."""
         return tuple(sorted(self._unmapped_quality))
 
+    @property
+    def unmatched_region_sources(self) -> tuple[str, ...]:
+        """Declared region fields that no sample carries, sorted.
+
+        A binding naming a field the dataset never has produces no rectangles
+        and no other symptom, so it is reported the same way an unmapped verdict
+        is rather than left for the annotator to notice in an empty editor.
+        """
+        if self._adapter in _REGION_SOURCE_OPTIONAL_ADAPTERS:
+            return ()
+        declared = {binding.source for binding in self._field_map.regions}
+        return tuple(sorted(declared - self._region_source_hits))
+
     def convert(self) -> ConvertedManifest:
+        tasks = (
+            self._tasks_from_jsonl()
+            if self._adapter in FILE_ADAPTERS
+            else self._tasks_from_directories()
+        )
+        if not tasks:
+            raise ConversionError(
+                f"Every sample in {self._dataset_path} was skipped: no readable "
+                f"sample metadata. Nothing to import."
+            )
+
+        batches = self._split_batches(tasks)
+        return ConvertedManifest(
+            project_ref="",
+            dataset_path=self._dataset_path,
+            converter_name=self._adapter,
+            config_hash=self._config_hash,
+            batches=batches,
+            total_tasks=len(tasks),
+            unmapped_quality=self.unmapped_quality_values,
+            unmatched_regions=self.unmatched_region_sources,
+            field_map_hash=self._field_map_hash,
+            field_map_path=self._field_map_path,
+        )
+
+    def _tasks_from_directories(self) -> list[dict[str, Any]]:
+        """Build one task per sample directory, in parallel."""
         sample_dirs = self._list_sample_dirs()
         if not sample_dirs:
             raise ConversionError(
@@ -397,32 +519,117 @@ class AVITrainToLabelStudioConverter:
         tasks: list[dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=_META_FETCH_CONCURRENCY) as pool:
             for task in pool.map(
-                lambda sample_dir: self._build_task(
-                    sample_dir, media_urls, bound_files[sample_dir]
+                lambda sample_dir: self._build_directory_task(
+                    sample_dir, bound_files[sample_dir], media_urls
                 ),
                 sample_dirs,
             ):
                 if task is not None:
                     tasks.append(task)
+        return tasks
 
-        if not tasks:
-            raise ConversionError(
-                f"All sample directories were skipped (missing or invalid "
-                f"{self._meta_filename}). Nothing to import."
-            )
-
-        batches = self._split_batches(tasks)
-        return ConvertedManifest(
-            project_ref="",
-            dataset_path=self._dataset_path,
-            converter_name=self._adapter,
-            config_hash=self._config_hash,
-            batches=batches,
-            total_tasks=len(tasks),
-            unmapped_quality=self.unmapped_quality_values,
-            field_map_hash=self._field_map_hash,
-            field_map_path=self._field_map_path,
+    def _build_directory_task(
+        self,
+        sample_dir: str,
+        bound_files: dict[str, str],
+        media_urls: dict[str, str],
+    ) -> dict[str, Any] | None:
+        """Build one sample's task, or None when its meta file is unreadable."""
+        meta = self._read_json_file(f"{sample_dir}/{self._meta_filename}")
+        if not isinstance(meta, dict):
+            return None
+        return self._build_task(
+            str(meta.get("sample_id", PurePosixPath(sample_dir).name)),
+            meta,
+            bound_files,
+            media_urls,
         )
+
+    def _tasks_from_jsonl(self) -> list[dict[str, Any]]:
+        """Build one task per line of a JSON Lines dataset file."""
+        rows = self._read_jsonl_rows()
+        if not rows:
+            raise ConversionError(f"{self._dataset_path} holds no samples.")
+
+        bound_files = self._bind_row_images(rows)
+        media_urls = self._resolve_media_urls(
+            [path for files in bound_files.values() for path in files.values()]
+        )
+        return [
+            self._build_task(
+                _row_sample_id(row, index),
+                row,
+                bound_files[index],
+                media_urls,
+            )
+            for index, row in enumerate(rows)
+        ]
+
+    def _read_jsonl_rows(self) -> list[dict[str, Any]]:
+        """Parse the dataset file, one JSON object per line.
+
+        A blank line is skipped rather than rejected -- hand-edited exports grow
+        them -- but a line that is not a JSON object fails the whole conversion:
+        silently dropping it would import a dataset that is quietly incomplete.
+        """
+        content = self._dataset_content
+        if content is None:
+            content = self._download_file(
+                self._dataset_path, max_bytes=DATASET_FILE_MAX_BYTES
+            )
+        if content is None:
+            raise ConversionError(
+                f"Dataset file not found in Storage: {self._dataset_path}"
+            )
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ConversionError(
+                f"Dataset file is not UTF-8 text: {self._dataset_path}"
+            ) from exc
+
+        rows: list[dict[str, Any]] = []
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ConversionError(
+                    f"{self._dataset_path} line {line_number} is not valid JSON: {exc}"
+                ) from exc
+            if not isinstance(row, dict):
+                raise ConversionError(
+                    f"{self._dataset_path} line {line_number} is not a JSON object."
+                )
+            rows.append(row)
+        return rows
+
+    def _bind_row_images(self, rows: list[dict[str, Any]]) -> dict[int, dict[str, str]]:
+        """Resolve every row's bound image object paths.
+
+        A row names its own images instead of having them listed from a sample
+        directory: a binding's ``source`` is a dotted path into the row, so both
+        a flat ``{"defect_image": "/datasets/0001/defect.jpg"}`` and a nested
+        ``{"images": {"defect_image": ...}}`` are expressible without a second
+        convention.
+        """
+        bound: dict[int, dict[str, str]] = {}
+        for index, row in enumerate(rows):
+            files: dict[str, str] = {}
+            for binding in self._field_map.images:
+                path = _row_path(row, binding.source)
+                if path is None:
+                    if binding.required:
+                        raise ConversionError(
+                            f"{self._dataset_path} line {index + 1} has no image "
+                            f"path at {binding.source!r} for image field "
+                            f"{binding.field!r}"
+                        )
+                    continue
+                files[binding.field] = path
+            bound[index] = files
+        return bound
 
     def _list_sample_dirs(self) -> list[str]:
         """List direct subdirectories of the dataset path."""
@@ -488,19 +695,16 @@ class AVITrainToLabelStudioConverter:
 
     def _build_task(
         self,
-        sample_dir: str,
-        media_urls: dict[str, str],
+        sample_id: str,
+        meta: dict[str, Any],
         bound_files: dict[str, str],
-    ) -> dict[str, Any] | None:
-        meta = self._read_json_file(f"{sample_dir}/{self._meta_filename}")
-        if meta is None:
-            return None
-        if not isinstance(meta, dict):
-            return None
-
-        data: dict[str, Any] = {
-            "sample_id": str(meta.get("sample_id", PurePosixPath(sample_dir).name)),
-        }
+        media_urls: dict[str, str],
+    ) -> dict[str, Any]:
+        """Build one task from a sample's meta and its bound image paths."""
+        data: dict[str, Any] = {"sample_id": sample_id}
+        for binding in self._field_map.regions:
+            if binding.source in meta:
+                self._region_source_hits.add(binding.source)
         for binding in self._field_map.images:
             object_path = bound_files.get(binding.field)
             if object_path is None:
@@ -537,6 +741,10 @@ class AVITrainToLabelStudioConverter:
                 "vlm_verdict": meta.get("vlm_verdict") or meta.get("label"),
                 "note": meta.get("note"),
             }
+        if self._adapter in FILE_ADAPTERS:
+            # A row is already the mapping a binding reads by field name, so the
+            # declaration -- not this adapter -- decides where each value lives.
+            return meta
         return {"quality": meta.get("quality")}
 
     def _sample_result(
@@ -622,11 +830,17 @@ class AVITrainToLabelStudioConverter:
     def _region_sources(self, meta: dict[str, Any]) -> dict[str, list[Any]]:
         """Return each region list an adapter can offer, keyed by meta field.
 
-        An AOI export is a whole-sample verdict, so many carry no coordinates at
-        all and nothing is returned -- the sample is annotated by hand, as
-        before. When coordinates do appear, an explicit ``findings`` list wins
-        over the flat ``boxes`` plus the sample's category, which is why only one
-        of the two is ever offered.
+        Most AOI exports are a whole-sample verdict with no coordinates at all,
+        so nothing is returned and the sample is annotated by hand. When
+        coordinates do appear, an explicit ``findings`` list wins over the flat
+        ``boxes`` plus the sample's category, which is why only one of the two is
+        ever offered.
+
+        A dataset row is read where its declaration says instead of only under
+        these two names: a row that keeps its regions under ``regions`` is
+        offered as written, so importing a pipeline's output needs a binding and
+        not a rewrite. Bare boxes in such a list still get the row's sample-level
+        category copied on, because a rectangle with no label does not render.
         """
         findings = meta.get("findings")
         sources: dict[str, list[Any]] = {
@@ -634,14 +848,30 @@ class AVITrainToLabelStudioConverter:
             if isinstance(findings, list)
             else []
         }
-        if self._adapter != "aoi_export" or sources["findings"]:
+        if sources["findings"]:
             return sources
 
         boxes = meta.get("boxes")
-        if not isinstance(boxes, list):
-            return sources
         category = str(meta.get("category") or meta.get("vlm_category") or "").strip()
-        sources["boxes"] = [{"bbox": box, "category": category} for box in boxes if box]
+        if isinstance(boxes, list):
+            sources["boxes"] = [
+                {"bbox": box, "category": category} for box in boxes if box
+            ]
+        if self._adapter in FILE_ADAPTERS:
+            for binding in self._field_map.regions:
+                value = meta.get(binding.source)
+                if not isinstance(value, list) or not value:
+                    continue
+                sources.setdefault(
+                    binding.source,
+                    [
+                        item
+                        if isinstance(item, dict)
+                        else {"bbox": item, "category": category}
+                        for item in value
+                        if item
+                    ],
+                )
         return sources
 
     def _region_results(self, meta: dict[str, Any]) -> list[dict[str, Any]]:
@@ -674,18 +904,26 @@ class AVITrainToLabelStudioConverter:
         region_id: str,
         to_name: str,
     ) -> list[dict[str, Any]]:
-        """Build the controls one region produces: its box and its text."""
+        """Build the controls one region produces: its boxes and its text.
+
+        A region naming several boxes becomes several rectangles, because Label
+        Studio renders one rectangle per result. The note describes the whole
+        finding, so every rectangle carries it; a region whose label is missing
+        keeps its note and drops the rectangle that could not render.
+        """
         results: list[dict[str, Any]] = []
-        geometry = _region_geometry(finding, binding)
+        geometries = _region_geometries(finding, binding)
         label = str(finding.get(binding.label) or "").strip()
-        if geometry is not None:
-            if label:
-                if binding.label_synonyms:
-                    label = binding.label_synonyms.get(label.lower(), label)
+        observation = finding.get(binding.observation) if binding.observation else None
+        if geometries and label:
+            if binding.label_synonyms:
+                label = binding.label_synonyms.get(label.lower(), label)
+            for index, geometry in enumerate(geometries):
+                box_id = region_id if index == 0 else f"{region_id}_{index + 1}"
                 x, y, width, height = geometry
                 results.append(
                     {
-                        "id": region_id,
+                        "id": box_id,
                         "from_name": binding.control,
                         "to_name": to_name,
                         "type": "rectanglelabels",
@@ -698,15 +936,25 @@ class AVITrainToLabelStudioConverter:
                         },
                     }
                 )
-            else:
-                logger.warning(
-                    "Region %s has usable geometry but no %r label; Label Studio "
-                    "would render an unlabelled rectangle, so it is skipped",
-                    region_id,
-                    binding.label,
-                )
+                if observation and binding.observation_control:
+                    results.append(
+                        {
+                            "id": box_id,
+                            "from_name": binding.observation_control,
+                            "to_name": to_name,
+                            "type": "textarea",
+                            "value": {"text": [str(observation)]},
+                        }
+                    )
+            return results
 
-        observation = finding.get(binding.observation) if binding.observation else None
+        if geometries:
+            logger.warning(
+                "Region %s has usable geometry but no %r label; Label Studio "
+                "would render an unlabelled rectangle, so it is skipped",
+                region_id,
+                binding.label,
+            )
         if observation and binding.observation_control:
             results.append(
                 {

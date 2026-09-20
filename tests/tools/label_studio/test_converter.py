@@ -1,6 +1,7 @@
 """Tests for AVI Train and Label Studio converters."""
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import httpx
@@ -11,6 +12,10 @@ from openhands.tools.label_studio.converter import (
     ConversionError,
     LabelStudioToAVITrainConverter,
 )
+from openhands.tools.label_studio.field_map import parse_field_map
+
+
+EXAMPLES = Path(__file__).parents[3] / ".agents/skills/label-studio/references/examples"
 
 
 SAMPLE_META = {
@@ -179,6 +184,408 @@ def test_convert_signs_media_urls(monkeypatch):
             "/datasets/pcb-001/sample_001/gt.jpg",
         ]
     ]
+
+
+JSONL_ROWS = [
+    {
+        "id": "s1",
+        "quality": "defect",
+        "defect_image": "/datasets/pcb-001/s1/defect.jpg",
+        "findings": [
+            {
+                "category": "开路",
+                "observation": "线路断开",
+                "bbox": {
+                    "x_min_norm": 100,
+                    "y_min_norm": 200,
+                    "x_max_norm": 400,
+                    "y_max_norm": 500,
+                },
+            }
+        ],
+    },
+    {"quality": "ok", "defect_image": "/datasets/pcb-001/s2/defect.jpg"},
+]
+
+
+def _jsonl_converter(
+    monkeypatch,
+    rows,
+    *,
+    field_map=None,
+    dataset_path="/datasets/pcb-001/processed.jsonl",
+):
+    content = "".join(
+        json.dumps(row, ensure_ascii=False) + "\n" for row in rows
+    ).encode("utf-8")
+    converter = AVITrainToLabelStudioConverter(
+        dataset_path=dataset_path,
+        storage_base_url="http://storage.example.com",
+        storage_headers={},
+        adapter="jsonl",
+        field_map=field_map,
+        dataset_content=content,
+    )
+    monkeypatch.setattr(
+        converter,
+        "_resolve_media_urls",
+        lambda paths: {path: f"https://media/{path}?token=x" for path in paths},
+    )
+    return converter
+
+
+def test_jsonl_rows_become_tasks(monkeypatch):
+    """A processed file imports as written: no sample directory has to exist."""
+    manifest = _jsonl_converter(monkeypatch, JSONL_ROWS).convert()
+    assert manifest.total_tasks == 2
+    tasks = json.loads(manifest.batch_payloads[0][1])
+
+    assert [task["data"]["sample_id"] for task in tasks] == ["s1", "line-2"]
+    first = tasks[0]
+    assert first["data"]["defect_image"] == (
+        "https://media//datasets/pcb-001/s1/defect.jpg?token=x"
+    )
+    assert first["data"]["defect_image_path"] == "/datasets/pcb-001/s1/defect.jpg"
+    # The other two images are optional here, so a row without them renders one
+    # view instead of failing the conversion.
+    assert "diff_image" not in first["data"]
+    assert "gt_image" not in tasks[1]["data"]
+
+    results = first["predictions"][0]["result"]
+    choice = next(r for r in results if r["type"] == "choices")
+    assert choice["value"]["choices"] == ["defect"]
+    region = next(r for r in results if r["type"] == "rectanglelabels")
+    assert region["value"]["rectanglelabels"] == ["开路"]
+    assert region["value"]["x"] == 10.0
+
+
+def test_jsonl_image_source_may_be_a_nested_path(monkeypatch):
+    """A row that groups its images under one key binds them by dotted path."""
+    field_map = parse_field_map(
+        {"images": [{"field": "defect_image", "source": "images.defect_image"}]},
+        adapter="jsonl",
+    )
+    converter = _jsonl_converter(
+        monkeypatch,
+        [{"id": "s1", "images": {"defect_image": "/a/b.jpg"}}],
+        field_map=field_map,
+    )
+    tasks = json.loads(converter.convert().batch_payloads[0][1])
+    assert tasks[0]["data"]["defect_image_path"] == "/a/b.jpg"
+
+
+def test_jsonl_declared_bindings_decide_where_each_value_lands(monkeypatch):
+    """A row is read by field name, so a declaration is all a new layout needs.
+
+    This is the shape a preprocessing run tends to write: a bare label, a
+    category at sample level, and a list of boxes.
+    """
+    field_map = parse_field_map(
+        {
+            "images": [{"field": "image", "source": "image"}],
+            "samples": [
+                {
+                    "field": "label",
+                    "control": "quality_label",
+                    "type": "choices",
+                    "synonyms": {"defect": "defect", "ok": "ok"},
+                    "on_unmapped": "keep",
+                }
+            ],
+            "regions": [
+                {
+                    "source": "boxes",
+                    "control": "finding_category",
+                    "label": "category",
+                }
+            ],
+        },
+        adapter="jsonl",
+    )
+    converter = _jsonl_converter(
+        monkeypatch,
+        [
+            {
+                "id": "s1",
+                "label": "defect",
+                "category": "开路",
+                "image": "/datasets/pcb-001/s1.jpg",
+                "boxes": [[100, 200, 400, 500]],
+            }
+        ],
+        field_map=field_map,
+    )
+    tasks = json.loads(converter.convert().batch_payloads[0][1])
+    assert tasks[0]["data"]["image_path"] == "/datasets/pcb-001/s1.jpg"
+    results = tasks[0]["predictions"][0]["result"]
+    assert {r["from_name"]: r["type"] for r in results} == {
+        "quality_label": "choices",
+        "finding_category": "rectanglelabels",
+    }
+    box = next(r for r in results if r["type"] == "rectanglelabels")
+    # A bare box list carries no label of its own, so the row's category is
+    # copied onto it -- otherwise Label Studio renders no rectangle at all.
+    assert box["value"]["rectanglelabels"] == ["开路"]
+
+
+def test_jsonl_row_without_a_required_image_fails(monkeypatch):
+    converter = _jsonl_converter(monkeypatch, [{"id": "s1", "quality": "ok"}])
+    with pytest.raises(ConversionError, match="line 1 has no image path"):
+        converter.convert()
+
+
+PIPELINE_ROW = {
+    "id": "1-3-0804F/118/B0",
+    "source_images": {
+        "待检原图": "/datasets/test_100/1-3-0804F/118/B0.bmp",
+        "CAM参考图": "/datasets/test_100/1-3-0804F/118/B0_cam.bmp",
+    },
+    "context": "非铜区可见异物；未提供放行阈值。",
+    "label": True,
+    "regions": [
+        {
+            "category": "垃圾/异物",
+            "boxes": [[425, 460, 550, 535], [700, 600, 900, 800]],
+            "note": "非铜区可见不规则亮色异物颗粒",
+        }
+    ],
+}
+
+
+def test_a_pipeline_row_imports_through_the_shipped_field_map(monkeypatch):
+    """The shipped PCB binding reads a processed row exactly as the pipeline wrote it.
+
+    This is the whole point of the row contract: the example binding declares
+    where each field lives, so no reshape step stands between a pre-labeling run
+    and the review project.
+    """
+    declared = json.loads(
+        (EXAMPLES / "field-maps" / "pcb_prelabel.json").read_text(encoding="utf-8")
+    )
+    converter = _jsonl_converter(
+        monkeypatch,
+        [PIPELINE_ROW],
+        field_map=parse_field_map(declared, adapter="jsonl"),
+    )
+    manifest = converter.convert()
+    assert manifest.unmapped_quality == ()
+    task = json.loads(manifest.batch_payloads[0][1])[0]
+    assert task["data"]["defect_image_path"] == (
+        "/datasets/test_100/1-3-0804F/118/B0.bmp"
+    )
+    assert task["data"]["gt_image_path"] == (
+        "/datasets/test_100/1-3-0804F/118/B0_cam.bmp"
+    )
+
+    results = task["predictions"][0]["result"]
+    choices = next(r for r in results if r["type"] == "choices")
+    assert choices["value"]["choices"] == ["defect"]
+    whole_note = next(r for r in results if r["from_name"] == "overall_note")
+    assert whole_note["value"]["text"] == ["非铜区可见异物；未提供放行阈值。"]
+
+    # One finding naming two boxes renders two rectangles, each carrying the
+    # finding's own note, so a defect seen twice is not split in the source data.
+    boxes = [r for r in results if r["type"] == "rectanglelabels"]
+    assert [r["id"] for r in boxes] == ["finding_1", "finding_1_2"]
+    assert [(r["value"]["x"], r["value"]["y"]) for r in boxes] == [
+        (42.5, 46.0),
+        (70.0, 60.0),
+    ]
+    assert [r["value"]["rectanglelabels"] for r in boxes] == [
+        ["垃圾/异物"],
+        ["垃圾/异物"],
+    ]
+    region_notes = [r for r in results if r["from_name"] == "finding_observation"]
+    assert [r["id"] for r in region_notes] == ["finding_1", "finding_1_2"]
+    assert all(
+        r["value"]["text"] == ["非铜区可见不规则亮色异物颗粒"] for r in region_notes
+    )
+
+
+ROW_WITH_A_ROW_LEVEL_BOX = {
+    "id": "1-3-0804F/118/B0",
+    "source_images": {"待检原图": "/datasets/test_100/1-3-0804F/118/B0.bmp"},
+    "label": True,
+    "category": "垃圾/异物",
+    "boxes": [[190, 820, 290, 870]],
+    "note": "非铜区可见不规则亮色异物颗粒",
+}
+
+
+def test_declared_geometry_falls_back_to_the_wrapped_box(monkeypatch):
+    """A binding named after the row's own field still finds the box.
+
+    A row-level ``boxes`` list is imported as bare coordinates, which the
+    adapter wraps as ``{"bbox": ..., "category": ...}``. A binding written
+    against the row's field name therefore names a key no region carries, and
+    dropping the rectangle for it would look like a region without coordinates.
+    """
+    converter = _jsonl_converter(
+        monkeypatch,
+        [ROW_WITH_A_ROW_LEVEL_BOX],
+        field_map=parse_field_map(
+            {
+                "images": [
+                    {"field": "defect_image", "source": "source_images.待检原图"}
+                ],
+                "regions": [
+                    {
+                        "source": "boxes",
+                        "control": "finding_category",
+                        "label": "category",
+                        "geometry": "boxes",
+                        "unit": "norm1000",
+                        "observation": "note",
+                        "observation_control": "finding_observation",
+                    }
+                ],
+            },
+            adapter="jsonl",
+        ),
+    )
+    task = json.loads(converter.convert().batch_payloads[0][1])[0]
+    results = task["predictions"][0]["result"]
+
+    box = next(r for r in results if r["type"] == "rectanglelabels")
+    assert box["value"] == {
+        "x": 19.0,
+        "y": 82.0,
+        "width": 10.0,
+        "height": 5.0,
+        "rectanglelabels": ["垃圾/异物"],
+    }
+
+
+def test_a_declared_geometry_key_still_wins_over_the_documented_ones(monkeypatch):
+    """The declaration decides which field is read when a region carries both."""
+    converter = _jsonl_converter(
+        monkeypatch,
+        [
+            {
+                "id": "s1",
+                "source_images": {"待检原图": "/datasets/x/defect.bmp"},
+                "regions": [
+                    {
+                        "category": "垃圾/异物",
+                        "bbox": [0, 0, 100, 100],
+                        "value": [500, 500, 600, 600],
+                    }
+                ],
+            }
+        ],
+        field_map=parse_field_map(
+            {
+                "images": [
+                    {"field": "defect_image", "source": "source_images.待检原图"}
+                ],
+                "regions": [
+                    {
+                        "source": "regions",
+                        "control": "finding_category",
+                        "label": "category",
+                        "geometry": "value",
+                        "unit": "norm1000",
+                    }
+                ],
+            },
+            adapter="jsonl",
+        ),
+    )
+    task = json.loads(converter.convert().batch_payloads[0][1])[0]
+    box = next(
+        r for r in task["predictions"][0]["result"] if r["type"] == "rectanglelabels"
+    )
+    assert (box["value"]["x"], box["value"]["y"]) == (50.0, 50.0)
+
+
+def test_a_region_source_no_row_carries_is_reported(monkeypatch):
+    """A binding naming a field the data never has must not fail silently.
+
+    Without this, the only symptom is a project whose editor shows no
+    rectangles, which reads the same as a sample an annotator draws by hand.
+    """
+    converter = _jsonl_converter(
+        monkeypatch,
+        [{"id": "s1", "image": "/datasets/x/a.jpg", "regions": []}],
+        field_map=parse_field_map(
+            {
+                "images": [{"field": "image", "source": "image"}],
+                "regions": [
+                    {
+                        "source": "boxes",
+                        "control": "finding_category",
+                        "label": "category",
+                    }
+                ],
+            },
+            adapter="jsonl",
+        ),
+    )
+    assert converter.convert().unmatched_regions == ("boxes",)
+
+
+def test_a_region_source_the_rows_carry_is_not_reported(monkeypatch):
+    """The hit is what suppresses the warning, so a matched binding stays quiet."""
+    converter = _jsonl_converter(
+        monkeypatch,
+        [
+            {
+                "id": "s1",
+                "image": "/datasets/x/a.jpg",
+                "category": "开路",
+                "boxes": [[100, 200, 400, 500]],
+            }
+        ],
+        field_map=parse_field_map(
+            {
+                "images": [{"field": "image", "source": "image"}],
+                "regions": [
+                    {
+                        "source": "boxes",
+                        "control": "finding_category",
+                        "label": "category",
+                    }
+                ],
+            },
+            adapter="jsonl",
+        ),
+    )
+    assert converter.convert().unmatched_regions == ()
+
+
+def test_an_aoi_export_never_reports_a_region_source(monkeypatch):
+    """Most AOI exports are a whole-sample verdict, so a region less verdict is
+    the documented normal case rather than a declaration that missed the data.
+    """
+    converter, _ = _aoi_converter(
+        monkeypatch,
+        ["/datasets/aoi-001/10_B1"],
+        {"/datasets/aoi-001/10_B1": dict(AOI_META)},
+    )
+    assert converter.convert().unmatched_regions == ()
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        (b'{"id": "s1"}\n{not json}\n', "line 2 is not valid JSON"),
+        (b'["s1"]\n', "line 1 is not a JSON object"),
+        (b"", "holds no samples"),
+        (b"\n  \n", "holds no samples"),
+    ],
+)
+def test_jsonl_bad_input_is_reported_not_skipped(content, message):
+    """Half-importing a file is worse than failing: the annotation work would
+    land on a project whose task set silently lost rows."""
+    converter = AVITrainToLabelStudioConverter(
+        dataset_path="/datasets/pcb-001/processed.jsonl",
+        storage_base_url="http://storage.example.com",
+        storage_headers={},
+        adapter="jsonl",
+        dataset_content=content,
+    )
+    with pytest.raises(ConversionError, match=message):
+        converter.convert()
 
 
 def test_resolve_media_urls_signs_each_path(monkeypatch):

@@ -424,7 +424,12 @@ class TestSkillExamples:
 
     @pytest.mark.parametrize(
         "name",
-        ["optional_reference_image", "renamed_controls", "pinned_unit"],
+        [
+            "optional_reference_image",
+            "pcb_prelabel",
+            "renamed_controls",
+            "pinned_unit",
+        ],
     )
     def test_every_field_map_example_parses(self, name: str):
         declared = json.loads(

@@ -71,7 +71,9 @@ class ImageBinding(BaseModel):
     )
     source: str = Field(
         description=(
-            "File name inside the sample directory, or a glob such as '*_cam.bmp'."
+            "Where this sample's image object path is written: a file name or "
+            "glob inside the sample directory, or, for a dataset file, a dotted "
+            "path into the row such as 'images.defect'."
         ),
     )
     required: bool = Field(
@@ -86,7 +88,12 @@ class ImageBinding(BaseModel):
 class SampleFieldBinding(BaseModel):
     """One whole-sample meta field bound to one control."""
 
-    field: str = Field(description="Meta key holding the value, e.g. 'quality'.")
+    field: str = Field(
+        description=(
+            "Key holding the value, e.g. 'quality': a key in the sample's meta "
+            "file, or a top-level key of a dataset row."
+        )
+    )
     control: str = Field(description="Control name, i.e. its <... name=...>.")
     type: SampleControlType = Field(
         default="choices",
@@ -119,7 +126,10 @@ class RegionBinding(BaseModel):
     """One list of regions bound to a rectangle control and its text control."""
 
     source: str = Field(
-        description="Meta key holding the region list, e.g. 'findings'.",
+        description=(
+            "Key holding the region list, e.g. 'findings': a key in the "
+            "sample's meta file, or a top-level key of a dataset row."
+        ),
     )
     control: str = Field(description="Rectangle control name, a <RectangleLabels>.")
     label: str = Field(
@@ -231,9 +241,10 @@ class FieldMap(BaseModel):
         return self
 
 
-# The pre-FieldMap behaviour of both adapters, spelled out as bindings. Passing
-# no map reproduces exactly this, which is what keeps the change backward
-# compatible: same control names, same toName, same three required images.
+# The pre-FieldMap behaviour of the two directory adapters, spelled out as
+# bindings. Passing no map reproduces exactly this, which is what keeps the
+# change backward compatible: same control names, same toName, same three
+# required images. ``jsonl`` is new, so it only has to be a sensible default.
 DEFAULT_FIELD_MAPS: dict[str, FieldMap] = {
     "avi_train": FieldMap(
         images=[
@@ -298,6 +309,44 @@ DEFAULT_FIELD_MAPS: dict[str, FieldMap] = {
                 label="category",
                 required=False,
                 unit="norm1000",
+            ),
+        ],
+    ),
+    # A dataset file has no directory to list, so each row names its own image
+    # object paths and carries its metadata inline. Only the first image is
+    # required: a processed row usually has one picture, not the three an
+    # inspection export ships.
+    "jsonl": FieldMap(
+        images=[
+            ImageBinding(field="defect_image", source="defect_image"),
+            ImageBinding(field="diff_image", source="diff_image", required=False),
+            ImageBinding(field="gt_image", source="gt_image", required=False),
+        ],
+        samples=[
+            SampleFieldBinding(
+                field="quality",
+                control="quality_label",
+                type="choices",
+                synonyms=_QUALITY_CHOICE_SYNONYMS,
+                on_unmapped="keep",
+            ),
+        ],
+        regions=[
+            RegionBinding(
+                source="findings",
+                control="finding_category",
+                label="category",
+                required=False,
+                observation="observation",
+                observation_control="finding_observation",
+            ),
+            # Flat box lists carry no label of their own; the row's category is
+            # copied onto each one, which is how a processed row writes them.
+            RegionBinding(
+                source="boxes",
+                control="finding_category",
+                label="category",
+                required=False,
             ),
         ],
     ),

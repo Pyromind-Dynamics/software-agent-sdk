@@ -33,7 +33,12 @@ class LabelStudioProjectAction(Action):
     ] = Field(description="The Label Studio project operation to perform.")
     dataset_path: str | None = Field(
         default=None,
-        description="User storage path. Required for operation='create'.",
+        description=(
+            "User storage path. Required for operation='create'. A directory of "
+            "sample directories for the directory adapters, or one JSON Lines "
+            "object for adapter='jsonl' -- a pipeline's own output file is "
+            "imported as written, without being reshaped first."
+        ),
     )
     label_config_path: str | None = Field(
         default=None,
@@ -69,9 +74,11 @@ class LabelStudioProjectAction(Action):
     adapter: str = Field(
         default="avi_train",
         description=(
-            "Dataset adapter used during project creation: 'avi_train' reads "
-            "meta_vlm.json (quality/findings); 'aoi_export' reads meta.json "
-            "(whole-sample vlm_verdict/note)."
+            "Dataset layout used during project creation: 'avi_train' reads "
+            "meta_vlm.json (quality/findings) from each sample directory; "
+            "'aoi_export' reads meta.json (whole-sample vlm_verdict/note) from "
+            "each sample directory; 'jsonl' reads one task per line of a JSON "
+            "Lines file, each row carrying its own metadata and image paths."
         ),
     )
     idempotency_key: str | None = Field(
@@ -149,12 +156,13 @@ class LabelStudioProjectObservation(Observation):
 TOOL_DESCRIPTION = """Create, inspect, update, or export a Label Studio annotation project.
 
 Use operation='create' to import a user-storage dataset after preview_dataset and
-after generating a validated label_config.xml in the workspace. The tool converts
-the dataset deterministically, imports tasks in batches, and returns a PyroMind
-project_ref, Label Studio project_id, manifest_path, open_url, and project_url.
-open_url is the preferred link to give the user; project_url is the same project's
-own Label Studio address. Both recover from an expired Label Studio session by
-returning through portal SSO.
+after generating a validated label_config.xml in the workspace. The dataset is a
+directory of sample directories, or one JSON Lines file when a pipeline writes
+its own dataset rows; either way it is converted deterministically, imported in
+batches, and returns a PyroMind project_ref, Label Studio project_id,
+manifest_path, open_url, and project_url. open_url is the preferred link to give
+the user; project_url is the same project's own Label Studio address. Both
+recover from an expired Label Studio session by returning through portal SSO.
 
 Pre-annotations are written through bindings: each adapter has built-in ones, and
 an optional field_map_path JSON replaces any of them (control names, image slots,

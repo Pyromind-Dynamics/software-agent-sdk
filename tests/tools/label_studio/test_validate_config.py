@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from openhands.tools.label_studio.converter import AVITrainToLabelStudioConverter
+from openhands.tools.label_studio.field_map import DEFAULT_FIELD_MAPS
 from openhands.tools.label_studio.skill_helpers import (
     REQUIRED_MEDIA_OBJECT,
     LabelConfigValidationError,
@@ -48,6 +49,22 @@ AOI_XML = """\
     <Choice value="ok"/>
     <Choice value="defect"/>
   </Choices>
+  <TextArea name="overall_note" toName="defect_image"/>
+</View>
+"""
+
+# Every control any built-in map requires, so one document satisfies them all.
+ALL_ADAPTERS_XML = """\
+<View>
+  <Image name="defect_image" value="$defect_image"/>
+  <Choices name="quality_label" toName="defect_image">
+    <Choice value="ok"/>
+    <Choice value="defect"/>
+  </Choices>
+  <RectangleLabels name="finding_category" toName="defect_image">
+    <Label value="开路"/>
+  </RectangleLabels>
+  <TextArea name="finding_observation" toName="defect_image"/>
   <TextArea name="overall_note" toName="defect_image"/>
 </View>
 """
@@ -148,6 +165,24 @@ class TestAdapterContract:
         assert {c["from_name"] for c in controls} >= set(
             required_controls("aoi_export")
         )
+
+    def test_jsonl_config_needs_only_a_verdict_and_one_image(self):
+        """A dataset row names its own images, so its built-in map has no fixed
+        set to demand: one image and the verdict control are the whole contract.
+        """
+        xml = (
+            '<View><Image name="defect_image" value="$defect_image"/>'
+            '<Choices name="quality_label" toName="defect_image">'
+            '<Choice value="ok"/><Choice value="defect"/></Choices></View>'
+        )
+        controls = validate_label_config_xml(xml, adapter="jsonl")
+        assert {c["from_name"] for c in controls} == set(required_controls("jsonl"))
+
+        with pytest.raises(LabelConfigValidationError, match="missing <Choices"):
+            validate_label_config_xml(
+                '<View><Image name="defect_image" value="$defect_image"/></View>',
+                adapter="jsonl",
+            )
 
     def test_avi_train_rejects_a_renamed_control(self):
         xml = VALID_XML.replace('name="quality_label"', 'name="verdict"')
@@ -336,3 +371,17 @@ class TestSkillScript:
         assert (result.returncode != 0) is raises, (
             f"{label}: script exit={result.returncode} stdout={result.stdout}"
         )
+
+    @pytest.mark.parametrize("adapter", sorted(DEFAULT_FIELD_MAPS))
+    def test_script_knows_every_adapter_the_tool_defines(
+        self, tmp_path: Path, adapter: str
+    ):
+        """The script carries its own copy of the bindings, so an adapter missing
+        there would make ``--adapter`` unusable for a layout create accepts.
+        """
+        xml_file = tmp_path / "label_config.xml"
+        xml_file.write_text(ALL_ADAPTERS_XML, encoding="utf-8")
+
+        result = _run_skill_script(str(xml_file), "--adapter", adapter)
+        assert "unknown adapter" not in result.stderr, result.stderr
+        assert result.returncode == 0, result.stdout

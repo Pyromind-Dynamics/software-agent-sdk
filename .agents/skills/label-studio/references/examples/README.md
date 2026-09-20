@@ -17,6 +17,7 @@ examples/
 │   └── expected_predictions.json
 └── field-maps/                   # 自定义绑定声明的写法（P1-1）
     ├── optional_reference_image.json
+    ├── pcb_prelabel.json
     ├── renamed_controls.json
     └── pinned_unit.json
 ```

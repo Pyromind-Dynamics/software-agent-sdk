@@ -69,7 +69,9 @@ user 文本前，路径是相对 POSIX 路径；assistant 文本含一组非空 
 
 图片预标注使用 `output_schema="structured"` 和
 `ImagePipelineConfig.output_format="structured"`。每行是响应 Schema 校验后的对象，
-再由运行时注入源样本 `id`，不含训练 messages 包装。业务字段由任务的
+再由运行时注入源样本 `id` 和源图关联 `source_images`，不含训练 messages 包装。
+`source_images` 用输入的图片角色做键，值是图片路径，所以整行自包含，下游拿这一行
+就能定位原图。业务字段由任务的
 `response_json_schema` 定义，模型不能返回或覆盖 id。[PCB 场景](cases/pcb-inspection.md) 给出的字段仅是引导案例，不是校验协议。
 
 structured 不使用固定产物校验器；响应由图片执行链按任务配置的 Schema 处理。

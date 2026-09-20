@@ -964,7 +964,11 @@ async def test_runner_loads_sandbox_skills_and_business_tools(
             "analyze_task_failure",
             "training_analysis",
             "label_studio_project",
+            "update_plan",
         }
+        assert (
+            "Use update_plan for complex, multi-step work." in captured["system_prompt"]
+        )
     finally:
         await adapter.close(handle)
 
@@ -976,11 +980,59 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
         repository / ".agents" / "skills" / "training-analysis",
     ]
     specs = PyromindBusinessToolHost(roots).specs()
-    assert len(specs) == 23
-    assert {"edp_render", "edp_submit", "edp_aggregate"} <= {
+    assert len(specs) == 24
+    assert {"edp_render", "edp_submit", "edp_aggregate", "update_plan"} <= {
         spec["name"] for spec in specs
     }
     assert all(spec["input_schema"].get("type") == "object" for spec in specs)
+
+
+async def test_pi_host_bridges_update_plan_and_persists_snapshot(tmp_path) -> None:
+    host = PyromindBusinessToolHost(
+        [
+            Path(pi_adapter_module.__file__).parents[3]
+            / ".agents"
+            / "skills"
+            / "data-processing",
+            Path(pi_adapter_module.__file__).parents[3]
+            / ".agents"
+            / "skills"
+            / "training-analysis",
+        ]
+    )
+    result = await host.execute(
+        "update_plan",
+        {
+            "explanation": "Continue",
+            "plan": [
+                {"step": "Inspect input", "status": "completed"},
+                {"step": "Build output", "status": "in_progress"},
+            ],
+        },
+        ToolExecutionContext(
+            conversation_id="conversation-plan",
+            workspace_root=tmp_path,
+            request_context=RequestContext(user_id="42"),
+            model_configuration={"model": "gpt-5"},
+        ),
+    )
+
+    assert result["is_error"] is False
+    assert result["details"] == {
+        "kind": "UpdatePlanObservation",
+        "explanation": "Continue",
+        "plan": [
+            {"step": "Inspect input", "status": "completed"},
+            {"step": "Build output", "status": "in_progress"},
+        ],
+    }
+    assert json.loads((tmp_path / "pi" / "PLAN.json").read_text()) == {
+        "explanation": "Continue",
+        "plan": [
+            {"step": "Inspect input", "status": "completed"},
+            {"step": "Build output", "status": "in_progress"},
+        ],
+    }
 
 
 @pytest.mark.parametrize(

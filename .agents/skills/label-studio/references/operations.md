@@ -12,6 +12,8 @@ python <技能目录>/scripts/validate_label_config.py <label_config.xml> --adap
 
 `<技能目录>` 必须是**绝对路径** —— 技能目录在 workspace 之外，相对路径
 `.agents/skills/...` 只在 read/write/edit 工具里有效，terminal 里会找不到文件。
+技能目录与 workspace 根同址，直接用 `ls "$PWD/.agents/skills/label-studio/scripts/"`
+确认即可，不要全盘 `find`。
 路径不确定就别折腾：直接跳到 create，它会在转换**之前**做同样的校验并返回可读
 错误，结论一致；这一步只省一次全量转换的时间。退出码：0 通过，1 不通过
 （打印原因），2 用法错误。

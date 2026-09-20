@@ -57,6 +57,7 @@ from openhands.tools.sandbox import (
     SandboxWriteFileTool,
 )
 from openhands.tools.training_analysis import TrainingAnalysisTool
+from openhands.tools.update_plan import UpdatePlanTool
 from openhands.tools.workflow.analyze_task_failure import AnalyzeTaskFailureTool
 from openhands.tools.workflow.run_workflow import WORKFLOW_ATTEMPT_STATE_KEY
 from openhands.tools.workflow.task_submission import (
@@ -371,10 +372,19 @@ class PyromindBusinessToolHost:
             LabelStudioProjectTool.name: lambda context: LabelStudioProjectTool.create(
                 **self._label_studio_params(context)
             )[0],
+            UpdatePlanTool.name: lambda context: UpdatePlanTool.create(
+                cast(
+                    Any,
+                    SimpleNamespace(persistence_dir=str(context.workspace_root / "pi")),
+                )
+            )[0],
         }
 
     def specs(self) -> list[dict[str, Any]]:
         specs = [validation_tool_spec()]
+        tools: list[ToolDefinition[Any, Any]] = [
+            UpdatePlanTool.create(cast(Any, SimpleNamespace(persistence_dir=None)))[0]
+        ]
         for tool_type in (
             PreviewDatasetTool,
             UploadFileToPyromindTool,
@@ -399,7 +409,8 @@ class PyromindBusinessToolHost:
             TrainingAnalysisTool,
             LabelStudioProjectTool,
         ):
-            tool = tool_type.create()[0]
+            tools.append(tool_type.create()[0])
+        for tool in tools:
             definition = tool.to_mcp_tool()
             schema = definition.get("inputSchema")
             if not isinstance(schema, dict):

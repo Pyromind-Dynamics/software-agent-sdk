@@ -182,6 +182,45 @@ def test_runner_tool_event_has_product_operation_shape_and_object_details() -> N
     assert events[0].payload["details"] is None
 
 
+def test_runner_update_plan_event_emits_structured_plan_update() -> None:
+    events = translate_runner_event(
+        {
+            "protocolVersion": PROTOCOL_VERSION,
+            "type": "pi.event",
+            "eventId": "e1",
+            "sessionId": "s1",
+            "runId": "r1",
+            "occurredAt": "2026-08-19T00:00:00Z",
+            "kind": "tool.completed",
+            "payload": {
+                "tool_call_id": "t1",
+                "tool_name": "update_plan",
+                "content": [{"type": "text", "text": "Plan updated"}],
+                "details": {
+                    "explanation": "Continue",
+                    "plan": [
+                        {"step": "Inspect input", "status": "completed"},
+                        {"step": "Build output", "status": "in_progress"},
+                    ],
+                },
+            },
+        }
+    )
+
+    assert [event.type for event in events] == [
+        "operation.completed",
+        "plan.updated",
+    ]
+    assert events[1].event_id == "e1:plan"
+    assert events[1].payload == {
+        "steps": [
+            {"step": "Inspect input", "status": "completed"},
+            {"step": "Build output", "status": "in_progress"},
+        ],
+        "explanation": "Continue",
+    }
+
+
 def test_runner_content_normalizes_pi_images_for_product_events() -> None:
     frames = (
         {

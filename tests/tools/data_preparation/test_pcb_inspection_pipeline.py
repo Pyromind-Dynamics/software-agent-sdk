@@ -72,6 +72,14 @@ def _response(
     }
 
 
+def _source_images(tmp_path: Path, sample: dict[str, Any]) -> dict[str, str]:
+    """The source-image mapping a run over *sample* writes into its row."""
+    return {
+        label: str((tmp_path / name).resolve())
+        for label, name in zip(sample["image_labels"], sample["images"], strict=True)
+    }
+
+
 def test_pcb_template_satisfies_managed_pipeline_contract() -> None:
     validate_managed_image_pipeline(
         TEMPLATE, runtime_public_names(SCRIPTS / "image_utils.py")
@@ -107,7 +115,12 @@ def test_pcb_predictions_round_trip_through_dataflow(
     rows = [json.loads(line) for line in output.read_text().splitlines()]
     assert len(rows) == 3
     for row, sample, response in zip(rows, samples, responses, strict=True):
-        assert row == {"id": sample["id"], **response}
+        assert row == {
+            "id": sample["id"],
+            "source_images": _source_images(tmp_path, sample),
+            **response,
+        }
+    assert list(rows[0]["source_images"]) == ["待检原图", "正常结构参考"]
     frozen = [
         json.loads(line)
         for line in (output.parent / "source_manifest.jsonl").read_text().splitlines()
@@ -160,12 +173,17 @@ def test_pcb_invalid_input_never_becomes_a_false_positive_label(
     assert (output.parent / "failure.json").is_file()
 
 
-def test_structured_rejects_model_id_and_message_wrappers(
+def test_structured_rejects_model_reserved_fields_and_message_wrappers(
     runtime: Any, config: Any
 ) -> None:
     response = _response(False)
     with pytest.raises(ValueError, match="reserved source id"):
         runtime._validate_response(json.dumps({"id": "wrong", **response}), config)
+    with pytest.raises(ValueError, match="reserved source images"):
+        runtime._validate_response(
+            json.dumps({"source_images": {"待检原图": "/datasets/a.bmp"}, **response}),
+            config,
+        )
     for wrapped in (
         f"<answer>{json.dumps(response)}</answer>",
         f"```json\n{json.dumps(response)}\n```",
@@ -179,6 +197,14 @@ def test_structured_rejects_model_id_and_message_wrappers(
             response_json_schema={
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
+            },
+        )
+    with pytest.raises(ValueError, match="reserved"):
+        replace(
+            config,
+            response_json_schema={
+                "type": "object",
+                "properties": {"source_images": {"type": "object"}},
             },
         )
     assert not config.training_system_prompt
@@ -207,8 +233,16 @@ def test_structured_retry_skip_and_resume_preserve_source(
         runtime.run_image_pipeline(config, str(source), str(output))
     rows = [json.loads(line) for line in output.read_text().splitlines()]
     assert rows == [
-        {"id": samples[0]["id"], **good},
-        {"id": samples[2]["id"], **_response(False)},
+        {
+            "id": samples[0]["id"],
+            "source_images": _source_images(tmp_path, samples[0]),
+            **good,
+        },
+        {
+            "id": samples[2]["id"],
+            "source_images": _source_images(tmp_path, samples[2]),
+            **_response(False),
+        },
     ]
     failures = [
         json.loads(line)
@@ -304,6 +338,31 @@ def test_structured_preserves_task_specific_objects_and_ids(
     runtime.run_image_pipeline(config, str(source), str(output))
     rows = [json.loads(line) for line in output.read_text().splitlines()]
     assert rows == [
-        {"id": sample["id"], **response}
+        {
+            "id": sample["id"],
+            "source_images": _source_images(tmp_path, sample),
+            **response,
+        }
         for sample, response in zip(samples, responses, strict=True)
     ]
+
+
+def test_source_images_keep_repeated_roles_and_strip_the_pod_mount(
+    runtime: Any,
+) -> None:
+    """Two images sharing a role both survive, and pod paths become Storage paths."""
+    images = runtime._source_images(
+        ["待检原图", "辅助图", "辅助图"],
+        [
+            "/target-workspace/datasets/pcb/board.bmp",
+            "/target-workspace/datasets/pcb/diff.bmp",
+            "/target-workspace/datasets/pcb/zoom.bmp",
+        ],
+    )
+    assert images == {
+        "待检原图": "/datasets/pcb/board.bmp",
+        "辅助图": "/datasets/pcb/diff.bmp",
+        "辅助图#2": "/datasets/pcb/zoom.bmp",
+    }
+    # A local sample run has no mount, so its own path is what it records.
+    assert runtime._storage_object_path("/tmp/ws/board.bmp") == "/tmp/ws/board.bmp"

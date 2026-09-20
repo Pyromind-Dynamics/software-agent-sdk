@@ -1000,7 +1000,8 @@ class PreviewDatasetExecutor(
                 text=(
                     f"sample_paths 有 {len(action.sample_paths)} 项，"
                     f"超过 n={action.n}。\n"
-                    "请减少路径数量，或增大 n。\n"
+                    f"把 n 设成 {len(action.sample_paths)} 即可全部选中；"
+                    f"要少取几条就把 sample_paths 收到 {action.n} 项以内。\n"
                     "错误码：sample_selection_limit"
                 ),
                 is_error=True,
@@ -1066,7 +1067,10 @@ class PreviewDatasetExecutor(
                     if total_files > _MAX_SAMPLE_FILES:
                         raise ValueError(
                             "Sample selection exceeds the "
-                            f"{_MAX_SAMPLE_FILES}-file limit."
+                            f"{_MAX_SAMPLE_FILES}-file limit. Pass "
+                            "sample_paths with the exact files or subfolders "
+                            "you need (one subfolder counts as one sample) "
+                            "instead of materializing the whole folder."
                         )
                     row_sample = (
                         action.mode == "sample"
@@ -1635,10 +1639,18 @@ class PreviewDatasetExecutor(
         if filter_term:
             entries = [entry for entry in entries if filter_term in entry.path.lower()]
             if not entries:
+                available = _cap_entry_listing(
+                    [
+                        f"  - {entry.path} ({'folder' if entry.is_dir else 'file'})"
+                        for entry in list_result
+                    ]
+                )
                 return PreviewDatasetObservation.from_text(
                     text=(
                         f"No entries under {dataset_path} match "
-                        f"path_filter '{path_filter}'."
+                        f"path_filter '{path_filter}'. path_filter only matches "
+                        "the names listed at this level, not files inside them.\n"
+                        f"Available entries:\n{available}"
                     ),
                     dataset_path=dataset_path,
                     files=[],

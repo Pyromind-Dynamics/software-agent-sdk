@@ -47,10 +47,15 @@ except ImportError:  # DataFlow normally installs it transitively.
 
 
 SUPPORTED_DATAFLOW_VERSION = "1.0.10"
-IMAGE_UTILS_API_VERSION = "3"
+IMAGE_UTILS_API_VERSION = "4"
 NATIVE_VLM_SUFFIXES = {".jpg", ".jpeg", ".png"}
 CONVERTIBLE_VLM_SUFFIXES = {".gif", ".webp", ".bmp"}
 IMAGE_SUFFIXES = NATIVE_VLM_SUFFIXES | CONVERTIBLE_VLM_SUFFIXES
+
+# Platform pods mount user Storage here. Everything an agent or a downstream
+# tool reads back must be expressed without this prefix, so the object paths
+# written into structured rows are Storage paths rather than pod paths.
+STORAGE_MOUNT_PREFIX = "/target-workspace"
 
 # Run-level failure summary, read back by generate_report.py as ``runtime_failure``
 # and by the host tool as ``report.json.failure``.
@@ -147,10 +152,13 @@ class ImagePipelineConfig:
                 raise ValueError(
                     "structured response_json_schema must describe an object"
                 )
-            if "id" in self.response_json_schema.get("properties", {}) or "id" in (
-                self.response_json_schema.get("required", [])
-            ):
-                raise ValueError("structured id is reserved for the source sample")
+            for reserved in ("id", "source_images"):
+                if reserved in self.response_json_schema.get("properties", {}) or (
+                    reserved in self.response_json_schema.get("required", [])
+                ):
+                    raise ValueError(
+                        f"structured {reserved} is reserved for the source sample"
+                    )
             if self.allow_reference_correction:
                 raise ValueError("reference correction requires vision output")
         if _Draft202012Validator is not None:
@@ -1073,6 +1081,7 @@ def _prepare_sample(
         )
     sample["_local_images"] = local_images
     sample["_image_labels"] = labels
+    sample["_source_images"] = _source_images(labels, raw_local_images)
     sample["_user_prompt"] = user_prompt
     sample["_model_prompt"] = (
         f"{sample_system_prompt}\n\n{user_prompt}{reconciliation_prompt}"
@@ -1193,8 +1202,12 @@ def _validate_response(
         value = json.loads(raw_response)
         if not isinstance(value, dict):
             raise ValueError("structured response must be a JSON object")
-        if "id" in value:
-            raise ValueError("model cannot supply the reserved source id")
+        for reserved, label in (
+            ("id", "source id"),
+            ("source_images", "source images"),
+        ):
+            if reserved in value:
+                raise ValueError(f"model cannot supply the reserved {label}")
         _validate_json_schema(value, config.response_json_schema)
         return value, "raw_json"
     payload, parse_mode = _unwrap_json_response(raw_response)
@@ -1315,13 +1328,52 @@ def _validate_schema_subset(value: Any, schema: Any, *, path: str) -> None:
             )
 
 
+def _storage_object_path(local_path: str) -> str:
+    """Return the agent-facing path for one source image.
+
+    A platform run materializes user Storage under :data:`STORAGE_MOUNT_PREFIX`,
+    so the object path is the local path without that mount. A local sample run
+    has no mount and keeps its local path, which is the path that run can read.
+    """
+    path = Path(local_path)
+    try:
+        relative = path.relative_to(STORAGE_MOUNT_PREFIX)
+    except ValueError:
+        return str(path)
+    return f"/{relative.as_posix()}"
+
+
+def _source_images(labels: list[str], local_paths: list[str]) -> dict[str, str]:
+    """Map each image's role label to its path.
+
+    Roles come from the input's ``image_labels``, so the row says which image is
+    the one under inspection and which is the reference without any downstream
+    tool having to guess from file names or position. Repeated roles get a
+    ``#2``, ``#3`` suffix so a dataset with several auxiliary images still
+    exposes all of them; the first occurrence keeps the bare label.
+    """
+    counts: dict[str, int] = {}
+    images: dict[str, str] = {}
+    for label, path in zip(labels, local_paths, strict=True):
+        counts[label] = counts.get(label, 0) + 1
+        key = label if counts[label] == 1 else f"{label}#{counts[label]}"
+        images[key] = _storage_object_path(path)
+    return images
+
+
 def _canonical_output(
     sample: dict[str, Any],
     response: dict[str, Any],
     config: ImagePipelineConfig,
 ) -> dict[str, Any]:
     if config.output_format == "structured":
-        return {"id": sample["id"], **{k: v for k, v in response.items() if k != "id"}}
+        # The annotation object plus its source images: a reader that only has
+        # this row can still tell which image the judgment is about.
+        return {
+            "id": sample["id"],
+            "source_images": sample["_source_images"],
+            **{k: v for k, v in response.items() if k not in {"id", "source_images"}},
+        }
     reasoning = _stringify(response.get(config.reasoning_key), config.reasoning_key)
     answer = _stringify(response.get(config.answer_key), config.answer_key)
     if config.answer_is_json:

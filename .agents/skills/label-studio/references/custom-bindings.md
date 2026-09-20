@@ -10,7 +10,7 @@
 
 | section | 作用 | 字段 |
 |---|---|---|
-| `images` | 图片文件 → `<Image>` 对象 | `field`、`source`（文件名或 glob）、`required` |
+| `images` | 图片文件 → `<Image>` 对象 | `field`、`source`（样本目录里的文件名/glob，或 `jsonl` 的行内点号路径）、`required` |
 | `samples` | meta 整图字段 → 控件 | `field`、`control`、`type`（`choices`/`textarea`）、`synonyms`、`on_unmapped` |
 | `regions` | meta 区域数组 → 矩形 | `source`、`control`、`label`、`geometry`、`unit`、`observation`、`observation_control` |
 
@@ -30,15 +30,33 @@
 - **坐标量纲写清楚**：`"unit": "norm1000" | "percent" | "unit"`。不写（`auto`）
   时按数值大小推断；写了就**不再猜**，超出该量纲会**直接报错**而不是静默裁到
   边界。小于 1% 的百分比框正是被"推断"画错位的那类，量纲有把握就写上。
+- **接 data-processing 的预打标产出**（`jsonl` 最常见的一支）：
+  `references/examples/field-maps/pcb_prelabel.json` 可以直接当起点。structured
+  产出的行自带 `source_images`（角色 → 图片 Storage 路径），图片按角色绑定，
+  例如 `"source": "source_images.待检原图"`；角色名取自数据集的 `image_labels`，
+  对不上时只改这一处 key，不要改数据。同理，判定字段和区域字段各绑一次即可，
+  **产出文件原样导入**，不要再拼 `source_manifest.jsonl`。
+  区域那一段按行内实际形状写：行里有 `regions`（每项含 `category`/`boxes`/`note`）
+  就 `"source": "regions"`；行是顶层 `label`+`category`+`boxes`+`note` 就
+  `"source": "boxes"`（`boxes` 是数据里已有键名之一，绑定直接读它），此时
+  `note` 按整图字段绑到 `overall_note`。一个区域带多个 `boxes` 时每个框各出一个
+  矩形，不必先摊平。`geometry` 声明的是**区域项里**优先读哪个键，不是行里的键：
+  行内给裸坐标数组（`source` 直接指向 `boxes`）时，坐标在区域项里叫 `bbox`，
+  这时写 `"geometry": "boxes"` 这个名字照样出框（读不到声明的键会回退到
+  `bbox`/`boxes`/`box`/`value`）；拿不准就整个不写。
 
 改了绑定要**重新 create**：映射内容参与项目标识，改了会得到新项目，不会复用
 旧映射的旧项目。
 
 ## 源数据不是 adapter 布局时
 
-内置 adapter 只认"已经铺好的样本目录"（见 `references/adapters.md`）。源是
-JSONL、扁平文件列表或混合布局时，先做一次**物化**，把源数据铺成 adapter 认的
-形状，再按路由回到 adapters 那一支。物化是确定性转换，只改形状、不改业务语义：
+先看能不能直接用 `jsonl`：**预处理/清洗产出的 JSONL 按 `references/adapters.md`
+的行契约原样导入**（`adapter=jsonl`，字段名不同就声明绑定），不要再写一遍格式
+转换脚本把它摊成样本目录 —— 那一步既慢又多一个出错的地方。
+
+只有源既不是样本目录、也不是 JSONL（扁平文件列表、混合布局等）时才**物化**：
+把源数据铺成 adapter 认的形状，再按路由回到 adapters 那一支。物化是确定性
+转换，只改形状、不改业务语义：
 
 - 目录名用源标识的可读化形式（例如 `a/b/c` → `a__b__c`），保证唯一；
 - 图片按角色落成声明的 `source` 文件（如 `defect.bmp`、`*_cam.bmp`）；

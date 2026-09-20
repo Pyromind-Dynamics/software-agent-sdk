@@ -1,0 +1,35 @@
+{
+  "images": [
+    { "field": "defect_image", "source": "source_images.待检原图" },
+    {
+      "field": "gt_image",
+      "source": "source_images.CAM参考图",
+      "required": false
+    }
+  ],
+  "samples": [
+    {
+      "field": "label",
+      "control": "quality_label",
+      "type": "choices",
+      "synonyms": { "true": "defect", "false": "ok" }
+    },
+    {
+      "field": "context",
+      "control": "overall_note",
+      "type": "textarea",
+      "required": false
+    }
+  ],
+  "regions": [
+    {
+      "source": "regions",
+      "control": "finding_category",
+      "label": "category",
+      "geometry": "boxes",
+      "unit": "norm1000",
+      "observation": "note",
+      "observation_control": "finding_observation"
+    }
+  ]
+}

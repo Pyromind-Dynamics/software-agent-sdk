@@ -117,6 +117,39 @@ DEFAULT_FIELD_MAPS = {
             },
         ],
     },
+    # One JSON Lines object per sample, so only the first image is required: a
+    # processed row usually names one picture rather than three.
+    "jsonl": {
+        "images": [
+            {"field": "defect_image"},
+            {"field": "diff_image"},
+            {"field": "gt_image"},
+        ],
+        "samples": [
+            {
+                "field": "quality",
+                "control": "quality_label",
+                "type": "choices",
+                "required": True,
+            },
+        ],
+        "regions": [
+            {
+                "source": "findings",
+                "control": "finding_category",
+                "label": "category",
+                "required": False,
+                "observation": "observation",
+                "observation_control": "finding_observation",
+            },
+            {
+                "source": "boxes",
+                "control": "finding_category",
+                "label": "category",
+                "required": False,
+            },
+        ],
+    },
 }
 
 

@@ -78,7 +78,7 @@ RUNTIME_FILENAMES = (
     "source_fingerprint.py",
     "validate_prepared_data.py",
 )
-IMAGE_UTILS_API_VERSION = "3"
+IMAGE_UTILS_API_VERSION = "4"
 DATAFLOW_NODE_TYPE = "CustomCommandCPUNode"
 OutputSchema = Literal[
     "text",

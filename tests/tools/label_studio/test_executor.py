@@ -11,7 +11,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from openhands.tools.label_studio.api_client import LabelStudioAPIError
-from openhands.tools.label_studio.converter import ConversionError
+from openhands.tools.label_studio.converter import (
+    DATASET_FILE_MAX_BYTES,
+    ConversionError,
+)
 from openhands.tools.label_studio.definition import (
     LabelStudioProjectAction,
 )
@@ -138,6 +141,8 @@ class TestCreate:
             mock_manifest = MockConverter.return_value.convert.return_value
             mock_manifest.total_tasks = 3
             mock_manifest.batch_payloads = [("tasks-00001.json", b"[{},{},{}]", 3)]
+            mock_manifest.unmapped_quality = ()
+            mock_manifest.unmatched_regions = ()
             mock_manifest.to_manifest_data.return_value.model_dump_json.return_value = (
                 "{}"
             )
@@ -734,6 +739,7 @@ def _mock_manifest(
     tasks: int,
     payload: bytes,
     unmapped_quality: tuple[str, ...] = (),
+    unmatched_regions: tuple[str, ...] = (),
 ) -> MagicMock:
     manifest = MockConverter.return_value.convert.return_value
     manifest.total_tasks = tasks
@@ -742,6 +748,7 @@ def _mock_manifest(
     # which is both truthy and iterable-as-empty -- so the executor's warning
     # branch would be taken and satisfied without a single test intending it.
     manifest.unmapped_quality = unmapped_quality
+    manifest.unmatched_regions = unmatched_regions
     return manifest
 
 
@@ -774,6 +781,40 @@ def test_create_reports_unmapped_quality_to_the_agent(conversation: MagicMock) -
 
     assert not obs.is_error
     assert "unmapped_quality:NG+" in obs.text
+
+
+def test_create_reports_unmatched_regions_to_the_agent(
+    conversation: MagicMock,
+) -> None:
+    """A binding that names a field no sample carries has to reach the agent.
+
+    The editor renders it as a project with no rectangles, which is
+    indistinguishable from a region the annotator has to draw by hand, so the
+    only place this declaration/data mismatch can surface is here.
+    """
+    executor = _create_executor()
+    mock_ls = _mock_ls_api()
+    with (
+        patch.object(executor, "_load_state", return_value=None),
+        patch.object(executor, "_build_ls_api", return_value=mock_ls),
+        patch.object(executor, "_upload_to_storage", return_value=None),
+        patch.object(executor, "_save_state", return_value=None),
+        patch(
+            "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+        ) as MockConverter,
+    ):
+        _mock_manifest(MockConverter, 1, b"[{}]", unmatched_regions=("boxes",))
+        obs = executor(
+            _action(
+                operation="create",
+                dataset_path="/datasets/pcb",
+                label_config_path="label_config.xml",
+            ),
+            conversation,
+        )
+
+    assert not obs.is_error
+    assert "unmatched_regions:boxes" in obs.text
 
 
 def test_create_stays_quiet_when_every_verdict_mapped(
@@ -921,6 +962,82 @@ class TestCreateIdempotency:
                 )
 
         assert len(set(refs)) == 1
+
+    def test_a_file_dataset_is_read_here_and_seeds_the_project_ref(
+        self, conversation: MagicMock
+    ) -> None:
+        """A JSONL export is rewritten in place, so its path is not a revision.
+
+        The converter cannot seed the ref itself -- the ref is decided before any
+        artifact exists -- so the file is read once here, hashed into the ref,
+        and handed over rather than fetched a second time.
+        """
+        payloads = [
+            b'{"id": "s1", "defect_image": "/a.jpg"}\n',
+            b'{"id": "s2"}\n',
+        ]
+        refs: list[str] = []
+        for payload in payloads:
+            executor = _create_executor()
+            with (
+                patch.object(executor, "_load_state", return_value=None),
+                patch.object(executor, "_build_ls_api", return_value=_mock_ls_api()),
+                patch.object(executor, "_upload_to_storage", return_value=None),
+                patch.object(executor, "_save_state", return_value=None),
+                patch.object(
+                    executor, "_download_from_storage", return_value=payload
+                ) as mock_download,
+                patch(
+                    "openhands.tools.label_studio.executor."
+                    "AVITrainToLabelStudioConverter"
+                ) as MockConverter,
+            ):
+                _mock_manifest(MockConverter, 1, b"[{}]")
+                obs = executor(
+                    _action(
+                        operation="create",
+                        dataset_path="/datasets/pcb-001/processed.jsonl",
+                        label_config_path="label_config.xml",
+                        adapter="jsonl",
+                    ),
+                    conversation,
+                )
+                refs.append(obs.project_ref)
+                assert not obs.is_error
+                assert MockConverter.call_args.kwargs["dataset_content"] == payload
+            assert mock_download.call_args[0][0] == (
+                "/datasets/pcb-001/processed.jsonl"
+            )
+            assert mock_download.call_args.kwargs["max_bytes"] == DATASET_FILE_MAX_BYTES
+
+        assert refs[0] != refs[1]
+
+    def test_a_directory_dataset_is_not_downloaded_to_seed_the_ref(
+        self, executor: LabelStudioProjectExecutor, conversation: MagicMock
+    ) -> None:
+        with (
+            patch.object(executor, "_load_state", return_value=None),
+            patch.object(executor, "_build_ls_api", return_value=_mock_ls_api()),
+            patch.object(executor, "_upload_to_storage", return_value=None),
+            patch.object(executor, "_save_state", return_value=None),
+            patch.object(executor, "_download_from_storage") as mock_download,
+            patch(
+                "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+            ) as MockConverter,
+        ):
+            _mock_manifest(MockConverter, 1, b"[{}]")
+            obs = executor(
+                _action(
+                    operation="create",
+                    dataset_path="/datasets/pcb",
+                    label_config_path="label_config.xml",
+                ),
+                conversation,
+            )
+
+        assert not obs.is_error
+        assert not mock_download.called
+        assert MockConverter.call_args.kwargs["dataset_content"] is None
 
     def test_idempotency_key_separates_projects(
         self, executor: LabelStudioProjectExecutor, conversation: MagicMock
@@ -1443,6 +1560,8 @@ def test_create_records_the_window_the_portal_reported(conversation):
         manifest = MockConverter.return_value.convert.return_value
         manifest.total_tasks = 1
         manifest.batch_payloads = [("tasks-00001.json", b"[{}]", 1)]
+        manifest.unmapped_quality = ()
+        manifest.unmatched_regions = ()
         manifest.to_manifest_data.return_value.model_dump_json.return_value = "{}"
 
         obs = executor(

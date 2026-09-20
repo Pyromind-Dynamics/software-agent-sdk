@@ -2207,7 +2207,7 @@ def test_sample_mode_rejects_explicit_paths_over_n(tmp_path) -> None:
     assert observation.error_code == "sample_selection_limit"
     assert observation.text == (
         "sample_paths 有 11 项，超过 n=10。\n"
-        "请减少路径数量，或增大 n。\n"
+        "把 n 设成 11 即可全部选中；要少取几条就把 sample_paths 收到 10 项以内。\n"
         "错误码：sample_selection_limit"
     )
 

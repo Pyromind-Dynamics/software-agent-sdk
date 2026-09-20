@@ -81,6 +81,9 @@ use cd within one command, but never rely on a directory change from an earlier 
 Workspace files use public_data/... paths; authorized absolute paths are also accepted.
 The read tool maps .agents/skills/ and knowledge/ to shared read-only resource
 directories outside the workspace; terminal commands use their absolute paths.
+Use update_plan for complex, multi-step work. Each call must contain the complete
+plan snapshot; keep at most one step in_progress, mark completed steps promptly,
+and do not use it for simple tasks.
 For Pyromind workflow requests, read the matching
 skill before editing exactly
 public_data/workflow_canvas/workflow.py, then call validate_workflow_dsl without

@@ -45,6 +45,14 @@ class ManifestData(BaseModel):
             "render, because the value is absent from the config's <Choice> list."
         ),
     )
+    unmatched_regions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Region fields the bindings declare but no sample carries. Non-empty "
+            "means those rectangles were never built, because the declaration "
+            "names a field the data does not have."
+        ),
+    )
 
 
 class ProjectState(BaseModel):
