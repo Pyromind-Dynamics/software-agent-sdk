@@ -10,7 +10,7 @@ or resolved from a ``run_id`` / ``output_dir`` recorded by
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, cast
 
@@ -136,11 +136,14 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
         secret_headers: dict[str, str] | None = None,
         timeout: float = 30.0,
         task_store_dir: str | None = None,
+        task_resolver: Callable[[str | None, str | None, str | None], str | None]
+        | None = None,
     ) -> None:
         self._stop_url = (stop_url or _default_stop_url()).rstrip("/")
         self._headers = dict(headers or {})
         self._secret_headers = dict(secret_headers or {})
         self._timeout = timeout
+        self._task_resolver = task_resolver
         self._task_store_dir = (
             Path(task_store_dir) if task_store_dir is not None else None
         )
@@ -196,6 +199,12 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
     def _resolve_task_id(
         self, action: DfStopTaskAction, conversation: BaseConversation | None
     ) -> str | None:
+        if self._task_resolver is not None:
+            resolved = self._task_resolver(
+                action.task_id, action.run_id, action.output_dir
+            )
+            if resolved is not None:
+                return resolved
         if action.task_id and action.task_id.strip():
             task_id = action.task_id.strip()
             if conversation is None:
@@ -296,6 +305,7 @@ class DfStopTaskTool(ToolDefinition[DfStopTaskAction, DfStopTaskObservation]):
             params.pop("storage_secret_headers", params.pop("secret_headers", None))
         )
         timeout = float(params.pop("timeout", 30.0))
+        task_resolver = params.pop("task_resolver", None)
         task_store_dir_value = params.pop("task_store_dir", None)
         task_store_dir = (
             str(task_store_dir_value) if task_store_dir_value is not None else None
@@ -314,6 +324,7 @@ class DfStopTaskTool(ToolDefinition[DfStopTaskAction, DfStopTaskObservation]):
                     secret_headers=secret_headers,
                     timeout=timeout,
                     task_store_dir=task_store_dir,
+                    task_resolver=task_resolver,
                 ),
                 annotations=ToolAnnotations(
                     title="df_stop_task",

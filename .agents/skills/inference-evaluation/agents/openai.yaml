@@ -1,0 +1,4 @@
+---
+interface:
+    display_name: Inference Evaluation
+    short_description: Storage 模型推理、rubric 评分和 HTML 评测报告

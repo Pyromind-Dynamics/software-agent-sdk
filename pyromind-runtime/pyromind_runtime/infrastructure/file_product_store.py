@@ -15,6 +15,7 @@ from pyromind_runtime.domain.base import ContractModel
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
 from pyromind_runtime.domain.events import ProductEvent, WorkflowRunState
+from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 
 
@@ -118,6 +119,33 @@ class FileProductStore:
         metadata = self._load_metadata()
         if metadata.user_id != user_id:
             raise PermissionError("conversation does not belong to current user")
+
+    def load_pipeline_runs(self) -> dict[str, PipelineRun]:
+        with self._lock():
+            return self._load_pipeline_runs()
+
+    def _load_pipeline_runs(self) -> dict[str, PipelineRun]:
+        path = self.directory / "pipeline-runs.json"
+        if not path.exists():
+            return {}
+        return TypeAdapter(dict[str, PipelineRun]).validate_json(path.read_text())
+
+    def save_pipeline_run(
+        self, state: PipelineRun, *, expected_revision: int | None
+    ) -> None:
+        with self._lock():
+            runs = self._load_pipeline_runs()
+            previous = runs.get(str(state.run_id))
+            revision = previous.revision if previous else None
+            if revision != expected_revision:
+                raise ValueError("pipeline run changed concurrently; reload its state")
+            if self._load_metadata().conversation_id != state.conversation_id:
+                raise ValueError("pipeline run belongs to another conversation")
+            runs[str(state.run_id)] = state
+            self._atomic_write(
+                self.directory / "pipeline-runs.json",
+                TypeAdapter(dict[str, PipelineRun]).dump_json(runs).decode(),
+            )
 
     def load_workflow_runs(self) -> dict[str, WorkflowRunState]:
         with self._lock():

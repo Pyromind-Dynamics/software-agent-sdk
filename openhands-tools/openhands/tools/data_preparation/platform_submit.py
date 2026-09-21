@@ -31,6 +31,11 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
+from openhands.tools.data_preparation.inference import (
+    InferenceOptions,
+    InferencePipelineHandler,
+    validate_pipeline_topology,
+)
 from openhands.tools.data_preparation.runner import (
     SUPPORTED_DATAFLOW_VERSION,
     build_dataflow_env,
@@ -104,8 +109,18 @@ DATA_PROCESSING_PACKAGES = (
 TOOL_DESCRIPTION = """\
 Submit an agent-authored Python pipeline for asynchronous execution on Pyromind.
 
+For Storage model evaluation, pass inference with model_path and workspace
+dataset_config_path / evaluation_config_path. This builds exactly one
+VLLMInference connected to one CustomCommandCPUNode with the built-in rubric
+evaluator. No local GPU sample, script_path, model_profile, output_schema or
+format conversion is needed in this mode. Read report.json and its HTML artifact
+after the callback. Inference resume requires unchanged configuration and data;
+omit inference to reuse the frozen configuration. Only submit when execution
+has been requested. Evaluation configuration changes require a new full run.
+
 Call mode='full' only after the user confirms a successful local
-df_run_pipeline result. The tool freezes the local script and shared runtime
+df_run_pipeline result for data processing. The tool freezes the local script
+and shared runtime
 in a per-run Storage directory. Set model_profile and output_schema explicitly
 for new standard runs.
 
@@ -161,6 +176,11 @@ class ReuseAssessment(BaseModel):
 
 class DfSubmitPipelineAction(Action):
     """Submit a DataFlow-compatible Python pipeline to Pyromind Studio."""
+
+    inference: InferenceOptions | None = Field(
+        default=None,
+        description="Storage model evaluation with a fixed inference -> CPU topology.",
+    )
 
     script_path: str | None = Field(
         default=None,
@@ -494,6 +514,7 @@ class DfSubmitPipelineExecutor(
         storage_secret_headers: dict[str, str] | None = None,
         task_store_dir: str | None = None,
         timeout: int = 30,
+        inference_handler: InferencePipelineHandler | None = None,
     ) -> None:
         self._env = env
         self._cluster = cluster
@@ -511,6 +532,7 @@ class DfSubmitPipelineExecutor(
         self._storage_secret_headers = dict(storage_secret_headers or {})
         self._task_store_dir = Path(task_store_dir) if task_store_dir else None
         self._timeout = timeout
+        self._inference_handler = inference_handler
 
     def __call__(
         self,
@@ -520,6 +542,26 @@ class DfSubmitPipelineExecutor(
         try:
             if conversation is None:
                 raise ValueError("df_submit_pipeline requires an active conversation.")
+            handler = self._inference_handler
+            inference_resume = (
+                handler is not None
+                and action.mode == "resume"
+                and action.resume_run_id is not None
+                and handler.runs.resolve(str(action.resume_run_id)) is not None
+            )
+            if action.inference is not None or inference_resume:
+                if handler is None:
+                    raise ValueError("inference evaluation is not configured")
+                try:
+                    return DfSubmitPipelineObservation.from_text(
+                        **handler.submit(self, action, conversation)
+                    )
+                except Exception as exc:
+                    return DfSubmitPipelineObservation.from_text(
+                        text=f"Inference evaluation submission failed: {exc}",
+                        status="Failed",
+                        is_error=True,
+                    )
             input_path = _normalize_storage_path(action.input_path, "input_path")
             task_store = self._task_store(conversation)
             resumed = action.mode == "resume"
@@ -709,6 +751,7 @@ class DfSubmitPipelineExecutor(
                 support_file_name=support_file_name,
             )
             workflow = _build_dataflow_workflow(action, run_id, command)
+            validate_pipeline_topology(workflow)
         except PipelineResolutionError as exc:
             return DfSubmitPipelineObservation.from_text(
                 text=(
@@ -1052,6 +1095,7 @@ class DfSubmitPipelineTool(
             str(task_store_dir_value) if task_store_dir_value is not None else None
         )
         timeout = int(params.pop("timeout", 30))
+        inference_handler = params.pop("inference_handler", None)
         if params:
             names = ", ".join(sorted(params))
             raise ValueError(f"DfSubmitPipelineTool got unknown params: {names}")
@@ -1075,6 +1119,7 @@ class DfSubmitPipelineTool(
                     storage_secret_headers=storage_secret_headers,
                     task_store_dir=task_store_dir,
                     timeout=timeout,
+                    inference_handler=inference_handler,
                 ),
                 annotations=ToolAnnotations(
                     title="df_submit_pipeline",

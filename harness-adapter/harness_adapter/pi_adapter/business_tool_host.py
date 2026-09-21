@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 from pydantic import SecretStr
+from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.domain.context import RequestContext
 
 from harness_adapter.openhands_adapter.session_factory import current_user_from_context
@@ -31,6 +32,7 @@ from openhands.tools.data_preparation import (
     DfStopTaskTool,
     DfSubmitPipelineTool,
 )
+from openhands.tools.data_preparation.inference import InferencePipelineHandler
 from openhands.tools.environment_processing import (
     EdpAggregateTool,
     EdpRenderTool,
@@ -66,6 +68,7 @@ from openhands.tools.workflow.task_submission import (
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
+    ValidateWorkflowDslExecutor,
 )
 from openhands.tools.workflow_debug import WorkflowDebugTool
 
@@ -274,6 +277,7 @@ class PyromindBusinessToolHost:
         skill_roots: Sequence[Path],
         *,
         skills_directory: Path | None = None,
+        pipeline_runs: Callable[[str], PipelineRuns] | None = None,
     ) -> None:
         roots = (
             {
@@ -293,6 +297,12 @@ class PyromindBusinessToolHost:
         self._preparation_runtime = roots["data-processing"] / "scripts" / "preparation"
         self._edp_runtime = roots["data-processing"] / "scripts" / "edp"
         self._training_runtime = roots["training-analysis"] / "scripts"
+        self._inference_runtime = (
+            skills_directory / "inference-evaluation" / "scripts"
+            if skills_directory is not None
+            else None
+        )
+        self._pipeline_runs = pipeline_runs
         for path in (
             self._cleaning_runtime,
             self._preparation_runtime,
@@ -620,6 +630,16 @@ class PyromindBusinessToolHost:
     def _preparation_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         params = self._execution_params(context)
         params["runtime_dir"] = str(self._preparation_runtime)
+        if self._pipeline_runs is not None and self._inference_runtime is not None:
+            params["inference_handler"] = InferencePipelineHandler(
+                self._inference_runtime,
+                self._pipeline_runs(context.conversation_id),
+                ValidateWorkflowDslExecutor(
+                    secret_headers={"authorization": _VALIDATE_AUTHORIZATION_SECRET}
+                    if context.request_context.authorization
+                    else None,
+                ),
+            )
         return params
 
     def _edp_params(self, context: ToolExecutionContext) -> dict[str, Any]:
@@ -675,6 +695,10 @@ class PyromindBusinessToolHost:
         params: dict[str, Any] = {
             "headers": _forward_headers(context.request_context, include_cookie=False)
         }
+        if self._pipeline_runs is not None:
+            params["task_resolver"] = self._pipeline_runs(
+                context.conversation_id
+            ).task_for
         if context.request_context.cookie:
             params["secret_headers"] = {"cookie": _STORAGE_COOKIE_SECRET}
         return params
