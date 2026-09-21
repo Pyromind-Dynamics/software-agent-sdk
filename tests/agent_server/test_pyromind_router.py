@@ -21,6 +21,7 @@ from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_VALUE,
 )
 from openhands.agent_server.pyromind_router import (
+    _PYROMIND_PRODUCTION_RUN_SKILL_ALLOWLIST,
     PYROMIND_AUTH_TOKEN_SECRET,
     PYROMIND_KB_INSTRUCTIONS,
     PYROMIND_X_CLUSTER_SECRET,
@@ -608,7 +609,42 @@ async def test_pyromind_conversation_registers_skill_runtime_tools(tmp_path):
     assert SkillsReadTool.__name__ in tools
     assert tools[SkillsListTool.__name__].params == {}
     assert tools[SkillsReadTool.__name__].params == {}
+    assert RunWorkflowTool.name not in tools
     service.start_request.model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_inference_skill_registers_allowlisted_production_run_tool(tmp_path):
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "inference-evaluation"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: inference-evaluation\n"
+        "description: Evaluate inference with Agent-authored Rubrics.\n"
+        "---\n# Inference evaluation",
+        encoding="utf-8",
+    )
+    service = _FakeConversationService(tmp_path / "conversations")
+    response = Response()
+    request = _make_request({})
+    load_base_env(request)
+
+    await create_pyromind_conversation(
+        request,
+        PyromindCreateConversationRequest(
+            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            extra={"skills_path": str(skills_dir)},
+        ),
+        response,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert service.start_request is not None
+    tools = {tool.name: tool for tool in service.start_request.agent.tools}
+    assert RunWorkflowTool.name in tools
+    assert tools[RunWorkflowTool.name].params["allowed_skill_names"] == [
+        "inference-evaluation"
+    ]
 
 
 @pytest.mark.asyncio
@@ -1176,6 +1212,18 @@ def test_build_workflow_run_tool_wires_env_headers_and_auth_token():
         },
     }
     assert secrets["auth_token"].get_value() == "jwt-token"
+
+
+def test_build_workflow_run_tool_accepts_skill_allowlist():
+    request = _make_request({"x-cluster": "us-west-1#pre"})
+    load_base_env(request)
+
+    tool, _ = _build_workflow_run_tool(
+        request,
+        allowed_skill_names=_PYROMIND_PRODUCTION_RUN_SKILL_ALLOWLIST,
+    )
+
+    assert tool.params["allowed_skill_names"] == ["inference-evaluation"]
 
 
 def test_build_analyze_task_failure_tool_matches_create_params():

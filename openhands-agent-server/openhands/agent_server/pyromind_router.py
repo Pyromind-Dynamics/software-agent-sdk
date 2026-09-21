@@ -8,6 +8,7 @@ frontend only needs to pass minimal configuration fields.
 import logging
 import os
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID
@@ -171,6 +172,7 @@ _PYROMIND_SKILL_NAMES = [
     "sandbox",
     "training-analysis",
 ]
+_PYROMIND_PRODUCTION_RUN_SKILL_ALLOWLIST = frozenset({"inference-evaluation"})
 _PYROMIND_VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
 _PYROMIND_VALIDATE_FORWARD_HEADERS = ("x-cluster", "accept-language")
 _PYROMIND_DEBUG_URL_TIMEOUT_SECONDS = 30.0
@@ -225,11 +227,15 @@ Skill usage rules:
   choice. If the intent is genuinely ambiguous, ask the user before invoking.
 - Every inference evaluation request uses the `inference-evaluation` skill and
   Agent-authored Rubric scoring, regardless of dataset modality or whether the
-  user explicitly asks for Rubric. Run the generated evaluation script through
-  the platform-provided `CustomCommandNode` for a Storage model or
-  `CustomCommandCPUNode` for an existing endpoint. Do not replace this route
-  with `VLLMInference`, `ModelEvalApiNode`, or a MetricsConfigBuilder node, and
-  do not create or register a new node type.
+  user explicitly asks for Rubric. For a Storage model, use `VLLMInference` to
+  provide the endpoint and pass it to `CustomCommandCPUNode`, which runs the
+  generated evaluation script. For an existing endpoint, use only
+  `CustomCommandCPUNode`. Do not start vLLM inside a `CustomCommandNode`, replace
+  Agent Rubrics with `ModelEvalApiNode` or MetricsConfigBuilder nodes, or create
+  a new node type.
+- When the user explicitly requests execution or report generation, the invoked
+  `inference-evaluation` skill may submit with `run_workflow`. Do not route this
+  production evaluation through `debug-workflow` or `workflow_debug`.
 - Treat any requested node, model, parameter, data, or topology change as a
   `generate-workflow-dsl` request, including phrases such as "换个模型跑一下"
   or "跑下 <model> 的效果". Modify and validate the DSL, then stop; do not
@@ -475,6 +481,7 @@ def _load_auth_token(
 
 def _build_workflow_run_tool(
     http_request: Request,
+    allowed_skill_names: Iterable[str] = (),
 ) -> tuple[Tool, dict[str, SecretSource]]:
     params: dict[str, Any] = {}
     secrets: dict[str, SecretSource] = {}
@@ -486,6 +493,8 @@ def _build_workflow_run_tool(
 
     # 加载用户认证 token。
     secrets = _load_auth_token(http_request=http_request, secrets=secrets)
+    if allowed_skill_names:
+        params["allowed_skill_names"] = list(allowed_skill_names)
 
     # 返回会话级工具参数。
     return Tool(name=RunWorkflowTool.name, params=params), secrets
@@ -1305,6 +1314,11 @@ async def create_pyromind_conversation(
     #    actually call invoke_skill(...) (prompt text alone does not attach it).
     skills_path = request.extra.get("skills_path", _DEFAULT_SKILLS_PATH)
     skills = _load_agent_skills(skills_path, allow_list=_PYROMIND_SKILL_NAMES)
+    production_run_skills = sorted(
+        _PYROMIND_PRODUCTION_RUN_SKILL_ALLOWLIST.intersection(
+            skill.name for skill in skills
+        )
+    )
     agent_context = AgentContext(skills=skills) if skills else None
     validation_tool, validation_secrets = _build_workflow_validation_tool(
         http_request, request.extra
@@ -1317,7 +1331,10 @@ async def create_pyromind_conversation(
     )
 
     # run_workflow / workflow_debug reuse validate auth/header wiring
-    run_tool, run_secrets = _build_workflow_run_tool(http_request)
+    run_tool, run_secrets = _build_workflow_run_tool(
+        http_request,
+        allowed_skill_names=production_run_skills,
+    )
     debug_tool, debug_secrets = _build_workflow_debug_tool(http_request)
     sandbox_tools, sandbox_secrets = _build_sandbox_tools(
         http_request,
@@ -1358,6 +1375,7 @@ async def create_pyromind_conversation(
             Tool(name="grep"),
             Tool(name="file_editor"),
             Tool(name=PyromindSubAgentTool.name),
+            *([run_tool] if production_run_skills else []),
             Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
             *sandbox_tools,
             *storage_tools,

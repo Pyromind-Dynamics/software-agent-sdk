@@ -1,4 +1,5 @@
-import { readdir, realpath, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { readdir, realpath, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import {
   delimiter,
@@ -17,6 +18,7 @@ import {
   createLocalBashOperations,
   type BashOperations,
 } from "@earendil-works/pi-coding-agent";
+import { parse as parseShell, quote as quoteShell } from "shell-quote";
 import { inside, WorkspaceAccessPolicy } from "./workspace-policy.js";
 
 interface SandboxController {
@@ -44,6 +46,53 @@ const OH_SANDBOX_VMEM_LIMIT_ENV = "OH_SANDBOX_VMEM_LIMIT";
 const DEFAULT_SANDBOX_VMEM_LIMIT = "500M";
 const OH_SANDBOX_NPROC_LIMIT_ENV = "OH_SANDBOX_NPROC_LIMIT";
 const DEFAULT_SANDBOX_NPROC_LIMIT = 2;
+
+function quoteShellArgument(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+async function stageSandboxCommand(
+  command: string,
+  temporary: string,
+): Promise<{ invocation: string; path: string }> {
+  const path = resolve(temporary, `command-${randomUUID()}.sh`);
+  await writeFile(path, `${command}\n`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o700,
+  });
+  return {
+    invocation: `/bin/bash ${quoteShellArgument(path)}`,
+    path,
+  };
+}
+
+async function stageMacOsSandboxProfile(
+  wrappedCommand: string,
+  temporary: string,
+): Promise<{ invocation: string; path?: string }> {
+  if (process.platform !== "darwin" || !wrappedCommand.includes("sandbox-exec")) {
+    return { invocation: wrappedCommand };
+  }
+  const arguments_ = parseShell(wrappedCommand);
+  if (!arguments_.every((argument): argument is string => typeof argument === "string")) {
+    throw new Error("sandbox runtime returned an unsupported macOS command");
+  }
+  const sandboxIndex = arguments_.indexOf("sandbox-exec");
+  const profileFlagIndex = arguments_.indexOf("-p", sandboxIndex + 1);
+  const profile = arguments_[profileFlagIndex + 1];
+  if (sandboxIndex < 0 || profileFlagIndex < 0 || profile === undefined) {
+    throw new Error("sandbox runtime omitted the macOS sandbox profile");
+  }
+  const path = resolve(temporary, `profile-${randomUUID()}.sb`);
+  await writeFile(path, profile, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
+  arguments_.splice(profileFlagIndex, 2, "-f", path);
+  return { invocation: quoteShell(arguments_), path };
+}
 
 export interface ResourceLimitsConfig {
   memoryLimitBytes: number;
@@ -211,24 +260,46 @@ function createWorkspaceSandbox(
     operations: {
       async exec(command, cwd, options) {
         await assertWorkspaceCwd(cwd, policy.workspaceRoot);
+        const staged = await stageSandboxCommand(
+          commandWithResourceCaps(command, dependencies.resourceLimits),
+          policy.terminalTempRoot,
+        );
         try {
           const config = await prepare();
           const wrapped = await wrapWithPrivateTemp(
             controller,
-            commandWithResourceCaps(command, dependencies.resourceLimits),
+            staged.invocation,
             config,
             policy.terminalTempRoot,
             options.signal,
           );
-          return await localOperations.exec(wrapped, policy.workspaceRoot, {
-            ...options,
-            env: {
-              ...options.env,
-              TMPDIR: policy.terminalTempRoot,
-              TMP: policy.terminalTempRoot,
-              TEMP: policy.terminalTempRoot,
-            },
-          });
+          const sandboxed = await stageMacOsSandboxProfile(
+            wrapped,
+            policy.terminalTempRoot,
+          );
+          const env: NodeJS.ProcessEnv = {
+            ...options.env,
+            TMPDIR: policy.terminalTempRoot,
+            TMP: policy.terminalTempRoot,
+            TEMP: policy.terminalTempRoot,
+          };
+          if (policy.skillsDirectory && !env.PYROMIND_SKILLS_PATH) {
+            env.PYROMIND_SKILLS_PATH = policy.skillsDirectory;
+          }
+          try {
+            return await localOperations.exec(
+              sandboxed.invocation,
+              policy.workspaceRoot,
+              {
+                ...options,
+                env,
+              },
+            );
+          } finally {
+            if (sandboxed.path) {
+              await unlink(sandboxed.path).catch(() => undefined);
+            }
+          }
         } catch (error) {
           if (
             error instanceof Error
@@ -238,6 +309,8 @@ function createWorkspaceSandbox(
             throw error;
           }
           throw sandboxUnavailable(error);
+        } finally {
+          await unlink(staged.path).catch(() => undefined);
         }
       },
     },

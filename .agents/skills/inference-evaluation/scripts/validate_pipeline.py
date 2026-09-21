@@ -7,16 +7,17 @@ import argparse
 import ast
 import json
 import shlex
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
-COMMAND_NODES = {"CustomCommandNode", "CustomCommandCPUNode"}
+COMMAND_NODE = "CustomCommandCPUNode"
+INFERENCE_NODE = "VLLMInference"
 FORBIDDEN_NODES = {
+    "CustomCommandNode",
     "MetricsConfigBuilderCustomNode",
     "MetricsConfigBuilderNode",
     "ModelEvalApiNode",
-    "VLLMInference",
 }
 RUBRIC_EVALUATORS = {
     "bbox_iou",
@@ -36,6 +37,7 @@ COMMON_FLAGS = {
     "--output-dir",
 }
 STORAGE_LOGICAL_PREFIX = "/.pyromind-agent/"
+BOUND_ENDPOINT_PARAMETER = "$param"
 
 
 def _call_name(call: ast.Call) -> str:
@@ -67,6 +69,39 @@ def _flag_value(tokens: list[str], flag: str) -> str | None:
         return None
     index = tokens.index(flag)
     return tokens[index + 1] if index + 1 < len(tokens) else ""
+
+
+def _repeats_dataset_directory(dataset_path: str, media_base_dir: str) -> bool:
+    media_path = PurePosixPath(media_base_dir)
+    if media_path.is_absolute() or not media_path.parts:
+        return False
+    dataset_parts = PurePosixPath(dataset_path).parent.parts
+    media_parts = media_path.parts
+    return len(media_parts) <= len(dataset_parts) and (
+        dataset_parts[-len(media_parts) :] == media_parts
+    )
+
+
+def _assigned_node_names(tree: ast.AST, node_type: str) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        if _call_name(node.value) != node_type:
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+    return names
+
+
+def _is_endpoint_reference(expression: ast.expr | None, names: set[str]) -> bool:
+    return (
+        isinstance(expression, ast.Attribute)
+        and expression.attr == "endpoint"
+        and isinstance(expression.value, ast.Name)
+        and expression.value.id in names
+    )
 
 
 def _json_object(path: Path, label: str) -> dict[str, Any]:
@@ -222,6 +257,10 @@ def validate_pipeline(
 ) -> list[str]:
     errors: list[str] = []
     try:
+        dataset_config = _json_object(dataset_config_path, "dataset config")
+    except ValueError:
+        dataset_config = {}
+    try:
         tree = ast.parse(workflow_path.read_text(encoding="utf-8"))
     except (OSError, SyntaxError) as exc:
         return [f"workflow is not readable Python: {exc}"]
@@ -237,17 +276,12 @@ def validate_pipeline(
             "forbidden benchmark nodes are present: " + ", ".join(used_forbidden)
         )
 
-    command_calls = [
-        call for name in COMMAND_NODES for call in calls_by_name.get(name, [])
-    ]
+    command_calls = calls_by_name.get(COMMAND_NODE, [])
+    inference_calls = calls_by_name.get(INFERENCE_NODE, [])
     if len(command_calls) != 1:
-        errors.append(
-            "workflow must contain exactly one CustomCommandNode or "
-            "CustomCommandCPUNode"
-        )
+        errors.append("workflow must contain exactly one CustomCommandCPUNode")
     else:
         call = command_calls[0]
-        node_name = _call_name(call)
         command = _string_value(_keyword(call, "command"))
         if command is None:
             errors.append("command node command must be a static string literal")
@@ -267,35 +301,52 @@ def validate_pipeline(
             missing_flags = sorted(flag for flag in COMMON_FLAGS if flag not in tokens)
             if missing_flags:
                 errors.append("command is missing flags: " + ", ".join(missing_flags))
+            dataset_path = _flag_value(tokens, "--dataset-path")
+            media_base_dir = dataset_config.get("media_base_dir")
+            if (
+                dataset_path
+                and isinstance(media_base_dir, str)
+                and _repeats_dataset_directory(dataset_path, media_base_dir)
+            ):
+                errors.append(
+                    "dataset config media_base_dir repeats the dataset directory; "
+                    "omit it when media paths are relative to the dataset file"
+                )
             for resource in ("cpu", "memory"):
                 if _keyword(call, resource) is None:
-                    errors.append(f"{node_name} requires {resource}")
-            if node_name == "CustomCommandNode":
-                if "--model-path" not in tokens or "--gpu-count" not in tokens:
+                    errors.append(f"CustomCommandCPUNode requires {resource}")
+            endpoint = _flag_value(tokens, "--endpoint")
+            if endpoint is None:
+                errors.append("CustomCommandCPUNode requires --endpoint")
+            if "--model-path" in tokens or "--gpu-count" in tokens:
+                errors.append(
+                    "CustomCommandCPUNode must not use --model-path or --gpu-count"
+                )
+
+            if inference_calls:
+                inference_names = _assigned_node_names(tree, INFERENCE_NODE)
+                if not _is_endpoint_reference(_keyword(call, "param"), inference_names):
                     errors.append(
-                        "CustomCommandNode requires --model-path and --gpu-count"
+                        "CustomCommandCPUNode param must reference "
+                        "VLLMInference.endpoint"
                     )
-                if "--endpoint" in tokens:
-                    errors.append("CustomCommandNode must not use --endpoint")
-                for resource in ("gpu_count", "gpu_product"):
-                    if _keyword(call, resource) is None:
-                        errors.append(f"CustomCommandNode requires {resource}")
-                node_gpu_count = _keyword(call, "gpu_count")
-                command_gpu_count = _flag_value(tokens, "--gpu-count")
-                if (
-                    isinstance(node_gpu_count, ast.Constant)
-                    and isinstance(node_gpu_count.value, int)
-                    and command_gpu_count
-                    and command_gpu_count != str(node_gpu_count.value)
-                ):
-                    errors.append("CustomCommandNode gpu_count must match --gpu-count")
-            else:
-                if "--endpoint" not in tokens:
-                    errors.append("CustomCommandCPUNode requires --endpoint")
-                if "--model-path" in tokens or "--gpu-count" in tokens:
+                if endpoint != BOUND_ENDPOINT_PARAMETER:
                     errors.append(
-                        "CustomCommandCPUNode must not use --model-path or --gpu-count"
+                        "CustomCommandCPUNode --endpoint must use the directly "
+                        "bound $param"
                     )
+            elif endpoint == BOUND_ENDPOINT_PARAMETER:
+                errors.append(
+                    "CustomCommandCPUNode endpoint param requires VLLMInference"
+                )
+
+    if len(inference_calls) > 1:
+        errors.append("workflow may contain at most one VLLMInference")
+    elif len(inference_calls) == 1:
+        inference = inference_calls[0]
+        for resource in ("model_path", "port", "gpu_count", "gpu_product"):
+            if _keyword(inference, resource) is None:
+                errors.append(f"VLLMInference requires {resource}")
 
     errors.extend(validate_configs(dataset_config_path, evaluation_config_path))
 

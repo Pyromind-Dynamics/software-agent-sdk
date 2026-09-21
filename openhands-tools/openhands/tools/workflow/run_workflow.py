@@ -172,6 +172,7 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
         env: str | None = None,
         current_user: object | None = None,
         headers: dict[str, str] | None = None,
+        allowed_skill_names: Sequence[str] | None = None,
     ) -> None:
         """Configure how this executor talks to the Pyromind run API.
 
@@ -186,12 +187,16 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
                 the incoming HTTP/WebSocket request.
                 每次运行请求转发的非敏感 HTTP header（如 ``x-cluster``），由
                 Pyromind router 从入站 HTTP/WebSocket 请求填充。
+            allowed_skill_names: When provided, production submissions require
+                the conversation to have invoked at least one listed skill.
+                Programmatic debug submissions are unaffected.
         """
         self.cluster = cluster
         self.env = env
         self.current_user = current_user
         self._max_attempts = DEFAULT_MAX_ATTEMPTS  # 每轮最大提交次数
         self.headers = headers or {}
+        self.allowed_skill_names = frozenset(allowed_skill_names or ())
 
     def __call__(
         self,
@@ -237,6 +242,22 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
                 max_attempts=self._max_attempts,
                 is_error=True,
             )
+
+        if not test_mode and self.allowed_skill_names:
+            state = cast("ConversationState", conversation.state)
+            if not self.allowed_skill_names.intersection(state.invoked_skills):
+                allowed = ", ".join(sorted(self.allowed_skill_names))
+                return RunWorkflowObservation.from_text(
+                    text=(
+                        "Production workflow submission is restricted to an "
+                        f"invoked allowlisted skill: {allowed}."
+                    ),
+                    status="Error",
+                    attempt=self._read_attempts(conversation),
+                    max_attempts=self._max_attempts,
+                    is_error=True,
+                    error_log="No allowlisted production-run skill was invoked.",
+                )
 
         attempts = self._read_attempts(conversation)
         if action.reset_round:
@@ -568,6 +589,7 @@ class RunWorkflowTool(ToolDefinition[RunWorkflowAction, RunWorkflowObservation])
         cluster = params.get("cluster", None)
         current_user = params.get("current_user", None)
         headers = params.get("headers", {})
+        allowed_skill_names = params.get("allowed_skill_names", None)
 
         return [
             cls(
@@ -579,6 +601,7 @@ class RunWorkflowTool(ToolDefinition[RunWorkflowAction, RunWorkflowObservation])
                     env=env,
                     current_user=current_user,
                     headers=headers,
+                    allowed_skill_names=allowed_skill_names,
                 ),
                 annotations=ToolAnnotations(
                     title="run_workflow",

@@ -20,6 +20,7 @@ from harness_adapter.pi_adapter.adapter import (
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,
+    _invoked_skills,
 )
 from harness_adapter.pi_adapter.business_tools import (
     execute_validation_tool,
@@ -960,6 +961,7 @@ async def test_runner_loads_sandbox_skills_and_business_tools(
             "sandbox_terminal",
             "sandbox_upload",
             "sandbox_download",
+            "run_workflow",
             "workflow_debug",
             "analyze_task_failure",
             "training_analysis",
@@ -975,11 +977,58 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
         repository / ".agents" / "skills" / "training-analysis",
     ]
     specs = PyromindBusinessToolHost(roots).specs()
-    assert len(specs) == 22
-    assert {"edp_render", "edp_submit", "edp_aggregate"} <= {
+    assert len(specs) == 23
+    assert {"edp_render", "edp_submit", "edp_aggregate", "run_workflow"} <= {
         spec["name"] for spec in specs
     }
     assert all(spec["input_schema"].get("type") == "object" for spec in specs)
+
+
+def test_pi_run_workflow_detects_invoked_inference_skill(tmp_path: Path) -> None:
+    files = PiSessionFiles(tmp_path)
+    files.initialize({"session_id": "conversation-1"})
+    event = {
+        "type": "message",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "toolCall",
+                    "name": "read",
+                    "arguments": {
+                        "path": "/repo/.agents/skills/inference-evaluation/SKILL.md"
+                    },
+                }
+            ],
+        },
+    }
+    with files.session_log_path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(event) + "\n")
+
+    context = ToolExecutionContext(
+        conversation_id="conversation-1",
+        workspace_root=tmp_path,
+        request_context=RequestContext(user_id="42"),
+        model_configuration={"model": "gpt-5"},
+    )
+
+    assert _invoked_skills(context) == ["inference-evaluation"]
+
+
+def test_pi_run_workflow_params_keep_production_skill_gate(tmp_path: Path) -> None:
+    host = _business_tool_host()
+    context = ToolExecutionContext(
+        conversation_id="conversation-1",
+        workspace_root=tmp_path,
+        request_context=RequestContext(user_id="42", x_cluster="us-west-1#pre"),
+        model_configuration={"model": "gpt-5"},
+    )
+
+    params = host._workflow_run_params(context)
+
+    assert params["cluster"] == "us-west-1"
+    assert params["env"] == "pre"
+    assert params["allowed_skill_names"] == ["inference-evaluation"]
 
 
 @pytest.mark.parametrize(
@@ -1150,6 +1199,71 @@ async def test_pi_host_synthesizes_debug_task_and_persists_only_attempt_budget(
     assert json.loads(persisted) == {"pyromind_workflow_attempts": 4}
     assert "request-secret" not in persisted
     assert "must_not_persist" not in persisted
+
+
+async def test_pi_host_executes_allowlisted_production_workflow(tmp_path) -> None:
+    host = _business_tool_host()
+    files = PiSessionFiles(tmp_path)
+    files.initialize({"session_id": "conversation-1"})
+    event = {
+        "type": "message",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "toolCall",
+                    "name": "read",
+                    "arguments": {
+                        "path": "/repo/.agents/skills/inference-evaluation/SKILL.md"
+                    },
+                }
+            ],
+        },
+    }
+    with files.session_log_path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(event) + "\n")
+
+    class FakeAction(BaseModel):
+        pass
+
+    class FakeObservation:
+        is_error = False
+        to_llm_content = ()
+
+        @staticmethod
+        def model_dump(*_args, **_kwargs):
+            return {"task_id": "run-task", "status": "Pending"}
+
+    class FakeTool:
+        action_type = FakeAction
+        executor = None
+
+        def __call__(self, _action, facade):
+            assert facade.state.invoked_skills == ["inference-evaluation"]
+            return FakeObservation()
+
+    host._factories["run_workflow"] = cast(Any, lambda _context: FakeTool())
+    result = await host.execute(
+        "run_workflow",
+        {},
+        ToolExecutionContext(
+            conversation_id="conversation-1",
+            workspace_root=tmp_path,
+            request_context=RequestContext(user_id="42"),
+            model_configuration={"model": "gpt-5"},
+        ),
+    )
+
+    assert result["signals"] == [
+        {
+            "type": "external_task.submitted",
+            "task": {
+                "task_id": "run-task",
+                "kind": "run_workflow",
+                "status": "Pending",
+            },
+        }
+    ]
 
 
 def _business_tool_host() -> PyromindBusinessToolHost:

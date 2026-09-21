@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { chmod, mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -9,6 +17,7 @@ import {
   type SandboxRuntimeConfig,
 } from "@anthropic-ai/sandbox-runtime";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
+import { parse as parseShell, quote as quoteShell } from "shell-quote";
 import {
   configuredRuntimeReadRoots,
   createWorkspaceSandboxedBashOperations,
@@ -117,6 +126,8 @@ test("sandboxed commands allow cd within one call and reset cwd for every call",
   let initialized: SandboxRuntimeConfig | undefined;
   let updated: SandboxRuntimeConfig | undefined;
   let checkedRipgrep: { command: string; args?: string[] } | undefined;
+  const sandboxInputs: string[] = [];
+  const stagedCommands: string[] = [];
   const localCalls: Array<{
     command: string;
     cwd: string;
@@ -134,10 +145,18 @@ test("sandboxed commands allow cd within one call and reset cwd for every call",
     updateConfig: (config: SandboxRuntimeConfig) => {
       updated = config;
     },
-    wrapWithSandbox: async (command: string) => `sandboxed:${command}`,
+    wrapWithSandbox: async (command: string) => {
+      sandboxInputs.push(command);
+      return `sandboxed:${command}`;
+    },
   };
   const localOperations: BashOperations = {
     exec: async (command, cwd, options) => {
+      const stagedFiles = await readdir(tree.terminalTemp);
+      assert.equal(stagedFiles.length, 1);
+      stagedCommands.push(
+        await readFile(join(tree.terminalTemp, stagedFiles[0]), "utf8"),
+      );
       localCalls.push({ command, cwd, env: options.env });
       return { exitCode: 0 };
     },
@@ -157,17 +176,35 @@ test("sandboxed commands allow cd within one call and reset cwd for every call",
     onData: () => undefined,
     env: { PATH: "/bin" },
   });
+  const longCommand = `printf '%s' '${"x".repeat(300_000)}'`;
+  await operations.exec(longCommand, tree.workspace, {
+    onData: () => undefined,
+    env: { PATH: "/bin" },
+  });
 
   const vmemPrefix = resourceCapPrefix(2, 512000);
-  assert.deepEqual(
-    localCalls.map((call) => call.command),
-    [
-      `sandboxed:${vmemPrefix}cd public_data && pwd`,
-      `sandboxed:${vmemPrefix}pwd`,
-    ],
+  assert.deepEqual(stagedCommands, [
+    `${vmemPrefix}cd public_data && pwd\n`,
+    `${vmemPrefix}pwd\n`,
+    `${vmemPrefix}${longCommand}\n`,
+  ]);
+  assert(
+    sandboxInputs.every((command) =>
+      command.startsWith(`/bin/bash '${tree.policy.terminalTempRoot}/command-`)
+    ),
+  );
+  assert(sandboxInputs.every((command) => command.length < 1000));
+  assert(
+    localCalls.every((call) => call.command.startsWith("sandboxed:/bin/bash ")),
   );
   assert(localCalls.every((call) => call.cwd === tree.policy.workspaceRoot));
   assert(localCalls.every((call) => call.env?.TMPDIR === tree.policy.terminalTempRoot));
+  assert(
+    localCalls.every((call) =>
+      call.env?.PYROMIND_SKILLS_PATH === tree.policy.skillsDirectory
+    ),
+  );
+  assert.deepEqual(await readdir(tree.terminalTemp), []);
   assert.deepEqual(initialized?.network.allowedDomains, []);
   assert.deepEqual(
     checkedRipgrep,
@@ -182,6 +219,60 @@ test("sandboxed commands allow cd within one call and reset cwd for every call",
   if (previousVmemLimit === undefined) delete process.env.OH_SANDBOX_VMEM_LIMIT;
   else process.env.OH_SANDBOX_VMEM_LIMIT = previousVmemLimit;
 });
+
+test(
+  "macOS sandbox profiles use a file instead of an oversized process argument",
+  { skip: process.platform !== "darwin" },
+  async () => {
+    const tree = await workspaceTree();
+    const profile = `(version 1)\n${"; profile padding\n".repeat(30_000)}`;
+    let executedArguments: string[] = [];
+    let stagedProfile = "";
+    const operations = createWorkspaceSandboxedBashOperations(tree.policy, {
+      controller: {
+        checkDependencies: () => true,
+        initialize: async () => undefined,
+        isSandboxingEnabled: () => true,
+        updateConfig: () => undefined,
+        wrapWithSandbox: async (command: string) =>
+          quoteShell([
+            "env",
+            "sandbox-exec",
+            "-p",
+            profile,
+            "/bin/bash",
+            "-c",
+            command,
+          ]),
+      },
+      localOperations: {
+        exec: async (command: string) => {
+          const parsed = parseShell(command);
+          assert(parsed.every((argument) => typeof argument === "string"));
+          executedArguments = parsed;
+          const profileFlagIndex = executedArguments.indexOf("-f");
+          assert(profileFlagIndex >= 0);
+          stagedProfile = await readFile(
+            executedArguments[profileFlagIndex + 1],
+            "utf8",
+          );
+          return { exitCode: 0 };
+        },
+      },
+      userHome: tree.home,
+      runtimeReadRoots: [],
+    });
+
+    await operations.exec("pwd", tree.workspace, {
+      onData: () => undefined,
+    });
+
+    assert.equal(stagedProfile, profile);
+    assert.equal(executedArguments.includes("-p"), false);
+    assert(executedArguments.join(" ").length < 1000);
+    assert.deepEqual(await readdir(tree.terminalTemp), []);
+  },
+);
 
 test("sandbox vmem cap parses OH_SANDBOX_VMEM_LIMIT on Linux", async () => {
   const original = process.env.OH_SANDBOX_VMEM_LIMIT;
@@ -234,6 +325,7 @@ test("sandbox caps prefer explicit resource limits over environment", async () =
 test("sandboxed commands carry the RLIMIT_AS cap on Linux", async () => {
   const tree = await workspaceTree();
   const localCalls: string[] = [];
+  let stagedCommand = "";
   const controller = {
     checkDependencies: () => true,
     initialize: async () => undefined,
@@ -245,6 +337,12 @@ test("sandboxed commands carry the RLIMIT_AS cap on Linux", async () => {
     controller,
     localOperations: {
       exec: async (command: string) => {
+        const stagedFiles = await readdir(tree.terminalTemp);
+        assert.equal(stagedFiles.length, 1);
+        stagedCommand = await readFile(
+          join(tree.terminalTemp, stagedFiles[0]),
+          "utf8",
+        );
         localCalls.push(command);
         return { exitCode: 0 };
       },
@@ -274,10 +372,9 @@ test("sandboxed commands carry the RLIMIT_AS cap on Linux", async () => {
     else process.env.OH_SANDBOX_VMEM_LIMIT = previousLimit;
   }
 
-  assert.equal(
-    localCalls[0],
-    `sandboxed:${expectedPrefix}cd public_data && pwd`,
-  );
+  assert(localCalls[0].startsWith("sandboxed:/bin/bash "));
+  assert.equal(stagedCommand, `${expectedPrefix}cd public_data && pwd\n`);
+  assert.deepEqual(await readdir(tree.terminalTemp), []);
 });
 
 test("workspace bash operations fail closed when sandbox is unavailable", async () => {

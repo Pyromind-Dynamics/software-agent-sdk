@@ -125,6 +125,107 @@ def test_messages_exact_match_generates_reports_and_resumes(
     assert len(state["requests"]) == 1
 
 
+def test_resume_retries_only_checkpoint_rows_without_prediction(
+    evaluation_module: ModuleType,
+    inference_server: tuple[str, dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    endpoint, state = inference_server
+    dataset = tmp_path / "data.jsonl"
+    dataset.write_text(
+        "\n".join(
+            json.dumps({"id": case_id, "prompt": "Say hello", "answer": "hello"})
+            for case_id in ("case-1", "case-2")
+        )
+        + "\n"
+    )
+    output_dir = tmp_path / "output"
+    arguments = {
+        "endpoint": endpoint,
+        "model": "test-model",
+        "model_reference": "/workspace/models/test-v1",
+        "dataset_path": str(dataset),
+        "output_dir": str(output_dir),
+        "dataset_config_json": json.dumps(
+            {
+                "id_field": "id",
+                "user_prompt_field": "prompt",
+                "reference_field": "answer",
+            }
+        ),
+        "evaluation_config_json": json.dumps(
+            {"mode": "exact_match", "case_sensitive": False}
+        ),
+        "workers": 1,
+    }
+
+    evaluation_module.evaluate_inference(**arguments)
+    assert len(state["requests"]) == 2
+
+    checkpoint = output_dir / "predictions.partial.jsonl"
+    rows = [json.loads(line) for line in checkpoint.read_text().splitlines()]
+    failed_row = next(row for row in rows if row["id"] == "case-2")
+    failed_row.update(
+        {
+            "prediction": None,
+            "passed": False,
+            "overall_score": None,
+            "error": "TimeoutError: request timed out",
+        }
+    )
+    checkpoint.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    result = evaluation_module.evaluate_inference(**arguments)
+
+    assert len(state["requests"]) == 3
+    summary = json.loads(result["summary_json"])
+    assert summary["successful_predictions"] == 2
+    assert summary["api_or_evaluation_errors"] == 0
+
+
+def test_resume_reuses_prediction_that_failed_business_score(
+    evaluation_module: ModuleType,
+    inference_server: tuple[str, dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    endpoint, state = inference_server
+    dataset = tmp_path / "data.jsonl"
+    dataset.write_text(
+        json.dumps({"id": "case-1", "prompt": "Say hello", "answer": "goodbye"}) + "\n"
+    )
+    arguments = {
+        "endpoint": endpoint,
+        "model": "test-model",
+        "model_reference": "/workspace/models/test-v1",
+        "dataset_path": str(dataset),
+        "output_dir": str(tmp_path / "output"),
+        "dataset_config_json": json.dumps(
+            {
+                "id_field": "id",
+                "user_prompt_field": "prompt",
+                "reference_field": "answer",
+            }
+        ),
+        "evaluation_config_json": json.dumps(
+            {"mode": "exact_match", "case_sensitive": False}
+        ),
+        "workers": 1,
+    }
+
+    first = evaluation_module.evaluate_inference(**arguments)
+    assert json.loads(first["summary_json"])["passed"] == 0
+    assert len(state["requests"]) == 1
+
+    arguments["endpoint"] = "http://127.0.0.1:1"
+    resumed = evaluation_module.evaluate_inference(**arguments)
+
+    assert json.loads(resumed["summary_json"])["passed"] == 0
+    assert len(state["requests"]) == 1
+
+
 def test_field_mapping_builds_multimodal_request_and_matches_json(
     evaluation_module: ModuleType,
     inference_server: tuple[str, dict[str, Any]],

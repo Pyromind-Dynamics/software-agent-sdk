@@ -54,7 +54,10 @@ from openhands.tools.sandbox import (
 )
 from openhands.tools.training_analysis import TrainingAnalysisTool
 from openhands.tools.workflow.analyze_task_failure import AnalyzeTaskFailureTool
-from openhands.tools.workflow.run_workflow import WORKFLOW_ATTEMPT_STATE_KEY
+from openhands.tools.workflow.run_workflow import (
+    WORKFLOW_ATTEMPT_STATE_KEY,
+    RunWorkflowTool,
+)
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
 )
@@ -67,6 +70,7 @@ from openhands.tools.workflow_debug import WorkflowDebugTool
 
 _STORAGE_COOKIE_SECRET = "PYROMIND_STORAGE_AUTH_COOKIE"
 _VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
+_PRODUCTION_RUN_SKILL_ALLOWLIST = frozenset({"inference-evaluation"})
 _READ_ONLY_TOOLS = frozenset(
     {
         "preview_dataset",
@@ -239,6 +243,7 @@ class _ToolConversationFacade:
                     context.request_context, include_cookie=False
                 ),
             },
+            invoked_skills=_invoked_skills(context),
             secret_registry=registry,
         )
         self.signals: list[dict[str, Any]] = []
@@ -252,6 +257,46 @@ class _ToolConversationFacade:
 
 
 ToolFactory = Callable[[ToolExecutionContext], ToolDefinition[Any, Any]]
+
+
+def _invoked_skills(context: ToolExecutionContext) -> list[str]:
+    session_log = PiSessionFiles(context.workspace_root).session_log_path
+    if not session_log.is_file():
+        return []
+
+    invoked: set[str] = set()
+    with session_log.open(encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            message = event.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "toolCall":
+                    continue
+                arguments = block.get("arguments")
+                if not isinstance(arguments, dict):
+                    continue
+                name = block.get("name")
+                if name == "invoke_skill":
+                    skill_name = arguments.get("name")
+                    if skill_name in _PRODUCTION_RUN_SKILL_ALLOWLIST:
+                        invoked.add(skill_name)
+                elif name == "read":
+                    path = arguments.get("path")
+                    if not isinstance(path, str):
+                        continue
+                    normalized = path.replace("\\", "/").rstrip("/")
+                    for skill_name in _PRODUCTION_RUN_SKILL_ALLOWLIST:
+                        if normalized.endswith(f"/{skill_name}/SKILL.md"):
+                            invoked.add(skill_name)
+    return sorted(invoked)
 
 
 class PyromindBusinessToolHost:
@@ -350,6 +395,9 @@ class PyromindBusinessToolHost:
             WorkflowDebugTool.name: lambda context: WorkflowDebugTool.create(
                 **self._workflow_debug_params(context)
             )[0],
+            RunWorkflowTool.name: lambda context: RunWorkflowTool.create(
+                **self._workflow_run_params(context)
+            )[0],
             AnalyzeTaskFailureTool.name: lambda context: AnalyzeTaskFailureTool.create(
                 **self._analysis_params(context)
             )[0],
@@ -380,6 +428,7 @@ class PyromindBusinessToolHost:
             SandboxTerminalTool,
             SandboxUploadTool,
             SandboxDownloadTool,
+            RunWorkflowTool,
             WorkflowDebugTool,
             AnalyzeTaskFailureTool,
             TrainingAnalysisTool,
@@ -425,21 +474,26 @@ class PyromindBusinessToolHost:
                 observation = await asyncio.to_thread(tool, action, cast(Any, facade))
             finally:
                 self._active_executors.pop(key, None)
-            if name == WorkflowDebugTool.name:
-                debug_details = observation.model_dump(mode="json")
-                debug_task_id = debug_details.get("task_id")
+            if name in {RunWorkflowTool.name, WorkflowDebugTool.name}:
+                workflow_details = observation.model_dump(mode="json")
+                workflow_task_id = workflow_details.get("task_id")
                 if (
                     not observation.is_error
-                    and isinstance(debug_task_id, str)
-                    and debug_task_id
+                    and isinstance(workflow_task_id, str)
+                    and workflow_task_id
                 ):
+                    kind = (
+                        "workflow_debug"
+                        if name == WorkflowDebugTool.name
+                        else "run_workflow"
+                    )
                     facade.signals.append(
                         {
                             "type": "external_task.submitted",
                             "task": {
-                                "task_id": debug_task_id,
-                                "kind": "workflow_debug",
-                                "status": debug_details.get("status", "Pending"),
+                                "task_id": workflow_task_id,
+                                "kind": kind,
+                                "status": workflow_details.get("status", "Pending"),
                             },
                         }
                     )
@@ -664,6 +718,12 @@ class PyromindBusinessToolHost:
             "env": env,
             "current_user": current_user_from_context(context.request_context),
             "headers": _forward_headers(context.request_context, include_cookie=False),
+        }
+
+    def _workflow_run_params(self, context: ToolExecutionContext) -> dict[str, Any]:
+        return {
+            **self._workflow_debug_params(context),
+            "allowed_skill_names": sorted(_PRODUCTION_RUN_SKILL_ALLOWLIST),
         }
 
     @staticmethod

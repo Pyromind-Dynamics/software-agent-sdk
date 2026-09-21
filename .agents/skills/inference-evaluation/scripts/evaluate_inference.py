@@ -672,6 +672,13 @@ def _case_id(sample: dict[str, Any], config: dict[str, Any], index: int) -> str:
     return str(value) if value is not None else f"case-{index:06d}"
 
 
+def _has_reusable_prediction(result: dict[str, Any] | None) -> bool:
+    if result is None:
+        return False
+    prediction = result.get("prediction")
+    return isinstance(prediction, str) and bool(prediction.strip())
+
+
 def _error_result(
     case_id: str,
     sample: dict[str, Any],
@@ -1093,7 +1100,9 @@ def evaluate_inference(
     pending = [
         (index, sample)
         for index, sample in enumerate(rows, 1)
-        if _case_id(sample, dataset_config, index) not in completed
+        if not _has_reusable_prediction(
+            completed.get(_case_id(sample, dataset_config, index))
+        )
     ]
     lock = threading.Lock()
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -1128,10 +1137,7 @@ def evaluate_inference(
         completed[_case_id(sample, dataset_config, index)]
         for index, sample in enumerate(rows, 1)
     ]
-    successful_predictions = sum(
-        isinstance(row.get("prediction"), str) and bool(row["prediction"].strip())
-        for row in results
-    )
+    successful_predictions = sum(_has_reusable_prediction(row) for row in results)
     evaluated_cases = sum(row.get("error") is None for row in results)
     if successful_predictions == 0:
         raise RuntimeError(

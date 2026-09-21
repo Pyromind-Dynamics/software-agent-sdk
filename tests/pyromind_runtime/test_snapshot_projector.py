@@ -157,9 +157,10 @@ def test_projector_tracks_external_task_lifecycle() -> None:
     assert snapshot.external_tasks[0].resume_pending is True
 
 
-def test_projector_accepts_environment_processing_kinds() -> None:
+def test_projector_accepts_external_task_kinds() -> None:
     projector = SnapshotProjector()
     for kind in (
+        "run_workflow",
         "environment_processing",
         "environment_processing_render",
         "environment_processing_aggregate",

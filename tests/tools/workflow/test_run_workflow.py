@@ -41,6 +41,7 @@ def _fake_conversation(
     tmp_path: Path,
     *,
     secret_registry: SecretRegistry | None = None,
+    invoked_skills: list[str] | None = None,
 ) -> LocalConversation:
     return cast(
         LocalConversation,
@@ -50,6 +51,7 @@ def _fake_conversation(
             state=SimpleNamespace(
                 secret_registry=secret_registry or SecretRegistry(),
                 agent_state={},
+                invoked_skills=invoked_skills or [],
             ),
         ),
     )
@@ -88,6 +90,41 @@ def test_run_workflow_requires_conversation_context() -> None:
     assert observation.is_error
     assert observation.status == "Error"
     assert "requires a local conversation context" in observation.text
+
+
+def test_run_workflow_rejects_non_allowlisted_skill(tmp_path: Path) -> None:
+    observation = RunWorkflowExecutor(
+        **_executor_kwargs(),
+        allowed_skill_names=["inference-evaluation"],
+    )(
+        RunWorkflowAction(dsl="# workflow"),
+        conversation=_fake_conversation(
+            tmp_path,
+            invoked_skills=["generate-workflow-dsl"],
+        ),
+    )
+
+    assert observation.is_error
+    assert observation.status == "Error"
+    assert "inference-evaluation" in observation.text
+    assert observation.error_log == "No allowlisted production-run skill was invoked."
+
+
+def test_run_workflow_accepts_allowlisted_skill(tmp_path: Path) -> None:
+    observation = RunWorkflowExecutor(
+        **_executor_kwargs(env=None),
+        allowed_skill_names=["inference-evaluation"],
+    )(
+        RunWorkflowAction(dsl="# workflow"),
+        conversation=_fake_conversation(
+            tmp_path,
+            invoked_skills=["inference-evaluation"],
+        ),
+    )
+
+    assert observation.is_error
+    assert observation.status == "Failed"
+    assert observation.error_log == "param env is blank"
 
 
 def test_run_workflow_reports_blank_env(tmp_path: Path) -> None:

@@ -20,6 +20,14 @@ def test_inference_evaluation_is_available_to_pyromind_agents() -> None:
     assert "inference-evaluation" in _PYROMIND_SKILL_NAMES
 
 
+def test_inference_evaluation_uses_split_inference_and_cpu_nodes() -> None:
+    assert "use `VLLMInference`" in PYROMIND_KB_INSTRUCTIONS
+    assert "pass it to `CustomCommandCPUNode`" in PYROMIND_KB_INSTRUCTIONS
+    assert "Do not start vLLM inside a `CustomCommandNode`" in (
+        PYROMIND_KB_INSTRUCTIONS
+    )
+
+
 def test_load_agent_skills_returns_skill_objects(tmp_path) -> None:
     """AgentSkills-format SKILL.md directories load as invocable Skill objects."""
     skill_dir = tmp_path / "generate-workflow-dsl"
