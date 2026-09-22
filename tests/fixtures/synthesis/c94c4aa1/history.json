@@ -1,0 +1,594 @@
+{
+  "conversation_id": "c94c4aa190d042f98e621ce86379b821",
+  "plan": {
+    "donor_id": "3-0803A/36/029-4PT57869A0/TOP/外　层/29",
+    "donor_rgb": "inputs/29.bmp",
+    "donor_cam": "inputs/29_cam.bmp",
+    "category": "开路",
+    "annotation_note": "real open-circuit donor; outer layer TOP",
+    "category_definitions": "开路(open circuit): a signal trace that should be continuous is broken/disconnected. In the grayscale high-pass image a bright residual marks the removal site. Expected to sit on copper(trace) material at a trace boundary, not floating in the substrate.",
+    "source_split": "method_validation",
+    "purpose": "method_validation",
+    "source_material_threshold": 100,
+    "gt_foreground_min": [
+      150,
+      150,
+      0
+    ],
+    "gt_foreground_max": [
+      255,
+      255,
+      120
+    ],
+    "annotation_box_1000": [
+      372,
+      415,
+      642,
+      594
+    ],
+    "allowed_margin": 0,
+    "exclusion_margin": 8,
+    "alignment": {
+      "radius": 12,
+      "max_mismatch": 0.1,
+      "min_pixels": 4000
+    },
+    "reference": {
+      "seed": 7,
+      "min_material_pixels": 3000,
+      "boundary_margin": 3,
+      "texture_std_cap": 60.0
+    },
+    "extraction": {
+      "method": "missing",
+      "min_area": 40,
+      "max_box_fraction": 0.85,
+      "boundary_margin": 2
+    },
+    "placement": {
+      "relation": "edge",
+      "target_foreground": true,
+      "margin": 0
+    },
+    "structure_rule": {
+      "operation": "remove",
+      "relation": "any",
+      "target_foreground": true,
+      "component_delta": null,
+      "margin": 1
+    },
+    "synthesis": {
+      "min_area": 40,
+      "max_area": 12000,
+      "max_clip_fraction": 0.75,
+      "max_attempts": 400,
+      "feather": 1,
+      "highpass_radius": 2.5,
+      "highpass_gain": 5,
+      "visibility_threshold": 20,
+      "min_visible_pixels": 40
+    },
+    "variants": [
+      {
+        "seed": 101,
+        "scale_xy": [
+          1.0,
+          1.0
+        ],
+        "angle_deg": 0,
+        "pair_transform": "identity"
+      },
+      {
+        "seed": 102,
+        "scale_xy": [
+          1.0,
+          1.0
+        ],
+        "angle_deg": 90,
+        "pair_transform": "identity"
+      },
+      {
+        "seed": 103,
+        "scale_xy": [
+          1.2,
+          1.2
+        ],
+        "angle_deg": 180,
+        "pair_transform": "identity"
+      }
+    ],
+    "context_policy": {
+      "material_fraction_tolerance": 0.1,
+      "boundary_fraction_tolerance": 0.6,
+      "clearance_tolerance": 6.0,
+      "boundary_band_ratio": 0.3
+    },
+    "pipeline_sha256": "255a1889570505222af239b51691db2b54ba3d525af972b45a544f439d94cc20",
+    "review_min_iou": 0.5
+  },
+  "records": [
+    {
+      "sample_id": "candidate_01",
+      "category": "开路",
+      "bbox_xyxy": [
+        20,
+        118,
+        90,
+        129
+      ],
+      "image_size": [
+        256,
+        256
+      ],
+      "artifacts": [
+        {
+          "role": "image",
+          "path": "assets/candidate_01/image.png",
+          "semantics": "image"
+        },
+        {
+          "role": "gt",
+          "path": "assets/candidate_01/reference.png",
+          "semantics": "reference"
+        },
+        {
+          "role": "annotation",
+          "path": "assets/candidate_01/mask.png",
+          "semantics": "mask"
+        }
+      ],
+      "program_status": "passed",
+      "visual_status": "not_reviewed",
+      "training_ready": false,
+      "difference_kind": "defect_gray_gaussian_highpass",
+      "parameters": {
+        "seed": 101,
+        "center_xy": [
+          55,
+          118
+        ],
+        "scale_xy": [
+          1.0,
+          1.0
+        ],
+        "angle_deg": 0,
+        "pair_transform": "identity",
+        "clipped_fraction": 0.3717948717948718,
+        "rejected_attempts": [],
+        "highpass_radius": 2.5,
+        "highpass_gain": 5,
+        "defect_source": "3-0803A/36/029-4PT57869A0/TOP/外　层/29",
+        "reference_source": "3-0803A/36/029-4PT57869A0/TOP/外　层/29",
+        "extraction_method": "missing",
+        "annotation_box": [
+          96,
+          105,
+          166,
+          152
+        ],
+        "reference_parameters": {
+          "seed": 7,
+          "shift_xy": [
+            1,
+            -1
+          ],
+          "mismatch_ratio": 0.02065193685305417,
+          "boundary_margin": 3,
+          "texture_std_cap": 60.0,
+          "materials": {
+            "foreground": {
+              "pixels": 37033,
+              "median_rgb": [
+                255.0,
+                255.0,
+                255.0
+              ],
+              "std_rgb": [
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "background": {
+              "pixels": 12053,
+              "median_rgb": [
+                63.0,
+                49.0,
+                41.0
+              ],
+              "std_rgb": [
+                2.9651999473571777,
+                2.9651999473571777,
+                2.9651999473571777
+              ]
+            }
+          }
+        },
+        "source_context": {
+          "foreground_fraction": 1.0,
+          "boundary_fraction": 0.7115384615384616,
+          "clearance": 0.0
+        },
+        "context_policy": {
+          "material_fraction_tolerance": 0.1,
+          "boundary_fraction_tolerance": 0.6,
+          "clearance_tolerance": 6.0,
+          "boundary_band_ratio": 0.3
+        },
+        "material_mapping": "same_pair",
+        "mapping_basis": ""
+      },
+      "checks": [
+        {
+          "name": "area",
+          "passed": true,
+          "reason": "pixels=294"
+        },
+        {
+          "name": "clipping",
+          "passed": true,
+          "reason": "lost_fraction=0.3717948717948718"
+        },
+        {
+          "name": "source_context",
+          "passed": true,
+          "reason": "{\"source\": {\"foreground_fraction\": 1.0, \"boundary_fraction\": 0.7115384615384616, \"clearance\": 0.0}, \"target\": {\"foreground_fraction\": 1.0, \"boundary_fraction\": 0.42517006802721086, \"clearance\": 0.0}}"
+        },
+        {
+          "name": "structure",
+          "passed": true,
+          "reason": "inside=True, touches=True, cc_delta=0"
+        },
+        {
+          "name": "modified_context",
+          "passed": true,
+          "reason": "{\"source\": {\"foreground_fraction\": 1.0, \"boundary_fraction\": 0.7115384615384616, \"clearance\": 0.0}, \"target\": {\"foreground_fraction\": 1.0, \"boundary_fraction\": 0.42517006802721086, \"clearance\": 0.0}}"
+        }
+      ],
+      "source_annotation_note": "real open-circuit donor; outer layer TOP",
+      "use": "method_validation",
+      "source_split": "method_validation"
+    },
+    {
+      "sample_id": "candidate_02",
+      "category": "开路",
+      "bbox_xyxy": [
+        63,
+        128,
+        84,
+        198
+      ],
+      "image_size": [
+        256,
+        256
+      ],
+      "artifacts": [
+        {
+          "role": "image",
+          "path": "assets/candidate_02/image.png",
+          "semantics": "image"
+        },
+        {
+          "role": "gt",
+          "path": "assets/candidate_02/reference.png",
+          "semantics": "reference"
+        },
+        {
+          "role": "annotation",
+          "path": "assets/candidate_02/mask.png",
+          "semantics": "mask"
+        }
+      ],
+      "program_status": "passed",
+      "visual_status": "not_reviewed",
+      "training_ready": false,
+      "difference_kind": "defect_gray_gaussian_highpass",
+      "parameters": {
+        "seed": 102,
+        "center_xy": [
+          73,
+          163
+        ],
+        "scale_xy": [
+          1.0,
+          1.0
+        ],
+        "angle_deg": 90,
+        "pair_transform": "identity",
+        "clipped_fraction": 0.38888888888888884,
+        "rejected_attempts": [],
+        "highpass_radius": 2.5,
+        "highpass_gain": 5,
+        "defect_source": "3-0803A/36/029-4PT57869A0/TOP/外　层/29",
+        "reference_source": "3-0803A/36/029-4PT57869A0/TOP/外　层/29",
+        "extraction_method": "missing",
+        "annotation_box": [
+          96,
+          105,
+          166,
+          152
+        ],
+        "reference_parameters": {
+          "seed": 7,
+          "shift_xy": [
+            1,
+            -1
+          ],
+          "mismatch_ratio": 0.02065193685305417,
+          "boundary_margin": 3,
+          "texture_std_cap": 60.0,
+          "materials": {
+            "foreground": {
+              "pixels": 37033,
+              "median_rgb": [
+                255.0,
+                255.0,
+                255.0
+              ],
+              "std_rgb": [
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "background": {
+              "pixels": 12053,
+              "median_rgb": [
+                63.0,
+                49.0,
+                41.0
+              ],
+              "std_rgb": [
+                2.9651999473571777,
+                2.9651999473571777,
+                2.9651999473571777
+              ]
+            }
+          }
+        },
+        "source_context": {
+          "foreground_fraction": 1.0,
+          "boundary_fraction": 0.7115384615384616,
+          "clearance": 0.0
+        },
+        "context_policy": {
+          "material_fraction_tolerance": 0.1,
+          "boundary_fraction_tolerance": 0.6,
+          "clearance_tolerance": 6.0,
+          "boundary_band_ratio": 0.3
+        },
+        "material_mapping": "same_pair",
+        "mapping_basis": ""
+      },
+      "checks": [
+        {
+          "name": "area",
+          "passed": true,
+          "reason": "pixels=286"
+        },
+        {
+          "name": "clipping",
+          "passed": true,
+          "reason": "lost_fraction=0.38888888888888884"
+        },
+        {
+          "name": "source_context",
+          "passed": true,
+          "reason": "{\"source\": {\"foreground_fraction\": 1.0, \"boundary_fraction\": 0.7115384615384616, \"clearance\": 0.0}, \"target\": {\"foreground_fraction\": 1.0, \"boundary_fraction\": 0.46153846153846156, \"clearance\": 0.0}}"
+        },
+        {
+          "name": "structure",
+          "passed": true,
+          "reason": "inside=True, touches=True, cc_delta=0"
+        },
+        {
+          "name": "modified_context",
+          "passed": true,
+          "reason": "{\"source\": {\"foreground_fraction\": 1.0, \"boundary_fraction\": 0.7115384615384616, \"clearance\": 0.0}, \"target\": {\"foreground_fraction\": 1.0, \"boundary_fraction\": 0.46153846153846156, \"clearance\": 0.0}}"
+        }
+      ],
+      "source_annotation_note": "real open-circuit donor; outer layer TOP",
+      "use": "method_validation",
+      "source_split": "method_validation"
+    },
+    {
+      "sample_id": "candidate_03",
+      "category": "开路",
+      "bbox_xyxy": [
+        102,
+        0,
+        119,
+        21
+      ],
+      "image_size": [
+        256,
+        256
+      ],
+      "artifacts": [
+        {
+          "role": "image",
+          "path": "assets/candidate_03/image.png",
+          "semantics": "image"
+        },
+        {
+          "role": "gt",
+          "path": "assets/candidate_03/reference.png",
+          "semantics": "reference"
+        },
+        {
+          "role": "annotation",
+          "path": "assets/candidate_03/mask.png",
+          "semantics": "mask"
+        }
+      ],
+      "program_status": "passed",
+      "visual_status": "not_reviewed",
+      "training_ready": false,
+      "difference_kind": "defect_gray_gaussian_highpass",
+      "parameters": {
+        "seed": 103,
+        "center_xy": [
+          114,
+          8
+        ],
+        "scale_xy": [
+          1.2,
+          1.2
+        ],
+        "angle_deg": 180,
+        "pair_transform": "identity",
+        "clipped_fraction": 0.6452599388379205,
+        "rejected_attempts": [],
+        "highpass_radius": 2.5,
+        "highpass_gain": 5,
+        "defect_source": "3-0803A/36/029-4PT57869A0/TOP/外　层/29",
+        "reference_source": "3-0803A/36/029-4PT57869A0/TOP/外　层/29",
+        "extraction_method": "missing",
+        "annotation_box": [
+          96,
+          105,
+          166,
+          152
+        ],
+        "reference_parameters": {
+          "seed": 7,
+          "shift_xy": [
+            1,
+            -1
+          ],
+          "mismatch_ratio": 0.02065193685305417,
+          "boundary_margin": 3,
+          "texture_std_cap": 60.0,
+          "materials": {
+            "foreground": {
+              "pixels": 37033,
+              "median_rgb": [
+                255.0,
+                255.0,
+                255.0
+              ],
+              "std_rgb": [
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "background": {
+              "pixels": 12053,
+              "median_rgb": [
+                63.0,
+                49.0,
+                41.0
+              ],
+              "std_rgb": [
+                2.9651999473571777,
+                2.9651999473571777,
+                2.9651999473571777
+              ]
+            }
+          }
+        },
+        "source_context": {
+          "foreground_fraction": 1.0,
+          "boundary_fraction": 0.7115384615384616,
+          "clearance": 0.0
+        },
+        "context_policy": {
+          "material_fraction_tolerance": 0.1,
+          "boundary_fraction_tolerance": 0.6,
+          "clearance_tolerance": 6.0,
+          "boundary_band_ratio": 0.3
+        },
+        "material_mapping": "same_pair",
+        "mapping_basis": ""
+      },
+      "checks": [
+        {
+          "name": "area",
+          "passed": true,
+          "reason": "pixels=232"
+        },
+        {
+          "name": "clipping",
+          "passed": true,
+          "reason": "lost_fraction=0.6452599388379205"
+        },
+        {
+          "name": "source_context",
+          "passed": true,
+          "reason": "{\"source\": {\"foreground_fraction\": 1.0, \"boundary_fraction\": 0.7115384615384616, \"clearance\": 0.0}, \"target\": {\"foreground_fraction\": 1.0, \"boundary_fraction\": 0.5344827586206896, \"clearance\": 0.0}}"
+        },
+        {
+          "name": "structure",
+          "passed": true,
+          "reason": "inside=True, touches=True, cc_delta=0"
+        },
+        {
+          "name": "modified_context",
+          "passed": true,
+          "reason": "{\"source\": {\"foreground_fraction\": 1.0, \"boundary_fraction\": 0.7115384615384616, \"clearance\": 0.0}, \"target\": {\"foreground_fraction\": 1.0, \"boundary_fraction\": 0.5344827586206896, \"clearance\": 0.0}}"
+        }
+      ],
+      "source_annotation_note": "real open-circuit donor; outer layer TOP",
+      "use": "method_validation",
+      "source_split": "method_validation"
+    }
+  ],
+  "reviews": [
+    {
+      "category": "unknown",
+      "bbox_xyxy": [
+        115,
+        45,
+        135,
+        125
+      ],
+      "realistic": true,
+      "extra_anomalies": false,
+      "uncertain": true,
+      "context_consistent": false
+    },
+    {
+      "category": "unknown",
+      "bbox_xyxy": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "realistic": false,
+      "extra_anomalies": true,
+      "uncertain": true,
+      "context_consistent": false
+    },
+    {
+      "category": "unknown",
+      "bbox_xyxy": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "realistic": false,
+      "extra_anomalies": false,
+      "uncertain": true,
+      "context_consistent": false
+    }
+  ],
+  "sha256": {
+    "source_aligned.png": "3c42ef17859aef99a8d8dc966c19b6cbea277c29c96580f69d56353853f7d057",
+    "source_gt.png": "d2d39579a5de528489195c934c94fbec04ae86b342305d311f9c168b043479e9",
+    "template_mask.png": "e258c3b57e5851a1308bff4e0ca8787f2e2ffe7cf2200ed7209e48e7187b435d",
+    "assets/candidate_01/image.png": "7487ee523ad23dd877ecee88080fbd464038845b6b57e4297715f6109f67806f",
+    "assets/candidate_01/reference.png": "2aceec9ec37f19f2dbdced4d491c5914bce1ae0b7a0f43e5886b267378fb01cf",
+    "assets/candidate_01/mask.png": "5b4f443934e1689ac56e5337fc6e1457bd3784131a4739670de5ff1e52c1fdae",
+    "assets/candidate_02/image.png": "54ce4324e3e9332611f0bf49292565fcea3ddb719c80a8b39cc4bc939d712334",
+    "assets/candidate_02/reference.png": "2aceec9ec37f19f2dbdced4d491c5914bce1ae0b7a0f43e5886b267378fb01cf",
+    "assets/candidate_02/mask.png": "fdb8c12b2bcf65894c1c3464e887f574755e4621025a05717bff10a61679b9bd",
+    "assets/candidate_03/image.png": "f7422fa53fbcd0dba8510625143476122d9fe25f62c47f5be32b56bb55a62912",
+    "assets/candidate_03/reference.png": "2aceec9ec37f19f2dbdced4d491c5914bce1ae0b7a0f43e5886b267378fb01cf",
+    "assets/candidate_03/mask.png": "4351485fca8688d96c7c75b97dbb7cf40c2c22e49c5006a10581390147ef6c1f",
+    "inputs/29.bmp": "ac4537933fd28f4d396f3be26e892bbec47f2ccb51585d372913e76c7677406f",
+    "inputs/29_cam.bmp": "dacb53878bf573232ce2c07731671715864c21a778d71cdfa152f5290c30bcf8"
+  }
+}

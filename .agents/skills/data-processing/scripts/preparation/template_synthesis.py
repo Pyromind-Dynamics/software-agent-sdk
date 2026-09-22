@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from typing import Literal
+from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, replace
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -28,8 +29,10 @@ class Template:
 @dataclass(frozen=True)
 class Check:
     name: str
-    passed: bool
+    passed: bool | None
     reason: str
+    measurements: dict[str, Any] = field(default_factory=dict)
+    stage: str = "legacy"
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,304 @@ class Artifacts:
     difference_kind: str
     bbox_xyxy: Box
     visible_pixels: int
+
+
+@dataclass(frozen=True)
+class SourceEvidence:
+    image: Pixels | None
+    reference: Pixels | None
+    annotation: Mask
+    template: Template
+    regions: Mapping[str, Mask] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CandidateEvidence:
+    reference: Pixels
+    transformed: Template
+    constrained: Template
+    allowed_mask: Mask
+    regions: Mapping[str, Mask]
+    clipped_fraction: float
+
+
+@dataclass(frozen=True)
+class RenderedEvidence:
+    image: Pixels
+    reference: Pixels
+    mask: Mask
+    changed: Mask
+    regions: Mapping[str, Mask]
+    bbox_xyxy: Box
+
+
+@dataclass(frozen=True)
+class Acceptance:
+    min_area: int
+    max_area: int
+    max_clip_fraction: float
+    visibility_threshold: int
+    min_visible_pixels: int
+
+    def __post_init__(self) -> None:
+        if not (
+            1 <= self.min_area <= self.max_area
+            and 0 <= self.max_clip_fraction < 1
+            and 0 <= self.visibility_threshold < 255
+            and self.min_visible_pixels >= 1
+        ):
+            raise ValueError("invalid acceptance limits")
+
+
+@dataclass(frozen=True)
+class GeneratedSample:
+    image: Pixels
+    reference: Pixels
+    mask: Mask
+    artifacts: Artifacts
+    checks: list[Check]
+    parameters: dict[str, Any]
+    regions: Mapping[str, Mask]
+    source: SourceEvidence
+
+
+class SynthesisFailure(ValueError):
+    def __init__(self, code: str, attempts: list[dict[str, Any]]) -> None:
+        self.code = code
+        self.attempts = attempts
+        super().__init__(f"{code}: {attempts}")
+
+
+def validation_coverage(checks: Sequence[Check]) -> dict[str, bool]:
+    return {
+        stage: bool(selected := [c for c in checks if c.stage == stage])
+        and all(c.passed is True for c in selected)
+        for stage in ("source", "candidate", "rendered")
+    }
+
+
+def _stage_checks(checks: Sequence[Check], stage: str) -> list[Check]:
+    return [replace(c, stage=stage) for c in checks] or [
+        Check("missing_verdict", None, "strategy returned no checks", stage=stage)
+    ]
+
+
+def transform_region(mask: Mask, transform: PairTransform) -> Mask:
+    """Transform target-space evidence, including empty regions, with the image."""
+    _check_mask(mask)
+    if transform == "identity":
+        return mask.copy()
+    if transform == "flip_lr":
+        return np.fliplr(mask).copy()
+    if transform == "flip_ud":
+        return np.flipud(mask).copy()
+    if transform == "rotate_180":
+        return np.rot90(mask, 2).copy()
+    raise ValueError(f"unsupported pair transform: {transform}")
+
+
+def synthesize_template(
+    source: SourceEvidence,
+    reference: Pixels,
+    *,
+    candidate_centers: Mask,
+    allowed_mask: Mask,
+    acceptance: Acceptance,
+    seed: int,
+    max_attempts: int,
+    scale_xy: tuple[float, float] = (1.0, 1.0),
+    angle_deg: float = 0,
+    pair_transform: PairTransform = "identity",
+    feather: float = 0,
+    fill_rgb: Pixels | None = None,
+    regions: Mapping[str, Mask] | None = None,
+    validate_source: Callable[[SourceEvidence], Sequence[Check]] | None = None,
+    validate_candidate: Callable[[CandidateEvidence], Sequence[Check]] | None = None,
+    validate_rendered: Callable[[RenderedEvidence], Sequence[Check]] | None = None,
+) -> GeneratedSample:
+    """Search with fixed acceptance; strategies judge meaning, including final pixels.
+
+    Omitted callbacks support legacy exploration but leave validation incomplete.
+    Callbacks receive copies; they do not control acceptance or rendering inputs.
+    """
+    source, reference = deepcopy(source), reference.copy()
+    candidate_centers, allowed_mask = candidate_centers.copy(), allowed_mask.copy()
+    regions = deepcopy(dict(regions or {}))
+    fill_rgb = None if fill_rgb is None else fill_rgb.copy()
+    _check_mask(source.annotation)
+    if source.image is not None:
+        _check_rgb(source.image, source.annotation.shape)
+    if source.reference is not None:
+        _check_rgb(source.reference, source.annotation.shape)
+    bbox_from_mask(source.template.mask)
+    if source.template.mask.shape != source.annotation.shape or np.any(
+        source.template.mask & ~source.annotation
+    ):
+        raise ValueError("source template must lie inside its annotation")
+    _check_mask(allowed_mask)
+    _check_mask(candidate_centers)
+    _check_rgb(reference, allowed_mask.shape)
+    if candidate_centers.shape != allowed_mask.shape or max_attempts < 1:
+        raise ValueError("invalid candidate search")
+    for masks, shape in (
+        (source.regions, source.annotation.shape),
+        (regions, allowed_mask.shape),
+    ):
+        for mask in masks.values():
+            _check_mask(mask)
+            if mask.shape != shape:
+                raise ValueError("region must match its image coordinates")
+    source_checks = (
+        _stage_checks(validate_source(deepcopy(source)), "source")
+        if validate_source is not None and source.image is not None
+        else []
+    )
+    if validate_source is not None and source.image is None:
+        source_checks.append(
+            Check(
+                "source_image",
+                None,
+                "original source image is unavailable",
+                stage="source",
+            )
+        )
+    if any(c.passed is not True for c in source_checks):
+        raise SynthesisFailure(
+            "source_rejected",
+            [{"stage": "source", "checks": [asdict(c) for c in source_checks]}],
+        )
+    centers = np.argwhere(candidate_centers)
+    if not len(centers):
+        raise SynthesisFailure(
+            "candidate_exhausted", [{"stage": "search", "reason": "no centers"}]
+        )
+    attempts: list[dict[str, Any]] = []
+    rng = np.random.default_rng(seed)
+    for index in rng.permutation(len(centers))[:max_attempts]:
+        cy, cx = (int(v) for v in centers[index])
+        checks = list(source_checks)
+        stage = "candidate"
+        try:
+            transformed = transform_template(
+                source.template,
+                target_shape=allowed_mask.shape,
+                center_xy=(cx, cy),
+                scale_xy=scale_xy,
+                angle_deg=angle_deg,
+            )
+            placed = constrain_template(transformed, allowed_mask)
+            assert placed.uncropped_area is not None
+            area = int(placed.mask.sum())
+            clip = 1 - area / placed.uncropped_area
+            checks.extend(
+                [
+                    Check(
+                        "area",
+                        acceptance.min_area <= area <= acceptance.max_area,
+                        f"pixels={area}",
+                        {"pixels": area},
+                        "geometry",
+                    ),
+                    Check(
+                        "clipping",
+                        clip <= acceptance.max_clip_fraction,
+                        f"lost_fraction={clip}",
+                        {"lost_fraction": clip},
+                        "geometry",
+                    ),
+                ]
+            )
+            candidate = CandidateEvidence(
+                reference, transformed, placed, allowed_mask, regions, clip
+            )
+            if validate_candidate is not None:
+                checks.extend(
+                    _stage_checks(validate_candidate(deepcopy(candidate)), "candidate")
+                )
+            if any(c.passed is not True for c in checks):
+                raise ValueError("candidate validation failed")
+            stage = "rendered"
+            image = inject_anomaly(
+                reference,
+                placed,
+                base_role="normal_image",
+                fill_rgb=fill_rgb,
+                feather=feather,
+            )
+            image, normal, mask = apply_pair_transform(
+                image, reference, placed.mask, pair_transform
+            )
+            final_regions = {
+                name: transform_region(region, pair_transform)
+                for name, region in regions.items()
+            }
+            changed = np.any(image != normal, axis=2)
+            if np.any(changed & ~mask):
+                raise ValueError("pixel changes outside defect mask")
+            artifacts = compute_artifacts(
+                image,
+                normal,
+                mask,
+                difference_fn=lambda a, b: np.abs(
+                    a.astype(np.int16) - b.astype(np.int16)
+                ).astype(np.uint8),
+                difference_kind="absolute_reference_difference",
+                visibility_threshold=acceptance.visibility_threshold,
+                min_visible_pixels=acceptance.min_visible_pixels,
+            )
+            checks.append(
+                Check(
+                    "pixel_change",
+                    True,
+                    "visible change confined to template",
+                    {"visible_pixels": artifacts.visible_pixels},
+                    "pixels",
+                )
+            )
+            rendered = RenderedEvidence(
+                image, normal, mask, changed, final_regions, artifacts.bbox_xyxy
+            )
+            if validate_rendered is not None:
+                checks.extend(
+                    _stage_checks(validate_rendered(deepcopy(rendered)), "rendered")
+                )
+            if any(c.passed is not True for c in checks):
+                raise ValueError("rendered validation failed")
+            return GeneratedSample(
+                image,
+                normal,
+                mask,
+                artifacts,
+                checks,
+                {
+                    "validation_version": 2,
+                    "validation_coverage": validation_coverage(checks),
+                    "acceptance": asdict(acceptance),
+                    "search": {
+                        "seed": seed,
+                        "max_attempts": max_attempts,
+                        "scale_xy": scale_xy,
+                        "angle_deg": angle_deg,
+                    },
+                    "pair_transform": pair_transform,
+                    "feather": feather,
+                    "center_xy": [cx, cy],
+                    "clipped_fraction": clip,
+                    "rejected_attempts": attempts,
+                },
+                final_regions,
+                source,
+            )
+        except ValueError as exc:
+            attempts.append(
+                {
+                    "center_xy": [cx, cy],
+                    "stage": stage,
+                    "reason": str(exc),
+                    "checks": [asdict(c) for c in checks],
+                }
+            )
+    raise SynthesisFailure("candidate_exhausted", attempts)
 
 
 def _check_mask(mask: Mask) -> None:

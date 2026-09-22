@@ -256,3 +256,174 @@ np.savez(sys.argv[2], image=image, reference=reference, mask=moved,
         assert np.array_equal(
             np.any(first["image"] != first["reference"], axis=2), first["mask"]
         )
+
+
+@pytest.fixture
+def structural_pilot(synthesis: Any) -> tuple[Any, Any, dict[str, Any]]:
+    normal = np.full((18, 24, 3), 20, dtype=np.uint8)
+    normal[5:9, 2:22] = 220
+    mask = np.zeros((18, 24), dtype=bool)
+    mask[5:9, 10:11] = True
+    donor = normal.copy()
+    donor[mask] = 20
+    source = synthesis.SourceEvidence(
+        donor, normal, mask.copy(), synthesis.Template(mask, donor)
+    )
+    centers = np.zeros_like(mask)
+    centers[7, 10] = True
+
+    def source_check(evidence: Any) -> list[Any]:
+        count = len(synthesis.mask_components(evidence.image[:, :, 0] > 128))
+        return [synthesis.Check("separation", count == 2, "source regions separate")]
+
+    def candidate_check(evidence: Any) -> list[Any]:
+        ideal = (evidence.reference[:, :, 0] > 128) & ~evidence.constrained.mask
+        count = len(synthesis.mask_components(ideal))
+        return [synthesis.Check("separation", count == 2, "ideal regions separate")]
+
+    def rendered_check(evidence: Any) -> list[Any]:
+        count = len(synthesis.mask_components(evidence.image[:, :, 0] > 128))
+        return [
+            synthesis.Check(
+                "separation",
+                count == 2,
+                "rendered regions separate",
+                {"components": count},
+            )
+        ]
+
+    return (
+        source,
+        normal,
+        dict(
+            candidate_centers=centers,
+            allowed_mask=np.ones_like(mask),
+            acceptance=synthesis.Acceptance(1, 80, 0.05, 1, 1),
+            seed=3,
+            max_attempts=4,
+            validate_source=source_check,
+            validate_candidate=candidate_check,
+            validate_rendered=rendered_check,
+        ),
+    )
+
+
+def test_rendered_pixels_reject_feathered_false_separation(
+    synthesis: Any, structural_pilot: Any
+) -> None:
+    source, normal, options = structural_pilot
+    result = synthesis.synthesize_template(source, normal, **options)
+    assert all(result.parameters["validation_coverage"].values())
+    with pytest.raises(synthesis.SynthesisFailure) as caught:
+        synthesis.synthesize_template(source, normal, feather=5, **options)
+    attempts = caught.value.attempts
+    assert len(attempts) == 1
+    assert attempts[0]["stage"] == "rendered"
+    verdicts = {c["stage"]: c for c in attempts[0]["checks"]}
+    assert verdicts["candidate"]["passed"] is True
+    assert verdicts["rendered"]["passed"] is False
+    assert verdicts["rendered"]["measurements"]["components"] == 1
+
+
+@pytest.mark.parametrize("stage", ["source", "candidate", "rendered"])
+def test_uncertainty_and_empty_verdicts_do_not_pass(
+    synthesis: Any, structural_pilot: Any, stage: str
+) -> None:
+    source, normal, options = structural_pilot
+    for verdicts in ([], [synthesis.Check("meaning", None, "insufficient evidence")]):
+        options[f"validate_{stage}"] = lambda evidence: verdicts
+        with pytest.raises(synthesis.SynthesisFailure) as caught:
+            synthesis.synthesize_template(source, normal, **options)
+        assert caught.value.attempts[0]["stage"] == stage
+        assert any(c["passed"] is None for c in caught.value.attempts[0]["checks"])
+
+
+@pytest.mark.parametrize("transform", ["identity", "flip_lr", "flip_ud", "rotate_180"])
+@pytest.mark.parametrize("kind", ["texture", "isolated_region"])
+def test_multi_region_strategies_and_final_coordinates(
+    synthesis: Any, transform: str, kind: str
+) -> None:
+    normal = np.zeros((24, 36, 3), dtype=np.uint8)
+    normal[:, :12] = (180, 50, 40)
+    normal[:, 12:24] = (40, 180, 50)
+    normal[:, 24:] = (50, 40, 180)
+    masks = {f"region_{i}": np.indices((24, 36))[1] // 12 == i for i in range(3)}
+    mask = np.zeros((24, 36), dtype=bool)
+    mask[6:10, 15:19] = True
+    donor = normal.copy()
+    if kind == "texture":
+        donor[6:10:2, 15:19] = (100, 90, 80)
+    else:
+        donor[mask] = (210, 210, 20)
+    source = synthesis.SourceEvidence(
+        donor, normal, mask, synthesis.Template(mask, donor), masks
+    )
+    centers = np.zeros_like(mask)
+    centers[17, 18] = True
+
+    def appearance(e: Any) -> list[Any]:
+        delta = np.abs(e.image.astype(float) - e.reference)
+        return [
+            synthesis.Check(
+                "contrast", bool((delta.max(axis=2) > 40).any()), "measured contrast"
+            )
+        ]
+
+    def final(e: Any) -> list[Any]:
+        region = synthesis.transform_region(masks["region_1"], transform)
+        assert np.array_equal(e.regions["region_1"], region)
+        assert e.bbox_xyxy == synthesis.bbox_from_mask(e.mask)
+        return appearance(e) + [
+            synthesis.Check(
+                "support", bool(np.all(region[e.changed])), "inside selected material"
+            )
+        ]
+
+    result = synthesis.synthesize_template(
+        source,
+        normal,
+        candidate_centers=centers,
+        allowed_mask=masks["region_1"],
+        acceptance=synthesis.Acceptance(1, 100, 0.1, 20, 3),
+        seed=4,
+        max_attempts=10,
+        angle_deg=90,
+        scale_xy=(1.5, 1),
+        pair_transform=transform,
+        regions=masks,
+        validate_source=appearance,
+        validate_candidate=lambda e: [
+            synthesis.Check(
+                "support",
+                bool(np.all(e.regions["region_1"][e.constrained.mask])),
+                "material",
+            )
+        ],
+        validate_rendered=final,
+    )
+    assert all(result.parameters["validation_coverage"].values())
+    assert result.artifacts.difference_kind == "absolute_reference_difference"
+
+
+def test_search_keeps_acceptance_and_callback_inputs_isolated(
+    synthesis: Any, structural_pilot: Any
+) -> None:
+    source, normal, options = structural_pilot
+    before = normal.copy()
+    original = options["validate_candidate"]
+
+    def mutating(e: Any) -> list[Any]:
+        verdicts = original(e)
+        e.reference[:] = 0
+        e.constrained.mask[:] = False
+        e.allowed_mask[:] = False
+        return verdicts
+
+    options["validate_candidate"] = mutating
+    result = synthesis.synthesize_template(source, normal, **options)
+    assert np.array_equal(normal, before)
+    assert result.parameters["acceptance"]["max_clip_fraction"] == 0.05
+    assert result.mask.sum() == 4
+    options["candidate_centers"][:] = False
+    with pytest.raises(synthesis.SynthesisFailure, match="no centers"):
+        synthesis.synthesize_template(source, normal, **options)

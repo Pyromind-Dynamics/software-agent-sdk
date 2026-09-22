@@ -458,8 +458,9 @@ df_run_input_path (single input) or selected local_sample_paths entry directly
 to df_run_pipeline; storage source paths are not local workspace inputs. Image
 samples are sent to the configured DF vision model
 (normally Gemma) for OCR and a short visual summary.
-Image previews also return preview_url in the text result. Use that exact URL
-in Markdown image syntax ![description](URL) to show the image to the user.
+Image previews return preview_url and ready-to-use Markdown in the text result.
+For visual previews, copy the Markdown into your reply outside code blocks so
+the chat displays the image inline. Preserve the full signed URL.
 
 Returns:
 - files found under the path
@@ -1559,7 +1560,12 @@ class PreviewDatasetExecutor(
         result = self._get_download_url(path, headers)
         if isinstance(result, PreviewDatasetObservation):
             return f"Image preview: {path}\npreview_url_error={result.text}"
-        return f"Image preview: {path}\npreview_url={result}"
+        return (
+            f"Image preview: {path}\npreview_url={result}\n"
+            "To show this image in chat, copy the following Markdown into your "
+            "reply (outside code blocks):\n"
+            f"![Image preview](<{result}>)"
+        )
 
     def _storage_image_preview(
         self,

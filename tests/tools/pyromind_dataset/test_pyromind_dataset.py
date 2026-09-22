@@ -2194,6 +2194,7 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
     if link_failure:
         assert "preview_url_error=Preview link unavailable" in llm_text
     assert "preview_url=https://download.test/image" in llm_text
+    assert "![Image preview](<https://download.test/image>)" in llm_text
     assert "/dataset/sample-a/second.png" in llm_text
     assert "/dataset/sample-a/diagram.png" in llm_text
 
@@ -2357,8 +2358,10 @@ def test_inspect_storage_image_uses_vision_model(
     if link_failure:
         assert "preview_url_error=Preview link unavailable" in llm_text
         assert "preview_url=" not in llm_text
+        assert "![Image preview]" not in llm_text
     else:
         assert f"preview_url={signed_url}" in llm_text
+        assert f"![Image preview](<{signed_url}>)" in llm_text
     assert "Image preview: /dataset/defect.jpg" in llm_text
 
 

@@ -65,6 +65,8 @@ debug-workflow。sandbox 不得用来搬运或组装 Pipeline 的 Storage 输入
    放在**同一目录** —— input 行保留的是相对图片路径，只有同目录才能解析
    回原图（绝对路径会被 pipeline 以"必须是相对 POSIX 路径"拒绝）。
 7. **交付**：展示产物与统计；场景内的产物契约与失败分类学以 playbook 为准。
+   图片预览用 `preview_dataset` 返回的 Markdown 嵌入对话，让用户直接看图；
+   保留完整签名 URL，不放进代码块。仅在用户明确只要链接时改用普通链接。
 
 一期边界：分布分析不读取 eval/rubric/badcase；不注册 Dataset Version 或
 SQLite 元数据；不处理音视频。图片合成可复用、组合或编写策略；适用条件、
