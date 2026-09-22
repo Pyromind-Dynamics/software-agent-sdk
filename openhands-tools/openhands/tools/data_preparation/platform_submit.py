@@ -38,6 +38,7 @@ from openhands.tools.data_preparation.inference import (
 )
 from openhands.tools.data_preparation.runner import (
     SUPPORTED_DATAFLOW_VERSION,
+    LabelingModelGateway,
     build_dataflow_env,
     runtime_bundle_fingerprint,
     runtime_public_names,
@@ -122,7 +123,9 @@ Call mode='full' only after the user confirms a successful local
 df_run_pipeline result for data processing. The tool freezes the local script
 and shared runtime
 in a per-run Storage directory. Set model_profile and output_schema explicitly
-for new standard runs.
+for new standard runs. When the user supplies their own labeling gateway, pass
+it as labeling_gateway with model_profile='vision'; it replaces the managed
+vision model for this run.
 
 The tool creates a one-node CustomCommandNode workflow that:
 1. Creates a venv with the server-locked data-processing dependencies
@@ -223,6 +226,15 @@ class DfSubmitPipelineAction(Action):
             "Use none for pure Python/AVI work without model credentials, text "
             "for the conversation model, or vision for managed image work. "
             "Resume inherits the prior profile when omitted."
+        ),
+    )
+    labeling_gateway: LabelingModelGateway | None = Field(
+        default=None,
+        description=(
+            "Optional user-supplied OpenAI-compatible gateway for the image "
+            "labeling model: api_url (or base_url), model, and api_key. When set "
+            "it replaces the managed vision model for this run and requires the "
+            "vision profile."
         ),
     )
     output_schema: OutputSchema | None = Field(
@@ -650,7 +662,7 @@ class DfSubmitPipelineExecutor(
                     )
                     should_stage_support_file = True
                 llm_env = (
-                    _build_llm_env(conversation, model_profile)
+                    _build_llm_env(conversation, model_profile, action.labeling_gateway)
                     if model_profile != "none"
                     else {}
                 )
@@ -702,7 +714,7 @@ class DfSubmitPipelineExecutor(
                 frozen_script_name = "pipeline.py"
                 pipeline_fingerprint = _file_sha256(Path(local_script_path))
                 llm_env = (
-                    _build_llm_env(conversation, model_profile)
+                    _build_llm_env(conversation, model_profile, action.labeling_gateway)
                     if model_profile != "none"
                     else {}
                 )
@@ -1346,10 +1358,11 @@ def _build_dataflow_workflow(
 def _build_llm_env(
     conversation: BaseConversation,
     model_profile: Literal["text", "vision"] = "text",
+    gateway: LabelingModelGateway | None = None,
 ) -> dict[str, str]:
     """Use the same model-profile resolver as local df_run_pipeline."""
 
-    return build_dataflow_env(conversation, model_profile)
+    return build_dataflow_env(conversation, model_profile, gateway=gateway)
 
 
 class PipelineResolutionError(ValueError):

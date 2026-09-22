@@ -7,6 +7,24 @@
 当前客户规则优先；不把裸板类别直接套用于 PCBA 元件和焊点；现场阈值和标签约定
 不默认迁移至其他产线。
 
+## 打标模型（先问用户）
+
+开始预打标前，先在对话里问用户要**打标模型的 LLM 网关**，让用户书面给出三个值：
+
+- `api_url`：OpenAI 兼容的 chat-completions 完整地址，例如
+  `https://inference-cn-east-1.pyromind-asia.cn/inference/inf-xxxx/v1/chat/completions`；
+- `model`：该网关上的模型名，例如 `pcb_avi_sft_merge_v10`；
+- `api_key`：网关的 Bearer key。
+
+用户给了，就把三者作为 `labeling_gateway` 传给 `df_run_pipeline` 和
+`df_submit_pipeline`（配 `model_profile="vision"`），本次预打标用用户的模型。
+用户说没有、或明确用平台默认时**不要**传 `labeling_gateway`，直接走平台的
+`DF_API_URL` / `DF_MODEL_NAME` / `DF_API_KEY` / `DF_API_BASE_URL`。
+
+`labeling_gateway` 整体替换视觉模型配置，不与平台配置混用：用户网关没给 key
+时不会把平台 key 发过去。本地试跑和平台全量必须用同一个网关；换了网关或模型
+会得到新的 run，不会复用旧结果。这块暂由用户书面提供，规范化入口后续再补。
+
 ## 完成标准
 
 预标注应保留四项核心信息，字段名、JSON/JSONL 和整图或逐区域组织优先遵循
