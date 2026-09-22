@@ -11,12 +11,25 @@
     "defect_image_path": "/exports/.../defect.jpg",
     "diff_image_path": "/exports/.../diff.jpg",
     "gt_image_path": "/exports/.../gt.jpg",
-    "sample_id": "sample_001"
+    "sample_id": "sample_001",
+    "quality_label": "defect",
+    "finding_category": "开路"
   },
 ```
 
 `*_image` 是浏览器渲染用的 URL，指向 portal 的 media 路由（每次渲染时才向存储换取带签名的对象 URL），因此有有效期。
 `*_image_path` 是该图片在用户存储中的真实对象路径，用于导出回写和 URL 过期后重新签发；不要把 URL 当作路径使用。
+
+`quality_label` / `finding_category` 这类**以控件名为键**的字段，是预标注值的副本：
+Label Studio 的 Data Manager 只能按 task data 的列过滤，值只存在于 prediction 里时
+就只能做非结构化文本搜索，分不出缺陷类型。
+
+哪些控件会复制**由控件类型决定**：分类控件（`choices` 和各类 `*labels`）复制，长
+文本（`textarea`）不复制；单个绑定可以加 `"filterable": false` 退出（见
+`references/custom-bindings.md`）。一个样本有多个区域时取**第一个**区域的标签
+（主类别）；`finding_observation` 这类长文本不复制。这些列就是 Data Manager 的
+过滤依据。
+
   "predictions": [
     {
       "model_version": "vlm-v1",
