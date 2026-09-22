@@ -471,8 +471,6 @@ class PiAdapter:
         status = _external_task_status(notification.status)
         if status in {"succeeded", "failed", "terminated", "stopped"}:
             session.active_external_tasks.pop(notification.task_id, None)
-        if status == "stopped":
-            return {"accepted": False, "reason": "user_stopped"}
         await self._ensure_runner(session)
         assert session.runner is not None
         task_id = notification.task_id

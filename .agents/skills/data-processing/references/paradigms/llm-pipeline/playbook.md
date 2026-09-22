@@ -24,6 +24,10 @@
 - 新链路优先复用 DataFlow Storage 和 Operator 编排；生成、打分、过滤、去重等已有
   算子能覆盖的环节，尽量不要手写重复实现。
 - 使用 LLM 的 DataFlow 算子必须由 `LoggingLLMServing` 包装。
+- 用户提供打标模型网关时，把 `api_url`/`model`/`api_key` 作为
+  `labeling_gateway` 传给 `df_run_pipeline` 与 `df_submit_pipeline`（配
+  `model_profile="vision"`），本地试跑和平台全量用同一个网关；用户没有网关时
+  不要传，走平台 `DF_*` 配置。网关整体替换平台视觉模型，不与平台配置混用。
 - LLM 批处理必须分批调用（`BATCH_SIZE`，可用 `DF_BATCH_SIZE` 调整）、增量写入
   （append 模式，每批 flush 落盘）、每批更新 `progress.json`（供
   `df_check_progress` 观测），并内置断点续跑（启动时统计已处理行数并跳过）；
