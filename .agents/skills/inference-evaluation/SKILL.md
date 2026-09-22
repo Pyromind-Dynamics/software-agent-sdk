@@ -37,8 +37,9 @@ output_schema 或 convert_format。不使用 workflow_debug 或 run_workflow。
 使用 `df_stop_task` 停止整个工作流。平台回调只代表任务终态，不代表业务指标达标。
 
 回调后通过 `preview_dataset` 读取 output_dir 下的 report.json 和 metrics.json，核对样本数、
-成功 prediction 数、完成评分数、通过率及执行错误。通过 `df_check_progress` 的 artifact_urls 获取报告访问地址后交付
-HTML 链接；不要把容器路径当成用户可打开的地址，也不要编造签名下载链接。
+成功 prediction 数、完成评分数、通过率及执行错误。通过 `df_check_progress` 的 artifact_urls 获取 HTML 报告完整预览 URL，
+在最终回答中以 Markdown 链接 `[查看完整评测报告](完整预览URL)` 展示，原样保留完整 URL（含查询参数）。
+不要把容器路径当成用户可打开的地址，也不要编造签名下载链接。
 若工具未返回可访问 URL，交付 Storage 位置及汇总，明确报告需从 Storage 打开。
 
 模式 `resume` 使用原 run_id，input_path 不变，可省略 inference 复用冻结配置。
