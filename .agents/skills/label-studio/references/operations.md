@@ -25,6 +25,13 @@ workspace 中修改 XML → 校验 → `operation="update_config"`（带
 `expected_config_version`）。如果新 XML 删除了已有标注使用的控件名，工具会拒绝
 更新。
 
+## 按打标属性过滤
+
+分类控件（`choices` 和各类 `*labels`）的值会被复制进 task data，于是 Data Manager
+能按 `data.<控件名>` 这一列过滤。用户打开项目后自己选列、选值即可，不需要预先建
+标签页。长文本控件不复制；要屏蔽某个分类控件，给它的绑定加
+`"filterable": false`。
+
 ## 导出标注结果
 
 `label_studio_project(operation="export", project_ref=...)`。工具自动把标注结果

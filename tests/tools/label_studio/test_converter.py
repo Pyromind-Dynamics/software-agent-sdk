@@ -77,6 +77,94 @@ def test_convert_builds_tasks_with_predictions(monkeypatch):
     assert text_result["value"]["text"] == ["线路断开"]
 
 
+def test_convert_flattens_filterable_values_into_task_data(monkeypatch):
+    """The verdict and the defect category have to be task columns.
+
+    Label Studio's Data Manager filters task data; a value that lives only in a
+    prediction's result JSON is reachable through unstructured text search,
+    which cannot tell one defect category from another.
+    """
+    converter = _mock_converter(monkeypatch, ["/datasets/pcb-001/sample_001"])
+    manifest = converter.convert()
+    task = json.loads(manifest.batch_payloads[0][1])[0]
+    assert task["data"]["quality_label"] == "defect"
+    assert task["data"]["finding_category"] == "开路"
+
+
+def test_a_binding_can_keep_a_control_out_of_the_filter_columns(monkeypatch):
+    """Categorical controls become columns by default; a map can opt one out.
+
+    Flattening is driven by the result type rather than a fixed list of control
+    names, so a map that says nothing about it still gets its verdict and
+    category as columns. Setting filterable=False keeps a control out.
+    """
+    field_map = parse_field_map(
+        {
+            "samples": [
+                {
+                    "field": "quality",
+                    "control": "quality_label",
+                    "type": "choices",
+                    "filterable": False,
+                }
+            ],
+            "regions": [{"source": "findings", "control": "finding_category"}],
+        },
+        adapter="avi_train",
+    )
+    converter = AVITrainToLabelStudioConverter(
+        dataset_path="/datasets/pcb-001",
+        storage_base_url="http://storage.example.com",
+        storage_headers={},
+        field_map=field_map,
+    )
+    monkeypatch.setattr(
+        converter, "_list_sample_dirs", lambda: ["/datasets/pcb-001/sample_001"]
+    )
+    monkeypatch.setattr(converter, "_read_json_file", lambda path: SAMPLE_META)
+    monkeypatch.setattr(
+        converter,
+        "_resolve_media_urls",
+        lambda paths: {path: f"https://media/{path}?token=x" for path in paths},
+    )
+    manifest = converter.convert()
+    task = json.loads(manifest.batch_payloads[0][1])[0]
+    assert "quality_label" not in task["data"]
+    assert task["data"]["finding_category"] == "开路"
+
+
+def test_free_text_controls_are_not_flattened(monkeypatch):
+    """Only categorical values become columns; a region's note stays put.
+
+    The default map pre-annotates the region observation as a textarea, so the
+    prediction carries a text result alongside the boxes. It must not become a
+    task column.
+    """
+    converter = _mock_converter(monkeypatch, ["/datasets/pcb-001/sample_001"])
+    manifest = converter.convert()
+    task = json.loads(manifest.batch_payloads[0][1])[0]
+    assert task["data"]["quality_label"] == "defect"
+    assert task["data"]["finding_category"] == "开路"
+    assert "finding_observation" not in task["data"]
+
+
+def test_flattened_category_is_the_samples_first_finding(monkeypatch):
+    """One task can carry several defects; the column records the primary one."""
+    meta = dict(
+        SAMPLE_META,
+        findings=[
+            {"category": "短路", "bbox": [0, 0, 100, 100]},
+            {"category": "开路", "bbox": [100, 100, 200, 200]},
+        ],
+    )
+    converter = _mock_converter(
+        monkeypatch, ["/datasets/pcb-001/sample_001"], meta=meta
+    )
+    manifest = converter.convert()
+    task = json.loads(manifest.batch_payloads[0][1])[0]
+    assert task["data"]["finding_category"] == "短路"
+
+
 def test_avi_quality_synonyms_are_normalised(monkeypatch):
     """Upstream spellings such as NG/PASS must land on the config's own choices.
 

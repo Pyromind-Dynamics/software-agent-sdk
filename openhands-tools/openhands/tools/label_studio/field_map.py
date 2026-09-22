@@ -120,6 +120,15 @@ class SampleFieldBinding(BaseModel):
             "'drop' emits nothing so a human fills the control in."
         ),
     )
+    filterable: bool = Field(
+        default=True,
+        description=(
+            "Whether a categorical control's value is copied into task data as "
+            "well, which is what lets Label Studio's Data Manager filter on it. "
+            "On by default; text controls are never copied, and a map sets it "
+            "to false to keep one categorical control out of the columns."
+        ),
+    )
 
 
 class RegionBinding(BaseModel):
@@ -168,6 +177,15 @@ class RegionBinding(BaseModel):
     observation_control: str | None = Field(
         default=None,
         description="TextArea control name for that text.",
+    )
+    filterable: bool = Field(
+        default=True,
+        description=(
+            "Whether the sample's primary label for this control is copied "
+            "into task data as well, which is what lets Label Studio's Data "
+            "Manager filter on it. On by default; set it to false to keep this "
+            "control out of the columns."
+        ),
     )
 
     @model_validator(mode="after")

@@ -722,10 +722,52 @@ class AVITrainToLabelStudioConverter:
             predictions = self._build_aoi_predictions(meta)
         else:
             predictions = self._build_predictions(meta)
+        self._flatten_filter_values(data, predictions)
         task: dict[str, Any] = {"data": data}
         if predictions is not None:
             task["predictions"] = [predictions]
         return task
+
+    def _flatten_filter_values(
+        self, data: dict[str, Any], predictions: dict[str, Any] | None
+    ) -> None:
+        """Mirror the map's categorical values into the task's own data.
+
+        Label Studio's Data Manager filters task data by its columns; a value
+        that lives only inside a prediction's result JSON is reachable through
+        unstructured text search, which cannot tell one defect category from
+        another. Copying a categorical control's value into ``data`` under the
+        control's own name turns it into a column the annotator can select tasks
+        by.
+
+        Only categorical results -- choices and the various label controls -- are
+        copied; free text stays in the prediction where it belongs. A binding
+        can keep one control out of the columns with ``filterable=False``.
+        """
+        if predictions is None:
+            return
+        opted_out = {
+            binding.control
+            for binding in (*self._field_map.samples, *self._field_map.regions)
+            if not binding.filterable
+        }
+        for result in predictions["result"]:
+            control = result["from_name"]
+            if control in opted_out:
+                continue
+            result_type = result["type"]
+            if result_type == "choices":
+                values = result["value"].get("choices") or []
+            elif result_type.endswith("labels"):
+                values = result["value"].get(result_type) or []
+            else:
+                continue
+            if not values:
+                continue
+            # The first value wins: a sample's primary category is its first
+            # labelled region, and an image binding that shares the control's
+            # name keeps the URL it already put there.
+            data.setdefault(control, values[0])
 
     def _sample_values(self, meta: dict[str, Any]) -> dict[str, Any]:
         """Return the whole-sample values this adapter's bindings read.

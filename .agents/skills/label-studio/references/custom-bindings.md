@@ -11,8 +11,8 @@
 | section | 作用 | 字段 |
 |---|---|---|
 | `images` | 图片文件 → `<Image>` 对象 | `field`、`source`（样本目录里的文件名/glob，或 `jsonl` 的行内点号路径）、`required` |
-| `samples` | meta 整图字段 → 控件 | `field`、`control`、`type`（`choices`/`textarea`）、`synonyms`、`on_unmapped` |
-| `regions` | meta 区域数组 → 矩形 | `source`、`control`、`label`、`geometry`、`unit`、`observation`、`observation_control` |
+| `samples` | meta 整图字段 → 控件 | `field`、`control`、`type`（`choices`/`textarea`）、`synonyms`、`on_unmapped`、`filterable` |
+| `regions` | meta 区域数组 → 矩形 | `source`、`control`、`label`、`geometry`、`unit`、`observation`、`observation_control`、`filterable` |
 
 完整可运行写法见 `references/examples/field-maps/`。三种最常用：
 
@@ -30,6 +30,16 @@
 - **坐标量纲写清楚**：`"unit": "norm1000" | "percent" | "unit"`。不写（`auto`）
   时按数值大小推断；写了就**不再猜**，超出该量纲会**直接报错**而不是静默裁到
   边界。小于 1% 的百分比框正是被"推断"画错位的那类，量纲有把握就写上。
+- **让标注员按这个属性筛任务**：分类控件的值会额外复制进 task data，成为 Data
+  Manager 的一列。所以 `choices` 和各类 `*labels` 控件（矩形、多边形等）开箱即可
+  按值筛选，长文本不复制 —— 任务数据不是预测结果的第二份副本。要**屏蔽**某个分类
+  控件，给它的绑定加 `"filterable": false`。
+  ```json
+  {"samples": [{"field": "quality", "control": "quality_label",
+                "type": "choices", "filterable": false}]}
+  ```
+  区域绑定同样支持；一个样本有多个区域时，只取**第一个**区域的标签作为该样本
+  在这一列上的值。
 - **接 data-processing 的预打标产出**（`jsonl` 最常见的一支）：
   `references/examples/field-maps/pcb_prelabel.json` 可以直接当起点。structured
   产出的行自带 `source_images`（角色 → 图片 Storage 路径），图片按角色绑定，
