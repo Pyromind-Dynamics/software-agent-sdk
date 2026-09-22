@@ -458,6 +458,8 @@ df_run_input_path (single input) or selected local_sample_paths entry directly
 to df_run_pipeline; storage source paths are not local workspace inputs. Image
 samples are sent to the configured DF vision model
 (normally Gemma) for OCR and a short visual summary.
+Image previews also return preview_url in the text result. Use that exact URL
+in Markdown image syntax ![description](URL) to show the image to the user.
 
 Returns:
 - files found under the path
@@ -1051,6 +1053,7 @@ class PreviewDatasetExecutor(
             local_paths: list[str] = []
             vision_previews: list[dict[str, Any]] = []
             preview_images: list[ImageContent] = []
+            preview_links: list[str] = []
             total_bytes = 0
             total_files = 0
             vision_images = 0
@@ -1128,6 +1131,13 @@ class PreviewDatasetExecutor(
                         row_images.append(manifest_file_path)
                         if (
                             _is_image_path(storage_file.path)
+                            and len(preview_links) < _DEFAULT_SAMPLE_COUNT
+                        ):
+                            preview_links.append(
+                                self._image_preview_link(storage_file.path, headers)
+                            )
+                        if (
+                            _is_image_path(storage_file.path)
                             and len(preview_images) < _DEFAULT_SAMPLE_COUNT
                             and len(content) <= _MAX_INLINE_IMAGE_BYTES
                         ):
@@ -1199,6 +1209,8 @@ class PreviewDatasetExecutor(
             if len(local_paths) == 1:
                 summary_lines.append(f"df_run_input_path={local_paths[0]}")
             summary_text = "\n".join(summary_lines)
+            if preview_links:
+                summary_text += "\n\n" + "\n\n".join(preview_links)
             for preview in vision_previews:
                 summary_text += (
                     f"\n\n--- vision preview: {preview['source_path']} ---\n"
@@ -1543,6 +1555,12 @@ class PreviewDatasetExecutor(
             **_metadata_observation_fields(metadata),
         )
 
+    def _image_preview_link(self, path: str, headers: dict[str, str]) -> str:
+        result = self._get_download_url(path, headers)
+        if isinstance(result, PreviewDatasetObservation):
+            return f"Image preview: {path}\npreview_url_error={result.text}"
+        return f"Image preview: {path}\npreview_url={result}"
+
     def _storage_image_preview(
         self,
         *,
@@ -1596,7 +1614,7 @@ class PreviewDatasetExecutor(
             )
 
         text = (
-            f"Image preview: {preview_path}\n"
+            f"{self._image_preview_link(preview_path, headers)}\n"
             f"size={len(content)} bytes\n"
             f"vision_summary={summary}"
         )

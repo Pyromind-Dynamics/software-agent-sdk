@@ -23,6 +23,7 @@ from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
     PreviewDatasetAction,
     PreviewDatasetExecutor,
+    PreviewDatasetObservation,
     UploadFileToPyromindAction,
     UploadFileToPyromindExecutor,
     _match_shared_dataset,
@@ -2076,9 +2077,11 @@ def test_storage_virtual_directory_without_slash_falls_back_to_listing(
     assert len(observation.entries) == 2
 
 
+@pytest.mark.parametrize("link_failure", [False, True])
 def test_sample_mode_materializes_folder_and_runs_vision_preview(
     monkeypatch,
     tmp_path,
+    link_failure,
 ):
     image = b"\x89PNG\r\n\x1a\nfake"
     note = b"sample notes"
@@ -2102,6 +2105,12 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
                             {
                                 "name": "diagram.png",
                                 "path": "/dataset/sample-a/diagram.png",
+                                "type": "File",
+                                "size": len(image),
+                            },
+                            {
+                                "name": "second.png",
+                                "path": "/dataset/sample-a/second.png",
                                 "type": "File",
                                 "size": len(image),
                             },
@@ -2137,9 +2146,22 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
         lambda **kwargs: "OCR: triangle ABC",
     )
 
-    observation = PreviewDatasetExecutor(
+    executor = PreviewDatasetExecutor(
         storage_base_url="https://portal.test/storage_api",
-    )(
+    )
+    if link_failure:
+        monkeypatch.setattr(
+            executor,
+            "_get_download_url",
+            lambda path, headers: (
+                PreviewDatasetObservation.from_text(
+                    text="Preview link unavailable", is_error=True, dataset_path=path
+                )
+                if path.endswith("diagram.png")
+                else "https://download.test/image"
+            ),
+        )
+    observation = executor(
         PreviewDatasetAction(
             dataset_path="/dataset/",
             mode="sample",
@@ -2158,7 +2180,7 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
     assert manifest["local_path"].endswith("sample-a")
     assert manifest["workspace_path"] == observation.local_sample_paths[0]
     assert manifest["images"][0].endswith("diagram.png")
-    assert len(manifest["files"]) == 2
+    assert len(manifest["files"]) == 3
     assert (manifest_path.parent / manifest["images"][0]).read_bytes() == image
     assert (tmp_path / observation.local_sample_paths[0]).is_dir()
     assert observation.vision_previews[0]["ocr_text"] == "OCR: triangle ABC"
@@ -2168,6 +2190,12 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
     assert f"sample_manifest_path={observation.sample_manifest_path}" in llm_text
     assert f"- {observation.local_sample_paths[0]}" in llm_text
     assert f"df_run_input_path={observation.local_sample_paths[0]}" in llm_text
+
+    if link_failure:
+        assert "preview_url_error=Preview link unavailable" in llm_text
+    assert "preview_url=https://download.test/image" in llm_text
+    assert "/dataset/sample-a/second.png" in llm_text
+    assert "/dataset/sample-a/diagram.png" in llm_text
 
 
 def test_sample_mode_explicit_paths_allow_up_to_n() -> None:
@@ -2256,8 +2284,15 @@ def test_sample_mode_allows_conversation_public_data_workspace(tmp_path) -> None
     assert resolved == workspace.resolve()
 
 
-def test_inspect_storage_image_uses_vision_model(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("link_failure", [False, True])
+def test_inspect_storage_image_uses_vision_model(
+    monkeypatch, tmp_path, link_failure
+) -> None:
     _patch_shared_empty(monkeypatch)
+    signed_url = (
+        "https://download.test/image?X-Amz-Credential=admin%2F20260922"
+        "&X-Amz-Signature=abc123&X-Amz-Expires=604800"
+    )
     image = b"\xff\xd8\xff\xe0fake-jpeg"
 
     def fake_post(url, *, headers, json, timeout):
@@ -2279,13 +2314,13 @@ def test_inspect_storage_image_uses_vision_model(monkeypatch, tmp_path) -> None:
         if url.endswith("/get_url"):
             return _Response(
                 200,
-                {"success": True, "data": {"url": "https://download.test/image"}},
+                {"success": True, "data": {"url": signed_url}},
             )
         raise AssertionError(f"unexpected POST URL: {url}")
 
     def fake_stream(method, url, *, headers, timeout, follow_redirects):
         assert method == "GET"
-        assert url == "https://download.test/image"
+        assert url == signed_url
         return _StreamResponse(image)
 
     monkeypatch.setattr(httpx, "post", fake_post)
@@ -2295,9 +2330,18 @@ def test_inspect_storage_image_uses_vision_model(monkeypatch, tmp_path) -> None:
         lambda **kwargs: "AOI image without visible text; red defect box.",
     )
 
-    observation = PreviewDatasetExecutor(
+    executor = PreviewDatasetExecutor(
         storage_base_url="https://portal.test/storage_api",
-    )(
+    )
+    if link_failure:
+        monkeypatch.setattr(
+            executor,
+            "_get_download_url",
+            lambda path, headers: PreviewDatasetObservation.from_text(
+                text="Preview link unavailable", is_error=True, dataset_path=path
+            ),
+        )
+    observation = executor(
         PreviewDatasetAction(dataset_path="/dataset/defect.jpg"),
         cast(Any, _fake_conversation(tmp_path)),
     )
@@ -2308,6 +2352,14 @@ def test_inspect_storage_image_uses_vision_model(monkeypatch, tmp_path) -> None:
     assert "vision_summary=AOI image" in observation.text
     assert any(item.type == "image" for item in observation.content)
     assert all(item.type == "text" for item in observation.to_llm_content)
+
+    llm_text = "\n".join(item.text for item in observation.to_llm_content)
+    if link_failure:
+        assert "preview_url_error=Preview link unavailable" in llm_text
+        assert "preview_url=" not in llm_text
+    else:
+        assert f"preview_url={signed_url}" in llm_text
+    assert "Image preview: /dataset/defect.jpg" in llm_text
 
 
 def _clear_vision_env(monkeypatch) -> None:
