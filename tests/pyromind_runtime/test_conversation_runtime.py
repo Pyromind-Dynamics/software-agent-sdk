@@ -619,6 +619,53 @@ async def test_runtime_owns_workflow_debug_callback_policy(tmp_path) -> None:
     await runtime.close()
 
 
+async def test_runtime_wakes_for_all_terminal_external_tasks(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter("pi")
+    runtime = ConversationRuntime(
+        conversations, {"pi": adapter}, default_harness_id="pi"
+    )
+    context = RequestContext(user_id="42")
+    await runtime.create_conversation(
+        SessionSpec(
+            conversation_id="terminal-callbacks",
+            user_id="42",
+            workspace_root=str(conversations / "terminal-callbacks"),
+        ),
+        context,
+    )
+    for task_id in ("task-terminated", "task-stopped"):
+        runtime.register_external_task(
+            "terminal-callbacks",
+            {
+                "task_id": task_id,
+                "kind": "data_preparation",
+                "run_id": task_id,
+                "status": "running",
+                "output_dir": None,
+                "submitted_at": "2026-08-27T00:00:00+00:00",
+                "updated_at": "2026-08-27T00:00:00+00:00",
+                "resume_pending": False,
+            },
+        )
+
+    await runtime.deliver_external_task_status(
+        "terminal-callbacks", task_id="task-terminated", status="Terminated"
+    )
+    await runtime.deliver_external_task_status(
+        "terminal-callbacks", task_id="task-stopped", status="Stopped"
+    )
+
+    notifications = {
+        notification.task_id: notification
+        for _, notification, _ in adapter.external_task_notifications
+    }
+    assert notifications["task-terminated"].trigger_turn is True
+    assert notifications["task-stopped"].trigger_turn is True
+    await runtime.close()
+
+
 async def test_idle_conversation_is_evicted_and_reactivated(tmp_path) -> None:
     conversations = tmp_path / "conversations"
     conversations.mkdir()
