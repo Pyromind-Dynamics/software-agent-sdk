@@ -53,6 +53,16 @@ class ManifestData(BaseModel):
             "names a field the data does not have."
         ),
     )
+    unlisted_values: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Values the data carries for a bound control that the config's own "
+            "value list does not hold, keyed by control name. The create path "
+            "adds them to the project's config so their pre-annotations render; "
+            "a control named here that the config does not declare at all means "
+            "those predictions land nowhere."
+        ),
+    )
 
 
 class ProjectState(BaseModel):

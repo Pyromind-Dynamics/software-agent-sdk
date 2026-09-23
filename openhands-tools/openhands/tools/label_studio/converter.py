@@ -31,6 +31,7 @@ import json
 import logging
 import math
 import time
+from collections.abc import Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePosixPath
 from typing import Any, Protocol
@@ -47,6 +48,11 @@ from openhands.tools.label_studio.field_map import (
     is_glob,
 )
 from openhands.tools.label_studio.models import ManifestBatch, ManifestData
+from openhands.tools.label_studio.value_mapping import (
+    VERDICT_SYNONYMS,
+    ControlValueIndex,
+    resolve_control_value,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -345,6 +351,7 @@ class ConvertedManifest:
         total_tasks: int,
         unmapped_quality: tuple[str, ...] = (),
         unmatched_regions: tuple[str, ...] = (),
+        unlisted_values: Mapping[str, tuple[str, ...]] | None = None,
         field_map_hash: str = "",
         field_map_path: str | None = None,
     ) -> None:
@@ -360,6 +367,10 @@ class ConvertedManifest:
         # Region fields no sample carries: the binding names something the data
         # does not have, which otherwise shows up only as an empty editor.
         self.unmatched_regions = unmatched_regions
+        # Values written to predictions that the config's own value list does not
+        # hold, per control. They import without error and then render nothing, so
+        # they are reported here for the create path to reconcile.
+        self.unlisted_values = dict(unlisted_values or {})
         self.field_map_hash = field_map_hash
         self.field_map_path = field_map_path
 
@@ -385,6 +396,10 @@ class ConvertedManifest:
             batches=manifest_batches,
             unmapped_quality=list(self.unmapped_quality),
             unmatched_regions=list(self.unmatched_regions),
+            unlisted_values={
+                control: list(values)
+                for control, values in self.unlisted_values.items()
+            },
         )
 
 
@@ -422,6 +437,7 @@ class AVITrainToLabelStudioConverter:
         field_map: FieldMap | None = None,
         field_map_hash: str = "",
         field_map_path: str | None = None,
+        config_values: Mapping[str, Collection[str]] | None = None,
         dataset_content: bytes | None = None,
     ) -> None:
         if adapter not in _SUPPORTED_ADAPTERS:
@@ -438,6 +454,15 @@ class AVITrainToLabelStudioConverter:
         )
         self._field_map_hash = field_map_hash
         self._field_map_path = field_map_path
+        # Control name -> the values its own <Choice>/<Label> list can render.
+        # A prediction renders only when its value is one of these, so the
+        # converter resolves against them before any synonym table: a table says
+        # how to translate a foreign spelling, it must not shadow a value the
+        # config already accepts.
+        self._config_values = {
+            control: ControlValueIndex(values)
+            for control, values in (config_values or {}).items()
+        }
         self._dataset_path = dataset_path.rstrip("/")
         self._storage_base_url = storage_base_url.rstrip("/")
         self._storage_headers = dict(storage_headers)
@@ -452,6 +477,10 @@ class AVITrainToLabelStudioConverter:
         self._unmapped_quality: set[str] = set()
         # Same, for the region fields the samples actually carry.
         self._region_source_hits: set[str] = set()
+        # Control name -> values written to its predictions that the config's own
+        # value list does not hold. Label Studio renders neither, silently, so
+        # they are collected per control for the create path to add.
+        self._unlisted_values: dict[str, set[str]] = {}
 
     @property
     def field_map(self) -> FieldMap:
@@ -476,6 +505,20 @@ class AVITrainToLabelStudioConverter:
         declared = {binding.source for binding in self._field_map.regions}
         return tuple(sorted(declared - self._region_source_hits))
 
+    @property
+    def unlisted_values(self) -> dict[str, tuple[str, ...]]:
+        """Values written to a control that its config's value list lacks."""
+        return {
+            control: tuple(sorted(values))
+            for control, values in sorted(self._unlisted_values.items())
+            if values
+        }
+
+    def _record_unlisted(self, control: str, value: str) -> None:
+        # ``setdefault`` hands back the one set stored under the key, so the
+        # conversion thread pool adds to a single set without a lock.
+        self._unlisted_values.setdefault(control, set()).add(value)
+
     def convert(self) -> ConvertedManifest:
         tasks = (
             self._tasks_from_jsonl()
@@ -498,6 +541,7 @@ class AVITrainToLabelStudioConverter:
             total_tasks=len(tasks),
             unmapped_quality=self.unmapped_quality_values,
             unmatched_regions=self.unmatched_region_sources,
+            unlisted_values=self.unlisted_values,
             field_map_hash=self._field_map_hash,
             field_map_path=self._field_map_path,
         )
@@ -803,28 +847,44 @@ class AVITrainToLabelStudioConverter:
         if not text:
             return None
 
-        mapped = text
-        if binding.synonyms:
-            # A binding only normalises when it declares a table; free text such
-            # as a note has nothing to map from, so it is written through.
-            mapped = binding.synonyms.get(text.lower())
-            if mapped is None:
+        if binding.type == "textarea":
+            # Free text such as a note has no value list to match against, so it
+            # is written through untouched.
+            mapped = text
+        else:
+            match = resolve_control_value(
+                text,
+                config_values=self._config_values.get(binding.control),
+                synonyms=binding.synonyms,
+                builtin=VERDICT_SYNONYMS,
+            )
+            if not match.matched:
                 if binding.on_unmapped == "drop":
                     # The source is a foreign system's verdict, so an unknown
                     # spelling means we do not know -- leave it to the annotator.
                     return None
-                # Our own pipeline's verdict: keep it, but record it, because a
-                # value outside the config's <Choice> list does not render and
-                # that has to be visible somewhere.
+                # Our own pipeline's verdict: keep it. It is outside the config's
+                # <Choice> list, so it is recorded for the caller to reconcile --
+                # as written it imports without rendering.
                 self._unmapped_quality.add(text)
-                logger.warning(
-                    "%s value %r matched no synonym; written verbatim to control "
-                    "%r, where it may not render",
+                self._record_unlisted(binding.control, text)
+                logger.info(
+                    "%s value %r matched no config choice or synonym; written "
+                    "verbatim to control %r and recorded in unlisted_values",
                     binding.field,
                     text,
                     binding.control,
                 )
-                mapped = text
+            elif match.strategy == "fuzzy":
+                logger.warning(
+                    "%s value %r is not one of control %r's <Choice> values; "
+                    "adopting the closest one (%r) so it renders",
+                    binding.field,
+                    text,
+                    binding.control,
+                    match.value,
+                )
+            mapped = match.value
 
         value = (
             {"choices": [mapped]} if binding.type == "choices" else {"text": [mapped]}
@@ -958,10 +1018,38 @@ class AVITrainToLabelStudioConverter:
         label = str(finding.get(binding.label) or "").strip()
         observation = finding.get(binding.observation) if binding.observation else None
         if geometries and label:
-            if binding.label_synonyms:
-                label = binding.label_synonyms.get(label.lower(), label)
-            for index, geometry in enumerate(geometries):
-                box_id = region_id if index == 0 else f"{region_id}_{index + 1}"
+            index = self._config_values.get(binding.control)
+            match = resolve_control_value(
+                label,
+                config_values=index,
+                synonyms=binding.label_synonyms,
+                builtin=VERDICT_SYNONYMS,
+            )
+            label = match.value
+            if not match.matched:
+                # Outside the control's <Label> list, so Label Studio draws the
+                # rectangle with no label at all. Recorded per control for the
+                # caller to add; a control the config does not declare shows up
+                # in the same ledger and cannot be widened.
+                self._record_unlisted(binding.control, label)
+                logger.info(
+                    "%s label %r is not one of control %r's values; recorded in "
+                    "unlisted_values",
+                    binding.source,
+                    label,
+                    binding.control,
+                )
+            elif match.strategy == "fuzzy":
+                logger.warning(
+                    "%s label %r is not one of control %r's <Label> values; "
+                    "adopting the closest one (%r) so the rectangle renders",
+                    binding.source,
+                    label,
+                    binding.control,
+                    match.value,
+                )
+            for position, geometry in enumerate(geometries):
+                box_id = region_id if position == 0 else f"{region_id}_{position + 1}"
                 x, y, width, height = geometry
                 results.append(
                     {

@@ -20,11 +20,14 @@ XML agree -- what is rejected is a binding that cannot land anywhere.
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 
 from openhands.tools.label_studio.field_map import (
     DEFAULT_FIELD_MAPS,
     FieldMap,
 )
+from openhands.tools.label_studio.value_mapping import normalize_value_key
 
 
 _OBJECT_TAGS = {"Image", "Text", "Audio", "Video", "HyperText", "TimeSeries"}
@@ -38,6 +41,10 @@ _CONTROL_TAG_TO_TYPE = {
     "KeyPointLabels": "keypointlabels",
 }
 _TYPE_TO_TAG = {value: tag for tag, value in _CONTROL_TAG_TO_TYPE.items()}
+
+# The element a control's own values live in. Every labelled control nests
+# ``<Label>`` except ``<Choices>``, whose options are ``<Choice>``.
+_CONTROL_CHILD_TAG = {"Choices": "Choice"}
 
 # Objects a region control can legally draw on. Label Studio draws rectangles on
 # images and video frames alike.
@@ -82,6 +89,111 @@ def required_controls(adapter: str) -> dict[str, str]:
 def extract_control_names(xml_content: str) -> set[str]:
     """Return all control ``from_name`` values defined in the XML."""
     return {control["from_name"] for control in validate_label_config_xml(xml_content)}
+
+
+def extract_control_values(xml_content: str) -> dict[str, tuple[str, ...]]:
+    """Return ``{control name: values it can render}`` for a label config.
+
+    Label Studio draws a pre-annotation only when its value is one of the
+    control's own choices/labels; anything else imports without error and shows
+    nothing. The converter uses these to tell a value the config already accepts
+    from a foreign spelling that needs normalising, so a declared synonym table
+    cannot shadow a value that needs no translation.
+
+    Controls without values (``<TextArea>``) map to an empty tuple.
+    """
+    root = ET.fromstring(xml_content)
+    values: dict[str, tuple[str, ...]] = {}
+    for elem in root.iter():
+        if elem.tag not in _CONTROL_TAG_TO_TYPE:
+            continue
+        name = elem.get("name", "")
+        if not name:
+            continue
+        found = [value for child in elem if (value := child.get("value"))]
+        values[name] = tuple(found)
+    return values
+
+
+@dataclass(frozen=True)
+class WidenedConfig:
+    """A label config reconciled with the values the dataset actually carries."""
+
+    xml: str
+    added: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    missing_controls: tuple[str, ...] = ()
+
+
+def widen_label_config(
+    xml_content: str,
+    values: Mapping[str, Iterable[str]],
+) -> WidenedConfig:
+    """Add data-carried values to the value lists a config declares.
+
+    The config a caller writes is a template: it names the controls and the
+    values it starts from. A value the data carries that the template does not
+    list imports as a pre-annotation that draws nothing -- Label Studio compares
+    the value against the control's own list and silently ignores a miss -- so
+    the value list follows the data while the controls, their names, and their
+    layout stay exactly as declared.
+
+    Returns the reconciled config plus what changed: ``added`` per control, and
+    ``missing_controls`` for values whose control the config does not declare at
+    all, which no widening can place. The original text is returned unchanged
+    when there is nothing to add, so an already-complete template is untouched.
+    """
+    candidates = {
+        control: list(values_for_control)
+        for control, values_for_control in values.items()
+        if values_for_control
+    }
+    if not candidates:
+        return WidenedConfig(xml_content)
+
+    # Comments are preserved so the config the project runs on still reads like
+    # the template it came from; only the added values differ.
+    parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+    root = ET.fromstring(xml_content, parser=parser)
+    controls = {
+        element.get("name"): element
+        for element in root.iter()
+        if element.tag in _CONTROL_TAG_TO_TYPE and element.get("name")
+    }
+
+    added: dict[str, tuple[str, ...]] = {}
+    missing: list[str] = []
+    for control, raw_values in candidates.items():
+        element = controls.get(control)
+        if element is None:
+            missing.append(control)
+            continue
+        declared = {
+            normalize_value_key(child.get("value", ""))
+            for child in element
+            if child.get("value")
+        }
+        new_values: list[str] = []
+        for value in raw_values:
+            key = normalize_value_key(value)
+            if not key or key in declared:
+                continue
+            declared.add(key)
+            new_values.append(value)
+        if not new_values:
+            continue
+        child_tag = _CONTROL_CHILD_TAG.get(element.tag, "Label")
+        tail = element[-1].tail if len(element) else element.text
+        for value in new_values:
+            child = ET.SubElement(element, child_tag)
+            child.set("value", value)
+            child.tail = tail
+        added[control] = tuple(new_values)
+
+    if not added:
+        return WidenedConfig(xml_content, {}, tuple(sorted(missing)))
+    return WidenedConfig(
+        ET.tostring(root, encoding="unicode"), added, tuple(sorted(missing))
+    )
 
 
 def validate_label_config_xml(

@@ -24,6 +24,7 @@ from openhands.tools.label_studio.executor import (
 )
 from openhands.tools.label_studio.export_ticket import PortalExportTicketProvider
 from openhands.tools.label_studio.models import ProjectState
+from openhands.tools.label_studio.skill_helpers import extract_control_values
 from openhands.tools.label_studio.token_provider import PortalTokenProvider
 from openhands.tools.pyromind_dataset.definition import StorageFileNotFoundError
 
@@ -143,6 +144,7 @@ class TestCreate:
             mock_manifest.batch_payloads = [("tasks-00001.json", b"[{},{},{}]", 3)]
             mock_manifest.unmapped_quality = ()
             mock_manifest.unmatched_regions = ()
+            mock_manifest.unlisted_values = {}
             mock_manifest.to_manifest_data.return_value.model_dump_json.return_value = (
                 "{}"
             )
@@ -740,6 +742,7 @@ def _mock_manifest(
     payload: bytes,
     unmapped_quality: tuple[str, ...] = (),
     unmatched_regions: tuple[str, ...] = (),
+    unlisted_values: dict[str, tuple[str, ...]] | None = None,
 ) -> MagicMock:
     manifest = MockConverter.return_value.convert.return_value
     manifest.total_tasks = tasks
@@ -749,14 +752,18 @@ def _mock_manifest(
     # branch would be taken and satisfied without a single test intending it.
     manifest.unmapped_quality = unmapped_quality
     manifest.unmatched_regions = unmatched_regions
+    manifest.unlisted_values = unlisted_values or {}
     return manifest
 
 
-def test_create_reports_unmapped_quality_to_the_agent(conversation: MagicMock) -> None:
-    """A verdict that cannot render has to reach the agent, not just the log.
+def test_create_widens_the_config_with_the_values_the_data_uses(
+    conversation: MagicMock,
+) -> None:
+    """The config is a template: a value it does not list is added, not dropped.
 
-    Label Studio silently ignores a prediction whose choice is absent from the
-    config, so the only place this failure can surface is here.
+    Label Studio silently ignores a prediction whose value is absent from the
+    control's own list, so the value the data carries has to reach the project's
+    config. The caller's file is left as written.
     """
     executor = _create_executor()
     mock_ls = _mock_ls_api()
@@ -769,7 +776,12 @@ def test_create_reports_unmapped_quality_to_the_agent(conversation: MagicMock) -
             "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
         ) as MockConverter,
     ):
-        _mock_manifest(MockConverter, 1, b"[{}]", unmapped_quality=("NG+",))
+        _mock_manifest(
+            MockConverter,
+            1,
+            b"[{}]",
+            unlisted_values={"quality_label": ("NG+",)},
+        )
         obs = executor(
             _action(
                 operation="create",
@@ -780,7 +792,48 @@ def test_create_reports_unmapped_quality_to_the_agent(conversation: MagicMock) -
         )
 
     assert not obs.is_error
-    assert "unmapped_quality:NG+" in obs.text
+    assert "widened=quality_label:NG+" in obs.text
+    created = mock_ls.create_project.call_args.kwargs["label_config"]
+    # The values the template already declared are kept alongside the new one.
+    assert extract_control_values(created)["quality_label"] == (
+        "ok",
+        "defect",
+        "NG+",
+    )
+
+
+def test_create_reports_bindings_that_name_an_undeclared_control(
+    conversation: MagicMock,
+) -> None:
+    """Widening cannot place a value whose control the config does not have."""
+    executor = _create_executor()
+    mock_ls = _mock_ls_api()
+    with (
+        patch.object(executor, "_load_state", return_value=None),
+        patch.object(executor, "_build_ls_api", return_value=mock_ls),
+        patch.object(executor, "_upload_to_storage", return_value=None),
+        patch.object(executor, "_save_state", return_value=None),
+        patch(
+            "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+        ) as MockConverter,
+    ):
+        _mock_manifest(
+            MockConverter,
+            1,
+            b"[{}]",
+            unlisted_values={"missing_control": ("x",)},
+        )
+        obs = executor(
+            _action(
+                operation="create",
+                dataset_path="/datasets/pcb",
+                label_config_path="label_config.xml",
+            ),
+            conversation,
+        )
+
+    assert not obs.is_error
+    assert "warning=unmapped_controls:missing_control" in obs.text
 
 
 def test_create_reports_unmatched_regions_to_the_agent(
@@ -1562,6 +1615,7 @@ def test_create_records_the_window_the_portal_reported(conversation):
         manifest.batch_payloads = [("tasks-00001.json", b"[{}]", 1)]
         manifest.unmapped_quality = ()
         manifest.unmatched_regions = ()
+        manifest.unlisted_values = {}
         manifest.to_manifest_data.return_value.model_dump_json.return_value = "{}"
 
         obs = executor(

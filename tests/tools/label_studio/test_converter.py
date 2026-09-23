@@ -37,11 +37,12 @@ SAMPLE_META = {
 }
 
 
-def _mock_converter(monkeypatch, sample_dirs, meta=SAMPLE_META):
+def _mock_converter(monkeypatch, sample_dirs, meta=SAMPLE_META, config_values=None):
     converter = AVITrainToLabelStudioConverter(
         dataset_path="/datasets/pcb-001",
         storage_base_url="http://storage.example.com",
         storage_headers={},
+        config_values=config_values,
     )
     monkeypatch.setattr(converter, "_list_sample_dirs", lambda: sample_dirs)
     monkeypatch.setattr(converter, "_read_json_file", lambda path: meta)
@@ -163,6 +164,170 @@ def test_flattened_category_is_the_samples_first_finding(monkeypatch):
     manifest = converter.convert()
     task = json.loads(manifest.batch_payloads[0][1])[0]
     assert task["data"]["finding_category"] == "短路"
+
+
+def test_a_config_value_survives_a_declared_synonym_table(monkeypatch):
+    """A value the config already lists must not be dropped by a synonym table.
+
+    A table maps foreign spellings onto the config's own values; treating it as
+    a replacement makes it shadow the built-in spellings, so an upstream
+    ``defect`` with a ``{"true": "defect"}`` table adds no prediction at all and
+    the verdict silently disappears from the review screen.
+    """
+    field_map = parse_field_map(
+        {
+            "samples": [
+                {
+                    "field": "quality",
+                    "control": "quality_label",
+                    "type": "choices",
+                    "synonyms": {"true": "defect", "false": "ok"},
+                }
+            ]
+        },
+        adapter="avi_train",
+    )
+    converter = AVITrainToLabelStudioConverter(
+        dataset_path="/datasets/pcb-001",
+        storage_base_url="http://storage.example.com",
+        storage_headers={},
+        field_map=field_map,
+        config_values={"quality_label": ("ok", "defect", "unknown")},
+    )
+    monkeypatch.setattr(
+        converter, "_list_sample_dirs", lambda: ["/datasets/pcb-001/sample_001"]
+    )
+    monkeypatch.setattr(converter, "_read_json_file", lambda path: SAMPLE_META)
+    monkeypatch.setattr(
+        converter,
+        "_resolve_media_urls",
+        lambda paths: {path: f"https://media/{path}?token=x" for path in paths},
+    )
+    manifest = converter.convert()
+    results = json.loads(manifest.batch_payloads[0][1])[0]["predictions"][0]["result"]
+    verdict = next(r for r in results if r["from_name"] == "quality_label")
+    assert verdict["value"]["choices"] == ["defect"]
+    assert manifest.unmapped_quality == ()
+
+
+def test_a_config_value_is_used_with_the_config_own_spelling(monkeypatch):
+    """Case differences resolve to the config's spelling, not a dropped value."""
+    converter = _mock_converter(
+        monkeypatch,
+        ["/datasets/pcb-001/sample_001"],
+        meta=dict(SAMPLE_META, quality="DEFECT"),
+        config_values={"quality_label": ("ok", "defect")},
+    )
+    manifest = converter.convert()
+    results = json.loads(manifest.batch_payloads[0][1])[0]["predictions"][0]["result"]
+    verdict = next(r for r in results if r["from_name"] == "quality_label")
+    assert verdict["value"]["choices"] == ["defect"]
+    assert manifest.unmapped_quality == ()
+
+
+def test_region_labels_the_config_does_not_list_are_recorded(monkeypatch):
+    """A label absent from the config's <Label> values draws nothing, silently.
+
+    It is recorded per control instead, which is what lets the create path add
+    it to the config the project runs on.
+    """
+    meta = dict(
+        SAMPLE_META,
+        findings=[{"category": "氧化", "bbox": [0, 0, 100, 100]}],
+    )
+    converter = _mock_converter(
+        monkeypatch,
+        ["/datasets/pcb-001/sample_001"],
+        meta=meta,
+        config_values={"finding_category": ("短路", "断路")},
+    )
+    manifest = converter.convert()
+    assert manifest.unlisted_values == {"finding_category": ("氧化",)}
+
+
+def test_a_binding_without_a_table_still_uses_the_builtin_vocabulary(monkeypatch):
+    """A custom map must not have to restate "defect"/"ok"/NG spellings."""
+    field_map = parse_field_map(
+        {
+            "samples": [
+                {"field": "quality", "control": "quality_label", "type": "choices"}
+            ]
+        },
+        adapter="avi_train",
+    )
+    converter = AVITrainToLabelStudioConverter(
+        dataset_path="/datasets/pcb-001",
+        storage_base_url="http://storage.example.com",
+        storage_headers={},
+        field_map=field_map,
+        config_values={"quality_label": ("ok", "defect")},
+    )
+    meta = dict(SAMPLE_META, quality="NG")
+    monkeypatch.setattr(
+        converter, "_list_sample_dirs", lambda: ["/datasets/pcb-001/sample_001"]
+    )
+    monkeypatch.setattr(converter, "_read_json_file", lambda path: meta)
+    monkeypatch.setattr(
+        converter,
+        "_resolve_media_urls",
+        lambda paths: {path: f"https://media/{path}?token=x" for path in paths},
+    )
+    manifest = converter.convert()
+    results = json.loads(manifest.batch_payloads[0][1])[0]["predictions"][0]["result"]
+    verdict = next(r for r in results if r["from_name"] == "quality_label")
+    assert verdict["value"]["choices"] == ["defect"]
+    assert manifest.unmapped_quality == ()
+
+
+def test_a_region_label_only_differs_by_separators(monkeypatch):
+    """Whitespace inside a label must not cost the rectangle its label."""
+    meta = dict(
+        SAMPLE_META,
+        findings=[{"category": "短 路", "bbox": [0, 0, 100, 100]}],
+    )
+    converter = _mock_converter(
+        monkeypatch,
+        ["/datasets/pcb-001/sample_001"],
+        meta=meta,
+        config_values={"finding_category": ("短路", "断路")},
+    )
+    manifest = converter.convert()
+    results = json.loads(manifest.batch_payloads[0][1])[0]["predictions"][0]["result"]
+    box = next(r for r in results if r["type"] == "rectanglelabels")
+    assert box["value"]["rectanglelabels"] == ["短路"]
+    assert manifest.unlisted_values == {}
+
+
+def test_a_near_miss_region_label_is_snapped_to_the_config_value(monkeypatch):
+    """A typo'd label would draw nothing, so the unique nearest one is used."""
+    meta = dict(
+        SAMPLE_META,
+        findings=[{"category": "氧化膜", "bbox": [0, 0, 100, 100]}],
+    )
+    converter = _mock_converter(
+        monkeypatch,
+        ["/datasets/pcb-001/sample_001"],
+        meta=meta,
+        config_values={"finding_category": ("氧化", "短路", "断路")},
+    )
+    manifest = converter.convert()
+    results = json.loads(manifest.batch_payloads[0][1])[0]["predictions"][0]["result"]
+    box = next(r for r in results if r["type"] == "rectanglelabels")
+    assert box["value"]["rectanglelabels"] == ["氧化"]
+    assert manifest.unlisted_values == {}
+
+
+def test_a_control_the_config_does_not_declare_is_recorded_too(monkeypatch):
+    """The ledger is per control, so a missing control cannot pass unnoticed."""
+    meta = dict(
+        SAMPLE_META,
+        findings=[{"category": "氧化", "bbox": [0, 0, 100, 100]}],
+    )
+    converter = _mock_converter(
+        monkeypatch, ["/datasets/pcb-001/sample_001"], meta=meta
+    )
+    manifest = converter.convert()
+    assert manifest.unlisted_values == {"finding_category": ("氧化",)}
 
 
 def test_avi_quality_synonyms_are_normalised(monkeypatch):

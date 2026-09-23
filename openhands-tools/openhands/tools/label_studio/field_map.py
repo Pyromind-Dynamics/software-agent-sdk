@@ -25,6 +25,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from openhands.tools.label_studio.value_mapping import VERDICT_SYNONYMS
+
 
 # Maps upstream verdict/label spellings onto the quality choices used by the
 # generated label configs ("defect"/"ok"). Both adapters share this table, but
@@ -37,19 +39,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 #     recorded in the manifest rather than silently dropped.
 # The self-mapping entries ("defect"/"ok") are what keep an already-normalised
 # meta value from being counted as a miss.
-_QUALITY_CHOICE_SYNONYMS = {
-    "defect": "defect",
-    "true": "defect",
-    "bad": "defect",
-    "ng": "defect",
-    "fault": "defect",
-    "faulty": "defect",
-    "ok": "ok",
-    "good": "ok",
-    "pass": "ok",
-    "false_positive": "ok",
-    "false": "ok",
-}
+_QUALITY_CHOICE_SYNONYMS = VERDICT_SYNONYMS
 
 # Coordinate scales a binding can declare. "auto" infers the scale from the
 # values' magnitude, which is what the converter did before units were
@@ -109,8 +99,9 @@ class SampleFieldBinding(BaseModel):
     synonyms: dict[str, str] = Field(
         default_factory=dict,
         description=(
-            "Case-insensitive value normalisation table. Empty writes the value "
-            "through untouched."
+            "Extra value normalisation table, for spellings the control's own "
+            "values do not cover. Applied after those values, which always win, "
+            "and before the built-in verdict vocabulary."
         ),
     )
     on_unmapped: Literal["keep", "drop"] = Field(
@@ -168,7 +159,10 @@ class RegionBinding(BaseModel):
     )
     label_synonyms: dict[str, str] = Field(
         default_factory=dict,
-        description="Case-insensitive normalisation table for region labels.",
+        description=(
+            "Extra normalisation table for region labels, applied after the "
+            "control's own <Label> values, which always win."
+        ),
     )
     observation: str | None = Field(
         default=None,

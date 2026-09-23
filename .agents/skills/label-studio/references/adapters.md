@@ -66,15 +66,23 @@ create 时按数据布局选一个 `adapter`（默认 `avi_train`），三种都
 - `quality_label` 的 `<Choice>` 至少要有 `ok` 和 `defect`，这是 meta 判定值的
   映射目标。
 
-三个 adapter 的判定值都按同一张同义词表归一化（`NG`/`BAD`/`FAULT`/`TRUE`
-→`defect`，`PASS`/`GOOD`/`FALSE_POSITIVE`→`ok`，忽略大小写），认不出时处理
-不同：
+三个 adapter 的判定值都按同一套解析归一化，不必先把数据洗成 XML 的写法：
+先用控件自己的 `<Choice>` 值匹配（忽略大小写、全半角、空白与分隔符），再用
+绑定声明的 `synonyms` 和内置判定词表（`NG`/`BAD`/`FAULT`/`TRUE`/`1`
+→`defect`，`PASS`/`GOOD`/`FALSE_POSITIVE`/`0`→`ok`…）翻译，最后与控件值做一次
+**唯一最近者**的近似匹配。`synonyms` 只是补充外部拼写，**不会遮蔽控件已有的
+值**，所以一张只写了 `true`/`false` 的表不会把上游的 `defect` 顶掉。认不出时
+处理不同：
 
 - `avi_train` 和 `jsonl` 读的是自家 VLM / 预处理产物，认不出就**原样写进
-  预标注**，并在 create 返回里带一句 `warning=unmapped_quality:<值>` —— 看到它
-  就把对应的 `<Choice value="...">` 补上，否则那条预标注在界面上不会显示。
+  预标注**，create 会把这个值补进**项目上**的配置（控件名、布局不动），返回里
+  带一句 `widened=<控件>:<值>`，所以那条预标注照常显示。调用者的 XML 文件不受
+  影响。
 - `aoi_export` 读的是外部检测系统的判定，认不出说明确实不知道，**留空**给人工
   标注。
+
+绑定指向的控件在配置里根本没有时，create 返回 `warning=unmapped_controls:<控件>`
+—— 扩值无处可加，要回去补上这个控件或改绑定的 `control`。
 
 ## 区域预标注（框）
 
@@ -90,6 +98,10 @@ create 时按数据布局选一个 `adapter`（默认 `avi_train`），三种都
   该区域的说明挂在每个矩形上。多个框合并成一条区域记录所以不必摊平数据。
 - 每个区域必须有 `category`。只有坐标没有类别时**该区域会被跳过** ——
   Label Studio 不渲染没有标签的矩形，写进去也看不见。
+- 区域标签按和整图判定同一套解析归一化（控件值 → `synonyms`/内置词表 → 唯一
+  最近者）。解析不到、又不在控件 `<Label>` 列表里的标签，同样由 create 补进
+  项目配置并报 `widened=<控件>:<标签>`，框正常画出来。（`aoi_export` 读外部
+  检测结论，认不出的标签按丢弃处理，不扩值。）
 - 绑定的 `source` 指向数据里根本没有的字段时，create 返回会带一句
   `warning=unmatched_regions:<字段>` —— 说明这些框一个都没建出来，要回去改
   绑定的 `source` 或上游数据的字段名。（`aoi_export` 不报，它的整图判定本来
