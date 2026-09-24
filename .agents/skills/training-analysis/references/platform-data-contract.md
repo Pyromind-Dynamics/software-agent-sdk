@@ -43,7 +43,7 @@ entity 由 wandb API `viewer()` 推断(如 `pengtao-shi-pyromind`),或 `--entity
 ## 响应形状(真实校准, task 7710)
 
 - **task_workflow_result**: 顶层 `{path, workflow, task_status}`;节点在
-  `workflow.nodes[]`,节点字段为 `id`(字符串)、`data.nodeType`
+  `workflow.nodes[]`,节点字段为 `id`(字符串或整数,分析工具统一转为字符串)、`data.nodeType`
   (如 `ModelTrainSFTNode`/`WandbConfigBuilderNode`)、`data.config`
   (含 `wandb_config` 文本块或 `wandb_api_key` 等结构化字段)。
 - **节点日志/输出**: `{size: {cols, row}, entries: [{t, m}]}`,

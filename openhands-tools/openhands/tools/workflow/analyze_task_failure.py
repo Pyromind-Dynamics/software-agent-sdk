@@ -268,22 +268,31 @@ def _find_nodes(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
-def _first_string(node: dict[str, Any], keys: Sequence[str]) -> str | None:
+def _scalar_text(value: Any) -> str | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (str, int)):
+        text = str(value).strip()
+        return text or None
+    return None
+
+
+def _first_text(node: dict[str, Any], keys: Sequence[str]) -> str | None:
     for key in keys:
-        value = node.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+        text = _scalar_text(node.get(key))
+        if text:
+            return text
     data = node.get("data")
     if isinstance(data, dict):
         for key in keys:
-            value = data.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+            text = _scalar_text(data.get(key))
+            if text:
+                return text
     return None
 
 
 def _node_identifier(node: dict[str, Any]) -> str | None:
-    return _first_string(node, _NODE_ID_KEYS)
+    return _first_text(node, _NODE_ID_KEYS)
 
 
 def _node_type(node: dict[str, Any]) -> str | None:
@@ -418,7 +427,7 @@ class AnalyzeTaskFailureExecutor(
             TaskNodeInfo(
                 node_id=node_id,
                 node_type=_node_type(node),
-                node_name=_first_string(node, _NODE_NAME_KEYS),
+                node_name=_first_text(node, _NODE_NAME_KEYS),
                 status=_node_status(node),
             )
             for node in _find_nodes(payload)
