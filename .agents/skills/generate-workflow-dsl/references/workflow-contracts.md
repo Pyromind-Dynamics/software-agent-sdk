@@ -49,8 +49,8 @@ Merge、推理与评测｜平台边界。
 | ModelConfigBuilderNode | model_path | model_type | `model_config` |
 
 Text 的 assistant 默认 `gt`，rejected 默认 `rejected_answer`；Message 的 `messages_field` 必填、
-rejected 默认 `rejected_messages`；Vision 的 `image_field` 必填，填 preview 中的真实图片列名。
-字段名一律以 preview 真实列名为准，禁止按常见名猜测。`model_type` 只用
+rejected 默认 `rejected_messages`；Vision 的 `image_field` 必填，填数据画像里的真实图片列名。
+字段名一律以数据画像里的真实列名为准，禁止按常见名猜测。`model_type` 只用
 `auto`、`qwen3vl`、`qwen3.5`。`max_seq_length` 默认取 `min(P95, 4096)`；P95 未知时用 4096
 并在最终回复声明该假设。
 

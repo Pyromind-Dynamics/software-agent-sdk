@@ -51,6 +51,11 @@ from openhands.tools.pyromind_dataset.definition import (
     download_file_from_pyromind,
     upload_local_file_to_pyromind,
 )
+from openhands.tools.utils.workspace_staging import (
+    WorkspaceStagingError,
+    is_remote_workspace,
+    staged_remote_path,
+)
 
 
 if TYPE_CHECKING:
@@ -882,6 +887,12 @@ class LabelStudioProjectExecutor(
         if conversation is None:
             return None
         workspace = cast(Any, conversation).workspace
+        if is_remote_workspace(workspace):
+            try:
+                with staged_remote_path(workspace, relative_path) as staged:
+                    return staged.read_bytes() if staged.is_file() else None
+            except WorkspaceStagingError:
+                return None
         file_path = Path(workspace.working_dir) / relative_path
         if not file_path.is_file():
             return None

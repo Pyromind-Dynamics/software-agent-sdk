@@ -20,6 +20,7 @@ export class PiAgentRuntime {
   private session: AgentSession | undefined;
   private sessionId: string | undefined;
   private workspaceRoot: string | undefined;
+  private terminalBackend: string | undefined;
   private normalizer: PiEventNormalizer | undefined;
   private readonly outcome = new PiOutcomeNormalizer();
   private readonly finishedRuns = new Set<string>();
@@ -53,6 +54,7 @@ export class PiAgentRuntime {
     this.session = session;
     this.sessionId = sessionId;
     this.workspaceRoot = requiredString(params, "workspace_root");
+    this.terminalBackend = requiredString(params, "terminal_backend");
     return { ready: true };
   }
 
@@ -112,6 +114,9 @@ export class PiAgentRuntime {
   }
 
   private captureWorkflow(): JsonObject {
+    // The sandbox execution workspace is the authority for workflow files, so
+    // the control plane reads it through the workspace port instead.
+    if (this.terminalBackend === "sandbox") return {};
     try {
       return { workflow_dsl: readFileSync(join(this.workspaceRoot!, "public_data/workflow_canvas/workflow.py"), "utf8") };
     } catch (error) {

@@ -1,6 +1,7 @@
 import ast
 import importlib.util
 import json
+import os
 import sys
 import threading
 import time
@@ -15,6 +16,7 @@ from pydantic import SecretStr
 
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.llm import LLM, FailoverRouter
+from openhands.sdk.workspace.models import CommandResult
 from openhands.sdk.workspace.workspace import LocalWorkspace
 from openhands.tools.data_preparation.definition import (
     RUNTIME_FILENAMES,
@@ -332,6 +334,7 @@ def test_df_run_pipeline_validates_output_and_writes_local_report(
         ).is_file()
     assert observation.output_path is not None
     assert observation.record_count == 1
+    assert "staged_root=" not in observation.text
     assert observation.sample_records == [
         {
             "id": "text-1",
@@ -494,6 +497,9 @@ def test_df_run_pipeline_classifies_pipeline_execution_failure(
     assert observation.error_code == "dataflow_pipeline_failed"
     assert observation.error_message == "DataFlow pipeline exited with code 7."
     assert observation.exit_code == 7
+    assert observation.execution == "host"
+    llm_text = "\n".join(item.text for item in observation.to_llm_content)
+    assert "execution=host" in llm_text
 
 
 def test_df_run_pipeline_uses_reported_failure_details(
@@ -1939,6 +1945,7 @@ def test_df_run_pipeline_none_profile_passes_frozen_support_and_artifacts(
 
     assert not observation.is_error, observation.text
     assert observation.sample_records[0]["label"] == "scratch"
+    assert observation.report_path is not None
     report = json.loads(Path(observation.report_path).read_text(encoding="utf-8"))
     assert report["source_integrity"]["unchanged"] is True
 
@@ -2130,3 +2137,802 @@ def test_df_run_pipeline_legacy_keeps_pipeline_relative_args(
     assert observation.exit_code == 0
     assert (pipeline_dir / "filtered.sample.jsonl").is_file()
     assert not (tmp_path / "filtered.sample.jsonl").exists()
+
+
+def _sandbox_conversation(workspace) -> Any:
+    return type(
+        "FakeSandboxConversation",
+        (),
+        {"id": "conversation-1", "workspace": workspace},
+    )()
+
+
+class _NoStorageRemoteWorkspace:
+    """Remote workspace with a command port but no Storage mount.
+
+    A remote workspace that cannot mount user Storage keeps the host staging
+    path, so this double pins that fallback.
+    """
+
+    is_remote = True
+
+    def __init__(self, workspace) -> None:
+        self._workspace = workspace
+        self.workspace_dir = workspace.workspace_dir
+        self.working_dir = workspace.working_dir
+
+    def execute_command(
+        self,
+        command: str,
+        cwd: str | Path | None = None,
+        timeout: float = 30.0,
+    ):
+        return self._workspace.execute_command(command, cwd=cwd, timeout=timeout)
+
+    def file_upload(self, source_path: str | Path, destination_path: str | Path):
+        return self._workspace.file_upload(source_path, destination_path)
+
+    def file_download(self, source_path: str | Path, destination_path: str | Path):
+        return self._workspace.file_download(source_path, destination_path)
+
+
+def test_df_run_pipeline_without_storage_mount_keeps_staging(
+    tmp_path: Path,
+    monkeypatch,
+    sandbox_workspace,
+) -> None:
+    """A remote workspace without Storage still stages onto the agent host."""
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    workspace = _NoStorageRemoteWorkspace(sandbox_workspace)
+    conversation = _sandbox_conversation(workspace)
+    pipeline_dir = sandbox_workspace.workspace_dir / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    _write_legacy_copy_pipeline(pipeline_dir / "pipeline.py")
+    (pipeline_dir / "input.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "text-1",
+                "system_prompt": "system",
+                "user_prompt": "question",
+                "gt": "answer",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/filtered.sample.jsonl",
+            ],
+            output_schema="text",
+            model_profile="none",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.exit_code == 0
+    staged = [
+        line for line in observation.text.splitlines() if line.startswith("staged_")
+    ]
+    assert len(staged) == 1
+    assert staged[0].startswith("staged_root=/")
+    assert (pipeline_dir / "filtered.sample.jsonl").is_file()
+    assert not list(tmp_path.glob("pyromind-dataflow-run-*"))
+
+
+def test_df_run_pipeline_without_storage_mount_classifies_truncated_staging(
+    monkeypatch,
+    sandbox_workspace,
+    truncated_downloads,
+) -> None:
+    """A cut staging transfer becomes a classified failure, not a raw crash."""
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    workspace = _NoStorageRemoteWorkspace(
+        truncated_downloads(sandbox_workspace, limit=1024)
+    )
+    conversation = _sandbox_conversation(workspace)
+    pipeline_dir = sandbox_workspace.workspace_dir / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    _write_legacy_copy_pipeline(pipeline_dir / "pipeline.py")
+    # Incompressible bytes keep the staged archive larger than the cut transfer
+    # budget, which is what the pipeline never gets to read.
+    (pipeline_dir / "input.jsonl").write_bytes(os.urandom(8192))
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/filtered.sample.jsonl",
+            ],
+            model_profile="none",
+        ),
+        conversation,
+    )
+
+    assert observation.is_error
+    assert observation.failure_stage == "input_resolution"
+    assert observation.error_code == "workspace_input_staging_truncated"
+    assert observation.error_message is not None
+    assert "truncated" in observation.error_message
+
+
+def test_df_run_pipeline_sandbox_reads_storage_without_downloading(
+    monkeypatch,
+    sandbox_workspace,
+    truncated_downloads,
+) -> None:
+    """A sandbox run reads Storage where it lives and validates in place."""
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    workspace = truncated_downloads(sandbox_workspace, limit=1024)
+    conversation = _sandbox_conversation(workspace)
+    pipeline_dir = sandbox_workspace.workspace_dir / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    (pipeline_dir / "pipeline.py").write_text(
+        "\n".join(
+            [
+                "import json, sys",
+                "with open(sys.argv[1], encoding='utf-8') as src:",
+                "    rows = [line for line in src if line.strip()]",
+                "with open(sys.argv[2], 'w', encoding='utf-8') as dst:",
+                "    for index, _ in enumerate(rows):",
+                "        dst.write(json.dumps({",
+                "            'id': f'row-{index}',",
+                "            'system_prompt': 'system',",
+                "            'user_prompt': 'question',",
+                "            'gt': 'answer',",
+                "        }) + '\\n')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    datasets = sandbox_workspace.storage_dir / "datasets"
+    datasets.mkdir()
+    (datasets / "input.jsonl").write_text("{'a': 1}\n" * 512, encoding="utf-8")
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "storage/datasets/input.jsonl",
+                "public_data/data-preparation/filtered.sample.jsonl",
+            ],
+            model_profile="none",
+            output_schema="text",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.exit_code == 0
+    assert "execution=sandbox" in observation.text
+    assert observation.execution == "sandbox"
+    llm_text = "\n".join(item.text for item in observation.to_llm_content)
+    assert "execution=sandbox" in llm_text
+    assert workspace.downloads == 0
+    # Validation and the report run inside the sandbox, on the whole file.
+    assert observation.record_count == 512
+    assert observation.report_path is not None
+    report = json.loads(Path(observation.report_path).read_text(encoding="utf-8"))
+    assert report["status"] == "succeeded"
+    assert report["validation"]["status"] == "passed"
+
+
+def test_df_run_pipeline_sandbox_reads_legacy_storage_without_downloading(
+    monkeypatch,
+    sandbox_workspace,
+    truncated_downloads,
+) -> None:
+    """Legacy arguments address Storage directly inside the sandbox too."""
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    workspace = truncated_downloads(sandbox_workspace, limit=1024)
+    conversation = _sandbox_conversation(workspace)
+    pipeline_dir = sandbox_workspace.workspace_dir / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    _write_legacy_copy_pipeline(pipeline_dir / "pipeline.py")
+    datasets = sandbox_workspace.storage_dir / "datasets"
+    datasets.mkdir()
+    (datasets / "input.jsonl").write_text("{'a': 1}\n" * 512, encoding="utf-8")
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "storage/datasets/input.jsonl",
+                "public_data/data-preparation/filtered.sample.jsonl",
+            ],
+            model_profile="none",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.exit_code == 0
+    assert workspace.downloads == 0
+    assert (pipeline_dir / "filtered.sample.jsonl").read_bytes() == (
+        datasets / "input.jsonl"
+    ).read_bytes()
+
+
+def test_df_run_pipeline_sandbox_reads_storage_input(
+    tmp_path: Path,
+    monkeypatch,
+    sandbox_workspace,
+) -> None:
+    """Sandbox runs read ``storage/`` in place and write straight into the workspace."""
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    conversation = _sandbox_conversation(sandbox_workspace)
+    workspace_dir = sandbox_workspace.workspace_dir
+    storage_dir = sandbox_workspace.storage_dir
+    pipeline_dir = workspace_dir / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    _write_legacy_copy_pipeline(pipeline_dir / "pipeline.py")
+    (storage_dir / "datasets").mkdir()
+    (storage_dir / "datasets" / "input.jsonl").write_text(
+        "{'a': 1}\n", encoding="utf-8"
+    )
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "storage/datasets/input.jsonl",
+                "public_data/data-preparation/filtered.sample.jsonl",
+            ],
+            model_profile="none",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.exit_code == 0
+    assert observation.output_path == (
+        "public_data/data-preparation/filtered.sample.jsonl"
+    )
+    # The observation names the execution location, so a failed run stays
+    # debuggable without implying anything was copied to the agent host.
+    assert f"execution=sandbox workspace={workspace_dir}" in observation.text
+    assert "staged_" not in observation.text
+    published = pipeline_dir / "filtered.sample.jsonl"
+    assert published.read_text(encoding="utf-8") == "{'a': 1}\n"
+    # Nothing is materialized into the workspace or the agent host.
+    assert not (workspace_dir / "storage").exists()
+    assert not list(tmp_path.glob("pyromind-dataflow-run-*"))
+
+
+def test_df_run_pipeline_sandbox_publishes_generated_assets(
+    monkeypatch,
+    sandbox_workspace,
+) -> None:
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    conversation = _sandbox_conversation(sandbox_workspace)
+    workspace_dir = sandbox_workspace.workspace_dir
+    pipeline_dir = workspace_dir / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    (pipeline_dir / "input.jsonl").write_text("{}\n", encoding="utf-8")
+    (pipeline_dir / "pipeline.py").write_text(
+        "\n".join(
+            [
+                "import json, pathlib, sys",
+                "output = pathlib.Path(sys.argv[2])",
+                "assets = output.parent / 'assets'",
+                "assets.mkdir(parents=True, exist_ok=True)",
+                "(assets / 'preview.png').write_bytes(b'png')",
+                "output.write_text(json.dumps({",
+                "    'id': '1',",
+                "    'system_prompt': 'system',",
+                "    'user_prompt': 'q',",
+                "    'gt': 'a',",
+                "}) + '\\n', encoding='utf-8')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/result.jsonl",
+            ],
+            output_schema="text",
+            model_profile="none",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    assert (
+        workspace_dir / "public_data" / "data-preparation" / "assets" / "preview.png"
+    ).is_file()
+
+
+def test_df_run_pipeline_sandbox_rejects_storage_output(
+    monkeypatch,
+    sandbox_workspace,
+) -> None:
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    conversation = _sandbox_conversation(sandbox_workspace)
+    workspace_dir = sandbox_workspace.workspace_dir
+    storage_dir = sandbox_workspace.storage_dir
+    pipeline_dir = workspace_dir / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    pipeline = pipeline_dir / "pipeline.py"
+    pipeline.write_text(
+        "\n".join(
+            [
+                "import sys",
+                "with open(sys.argv[2], 'w', encoding='utf-8') as dst:",
+                "    dst.write('{}\\n')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (storage_dir / "datasets").mkdir()
+    (storage_dir / "datasets" / "input.jsonl").write_text("{}\n", encoding="utf-8")
+
+    observation = DfRunPipelineExecutor()(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=["storage/datasets/input.jsonl", "storage/output.jsonl"],
+            output_schema="text",
+            model_profile="none",
+        ),
+        conversation,
+    )
+
+    assert observation.is_error
+    assert observation.error_code == "workspace_output_not_writable"
+    assert not (storage_dir / "output.jsonl").exists()
+
+
+class _BlockingSandboxWorkspace:
+    """Sandbox double that holds the sample runner open until it is released."""
+
+    is_remote = True
+
+    def __init__(self, workspace) -> None:
+        self._workspace = workspace
+        self.workspace_dir = workspace.workspace_dir
+        self.working_dir = workspace.working_dir
+        self.storage_path = workspace.storage_path
+        self.commands: list[str] = []
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def execute_command(
+        self,
+        command: str,
+        cwd: str | Path | None = None,
+        timeout: float = 30.0,
+    ):
+        self.commands.append(command)
+        if "sandbox_sample.py" in command:
+            self.started.set()
+            self.release.wait(timeout=30)
+        return self._workspace.execute_command(command, cwd=cwd, timeout=timeout)
+
+    def file_upload(self, source_path: str | Path, destination_path: str | Path):
+        return self._workspace.file_upload(source_path, destination_path)
+
+    def file_download(self, source_path: str | Path, destination_path: str | Path):
+        return self._workspace.file_download(source_path, destination_path)
+
+
+def test_df_run_pipeline_sandbox_interrupt_cancels_remote_run(
+    monkeypatch,
+    sandbox_workspace,
+) -> None:
+    """Interrupting a sandbox sample cancels the run inside the sandbox."""
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    workspace = _BlockingSandboxWorkspace(sandbox_workspace)
+    conversation = _sandbox_conversation(workspace)
+    pipeline_dir = sandbox_workspace.workspace_dir / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    _write_legacy_copy_pipeline(pipeline_dir / "pipeline.py")
+    (pipeline_dir / "input.jsonl").write_text("{}\n", encoding="utf-8")
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+    executor = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))
+
+    worker = threading.Thread(
+        target=executor,
+        args=(
+            DfRunPipelineAction(
+                pipeline_path="public_data/data-preparation/pipeline.py",
+                args=[
+                    "public_data/data-preparation/input.jsonl",
+                    "public_data/data-preparation/filtered.sample.jsonl",
+                ],
+                model_profile="none",
+            ),
+            conversation,
+        ),
+        daemon=True,
+    )
+    worker.start()
+    assert workspace.started.wait(timeout=30)
+
+    executor.interrupt()
+    workspace.release.set()
+    worker.join(timeout=60)
+
+    assert not worker.is_alive()
+    assert any(command.startswith("pkill -f") for command in workspace.commands)
+
+
+class _WrappingTerminalWorkspace:
+    """Sandbox double whose terminal stream re-wraps long output lines.
+
+    A terminal that renders at a fixed width turns one long line into many, so
+    this double keeps the sample envelope readable only if the transport does
+    not depend on line breaks.
+    """
+
+    is_remote = True
+
+    def __init__(self, workspace, *, width: int = 80) -> None:
+        self._workspace = workspace
+        self._width = width
+        self.width = width
+        self.last_stdout = ""
+        self.workspace_dir = workspace.workspace_dir
+        self.working_dir = workspace.working_dir
+        self.storage_path = workspace.storage_path
+
+    def execute_command(
+        self,
+        command: str,
+        cwd: str | Path | None = None,
+        timeout: float = 30.0,
+    ) -> CommandResult:
+        result = self._workspace.execute_command(command, cwd=cwd, timeout=timeout)
+        if "sandbox_sample.py" not in command:
+            return result
+        wrapped = "\r\n".join(
+            line[index : index + self._width]
+            for line in (result.stdout or "").splitlines()
+            for index in range(0, max(len(line), 1), self._width)
+        )
+        stdout = f"{command}\r\n{wrapped}\r\n__OH_EXIT__test:{result.exit_code}\r\n"
+        self.last_stdout = stdout
+        return CommandResult(
+            command=command,
+            exit_code=result.exit_code,
+            stdout=stdout,
+            stderr="",
+            timeout_occurred=False,
+        )
+
+    def file_upload(self, source_path: str | Path, destination_path: str | Path):
+        return self._workspace.file_upload(source_path, destination_path)
+
+    def file_download(self, source_path: str | Path, destination_path: str | Path):
+        return self._workspace.file_download(source_path, destination_path)
+
+
+def test_df_run_pipeline_sandbox_survives_a_wrapping_terminal(
+    monkeypatch,
+    sandbox_workspace,
+) -> None:
+    """A re-wrapping terminal still delivers the sample result envelope."""
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    workspace = _WrappingTerminalWorkspace(sandbox_workspace)
+    conversation = _sandbox_conversation(workspace)
+    pipeline_dir = sandbox_workspace.workspace_dir / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    (pipeline_dir / "pipeline.py").write_text(
+        "\n".join(
+            [
+                "import json, sys",
+                "with open(sys.argv[2], 'w', encoding='utf-8') as dst:",
+                "    dst.write(json.dumps({",
+                "        'id': 'text-1',",
+                "        'system_prompt': 'system',",
+                "        'user_prompt': 'question',",
+                "        'gt': 'answer',",
+                "    }) + '\\n')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (pipeline_dir / "input.jsonl").write_text("{}\n", encoding="utf-8")
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/processed.jsonl",
+            ],
+            output_schema="text",
+            model_profile="none",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.exit_code == 0
+    assert observation.record_count == 1
+    assert observation.sample_records[0]["id"] == "text-1"
+    # The envelope really did arrive split across lines.
+    body = workspace.last_stdout.split("__PM_DF_BEGIN__")[1].split("__PM_DF_END__")[0]
+    assert all(len(line) <= workspace.width for line in body.splitlines())
+
+
+def _run_vision_sandbox_sample(
+    monkeypatch,
+    sandbox_workspace,
+    pipeline_body: list[str],
+    *,
+    manifest_in_storage: bool = False,
+    image_count: int = 1,
+    payload_bytes: int = 0,
+) -> tuple[DfRunPipelineObservation, Path]:
+    """Run one managed image pipeline against a sandbox-backed workspace.
+
+    ``manifest_in_storage`` addresses ``args[0]`` as a Storage manifest, whose
+    records name images the run resolves inside the Storage mount.
+    """
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.definition.build_dataflow_env",
+        lambda conversation, model_profile: {
+            "DF_API_KEY": "secret",
+            "DF_API_URL": "http://example.test/v1/chat/completions",
+            "DF_API_BASE_URL": "http://example.test/v1",
+            "DF_MODEL_NAME": "vision-model",
+        },
+    )
+    monkeypatch.setattr(
+        DfRunPipelineExecutor,
+        "_preflight_managed_image_pipeline",
+        lambda self, pipeline: None,
+    )
+    conversation = _sandbox_conversation(sandbox_workspace)
+    workspace_dir = sandbox_workspace.workspace_dir
+    if manifest_in_storage:
+        sample_dir = sandbox_workspace.storage_dir / "datasets" / "prelabel_in"
+        pipeline_path = "public_data/data-preparation/pipeline.py"
+        manifest_arg = "storage/datasets/prelabel_in/sample_manifest.jsonl"
+    else:
+        sample_dir = workspace_dir / "public_data" / "data-preparation" / "prelabel_in"
+        pipeline_path = "public_data/data-preparation/prelabel_in/pipeline.py"
+        manifest_arg = "public_data/data-preparation/prelabel_in/sample_manifest.jsonl"
+    (sample_dir / "1-3-0804F" / "118").mkdir(parents=True)
+    (sample_dir / "1-3-0804F" / "118" / "B0.bmp").write_bytes(
+        os.urandom(payload_bytes) if payload_bytes else b"bmp"
+    )
+    (sample_dir / "unused.bmp").write_bytes(b"unused")
+    records = ['{"id": "1-3-0804F/118/B0", "images": ["1-3-0804F/118/B0.bmp"]}']
+    for index in range(1, image_count):
+        name = f"extra{index}.bmp"
+        (sample_dir / name).write_bytes(
+            os.urandom(payload_bytes) if payload_bytes else b"bmp"
+        )
+        records.append(f'{{"id": "extra-{index}", "images": ["{name}"]}}')
+    (sample_dir / "sample_manifest.jsonl").write_text(
+        "\n".join(records) + "\n",
+        encoding="utf-8",
+    )
+    pipeline_file = workspace_dir / pipeline_path
+    pipeline_file.parent.mkdir(parents=True, exist_ok=True)
+    pipeline_file.write_text(
+        "\n".join(pipeline_body),
+        encoding="utf-8",
+    )
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path=pipeline_path,
+            args=[
+                manifest_arg,
+                "public_data/data-preparation/prelabel.jsonl",
+            ],
+            output_schema="structured",
+            model_profile="vision",
+        ),
+        conversation,
+    )
+    return observation, workspace_dir
+
+
+def test_df_run_pipeline_sandbox_vision_reads_workspace_images_in_place(
+    monkeypatch,
+    sandbox_workspace,
+) -> None:
+    """A vision manifest resolves the image tree stored beside it."""
+    observation, workspace_dir = _run_vision_sandbox_sample(
+        monkeypatch,
+        sandbox_workspace,
+        [
+            "import sys",
+            "from pathlib import Path",
+            "manifest = Path(sys.argv[1])",
+            "image = manifest.parent / '1-3-0804F' / '118' / 'B0.bmp'",
+            "if not image.is_file():",
+            "    raise ValueError('record 0: missing image 1-3-0804F/118/B0.bmp')",
+            "Path(sys.argv[2]).write_text('{}\\n', encoding='utf-8')",
+        ],
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.exit_code == 0
+    published = workspace_dir / "public_data" / "data-preparation" / "prelabel.jsonl"
+    assert published.read_text(encoding="utf-8") == "{}\n"
+
+
+def test_df_run_pipeline_sandbox_vision_reads_storage_manifest_in_place(
+    monkeypatch,
+    sandbox_workspace,
+) -> None:
+    """A Storage manifest resolves its images inside the Storage mount."""
+    observation, workspace_dir = _run_vision_sandbox_sample(
+        monkeypatch,
+        sandbox_workspace,
+        [
+            "import json, sys",
+            "from pathlib import Path",
+            "manifest = Path(sys.argv[1])",
+            "record = json.loads(manifest.read_text(encoding='utf-8').splitlines()[0])",
+            "image = manifest.parent / record['images'][0]",
+            "if not image.is_file():",
+            "    raise ValueError(f'record 0: missing image {image}')",
+            "Path(sys.argv[2]).write_text('{}\\n', encoding='utf-8')",
+        ],
+        manifest_in_storage=True,
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.exit_code == 0
+    assert "execution=sandbox" in observation.text
+    assert "staged_" not in observation.text
+    published = workspace_dir / "public_data" / "data-preparation" / "prelabel.jsonl"
+    assert published.read_text(encoding="utf-8") == "{}\n"
+
+
+def test_df_run_pipeline_sandbox_vision_reads_storage_images_without_transfers(
+    monkeypatch,
+    sandbox_workspace,
+    truncated_downloads,
+) -> None:
+    """A manifest whose images are large still reaches the run without transfers."""
+    workspace = truncated_downloads(sandbox_workspace, limit=12000)
+
+    observation, _ = _run_vision_sandbox_sample(
+        monkeypatch,
+        workspace,
+        [
+            "import json, sys",
+            "from pathlib import Path",
+            "manifest = Path(sys.argv[1])",
+            "records = [",
+            "    json.loads(line)",
+            "    for line in manifest.read_text(encoding='utf-8').splitlines()",
+            "    if line.strip()",
+            "]",
+            "missing = [",
+            "    record['images'][0]",
+            "    for record in records",
+            "    if not (manifest.parent / record['images'][0]).is_file()",
+            "]",
+            "if len(records) != 8 or missing:",
+            "    raise ValueError(f'records={len(records)} missing={missing}')",
+            "Path(sys.argv[2]).write_text('{}\\n', encoding='utf-8')",
+        ],
+        manifest_in_storage=True,
+        image_count=8,
+        payload_bytes=4096,
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.exit_code == 0
+    assert workspace.downloads == 0
+
+
+def test_df_run_pipeline_sandbox_vision_missing_image_hint(
+    monkeypatch,
+    sandbox_workspace,
+) -> None:
+    """A sandbox file input that cannot resolve its images explains the fix."""
+    observation, _ = _run_vision_sandbox_sample(
+        monkeypatch,
+        sandbox_workspace,
+        [
+            "import json, os, sys",
+            "from pathlib import Path",
+            "payload = {",
+            "    'status': 'failed',",
+            "    'failure': {",
+            "        'stage': 'input_validation',",
+            "        'error': 'record 0: missing image 1-3-0804F/118/B0.bmp',",
+            "    },",
+            "}",
+            "log_dir = Path(os.environ['DF_LOG_DIR'])",
+            "log_dir.mkdir(parents=True, exist_ok=True)",
+            "(log_dir / 'failure.json').write_text(",
+            "    json.dumps(payload), encoding='utf-8'",
+            ")",
+            "sys.exit(1)",
+        ],
+    )
+
+    assert observation.is_error
+    assert observation.error_message is not None
+    assert "workspace directory" in observation.error_message
+    assert "manifest file" in observation.error_message

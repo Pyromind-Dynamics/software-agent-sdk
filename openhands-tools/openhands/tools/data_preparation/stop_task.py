@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, Self
 
 import httpx
 from pydantic import Field
@@ -36,6 +36,7 @@ from openhands.tools.pyromind_dataset.definition import (
     _resolve_conversation_headers,
     _resolve_secret_headers,
 )
+from openhands.tools.utils.conversation_dirs import conversation_state_dir
 
 
 if TYPE_CHECKING:
@@ -230,9 +231,10 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
             return DataPreparationTaskStore(self._task_store_dir)
         if conversation is None:
             return None
-        workspace = cast(Any, conversation).workspace
-        conversations_dir = Path(workspace.working_dir).resolve().parent
-        return DataPreparationTaskStore(conversations_dir / TASK_ASSOCIATION_DIRNAME)
+        state_dir = conversation_state_dir(conversation, TASK_ASSOCIATION_DIRNAME)
+        if state_dir is None:
+            return None
+        return DataPreparationTaskStore(state_dir)
 
     # -- HTTP ---------------------------------------------------------------
 

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import shutil
 import time
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -77,6 +78,7 @@ class _ActiveConversation:
     ready: asyncio.Event
     context: RequestContext
     last_access: float = field(default_factory=time.monotonic)
+    inflight: int = 0
 
     def touch(self) -> None:
         self.last_access = time.monotonic()
@@ -90,7 +92,9 @@ class ConversationRuntime:
         *,
         default_harness_id: str = "openhands",
         external_tasks: ExternalTaskRegistry | None = None,
-        idle_eviction_seconds: int = 1800,
+        idle_eviction_seconds: int = 300,
+        release_grace_seconds: int = 300,
+        max_active_conversations: int = 0,
         resource_limits: ResourceLimits | None = None,
     ) -> None:
         self.conversation_root = Path(conversation_root)
@@ -106,7 +110,10 @@ class ConversationRuntime:
         self._external_tasks = external_tasks
         self._projector = ProductEventProjector()
         self._idle_eviction_seconds = max(0, int(idle_eviction_seconds))
+        self._release_grace_seconds = max(0, int(release_grace_seconds))
+        self._max_active_conversations = max(0, int(max_active_conversations))
         self._evictor: asyncio.Task[None] | None = None
+        self._release_timers: dict[str, asyncio.Task[None]] = {}
         self._active: dict[str, _ActiveConversation] = {}
         self._activation_locks: dict[str, asyncio.Lock] = {}
         self._subscribers: dict[str, set[asyncio.Queue[ProductEvent]]] = {}
@@ -121,6 +128,7 @@ class ConversationRuntime:
         total_started_at = time.perf_counter()
         adapter = self._adapter(self.default_harness_id)
         adapter_started_at = time.perf_counter()
+        await self._make_room()
         if self._resource_limits is not None:
             spec = spec.model_copy(update={"resource_limits": self._resource_limits})
         handle = await adapter.create_session(spec, context)
@@ -175,6 +183,10 @@ class ConversationRuntime:
             conversation_id=handle.session_id,
             harness_id=handle.harness_id,
         )
+        if not spec.initial_message:
+            # Nothing will run for a conversation created without a prompt, so no
+            # ``run.finished`` would ever schedule its release.
+            self._schedule_release(handle.session_id)
         return snapshot
 
     async def get_snapshot(
@@ -182,8 +194,7 @@ class ConversationRuntime:
         conversation_id: str,
         context: RequestContext,
     ) -> ConversationSnapshot:
-        store = await self._ensure_active(conversation_id, context)
-        store.authorize(context.user_id)
+        store = await self._read_store(conversation_id, context)
         return store.load_snapshot()
 
     async def submit_command(
@@ -197,51 +208,51 @@ class ConversationRuntime:
         receipt, claimed = store.claim_command(command)
         if not claimed:
             return receipt
-        active = self._active[conversation_id]
-        active.context = context
-        if isinstance(command, RollbackWorkflowCommand):
-            return await self._rollback_workflow(
-                active, store, command, receipt, context
-            )
-        first_command = (
-            isinstance(command, UserMessageCommand)
-            and conversation_id in self._first_command_pending
-        )
-        command_started_at = time.perf_counter()
-        if isinstance(command, UserMessageCommand):
-            self._first_delta_started_at[(conversation_id, command.command_id)] = (
-                command_started_at
-            )
-        try:
-            response = await active.adapter.send(active.handle, command, context)
-        except Exception as exc:
-            if isinstance(command, UserMessageCommand):
-                self._first_delta_started_at.pop(
-                    (conversation_id, command.command_id), None
+        async with self._use(conversation_id) as active:
+            active.context = context
+            if isinstance(command, RollbackWorkflowCommand):
+                return await self._rollback_workflow(
+                    active, store, command, receipt, context
                 )
-            failed = receipt.model_copy(
-                update={
-                    "status": "failed",
-                    "response": {
-                        "error": type(exc).__name__,
-                        "message": str(exc),
-                    },
-                }
+            first_command = (
+                isinstance(command, UserMessageCommand)
+                and conversation_id in self._first_command_pending
             )
-            store.complete_command(failed)
-            raise
-        if first_command:
-            self._first_command_pending.discard(conversation_id)
-            self._log_timing(
-                "first_command.accept_ms",
-                command_started_at,
-                conversation_id=conversation_id,
-                harness_id=active.handle.harness_id,
+            command_started_at = time.perf_counter()
+            if isinstance(command, UserMessageCommand):
+                self._first_delta_started_at[(conversation_id, command.command_id)] = (
+                    command_started_at
+                )
+            try:
+                response = await active.adapter.send(active.handle, command, context)
+            except Exception as exc:
+                if isinstance(command, UserMessageCommand):
+                    self._first_delta_started_at.pop(
+                        (conversation_id, command.command_id), None
+                    )
+                failed = receipt.model_copy(
+                    update={
+                        "status": "failed",
+                        "response": {
+                            "error": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    }
+                )
+                store.complete_command(failed)
+                raise
+            if first_command:
+                self._first_command_pending.discard(conversation_id)
+                self._log_timing(
+                    "first_command.accept_ms",
+                    command_started_at,
+                    conversation_id=conversation_id,
+                    harness_id=active.handle.harness_id,
+                )
+            completed = receipt.model_copy(
+                update={"status": "completed", "response": response}
             )
-        completed = receipt.model_copy(
-            update={"status": "completed", "response": response}
-        )
-        return store.complete_command(completed)
+            return store.complete_command(completed)
 
     async def fork_conversation(
         self,
@@ -273,9 +284,10 @@ class ConversationRuntime:
         )
         target_handle: SessionHandle | None = None
         try:
-            target_handle = await source_active.adapter.fork(
-                source_active.handle, spec, checkpoint, context
-            )
+            async with self._use(conversation_id):
+                target_handle = await source_active.adapter.fork(
+                    source_active.handle, spec, checkpoint, context
+                )
             if target_handle.session_id != target_id:
                 raise ProductRuntimeError(
                     "harness_operation_failed",
@@ -414,33 +426,34 @@ class ConversationRuntime:
             return persisted
         self._publish(persisted)
         if active is not None and terminal and normalized != "stopped":
-            try:
-                await active.adapter.notify_external_task(
-                    active.handle,
-                    _build_external_task_notification(
-                        task,
-                        status=normalized,
-                        error_summary=_controlled_error(error_summary),
-                        auto_run=auto_run,
-                    ),
-                    active.context,
-                )
-            except Exception:
-                logger.exception(
-                    "Could not notify %s for external task %s; deferring",
-                    active.handle.harness_id,
-                    task_id,
-                )
-                pending = {**notification_payload, "resume_pending": True}
-                persisted, _ = store.append(
-                    ProductEvent(
-                        event_id=f"external-task:{task_id}:{normalized}:pending",
-                        conversation_id=conversation_id,
-                        type="external_task.updated",
-                        payload=pending,
+            async with self._use(conversation_id):
+                try:
+                    await active.adapter.notify_external_task(
+                        active.handle,
+                        _build_external_task_notification(
+                            task,
+                            status=normalized,
+                            error_summary=_controlled_error(error_summary),
+                            auto_run=auto_run,
+                        ),
+                        active.context,
                     )
-                )
-                self._publish(persisted)
+                except Exception:
+                    logger.exception(
+                        "Could not notify %s for external task %s; deferring",
+                        active.handle.harness_id,
+                        task_id,
+                    )
+                    pending = {**notification_payload, "resume_pending": True}
+                    persisted, _ = store.append(
+                        ProductEvent(
+                            event_id=f"external-task:{task_id}:{normalized}:pending",
+                            conversation_id=conversation_id,
+                            type="external_task.updated",
+                            payload=pending,
+                        )
+                    )
+                    self._publish(persisted)
         return persisted
 
     def resolve_external_task_owner(self, task_id: str) -> str | None:
@@ -478,8 +491,7 @@ class ConversationRuntime:
         after_seq: int,
         context: RequestContext,
     ) -> AsyncGenerator[ProductEvent]:
-        store = await self._ensure_active(conversation_id, context)
-        store.authorize(context.user_id)
+        store = await self._read_store(conversation_id, context)
         queue: asyncio.Queue[ProductEvent] = asyncio.Queue(_SUBSCRIBER_QUEUE_MAX)
         self._subscribers.setdefault(conversation_id, set()).add(queue)
         cursor = after_seq
@@ -504,6 +516,9 @@ class ConversationRuntime:
         if self._evictor is not None:
             self._evictor.cancel()
             self._evictor = None
+        for timer in self._release_timers.values():
+            timer.cancel()
+        self._release_timers.clear()
         active = tuple(self._active.values())
         self._active.clear()
         self._first_command_pending.clear()
@@ -551,6 +566,31 @@ class ConversationRuntime:
         )
         return tuple(snapshots)
 
+    async def _read_store(
+        self,
+        conversation_id: str,
+        context: RequestContext,
+    ) -> FileProductStore:
+        """Return the store for a read without materialising a harness session.
+
+        A read is how a dormant conversation is woken for a platform task that
+        finished while nobody was watching, so it attaches only when such work
+        is waiting. Attaching on every read would undo each release: clients
+        poll snapshots and re-open event streams while a conversation sits idle.
+        """
+        store = self._store(conversation_id)
+        if conversation_id in self._active or self._has_pending_external_work(store):
+            store = await self._ensure_active(conversation_id, context)
+        store.authorize(context.user_id)
+        return store
+
+    def _has_pending_external_work(self, store: FileProductStore) -> bool:
+        try:
+            snapshot = store.load_snapshot()
+        except (OSError, ProductStoreError):
+            return False
+        return any(task.resume_pending for task in snapshot.external_tasks)
+
     async def _ensure_active(
         self,
         conversation_id: str,
@@ -567,6 +607,7 @@ class ConversationRuntime:
         async with lock:
             existing = self._active.get(conversation_id)
             if existing is not None:
+                existing.touch()
                 await existing.ready.wait()
                 await self._heal_active(existing, context)
                 return self._store(conversation_id)
@@ -581,6 +622,7 @@ class ConversationRuntime:
                 "present" if store.metadata_path.is_file() else "missing",
             )
             adapter = self._adapter(harness_id)
+            await self._make_room(conversation_id)
             handle = await adapter.attach_session(conversation_id, context)
             if handle.harness_id != harness_id:
                 await adapter.close(handle)
@@ -622,6 +664,22 @@ class ConversationRuntime:
                 "the product pump may no longer observe it",
                 active.handle.session_id,
             )
+
+    @contextlib.asynccontextmanager
+    async def _use(self, conversation_id: str) -> AsyncIterator[_ActiveConversation]:
+        """Mark a conversation as in use so release paths leave it alone.
+
+        A command that was already accepted must reach the harness even when the
+        grace period expires while it is being delivered, so the release guards
+        also clear any pending release timer for this conversation.
+        """
+        active = self._active[conversation_id]
+        self._cancel_release(conversation_id)
+        active.inflight += 1
+        try:
+            yield active
+        finally:
+            active.inflight -= 1
 
     async def _resume_pending_external_tasks(
         self, active: _ActiveConversation, store: FileProductStore
@@ -690,6 +748,8 @@ class ConversationRuntime:
                 if harness_event.type in {"workflow.modified", "run.finished"}:
                     for completed in await workflow_hook.accept(harness_event):
                         self._publish(completed)
+                    if harness_event.type == "run.finished":
+                        self._schedule_release(handle.session_id)
                     continue
                 if harness_event.type == "message.delta" and harness_event.run_id:
                     started_at = self._first_delta_started_at.pop(
@@ -789,31 +849,117 @@ class ConversationRuntime:
                 continue
             if self._subscribers.get(conversation_id):
                 continue
-            try:
-                status = self._store(conversation_id).load_snapshot().status
-            except (OSError, ProductStoreError):
+            if not self._is_releasable(active):
                 continue
-            if status not in _EVICTABLE_STATUSES:
-                continue
-            self._active.pop(conversation_id, None)
-            stale_timings = [
-                key for key in self._first_delta_started_at if key[0] == conversation_id
+            await self._release(conversation_id, reason="idle")
+
+    def _schedule_release(self, conversation_id: str) -> None:
+        """Release a conversation a short while after its run finished.
+
+        Idle eviction alone cannot bound memory for interactive traffic: the
+        runner would stay resident for the whole idle window after every turn.
+        Releasing shortly after a run finishes keeps it only for the window
+        where a follow-up message is likely.
+        """
+        if self._release_grace_seconds <= 0:
+            return
+        self._cancel_release(conversation_id)
+        self._release_timers[conversation_id] = asyncio.create_task(
+            self._release_after_grace(conversation_id, self._release_grace_seconds),
+            name=f"product-release-{conversation_id}",
+        )
+
+    async def _release_after_grace(self, conversation_id: str, grace: float) -> None:
+        try:
+            await asyncio.sleep(grace)
+            active = self._active.get(conversation_id)
+            if active is None or not self._is_releasable(active):
+                return
+            await self._release(conversation_id, reason="run_finished_grace")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Grace release failed for %s", conversation_id)
+        finally:
+            if self._release_timers.get(conversation_id) is asyncio.current_task():
+                self._release_timers.pop(conversation_id, None)
+
+    def _cancel_release(self, conversation_id: str) -> None:
+        timer = self._release_timers.pop(conversation_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _is_releasable(self, active: _ActiveConversation) -> bool:
+        """Report whether a live conversation can be torn down right now.
+
+        Every check here closes a window where releasing would break work that
+        is already under way: an in-flight command, a concurrent activation
+        holding the conversation lock, a run that has not reported its status
+        yet, or a platform task whose callback has to reach the runner.
+        """
+        if active.inflight > 0:
+            return False
+        lock = self._activation_locks.get(active.handle.session_id)
+        if lock is not None and lock.locked():
+            return False
+        try:
+            snapshot = self._store(active.handle.session_id).load_snapshot()
+        except (OSError, ProductStoreError):
+            return False
+        if snapshot.status not in _EVICTABLE_STATUSES:
+            return False
+        return not any(
+            task.status in {"pending", "running"} for task in snapshot.external_tasks
+        )
+
+    async def _make_room(self, conversation_id: str | None = None) -> None:
+        """Keep the live conversation count under the configured ceiling.
+
+        Least recently used conversations are released first. Conversations with
+        work in flight are never released, so a saturated server rejects the new
+        conversation instead of interrupting someone else's run.
+        """
+        if self._max_active_conversations <= 0:
+            return
+        while len(self._active) >= self._max_active_conversations:
+            candidates = [
+                active
+                for active_id, active in self._active.items()
+                if active_id != conversation_id and self._is_releasable(active)
             ]
-            for key in stale_timings:
-                self._first_delta_started_at.pop(key, None)
-            logger.info(
-                "evicting idle conversation %s (harness=%s)",
-                conversation_id,
-                active.handle.harness_id,
-            )
-            active.task.cancel()
-            try:
-                await active.adapter.close(active.handle)
-            except Exception:
-                logger.exception(
-                    "Failed to close adapter for evicted conversation %s",
-                    conversation_id,
+            if not candidates:
+                raise ProductRuntimeError(
+                    "capacity_exceeded",
+                    "Agent server is at capacity and every active conversation "
+                    "is busy; retry shortly.",
                 )
+            oldest = min(candidates, key=lambda active: active.last_access)
+            await self._release(oldest.handle.session_id, reason="capacity")
+
+    async def _release(self, conversation_id: str, *, reason: str) -> None:
+        active = self._active.pop(conversation_id, None)
+        if active is None:
+            return
+        self._cancel_release(conversation_id)
+        for key in [
+            key for key in self._first_delta_started_at if key[0] == conversation_id
+        ]:
+            self._first_delta_started_at.pop(key, None)
+        logger.info(
+            "releasing conversation %s reason=%s harness=%s",
+            conversation_id,
+            reason,
+            active.handle.harness_id,
+        )
+        active.task.cancel()
+        try:
+            await active.adapter.close(active.handle)
+        except Exception:
+            logger.exception(
+                "Failed to close adapter for released conversation %s",
+                conversation_id,
+            )
+        await asyncio.gather(active.task, return_exceptions=True)
 
     def _store(self, conversation_id: str) -> FileProductStore:
         if not conversation_id or "/" in conversation_id or "\\" in conversation_id:
@@ -1034,8 +1180,9 @@ def _build_external_task_notification(
     else:
         instruction = (
             f"The Pyromind {task_label} task is {status}. Follow the matching "
-            "skill's callback contract. Inspect Storage output only through "
-            "preview_dataset; do not assume callback payload contains data."
+            "skill's callback contract. Inspect the reported output_dir under "
+            "storage/ with the file tools; do not assume the callback payload "
+            "contains data."
         )
     if error_summary:
         instruction += f" Controlled error summary: {error_summary}"

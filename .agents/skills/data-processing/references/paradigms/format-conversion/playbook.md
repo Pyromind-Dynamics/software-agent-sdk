@@ -10,12 +10,12 @@
 
 所有读取数据、执行清洗、格式校验和查看产物的动作都必须发生在 Pyromind 平台。
 本地工作区只用于编写或修改 `clean_script.py`，不得下载数据或本地运行 cleaner、
-validator。平台产物只能用 `preview_dataset` 查看。
+validator。用户 Storage 挂载为 `storage/`，可直接查看源数据和平台产物。
 
 ## 工作流
 
-1. 用 `preview_dataset` 查看用户给出的 Storage 路径。目录包含多个候选文件时，先让
-   用户确认输入；确认字段语义、对话分组、过滤规则、system prompt 和有损转换。
+1. 查看用户给出的 Storage 路径：直接读 `storage/<path>`。目录包含多个候选文件时，
+   先让用户确认输入；确认字段语义、对话分组、过滤规则、system prompt 和有损转换。
 2. 只使用 [target-formats.md](target-formats.md) 定义的格式。完整的
    prompt/chosen/rejected 自动按 DPO 清洗，不丢弃任一分支；其他数据输出 messages。
 3. [cleaning-utils-api.md](cleaning-utils-api.md) 是正常清洗任务中唯一的
@@ -25,7 +25,8 @@ validator。平台产物只能用 `preview_dataset` 查看。
 4. 用 `upload_file_to_pyromind` 上传脚本，再调用 `run_dataset_cleaning`，传
    `script_path`、`input_path` 和 `limit=3`。不要自行传 `output_dir`。
 5. 收到通用 callback 后，从最近一次工具 Observation 取得 `run_id` 和
-   `output_dir`，用 `preview_dataset` 查看 `report.json` 和 `output.jsonl`。
+   `output_dir`，直接读取 `storage/<output_dir>/report.json` 和
+   `output.jsonl`。
    `report.json` 包含格式校验、统计、错误样本和 checkpoint。格式失败或存在系统性
    清洗错误时修改脚本并创建新的试跑，不恢复错误 run。失败且没有报告时按启动失败
    处理，不要在本地解码 callback 的不透明 `error_log`。

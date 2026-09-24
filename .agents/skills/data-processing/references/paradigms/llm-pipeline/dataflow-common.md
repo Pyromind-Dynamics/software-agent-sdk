@@ -58,8 +58,8 @@ pipeline 必须把无响应/解析失败的记录写入 `failures.jsonl`（`reas
 
 ## 资源与版本
 
-- 本地和 Pyromind 都使用 `open-dataflow==1.0.10`。
-- Text2SQL 算子在 Python 3.13 存在上游 `re.template` 兼容问题，本地 Sample 使用
-  Python 3.10 的 `DATAFLOW_PYTHON`。
+- 沙箱小样和 Pyromind 都使用 `open-dataflow==1.0.10`。
+- Text2SQL 算子在 Python 3.13 存在上游 `re.template` 兼容问题，这类 Pipeline 需要
+  用 `PYROMIND_SANDBOX_DATAFLOW_PYTHON` 指向沙箱内 Python 3.10 的解释器。
 - 只使用 API Chat/Vision 和 CPU 算子；需要 Embedding、CUDA、外部服务或模型下载的
   算子不进入首批链路。

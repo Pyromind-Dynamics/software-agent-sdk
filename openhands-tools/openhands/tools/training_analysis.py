@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Sequence
+from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
@@ -22,6 +23,12 @@ from openhands.sdk.tool import (
     ToolDefinition,
     ToolExecutor,
     register_tool,
+)
+from openhands.tools.utils.workspace_staging import (
+    WorkspaceStagingError,
+    is_remote_workspace,
+    publish_workspace_path,
+    staged_remote_dir,
 )
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
@@ -105,9 +112,7 @@ def _redact_value(value: Any, payload: Any, key: str = "", depth: int = 0) -> An
             for name, child in list(value.items())[:200]
         }
     if isinstance(value, list):
-        return [
-            _redact_value(child, payload, key, depth + 1) for child in value[:1000]
-        ]
+        return [_redact_value(child, payload, key, depth + 1) for child in value[:1000]]
     if isinstance(value, str):
         return _redact_text(value, payload)[:100_000]
     return value
@@ -141,8 +146,7 @@ class TrainingAnalysisAction(Action):
     output_path: str | None = Field(
         default=None,
         description=(
-            "Report-only workspace-relative path under "
-            "public_data/training-analysis/."
+            "Report-only workspace-relative path under public_data/training-analysis/."
         ),
     )
 
@@ -213,9 +217,30 @@ class TrainingAnalysisExecutor(
                 "missing_context",
                 "training_analysis requires a conversation",
             )
+        workspace = cast(Any, conversation).workspace
+        with ExitStack() as stack:
+            host_root = _host_analysis_root(workspace, stack)
+            observation = self._analyze(action, conversation, host_root)
+            try:
+                _publish_analysis_report(workspace, host_root, observation)
+            except WorkspaceStagingError as exc:
+                return self._error(
+                    action.operation,
+                    "workspace_publish",
+                    "training_report_publish_failed",
+                    str(exc),
+                )
+            return observation
+
+    def _analyze(
+        self,
+        action: TrainingAnalysisAction,
+        conversation: BaseConversation,
+        host_root: Path,
+    ) -> TrainingAnalysisObservation:
         payload: dict[str, Any]
         try:
-            payload = self._payload(action, conversation)
+            payload = self._payload(action, conversation, host_root)
         except ValueError as exc:
             message = str(exc)
             if "required secret header" in message:
@@ -247,7 +272,7 @@ class TrainingAnalysisExecutor(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                cwd=str(cast(Any, conversation).workspace.working_dir),
+                cwd=str(host_root),
                 env=_worker_environment(),
                 start_new_session=True,
             )
@@ -386,10 +411,12 @@ class TrainingAnalysisExecutor(
         self.interrupt()
 
     def _payload(
-        self, action: TrainingAnalysisAction, conversation: BaseConversation
+        self,
+        action: TrainingAnalysisAction,
+        conversation: BaseConversation,
+        host_root: Path,
     ) -> dict[str, Any]:
-        workspace = Path(cast(Any, conversation).workspace.working_dir).resolve()
-        output_path = self._output_path(action, workspace)
+        output_path = self._output_path(action, host_root)
         state = cast("ConversationState", conversation.state)
         headers = _safe_headers(self.headers)
         raw_headers = (getattr(state, "agent_state", None) or {}).get(
@@ -416,7 +443,7 @@ class TrainingAnalysisExecutor(
             "keys": action.keys,
             "output_path": str(output_path) if output_path else None,
             "output_relative": (
-                output_path.relative_to(workspace).as_posix() if output_path else None
+                output_path.relative_to(host_root).as_posix() if output_path else None
             ),
             "api_base": self.api_base,
             "headers": headers,
@@ -535,6 +562,35 @@ class TrainingAnalysisTool(
 
 
 register_tool(TrainingAnalysisTool.name, TrainingAnalysisTool)
+
+
+def _host_analysis_root(workspace: Any, stack: ExitStack) -> Path:
+    """Host directory the training worker runs in.
+
+    Local workspaces run in place. A remote (sandbox) workspace has no host
+    filesystem, so the worker runs in a staging directory that mirrors the
+    workspace and its report is published back afterwards.
+    """
+    if not is_remote_workspace(workspace):
+        return Path(workspace.working_dir).resolve()
+    return stack.enter_context(staged_remote_dir())
+
+
+def _publish_analysis_report(
+    workspace: Any,
+    host_root: Path,
+    observation: TrainingAnalysisObservation,
+) -> None:
+    """Copy a report the worker wrote into staging back into the workspace."""
+    if observation.is_error or not is_remote_workspace(workspace):
+        return
+    relative = observation.report_path
+    if not isinstance(relative, str) or not relative:
+        return
+    report = host_root / relative
+    if not report.is_file():
+        return
+    publish_workspace_path(workspace, report, relative)
 
 
 def _worker_environment() -> dict[str, str]:

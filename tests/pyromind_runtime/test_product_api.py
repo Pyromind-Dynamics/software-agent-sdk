@@ -106,6 +106,43 @@ async def test_http_create_list_snapshot_and_command(tmp_path) -> None:
     await runtime.close()
 
 
+async def test_create_conversation_reports_capacity_exceeded_as_429(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, max_active_conversations=1)
+    transport = httpx.ASGITransport(app=_app(tmp_path, runtime))
+    headers = {"x-pyromind-debug-user-id": "42"}
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers=headers
+    ) as client:
+        created = await client.post(
+            "/api/v2/pyromind/conversations", json={"llm": {"model": "test-model"}}
+        )
+        assert created.status_code == 201
+        runtime.register_external_task(
+            created.json()["conversation_id"],
+            {
+                "task_id": "task-1",
+                "kind": "data_cleaning",
+                "run_id": "run-1",
+                "status": "running",
+                "output_dir": "/outputs/run-1",
+                "submitted_at": "2026-09-01T00:00:00+00:00",
+                "updated_at": "2026-09-01T00:00:00+00:00",
+                "resume_pending": False,
+            },
+        )
+
+        rejected = await client.post(
+            "/api/v2/pyromind/conversations", json={"llm": {"model": "test-model"}}
+        )
+
+    assert rejected.status_code == 429
+    assert rejected.json()["detail"]["code"] == "capacity_exceeded"
+    await runtime.close()
+
+
 async def test_sse_uses_persisted_sequence_as_event_id(tmp_path) -> None:
     conversations = tmp_path / "conversations"
     conversations.mkdir()

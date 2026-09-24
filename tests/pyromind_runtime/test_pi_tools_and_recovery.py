@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, cast
@@ -28,6 +27,7 @@ from harness_adapter.pi_adapter.business_tools import (
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.runner import PiRunnerExit, PlannedPiRunnerExitReason
+from harness_adapter.pi_adapter.sandbox_runtime import DEFAULT_MOUNT_PATH
 from pydantic import BaseModel, ValidationError
 from pyromind_runtime.domain.commands import UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
@@ -42,6 +42,7 @@ from pyromind_runtime.ports.harness import (
 )
 
 from openhands.agent_server.pyromind_router import PyromindLLMConfig
+from openhands.sdk.workspace.local import LocalWorkspace
 
 
 class _LifecycleFakeRunner:
@@ -99,7 +100,7 @@ async def test_validation_reads_conversation_file_and_forwards_request_context(
 
     monkeypatch.setattr(httpx, "post", fake_post)
     result = await execute_validation_tool(
-        tmp_path,
+        LocalWorkspace(working_dir=tmp_path),
         {},
         RequestContext(
             user_id="42",
@@ -130,7 +131,7 @@ async def test_validation_projects_401_without_retry(tmp_path, monkeypatch) -> N
 
     monkeypatch.setattr(httpx, "post", fake_post)
     result = await execute_validation_tool(
-        tmp_path,
+        LocalWorkspace(working_dir=tmp_path),
         {"dsl_path": "workflow.py"},
         RequestContext(user_id="42", cookie="auth=secret"),
     )
@@ -141,7 +142,7 @@ async def test_validation_projects_401_without_retry(tmp_path, monkeypatch) -> N
 
 async def test_validation_path_errors_are_returned_as_tool_results(tmp_path) -> None:
     result = await execute_validation_tool(
-        tmp_path,
+        LocalWorkspace(working_dir=tmp_path),
         {"dsl_path": "../workflow.py"},
         RequestContext(user_id="42"),
     )
@@ -156,10 +157,14 @@ def test_terminal_only_confirms_high_risk_commands() -> None:
     assert policy.requires_confirmation("danger", {"command": "rm -rf /tmp/example"})
 
 
-def test_pi_terminal_backend_requires_os_sandbox(monkeypatch) -> None:
+def test_pi_terminal_backend_accepts_local_and_sandbox_execution(monkeypatch) -> None:
     monkeypatch.setenv("APP_ENV", "dev")
     monkeypatch.setenv("PYROMIND_PI_TERMINAL_BACKEND", "os-sandbox")
     assert resolve_pi_terminal_backend() == "os-sandbox"
+    monkeypatch.setenv("PYROMIND_PI_TERMINAL_BACKEND", "sandbox")
+    assert resolve_pi_terminal_backend() == "sandbox"
+    with pytest.raises(RuntimeError, match="expected one of: os-sandbox, sandbox"):
+        resolve_pi_terminal_backend(terminal_backend="remote")
     with pytest.raises(RuntimeError, match="expected one of: os-sandbox"):
         resolve_pi_terminal_backend(terminal_backend="local")
 
@@ -942,8 +947,8 @@ async def test_runner_loads_sandbox_skills_and_business_tools(
         assert captured["skill_roots"] == []
         assert {item["name"] for item in captured["tools"]} == {
             "validate_workflow_dsl",
-            "preview_dataset",
             "upload_file_to_pyromind",
+            "get_storage_url",
             "run_dataset_cleaning",
             "df_run_pipeline",
             "df_submit_pipeline",
@@ -969,6 +974,46 @@ async def test_runner_loads_sandbox_skills_and_business_tools(
         assert (
             "Use update_plan for complex, multi-step work." in captured["system_prompt"]
         )
+    finally:
+        await adapter.close(handle)
+
+
+async def test_sandbox_session_prompt_steers_storage_reads(
+    tmp_path, monkeypatch
+) -> None:
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, config) -> None:
+            captured.update(config)
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="sandbox-prompt",
+            user_id="42",
+            workspace_root=str(conversations / "sandbox-prompt"),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    try:
+        prompt = captured["system_prompt"]
+        assert "df_run_pipeline" in prompt
+        assert "every dataset this session" in prompt
+        assert "Platform task state comes from the platform tools" in prompt
+        assert "Do not search the filesystem or" in prompt
+        assert "Use the absolute form when a command has changed directory." in prompt
+        assert DEFAULT_MOUNT_PATH in prompt
     finally:
         await adapter.close(handle)
 
@@ -1093,47 +1138,6 @@ def test_pi_tool_params_fall_back_to_deployment_target(tmp_path, monkeypatch) ->
 
     assert params["env"] == "pre"
     assert params["cluster"] == "us-west-1"
-
-
-async def test_preview_dataset_timeout_returns_a_tool_error(tmp_path) -> None:
-    repository = Path(pi_adapter_module.__file__).parents[3]
-    host = PyromindBusinessToolHost(
-        [
-            repository / ".agents" / "skills" / "data-processing",
-            repository / ".agents" / "skills" / "training-analysis",
-        ]
-    )
-
-    class FakeAction(BaseModel):
-        dataset_path: str
-
-    class SlowPreviewTool:
-        action_type = FakeAction
-        executor = None
-
-        def __call__(self, _action, _facade):
-            time.sleep(0.05)
-            return object()
-
-    host._factories["preview_dataset"] = cast(Any, lambda _context: SlowPreviewTool())
-    result = await host.execute(
-        "preview_dataset",
-        {"dataset_path": "datasets/large"},
-        ToolExecutionContext(
-            conversation_id="conversation-timeout",
-            workspace_root=tmp_path,
-            request_context=RequestContext(user_id="42"),
-            model_configuration={"model": "gpt-5"},
-            extra={"preview_dataset_timeout_seconds": 0.01},
-        ),
-    )
-
-    assert result["is_error"] is True
-    assert result["details"] == {
-        "error_code": "tool_timeout",
-        "timeout_seconds": 0.01,
-    }
-    assert "Narrow dataset_path" in result["content"][0]["text"]
 
 
 async def test_pi_host_synthesizes_debug_task_and_persists_only_attempt_budget(
@@ -1342,17 +1346,17 @@ def test_session_config_persists_model_api_resolution() -> None:
 
     config = _session_config(
         SessionSpec(
-            conversation_id="conversation-timeout",
+            conversation_id="conversation-extra",
             user_id="42",
-            workspace_root="/tmp/conversation-timeout",
+            workspace_root="/tmp/conversation-extra",
             model_configuration={"model": "gpt-5"},
             extra={
-                "preview_dataset_timeout_seconds": 45,
+                "training_analysis_timeout_seconds": 45,
                 "untrusted_extra": "ignored",
             },
         )
     )
-    assert config["extra"] == {"preview_dataset_timeout_seconds": 45}
+    assert config["extra"] == {"training_analysis_timeout_seconds": 45}
 
 
 def test_pyromind_llm_config_rejects_unknown_model_api() -> None:
@@ -1372,6 +1376,7 @@ async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
     session = SimpleNamespace(
         session_id="conversation-1",
         workspace_root=tmp_path / "conversation-1",
+        workspace=None,
         finished_runs=set(),
         running=True,
         files=files,
@@ -1403,6 +1408,7 @@ async def test_adapter_projects_generic_write_completion_to_workflow(tmp_path) -
     session = SimpleNamespace(
         session_id="conversation-1",
         workspace_root=workspace,
+        workspace=None,
         finished_runs=set(),
         running=True,
         files=files,
@@ -1561,6 +1567,137 @@ async def test_pi_adapter_forks_native_session_and_sanitizes_workspace(
     assert "request-secret" not in (target / "pi" / "session.json").read_text()
     await adapter.close(target_handle)
     await adapter.close(source_handle)
+
+
+def test_execution_workspace_root_falls_back_to_persisted_record(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="sandbox")
+    root = conversations / "conversation-1"
+    root.mkdir()
+    files = PiSessionFiles(root)
+    files.initialize({"session_id": "conversation-1"})
+    files.save_sandbox(
+        {
+            "sandbox_id": "sbx-1",
+            "workspace_path": "/target-workspace/.pyromind-agent/conversation-1",
+            "mount_path": "/target-workspace",
+        }
+    )
+    session = pi_adapter_module._PiSession(
+        "conversation-1",
+        root,
+        files,
+        {},
+        RequestContext(user_id="42"),
+    )
+
+    assert (
+        adapter._execution_workspace_root(session)
+        == "/target-workspace/.pyromind-agent/conversation-1"
+    )
+
+
+async def test_sandbox_fork_marks_pending_when_source_never_materialized(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, _config) -> None:
+            return None
+
+        async def request(self, method, params):
+            assert method == "fork"
+            target = Path(params["target_session_dir"]) / "branched.jsonl"
+            target.write_text('{"type":"session"}\n', encoding="utf-8")
+            return {"session_path": str(target)}
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="sandbox")
+    context = RequestContext(user_id="42")
+    source_handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="source",
+            user_id="42",
+            workspace_root=str(conversations / "source"),
+            model_configuration={"model": "gpt-5", "api_key": "request-secret"},
+        ),
+        context,
+    )
+    PiSessionFiles(conversations / "source").save_checkpoint_index(
+        {"workflow-v1": "leaf-1"}
+    )
+    checkpoint = ProductCheckpoint(
+        event_id="workflow-v1",
+        through_seq=2,
+        workflow=WorkflowState(
+            resource_id="pyromind_workflow",
+            version="v1",
+            dsl="workflow = InputNode()",
+            canvas=None,
+        ),
+    )
+
+    target_handle = await adapter.fork(
+        source_handle,
+        ForkSpec(
+            source_conversation_id="source",
+            target_conversation_id="target",
+            event_id="workflow-v1",
+        ),
+        checkpoint,
+        context,
+    )
+
+    pending = PiSessionFiles(conversations / "target").load_pending_sandbox_fork()
+    assert pending is not None
+    assert pending["source_conversation_id"] is None
+    assert pending["workflow_dsl"] == "workflow = InputNode()"
+    await adapter.close(target_handle)
+    await adapter.close(source_handle)
+
+
+async def test_sandbox_close_pauses_instead_of_deleting_the_container(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeManager:
+        def __init__(self) -> None:
+            self.paused: list[str] = []
+            self.deleted: list[str] = []
+
+        async def pause(self, context, _files) -> None:
+            self.paused.append(context.conversation_id)
+
+        async def delete(self, context, _files) -> None:
+            self.deleted.append(context.conversation_id)
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="sandbox")
+    manager = FakeManager()
+    adapter._sandbox = cast(Any, manager)
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="conversation-1",
+            user_id="42",
+            workspace_root=str(conversations / "conversation-1"),
+            model_configuration={"model": "gpt-5", "api_key": "request-secret"},
+        ),
+        RequestContext(user_id="42"),
+    )
+
+    await adapter.close(handle)
+
+    assert manager.paused == ["conversation-1"]
+    assert manager.deleted == []
 
 
 async def test_pi_adapter_restores_workflow_and_resets_debug_budget(

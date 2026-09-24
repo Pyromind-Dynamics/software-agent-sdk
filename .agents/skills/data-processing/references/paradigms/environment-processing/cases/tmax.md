@@ -21,14 +21,14 @@ storage 上的 tmax 目录是 HF 数据集镜像:
 
 | storage 路径 | 内容与用途 |
 | --- | --- |
-| `data/train-*.parquet` | **渲染主源**(任务索引,每行一个 task_id 对应 `tasks/` 同名目录);parquet 是二进制,preview 按文本读会乱码,用 `mode='sample'` 物化后以 pandas 解析字段 |
+| `data/train-*.parquet` | **渲染主源**(任务索引,每行一个 task_id 对应 `tasks/` 同名目录);parquet 是二进制,按文本读会乱码。用 pandas 直接读 `storage/.../train-*.parquet` 解析字段 |
 | `tasks/<task_id>/` | 每条任务的原始素材,仅供交叉核对:`container.def`(Apptainer 构建定义,**不是**可直接传 sandbox_create 的镜像引用,manifest 的 image 用 join 源映射)/`setup.sh`/`test_initial_state.py`/`test_final_state.py`(与 test_sh 交叉核对)/`task_summary.txt`(题面摘要)/`solutions/`(**参考解,严禁写入 manifest 或 prompt**——RL rollout 需要解题 agent 真实解题,泄漏参考解会污染训练数据) |
 | `tasks.zip` | tasks/ 的原始压缩包,勿重复解压 |
 
 ## 字段映射
 
-**以实际 parquet schema 为准,HF 发布版字段名可能不同**;若字段对不上先
-`preview_dataset mode='sample'` 确认再调整模板:
+**以实际 parquet schema 为准,HF 发布版字段名可能不同**;若字段对不上先确认
+schema(直读 `storage/` 并用 pandas 解析)再调整模板:
 
 | manifest 字段 | 来源(实测 tmax parquet 13 列) | 说明 |
 | --- | --- | --- |

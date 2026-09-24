@@ -235,7 +235,7 @@ async def test_native_inflight_recovery_keeps_dirty_flag_until_product_finalizes
         "workflow = Recovered()"
     )
     session.files.save_inflight({"run_id": "run", "workflow_modified": True})
-    adapter._recover_inflight(session)
+    await adapter._recover_inflight(session)
     assert session.files.load_inflight()["completion"]
     await drain(session, hook, store)
     assert store.load_snapshot().current_workflow.dsl == "workflow = Recovered()"
@@ -310,7 +310,7 @@ async def test_finished_run_survives_next_run_overwriting_inflight(workflow_sess
     while not session.queue.empty():
         session.queue.get_nowait()
     assert store.load_workflow_runs() == {}
-    adapter._recover_inflight(session)
+    await adapter._recover_inflight(session)
     await drain(session, hook, store)
     output = [event for event in store.replay() if event.type == "workflow.updated"]
     assert len(output) == 1

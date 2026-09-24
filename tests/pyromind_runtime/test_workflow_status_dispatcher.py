@@ -229,15 +229,20 @@ async def test_dispatcher_routes_openhands_through_same_runtime_path(tmp_path) -
         {"openhands": adapter},
         external_tasks=external_tasks,
     )
-    await runtime.get_snapshot("conversation-2", RequestContext(user_id="42"))
-
     result = await WorkflowStatusDispatcher(runtime).dispatch(
         task_id="task-2",
         status="Succeeded",
     )
 
     assert result.outcome == "delivered_async"
-    assert store.load_snapshot().external_tasks[0].status == "succeeded"
+    deferred = store.load_snapshot().external_tasks[0]
+    assert deferred.status == "succeeded"
+    assert deferred.resume_pending is True
+    assert adapter.external_task_notifications == []
+
+    await runtime.get_snapshot("conversation-2", RequestContext(user_id="42"))
+
+    assert store.load_snapshot().external_tasks[0].resume_pending is False
     assert adapter.external_task_notifications[0][0] == "conversation-2"
     assert adapter.external_task_notifications[0][1].task_id == "task-2"
     assert external_tasks.updated == [("conversation-2", "task-2", "succeeded")]

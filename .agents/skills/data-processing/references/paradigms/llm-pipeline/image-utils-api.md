@@ -93,7 +93,7 @@ run_image_pipeline(CONFIG, input_path, output_path, limit)
 `source_manifest.jsonl` 完整保留样本 ID、原始图片路径、角色和输入元数据。structured
 要求源 ID 唯一，结果注入源 ID 与 `source_images`，不按输出行号关联（失败记录可能
 跳过）。`source_images` 是角色到图片路径的映射，取自输入的 `image_labels`；平台运行时
-写入 Storage 对象路径（`/datasets/...`），本地 Sample 运行时写该次运行可读的本地路径。
+写入 Storage 对象路径（`/datasets/...`），小样运行时写该次运行可读的沙箱内路径。
 于是每一行都自带源图关联，后续 Label Studio 等消费方直接读行内字段，不需要再和
 Manifest 做一次拼接；重复角色带 `#2`、`#3` 后缀。Manifest 仍保留输入侧完整路径基准，
 模型预标注不改写人工标签。

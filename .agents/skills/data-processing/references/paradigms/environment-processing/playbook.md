@@ -64,7 +64,7 @@ manifest 的构造、逐条验证、最终聚合**全部在平台节点执行**,
 不出现本地 manifest.jsonl / verdicts.jsonl / 训练文件:
 
 ```text
-preview_dataset 看字段 → 写/确认 render 模板 JSON(几 KB)
+看字段(直读 storage/) → 写/确认 render 模板 JSON(几 KB)
   ① edp_render    → 平台节点:读 parquet → 分片写 batch-XXX/manifest.jsonl + shards.json
   ② edp_submit    → 平台节点:逐条起镜像验证 → verdicts.jsonl + traces/
   ③ edp_aggregate → 平台节点:跨片合并去重 + 转 slime/SFT → 训练文件落 storage
@@ -76,36 +76,35 @@ preview_dataset 看字段 → 写/确认 render 模板 JSON(几 KB)
 每次 `edp_render` / `edp_submit` / `edp_aggregate` 提交成功后,必须**立即**
 向用户发一条简报(提交了什么 / task_id / 预计量级 / 终态回调后自动汇报
 verdict 或 report),然后**结束当前回复**,把控制权交回平台回调。
-**禁止**用 sleep 终端命令或反复 `preview_dataset` 输出目录来消磨等待
-(对话 b32487cc 教训:agent 等待期间 23 次 preview + 11 次 sleep 轮询
+**禁止**用 sleep 终端命令或反复查看输出目录来消磨等待
+(对话 b32487cc 教训:agent 等待期间 23 次目录轮询 + 11 次 sleep 轮询
 约 6 分钟,用户全程零信息)。中途确需看进度用 `df_check_progress`
-(一次即回),不要 preview 整个目录;终态回调会自动唤醒会话,回调之前
+(一次即回),不要反复列整个目录;终态回调会自动唤醒会话,回调之前
 agent 不需要做任何事。
 
 ### 1. 渲染分片(manifest 由平台节点构造)
 
 **数据源定位(先做这一步)**:用户给出的数据路径(如 `/workspace/datasets/...`)
-一律是 storage 路径,**第一步就直接 `preview_dataset` 探索目录结构**,不要先在
-本地 terminal 找(storage 路径本地不可见,白绕一步)。数据源的目录结构与
-字段映射见对应 case 文档(如 [tmax](cases/tmax.md))。
+一律是 storage 路径,**第一步先探索目录结构**。Storage 已挂载为 `storage/`,
+直接用 `read`/`terminal` 查看(`storage/` 相对路径)。数据源的目录结构与字段映射
+见对应 case 文档(如 [tmax](cases/tmax.md))。
 
-**调研纪律(硬约束)**:写模板前的调研只允许两类动作——`preview_dataset`
-(含 `mode='sample'` 物化)与读本 skill 文档/源码。预览单文件超限时
-**不要**自建沙箱下载全量数据查 schema——那会把全量数据拉回 agent 侧,
+**调研纪律(硬约束)**:写模板前的调研只允许两类动作——查看数据(用
+`read`/`terminal` 直读 `storage/...`)与读本 skill 文档/源码。单文件超限时
+**不要**把全量数据拷进会话工作区查 schema——那会把全量数据拉回 agent 侧,
 违背三段平台化的控制面原则;正确动作是 AskUserQuestion 向用户说明缺口
 与候选方案,由用户决策。字段来源表达不了时先查下方 spec 能力表
 (`message`/`storage_file` kind 与点号嵌套下钻覆盖 chat 格式、逐任务目录
 与 struct 嵌套形态),仍表达不了再问用户,不要绕开平台自行构造 manifest,
 也不要另起 pipeline 先把 parquet 展平再渲染。
 
-**探查预算(硬约束)**:写模板前的探查控制在 **8 次 `preview_dataset`
-以内**(1 次列数据集根目录、1-2 次定向看数据文件列名/样本,其余按
-case 文档补看关键路径);一次 preview 拿到的列名与嵌套结构直接记下来
-写模板,**禁止反复 preview 同一文件调 n**;本地 terminal 不参与 storage
-探查(storage 路径本地不可见,白绕一步)。
+**探查预算(硬约束)**:写模板前的探查控制在 **8 次查看以内**(1 次列数据集
+根目录、1-2 次定向看数据文件列名/样本,其余按 case 文档补看关键路径);
+一次查看拿到的列名与嵌套结构直接记下来写模板,**禁止反复查看同一文件调 n**;
+探查预算按数据集一次性用完,不要对同一数据集反复重看。
 
 **大规模探查委派**:当数据集**无 case 文档**且预计需要 **>10 次
-preview** 才能摸清结构时,改用 `subagent(type=data_explorer)` 委派
+查看** 才能摸清结构时,改用 `subagent(type=data_explorer)` 委派
 批量探查——主 agent 只接收四段式交接(数据集结构/逐字 schema/一条
 原始样本/注意点),探查噪声不进入主链路;任务描述写清要摸清哪些路径、
 回答哪些问题。有 case 文档或 8 次以内能完成的验证型探查**不委派**,主
@@ -171,7 +170,7 @@ edp_render(template_path=<file_editor/apply_patch 写模板时用的同一相对
 - 渲染内存 ≈ 单片,10W+ 级数据源同样适用;agent 不下载 parquet
 
 **门禁(硬约束)**:渲染完成后**立即用第一片提交平台 smoke**——禁止本地
-核验/手工逐条编排/反复 preview。已有产物复用规则:同一批数据未完成 →
+核验/手工逐条编排/反复查看目录。已有产物复用规则:同一批数据未完成 →
 直接消费旧产物或同 run 续跑;数据变了 → 重新渲染后新 run 提交。
 
 ### 2. 提交验证(smoke → 用户决策 → 分批/全量)
@@ -187,9 +186,10 @@ run 的 storage 目录,提交含凭据注入的节点工作流;每片一个独�
 edp_submit(manifest=<render 输出的 batch-001/manifest.jsonl>, limit=3)
 ```
 
-- Kafka 终态回调自动唤醒会话(Succeeded/Failed),随后用 `preview_dataset`
-  查看 `<output_dir>/run/verdicts.jsonl`(task_id / verdict / exit_code /
-  error_category / reward / note)与 `<output_dir>/run/traces/`(解题轨迹)
+- Kafka 终态回调自动唤醒会话(Succeeded/Failed),随后查看
+  `<output_dir>/run/verdicts.jsonl`(task_id / verdict / exit_code /
+  error_category / reward / note)与 `<output_dir>/run/traces/`(解题轨迹):
+  用 `read`/`terminal` 读 `storage/<output_dir>/run/...`
 - 运行中可 `df_check_progress(output_dir=<run 目录>, tail_filename="verdicts.jsonl")`
   看实时进度(total/processed/ETA + 最近若干条 verdict);节点日志逐条一行
   (`[i/N] task_id=... verdict=... reward=...`)

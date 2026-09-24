@@ -461,6 +461,21 @@ def test_empty_log_reports_placeholder(monkeypatch):
     _install_router(monkeypatch, routes)
     observation = AnalyzeTaskFailureExecutor()(AnalyzeTaskFailureAction(task_id="7758"))
     assert observation.logs["1"] == "<empty node log>"
+    assert observation.node_log_available is False
+    assert "complete failure record" in observation.text
+    assert "do not search the filesystem" in observation.text
+
+
+def test_usable_log_marks_observation_as_available(monkeypatch):
+    routes = {
+        "task_workflow_result": _Response(200, _task_result_payload()),
+        "logs/node/raw": _Response(200, _log_payload(["boom"])),
+    }
+    _install_router(monkeypatch, routes)
+    observation = AnalyzeTaskFailureExecutor()(AnalyzeTaskFailureAction(task_id="7758"))
+    assert observation.logs["1"] == "boom"
+    assert observation.node_log_available is True
+    assert "complete failure record" not in observation.text
 
 
 # ---------------------------------------------------------------------------

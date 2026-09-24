@@ -16,6 +16,8 @@ class PiSessionFiles:
         self.business_state_path = self.directory / "business-state.json"
         self.checkpoint_index_path = self.directory / "fork-index.json"
         self.completions_path = self.directory / "run-completions.json"
+        self.sandbox_path = self.directory / "sandbox.json"
+        self.sandbox_fork_path = self.directory / "sandbox-fork.json"
 
     def initialize(self, session: dict[str, Any]) -> None:
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -84,6 +86,36 @@ class PiSessionFiles:
 
     def save_checkpoint_index(self, value: dict[str, str]) -> None:
         _atomic_json(self.checkpoint_index_path, value)
+
+    def load_sandbox(self) -> dict[str, Any] | None:
+        if not self.sandbox_path.is_file():
+            return None
+        return _load_object(self.sandbox_path)
+
+    def save_sandbox(self, value: dict[str, Any]) -> None:
+        _atomic_json(self.sandbox_path, value)
+
+    def clear_sandbox(self) -> None:
+        self.sandbox_path.unlink(missing_ok=True)
+
+    def load_pending_sandbox_fork(self) -> dict[str, Any] | None:
+        if not self.sandbox_fork_path.is_file():
+            return None
+        return _load_object(self.sandbox_fork_path)
+
+    def save_pending_sandbox_fork(
+        self, source_conversation_id: str | None, workflow_dsl: str
+    ) -> None:
+        _atomic_json(
+            self.sandbox_fork_path,
+            {
+                "source_conversation_id": source_conversation_id,
+                "workflow_dsl": workflow_dsl,
+            },
+        )
+
+    def clear_pending_sandbox_fork(self) -> None:
+        self.sandbox_fork_path.unlink(missing_ok=True)
 
 
 def _load_object(path: Path) -> dict[str, Any]:

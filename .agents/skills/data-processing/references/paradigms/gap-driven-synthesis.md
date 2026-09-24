@@ -39,9 +39,9 @@ GT 提供正常结构，实拍可信区域提供材料色调与纹理，标注�
 
 ## 执行与复核
 
-沿用通用 SOP 和已有执行工具。小样输入通过 `preview_dataset(mode="sample")`
-准备，覆盖计划采用的策略和目标类别；数量由输入和派生小样计划控制，执行器
-不截断输入。`df_run_pipeline` 运行纯图片生成时使用 `model_profile=none`；
+沿用通用 SOP 和已有执行工具。`df_run_pipeline` 输入直接用 `storage/...`。
+输入覆盖计划采用的策略和目标类别，数量由输入和派生小样计划控制，执行器不截断
+输入。`df_run_pipeline` 运行纯图片生成时使用 `model_profile=none`；
 视觉复核使用 [固定入口](../../scripts/preparation/image_synthesis_review.py)
 （managed image runtime，`model_profile=vision`），保留分批、
 墙钟截止、失败账本和断点状态，不自行构造模型认证或传输代码。

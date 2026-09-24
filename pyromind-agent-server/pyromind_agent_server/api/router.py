@@ -75,7 +75,10 @@ def create_product_router() -> APIRouter:
             model_configuration=body.llm.model_dump(mode="json"),
             extra=body.extra,
         )
-        return await get_product_runtime(request).create_conversation(spec, context)
+        try:
+            return await get_product_runtime(request).create_conversation(spec, context)
+        except ProductRuntimeError as exc:
+            raise _product_error(exc) from exc
 
     @router.get("", response_model=tuple[ConversationSnapshot, ...])
     async def list_conversations(request: Request) -> tuple[ConversationSnapshot, ...]:
@@ -198,6 +201,7 @@ def _product_error(error: ProductRuntimeError) -> HTTPException:
     status_code = {
         "conversation_not_found": status.HTTP_404_NOT_FOUND,
         "checkpoint_not_found": status.HTTP_404_NOT_FOUND,
+        "capacity_exceeded": status.HTTP_429_TOO_MANY_REQUESTS,
         "harness_operation_failed": status.HTTP_502_BAD_GATEWAY,
     }.get(error.code, status.HTTP_409_CONFLICT)
     return HTTPException(

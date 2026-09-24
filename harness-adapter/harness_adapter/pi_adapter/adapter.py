@@ -5,14 +5,16 @@ import hashlib
 import json
 import logging
 import os
+import posixpath
+import shlex
 import shutil
 import sys
 import tempfile
 import time
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -48,11 +50,21 @@ from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.protocol import PROTOCOL_VERSION
 from harness_adapter.pi_adapter.runner import PiRunnerExit, PiRunnerProcess
+from harness_adapter.pi_adapter.sandbox_runtime import (
+    SandboxExecutionManager,
+    SandboxSettings,
+)
 from harness_adapter.pi_adapter.terminal_backend import validate_pi_terminal_backend
 from openhands.agent_server.workflow_canvas_models import (
     SaveWorkflowCanvasEventSnapshotRequest,
 )
 from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
+from openhands.sdk.workspace.base import BaseWorkspace
+from openhands.sdk.workspace.local import LocalWorkspace
+from openhands.tools.utils.workspace_files import (
+    WorkspaceFileNotFoundError,
+    read_workspace_text,
+)
 from openhands.tools.workflow.dsl_to_xyflow import (
     convert_dsl_to_xyflow,
     convert_xyflow_to_dsl,
@@ -99,6 +111,36 @@ for tasks that require a specific sandbox runtime, including embodied robot
 data cleaning. If the intent is ambiguous, ask the user first.
 Never start both full-run paths for one request."""
 
+# Appended only when the execution plane is the platform Sandbox, where the
+# user's Storage is mounted and reading data is a local operation.
+_SANDBOX_SYSTEM_PROMPT = """
+
+This session runs its execution plane in a platform Sandbox with your Storage
+mounted at storage/, relative to the workspace root. That is the local copy of
+Storage: when the user asks about data or files, inspect and read them there
+with read, terminal commands, and scripts, and pass storage/... paths straight
+to df_run_pipeline. Treat storage/ as read-only; every dataset this session
+works on is a Storage path you can read directly.
+
+Platform task state comes from the platform tools, never from this workspace.
+task_status, node logs, and workflow runs are reported by analyze_task_failure,
+df_check_progress, and the workflow tools. Do not search the filesystem or
+Storage for them, and do not read a platform failure out of local files.
+
+To show the user an image, HTML page, PDF, or another artifact, call
+get_storage_url on its paths and embed the returned URLs in your reply as
+Markdown. Showing a file never depends on image support in your own model."""
+
+
+def _sandbox_system_prompt(mount_path: str) -> str:
+    """Add the absolute Storage mount, which survives a ``cd`` in terminal."""
+    root = mount_path.rstrip("/")
+    return (
+        f"{_SANDBOX_SYSTEM_PROMPT}\n\nstorage/ is a symbolic link to the Storage "
+        f"mount at {root}, so storage/<path> and {root}/<path> name the same "
+        "file. Use the absolute form when a command has changed directory."
+    )
+
 
 @dataclass(slots=True)
 class _PendingPermission:
@@ -114,6 +156,7 @@ class _PiSession:
     files: PiSessionFiles
     config: dict[str, Any]
     context: RequestContext
+    workspace: BaseWorkspace | None = None
     model_configuration: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
     queue: asyncio.Queue[HarnessEvent | None] = field(default_factory=asyncio.Queue)
@@ -175,10 +218,118 @@ class PiAdapter:
         self._permissions = TerminalPermissionPolicy()
         self._lock = asyncio.Lock()
         self._apply_workspace_quota = apply_workspace_quota
+        resource_roots: list[tuple[str, Path]] = [
+            (".agents/skills", self._skills_directory)
+        ]
+        extra_skill_names: set[str] = set()
+        for root in self._skill_roots:
+            if root.is_relative_to(self._skills_directory):
+                continue
+            if root.name in extra_skill_names:
+                continue
+            extra_skill_names.add(root.name)
+            resource_roots.append((f".agents/skills/{root.name}", root))
+        if self._knowledge_root is not None:
+            resource_roots.append(("knowledge", self._knowledge_root))
+        self._sandbox = SandboxExecutionManager(resource_roots=resource_roots)
 
     def _apply_quota(self, root: Path, conversation_id: str) -> None:
         if self._apply_workspace_quota is not None:
             self._apply_workspace_quota(root, conversation_id)
+
+    def _prepare_session_workspace(self, root: Path, *, create: bool) -> None:
+        return _prepare_workspace(
+            root,
+            create=create,
+            prepare_public_data=self._terminal_backend == "os-sandbox",
+        )
+
+    async def _workspace(self, session: _PiSession) -> BaseWorkspace:
+        if session.workspace is not None:
+            return session.workspace
+        if self._terminal_backend == "os-sandbox":
+            workspace: BaseWorkspace = LocalWorkspace(
+                working_dir=session.workspace_root
+            )
+        else:
+            workspace = await self._sandbox.workspace(
+                self._control_tool_context(session), session.files
+            )
+        session.workspace = workspace
+        return workspace
+
+    def _has_execution_workspace(self, session: _PiSession) -> bool:
+        """False when a sandbox session never materialized its execution workspace."""
+        if self._terminal_backend == "os-sandbox":
+            return True
+        return session.files.load_sandbox() is not None
+
+    def _execution_workspace_root(self, session: _PiSession) -> str | None:
+        if self._terminal_backend != "sandbox":
+            return None
+        live = self._sandbox.execution_workspace_path(session.session_id)
+        if live is not None:
+            return live
+        record = session.files.load_sandbox() or {}
+        recorded = record.get("workspace_path")
+        return recorded if isinstance(recorded, str) and recorded else None
+
+    async def _pause_sandbox(self, session: _PiSession) -> None:
+        """Release the sandbox without discarding the execution workspace.
+
+        The runtime calls ``close`` both on idle eviction and on shutdown, then
+        re-attaches the conversation later, so the container has to stay
+        resumable. Container deletion happens only through the explicit delete
+        path or the platform's own TTL cleanup.
+        """
+        if self._terminal_backend != "sandbox":
+            return
+        try:
+            await self._sandbox.pause(
+                self._control_tool_context(session), session.files
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Pi sandbox pause on close failed conversation_id=%s error=%s",
+                session.session_id,
+                type(exc).__name__,
+            )
+
+    async def _discard_sandbox(self, session: _PiSession) -> None:
+        """Delete a sandbox that failed before it became usable."""
+        if self._terminal_backend != "sandbox":
+            return
+        try:
+            await self._sandbox.delete(
+                self._control_tool_context(session), session.files
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Pi sandbox cleanup on failure failed conversation_id=%s error=%s",
+                session.session_id,
+                type(exc).__name__,
+            )
+
+    async def _read_workflow(self, session: _PiSession) -> str | None:
+        if not self._has_execution_workspace(session):
+            return None
+        workspace = await self._workspace(session)
+        try:
+            return await asyncio.to_thread(
+                read_workspace_text, workspace, _WORKFLOW_PATH.as_posix()
+            )
+        except WorkspaceFileNotFoundError:
+            return None
+        except ValueError as exc:
+            raise OSError(str(exc)) from exc
+
+    async def _write_workflow(self, session: _PiSession, dsl: str) -> None:
+        workspace = await self._workspace(session)
+        await asyncio.to_thread(_write_workspace_text, workspace, _WORKFLOW_PATH, dsl)
+
+    async def _delete_workflow(self, session: _PiSession) -> None:
+        workspace = await self._workspace(session)
+        await asyncio.to_thread(_delete_workspace_file, workspace, _WORKFLOW_PATH)
 
     async def describe(self) -> tuple[str, HarnessCapabilities]:
         return "pi", PI_CAPABILITIES
@@ -194,8 +345,9 @@ class PiAdapter:
             )
         session: _PiSession | None = None
         try:
-            _prepare_workspace(root, create=True)
-            self._apply_quota(root, spec.conversation_id)
+            self._prepare_session_workspace(root, create=True)
+            if self._terminal_backend == "os-sandbox":
+                self._apply_quota(root, spec.conversation_id)
             _prepare_pi_runtime_directories(root)
             files = PiSessionFiles(root)
             config = _session_config(spec)
@@ -227,12 +379,11 @@ class PiAdapter:
         except Exception:
             if session is not None:
                 await self._remove(session.session_id)
-                if session.runner is not None:
-                    try:
+                try:
+                    if session.runner is not None:
                         await session.runner.close()
-                    finally:
-                        _remove_created_workspace(root, self._conversation_root)
-                else:
+                finally:
+                    await self._discard_sandbox(session)
                     _remove_created_workspace(root, self._conversation_root)
             else:
                 _remove_created_workspace(root, self._conversation_root)
@@ -246,7 +397,7 @@ class PiAdapter:
             existing.context = context
             return self._handle(conversation_id)
         root = self._safe_conversation_dir(conversation_id)
-        _prepare_workspace(root, create=False)
+        self._prepare_session_workspace(root, create=False)
         _prepare_pi_runtime_directories(root)
         files = PiSessionFiles(root)
         config = files.load_session()
@@ -263,14 +414,17 @@ class PiAdapter:
         )
         await self._register(session)
         try:
-            self._recover_inflight(session)
+            await self._recover_inflight(session)
             await self._start_runner(session, _api_key({}))
             session.queue.put_nowait(_history_synced(conversation_id))
             return self._handle(conversation_id)
         except Exception:
             await self._remove(conversation_id)
-            if session.runner is not None:
-                await session.runner.close()
+            try:
+                if session.runner is not None:
+                    await session.runner.close()
+            finally:
+                await self._discard_sandbox(session)
             raise
 
     async def send(
@@ -299,7 +453,7 @@ class PiAdapter:
             stop_results = []
             for task_id in tuple(session.active_external_tasks):
                 stop_result = await self._business_tools.stop_platform_task(
-                    task_id, self._tool_context(session)
+                    task_id, await self._tool_context(session)
                 )
                 stop_results.append(stop_result)
                 if not stop_result.get("is_error"):
@@ -339,23 +493,36 @@ class PiAdapter:
         target_root = (self._conversation_root / spec.target_conversation_id).resolve()
         if target_root.parent != self._conversation_root:
             raise ValueError("unsafe Pi fork target")
-        _copy_public_data_for_fork(source.workspace_root, target_root)
+        sandbox_fork = self._terminal_backend == "sandbox"
+        if sandbox_fork:
+            self._prepare_session_workspace(target_root, create=True)
+        else:
+            _copy_public_data_for_fork(source.workspace_root, target_root)
         target: _PiSession | None = None
         try:
-            target_workflow = target_root / _WORKFLOW_PATH
             checkpoint_dsl = checkpoint.workflow.dsl
-            if checkpoint_dsl.strip():
-                _atomic_text(target_workflow, checkpoint_dsl)
-            else:
-                target_workflow.unlink(missing_ok=True)
+            if not sandbox_fork:
+                target_workflow = target_root / _WORKFLOW_PATH
+                if checkpoint_dsl.strip():
+                    _atomic_text(target_workflow, checkpoint_dsl)
+                else:
+                    target_workflow.unlink(missing_ok=True)
             _prepare_pi_runtime_directories(target_root)
-            self._apply_quota(target_root, spec.target_conversation_id)
+            if not sandbox_fork:
+                self._apply_quota(target_root, spec.target_conversation_id)
             target_files = PiSessionFiles(target_root)
             target_config = {
                 **source.config,
                 "session_id": spec.target_conversation_id,
             }
             target_files.initialize(target_config)
+            if sandbox_fork:
+                target_files.save_pending_sandbox_fork(
+                    source.session_id
+                    if self._has_execution_workspace(source)
+                    else None,
+                    checkpoint_dsl,
+                )
             await self._ensure_runner(source)
             assert source.runner is not None
             branch = await source.runner.request(
@@ -390,12 +557,11 @@ class PiAdapter:
         except Exception:
             if target is not None:
                 await self._remove(target.session_id)
-                if target.runner is not None:
-                    try:
+                try:
+                    if target.runner is not None:
                         await target.runner.close()
-                    finally:
-                        _remove_created_workspace(target_root, self._conversation_root)
-                else:
+                finally:
+                    await self._discard_sandbox(target)
                     _remove_created_workspace(target_root, self._conversation_root)
             else:
                 _remove_created_workspace(target_root, self._conversation_root)
@@ -409,11 +575,9 @@ class PiAdapter:
     ) -> RestoreWorkflowResult:
         session = self._session(handle.session_id)
         session.context = context
-        _prepare_workspace(session.workspace_root, create=False)
-        path = session.workspace_root / _WORKFLOW_PATH
         dsl = spec.checkpoint.workflow.dsl
         if dsl.strip():
-            _atomic_text(path, dsl)
+            await self._write_workflow(session, dsl)
             action = "updated"
             # Restore bypasses input synchronization; seed the dedupe signature with
             # the restored state so an unchanged next sync stays silent.
@@ -421,7 +585,7 @@ class PiAdapter:
                 dsl, spec.checkpoint.workflow.canvas
             )
         else:
-            path.unlink(missing_ok=True)
+            await self._delete_workflow(session)
             action = "removed"
             session.last_workflow_signature = None
         await self._ensure_runner(session)
@@ -496,14 +660,17 @@ class PiAdapter:
         session = await self._remove(handle.session_id)
         if session is None:
             return
-        if (
-            session.pending_permission is not None
-            and not session.pending_permission.future.done()
-        ):
-            session.pending_permission.future.set_result((False, "Session closed"))
-        if session.runner is not None:
-            await session.runner.close()
-        session.queue.put_nowait(None)
+        try:
+            if (
+                session.pending_permission is not None
+                and not session.pending_permission.future.done()
+            ):
+                session.pending_permission.future.set_result((False, "Session closed"))
+            if session.runner is not None:
+                await session.runner.close()
+            await self._pause_sandbox(session)
+        finally:
+            session.queue.put_nowait(None)
 
     async def _register(self, session: _PiSession) -> None:
         async with self._lock:
@@ -597,6 +764,11 @@ class PiAdapter:
         )
         session.runner = runner
         started_at = time.perf_counter()
+        system_prompt = _SYSTEM_PROMPT
+        if self._terminal_backend == "sandbox":
+            system_prompt += _sandbox_system_prompt(
+                SandboxSettings.from_extra(session.extra).mount_path
+            )
         await runner.start(
             {
                 "session_id": session.session_id,
@@ -612,7 +784,7 @@ class PiAdapter:
                     if self._knowledge_root is not None
                     else {}
                 ),
-                "system_prompt": _SYSTEM_PROMPT,
+                "system_prompt": system_prompt,
                 "model": {**session.config["model"], "api_key": api_key},
                 "tools": self._business_tools.specs(),
                 **(
@@ -656,7 +828,7 @@ class PiAdapter:
             result = await self._business_tools.execute(
                 tool_name,
                 arguments,
-                self._tool_context(session),
+                await self._tool_context(session),
                 tool_call_id=(
                     params.get("tool_call_id")
                     if isinstance(params.get("tool_call_id"), str)
@@ -671,6 +843,12 @@ class PiAdapter:
             if not isinstance(arguments, dict) or not isinstance(tool_call_id, str):
                 raise ValueError("invalid terminal permission request")
             return await self._check_permission(session, tool_call_id, arguments)
+        if method == "sandbox.ensure":
+            return await self._sandbox.ensure(
+                self._control_tool_context(session),
+                session.files,
+                refresh=params.get("refresh") is True,
+            )
         raise ValueError(f"unsupported runner request: {method}")
 
     def _emit_tool_signals(
@@ -762,13 +940,19 @@ class PiAdapter:
         )
 
     @staticmethod
-    def _tool_context(session: _PiSession) -> ToolExecutionContext:
+    def _control_tool_context(session: _PiSession) -> ToolExecutionContext:
         return ToolExecutionContext(
             conversation_id=session.session_id,
             workspace_root=session.workspace_root,
             request_context=session.context,
             model_configuration=session.model_configuration,
             extra=session.extra,
+        )
+
+    async def _tool_context(self, session: _PiSession) -> ToolExecutionContext:
+        return replace(
+            self._control_tool_context(session),
+            workspace=await self._workspace(session),
         )
 
     async def _check_permission(
@@ -832,7 +1016,7 @@ class PiAdapter:
                 return
             session.finished_runs.add(run_id)
             session.running = False
-            completion = self._completion_event(session, frame)
+            completion = await self._completion_event(session, frame)
             inflight = session.files.load_inflight() or {"run_id": run_id}
             session.files.save_pending_completion(
                 run_id,
@@ -860,7 +1044,9 @@ class PiAdapter:
         for event in translate_runner_event(frame):
             session.queue.put_nowait(event)
         if kind == "tool.completed" and _is_workflow_mutation(
-            session.workspace_root, payload
+            session.workspace_root,
+            payload,
+            execution_root=self._execution_workspace_root(session),
         ):
             source_event_id = str(frame.get("eventId") or uuid4().hex)
             inflight = session.files.load_inflight() or {"run_id": run_id}
@@ -875,25 +1061,23 @@ class PiAdapter:
                 )
             )
 
-    def _completion_event(
+    async def _completion_event(
         self, session: _PiSession, frame: dict[str, Any]
     ) -> HarnessEvent:
         payload = frame.get("payload") or {}
-        path = session.workspace_root / _WORKFLOW_PATH
         # New runners freeze the file before starting queued follow-ups. The
         # fallback is for interrupted/recovered runs without a native finish.
         snapshot_error = bool(payload.get("workflow_snapshot_error"))
-        try:
-            dsl = (
-                payload["workflow_dsl"]
-                if "workflow_dsl" in payload
-                else path.read_text(encoding="utf-8")
-                if path.is_file()
-                else None
-            )
-        except (OSError, UnicodeError):
+        dsl = payload.get("workflow_dsl")
+        if dsl is not None and not isinstance(dsl, str):
             dsl = None
             snapshot_error = True
+        if dsl is None and not snapshot_error:
+            try:
+                dsl = await self._read_workflow(session)
+            except (OSError, UnicodeError):
+                dsl = None
+                snapshot_error = True
         normalized: JsonObject = {
             "dsl": dsl,
             "snapshot_error": snapshot_error,
@@ -928,7 +1112,7 @@ class PiAdapter:
             inflight.pop("operation_id", None)
         session.files.save_inflight(inflight)
 
-    def _recover_inflight(self, session: _PiSession) -> None:
+    async def _recover_inflight(self, session: _PiSession) -> None:
         pending = session.files.load_pending_completions()
         for run_id, record in pending.items():
             if record.get("workflow_modified"):
@@ -996,7 +1180,7 @@ class PiAdapter:
                     payload={"permission_id": permission_id, "decision": "deny"},
                 )
             )
-        completion = self._completion_event(
+        completion = await self._completion_event(
             session,
             {
                 "runId": run_id,
@@ -1021,10 +1205,11 @@ class PiAdapter:
     async def _stage_xyflow(
         self, session: _PiSession, xyflow: dict[str, Any]
     ) -> str | None:
-        _prepare_workspace(session.workspace_root, create=False)
         dsl = await asyncio.to_thread(convert_xyflow_to_dsl, xyflow)
-        _atomic_text(session.workspace_root / _WORKFLOW_PATH, dsl)
-        return await self._save_input_workflow(session, uuid4().hex, canvas=xyflow)
+        await self._write_workflow(session, dsl)
+        return await self._save_input_workflow(
+            session, uuid4().hex, dsl=dsl, canvas=xyflow
+        )
 
     async def _append_workflow_context(
         self, session: _PiSession, event_id: str
@@ -1049,10 +1234,13 @@ class PiAdapter:
             session.files.save_checkpoint_index(index)
 
     async def _save_input_workflow(
-        self, session: _PiSession, event_id: str, *, canvas: dict[str, Any]
+        self,
+        session: _PiSession,
+        event_id: str,
+        *,
+        dsl: str,
+        canvas: dict[str, Any],
     ) -> str | None:
-        path = session.workspace_root / _WORKFLOW_PATH
-        dsl = path.read_text(encoding="utf-8")
         signature = _workflow_signature(dsl, canvas)
         if signature == session.last_workflow_signature:
             return None
@@ -1172,22 +1360,37 @@ def _session_config(spec: SessionSpec) -> dict[str, Any]:
     }
 
 
+_SANDBOX_EXTRA_KEYS = frozenset(
+    {"image", "cpu", "memory", "gpu", "gpu_card", "mount_path"}
+)
+
+
 def _safe_session_extra(extra: dict[str, Any]) -> dict[str, Any]:
     allowed = {
         "env",
         "storage_base_url",
         "storage_api_base_url",
         "dataset_cleaning_output_root",
-        "dataset_extraction_output_root",
-        "preview_dataset_timeout_seconds",
         "training_analysis_api_base",
         "training_analysis_timeout_seconds",
     }
-    return {
+    safe: dict[str, Any] = {
         key: value
         for key, value in extra.items()
         if key in allowed and isinstance(value, (str, int, float, bool))
     }
+    sandbox = extra.get("sandbox")
+    if isinstance(sandbox, dict):
+        configured = {
+            key: value
+            for key, value in sandbox.items()
+            if key in _SANDBOX_EXTRA_KEYS
+            and isinstance(value, (str, int))
+            and not isinstance(value, bool)
+        }
+        if configured:
+            safe["sandbox"] = configured
+    return safe
 
 
 def _restored_model_configuration(config: dict[str, Any]) -> dict[str, Any]:
@@ -1252,7 +1455,18 @@ def _is_empty_canvas(canvas: dict[str, Any] | None) -> bool:
     return canvas is not None and not canvas.get("nodes") and not canvas.get("edges")
 
 
-def _is_workflow_mutation(workspace_root: Path, payload: dict[str, Any]) -> bool:
+def _is_workflow_mutation(
+    workspace_root: Path,
+    payload: dict[str, Any],
+    *,
+    execution_root: str | None = None,
+) -> bool:
+    """Report whether a write/edit tool call targeted the workflow DSL file.
+
+    ``execution_root`` is the sandbox-side conversation root; when it is None the
+    tool paths come from the host filesystem and are resolved against
+    ``workspace_root``.
+    """
     if payload.get("tool_name") not in {"write", "edit"}:
         return False
     arguments = payload.get("arguments")
@@ -1261,6 +1475,13 @@ def _is_workflow_mutation(workspace_root: Path, payload: dict[str, Any]) -> bool
     value = arguments.get("path")
     if not isinstance(value, str) or not value:
         return False
+    if execution_root is not None:
+        root = PurePosixPath(execution_root)
+        target = PurePosixPath(value)
+        if not target.is_absolute():
+            target = root / target
+        workflow = root / _WORKFLOW_PATH.as_posix()
+        return posixpath.normpath(str(target)) == posixpath.normpath(str(workflow))
     path = Path(value)
     target = path.resolve() if path.is_absolute() else (workspace_root / path).resolve()
     return target == (workspace_root / _WORKFLOW_PATH).resolve()
@@ -1337,7 +1558,15 @@ def _atomic_text(path: Path, value: str) -> None:
         raise
 
 
-def _prepare_workspace(root: Path, *, create: bool) -> Path:
+def _prepare_workspace(
+    root: Path, *, create: bool, prepare_public_data: bool = True
+) -> None:
+    """Validate the local conversation directory.
+
+    ``prepare_public_data`` is False for sandbox sessions: their authoritative
+    ``public_data`` lives in the execution workspace, so the local directory only
+    holds control-plane state.
+    """
     if create:
         root.mkdir(mode=0o700, parents=True, exist_ok=False)
     if root.is_symlink() or not root.is_dir():
@@ -1350,6 +1579,8 @@ def _prepare_workspace(root: Path, *, create: bool) -> Path:
             f"PI_WORKSPACE_INVALID: conversation root resolves outside itself: {root}"
         )
     root.chmod(0o700)
+    if not prepare_public_data:
+        return
 
     public_data = root / "public_data"
     if public_data.is_symlink():
@@ -1367,7 +1598,31 @@ def _prepare_workspace(root: Path, *, create: bool) -> Path:
             "PI_WORKSPACE_INVALID: public_data must stay inside the conversation root"
         )
     public_data.chmod(0o700)
-    return public_data
+
+
+def _write_workspace_text(workspace: BaseWorkspace, relative: Path, value: str) -> None:
+    if isinstance(workspace, LocalWorkspace):
+        _atomic_text(Path(workspace.working_dir) / relative, value)
+        return
+    with tempfile.TemporaryDirectory(prefix="pi-workspace-write-") as directory:
+        source = Path(directory) / relative.name
+        source.write_text(value, encoding="utf-8")
+        result = workspace.file_upload(source, relative.as_posix())
+        if not result.success:
+            raise OSError(
+                result.error or f"cannot write workspace file: {relative.as_posix()}"
+            )
+
+
+def _delete_workspace_file(workspace: BaseWorkspace, relative: Path) -> None:
+    if isinstance(workspace, LocalWorkspace):
+        (Path(workspace.working_dir) / relative).unlink(missing_ok=True)
+        return
+    result = workspace.execute_command(f"rm -f {shlex.quote(relative.as_posix())}")
+    if result.exit_code != 0:
+        raise OSError(
+            result.stderr or result.stdout or f"cannot delete {relative.as_posix()}"
+        )
 
 
 def _prepare_pi_runtime_directories(root: Path) -> None:
@@ -1406,11 +1661,11 @@ def _prepare_pi_runtime_directories(root: Path) -> None:
 def _copy_public_data_for_fork(source: Path, target: Path) -> None:
     if target.exists():
         raise FileExistsError(f"Pi fork target already exists: {target.name}")
-    source_public = _prepare_workspace(source, create=False)
+    _prepare_workspace(source, create=False)
     try:
         _prepare_workspace(target, create=True)
         shutil.copytree(
-            source_public,
+            source / "public_data",
             target / "public_data",
             dirs_exist_ok=True,
             symlinks=False,

@@ -20,6 +20,7 @@ import struct
 import tempfile
 import uuid
 from collections.abc import Sequence
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Self, cast
@@ -45,6 +46,11 @@ from openhands.tools.pyromind_dataset.definition import (
     _resolve_secret_headers,
     download_tail_from_pyromind,
     upload_local_file_to_pyromind,
+)
+from openhands.tools.utils.workspace_staging import (
+    WorkspaceStagingError,
+    is_remote_workspace,
+    staged_remote_path,
 )
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
@@ -353,6 +359,45 @@ def build_render_command(
     return " && ".join(steps)
 
 
+def _resolve_render_template(
+    template_path: str,
+    conversation: BaseConversation,
+    stack: ExitStack,
+) -> Path:
+    """Host path holding the render template the agent wrote.
+
+    Local workspaces resolve in place. A remote (sandbox) workspace has no host
+    filesystem, so the template is downloaded to a temporary host copy that the
+    caller's ``stack`` removes once the submission finishes.
+    """
+    workspace = cast("Any", conversation).workspace
+    if is_remote_workspace(workspace):
+        try:
+            staged = stack.enter_context(staged_remote_path(workspace, template_path))
+        except WorkspaceStagingError as exc:
+            raise ValueError(
+                f"render template not found: {template_path} ({exc})"
+            ) from exc
+        if not staged.is_file():
+            raise ValueError(f"render template not found: {template_path}")
+        return staged
+    path = Path(template_path)
+    if path.is_file():
+        return path
+    # file_editor/apply_patch write agent-relative paths into the conversation
+    # workspace, so retry against its root before giving up (the executor cwd is
+    # the server, not the workspace).
+    workspace_dir = Path(workspace.working_dir).resolve()
+    resolved = path if path.is_absolute() else workspace_dir / path
+    if not resolved.is_file():
+        raise ValueError(
+            f"render template not found: tried {path} and {resolved}. Pass the "
+            "same path you gave file_editor/apply_patch (workspace-relative) or "
+            "an absolute local path."
+        )
+    return resolved
+
+
 class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
     """Stage template/render script and submit the render task."""
 
@@ -419,32 +464,25 @@ class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
                 status="Failed",
                 is_error=True,
             )
-        template_path = Path(action.template_path)
-        if not template_path.is_file():
-            # file_editor/apply_patch write agent-relative paths into the
-            # conversation workspace, so retry against its root before
-            # giving up (the executor cwd is the server, not the workspace).
-            workspace_dir = Path(
-                cast("Any", conversation).workspace.working_dir
-            ).resolve()
-            resolved = (
-                template_path
-                if template_path.is_absolute()
-                else workspace_dir / template_path
-            )
-            if not resolved.is_file():
+        with ExitStack() as stack:
+            try:
+                template_path = _resolve_render_template(
+                    action.template_path, conversation, stack
+                )
+            except ValueError as exc:
                 return EdpRenderObservation.from_text(
-                    text=(
-                        f"render template not found: tried {template_path} and "
-                        f"{resolved}. Pass the same path you gave "
-                        "file_editor/apply_patch (workspace-relative) or an "
-                        "absolute local path."
-                    ),
+                    text=str(exc),
                     status="Failed",
                     is_error=True,
                 )
-            template_path = resolved
+            return self._submit_render(action, conversation, template_path)
 
+    def _submit_render(
+        self,
+        action: EdpRenderAction,
+        conversation: BaseConversation,
+        template_path: Path,
+    ) -> EdpRenderObservation:
         try:
             template = json.loads(template_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:

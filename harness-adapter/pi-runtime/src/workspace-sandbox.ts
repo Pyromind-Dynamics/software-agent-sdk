@@ -50,7 +50,7 @@ export interface ResourceLimitsConfig {
   nprocLimit: number;
 }
 
-export type PiTerminalBackend = "os-sandbox";
+export type PiTerminalBackend = "os-sandbox" | "sandbox";
 
 /**
  * Per-command address-space cap in KiB (RLIMIT_AS for `ulimit -v`).

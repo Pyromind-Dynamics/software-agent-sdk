@@ -296,6 +296,16 @@ async def test_runtime_routes_existing_session_by_persisted_harness(tmp_path) ->
         "pi-conversation", RequestContext(user_id="42")
     )
     assert snapshot.conversation_id == "pi-conversation"
+    assert pi.queues == {} and openhands.queues == {}
+
+    await restarted.submit_command(
+        "pi-conversation",
+        UserMessageCommand(
+            command_id="command-1",
+            content=(TextContent(text="continue"),),
+        ),
+        RequestContext(user_id="42"),
+    )
     assert "pi-conversation" in pi.queues
     assert "pi-conversation" not in openhands.queues
     await restarted.close()
@@ -676,6 +686,286 @@ async def test_eviction_skips_running_or_subscribed_conversations(tmp_path) -> N
 
     await runtime._evict_idle()
     assert snapshot.conversation_id in runtime._active
+    await runtime.close()
+
+
+async def _wait_for_status(store: FileProductStore, expected: str) -> None:
+    for _ in range(200):
+        if store.load_snapshot().status == expected:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"conversation status never became {expected}")
+
+
+async def _create(runtime: ConversationRuntime, root, conversation_id: str):
+    return await runtime.create_conversation(
+        SessionSpec(
+            conversation_id=conversation_id,
+            user_id="42",
+            workspace_root=str(root / conversation_id),
+        ),
+        RequestContext(user_id="42"),
+    )
+
+
+def test_default_idle_release_window_is_five_minutes(tmp_path) -> None:
+    runtime = ConversationRuntime(tmp_path, FakeAdapter())
+
+    assert runtime._idle_eviction_seconds == 300
+    assert runtime._release_grace_seconds == 300
+
+
+async def test_finished_run_releases_runner_after_grace_period(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, release_grace_seconds=1)
+    context = RequestContext(user_id="42")
+    await _create(runtime, conversations, "conversation-grace")
+
+    adapter.emit(
+        "conversation-grace",
+        "run.finished",
+        {"status": "idle"},
+        run_id="run-1",
+        event_id="run-1:finished",
+    )
+
+    await asyncio.sleep(1.3)
+    assert "conversation-grace" not in runtime._active
+    assert adapter.closed == ["conversation-grace"]
+
+    await runtime.submit_command(
+        "conversation-grace",
+        UserMessageCommand(command_id="command-1", content=(TextContent(text="hi"),)),
+        context,
+    )
+    assert adapter.attached == ["conversation-grace"]
+    assert "conversation-grace" in runtime._active
+    await runtime.close()
+
+
+async def test_promptless_conversation_is_released_after_grace(tmp_path) -> None:
+    """A conversation created without a prompt has no run to end the session.
+
+    The frontend can open a conversation before the user types anything, and
+    that runner would otherwise stay resident for the whole idle window.
+    """
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, release_grace_seconds=1)
+    await _create(runtime, conversations, "conversation-empty")
+
+    await asyncio.sleep(1.3)
+
+    assert "conversation-empty" not in runtime._active
+    assert adapter.closed == ["conversation-empty"]
+    await runtime.close()
+
+
+async def test_reads_do_not_reactivate_a_released_conversation(tmp_path) -> None:
+    """Reads must not re-create a released session.
+
+    Clients poll snapshots and re-open event streams while a conversation sits
+    idle. Attaching on those reads re-created the harness session right after
+    every release, so memory never dropped for a conversation anyone watched.
+    """
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter)
+    context = RequestContext(user_id="42")
+    await _create(runtime, conversations, "conversation-released")
+    await runtime._release("conversation-released", reason="test")
+
+    await runtime.get_snapshot("conversation-released", context)
+    async for _ in runtime.stream_events("conversation-released", 0, context):
+        break
+
+    assert adapter.attached == []
+    assert "conversation-released" not in runtime._active
+
+    await runtime.submit_command(
+        "conversation-released",
+        UserMessageCommand(command_id="command-1", content=(TextContent(text="hi"),)),
+        context,
+    )
+    assert adapter.attached == ["conversation-released"]
+    await runtime.close()
+
+
+async def test_released_conversation_keeps_streaming_to_watchers(tmp_path) -> None:
+    """A watcher must not pin the runner, and must not lose events either.
+
+    Events are persisted before they are published and the subscriber set is
+    owned by the runtime, so the pump created by the next attach feeds the same
+    queues a released conversation's watchers are already reading.
+    """
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, release_grace_seconds=1)
+    context = RequestContext(user_id="42")
+    await _create(runtime, conversations, "conversation-stream")
+    received: list[ProductEvent] = []
+
+    async def consume() -> None:
+        async for event in runtime.stream_events("conversation-stream", 0, context):
+            received.append(event)
+
+    consumer = asyncio.create_task(consume())
+    adapter.emit(
+        "conversation-stream",
+        "run.finished",
+        {"status": "idle"},
+        run_id="run-1",
+        event_id="run-1:finished",
+    )
+
+    await asyncio.sleep(1.3)
+    assert "conversation-stream" not in runtime._active
+
+    await runtime.submit_command(
+        "conversation-stream",
+        UserMessageCommand(command_id="command-1", content=(TextContent(text="hi"),)),
+        context,
+    )
+    adapter.emit(
+        "conversation-stream",
+        "message.delta",
+        {"message_id": "assistant-1", "text": "H"},
+        run_id="command-1",
+        event_id="assistant-1:delta:1",
+    )
+    for _ in range(50):
+        if any(event.type == "message.delta" for event in received):
+            break
+        await asyncio.sleep(0.02)
+
+    assert any(event.type == "message.delta" for event in received)
+    consumer.cancel()
+    await runtime.close()
+
+
+async def test_grace_release_skips_command_already_in_flight(
+    tmp_path, monkeypatch
+) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, release_grace_seconds=1)
+    context = RequestContext(user_id="42")
+    await _create(runtime, conversations, "conversation-busy")
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def blocked_send(handle, command, request_context):
+        started.set()
+        await finish.wait()
+        return {"accepted": True}
+
+    monkeypatch.setattr(adapter, "send", blocked_send)
+    command = asyncio.create_task(
+        runtime.submit_command(
+            "conversation-busy",
+            UserMessageCommand(
+                command_id="command-busy", content=(TextContent(text="hi"),)
+            ),
+            context,
+        )
+    )
+    await started.wait()
+    adapter.emit(
+        "conversation-busy",
+        "run.finished",
+        {"status": "idle"},
+        run_id="run-2",
+        event_id="run-2:finished",
+    )
+
+    await asyncio.sleep(1.3)
+    assert "conversation-busy" in runtime._active
+    assert adapter.closed == []
+
+    finish.set()
+    await command
+    await runtime.close()
+
+
+async def test_release_skips_conversation_with_running_external_task(
+    tmp_path,
+) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, release_grace_seconds=1)
+    await _create(runtime, conversations, "conversation-waiting")
+    runtime.register_external_task(
+        "conversation-waiting",
+        {
+            "task_id": "task-1",
+            "kind": "data_cleaning",
+            "run_id": "run-3",
+            "status": "running",
+            "output_dir": "/outputs/run-3",
+            "submitted_at": "2026-09-01T00:00:00+00:00",
+            "updated_at": "2026-09-01T00:00:00+00:00",
+            "resume_pending": False,
+        },
+    )
+    adapter.emit(
+        "conversation-waiting",
+        "run.finished",
+        {"status": "idle"},
+        run_id="run-3",
+        event_id="run-3:finished",
+    )
+
+    await asyncio.sleep(1.3)
+    assert "conversation-waiting" in runtime._active
+    assert adapter.closed == []
+    await runtime.close()
+
+
+async def test_capacity_limit_releases_least_recent_conversation(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, max_active_conversations=2)
+    for conversation_id in ("conversation-a", "conversation-b"):
+        await _create(runtime, conversations, conversation_id)
+        await asyncio.sleep(0.01)
+
+    await _create(runtime, conversations, "conversation-c")
+
+    assert set(runtime._active) == {"conversation-b", "conversation-c"}
+    assert adapter.closed == ["conversation-a"]
+    await runtime.close()
+
+
+async def test_capacity_limit_rejects_new_conversation_when_all_busy(
+    tmp_path,
+) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, max_active_conversations=1)
+    await _create(runtime, conversations, "conversation-busy")
+    store = FileProductStore(conversations / "conversation-busy")
+    adapter.emit(
+        "conversation-busy",
+        "status.changed",
+        {"status": "running"},
+        event_id="status-running",
+    )
+    await _wait_for_status(store, "running")
+
+    with pytest.raises(ProductRuntimeError) as error:
+        await _create(runtime, conversations, "conversation-new")
+
+    assert error.value.code == "capacity_exceeded"
+    assert set(runtime._active) == {"conversation-busy"}
     await runtime.close()
 
 

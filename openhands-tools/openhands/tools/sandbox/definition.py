@@ -16,12 +16,15 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import posixpath
 import re
+import secrets
 import shlex
 import ssl
 import time
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 
 import certifi
 from pydantic import BaseModel, Field
@@ -63,7 +66,7 @@ DEFAULT_WAIT_TIMEOUT = 600
 MAX_FILE_TEXT_CHARS = 20000
 
 
-def _default_image(cluster: str | None) -> str:
+def default_sandbox_image(cluster: str | None) -> str:
     """Cluster default Jupyter-lab image when no image is pinned."""
     if cluster and "us-west-2" in cluster:
         return "pyrominddynamics/jupyter-lab-with-ssh:v0.9-aws"
@@ -305,7 +308,11 @@ class SandboxCreateExecutor(
             name=action.name,
             sandbox_type=SandboxType.CUSTOM,
             resources=resources,
-            image=action.image or self.default_image or _default_image(self.cluster),
+            image=(
+                action.image
+                or self.default_image
+                or default_sandbox_image(self.cluster)
+            ),
             volume_mounts=[
                 VolumeMount(
                     host_path=mount.host_path,
@@ -529,6 +536,13 @@ class SandboxWriteFileExecutor(
 ):
     """Write one file into a custom sandbox."""
 
+    def _terminal_base_url(self, client: SandboxClient) -> str:
+        return terminal_base_url(
+            cluster=self.cluster or client.cluster,
+            env=self.env,
+            fallback=client.base_url,
+        )
+
     def __call__(
         self,
         action: SandboxWriteFileAction,
@@ -536,8 +550,13 @@ class SandboxWriteFileExecutor(
     ) -> SandboxWriteFileObservation:
         try:
             raw = action.content.encode("utf-8")
-            self._sandbox_client(conversation).write_file(
-                action.sandbox_id, action.path, raw
+            client = self._sandbox_client(conversation)
+            write_sandbox_file(
+                client,
+                ws_base_url=self._terminal_base_url(client),
+                sandbox_id=action.sandbox_id,
+                path=action.path,
+                source=raw,
             )
             return SandboxWriteFileObservation.from_text(
                 text=f"Wrote {len(raw)} bytes to {action.path}.",
@@ -622,10 +641,35 @@ _EXIT_MARKER = "__PYROMIND_TERMINAL_EXIT__"
 _TERMINAL_COLS = 160
 _TERMINAL_ROWS = 48
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
-_PROD_ENVS = frozenset({"prod", "production", "online"})
+PROD_ENVS = frozenset({"prod", "production", "online"})
 
 
-def _terminal_websocket_url(
+def terminal_base_url(
+    *,
+    cluster: str | None,
+    env: str | None,
+    fallback: str,
+) -> str:
+    """Resolve the per-cluster base URL used by the terminal WebSocket.
+
+    The portal domain does not proxy WebSocket, so terminal connections must be
+    reached through the per-cluster direct domain (``cluster[#env]``), matching
+    the ``pyromind terminal`` CLI. ``fallback`` is used when the cluster route is
+    unknown or absent.
+    """
+    route = (cluster or "").strip()
+    environment = (env or "").strip()
+    if route and "#" not in route and environment and environment not in PROD_ENVS:
+        route = f"{route}#{environment}"
+    if route:
+        try:
+            return resolve_base_url_from_cluster(route)
+        except ValueError:
+            pass
+    return fallback
+
+
+def terminal_websocket_url(
     *,
     base_url: str,
     sandbox_id: str,
@@ -646,14 +690,20 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", text)
 
 
-def _terminal_exit_code(text: str) -> int | None:
-    matches = re.findall(rf"{re.escape(_EXIT_MARKER)}:\s*(\d+)", text)
+def _terminal_exit_code(text: str, marker: str) -> int | None:
+    """Last complete ``<marker>:<exit code>`` line in the terminal stream.
+
+    The TTY bridge echoes the line that prints the marker, so the echoed copy
+    matches the prefix but never the digits. Requiring the value and the line
+    ending keeps the echoed command line from being mistaken for the result.
+    """
+    matches = re.findall(rf"{re.escape(marker)}:\s*(-?\d+)(?:\r\n?|\n)", text)
     if not matches:
         return None
     return int(matches[-1])
 
 
-def _run_terminal_command(
+def run_terminal_command(
     *,
     base_url: str,
     api_key: str,
@@ -667,7 +717,7 @@ def _run_terminal_command(
     command line. The exit code is captured with an echo marker because the
     terminal protocol is a raw byte stream.
     """
-    url = _terminal_websocket_url(
+    url = terminal_websocket_url(
         base_url=base_url,
         sandbox_id=sandbox_id,
         api_key=api_key,
@@ -677,15 +727,30 @@ def _run_terminal_command(
     # some hosts (e.g. Homebrew OpenSSL without a populated CA file) and
     # fails with CERTIFICATE_VERIFY_FAILED. Align with the REST path.
     ssl_context = ssl.create_default_context(cafile=certifi.where())
+    # A per-call suffix keeps a status line left by an earlier command on a
+    # reused terminal session from being read as this command's exit code.
+    marker = f"{_EXIT_MARKER}{secrets.token_hex(4)}"
     buffer = bytearray()
     timed_out = False
     with connect(url, ssl=ssl_context, open_timeout=30, close_timeout=5) as terminal:
         terminal.send((command + "\r\n").encode("utf-8", "replace"))
-        terminal.send(f"echo {_EXIT_MARKER}:$?\r\n".encode("ascii"))
+        terminal.send(f"echo {marker}:$?\r\n".encode("ascii"))
         deadline = time.monotonic() + timeout_seconds
         while True:
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or _EXIT_MARKER.encode("ascii") in buffer:
+            if remaining <= 0:
+                timed_out = True
+                break
+            # Wait for the printed status line, not for the marker text: the
+            # TTY echoes the command that prints it long before it runs.
+            marker_at = buffer.find(marker.encode("ascii"))
+            if (
+                marker_at >= 0
+                and _terminal_exit_code(
+                    buffer[marker_at:].decode("utf-8", "replace"), marker
+                )
+                is not None
+            ):
                 break
             try:
                 message = terminal.recv(timeout=remaining)
@@ -707,7 +772,58 @@ def _run_terminal_command(
         except Exception:  # noqa: BLE001
             pass
     text = _strip_ansi(buffer.decode("utf-8", "replace"))
-    return text, _terminal_exit_code(text), timed_out
+    return text, _terminal_exit_code(text, marker), timed_out
+
+
+class SandboxFileClient(Protocol):
+    """The slice of ``SandboxClient`` needed to write one file."""
+
+    api_key: str
+
+    def write_file(
+        self, sandbox_id: str, path: str, source: str | os.PathLike[str] | bytes
+    ) -> Any: ...
+
+
+def _is_empty_source(source: str | os.PathLike[str] | bytes) -> bool:
+    if isinstance(source, bytes):
+        return not source
+    return os.path.getsize(source) == 0
+
+
+def write_sandbox_file(
+    client: SandboxFileClient,
+    *,
+    ws_base_url: str,
+    sandbox_id: str,
+    path: str,
+    source: str | os.PathLike[str] | bytes,
+    timeout_seconds: int = 60,
+) -> None:
+    """Write one file into a sandbox, including zero-byte files.
+
+    ``SandboxClient.write_file`` splits the payload into chunks and the platform
+    rejects an init carrying zero chunks, so empty content is created through
+    the terminal bridge instead.
+    """
+    if not _is_empty_source(source):
+        client.write_file(sandbox_id, path, source)
+        return
+    directory = posixpath.dirname(path) or "/"
+    command = f"mkdir -p {shlex.quote(directory)} && : > {shlex.quote(path)}"
+    output, exit_code, timed_out = run_terminal_command(
+        base_url=ws_base_url,
+        api_key=client.api_key,
+        sandbox_id=sandbox_id,
+        command=command,
+        timeout_seconds=timeout_seconds,
+    )
+    if exit_code != 0:
+        raise RuntimeError(
+            f"PI_SANDBOX_WRITE_FAILED: cannot create empty file {path} "
+            f"(exit_code={exit_code}, timed_out={timed_out}, "
+            f"output={output.strip()[-200:]})"
+        )
 
 
 class SandboxTerminalAction(Action):
@@ -753,22 +869,11 @@ class SandboxTerminalExecutor(
     """Execute a command in a sandbox over the terminal TTY WebSocket."""
 
     def _terminal_base_url(self, client: SandboxClient) -> str:
-        """Resolve the per-cluster base URL used by the terminal WebSocket.
-
-        The portal domain (client.base_url) does not proxy WebSocket, so the
-        terminal endpoint must be reached through the per-cluster direct
-        domain, matching the ``pyromind terminal`` CLI (cluster[#env]).
-        """
-        cluster = (self.cluster or client.cluster or "").strip()
-        env = (self.env or "").strip()
-        if cluster and "#" not in cluster and env and env not in _PROD_ENVS:
-            cluster = f"{cluster}#{env}"
-        if cluster:
-            try:
-                return resolve_base_url_from_cluster(cluster)
-            except ValueError:
-                pass
-        return client.base_url
+        return terminal_base_url(
+            cluster=self.cluster or client.cluster,
+            env=self.env,
+            fallback=client.base_url,
+        )
 
     def __call__(
         self,
@@ -782,7 +887,7 @@ class SandboxTerminalExecutor(
                 if action.cwd
                 else action.command
             )
-            output, returncode, timed_out = _run_terminal_command(
+            output, returncode, timed_out = run_terminal_command(
                 base_url=self._terminal_base_url(client),
                 api_key=client.api_key,
                 sandbox_id=action.sandbox_id,

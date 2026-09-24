@@ -4,6 +4,7 @@ import asyncio
 import os
 import signal
 
+import certifi
 import pytest
 from harness_adapter.pi_adapter.event_translator import translate_runner_event
 from harness_adapter.pi_adapter.protocol import (
@@ -12,7 +13,11 @@ from harness_adapter.pi_adapter.protocol import (
     decode_frame,
     encode_frame,
 )
-from harness_adapter.pi_adapter.runner import PiRunnerExit, PiRunnerProcess
+from harness_adapter.pi_adapter.runner import (
+    PiRunnerExit,
+    PiRunnerProcess,
+    _runner_environment,
+)
 from pyromind_runtime.application import SnapshotProjector
 from pyromind_runtime.application.event_projection import ProductEventProjector
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
@@ -47,6 +52,18 @@ def test_runner_entrypoint_resolves_from_env(monkeypatch, tmp_path) -> None:
         exit_handler=noop,
     )
     assert runner._entrypoint == entrypoint
+
+
+def test_runner_environment_gives_node_pythons_ca_bundle(monkeypatch) -> None:
+    monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+
+    assert _runner_environment()["NODE_EXTRA_CA_CERTS"] == certifi.where()
+
+
+def test_runner_environment_keeps_a_configured_ca_bundle(monkeypatch) -> None:
+    monkeypatch.setenv("NODE_EXTRA_CA_CERTS", "/etc/ssl/custom.pem")
+
+    assert _runner_environment()["NODE_EXTRA_CA_CERTS"] == "/etc/ssl/custom.pem"
 
 
 async def test_runner_start_uses_a_new_process_session_on_posix(

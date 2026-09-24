@@ -14,10 +14,21 @@ import {
 import { type ImageContent, type TextContent, type TSchema } from "@earendil-works/pi-ai";
 import {
   createBashTool,
+  createEditTool as createCodingEditTool,
+  createReadTool as createCodingReadTool,
+  createWriteTool as createCodingWriteTool,
   type InlineExtension,
 } from "@earendil-works/pi-coding-agent";
 import { isRecord, type JsonObject } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
+import {
+  createSandboxFileOperations,
+  SandboxFileClient,
+  SandboxEndpointSession,
+  type SandboxEndpointProvider,
+} from "./sandbox-operations.js";
+import { SandboxPathPolicy } from "./sandbox-paths.js";
+import { LazySandboxTerminalOperations } from "./sandbox-terminal.js";
 import {
   createWorkspaceBashOperations,
   type PiTerminalBackend,
@@ -30,6 +41,10 @@ import {
 
 const OPENHANDS_ERROR_HEADER = "[An error occurred during execution.]";
 const OMITTED_IMAGE_TEXT = "[Image omitted: Pi only accepts inline base64 image data.]";
+const SANDBOX_READ_PATH_SCOPE =
+  "Mounted Storage is read-only and addressed as storage/... . Conversation files are read from public_data/. Configured skill directories and knowledge are read-only; .agents/skills/ and knowledge/ address their configured resource directories.";
+const SANDBOX_WRITE_PATH_SCOPE =
+  "Write and edit paths must stay within public_data/. Mounted Storage under storage/... is read-only.";
 
 export interface BusinessToolConfig {
   name: string;
@@ -42,6 +57,12 @@ export interface SkillRootConfig {
   path: string;
 }
 
+export interface CreateToolsOptions {
+  skillsDirectory?: string;
+  /** Present only when the session runs its execution plane in a sandbox. */
+  sandbox?: SandboxEndpointProvider;
+}
+
 export async function createTools(
   peer: JsonlRpcPeer,
   env: ExecutionEnv,
@@ -51,8 +72,12 @@ export async function createTools(
   knowledgeRoot: string | undefined,
   resourceLimits: ResourceLimitsConfig | undefined,
   businessTools: BusinessToolConfig[],
-  skillsDirectory?: string,
+  options: CreateToolsOptions = {},
 ): Promise<AgentTool[]> {
+  if (terminalBackend === "sandbox") {
+    return createSandboxTools(peer, businessTools, options);
+  }
+  const { skillsDirectory } = options;
   const policy = await WorkspaceAccessPolicy.create({
     workspaceRoot,
     readOnlyRoots: skillRoots.map((root) => root.path),
@@ -93,9 +118,114 @@ export async function createTools(
     }),
   });
   return [
-    bindPathTool(read, env, policy, "read"),
-    bindPathTool(write, env, policy, "write"),
-    bindPathTool(edit, env, policy, "write"),
+    bindPathTool(
+      bindNative(read, env),
+      (path, operation) => policy.resolvePath(path, operation),
+      "read",
+    ),
+    bindPathTool(
+      bindNative(write, env),
+      (path, operation) => policy.resolvePath(path, operation),
+      "write",
+    ),
+    bindPathTool(
+      bindNative(edit, env),
+      (path, operation) => policy.resolvePath(path, operation),
+      "write",
+    ),
+    {
+      ...bash,
+      name: "terminal",
+      label: "terminal",
+      async execute(callId, params: any, signal, onUpdate) {
+        return bash.execute(callId, params, signal, onUpdate);
+      },
+    },
+    ...businessTools.map((config) => businessTool(peer, config)),
+  ];
+}
+
+/**
+ * Sandbox execution plane: file tools talk to the sandbox file API and the
+ * terminal tool drives the sandbox TTY. The endpoint is resolved on first use
+ * so a conversation that never touches files never creates a sandbox.
+ *
+ * Every tool is created with a workspace-relative cwd (`"."`): the sandbox
+ * operations resolve paths against the sandbox-side conversation root, so the
+ * host conversation directory must never leak into a command or file path.
+ */
+async function createSandboxTools(
+  peer: JsonlRpcPeer,
+  businessTools: BusinessToolConfig[],
+  options: CreateToolsOptions,
+): Promise<AgentTool[]> {
+  const provider = options.sandbox;
+  if (!provider) {
+    throw new Error("SANDBOX_ENDPOINT_MISSING: sandbox terminal backend requires a provider");
+  }
+  const sandboxCwd = ".";
+  const endpoints = new SandboxEndpointSession(provider);
+  const fileOperations = createSandboxFileOperations(new SandboxFileClient(endpoints));
+  let policy: SandboxPathPolicy | undefined;
+  const resolvePolicy = async (): Promise<SandboxPathPolicy> => {
+    if (policy) return policy;
+    const resolved = await endpoints.resolve();
+    const skillsDirectory = `${resolved.workspacePath}/.agents/skills`;
+    const knowledgeRoot = `${resolved.workspacePath}/knowledge`;
+    policy = SandboxPathPolicy.create({
+      workspacePath: resolved.workspacePath,
+      readOnlyRoots: [skillsDirectory, knowledgeRoot],
+      skillsDirectory,
+      knowledgeRoot,
+      storageRoot: resolved.storagePath,
+    });
+    return policy;
+  };
+
+  const read = createCodingReadTool(sandboxCwd, {
+    operations: {
+      readFile: async (path) => fileOperations.read.readFile(path),
+      access: async (path) => fileOperations.read.access(path),
+      detectImageMimeType: async (path) =>
+        fileOperations.read.detectImageMimeType?.(path),
+    },
+  });
+  const write = createCodingWriteTool(sandboxCwd, {
+    operations: {
+      writeFile: async (path, content) => fileOperations.write.writeFile(path, content),
+      mkdir: async (dir) => fileOperations.write.mkdir(dir),
+    },
+  });
+  const edit = createCodingEditTool(sandboxCwd, {
+    operations: {
+      readFile: async (path) => fileOperations.edit.readFile(path),
+      writeFile: async (path, content) => fileOperations.edit.writeFile(path, content),
+      access: async (path) => fileOperations.edit.access(path),
+    },
+  });
+  const bash = createBashTool(sandboxCwd, {
+    operations: new LazySandboxTerminalOperations(endpoints),
+    exposeSessionEnvironment: false,
+  });
+  return [
+    bindPathTool(
+      read,
+      async (path, operation) => (await resolvePolicy()).resolvePath(path, operation),
+      "read",
+      SANDBOX_READ_PATH_SCOPE,
+    ),
+    bindPathTool(
+      write,
+      async (path, operation) => (await resolvePolicy()).resolvePath(path, operation),
+      "write",
+      SANDBOX_WRITE_PATH_SCOPE,
+    ),
+    bindPathTool(
+      edit,
+      async (path, operation) => (await resolvePolicy()).resolvePath(path, operation),
+      "write",
+      SANDBOX_WRITE_PATH_SCOPE,
+    ),
     {
       ...bash,
       name: "terminal",
@@ -141,30 +271,29 @@ function bindNative(
 }
 
 function bindPathTool(
-  tool: AgentHarnessTool<ExecutionToolContext, any, any>,
-  env: ExecutionEnv,
-  policy: WorkspaceAccessPolicy,
+  tool: AgentTool<any, any>,
+  resolvePath: (path: string, operation: WorkspacePathOperation) => string | Promise<string>,
   operation: WorkspacePathOperation,
+  pathScopeOverride?: string,
 ): AgentTool<any, any> {
-  const bound = bindNative(tool, env);
-  const pathScope = operation === "read"
+  const pathScope = pathScopeOverride ?? (operation === "read"
     ? "Conversation files are read from public_data/. Configured skill directories and knowledge are read-only. .agents/skills/ and knowledge/ address their configured resource directories. Other relative paths start at the conversation root; authorized absolute paths are also accepted."
-    : "Write and edit paths must stay within public_data/. Relative paths start at the conversation root; authorized absolute paths are also accepted.";
-  const parameters = structuredClone(bound.parameters);
+    : "Write and edit paths must stay within public_data/. Relative paths start at the conversation root; authorized absolute paths are also accepted.");
+  const parameters = structuredClone(tool.parameters);
   if (isRecord(parameters.properties) && isRecord(parameters.properties.path)) {
     parameters.properties.path.description = pathScope;
   }
   return {
-    ...bound,
-    description: `${bound.description}\n\n${pathScope}`,
+    ...tool,
+    description: `${tool.description}\n\n${pathScope}`,
     parameters,
     async execute(callId, params: any, signal, onUpdate) {
       if (!isRecord(params) || typeof params.path !== "string") throw new Error("path must be a string");
       const safe = {
         ...params,
-        path: await policy.resolvePath(params.path, operation),
+        path: await resolvePath(params.path, operation),
       };
-      return tool.execute(callId, safe, signal, onUpdate, { env });
+      return tool.execute(callId, safe, signal, onUpdate);
     },
   };
 }

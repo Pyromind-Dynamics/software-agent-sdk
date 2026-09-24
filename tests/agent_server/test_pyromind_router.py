@@ -66,6 +66,7 @@ from openhands.tools.environment_processing import (
 from openhands.tools.pyromind_archive import ExtractArchiveTool
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
+    GetStorageUrlTool,
     PreviewDatasetTool,
     UploadFileToPyromindTool,
 )
@@ -143,12 +144,10 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     }
     assert not (skill_root / "references" / "example-workflows.md").exists()
     assert "PathJoinNode → LoadDataset" in references["data-routing.md"]
-    assert "sample_file_path" in references["data-routing.md"]
-    assert "未返回时只用" in references["data-routing.md"]
-    assert "不得假设副本存在或搜索本地工作区" in references["data-routing.md"]
+    assert "对原路径读一次 `storage/...` 取数据画像" in references["data-routing.md"]
     assert "去掉可选的 `/workspace/` 前缀和开头 `/`" in references["data-routing.md"]
-    assert "同一路径已有成功 preview 时复用" in references["data-routing.md"]
-    assert "可选统计为空不等于 preview 失败" in references["data-routing.md"]
+    assert "同一路径已有画像时复用" in references["data-routing.md"]
+    assert "不伪装成总条数" in references["data-routing.md"]
     assert "## 训练格式门禁" in references["data-routing.md"]
     assert "可验证信号" in references["data-routing.md"]
     assert "本文件只识别数据形态" in references["data-routing.md"]
@@ -1116,6 +1115,7 @@ def test_pyromind_storage_tools_use_user_context_headers():
     assert [tool.name for tool in tools] == [
         PreviewDatasetTool.name,
         UploadFileToPyromindTool.name,
+        GetStorageUrlTool.name,
         RunDatasetCleaningTool.name,
         DfSubmitPipelineTool.name,
         EdpSubmitTool.name,
@@ -1133,7 +1133,7 @@ def test_pyromind_storage_tools_use_user_context_headers():
         "headers": {"x-cluster": "context-cluster"},
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
-    cleaning_params = tools[2].params
+    cleaning_params = tools[3].params
     assert cleaning_params == {
         "current_user": CurrentLoginUser(
             username="debug-user-42",

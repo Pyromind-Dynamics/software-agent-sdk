@@ -588,11 +588,13 @@ def test_skill_requires_platform_sample_and_user_confirmation():
     assert "limit=3" in skill
     assert "等待用户明确确认" in skill
     assert "不得下载数据或本地运行" in skill
-    assert "平台产物只能用 `preview_dataset` 查看" in skill
+    assert "用户 Storage 挂载为 `storage/`，可直接查看源数据和平台产物" in skill
+    assert "直接读 `storage/<path>`" in skill
     assert "不要查看、搜索或反复读取 `cleaning_utils.py`" in skill
     assert "prompt/chosen/rejected 自动按 DPO 清洗" in skill
     assert "不透明 `error_log`" in skill
-    assert "`report.json` 和 `output.jsonl`" in skill
+    assert "`storage/<output_dir>/report.json`" in skill
+    assert "`output.jsonl`" in skill
     assert "只生成两个数据产物" in skill
     assert "`read_file`" not in skill
     assert "`execute_bash`" not in skill

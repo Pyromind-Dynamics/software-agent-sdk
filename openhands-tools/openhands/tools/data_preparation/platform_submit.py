@@ -13,12 +13,12 @@ import json
 import shlex
 import tempfile
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
-import httpx
 from pydantic import BaseModel, Field
 from rich.text import Text
 
@@ -32,7 +32,7 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.data_preparation.runner import (
-    SUPPORTED_DATAFLOW_VERSION,
+    DATAFLOW_RUNTIME_PACKAGES,
     build_dataflow_env,
     runtime_bundle_fingerprint,
     runtime_public_names,
@@ -44,18 +44,26 @@ from openhands.tools.data_preparation.workspace_paths import (
 )
 from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_AGENT_STORAGE_ROOT,
-    _decode_json_response,
     _default_storage_base_url,
-    _extract_api_data,
     _resolve_conversation_headers,
     _resolve_secret_headers,
+    storage_file_names,
     upload_local_file_to_pyromind,
 )
+from openhands.tools.utils.conversation_dirs import conversation_state_dir
 from openhands.tools.utils.dataflow_config import (
     ENV_DF_API_BASE_URL,
     ENV_DF_API_KEY,
     ENV_DF_API_URL,
     ENV_DF_MODEL_NAME,
+)
+from openhands.tools.utils.workspace_staging import (
+    STORAGE_ALIAS,
+    WorkspaceStagingError,
+    is_remote_workspace,
+    resolve_workspace_path,
+    stage_workspace_path,
+    staged_remote_dir,
 )
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
@@ -93,13 +101,7 @@ OutputSchema = Literal[
 ]
 PersistedTaskKind = Literal["data_preparation", "dataset_analysis", "data_synthesis"]
 
-DATA_PROCESSING_PACKAGES = (
-    f"open-dataflow=={SUPPORTED_DATAFLOW_VERSION}",
-    "numpy==1.26.4",
-    "Pillow==12.1.1",
-    "opencv-python-headless==4.10.0.84",
-    "matplotlib==3.9.4",
-)
+DATA_PROCESSING_PACKAGES = DATAFLOW_RUNTIME_PACKAGES
 
 TOOL_DESCRIPTION = """\
 Submit an agent-authored Python pipeline for asynchronous execution on Pyromind.
@@ -116,9 +118,8 @@ The tool creates a one-node CustomCommandNode workflow that:
 4. Always generates report.json, including failure and checkpoint state
 
 Execution is asynchronous. A terminal Kafka callback resumes the
-conversation when the workflow completes. After the callback, inspect
-all Pyromind artifacts exclusively with `preview_dataset`; never use Terminal,
-workspace file APIs, or local filesystem reads for these Storage paths:
+conversation when the workflow completes. After the callback, inspect the
+returned Storage `output_dir` artifacts:
 - report.json: execution summary, LLM call stats, error samples
 - failure.json / validation.json: detailed failure evidence when present
 - failures.jsonl: retry ledger for skipped records; rows carry the source input
@@ -517,9 +518,22 @@ class DfSubmitPipelineExecutor(
         action: DfSubmitPipelineAction,
         conversation: BaseConversation | None = None,
     ) -> DfSubmitPipelineObservation:
+        if conversation is None:
+            return DfSubmitPipelineObservation.from_text(
+                text="df_submit_pipeline requires an active conversation.",
+                status="Failed",
+                is_error=True,
+            )
+        with _submission_files(conversation) as files:
+            return self._submit(action, conversation, files)
+
+    def _submit(
+        self,
+        action: DfSubmitPipelineAction,
+        conversation: BaseConversation,
+        files: _SubmissionFiles,
+    ) -> DfSubmitPipelineObservation:
         try:
-            if conversation is None:
-                raise ValueError("df_submit_pipeline requires an active conversation.")
             input_path = _normalize_storage_path(action.input_path, "input_path")
             task_store = self._task_store(conversation)
             resumed = action.mode == "resume"
@@ -580,8 +594,8 @@ class DfSubmitPipelineExecutor(
                     runtime_storage_dir = prior_run.runtime_storage_dir
                     image_utils_api_version = prior_run.image_utils_api_version
                 else:
-                    local_script_path, script_path = _validate_local_pipeline(
-                        conversation, action.script_path
+                    local_script_path, script_path = _validate_pipeline(
+                        files, action.script_path
                     )
                     pipeline_fingerprint = _file_sha256(Path(local_script_path))
                     frozen_script_name = f"pipeline-r{execution_revision}.py"
@@ -599,8 +613,8 @@ class DfSubmitPipelineExecutor(
                     support_file_name = prior_run.support_file_name
                     support_file_fingerprint = prior_run.support_file_fingerprint
                 else:
-                    local_support_file_path, _ = _validate_local_support_file(
-                        conversation, action.support_file_path
+                    local_support_file_path, _ = _validate_support_file(
+                        files, action.support_file_path
                     )
                     support_file_name = f"job-spec-r{execution_revision}.json"
                     support_file_fingerprint = _file_sha256(
@@ -643,8 +657,8 @@ class DfSubmitPipelineExecutor(
                     raise ValueError("resume_run_id is only valid when mode='resume'.")
                 if action.script_path is None:
                     raise ValueError("script_path is required for a new full run.")
-                local_script_path, script_path = _validate_local_pipeline(
-                    conversation, action.script_path
+                local_script_path, script_path = _validate_pipeline(
+                    files, action.script_path
                 )
                 run_id = uuid.uuid4()
                 output_root = (
@@ -674,8 +688,8 @@ class DfSubmitPipelineExecutor(
                 support_file_name = None
                 support_file_fingerprint = None
                 if action.support_file_path is not None:
-                    local_support_file_path, _ = _validate_local_support_file(
-                        conversation, action.support_file_path
+                    local_support_file_path, _ = _validate_support_file(
+                        files, action.support_file_path
                     )
                     support_file_name = "job-spec.json"
                     support_file_fingerprint = _file_sha256(
@@ -867,9 +881,12 @@ class DfSubmitPipelineExecutor(
     def _task_store(self, conversation: BaseConversation) -> DataPreparationTaskStore:
         if self._task_store_dir is not None:
             return DataPreparationTaskStore(self._task_store_dir)
-        workspace = cast(Any, conversation).workspace
-        conversations_dir = Path(workspace.working_dir).resolve().parent
-        return DataPreparationTaskStore(conversations_dir / TASK_ASSOCIATION_DIRNAME)
+        state_dir = conversation_state_dir(conversation, TASK_ASSOCIATION_DIRNAME)
+        if state_dir is None:
+            raise ValueError(
+                "Cannot resolve the host conversation directory for task associations."
+            )
+        return DataPreparationTaskStore(state_dir)
 
     def _stage_runtime_files(
         self,
@@ -905,33 +922,12 @@ class DfSubmitPipelineExecutor(
         headers: dict[str, str],
     ) -> set[str]:
         """Best-effort cache lookup; upload remains the safe fallback."""
-        try:
-            response = httpx.post(
-                f"{self._storage_base_url}/file_list",
-                headers=headers,
-                json={"path": storage_dir, "search": ""},
-                timeout=float(self._timeout),
-            )
-        except httpx.RequestError:
-            return set()
-        payload = _decode_json_response(response, "Pyromind storage file_list API")
-        if isinstance(payload, str):
-            return set()
-        data = _extract_api_data("file_list", payload)
-        if isinstance(data, str) or not isinstance(data.get("list"), list):
-            return set()
-        names: set[str] = set()
-        for item in data["list"]:
-            if not isinstance(item, dict):
-                continue
-            name = item.get("name")
-            if isinstance(name, str) and name:
-                names.add(name)
-                continue
-            item_path = item.get("path")
-            if isinstance(item_path, str) and item_path:
-                names.add(PurePosixPath(item_path).name)
-        return names
+        return storage_file_names(
+            directory=storage_dir,
+            storage_base_url=self._storage_base_url,
+            headers=headers,
+            timeout=float(self._timeout),
+        )
 
     def _runtime_cache_dir(
         self,
@@ -1311,33 +1307,73 @@ class PipelineResolutionError(ValueError):
     pass
 
 
-def _validate_local_pipeline(
-    conversation: BaseConversation,
-    script_path: str,
-) -> tuple[str, str]:
-    try:
-        path = resolve_workspace_file(
-            conversation,
-            script_path,
-            allow_virtual_conversation_path=True,
+class _SubmissionFiles:
+    """Resolve submission inputs to host paths.
+
+    Local workspaces resolve in place. A remote (sandbox) workspace has no host
+    filesystem, so inputs are staged into a private host directory that lives
+    for the duration of the submission.
+    """
+
+    def __init__(
+        self,
+        conversation: BaseConversation,
+        staging: Path | None,
+    ) -> None:
+        self._conversation = conversation
+        self._workspace = cast(Any, conversation).workspace
+        self._staging = staging
+
+    def resolve(self, path: str) -> tuple[Path, str]:
+        """Return the host path holding ``path`` and its workspace-relative form."""
+        if self._staging is None:
+            resolved = resolve_workspace_file(
+                self._conversation,
+                path,
+                allow_virtual_conversation_path=True,
+            )
+            return resolved, workspace_relative_path(self._conversation, resolved)
+        try:
+            staged = stage_workspace_path(
+                self._workspace, path, destination=self._staging
+            )
+        except WorkspaceStagingError as exc:
+            raise ValueError(str(exc)) from exc
+        relative, from_storage = resolve_workspace_path(self._workspace, path)
+        display = (
+            f"{STORAGE_ALIAS}/{relative.as_posix()}"
+            if from_storage
+            else relative.as_posix()
         )
+        return staged, display
+
+
+@contextmanager
+def _submission_files(conversation: BaseConversation) -> Iterator[_SubmissionFiles]:
+    workspace = cast(Any, conversation).workspace
+    if not is_remote_workspace(workspace):
+        yield _SubmissionFiles(conversation, staging=None)
+        return
+    with staged_remote_dir() as staging:
+        yield _SubmissionFiles(conversation, staging=staging)
+
+
+def _validate_pipeline(files: _SubmissionFiles, script_path: str) -> tuple[str, str]:
+    try:
+        path, relative = files.resolve(script_path)
     except ValueError as exc:
         raise PipelineResolutionError(str(exc)) from exc
     if path.suffix.lower() != ".py":
         raise PipelineResolutionError("script_path must point to a Python .py file.")
-    return str(path), workspace_relative_path(conversation, path)
+    return str(path), relative
 
 
-def _validate_local_support_file(
-    conversation: BaseConversation,
+def _validate_support_file(
+    files: _SubmissionFiles,
     support_file_path: str,
 ) -> tuple[str, str]:
     try:
-        path = resolve_workspace_file(
-            conversation,
-            support_file_path,
-            allow_virtual_conversation_path=True,
-        )
+        path, relative = files.resolve(support_file_path)
     except ValueError as exc:
         raise PipelineResolutionError(str(exc)) from exc
     if path.suffix.lower() != ".json":
@@ -1348,7 +1384,7 @@ def _validate_local_support_file(
         raise PipelineResolutionError(
             f"support_file_path is not valid JSON: {exc}"
         ) from exc
-    return str(path), workspace_relative_path(conversation, path)
+    return str(path), relative
 
 
 def _file_sha256(path: Path) -> str:

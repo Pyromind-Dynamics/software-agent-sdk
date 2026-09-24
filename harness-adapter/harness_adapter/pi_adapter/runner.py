@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
+import certifi
+
 from harness_adapter.pi_adapter.protocol import (
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
@@ -300,8 +302,21 @@ def _runner_environment() -> dict[str, str]:
         "LC_ALL",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
-        "NODE_EXTRA_CA_CERTS",
         "OH_SANDBOX_VMEM_LIMIT",
         "OH_SANDBOX_NPROC_LIMIT",
     )
-    return {name: os.environ[name] for name in allowed if name in os.environ}
+    environment = {name: os.environ[name] for name in allowed if name in os.environ}
+    ca_bundle = os.environ.get("NODE_EXTRA_CA_CERTS") or _node_ca_bundle()
+    if ca_bundle:
+        environment["NODE_EXTRA_CA_CERTS"] = ca_bundle
+    return environment
+
+
+def _node_ca_bundle() -> str | None:
+    """Give the runner the same trust store the Python clients verify against.
+
+    Node ships its own root store, which does not carry the platform CA chain,
+    so sandbox HTTP and WebSocket calls fail TLS verification without this.
+    """
+    bundle = Path(certifi.where())
+    return os.fspath(bundle) if bundle.is_file() else None

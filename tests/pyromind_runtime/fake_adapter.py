@@ -161,7 +161,12 @@ class FakeAdapter:
 
     async def close(self, handle: SessionHandle) -> None:
         self.closed.append(handle.session_id)
-        self.queues[handle.session_id].put_nowait(None)
+        # Mirror the real adapters: closing drops the session from the registry
+        # and only then terminates its event stream, so a later attach starts
+        # from a fresh queue instead of reading a stale terminator.
+        queue = self.queues.pop(handle.session_id, None)
+        if queue is not None:
+            queue.put_nowait(None)
 
     def emit(
         self,

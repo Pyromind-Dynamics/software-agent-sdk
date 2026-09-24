@@ -11,7 +11,6 @@ that always submits with ``test_mode=True`` (platform ``execution_mode=test``).
 from __future__ import annotations
 
 from collections.abc import Sequence
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
 from pydantic import Field
@@ -24,6 +23,7 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
+from openhands.tools.utils.workspace_files import read_workspace_text
 from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 from openhands.tools.workflow.run_workflow import (
     DEFAULT_MAX_ATTEMPTS,
@@ -214,18 +214,7 @@ class WorkflowDebugExecutor(
             raise ValueError(
                 "Cannot read the workflow DSL file without an active conversation."
             )
-        workspace = cast(Any, conversation).workspace
-        base_dir = Path(workspace.working_dir).resolve()
-        workflow_path = (base_dir / dsl_path).resolve()
-        if not workflow_path.is_relative_to(base_dir):
-            raise ValueError(
-                f"Workflow DSL path must stay inside the workspace: {dsl_path!r}"
-            )
-        if not workflow_path.is_file():
-            raise ValueError(
-                f"Cannot read workflow DSL file: {dsl_path!r} does not exist."
-            )
-        return workflow_path.read_text(encoding="utf-8")
+        return read_workspace_text(cast(Any, conversation).workspace, dsl_path)
 
     def __call__(
         self,

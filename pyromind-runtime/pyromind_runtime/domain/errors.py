@@ -10,6 +10,7 @@ type ProductErrorCode = Literal[
     "capability_not_supported",
     "command_conflict",
     "fork_target_conflict",
+    "capacity_exceeded",
     "harness_operation_failed",
 ]
 

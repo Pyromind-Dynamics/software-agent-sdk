@@ -3,7 +3,7 @@ name: label-studio
 description: >-
   使用 label_studio_project 工具将用户数据集创建为 Label Studio
   标注项目。用户要求创建标注项目、标注数据、打标、review 图片质检
-  结果时使用。需要先 preview_dataset 理解数据再生成 XML。
+  结果时使用。需要先看清 `storage/` 里的数据结构再生成 XML。
 ---
 
 # Label Studio 标注集成
@@ -58,9 +58,9 @@ Label Studio 本身支持的控件（画笔、多边形、关键点）转换器�
 
 ## 控制面 SOP
 
-1. **探查**：`preview_dataset(dataset_path=...)` 先看清数据结构（样本目录 +
-   meta 字段，或 JSONL 行内字段和图片路径）；需要对比多个样本时，把其余路径
-   放进 `dataset_paths` 一次看完，不要一个样本调一次。
+1. **探查**：用 `read`/`terminal` 读 `storage/<dataset_path>` 先看清数据结构
+   （样本目录 + meta 字段，或 JSONL 行内字段和图片路径）；一次看完多个样本，
+   不要一个样本调一次。
 2. **路由**：按上表命中一条 reference 并读取；不命中则进入自定义绑定分支。
    数据形状与 `references/examples/` 不一致时，先核对字段名和坐标写法。
 3. **生成配置**：按样本结构生成 `label_config.xml`；需要改绑定时同一层再写
@@ -86,7 +86,7 @@ Label Studio 本身支持的控件（画笔、多边形、关键点）转换器�
 
 ## 禁止
 
-- 未 preview_dataset 就生成 XML
+- 未看清数据结构就生成 XML
 - 在 operation 参数中传递 UID、Token 或认证信息
 - 用 terminal/curl 直接调用 Label Studio API
 - 由 Agent 遍历完整数据集或生成 Manifest —— 批量由 create 负责

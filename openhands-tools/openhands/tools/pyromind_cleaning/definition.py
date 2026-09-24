@@ -35,6 +35,7 @@ from openhands.tools.pyromind_dataset.definition import (
     download_file_from_pyromind,
     upload_local_file_to_pyromind,
 )
+from openhands.tools.utils.conversation_dirs import conversation_state_dir
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
     create_workflow_api_client,
@@ -131,10 +132,9 @@ run. To continue an interrupted run, call this tool again with `resume_run_id`;
 the platform reuses all frozen runtime files and passes `--resume`.
 
 When the terminal workflow callback resumes the conversation, use the
-`output_dir` returned by this tool. Inspect platform artifacts only with
-`preview_dataset`: read report.json for validation, counters, errors, and
-checkpoint state, then output.jsonl for cleaned rows. Never run or validate
-Storage data locally.
+`output_dir` returned by this tool: read report.json for validation,
+counters, errors, and checkpoint state, then output.jsonl for cleaned rows.
+Do not re-run the cleaning pipeline locally to validate platform output.
 """
 
 
@@ -330,9 +330,12 @@ class RunDatasetCleaningExecutor(
     def _task_store(self, conversation: BaseConversation) -> DatasetCleaningTaskStore:
         if self._task_store_dir is not None:
             return DatasetCleaningTaskStore(self._task_store_dir)
-        workspace = cast(Any, conversation).workspace
-        conversations_dir = Path(workspace.working_dir).resolve().parent
-        return DatasetCleaningTaskStore(conversations_dir / TASK_ASSOCIATION_DIRNAME)
+        state_dir = conversation_state_dir(conversation, TASK_ASSOCIATION_DIRNAME)
+        if state_dir is None:
+            raise ValueError(
+                "Cannot resolve the host conversation directory for task associations."
+            )
+        return DatasetCleaningTaskStore(state_dir)
 
     def _stage_runtime_files(
         self,

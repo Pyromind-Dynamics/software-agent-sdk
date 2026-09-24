@@ -115,5 +115,5 @@ storage = storage.step()
 }
 ```
 
-用 `df_run_pipeline(output_schema="dpo", model_profile="text")` 本地验证 Sample；用户确认
+先用 `df_run_pipeline(output_schema="dpo", model_profile="text")` 跑小样验证；用户确认
 后再 `df_submit_pipeline(output_schema="dpo", model_profile="text")`。

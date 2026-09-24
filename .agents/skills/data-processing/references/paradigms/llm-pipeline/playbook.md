@@ -1,6 +1,6 @@
 # 数据准备（llm-pipeline）
 
-- **基底**：本地 Sample（`df_run_pipeline` 隔离子进程执行 DataFlow 算子）→
+- **基底**：沙箱小样（`df_run_pipeline` 在会话沙箱内隔离子进程执行 DataFlow 算子）→
   用户确认后平台全量（`df_submit_pipeline`）
 - **适用**：内容级处理——规则清洗（词数/语言/MinHash 去重/PII/毒性/HTML）、
   LLM 生成与改写、质量评分、格式化；覆盖 SFT、推理、代码、知识问答、
@@ -9,13 +9,14 @@
 - **不适用**：纯格式转换/字段映射/简单过滤 → format-conversion；
   需在特定环境执行复杂流程的编排式处理（验证/筛选/执行判定）→ environment-processing
 
-先在本地验证最多 3 条 Sample；用户明确确认后，才提交 Pyromind 全量任务。
+先在沙箱验证最多 3 条 Sample；用户明确确认后，才提交 Pyromind 全量任务。
 
 ## 强制边界
 
 - 工作区中间文件放在 `public_data/data-preparation/`。
-- Storage 数据和平台产物只能用 `preview_dataset` 查看，不得用本地文件工具读取。
-- `df_run_pipeline` 只运行本地 Sample；用户确认前不得调用 `df_submit_pipeline`。
+- Storage 挂载为 `storage/`，直接用 `read`/`terminal` 查看数据和平台产物，
+  `df_run_pipeline` 的输入也直接写 `storage/...`。
+- `df_run_pipeline` 只运行沙箱小样；用户确认前不得调用 `df_submit_pipeline`。
 - 平台全量输入必须已经存在于 Storage：`df_submit_pipeline` 不接受工作区路径。
   工作区写好的 Manifest 用 `upload_file_to_pyromind` 落到图片所在的 Storage 目录
   （见[平台全量输入](#平台全量输入)），不要用 sandbox 搬运。
@@ -48,11 +49,13 @@ Manifest 小文件；不要为此创建 sandbox。
 
 ## 执行流程
 
-1. `preview_dataset(mode="inspect")` 确认结构；目录输入先读取
-   `directory_summary`，再决定继续 inspect、sample 哪些路径，或向用户确认格式意图。
-   随后调用 `preview_dataset(mode="sample", n<=3)`；本地 Pipeline 的输入直接使用返回的
-   `df_run_input_path`，多输入时使用 `local_sample_paths`。Storage `source_path` 只用于全量
-   提交，不得作为本地路径，也不得复制 Sample 到另一个文件。
+1. 先确认结构：直接查看 `storage/<input_path>`（目录先 `ls`，再看 schema 和
+   最多 3 条样例），`df_run_pipeline` 直接以 `storage/<input_path>` 作为输入。
+   Storage `source_path` 供全量提交与沙箱直读使用，不得复制 Sample
+   到另一个文件。**vision 小样例外**：图片按 manifest 的相对路径解析，`storage/...`
+   的 manifest 与工作区里的 manifest 都在原地解析其图片，工作区里的 manifest 要求
+   图片与其同目录，`args[0]` 一律传 manifest 文件本身 —— 传目录会走目录发现，
+   丢掉 `image_labels` 等 manifest 字段。
 2. 按下表（运行规则）只读取相关场景 case 文档，同时读取
    [通用约定](dataflow-common.md) 和
    [输出契约](schema-conventions.md)。
@@ -65,9 +68,10 @@ Manifest 小文件；不要为此创建 sandbox。
    重新试跑，直到结果符合预期；迭代过程不向用户展示。
 6. 展示符合预期的 Sample 结果并等待用户明确确认。
 7. 确认输入已按[平台全量输入](#平台全量输入)落到 Storage 后，调用
-   `df_submit_pipeline(mode="full")`。收到 Kafka callback 后，调用
-   `preview_dataset` 查看 `<output_dir>/report.json`；如失败，再查看同目录的
-   `failure.json`、`validation.json` 和必要的 `llm_calls.jsonl`。
+   `df_submit_pipeline(mode="full")`。收到 Kafka callback 后，直接读取
+   `storage/<output_dir>/report.json`；如失败，再查看同目录的
+   `failure.json`、`validation.json` 和必要的
+   `llm_calls.jsonl`。
    图片任务若 `report.json.label_reconciliation.corrected > 0`，继续查看
    `label_corrections.jsonl`，并向用户说明修正数量、原/新标签和证据；训练数据中不写
    审计字段。
@@ -109,7 +113,7 @@ messages 时选择 `vision`。具体完成标准见 PCB 场景文档。
 ## 运行与完成条件
 
 - 只读取需求匹配的场景 case 及其模板；例如 DPO 不读取文本清洗等相邻模板。
-- 按 `failure_stage` 修复：`input_resolution` 只改用工具返回的本地路径，
+- 按 `failure_stage` 修复：`input_resolution` 只改用 `storage/...` 路径，
   `pipeline_resolution` 只修正工作区相对路径，`pipeline_execution` 根据 stderr/report
   修脚本；仅 `runtime_dependency` 可检查运行环境，且不得浏览 SDK 仓库源码。
 - 相同参数得到相同 `error_code` 后不得原样重试；本地输入、输出和报告路径均使用工具
@@ -117,8 +121,8 @@ messages 时选择 `vision`。具体完成标准见 PCB 场景文档。
 - 文本任务使用 `model_profile="text"`；图片任务使用 `model_profile="vision"`。
 - 图片 Pipeline 只配置 `ImagePipelineConfig`，不得自行实现 HTTP、Base64、重试或
   Checkpoint。
-- `directory_summary` 只是结构摘要，不是数据 Schema；低置信度、混合结构或需要
-  类别/异常/大小/命名模式覆盖时，继续 inspect 或自行选择 `sample_paths`。
+- 目录形状只是弱信号，不是数据 Schema；混合结构或需要类别/异常/大小/命名模式
+  覆盖时，先按实际目录结构确认样本边界，再决定输入形态。
 - Text2SQL Sample 使用 Python 3.10 的 `DATAFLOW_PYTHON`；Pyromind 固定
   `open-dataflow==1.0.10`、CPU 执行。
 - `processed.jsonl` 必须通过所选 Schema 校验，ID 唯一且不含运行审计字段。

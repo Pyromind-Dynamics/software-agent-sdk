@@ -11,13 +11,17 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { createPiModelRuntime, type PiModelConfig } from "./pi-model.js";
+import { createNoProgressGuardExtension } from "./no-progress-guard.js";
 import { isRecord, type JsonObject, type JsonValue } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
+import type { SandboxEndpoint, SandboxEndpointProvider } from "./sandbox-operations.js";
+import { applySandboxPathAliases } from "./sandbox-paths.js";
 import { inside } from "./workspace-policy.js";
 import {
   createTerminalPermissionExtension,
   createTools,
   type BusinessToolConfig,
+  type CreateToolsOptions,
   type SkillRootConfig,
 } from "./tools.js";
 import type {
@@ -51,6 +55,12 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
   const config = parseConfig(params);
   const { modelRuntime, model } = await createPiModelRuntime(config);
   const env = new NodeExecutionEnv({ cwd: config.workspaceRoot, shellEnv: safeShellEnvironment() });
+  const options: CreateToolsOptions = {
+    skillsDirectory: config.skillsDirectory,
+    ...(config.terminalBackend === "sandbox"
+      ? { sandbox: sandboxEndpointProvider(peer) }
+      : {}),
+  };
   const tools = await createTools(
     peer,
     env,
@@ -60,7 +70,7 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
     config.knowledgeRoot,
     config.resourceLimits,
     config.tools,
-    config.skillsDirectory,
+    options,
   );
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 20_000 },
@@ -72,6 +82,23 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
     ...config.skillRoots.map((root) => root.path),
     ...(config.skillsDirectory ? [config.skillsDirectory] : []),
   ].map((path) => realpathSync(path));
+  // Sandbox resources are uploaded under the runtime aliases, so the skill
+  // locations baked into the system prompt must not expose host paths.
+  const sandboxPathAliases =
+    config.terminalBackend === "sandbox"
+      ? [
+          ...config.skillRoots.map((root) => ({
+            host: realpathSync(root.path),
+            alias: `.agents/skills/${root.name}`,
+          })),
+          ...(config.skillsDirectory
+            ? [{ host: realpathSync(config.skillsDirectory), alias: ".agents/skills" }]
+            : []),
+          ...(config.knowledgeRoot
+            ? [{ host: realpathSync(config.knowledgeRoot), alias: "knowledge" }]
+            : []),
+        ].sort((left, right) => right.host.length - left.host.length)
+      : [];
   const resourceLoader = new DefaultResourceLoader({
     cwd: config.workspaceRoot,
     agentDir,
@@ -79,13 +106,17 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
     systemPrompt: config.systemPrompt,
     extensionFactories: [
       createTerminalPermissionExtension(peer),
+      createNoProgressGuardExtension(),
       (pi) => {
-        pi.on("before_agent_start", (event) => ({
-          systemPrompt: event.systemPrompt.replace(
+        pi.on("before_agent_start", (event) => {
+          let systemPrompt = event.systemPrompt.replace(
             "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
             "Paths starting with knowledge/ or .agents/skills/ are runtime resource aliases: pass them unchanged to file tools, without prepending the skill directory. For other relative paths referenced by a skill file, resolve them against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
-          ),
-        }));
+          );
+          return {
+            systemPrompt: applySandboxPathAliases(systemPrompt, sandboxPathAliases),
+          };
+        });
       },
     ],
     additionalSkillPaths: skillPaths,
@@ -199,10 +230,33 @@ function requiredInteger(value: unknown, name: string): number {
 
 function terminalBackend(value: JsonObject): PiTerminalBackend {
   const backend = requiredString(value, "terminal_backend");
-  if (backend !== "os-sandbox") {
-    throw new Error("invalid terminal_backend; expected os-sandbox");
+  if (backend !== "os-sandbox" && backend !== "sandbox") {
+    throw new Error("invalid terminal_backend; expected one of: os-sandbox, sandbox");
   }
   return backend;
+}
+
+/**
+ * The control plane owns sandbox lifecycle and credentials. The runner asks for
+ * an endpoint only when it is about to touch the execution workspace, so the
+ * access token never travels in the start frame and idle chats create nothing.
+ */
+function sandboxEndpointProvider(peer: JsonlRpcPeer): SandboxEndpointProvider {
+  return async ({ refresh }) => {
+    const result = await peer.request("sandbox.ensure", { refresh });
+    if (!isRecord(result)) throw new Error("invalid sandbox.ensure response");
+    const endpoint: SandboxEndpoint = {
+      baseUrl: requiredString(result, "base_url"),
+      wsBaseUrl: requiredString(result, "ws_base_url"),
+      sandboxId: requiredString(result, "sandbox_id"),
+      apiKey: requiredString(result, "api_key"),
+      workspacePath: requiredString(result, "workspace_path"),
+      storagePath: requiredString(result, "storage_path"),
+    };
+    const cluster = result.cluster;
+    if (typeof cluster === "string" && cluster) endpoint.cluster = cluster;
+    return endpoint;
+  };
 }
 
 function parseSkillRoots(value: JsonObject): SkillRootConfig[] {

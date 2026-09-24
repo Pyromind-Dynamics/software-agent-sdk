@@ -3,7 +3,7 @@ name: generate-workflow-dsl
 description: >-
   为 Pyromind 生成、修改或校验模型训练与评测工作流。用户用自然语言要求“用这份数据训练模型”、
   微调、基线评测、SFT/DPO/GRPO、修改画布、换模型跑 benchmark/看看效果或检查 workflow.py
-  时使用；负责预览 Storage 数据、推断训练阶段、整组决定参数、生成并上传自定义
+  时使用；负责读取 Storage 数据、推断训练阶段、整组决定参数、生成并上传自定义
   Metrics/Reward、绑定阶段产物并校验 Python DSL。不执行正式训练，不在训练生成场景自动清洗数据。
 ---
 
@@ -30,7 +30,7 @@ description: >-
 
 | reference | 读取时机 |
 |---|---|
-| `references/data-routing.md` | 判断数据源、preview 结果、训练格式、字段映射或训练类型 |
+| `references/data-routing.md` | 判断数据源、数据画像、训练格式、字段映射或训练类型 |
 | `references/workflow-contracts.md` | 完整生成或组合阶段时查拓扑、节点参数、端口、枚举和平台覆盖项 |
 | `references/custom-python-assets.md` | 内置 Metrics/Reward 不适用，需要生成、上传并回填 Python 入口 |
 | 其他 Skill: `training-analysis` | 分析已有训练效果（loss 异常/对比/优化超参）时，先调该 skill 产出报告与探针实验，再整组落参数 |
@@ -45,7 +45,7 @@ Pi 使用 `<available_skills>` 中的 Skill 位置并从该目录解析 referenc
 若请求只改已有节点参数，或把一个节点替换为输出端口兼容的单节点，走快路径：
 
 - 保留原变量名、节点 ID、下游连线和所有未被点名的参数；只写需求图差分。
-- 跳过数据画像、阶段选择和整组配参；不调用 preview，不读取 reference 或 `knowledge/`。
+- 跳过数据画像、阶段选择和整组配参；不读 Storage，不读取 reference 或 `knowledge/`。
 - 只有缺少新节点契约或校验返回结构错误时，才读取一份最相关的 reference，然后修改并进入第 8 步。
 
 模型入口规则供快路径和完整生成共用：
@@ -68,7 +68,7 @@ Pi 使用 `<available_skills>` 中的 Skill 位置并从该目录解析 referenc
 ### 2. 建立数据画像
 
 - Storage 相对路径：按 `data-routing.md` 获取或复用数据画像。
-- 平台预置或外部数据集标识：选择 Clone/Download，不调用 `preview_dataset`。
+- 平台预置或外部数据集标识：选择 Clone/Download，不去读 Storage。
 - 未提供数据：先索要 Storage 路径；用户明确要求演示/模板时直接使用公开测试集标识，不枚举用户 Storage。
 - 内部记录数据源、实际训练文件、N、P95 长度 L、字段、模态和样本形态，不向用户展示冗长清单。
 

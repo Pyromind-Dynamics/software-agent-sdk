@@ -53,6 +53,16 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
+_EMPTY_NODE_LOG = "<empty node log>"
+_NO_USABLE_LOG_GUIDANCE = (
+    "The platform has no usable log for the analyzed node(s), so this "
+    "observation is the complete failure record for this task. The workspace "
+    "and Storage hold no copy of it: do not search the filesystem, and do not "
+    "re-call this tool with different tail_lines or max_log_chars, which "
+    "returns the same answer. Report what is known (task_status and the "
+    "failing node) and suggest re-running the task to capture a fresh log."
+)
+
 _NODE_ID_KEYS = ("node_code", "node_id", "id", "nodeId", "code")
 _NODE_TYPE_KEYS = ("nodeType", "node_type", "type", "node_class")
 _NODE_NAME_KEYS = ("name", "label", "display_name", "title")
@@ -190,6 +200,15 @@ class AnalyzeTaskFailureObservation(Observation):
         default_factory=dict,
         description="node_id -> trailing log text fetched for each analyzed node.",
     )
+    node_log_available: bool = Field(
+        default=False,
+        description=(
+            "True when at least one analyzed node returned a usable log tail. "
+            "False means the platform has no failure detail for this task, so "
+            "this observation is the complete record and no further lookup can "
+            "add information."
+        ),
+    )
     diagnosis: str | None = Field(
         default=None,
         description=(
@@ -218,7 +237,7 @@ class AnalyzeTaskFailureObservation(Observation):
         content = Text()
         if self.is_error:
             content.append("Task failure analysis failed", style="bold red")
-        elif self.logs:
+        elif self.node_log_available:
             content.append("Task failure analysis", style="bold yellow")
             content.append(f" ({len(self.logs)} node log(s))")
         else:
@@ -460,7 +479,7 @@ class AnalyzeTaskFailureExecutor(
                 _extract_log_text(raw), action.tail_lines, action.max_log_chars
             )
             if not log_text:
-                log_text = "<empty node log>"
+                log_text = _EMPTY_NODE_LOG
             logs[target] = log_text
             if not action.include_source or auth_token is None:
                 continue
@@ -490,6 +509,7 @@ class AnalyzeTaskFailureExecutor(
             nodes=nodes,
             failed_nodes=failed_nodes,
             logs=logs,
+            node_log_available=bool(_usable_node_logs(logs)),
             diagnosis=diagnosis,
             source=source,
         )
@@ -691,6 +711,15 @@ class AnalyzeTaskFailureExecutor(
         )
 
 
+def _usable_node_logs(logs: Mapping[str, str]) -> dict[str, str]:
+    """Logs that carry failure detail; placeholders and fetch errors do not."""
+    return {
+        node_id: text
+        for node_id, text in logs.items()
+        if text != _EMPTY_NODE_LOG and not text.startswith("<log fetch failed:")
+    }
+
+
 def _format_observation_text(
     task_status: str | None,
     nodes: list[TaskNodeInfo],
@@ -711,6 +740,8 @@ def _format_observation_text(
             parts.append(f"--- node {node_id} (last log tail) ---\n{log_text}")
         if diagnosis:
             parts.append(f"--- failure diagnosis ---\n{diagnosis}")
+        if not _usable_node_logs(logs):
+            parts.append(_NO_USABLE_LOG_GUIDANCE)
     elif source == "all":
         parts.append(
             "No failed node could be identified from the task result (the payload "
@@ -751,6 +782,9 @@ instead the tool condenses it into a concise root-cause + fix suggestion. Fix
 the workflow DSL if the error is deterministic, then re-run via workflow_debug.
 Source fetching and diagnosis are best-effort: a failed source fetch or failed
 diagnosis never fails the whole analysis (the log tail is always returned).
+When the platform has no usable log for a node, the observation says so and
+sets node_log_available=false: that is the platform's complete failure record,
+so do not look for it on the filesystem or repeat the call with other limits.
 
 Auth mirrors validate_workflow_dsl: cookie / x-cluster / authorization headers
 are forwarded, and the request carries a browser-style User-Agent (the platform

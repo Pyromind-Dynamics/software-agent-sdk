@@ -65,7 +65,10 @@ def test_adapter_does_not_depend_on_pyromind_server() -> None:
 def test_pyromind_start_scripts_use_composed_server_entrypoint() -> None:
     for script_name in ("start.sh", "start_inference.sh"):
         script = (ROOT / script_name).read_text(encoding="utf-8")
-        assert "python -m pyromind_agent_server" in script
+        assert (
+            "python -m pyromind_agent_server" in script
+            or '"${server_python}" -m pyromind_agent_server' in script
+        )
         assert "python -m openhands.agent_server" not in script
 
 
@@ -73,7 +76,10 @@ def test_inference_start_requires_os_sandbox_for_pi_terminal() -> None:
     script = (ROOT / "start_inference.sh").read_text(encoding="utf-8")
 
     assert 'export APP_ENV="${APP_ENV:-dev}"' in script
-    assert 'export PYROMIND_PI_TERMINAL_BACKEND="os-sandbox"' in script
+    assert (
+        "export PYROMIND_PI_TERMINAL_BACKEND="
+        '"${PYROMIND_PI_TERMINAL_BACKEND:-os-sandbox}"' in script
+    )
 
 
 def test_pre_deployment_uses_os_sandbox_for_pi_terminal() -> None:

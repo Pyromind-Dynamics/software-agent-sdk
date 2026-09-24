@@ -24,6 +24,7 @@ from openhands.agent_server.pyromind_auth import parse_auth_token_from_cookie_he
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.secret import StaticSecret
 from openhands.sdk.tool import ToolDefinition
+from openhands.sdk.workspace.base import BaseWorkspace
 from openhands.sdk.workspace.local import LocalWorkspace
 from openhands.tools.data_preparation import (
     DfCheckProgressTool,
@@ -43,7 +44,7 @@ from openhands.tools.label_studio import (
 )
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
-    PreviewDatasetTool,
+    GetStorageUrlTool,
     UploadFileToPyromindTool,
 )
 from openhands.tools.sandbox import (
@@ -74,13 +75,12 @@ _STORAGE_COOKIE_SECRET = "PYROMIND_STORAGE_AUTH_COOKIE"
 _VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
 _READ_ONLY_TOOLS = frozenset(
     {
-        "preview_dataset",
+        GetStorageUrlTool.name,
         "df_check_progress",
         SandboxReadFileTool.name,
         AnalyzeTaskFailureTool.name,
     }
 )
-_DEFAULT_PREVIEW_TIMEOUT_SECONDS = 60.0
 logger = logging.getLogger(__name__)
 
 # Runner frames are capped at 1MiB; keep tool text well under it so the
@@ -155,6 +155,7 @@ class ToolExecutionContext:
     request_context: RequestContext
     model_configuration: dict[str, Any]
     extra: dict[str, Any] = field(default_factory=dict)
+    workspace: BaseWorkspace | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,7 +209,10 @@ class _ToolConversationFacade:
         persisted_state: dict[str, Any] | None = None,
     ) -> None:
         self.id = context.conversation_id
-        self.workspace = LocalWorkspace(working_dir=context.workspace_root)
+        self.workspace_root = context.workspace_root
+        self.workspace = context.workspace or LocalWorkspace(
+            working_dir=context.workspace_root
+        )
         registry = SecretRegistry()
         secrets: dict[str, StaticSecret] = {}
         cookie = context.request_context.cookie
@@ -304,13 +308,12 @@ class PyromindBusinessToolHost:
         self._locks: dict[str, asyncio.Lock] = {}
         self._active_executors: dict[tuple[str, str], Any] = {}
         self._factories: dict[str, ToolFactory] = {
-            PreviewDatasetTool.name: lambda context: PreviewDatasetTool.create(
-                **self._storage_params(context),
-                extract_params=self._extraction_params(context),
-            )[0],
             UploadFileToPyromindTool.name: lambda context: (
                 UploadFileToPyromindTool.create(**self._storage_params(context))[0]
             ),
+            GetStorageUrlTool.name: lambda context: GetStorageUrlTool.create(
+                **self._storage_params(context)
+            )[0],
             RunDatasetCleaningTool.name: lambda context: RunDatasetCleaningTool.create(
                 **self._cleaning_params(context)
             )[0],
@@ -386,8 +389,8 @@ class PyromindBusinessToolHost:
             UpdatePlanTool.create(cast(Any, SimpleNamespace(persistence_dir=None)))[0]
         ]
         for tool_type in (
-            PreviewDatasetTool,
             UploadFileToPyromindTool,
+            GetStorageUrlTool,
             RunDatasetCleaningTool,
             DfRunPipelineTool,
             DfSubmitPipelineTool,
@@ -430,7 +433,9 @@ class PyromindBusinessToolHost:
         started_at = time.perf_counter()
         if name == "validate_workflow_dsl":
             result = await execute_validation_tool(
-                context.workspace_root, arguments, context.request_context
+                context.workspace or LocalWorkspace(working_dir=context.workspace_root),
+                arguments,
+                context.request_context,
             )
             response = {**result, "signals": []}
             self._log_execution(name, context, started_at, response)
@@ -491,30 +496,7 @@ class PyromindBusinessToolHost:
             ).as_dict()
 
         if name in _READ_ONLY_TOOLS:
-            if name == PreviewDatasetTool.name:
-                timeout = _preview_timeout_seconds(context)
-                try:
-                    response = await asyncio.wait_for(invoke(), timeout=timeout)
-                except TimeoutError:
-                    response = BusinessToolResult(
-                        is_error=True,
-                        content=[
-                            {
-                                "type": "text",
-                                "text": (
-                                    "preview_dataset timed out after "
-                                    f"{timeout:g} seconds. Narrow dataset_path to a "
-                                    "specific file or a smaller directory."
-                                ),
-                            }
-                        ],
-                        details={
-                            "error_code": "tool_timeout",
-                            "timeout_seconds": timeout,
-                        },
-                    ).as_dict()
-            else:
-                response = await invoke()
+            response = await invoke()
             self._log_execution(name, context, started_at, response)
             return response
         lock = self._locks.setdefault(context.conversation_id, asyncio.Lock())
@@ -664,13 +646,6 @@ class PyromindBusinessToolHost:
             params["storage_secret_headers"] = storage["secret_headers"]
         return params
 
-    def _extraction_params(self, context: ToolExecutionContext) -> dict[str, Any]:
-        params = self._execution_params(context)
-        output_root = context.extra.get("dataset_extraction_output_root")
-        if isinstance(output_root, str) and output_root:
-            params["output_root"] = output_root
-        return params
-
     def _stop_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         params: dict[str, Any] = {
             "headers": _forward_headers(context.request_context, include_cookie=False)
@@ -774,13 +749,6 @@ def _cluster_route(context: ToolExecutionContext) -> str:
     cluster, so falling back to the wrong one reads another cluster's objects.
     """
     return (context.request_context.x_cluster or "").strip()
-
-
-def _preview_timeout_seconds(context: ToolExecutionContext) -> float:
-    value = context.extra.get("preview_dataset_timeout_seconds")
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
-        return float(value)
-    return _DEFAULT_PREVIEW_TIMEOUT_SECONDS
 
 
 def _auth_token(context: RequestContext) -> str | None:

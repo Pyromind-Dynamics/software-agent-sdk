@@ -44,8 +44,12 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             apply_workspace_quota=ensure_conversation_quota,
         )
     idle_eviction_seconds = int(
-        os.getenv("PYROMIND_IDLE_CONVERSATION_EVICTION_SECONDS", "1800")
+        os.getenv("PYROMIND_IDLE_CONVERSATION_EVICTION_SECONDS", "300")
     )
+    release_grace_seconds = int(
+        os.getenv("PYROMIND_CONVERSATION_RELEASE_GRACE_SECONDS", "300")
+    )
+    max_active_conversations = int(os.getenv("PYROMIND_MAX_ACTIVE_CONVERSATIONS", "0"))
     # The harness reclaims idle conversations on its own timer. When the product
     # timer is the slower of the two, live product sessions go cold underneath
     # the product layer and every command in that window has to self-heal on
@@ -69,17 +73,22 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         default_harness_id=backend,
         external_tasks=WorkflowExternalTaskRegistry(service.conversations_dir),
         idle_eviction_seconds=idle_eviction_seconds,
+        release_grace_seconds=release_grace_seconds,
+        max_active_conversations=max_active_conversations,
         resource_limits=resource_limits_from_environment(),
     )
     logger.info(
         "Pyromind product runtime ready: default_harness=%s "
         "PYROMIND_HARNESS_BACKEND=%s registered_harnesses=%s "
-        "pi_terminal_backend=%s idle_eviction_seconds=%d conversations_dir=%s",
+        "pi_terminal_backend=%s idle_eviction_seconds=%d "
+        "release_grace_seconds=%d max_active_conversations=%d conversations_dir=%s",
         backend,
         raw_backend if raw_backend is not None else "<unset, defaulting to openhands>",
         sorted(adapters),
         terminal_backend or "-",
         idle_eviction_seconds,
+        release_grace_seconds,
+        max_active_conversations,
         service.conversations_dir,
     )
     set_workflow_status_dispatcher(WorkflowStatusDispatcher(runtime).dispatch)

@@ -65,6 +65,23 @@ def executor() -> LabelStudioProjectExecutor:
     )
 
 
+def test_read_workspace_file_stages_remote_workspace_file(
+    executor: LabelStudioProjectExecutor,
+    sandbox_workspace,
+    conversation: MagicMock,
+) -> None:
+    """Sandbox sessions read agent-written config out of the sandbox, not the host."""
+    (sandbox_workspace.workspace_dir / "label_config.xml").write_text(
+        VALID_XML, encoding="utf-8"
+    )
+    conversation.workspace = sandbox_workspace
+
+    assert executor._read_workspace_file("label_config.xml", conversation) == (
+        VALID_XML.encode()
+    )
+    assert executor._read_workspace_file("missing.xml", conversation) is None
+
+
 def _mock_ls_api(
     *, project_id: int = 42, export_data: list[dict] | None = None
 ) -> MagicMock:

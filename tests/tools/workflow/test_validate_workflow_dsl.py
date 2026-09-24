@@ -14,6 +14,7 @@ from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.secret import StaticSecret
 from openhands.sdk.tool import Tool
 from openhands.sdk.tool.registry import resolve_tool
+from openhands.sdk.workspace.local import LocalWorkspace
 from openhands.tools.workflow import (
     ValidateWorkflowDslAction,
     ValidateWorkflowDslExecutor,
@@ -25,11 +26,6 @@ from openhands.tools.workflow.validate_workflow_dsl import (
     PRE_VALIDATE_URL,
     PROD_VALIDATE_URL,
 )
-
-
-class _FakeWorkspace:
-    def __init__(self, working_dir: Path) -> None:
-        self.working_dir = str(working_dir)
 
 
 class _Response:
@@ -71,7 +67,7 @@ def _fake_conversation(
         "FakeConversation",
         (),
         {
-            "workspace": _FakeWorkspace(tmp_path),
+            "workspace": LocalWorkspace(working_dir=tmp_path),
             "state": type(
                 "FakeState",
                 (),
@@ -240,9 +236,7 @@ def test_validate_workflow_dsl_reads_workflow_file_when_dsl_omitted(
     monkeypatch.setattr(httpx, "post", fake_post)
 
     observation = ValidateWorkflowDslExecutor()(
-        ValidateWorkflowDslAction(
-            dsl_path="public_data/workflow_canvas/workflow.py"
-        ),
+        ValidateWorkflowDslAction(dsl_path="public_data/workflow_canvas/workflow.py"),
         cast(Any, _fake_conversation(tmp_path)),
     )
 
@@ -287,9 +281,7 @@ def test_validate_workflow_dsl_reports_missing_workflow_file(monkeypatch, tmp_pa
     monkeypatch.setattr(httpx, "post", fake_post)
 
     observation = ValidateWorkflowDslExecutor()(
-        ValidateWorkflowDslAction(
-            dsl_path="public_data/workflow_canvas/workflow.py"
-        ),
+        ValidateWorkflowDslAction(dsl_path="public_data/workflow_canvas/workflow.py"),
         cast(Any, _fake_conversation(tmp_path)),
     )
 

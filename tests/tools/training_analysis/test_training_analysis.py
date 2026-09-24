@@ -19,8 +19,7 @@ from openhands.tools.training_analysis import (
 
 
 _SKILL_SCRIPTS = (
-    Path(__file__).resolve().parents[3]
-    / ".agents/skills/training-analysis/scripts"
+    Path(__file__).resolve().parents[3] / ".agents/skills/training-analysis/scripts"
 )
 sys.path.insert(0, str(_SKILL_SCRIPTS))
 TrainingAnalysisService = importlib.import_module(
@@ -39,6 +38,50 @@ def _conversation(workspace: Path) -> LocalConversation:
             ),
         ),
     )
+
+
+def _remote_conversation(workspace: object) -> LocalConversation:
+    return cast(
+        LocalConversation,
+        SimpleNamespace(
+            workspace=workspace,
+            state=SimpleNamespace(
+                agent_state={},
+                secret_registry=SecretRegistry(),
+            ),
+        ),
+    )
+
+
+def test_training_analysis_publishes_report_into_remote_workspace(
+    tmp_path: Path,
+    sandbox_workspace,
+) -> None:
+    """A sandbox session runs the worker in staging and publishes the report back."""
+    worker = tmp_path / "training_analysis_worker.py"
+    worker.write_text(
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "payload = json.load(sys.stdin)\n"
+        "report = Path(payload['output_path'])\n"
+        "report.parent.mkdir(parents=True, exist_ok=True)\n"
+        "report.write_text('report body', encoding='utf-8')\n"
+        "print(json.dumps({'ok': True, 'target': {}, 'result': {}, "
+        "'report_path': payload['output_relative']}))\n",
+        encoding="utf-8",
+    )
+    conversation = _remote_conversation(sandbox_workspace)
+    executor = TrainingAnalysisExecutor(runtime_dir=str(tmp_path))
+
+    observation = executor(
+        TrainingAnalysisAction(operation="report", task_id="task-1"),
+        conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.report_path == "public_data/training-analysis/task-1/report.md"
+    published = sandbox_workspace.workspace_dir / observation.report_path
+    assert published.read_text(encoding="utf-8") == "report body"
 
 
 def test_training_analysis_schema_requires_a_target() -> None:

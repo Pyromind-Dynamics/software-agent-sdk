@@ -13,6 +13,7 @@ from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.tool import Tool
 from openhands.sdk.tool.registry import resolve_tool
+from openhands.sdk.workspace.local import LocalWorkspace
 from openhands.tools.workflow import RunWorkflowObservation
 from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 from openhands.tools.workflow.run_workflow import RunWorkflowExecutor
@@ -57,7 +58,7 @@ def _fake_conversation(
         LocalConversation,
         SimpleNamespace(
             id=_CONVERSATION_ID,
-            workspace=SimpleNamespace(working_dir=str(tmp_path)),
+            workspace=LocalWorkspace(working_dir=tmp_path),
             state=SimpleNamespace(
                 secret_registry=secret_registry or SecretRegistry(),
                 agent_state={},

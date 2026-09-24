@@ -155,14 +155,15 @@ class LabelStudioProjectObservation(Observation):
 
 TOOL_DESCRIPTION = """Create, inspect, update, or export a Label Studio annotation project.
 
-Use operation='create' to import a user-storage dataset after preview_dataset and
-after generating a validated label_config.xml in the workspace. The dataset is a
-directory of sample directories, or one JSON Lines file when a pipeline writes
-its own dataset rows; either way it is converted deterministically, imported in
-batches, and returns a PyroMind project_ref, Label Studio project_id,
-manifest_path, open_url, and project_url. open_url is the preferred link to give
-the user; project_url is the same project's own Label Studio address. Both
-recover from an expired Label Studio session by returning through portal SSO.
+Use operation='create' to import a user-storage dataset after inspecting its
+structure and after generating a validated label_config.xml in the workspace.
+The dataset is a directory of sample directories, or one JSON Lines file when
+a pipeline writes its own dataset rows; either way it is converted
+deterministically, imported in batches, and returns a PyroMind project_ref,
+Label Studio project_id, manifest_path, open_url, and project_url. open_url is
+the preferred link to give the user; project_url is the same project's own
+Label Studio address. Both recover from an expired Label Studio session by
+returning through portal SSO.
 
 Pre-annotations are written through bindings: each adapter has built-in ones, and
 an optional field_map_path JSON replaces any of them (control names, image slots,

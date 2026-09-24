@@ -37,6 +37,11 @@ from openhands.tools.sandbox.definition import (
     SandboxWriteFileObservation,
     SandboxWriteFileTool,
     create_sandbox_api_client,
+    default_sandbox_image,
+    run_terminal_command,
+    terminal_base_url,
+    terminal_websocket_url,
+    write_sandbox_file,
 )
 from openhands.tools.sandbox.storage_ops import (
     SandboxDownloadAction,
@@ -87,4 +92,9 @@ __all__ = [
     "SandboxWriteFileObservation",
     "SandboxWriteFileTool",
     "create_sandbox_api_client",
+    "default_sandbox_image",
+    "run_terminal_command",
+    "terminal_base_url",
+    "terminal_websocket_url",
+    "write_sandbox_file",
 ]

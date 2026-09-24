@@ -21,6 +21,8 @@ from openhands.tools.pyromind_dataset.definition import (
     _PREVIEW_DATASET_DESCRIPTION,
     PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
+    GetStorageUrlAction,
+    GetStorageUrlExecutor,
     PreviewDatasetAction,
     PreviewDatasetExecutor,
     UploadFileToPyromindAction,
@@ -128,13 +130,16 @@ def _fake_conversation(
     *,
     secret_registry: SecretRegistry | None = None,
     agent_state: dict[str, Any] | None = None,
+    workspace: object | None = None,
 ):
     return type(
         "FakeConversation",
         (),
         {
             "id": _CONVERSATION_ID,
-            "workspace": _FakeWorkspace(tmp_path),
+            "workspace": (
+                workspace if workspace is not None else _FakeWorkspace(tmp_path)
+            ),
             "state": type(
                 "FakeState",
                 (),
@@ -840,6 +845,109 @@ def test_upload_file_to_pyromind_explicit_target_dir_wins(
     assert posted_path["path"] == "/custom/dir"
 
 
+def test_upload_file_to_pyromind_warns_before_overwriting(
+    monkeypatch,
+    tmp_path,
+):
+    local_file = tmp_path / "metric.py"
+    local_file.write_text("def acc():\n    return 1\n", encoding="utf-8")
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "list": [
+                            {
+                                "name": "metric.py",
+                                "path": (
+                                    f"/.pyromind-agent/{_CONVERSATION_ID}/metric.py"
+                                ),
+                            }
+                        ]
+                    },
+                },
+            )
+        return _Response(
+            200,
+            {
+                "success": True,
+                "data": {
+                    "multipart": False,
+                    "upload_url": "https://upload.test/presigned",
+                    "method": "PUT",
+                    "headers": {},
+                },
+            },
+        )
+
+    def fake_request(method, url, *, content, headers, timeout):
+        content.read()
+        return _Response(200, {})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "request", fake_request)
+    conversation = _fake_conversation(tmp_path, secret_registry=_secret_registry())
+
+    observation = UploadFileToPyromindExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        UploadFileToPyromindAction(file_path="metric.py"),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error, observation.text
+    assert (
+        "Warning: an existing file at that Storage path was overwritten."
+        in observation.text
+    )
+
+
+def test_upload_file_to_pyromind_ignores_a_failing_overwrite_probe(
+    monkeypatch,
+    tmp_path,
+):
+    """The advisory listing never blocks the upload it guards."""
+    local_file = tmp_path / "metric.py"
+    local_file.write_text("def acc():\n    return 1\n", encoding="utf-8")
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            raise httpx.ConnectError("listing unavailable")
+        return _Response(
+            200,
+            {
+                "success": True,
+                "data": {
+                    "multipart": False,
+                    "upload_url": "https://upload.test/presigned",
+                    "method": "PUT",
+                    "headers": {},
+                },
+            },
+        )
+
+    def fake_request(method, url, *, content, headers, timeout):
+        content.read()
+        return _Response(200, {})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "request", fake_request)
+    conversation = _fake_conversation(tmp_path, secret_registry=_secret_registry())
+
+    observation = UploadFileToPyromindExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        UploadFileToPyromindAction(file_path="metric.py"),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error, observation.text
+    assert "Warning:" not in observation.text
+
+
 def test_upload_file_to_pyromind_multipart_uploads_parts_and_completes(
     monkeypatch,
     tmp_path,
@@ -871,6 +979,8 @@ def test_upload_file_to_pyromind_multipart_uploads_parts_and_completes(
                     },
                 },
             )
+        if url.endswith("/file_list"):
+            return _Response(200, {"success": True, "data": {"list": []}})
         assert url.endswith("/multipart_complete")
         complete_calls.append(json)
         return _Response(200, {"success": True, "data": {"etag": "etag-1"}})
@@ -953,6 +1063,113 @@ def test_upload_file_to_pyromind_rejects_workspace_escape(monkeypatch, tmp_path)
 
     assert observation.is_error
     assert "outside the conversation workspace" in observation.text
+
+
+def test_upload_file_to_pyromind_stages_remote_workspace_file(
+    monkeypatch,
+    sandbox_workspace,
+) -> None:
+    content = b"def acc():\n    return 1\n"
+    local_file = sandbox_workspace.workspace_dir / "metric.py"
+    local_file.write_bytes(content)
+    uploaded: list[bytes] = []
+
+    def fake_post(url, *, headers, json, timeout):
+        return _Response(
+            200,
+            {
+                "success": True,
+                "data": {
+                    "multipart": False,
+                    "upload_url": "https://upload.test/presigned",
+                    "method": "PUT",
+                    "headers": {},
+                },
+            },
+        )
+
+    def fake_request(method, url, *, content, headers, timeout):
+        uploaded.append(content.read())
+        return _Response(200, {})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "request", fake_request)
+    conversation = _fake_conversation(
+        sandbox_workspace.workspace_dir,
+        secret_registry=_secret_registry(),
+        workspace=sandbox_workspace,
+    )
+
+    observation = UploadFileToPyromindExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        UploadFileToPyromindAction(file_path="metric.py"),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error, observation.text
+    assert uploaded == [content]
+
+
+def test_preview_dataset_publishes_samples_into_remote_workspace(
+    monkeypatch,
+    sandbox_workspace,
+) -> None:
+    """Sandbox sessions stage samples on the host, then push them into the sandbox."""
+    _patch_shared_empty(monkeypatch)
+    jsonl = b'{"prompt":"p1","completion":"c1"}\n'
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            assert json["path"] == "/datasets/train.jsonl"
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": "datasets/train.jsonl",
+                        "size": len(jsonl),
+                        "content_type": "application/jsonl",
+                        "is_dir": False,
+                    },
+                },
+            )
+        if url.endswith("/get_url"):
+            return _Response(
+                200,
+                {"success": True, "data": {"url": "https://download.test/train"}},
+            )
+        raise AssertionError(f"unexpected URL: {url}")
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        assert method == "GET"
+        return _StreamResponse(jsonl)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    conversation = _fake_conversation(
+        sandbox_workspace.workspace_dir,
+        workspace=sandbox_workspace,
+    )
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api"
+    )(
+        PreviewDatasetAction(dataset_path="datasets/train.jsonl", mode="sample"),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.sample_manifest_path is not None
+    assert observation.sample_manifest_path.startswith(
+        "public_data/data-preparation/previews/"
+    )
+    workspace_dir = sandbox_workspace.workspace_dir
+    manifest_file = workspace_dir / observation.sample_manifest_path
+    manifest = jsonlib.loads(manifest_file.read_text().strip())
+    assert manifest["source_path"] == "/datasets/train.jsonl"
+    assert manifest["workspace_path"] == observation.local_sample_paths[0]
+    assert (workspace_dir / observation.local_sample_paths[0]).is_file()
 
 
 def test_preview_dataset_reports_invalid_json(monkeypatch):
@@ -2572,3 +2789,109 @@ def test_directory_listing_hint_points_at_file_modes(monkeypatch, tmp_path) -> N
 
     assert "No files or folders found under agentTest/dataset.jsonl" in observation.text
     assert "mode=inspect or mode=sample" in observation.text
+
+
+class _StorageWorkspace(_FakeWorkspace):
+    """Workspace double that also exposes the sandbox Storage mount."""
+
+    def __init__(
+        self, working_dir: Path, storage_path: str = "/target-workspace"
+    ) -> None:
+        super().__init__(working_dir)
+        self.storage_path = storage_path
+
+
+def test_get_storage_url_maps_workspace_and_storage_paths(
+    monkeypatch, tmp_path
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_post(url, *, headers, json, timeout):
+        calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        return _Response(
+            200,
+            {"success": True, "data": {"url": f"https://download.test{json['path']}"}},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    conversation = _fake_conversation(
+        tmp_path,
+        secret_registry=_secret_registry(),
+        agent_state={PYROMIND_STORAGE_HEADERS_STATE_KEY: {"x-cluster": "pre"}},
+        workspace=_StorageWorkspace(tmp_path),
+    )
+
+    observation = GetStorageUrlExecutor(
+        storage_base_url="https://portal.test/storage_api",
+        timeout=7.0,
+    )(
+        GetStorageUrlAction(
+            paths=["public_data/report.html", "storage/datasets/img.png"]
+        ),
+        cast(Any, conversation),
+    )
+
+    workspace_path = f"/.pyromind-agent/{_CONVERSATION_ID}/public_data/report.html"
+    assert not observation.is_error
+    assert [(entry.path, entry.url) for entry in observation.urls] == [
+        (workspace_path, f"https://download.test{workspace_path}"),
+        ("/datasets/img.png", "https://download.test/datasets/img.png"),
+    ]
+    assert [call["json"] for call in calls] == [
+        {"path": workspace_path, "force_download": False},
+        {"path": "/datasets/img.png", "force_download": False},
+    ]
+    assert calls[0]["url"] == "https://portal.test/storage_api/get_url"
+    assert calls[0]["headers"]["cookie"] == "auth_token=session-token"
+    assert calls[0]["headers"]["x-cluster"] == "pre"
+    assert calls[0]["timeout"] == 7.0
+
+
+def test_get_storage_url_rejects_workspace_paths_without_a_mount(
+    monkeypatch, tmp_path
+) -> None:
+    def fake_post(url, *, headers, json, timeout):
+        raise AssertionError("no Storage request expected")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    conversation = _fake_conversation(tmp_path)
+
+    observation = GetStorageUrlExecutor(
+        storage_base_url="https://portal.test/storage_api"
+    )(
+        GetStorageUrlAction(paths=["public_data/report.html"]),
+        cast(Any, conversation),
+    )
+
+    assert observation.is_error
+    assert "has no Storage mount" in observation.text
+
+
+def test_get_storage_url_reports_per_path_failures(monkeypatch, tmp_path) -> None:
+    def fake_post(url, *, headers, json, timeout):
+        if json["path"].endswith("missing.png"):
+            return _Response(404, {"success": False}, text="not found")
+        return _Response(
+            200, {"success": True, "data": {"url": "https://download.test/ok"}}
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    conversation = _fake_conversation(
+        tmp_path,
+        secret_registry=_secret_registry(),
+        workspace=_StorageWorkspace(tmp_path),
+    )
+
+    observation = GetStorageUrlExecutor(
+        storage_base_url="https://portal.test/storage_api"
+    )(
+        GetStorageUrlAction(paths=["storage/ok.png", "storage/missing.png"]),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert [entry.path for entry in observation.urls] == ["/ok.png"]
+    assert observation.failures == [
+        "storage/missing.png: Pyromind storage get_url API returned HTTP 404: not found"
+    ]
+    assert "--- failed ---" in observation.text

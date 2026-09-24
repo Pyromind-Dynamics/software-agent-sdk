@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 from pyromind_runtime.domain.context import RequestContext
 
 from openhands.sdk.conversation.secret_registry import SecretRegistry
-from openhands.sdk.workspace.local import LocalWorkspace
+from openhands.sdk.workspace.base import BaseWorkspace
 from openhands.tools.workflow.validate_workflow_dsl import (
     ValidateWorkflowDslAction,
     ValidateWorkflowDslExecutor,
@@ -30,7 +29,7 @@ def validation_tool_spec() -> dict[str, Any]:
 
 
 async def execute_validation_tool(
-    workspace_root: Path,
+    workspace: BaseWorkspace,
     arguments: dict[str, Any],
     context: RequestContext,
 ) -> dict[str, Any]:
@@ -47,7 +46,7 @@ async def execute_validation_tool(
     }
     executor = ValidateWorkflowDslExecutor(headers=headers)
     conversation = SimpleNamespace(
-        workspace=LocalWorkspace(working_dir=workspace_root),
+        workspace=workspace,
         state=SimpleNamespace(agent_state={}, secret_registry=SecretRegistry()),
     )
     observation = await asyncio.to_thread(executor, action, cast(Any, conversation))

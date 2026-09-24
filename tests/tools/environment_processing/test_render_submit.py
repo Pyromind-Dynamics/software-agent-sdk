@@ -199,6 +199,38 @@ def test_executor_resolves_workspace_relative_template(
     )
 
 
+def test_executor_stages_template_from_remote_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_workspace,
+) -> None:
+    """A sandbox session downloads the template the agent wrote before staging it."""
+    mocks = _patch_submission(monkeypatch)
+    uploaded: list[tuple[str, str]] = []
+
+    def capture_upload(*, local_path, **kwargs) -> None:
+        path = Path(local_path)
+        uploaded.append((path.name, path.read_text()))
+
+    mocks.upload.side_effect = capture_upload
+    template = sandbox_workspace.workspace_dir / "public_data" / "render_template.json"
+    template.parent.mkdir(parents=True)
+    template.write_text(json.dumps({"fields": {"task_id": "task_id"}}))
+    conversation = _conversation_with_secrets({"auth_token": "tok"})
+    conversation.workspace = sandbox_workspace
+
+    obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
+        EdpRenderAction(
+            template_path="public_data/render_template.json",
+            data_source="datasets/tmax/data/train.parquet",
+        ),
+        conversation,
+    )
+
+    assert obs.status == "Pending"
+    assert ("render_template.json", template.read_text()) in uploaded
+
+
 def test_executor_env_falls_back_to_app_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

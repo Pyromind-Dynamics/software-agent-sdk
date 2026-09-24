@@ -23,6 +23,8 @@ from openhands.tools.sandbox import (
     SandboxReadFileExecutor,
     SandboxTerminalAction,
     SandboxTerminalExecutor,
+    SandboxWriteFileAction,
+    SandboxWriteFileExecutor,
 )
 
 
@@ -71,6 +73,12 @@ class _FakeTerminal:
         self.chunks = list(chunks)
         self.sent: list[bytes] = []
 
+    def _exit_marker(self) -> bytes:
+        for data in self.sent:
+            if data.startswith(b"echo __PYROMIND_TERMINAL_EXIT__"):
+                return data.split(b":$?", 1)[0].removeprefix(b"echo ")
+        return b""
+
     def __enter__(self) -> "_FakeTerminal":
         return self
 
@@ -83,7 +91,12 @@ class _FakeTerminal:
     def recv(self, timeout: float) -> bytes:
         if not self.chunks:
             raise TimeoutError
-        return self.chunks.pop(0)
+        chunk = self.chunks.pop(0)
+        chunk = chunk.replace(b"<EXIT_MARKER>", self._exit_marker())
+        if b"<ECHO>" in chunk:
+            echoed = self.sent[1].strip() if len(self.sent) > 1 else b""
+            chunk = chunk.replace(b"<ECHO>", echoed)
+        return chunk
 
 
 def _fake_terminal(
@@ -342,6 +355,51 @@ def test_sandbox_delete_other_errors_do_not_pause(
     client.sandboxes.pause.assert_not_called()
 
 
+def test_sandbox_write_file_creates_empty_files_through_the_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The chunked upload API rejects an init with zero chunks, so empty content
+    # has to be created inside the container instead.
+    client = MagicMock()
+    _patch_client(monkeypatch, client)
+    terminals = _fake_terminal(monkeypatch, [b"<EXIT_MARKER>:0\r\n"])
+
+    observation = SandboxWriteFileExecutor(**_executor_kwargs())(
+        SandboxWriteFileAction(
+            sandbox_id=_SANDBOX_ID, path="/data/pkg/__init__.py", content=""
+        ),
+        _fake_conversation(),
+    )
+
+    assert not observation.is_error
+    assert observation.size == 0
+    client.sandboxes.write_file.assert_not_called()
+    assert len(terminals) == 1
+    assert (
+        terminals[0].sent[0] == b"mkdir -p /data/pkg && : > /data/pkg/__init__.py\r\n"
+    )
+
+
+def test_sandbox_write_file_uses_the_chunked_api_for_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MagicMock()
+    _patch_client(monkeypatch, client)
+
+    observation = SandboxWriteFileExecutor(**_executor_kwargs())(
+        SandboxWriteFileAction(
+            sandbox_id=_SANDBOX_ID, path="/data/notes.md", content="hi\n"
+        ),
+        _fake_conversation(),
+    )
+
+    assert not observation.is_error
+    assert observation.size == 3
+    client.sandboxes.write_file.assert_called_once_with(
+        _SANDBOX_ID, "/data/notes.md", b"hi\n"
+    )
+
+
 def test_sandbox_read_file_text(monkeypatch: pytest.MonkeyPatch) -> None:
     client = MagicMock()
     client.sandboxes.read_file.return_value = b"hello world\n"
@@ -431,7 +489,7 @@ def test_sandbox_terminal_command(monkeypatch: pytest.MonkeyPatch) -> None:
         [
             b"root@pod:/# ",
             b"hi\r\n",
-            b"__PYROMIND_TERMINAL_EXIT__:0\r\n",
+            b"<EXIT_MARKER>:0\r\n",
         ],
     )
 
@@ -452,7 +510,8 @@ def test_sandbox_terminal_command(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "hi" in observation.output
     sent = terminal[0].sent
     assert b"cd /data && echo hi" in sent[0]
-    assert sent[1].startswith(b"echo __PYROMIND_TERMINAL_EXIT__:$?")
+    assert sent[1].startswith(b"echo __PYROMIND_TERMINAL_EXIT__")
+    assert sent[1].endswith(b":$?\r\n")
     assert terminal[0].url.startswith("wss://pre-api.pyromind.ai")
     assert "token=access-key-1" in terminal[0].url
 
@@ -465,7 +524,7 @@ def test_sandbox_terminal_falls_back_to_client_base_url(
     client.sandboxes.api_key = "access-key-1"
     client.sandboxes.cluster = None
     _patch_client(monkeypatch, client)
-    terminal = _fake_terminal(monkeypatch, [b"__PYROMIND_TERMINAL_EXIT__:0\r\n"])
+    terminal = _fake_terminal(monkeypatch, [b"<EXIT_MARKER>:0\r\n"])
 
     observation = SandboxTerminalExecutor(
         **_executor_kwargs(cluster="unknown-cluster")
@@ -485,7 +544,7 @@ def test_sandbox_terminal_surfaces_exit_code(
     client.sandboxes.base_url = "https://pre-api.pyromind.ai/api/v1"
     client.sandboxes.api_key = "access-key-1"
     _patch_client(monkeypatch, client)
-    _fake_terminal(monkeypatch, [b"__PYROMIND_TERMINAL_EXIT__:127\r\n"])
+    _fake_terminal(monkeypatch, [b"<EXIT_MARKER>:127\r\n"])
 
     observation = SandboxTerminalExecutor(**_executor_kwargs())(
         SandboxTerminalAction(sandbox_id=_SANDBOX_ID, command="nope"),
@@ -494,6 +553,33 @@ def test_sandbox_terminal_surfaces_exit_code(
 
     assert not observation.is_error
     assert observation.returncode == 127
+
+
+def test_sandbox_terminal_ignores_the_echoed_exit_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The TTY echoes the marker line before the command produces its status."""
+    client = MagicMock()
+    client.sandboxes.base_url = "https://pre-api.pyromind.ai/api/v1"
+    client.sandboxes.api_key = "access-key-1"
+    _patch_client(monkeypatch, client)
+    _fake_terminal(
+        monkeypatch,
+        [
+            b"root@pod:/# <ECHO>\r\n",
+            b"hi\r\n",
+            b"<EXIT_MARKER>:0\r\n",
+        ],
+    )
+
+    observation = SandboxTerminalExecutor(**_executor_kwargs())(
+        SandboxTerminalAction(sandbox_id=_SANDBOX_ID, command="echo hi"),
+        _fake_conversation(),
+    )
+
+    assert observation.returncode == 0
+    assert observation.output is not None
+    assert "hi" in observation.output
 
 
 def test_sandbox_terminal_timeout(monkeypatch: pytest.MonkeyPatch) -> None:

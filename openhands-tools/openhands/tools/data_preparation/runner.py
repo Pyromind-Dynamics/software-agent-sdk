@@ -38,6 +38,16 @@ from openhands.tools.utils.dataflow_config import (
 
 SUPPORTED_DATAFLOW_VERSION = "1.0.10"
 
+# Platform runs and sandbox samples must agree on the DataFlow runtime, so both
+# install this pinned set.
+DATAFLOW_RUNTIME_PACKAGES = (
+    f"open-dataflow=={SUPPORTED_DATAFLOW_VERSION}",
+    "numpy==1.26.4",
+    "Pillow==12.1.1",
+    "opencv-python-headless==4.10.0.84",
+    "matplotlib==3.9.4",
+)
+
 _DATAFLOW_CHECK_CACHE: dict[str, tuple[bool, str]] = {}
 _FORBIDDEN_MANAGED_IMAGE_IMPORTS = {
     "base64",

@@ -94,6 +94,7 @@ from openhands.tools.preset.default import register_default_tools
 from openhands.tools.pyromind_archive import ExtractArchiveTool
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
+    GetStorageUrlTool,
     PreviewDatasetTool,
     UploadFileToPyromindTool,
 )
@@ -681,6 +682,7 @@ def _build_pyromind_storage_tools(
                 params={**params, "extract_params": extraction_params},
             ),
             Tool(name=UploadFileToPyromindTool.name, params=dict(params)),
+            Tool(name=GetStorageUrlTool.name, params=dict(params)),
             Tool(name=RunDatasetCleaningTool.name, params=cleaning_params),
             Tool(name=DfSubmitPipelineTool.name, params=preparation_params),
             Tool(name=EdpSubmitTool.name, params=edp_params),

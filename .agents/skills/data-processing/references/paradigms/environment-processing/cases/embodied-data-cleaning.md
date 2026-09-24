@@ -108,7 +108,8 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
 
 ## 门禁与流程
 
-1. 预览探查（preview_dataset）→ 确认源形态（LeRobot v2.1 / S2 自采集）；
+1. 预览探查（直读 `storage/`）→ 确认源形态
+   （LeRobot v2.1 / S2 自采集）；
    自采集源先构建并上传 episode 索引（见上）。
 0. **无需 wheel 预置**：runtime wheel 已内置于 skill bundle，由 edp_submit
    随冻结包自动暂存；提交报"wheel bundle is missing"才是部署配置错误。
@@ -122,4 +123,4 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
 6. 用户确认后默认串行全量提交（每次一片，终态后再提交下一片）；仅当
    用户明确要求时才并发 2-5 片。`df_check_progress` 观察进度。
 7. 全部 episode 终态后提交 merge 记录（`embodied-cleaning-merge`），
-   Kafka 回调后用 `preview_dataset` 校验 target 发布物与聚合 report。
+   Kafka 回调后校验 target 发布物与聚合 report（直读 `storage/`）。

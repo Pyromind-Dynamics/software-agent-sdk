@@ -24,7 +24,8 @@ from openhands.tools.data_preparation.platform_submit import (
     _model_fingerprint,
     _normalize_storage_path,
     _pod_path,
-    _validate_local_pipeline,
+    _SubmissionFiles,
+    _validate_pipeline,
 )
 
 
@@ -793,6 +794,63 @@ def test_new_full_run_uses_conversation_scoped_output_root(
     conversation.send_agent_message.assert_not_called()
 
 
+def test_remote_workspace_submission_stages_pipeline_script(
+    monkeypatch,
+    tmp_path: Path,
+    sandbox_workspace,
+) -> None:
+    """A sandbox submission stages the script before uploading it to Storage."""
+    executor = _make_executor(tmp_path)
+    script_dir = sandbox_workspace.workspace_dir / "public_data" / "data-preparation"
+    script_dir.mkdir(parents=True)
+    (script_dir / "pipeline.py").write_text("print('sandbox')")
+    conversation = _make_conversation_with_llm()
+    conversation.id = "conv-1"
+    conversation.workspace = sandbox_workspace
+
+    monkeypatch.setattr(
+        executor,
+        "_stage_runtime_files",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.create_workflow_api_client",
+        lambda **kwargs: object(),
+    )
+    response = MagicMock()
+    response.task_id = "task-remote"
+    response.status = "Pending"
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.submit_workflow_task",
+        lambda **kwargs: response,
+    )
+    uploaded: list[bytes] = []
+
+    def _capture_upload(*, local_path: Path, **kwargs: Any) -> str:
+        uploaded.append(Path(local_path).read_bytes())
+        return "/.pyromind-agent/conv-1/data_preparation/pipeline.py"
+
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.upload_local_file_to_pyromind",
+        _capture_upload,
+    )
+
+    observation = executor(
+        DfSubmitPipelineAction(
+            script_path="public_data/data-preparation/pipeline.py",
+            input_path="/data/in.jsonl",
+            output_schema="text",
+        ),
+        conversation=conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    assert uploaded == [b"print('sandbox')"]
+    saved = DataPreparationTaskStore(tmp_path / "tasks").get("task-remote")
+    assert saved is not None
+    assert saved.script_path == "public_data/data-preparation/pipeline.py"
+
+
 def test_pipeline_path_compatibility_is_normalized(tmp_path: Path) -> None:
     script = tmp_path / "public_data" / "data-preparation" / "pipeline.py"
     script.parent.mkdir(parents=True)
@@ -807,7 +865,8 @@ def test_pipeline_path_compatibility_is_normalized(tmp_path: Path) -> None:
         "public_data/data-preparation/pipeline.py",
     ]
 
-    resolved = [_validate_local_pipeline(conversation, path) for path in paths]
+    files = _SubmissionFiles(conversation, staging=None)
+    resolved = [_validate_pipeline(files, path) for path in paths]
 
     assert {local for local, _ in resolved} == {str(script)}
     assert {relative for _, relative in resolved} == {
@@ -823,10 +882,11 @@ def test_pipeline_path_rejects_wrong_conversation_and_workspace_escape(
     conversation = _make_conversation_with_llm(workspace_dir=tmp_path)
     conversation.id = "conversation-1"
 
+    files = _SubmissionFiles(conversation, staging=None)
     with pytest.raises(ValueError, match="another conversation"):
-        _validate_local_pipeline(
-            conversation,
+        _validate_pipeline(
+            files,
             "/workspace/conversations/conversation-2/pipeline.py",
         )
     with pytest.raises(ValueError, match="outside the conversation workspace"):
-        _validate_local_pipeline(conversation, "../pipeline.py")
+        _validate_pipeline(files, "../pipeline.py")

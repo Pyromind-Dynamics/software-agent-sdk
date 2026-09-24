@@ -8,8 +8,8 @@ skill's ``sandbox_runner.py`` against the shard's Storage manifest, then
 submit and let the Kafka terminal callback resume the conversation.
 
 The runner writes its verdicts and traces into the pod's mounted Storage
-directory, so after the callback everything is inspectable with
-``preview_dataset`` — no local sandbox loop is involved.
+directory, so after the callback everything is inspectable under the returned
+``output_dir`` — no local sandbox loop is involved.
 
 Credentials come from the conversation secret registry exactly like every
 other platform tool: the platform ``auth_token`` (key ``auth_token``) and the
@@ -128,9 +128,8 @@ Two modes (exactly one required):
   output_dir and terminal callback.
 
 Execution is asynchronous. Terminal Kafka callbacks resume the
-conversation per shard; after the callbacks, inspect artefacts exclusively
-with `preview_dataset` under
-the returned output_dirs:
+conversation per shard; after the callbacks, inspect the returned
+output_dirs:
 - <output_dir>/run/verdicts.jsonl : per-record usable/error + reward
 - <output_dir>/run/traces/<task_id>.pi_trace.jsonl : agent json traces
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 
-PI_TERMINAL_BACKENDS = frozenset({"os-sandbox"})
+PI_TERMINAL_BACKENDS = frozenset({"os-sandbox", "sandbox"})
 
 
 def validate_pi_terminal_backend(value: str) -> str:

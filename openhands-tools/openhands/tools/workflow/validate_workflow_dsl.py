@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
 import httpx
@@ -19,6 +18,7 @@ from openhands.sdk.tool.tool import (
     ToolDefinition,
     ToolExecutor,
 )
+from openhands.tools.utils.workspace_files import read_workspace_text
 from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 
 
@@ -145,7 +145,7 @@ class ValidateWorkflowDslAction(Action):
     name: str = Field(default="workflow", description="Workflow name.")
 
     @model_validator(mode="after")
-    def validate_source(self) -> "ValidateWorkflowDslAction":
+    def validate_source(self) -> ValidateWorkflowDslAction:
         if self.dsl_path is not None and self.dsl is not None:
             raise ValueError("pass at most one of dsl_path or legacy dsl")
         return self
@@ -393,37 +393,12 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
                 "workspace."
             )
 
-        workspace = cast(Any, conversation).workspace
-        workspace_root = Path(workspace.working_dir).resolve()
-        relative_path = Path(dsl_path)
-        if relative_path.is_absolute() or ".." in relative_path.parts:
-            raise ValueError(
-                f"Workflow DSL path must stay inside the workspace: {dsl_path!r}"
-            )
-        current = workspace_root
-        for part in relative_path.parts:
-            current /= part
-            if current.is_symlink():
-                raise ValueError(
-                    f"Workflow DSL path must not contain symlinks: {dsl_path!r}"
-                )
-        workflow_path = (workspace_root / relative_path).resolve()
-        if not workflow_path.is_relative_to(workspace_root):
-            raise ValueError(
-                f"Workflow DSL path must stay inside the workspace: {dsl_path!r}"
-            )
-        if not workflow_path.is_file():
-            raise ValueError(
-                f"Cannot read workflow DSL file: {dsl_path!r} does not exist."
-            )
-        if workflow_path.stat().st_size > _MAX_DSL_FILE_BYTES:
-            raise ValueError(
-                f"Workflow DSL file exceeds {_MAX_DSL_FILE_BYTES} bytes: {dsl_path!r}"
-            )
-        try:
-            return workflow_path.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"Workflow DSL file must be UTF-8: {dsl_path!r}") from exc
+        return read_workspace_text(
+            cast(Any, conversation).workspace,
+            dsl_path,
+            max_bytes=_MAX_DSL_FILE_BYTES,
+            reject_symlinks=True,
+        )
 
     def _resolve_secret_headers(
         self,

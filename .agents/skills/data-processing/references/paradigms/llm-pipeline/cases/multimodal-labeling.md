@@ -7,18 +7,17 @@ Base64、重试或 Checkpoint。完整字段见
 
 ## 输入
 
-图片原始数据集格式不可预设。先用 `preview_dataset(mode="inspect")` 的
-`directory_summary` 判断结构：
+图片原始数据集格式不可预设。直接用 `read`/`terminal` 列 `storage/` 目录、查看
+实际文件和 metadata 判断结构：
 
-- `detected_layout` 只是摘要里的弱信号；查看实际文件和 metadata 后再决定
-  Prompt/字段映射。
-- `flat_file_collection`、`mixed_directory`、`unknown` 或低置信度结构：继续 inspect
-  具体文件或向用户确认样本边界，不要假设每个目录就是一条样本。
-- 如需代表性、类别覆盖、异常覆盖、大小覆盖或命名模式覆盖，应基于
-  `directory_summary` 继续 inspect 或自行选择 `sample_paths`。
-- layout hint 只是弱信号，不是 Schema；Pipeline 仍以 sample 后看到的真实字段为准。
+- 目录形状只是弱信号；查看实际文件和 metadata 后再决定 Prompt/字段映射。
+- 平铺文件集合、混合目录或结构不明时：继续查看具体文件或向用户确认样本边界，
+  不要假设每个目录就是一条样本。
+- 如需代表性、类别覆盖、异常覆盖、大小覆盖或命名模式覆盖，应基于实际目录结构
+  挑选样本目录，再按选中范围建 Manifest。
+- 目录形状只是弱信号，不是 Schema；Pipeline 仍以真实字段为准。
 
-本地验证优先使用 `preview_dataset(mode="sample")` 返回的 Manifest。默认字段：
+小样验证输入直接用 `storage/...` 目录或 Manifest。默认字段：
 
 ```json
 {
@@ -58,8 +57,8 @@ df_run_pipeline(model_profile="vision", output_schema="vision")
 
 用户确认后使用 `df_submit_pipeline(mode="full")`；提交前按 playbook 的
 [平台全量输入](../playbook.md#平台全量输入)把 Manifest 与它引用的图片落到同一
-Storage 目录树（目录输入按直接子项划分样本，多图样本用 Manifest）。平台产物仍只能
-在 Kafka callback 后通过 `preview_dataset` 查看。
+Storage 目录树（目录输入按直接子项划分样本，多图样本用 Manifest）。平台产物在
+Kafka callback 后直接读 `storage/`。
 
 ## 输出
 
