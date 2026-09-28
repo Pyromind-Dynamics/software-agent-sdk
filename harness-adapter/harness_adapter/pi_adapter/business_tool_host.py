@@ -19,7 +19,8 @@ from harness_adapter.pi_adapter.business_tools import (
     execute_validation_tool,
     validation_tool_spec,
 )
-from harness_adapter.pi_adapter.persistence import PiSessionFiles
+from harness_adapter.pi_adapter.persistence import PiSessionFiles, SavedToolOutput
+from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
 from harness_adapter.pi_adapter.tool_output import (
     ToolOutputPolicy,
     business_tool_output_id,
@@ -428,7 +429,7 @@ class PyromindBusinessToolHost:
                 arguments,
                 context.request_context,
             )
-            response = self._finalize_result(
+            response = await self._finalize_result(
                 BusinessToolResult(
                     is_error=bool(raw["is_error"]),
                     content=list(raw["content"]),
@@ -505,7 +506,7 @@ class PyromindBusinessToolHost:
 
         if name in _READ_ONLY_TOOLS:
             result = await invoke()
-            response = self._finalize_result(
+            response = await self._finalize_result(
                 result,
                 policy=policy,
                 policy_source=policy_source,
@@ -518,7 +519,7 @@ class PyromindBusinessToolHost:
         lock = self._locks.setdefault(context.conversation_id, asyncio.Lock())
         async with lock:
             result = await invoke()
-        response = self._finalize_result(
+        response = await self._finalize_result(
             result,
             policy=policy,
             policy_source=policy_source,
@@ -530,7 +531,7 @@ class PyromindBusinessToolHost:
         return response
 
     @staticmethod
-    def _finalize_result(
+    async def _finalize_result(
         result: BusinessToolResult,
         *,
         policy: ToolOutputPolicy,
@@ -569,6 +570,7 @@ class PyromindBusinessToolHost:
             )
             if saved.sha256 != output_id:
                 raise RuntimeError("saved tool output hash does not match its content")
+            await _publish_tool_output_to_execution_workspace(saved, context)
         except Exception:
             saved = None
             persistence_failed = True
@@ -876,6 +878,28 @@ def _cluster_route(context: ToolExecutionContext) -> str:
     cluster, so falling back to the wrong one reads another cluster's objects.
     """
     return (context.request_context.x_cluster or "").strip()
+
+
+async def _publish_tool_output_to_execution_workspace(
+    saved: SavedToolOutput, context: ToolExecutionContext
+) -> None:
+    """Mirror a spilled tool output into the sandbox execution workspace.
+
+    The truncation marker quotes a workspace-relative path, and with a remote
+    sandbox the model's file tools resolve that path inside the container, so
+    the control-plane spill file alone would be unreachable for the model.
+    """
+    workspace = context.workspace
+    if not isinstance(workspace, SandboxWorkspace):
+        return
+    result = await asyncio.to_thread(
+        workspace.file_upload, saved.path, saved.relative_path
+    )
+    if not result.success:
+        raise RuntimeError(
+            "could not publish tool output to the sandbox execution "
+            f"workspace: {result.error}"
+        )
 
 
 def _auth_token(context: RequestContext) -> str | None:

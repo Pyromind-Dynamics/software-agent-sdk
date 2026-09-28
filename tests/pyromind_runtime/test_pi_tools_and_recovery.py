@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import harness_adapter.pi_adapter.adapter as pi_adapter_module
 import harness_adapter.pi_adapter.business_tool_host as business_tool_host_module
+import harness_adapter.pi_adapter.sandbox_workspace as sandbox_workspace_module
 import httpx
 import pytest
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
@@ -32,6 +33,7 @@ from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.protocol import MAX_FRAME_BYTES, encode_frame
 from harness_adapter.pi_adapter.runner import PiRunnerExit, PlannedPiRunnerExitReason
 from harness_adapter.pi_adapter.sandbox_runtime import DEFAULT_MOUNT_PATH
+from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
 from harness_adapter.pi_adapter.tool_output import (
     MIN_POLICY_INLINE_BYTES,
     PLATFORM_MAX_INLINE_TEXT_BYTES,
@@ -1258,11 +1260,11 @@ async def test_business_tool_host_rejects_invalid_output_policy_during_call(
         )
 
 
-def test_business_tool_finalizer_persists_output_and_fits_runner_frame(
+async def test_business_tool_finalizer_persists_output_and_fits_runner_frame(
     tmp_path: Path,
 ) -> None:
     text = "你" * 100_000
-    response = _business_tool_host()._finalize_result(
+    response = await _business_tool_host()._finalize_result(
         BusinessToolResult(
             is_error=False,
             content=[{"type": "text", "text": text}],
@@ -1294,7 +1296,7 @@ def test_business_tool_finalizer_persists_output_and_fits_runner_frame(
 
 
 @pytest.mark.parametrize("failure_mode", ["raise", "hash_mismatch"])
-def test_business_tool_finalizer_truncates_when_persistence_fails(
+async def test_business_tool_finalizer_truncates_when_persistence_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failure_mode: str,
@@ -1308,7 +1310,7 @@ def test_business_tool_finalizer_truncates_when_persistence_fails(
         )
 
     monkeypatch.setattr(PiSessionFiles, "save_business_tool_output", fail_to_save)
-    response = _business_tool_host()._finalize_result(
+    response = await _business_tool_host()._finalize_result(
         BusinessToolResult(
             is_error=False,
             content=[{"type": "text", "text": "x" * 1_000}],
@@ -1328,6 +1330,108 @@ def test_business_tool_finalizer_truncates_when_persistence_fails(
     assert metadata["retained_bytes"] <= MIN_POLICY_INLINE_BYTES
     assert "full output unavailable" in visible_text
     assert "pi/terminal-output" not in visible_text
+
+
+def _sandbox_workspace(conversation_id: str) -> SandboxWorkspace:
+    return SandboxWorkspace(
+        working_dir=f"/target-workspace/.pyromind-agent/{conversation_id}",
+        storage_path="/target-workspace",
+        sandbox_id="sandbox-1",
+        ws_base_url="ws://sandbox.invalid",
+        client=cast(Any, SimpleNamespace(api_key="test-key")),
+    )
+
+
+async def test_business_tool_finalizer_publishes_spill_to_sandbox_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uploads: list[tuple[str, str, bytes]] = []
+
+    def fake_write_sandbox_file(
+        client: Any, *, ws_base_url: str, sandbox_id: str, path: str, source: Path
+    ) -> None:
+        uploads.append((sandbox_id, str(path), Path(source).read_bytes()))
+
+    monkeypatch.setattr(
+        sandbox_workspace_module, "write_sandbox_file", fake_write_sandbox_file
+    )
+    conversation_id = "conversation-sandbox-publish"
+    context = ToolExecutionContext(
+        conversation_id=conversation_id,
+        workspace_root=tmp_path,
+        request_context=RequestContext(user_id="42"),
+        model_configuration={"model": "gpt-5"},
+        workspace=_sandbox_workspace(conversation_id),
+    )
+    text = "y" * 300_000
+
+    response = await _business_tool_host()._finalize_result(
+        BusinessToolResult(
+            is_error=False,
+            content=[{"type": "text", "text": text}],
+            details={},
+        ),
+        policy=ToolOutputPolicy(),
+        policy_source="platform_default",
+        context=context,
+        tool_name="large_output",
+        tool_call_id="call-3",
+    )
+
+    metadata = response["details"]["output_truncation"]
+    assert metadata["persistence_failed"] is False
+    assert len(uploads) == 1
+    sandbox_id, destination, payload = uploads[0]
+    assert sandbox_id == "sandbox-1"
+    assert destination == (
+        f"/target-workspace/.pyromind-agent/{conversation_id}/{metadata['path']}"
+    )
+    assert payload.decode("utf-8") == text
+    assert (tmp_path / metadata["path"]).read_text(encoding="utf-8") == text
+
+
+async def test_business_tool_finalizer_marks_unavailable_when_publish_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_write_sandbox_file(
+        client: Any, *, ws_base_url: str, sandbox_id: str, path: str, source: Path
+    ) -> None:
+        raise OSError("sandbox unreachable")
+
+    monkeypatch.setattr(
+        sandbox_workspace_module,
+        "write_sandbox_file",
+        failing_write_sandbox_file,
+    )
+    conversation_id = "conversation-sandbox-publish-failure"
+    context = ToolExecutionContext(
+        conversation_id=conversation_id,
+        workspace_root=tmp_path,
+        request_context=RequestContext(user_id="42"),
+        model_configuration={"model": "gpt-5"},
+        workspace=_sandbox_workspace(conversation_id),
+    )
+
+    response = await _business_tool_host()._finalize_result(
+        BusinessToolResult(
+            is_error=False,
+            content=[{"type": "text", "text": "z" * 300_000}],
+            details={},
+        ),
+        policy=ToolOutputPolicy(),
+        policy_source="platform_default",
+        context=context,
+        tool_name="large_output",
+        tool_call_id="call-4",
+    )
+
+    metadata = response["details"]["output_truncation"]
+    visible_text = "".join(block.get("text", "") for block in response["content"])
+    assert metadata["persistence_failed"] is True
+    assert metadata["path"] is None
+    assert "Full output could not be persisted" in visible_text
 
 
 async def test_business_tool_error_uses_declared_output_policy(
