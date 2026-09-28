@@ -565,8 +565,9 @@ class PyromindBusinessToolHost:
         saved = None
         persistence_failed = False
         try:
-            saved = PiSessionFiles(context.workspace_root).save_business_tool_output(
-                full_text
+            saved = await asyncio.to_thread(
+                PiSessionFiles(context.workspace_root).save_business_tool_output,
+                full_text,
             )
             if saved.sha256 != output_id:
                 raise RuntimeError("saved tool output hash does not match its content")
