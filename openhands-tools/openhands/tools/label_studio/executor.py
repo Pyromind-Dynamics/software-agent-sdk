@@ -305,6 +305,14 @@ class LabelStudioProjectExecutor(
                 + " (no sample carries these region fields, so no rectangles were "
                 "built -- fix the binding's source or the upstream row contract)"
             )
+        if manifest is not None and manifest.unmatched_samples:
+            summary += (
+                " warning=unmatched_samples:"
+                + ",".join(manifest.unmatched_samples)
+                + " (no sample carries these whole-sample fields, so those "
+                "controls stay empty -- fix the binding's field or the upstream "
+                "row contract)"
+            )
         return self._state_to_observation("create", state, summary=summary)
 
     def _validate_with_label_studio(

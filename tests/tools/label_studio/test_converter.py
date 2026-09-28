@@ -806,6 +806,24 @@ def test_a_region_source_the_rows_carry_is_not_reported(monkeypatch):
     assert converter.convert().unmatched_regions == ()
 
 
+def test_a_whole_sample_field_no_row_carries_is_reported(monkeypatch):
+    """A verdict binding the rows cannot fill must not fail silently.
+
+    The declared field is absent from every row, so the control it feeds stays
+    empty; without this the only symptom is an unannotated review screen.
+    """
+    converter = _jsonl_converter(
+        monkeypatch,
+        [{"id": "s1", "defect_image": "/datasets/x/a.jpg"}],
+    )
+    assert converter.convert().unmatched_samples == ("quality",)
+
+
+def test_a_whole_sample_field_the_rows_carry_is_not_reported(monkeypatch):
+    """The hit is what suppresses the warning, so a matched binding stays quiet."""
+    assert _jsonl_converter(monkeypatch, JSONL_ROWS).convert().unmatched_samples == ()
+
+
 def test_an_aoi_export_never_reports_a_region_source(monkeypatch):
     """Most AOI exports are a whole-sample verdict, so a region less verdict is
     the documented normal case rather than a declaration that missed the data.

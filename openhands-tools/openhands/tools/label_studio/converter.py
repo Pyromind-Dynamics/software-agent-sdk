@@ -350,6 +350,7 @@ class ConvertedManifest:
         batches: list[tuple[str, bytes, int]],
         total_tasks: int,
         unmapped_quality: tuple[str, ...] = (),
+        unmatched_samples: tuple[str, ...] = (),
         unmatched_regions: tuple[str, ...] = (),
         unlisted_values: Mapping[str, tuple[str, ...]] | None = None,
         field_map_hash: str = "",
@@ -364,6 +365,10 @@ class ConvertedManifest:
         # Verdicts kept verbatim because no synonym matched. Surfaced through the
         # manifest so a pre-annotation that will not render is visible, not silent.
         self.unmapped_quality = unmapped_quality
+        # Whole-sample fields no sample carries. A binding that names a field the
+        # data does not have emits no prediction at all, so the control simply
+        # stays empty and nothing says why.
+        self.unmatched_samples = unmatched_samples
         # Region fields no sample carries: the binding names something the data
         # does not have, which otherwise shows up only as an empty editor.
         self.unmatched_regions = unmatched_regions
@@ -395,6 +400,7 @@ class ConvertedManifest:
             total_tasks=self.total_tasks,
             batches=manifest_batches,
             unmapped_quality=list(self.unmapped_quality),
+            unmatched_samples=list(self.unmatched_samples),
             unmatched_regions=list(self.unmatched_regions),
             unlisted_values={
                 control: list(values)
@@ -475,6 +481,8 @@ class AVITrainToLabelStudioConverter:
         # set and convert() touches it once per sample from a thread pool; a lone
         # add() on a set is atomic under the GIL, so no lock is needed.
         self._unmapped_quality: set[str] = set()
+        # Whole-sample fields at least one sample actually carried a value for.
+        self._sample_field_hits: set[str] = set()
         # Same, for the region fields the samples actually carry.
         self._region_source_hits: set[str] = set()
         # Control name -> values written to its predictions that the config's own
@@ -491,6 +499,20 @@ class AVITrainToLabelStudioConverter:
     def unmapped_quality_values(self) -> tuple[str, ...]:
         """Raw quality values no synonym matched, sorted for stable output."""
         return tuple(sorted(self._unmapped_quality))
+
+    @property
+    def unmatched_sample_fields(self) -> tuple[str, ...]:
+        """Declared whole-sample fields no sample carries.
+
+        A binding naming a field the dataset never has emits no prediction and
+        no other symptom, so the control it feeds silently stays empty. Reported
+        the same way an unmatched region source is, rather than left for the
+        annotator to notice in an unfilled editor.
+        """
+        declared = {
+            binding.field for binding in self._field_map.samples if binding.required
+        }
+        return tuple(sorted(declared - self._sample_field_hits))
 
     @property
     def unmatched_region_sources(self) -> tuple[str, ...]:
@@ -540,6 +562,7 @@ class AVITrainToLabelStudioConverter:
             batches=batches,
             total_tasks=len(tasks),
             unmapped_quality=self.unmapped_quality_values,
+            unmatched_samples=self.unmatched_sample_fields,
             unmatched_regions=self.unmatched_region_sources,
             unlisted_values=self.unlisted_values,
             field_map_hash=self._field_map_hash,
@@ -846,6 +869,9 @@ class AVITrainToLabelStudioConverter:
         text = str(raw).strip()
         if not text:
             return None
+        # A single add() per sample from the thread pool is atomic under the GIL,
+        # the same way the region-source hits are recorded.
+        self._sample_field_hits.add(binding.field)
 
         if binding.type == "textarea":
             # Free text such as a note has no value list to match against, so it

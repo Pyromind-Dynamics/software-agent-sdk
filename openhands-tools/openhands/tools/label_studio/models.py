@@ -53,6 +53,14 @@ class ManifestData(BaseModel):
             "names a field the data does not have."
         ),
     )
+    unmatched_samples: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Whole-sample fields the bindings declare but no sample carries. "
+            "Non-empty means those controls were left empty, because the "
+            "declaration names a field the data does not have."
+        ),
+    )
     unlisted_values: dict[str, list[str]] = Field(
         default_factory=dict,
         description=(

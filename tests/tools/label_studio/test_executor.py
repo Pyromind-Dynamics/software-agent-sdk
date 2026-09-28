@@ -143,6 +143,7 @@ class TestCreate:
             mock_manifest.total_tasks = 3
             mock_manifest.batch_payloads = [("tasks-00001.json", b"[{},{},{}]", 3)]
             mock_manifest.unmapped_quality = ()
+            mock_manifest.unmatched_samples = ()
             mock_manifest.unmatched_regions = ()
             mock_manifest.unlisted_values = {}
             mock_manifest.to_manifest_data.return_value.model_dump_json.return_value = (
@@ -741,6 +742,7 @@ def _mock_manifest(
     tasks: int,
     payload: bytes,
     unmapped_quality: tuple[str, ...] = (),
+    unmatched_samples: tuple[str, ...] = (),
     unmatched_regions: tuple[str, ...] = (),
     unlisted_values: dict[str, tuple[str, ...]] | None = None,
 ) -> MagicMock:
@@ -751,6 +753,7 @@ def _mock_manifest(
     # which is both truthy and iterable-as-empty -- so the executor's warning
     # branch would be taken and satisfied without a single test intending it.
     manifest.unmapped_quality = unmapped_quality
+    manifest.unmatched_samples = unmatched_samples
     manifest.unmatched_regions = unmatched_regions
     manifest.unlisted_values = unlisted_values or {}
     return manifest
@@ -868,6 +871,40 @@ def test_create_reports_unmatched_regions_to_the_agent(
 
     assert not obs.is_error
     assert "unmatched_regions:boxes" in obs.text
+
+
+def test_create_reports_unmatched_samples_to_the_agent(
+    conversation: MagicMock,
+) -> None:
+    """A whole-sample binding that fills nothing has to reach the agent.
+
+    The verdict control simply renders empty, which reads the same as a sample
+    nobody has annotated yet, so the declaration/data mismatch can only surface
+    in the create summary.
+    """
+    executor = _create_executor()
+    mock_ls = _mock_ls_api()
+    with (
+        patch.object(executor, "_load_state", return_value=None),
+        patch.object(executor, "_build_ls_api", return_value=mock_ls),
+        patch.object(executor, "_upload_to_storage", return_value=None),
+        patch.object(executor, "_save_state", return_value=None),
+        patch(
+            "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+        ) as MockConverter,
+    ):
+        _mock_manifest(MockConverter, 1, b"[{}]", unmatched_samples=("quality",))
+        obs = executor(
+            _action(
+                operation="create",
+                dataset_path="/datasets/pcb",
+                label_config_path="label_config.xml",
+            ),
+            conversation,
+        )
+
+    assert not obs.is_error
+    assert "unmatched_samples:quality" in obs.text
 
 
 def test_create_stays_quiet_when_every_verdict_mapped(
@@ -1614,6 +1651,7 @@ def test_create_records_the_window_the_portal_reported(conversation):
         manifest.total_tasks = 1
         manifest.batch_payloads = [("tasks-00001.json", b"[{}]", 1)]
         manifest.unmapped_quality = ()
+        manifest.unmatched_samples = ()
         manifest.unmatched_regions = ()
         manifest.unlisted_values = {}
         manifest.to_manifest_data.return_value.model_dump_json.return_value = "{}"

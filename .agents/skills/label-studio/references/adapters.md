@@ -106,6 +106,11 @@ create 时按数据布局选一个 `adapter`（默认 `avi_train`），三种都
   `warning=unmatched_regions:<字段>` —— 说明这些框一个都没建出来，要回去改
   绑定的 `source` 或上游数据的字段名。（`aoi_export` 不报，它的整图判定本来
   就大多数不带坐标。）
+- 整图绑定同理：声明的 `samples.field` 在**所有**行里都取不到值时，create 返回
+  `warning=unmatched_samples:<字段>` —— 说明这个控件一个预标注都没铺上。最典型
+  的情况是上游行里压根没有整图判定字段（判定只逐区域写在 `annotations` 里），
+  这时要么给 `samples` 换成行里真实存在的字段，要么回上游补一个顶层判定字段，
+  不要在下载/导入环节拼数据。`required: false` 的绑定不参与这条检查。
 - 坐标超出画面会被裁到边界，零面积的框直接丢弃。
 - `aoi_export` 的 `meta.json` 通常**不含图内坐标**（`vrs_xy`/`map_xy` 是机台
   坐标，不能当框用），这类项目就是纯人工标注。
