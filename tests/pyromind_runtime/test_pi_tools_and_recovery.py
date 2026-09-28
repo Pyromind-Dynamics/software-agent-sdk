@@ -8,15 +8,18 @@ from typing import Any, ClassVar, cast
 from uuid import uuid4
 
 import harness_adapter.pi_adapter.adapter as pi_adapter_module
+import harness_adapter.pi_adapter.business_tool_host as business_tool_host_module
 import httpx
 import pytest
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.pi_adapter.adapter import (
+    _copy_business_tool_outputs_for_fork,
     _is_workflow_mutation,
     _resolve_model,
     _session_config,
 )
 from harness_adapter.pi_adapter.business_tool_host import (
+    BusinessToolResult,
     PyromindBusinessToolHost,
     ToolExecutionContext,
 )
@@ -26,8 +29,14 @@ from harness_adapter.pi_adapter.business_tools import (
 )
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
+from harness_adapter.pi_adapter.protocol import MAX_FRAME_BYTES, encode_frame
 from harness_adapter.pi_adapter.runner import PiRunnerExit, PlannedPiRunnerExitReason
 from harness_adapter.pi_adapter.sandbox_runtime import DEFAULT_MOUNT_PATH
+from harness_adapter.pi_adapter.tool_output import (
+    MIN_POLICY_INLINE_BYTES,
+    PLATFORM_MAX_INLINE_TEXT_BYTES,
+    ToolOutputPolicy,
+)
 from pydantic import BaseModel, ValidationError
 from pyromind_runtime.domain.commands import UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
@@ -1024,7 +1033,8 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
         repository / ".agents" / "skills" / "data-processing",
         repository / ".agents" / "skills" / "training-analysis",
     ]
-    specs = PyromindBusinessToolHost(roots).specs()
+    host = PyromindBusinessToolHost(roots)
+    specs = host.specs()
     assert len(specs) == 24
     assert {"edp_render", "edp_submit", "edp_aggregate", "update_plan"} <= {
         spec["name"] for spec in specs
@@ -1171,6 +1181,7 @@ async def test_pi_host_synthesizes_debug_task_and_persists_only_attempt_budget(
     class FakeTool:
         action_type = FakeAction
         executor = None
+        meta = None
 
         def __call__(self, _action, facade):
             facade.state.agent_state["pyromind_workflow_attempts"] = 4
@@ -1217,6 +1228,189 @@ def _business_tool_host() -> PyromindBusinessToolHost:
             repository / ".agents" / "skills" / "training-analysis",
         ]
     )
+
+
+def _tool_context(tmp_path: Path, conversation_id: str) -> ToolExecutionContext:
+    return ToolExecutionContext(
+        conversation_id=conversation_id,
+        workspace_root=tmp_path,
+        request_context=RequestContext(user_id="42"),
+        model_configuration={"model": "gpt-5"},
+    )
+
+
+async def test_business_tool_host_rejects_invalid_output_policy_during_call(
+    tmp_path: Path,
+) -> None:
+    host = _business_tool_host()
+    host._factories["invalid_policy_tool"] = cast(
+        Any,
+        lambda _context: SimpleNamespace(
+            meta={"output_policy": {"strategy": "middle"}}
+        ),
+    )
+
+    with pytest.raises(ValueError, match="invalid strategy"):
+        await host.execute(
+            "invalid_policy_tool",
+            {},
+            _tool_context(tmp_path, "conversation-invalid-policy"),
+        )
+
+
+def test_business_tool_finalizer_persists_output_and_fits_runner_frame(
+    tmp_path: Path,
+) -> None:
+    text = "你" * 100_000
+    response = _business_tool_host()._finalize_result(
+        BusinessToolResult(
+            is_error=False,
+            content=[{"type": "text", "text": text}],
+            details={"listing": "x" * 250_000},
+            signals=[{"type": "test.signal"}],
+        ),
+        policy=ToolOutputPolicy(),
+        policy_source="platform_default",
+        context=_tool_context(tmp_path, "conversation-large-output"),
+        tool_name="large_output",
+        tool_call_id="call-1",
+    )
+
+    metadata = response["details"]["output_truncation"]
+    assert metadata["truncated"] is True
+    assert metadata["original_bytes"] == 300_000
+    assert metadata["retained_bytes"] <= PLATFORM_MAX_INLINE_TEXT_BYTES
+    assert metadata["persistence_failed"] is False
+    output_path = tmp_path / metadata["path"]
+    assert output_path.read_text(encoding="utf-8") == text
+
+    frame = {
+        "protocolVersion": 2,
+        "type": "response",
+        "requestId": "request-1",
+        "result": response,
+    }
+    assert len(encode_frame(frame)) - 1 <= MAX_FRAME_BYTES
+
+
+@pytest.mark.parametrize("failure_mode", ["raise", "hash_mismatch"])
+def test_business_tool_finalizer_truncates_when_persistence_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    def fail_to_save(_files: PiSessionFiles, _text: str):
+        if failure_mode == "raise":
+            raise OSError("disk unavailable")
+        return SimpleNamespace(
+            sha256="0" * 64,
+            relative_path="pi/terminal-output/invalid.txt",
+        )
+
+    monkeypatch.setattr(PiSessionFiles, "save_business_tool_output", fail_to_save)
+    response = _business_tool_host()._finalize_result(
+        BusinessToolResult(
+            is_error=False,
+            content=[{"type": "text", "text": "x" * 1_000}],
+            details={},
+        ),
+        policy=ToolOutputPolicy(max_inline_bytes=MIN_POLICY_INLINE_BYTES),
+        policy_source="tool_meta",
+        context=_tool_context(tmp_path, "conversation-persistence-failure"),
+        tool_name="large_output",
+        tool_call_id="call-2",
+    )
+
+    metadata = response["details"]["output_truncation"]
+    visible_text = "".join(block.get("text", "") for block in response["content"])
+    assert metadata["persistence_failed"] is True
+    assert metadata["path"] is None
+    assert metadata["retained_bytes"] <= MIN_POLICY_INLINE_BYTES
+    assert "full output unavailable" in visible_text
+    assert "pi/terminal-output" not in visible_text
+
+
+async def test_business_tool_error_uses_declared_output_policy(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FakeAction(BaseModel):
+        pass
+
+    class FakeBlock:
+        @staticmethod
+        def model_dump(**_kwargs):
+            return {"type": "text", "text": "e" * 1_000}
+
+    class FakeObservation:
+        is_error = True
+        to_llm_content = (FakeBlock(),)
+
+        @staticmethod
+        def model_dump(*_args, **_kwargs):
+            return {"reason": "tool failed"}
+
+    class FakeTool:
+        action_type = FakeAction
+        executor = None
+        meta: ClassVar[dict[str, Any]] = {
+            "output_policy": {
+                "max_inline_bytes": MIN_POLICY_INLINE_BYTES + 20,
+                "strategy": "tail",
+            }
+        }
+
+        def __call__(self, _action, _facade):
+            return FakeObservation()
+
+    host = _business_tool_host()
+    host._factories["large_error"] = cast(Any, lambda _context: FakeTool())
+    caplog.set_level("INFO")
+    response = await host.execute(
+        "large_error",
+        {},
+        _tool_context(tmp_path, "conversation-large-error"),
+        tool_call_id="call-3",
+    )
+
+    metadata = response["details"]["output_truncation"]
+    assert response["is_error"] is True
+    assert metadata["triggered_by"] == "bytes"
+    assert metadata["retained_bytes"] <= MIN_POLICY_INLINE_BYTES + 20
+    assert (tmp_path / metadata["path"]).is_file()
+    assert "policy_source=tool_meta" in caplog.text
+    assert "triggered_by=bytes" in caplog.text
+    assert "omitted_chars=" in caplog.text
+
+
+async def test_validation_result_uses_the_same_finalizer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_validation(*_args, **_kwargs):
+        return {
+            "is_error": True,
+            "content": [{"type": "text", "text": "v" * 260_000}],
+            "details": {"reason": "invalid workflow"},
+        }
+
+    monkeypatch.setattr(
+        business_tool_host_module,
+        "execute_validation_tool",
+        fake_validation,
+    )
+    response = await _business_tool_host().execute(
+        "validate_workflow_dsl",
+        {},
+        _tool_context(tmp_path, "conversation-large-validation"),
+        tool_call_id="call-4",
+    )
+
+    metadata = response["details"]["output_truncation"]
+    assert response["is_error"] is True
+    assert metadata["original_bytes"] == 260_000
+    assert metadata["retained_bytes"] <= PLATFORM_MAX_INLINE_TEXT_BYTES
+    assert (tmp_path / metadata["path"]).is_file()
 
 
 def test_workflow_debug_params_fall_back_to_deployment_env(
@@ -1531,7 +1725,13 @@ async def test_pi_adapter_forks_native_session_and_sanitizes_workspace(
     (source / "product" / "snapshot.json").write_text("private", encoding="utf-8")
     (source / ".env").write_text("TOKEN=secret", encoding="utf-8")
     (source / "public_data" / "secret-link").symlink_to(source / ".env")
-    PiSessionFiles(source).save_checkpoint_index({"workflow-v1": "leaf-1"})
+    source_files = PiSessionFiles(source)
+    saved_output = source_files.save_business_tool_output("full tool output\n😀")
+    (source_files.terminal_output_directory / "pi-native-output.txt").write_text(
+        "do not copy",
+        encoding="utf-8",
+    )
+    source_files.save_checkpoint_index({"workflow-v1": "leaf-1"})
     checkpoint = ProductCheckpoint(
         event_id="workflow-v1",
         through_seq=2,
@@ -1564,6 +1764,10 @@ async def test_pi_adapter_forks_native_session_and_sanitizes_workspace(
     assert not (target / ".env").exists()
     assert not (target / "public_data" / "secret-link").exists()
     assert (target / "pi" / "session.jsonl").is_file()
+    assert (target / saved_output.relative_path).read_text(encoding="utf-8") == (
+        "full tool output\n😀"
+    )
+    assert not (target / "pi" / "terminal-output" / "pi-native-output.txt").exists()
     assert "request-secret" not in (target / "pi" / "session.json").read_text()
     await adapter.close(target_handle)
     await adapter.close(source_handle)
@@ -1698,6 +1902,27 @@ async def test_sandbox_close_pauses_instead_of_deleting_the_container(
 
     assert manager.paused == ["conversation-1"]
     assert manager.deleted == []
+
+
+def test_copy_business_tool_outputs_for_fork_rejects_symbolic_links(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source_files = PiSessionFiles(source_root)
+    target_files = PiSessionFiles(target_root)
+    saved = source_files.save_business_tool_output("tool output")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("tool output", encoding="utf-8")
+    saved.path.unlink()
+    saved.path.symlink_to(outside)
+
+    with pytest.raises(RuntimeError, match="must not be a symbolic link"):
+        _copy_business_tool_outputs_for_fork(source_files, target_files)
+
+    assert not (target_root / saved.relative_path).exists()
 
 
 async def test_pi_adapter_restores_workflow_and_resets_debug_budget(

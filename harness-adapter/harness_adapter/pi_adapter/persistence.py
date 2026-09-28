@@ -1,10 +1,27 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import stat
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
+
+from harness_adapter.pi_adapter.tool_output import (
+    build_business_tool_output_filename,
+    build_business_tool_output_relative_path,
+    business_tool_output_id,
+    normalize_utf8_text,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SavedToolOutput:
+    sha256: str
+    relative_path: str
+    path: Path
 
 
 class PiSessionFiles:
@@ -18,6 +35,7 @@ class PiSessionFiles:
         self.completions_path = self.directory / "run-completions.json"
         self.sandbox_path = self.directory / "sandbox.json"
         self.sandbox_fork_path = self.directory / "sandbox-fork.json"
+        self.terminal_output_directory = self.directory / "terminal-output"
 
     def initialize(self, session: dict[str, Any]) -> None:
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -117,6 +135,53 @@ class PiSessionFiles:
     def clear_pending_sandbox_fork(self) -> None:
         self.sandbox_fork_path.unlink(missing_ok=True)
 
+    def save_business_tool_output(self, text: str) -> SavedToolOutput:
+        normalized_text = normalize_utf8_text(text)
+        encoded = normalized_text.encode("utf-8")
+        output_id = business_tool_output_id(normalized_text)
+        relative_path = build_business_tool_output_relative_path(output_id)
+        output_path = self.terminal_output_directory / (
+            build_business_tool_output_filename(output_id)
+        )
+
+        _ensure_private_directory(self.directory)
+        _ensure_private_directory(self.terminal_output_directory)
+        if _reuse_existing_output(output_path, output_id):
+            return SavedToolOutput(output_id, relative_path, output_path)
+
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{output_path.name}.",
+            dir=self.terminal_output_directory,
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if output_path.is_symlink():
+                raise RuntimeError(
+                    "PI_WORKSPACE_INVALID: business tool output must not be a "
+                    "symbolic link"
+                )
+            os.replace(temporary, output_path)
+        except Exception:
+            Path(temporary).unlink(missing_ok=True)
+            raise
+        return SavedToolOutput(output_id, relative_path, output_path)
+
+    def load_business_tool_output(self, output_id: str) -> str:
+        output_path = self.terminal_output_directory / (
+            build_business_tool_output_filename(output_id)
+        )
+        with _open_verified_output(output_path, output_id) as stream:
+            encoded = stream.read()
+        try:
+            return encoded.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                "PI_WORKSPACE_INVALID: business tool output must be valid UTF-8"
+            ) from exc
+
 
 def _load_object(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -138,3 +203,69 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     except Exception:
         Path(temporary).unlink(missing_ok=True)
         raise
+
+
+def _ensure_private_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise RuntimeError(
+            f"PI_WORKSPACE_INVALID: {path.name} must not be a symbolic link"
+        )
+    try:
+        path.mkdir(mode=0o700, exist_ok=True)
+    except FileExistsError as exc:
+        raise RuntimeError(
+            f"PI_WORKSPACE_INVALID: {path.name} must be a directory"
+        ) from exc
+    if not path.is_dir():
+        raise RuntimeError(f"PI_WORKSPACE_INVALID: {path.name} must be a directory")
+    path.chmod(0o700)
+
+
+def _reuse_existing_output(path: Path, output_id: str) -> bool:
+    try:
+        stream = _open_verified_output(path, output_id)
+    except FileNotFoundError:
+        return False
+    with stream:
+        os.fchmod(stream.fileno(), 0o600)
+    return True
+
+
+def _open_verified_output(path: Path, output_id: str) -> BinaryIO:
+    file_stat = os.lstat(path)
+    if stat.S_ISLNK(file_stat.st_mode):
+        raise RuntimeError(
+            "PI_WORKSPACE_INVALID: business tool output must not be a symbolic link"
+        )
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise RuntimeError(
+                "PI_WORKSPACE_INVALID: business tool output must be a regular file"
+            )
+    except Exception:
+        os.close(descriptor)
+        raise
+    stream = os.fdopen(descriptor, "rb")
+    try:
+        if _hash_stream(stream) != output_id:
+            raise RuntimeError(
+                "PI_WORKSPACE_INVALID: existing business tool output does not match "
+                "its content hash"
+            )
+        stream.seek(0)
+        return stream
+    except Exception:
+        stream.close()
+        raise
+
+
+def _hash_stream(stream: BinaryIO) -> str:
+    digest = hashlib.sha256()
+    while chunk := stream.read(1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()

@@ -20,6 +20,13 @@ from harness_adapter.pi_adapter.business_tools import (
     validation_tool_spec,
 )
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
+from harness_adapter.pi_adapter.tool_output import (
+    ToolOutputPolicy,
+    business_tool_output_id,
+    normalize_utf8_text,
+    resolve_tool_output_policy,
+    truncate_tool_content,
+)
 from openhands.agent_server.pyromind_auth import parse_auth_token_from_cookie_header
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.secret import StaticSecret
@@ -83,9 +90,6 @@ _READ_ONLY_TOOLS = frozenset(
 )
 logger = logging.getLogger(__name__)
 
-# Runner frames are capped at 1MiB; keep tool text well under it so the
-# JSON envelope (details, signals) still fits.
-_MAX_RESPONSE_TEXT_CHARS = 250_000
 _TRUNCATED_SUFFIX = "\n\n[output truncated: exceeded the runner frame budget]"
 # Observation details (e.g. directory entries) are only machine-readable
 # context; cap them well below the frame budget so the full response frame
@@ -93,21 +97,6 @@ _TRUNCATED_SUFFIX = "\n\n[output truncated: exceeded the runner frame budget]"
 _MAX_DETAILS_BYTES = 200_000
 _MAX_DETAIL_ITEMS = 50
 _MAX_DETAIL_TEXT_CHARS = 20_000
-
-
-def _cap_response_text(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    remaining = _MAX_RESPONSE_TEXT_CHARS
-    capped: list[dict[str, Any]] = []
-    for block in content:
-        text = block.get("text")
-        if not isinstance(text, str) or len(text) <= remaining:
-            if isinstance(text, str):
-                remaining -= len(text)
-            capped.append(block)
-            continue
-        capped.append({**block, "text": text[:remaining] + _TRUNCATED_SUFFIX})
-        remaining = 0
-    return capped
 
 
 def _encoded_len(value: Any) -> int:
@@ -432,20 +421,39 @@ class PyromindBusinessToolHost:
     ) -> dict[str, Any]:
         started_at = time.perf_counter()
         if name == "validate_workflow_dsl":
-            result = await execute_validation_tool(
+            policy = ToolOutputPolicy()
+            policy_source = "platform_default"
+            raw = await execute_validation_tool(
                 context.workspace or LocalWorkspace(working_dir=context.workspace_root),
                 arguments,
                 context.request_context,
             )
-            response = {**result, "signals": []}
+            response = self._finalize_result(
+                BusinessToolResult(
+                    is_error=bool(raw["is_error"]),
+                    content=list(raw["content"]),
+                    details=dict(raw["details"]),
+                ),
+                policy=policy,
+                policy_source=policy_source,
+                context=context,
+                tool_name=name,
+                tool_call_id=tool_call_id,
+            )
             self._log_execution(name, context, started_at, response)
             return response
         factory = self._factories.get(name)
         if factory is None:
             raise ValueError(f"unsupported business tool: {name}")
+        tool = factory(context)
+        policy = resolve_tool_output_policy(tool.meta)
+        policy_source = (
+            "tool_meta"
+            if tool.meta is not None and "output_policy" in tool.meta
+            else "platform_default"
+        )
 
-        async def invoke() -> dict[str, Any]:
-            tool = factory(context)
+        async def invoke() -> BusinessToolResult:
             action = tool.action_type.model_validate(arguments)
             files = PiSessionFiles(context.workspace_root)
             facade = _ToolConversationFacade(context, files.load_business_state())
@@ -482,28 +490,147 @@ class PyromindBusinessToolHost:
                     else 0
                 }
             )
-            content = _cap_response_text(
-                [block.model_dump(mode="json") for block in observation.to_llm_content]
-            )
-            details = _cap_details_size(
-                observation.model_dump(mode="json", exclude={"content", "is_error"})
+            content = [
+                block.model_dump(mode="json") for block in observation.to_llm_content
+            ]
+            details = observation.model_dump(
+                mode="json", exclude={"content", "is_error"}
             )
             return BusinessToolResult(
                 is_error=bool(observation.is_error),
                 content=content,
                 details=details,
                 signals=facade.signals,
-            ).as_dict()
+            )
 
         if name in _READ_ONLY_TOOLS:
-            response = await invoke()
+            result = await invoke()
+            response = self._finalize_result(
+                result,
+                policy=policy,
+                policy_source=policy_source,
+                context=context,
+                tool_name=name,
+                tool_call_id=tool_call_id,
+            )
             self._log_execution(name, context, started_at, response)
             return response
         lock = self._locks.setdefault(context.conversation_id, asyncio.Lock())
         async with lock:
-            response = await invoke()
+            result = await invoke()
+        response = self._finalize_result(
+            result,
+            policy=policy,
+            policy_source=policy_source,
+            context=context,
+            tool_name=name,
+            tool_call_id=tool_call_id,
+        )
         self._log_execution(name, context, started_at, response)
         return response
+
+    @staticmethod
+    def _finalize_result(
+        result: BusinessToolResult,
+        *,
+        policy: ToolOutputPolicy,
+        policy_source: str,
+        context: ToolExecutionContext,
+        tool_name: str,
+        tool_call_id: str | None,
+    ) -> dict[str, Any]:
+        details = dict(_cap_details_size(result.details))
+        full_text = "".join(
+            normalize_utf8_text(text)
+            for block in result.content
+            if block.get("type") == "text"
+            and isinstance((text := block.get("text")), str)
+        )
+        output_id = business_tool_output_id(full_text)
+        truncation = truncate_tool_content(
+            result.content,
+            tool_name=tool_name,
+            output_id=output_id,
+            policy=policy,
+        )
+        if not truncation.truncated:
+            return BusinessToolResult(
+                is_error=result.is_error,
+                content=truncation.content,
+                details=details,
+                signals=result.signals,
+            ).as_dict()
+
+        saved = None
+        persistence_failed = False
+        try:
+            saved = PiSessionFiles(context.workspace_root).save_business_tool_output(
+                full_text
+            )
+            if saved.sha256 != output_id:
+                raise RuntimeError("saved tool output hash does not match its content")
+        except Exception:
+            saved = None
+            persistence_failed = True
+            logger.warning(
+                "Could not persist truncated business tool output "
+                "conversation_id=%s tool_name=%s tool_call_id=%s sha256=%s",
+                context.conversation_id,
+                tool_name,
+                tool_call_id,
+                output_id,
+                exc_info=True,
+            )
+            truncation = truncate_tool_content(
+                result.content,
+                tool_name=tool_name,
+                output_id=output_id,
+                policy=policy,
+                full_output_available=False,
+            )
+
+        details["output_truncation"] = {
+            "truncated": True,
+            "original_chars": truncation.original_chars,
+            "original_bytes": truncation.original_bytes,
+            "retained_chars": truncation.retained_chars,
+            "retained_bytes": truncation.retained_bytes,
+            "omitted_chars": truncation.omitted_chars,
+            "omitted_bytes": truncation.omitted_bytes,
+            "original_lines": truncation.original_lines,
+            "triggered_by": truncation.triggered_by,
+            "invalid_unicode_replacements": (truncation.invalid_unicode_replacements),
+            "sha256": output_id,
+            "path": saved.relative_path if saved is not None else None,
+            "persistence_failed": persistence_failed,
+        }
+        logger.info(
+            "pi.business_tool_output_truncated conversation_id=%s tool_name=%s "
+            "tool_call_id=%s policy_source=%s triggered_by=%s original_chars=%d "
+            "original_bytes=%d retained_chars=%d retained_bytes=%d "
+            "omitted_chars=%d omitted_bytes=%d persisted=%s "
+            "persistence_failed=%s sha256=%s",
+            context.conversation_id,
+            tool_name,
+            tool_call_id,
+            policy_source,
+            truncation.triggered_by,
+            truncation.original_chars,
+            truncation.original_bytes,
+            truncation.retained_chars,
+            truncation.retained_bytes,
+            truncation.omitted_chars,
+            truncation.omitted_bytes,
+            saved is not None,
+            persistence_failed,
+            output_id,
+        )
+        return BusinessToolResult(
+            is_error=result.is_error,
+            content=truncation.content,
+            details=details,
+            signals=result.signals,
+        ).as_dict()
 
     @staticmethod
     def _log_execution(
