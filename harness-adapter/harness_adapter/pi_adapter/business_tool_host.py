@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 from pydantic import SecretStr
+from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.domain.context import RequestContext
 
 from harness_adapter.openhands_adapter.session_factory import current_user_from_context
@@ -31,12 +32,17 @@ from openhands.tools.data_preparation import (
     DfStopTaskTool,
     DfSubmitPipelineTool,
 )
+from openhands.tools.data_preparation.inference import InferencePipelineHandler
 from openhands.tools.environment_processing import (
     EdpAggregateTool,
     EdpRenderTool,
     EdpSubmitTool,
 )
 from openhands.tools.environment_processing.platform_env import resolve_platform_env
+from openhands.tools.label_studio import (
+    LABEL_STUDIO_TOKEN_SECRET,
+    LabelStudioProjectTool,
+)
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
@@ -53,6 +59,7 @@ from openhands.tools.sandbox import (
     SandboxWriteFileTool,
 )
 from openhands.tools.training_analysis import TrainingAnalysisTool
+from openhands.tools.update_plan import UpdatePlanTool
 from openhands.tools.workflow.analyze_task_failure import AnalyzeTaskFailureTool
 from openhands.tools.workflow.run_workflow import WORKFLOW_ATTEMPT_STATE_KEY
 from openhands.tools.workflow.task_submission import (
@@ -61,6 +68,7 @@ from openhands.tools.workflow.task_submission import (
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
+    ValidateWorkflowDslExecutor,
 )
 from openhands.tools.workflow_debug import WorkflowDebugTool
 
@@ -221,6 +229,13 @@ class _ToolConversationFacade:
             secrets[PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET] = StaticSecret(
                 value=SecretStr(auth_token)
             )
+        label_studio_token = context.extra.get("label_studio_token")
+        if not isinstance(label_studio_token, str) or not label_studio_token.strip():
+            label_studio_token = os.getenv("LABEL_STUDIO_API_TOKEN", "")
+        if label_studio_token.strip():
+            secrets[LABEL_STUDIO_TOKEN_SECRET] = StaticSecret(
+                value=SecretStr(label_studio_token)
+            )
         secrets.update(_llm_credential_secrets(context))
         registry.secret_sources.update(secrets)
         model = context.model_configuration
@@ -262,6 +277,7 @@ class PyromindBusinessToolHost:
         skill_roots: Sequence[Path],
         *,
         skills_directory: Path | None = None,
+        pipeline_runs: Callable[[str], PipelineRuns] | None = None,
     ) -> None:
         roots = (
             {
@@ -281,6 +297,12 @@ class PyromindBusinessToolHost:
         self._preparation_runtime = roots["data-processing"] / "scripts" / "preparation"
         self._edp_runtime = roots["data-processing"] / "scripts" / "edp"
         self._training_runtime = roots["training-analysis"] / "scripts"
+        self._inference_runtime = (
+            skills_directory / "inference-evaluation" / "scripts"
+            if skills_directory is not None
+            else None
+        )
+        self._pipeline_runs = pipeline_runs
         for path in (
             self._cleaning_runtime,
             self._preparation_runtime,
@@ -357,10 +379,22 @@ class PyromindBusinessToolHost:
                 runtime_dir=str(self._training_runtime),
                 **self._training_analysis_params(context),
             )[0],
+            LabelStudioProjectTool.name: lambda context: LabelStudioProjectTool.create(
+                **self._label_studio_params(context)
+            )[0],
+            UpdatePlanTool.name: lambda context: UpdatePlanTool.create(
+                cast(
+                    Any,
+                    SimpleNamespace(persistence_dir=str(context.workspace_root / "pi")),
+                )
+            )[0],
         }
 
     def specs(self) -> list[dict[str, Any]]:
         specs = [validation_tool_spec()]
+        tools: list[ToolDefinition[Any, Any]] = [
+            UpdatePlanTool.create(cast(Any, SimpleNamespace(persistence_dir=None)))[0]
+        ]
         for tool_type in (
             PreviewDatasetTool,
             UploadFileToPyromindTool,
@@ -383,8 +417,10 @@ class PyromindBusinessToolHost:
             WorkflowDebugTool,
             AnalyzeTaskFailureTool,
             TrainingAnalysisTool,
+            LabelStudioProjectTool,
         ):
-            tool = tool_type.create()[0]
+            tools.append(tool_type.create()[0])
+        for tool in tools:
             definition = tool.to_mcp_tool()
             schema = definition.get("inputSchema")
             if not isinstance(schema, dict):
@@ -551,6 +587,21 @@ class PyromindBusinessToolHost:
             params["secret_headers"] = {"cookie": _STORAGE_COOKIE_SECRET}
         return params
 
+    def _label_studio_params(self, context: ToolExecutionContext) -> dict[str, Any]:
+        params = self._storage_params(context)
+        for key, legacy_key in (
+            ("ls_base_url", None),
+            ("portal_base_url", "sso_base_url"),
+        ):
+            value = context.extra.get(f"label_studio_{key}")
+            if not (isinstance(value, str) and value.strip()) and legacy_key:
+                value = context.extra.get(f"label_studio_{legacy_key}")
+            if isinstance(value, str) and value.strip():
+                params[key] = value.strip()
+        if cluster := _cluster_route(context):
+            params["cluster"] = cluster
+        return params
+
     def _execution_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         env, cluster = _execution_target(context)
         params: dict[str, Any] = {"env": env}
@@ -579,6 +630,16 @@ class PyromindBusinessToolHost:
     def _preparation_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         params = self._execution_params(context)
         params["runtime_dir"] = str(self._preparation_runtime)
+        if self._pipeline_runs is not None and self._inference_runtime is not None:
+            params["inference_handler"] = InferencePipelineHandler(
+                self._inference_runtime,
+                self._pipeline_runs(context.conversation_id),
+                ValidateWorkflowDslExecutor(
+                    secret_headers={"authorization": _VALIDATE_AUTHORIZATION_SECRET}
+                    if context.request_context.authorization
+                    else None,
+                ),
+            )
         return params
 
     def _edp_params(self, context: ToolExecutionContext) -> dict[str, Any]:
@@ -634,6 +695,10 @@ class PyromindBusinessToolHost:
         params: dict[str, Any] = {
             "headers": _forward_headers(context.request_context, include_cookie=False)
         }
+        if self._pipeline_runs is not None:
+            params["task_resolver"] = self._pipeline_runs(
+                context.conversation_id
+            ).task_for
         if context.request_context.cookie:
             params["secret_headers"] = {"cookie": _STORAGE_COOKIE_SECRET}
         return params
@@ -723,6 +788,16 @@ def _execution_target(
     if separator and routed_env.strip():
         env = routed_env.strip().lower()
     return resolve_platform_env(env), cluster.strip() or None
+
+
+def _cluster_route(context: ToolExecutionContext) -> str:
+    """Raw cluster route (``us-west-1#pre``) this conversation is served from.
+
+    Only the conversation's own routing is used. A process-wide default would
+    hide a session that never carried a cluster, and Storage is replicated per
+    cluster, so falling back to the wrong one reads another cluster's objects.
+    """
+    return (context.request_context.x_cluster or "").strip()
 
 
 def _preview_timeout_seconds(context: ToolExecutionContext) -> float:

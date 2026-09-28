@@ -9,7 +9,7 @@ import type { JsonObject, JsonValue, RunnerEvent } from "../src/protocol.js";
 import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 import { PiAgentRuntime } from "../src/agent-runtime.js";
 
-test("AgentSession discovers directory skills and reads skill aliases in the workflow tool loop", async (context) => {
+test("AgentSession discovers skills and preserves resource aliases in prompts and file tools", async (context) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "pi-runtime-test-")));
   const workspace = join(root, "conversation");
   const skillsDirectory = join(root, "configured-skills");
@@ -20,6 +20,7 @@ test("AgentSession discovers directory skills and reads skill aliases in the wor
   await mkdir(join(workspace, "pi", "terminal-output"), { recursive: true });
   await mkdir(join(skill, "references"), { recursive: true });
   await mkdir(knowledge);
+  await writeFile(join(knowledge, "domain.md"), "Shared domain knowledge.\n", "utf8");
   await mkdir(extraSkill);
   await writeFile(join(extraSkill, "SKILL.md"), "---\nname: extra-skill\ndescription: An explicitly configured skill.\n---\nExtra skill.\n");
   const shadowedSkill = join(skillsDirectory, "extra-skill");
@@ -35,6 +36,7 @@ test("AgentSession discovers directory skills and reads skill aliases in the wor
     "description: Generate and validate a workflow DSL.",
     "---",
     "Read references/workflow-contracts.md, generate and validate the workflow.",
+    "Read knowledge/domain.md for shared domain knowledge.",
     "",
   ].join("\n"), "utf8");
   await writeFile(join(skill, "references", "workflow-contracts.md"), "A workflow is valid when it defines workflow.\n", "utf8");
@@ -45,11 +47,12 @@ test("AgentSession discovers directory skills and reads skill aliases in the wor
     requests.push({ url: request.url ?? "", body });
     if (requests.length === 1) sendToolCall(response, "read", { path: ".agents/skills/custom-workflow/SKILL.md" }, "call-skill");
     else if (requests.length === 2) sendToolCall(response, "read", { path: "./.agents/skills/custom-workflow/references/workflow-contracts.md" }, "call-contract");
-    else if (requests.length === 3) sendToolCall(response, "write", {
+    else if (requests.length === 3) sendToolCall(response, "read", { path: "knowledge/domain.md" }, "call-knowledge");
+    else if (requests.length === 4) sendToolCall(response, "write", {
       path: "public_data/workflow_canvas/workflow.py",
       content: "workflow = SFTWorkflow()\n",
     }, "call-write");
-    else if (requests.length === 4) sendToolCall(response, "validate_workflow_dsl", {
+    else if (requests.length === 5) sendToolCall(response, "validate_workflow_dsl", {
       dsl_path: "public_data/workflow_canvas/workflow.py",
     }, "call-validate");
     else sendText(response, "SFT workflow generated and validated.");
@@ -149,8 +152,8 @@ test("AgentSession discovers directory skills and reads skill aliases in the wor
       : undefined,
     "public_data/workflow_canvas/workflow.py",
   );
-  assert.equal(requests.length, 5);
-  assert.deepEqual(requests.map((request) => request.url), Array(5).fill("/v1/chat/completions"));
+  assert.equal(requests.length, 6);
+  assert.deepEqual(requests.map((request) => request.url), Array(6).fill("/v1/chat/completions"));
   for (const request of requests) {
     assert.equal(Object.hasOwn(request.body, "max_tokens"), false);
     assert.equal(Object.hasOwn(request.body, "max_completion_tokens"), false);
@@ -177,6 +180,31 @@ test("AgentSession discovers directory skills and reads skill aliases in the wor
   assert.equal(firstRequest.includes("escaped-skill-description"), false);
   assert.equal(JSON.stringify(requests[1]!.body).includes("Read references/workflow-contracts.md"), true);
   assert.equal(JSON.stringify(requests[2]!.body).includes("A workflow is valid when it defines workflow."), true);
+  assert.equal(JSON.stringify(requests[3]!.body).includes("Shared domain knowledge."), true);
+
+  const secondFinished = new Promise<void>((resolve) => { resolveFinished = resolve; });
+  await runtime.handle("prompt", {
+    run_id: "run-2",
+    content: [{ type: "text", text: "Confirm the workflow is ready." }],
+  });
+  await Promise.race([
+    secondFinished,
+    new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => reject(new Error("second turn timed out")), 5_000);
+      timeout.unref();
+    }),
+  ]).finally(() => clearTimeout(timeout));
+  assert.equal(requests.length, 7);
+  for (const request of requests) {
+    const messages = request.body.messages as Array<{ role: string; content: string }>;
+    const system = messages.find((message) => message.role === "system" || message.role === "developer");
+    assert.ok(system);
+    assert.ok(system.content.includes("Generate an SFT workflow by following the skill, then validate it."));
+    assert.ok(system.content.includes("<available_skills>"));
+    assert.ok(system.content.includes("Paths starting with knowledge/ or .agents/skills/ are runtime resource aliases: pass them unchanged to file tools, without prepending the skill directory."));
+    assert.ok(system.content.includes("For other relative paths referenced by a skill file, resolve them against the skill directory"));
+    assert.ok(!system.content.includes("When a skill file references a relative path, resolve it against the skill directory"));
+  }
 });
 
 test("a persistent length stop finishes as output_truncated, never completed", async (context) => {

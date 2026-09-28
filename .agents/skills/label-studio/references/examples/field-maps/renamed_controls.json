@@ -1,0 +1,19 @@
+{
+  "samples": [
+    {
+      "field": "quality",
+      "control": "my_verdict",
+      "type": "choices",
+      "synonyms": { "ng": "defect", "pass": "ok" }
+    }
+  ],
+  "regions": [
+    {
+      "source": "findings",
+      "control": "my_box",
+      "label": "category",
+      "observation": "observation",
+      "observation_control": "my_note"
+    }
+  ]
+}

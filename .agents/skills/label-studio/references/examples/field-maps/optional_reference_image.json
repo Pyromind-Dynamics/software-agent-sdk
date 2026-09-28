@@ -1,0 +1,7 @@
+{
+  "images": [
+    { "field": "defect_image", "source": "defect.jpg" },
+    { "field": "diff_image", "source": "diff.jpg" },
+    { "field": "gt_image", "source": "*_cam.bmp", "required": false }
+  ]
+}

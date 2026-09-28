@@ -50,6 +50,29 @@ PYROMIND_STORAGE_AUTH_COOKIE_SECRET = "PYROMIND_STORAGE_AUTH_COOKIE"
 PYROMIND_STORAGE_HEADERS_STATE_KEY = "pyromind_storage_headers"
 PYROMIND_AGENT_STORAGE_ROOT = "/.pyromind-agent"
 
+_UPLOAD_ATTEMPTS = 3
+_UPLOAD_BACKOFF_SECONDS = 1.0
+# Presigned upload URLs are short-lived, so a 403 is worth retrying: the retry
+# mints a fresh URL. 404 and other 4xx mean the request itself is wrong.
+_TRANSIENT_STORAGE_STATUSES = frozenset({403, 408, 425, 429})
+
+
+class StorageFileNotFoundError(ValueError):
+    """Raised when a Storage object genuinely does not exist.
+
+    Callers use this to tell "absent" apart from a transient or server-side
+    failure; those must never be mistaken for a missing file.
+    """
+
+
+class _TransientStorageError(ValueError):
+    """Internal marker for a Storage failure that is worth retrying."""
+
+
+def _is_transient_storage_status(status_code: int) -> bool:
+    return status_code >= 500 or status_code in _TRANSIENT_STORAGE_STATUSES
+
+
 _WORKSPACE_PATH_PREFIXES = ("/workspace/", "workspace/")
 _ARCHIVE_SUFFIXES = {".zip", ".tar", ".tar.gz", ".tgz"}
 _ARCHIVE_CONTENT_TYPE_HINTS = ("zip", "tar", "gzip", "x-compress", "x-tar")
@@ -62,6 +85,10 @@ _DEFAULT_PREVIEW_BYTES = _LARGE_FILE_RANGE_BYTES * _LARGE_FILE_RANGE_COUNT
 _MAX_PREVIEW_BYTES = _DEFAULT_PREVIEW_BYTES
 _MAX_REQUESTED_SAMPLES = 100
 _MAX_LISTED_ENTRIES = 100
+# One call may cover several paths so a caller sampling a directory of samples
+# does not spend a request per file. The previews stay individually bounded, so
+# the ceiling keeps one observation from growing without limit.
+_MAX_PREVIEW_PATHS = 20
 _DELIMITED_HEADER_BYTES = 4096
 _MAX_XLSX_BYTES = 10 * 1024 * 1024
 _MAX_SAMPLE_STRING_CHARS = 2000
@@ -100,7 +127,20 @@ _VISION_RETRYABLE_STATUS_CODES = {408, 409, 425, 429}
 # manually by agents across whole turns; a bounded in-tool retry removes that
 # round trip. Timeouts stay non-retryable: each one costs a full 30s read.
 _STORAGE_CONNECT_RETRY_ATTEMPTS = 2
-_MAX_DIRECTORY_CHILD_SAMPLES = 3
+# A directory listing describes its layout by expanding a few child folders.
+# The count used to be the fixed 3 below, which sampled whichever folders
+# storage happened to return first: a directory holding one folder per label
+# class was described from an arbitrary sliver, and the sliver alone decided
+# whether the layout was recognised at all. The count now follows the caller's
+# ``n`` between these bounds, so a wide collection can be described from the
+# whole first page while one preview still cannot become an unbounded walk.
+_DIRECTORY_CHILD_SAMPLES_FLOOR = 3
+_DIRECTORY_CHILD_SAMPLES_CEILING = 20
+# Share of sampled child folders that must agree before their common value is
+# reported as the repeated structure. Below this, one odd folder out is enough
+# to hide a structure every other folder shares.
+_CHILD_AGREEMENT_DIVISOR = 3
+_CHILD_AGREEMENT_NUMERATOR = 2
 
 
 @dataclass(frozen=True)
@@ -153,6 +193,7 @@ class PreviewDatasetAction(Action):
     """Preview a dataset from shared space or user storage."""
 
     dataset_path: str = Field(
+        default="",
         description=(
             "Path of the dataset to preview. Can be a shared dataset name "
             "(e.g. 'openai/gsm8k'), a shared dataset with file path "
@@ -161,33 +202,49 @@ class PreviewDatasetAction(Action):
             "'datasets/my_data/train.jsonl'). A leading '/workspace/' or "
             "'workspace/' prefix (platform workspace path) is stripped "
             "automatically and the remainder is treated as a user storage "
-            "relative path."
+            "relative path. Pass a single path here, or add paths to "
+            "'dataset_paths' to preview several in one call."
+        ),
+    )
+    dataset_paths: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Further paths previewed in the same call, after 'dataset_path'. "
+            "Use it to compare samples or files side by side instead of calling "
+            f"once per path, up to {_MAX_PREVIEW_PATHS} paths per call. Inspect "
+            "mode only; sample mode takes one path with 'sample_paths'."
         ),
     )
     n: int = Field(
         default=10,
         description=(
             "Maximum number of sample rows or text lines to return (1-100). "
-            "Defaults to 10; large truncated files may return fewer."
+            "Defaults to 10; large truncated files may return fewer. For a "
+            "directory it also bounds how many child folders the layout "
+            "summary expands (between 3 and 20), so raise it to describe a "
+            "directory of many same-shaped folders from all of them instead "
+            "of the first few."
         ),
         ge=1,
         le=_MAX_REQUESTED_SAMPLES,
         validation_alias=AliasChoices("n", "max_samples"),
     )
-    mode: Literal["inspect", "sample"] = Field(
+    mode: Literal["inspect", "sample", "materialize"] = Field(
         default="inspect",
         description=(
             "Use 'inspect' for the existing bounded preview behavior. Use "
-            "'sample' to materialize explicitly selected user-storage files or "
-            "folders (up to n) in the conversation workspace and create a JSONL "
-            "manifest. Automatic selection is limited to min(n, 3) entries."
+            "'sample' to materialize up to n complete logical rows or selected "
+            "sample folders. Use 'materialize' to copy selected files/folders "
+            "in full for exact local analysis. Automatic directory selection "
+            "is limited to min(n, 3) entries."
         ),
     )
     sample_paths: list[str] = Field(
         default_factory=list,
         description=(
             "Optional exact user-storage file or folder paths to materialize in "
-            "sample mode. Explicit selections may contain up to n entries. When "
+            "sample/materialize mode. Explicit selections may contain up to n "
+            "entries. When "
             "omitted, up to min(n, 3) entries are selected from dataset_path in "
             "stable path order."
         ),
@@ -213,14 +270,26 @@ class PreviewDatasetAction(Action):
     def visualize(self) -> Text:
         content = Text()
         content.append("Preview dataset: ", style="bold blue")
-        content.append(self.dataset_path)
+        content.append(", ".join(path for path in self.requested_paths))
         return content
+
+    @property
+    def requested_paths(self) -> list[str]:
+        """Every path this action names, in the order it names them."""
+        return [path for path in (self.dataset_path, *self.dataset_paths) if path]
 
 
 class PreviewDatasetObservation(Observation):
     """Statistics and sample rows of a storage dataset."""
 
     dataset_path: str = Field(description="The storage path that was previewed.")
+    previewed_paths: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Every path covered by this observation when the call previewed "
+            "several; empty when it previewed one path."
+        ),
+    )
     files: list[str] = Field(
         default_factory=list,
         description="Data files found under the path (relative to it).",
@@ -379,14 +448,19 @@ When only a dataset/folder name is given (no specific file):
   with the exact file path. If the folder has exactly one file, it is
   previewed directly.
 
-Use mode='sample' for user storage after inspection. It materializes at most
-three selected files or folders inside the conversation workspace, preserves
-their storage-relative layout, and returns workspace-relative
+Use mode='sample' for user storage after inspection. Row-oriented files are
+materialized as up to n complete logical rows; directories materialize at most
+three selected sample folders. Use mode='materialize' to copy selected inputs
+in full for exact local analysis. Both modes preserve storage-relative layout and return
+workspace-relative
 local_sample_paths plus a sample_manifest_path. Pass the returned
 df_run_input_path (single input) or selected local_sample_paths entry directly
 to df_run_pipeline; storage source paths are not local workspace inputs. Image
 samples are sent to the configured DF vision model
 (normally Gemma) for OCR and a short visual summary.
+Image previews return preview_url and ready-to-use Markdown in the text result.
+For visual previews, copy the Markdown into your reply outside code blocks so
+the chat displays the image inline. Preserve the full signed URL.
 
 Returns:
 - files found under the path
@@ -435,12 +509,75 @@ class PreviewDatasetExecutor(
         action: PreviewDatasetAction,
         conversation: BaseConversation | None = None,
     ) -> PreviewDatasetObservation:
-        dataset_path = _strip_workspace_prefix(action.dataset_path.strip())
+        paths = [
+            stripped
+            for stripped in (
+                _strip_workspace_prefix(candidate.strip())
+                for candidate in action.requested_paths
+            )
+            if stripped
+        ]
+        if not paths:
+            return PreviewDatasetObservation.from_text(
+                text="dataset_path or dataset_paths must name at least one path.",
+                is_error=True,
+                dataset_path=action.dataset_path,
+            )
+        if len(paths) > _MAX_PREVIEW_PATHS:
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    f"{len(paths)} paths requested, but one call previews at most "
+                    f"{_MAX_PREVIEW_PATHS}. Narrow the selection."
+                ),
+                is_error=True,
+                dataset_path=action.dataset_path,
+            )
+        if len(paths) == 1:
+            return self._preview_path(action, paths[0], conversation)
+        if action.mode == "sample":
+            return PreviewDatasetObservation.from_text(
+                text=(
+                    "sample mode previews one path. Name the files to materialize "
+                    "in sample_paths instead."
+                ),
+                is_error=True,
+                dataset_path=action.dataset_path,
+            )
+        return self._preview_paths(action, paths, conversation)
+
+    def _preview_paths(
+        self,
+        action: PreviewDatasetAction,
+        paths: list[str],
+        conversation: BaseConversation | None,
+    ) -> PreviewDatasetObservation:
+        sections: list[str] = []
+        failures = 0
+        for path in paths:
+            result = self._preview_path(action, path, conversation)
+            if result.is_error:
+                failures += 1
+            sections.append(f"### {path}\n{result.text}")
+        return PreviewDatasetObservation.from_text(
+            text="\n\n".join(sections),
+            # A partial batch still reported every path it could, and the text
+            # above carries the per-path errors.
+            is_error=failures == len(paths),
+            dataset_path=", ".join(paths),
+            previewed_paths=paths,
+        )
+
+    def _preview_path(
+        self,
+        action: PreviewDatasetAction,
+        dataset_path: str,
+        conversation: BaseConversation | None = None,
+    ) -> PreviewDatasetObservation:
         if not dataset_path:
             return PreviewDatasetObservation.from_text(
                 text="dataset_path must be a non-empty path.",
                 is_error=True,
-                dataset_path=action.dataset_path,
+                dataset_path=dataset_path,
             )
 
         try:
@@ -452,7 +589,7 @@ class PreviewDatasetExecutor(
                 dataset_path=dataset_path,
             )
 
-        if action.mode == "sample":
+        if action.mode in {"sample", "materialize"}:
             return self._storage_sample(action, dataset_path, headers, conversation)
 
         # Option C: try shared dataset space first
@@ -866,7 +1003,8 @@ class PreviewDatasetExecutor(
                 text=(
                     f"sample_paths 有 {len(action.sample_paths)} 项，"
                     f"超过 n={action.n}。\n"
-                    "请减少路径数量，或增大 n。\n"
+                    f"把 n 设成 {len(action.sample_paths)} 即可全部选中；"
+                    f"要少取几条就把 sample_paths 收到 {action.n} 项以内。\n"
                     "错误码：sample_selection_limit"
                 ),
                 is_error=True,
@@ -876,23 +1014,28 @@ class PreviewDatasetExecutor(
             )
 
         try:
-            selection_limit = (
-                action.n
-                if action.sample_paths
-                else min(action.n, _DEFAULT_SAMPLE_COUNT)
-            )
-            selected_paths, entries = self._select_storage_samples(
-                dataset_path,
-                action.sample_paths,
-                selection_limit,
-                headers,
-            )
+            if action.mode == "materialize" and not action.sample_paths:
+                selected_paths, entries = [dataset_path], []
+            else:
+                selection_limit = (
+                    action.n
+                    if action.sample_paths
+                    else min(action.n, _DEFAULT_SAMPLE_COUNT)
+                )
+                selected_paths, entries = self._select_storage_samples(
+                    dataset_path,
+                    action.sample_paths,
+                    selection_limit,
+                    headers,
+                )
             workspace_dir = _resolve_workspace_dir(conversation)
             preview_key = hashlib.sha256(
                 json.dumps(
                     {
                         "dataset_path": dataset_path,
                         "sample_paths": selected_paths,
+                        "mode": action.mode,
+                        "n": action.n,
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -911,6 +1054,7 @@ class PreviewDatasetExecutor(
             local_paths: list[str] = []
             vision_previews: list[dict[str, Any]] = []
             preview_images: list[ImageContent] = []
+            preview_links: list[str] = []
             total_bytes = 0
             total_files = 0
             vision_images = 0
@@ -927,15 +1071,46 @@ class PreviewDatasetExecutor(
                     if total_files > _MAX_SAMPLE_FILES:
                         raise ValueError(
                             "Sample selection exceeds the "
-                            f"{_MAX_SAMPLE_FILES}-file limit."
+                            f"{_MAX_SAMPLE_FILES}-file limit. Pass "
+                            "sample_paths with the exact files or subfolders "
+                            "you need (one subfolder counts as one sample) "
+                            "instead of materializing the whole folder."
                         )
-                    content = download_file_from_pyromind(
-                        storage_path=storage_file.path,
-                        storage_base_url=self._storage_base_url,
-                        headers=headers,
-                        timeout=self._timeout,
-                        max_bytes=_MAX_SAMPLE_FILE_BYTES,
+                    row_sample = (
+                        action.mode == "sample"
+                        and len(storage_files) == 1
+                        and _is_row_sample_path(storage_file.path)
                     )
+                    if (
+                        _is_range_sample_path(storage_file.path)
+                        and storage_file.size is not None
+                        and storage_file.size > _MAX_SAMPLE_FILE_BYTES
+                    ):
+                        url_result = self._get_download_url(storage_file.path, headers)
+                        if isinstance(url_result, PreviewDatasetObservation):
+                            raise ValueError(url_result.text)
+                        content_result = self._download_range(
+                            url_result,
+                            storage_file.path,
+                            0,
+                            _MAX_SAMPLE_FILE_BYTES - 1,
+                        )
+                        if isinstance(content_result, PreviewDatasetObservation):
+                            raise ValueError(content_result.text)
+                        content = content_result
+                    else:
+                        content = download_file_from_pyromind(
+                            storage_path=storage_file.path,
+                            storage_base_url=self._storage_base_url,
+                            headers=headers,
+                            timeout=self._timeout,
+                            max_bytes=_MAX_SAMPLE_FILE_BYTES,
+                        )
+
+                    if row_sample:
+                        content = _sample_logical_rows(
+                            content, storage_file.path, action.n
+                        )
                     total_bytes += len(content)
                     if total_bytes > _MAX_SAMPLE_TOTAL_BYTES:
                         raise ValueError(
@@ -955,6 +1130,13 @@ class PreviewDatasetExecutor(
 
                     if _is_vision_path(storage_file.path):
                         row_images.append(manifest_file_path)
+                        if (
+                            _is_image_path(storage_file.path)
+                            and len(preview_links) < _DEFAULT_SAMPLE_COUNT
+                        ):
+                            preview_links.append(
+                                self._image_preview_link(storage_file.path, headers)
+                            )
                         if (
                             _is_image_path(storage_file.path)
                             and len(preview_images) < _DEFAULT_SAMPLE_COUNT
@@ -1028,6 +1210,8 @@ class PreviewDatasetExecutor(
             if len(local_paths) == 1:
                 summary_lines.append(f"df_run_input_path={local_paths[0]}")
             summary_text = "\n".join(summary_lines)
+            if preview_links:
+                summary_text += "\n\n" + "\n\n".join(preview_links)
             for preview in vision_previews:
                 summary_text += (
                     f"\n\n--- vision preview: {preview['source_path']} ---\n"
@@ -1372,6 +1556,17 @@ class PreviewDatasetExecutor(
             **_metadata_observation_fields(metadata),
         )
 
+    def _image_preview_link(self, path: str, headers: dict[str, str]) -> str:
+        result = self._get_download_url(path, headers)
+        if isinstance(result, PreviewDatasetObservation):
+            return f"Image preview: {path}\npreview_url_error={result.text}"
+        return (
+            f"Image preview: {path}\npreview_url={result}\n"
+            "To show this image in chat, copy the following Markdown into your "
+            "reply (outside code blocks):\n"
+            f"![Image preview](<{result}>)"
+        )
+
     def _storage_image_preview(
         self,
         *,
@@ -1425,7 +1620,7 @@ class PreviewDatasetExecutor(
             )
 
         text = (
-            f"Image preview: {preview_path}\n"
+            f"{self._image_preview_link(preview_path, headers)}\n"
             f"size={len(content)} bytes\n"
             f"vision_summary={summary}"
         )
@@ -1444,7 +1639,7 @@ class PreviewDatasetExecutor(
     def _resolve_storage_directory(
         self,
         dataset_path: str,
-        n: int,  # noqa: ARG002
+        n: int,
         headers: dict[str, str],
         *,
         path_filter: str = "",
@@ -1454,6 +1649,10 @@ class PreviewDatasetExecutor(
         When the directory contains multiple files, returns an observation
         listing file details so the agent asks the user which file to
         preview. When exactly one file exists, auto-selects it.
+
+        ``n`` bounds how many child folders the layout summary expands, so a
+        directory of many same-shaped folders can be described from all of them
+        instead of an arbitrary few.
         """
         list_result = self._list_entries(dataset_path, headers)
         if isinstance(list_result, PreviewDatasetObservation):
@@ -1464,10 +1663,18 @@ class PreviewDatasetExecutor(
         if filter_term:
             entries = [entry for entry in entries if filter_term in entry.path.lower()]
             if not entries:
+                available = _cap_entry_listing(
+                    [
+                        f"  - {entry.path} ({'folder' if entry.is_dir else 'file'})"
+                        for entry in list_result
+                    ]
+                )
                 return PreviewDatasetObservation.from_text(
                     text=(
                         f"No entries under {dataset_path} match "
-                        f"path_filter '{path_filter}'."
+                        f"path_filter '{path_filter}'. path_filter only matches "
+                        "the names listed at this level, not files inside them.\n"
+                        f"Available entries:\n{available}"
                     ),
                     dataset_path=dataset_path,
                     files=[],
@@ -1529,7 +1736,11 @@ class PreviewDatasetExecutor(
                 "materialize files or folders."
             )
             list_label = "Available entries"
-        directory_summary = self._build_directory_summary(entries, headers)
+        directory_summary = self._build_directory_summary(
+            entries,
+            headers,
+            child_sample_limit=_directory_child_sample_limit(n),
+        )
         directory_summary.update(_infer_directory_layout(entries, directory_summary))
         summary_text = (
             f"{summary}\n{list_label}:\n{file_list_text}\n\n"
@@ -1549,14 +1760,22 @@ class PreviewDatasetExecutor(
         self,
         entries: list[_StorageFileInfo],
         headers: dict[str, str],
+        *,
+        child_sample_limit: int,
     ) -> dict[str, Any]:
         files = [entry for entry in entries if not entry.is_dir]
-        folders = [entry for entry in entries if entry.is_dir]
+        # Sorted so the sampled sliver is the same on every call: storage makes
+        # no ordering promise, so the arbitrary first three used to decide how
+        # the whole directory was described.
+        folders = sorted(
+            (entry for entry in entries if entry.is_dir),
+            key=lambda entry: entry.path,
+        )
         top_suffix_counts = _suffix_counts(files)
         sampled_child_folders: list[dict[str, Any]] = []
         child_listing_errors: list[dict[str, str]] = []
 
-        for folder in folders[:_MAX_DIRECTORY_CHILD_SAMPLES]:
+        for folder in folders[:child_sample_limit]:
             child_result = self._list_entries(folder.path, headers)
             if isinstance(child_result, PreviewDatasetObservation):
                 child_listing_errors.append(
@@ -1575,19 +1794,24 @@ class PreviewDatasetExecutor(
                 }
             )
 
+        repeated_file_name_set, repeated_file_name_votes = _shared_child_value(
+            sampled_child_folders, "file_names"
+        )
+        repeated_suffix_set, repeated_suffix_votes = _shared_child_value(
+            sampled_child_folders, "suffix_counts"
+        )
         return {
             "top_level_folder_count": len(folders),
             "top_level_file_count": len(files),
             "top_level_suffix_counts": top_suffix_counts,
             "top_level_type_counts": _type_counts(top_suffix_counts),
             "sampled_child_folders": sampled_child_folders,
+            "child_sample_limit": child_sample_limit,
             "child_listing_errors": child_listing_errors,
-            "repeated_file_name_set": _shared_child_value(
-                sampled_child_folders, "file_names"
-            ),
-            "repeated_suffix_set": _shared_child_value(
-                sampled_child_folders, "suffix_counts"
-            ),
+            "repeated_file_name_set": repeated_file_name_set,
+            "repeated_file_name_votes": repeated_file_name_votes,
+            "repeated_suffix_set": repeated_suffix_set,
+            "repeated_suffix_votes": repeated_suffix_votes,
         }
 
     def _get_metadata(
@@ -1969,12 +2193,20 @@ class UploadFileToPyromindObservation(Observation):
 
 _UPLOAD_FILE_DESCRIPTION = """Upload a workspace file to Pyromind storage.
 
-Use this when a workflow node needs a server-side file path, most commonly a
-custom evaluation metric or reward script for MetricsConfigBuilderCustomNode:
-write the Python file locally first, upload it with this tool, then use the
-returned storage path in the node's `entry` parameter as
-`<storage_path>:<function_name>`
-(e.g. /.pyromind-agent/<conversation_id>/acc.py:acc_func).
+Use this when a server-side process needs a file that only exists in the
+conversation workspace. Two common cases:
+
+- A workflow node parameter that takes a server-side path, most commonly a
+  custom evaluation metric or reward script for MetricsConfigBuilderCustomNode:
+  write the Python file locally first, upload it with this tool, then use the
+  returned storage path in the node's `entry` parameter as
+  `<storage_path>:<function_name>`
+  (e.g. /.pyromind-agent/<conversation_id>/acc.py:acc_func).
+- A pipeline input sidecar for `df_submit_pipeline`, for example an image
+  manifest. Pass target_dir=<the storage directory that holds the data> so the
+  manifest lands beside the files it references, then pass the returned storage
+  path as `input_path`. Without target_dir the file goes to the conversation
+  directory.
 
 Returns the absolute storage path of the uploaded file.
 """
@@ -2062,43 +2294,205 @@ def upload_local_file_to_pyromind(
     timeout: float,
 ) -> str:
     """Upload a trusted local runtime file and return its Storage path."""
-    filename = local_path.name
-    storage_path = str(PurePosixPath(target_dir) / filename)
-    try:
-        with local_path.open("rb") as file_obj:
-            response = httpx.post(
-                f"{storage_base_url.rstrip('/')}/upload_file",
+    last_error: _TransientStorageError | None = None
+    for attempt in range(1, _UPLOAD_ATTEMPTS + 1):
+        try:
+            return _upload_local_file_once(
+                local_path=local_path,
+                target_dir=target_dir,
+                storage_base_url=storage_base_url,
                 headers=headers,
-                data={"name": filename, "path": target_dir, "bucket": ""},
-                files={"file": (filename, file_obj, "application/octet-stream")},
                 timeout=timeout,
             )
+        except _TransientStorageError as exc:
+            last_error = exc
+            if attempt < _UPLOAD_ATTEMPTS:
+                time.sleep(_UPLOAD_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+    raise ValueError(f"{last_error} (after {_UPLOAD_ATTEMPTS} attempts)") from None
+
+
+def _upload_local_file_once(
+    *,
+    local_path: Path,
+    target_dir: str,
+    storage_base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+) -> str:
+    filename = local_path.name
+    storage_path = str(PurePosixPath(target_dir) / filename)
+    file_size = local_path.stat().st_size
+    try:
+        response = httpx.post(
+            f"{storage_base_url.rstrip('/')}/presigned_upload_url",
+            headers=headers,
+            json={
+                "filename": filename,
+                "path": target_dir,
+                "content_type": "application/octet-stream",
+                "size": file_size,
+            },
+            timeout=timeout,
+        )
     except httpx.RequestError as exc:
-        raise ValueError(
-            "Failed to call Pyromind storage upload_file API: "
+        raise _TransientStorageError(
+            "Failed to call Pyromind storage presigned_upload_url API: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
 
-    payload_result = _decode_json_response(response, "Pyromind storage upload_file API")
+    if _is_transient_storage_status(response.status_code):
+        raise _TransientStorageError(
+            "Pyromind storage presigned_upload_url API returned HTTP "
+            f"{response.status_code}: {_truncate_text(response.text)}"
+        )
+
+    payload_result = _decode_json_response(
+        response, "Pyromind storage presigned_upload_url API"
+    )
     if isinstance(payload_result, str):
         raise ValueError(payload_result)
-    data_result = _extract_api_data("upload_file", payload_result)
+    data_result = _extract_api_data("presigned_upload_url", payload_result)
     if isinstance(data_result, str):
         raise ValueError(data_result)
 
-    failed_files = data_result.get("failed_files")
-    if isinstance(failed_files, list) and failed_files:
-        detail = _truncate_text(json.dumps(failed_files, ensure_ascii=False))
-        raise ValueError(
-            f"Pyromind storage upload_file API reported failed files: {detail}"
+    if data_result.get("multipart") is True:
+        _upload_local_file_multipart(
+            local_path=local_path,
+            data_result=data_result,
+            target_dir=target_dir,
+            filename=filename,
+            file_size=file_size,
+            storage_base_url=storage_base_url,
+            headers=headers,
+            timeout=timeout,
         )
-    if data_result.get("success_count") != 1:
-        detail = json.dumps(data_result, ensure_ascii=False)
+        return storage_path
+
+    upload_url = data_result.get("upload_url")
+    if not isinstance(upload_url, str) or not upload_url.strip():
         raise ValueError(
-            "Pyromind storage upload_file API did not report one uploaded "
-            f"file: {detail}"
+            "Pyromind storage presigned_upload_url API response is missing "
+            "upload_url data."
         )
+    _presigned_put(
+        upload_url,
+        content=local_path.open("rb"),
+        method=str(data_result.get("method") or "PUT").upper(),
+        extra_headers=data_result.get("headers"),
+        timeout=timeout,
+        error_label="Pyromind storage presigned upload",
+    )
     return storage_path
+
+
+def _presigned_put(
+    url: str,
+    *,
+    content: Any,
+    method: str,
+    extra_headers: Any,
+    timeout: float,
+    error_label: str,
+) -> None:
+    """PUT bytes/file-object to one presigned upload URL, raising ValueError."""
+    upload_headers = extra_headers if isinstance(extra_headers, dict) else {}
+    try:
+        upload_response = httpx.request(
+            method, url, content=content, headers=upload_headers, timeout=timeout
+        )
+    except httpx.RequestError as exc:
+        raise _TransientStorageError(
+            f"Failed to upload file via {error_label}: {type(exc).__name__}: {exc}"
+        ) from exc
+    if upload_response.status_code >= 400:
+        message = (
+            f"{error_label} returned HTTP {upload_response.status_code}: "
+            f"{_truncate_text(upload_response.text)}"
+        )
+        if _is_transient_storage_status(upload_response.status_code):
+            raise _TransientStorageError(message)
+        raise ValueError(message)
+
+
+def _upload_local_file_multipart(
+    *,
+    local_path: Path,
+    data_result: dict[str, Any],
+    target_dir: str,
+    filename: str,
+    file_size: int,
+    storage_base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+) -> None:
+    """Upload a presigned multipart payload part-by-part, then complete it."""
+    upload_id = data_result.get("upload_id")
+    part_size = data_result.get("part_size")
+    part_count = data_result.get("part_count")
+    part_urls = data_result.get("part_urls")
+    if not isinstance(upload_id, str) or not upload_id:
+        raise ValueError(
+            "Pyromind storage presigned_upload_url API multipart response is "
+            "missing upload_id data."
+        )
+    if not isinstance(part_size, int) or part_size < 1:
+        raise ValueError(
+            "Pyromind storage presigned_upload_url API multipart response is "
+            "missing part_size data."
+        )
+    if not isinstance(part_count, int) or part_count < 1:
+        raise ValueError(
+            "Pyromind storage presigned_upload_url API multipart response is "
+            "missing part_count data."
+        )
+    if not isinstance(part_urls, list) or len(part_urls) != part_count:
+        raise ValueError(
+            "Pyromind storage presigned_upload_url API multipart response "
+            f"has {len(part_urls) if isinstance(part_urls, list) else 0} "
+            f"part_urls, expected {part_count}."
+        )
+
+    part_label = "Pyromind storage multipart part upload"
+    with local_path.open("rb") as file_obj:
+        for part_url in part_urls:
+            chunk = file_obj.read(part_size)
+            if not chunk:
+                break
+            _presigned_put(
+                str(part_url),
+                content=chunk,
+                method="PUT",
+                extra_headers=None,
+                timeout=timeout,
+                error_label=part_label,
+            )
+
+    try:
+        complete_response = httpx.post(
+            f"{storage_base_url.rstrip('/')}/multipart_complete",
+            headers=headers,
+            json={
+                "path": target_dir,
+                "filename": filename,
+                "size": file_size,
+                "upload_id": upload_id,
+                "part_count": part_count,
+            },
+            timeout=timeout,
+        )
+    except httpx.RequestError as exc:
+        raise ValueError(
+            "Failed to call Pyromind storage multipart_complete API: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    payload_result = _decode_json_response(
+        complete_response, "Pyromind storage multipart_complete API"
+    )
+    if isinstance(payload_result, str):
+        raise ValueError(payload_result)
+    complete_result = _extract_api_data("multipart_complete", payload_result)
+    if isinstance(complete_result, str):
+        raise ValueError(complete_result)
 
 
 def download_file_from_pyromind(
@@ -2138,10 +2532,16 @@ def download_file_from_pyromind(
         with httpx.stream(
             "GET",
             url,
-            headers={},
+            # Signed-URL GETs are CDN-cached; bypass so freshly written
+            # control-plane files are visible immediately.
+            headers={"cache-control": "no-cache", "pragma": "no-cache"},
             timeout=timeout,
             follow_redirects=True,
         ) as download:
+            if download.status_code == 404:
+                raise StorageFileNotFoundError(
+                    f"Pyromind storage object not found: {storage_path}"
+                )
             if download.status_code >= 400:
                 body = download.read().decode("utf-8", errors="replace")
                 raise ValueError(
@@ -2599,6 +2999,84 @@ def _parse_preview_chunks(
     return parsed
 
 
+def _sample_logical_rows(content: bytes, file_path: str, limit: int) -> bytes:
+    """Materialize complete logical rows for row-oriented sample files."""
+
+    suffix = PurePosixPath(file_path).suffix.lower()
+    if suffix in {".csv", ".tsv"}:
+        from io import StringIO
+
+        text = content.decode("utf-8-sig", errors="replace")
+        source = StringIO(text)
+        target = StringIO()
+        delimiter = "\t" if suffix == ".tsv" else ","
+        reader = csv.reader(source, delimiter=delimiter)
+        writer = csv.writer(target, delimiter=delimiter, lineterminator="\n")
+        try:
+            writer.writerow(next(reader))
+        except StopIteration:
+            return content
+        for index, row in enumerate(reader):
+            if index >= limit:
+                break
+            writer.writerow(row)
+        return target.getvalue().encode("utf-8")
+    if suffix in {".jsonl", ".jsonlines", ".txt"}:
+        lines = content.decode("utf-8", errors="replace").splitlines()
+        selected = lines[:limit]
+        return (("\n".join(selected) + "\n") if selected else "").encode("utf-8")
+    if suffix in {".xlsx", ".xlsm"}:
+        try:
+            from io import BytesIO
+
+            from openpyxl import Workbook, load_workbook
+
+            source_book = load_workbook(
+                BytesIO(content), read_only=True, data_only=True
+            )
+            source_sheet = source_book.active
+            if source_sheet is None:
+                source_book.close()
+                return content
+            target_book = Workbook()
+            target_sheet = target_book.active
+            assert target_sheet is not None
+            for index, row in enumerate(source_sheet.iter_rows(values_only=True)):
+                if index > limit:
+                    break
+                target_sheet.append(list(row))
+            source_book.close()
+            buffer = BytesIO()
+            target_book.save(buffer)
+            target_book.close()
+            return buffer.getvalue()
+        except Exception:
+            return content
+    return content
+
+
+def _is_row_sample_path(file_path: str) -> bool:
+    return PurePosixPath(file_path).suffix.lower() in {
+        ".csv",
+        ".tsv",
+        ".jsonl",
+        ".jsonlines",
+        ".txt",
+        ".xlsx",
+        ".xlsm",
+    }
+
+
+def _is_range_sample_path(file_path: str) -> bool:
+    return PurePosixPath(file_path).suffix.lower() in {
+        ".csv",
+        ".tsv",
+        ".jsonl",
+        ".jsonlines",
+        ".txt",
+    }
+
+
 def _parse_excel_bytes(
     content: bytes,
     max_samples: int,
@@ -3002,9 +3480,12 @@ def _empty_directory_summary() -> dict[str, Any]:
             "other": 0,
         },
         "sampled_child_folders": [],
+        "child_sample_limit": _DIRECTORY_CHILD_SAMPLES_FLOOR,
         "child_listing_errors": [],
         "repeated_file_name_set": None,
+        "repeated_file_name_votes": 0,
         "repeated_suffix_set": None,
+        "repeated_suffix_votes": 0,
         "detected_layout": "unknown",
         "layout_confidence": "low",
         "layout_evidence": "directory is empty",
@@ -3044,17 +3525,41 @@ def _type_counts(suffix_counts: dict[str, int]) -> dict[str, int]:
     return result
 
 
+def _directory_child_sample_limit(n: int) -> int:
+    """How many child folders one directory listing may expand."""
+    return min(
+        max(n, _DIRECTORY_CHILD_SAMPLES_FLOOR),
+        _DIRECTORY_CHILD_SAMPLES_CEILING,
+    )
+
+
+def _child_agreement_threshold(total: int) -> int:
+    """Votes a child-folder value needs before it is called the shared one."""
+    numerator = total * _CHILD_AGREEMENT_NUMERATOR + _CHILD_AGREEMENT_DIVISOR - 1
+    return max(2, numerator // _CHILD_AGREEMENT_DIVISOR)
+
+
 def _shared_child_value(
     sampled_child_folders: list[dict[str, Any]],
     key: str,
-) -> Any | None:
+) -> tuple[Any | None, int]:
+    """The value a majority of sampled child folders agree on, and its votes.
+
+    Equality rather than identity: ``file_names`` lists and ``suffix_counts``
+    dicts are unhashable, so the tally walks the values. Requiring unanimity let
+    a single unrelated file inside one folder erase a structure that every other
+    folder shared. The vote count comes back with the value because a majority
+    is no longer the same thing as every sampled folder.
+    """
     values = [folder.get(key) for folder in sampled_child_folders]
     if not values:
-        return None
-    first = values[0]
-    if all(value == first for value in values):
-        return first
-    return None
+        return None, 0
+    threshold = _child_agreement_threshold(len(values))
+    for candidate in values:
+        votes = sum(1 for value in values if value == candidate)
+        if votes >= threshold:
+            return candidate, votes
+    return None, 0
 
 
 def _infer_directory_layout(
@@ -3067,24 +3572,27 @@ def _infer_directory_layout(
     repeated_names = directory_summary.get("repeated_file_name_set")
     repeated_suffixes = directory_summary.get("repeated_suffix_set")
     top_type_counts = directory_summary.get("top_level_type_counts") or {}
+    repeated_name_votes = directory_summary.get("repeated_file_name_votes") or 0
+    repeated_suffix_votes = directory_summary.get("repeated_suffix_votes") or 0
 
     if folders and len(sampled_folders) >= 2 and (repeated_names or repeated_suffixes):
-        sampled_count = min(len(folders), _MAX_DIRECTORY_CHILD_SAMPLES)
         if repeated_names:
-            evidence = (
-                f"{len(sampled_folders)}/{sampled_count} "
-                "sampled child folders share files: "
-                f"{', '.join(repeated_names)}"
-            )
+            votes = repeated_name_votes
+            shared = f"share files: {', '.join(repeated_names)}"
         else:
             assert repeated_suffixes is not None
+            votes = repeated_suffix_votes
             suffix_text = ", ".join(
                 f"{suffix}:{count}" for suffix, count in repeated_suffixes.items()
             )
-            evidence = (
-                f"{len(sampled_folders)}/{sampled_count} "
-                f"sampled child folders share suffix counts: {suffix_text}"
-            )
+            shared = f"share suffix counts: {suffix_text}"
+        # Report the votes that produced the value rather than the sample size:
+        # under the majority rule the two are no longer the same number. Say so
+        # when the directory holds more folders than were sampled, so a layout
+        # inferred from a sliver is not read as the whole directory.
+        evidence = f"{votes}/{len(sampled_folders)} sampled child folders {shared}"
+        if len(folders) > len(sampled_folders):
+            evidence += f" (of {len(folders)} folders in the directory)"
         return {
             "detected_layout": "repeated_sample_folders",
             "layout_confidence": "high",

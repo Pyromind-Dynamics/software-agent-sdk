@@ -1,0 +1,35 @@
+<View>
+  <Header value="PCB AVI Review"/>
+  <View style="display:flex; gap:8px;">
+    <View style="flex:1;">
+      <Header value="缺陷图"/>
+      <Image name="defect_image" value="$defect_image" maxWidth="600"/>
+    </View>
+    <View style="flex:1;">
+      <Header value="差分图"/>
+      <Image name="diff_image" value="$diff_image" maxWidth="600"/>
+    </View>
+    <View style="flex:1;">
+      <Header value="金手指/GT"/>
+      <Image name="gt_image" value="$gt_image" maxWidth="600"/>
+    </View>
+  </View>
+  <View style="margin-top:16px;">
+    <Header value="整体判定"/>
+    <Choices name="quality_label" toName="defect_image" choice="single">
+      <Choice value="ok"/>
+      <Choice value="defect"/>
+    </Choices>
+  </View>
+  <View style="margin-top:16px;">
+    <Header value="缺陷区域标注"/>
+    <RectangleLabels name="finding_category" toName="defect_image">
+      <Label value="开路" background="#FF6B6B"/>
+      <Label value="短路" background="#4ECDC4"/>
+      <Label value="异物" background="#F7DC6F"/>
+    </RectangleLabels>
+    <TextArea name="finding_observation" toName="defect_image"
+              placeholder="描述缺陷现象" maxRows="3" editable="true"
+              perRegion="true"/>
+  </View>
+</View>

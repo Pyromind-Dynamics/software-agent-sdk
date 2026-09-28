@@ -15,16 +15,20 @@ from openhands.tools.pyromind_archive.definition import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
 )
 from openhands.tools.pyromind_dataset.definition import (
+    _DIRECTORY_CHILD_SAMPLES_CEILING,
+    _DIRECTORY_CHILD_SAMPLES_FLOOR,
     _MAX_LISTED_ENTRIES,
     _PREVIEW_DATASET_DESCRIPTION,
     PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
     PreviewDatasetAction,
     PreviewDatasetExecutor,
+    PreviewDatasetObservation,
     UploadFileToPyromindAction,
     UploadFileToPyromindExecutor,
     _match_shared_dataset,
     _resolve_workspace_dir,
+    _sample_logical_rows,
     _vision_api_config,
     download_file_from_pyromind,
 )
@@ -36,6 +40,25 @@ def test_preview_description_mentions_shared_and_storage() -> None:
     assert "storage" in _PREVIEW_DATASET_DESCRIPTION.lower()
     assert "openai/gsm8k" in _PREVIEW_DATASET_DESCRIPTION
     assert "auto-selects" in _PREVIEW_DATASET_DESCRIPTION
+
+
+def test_sample_logical_rows_preserves_csv_header_and_requested_rows() -> None:
+    content = b"text,label\na,x\nb,y\nc,z\nd,w\n"
+
+    sampled = _sample_logical_rows(content, "/dataset/train.csv", 3)
+
+    assert sampled.decode().splitlines() == [
+        "text,label",
+        "a,x",
+        "b,y",
+        "c,z",
+    ]
+
+
+def test_materialize_mode_is_part_of_public_action_schema() -> None:
+    assert PreviewDatasetAction(dataset_path="/dataset", mode="materialize").mode == (
+        "materialize"
+    )
 
 
 def test_match_shared_dataset_exact() -> None:
@@ -286,6 +309,106 @@ def test_preview_dataset_strips_workspace_prefix(monkeypatch, tmp_path, dataset_
     assert observation.preview_file_path == "proto.jsonl"
     assert observation.source == "storage"
     assert metadata_calls[0]["path"] == "proto.jsonl"
+
+
+def test_preview_batch_covers_every_requested_path(monkeypatch, tmp_path):
+    """Sampling a directory of samples must not cost one call per sample."""
+    _patch_shared_empty(monkeypatch)
+    requested: list[str] = []
+    jsonl = b'{"prompt":"p1"}\n'
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/get_file_metadata"):
+            requested.append(json["path"])
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "object_name": json["path"],
+                        "bucket_name": "1001",
+                        "size": len(jsonl),
+                        "content_type": "application/jsonl",
+                        "is_dir": False,
+                        "metadata": {},
+                    },
+                },
+            )
+        if url.endswith("/get_url"):
+            return _Response(
+                200,
+                {"success": True, "data": {"url": "https://download.test/sample"}},
+            )
+        raise AssertionError(f"unexpected URL: {url}")
+
+    def fake_stream(method, url, *, headers, timeout, follow_redirects):
+        return _StreamResponse(jsonl)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    conversation = _fake_conversation(
+        tmp_path,
+        secret_registry=_secret_registry(),
+        agent_state={PYROMIND_STORAGE_HEADERS_STATE_KEY: {"x-cluster": "pre"}},
+    )
+
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+        timeout=5.0,
+    )(
+        PreviewDatasetAction.model_validate(
+            {
+                "dataset_path": "samples/10_B1/meta.json",
+                "dataset_paths": [
+                    "samples/10_B2/meta.json",
+                    "samples/11_B1/meta.json",
+                ],
+            }
+        ),
+        cast(Any, conversation),
+    )
+
+    assert requested == [
+        "samples/10_B1/meta.json",
+        "samples/10_B2/meta.json",
+        "samples/11_B1/meta.json",
+    ]
+    assert observation.previewed_paths == requested
+    assert not observation.is_error
+    for path in requested:
+        assert f"### {path}" in observation.text
+
+
+def test_preview_batch_rejects_more_paths_than_one_call_previews():
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api"
+    )(
+        PreviewDatasetAction.model_validate(
+            {"dataset_paths": [f"samples/{index}/meta.json" for index in range(21)]}
+        ),
+        cast(Any, None),
+    )
+
+    assert observation.is_error
+    assert "at most 20" in observation.text
+
+
+def test_preview_batch_leaves_sample_mode_to_sample_paths():
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api"
+    )(
+        PreviewDatasetAction.model_validate(
+            {
+                "dataset_path": "samples/",
+                "dataset_paths": ["other/"],
+                "mode": "sample",
+            }
+        ),
+        cast(Any, None),
+    )
+
+    assert observation.is_error
+    assert "sample_paths" in observation.text
 
 
 def test_preview_dataset_reports_archive_with_extract_hint(monkeypatch, tmp_path):
@@ -607,15 +730,12 @@ def test_upload_file_to_pyromind_posts_workspace_file(
     local_file.write_text("def acc():\n    return 1\n", encoding="utf-8")
     calls: dict[str, Any] = {}
 
-    def fake_post(url, *, headers, data, files, timeout):
-        uploaded_file = files["file"]
+    def fake_post(url, *, headers, json, timeout):
         calls.update(
             {
                 "url": url,
                 "headers": headers,
-                "data": data,
-                "filename": uploaded_file[0],
-                "content": uploaded_file[1].read(),
+                "body": json,
                 "timeout": timeout,
             }
         )
@@ -624,16 +744,23 @@ def test_upload_file_to_pyromind_posts_workspace_file(
             {
                 "success": True,
                 "data": {
-                    "uploaded": True,
-                    "success_count": 1,
-                    "failed_count": 0,
-                    "success_files": [{"filename": "metric.py"}],
-                    "failed_files": [],
+                    "multipart": False,
+                    "upload_url": "https://upload.test/presigned",
+                    "method": "PUT",
+                    "headers": {},
                 },
             },
         )
 
+    def fake_request(method, url, *, content, headers, timeout):
+        calls["upload_method"] = method
+        calls["upload_url"] = url
+        calls["content"] = content.read()
+        calls["upload_timeout"] = timeout
+        return _Response(200, {})
+
     monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "request", fake_request)
     conversation = _fake_conversation(
         tmp_path,
         secret_registry=_secret_registry(),
@@ -652,13 +779,20 @@ def test_upload_file_to_pyromind_posts_workspace_file(
     assert observation.storage_path == (
         f"/.pyromind-agent/{_CONVERSATION_ID}/metric.py"
     )
-    assert calls["url"] == "https://portal.test/storage_api/upload_file"
+    assert calls["url"] == "https://portal.test/storage_api/presigned_upload_url"
     assert calls["headers"]["cookie"] == "auth_token=session-token"
     assert calls["headers"]["x-cluster"] == "pre"
-    assert calls["data"]["path"] == f"/.pyromind-agent/{_CONVERSATION_ID}"
-    assert calls["filename"] == "metric.py"
+    assert calls["body"] == {
+        "filename": "metric.py",
+        "path": f"/.pyromind-agent/{_CONVERSATION_ID}",
+        "content_type": "application/octet-stream",
+        "size": len(b"def acc():\n    return 1\n"),
+    }
+    assert calls["upload_method"] == "PUT"
+    assert calls["upload_url"] == "https://upload.test/presigned"
     assert calls["content"] == b"def acc():\n    return 1\n"
     assert calls["timeout"] == 7.0
+    assert calls["upload_timeout"] == 7.0
 
 
 def test_upload_file_to_pyromind_explicit_target_dir_wins(
@@ -669,23 +803,27 @@ def test_upload_file_to_pyromind_explicit_target_dir_wins(
     local_file.write_text("def acc():\n    return 1\n", encoding="utf-8")
     posted_path: dict[str, str] = {}
 
-    def fake_post(url, *, headers, data, files, timeout):
-        posted_path["path"] = data["path"]
+    def fake_post(url, *, headers, json, timeout):
+        posted_path["path"] = json["path"]
         return _Response(
             200,
             {
                 "success": True,
                 "data": {
-                    "uploaded": True,
-                    "success_count": 1,
-                    "failed_count": 0,
-                    "success_files": [{"filename": "metric.py"}],
-                    "failed_files": [],
+                    "multipart": False,
+                    "upload_url": "https://upload.test/presigned",
+                    "method": "PUT",
+                    "headers": {},
                 },
             },
         )
 
+    def fake_request(method, url, *, content, headers, timeout):
+        content.read()
+        return _Response(200, {})
+
     monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "request", fake_request)
     conversation = _fake_conversation(tmp_path, secret_registry=_secret_registry())
 
     observation = UploadFileToPyromindExecutor(
@@ -701,6 +839,75 @@ def test_upload_file_to_pyromind_explicit_target_dir_wins(
     assert not observation.is_error
     assert observation.storage_path == "/custom/dir/metric.py"
     assert posted_path["path"] == "/custom/dir"
+
+
+def test_upload_file_to_pyromind_multipart_uploads_parts_and_completes(
+    monkeypatch,
+    tmp_path,
+):
+    local_file = tmp_path / "big.bin"
+    content = b"a" * 50 + b"b" * 10
+    local_file.write_bytes(content)
+    put_calls: dict[str, bytes] = {}
+    complete_calls: list[dict[str, Any]] = []
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/presigned_upload_url"):
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "multipart": True,
+                        "upload_url": None,
+                        "method": "PUT",
+                        "headers": {},
+                        "upload_id": "mp-123",
+                        "part_size": 50,
+                        "part_count": 2,
+                        "part_urls": [
+                            "https://upload.test/part1",
+                            "https://upload.test/part2",
+                        ],
+                    },
+                },
+            )
+        assert url.endswith("/multipart_complete")
+        complete_calls.append(json)
+        return _Response(200, {"success": True, "data": {"etag": "etag-1"}})
+
+    def fake_request(method, url, *, content, headers, timeout):
+        chunk = content if isinstance(content, bytes) else content.read()
+        put_calls.setdefault(url, b"")
+        put_calls[url] += chunk
+        return _Response(200, {})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "request", fake_request)
+    conversation = _fake_conversation(tmp_path, secret_registry=_secret_registry())
+
+    observation = UploadFileToPyromindExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        UploadFileToPyromindAction(file_path="big.bin"),
+        cast(Any, conversation),
+    )
+
+    assert not observation.is_error
+    assert observation.storage_path == (f"/.pyromind-agent/{_CONVERSATION_ID}/big.bin")
+    assert put_calls == {
+        "https://upload.test/part1": b"a" * 50,
+        "https://upload.test/part2": b"b" * 10,
+    }
+    assert complete_calls == [
+        {
+            "path": f"/.pyromind-agent/{_CONVERSATION_ID}",
+            "filename": "big.bin",
+            "size": len(content),
+            "upload_id": "mp-123",
+            "part_count": 2,
+        }
+    ]
 
 
 def test_download_file_from_pyromind_returns_bounded_script(monkeypatch):
@@ -1476,6 +1683,184 @@ def test_storage_directory_summary_detects_repeated_sample_folders(
     assert "share files" in observation.directory_summary["layout_evidence"]
 
 
+def test_storage_directory_child_sampling_is_sorted_and_follows_n(
+    monkeypatch,
+    tmp_path,
+):
+    """The child-folder sample used to be the first three folders storage
+    happened to return, so a directory holding one folder per label class was
+    described from an arbitrary sliver that storage, not the caller, chose.
+    It must be the sorted head, sized by ``n``."""
+    _patch_shared_empty(monkeypatch)
+
+    folder_names = [f"cls-{index:02d}" for index in range(1, 9)]
+
+    def folder_list(names: list[str]) -> _Response:
+        return _Response(
+            200,
+            {
+                "success": True,
+                "data": {
+                    "list": [
+                        {"name": name, "path": f"labels/{name}", "type": "Folder"}
+                        for name in names
+                    ]
+                },
+            },
+        )
+
+    def file_list(path: str) -> _Response:
+        return _Response(
+            200,
+            {
+                "success": True,
+                "data": {
+                    "list": [
+                        {
+                            "name": name,
+                            "path": f"{path}/{name}",
+                            "type": "File",
+                            "size": 10,
+                        }
+                        for name in ("meta.json", "defect.jpg")
+                    ]
+                },
+            },
+        )
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            path = json["path"]
+            if path == "labels/":
+                # Deliberately reversed, so an unsorted sample takes the tail.
+                return folder_list(list(reversed(folder_names)))
+            if path.startswith("labels/cls-"):
+                return file_list(path)
+        raise AssertionError(f"unexpected POST URL/path: {url} {json}")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    def summarize(**action_fields):
+        return PreviewDatasetExecutor(
+            storage_base_url="https://portal.test/storage_api",
+        )(
+            PreviewDatasetAction(dataset_path="labels/", **action_fields),
+            cast(Any, _fake_conversation(tmp_path)),
+        )
+
+    def sampled_paths(observation):
+        return [
+            folder["path"]
+            for folder in observation.directory_summary["sampled_child_folders"]
+        ]
+
+    expected = [f"labels/{name}" for name in folder_names]
+
+    default = summarize()
+    assert not default.is_error
+    # The old fixed limit of three would have sampled three of eight here.
+    assert sampled_paths(default) == expected
+    assert default.directory_summary["child_sample_limit"] == 10
+    assert (
+        "8/8 sampled child folders share files"
+        in (default.directory_summary["layout_evidence"])
+    )
+
+    narrowed = summarize(n=4)
+    assert sampled_paths(narrowed) == expected[:4]
+    assert narrowed.directory_summary["child_sample_limit"] == 4
+    assert (
+        "of 8 folders in the directory"
+        in (narrowed.directory_summary["layout_evidence"])
+    )
+
+    assert (
+        summarize(n=1).directory_summary["child_sample_limit"]
+        == _DIRECTORY_CHILD_SAMPLES_FLOOR
+    )
+    assert (
+        summarize(n=100).directory_summary["child_sample_limit"]
+        == _DIRECTORY_CHILD_SAMPLES_CEILING
+    )
+
+
+def test_storage_directory_summary_accepts_majority_shared_structure(
+    monkeypatch,
+    tmp_path,
+):
+    """A single extra file inside one folder used to erase a file set that every
+    other folder shared, and the whole directory was then reported as having no
+    recognisable structure."""
+    _patch_shared_empty(monkeypatch)
+
+    shared_files = ["defect.jpg", "diff.jpg", "gt.jpg"]
+
+    def fake_post(url, *, headers, json, timeout):
+        if url.endswith("/file_list"):
+            path = json["path"]
+            if path == "classes/":
+                return _Response(
+                    200,
+                    {
+                        "success": True,
+                        "data": {
+                            "list": [
+                                {
+                                    "name": name,
+                                    "path": f"classes/{name}",
+                                    "type": "Folder",
+                                }
+                                for name in ("cls-a", "cls-b", "cls-c")
+                            ]
+                        },
+                    },
+                )
+            if path == "classes/cls-a":
+                files = shared_files
+            elif path == "classes/cls-b":
+                files = shared_files
+            elif path == "classes/cls-c":
+                files = [*shared_files, "notes.txt"]
+            else:
+                raise AssertionError(f"unexpected child path: {path}")
+            return _Response(
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "list": [
+                            {
+                                "name": name,
+                                "path": f"{path}/{name}",
+                                "type": "File",
+                                "size": 10,
+                            }
+                            for name in files
+                        ]
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected POST URL/path: {url} {json}")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    observation = PreviewDatasetExecutor(
+        storage_base_url="https://portal.test/storage_api",
+    )(
+        PreviewDatasetAction(dataset_path="classes/"),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    summary = observation.directory_summary
+    assert not observation.is_error
+    assert summary["repeated_file_name_set"] == shared_files
+    assert summary["repeated_file_name_votes"] == 2
+    assert summary["detected_layout"] == "repeated_sample_folders"
+    assert summary["layout_confidence"] == "high"
+    # The evidence must report the votes that produced the value, not the
+    # sample size: under the majority rule the two differ.
+    assert "2/3 sampled child folders share files" in summary["layout_evidence"]
+
+
 def test_storage_directory_summary_detects_flat_file_collection(
     monkeypatch,
     tmp_path,
@@ -1692,9 +2077,11 @@ def test_storage_virtual_directory_without_slash_falls_back_to_listing(
     assert len(observation.entries) == 2
 
 
+@pytest.mark.parametrize("link_failure", [False, True])
 def test_sample_mode_materializes_folder_and_runs_vision_preview(
     monkeypatch,
     tmp_path,
+    link_failure,
 ):
     image = b"\x89PNG\r\n\x1a\nfake"
     note = b"sample notes"
@@ -1718,6 +2105,12 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
                             {
                                 "name": "diagram.png",
                                 "path": "/dataset/sample-a/diagram.png",
+                                "type": "File",
+                                "size": len(image),
+                            },
+                            {
+                                "name": "second.png",
+                                "path": "/dataset/sample-a/second.png",
                                 "type": "File",
                                 "size": len(image),
                             },
@@ -1753,9 +2146,22 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
         lambda **kwargs: "OCR: triangle ABC",
     )
 
-    observation = PreviewDatasetExecutor(
+    executor = PreviewDatasetExecutor(
         storage_base_url="https://portal.test/storage_api",
-    )(
+    )
+    if link_failure:
+        monkeypatch.setattr(
+            executor,
+            "_get_download_url",
+            lambda path, headers: (
+                PreviewDatasetObservation.from_text(
+                    text="Preview link unavailable", is_error=True, dataset_path=path
+                )
+                if path.endswith("diagram.png")
+                else "https://download.test/image"
+            ),
+        )
+    observation = executor(
         PreviewDatasetAction(
             dataset_path="/dataset/",
             mode="sample",
@@ -1774,7 +2180,7 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
     assert manifest["local_path"].endswith("sample-a")
     assert manifest["workspace_path"] == observation.local_sample_paths[0]
     assert manifest["images"][0].endswith("diagram.png")
-    assert len(manifest["files"]) == 2
+    assert len(manifest["files"]) == 3
     assert (manifest_path.parent / manifest["images"][0]).read_bytes() == image
     assert (tmp_path / observation.local_sample_paths[0]).is_dir()
     assert observation.vision_previews[0]["ocr_text"] == "OCR: triangle ABC"
@@ -1784,6 +2190,13 @@ def test_sample_mode_materializes_folder_and_runs_vision_preview(
     assert f"sample_manifest_path={observation.sample_manifest_path}" in llm_text
     assert f"- {observation.local_sample_paths[0]}" in llm_text
     assert f"df_run_input_path={observation.local_sample_paths[0]}" in llm_text
+
+    if link_failure:
+        assert "preview_url_error=Preview link unavailable" in llm_text
+    assert "preview_url=https://download.test/image" in llm_text
+    assert "![Image preview](<https://download.test/image>)" in llm_text
+    assert "/dataset/sample-a/second.png" in llm_text
+    assert "/dataset/sample-a/diagram.png" in llm_text
 
 
 def test_sample_mode_explicit_paths_allow_up_to_n() -> None:
@@ -1823,7 +2236,7 @@ def test_sample_mode_rejects_explicit_paths_over_n(tmp_path) -> None:
     assert observation.error_code == "sample_selection_limit"
     assert observation.text == (
         "sample_paths 有 11 项，超过 n=10。\n"
-        "请减少路径数量，或增大 n。\n"
+        "把 n 设成 11 即可全部选中；要少取几条就把 sample_paths 收到 10 项以内。\n"
         "错误码：sample_selection_limit"
     )
 
@@ -1872,8 +2285,15 @@ def test_sample_mode_allows_conversation_public_data_workspace(tmp_path) -> None
     assert resolved == workspace.resolve()
 
 
-def test_inspect_storage_image_uses_vision_model(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("link_failure", [False, True])
+def test_inspect_storage_image_uses_vision_model(
+    monkeypatch, tmp_path, link_failure
+) -> None:
     _patch_shared_empty(monkeypatch)
+    signed_url = (
+        "https://download.test/image?X-Amz-Credential=admin%2F20260922"
+        "&X-Amz-Signature=abc123&X-Amz-Expires=604800"
+    )
     image = b"\xff\xd8\xff\xe0fake-jpeg"
 
     def fake_post(url, *, headers, json, timeout):
@@ -1895,13 +2315,13 @@ def test_inspect_storage_image_uses_vision_model(monkeypatch, tmp_path) -> None:
         if url.endswith("/get_url"):
             return _Response(
                 200,
-                {"success": True, "data": {"url": "https://download.test/image"}},
+                {"success": True, "data": {"url": signed_url}},
             )
         raise AssertionError(f"unexpected POST URL: {url}")
 
     def fake_stream(method, url, *, headers, timeout, follow_redirects):
         assert method == "GET"
-        assert url == "https://download.test/image"
+        assert url == signed_url
         return _StreamResponse(image)
 
     monkeypatch.setattr(httpx, "post", fake_post)
@@ -1911,9 +2331,18 @@ def test_inspect_storage_image_uses_vision_model(monkeypatch, tmp_path) -> None:
         lambda **kwargs: "AOI image without visible text; red defect box.",
     )
 
-    observation = PreviewDatasetExecutor(
+    executor = PreviewDatasetExecutor(
         storage_base_url="https://portal.test/storage_api",
-    )(
+    )
+    if link_failure:
+        monkeypatch.setattr(
+            executor,
+            "_get_download_url",
+            lambda path, headers: PreviewDatasetObservation.from_text(
+                text="Preview link unavailable", is_error=True, dataset_path=path
+            ),
+        )
+    observation = executor(
         PreviewDatasetAction(dataset_path="/dataset/defect.jpg"),
         cast(Any, _fake_conversation(tmp_path)),
     )
@@ -1924,6 +2353,16 @@ def test_inspect_storage_image_uses_vision_model(monkeypatch, tmp_path) -> None:
     assert "vision_summary=AOI image" in observation.text
     assert any(item.type == "image" for item in observation.content)
     assert all(item.type == "text" for item in observation.to_llm_content)
+
+    llm_text = "\n".join(item.text for item in observation.to_llm_content)
+    if link_failure:
+        assert "preview_url_error=Preview link unavailable" in llm_text
+        assert "preview_url=" not in llm_text
+        assert "![Image preview]" not in llm_text
+    else:
+        assert f"preview_url={signed_url}" in llm_text
+        assert f"![Image preview](<{signed_url}>)" in llm_text
+    assert "Image preview: /dataset/defect.jpg" in llm_text
 
 
 def _clear_vision_env(monkeypatch) -> None:

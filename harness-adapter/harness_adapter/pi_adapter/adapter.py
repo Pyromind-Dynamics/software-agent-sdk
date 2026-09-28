@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import (
     CancelCommand,
@@ -81,13 +82,21 @@ use cd within one command, but never rely on a directory change from an earlier 
 Workspace files use public_data/... paths; authorized absolute paths are also accepted.
 The read tool maps .agents/skills/ and knowledge/ to shared read-only resource
 directories outside the workspace; terminal commands use their absolute paths.
+Use update_plan for complex, multi-step work. Each call must contain the complete
+plan snapshot; keep at most one step in_progress, mark completed steps promptly,
+and do not use it for simple tasks.
 For Pyromind workflow requests, read the matching
 skill before editing exactly
 public_data/workflow_canvas/workflow.py, then call validate_workflow_dsl without
 dsl_path; pass it only when validating another workspace file. Do not inspect
 credentials or work around failed validation authentication.
 
-Route dataset work before acting. Use the data-processing skill for any
+For model inference evaluation against ground truth or evaluation reports, read
+the inference-evaluation skill. Use df_submit_pipeline with its structured
+inference options for the fixed two-node production pipeline. Do not use
+workflow_debug for evaluation. Submit only when the user requests execution.
+
+Route other dataset work before acting. Use the data-processing skill for any
 dataset request; its SKILL.md routing table selects the paradigm:
 format-conversion for deterministic field, format, structure, regex, keyword,
 and length transformations; llm-pipeline for content assessment, DataFlow
@@ -132,6 +141,7 @@ class PiAdapter:
         skill_roots: list[Path] | None = None,
         knowledge_root: Path | None = None,
         apply_workspace_quota: Callable[[Path, str], None] | None = None,
+        pipeline_runs: Callable[[str], PipelineRuns] | None = None,
     ) -> None:
         if getattr(sys, "frozen", False):
             # PyInstaller: __file__ lives under the _MEIPASS extraction dir, so
@@ -157,7 +167,9 @@ class PiAdapter:
         if missing:
             raise ValueError(f"Pi skill roots do not exist: {', '.join(missing)}")
         self._business_tools = PyromindBusinessToolHost(
-            self._skill_roots, skills_directory=self._skills_directory
+            self._skill_roots,
+            skills_directory=self._skills_directory,
+            pipeline_runs=pipeline_runs,
         )
         configured_knowledge = knowledge_root or os.getenv(
             "PYROMIND_KNOWLEDGE_BASE_PATH"
@@ -459,8 +471,6 @@ class PiAdapter:
         status = _external_task_status(notification.status)
         if status in {"succeeded", "failed", "terminated", "stopped"}:
             session.active_external_tasks.pop(notification.task_id, None)
-        if status == "stopped":
-            return {"accepted": False, "reason": "user_stopped"}
         await self._ensure_runner(session)
         assert session.runner is not None
         task_id = notification.task_id

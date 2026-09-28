@@ -56,8 +56,10 @@ DataFlow checkpoint 决定已提交 batch；输出先写原子分片，再合并
 df_run_pipeline(model_profile="vision", output_schema="vision")
 ```
 
-用户确认后使用 `df_submit_pipeline(mode="full")`。平台产物仍只能在 Kafka callback
-后通过 `preview_dataset` 查看。
+用户确认后使用 `df_submit_pipeline(mode="full")`；提交前按 playbook 的
+[平台全量输入](../playbook.md#平台全量输入)把 Manifest 与它引用的图片落到同一
+Storage 目录树（目录输入按直接子项划分样本，多图样本用 Manifest）。平台产物仍只能
+在 Kafka callback 后通过 `preview_dataset` 查看。
 
 ## 输出
 

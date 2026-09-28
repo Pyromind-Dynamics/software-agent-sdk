@@ -11,14 +11,12 @@ from typing import Any, cast
 import pyarrow.parquet as pq
 import pytest
 from PIL import Image
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.llm import LLM, FailoverRouter
 from openhands.sdk.workspace.workspace import LocalWorkspace
 from openhands.tools.data_preparation.definition import (
-    DEFAULT_SAMPLE_LIMIT,
-    DF_SAMPLE_LIMIT_ENV,
     RUNTIME_FILENAMES,
     DfConvertAction,
     DfConvertExecutor,
@@ -26,10 +24,9 @@ from openhands.tools.data_preparation.definition import (
     DfRunPipelineAction,
     DfRunPipelineExecutor,
     DfRunPipelineObservation,
-    _sample_limit,
-    _truncate_sample_input,
 )
 from openhands.tools.data_preparation.runner import (
+    LabelingModelGateway,
     ProcessLocalSampleExecutor,
     _concrete_llm,
     build_dataflow_env,
@@ -246,6 +243,60 @@ def test_build_dataflow_env_vision_falls_back_to_conversation_llm(
     assert env["DF_API_KEY"] == "secret"
 
 
+def test_build_dataflow_env_prefers_a_user_labeling_gateway(monkeypatch) -> None:
+    """A user gateway replaces the managed vision model for the run."""
+    monkeypatch.setenv("DF_API_KEY", "platform-secret")
+    monkeypatch.setenv("DF_API_BASE_URL", "https://platform.example/v1")
+    monkeypatch.setenv("DF_MODEL_NAME", "platform-vision")
+
+    env = build_dataflow_env(
+        _conversation_with_llm(),
+        "vision",
+        gateway=LabelingModelGateway(
+            api_url=(
+                "https://inference.example.cn/inference/inf-abc/v1/chat/completions"
+            ),
+            model="pcb_avi_sft_merge_v10",
+            api_key="sk-user",
+        ),
+    )
+
+    assert env == {
+        "DF_API_URL": (
+            "https://inference.example.cn/inference/inf-abc/v1/chat/completions"
+        ),
+        "DF_API_BASE_URL": "https://inference.example.cn/inference/inf-abc/v1",
+        "DF_MODEL_NAME": "pcb_avi_sft_merge_v10",
+        "DF_API_KEY": "sk-user",
+    }
+
+
+def test_build_dataflow_env_gateway_never_inherits_the_platform_key() -> None:
+    """The platform credential must never be sent to a user-supplied endpoint."""
+    env = build_dataflow_env(
+        _conversation_with_llm(),
+        "vision",
+        gateway=LabelingModelGateway(base_url="https://gw.example/v1", model="m"),
+    )
+
+    assert "DF_API_KEY" not in env
+    assert env["DF_API_URL"] == "https://gw.example/v1/chat/completions"
+
+
+def test_build_dataflow_env_gateway_requires_the_vision_profile() -> None:
+    gateway = LabelingModelGateway(base_url="https://gw.example/v1", model="m")
+
+    with pytest.raises(ValueError, match="model_profile='vision'"):
+        build_dataflow_env(_conversation_with_llm(), "text", gateway=gateway)
+
+
+def test_labeling_gateway_requires_an_endpoint_and_a_model() -> None:
+    with pytest.raises(ValidationError):
+        LabelingModelGateway(model="pcb_avi_sft_merge_v10")
+    with pytest.raises(ValidationError):
+        LabelingModelGateway(base_url="https://gw.example/v1", model="   ")
+
+
 def test_run_dataflow_python_redacts_api_key(tmp_path: Path) -> None:
     api_key = "secret-that-must-not-leak"
 
@@ -282,7 +333,6 @@ def test_df_run_pipeline_validates_output_and_writes_local_report(
         "\n".join(
             [
                 "import json, sys",
-                "from image_utils import IMAGE_UTILS_API_VERSION",
                 "row = {",
                 "  'id': 'text-1',",
                 "  'system_prompt': 'system',",
@@ -316,7 +366,7 @@ def test_df_run_pipeline_validates_output_and_writes_local_report(
                 "public_data/data-preparation/processed.sample.jsonl",
             ],
             output_schema="text",
-            model_profile="text",
+            model_profile="none",
         ),
         conversation,
     )
@@ -392,7 +442,7 @@ def test_df_run_pipeline_validates_dpo_output(
                 "public_data/data-preparation/processed.sample.jsonl",
             ],
             output_schema="dpo",
-            model_profile="text",
+            model_profile="none",
         ),
         conversation,
     )
@@ -429,6 +479,7 @@ def test_df_run_pipeline_exposes_structured_missing_input_error(
                 "public_data/data-preparation/processed.sample.jsonl",
             ],
             output_schema="dpo",
+            model_profile="none",
         ),
         conversation,
     )
@@ -488,6 +539,7 @@ def test_df_run_pipeline_classifies_pipeline_execution_failure(
                 "public_data/data-preparation/processed.sample.jsonl",
             ],
             output_schema="dpo",
+            model_profile="none",
         ),
         conversation,
     )
@@ -540,6 +592,7 @@ def test_df_run_pipeline_uses_reported_failure_details(
                 "public_data/data-preparation/processed.sample.jsonl",
             ],
             output_schema="dpo",
+            model_profile="none",
         ),
         conversation,
     )
@@ -586,6 +639,7 @@ def test_df_run_pipeline_classifies_schema_validation_failure(
                 "public_data/data-preparation/processed.sample.jsonl",
             ],
             output_schema="dpo",
+            model_profile="none",
         ),
         conversation,
     )
@@ -1642,41 +1696,6 @@ def test_managed_image_pipeline_static_contract(tmp_path: Path) -> None:
         validate_managed_image_pipeline(invalid, public_names)
 
 
-def test_avi_manifest_adapter_is_only_a_boundary_example(tmp_path: Path) -> None:
-    adapter = _load_skill_reference("avi_manifest_adapter.py")
-    sample = tmp_path / "1_B1"
-    sample.mkdir()
-    for name, color in zip(
-        ("defect.jpg", "diff.jpg", "gt.jpg"),
-        ((255, 0, 0), (0, 255, 0), (0, 0, 255)),
-        strict=True,
-    ):
-        _write_image(sample / name, color)
-    (sample / "meta.json").write_text(
-        json.dumps(
-            {
-                "id": "1/B1",
-                "label": "skip",
-                "note": "same as reference",
-                "part": "part-1",
-            }
-        ),
-        encoding="utf-8",
-    )
-    output = tmp_path / "manifest.jsonl"
-
-    assert adapter.convert(str(sample), str(output)) == 1
-
-    record = json.loads(output.read_text(encoding="utf-8"))
-    assert record["sample_id"] == "1/B1"
-    assert record["image_labels"] == ["AOI检出图", "差分图", "GT参考图"]
-    assert record["reference_annotations"] == {
-        "label": "skip",
-        "note": "same as reference",
-    }
-    assert record["metadata"]["part"] == "part-1"
-
-
 class _FakePreflightResponse:
     def __init__(self, status_code: int, text: str, content_type: str) -> None:
         self.status_code = status_code
@@ -1868,63 +1887,77 @@ def test_concrete_llm_delegates_to_router_primary() -> None:
     assert _concrete_llm(plain) is plain
 
 
-def test_truncate_sample_input_csv_caps_rows(tmp_path: Path) -> None:
-    input_path = tmp_path / "testdata_3.csv"
-    input_path.write_text(
-        "qid,question_text\n"
-        + "\n".join(f"id{i},question {i}" for i in range(1, 8))  # 7 data rows
-        + "\n",
+def test_df_run_pipeline_passes_the_user_gateway_to_the_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gateway is resolved once and reaches the pipeline as DF_* env vars."""
+    monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
+    pipeline_dir = tmp_path / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    (pipeline_dir / "pipeline.py").write_text(
+        "\n".join(
+            [
+                "import json, os, pathlib, sys",
+                "output = pathlib.Path(sys.argv[2])",
+                "row = {'model': os.environ['DF_MODEL_NAME'],",
+                "       'base_url': os.environ['DF_API_BASE_URL'],",
+                "       'key': os.environ.get('DF_API_KEY', '')}",
+                "output.write_text(json.dumps(row) + '\\n', encoding='utf-8')",
+            ]
+        ),
         encoding="utf-8",
     )
+    (pipeline_dir / "input.jsonl").write_text('{"id": 1}\n', encoding="utf-8")
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+    conversation = cast(Any, _fake_conversation(tmp_path))
+    conversation.state.agent = _conversation_with_llm().state.agent
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.definition.check_dataflow_installed",
+        lambda python: (True, ""),
+    )
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.definition.check_dataflow_version",
+        lambda python: (True, ""),
+    )
 
-    sample = _truncate_sample_input(input_path, 3)
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/processed.jsonl",
+            ],
+            model_profile="vision",
+            labeling_gateway=LabelingModelGateway(
+                api_url=("https://gw.example.cn/inference/inf-1/v1/chat/completions"),
+                model="pcb_avi_sft_merge_v10",
+                api_key="sk-user",
+            ),
+        ),
+        conversation,
+    )
 
-    assert sample is not None
-    content = sample.read_text(encoding="utf-8").splitlines()
-    assert content[0] == "qid,question_text"  # header preserved
-    assert len(content) == 1 + 3  # header + 3 data rows
-
-
-def test_truncate_sample_input_jsonl_caps_rows(tmp_path: Path) -> None:
-    input_path = tmp_path / "input.jsonl"
-    input_path.write_text("".join(f'{{"id": {i}}}\n' for i in range(5)))
-
-    sample = _truncate_sample_input(input_path, 3)
-
-    assert sample is not None
-    assert len(sample.read_text(encoding="utf-8").splitlines()) == 3
-
-
-def test_truncate_sample_input_skips_within_limit(tmp_path: Path) -> None:
-    input_path = tmp_path / "input.jsonl"
-    input_path.write_text('{"id": 1}\n{"id": 2}\n')
-
-    assert _truncate_sample_input(input_path, 3) is None
-
-
-def test_truncate_sample_input_skips_directory(tmp_path: Path) -> None:
-    directory = tmp_path / "images"
-    directory.mkdir()
-
-    assert _truncate_sample_input(directory, 3) is None
+    assert not observation.is_error, observation.text
+    written = json.loads((pipeline_dir / "processed.jsonl").read_text(encoding="utf-8"))
+    assert written["model"] == "pcb_avi_sft_merge_v10"
+    assert written["base_url"] == "https://gw.example.cn/inference/inf-1/v1"
+    assert written["key"] == "sk-user"
 
 
-def test_sample_limit_env_and_default(monkeypatch) -> None:
-    monkeypatch.delenv(DF_SAMPLE_LIMIT_ENV, raising=False)
-    assert _sample_limit() == DEFAULT_SAMPLE_LIMIT
-    monkeypatch.setenv(DF_SAMPLE_LIMIT_ENV, "10")
-    assert _sample_limit() == 10
-    monkeypatch.setenv(DF_SAMPLE_LIMIT_ENV, "garbage")
-    assert _sample_limit() == DEFAULT_SAMPLE_LIMIT
-
-
-def test_df_run_pipeline_caps_local_sample_rows(
+def test_df_run_pipeline_processes_all_local_rows(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """A pipeline without ``--limit`` must still only see a 3-row local sample."""
+    """The executor processes exactly the input materialized upstream."""
     monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
-    monkeypatch.setenv("DF_SAMPLE_LIMIT", "3")
     pipeline_dir = tmp_path / "public_data" / "data-preparation"
     pipeline_dir.mkdir(parents=True)
     pipeline = pipeline_dir / "pipeline.py"
@@ -1941,13 +1974,13 @@ def test_df_run_pipeline_caps_local_sample_rows(
                 "    for i, l in enumerate(rows):",
                 "        f.write(json.dumps({'id': f'text-{i}',",
                 "            'system_prompt': 's', 'user_prompt': l.strip(),",
-                "            'gt': 'a'}) + '\\n')",
+                "            'gt': '<think>x</think><answer>a</answer>'}) + '\\n')",
             ]
         ),
         encoding="utf-8",
     )
     (pipeline_dir / "input.jsonl").write_text(
-        "".join(f"q{i}\n" for i in range(5)), encoding="utf-8"
+        "".join(f"q{i}\n" for i in range(1000)), encoding="utf-8"
     )
     scripts_dir = (
         Path(__file__).parents[3]
@@ -1965,16 +1998,161 @@ def test_df_run_pipeline_caps_local_sample_rows(
             pipeline_path="public_data/data-preparation/pipeline.py",
             args=[
                 "public_data/data-preparation/input.jsonl",
-                "public_data/data-preparation/sample3.jsonl",
+                "public_data/data-preparation/processed.jsonl",
             ],
             output_schema="text",
-            model_profile="text",
+            model_profile="none",
         ),
         conversation,
     )
 
     assert not observation.is_error, observation.text
-    assert observation.record_count == 3  # capped at DF_SAMPLE_LIMIT, not 5
+    assert observation.record_count == 1000
+
+
+def test_df_run_pipeline_none_profile_passes_frozen_support_and_artifacts(
+    tmp_path: Path,
+) -> None:
+    pipeline_dir = tmp_path / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    (pipeline_dir / "input.jsonl").write_text('{"id": 1}\n', encoding="utf-8")
+    (pipeline_dir / "plan.json").write_text('{"label": "scratch"}', encoding="utf-8")
+    (pipeline_dir / "pipeline.py").write_text(
+        "\n".join(
+            [
+                "import json, pathlib, sys",
+                "output = pathlib.Path(sys.argv[2])",
+                "assets = output.parent / 'assets'",
+                "assets.mkdir(parents=True, exist_ok=True)",
+                "(assets / 'proof.txt').write_text('ok', encoding='utf-8')",
+                "plan = json.loads(pathlib.Path(sys.argv[3]).read_text())",
+                "row = {'sample_id': 'one', 'label': plan['label'],",
+                "       'artifacts': [{'role': 'other',",
+                "                      'path': 'assets/proof.txt'}]}",
+                "output.write_text(json.dumps(row) + '\\n', encoding='utf-8')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+    conversation = cast(Any, _fake_conversation(tmp_path))
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/processed.jsonl",
+            ],
+            support_file_path="public_data/data-preparation/plan.json",
+            output_schema="artifacts",
+            model_profile="none",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    assert observation.sample_records[0]["label"] == "scratch"
+    assert observation.report_path is not None
+    report = json.loads(Path(observation.report_path).read_text(encoding="utf-8"))
+    assert report["source_integrity"]["unchanged"] is True
+
+
+def test_df_run_pipeline_rejects_source_mutation(tmp_path: Path) -> None:
+    pipeline_dir = tmp_path / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    (pipeline_dir / "input.jsonl").write_text('{"id": 1}\n', encoding="utf-8")
+    (pipeline_dir / "pipeline.py").write_text(
+        "\n".join(
+            [
+                "import pathlib, sys",
+                "pathlib.Path(sys.argv[1]).write_text(",
+                "    '{\"id\": 2}\\n', encoding='utf-8')",
+                "pathlib.Path(sys.argv[2]).write_text(",
+                '    \'{"sample_id":"x","artifacts":[]}\\n\',',
+                "    encoding='utf-8')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/processed.jsonl",
+            ],
+            output_schema="artifacts",
+            model_profile="none",
+        ),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert observation.is_error
+    assert observation.failure_stage == "source_integrity"
+    assert observation.error_code == "source_data_modified"
+
+
+def test_df_run_pipeline_reports_deleted_source_as_integrity_failure(
+    tmp_path: Path,
+) -> None:
+    pipeline_dir = tmp_path / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    (pipeline_dir / "input.jsonl").write_text('{"id": 1}\n', encoding="utf-8")
+    (pipeline_dir / "pipeline.py").write_text(
+        "\n".join(
+            [
+                "import pathlib, sys",
+                "pathlib.Path(sys.argv[1]).unlink()",
+                "pathlib.Path(sys.argv[2]).write_text(",
+                '    \'{"sample_id":"x","artifacts":[]}\\n\',',
+                "    encoding='utf-8')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+    observation = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/processed.jsonl",
+            ],
+            output_schema="artifacts",
+            model_profile="none",
+        ),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert observation.is_error
+    assert observation.failure_stage == "source_integrity"
+    assert observation.error_code == "source_data_modified"
+    integrity = json.loads((pipeline_dir / "source_integrity.json").read_text())
+    assert integrity["unchanged"] is False
+    assert integrity["after"] is None
+    assert integrity["error"]
 
 
 def _write_legacy_copy_pipeline(pipeline: Path) -> None:
@@ -2026,7 +2204,7 @@ def test_df_run_pipeline_legacy_accepts_workspace_relative_args(
                 "public_data/data-preparation/input.jsonl",
                 "public_data/data-preparation/filtered.sample.jsonl",
             ],
-            model_profile="text",
+            model_profile="none",
         ),
         conversation,
     )
@@ -2064,7 +2242,7 @@ def test_df_run_pipeline_legacy_keeps_pipeline_relative_args(
         DfRunPipelineAction(
             pipeline_path="public_data/data-preparation/pipeline.py",
             args=["input.jsonl", "filtered.sample.jsonl"],
-            model_profile="text",
+            model_profile="none",
         ),
         conversation,
     )

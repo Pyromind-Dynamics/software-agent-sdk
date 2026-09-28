@@ -23,7 +23,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 import dataflow
 import pandas as pd
@@ -47,10 +47,15 @@ except ImportError:  # DataFlow normally installs it transitively.
 
 
 SUPPORTED_DATAFLOW_VERSION = "1.0.10"
-IMAGE_UTILS_API_VERSION = "2"
+IMAGE_UTILS_API_VERSION = "4"
 NATIVE_VLM_SUFFIXES = {".jpg", ".jpeg", ".png"}
 CONVERTIBLE_VLM_SUFFIXES = {".gif", ".webp", ".bmp"}
 IMAGE_SUFFIXES = NATIVE_VLM_SUFFIXES | CONVERTIBLE_VLM_SUFFIXES
+
+# Platform pods mount user Storage here. Everything an agent or a downstream
+# tool reads back must be expressed without this prefix, so the object paths
+# written into structured rows are Storage paths rather than pod paths.
+STORAGE_MOUNT_PREFIX = "/target-workspace"
 
 # Run-level failure summary, read back by generate_report.py as ``runtime_failure``
 # and by the host tool as ``report.json.failure``.
@@ -96,7 +101,7 @@ class ImagePipelineConfig:
     """Declarative configuration for the managed image-labeling pipeline."""
 
     labeling_system_prompt: str
-    training_system_prompt: str
+    training_system_prompt: str = ""
     id_key: str = "id"
     images_key: str = "images"
     image_labels_key: str | None = "image_labels"
@@ -118,15 +123,20 @@ class ImagePipelineConfig:
     max_attempts: int = 3
     max_workers: int = 8
     timeout: int = 1800
+    output_format: Literal["vision", "structured"] = "vision"
 
     def __post_init__(self) -> None:
+        if self.output_format not in {"vision", "structured"}:
+            raise ValueError("output_format must be vision or structured")
         for name in (
             "labeling_system_prompt",
-            "training_system_prompt",
             "id_key",
             "images_key",
-            "reasoning_key",
-            "answer_key",
+            *(
+                ("training_system_prompt", "reasoning_key", "answer_key")
+                if self.output_format == "vision"
+                else ()
+            ),
         ):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
@@ -137,6 +147,20 @@ class ImagePipelineConfig:
             )
         if not isinstance(self.response_json_schema, dict):
             raise ValueError("response_json_schema must be an object")
+        if self.output_format == "structured":
+            if self.response_json_schema.get("type") != "object":
+                raise ValueError(
+                    "structured response_json_schema must describe an object"
+                )
+            for reserved in ("id", "source_images"):
+                if reserved in self.response_json_schema.get("properties", {}) or (
+                    reserved in self.response_json_schema.get("required", [])
+                ):
+                    raise ValueError(
+                        f"structured {reserved} is reserved for the source sample"
+                    )
+            if self.allow_reference_correction:
+                raise ValueError("reference correction requires vision output")
         if _Draft202012Validator is not None:
             try:
                 _Draft202012Validator.check_schema(self.response_json_schema)
@@ -230,6 +254,20 @@ class ManagedStreamBatchedFileStorage(StreamBatchedFileStorage):
     def checkpoint_path(self) -> Path:
         return self.state_dir / "image_pipeline_last_success_step.txt"
 
+    def _load_local_file(
+        self, file_path: str, file_type: str, batchsize: int | None = None
+    ) -> Any:
+        if file_type == "jsonl":
+            # Source ids such as "0002" must not undergo pandas type inference.
+            return pd.read_json(
+                file_path,
+                lines=True,
+                chunksize=batchsize,
+                dtype={"id": str},
+                convert_dates=False,
+            )
+        return super()._load_local_file(file_path, file_type, batchsize)
+
     def reset_managed_state(self) -> None:
         self.checkpoint_path.unlink(missing_ok=True)
         self.output_path.unlink(missing_ok=True)
@@ -260,17 +298,24 @@ class ManagedStreamBatchedFileStorage(StreamBatchedFileStorage):
                 part.unlink(missing_ok=True)
 
     def write(self, data: Any) -> str:
-        dataframe = _as_dataframe(data)
         self.parts_dir.mkdir(parents=True, exist_ok=True)
         target = self.parts_dir / f"part-{self.batch_step:08d}.jsonl"
         temporary = target.with_suffix(".jsonl.tmp")
         with temporary.open("w", encoding="utf-8") as handle:
-            dataframe.to_json(
-                handle,
-                orient="records",
-                lines=True,
-                force_ascii=False,
-            )
+            if isinstance(data, list) and all(isinstance(row, dict) for row in data):
+                # Preserve each validated object's optional fields and number types;
+                # a DataFrame would fill absent fields with null and coerce columns.
+                for row in data:
+                    handle.write(
+                        json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
+                    )
+            else:
+                _as_dataframe(data).to_json(
+                    handle,
+                    orient="records",
+                    lines=True,
+                    force_ascii=False,
+                )
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, target)
@@ -555,6 +600,11 @@ def run_image_pipeline(
 
     manifest = state_dir / "source_manifest.jsonl"
     try:
+        requested_schema = os.environ.get("DF_OUTPUT_SCHEMA")
+        if requested_schema and requested_schema != config.output_format:
+            raise ValueError(
+                "output_schema does not match ImagePipelineConfig.output_format"
+            )
         if resumed:
             if not manifest.is_file():
                 raise ValueError("cannot resume: source_manifest.jsonl is missing")
@@ -761,6 +811,10 @@ def _load_source_records(
         )
         for index, record in enumerate(records)
     ]
+    if config.output_format == "structured":
+        ids = [record["id"] for record in normalized]
+        if len(set(ids)) != len(ids):
+            raise ValueError("structured input contains duplicate source id values")
     return normalized, image_root
 
 
@@ -936,7 +990,11 @@ def _normalize_source_record(
         output_images.append(posix.as_posix())
         local_images.append(str(local))
 
-    normalized["id"] = str(record_id).strip()
+    normalized["id"] = (
+        str(record_id)
+        if config.output_format == "structured"
+        else str(record_id).strip()
+    )
     normalized["images"] = output_images
     metadata = _load_record_metadata(
         record,
@@ -1023,6 +1081,7 @@ def _prepare_sample(
         )
     sample["_local_images"] = local_images
     sample["_image_labels"] = labels
+    sample["_source_images"] = _source_images(labels, raw_local_images)
     sample["_user_prompt"] = user_prompt
     sample["_model_prompt"] = (
         f"{sample_system_prompt}\n\n{user_prompt}{reconciliation_prompt}"
@@ -1139,6 +1198,18 @@ def _validate_response(
 ) -> tuple[dict[str, Any], str]:
     if not isinstance(raw_response, str) or not raw_response.strip():
         raise ValueError("VLM response must be a non-empty string")
+    if config.output_format == "structured":
+        value = json.loads(raw_response)
+        if not isinstance(value, dict):
+            raise ValueError("structured response must be a JSON object")
+        for reserved, label in (
+            ("id", "source id"),
+            ("source_images", "source images"),
+        ):
+            if reserved in value:
+                raise ValueError(f"model cannot supply the reserved {label}")
+        _validate_json_schema(value, config.response_json_schema)
+        return value, "raw_json"
     payload, parse_mode = _unwrap_json_response(raw_response)
     value = json.loads(payload)
     if not isinstance(value, dict):
@@ -1257,11 +1328,52 @@ def _validate_schema_subset(value: Any, schema: Any, *, path: str) -> None:
             )
 
 
+def _storage_object_path(local_path: str) -> str:
+    """Return the agent-facing path for one source image.
+
+    A platform run materializes user Storage under :data:`STORAGE_MOUNT_PREFIX`,
+    so the object path is the local path without that mount. A local sample run
+    has no mount and keeps its local path, which is the path that run can read.
+    """
+    path = Path(local_path)
+    try:
+        relative = path.relative_to(STORAGE_MOUNT_PREFIX)
+    except ValueError:
+        return str(path)
+    return f"/{relative.as_posix()}"
+
+
+def _source_images(labels: list[str], local_paths: list[str]) -> dict[str, str]:
+    """Map each image's role label to its path.
+
+    Roles come from the input's ``image_labels``, so the row says which image is
+    the one under inspection and which is the reference without any downstream
+    tool having to guess from file names or position. Repeated roles get a
+    ``#2``, ``#3`` suffix so a dataset with several auxiliary images still
+    exposes all of them; the first occurrence keeps the bare label.
+    """
+    counts: dict[str, int] = {}
+    images: dict[str, str] = {}
+    for label, path in zip(labels, local_paths, strict=True):
+        counts[label] = counts.get(label, 0) + 1
+        key = label if counts[label] == 1 else f"{label}#{counts[label]}"
+        images[key] = _storage_object_path(path)
+    return images
+
+
 def _canonical_output(
     sample: dict[str, Any],
     response: dict[str, Any],
     config: ImagePipelineConfig,
 ) -> dict[str, Any]:
+    if config.output_format == "structured":
+        # The annotation object plus its source images: a reader that only has
+        # this row can still tell which image the judgment is about.
+        return {
+            "id": sample["id"],
+            "source_images": sample["_source_images"],
+            **{k: v for k, v in response.items() if k not in {"id", "source_images"}},
+        }
     reasoning = _stringify(response.get(config.reasoning_key), config.reasoning_key)
     answer = _stringify(response.get(config.answer_key), config.answer_key)
     if config.answer_is_json:
@@ -1336,6 +1448,12 @@ def _write_runtime_metadata(
         "manifest_path": str(manifest),
         "manifest_fingerprint": _sha256_file(manifest),
         "record_count": record_count,
+        "output_format": config.output_format,
+        "response_json_schema": (
+            config.response_json_schema
+            if config.output_format == "structured"
+            else None
+        ),
     }
     _write_json_atomic(state_dir / "runtime_metadata.json", payload)
 
@@ -1352,6 +1470,14 @@ def _refresh_resume_metadata(
         raise ValueError("cannot resume: runtime_metadata.json is missing") from exc
     if not isinstance(metadata, dict):
         raise ValueError("cannot resume: runtime metadata is invalid")
+    if metadata.get("output_format", "vision") != config.output_format:
+        raise ValueError(
+            "cannot resume with a different output_format; start a new run"
+        )
+    if config.output_format == "structured" and (
+        metadata.get("response_json_schema") != config.response_json_schema
+    ):
+        raise ValueError("cannot resume with a different response JSON Schema")
     expected_manifest = metadata.get("manifest_fingerprint")
     actual_manifest = _sha256_file(manifest)
     if expected_manifest != actual_manifest:

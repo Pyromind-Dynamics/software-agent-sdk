@@ -1,0 +1,26 @@
+{
+  "model_version": "aoi-vlm-v1",
+  "score": 0.95,
+  "result": [
+    {
+      "from_name": "quality_label",
+      "to_name": "defect_image",
+      "type": "choices",
+      "value": {
+        "choices": [
+          "ok"
+        ]
+      }
+    },
+    {
+      "from_name": "overall_note",
+      "to_name": "defect_image",
+      "type": "textarea",
+      "value": {
+        "text": [
+          "对比参考图，差异仅为边缘对齐伪影，无真实物理缺陷。"
+        ]
+      }
+    }
+  ]
+}

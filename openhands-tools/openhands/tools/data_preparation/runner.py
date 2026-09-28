@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
+from pydantic import BaseModel, Field, model_validator
 
 from openhands.sdk.llm import RouterLLM
 from openhands.sdk.utils.redact import redact_text_secrets
@@ -332,9 +333,74 @@ def _resolve_dataflow_urls(
     return base_url, api_url
 
 
+def _clean_optional(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+class LabelingModelGateway(BaseModel):
+    """A user-supplied OpenAI-compatible gateway for the labeling model.
+
+    Supplying one replaces the server-wide ``DF_*`` vision configuration for a
+    single run. The values still travel to the pipeline as the same ``DF_*``
+    env vars, so ``image_utils`` is unchanged and no pipeline ever reads or
+    hardcodes a credential.
+    """
+
+    api_url: str | None = Field(
+        default=None,
+        description=(
+            "Full chat-completions URL, e.g. "
+            "'https://host/inference/inf-abc/v1/chat/completions'."
+        ),
+    )
+    base_url: str | None = Field(
+        default=None,
+        description="Gateway root, used when api_url is omitted.",
+    )
+    model: str = Field(
+        description="Model name the gateway serves, e.g. 'pcb_avi_sft_merge_v10'.",
+    )
+    api_key: str | None = Field(
+        default=None,
+        description=(
+            "Bearer token for the gateway. Omit for an unauthenticated gateway; "
+            "the platform key is never sent to a user-supplied endpoint."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _normalize(self) -> LabelingModelGateway:
+        self.api_url = _clean_optional(self.api_url)
+        self.base_url = _clean_optional(self.base_url)
+        self.api_key = _clean_optional(self.api_key)
+        self.model = self.model.strip()
+        if not self.model:
+            raise ValueError("labeling gateway needs a non-empty model name")
+        if not (self.api_url or self.base_url):
+            raise ValueError("labeling gateway needs api_url or base_url")
+        return self
+
+    def resolve_env(self) -> dict[str, str]:
+        """Resolve the gateway into the DataFlow LLM env vars it replaces."""
+        base_url, api_url = _resolve_dataflow_urls(self.base_url, self.api_url, "")
+        resolved = {
+            ENV_DF_API_URL: api_url,
+            ENV_DF_API_BASE_URL: base_url,
+            ENV_DF_MODEL_NAME: self.model,
+        }
+        if self.api_key:
+            resolved[ENV_DF_API_KEY] = self.api_key
+        return resolved
+
+
 def build_dataflow_env(
     conversation: Any,
     model_profile: Literal["text", "vision"] = "vision",
+    *,
+    gateway: LabelingModelGateway | None = None,
 ) -> dict[str, str]:
     """Resolve DataFlow LLM env vars for an explicit text or vision profile.
 
@@ -344,9 +410,20 @@ def build_dataflow_env(
     conversation LLM, then the DataFlow defaults (mirroring
     ``_vision_api_config`` so preview and pipeline runs share one endpoint).
 
+    ``gateway`` is a per-run user-supplied labeling endpoint. When given it
+    replaces the whole vision configuration rather than merging with it: a
+    user's gateway must never inherit the platform key, and its model name is
+    what the caller asked to label with.
+
     Raises:
         ValueError: If the resolved configuration is incomplete or inconsistent.
     """
+
+    if gateway is not None and model_profile != "vision":
+        raise ValueError(
+            "A labeling gateway replaces the vision model, so it requires "
+            "model_profile='vision'."
+        )
 
     llm = _concrete_llm(conversation.state.agent.llm)
     if llm.api_key is None:
@@ -357,6 +434,8 @@ def build_dataflow_env(
         llm_api_key = str(llm.api_key)
     fallback_base_url = (llm.base_url or DEFAULT_DATAFLOW_API_BASE_URL).rstrip("/")
     if model_profile == "vision":
+        if gateway is not None:
+            return gateway.resolve_env()
         api_key = _nonempty_env(ENV_DF_API_KEY) or llm_api_key
         env_model_name = _nonempty_env(ENV_DF_MODEL_NAME)
         if env_model_name is not None and _is_unsubstituted_placeholder_model(

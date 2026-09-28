@@ -376,7 +376,7 @@ class ConversationRuntime:
             **task.model_dump(mode="json"),
             "status": normalized,
             "updated_at": datetime.now().astimezone().isoformat(),
-            "resume_pending": active is None and normalized != "stopped",
+            "resume_pending": active is None,
             "error_summary": _controlled_error(error_summary),
         }
         event = ProductEvent(
@@ -413,7 +413,7 @@ class ConversationRuntime:
             )
             return persisted
         self._publish(persisted)
-        if active is not None and terminal and normalized != "stopped":
+        if active is not None and terminal:
             try:
                 await active.adapter.notify_external_task(
                     active.handle,
@@ -627,7 +627,7 @@ class ConversationRuntime:
         self, active: _ActiveConversation, store: FileProductStore
     ) -> None:
         for task in store.load_snapshot().external_tasks:
-            if not task.resume_pending or task.status == "stopped":
+            if not task.resume_pending:
                 continue
             await active.adapter.notify_external_task(
                 active.handle,
@@ -1011,7 +1011,7 @@ def _build_external_task_notification(
     task_label = task.kind.replace("_", " ")
     visible_text: str | None = None
     reset_attempt_budget = task.kind == "workflow_debug" and status == "succeeded"
-    trigger_turn = auto_run and status not in {"terminated", "stopped"}
+    trigger_turn = auto_run
     if task.kind == "workflow_debug":
         if status == "succeeded":
             visible_text = f"工作流调试运行成功\n\n- task_id: {task.task_id}"

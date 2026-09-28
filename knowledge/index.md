@@ -13,7 +13,14 @@ original pages before answering.
 | `sdk/` | Python SDK installation, APIs, workflows, storage, and custom nodes |
 | `jupyterlab/` | JupyterLab access, SSH, Slurm, and startup configuration |
 | `nodes/` | System-node contracts, inputs, outputs, parameters, and examples |
+| `business-domain/` | Shared business-domain knowledge for data understanding, processing, synthesis, and annotation |
 | repository root | Standalone workflow DSL examples |
+
+## Business Domain
+
+| Page | Summary | Tags |
+|---|---|---|
+| [PCB 裸板 AVI/AOI](business-domain/pcb-avi-aoi.md) | 多铜/少铜缺陷、成像与标签语义、复判及过假率口径；区分通用依据与现场约定 | business-domain, pcb, avi, aoi, 缺陷, 假点, 过假率 |
 
 ## Basic
 
@@ -134,5 +141,4 @@ original pages before answering.
 | Page | Summary | Tags |
 |---|---|---|
 | [Dataset Processing Workflow](dataset_processing_workflow.py) | Pyromind Dataset Processing Workflow 示例 | examples, dataset-processing-workflow |
-
 

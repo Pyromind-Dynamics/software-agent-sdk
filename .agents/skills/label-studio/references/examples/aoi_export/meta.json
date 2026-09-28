@@ -1,0 +1,9 @@
+{
+  "id": "10/B1",
+  "sample_id": "10_B1",
+  "label": "skip",
+  "vlm_verdict": "false_positive",
+  "vlm_category": "其他",
+  "vlm_confidence": 0.95,
+  "note": "对比参考图，差异仅为边缘对齐伪影，无真实物理缺陷。"
+}

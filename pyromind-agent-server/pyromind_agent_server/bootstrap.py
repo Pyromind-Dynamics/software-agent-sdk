@@ -9,7 +9,9 @@ from fastapi import FastAPI
 from harness_adapter.openhands_adapter import OpenHandsAdapter
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.domain.capabilities import ResourceLimits
+from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.harness import HarnessAdapter
 
 from openhands.agent_server.run_workflow_callback import set_workflow_status_dispatcher
@@ -36,12 +38,22 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         "openhands": OpenHandsAdapter(lambda: app.state.conversation_service),
     }
     terminal_backend: str | None = None
+    external_tasks = WorkflowExternalTaskRegistry(service.conversations_dir)
+
+    def pipeline_runs(conversation_id: str) -> PipelineRuns:
+        return PipelineRuns(
+            conversation_id,
+            FileProductStore(service.conversations_dir / conversation_id),
+            external_tasks,
+        )
+
     if backend == "pi":
         terminal_backend = resolve_pi_terminal_backend()
         adapters["pi"] = PiAdapter(
             service.conversations_dir,
             terminal_backend=terminal_backend,
             apply_workspace_quota=ensure_conversation_quota,
+            pipeline_runs=pipeline_runs,
         )
     idle_eviction_seconds = int(
         os.getenv("PYROMIND_IDLE_CONVERSATION_EVICTION_SECONDS", "1800")
@@ -67,7 +79,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         service.conversations_dir,
         adapters,
         default_harness_id=backend,
-        external_tasks=WorkflowExternalTaskRegistry(service.conversations_dir),
+        external_tasks=external_tasks,
         idle_eviction_seconds=idle_eviction_seconds,
         resource_limits=resource_limits_from_environment(),
     )

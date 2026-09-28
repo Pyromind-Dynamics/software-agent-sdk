@@ -17,6 +17,7 @@ SchemaName = Literal[
     "function_call",
     "quality_evaluation",
     "text2sql",
+    "artifacts",
 ]
 SCHEMA_CHOICES = (
     "text",
@@ -26,6 +27,7 @@ SCHEMA_CHOICES = (
     "function_call",
     "quality_evaluation",
     "text2sql",
+    "artifacts",
 )
 TEXT_FIELDS = {"id", "system_prompt", "user_prompt", "gt"}
 DPO_FIELDS = {"id", "system_prompt", "user_prompt", "gt", "rejected_answer"}
@@ -50,6 +52,7 @@ FORBIDDEN_AUDIT_FIELDS = {
     "reasoning_content",
     "anthropic_response",
 }
+ARTIFACT_ROLES = {"image", "diff", "gt", "review", "annotation", "other"}
 
 
 def _expect_exact_fields(
@@ -835,12 +838,53 @@ def _validate_text2sql(row: dict[str, Any], *, line_number: int) -> str:
     return record_id
 
 
+def _validate_artifacts(
+    row: dict[str, Any], *, line_number: int, output_root: Path
+) -> str:
+    sample_id = _nonempty_string(row, "sample_id", line_number)
+    artifacts = row.get("artifacts", [])
+    if not isinstance(artifacts, list):
+        raise ValueError(f"line {line_number}: artifacts must be a list")
+    root = output_root.resolve()
+    for index, artifact in enumerate(artifacts):
+        if not isinstance(artifact, dict):
+            raise ValueError(
+                f"line {line_number}: artifacts[{index}] must be an object"
+            )
+        role = artifact.get("role")
+        path_value = artifact.get("path")
+        if not isinstance(role, str) or not role.strip():
+            raise ValueError(
+                f"line {line_number}: artifacts[{index}].role must be non-empty"
+            )
+        if role not in ARTIFACT_ROLES:
+            raise ValueError(
+                f"line {line_number}: artifacts[{index}].role is unsupported"
+            )
+        if not isinstance(path_value, str) or not path_value.strip():
+            raise ValueError(
+                f"line {line_number}: artifacts[{index}].path must be non-empty"
+            )
+        _validate_relative_path(path_value, line_number)
+        resolved = (root / path_value).resolve()
+        if not resolved.is_relative_to(root):
+            raise ValueError(
+                f"line {line_number}: artifact path escapes output directory"
+            )
+        if not resolved.is_file():
+            raise ValueError(
+                f"line {line_number}: artifact does not exist: {path_value}"
+            )
+    return sample_id
+
+
 def validate_row(
     row: dict[str, Any],
     *,
     schema: SchemaName,
     line_number: int,
     image_root: Path | None = None,
+    output_root: Path | None = None,
 ) -> str | None:
     if schema in {"text", "vision"}:
         return _validate_text_or_vision(
@@ -857,6 +901,12 @@ def validate_row(
         return _validate_function_call(row, line_number=line_number)
     if schema == "quality_evaluation":
         return _validate_quality_evaluation(row, line_number=line_number)
+    if schema == "artifacts":
+        if output_root is None:
+            raise ValueError("artifacts schema requires an output root")
+        return _validate_artifacts(
+            row, line_number=line_number, output_root=output_root
+        )
     return _validate_text2sql(row, line_number=line_number)
 
 
@@ -887,6 +937,7 @@ def validate_jsonl(
                 schema=schema,
                 line_number=line_number,
                 image_root=image_root,
+                output_root=path.parent,
             )
             if record_id is not None and record_id in seen_ids:
                 raise ValueError(f"line {line_number}: duplicate id: {record_id}")
@@ -896,6 +947,32 @@ def validate_jsonl(
     if rows == 0:
         raise ValueError("output JSONL must contain at least one record")
     return {"status": "passed", "schema": schema, "rows": rows}
+
+
+def _write_validation_report(path: Path, result: dict[str, Any]) -> None:
+    existing: dict[str, Any] | None = None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            existing = value
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    payload = result
+    if existing is not None and existing != result:
+        payload = {
+            "status": (
+                "passed"
+                if existing.get("status") == "passed"
+                and result.get("status") == "passed"
+                else "failed"
+            ),
+            "schema_validation": result,
+            "domain_validation": existing,
+        }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def main() -> int:
@@ -919,18 +996,12 @@ def main() -> int:
             "error": str(exc),
         }
         if args.report:
-            args.report.write_text(
-                json.dumps(result, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
+            _write_validation_report(args.report, result)
         print(json.dumps(result, ensure_ascii=False))
         return 1
 
     if args.report:
-        args.report.write_text(
-            json.dumps(result, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        _write_validation_report(args.report, result)
     print(json.dumps(result, ensure_ascii=False))
     return 0
 

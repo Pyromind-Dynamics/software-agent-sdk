@@ -1,7 +1,25 @@
 from pyromind_runtime.application import SnapshotProjector
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.events import ProductEvent
-from pyromind_runtime.domain.snapshot import ConversationSnapshot, TimelineOperation
+from pyromind_runtime.domain.snapshot import (
+    ConversationSnapshot,
+    ExternalTaskState,
+    TimelineOperation,
+)
+
+
+def test_legacy_dataset_task_kinds_normalize_to_data_preparation() -> None:
+    for legacy_kind in ("dataset_analysis", "data_synthesis"):
+        state = ExternalTaskState.model_validate(
+            {
+                "task_id": "task-1",
+                "kind": legacy_kind,
+                "status": "succeeded",
+                "submitted_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+            }
+        )
+        assert state.kind == "data_preparation"
 
 
 def _snapshot() -> ConversationSnapshot:

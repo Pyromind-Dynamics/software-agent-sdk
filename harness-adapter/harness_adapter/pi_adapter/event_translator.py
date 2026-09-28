@@ -112,13 +112,26 @@ def translate_runner_event(frame: dict[str, Any]) -> tuple[HarnessEvent, ...]:
                 else {}
             ),
         }
-    return (
-        HarnessEvent(
-            **common,
-            type=cast(HarnessEventType, event_type),
-            payload=payload,
-        ),
+    translated = HarnessEvent(
+        **common,
+        type=cast(HarnessEventType, event_type),
+        payload=payload,
     )
+    if kind == "tool.completed" and payload.get("name") == "update_plan":
+        details = payload.get("details")
+        if isinstance(details, dict) and isinstance(details.get("plan"), list):
+            return (
+                translated,
+                HarnessEvent(
+                    **{**common, "event_id": f"{common['event_id']}:plan"},
+                    type="plan.updated",
+                    payload={
+                        "steps": details["plan"],
+                        "explanation": details.get("explanation"),
+                    },
+                ),
+            )
+    return (translated,)
 
 
 def _content(value: Any, *, kind: str) -> list[dict[str, Any]]:

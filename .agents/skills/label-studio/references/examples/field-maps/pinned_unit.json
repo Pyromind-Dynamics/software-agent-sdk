@@ -1,0 +1,13 @@
+{
+  "regions": [
+    {
+      "source": "findings",
+      "control": "finding_category",
+      "label": "category",
+      "geometry": "bbox",
+      "unit": "norm1000",
+      "observation": "observation",
+      "observation_control": "finding_observation"
+    }
+  ]
+}

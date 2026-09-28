@@ -1,5 +1,6 @@
 """Tests for the DataFlow platform submission tool."""
 
+import subprocess
 import uuid
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from openhands.tools.data_preparation.platform_submit import (
     _pod_path,
     _validate_local_pipeline,
 )
+from openhands.tools.data_preparation.runner import LabelingModelGateway
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +85,9 @@ def test_build_dataflow_command_structure() -> None:
         image_utils_api_version="1",
     )
     assert "python3 -m venv /tmp/df-venv" in cmd
-    assert "pip install --use-deprecated=legacy-resolver open-dataflow==1.0.10" in cmd
+    assert "open-dataflow==1.0.10" in cmd
+    assert "opencv-python-headless==4.10.0.84" in cmd
+    assert "source_fingerprint.py" in cmd
     assert "mkdir -p" in cmd
     assert "/target-workspace/data/input.jsonl" in cmd
     assert "/target-workspace/output/run1/pipeline.py" in cmd
@@ -98,6 +102,46 @@ def test_build_dataflow_command_structure() -> None:
     assert "--image-utils-api-version 1" in cmd
     assert " && " in cmd
     assert "cp " not in cmd
+
+
+def test_none_profile_is_public_and_command_has_no_model_credentials() -> None:
+    action = DfSubmitPipelineAction(
+        script_path="pipeline.py",
+        input_path="/data/input.jsonl",
+        model_profile="none",
+        output_schema="artifacts",
+    )
+    command = _build_dataflow_command(
+        input_path="/data/input.jsonl",
+        output_dir="/output/run-none",
+        llm_env={},
+        convert_format="none",
+        runtime_dir_name="runtime-r1",
+        output_schema="artifacts",
+    )
+
+    assert action.model_profile == "none"
+    assert "DF_API_KEY=" not in command
+    assert "processed.jsonl --schema artifacts" in command
+
+
+def test_resume_command_rejects_a_changed_source_fingerprint() -> None:
+    command = _build_dataflow_command(
+        input_path="/data/input.jsonl",
+        output_dir="/output/run-resume",
+        llm_env={},
+        convert_format="none",
+        runtime_dir_name="runtime-r1",
+        resumed=True,
+    )
+
+    assert "--expected-report" in command
+    assert "/output/run-resume/source_integrity.json" in command
+    assert "resume_source_guard_rc" in command
+    syntax = subprocess.run(
+        ["bash", "-n"], input=command, text=True, capture_output=True, check=False
+    )
+    assert syntax.returncode == 0, syntax.stderr
 
 
 def test_build_dataflow_command_validates_dpo_schema() -> None:
@@ -226,6 +270,56 @@ def test_build_llm_env_model_no_prefix() -> None:
     conv = _make_conversation_with_llm(model="gpt-4o-mini")
     env = _build_llm_env(conv)
     assert env["DF_MODEL_NAME"] == "gpt-4o-mini"
+
+
+def test_build_llm_env_uses_the_user_labeling_gateway() -> None:
+    conv = _make_conversation_with_llm()
+    env = _build_llm_env(
+        conv,
+        "vision",
+        LabelingModelGateway(
+            api_url="https://gw.example.cn/inference/inf-1/v1/chat/completions",
+            model="pcb_avi_sft_merge_v10",
+            api_key="sk-user",
+        ),
+    )
+
+    assert env["DF_MODEL_NAME"] == "pcb_avi_sft_merge_v10"
+    assert env["DF_API_BASE_URL"] == "https://gw.example.cn/inference/inf-1/v1"
+    assert env["DF_API_URL"] == (
+        "https://gw.example.cn/inference/inf-1/v1/chat/completions"
+    )
+    assert env["DF_API_KEY"] == "sk-user"
+
+
+def test_model_fingerprint_follows_the_gateway_model() -> None:
+    """Reusing a run across two labeling models would serve the wrong one."""
+    conv = _make_conversation_with_llm()
+    first = _build_llm_env(
+        conv, "vision", LabelingModelGateway(base_url="https://gw/v1", model="m1")
+    )
+    second = _build_llm_env(
+        conv, "vision", LabelingModelGateway(base_url="https://gw/v1", model="m2")
+    )
+
+    assert _model_fingerprint(first) != _model_fingerprint(second)
+
+
+def test_submit_action_accepts_a_labeling_gateway() -> None:
+    action = DfSubmitPipelineAction(
+        input_path="/data/in.jsonl",
+        script_path="public_data/data-preparation/pipeline.py",
+        model_profile="vision",
+        output_schema="structured",
+        labeling_gateway=LabelingModelGateway(
+            api_url="https://gw.example.cn/inference/inf-1/v1/chat/completions",
+            model="pcb_avi_sft_merge_v10",
+            api_key="sk-user",
+        ),
+    )
+
+    assert action.labeling_gateway is not None
+    assert action.labeling_gateway.model == "pcb_avi_sft_merge_v10"
 
 
 # ---------------------------------------------------------------------------
