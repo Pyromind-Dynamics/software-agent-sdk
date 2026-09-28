@@ -55,6 +55,9 @@ from harness_adapter.pi_adapter.sandbox_runtime import (
     SandboxSettings,
 )
 from harness_adapter.pi_adapter.terminal_backend import validate_pi_terminal_backend
+from harness_adapter.pi_adapter.tool_output import (
+    parse_business_tool_output_filename,
+)
 from openhands.agent_server.workflow_canvas_models import (
     SaveWorkflowCanvasEventSnapshotRequest,
 )
@@ -523,6 +526,7 @@ class PiAdapter:
                     else None,
                     checkpoint_dsl,
                 )
+            _copy_business_tool_outputs_for_fork(source.files, target_files)
             await self._ensure_runner(source)
             assert source.runner is not None
             branch = await source.runner.request(
@@ -1677,6 +1681,32 @@ def _copy_public_data_for_fork(source: Path, target: Path) -> None:
         if target.exists() and not target.is_symlink():
             shutil.rmtree(target)
         raise
+
+
+def _copy_business_tool_outputs_for_fork(
+    source: PiSessionFiles,
+    target: PiSessionFiles,
+) -> None:
+    source_directory = source.terminal_output_directory
+    if source_directory.is_symlink():
+        raise RuntimeError(
+            "PI_WORKSPACE_INVALID: terminal-output must not be a symbolic link"
+        )
+    if not source_directory.exists():
+        return
+    if not source_directory.is_dir() or source_directory.resolve(
+        strict=True
+    ).parent != source.directory.resolve(strict=True):
+        raise RuntimeError("PI_WORKSPACE_INVALID: terminal-output must stay inside pi")
+
+    for path in source_directory.iterdir():
+        output_id = parse_business_tool_output_filename(path.name)
+        if output_id is None:
+            continue
+        text = source.load_business_tool_output(output_id)
+        saved = target.save_business_tool_output(text)
+        if saved.sha256 != output_id:
+            raise RuntimeError("copied business tool output hash does not match source")
 
 
 def _remove_created_workspace(root: Path, conversation_root: Path) -> None:
