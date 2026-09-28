@@ -657,8 +657,8 @@ class LabelStudioProjectExecutor(
         """Re-sign the media URLs baked into task data before they stop working.
 
         Label Studio keeps whatever URL the import produced and never asks for a
-        new one, so a project that outlives the portal's media URL lifetime shows
-        broken images until its tasks are written back with fresh URLs.
+        new one, so a project whose stored URLs have been invalidated shows broken
+        images until its tasks are written back with fresh ones.
         """
         if not action.project_ref:
             raise ValueError("project_ref is required for operation='refresh_media'.")
@@ -669,8 +669,8 @@ class LabelStudioProjectExecutor(
         signer = self._build_media_signer(conversation)
         if signer is None:
             raise ValueError(
-                "refresh_media requires a portal base URL: the media route that "
-                "signs these URLs lives there."
+                "refresh_media requires the Label Studio integration base URL: "
+                "the media route that signs these URLs lives there."
             )
 
         ls_api = self._build_ls_api(conversation)
@@ -773,10 +773,11 @@ class LabelStudioProjectExecutor(
             yield index, json.loads(payload.decode("utf-8"))
 
     def _open_url(self, project_id: int) -> str:
-        """Portal SSO entry point, so the browser lands on a project it can open.
+        """SSO entry point, so the browser lands on a project it can open.
 
-        The portal signs the browser in to Label Studio on the way through, which
-        the bare project link cannot do on its own.
+        The plugin signs the browser in to Label Studio (via the platform login
+        when the platform session has expired), which the bare project link cannot
+        do on its own.
         """
         if self._portal_base_url:
             return (
@@ -818,12 +819,12 @@ class LabelStudioProjectExecutor(
     def _export_ticket(
         self, project_ref: str, conversation: BaseConversation | None
     ) -> str:
-        """Mint a fresh export ticket, or nothing at all if the portal cannot.
+        """Mint a fresh export ticket, or nothing at all if the host cannot.
 
-        Every description write asks for a new ticket because the old one expires;
-        a project whose ticket has lapsed simply stops pushing its export. The
-        ticket is a capability, so it travels to the caller as an opaque string and
-        is never logged.
+        Every description write asks for a new ticket because the old one expires,
+        and an export refreshes it in place, so a project keeps pushing its export
+        without the agent re-running. The ticket is a capability, so it travels to
+        the caller as an opaque string and is never logged.
         """
         provider = self._build_export_ticket_provider(conversation)
         if provider is None:
@@ -866,7 +867,7 @@ class LabelStudioProjectExecutor(
     def _ls_token(
         self, conversation: BaseConversation, state: ConversationState
     ) -> str:
-        """The caller's own token, read from the portal when one is configured.
+        """The caller's own token, read from the integration host when configured.
 
         Label Studio shows an account only its own organization's projects, so a
         token shared by every conversation files each user's projects under one
@@ -1107,12 +1108,12 @@ def _resigned_data(
 
 
 def _media_expiry_iso(expires_in: int | None) -> str | None:
-    """Record the window the portal reported, for diagnostics only.
+    """Record the window the integration host reported, for diagnostics only.
 
-    The portal keeps serving a media token past its own `exp` claim -- Label
-    Studio cannot re-mint the URL it stored, so the token is bound to one user
-    and object instead of a deadline. Nothing warns on this window, and
-    refresh_media remains available for callers that want a fresh signature.
+    The plugin keeps serving a media token past its own `exp` claim -- Label
+    Studio cannot re-mint the URL it stored, so the token is bound to one user and
+    object instead of a deadline. Nothing warns on this window, and refresh_media
+    remains available for callers that want a fresh signature.
     """
     if expires_in is None:
         return None

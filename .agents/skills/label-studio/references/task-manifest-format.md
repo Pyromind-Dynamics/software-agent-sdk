@@ -5,9 +5,9 @@
 ```json
 {
   "data": {
-    "defect_image": "https://console/label_studio/media?path=...",
-    "diff_image": "https://console/label_studio/media?path=...",
-    "gt_image": "https://console/label_studio/media?path=...",
+    "defect_image": "/label_studio/media?path=...",
+    "diff_image": "/label_studio/media?path=...",
+    "gt_image": "/label_studio/media?path=...",
     "defect_image_path": "/exports/.../defect.jpg",
     "diff_image_path": "/exports/.../diff.jpg",
     "gt_image_path": "/exports/.../gt.jpg",
@@ -17,8 +17,8 @@
   },
 ```
 
-`*_image` 是浏览器渲染用的 URL，指向 portal 的 media 路由（每次渲染时才向存储换取带签名的对象 URL），因此有有效期。
-`*_image_path` 是该图片在用户存储中的真实对象路径，用于导出回写和 URL 过期后重新签发；不要把 URL 当作路径使用。
+`*_image` 是浏览器渲染用的 URL，指向 Label Studio 插件自己的 media 路由（同源，每次渲染时才用调用方的平台会话向存储换取带签名的对象 URL），因此不设到期时间。
+`*_image_path` 是该图片在用户存储中的真实对象路径，用于导出回写和重新签发；不要把 URL 当作路径使用。
 
 `quality_label` / `finding_category` 这类**以控件名为键**的字段，是预标注值的副本：
 Label Studio 的 Data Manager 只能按 task data 的列过滤，值只存在于 prediction 里时
@@ -29,7 +29,6 @@ Label Studio 的 Data Manager 只能按 task data 的列过滤，值只存在于
 `references/custom-bindings.md`）。一个样本有多个区域时取**第一个**区域的标签
 （主类别）；`finding_observation` 这类长文本不复制。这些列就是 Data Manager 的
 过滤依据。
-
   "predictions": [
     {
       "model_version": "vlm-v1",

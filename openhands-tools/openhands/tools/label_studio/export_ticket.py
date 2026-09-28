@@ -1,9 +1,9 @@
-"""Export capability tickets, minted by the portal for one project.
+"""Export capability tickets, minted by Label Studio for one project.
 
 The Label Studio deployment's export button has to push the export into the
 project owner's Storage, but that deployment serves every user at once, so it
 cannot hold a storage credential that would let any one of them write anywhere.
-The portal mints a ticket instead: a capability limited to writing that one
+The plugin mints a ticket instead: a capability limited to writing that one
 export key for that one user, over the credential the caller already
 authenticated with. The project description carries it to the button's plugin,
 which never sees any other credential.

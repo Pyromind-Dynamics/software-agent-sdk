@@ -222,13 +222,15 @@ class LabelStudioProjectTool(
         storage_base_url = str(
             params.pop("storage_base_url", None) or _default_storage_base_url()
         )
-        # The portal is the browser-facing half of the integration: it owns the
-        # SSO entry point and the media route that task data points at.
+        # The Label Studio deployment hosts the integration routes (SSO, media
+        # proxy, per-caller token and export ticket), so its own base URL is the
+        # fallback. A deployment that splits them can still point this elsewhere.
         portal_base_url = str(
             params.pop("portal_base_url", None)
             or params.pop("sso_base_url", None)
             or os.getenv("LABEL_STUDIO_PORTAL_BASE_URL")
             or os.getenv("LABEL_STUDIO_SSO_BASE_URL", "")
+            or ls_base_url
         )
         # Which cluster's storage service signs media downloads. Sent to the
         # portal, which pins it inside the signed media URL. Never defaulted:

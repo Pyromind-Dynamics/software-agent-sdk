@@ -28,3 +28,17 @@ def test_cluster_reaches_the_executor() -> None:
 
     assert isinstance(tool.executor, LabelStudioProjectExecutor)
     assert tool.executor._cluster == "us-west-1#pre"
+
+
+def test_integration_host_defaults_to_label_studio(monkeypatch) -> None:
+    """The plugin hosts the SSO/media/token routes, so LS is the default host."""
+    for name in (
+        "LABEL_STUDIO_PORTAL_BASE_URL",
+        "LABEL_STUDIO_SSO_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    tool = LabelStudioProjectTool.create(ls_base_url="http://ls")[0]
+
+    assert isinstance(tool.executor, LabelStudioProjectExecutor)
+    assert tool.executor._portal_base_url == "http://ls"

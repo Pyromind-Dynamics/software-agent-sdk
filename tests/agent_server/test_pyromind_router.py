@@ -609,6 +609,19 @@ def test_label_studio_tool_only_needs_a_portal_base_url(tmp_path):
     assert "LABEL_STUDIO_TOKEN" not in secrets
 
 
+def test_label_studio_tool_falls_back_to_the_label_studio_host(monkeypatch):
+    """Routes live on Label Studio now, so its own URL is the integration host."""
+    monkeypatch.delenv("LABEL_STUDIO_PORTAL_BASE_URL", raising=False)
+    tool, secrets = _build_label_studio_tool(
+        _make_request({"cookie": "session-cookie"}),
+        {"label_studio_base_url": "https://pre-label-studio.pyromind.ai"},
+    )
+
+    assert tool is not None
+    assert tool.params["portal_base_url"] == "https://pre-label-studio.pyromind.ai"
+    assert "LABEL_STUDIO_TOKEN" not in secrets
+
+
 def test_label_studio_tool_stays_off_without_a_portal_or_a_token():
     tool, secrets = _build_label_studio_tool(_make_request(), {})
 

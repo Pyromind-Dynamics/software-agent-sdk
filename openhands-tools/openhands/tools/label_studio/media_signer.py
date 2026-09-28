@@ -1,9 +1,10 @@
-"""Portal media URL signing for Label Studio task data.
+"""Media URL signing for Label Studio task data.
 
-The portal owns the browser-facing media route: it validates the caller's
-session cookie, binds the returned URL to that user's bucket, and redirects to a
-freshly presigned object URL on every render. Tasks therefore store stable
-portal URLs instead of short-lived storage signatures.
+The Label Studio plugin owns the browser-facing media route: it validates the
+caller's session cookie, binds the returned URL to that user's bucket, and
+proxies the bytes from a freshly presigned object URL on every render. Tasks
+therefore store stable Label Studio URLs instead of short-lived storage
+signatures.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from openhands.tools.label_studio.converter import ConversionError
 
 
 MEDIA_URLS_ROUTE = "/label_studio/media-urls"
-# The portal caps one request at 1000 paths.
+# The plugin caps one request at 1000 paths.
 MEDIA_URL_BATCH_LIMIT = 1000
 
 

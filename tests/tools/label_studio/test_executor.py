@@ -1558,7 +1558,7 @@ def test_refresh_media_reports_an_error_when_no_task_could_be_written(conversati
     assert obs.project_ref == "abc"
 
 
-def test_refresh_media_requires_a_portal(conversation):
+def test_refresh_media_requires_an_integration_base_url(conversation):
     executor = _create_executor()
     with patch.object(executor, "_load_state", return_value=_ready_state()):
         obs = executor(
@@ -1566,7 +1566,7 @@ def test_refresh_media_requires_a_portal(conversation):
         )
 
     assert obs.is_error
-    assert "portal" in obs.text
+    assert "integration base URL" in obs.text
 
 
 def test_refresh_media_rejects_a_project_without_media_paths(conversation):
