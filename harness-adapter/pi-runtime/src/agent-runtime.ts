@@ -16,7 +16,10 @@ import {
 } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
 
+import type { WorkflowExecution } from "./workflow-execution.js";
+
 export class PiAgentRuntime {
+  private execution: WorkflowExecution | undefined;
   private session: AgentSession | undefined;
   private sessionId: string | undefined;
   private workspaceRoot: string | undefined;
@@ -32,6 +35,10 @@ export class PiAgentRuntime {
   constructor(private readonly peer: JsonlRpcPeer) {}
 
   async handle(method: string, params: JsonObject): Promise<JsonValue> {
+    if (method.startsWith("execution.")) {
+      if (!this.execution) throw new Error("execution host not ready");
+      return this.execution.handle(method, params);
+    }
     if (method === "start") return this.start(params);
     if (method === "prompt") return this.prompt(params, false);
     if (method === "steer") return this.prompt(params, true);
@@ -45,7 +52,8 @@ export class PiAgentRuntime {
 
   private async start(params: JsonObject): Promise<JsonValue> {
     if (this.session) throw new Error("Pi session already started");
-    const { session, sessionId } = await createPiSession(params, this.peer);
+    const { session, sessionId, execution } = await createPiSession(params, this.peer);
+    this.execution = execution;
     session.subscribe((event) => {
       this.outcome.observe(event);
       if (!this.normalizer) return;

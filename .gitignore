@@ -212,6 +212,7 @@ openapi.json
 .worktrees/
 agent-sdk.workspace.code-workspace
 /public_data/
+start_inference.sh
 
 # Integration test outputs
 tests/integration/outputs/

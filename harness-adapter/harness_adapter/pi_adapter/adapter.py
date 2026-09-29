@@ -11,7 +11,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Coroutine
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -41,6 +41,7 @@ from pyromind_runtime.ports.harness import (
     SessionHandle,
     SessionSpec,
 )
+from pyromind_runtime.ports.workflows import WorkflowCall, WorkflowEventSink
 
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
@@ -188,6 +189,7 @@ class PiAdapter:
         knowledge_root: Path | None = None,
         apply_workspace_quota: Callable[[Path, str], None] | None = None,
         pipeline_runs: Callable[[str], PipelineRuns] | None = None,
+        workflow_call: WorkflowCall | None = None,
     ) -> None:
         if getattr(sys, "frozen", False):
             # PyInstaller: __file__ lives under the _MEIPASS extraction dir, so
@@ -196,6 +198,8 @@ class PiAdapter:
             repository = Path(getattr(sys, "_MEIPASS", ""))
         else:
             repository = Path(__file__).parents[3]
+        self._workflow_call = workflow_call
+        self._execution_outputs: dict[str, tuple[str, WorkflowEventSink]] = {}
         self._terminal_backend = validate_pi_terminal_backend(terminal_backend)
         self._conversation_root = Path(conversation_root).resolve()
         self._skills_directory = Path(
@@ -244,6 +248,33 @@ class PiAdapter:
         if self._knowledge_root is not None:
             resource_roots.append(("knowledge", self._knowledge_root))
         self._sandbox = SandboxExecutionManager(resource_roots=resource_roots)
+
+    def execution_request(
+        self, conversation_id: str
+    ) -> Callable[[str, JsonObject], Coroutine[Any, Any, Any]]:
+        async def request(method: str, params: JsonObject) -> Any:
+            session = self._sessions[conversation_id]
+            await self._ensure_runner(session)
+            if method == "execution.run" and params.get("stream") is True:
+                permission = await self._check_permission(
+                    session,
+                    str(params.get("id", "")),
+                    {"command": params.get("command")},
+                )
+                if permission.get("allow") is not True:
+                    raise PermissionError(str(permission.get("reason")))
+            assert session.runner is not None
+            return await session.runner.request(method, params)
+
+        return request
+
+    def execution_subscribe(
+        self, conversation_id: str, execution_id: str, sink: WorkflowEventSink | None
+    ) -> None:
+        if sink is None:
+            self._execution_outputs.pop(execution_id, None)
+        else:
+            self._execution_outputs[execution_id] = (conversation_id, sink)
 
     def _apply_quota(self, root: Path, conversation_id: str) -> None:
         if self._apply_workspace_quota is not None:
@@ -783,6 +814,7 @@ class PiAdapter:
         await runner.start(
             {
                 "session_id": session.session_id,
+                "workflows_enabled": self._workflow_call is not None,
                 "workspace_root": str(session.workspace_root),
                 "terminal_backend": self._terminal_backend,
                 "session_path": str(session.files.session_log_path),
@@ -829,6 +861,43 @@ class PiAdapter:
     async def _runner_request(
         self, session: _PiSession, method: str, params: dict[str, Any]
     ) -> Any:
+        if method == "workflow.invoke":
+            if self._workflow_call is None:
+                raise ValueError("workflows are not configured")
+            action, arguments, request_id = (
+                params.get("action"),
+                params.get("arguments"),
+                params.get("request_id"),
+            )
+            if (
+                not isinstance(action, str)
+                or not isinstance(arguments, dict)
+                or not isinstance(request_id, str)
+            ):
+                raise ValueError("invalid workflow request")
+            inflight = session.files.load_inflight() or {}
+            origin = inflight.get("run_id")
+            if action == "run" and not isinstance(origin, str):
+                raise ValueError("workflow start requires an active originating turn")
+            return await self._workflow_call(
+                session.session_id,
+                action,
+                arguments,
+                request_id,
+                session.context,
+                origin if isinstance(origin, str) else None,
+            )
+        if method == "execution.output":
+            execution_id = params.get("id")
+            if (
+                isinstance(execution_id, str)
+                and execution_id in self._execution_outputs
+            ):
+                scope, sink = self._execution_outputs[execution_id]
+                if scope != session.session_id:
+                    raise ValueError("execution belongs to another conversation")
+                await sink(params)
+            return {}
         if method == "tool.execute":
             tool_name = params.get("tool_name")
             if not isinstance(tool_name, str):

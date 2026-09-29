@@ -13,9 +13,11 @@ from typing import Any
 from uuid import uuid4
 
 from pyromind_runtime.application.event_projection import ProductEventProjector
+from pyromind_runtime.application.reusable_workflows import ReusableWorkflows
 from pyromind_runtime.application.workflow_completion import WorkflowCompletionHook
 from pyromind_runtime.domain.capabilities import ResourceLimits
 from pyromind_runtime.domain.commands import (
+    CancelCommand,
     CommandReceipt,
     ProductCommand,
     RollbackWorkflowCommand,
@@ -43,6 +45,7 @@ from pyromind_runtime.ports.harness import (
     SessionHandle,
     SessionSpec,
 )
+from pyromind_runtime.ports.workflows import WorkflowBackend
 
 
 logger = logging.getLogger(__name__)
@@ -96,6 +99,7 @@ class ConversationRuntime:
         release_grace_seconds: int = 300,
         max_active_conversations: int = 0,
         resource_limits: ResourceLimits | None = None,
+        workflows: WorkflowBackend | None = None,
     ) -> None:
         self.conversation_root = Path(conversation_root)
         self.adapters = (
@@ -109,6 +113,9 @@ class ConversationRuntime:
         self._resource_limits = resource_limits
         self._external_tasks = external_tasks
         self._projector = ProductEventProjector()
+        self._workflows = (
+            ReusableWorkflows(workflows, self._workflow_event) if workflows else None
+        )
         self._idle_eviction_seconds = max(0, int(idle_eviction_seconds))
         self._release_grace_seconds = max(0, int(release_grace_seconds))
         self._max_active_conversations = max(0, int(max_active_conversations))
@@ -119,6 +126,42 @@ class ConversationRuntime:
         self._subscribers: dict[str, set[asyncio.Queue[ProductEvent]]] = {}
         self._first_command_pending: set[str] = set()
         self._first_delta_started_at: dict[tuple[str, str], float] = {}
+
+    async def workflow_call(
+        self,
+        conversation_id: str,
+        action: str,
+        arguments: dict[str, Any],
+        request_id: str,
+        context: RequestContext,
+        origin_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        await self._read_store(conversation_id, context)
+        if self._workflows is None:
+            raise ValueError("Reusable workflows are not configured")
+        return await self._workflows.invoke(
+            conversation_id, action, arguments, request_id, origin_run_id
+        )
+
+    async def _workflow_event(
+        self,
+        conversation_id: str,
+        event_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        event = ProductEvent.model_validate(
+            {
+                "event_id": event_id,
+                "conversation_id": conversation_id,
+                "type": event_type,
+                "payload": payload,
+            }
+        )
+        persisted, _ = await asyncio.to_thread(
+            self._store(conversation_id).append, event
+        )
+        self._publish(persisted)
 
     async def create_conversation(
         self,
@@ -208,6 +251,42 @@ class ConversationRuntime:
         receipt, claimed = store.claim_command(command)
         if not claimed:
             return receipt
+        if self._workflows and isinstance(command, CancelCommand):
+            await self._workflows.cancel(conversation_id)
+        if (
+            self._workflows
+            and isinstance(command, UserMessageCommand)
+            and self._workflows.busy(conversation_id)
+        ):
+            self._workflows.defer(
+                self._send_after_workflow(conversation_id, command, receipt, context)
+            )
+            return receipt
+        return await self._send_claimed(conversation_id, command, receipt, context)
+
+    async def _send_after_workflow(
+        self,
+        conversation_id: str,
+        command: ProductCommand,
+        receipt: CommandReceipt,
+        context: RequestContext,
+    ) -> None:
+        assert self._workflows is not None
+        await self._workflows.wait_idle(conversation_id)
+        await self._ensure_active(conversation_id, context)
+        try:
+            await self._send_claimed(conversation_id, command, receipt, context)
+        except Exception:
+            logger.exception("Deferred workflow message failed: %s", conversation_id)
+
+    async def _send_claimed(
+        self,
+        conversation_id: str,
+        command: ProductCommand,
+        receipt: CommandReceipt,
+        context: RequestContext,
+    ) -> CommandReceipt:
+        store = self._store(conversation_id)
         async with self._use(conversation_id) as active:
             active.context = context
             if isinstance(command, RollbackWorkflowCommand):
@@ -513,6 +592,8 @@ class ConversationRuntime:
                     self._subscribers.pop(conversation_id, None)
 
     async def close(self) -> None:
+        if self._workflows:
+            await self._workflows.close()
         if self._evictor is not None:
             self._evictor.cancel()
             self._evictor = None
@@ -749,6 +830,10 @@ class ConversationRuntime:
                     for completed in await workflow_hook.accept(harness_event):
                         self._publish(completed)
                     if harness_event.type == "run.finished":
+                        if self._workflows:
+                            self._workflows.release(
+                                handle.session_id, harness_event.run_id
+                            )
                         self._schedule_release(handle.session_id)
                     continue
                 if harness_event.type == "message.delta" and harness_event.run_id:
@@ -798,6 +883,8 @@ class ConversationRuntime:
             raise
         except Exception as exc:
             logger.exception("Product event pump failed for %s", handle.session_id)
+            if self._workflows:
+                await self._workflows.cancel(handle.session_id)
             notice = ProductEvent(
                 event_id=f"{handle.session_id}:event-pump-failed",
                 conversation_id=handle.session_id,
@@ -890,6 +977,8 @@ class ConversationRuntime:
             timer.cancel()
 
     def _is_releasable(self, active: _ActiveConversation) -> bool:
+        if self._workflows and self._workflows.busy(active.handle.session_id):
+            return False
         """Report whether a live conversation can be torn down right now.
 
         Every check here closes a window where releasing would break work that

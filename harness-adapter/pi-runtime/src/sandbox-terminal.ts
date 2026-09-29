@@ -231,20 +231,25 @@ export function buildStartLine(
   commandScript: string,
   watchScript: string,
 ): string {
-  const write = (name: string, content: string): string =>
-    `printf '%s' ${shellQuote(Buffer.from(content, "utf8").toString("base64"))} ` +
-    `| base64 -d > ${shellQuote(`${runDir}/${name}`)}`;
+  // Canonical TTY input truncates long physical lines (4096 bytes on Linux).
+  // Shell continuations retain a single command while bounding each input line.
+  const write = (name: string, content: string): string => {
+    const encoded = Buffer.from(content, "utf8").toString("base64");
+    const chunks = encoded.match(/.{1,512}/g) ?? [""];
+    return "printf '%s' \\\n" + chunks.map(shellQuote).join(" \\\n") +
+      ` | base64 -d > ${shellQuote(`${runDir}/${name}`)}`;
+  };
   const setup = [
     "stty -echo 2>/dev/null",
     `mkdir -p ${shellQuote(runDir)}`,
     write("cmd.sh", commandScript),
     write("watch.sh", watchScript),
-  ].join(" && ");
+  ].join(" &&\n");
   const launch =
     `{ setsid sh ${shellQuote(`${runDir}/cmd.sh`)} ` +
     `> ${shellQuote(`${runDir}/out.log`)} 2>&1 & }`;
   return (
-    `${setup} && ${launch} && ` +
+    `${setup} &&\n${launch} &&\n` +
     `sh ${shellQuote(`${runDir}/watch.sh`)} ${shellQuote(runDir)} ${token}\n`
   );
 }

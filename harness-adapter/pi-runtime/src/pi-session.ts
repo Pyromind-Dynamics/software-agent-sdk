@@ -1,3 +1,5 @@
+import { createGenomeExtension } from "@agentgenome/pi-extension";
+import { WorkflowExecution, type ExecutionAccess } from "./workflow-execution.js";
 import { realpathSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -51,11 +53,14 @@ export interface ParsedPrompt {
 export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): Promise<{
   session: AgentSession;
   sessionId: string;
+  execution: WorkflowExecution;
 }> {
   const config = parseConfig(params);
   const { modelRuntime, model } = await createPiModelRuntime(config);
   const env = new NodeExecutionEnv({ cwd: config.workspaceRoot, shellEnv: safeShellEnvironment() });
+  let executionAccess: ExecutionAccess | undefined;
   const options: CreateToolsOptions = {
+    onExecutionReady: (access) => { executionAccess = access; },
     skillsDirectory: config.skillsDirectory,
     ...(config.terminalBackend === "sandbox"
       ? { sandbox: sandboxEndpointProvider(peer) }
@@ -105,6 +110,11 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
     settingsManager,
     systemPrompt: config.systemPrompt,
     extensionFactories: [
+      ...(params.workflows_enabled === true ? [createGenomeExtension({
+        invoke: async (action, args, callId, signal) => peer.request("workflow.invoke", {
+          action, arguments: JSON.parse(JSON.stringify(args)) as JsonObject, request_id: callId,
+        }, signal),
+      })] : []),
       createTerminalPermissionExtension(peer),
       createNoProgressGuardExtension(),
       (pi) => {
@@ -113,6 +123,9 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
             "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
             "Paths starting with knowledge/ or .agents/skills/ are runtime resource aliases: pass them unchanged to file tools, without prepending the skill directory. For other relative paths referenced by a skill file, resolve them against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
           );
+          if (params.workflows_enabled === true) {
+            systemPrompt += "\n历史经验的路径参数使用当前会话执行环境的路径：Storage 文件保留 storage/ 前缀（如 storage/agentTest/input.csv），会话文件使用 public_data/...。与 read/terminal 验证成功的路径保持一致；不要改成服务端路径、平台 /workspace 路径或省略 storage/。";
+          }
           return {
             systemPrompt: applySandboxPathAliases(systemPrompt, sandboxPathAliases),
           };
@@ -154,7 +167,8 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
     sessionManager,
     settingsManager,
   });
-  return { session, sessionId: config.sessionId };
+  if (!executionAccess) throw new Error("execution environment was not initialized");
+  return { session, sessionId: config.sessionId, execution: new WorkflowExecution(executionAccess, peer) };
 }
 
 export function parsePromptContent(value: JsonValue | undefined): ParsedPrompt {

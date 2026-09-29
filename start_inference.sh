@@ -5,6 +5,8 @@
 # Usage:
 #   chmod +x start_inference.sh
 #   ./start_inference.sh
+#   ./start_inference.sh --agentgenome       # enable workflow tools
+#   ./start_inference.sh --test-agentgenome  # validate without model keys
 # ============================================================
 
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -18,7 +20,8 @@ export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 
 export PYROMIND_HARNESS_BACKEND="pi"
 export APP_ENV="${APP_ENV:-dev}"
-export PYROMIND_PI_TERMINAL_BACKEND="${PYROMIND_PI_TERMINAL_BACKEND:-os-sandbox}"
+export PYROMIND_PI_TERMINAL_BACKEND="sandbox"
+export PYROMIND_AGENTGENOME_ENABLED=1
 
 case "$(uname -s)" in
   Darwin)
@@ -45,13 +48,15 @@ esac
 # LLM Configuration
 # ----------------------------------------------------------
 # LiteLLM requires a provider prefix (e.g. openai/) for custom OpenAI-compatible endpoints.
-# export LLM_MODEL="glm-5.3-flash"
-# export LLM_BASE_URL="http://208.64.254.189:8001/v1"
-export LLM_MODEL="deepseek/deepseek-v4-flash-0731"
-export LLM_BASE_URL="http://208.64.254.189:8000/v1"
-# export LLM_MODEL="z-ai/glm-5.3-flash"
+export LLM_MODEL="openai/deepseek-v4.1-flash"
+export LLM_BASE_URL="https://pre-token-plan-cn-east-1.pyromind.ai/v1"
+
+# export LLM_MODEL="deepseek/deepseek-v4-flash-0731"
 # export LLM_BASE_URL="https://openrouter.ai/api/v1"
-export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+#export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+
+export LABEL_STUDIO_BASE_URL=https://pre-label-studio.pyromind.ai
+export LABEL_STUDIO_PORTAL_BASE_URL=https://pre-label-studio.pyromind.ai
 
 #export LLM_MODEL="openai/deepseek-v4-pro"
 #export LLM_BASE_URL="https://api.deepseek.com"
@@ -62,6 +67,7 @@ fi
 export LLM_MODEL="${LLM_MODEL:-openai/deepseek-v4-flash-0731}"
 export OPENAI_API_KEY
 
+
 export DF_API_BASE_URL="https://openrouter.ai/api/v1"
 export DF_API_URL="https://openrouter.ai/api/v1/chat/completions"
 export DF_MODEL_NAME="google/gemma-4-31b-it"
@@ -70,7 +76,7 @@ if [[ -z "${DF_API_KEY:-}" ]]; then
   echo "ERROR: DF_API_KEY is required. Set DF_API_KEY or OPENROUTER_API_KEY." >&2
   exit 1
 fi
-export DF_API_KEY
+#export DF_API_KEY
 
 
 # ----------------------------------------------------------
@@ -150,20 +156,25 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # ----------------------------------------------------------
+# Node TLS Trust
+# ----------------------------------------------------------
+# The Pi runtime runs on Node, which ignores the macOS system keychain, so
+# gateways chained to a root missing from the local OpenSSL store fail with
+# "Connection error.". Point Node at certifi's Mozilla CA bundle instead.
+if [[ -z "${NODE_EXTRA_CA_CERTS:-}" ]]; then
+  export NODE_EXTRA_CA_CERTS="$(
+    uv run --project "${SOFTWARE_AGENT_SDK_DIR}" python -c \
+      'import certifi; print(certifi.where())'
+  )"
+fi
+
+# ----------------------------------------------------------
 # Shared DataFlow Runtime
 # ----------------------------------------------------------
 # Keep DataFlow outside the agent-server venv: some native dependencies do not
 # provide Python 3.13 wheels. Every harness inherits the same interpreter via
 # DATAFLOW_PYTHON, so adapters do not need harness-specific setup.
 DATAFLOW_VERSION="${DATAFLOW_VERSION:-1.0.10}"
-DATAFLOW_PACKAGES=(
-  "open-dataflow==${DATAFLOW_VERSION}"
-  "numpy==1.26.4"
-  "Pillow==12.1.1"
-  "pandas==2.2.3"
-  "opencv-python-headless==4.10.0.84"
-  "matplotlib==3.9.4"
-)
 DATAFLOW_RUNTIME_DIR="${DATAFLOW_RUNTIME_DIR:-${WORKSPACE_DIR}/runtime/dataflow-venv}"
 
 if [[ -z "${DATAFLOW_PYTHON:-}" ]]; then
@@ -185,42 +196,22 @@ import sys
 
 import dataflow
 
-for requirement in sys.argv[1:]:
-    package, version = requirement.split("==", 1)
-    if importlib.metadata.version(package) != version:
-        sys.exit(1)
-' "${DATAFLOW_PACKAGES[@]}" 2>/dev/null; then
-  echo "Installing DataFlow and image-processing dependencies into shared runtime..."
+sys.exit(importlib.metadata.version("open-dataflow") != sys.argv[1])
+' "${DATAFLOW_VERSION}" 2>/dev/null; then
+  echo "Installing open-dataflow==${DATAFLOW_VERSION} into shared runtime..."
   uv pip install \
     --python "${DATAFLOW_PYTHON}" \
-    "${DATAFLOW_PACKAGES[@]}"
+    "open-dataflow==${DATAFLOW_VERSION}"
 fi
 
 "${DATAFLOW_PYTHON}" -c '
 import importlib.metadata
 
-import cv2
 import dataflow
-import matplotlib
-import numpy
-import pandas
-from PIL import Image
 
 version = importlib.metadata.version("open-dataflow")
 print(f"DataFlow runtime ready: open-dataflow=={version}")
 '
-
-# uv venvs do not include pip by default. Seed the matching interpreter's pip,
-# rather than letting terminal commands fall through to a system installation.
-"${DATAFLOW_PYTHON}" -m ensurepip --upgrade --default-pip
-"${DATAFLOW_PYTHON}" -m pip --version
-
-TERMINAL_PYTHON_BIN="$(cd "$(dirname "${DATAFLOW_PYTHON}")" && pwd)"
-TERMINAL_PYTHON_BASE="$("${DATAFLOW_PYTHON}" -c 'import sys; print(sys.base_prefix)')"
-TERMINAL_UV_PYTHON_ROOT="$(uv python dir)"
-# Pi discovers read-only runtime roots from PATH. A venv alone does not cover
-# uv's base interpreter, version-alias symlinks and standard library.
-export TERMINAL_RUNTIME_PATH="${TERMINAL_PYTHON_BIN}:${TERMINAL_UV_PYTHON_ROOT}:${TERMINAL_PYTHON_BASE}:${PATH}"
 
 # ----------------------------------------------------------
 # Pi Runtime
@@ -252,11 +243,11 @@ echo "============================================"
 echo " Pyromind Agent Server"
 echo "============================================"
 echo " LLM Base URL:      ${LLM_BASE_URL}"
+echo " Node CA bundle:    ${NODE_EXTRA_CA_CERTS}"
 echo " Server root:       ${SOFTWARE_AGENT_SDK_DIR}"
 echo " Knowledge Base:    ${PYROMIND_KNOWLEDGE_BASE_PATH}"
 echo " Skills:            ${PYROMIND_SKILLS_PATH}"
 echo " DataFlow Python:   ${DATAFLOW_PYTHON}"
-echo " Terminal Python:   ${TERMINAL_PYTHON_BIN}/python3"
 echo " Workspace root:    ${WORKSPACE_DIR}"
 echo " Conversations:     ${OH_CONVERSATIONS_PATH}"
 echo " Project workspace: ${OH_WORKSPACE_PATH}"
@@ -274,13 +265,8 @@ echo " Auto-reload:       enabled"
 echo "============================================"
 echo ""
 
-# Preserve uv's server interpreter while exposing the shared Python to terminals.
-uv run bash -c '
-  set -euo pipefail
-  server_python="$(command -v python)"
-  export PATH="${TERMINAL_RUNTIME_PATH}"
-  exec "${server_python}" -m pyromind_agent_server "$@"
-' pyromind-agent-server \
+uv run python -m pyromind_agent_server \
   --host 127.0.0.1 \
   --port 8000 \
   --reload
+

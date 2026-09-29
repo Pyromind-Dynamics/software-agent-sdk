@@ -1,7 +1,7 @@
-import { lstat } from "node:fs/promises";
+import { lstat, mkdir, writeFile } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   createEditTool,
   createReadTool,
@@ -39,6 +39,8 @@ import {
   type WorkspacePathOperation,
 } from "./workspace-policy.js";
 
+import type { ExecutionAccess } from "./workflow-execution.js";
+
 const OPENHANDS_ERROR_HEADER = "[An error occurred during execution.]";
 const OMITTED_IMAGE_TEXT = "[Image omitted: Pi only accepts inline base64 image data.]";
 const SANDBOX_READ_PATH_SCOPE =
@@ -58,6 +60,7 @@ export interface SkillRootConfig {
 }
 
 export interface CreateToolsOptions {
+  onExecutionReady?: (access: ExecutionAccess) => void;
   skillsDirectory?: string;
   /** Present only when the session runs its execution plane in a sandbox. */
   sandbox?: SandboxEndpointProvider;
@@ -102,6 +105,13 @@ export async function createTools(
     policy,
     { resourceLimits },
   );
+  options.onExecutionReady?.({ operations: terminalOperations, cwd: workspaceRoot,
+    env: safeShellEnvironment(), confirmsAbort: true,
+    writeFile: async (path, content) => {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, content);
+    },
+    resolvePath: (path, operation) => policy.resolvePath(path, operation) });
   // sandbox-runtime creates Linux bridge sockets under os.tmpdir(). Initialize
   // it before pointing process temp variables at the conversation's much longer
   // terminal-output path, which can exceed sockaddr_un.sun_path's 108-byte limit.
@@ -165,7 +175,8 @@ async function createSandboxTools(
   }
   const sandboxCwd = ".";
   const endpoints = new SandboxEndpointSession(provider);
-  const fileOperations = createSandboxFileOperations(new SandboxFileClient(endpoints));
+  const fileClient = new SandboxFileClient(endpoints);
+  const fileOperations = createSandboxFileOperations(fileClient);
   let policy: SandboxPathPolicy | undefined;
   const resolvePolicy = async (): Promise<SandboxPathPolicy> => {
     if (policy) return policy;
@@ -203,8 +214,12 @@ async function createSandboxTools(
       access: async (path) => fileOperations.edit.access(path),
     },
   });
+  const terminalOperations = new LazySandboxTerminalOperations(endpoints);
+  options.onExecutionReady?.({ operations: terminalOperations, cwd: sandboxCwd,
+    writeFile: (path, content) => fileClient.write(path, content),
+    resolvePath: async (path, operation) => (await resolvePolicy()).resolvePath(path, operation) });
   const bash = createBashTool(sandboxCwd, {
-    operations: new LazySandboxTerminalOperations(endpoints),
+    operations: terminalOperations,
     exposeSessionEnvironment: false,
   });
   return [

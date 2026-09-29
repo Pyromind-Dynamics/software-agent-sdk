@@ -143,3 +143,23 @@ def test_internal_workflow_lifecycle_events_never_enter_public_protocol() -> Non
             }
         )
         assert ProductEventProjector().project("conversation", event) is None
+
+
+def test_reusable_workflow_runtime_has_no_engine_or_harness_imports() -> None:
+    runtime = ROOT / "pyromind-runtime" / "pyromind_runtime"
+    for relative in (
+        "ports/workflows.py",
+        "application/reusable_workflows.py",
+        "application/conversation_runtime.py",
+    ):
+        tree = ast.parse((runtime / relative).read_text())
+        imports = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.append(node.module)
+        assert not any(
+            name.split(".")[0] in {"agentgenome", "core", "harness_adapter", "fastapi"}
+            for name in imports
+        ), relative

@@ -4,15 +4,20 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
 from harness_adapter.openhands_adapter import OpenHandsAdapter
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.domain.capabilities import ResourceLimits
+from pyromind_runtime.domain.content import JsonObject
+from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.harness import HarnessAdapter
+from pyromind_runtime.ports.workflows import WorkflowEventSink
 
 from openhands.agent_server.run_workflow_callback import set_workflow_status_dispatcher
 from openhands.agent_server.storage_quota import ensure_conversation_quota
@@ -47,14 +52,49 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             external_tasks,
         )
 
+    workflows = None
+    workflow_enabled = os.getenv("PYROMIND_AGENTGENOME_ENABLED", "0") == "1"
+
+    async def workflow_call(
+        scope: str,
+        action: str,
+        arguments: JsonObject,
+        request_id: str,
+        context: RequestContext,
+        origin_run_id: str | None,
+    ) -> JsonObject:
+        assert isinstance(runtime, ConversationRuntime)
+        return await runtime.workflow_call(
+            scope, action, arguments, request_id, context, origin_run_id
+        )
+
     if backend == "pi":
         terminal_backend = resolve_pi_terminal_backend()
-        adapters["pi"] = PiAdapter(
+        pi_adapter = PiAdapter(
             service.conversations_dir,
             terminal_backend=terminal_backend,
             apply_workspace_quota=ensure_conversation_quota,
             pipeline_runs=pipeline_runs,
+            workflow_call=workflow_call if workflow_enabled else None,
         )
+        adapters["pi"] = pi_adapter
+        if workflow_enabled:
+
+            def execution_host(scope: str) -> ExecutionHost:
+                def subscribe(
+                    execution_id: str, sink: WorkflowEventSink | None
+                ) -> None:
+                    pi_adapter.execution_subscribe(scope, execution_id, sink)
+
+                return ExecutionHost(pi_adapter.execution_request(scope), subscribe)
+
+            workflows = AgentGenomeBackend(
+                Path(
+                    os.getenv("AGENTGENOME_HOME")
+                    or service.conversations_dir.parent / "agentgenome"
+                ),
+                execution_host,
+            )
     idle_eviction_seconds = int(
         os.getenv("PYROMIND_IDLE_CONVERSATION_EVICTION_SECONDS", "300")
     )
@@ -88,6 +128,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         release_grace_seconds=release_grace_seconds,
         max_active_conversations=max_active_conversations,
         resource_limits=resource_limits_from_environment(),
+        workflows=workflows,
     )
     logger.info(
         "Pyromind product runtime ready: default_harness=%s "
