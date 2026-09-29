@@ -114,6 +114,7 @@ def get_pi_skill_datas():
     data_files = []
     skills_dir = project_root / ".agents" / "skills"
     for skill_name in (
+        "inference-evaluation",
         "generate-workflow-dsl",
         "data-processing",
         "debug-workflow",

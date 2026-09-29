@@ -117,3 +117,24 @@ def test_check_progress_tail_lines_zero_returns_no_records() -> None:
 
     assert obs.percent == 100.0
     assert obs.latest_records == []
+
+
+def test_report_urls_only_resolve_artifacts_in_the_run_directory() -> None:
+    report = {
+        "status": "succeeded",
+        "artifacts": {
+            "evaluation_report.html": "/run/evaluation_report.html",
+            "outside.html": "/run/../other/report.html",
+        },
+    }
+    executor = _make_executor(
+        {
+            "/run/report.json": json.dumps(report).encode(),
+            "/run/evaluation_report.html": b"<!doctype html><html>report</html>",
+            "/run/../other/report.html": b"private",
+        }
+    )
+    observation = executor(DfCheckProgressAction(output_dir="/run"))
+    assert observation.artifact_urls == {
+        "evaluation_report.html": "https://cdn.test/run/evaluation_report.html",
+    }

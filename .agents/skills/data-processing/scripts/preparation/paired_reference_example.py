@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -11,7 +12,14 @@ from pathlib import Path
 import numpy as np
 import reference_synthesis as rs
 from PIL import Image
-from template_synthesis import bbox_from_mask
+from template_synthesis import (
+    Check,
+    RenderedEvidence,
+    SourceEvidence,
+    SynthesisFailure,
+    bbox_from_mask,
+    mask_components,
+)
 
 
 def main(input_path: str, output_path: str) -> None:
@@ -32,7 +40,10 @@ def main(input_path: str, output_path: str) -> None:
         and source_plan["purpose"] != "method_validation"
     ):
         raise ValueError("training candidates require an explicit train split")
-    if (out / "assets").exists() or Path(output_path).exists():
+    if any(
+        (out / name).exists()
+        for name in ("assets", "augmentation_plan.json", Path(output_path).name)
+    ):
         raise ValueError("use a new output directory for each pilot")
     if not source_plan["variants"]:
         raise ValueError("at least one variant is required")
@@ -108,6 +119,81 @@ def main(input_path: str, output_path: str) -> None:
             **source_plan["structure_rule"],
         )
 
+    def material_change(
+        image: rs.Pixels, normal: rs.Mask, mask: rs.Mask
+    ) -> list[Check]:
+        actual = (
+            np.asarray(Image.fromarray(image).convert("L"))
+            > source_plan["source_material_threshold"]
+        )
+        operation = source_plan["structure_rule"]["operation"]
+        expected_delta = source_plan["structure_rule"]["component_delta"]
+        delta = len(mask_components(actual)) - len(mask_components(normal))
+        changed = actual != normal
+        direction = bool(np.any(changed & mask))
+        if operation == "remove":
+            direction = direction and not bool(np.any(actual[mask] & ~normal[mask]))
+        elif operation == "add":
+            direction = direction and not bool(np.any(~actual[mask] & normal[mask]))
+        else:
+            direction = True
+        return [
+            Check("material_direction", direction, "measured on rendered pixels"),
+            Check(
+                "connectivity",
+                delta == expected_delta
+                if expected_delta is not None
+                else (True if operation == "appearance" else None),
+                "structural intent needs an explicit topology expectation",
+                {"actual_delta": delta, "expected_delta": expected_delta},
+            ),
+        ]
+
+    def validate_source(evidence: SourceEvidence) -> list[Check]:
+        if evidence.image is None:
+            return [Check("source_image", None, "source image is unavailable")]
+        checks = material_change(
+            evidence.image, evidence.regions["material"], evidence.template.mask
+        )
+        checks.append(
+            Check(
+                "material_basis",
+                True if source_plan.get("material_mapping_basis") else None,
+                source_plan.get(
+                    "material_mapping_basis", "material meaning is unverified"
+                ),
+            )
+        )
+        return checks
+
+    def validate_rendered(evidence: RenderedEvidence) -> list[Check]:
+        return material_change(
+            evidence.image, evidence.regions["material"], evidence.mask
+        )
+
+    version = source_plan.get("validation_version", 1)
+    if version not in (1, 2):
+        raise ValueError("unsupported validation_version")
+    source_evidence = SourceEvidence(
+        pair.source,
+        reference.image,
+        rs.region_mask(mask.shape, aligned_box),
+        defect.template,
+        {"material": reference.material},
+    )
+    source_plan["search"] = {
+        "variants": source_plan["variants"],
+        "max_attempts": source_plan["synthesis"]["max_attempts"],
+    }
+    source_plan["acceptance"] = {
+        "structure_rule": source_plan["structure_rule"],
+        "context_policy": source_plan["context_policy"],
+        **{k: v for k, v in source_plan["synthesis"].items() if k != "max_attempts"},
+    }
+    (out / "augmentation_plan.json").write_text(
+        json.dumps(source_plan, ensure_ascii=False, indent=2)
+    )
+    shutil.copyfile(__file__, out / "frozen_pipeline.py")
     records = []
     reviews = []
     panels = []
@@ -133,12 +219,22 @@ def main(input_path: str, output_path: str) -> None:
                 ),
                 rules=[rule],
                 context_policy=policy,
+                source_evidence=source_evidence,
+                validate_source=validate_source if version == 2 else None,
+                validate_rendered=validate_rendered if version == 2 else None,
                 **source_plan["synthesis"],
                 **variant,
             )
         except ValueError as exc:
             failures.append(
-                {"sample_id": sid, "stage": "synthesis", "reason": str(exc)}
+                {
+                    "sample_id": sid,
+                    "stage": "synthesis",
+                    "reason": str(exc),
+                    "attempts": exc.attempts
+                    if isinstance(exc, SynthesisFailure)
+                    else [],
+                }
             )
             continue
         record = rs.export_sample(result, out, sid, source_plan["category"])
@@ -197,11 +293,14 @@ def main(input_path: str, output_path: str) -> None:
         plan_path="augmentation_plan.json",
         selected_ids={r["sample_id"] for r in records},
         min_iou=source_plan["review_min_iou"],
+        strategy_path="frozen_pipeline.py",
     )
     (out / "review_binding.json").write_text(json.dumps(binding, indent=2))
     report = {
         "generated": len(records),
         "requested": len(source_plan["variants"]),
+        "validation_version": version,
+        "quality_passed": 0,
         "failures": failures,
         "training_ready": False,
         "status": "candidate_review_only",
@@ -217,17 +316,23 @@ def main(input_path: str, output_path: str) -> None:
             for k in ("donor_rgb", "donor_cam")
         },
     }
-    (out / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
-    (out / "validation.json").write_text(
+    (out / "synthesis_report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2)
+    )
+    (out / "synthesis_validation.json").write_text(
         json.dumps(
             {
-                "program_status": "passed" if records and not failures else "failed",
+                "program_status": "passed"
+                if records
+                and not failures
+                and all(r["program_status"] == "passed" for r in records)
+                else "needs_review",
                 "visual_status": "not_reviewed",
                 "training_ready": False,
             }
         )
     )
-    (out / "progress.json").write_text(
+    (out / "synthesis_progress.json").write_text(
         json.dumps(
             {
                 "processed": len(source_plan["variants"]),
@@ -237,7 +342,7 @@ def main(input_path: str, output_path: str) -> None:
             }
         )
     )
-    (out / "report.html").write_text(
+    (out / "synthesis_report.html").write_text(
         '<!doctype html><meta charset="utf-8"><title>Template synthesis review</title>'
         "<h2>Method-validation candidates; visual review pending</h2>"
         "<p>Template: source with annotation | GT | extracted pixels | mask</p>"

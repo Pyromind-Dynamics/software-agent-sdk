@@ -31,8 +31,14 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
+from openhands.tools.data_preparation.inference import (
+    InferenceOptions,
+    InferencePipelineHandler,
+    validate_pipeline_topology,
+)
 from openhands.tools.data_preparation.runner import (
     DATAFLOW_RUNTIME_PACKAGES,
+    LabelingModelGateway,
     build_dataflow_env,
     runtime_bundle_fingerprint,
     runtime_public_names,
@@ -106,10 +112,22 @@ DATA_PROCESSING_PACKAGES = DATAFLOW_RUNTIME_PACKAGES
 TOOL_DESCRIPTION = """\
 Submit an agent-authored Python pipeline for asynchronous execution on Pyromind.
 
+For Storage model evaluation, pass inference with model_path and workspace
+dataset_config_path / evaluation_config_path. This builds exactly one
+VLLMInference connected to one CustomCommandCPUNode with the built-in rubric
+evaluator. No local GPU sample, script_path, model_profile, output_schema or
+format conversion is needed in this mode. Read report.json and its HTML artifact
+after the callback. Inference resume requires unchanged configuration and data;
+omit inference to reuse the frozen configuration. Only submit when execution
+has been requested. Evaluation configuration changes require a new full run.
+
 Call mode='full' only after the user confirms a successful local
-df_run_pipeline result. The tool freezes the local script and shared runtime
+df_run_pipeline result for data processing. The tool freezes the local script
+and shared runtime
 in a per-run Storage directory. Set model_profile and output_schema explicitly
-for new standard runs.
+for new standard runs. When the user supplies their own labeling gateway, pass
+it as labeling_gateway with model_profile='vision'; it replaces the managed
+vision model for this run.
 
 The tool creates a one-node CustomCommandNode workflow that:
 1. Creates a venv with the server-locked data-processing dependencies
@@ -163,6 +181,11 @@ class ReuseAssessment(BaseModel):
 class DfSubmitPipelineAction(Action):
     """Submit a DataFlow-compatible Python pipeline to Pyromind Studio."""
 
+    inference: InferenceOptions | None = Field(
+        default=None,
+        description="Storage model evaluation with a fixed inference -> CPU topology.",
+    )
+
     script_path: str | None = Field(
         default=None,
         description=(
@@ -204,6 +227,15 @@ class DfSubmitPipelineAction(Action):
             "Use none for pure Python/AVI work without model credentials, text "
             "for the conversation model, or vision for managed image work. "
             "Resume inherits the prior profile when omitted."
+        ),
+    )
+    labeling_gateway: LabelingModelGateway | None = Field(
+        default=None,
+        description=(
+            "Optional user-supplied OpenAI-compatible gateway for the image "
+            "labeling model: api_url (or base_url), model, and api_key. When set "
+            "it replaces the managed vision model for this run and requires the "
+            "vision profile."
         ),
     )
     output_schema: OutputSchema | None = Field(
@@ -495,6 +527,7 @@ class DfSubmitPipelineExecutor(
         storage_secret_headers: dict[str, str] | None = None,
         task_store_dir: str | None = None,
         timeout: int = 30,
+        inference_handler: InferencePipelineHandler | None = None,
     ) -> None:
         self._env = env
         self._cluster = cluster
@@ -512,6 +545,7 @@ class DfSubmitPipelineExecutor(
         self._storage_secret_headers = dict(storage_secret_headers or {})
         self._task_store_dir = Path(task_store_dir) if task_store_dir else None
         self._timeout = timeout
+        self._inference_handler = inference_handler
 
     def __call__(
         self,
@@ -534,6 +568,26 @@ class DfSubmitPipelineExecutor(
         files: _SubmissionFiles,
     ) -> DfSubmitPipelineObservation:
         try:
+            handler = self._inference_handler
+            inference_resume = (
+                handler is not None
+                and action.mode == "resume"
+                and action.resume_run_id is not None
+                and handler.runs.resolve(str(action.resume_run_id)) is not None
+            )
+            if action.inference is not None or inference_resume:
+                if handler is None:
+                    raise ValueError("inference evaluation is not configured")
+                try:
+                    return DfSubmitPipelineObservation.from_text(
+                        **handler.submit(self, action, conversation)
+                    )
+                except Exception as exc:
+                    return DfSubmitPipelineObservation.from_text(
+                        text=f"Inference evaluation submission failed: {exc}",
+                        status="Failed",
+                        is_error=True,
+                    )
             input_path = _normalize_storage_path(action.input_path, "input_path")
             task_store = self._task_store(conversation)
             resumed = action.mode == "resume"
@@ -622,7 +676,7 @@ class DfSubmitPipelineExecutor(
                     )
                     should_stage_support_file = True
                 llm_env = (
-                    _build_llm_env(conversation, model_profile)
+                    _build_llm_env(conversation, model_profile, action.labeling_gateway)
                     if model_profile != "none"
                     else {}
                 )
@@ -674,7 +728,7 @@ class DfSubmitPipelineExecutor(
                 frozen_script_name = "pipeline.py"
                 pipeline_fingerprint = _file_sha256(Path(local_script_path))
                 llm_env = (
-                    _build_llm_env(conversation, model_profile)
+                    _build_llm_env(conversation, model_profile, action.labeling_gateway)
                     if model_profile != "none"
                     else {}
                 )
@@ -723,6 +777,7 @@ class DfSubmitPipelineExecutor(
                 support_file_name=support_file_name,
             )
             workflow = _build_dataflow_workflow(action, run_id, command)
+            validate_pipeline_topology(workflow)
         except PipelineResolutionError as exc:
             return DfSubmitPipelineObservation.from_text(
                 text=(
@@ -1048,6 +1103,7 @@ class DfSubmitPipelineTool(
             str(task_store_dir_value) if task_store_dir_value is not None else None
         )
         timeout = int(params.pop("timeout", 30))
+        inference_handler = params.pop("inference_handler", None)
         if params:
             names = ", ".join(sorted(params))
             raise ValueError(f"DfSubmitPipelineTool got unknown params: {names}")
@@ -1071,6 +1127,7 @@ class DfSubmitPipelineTool(
                     storage_secret_headers=storage_secret_headers,
                     task_store_dir=task_store_dir,
                     timeout=timeout,
+                    inference_handler=inference_handler,
                 ),
                 annotations=ToolAnnotations(
                     title="df_submit_pipeline",
@@ -1119,6 +1176,10 @@ def _build_dataflow_command(
     frozen_script = f"{pod_output_dir}/{frozen_script_name}"
     output_file = f"{pod_output_dir}/processed.jsonl"
     venv_python = "/tmp/df-venv/bin/python"
+    setup_log = f"{pod_output_dir}/setup.log"
+    pipeline_log = f"{pod_output_dir}/pipeline.log"
+    validation_log = f"{pod_output_dir}/validation.log"
+    report_log = f"{pod_output_dir}/report.log"
     required_runtime_files = (
         RUNTIME_FILENAMES
         if runtime_dir_name or runtime_storage_dir
@@ -1161,9 +1222,11 @@ def _build_dataflow_command(
     packages = DATA_PROCESSING_PACKAGES
     package_args = " ".join(shlex.quote(item) for item in packages)
     setup_steps = [
-        "python3 -m venv /tmp/df-venv",
-        "/tmp/df-venv/bin/pip install --use-deprecated=legacy-resolver " + package_args,
         f"mkdir -p {shlex.quote(pod_output_dir)}",
+        f"python3 -m venv /tmp/df-venv > {shlex.quote(setup_log)} 2>&1",
+        "/tmp/df-venv/bin/pip install --use-deprecated=legacy-resolver "
+        + package_args
+        + f" >> {shlex.quote(setup_log)} 2>&1",
         f"test -f {shlex.quote(frozen_script)}",
         *[
             f"test -f {shlex.quote(f'{pod_runtime_dir}/{filename}')}"
@@ -1206,6 +1269,7 @@ def _build_dataflow_command(
     pipeline_step = (
         f"{env_prefix} {venv_python} {shlex.quote(frozen_script)}"
         f" {' '.join(pipeline_args)}"
+        f" > {shlex.quote(pipeline_log)} 2>&1"
     )
     validation_step = "validation_rc=0"
     if output_schema is not None and output_schema != "structured":
@@ -1224,6 +1288,7 @@ def _build_dataflow_command(
             f"{shlex.quote(output_file)} --schema {shlex.quote(output_schema)} "
             f"{image_root_arg}"
             f"--report {shlex.quote(validation_report)}"
+            f" > {shlex.quote(validation_log)} 2>&1"
             " || validation_rc=$?; fi"
         )
     report_step = (
@@ -1244,13 +1309,21 @@ def _build_dataflow_command(
         report_step += " --reuse-assessment-json " + shlex.quote(
             json.dumps(reuse_assessment, ensure_ascii=False)
         )
-    report_step += " || true"
+    report_step += f" >> {shlex.quote(report_log)} 2>&1 || true"
     final_step = (
         'if [ "$source_integrity_rc" -ne 0 ]; then '
+        f'echo "Data processing failed during source integrity check; '
+        f'see {pod_output_dir}/source_integrity.json" >&2; '
         'exit "$source_integrity_rc"; fi; '
-        'if [ "$pipeline_rc" -ne 0 ]; then exit "$pipeline_rc"; fi; '
-        'if [ "$validation_rc" -ne 0 ]; then exit "$validation_rc"; fi; '
-        "exit 0"
+        'if [ "$pipeline_rc" -ne 0 ]; then '
+        f'echo "Data processing failed with exit code $pipeline_rc; '
+        f'last log lines:" >&2; tail -n 40 {shlex.quote(pipeline_log)} >&2; '
+        'exit "$pipeline_rc"; fi; '
+        'if [ "$validation_rc" -ne 0 ]; then '
+        f'echo "Output validation failed; '
+        f'last log lines:" >&2; tail -n 40 {shlex.quote(validation_log)} >&2; '
+        'exit "$validation_rc"; fi; '
+        f'echo "Data preparation completed: {output_file}"'
     )
     return (
         " && ".join([*setup_steps, pipeline_step])
@@ -1297,10 +1370,11 @@ def _build_dataflow_workflow(
 def _build_llm_env(
     conversation: BaseConversation,
     model_profile: Literal["text", "vision"] = "text",
+    gateway: LabelingModelGateway | None = None,
 ) -> dict[str, str]:
     """Use the same model-profile resolver as local df_run_pipeline."""
 
-    return build_dataflow_env(conversation, model_profile)
+    return build_dataflow_env(conversation, model_profile, gateway=gateway)
 
 
 class PipelineResolutionError(ValueError):

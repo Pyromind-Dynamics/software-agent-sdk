@@ -1,9 +1,9 @@
-"""Per-user Label Studio API tokens, issued by the portal.
+"""Per-user Label Studio API tokens, issued by the Label Studio plugin.
 
 Label Studio shows an account only the projects of its own organization, and the
-portal gives each user their own organization. A token shared by every
+plugin gives each portal user their own organization. A token shared by every
 conversation would therefore file each user's projects under a single account,
-where the user who asked for them could not see them. The portal hands each
+where the user who asked for them could not see them. The plugin hands each
 caller the token of their own account, over the credential that caller already
 authenticated with.
 """
@@ -21,7 +21,7 @@ TOKEN_ROUTE = "/label_studio/token"
 
 
 class PortalTokenProvider:
-    """Reads the calling user's own Label Studio token from the portal."""
+    """Reads the calling user's own Label Studio token from the plugin."""
 
     def __init__(
         self,
@@ -35,8 +35,8 @@ class PortalTokenProvider:
         self._timeout = timeout
 
     def fetch(self) -> str:
-        # The URL is part of every failure: a portal_base_url that names the
-        # console instead of this API answers with the console's SPA shell.
+        # The URL is part of every failure: a portal_base_url that names a static
+        # host instead of this API answers with that host's SPA shell.
         endpoint = f"{self._portal_base_url}{TOKEN_ROUTE}"
         try:
             response = httpx.get(endpoint, headers=self._headers, timeout=self._timeout)

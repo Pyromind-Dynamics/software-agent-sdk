@@ -67,7 +67,9 @@ JSON fence 解析、响应修复或日志逻辑。
 - `timeout=1800`
 
 模型配置统一来自 `DF_API_KEY`、`DF_API_BASE_URL` 和 `DF_MODEL_NAME`，不得写入
-Pipeline。
+Pipeline。这三个值有两个来源：用户自己提供的打标网关（工具参数
+`labeling_gateway`，整体替换平台配置），或平台默认的 `DF_*`。Pipeline 只读
+`DF_*`，不关心来源；本地试跑和平台全量用同一个网关。
 
 ## 执行入口
 

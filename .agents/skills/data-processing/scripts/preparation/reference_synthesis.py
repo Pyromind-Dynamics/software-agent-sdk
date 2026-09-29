@@ -13,21 +13,25 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image, ImageDraw, ImageFilter
 from template_synthesis import (
+    Acceptance,
     Artifacts,
     Box,
+    CandidateEvidence,
     Check,
+    GeneratedSample,
     Mask,
     PairTransform,
     Pixels,
+    RenderedEvidence,
+    SourceEvidence,
     Template,
     apply_pair_transform,
-    compute_artifacts,
-    constrain_template,
     extract_template,
-    inject_anomaly,
     mask_components,
-    transform_template,
+    synthesize_template,
+    transform_region,
     validate_rules,
+    validation_coverage,
 )
 
 
@@ -526,6 +530,11 @@ def synthesize_sample(
     context_policy: ContextPolicy | None = None,
     material_mapping: Literal["same", "inverted"] | None = None,
     mapping_basis: str = "",
+    source_evidence: SourceEvidence | None = None,
+    regions: Mapping[str, Mask] | None = None,
+    validate_source: Callable[[SourceEvidence], Sequence[Check]] | None = None,
+    validate_candidate: Callable[[CandidateEvidence], Sequence[Check]] | None = None,
+    validate_rendered: Callable[[RenderedEvidence], Sequence[Check]] | None = None,
 ) -> Sample:
     context_policy = context_policy or ContextPolicy()
     if (
@@ -564,95 +573,167 @@ def synthesize_sample(
         )
         return context_check(source_context, target, policy=context_policy, name=name)
 
-    centers = np.argwhere(candidate_centers)
-    rng = np.random.default_rng(seed)
-    attempts: list[dict[str, Any]] = []
-    for index in rng.permutation(len(centers))[:max_attempts]:
-        cy, cx = (int(v) for v in centers[index])
-        try:
-            placed = transform_template(
-                defect.template,
-                target_shape=reference.material.shape,
-                center_xy=(cx, cy),
-                scale_xy=scale_xy,
-                angle_deg=angle_deg,
-            )
-            placed = constrain_template(placed, allowed_mask)
-            assert placed.uncropped_area is not None
-            area = int(placed.mask.sum())
-            clip = 1 - area / placed.uncropped_area
-            checks = [
-                Check("area", min_area <= area <= max_area, f"pixels={area}"),
-                Check("clipping", clip <= max_clip_fraction, f"lost_fraction={clip}"),
-                check_context(placed.mask, "source_context"),
-            ]
-            checks.extend(validate_rules(placed.mask, rules))
-            if not all(c.passed for c in checks):
-                raise ValueError(
-                    "; ".join(f"{c.name}: {c.reason}" for c in checks if not c.passed)
-                )
-            image = inject_anomaly(
-                reference.image,
-                placed,
-                base_role="gt_recolored_reference",
-                fill_rgb=fill_rgb,
-                feather=feather,
-            )
-            modified = np.any(image != reference.image, axis=2)
-            if np.any(modified & ~placed.mask):
-                raise ValueError("pixel changes outside defect mask")
-            changed_context = check_context(modified, "modified_context")
-            checks.append(changed_context)
-            if not changed_context.passed:
-                raise ValueError(f"{changed_context.name}: {changed_context.reason}")
-            image, normal, mask = apply_pair_transform(
-                image, reference.image, placed.mask, pair_transform
-            )
-            gt, _, _ = apply_pair_transform(
-                reference.gt, reference.gt, placed.mask, pair_transform
-            )
-            artifacts = compute_artifacts(
-                image,
-                normal,
-                mask,
-                difference_fn=lambda s, _r: highpass_display(
-                    highpass_residual(s, radius=highpass_radius), gain=highpass_gain
-                ),
-                difference_kind="defect_gray_gaussian_highpass",
-                visibility_threshold=visibility_threshold,
-                min_visible_pixels=min_visible_pixels,
-            )
-            return Sample(
-                image,
-                normal,
-                gt,
-                mask,
-                artifacts,
-                checks,
-                {
-                    "seed": seed,
-                    "center_xy": [cx, cy],
-                    "scale_xy": scale_xy,
-                    "angle_deg": angle_deg,
-                    "pair_transform": pair_transform,
-                    "clipped_fraction": clip,
-                    "rejected_attempts": attempts,
-                    "highpass_radius": highpass_radius,
-                    "highpass_gain": highpass_gain,
-                    "defect_source": defect.source_id,
-                    "reference_source": reference.source_id,
-                    "extraction_method": defect.extraction_method,
-                    "annotation_box": defect.annotation_box,
-                    "reference_parameters": reference.parameters,
-                    "source_context": source_context,
-                    "context_policy": asdict(context_policy),
-                    "material_mapping": material_mapping or "same_pair",
-                    "mapping_basis": mapping_basis,
-                },
-            )
-        except ValueError as exc:
-            attempts.append({"center_xy": [cx, cy], "reason": str(exc)})
-    raise ValueError(f"candidate_exhausted: {attempts}")
+    if validate_source is not None and source_evidence is None:
+        raise ValueError("source validation requires original source evidence")
+    if source_evidence is not None and not np.array_equal(
+        source_evidence.template.mask, defect.template.mask
+    ):
+        raise ValueError("source evidence must describe the template being placed")
+    source_evidence = source_evidence or SourceEvidence(
+        defect.template.texture,
+        None,
+        region_mask(defect.template.mask.shape, defect.annotation_box),
+        defect.template,
+        {"material": defect.source_material},
+    )
+
+    def candidate_checks(candidate: CandidateEvidence) -> list[Check]:
+        checks = [check_context(candidate.constrained.mask, "source_context")]
+        checks.extend(validate_rules(candidate.constrained.mask, rules))
+        if validate_candidate is not None:
+            checks.extend(validate_candidate(candidate))
+        return checks
+
+    def rendered_checks(rendered: RenderedEvidence) -> list[Check]:
+        # Pair transforms are involutions, so this restores reference coordinates.
+        changed = transform_region(rendered.changed, pair_transform)
+        checks = [check_context(changed, "modified_context")]
+        if validate_rendered is not None:
+            checks.extend(validate_rendered(rendered))
+        return checks
+
+    generated = synthesize_template(
+        source_evidence,
+        reference.image,
+        candidate_centers=candidate_centers,
+        allowed_mask=allowed_mask,
+        acceptance=Acceptance(
+            min_area,
+            max_area,
+            max_clip_fraction,
+            visibility_threshold,
+            min_visible_pixels,
+        ),
+        seed=seed,
+        max_attempts=max_attempts,
+        scale_xy=scale_xy,
+        angle_deg=angle_deg,
+        pair_transform=pair_transform,
+        feather=feather,
+        fill_rgb=fill_rgb,
+        regions={**(regions or {}), "material": reference.material},
+        validate_source=validate_source,
+        validate_candidate=candidate_checks,
+        validate_rendered=rendered_checks,
+    )
+    checks = [
+        Check(
+            c.name,
+            c.passed,
+            c.reason,
+            c.measurements,
+            "context" if c.name in {"source_context", "modified_context"} else c.stage,
+        )
+        for c in generated.checks
+    ]
+    gt, _, _ = apply_pair_transform(
+        reference.gt, reference.gt, generated.mask, pair_transform
+    )
+    difference = highpass_display(
+        highpass_residual(generated.image, radius=highpass_radius), gain=highpass_gain
+    )
+    artifacts = Artifacts(
+        difference,
+        "defect_gray_gaussian_highpass",
+        generated.artifacts.bbox_xyxy,
+        generated.artifacts.visible_pixels,
+    )
+    return Sample(
+        generated.image,
+        generated.reference,
+        gt,
+        generated.mask,
+        artifacts,
+        checks,
+        {
+            **generated.parameters,
+            "validation_coverage": validation_coverage(checks),
+            "highpass_radius": highpass_radius,
+            "highpass_gain": highpass_gain,
+            "defect_source": defect.source_id,
+            "reference_source": reference.source_id,
+            "extraction_method": defect.extraction_method,
+            "annotation_box": defect.annotation_box,
+            "reference_parameters": reference.parameters,
+            "source_context": source_context,
+            "context_policy": asdict(context_policy),
+            "material_mapping": material_mapping or "same_pair",
+            "mapping_basis": mapping_basis,
+        },
+    )
+
+
+def review_assessment(
+    result: Mapping[str, Any] | None,
+    *,
+    expected_category: str,
+    expected_box: Box,
+    min_iou: float,
+    failed: bool = False,
+    image_size: Sequence[int] | None = None,
+    category_aliases: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Keep independent verdicts; aliases must be declared before blind review."""
+    if failed or result is None:
+        return {"status": "review_failed", "reasons": ["missing_review"], "checks": {}}
+    required = {
+        "category",
+        "bbox_xyxy",
+        "realistic",
+        "extra_anomalies",
+        "uncertain",
+        "context_consistent",
+    }
+    if not required <= result.keys() or not 0 < min_iou <= 1:
+        return {"status": "review_failed", "reasons": ["invalid_review"], "checks": {}}
+    box = result["bbox_xyxy"]
+    if (
+        not isinstance(box, list)
+        or len(box) != 4
+        or any(type(v) is not int for v in box)
+        or not isinstance(result["category"], str)
+        or any(
+            type(result[k]) is not bool
+            for k in ("realistic", "extra_anomalies", "uncertain", "context_consistent")
+        )
+    ):
+        return {"status": "review_failed", "reasons": ["invalid_review"], "checks": {}}
+    x1, y1, x2, y2 = box
+    valid_box = x1 < x2 and y1 < y2 and min(x1, y1) >= 0
+    if image_size is not None:
+        valid_box = valid_box and x2 <= image_size[0] and y2 <= image_size[1]
+    a, b, c, d = expected_box
+    intersection = max(0, min(x2, c) - max(x1, a)) * max(0, min(y2, d) - max(y1, b))
+    union = (x2 - x1) * (y2 - y1) + (c - a) * (d - b) - intersection
+    iou = intersection / union if valid_box and union > 0 else 0.0
+    aliases = category_aliases or {}
+    checks = {
+        "category": aliases.get(result["category"], result["category"])
+        == expected_category,
+        "localization": valid_box and iou >= min_iou,
+        "realism": result["realistic"],
+        "no_extra_anomalies": not result["extra_anomalies"],
+        "certainty": not result["uncertain"],
+        "context": result["context_consistent"],
+    }
+    return {
+        "status": "passed" if all(checks.values()) else "needs_review",
+        "checks": checks,
+        "reasons": [key for key, passed in checks.items() if not passed],
+        "iou": iou,
+        "reported_category": result["category"],
+        "reported_box": box,
+    }
 
 
 def review_status(
@@ -663,51 +744,17 @@ def review_status(
     min_iou: float,
     failed: bool = False,
     image_size: Sequence[int] | None = None,
+    category_aliases: Mapping[str, str] | None = None,
 ) -> str:
-    """Merge independently inferred category/location with expected annotation."""
-    if failed or result is None:
-        return "review_failed"
-    required = {
-        "category",
-        "bbox_xyxy",
-        "realistic",
-        "extra_anomalies",
-        "uncertain",
-        "context_consistent",
-    }
-    if not required <= result.keys() or not 0 < min_iou <= 1:
-        return "review_failed"
-    box = result["bbox_xyxy"]
-    if (
-        not isinstance(box, list)
-        or len(box) != 4
-        or any(type(v) is not int for v in box)
-    ):
-        return "review_failed"
-    if any(
-        type(result[k]) is not bool
-        for k in ("realistic", "extra_anomalies", "uncertain", "context_consistent")
-    ):
-        return "review_failed"
-    x1, y1, x2, y2 = box
-    if x1 >= x2 or y1 >= y2:
-        return "needs_review"
-    if min(x1, y1) < 0 or (
-        image_size is not None and (x2 > image_size[0] or y2 > image_size[1])
-    ):
-        return "needs_review"
-    a, b, c, d = expected_box
-    intersection = max(0, min(x2, c) - max(x1, a)) * max(0, min(y2, d) - max(y1, b))
-    union = (x2 - x1) * (y2 - y1) + (c - a) * (d - b) - intersection
-    passed = (
-        not result["uncertain"]
-        and result["realistic"]
-        and not result["extra_anomalies"]
-        and result["context_consistent"]
-        and result["category"] == expected_category
-        and intersection / union >= min_iou
-    )
-    return "passed" if passed else "needs_review"
+    return review_assessment(
+        result,
+        expected_category=expected_category,
+        expected_box=expected_box,
+        min_iou=min_iou,
+        failed=failed,
+        image_size=image_size,
+        category_aliases=category_aliases,
+    )["status"]
 
 
 def merge_review_outputs(
@@ -716,6 +763,7 @@ def merge_review_outputs(
     *,
     selected_ids: set[str],
     min_iou: float,
+    category_aliases: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Read the managed vision wire format; match by image path, never row order."""
     answers: dict[str, Mapping[str, Any] | None] = {}
@@ -748,26 +796,49 @@ def merge_review_outputs(
         image_path = next(
             a["path"] for a in sample["artifacts"] if a["role"] == "image"
         )
-        status = "not_reviewed"
+        assessment = {
+            "status": "not_reviewed",
+            "checks": {},
+            "reasons": ["not_reviewed"],
+        }
         if sample["sample_id"] in selected_ids:
-            status = review_status(
+            assessment = review_assessment(
                 answers.get(image_path),
                 expected_category=sample["category"],
                 expected_box=sample["bbox_xyxy"],
                 min_iou=min_iou,
                 image_size=sample.get("image_size"),
+                category_aliases=category_aliases,
             )
+        status = assessment["status"]
         checks = sample.get("checks", [])
+        coverage = {
+            stage: bool(selected := [c for c in checks if c.get("stage") == stage])
+            and all(c.get("passed") is True for c in selected)
+            for stage in ("source", "candidate", "rendered")
+        }
+        reasons = list(assessment["reasons"])
+        if not all(coverage.values()) or sample.get("validation_version") != 2:
+            reasons.append("incomplete_validation")
+        reasons.extend(
+            f"{c.get('stage', 'legacy')}:{c.get('name', 'check')}"
+            for c in checks
+            if c.get("passed") is not True
+        )
         program_passed = (
             sample.get("program_status") == "passed"
-            and {"source_context", "modified_context"}
-            <= {c.get("name") for c in checks}
+            and sample.get("validation_version") == 2
+            and all(coverage.values())
             and all(c.get("passed") is True for c in checks)
         )
         merged.append(
             {
                 **sample,
                 "visual_status": status,
+                "visual_assessment": assessment,
+                "validation_coverage": coverage,
+                "quality_reasons": reasons
+                + ([] if program_passed else ["program_validation"]),
                 "quality_status": "passed"
                 if program_passed and status == "passed"
                 else "needs_review",
@@ -785,6 +856,7 @@ def freeze_review_binding(
     plan_path: str,
     selected_ids: set[str],
     min_iou: float,
+    strategy_path: str | None = None,
 ) -> dict[str, Any]:
     """Bind review to the exact input, strategy and assets before model execution."""
     if not 0 < min_iou <= 1:
@@ -795,6 +867,20 @@ def freeze_review_binding(
     if not selected_ids <= {s["sample_id"] for s in samples}:
         raise ValueError("selected review IDs must exist")
     paths = {samples_path, review_input_path, plan_path}
+    if strategy_path is not None:
+        paths.add(strategy_path)
+    plan = json.loads((root / plan_path).read_text())
+    if plan.get("review_min_iou", min_iou) != min_iou:
+        raise ValueError("review threshold must match the frozen plan")
+    aliases = plan.get("category_aliases", {})
+    if not isinstance(aliases, dict) or any(
+        not isinstance(k, str) or not isinstance(v, str) or not k or not v
+        for k, v in aliases.items()
+    ):
+        raise ValueError("category_aliases must explicitly map aliases to category IDs")
+    for category in {s["category"] for s in samples}:
+        if aliases.get(category, category) != category:
+            raise ValueError("category aliases cannot redefine a canonical category")
     for sample in samples:
         paths.update(a["path"] for a in sample["artifacts"])
     review_rows = [
@@ -838,6 +924,8 @@ def freeze_review_binding(
         "selected_ids": sorted(selected_ids),
         "min_iou": min_iou,
         "review_evidence_id": evidence_id,
+        "plan_path": plan_path,
+        "strategy_path": strategy_path,
     }
 
 
@@ -874,18 +962,57 @@ def finalize_review(
                 bound_outputs.append(row)
         except (KeyError, TypeError, StopIteration):
             continue
+    plan = {}
+    if binding.get("plan_path") in binding["files"] and not stale:
+        plan = json.loads((root / binding["plan_path"]).read_text())
     merged = merge_review_outputs(
         samples,
         [] if stale else bound_outputs,
         selected_ids=set(binding["selected_ids"]),
         min_iou=binding["min_iou"],
+        category_aliases=plan.get("category_aliases", {}),
     )
+    strategy_bound = binding.get("strategy_path") in binding["files"]
+    for row in merged:
+        if not strategy_bound:
+            row["quality_status"] = "needs_review"
+            row["quality_reasons"].append("unbound_strategy")
+        if stale:
+            row["quality_reasons"].append("stale_evidence")
     counts: dict[str, int] = {}
     for row in merged:
         counts[row["visual_status"]] = counts.get(row["visual_status"], 0) + 1
+    rejection_counts: dict[str, int] = {}
+    for row in merged:
+        for reason in row["quality_reasons"]:
+            rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+    requested = len(plan["variants"]) if "variants" in plan else plan.get("requested")
+    shortfall = max(0, requested - len(merged)) if isinstance(requested, int) else None
+    if shortfall:
+        rejection_counts["generation_shortfall"] = shortfall
+    summary_reasons = []
+    if requested is None:
+        summary_reasons.append("request_count_unavailable")
+    if shortfall:
+        summary_reasons.append("generation_shortfall")
+    if not merged:
+        summary_reasons.append("no_candidates")
+    if stale:
+        summary_reasons.append("stale_evidence")
+    if any(row["quality_status"] != "passed" for row in merged):
+        summary_reasons.append("sample_quality")
     summary = {
+        "requested": requested,
+        "generated": len(merged),
+        "generation_shortfall": shortfall,
+        "quality_passed": sum(r["quality_status"] == "passed" for r in merged),
+        "rejection_counts": rejection_counts,
+        "summary_reasons": summary_reasons,
         "quality_status": "passed"
-        if merged and not stale and all(r["quality_status"] == "passed" for r in merged)
+        if merged
+        and not stale
+        and shortfall == 0
+        and all(r["quality_status"] == "passed" for r in merged)
         else "needs_review",
         "visual_status_counts": counts,
         "stale_evidence": stale,
@@ -913,7 +1040,7 @@ def review_grid(images: Sequence[Pixels], *, box: Box | None = None) -> Image.Im
 
 
 def export_sample(
-    sample: Sample, output_dir: Path, sample_id: str, category: str
+    sample: Sample | GeneratedSample, output_dir: Path, sample_id: str, category: str
 ) -> dict[str, Any]:
     if not sample_id or Path(sample_id).name != sample_id or sample_id in {".", ".."}:
         raise ValueError("sample_id must be a plain name")
@@ -922,10 +1049,22 @@ def export_sample(
     arrays = {
         "image": sample.image,
         "reference": sample.reference,
-        "original_gt": sample.gt,
         "mask": sample.mask.astype(np.uint8) * 255,
         "diff": sample.artifacts.difference,
     }
+    if isinstance(sample, Sample):
+        arrays["original_gt"] = sample.gt
+    else:
+        arrays.update(
+            {
+                "source_annotation": sample.source.annotation.astype(np.uint8) * 255,
+                "source_template": sample.source.template.mask.astype(np.uint8) * 255,
+            }
+        )
+        if sample.source.image is not None:
+            arrays["source_image"] = sample.source.image
+        if sample.source.reference is not None:
+            arrays["source_reference"] = sample.source.reference
     artifacts = []
     roles = {
         "image": "image",
@@ -933,6 +1072,10 @@ def export_sample(
         "original_gt": "other",
         "mask": "annotation",
         "diff": "diff",
+        "source_image": "other",
+        "source_reference": "other",
+        "source_annotation": "annotation",
+        "source_template": "annotation",
     }
     for name, array in arrays.items():
         Image.fromarray(array).save(target / f"{name}.png")
@@ -943,17 +1086,33 @@ def export_sample(
                 "semantics": name,
             }
         )
-    residual = highpass_residual(
-        sample.image, radius=sample.parameters["highpass_radius"]
-    )
-    np.save(target / "highpass_signed.npy", residual)
-    artifacts.append(
-        {
-            "role": "other",
-            "path": f"assets/{sample_id}/highpass_signed.npy",
-            "semantics": "signed_gray_minus_gaussian",
-        }
-    )
+    if isinstance(sample, GeneratedSample):
+        for prefix, regions in (
+            ("region", sample.regions),
+            ("source_region", sample.source.regions),
+        ):
+            for index, (name, region) in enumerate(regions.items()):
+                filename = f"{prefix}_{index}.png"
+                Image.fromarray(region.astype(np.uint8) * 255).save(target / filename)
+                artifacts.append(
+                    {
+                        "role": "other",
+                        "path": f"assets/{sample_id}/{filename}",
+                        "semantics": f"{prefix}:{name}",
+                    }
+                )
+    if sample.artifacts.difference_kind == "defect_gray_gaussian_highpass":
+        residual = highpass_residual(
+            sample.image, radius=sample.parameters["highpass_radius"]
+        )
+        np.save(target / "highpass_signed.npy", residual)
+        artifacts.append(
+            {
+                "role": "other",
+                "path": f"assets/{sample_id}/highpass_signed.npy",
+                "semantics": "signed_gray_minus_gaussian",
+            }
+        )
     review_grid(
         [sample.image, sample.reference, sample.artifacts.difference],
         box=sample.artifacts.bbox_xyxy,
@@ -965,13 +1124,15 @@ def export_sample(
         "bbox_xyxy": sample.artifacts.bbox_xyxy,
         "image_size": [sample.image.shape[1], sample.image.shape[0]],
         "artifacts": artifacts,
-        "program_status": "passed",
+        "program_status": "passed"
+        if all(validation_coverage(sample.checks).values())
+        and all(c.passed is True for c in sample.checks)
+        else "needs_review",
+        "validation_version": sample.parameters.get("validation_version", 1),
+        "validation_coverage": validation_coverage(sample.checks),
         "visual_status": "not_reviewed",
         "training_ready": False,
         "difference_kind": sample.artifacts.difference_kind,
         "parameters": sample.parameters,
-        "checks": [
-            {"name": c.name, "passed": c.passed, "reason": c.reason}
-            for c in sample.checks
-        ],
+        "checks": [asdict(c) for c in sample.checks],
     }

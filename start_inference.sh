@@ -18,7 +18,7 @@ export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 
 export PYROMIND_HARNESS_BACKEND="pi"
 export APP_ENV="${APP_ENV:-dev}"
-export PYROMIND_PI_TERMINAL_BACKEND="os-sandbox"
+export PYROMIND_PI_TERMINAL_BACKEND="${PYROMIND_PI_TERMINAL_BACKEND:-os-sandbox}"
 
 case "$(uname -s)" in
   Darwin)

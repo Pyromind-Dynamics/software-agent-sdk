@@ -192,16 +192,20 @@ def _build_label_studio_tool(
     ls_base_url = extra.get("label_studio_base_url")
     if isinstance(ls_base_url, str) and ls_base_url.strip():
         params["ls_base_url"] = ls_base_url.strip()
+    # The integration routes (SSO entry point, media proxy, per-caller token and
+    # export ticket) live on the Label Studio deployment itself, so its base URL is
+    # the integration host unless a deployment pins a different one.
     portal_base_url = (
         extra.get("label_studio_portal_base_url")
         or extra.get("label_studio_sso_base_url")
         or os.getenv("LABEL_STUDIO_PORTAL_BASE_URL")
+        or params.get("ls_base_url")
     )
     if isinstance(portal_base_url, str) and portal_base_url.strip():
         params["portal_base_url"] = portal_base_url.strip()
 
-    # The portal issues each caller their own token, so a configured portal is
-    # enough to offer the tool; only a deployment without one needs a token here.
+    # The integration host issues each caller their own token, so one is enough to
+    # offer the tool; only a deployment without one needs a static token.
     if not params.get("portal_base_url") and not ls_token.strip():
         return None, {}
 

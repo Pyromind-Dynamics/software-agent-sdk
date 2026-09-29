@@ -286,6 +286,29 @@ def test_parses_top_level_nodes_and_alternate_status_keys(monkeypatch):
     assert observation.nodes[2].status is None
 
 
+def test_parses_numeric_node_ids(monkeypatch):
+    nodes = [
+        {
+            "id": 4,
+            "data": {"nodeType": "AnnotronTrainSynth", "display_name": "Train Synth"},
+            "properties": {"dystatus": "Failed"},
+        }
+    ]
+    routes = {
+        "task_workflow_result": _Response(
+            200, _task_result_payload(task_status="Failed", nodes=nodes)
+        ),
+        "logs/node/raw": _Response(200, _log_payload(["RuntimeError: boom"])),
+    }
+    calls = _install_router(monkeypatch, routes)
+    observation = AnalyzeTaskFailureExecutor()(AnalyzeTaskFailureAction(task_id="672"))
+
+    assert not observation.is_error
+    assert [node.node_id for node in observation.nodes] == ["4"]
+    assert [node.node_id for node in observation.failed_nodes] == ["4"]
+    assert calls[1][1] == {"nodeId": "4", "taskId": "672"}
+
+
 def test_xyflow_shape_ignores_render_type_and_reads_dystatus(monkeypatch):
     # Mirrors the real task_workflow_result payload (task 7758): top-level
     # ``type: "default"`` must not shadow ``data.nodeType``, and the run status

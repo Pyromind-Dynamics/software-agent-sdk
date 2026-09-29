@@ -460,11 +460,16 @@ When only a dataset/folder name is given (no specific file):
 Use mode='sample' for user storage after inspection. Row-oriented files are
 materialized as up to n complete logical rows; directories materialize at most
 three selected sample folders. Use mode='materialize' to copy selected inputs
-in full for exact local analysis. Both modes preserve storage-relative layout and
-return workspace-relative local_sample_paths plus a sample_manifest_path. Pass
-the returned df_run_input_path (single input) or a selected local_sample_paths
-entry directly to df_run_pipeline. Image samples are sent to the configured DF
-vision model (normally Gemma) for OCR and a short visual summary.
+in full for exact local analysis. Both modes preserve storage-relative layout
+and return workspace-relative local_sample_paths plus a sample_manifest_path.
+Pass the returned df_run_input_path (single input) or a selected
+local_sample_paths entry directly to df_run_pipeline; without a platform
+sandbox, storage source paths are not local workspace inputs. Image samples are
+sent to the configured DF vision model (normally Gemma) for OCR and a short
+visual summary.
+Image previews return preview_url and ready-to-use Markdown in the text result.
+For visual previews, copy the Markdown into your reply outside code blocks so
+the chat displays the image inline. Preserve the full signed URL.
 
 When the session runs its execution plane in a platform sandbox, user storage is
 mounted as 'storage/' and read with the file tools, so pass 'storage/...'
@@ -1090,6 +1095,7 @@ class PreviewDatasetExecutor(
         local_paths: list[str] = []
         vision_previews: list[dict[str, Any]] = []
         preview_images: list[ImageContent] = []
+        preview_links: list[str] = []
         total_bytes = 0
         total_files = 0
         vision_images = 0
@@ -1178,6 +1184,13 @@ class PreviewDatasetExecutor(
                                 ]
                             )
                         )
+                    if (
+                        _is_image_path(storage_file.path)
+                        and len(preview_links) < _DEFAULT_SAMPLE_COUNT
+                    ):
+                        preview_links.append(
+                            self._image_preview_link(storage_file.path, headers)
+                        )
                     if action.vision_ocr and (
                         vision_images < _MAX_VISION_PREVIEW_IMAGES
                     ):
@@ -1236,6 +1249,8 @@ class PreviewDatasetExecutor(
         if len(local_paths) == 1:
             summary_lines.append(f"df_run_input_path={local_paths[0]}")
         summary_text = "\n".join(summary_lines)
+        if preview_links:
+            summary_text += "\n\n" + "\n\n".join(preview_links)
         for preview in vision_previews:
             summary_text += (
                 f"\n\n--- vision preview: {preview['source_path']} ---\n"
@@ -1576,6 +1591,17 @@ class PreviewDatasetExecutor(
             **_metadata_observation_fields(metadata),
         )
 
+    def _image_preview_link(self, path: str, headers: dict[str, str]) -> str:
+        result = self._get_download_url(path, headers)
+        if isinstance(result, PreviewDatasetObservation):
+            return f"Image preview: {path}\npreview_url_error={result.text}"
+        return (
+            f"Image preview: {path}\npreview_url={result}\n"
+            "To show this image in chat, copy the following Markdown into your "
+            "reply (outside code blocks):\n"
+            f"![Image preview](<{result}>)"
+        )
+
     def _storage_image_preview(
         self,
         *,
@@ -1629,7 +1655,7 @@ class PreviewDatasetExecutor(
             )
 
         text = (
-            f"Image preview: {preview_path}\n"
+            f"{self._image_preview_link(preview_path, headers)}\n"
             f"size={len(content)} bytes\n"
             f"vision_summary={summary}"
         )

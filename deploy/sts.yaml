@@ -76,15 +76,15 @@ spec:
                                 key: DEEPSEEK_API_KEY
                                 name: software-agent-sdk-secret
                       # Label Studio integration. BASE_URL is the LS REST API the
-                      # server calls; PORTAL_BASE_URL is the browser-facing half
-                      # that owns the SSO entry point and signs media URLs. The
-                      # portal issues per-caller tokens, so no API token is
-                      # configured here. Both fall back to production defaults
-                      # when unset, so they must be pinned per environment.
+                      # server calls; PORTAL_BASE_URL is the same LS deployment,
+                      # which hosts the plugin's SSO, media and per-caller token
+                      # routes. No API token is configured here because those
+                      # routes issue one per caller. BASE_URL falls back to the
+                      # production default when unset, so pin both per environment.
                       - name: LABEL_STUDIO_BASE_URL
                         value: https://pre-label-studio.pyromind.ai
                       - name: LABEL_STUDIO_PORTAL_BASE_URL
-                        value: https://pre-api-portal.pyromind.ai
+                        value: https://pre-label-studio.pyromind.ai
                       - name: OH_CONVERSATION_STORAGE_QUOTA
                         value: 500M
                       - name: OH_STORAGE_QUOTA_REQUIRED

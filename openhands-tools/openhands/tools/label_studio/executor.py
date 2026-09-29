@@ -40,8 +40,11 @@ from openhands.tools.label_studio.field_map import (
 from openhands.tools.label_studio.media_signer import PortalMediaSigner
 from openhands.tools.label_studio.models import ProjectState
 from openhands.tools.label_studio.skill_helpers import (
+    WidenedConfig,
     extract_control_names,
+    extract_control_values,
     validate_label_config_xml,
+    widen_label_config,
 )
 from openhands.tools.label_studio.token_provider import PortalTokenProvider
 from openhands.tools.pyromind_dataset.definition import (
@@ -231,12 +234,13 @@ class LabelStudioProjectExecutor(
             return self._state_to_observation("create", state, summary=summary)
 
         manifest: ConvertedManifest | None = None
+        widened: WidenedConfig | None = None
         if state is None:
             # Label Studio's own validator runs before any artifact is uploaded, so
             # one bad config fails in a single request instead of after the dataset
             # has been converted, its media signed, and its manifest uploaded.
             self._validate_with_label_studio(xml_text, conversation)
-            manifest, state = self._create_project(
+            manifest, state, widened = self._create_project(
                 action=action,
                 dataset_path=dataset_path,
                 config_hash=config_hash,
@@ -281,12 +285,23 @@ class LabelStudioProjectExecutor(
             f"manifest_path={artifact_dir}/manifests/manifest.json "
             f"open_url={self._open_url(state.project_id)}"
         )
-        if manifest is not None and manifest.unmapped_quality:
+        if widened is not None and widened.added:
             summary += (
-                " warning=unmapped_quality:"
-                + ",".join(manifest.unmapped_quality)
-                + " (written to predictions verbatim, so they may not render -- "
-                "make sure the config's <Choice> values cover them)"
+                " widened="
+                + ";".join(
+                    f"{control}:{'|'.join(values)}"
+                    for control, values in widened.added.items()
+                )
+                + " (values the data carries were added to the project's label "
+                "config so their pre-annotations render)"
+            )
+        if widened is not None and widened.missing_controls:
+            summary += (
+                " warning=unmapped_controls:"
+                + ",".join(widened.missing_controls)
+                + " (bindings point at controls this config does not declare, so "
+                "their pre-annotations land nowhere -- add the control or fix the "
+                "binding)"
             )
         if manifest is not None and manifest.unmatched_regions:
             summary += (
@@ -294,6 +309,14 @@ class LabelStudioProjectExecutor(
                 + ",".join(manifest.unmatched_regions)
                 + " (no sample carries these region fields, so no rectangles were "
                 "built -- fix the binding's source or the upstream row contract)"
+            )
+        if manifest is not None and manifest.unmatched_samples:
+            summary += (
+                " warning=unmatched_samples:"
+                + ",".join(manifest.unmatched_samples)
+                + " (no sample carries these whole-sample fields, so those "
+                "controls stay empty -- fix the binding's field or the upstream "
+                "row contract)"
             )
         return self._state_to_observation("create", state, summary=summary)
 
@@ -385,14 +408,9 @@ class LabelStudioProjectExecutor(
         field_map: FieldMap,
         field_map_hash: str,
         dataset_content: bytes | None,
-    ) -> tuple[ConvertedManifest, ProjectState]:
+    ) -> tuple[ConvertedManifest, ProjectState, WidenedConfig]:
         """Convert the dataset, persist its artifacts, and create the LS project."""
-        self._upload_to_storage(
-            f"{artifact_dir}/label_config.xml",
-            xml_content,
-            conversation,
-        )
-
+        xml_text = xml_content.decode("utf-8")
         converter = AVITrainToLabelStudioConverter(
             dataset_path=dataset_path,
             storage_base_url=self._storage_base_url,
@@ -405,9 +423,24 @@ class LabelStudioProjectExecutor(
             field_map=field_map,
             field_map_hash=field_map_hash,
             field_map_path=action.field_map_path,
+            config_values=extract_control_values(xml_text),
             dataset_content=dataset_content,
         )
         manifest = converter.convert()
+
+        # The template names the controls; the values come from the data. A value
+        # the config does not list would import as a pre-annotation that draws
+        # nothing, so it is added to the config the project runs on. The caller's
+        # file is left alone, and the added values are reported back.
+        effective = widen_label_config(xml_text, manifest.unlisted_values)
+        if effective.added:
+            validate_label_config_xml(effective.xml, field_map=field_map)
+
+        self._upload_to_storage(
+            f"{artifact_dir}/label_config.xml",
+            effective.xml.encode("utf-8"),
+            conversation,
+        )
         self._upload_manifest(artifact_dir, manifest, conversation)
 
         ls_api = self._build_ls_api(conversation)
@@ -418,7 +451,7 @@ class LabelStudioProjectExecutor(
         if ls_project is None:
             ls_project = ls_api.create_project(
                 title=title,
-                label_config=xml_content.decode("utf-8"),
+                label_config=effective.xml,
             )
         raw_id = ls_project.get("id")
         if not isinstance(raw_id, int):
@@ -456,7 +489,7 @@ class LabelStudioProjectExecutor(
             ),
         )
         self._save_state(artifact_dir, state, conversation)
-        return manifest, state
+        return manifest, state, effective
 
     def _handle_get(
         self,
@@ -637,8 +670,8 @@ class LabelStudioProjectExecutor(
         """Re-sign the media URLs baked into task data before they stop working.
 
         Label Studio keeps whatever URL the import produced and never asks for a
-        new one, so a project that outlives the portal's media URL lifetime shows
-        broken images until its tasks are written back with fresh URLs.
+        new one, so a project whose stored URLs have been invalidated shows broken
+        images until its tasks are written back with fresh ones.
         """
         if not action.project_ref:
             raise ValueError("project_ref is required for operation='refresh_media'.")
@@ -649,8 +682,8 @@ class LabelStudioProjectExecutor(
         signer = self._build_media_signer(conversation)
         if signer is None:
             raise ValueError(
-                "refresh_media requires a portal base URL: the media route that "
-                "signs these URLs lives there."
+                "refresh_media requires the Label Studio integration base URL: "
+                "the media route that signs these URLs lives there."
             )
 
         ls_api = self._build_ls_api(conversation)
@@ -753,10 +786,11 @@ class LabelStudioProjectExecutor(
             yield index, json.loads(payload.decode("utf-8"))
 
     def _open_url(self, project_id: int) -> str:
-        """Portal SSO entry point, so the browser lands on a project it can open.
+        """SSO entry point, so the browser lands on a project it can open.
 
-        The portal signs the browser in to Label Studio on the way through, which
-        the bare project link cannot do on its own.
+        The plugin signs the browser in to Label Studio (via the platform login
+        when the platform session has expired), which the bare project link cannot
+        do on its own.
         """
         if self._portal_base_url:
             return (
@@ -798,12 +832,12 @@ class LabelStudioProjectExecutor(
     def _export_ticket(
         self, project_ref: str, conversation: BaseConversation | None
     ) -> str:
-        """Mint a fresh export ticket, or nothing at all if the portal cannot.
+        """Mint a fresh export ticket, or nothing at all if the host cannot.
 
-        Every description write asks for a new ticket because the old one expires;
-        a project whose ticket has lapsed simply stops pushing its export. The
-        ticket is a capability, so it travels to the caller as an opaque string and
-        is never logged.
+        Every description write asks for a new ticket because the old one expires,
+        and an export refreshes it in place, so a project keeps pushing its export
+        without the agent re-running. The ticket is a capability, so it travels to
+        the caller as an opaque string and is never logged.
         """
         provider = self._build_export_ticket_provider(conversation)
         if provider is None:
@@ -846,7 +880,7 @@ class LabelStudioProjectExecutor(
     def _ls_token(
         self, conversation: BaseConversation, state: ConversationState
     ) -> str:
-        """The caller's own token, read from the portal when one is configured.
+        """The caller's own token, read from the integration host when configured.
 
         Label Studio shows an account only its own organization's projects, so a
         token shared by every conversation files each user's projects under one
@@ -1093,12 +1127,12 @@ def _resigned_data(
 
 
 def _media_expiry_iso(expires_in: int | None) -> str | None:
-    """Record the window the portal reported, for diagnostics only.
+    """Record the window the integration host reported, for diagnostics only.
 
-    The portal keeps serving a media token past its own `exp` claim -- Label
-    Studio cannot re-mint the URL it stored, so the token is bound to one user
-    and object instead of a deadline. Nothing warns on this window, and
-    refresh_media remains available for callers that want a fresh signature.
+    The plugin keeps serving a media token past its own `exp` claim -- Label
+    Studio cannot re-mint the URL it stored, so the token is bound to one user and
+    object instead of a deadline. Nothing warns on this window, and refresh_media
+    remains available for callers that want a fresh signature.
     """
     if expires_in is None:
         return None

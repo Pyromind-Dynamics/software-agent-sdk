@@ -53,6 +53,7 @@ Pass the `output_dir` returned by `df_submit_pipeline`. The tool reads the
 run's `progress.json` snapshot (total / processed / succeeded / failed /
 ETA), the most recent records from `processed.jsonl`, and `report.json` when
 available, so you can report progress and verify output quality.
+When report.json lists HTML artifacts, also returns fresh Storage download URLs.
 
 Use this when the user asks about the status of a submitted pipeline, or
 proactively between submission and the terminal Kafka callback for
@@ -117,6 +118,10 @@ class DfCheckProgressObservation(Observation):
     )
     report: dict[str, Any] | None = Field(
         default=None, description="Generic terminal or partial pipeline report."
+    )
+    artifact_urls: dict[str, str] = Field(
+        default_factory=dict,
+        description="Fresh Storage download URLs for HTML artifacts in this run.",
     )
 
     @property
@@ -203,6 +208,25 @@ class DfCheckProgressExecutor(
             fields["progress_found"] = False
 
         text = self._format_text(fields, progress, tail_error)
+        artifact_urls: dict[str, str] = {}
+        artifacts = report.get("artifacts") if isinstance(report, dict) else None
+        if isinstance(artifacts, dict):
+            for name, path in artifacts.items():
+                if not (
+                    isinstance(name, str)
+                    and name.endswith(".html")
+                    and isinstance(path, str)
+                    and posixpath.dirname(posixpath.normpath(path)) == output_dir
+                ):
+                    continue
+                result = self._get_size_and_url(path, headers)
+                if not isinstance(result, str):
+                    artifact_urls[name] = result[1]
+            if artifact_urls:
+                text += "\n" + "\n".join(
+                    f"{name}: {url}" for name, url in artifact_urls.items()
+                )
+        fields["artifact_urls"] = artifact_urls
         return DfCheckProgressObservation.from_text(text=text, **fields)
 
     # -- Storage primitives -------------------------------------------------

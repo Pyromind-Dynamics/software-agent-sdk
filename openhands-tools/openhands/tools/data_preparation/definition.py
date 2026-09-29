@@ -42,6 +42,7 @@ from openhands.sdk.workspace.workspace import LocalWorkspace
 from openhands.tools.data_preparation.runner import (
     DATAFLOW_RUNTIME_PACKAGES,
     SUPPORTED_DATAFLOW_VERSION,
+    LabelingModelGateway,
     ProcessLocalSampleExecutor,
     build_dataflow_env,
     check_dataflow_installed,
@@ -555,6 +556,16 @@ class DfRunPipelineAction(Action):
         description=(
             "Use none for pure Python/AVI work without model credentials, text "
             "for the conversation model, or vision for the managed image model."
+        ),
+    )
+    labeling_gateway: LabelingModelGateway | None = Field(
+        default=None,
+        description=(
+            "Optional user-supplied OpenAI-compatible gateway for the image "
+            "labeling model: api_url (or base_url), model, and api_key. When set "
+            "it replaces the managed vision model for this run and requires "
+            "model_profile='vision'. Collect these values from the user in "
+            "writing before falling back to the platform default."
         ),
     )
 
@@ -1656,7 +1667,11 @@ class DfRunPipelineExecutor(ToolExecutor):
         env_extra: dict[str, str] = {}
         if action.model_profile != "none":
             try:
-                env_extra = build_dataflow_env(conversation, action.model_profile)
+                env_extra = build_dataflow_env(
+                    conversation,
+                    action.model_profile,
+                    gateway=action.labeling_gateway,
+                )
             except ValueError as exc:
                 return _df_failure(
                     stage="model_configuration",
@@ -1953,17 +1968,18 @@ class DfRunPipelineTool(ToolDefinition[DfRunPipelineAction, DfRunPipelineObserva
                     "tool never samples or truncates it. model_profile=none "
                     "injects no model credentials and does not require DataFlow. "
                     "text/vision inject the conversation or managed vision model "
-                    "configuration; scripts must never hardcode secrets. Logging, "
-                    "retry, checkpoint, report, and canonical JSONL validation "
-                    "helpers are provided to the run automatically — the agent "
-                    "must NOT create or copy them manually. For standard runs with "
-                    "output_schema, input/output arguments are resolved from the "
-                    "workspace root, and read-only inputs may also be addressed as "
-                    "'storage/...' against the mounted Storage; legacy arguments "
-                    "remain unchanged. When the conversation runs on a platform "
-                    "sandbox, the sample executes inside that sandbox and the same "
-                    "paths resolve there. The tool returns textual status only; "
-                    "image content is read by the DataFlow VLM."
+                    "configuration; a user-supplied labeling_gateway replaces the "
+                    "managed vision model for this run. Scripts must never hardcode "
+                    "secrets. Logging, retry, checkpoint, report, and canonical "
+                    "JSONL validation helpers are provided to the run automatically "
+                    "— the agent must NOT create or copy them manually. For standard "
+                    "runs with output_schema, input/output arguments are resolved "
+                    "from the workspace root, and read-only inputs may also be "
+                    "addressed as 'storage/...' against the mounted Storage; legacy "
+                    "arguments remain unchanged. When the conversation runs on a "
+                    "platform sandbox, the sample executes inside that sandbox and "
+                    "the same paths resolve there. The tool returns textual status "
+                    "only; image content is read by the DataFlow VLM."
                 ),
                 action_type=DfRunPipelineAction,
                 observation_type=DfRunPipelineObservation,

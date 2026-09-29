@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -478,11 +479,29 @@ def test_review_bbox_must_be_within_image(runtime: Any) -> None:
 def test_finalization_binds_inputs_and_cannot_promote_missing_checks(
     runtime: Any, paired: Any, synthesis_options: Any, tmp_path: Path
 ) -> None:
-    _, reference, defect, _ = paired
-    sample = runtime.synthesize_sample(reference, defect, **synthesis_options)
+    pair, reference, defect, _ = paired
+
+    def appearance(evidence: Any) -> list[Any]:
+        changed = np.any(evidence.image != evidence.reference, axis=2)
+        return [runtime.Check("appearance", bool(changed.any()), "visible appearance")]
+
+    sample = runtime.synthesize_sample(
+        reference,
+        defect,
+        **synthesis_options,
+        source_evidence=runtime.SourceEvidence(
+            pair.source,
+            reference.image,
+            runtime.region_mask(defect.template.mask.shape, defect.annotation_box),
+            defect.template,
+        ),
+        validate_source=appearance,
+        validate_rendered=appearance,
+    )
     record = runtime.export_sample(sample, tmp_path, "a", "a")
     (tmp_path / "processed.jsonl").write_text(json.dumps(record) + "\n")
-    (tmp_path / "plan.json").write_text('{"strategy":"test"}')
+    (tmp_path / "plan.json").write_text('{"strategy":"test","requested":1}')
+    (tmp_path / "strategy.py").write_text("# frozen strategy fixture")
     (tmp_path / "review_input.jsonl").write_text(
         json.dumps({"images": ["assets/a/image.png"]}) + "\n"
     )
@@ -493,6 +512,7 @@ def test_finalization_binds_inputs_and_cannot_promote_missing_checks(
         plan_path="plan.json",
         selected_ids={"a"},
         min_iou=0.5,
+        strategy_path="strategy.py",
     )
     answer = dict(
         category="a",
@@ -528,6 +548,61 @@ def test_finalization_binds_inputs_and_cannot_promote_missing_checks(
     rows, summary = runtime.finalize_review(tmp_path, binding, [output])
     assert summary["quality_status"] == "passed"
     assert rows[0]["training_ready"] is False
+    unbound_rows, _ = runtime.finalize_review(
+        tmp_path, binding | {"strategy_path": None}, [output]
+    )
+    assert unbound_rows[0]["quality_status"] == "needs_review"
+    assert "unbound_strategy" in unbound_rows[0]["quality_reasons"]
+    (tmp_path / "strategy.py").write_text("# changed strategy")
+    stale_rows, stale_summary = runtime.finalize_review(tmp_path, binding, [output])
+    assert stale_summary["stale_evidence"] == ["strategy.py"]
+    assert "stale_evidence" in stale_rows[0]["quality_reasons"]
+    (tmp_path / "strategy.py").write_text("# frozen strategy fixture")
+
+    review_dir, quality_dir = tmp_path / "review", tmp_path / "quality"
+    review_dir.mkdir()
+    quality_dir.mkdir()
+    (tmp_path / "binding.json").write_text(json.dumps(binding))
+    (review_dir / "review_output.jsonl").write_text(json.dumps(output) + "\n")
+    (quality_dir / "review_job.json").write_text(
+        json.dumps(
+            {
+                "binding_path": "../binding.json",
+                "review_output_path": "../review/review_output.jsonl",
+            }
+        )
+    )
+    for folder in (tmp_path, review_dir, quality_dir):
+        (folder / "report.json").write_text('{"status":"executor_only"}')
+    finalizer = tmp_path / "finalize.py"
+    sys.modules["bundle_template_pipeline"].bundle_pipeline(
+        SCRIPTS / "finalize_synthesis_review.py", finalizer
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(finalizer),
+            str(quality_dir / "review_job.json"),
+            str(quality_dir / "reviewed.jsonl"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert (
+        json.loads((quality_dir / "reviewed.quality.json").read_text())[
+            "quality_passed"
+        ]
+        == 1
+    )
+    assert (quality_dir / "assets/a/image.png").read_bytes() == (
+        tmp_path / "assets/a/image.png"
+    ).read_bytes()
+    assert all(
+        json.loads((folder / "report.json").read_text())["status"] == "executor_only"
+        for folder in (tmp_path, review_dir, quality_dir)
+    )
     unbound_output = json.loads(json.dumps(output))
     unbound_output["messages"][0]["content"].pop()
     unbound_rows, _ = runtime.finalize_review(tmp_path, binding, [unbound_output])
@@ -574,3 +649,288 @@ def test_bundle_contains_reference_module_and_review_matches_managed_contract(
     )
     for name in ("reference_synthesis.py", "paired_reference_example.py"):
         ast.parse((SCRIPTS / name).read_text(), feature_version=(3, 10))
+
+
+def test_review_dimensions_and_explicit_aliases(runtime: Any) -> None:
+    answer = dict(
+        category="extra (material)",
+        bbox_xyxy=[40, 40, 50, 50],
+        realistic=True,
+        extra_anomalies=False,
+        uncertain=False,
+        context_consistent=True,
+    )
+    kwargs = dict(expected_category="extra", expected_box=(1, 2, 5, 6), min_iou=0.5)
+    assessment = runtime.review_assessment(answer, **kwargs)
+    assert set(assessment["reasons"]) == {"category", "localization"}
+    assessment = runtime.review_assessment(
+        answer, **kwargs, category_aliases={"extra (material)": "extra"}
+    )
+    assert assessment["reasons"] == ["localization"]
+    assert assessment["checks"]["category"] is True
+    assert runtime.review_status(answer | {"category": " extra"}, **kwargs) != "passed"
+
+
+def test_real_history_cannot_be_promoted_by_successful_visual_review(
+    runtime: Any,
+) -> None:
+    fixture = Path(__file__).parents[2] / "fixtures/synthesis/c94c4aa1"
+    history = json.loads((fixture / "history.json").read_text())
+    for name, digest in history["sha256"].items():
+        assert hashlib.sha256((fixture / name).read_bytes()).hexdigest() == digest
+    outputs = []
+    for record in history["records"]:
+        answer = dict(
+            category=record["category"],
+            bbox_xyxy=record["bbox_xyxy"],
+            realistic=True,
+            extra_anomalies=False,
+            uncertain=False,
+            context_consistent=True,
+        )
+        outputs.append(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "value": next(
+                                    a["path"]
+                                    for a in record["artifacts"]
+                                    if a["role"] == "image"
+                                ),
+                            }
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "value": "<answer>" + json.dumps(answer) + "</answer>",
+                            }
+                        ],
+                    },
+                ]
+            }
+        )
+    merged = runtime.merge_review_outputs(
+        history["records"],
+        outputs,
+        selected_ids={r["sample_id"] for r in history["records"]},
+        min_iou=0.5,
+    )
+    assert all(r["visual_status"] == "passed" for r in merged)
+    assert all(r["quality_status"] == "needs_review" for r in merged)
+    assert all("incomplete_validation" in r["quality_reasons"] for r in merged)
+    assert all(r["training_ready"] is False for r in merged)
+    observed = [
+        runtime.review_assessment(
+            review,
+            expected_category=record["category"],
+            expected_box=record["bbox_xyxy"],
+            min_iou=0.5,
+        )
+        for record, review in zip(history["records"], history["reviews"], strict=True)
+    ]
+    assert all(
+        "category" in r["reasons"] and "context" in r["reasons"] for r in observed
+    )
+
+
+def test_bundled_paired_driver_preserves_stage_outputs_and_rejects_unproven_source(
+    runtime: Any, tmp_path: Path
+) -> None:
+    fixture = Path(__file__).parents[2] / "fixtures/synthesis/c94c4aa1"
+    history = json.loads((fixture / "history.json").read_text())
+    plan = history["plan"]
+    for key in ("donor_rgb", "donor_cam"):
+        plan[key] = str(fixture / plan[key])
+    pipeline = tmp_path / "pipeline.py"
+    sys.modules["bundle_template_pipeline"].bundle_pipeline(
+        SCRIPTS / "paired_reference_example.py", pipeline
+    )
+    for version in (1, 2):
+        folder = tmp_path / str(version) / "generation"
+        folder.mkdir(parents=True)
+        sentinel = folder / "report.json"
+        sentinel.write_text('{"status":"runtime_report"}')
+        plan_file = tmp_path / f"plan_{version}.json"
+        plan_file.write_text(json.dumps(plan | {"validation_version": version}))
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(pipeline),
+                str(plan_file),
+                str(folder / "processed.jsonl"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert json.loads(sentinel.read_text()) == {"status": "runtime_report"}
+        report = json.loads((folder / "synthesis_report.json").read_text())
+        assert report["requested"] == 3
+        if version == 2:
+            assert result.returncode != 0
+            assert report["generated"] == 0
+            assert all(
+                f["attempts"][0]["stage"] == "source" for f in report["failures"]
+            )
+        else:
+            assert result.returncode == 0, result.stderr
+            records = list(
+                map(json.loads, (folder / "processed.jsonl").read_text().splitlines())
+            )
+            assert all(r["program_status"] == "needs_review" for r in records)
+        original = (folder / "augmentation_plan.json").read_bytes()
+        repeated = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(pipeline),
+                str(plan_file),
+                str(folder / "processed.jsonl"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert repeated.returncode != 0
+        assert (folder / "augmentation_plan.json").read_bytes() == original
+
+
+def test_legacy_template_can_move_to_different_sized_reference(
+    runtime: Any, paired: Any, synthesis_options: Any
+) -> None:
+    _, reference, defect, _ = paired
+    other = replace(
+        reference,
+        source_id="larger",
+        image=np.pad(reference.image, ((8, 8), (8, 8), (0, 0))),
+        gt=np.pad(reference.gt, ((8, 8), (8, 8), (0, 0))),
+        material=np.pad(reference.material, 8),
+    )
+    centers = np.pad(synthesis_options["candidate_centers"], 8)
+    result = runtime.synthesize_sample(
+        other,
+        defect,
+        **(
+            synthesis_options
+            | {
+                "candidate_centers": centers,
+                "allowed_mask": other.material,
+                "rules": [lambda m: runtime.Check("area", bool(m.any()), "nonempty")],
+            }
+        ),
+        material_mapping="same",
+        mapping_basis="same reference padded by 8 pixels",
+    )
+    assert result.image.shape == other.image.shape
+    assert result.parameters["validation_coverage"]["source"] is False
+    assert result.parameters["validation_coverage"]["rendered"] is False
+
+
+def test_generic_export_binds_source_and_reports_shortfall(
+    runtime: Any, paired: Any, synthesis_options: Any, tmp_path: Path
+) -> None:
+    pair, reference, defect, _ = paired
+
+    def appearance(e: Any) -> list[Any]:
+        delta = np.abs(e.image.astype(float) - e.reference)
+        return [runtime.Check("contrast", bool((delta > 40).any()), "actual contrast")]
+
+    result = runtime.synthesize_template(
+        runtime.SourceEvidence(
+            pair.source,
+            reference.image,
+            runtime.region_mask(defect.template.mask.shape, defect.annotation_box),
+            defect.template,
+            {"support": reference.material},
+        ),
+        reference.image,
+        candidate_centers=synthesis_options["candidate_centers"],
+        allowed_mask=reference.material,
+        acceptance=runtime.Acceptance(1, 40, 0.05, 10, 4),
+        seed=2,
+        max_attempts=10,
+        regions={"support": reference.material},
+        validate_source=appearance,
+        validate_candidate=lambda e: [
+            runtime.Check(
+                "inside",
+                bool(np.all(e.regions["support"][e.constrained.mask])),
+                "support",
+            )
+        ],
+        validate_rendered=appearance,
+    )
+    record = runtime.export_sample(result, tmp_path, "one", "appearance")
+    assert record["program_status"] == "passed"
+    assert (tmp_path / "assets/one/source_image.png").is_file()
+    assert (tmp_path / "assets/one/source_region_0.png").is_file()
+    (tmp_path / "samples.jsonl").write_text(json.dumps(record) + "\n")
+    plan = {
+        "requested": 2,
+        "review_min_iou": 0.5,
+        "category_aliases": {"appearance (texture)": "appearance"},
+    }
+    (tmp_path / "plan.json").write_text(json.dumps(plan))
+    (tmp_path / "strategy.py").write_text("# source, candidate, rendered strategy")
+    (tmp_path / "review_input.jsonl").write_text(
+        json.dumps({"images": ["assets/one/image.png"]}) + "\n"
+    )
+    args = dict(
+        samples_path="samples.jsonl",
+        review_input_path="review_input.jsonl",
+        plan_path="plan.json",
+        selected_ids={"one"},
+        strategy_path="strategy.py",
+    )
+    with pytest.raises(ValueError, match="threshold"):
+        runtime.freeze_review_binding(tmp_path, min_iou=0.1, **args)
+    binding = runtime.freeze_review_binding(tmp_path, min_iou=0.5, **args)
+    answer = dict(
+        category="appearance (texture)",
+        bbox_xyxy=list(result.artifacts.bbox_xyxy),
+        realistic=True,
+        extra_anomalies=False,
+        uncertain=False,
+        context_consistent=True,
+    )
+    output = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "value": "assets/one/image.png"},
+                    {
+                        "type": "text",
+                        "value": "Review evidence ID: " + binding["review_evidence_id"],
+                    },
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "value": "<answer>" + json.dumps(answer) + "</answer>",
+                    },
+                ],
+            },
+        ]
+    }
+    rows, summary = runtime.finalize_review(tmp_path, binding, [output])
+    assert rows[0]["quality_status"] == "passed"
+    assert summary["quality_status"] == "needs_review"
+    assert summary["requested"] == 2 and summary["generated"] == 1
+    assert summary["generation_shortfall"] == 1 and summary["quality_passed"] == 1
+    assert "generation_shortfall" in summary["summary_reasons"]
+    (tmp_path / "assets/one/source_image.png").write_bytes(b"changed")
+    rows, summary = runtime.finalize_review(tmp_path, binding, [output])
+    assert summary["stale_evidence"] == ["assets/one/source_image.png"]
+    assert rows[0]["quality_status"] == "needs_review"
