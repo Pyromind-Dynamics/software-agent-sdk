@@ -324,7 +324,12 @@ class PiAdapter:
 
     async def _read_workflow(self, session: _PiSession) -> str | None:
         if not self._has_execution_workspace(session):
-            return None
+            # The sandbox execution plane holds the authoritative workflow file,
+            # so until the container exists the staged DSL is what the control
+            # plane has.
+            staging = session.files.load_pending_sandbox_staging()
+            dsl = staging.get("workflow_dsl") if staging is not None else None
+            return dsl if isinstance(dsl, str) else None
         workspace = await self._workspace(session)
         try:
             return await asyncio.to_thread(
@@ -336,12 +341,35 @@ class PiAdapter:
             raise OSError(str(exc)) from exc
 
     async def _write_workflow(self, session: _PiSession, dsl: str) -> None:
+        if self._stage_pending_workflow(session, dsl):
+            return
         workspace = await self._workspace(session)
         await asyncio.to_thread(_write_workspace_text, workspace, _WORKFLOW_PATH, dsl)
 
     async def _delete_workflow(self, session: _PiSession) -> None:
+        if self._stage_pending_workflow(session, ""):
+            return
         workspace = await self._workspace(session)
         await asyncio.to_thread(_delete_workspace_file, workspace, _WORKFLOW_PATH)
+
+    def _stage_pending_workflow(self, session: _PiSession, dsl: str) -> bool:
+        """Park a workflow file change until the sandbox container exists.
+
+        The container is created on the first tool that touches the execution
+        workspace, so staging a canvas must not materialize one; the sandbox
+        runtime replays the staged DSL once the container is created.
+        """
+        if self._terminal_backend != "sandbox" or self._has_execution_workspace(
+            session
+        ):
+            return False
+        staging = session.files.load_pending_sandbox_staging() or {}
+        source_id = staging.get("source_conversation_id")
+        session.files.save_pending_sandbox_staging(
+            source_conversation_id=source_id if isinstance(source_id, str) else None,
+            workflow_dsl=dsl,
+        )
+        return True
 
     async def describe(self) -> tuple[str, HarnessCapabilities]:
         return "pi", PI_CAPABILITIES
@@ -529,11 +557,13 @@ class PiAdapter:
             }
             target_files.initialize(target_config)
             if sandbox_fork:
-                target_files.save_pending_sandbox_fork(
-                    source.session_id
-                    if self._has_execution_workspace(source)
-                    else None,
-                    checkpoint_dsl,
+                target_files.save_pending_sandbox_staging(
+                    source_conversation_id=(
+                        source.session_id
+                        if self._has_execution_workspace(source)
+                        else None
+                    ),
+                    workflow_dsl=checkpoint_dsl,
                 )
             _copy_business_tool_outputs_for_fork(source.files, target_files)
             await self._ensure_runner(source)

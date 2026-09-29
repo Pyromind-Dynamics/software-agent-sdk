@@ -574,7 +574,9 @@ def test_ensure_reports_prepare_failures_that_are_not_a_missing_mount(
 def test_ensure_applies_pending_fork_from_materialized_source(
     tmp_path: Path, files: PiSessionFiles, monkeypatch
 ) -> None:
-    files.save_pending_sandbox_fork("conv-source", "nodes: []\n")
+    files.save_pending_sandbox_staging(
+        source_conversation_id="conv-source", workflow_dsl="nodes: []\n"
+    )
     client = _FakeSandboxClient()
     commands: list[str] = []
 
@@ -600,13 +602,15 @@ def test_ensure_applies_pending_fork_from_materialized_source(
         ]
         == b"nodes: []\n"
     )
-    assert files.load_pending_sandbox_fork() is None
+    assert files.load_pending_sandbox_staging() is None
 
 
 def test_ensure_skips_copy_when_fork_source_never_materialized(
     tmp_path: Path, files: PiSessionFiles, monkeypatch
 ) -> None:
-    files.save_pending_sandbox_fork(None, "nodes: []\n")
+    files.save_pending_sandbox_staging(
+        source_conversation_id=None, workflow_dsl="nodes: []\n"
+    )
     client = _FakeSandboxClient()
     commands: list[str] = []
 
@@ -631,7 +635,40 @@ def test_ensure_skips_copy_when_fork_source_never_materialized(
         ]
         == b"nodes: []\n"
     )
-    assert files.load_pending_sandbox_fork() is None
+    assert files.load_pending_sandbox_staging() is None
+
+
+def test_ensure_flushes_staged_workflow_into_a_running_sandbox(
+    tmp_path: Path, files: PiSessionFiles
+) -> None:
+    client = _FakeSandboxClient()
+    files.save_sandbox(
+        {
+            "sandbox_id": "sbx-1",
+            "workspace_path": (
+                f"{DEFAULT_MOUNT_PATH}{PYROMIND_AGENT_STORAGE_ROOT}/conv-1"
+            ),
+            "mount_path": DEFAULT_MOUNT_PATH,
+            "storage_host_path": STORAGE_HOST_PATH,
+            "workspace_version": _WORKSPACE_LAYOUT_VERSION,
+        }
+    )
+    files.save_pending_sandbox_staging(
+        source_conversation_id=None, workflow_dsl="nodes: []\n"
+    )
+    manager = SandboxExecutionManager(client_factory=lambda context: client)
+
+    asyncio.run(manager.ensure(_context(tmp_path), files))
+
+    assert "create:running" not in client.calls
+    assert (
+        client.files[
+            f"{DEFAULT_MOUNT_PATH}{PYROMIND_AGENT_STORAGE_ROOT}/conv-1"
+            "/public_data/workflow_canvas/workflow.py"
+        ]
+        == b"nodes: []\n"
+    )
+    assert files.load_pending_sandbox_staging() is None
 
 
 def test_sandbox_workspace_maps_paths_for_upload_download_and_execute(

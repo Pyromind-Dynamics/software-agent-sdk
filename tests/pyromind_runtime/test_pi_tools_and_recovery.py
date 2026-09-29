@@ -2010,12 +2010,80 @@ async def test_sandbox_fork_marks_pending_when_source_never_materialized(
         context,
     )
 
-    pending = PiSessionFiles(conversations / "target").load_pending_sandbox_fork()
+    pending = PiSessionFiles(conversations / "target").load_pending_sandbox_staging()
     assert pending is not None
     assert pending["source_conversation_id"] is None
     assert pending["workflow_dsl"] == "workflow = InputNode()"
     await adapter.close(target_handle)
     await adapter.close(source_handle)
+
+
+async def test_sandbox_canvas_stage_does_not_create_the_container(
+    tmp_path, monkeypatch
+) -> None:
+    class RecordingManager:
+        def __init__(self) -> None:
+            self.workspace_calls: list[str] = []
+            self.paused: list[str] = []
+
+        async def workspace(self, context, _files):
+            self.workspace_calls.append(context.conversation_id)
+            raise AssertionError("staging a canvas must not create a sandbox")
+
+        async def ensure(self, context, _files, *, refresh: bool = False):
+            self.workspace_calls.append(context.conversation_id)
+            raise AssertionError("staging a canvas must not create a sandbox")
+
+        async def pause(self, context, _files) -> None:
+            self.paused.append(context.conversation_id)
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
+    monkeypatch.setattr(
+        pi_adapter_module,
+        "convert_xyflow_to_dsl",
+        lambda _xyflow: "workflow = InputNode()",
+    )
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="sandbox")
+    manager = RecordingManager()
+    adapter._sandbox = cast(Any, manager)
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="conversation-1",
+            user_id="42",
+            workspace_root=str(conversations / "conversation-1"),
+            workflow_xyflow={"name": "demo", "nodes": [{"id": "n1"}], "edges": []},
+            model_configuration={"model": "gpt-5", "api_key": "request-secret"},
+        ),
+        RequestContext(user_id="42"),
+    )
+
+    files = PiSessionFiles(conversations / "conversation-1")
+    staging = files.load_pending_sandbox_staging()
+    assert manager.workspace_calls == []
+    assert files.load_sandbox() is None
+    assert staging is not None
+    assert staging["workflow_dsl"] == "workflow = InputNode()"
+    await adapter.close(handle)
+
+
+async def test_sandbox_reads_staged_workflow_before_container_exists(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="sandbox")
+    root = conversations / "conversation-1"
+    files = PiSessionFiles(root)
+    files.initialize({"session_id": "conversation-1"})
+    files.save_pending_sandbox_staging(
+        source_conversation_id=None, workflow_dsl="workflow = InputNode()"
+    )
+    session = pi_adapter_module._PiSession(
+        "conversation-1", root, files, {}, RequestContext(user_id="42")
+    )
+
+    assert files.load_sandbox() is None
+    assert await adapter._read_workflow(session) == "workflow = InputNode()"
 
 
 async def test_sandbox_close_pauses_instead_of_deleting_the_container(
