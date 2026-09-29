@@ -32,7 +32,10 @@ from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.protocol import MAX_FRAME_BYTES, encode_frame
 from harness_adapter.pi_adapter.runner import PiRunnerExit, PlannedPiRunnerExitReason
-from harness_adapter.pi_adapter.sandbox_runtime import DEFAULT_MOUNT_PATH
+from harness_adapter.pi_adapter.sandbox_runtime import (
+    DEFAULT_MOUNT_PATH,
+    STORAGE_HOST_PATH,
+)
 from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
 from harness_adapter.pi_adapter.tool_output import (
     MIN_POLICY_INLINE_BYTES,
@@ -49,6 +52,7 @@ from pyromind_runtime.ports.harness import (
     ForkSpec,
     ProductCheckpoint,
     RestoreWorkflowSpec,
+    SessionHandle,
     SessionSpec,
 )
 
@@ -1027,6 +1031,48 @@ async def test_sandbox_session_prompt_steers_storage_reads(
         assert DEFAULT_MOUNT_PATH in prompt
     finally:
         await adapter.close(handle)
+
+
+async def test_purge_deletes_the_paused_sandbox_and_clears_the_record(
+    tmp_path, monkeypatch
+) -> None:
+    calls: list[str] = []
+
+    class FakeClient:
+        base_url = "https://pre-api.pyromind.ai/api/v1"
+        api_key = "access-key"
+        cluster = "us-west-1"
+
+        def delete(self, sandbox_id: str) -> None:
+            calls.append(f"delete:{sandbox_id}")
+
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="sandbox")
+    monkeypatch.setattr(
+        adapter._sandbox, "_client_factory", lambda context: FakeClient()
+    )
+    files = PiSessionFiles(conversations / "conversation-purge")
+    files.initialize({"session_id": "conversation-purge"})
+    files.save_sandbox(
+        {
+            "sandbox_id": "sbx-1",
+            "workspace_path": f"{DEFAULT_MOUNT_PATH}/.pyromind-agent/conv",
+            "mount_path": DEFAULT_MOUNT_PATH,
+            "storage_host_path": STORAGE_HOST_PATH,
+        }
+    )
+    handle = SessionHandle(
+        session_id="conversation-purge",
+        adapter_session_ref="conversation-purge",
+        harness_id="pi",
+        capabilities=pi_adapter_module.PI_CAPABILITIES,
+    )
+
+    await adapter.purge(handle, RequestContext(user_id="42"))
+
+    assert calls == ["delete:sbx-1"]
+    assert files.load_sandbox() is None
 
 
 def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:

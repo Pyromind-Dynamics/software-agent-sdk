@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, runtime_checkable
 
-from openhands.sdk.workspace.models import CommandResult
+from openhands.sdk.workspace.models import CommandResult, FileOperationResult
 from openhands.tools.utils.workspace_staging import (
     STORAGE_ALIAS,
     WorkspaceStagingError,
@@ -72,6 +72,12 @@ class SandboxCommandWorkspace(Protocol):
         source_path: str | Path,
         destination_path: str | Path,
     ) -> Any: ...
+
+    def file_download(
+        self,
+        source_path: str | Path,
+        destination_path: str | Path,
+    ) -> FileOperationResult: ...
 
 
 def supports_sandbox_execution(workspace: Any) -> bool:
@@ -202,19 +208,26 @@ def sandbox_is_dir(workspace: Any, path: str) -> bool:
 
 
 def sandbox_read_text(workspace: Any, path: str, *, limit: int = 1_000_000) -> str:
-    """Read a bounded text file out of the sandbox."""
+    """Read a bounded text file out of the sandbox.
 
-    result = sandbox_execute(
-        workspace,
-        f"head -c {int(limit)} {shlex.quote(path)}",
-        timeout=_CACHE_TIMEOUT_SECONDS,
-    )
-    if result.exit_code != 0:
-        raise SandboxExecutionError(
-            f"cannot read {path} from the sandbox: "
-            f"{(result.stdout or '').strip()[-500:]}"
-        )
-    return result.stdout or ""
+    The content travels through the workspace file port. Reading it with a
+    terminal command would return the TTY transcript (prompt, echoed command,
+    and exit marker) instead of the file.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="pyromind-sandbox-read-") as staging:
+        local = Path(staging) / "content"
+        result = workspace.file_download(path, local)
+        if not result.success:
+            detail = result.error or "download failed"
+            raise SandboxExecutionError(
+                f"cannot read {path} from the sandbox: {detail}"
+            )
+        content = local.read_bytes()[: int(limit)]
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SandboxExecutionError(f"{path} is not a UTF-8 text file") from exc
 
 
 def sandbox_upload(workspace: Any, source: Path, destination: str) -> None:
@@ -270,14 +283,10 @@ class SandboxSampleExecutor:
         """Upload the runtime helpers once per fingerprint and return the dir."""
         target = self.runtime_path()
         marker = f"{target}/{_RUNTIME_READY_MARKER}"
-        result = sandbox_execute(
-            self._workspace,
-            f"cat {shlex.quote(marker)} 2>/dev/null",
-            timeout=_CACHE_TIMEOUT_SECONDS,
-        )
-        if result.exit_code == 0 and (result.stdout or "").strip() == (
-            self._runtime_fingerprint
-        ):
+        # The marker lives under a fingerprint-named directory, and terminal
+        # reads come back wrapped in the shell transcript, so existence is the
+        # reliable signal that the cached runtime matches.
+        if sandbox_exists(self._workspace, marker):
             return target
         sources = [self._runtime_dir / name for name in self._runtime_filenames]
         sources.append(self._runner_source)

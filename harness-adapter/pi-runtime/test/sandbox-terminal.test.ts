@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   buildCommandScript,
@@ -6,6 +10,7 @@ import {
   buildWatchScript,
   SandboxTerminalOperations,
   sandboxTerminalUrl,
+  TERMINAL_SCRIPT_CHUNK_CHARS,
   TerminalMarkerScanner,
   TERMINAL_BEGIN_MARKER,
   TERMINAL_END_MARKER,
@@ -119,6 +124,30 @@ function run(
   return { result, sockets, output: () => Buffer.concat(chunks).toString("utf8") };
 }
 
+function runCommandScript(command: string): {
+  stdout: string;
+  stderr: string;
+  exitCode: string;
+} {
+  const root = mkdtempSync(join(tmpdir(), "sandbox-terminal-"));
+  const runDir = join(root, "run");
+  const workspace = join(root, "workspace");
+  mkdirSync(runDir);
+  mkdirSync(workspace);
+  const scriptPath = join(runDir, "cmd.sh");
+  writeFileSync(scriptPath, buildCommandScript(runDir, workspace, command));
+  try {
+    const result = spawnSync("sh", [scriptPath], { encoding: "utf8" });
+    return {
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: readFileSync(join(runDir, "rc"), "utf8"),
+    };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 test("terminal scanner drops the prompt, swallows heartbeats, and reads the exit code", () => {
   const scanner = new TerminalMarkerScanner("token");
   const marker = frames("token");
@@ -181,6 +210,73 @@ test("terminal start line launches the command before tailing its output", () =>
     /setsid sh '\/target-workspace\/\.pyromind-agent\/conv-1\/\.pyromind-agent-runs\/call-1\/cmd\.sh' > '\/target-workspace\/\.pyromind-agent\/conv-1\/\.pyromind-agent-runs\/call-1\/out\.log' 2>&1 &/,
   );
   assert.ok(line.indexOf("cmd.sh") < line.lastIndexOf("watch.sh"));
+});
+
+test("terminal start line keeps every line below the canonical input cap", () => {
+  const runDir = "/target-workspace/.pyromind-agent/conv-1/.pyromind-agent-runs/call-1";
+  // Linux caps one canonical TTY line at MAX_CANON (4096 bytes); stay far below.
+  const lineBudget = 1024;
+  const command = [
+    "cd /target-workspace/datasets/test_100/test_100",
+    "python3 - <<'EOF'",
+    "import json",
+    `print(${JSON.stringify("x".repeat(3000))})`,
+    // The measured failure packed this much into one 5 KB start line.
+    `payload = ${JSON.stringify("y".repeat(2000))}`,
+    "EOF",
+  ].join("\n");
+  const line = buildStartLine(
+    runDir,
+    "token",
+    buildCommandScript(runDir, "/target-workspace/.pyromind-agent/conv-1", command),
+    buildWatchScript(60),
+  );
+  const lines = line.split("\n").filter((entry) => entry.length > 0);
+  assert.ok(lines.length > 3, "the start line is split into standalone commands");
+  for (const entry of lines) {
+    assert.ok(
+      Buffer.byteLength(entry, "utf8") < lineBudget,
+      `start line fragment is too long for the TTY: ${entry.slice(0, 60)}`,
+    );
+  }
+  assert.ok(TERMINAL_SCRIPT_CHUNK_CHARS < lineBudget);
+  assert.ok(line.endsWith("\n"));
+});
+
+test("terminal start line setup rebuilds both scripts byte for byte", () => {
+  const root = mkdtempSync(join(tmpdir(), "sandbox-start-line-"));
+  try {
+    const runDir = join(root, "run");
+    const workspace = join(root, "workspace");
+    mkdirSync(workspace);
+    const command = ["cat <<'EOF'", "hello", "EOF", "exit 3"].join("\n");
+    const commandScript = buildCommandScript(runDir, workspace, command);
+    const watchScript = buildWatchScript(60);
+    const lines = buildStartLine(runDir, "token", commandScript, watchScript)
+      .split("\n")
+      .filter((entry) => entry.length > 0);
+    const launchAt = lines.findIndex((entry) => entry.includes("setsid"));
+    assert.ok(launchAt > 0, "the launch line follows the staged scripts");
+    const setup = lines.slice(0, launchAt);
+    const result = spawnSync("sh", ["-c", setup.join("\n")], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(join(runDir, "cmd.sh"), "utf8"), commandScript);
+    assert.equal(readFileSync(join(runDir, "watch.sh"), "utf8"), watchScript);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("command script supports heredocs and records syntax errors", () => {
+  const heredoc = runCommandScript(["cat <<'EOF'", "hello", "EOF"].join("\n"));
+  assert.equal(heredoc.stdout, "hello\n");
+  assert.equal(heredoc.exitCode, "0");
+
+  const syntaxError = runCommandScript("if true; then");
+  assert.match(syntaxError.stderr, /syntax error/i);
+  assert.notEqual(syntaxError.exitCode, "0");
+
+  assert.equal(runCommandScript("exit 7").exitCode, "7");
 });
 
 test("terminal operations stream output and resolve the exit code", async () => {

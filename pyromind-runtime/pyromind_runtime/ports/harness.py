@@ -124,3 +124,14 @@ class HarnessAdapter(Protocol):
     def subscribe(self, handle: SessionHandle) -> AsyncIterator[HarnessEvent]: ...
 
     async def close(self, handle: SessionHandle) -> None: ...
+
+    async def purge(self, handle: SessionHandle, context: RequestContext) -> None:
+        """Delete execution resources retained for a released session.
+
+        The runtime releases a session with ``close`` and keeps it releasable;
+        once the session has stayed idle past the retention window it calls
+        ``purge`` to discard whatever outlives the process, such as a paused
+        remote sandbox. Adapters whose resources are local files that must
+        survive for the next attach implement this as a no-op.
+        """
+        ...

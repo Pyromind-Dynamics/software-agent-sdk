@@ -61,6 +61,9 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     release_grace_seconds = int(
         os.getenv("PYROMIND_CONVERSATION_RELEASE_GRACE_SECONDS", "300")
     )
+    resource_retention_seconds = int(
+        os.getenv("PYROMIND_SANDBOX_IDLE_DELETE_SECONDS", "1800")
+    )
     max_active_conversations = int(os.getenv("PYROMIND_MAX_ACTIVE_CONVERSATIONS", "0"))
     # The harness reclaims idle conversations on its own timer. When the product
     # timer is the slower of the two, live product sessions go cold underneath
@@ -86,6 +89,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         external_tasks=external_tasks,
         idle_eviction_seconds=idle_eviction_seconds,
         release_grace_seconds=release_grace_seconds,
+        resource_retention_seconds=resource_retention_seconds,
         max_active_conversations=max_active_conversations,
         resource_limits=resource_limits_from_environment(),
     )
@@ -93,13 +97,15 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         "Pyromind product runtime ready: default_harness=%s "
         "PYROMIND_HARNESS_BACKEND=%s registered_harnesses=%s "
         "pi_terminal_backend=%s idle_eviction_seconds=%d "
-        "release_grace_seconds=%d max_active_conversations=%d conversations_dir=%s",
+        "release_grace_seconds=%d resource_retention_seconds=%d "
+        "max_active_conversations=%d conversations_dir=%s",
         backend,
         raw_backend if raw_backend is not None else "<unset, defaulting to openhands>",
         sorted(adapters),
         terminal_backend or "-",
         idle_eviction_seconds,
         release_grace_seconds,
+        resource_retention_seconds,
         max_active_conversations,
         service.conversations_dir,
     )

@@ -683,6 +683,39 @@ class PiAdapter:
         finally:
             session.queue.put_nowait(None)
 
+    async def purge(self, handle: SessionHandle, context: RequestContext) -> None:
+        """Delete the paused sandbox a released conversation left behind.
+
+        ``close`` only pauses the container so the next attach can resume it;
+        once the runtime decides the conversation has idled past its retention
+        window, the sandbox is deleted and its persisted record cleared so a
+        later attach rebuilds a fresh container.
+        """
+        if self._terminal_backend != "sandbox":
+            return
+        conversation_id = handle.session_id
+        try:
+            root = self._safe_conversation_dir(conversation_id)
+        except (FileNotFoundError, RuntimeError):
+            return
+        files = PiSessionFiles(root)
+        config = files.load_session()
+        tool_context = ToolExecutionContext(
+            conversation_id=conversation_id,
+            workspace_root=root,
+            request_context=context,
+            model_configuration=_restored_model_configuration(config),
+            extra=dict(config.get("extra") or {}),
+        )
+        try:
+            await self._sandbox.delete(tool_context, files)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Pi sandbox purge failed conversation_id=%s error=%s",
+                conversation_id,
+                type(exc).__name__,
+            )
+
     async def _register(self, session: _PiSession) -> None:
         async with self._lock:
             if session.session_id in self._sessions:

@@ -811,6 +811,42 @@ async def test_promptless_conversation_is_released_after_grace(tmp_path) -> None
     await runtime.close()
 
 
+async def test_released_conversation_purges_after_retention_window(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, resource_retention_seconds=1)
+    await _create(runtime, conversations, "conversation-retain")
+    await runtime._release("conversation-retain", reason="test")
+
+    await asyncio.sleep(1.3)
+
+    assert adapter.purged == ["conversation-retain"]
+    assert "conversation-retain" not in runtime._retained
+    await runtime.close()
+
+
+async def test_reattach_before_retention_cancels_purge(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, resource_retention_seconds=1)
+    context = RequestContext(user_id="42")
+    await _create(runtime, conversations, "conversation-retain")
+    await runtime._release("conversation-retain", reason="test")
+
+    await runtime.submit_command(
+        "conversation-retain",
+        UserMessageCommand(command_id="command-1", content=(TextContent(text="hi"),)),
+        context,
+    )
+    await asyncio.sleep(1.3)
+
+    assert adapter.purged == []
+    assert runtime._retained == {}
+    await runtime.close()
+
+
 async def test_reads_do_not_reactivate_a_released_conversation(tmp_path) -> None:
     """Reads must not re-create a released session.
 

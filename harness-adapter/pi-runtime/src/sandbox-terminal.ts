@@ -15,6 +15,16 @@ export const SANDBOX_RUNS_DIRNAME = ".pyromind-agent-runs";
 export const TERMINAL_BEGIN_MARKER = "__PM_BEGIN__";
 export const TERMINAL_HEARTBEAT_MARKER = "__PM_HB__";
 export const TERMINAL_END_MARKER = "__PM_END__";
+/**
+ * Base64 characters written per `printf` line when staging a script.
+ *
+ * The TTY bridge feeds a canonical-mode terminal, which caps one input line
+ * (Linux `MAX_CANON` is 4096 bytes) and discards whatever follows. Long start
+ * lines therefore lose their tail, and the dropped `watch.sh` invocation is
+ * what left commands pending forever. Keeping every staged chunk well under
+ * that cap means no line can be truncated.
+ */
+export const TERMINAL_SCRIPT_CHUNK_CHARS = 512;
 
 const TERMINAL_COLS = 160;
 const TERMINAL_ROWS = 48;
@@ -180,7 +190,7 @@ export function buildCommandScript(
     "#!/bin/sh",
     `echo $$ > ${shellQuote(`${runDir}/pid`)}`,
     `cd ${shellQuote(workspacePath)} || exit 127`,
-    "( " + command + " )",
+    `sh -c ${shellQuote(command)}`,
     "rc=$?",
     `printf '%s' "$rc" > ${shellQuote(`${runDir}/rc`)}`,
     "",
@@ -231,22 +241,43 @@ export function buildStartLine(
   commandScript: string,
   watchScript: string,
 ): string {
-  const write = (name: string, content: string): string =>
-    `printf '%s' ${shellQuote(Buffer.from(content, "utf8").toString("base64"))} ` +
-    `| base64 -d > ${shellQuote(`${runDir}/${name}`)}`;
-  const setup = [
-    "stty -echo 2>/dev/null",
-    `mkdir -p ${shellQuote(runDir)}`,
-    write("cmd.sh", commandScript),
-    write("watch.sh", watchScript),
-  ].join(" && ");
   const launch =
     `{ setsid sh ${shellQuote(`${runDir}/cmd.sh`)} ` +
     `> ${shellQuote(`${runDir}/out.log`)} 2>&1 & }`;
   return (
-    `${setup} && ${launch} && ` +
-    `sh ${shellQuote(`${runDir}/watch.sh`)} ${shellQuote(runDir)} ${token}\n`
+    [
+      "stty -echo 2>/dev/null",
+      `mkdir -p ${shellQuote(runDir)}`,
+      ...stageScriptLines(runDir, "cmd.sh", commandScript),
+      ...stageScriptLines(runDir, "watch.sh", watchScript),
+      launch,
+      `sh ${shellQuote(`${runDir}/watch.sh`)} ${shellQuote(runDir)} ${token}`,
+    ].join("\n") + "\n"
   );
+}
+
+/**
+ * Writes one script into `runDir` with short, self-contained shell lines.
+ *
+ * The terminal has no upload channel, so the script travels as base64 that the
+ * remote shell appends to a staging file and decodes. Each line stays far below
+ * the canonical input cap; see {@link TERMINAL_SCRIPT_CHUNK_CHARS}.
+ */
+function stageScriptLines(
+  runDir: string,
+  name: string,
+  content: string,
+): string[] {
+  const staging = shellQuote(`${runDir}/${name}.b64`);
+  const target = shellQuote(`${runDir}/${name}`);
+  const encoded = Buffer.from(content, "utf8").toString("base64");
+  const lines = [`: > ${staging}`];
+  for (let at = 0; at < encoded.length; at += TERMINAL_SCRIPT_CHUNK_CHARS) {
+    const chunk = encoded.slice(at, at + TERMINAL_SCRIPT_CHUNK_CHARS);
+    lines.push(`printf '%s' ${shellQuote(chunk)} >> ${staging}`);
+  }
+  lines.push(`base64 -d < ${staging} > ${target} && rm -f ${staging}`);
+  return lines;
 }
 
 export function buildResumeLine(runDir: string, token: string): string {
