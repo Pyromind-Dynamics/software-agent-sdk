@@ -1180,6 +1180,10 @@ def _build_dataflow_command(
     frozen_script = f"{pod_output_dir}/{frozen_script_name}"
     output_file = f"{pod_output_dir}/processed.jsonl"
     venv_python = "/tmp/df-venv/bin/python"
+    setup_log = f"{pod_output_dir}/setup.log"
+    pipeline_log = f"{pod_output_dir}/pipeline.log"
+    validation_log = f"{pod_output_dir}/validation.log"
+    report_log = f"{pod_output_dir}/report.log"
     required_runtime_files = (
         RUNTIME_FILENAMES
         if runtime_dir_name or runtime_storage_dir
@@ -1222,9 +1226,11 @@ def _build_dataflow_command(
     packages = DATA_PROCESSING_PACKAGES
     package_args = " ".join(shlex.quote(item) for item in packages)
     setup_steps = [
-        "python3 -m venv /tmp/df-venv",
-        "/tmp/df-venv/bin/pip install --use-deprecated=legacy-resolver " + package_args,
         f"mkdir -p {shlex.quote(pod_output_dir)}",
+        f"python3 -m venv /tmp/df-venv > {shlex.quote(setup_log)} 2>&1",
+        "/tmp/df-venv/bin/pip install --use-deprecated=legacy-resolver "
+        + package_args
+        + f" >> {shlex.quote(setup_log)} 2>&1",
         f"test -f {shlex.quote(frozen_script)}",
         *[
             f"test -f {shlex.quote(f'{pod_runtime_dir}/{filename}')}"
@@ -1267,6 +1273,7 @@ def _build_dataflow_command(
     pipeline_step = (
         f"{env_prefix} {venv_python} {shlex.quote(frozen_script)}"
         f" {' '.join(pipeline_args)}"
+        f" > {shlex.quote(pipeline_log)} 2>&1"
     )
     validation_step = "validation_rc=0"
     if output_schema is not None and output_schema != "structured":
@@ -1285,6 +1292,7 @@ def _build_dataflow_command(
             f"{shlex.quote(output_file)} --schema {shlex.quote(output_schema)} "
             f"{image_root_arg}"
             f"--report {shlex.quote(validation_report)}"
+            f" > {shlex.quote(validation_log)} 2>&1"
             " || validation_rc=$?; fi"
         )
     report_step = (
@@ -1305,13 +1313,21 @@ def _build_dataflow_command(
         report_step += " --reuse-assessment-json " + shlex.quote(
             json.dumps(reuse_assessment, ensure_ascii=False)
         )
-    report_step += " || true"
+    report_step += f" >> {shlex.quote(report_log)} 2>&1 || true"
     final_step = (
         'if [ "$source_integrity_rc" -ne 0 ]; then '
+        f'echo "Data processing failed during source integrity check; '
+        f'see {pod_output_dir}/source_integrity.json" >&2; '
         'exit "$source_integrity_rc"; fi; '
-        'if [ "$pipeline_rc" -ne 0 ]; then exit "$pipeline_rc"; fi; '
-        'if [ "$validation_rc" -ne 0 ]; then exit "$validation_rc"; fi; '
-        "exit 0"
+        'if [ "$pipeline_rc" -ne 0 ]; then '
+        f'echo "Data processing failed with exit code $pipeline_rc; '
+        f'last log lines:" >&2; tail -n 40 {shlex.quote(pipeline_log)} >&2; '
+        'exit "$pipeline_rc"; fi; '
+        'if [ "$validation_rc" -ne 0 ]; then '
+        f'echo "Output validation failed; '
+        f'last log lines:" >&2; tail -n 40 {shlex.quote(validation_log)} >&2; '
+        'exit "$validation_rc"; fi; '
+        f'echo "Data preparation completed: {output_file}"'
     )
     return (
         " && ".join([*setup_steps, pipeline_step])
