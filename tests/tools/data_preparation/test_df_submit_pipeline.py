@@ -100,6 +100,9 @@ def test_build_dataflow_command_structure() -> None:
     assert "PYTHONPATH=" in cmd
     assert "DF_RUNTIME_FINGERPRINT=runtime-sha" in cmd
     assert "--image-utils-api-version 1" in cmd
+    assert "> /target-workspace/output/run1/pipeline.log 2>&1" in cmd
+    assert "tail -n 40 /target-workspace/output/run1/pipeline.log" in cmd
+    assert "Data preparation completed: " in cmd
     assert " && " in cmd
     assert "cp " not in cmd
 
