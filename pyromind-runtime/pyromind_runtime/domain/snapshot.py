@@ -32,6 +32,7 @@ class TimelineMessage(ContractModel):
     content: tuple[ContentBlock, ...] = ()
     status: Literal["streaming", "completed", "failed"] = "streaming"
     run_id: str | None = None
+    command_id: str | None = None
 
 
 class TimelineOperation(ContractModel):
@@ -121,6 +122,7 @@ class UsageState(ContractModel):
 class ExternalTaskState(ContractModel):
     task_id: str = Field(min_length=1)
     kind: Literal[
+        "historical_experience",
         "data_cleaning",
         "data_preparation",
         "workflow_debug",
@@ -147,6 +149,8 @@ class ExternalTaskState(ContractModel):
     submitted_at: str
     updated_at: str
     resume_pending: bool = False
+    completion_result: JsonObject = Field(default_factory=dict)
+    resume_auto_run: bool = True
     error_summary: str | None = None
 
 
@@ -156,6 +160,7 @@ class ConversationSnapshot(ContractModel):
     through_seq: int = Field(default=0, ge=0)
     updated_at: AwareDatetime | None = None
     status: ConversationStatus = "idle"
+    active_run_id: str | None = None
     capabilities: HarnessCapabilities
     timeline: tuple[TimelineItem, ...] = ()
     current_workflow: WorkflowState | None = None

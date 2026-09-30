@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, AssistantMessage, Model, Models } from "@earendil-works/pi-ai";
-import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import { PiAgentRuntime } from "../src/agent-runtime.js";
+import { SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
+import { PiAgentRuntime, notificationWasDelivered } from "../src/agent-runtime.js";
 import { resolveModel } from "../src/pi-model.js";
 import { normalizePiOutcome } from "../src/pi-outcome.js";
 import type { JsonObject, JsonValue, RunnerEvent } from "../src/protocol.js";
@@ -141,6 +141,7 @@ test("idle external notification triggers an independent hidden Pi turn", async 
   const runtime = new PiAgentRuntime(peer);
   const calls: Array<{ message: unknown; options: unknown }> = [];
   const session = {
+    sessionManager: SessionManager.inMemory(),
     isStreaming: false,
     messages: [assistant("stop")],
     sendCustomMessage: async (message: unknown, options: unknown) => {
@@ -163,6 +164,10 @@ test("idle external notification triggers an independent hidden Pi turn", async 
 
   assert.deepEqual(result, { accepted: true, queued: false });
   assert.equal(calls.length, 1);
+  assert.deepEqual(await runtime.handle("notify", {
+    run_id: "callback:task-1:succeeded", content: "done", details: {},
+  }), { accepted: true, duplicate: true });
+  assert.equal(session.sessionManager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === "pyromind.notification").length, 1);
   assert.deepEqual(calls[0]!.options, { triggerTurn: true });
   assert.equal(events.at(-1)?.kind, "run.finished");
 });
@@ -183,3 +188,41 @@ function assistant(stopReason: AssistantMessage["stopReason"]): AgentMessage {
     timestamp: Date.now(),
   } as AssistantMessage;
 }
+
+test("notifications arriving during a reply are durable, deduplicated and drained later", async () => {
+  const manager = SessionManager.inMemory();
+  let calls = 0;
+  const session = {
+    sessionManager: manager, isStreaming: true, messages: [assistant("stop")],
+    sendCustomMessage: async () => { calls++; },
+  };
+  const runtime = new PiAgentRuntime({ emit: () => {} } as unknown as JsonlRpcPeer);
+  const state = runtime as unknown as { session: AgentSession; sessionId: string; drainNotifications(): void };
+  state.session = session as unknown as AgentSession;
+  state.sessionId = "s";
+  const params = { run_id: "callback:graph-1:succeeded", content: "result", details: {} };
+  assert.deepEqual(await runtime.handle("notify", params), { accepted: true, queued: true });
+  assert.deepEqual(await runtime.handle("notify", params), { accepted: true, duplicate: true });
+  assert.equal(calls, 0);
+  assert.equal(manager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === "pyromind.notification").length, 1);
+  session.isStreaming = false;
+  state.drainNotifications();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+});
+
+
+test("recovery recognizes native custom_message delivery and legacy receipts", () => {
+  const runId = "callback:graph-1:succeeded";
+  for (const details of [{ notification_run_id: runId }, { task_id: "graph-1", status: "succeeded" }]) {
+    const manager = SessionManager.inMemory();
+    manager.appendCustomEntry("pyromind.notification", { runId, message: { content: "result" } });
+    assert.equal(notificationWasDelivered(manager.getBranch(), runId), false);
+    manager.appendCustomMessageEntry("pyromind.external_task", "result", false, details);
+    assert.equal(notificationWasDelivered(manager.getBranch(), runId), true);
+    assert.equal(notificationWasDelivered(manager.getBranch(), "callback:other:succeeded"), false);
+  }
+  const completed = SessionManager.inMemory();
+  completed.appendCustomEntry("pyromind.notification.finished", { runId });
+  assert.equal(notificationWasDelivered(completed.getBranch(), runId), true);
+});

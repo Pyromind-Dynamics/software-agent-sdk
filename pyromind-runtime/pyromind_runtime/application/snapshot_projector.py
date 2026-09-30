@@ -99,7 +99,19 @@ class SnapshotProjector:
                 code="unsupported_status",
                 message=f"Unsupported conversation status: {status}",
             )
-        return snapshot.model_copy(update={"status": status})
+        if (
+            status != "running"
+            and event.run_id is not None
+            and snapshot.active_run_id is not None
+            and event.run_id != snapshot.active_run_id
+        ):
+            return snapshot
+        return snapshot.model_copy(
+            update={
+                "status": status,
+                "active_run_id": event.run_id if status == "running" else None,
+            }
+        )
 
     def _on_message_started(
         self, snapshot: ConversationSnapshot, event: ProductEvent
@@ -120,6 +132,9 @@ class SnapshotProjector:
             content=self._content(event.payload),
             run_id=event.run_id,
         )
+        command_id = event.payload.get("command_id")
+        if isinstance(command_id, str):
+            message = message.model_copy(update={"command_id": command_id})
         return self._append(snapshot, message)
 
     def _on_message_delta(
@@ -166,6 +181,9 @@ class SnapshotProjector:
             "completed_seq": event.seq,
             "status": "completed",
         }
+        command_id = event.payload.get("command_id")
+        if isinstance(command_id, str):
+            update["command_id"] = command_id
         if "content" in event.payload:
             update["content"] = self._content(event.payload)
         return self._replace(snapshot, item.model_copy(update=update))
@@ -380,7 +398,9 @@ class SnapshotProjector:
         return snapshot.model_copy(
             update={
                 "external_tasks": (*tasks, task),
-                "status": "waiting_for_external_task",
+                "status": snapshot.status
+                if task.kind == "historical_experience"
+                else "waiting_for_external_task",
             }
         )
 
@@ -393,6 +413,8 @@ class SnapshotProjector:
         self, snapshot: ConversationSnapshot, event: ProductEvent
     ) -> ConversationSnapshot:
         updated = self._update_external_task(snapshot, event)
+        if event.payload.get("kind") == "historical_experience":
+            return updated
         running = any(
             task.status in {"pending", "running"} for task in updated.external_tasks
         )

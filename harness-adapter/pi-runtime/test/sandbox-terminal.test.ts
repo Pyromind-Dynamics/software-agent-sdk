@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -210,6 +210,25 @@ test("terminal start line launches the command before tailing its output", () =>
     /setsid sh '\/target-workspace\/\.pyromind-agent\/conv-1\/\.pyromind-agent-runs\/call-1\/cmd\.sh' > '\/target-workspace\/\.pyromind-agent\/conv-1\/\.pyromind-agent-runs\/call-1\/out\.log' 2>&1 &/,
   );
   assert.ok(line.indexOf("cmd.sh") < line.lastIndexOf("watch.sh"));
+});
+
+test("large script uploads survive terminal line limits and preserve exact bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "genome-tty-"));
+  try {
+    const runDir = join(root, "run");
+    const command = "printf '%s' '" + "历史经验".repeat(2000) + "'";
+    const script = buildCommandScript(runDir, root, command);
+    const watch = buildWatchScript(60).replace("stty echo 2>/dev/null", "true");
+    const line = buildStartLine(runDir, "token", script, watch);
+    assert.ok(line.split("\n").every((part) => Buffer.byteLength(part) < 1024));
+    // Supply terminal/process-group primitives while exercising actual shell parsing.
+    execFileSync("sh", ["-c", "stty() { :; }; setsid() { \"$@\"; };\n" + line], { timeout: 10000 });
+    assert.equal(readFileSync(join(runDir, "cmd.sh"), "utf8"), script);
+    assert.equal(readFileSync(join(runDir, "out.log"), "utf8"), "历史经验".repeat(2000));
+    assert.equal(readFileSync(join(runDir, "rc"), "utf8"), "0");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("terminal start line keeps every line below the canonical input cap", () => {

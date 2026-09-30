@@ -37,3 +37,18 @@ test("tool completion reports generic arguments without workflow semantics", () 
   });
   assert.equal("resource_type" in events[0]!.payload, false);
 });
+
+test("steered identical messages keep command identity separate from callback run", () => {
+  const normalizer = new PiEventNormalizer("s", "callback:graph:unique", ["command-1", "command-2"]);
+  const ids = [];
+  for (const commandId of ["command-1", "command-2"]) {
+    const message = { role: "user", content: "same text", timestamp: 1 };
+    const started = normalizer.translate({ type: "message_start", message } as AgentSessionEvent)[0]!;
+    const completed = normalizer.translate({ type: "message_end", message } as AgentSessionEvent)[0]!;
+    assert.equal(started.payload.command_id, commandId);
+    assert.equal(completed.payload.command_id, commandId);
+    assert.equal(completed.runId, "callback:graph:unique");
+    ids.push(completed.payload.message_id);
+  }
+  assert.notEqual(ids[0], ids[1]);
+});

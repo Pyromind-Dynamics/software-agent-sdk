@@ -1156,3 +1156,67 @@ async def test_subscriber_queue_sheds_deltas_but_keeps_state_events() -> None:
     assert queue.get_nowait().seq == 1
     assert queue.get_nowait().seq == 2
     assert queue.get_nowait().seq == 100
+
+
+@pytest.mark.parametrize(
+    "status,trigger", [("succeeded", True), ("failed", True), ("stopped", False)]
+)
+async def test_history_result_recovers_once_without_reexecuting(
+    tmp_path, status, trigger, monkeypatch
+):
+    (tmp_path / "history").mkdir()
+    store = FileProductStore(tmp_path / "history")
+    store.create(
+        ConversationSnapshot(
+            conversation_id="history", capabilities=HarnessCapabilities()
+        ),
+        user_id="42",
+        harness_id="openhands",
+    )
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(tmp_path, adapter)
+    runtime.register_external_task(
+        "history",
+        {
+            "task_id": "graph-1",
+            "kind": "historical_experience",
+            "status": "pending",
+            "submitted_at": "2026-09-30T00:00:00Z",
+            "updated_at": "2026-09-30T00:00:00Z",
+            "completion_result": {"asset_id": "clean", "version": "1"},
+        },
+    )
+    await runtime.deliver_external_task_status(
+        "history",
+        task_id="graph-1",
+        status=status,
+        auto_run=trigger,
+        completion_result={
+            "result": {"report": {"execution_path": "public_data/report.json"}}
+        },
+    )
+    assert store.load_snapshot().external_tasks[0].resume_pending
+    original_notify = adapter.notify_external_task
+    fail_once = True
+
+    async def flaky_notify(*args):
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise RuntimeError("notification unavailable")
+        return await original_notify(*args)
+
+    monkeypatch.setattr(adapter, "notify_external_task", flaky_notify)
+    context = RequestContext(user_id="42")
+    with pytest.raises(RuntimeError, match="notification unavailable"):
+        await runtime.get_snapshot("history", context)
+    assert store.load_snapshot().external_tasks[0].resume_pending
+    await runtime.get_snapshot("history", context)
+    await runtime.get_snapshot("history", context)
+    assert len(adapter.external_task_notifications) == 1
+    notice = adapter.external_task_notifications[0][1]
+    assert notice.trigger_turn is trigger
+    assert "public_data/report.json" in notice.hidden_text
+    assert '"asset_id": "clean"' in notice.hidden_text
+    assert not store.load_snapshot().external_tasks[0].resume_pending
+    await runtime.close()

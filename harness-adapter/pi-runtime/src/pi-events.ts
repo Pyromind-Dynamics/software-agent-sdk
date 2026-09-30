@@ -9,10 +9,11 @@ const MAX_STRING = 64 * 1024;
 
 export class PiEventNormalizer {
   private messageId: string | undefined;
+  private commandId: string | undefined;
   private messageRole: "user" | "assistant" | undefined;
   private readonly toolArguments = new Map<string, JsonValue>();
 
-  constructor(private readonly sessionId: string, private readonly runId: string) {}
+  constructor(private readonly sessionId: string, private readonly runId: string, private readonly pendingCommandIds: string[] = []) {}
 
   translate(event: AgentSessionEvent): RunnerEvent[] {
     switch (event.type) {
@@ -50,7 +51,8 @@ export class PiEventNormalizer {
     if (message.role !== "user" && message.role !== "assistant") return [];
     this.messageId = randomUUID();
     this.messageRole = message.role;
-    return [this.make("message.started", { message_id: this.messageId, role: message.role, content: messageContent(message) })];
+    this.commandId = message.role === "user" ? this.pendingCommandIds.shift() : undefined;
+    return [this.make("message.started", { message_id: this.messageId, role: message.role, ...(this.commandId ? { command_id: this.commandId } : {}), content: messageContent(message) })];
   }
 
   private endMessage(message: AgentMessage): RunnerEvent[] {
@@ -58,7 +60,8 @@ export class PiEventNormalizer {
     const id = this.messageRole === message.role && this.messageId ? this.messageId : randomUUID();
     this.messageId = undefined;
     this.messageRole = undefined;
-    const events = [this.make("message.completed", { message_id: id, role: message.role, content: messageContent(message) })];
+    const events = [this.make("message.completed", { message_id: id, role: message.role, ...(this.commandId ? { command_id: this.commandId } : {}), content: messageContent(message) })];
+    this.commandId = undefined;
     if (message.role === "assistant") {
       events.push(this.make("usage.updated", usagePayload(message.usage)));
     }

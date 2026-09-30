@@ -19,13 +19,20 @@ type Publish = Callable[[str, str, str, JsonObject], Coroutine[Any, Any, None]]
 class _Run:
     run_id: str
     origin_run_id: str | None = None
+    cancel_requested: bool = False
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     done: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task[None] | None = None
 
 
 class ReusableWorkflows:
-    def __init__(self, backend: WorkflowBackend, publish: Publish) -> None:
+    def __init__(
+        self,
+        backend: WorkflowBackend,
+        publish: Publish,
+        complete: Callable[[str, JsonObject], Coroutine[Any, Any, None]] | None = None,
+    ) -> None:
+        self.complete = complete
         self.backend = backend
         self.publish = publish
         self.active: dict[str, _Run] = {}
@@ -47,12 +54,18 @@ class ReusableWorkflows:
             run_id = result.get("id")
             if not isinstance(run_id, str):
                 raise ValueError("workflow backend returned no run id")
-            if scope not in self.active:
+            if scope not in self.active or self.active[scope].run_id != run_id:
                 run = _Run(run_id, origin_run_id)
                 self.active[scope] = run
                 run.task = asyncio.create_task(self._execute(scope, run))
-        if action == "cancel" and result.get("status") == "cancelled":
-            self.release(scope)
+        if (
+            action == "cancel"
+            and scope in self.active
+            and self.active[scope].run_id == arguments.get("run_id")
+        ):
+            self.active[scope].cancel_requested = True
+            if result.get("status") == "cancelled":
+                self.release(scope)
         return result
 
     def release(self, scope: str, origin_run_id: str | None = None) -> None:
@@ -85,10 +98,13 @@ class ReusableWorkflows:
         last_output = 0.0
         current_node = None
         current_command = None
+        result: JsonObject = {"id": run.run_id, "status": "interrupted"}
 
         async def emit(event: JsonObject) -> None:
             nonlocal tail, sequence, last_output, current_node, current_command
             if isinstance(event.get("node"), str):
+                if current_node != event["node"]:
+                    current_command = None
                 current_node = event["node"]
             if isinstance(event.get("command"), str):
                 current_command = event["command"]
@@ -121,12 +137,6 @@ class ReusableWorkflows:
             await run.ready.wait()
             await self.publish(
                 scope,
-                f"{operation_id}:running",
-                "status.changed",
-                {"status": "running"},
-            )
-            await self.publish(
-                scope,
                 f"{operation_id}:start",
                 "operation.started",
                 {
@@ -138,7 +148,7 @@ class ReusableWorkflows:
                 },
             )
             result = await self.backend.execute(scope, run.run_id, emit)
-            success = result.get("status") == "succeeded"
+            success = result.get("status") in {"succeeded", "cancelled"}
             await self.publish(
                 scope,
                 f"{operation_id}:end",
@@ -152,6 +162,11 @@ class ReusableWorkflows:
                 },
             )
         except Exception as exc:
+            result = {
+                "id": run.run_id,
+                "status": "interrupted",
+                "result": {"error": str(exc)},
+            }
             await self.publish(
                 scope,
                 f"{operation_id}:end",
@@ -163,13 +178,15 @@ class ReusableWorkflows:
                 },
             )
         finally:
-            try:
-                await self.publish(
-                    scope, f"{operation_id}:idle", "status.changed", {"status": "idle"}
-                )
-            finally:
+            if self.active.get(scope) is run:
                 self.active.pop(scope, None)
-                run.done.set()
+        try:
+            if run.cancel_requested:
+                result = {**result, "cancel_requested": True}
+            if self.complete is not None:
+                await self.complete(scope, result)
+        finally:
+            run.done.set()
 
     async def close(self) -> None:
         for scope in tuple(self.active):
