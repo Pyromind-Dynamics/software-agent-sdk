@@ -64,6 +64,11 @@ DEFAULT_CPU = "4"
 DEFAULT_MEMORY = "8Gi"
 _READY_STATUSES = frozenset({"running"})
 _RESUMABLE_STATUSES = frozenset({"paused", "stopped"})
+# A resumed container reports these statuses while its pod is still coming up;
+# resume() only accepts the request, so `running` is the first usable status.
+_STARTING_STATUSES = frozenset({"creating", "pending", "starting"})
+_START_TIMEOUT_SECONDS = 180
+_START_POLL_SECONDS = 3
 # Exit codes reported by the workspace scripts so a failure can be attributed
 # without grepping terminal output (the TTY bridge echoes the command line).
 _MOUNT_MISSING_EXIT_CODE = 3
@@ -144,6 +149,15 @@ class SandboxClientLike(Protocol):
     def create_and_wait(
         self, request: SandboxRequest, *, target_status: str, timeout: int
     ) -> SandboxResponse: ...
+
+    def wait_for_sandbox_status(
+        self,
+        sandbox_id: str,
+        target_status: str,
+        timeout: int = 300,
+        check_interval: int = 3,
+        intermediate_statuses: list[str] | None = None,
+    ) -> bool: ...
 
     def resume(self, sandbox_id: str) -> SandboxResponse: ...
 
@@ -365,7 +379,12 @@ class SandboxExecutionManager:
             sandbox = await self._create(client, settings, context.conversation_id)
             prepare = True
         elif sandbox.status.strip().lower() in _RESUMABLE_STATUSES:
-            sandbox = await asyncio.to_thread(client.resume, sandbox.id)
+            sandbox = await self._start(client, sandbox)
+            prepare = True
+        elif sandbox.status.strip().lower() in _STARTING_STATUSES:
+            # A sandbox whose pod is still starting (for example a resume that
+            # is already in flight) must be waited for, not deleted.
+            sandbox = await self._start(client, sandbox)
             prepare = True
         elif sandbox.status.strip().lower() not in _READY_STATUSES:
             logger.warning(
@@ -502,7 +521,7 @@ class SandboxExecutionManager:
                 sandbox.id,
                 type(exc).__name__,
             )
-        return await self._running(client, sandbox)
+        return await self._start(client, sandbox)
 
     async def _adopt_named(
         self,
@@ -524,17 +543,34 @@ class SandboxExecutionManager:
             return None
         return next((sandbox for sandbox in sandboxes if sandbox.name == name), None)
 
-    async def _running(
+    async def _start(
         self, client: SandboxClientLike, sandbox: SandboxResponse
     ) -> SandboxResponse:
+        """Return the sandbox once its pod is actually serving.
+
+        ``SandboxClient.resume`` and the platform's status both lag the pod:
+        resume accepts the request before the container exists, so writing the
+        workspace right after it fails with ``No Running pod found``.
+        """
+        if sandbox.status.strip().lower() in _READY_STATUSES:
+            return sandbox
         if sandbox.status.strip().lower() in _RESUMABLE_STATUSES:
-            sandbox = await asyncio.to_thread(client.resume, sandbox.id)
-        if sandbox.status.strip().lower() != "running":
+            await asyncio.to_thread(client.resume, sandbox.id)
+        await asyncio.to_thread(
+            client.wait_for_sandbox_status,
+            sandbox.id,
+            target_status="running",
+            timeout=_START_TIMEOUT_SECONDS,
+            check_interval=_START_POLL_SECONDS,
+            intermediate_statuses=sorted(_RESUMABLE_STATUSES | _STARTING_STATUSES),
+        )
+        latest = await asyncio.to_thread(client.get_sandbox, sandbox.id)
+        if latest.status.strip().lower() not in _READY_STATUSES:
             raise RuntimeError(
                 f"PI_SANDBOX_NOT_RUNNING: sandbox {sandbox.id} is "
-                f"{sandbox.status or 'unknown'}"
+                f"{latest.status or 'unknown'}"
             )
-        return sandbox
+        return latest
 
     async def _prepare_workspace(
         self,
