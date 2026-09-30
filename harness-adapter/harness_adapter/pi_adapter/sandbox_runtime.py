@@ -314,11 +314,11 @@ class SandboxExecutionManager:
                 # re-keyed behind this process, so re-read the platform state and
                 # mint a fresh access key instead of returning the cached bundle.
                 self._states.pop(context.conversation_id, None)
-            pending_fork = files.load_pending_sandbox_fork()
+            pending_staging = files.load_pending_sandbox_staging()
             existing = self._states.get(context.conversation_id)
-            if existing is not None and pending_fork is None:
+            if existing is not None and pending_staging is None:
                 return existing
-            state = await self._ensure_state_locked(context, files, pending_fork)
+            state = await self._ensure_state_locked(context, files, pending_staging)
             self._states[context.conversation_id] = state
             return state
 
@@ -326,7 +326,7 @@ class SandboxExecutionManager:
         self,
         context: ToolExecutionContext,
         files: PiSessionFiles,
-        pending_fork: dict[str, Any] | None,
+        pending_staging: dict[str, Any] | None,
     ) -> _SandboxState:
         settings = SandboxSettings.from_extra(context.extra)
         record = files.load_sandbox() or {}
@@ -398,16 +398,16 @@ class SandboxExecutionManager:
             env=_execution_target(context)[0],
             fallback=client.base_url,
         )
-        if pending_fork is not None:
-            await self._apply_pending_fork(
+        if pending_staging is not None:
+            await self._apply_pending_staging(
                 client,
                 sandbox.id,
                 ws_base_url,
                 mount_path,
                 workspace_path,
-                pending_fork,
+                pending_staging,
             )
-            files.clear_pending_sandbox_fork()
+            files.clear_pending_sandbox_staging()
         if prepare or record_needs_prepare:
             logger.info(
                 "Preparing Pi sandbox workspace conversation_id=%s sandbox_id=%s "
@@ -598,7 +598,7 @@ class SandboxExecutionManager:
             timeout_seconds=timeout_seconds,
         )
 
-    async def _apply_pending_fork(
+    async def _apply_pending_staging(
         self,
         client: SandboxClientLike,
         sandbox_id: str,

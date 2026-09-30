@@ -38,6 +38,7 @@ class FakeAdapter:
         self.sent: list[tuple[str, ProductCommand, RequestContext]] = []
         self.attached: list[str] = []
         self.closed: list[str] = []
+        self.purged: list[str] = []
         self.created_specs: list[SessionSpec] = []
         self.external_task_notifications: list[
             tuple[str, ExternalTaskNotification, RequestContext]
@@ -167,6 +168,9 @@ class FakeAdapter:
         queue = self.queues.pop(handle.session_id, None)
         if queue is not None:
             queue.put_nowait(None)
+
+    async def purge(self, handle: SessionHandle, context: RequestContext) -> None:
+        self.purged.append(handle.session_id)
 
     def emit(
         self,
