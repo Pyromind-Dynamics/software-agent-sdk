@@ -167,3 +167,29 @@ def test_reusable_workflow_runtime_has_no_engine_or_harness_imports() -> None:
             name.split(".")[0] in {"agentgenome", "core", "harness_adapter", "fastapi"}
             for name in imports
         ), relative
+
+
+def test_sdk_agentgenome_uses_host_bridge_without_native_execution_fallback() -> None:
+    adapter = ROOT / "harness-adapter"
+    bridge = (adapter / "harness_adapter/agentgenome_bridge.py").read_text()
+    imports = {
+        node.module
+        for node in ast.walk(ast.parse(bridge))
+        if isinstance(node, ast.ImportFrom)
+    }
+    assert "agentgenome.dispatch" in imports
+    assert not imports.intersection(
+        {"agentgenome.local_host", "agentgenome.local_service"}
+    )
+    session = (adapter / "pi-runtime/src/pi-session.ts").read_text()
+    assert "additionalExtensionPaths" in session
+    assert "experienceHost.assertLoaded(resourceLoader)" in session
+    for path in (adapter / "pi-runtime/src").rglob("*.ts"):
+        source = path.read_text()
+        assert "createGenomeExtension" not in source, path
+        assert "createBridgeHost" not in source, path
+    host = (adapter / "pi-runtime/src/genome-host.ts").read_text()
+    assert "provideGenomeHost" in host
+    assert 'peer.request("workflow.invoke"' not in session
+    assert "NativeClient" not in session
+    assert "nativeHost" not in session

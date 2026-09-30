@@ -2,6 +2,10 @@
 
 AgentGenome 管共享资产、版本和图内状态。SDK Runtime 管会话、权限、排队和产品事件；HarnessAdapter 将执行请求接到当前 Pi 会话的终端后端。固定脚本直接执行，不经过第二次 LLM 调用。
 
+AgentGenome 0.2.0 在原生 Pi 与 SDK 中使用同一个默认插件入口。SDK 通过 Pi 的 `additionalExtensionPaths` 从已安装包读取插件，不再通过 `extensionFactories` 创建 AgentGenome。插件通过 Pi 事件总线发现 SDK 的宿主能力；工具定义、请求封装及 Python 操作分发都在 AgentGenome，SDK 只保留沙箱、权限、会话和通知适配。启动时校验插件已连到 SDK，失败不回退为本机执行。
+
+原生 Pi 的安装、`/genome setup` 和共享本地服务由 AgentGenome 自带，不需要修改 Pi。SDK 仍使用独立的 `workspace/agentgenome` 目录，不与正在运行的原生服务争用同一执行锁。对外产品协议和已有持久化模型不变。
+
 ## 名称与选用顺序
 
 面向 Agent 和用户，AgentGenome graph 统一称为“历史经验”；“工作流”指 Pyromind 平台 DSL。历史经验（graph + scripts）和 Skill 都可复用：执行任务先查 `genome_list`，用 `genome_get` 确认适用性，合适则复用，否则再选 Skill。闲聊无需查询。工具名 `genome_*` 和内部工作流接口保持兼容。
@@ -22,6 +26,8 @@ Storage 输入须保留 `storage/` 前缀，例如 `storage/agentTest/input.csv`
 也可以在 AgentGenome 目录执行 `./start_sdk.sh test`、`./start_sdk.sh start`。两个入口调用同一套 SDK，不启动独立的 AgentGenome 服务。
 
 测试命令安装锁定的 Python/npm 依赖、编译 Pi runtime，然后通过 SDK 的实际 Pi OS 沙箱执行两批 CSV。不调用模型或业务平台，不需要 API Key。预期两次输出 `succeeded`，清洗后分别为 2 行和 1 行，最后输出 `published`。已安装依赖时，可用 `AGENTGENOME_SKIP_INSTALL=1 ./start_inference.sh --test-agentgenome` 跳过安装。
+
+这两个启动入口现在都走 Pi 标准插件加载链路。`pi-runtime` 的 `genome-plugin.integration.test.ts` 另外通过真实 Pi 会话和本地模拟模型验证 `genome_list/genome_run → SDK RPC`，覆盖包加载、宿主发现、重载、关闭开关和禁止本地回退。CSV 验证负责真实沙箱执行，不需要真实模型调用。
 
 模板会复制到 `workspace/agentgenome/assets/data-cleaning/1.0.0/`，验收后发布；测试输入和产物在 `workspace/genome-validation/`。重复测试创建新运行，不能用不同内容覆盖已发布版本。测试固定使用本地 `os-sandbox`；真实平台沙箱需在聊天中另测。
 
@@ -64,12 +70,14 @@ Storage 输入须保留 `storage/` 前缀，例如 `storage/agentTest/input.csv`
 uv build --wheel --out-dir vendor ../AgentGenome
 cd harness-adapter/pi-runtime
 npm pack ../../../AgentGenome/pi-extension --pack-destination vendor
-npm install --ignore-scripts ./vendor/agentgenome-pi-extension-0.1.0.tgz
+npm install --ignore-scripts ./vendor/agentgenome-pi-extension-0.2.0.tgz
 npm run build
 cd ../..
 uv lock --upgrade-package agentgenome --refresh-package agentgenome
 uv sync
 ```
+
+升级版本时同步更新根 `pyproject.toml` 的 wheel 路径和 `harness-adapter/pyproject.toml` 的版本约束，再生成锁文件。npm 包包含同版 Python wheel；SDK Python 环境仍通过正常 wheel 依赖安装，不使用插件的本地环境初始化流程。
 
 对外 API 和已有 Product Store 模型不变。新增通用工作流端口；AgentGenome 的 SQLite 独立管理，不复用原画布工作流记录。
 
