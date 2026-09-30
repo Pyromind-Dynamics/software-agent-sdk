@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { setImmediate } from "node:timers";
-import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { PiEventNormalizer } from "./pi-events.js";
 import { PiOutcomeNormalizer } from "./pi-outcome.js";
@@ -27,6 +27,8 @@ export class PiAgentRuntime {
   private normalizer: PiEventNormalizer | undefined;
   private readonly outcome = new PiOutcomeNormalizer();
   private readonly finishedRuns = new Set<string>();
+  private readonly pendingCommandIds: string[] = [];
+  private readonly notificationIds = new Set<string>();
   private readonly pendingNotifications: Array<{
     runId: string;
     message: { customType: string; content: string; display: boolean; details: JsonObject };
@@ -63,6 +65,19 @@ export class PiAgentRuntime {
     this.sessionId = sessionId;
     this.workspaceRoot = requiredString(params, "workspace_root");
     this.terminalBackend = requiredString(params, "terminal_backend");
+    for (const entry of session.sessionManager.getBranch()) {
+      if (entry.type !== "custom" || entry.customType !== "pyromind.notification" || !isObject(entry.data)) continue;
+      const { runId, message } = entry.data;
+      if (typeof runId !== "string" || !isObject(message) || typeof message.content !== "string") continue;
+      if (this.notificationIds.has(runId)) continue;
+      this.notificationIds.add(runId);
+      const delivered = notificationWasDelivered(session.sessionManager.getBranch(), runId);
+      if (!delivered) this.pendingNotifications.push({ runId, message: {
+        customType: "pyromind.external_task", content: message.content, display: false,
+        details: isObject(message.details) ? message.details : {},
+      } });
+    }
+    setImmediate(() => this.drainNotifications());
     return { ready: true };
   }
 
@@ -71,14 +86,22 @@ export class PiAgentRuntime {
     const runId = requiredString(params, "run_id");
     const prompt = parsePromptContent(params.content);
     if (forceSteer || session.isStreaming) {
-      await session.steer(prompt.text, prompt.images);
+      this.pendingCommandIds.push(runId);
+      try { await session.steer(prompt.text, prompt.images); }
+      catch (error) { this.discardCommand(runId); throw error; }
       return { accepted: true, steered: true };
     }
     if (this.normalizer) throw new Error("Pi agent is already running");
-    this.normalizer = new PiEventNormalizer(this.sessionId!, runId);
+    this.normalizer = new PiEventNormalizer(this.sessionId!, runId, this.pendingCommandIds);
     this.outcome.reset();
+    this.pendingCommandIds.push(runId);
     setImmediate(() => void this.runPrompt(runId, prompt));
     return { accepted: true, steered: false };
+  }
+
+  private discardCommand(commandId: string): void {
+    const index = this.pendingCommandIds.indexOf(commandId);
+    if (index >= 0) this.pendingCommandIds.splice(index, 1);
   }
 
   private async runPrompt(runId: string, prompt: ParsedPrompt): Promise<void> {
@@ -96,6 +119,7 @@ export class PiAgentRuntime {
         message: error instanceof Error ? error.message : "Pi runner failed",
       });
     } finally {
+      this.discardCommand(runId);
       this.normalizer = undefined;
       this.drainNotifications();
     }
@@ -141,13 +165,16 @@ export class PiAgentRuntime {
     const session = this.requireSession();
     const runId = requiredString(params, "run_id");
     const content = requiredString(params, "content");
-    const details = isObject(params.details) ? params.details : {};
+    if (this.notificationIds.has(runId)) return { accepted: true, duplicate: true };
+    const details = { ...(isObject(params.details) ? params.details : {}), notification_run_id: runId };
     const message = {
       customType: "pyromind.external_task",
       content,
       display: false,
       details,
     };
+    session.sessionManager.appendCustomEntry("pyromind.notification", { runId, message });
+    this.notificationIds.add(runId);
     if (session.isStreaming || this.normalizer) {
       this.pendingNotifications.push({ runId, message });
       return { accepted: true, queued: true };
@@ -193,14 +220,16 @@ export class PiAgentRuntime {
     runId: string,
     message: { customType: string; content: string; display: boolean; details: JsonObject },
   ): void {
-    this.normalizer = new PiEventNormalizer(this.sessionId!, runId);
+    const executionRunId = `${runId}:${randomUUID()}`;
+    this.normalizer = new PiEventNormalizer(this.sessionId!, executionRunId, this.pendingCommandIds);
     this.outcome.reset();
-    setImmediate(() => void this.runNotification(runId, message));
+    setImmediate(() => void this.runNotification(executionRunId, message, runId));
   }
 
   private async runNotification(
     runId: string,
     message: { customType: string; content: string; display: boolean; details: JsonObject },
+    notificationId: string,
   ): Promise<void> {
     try {
       const session = this.requireSession();
@@ -215,6 +244,7 @@ export class PiAgentRuntime {
         message: error instanceof Error ? error.message : "Pi notification failed",
       });
     } finally {
+      this.requireSession().sessionManager.appendCustomEntry("pyromind.notification.finished", { runId: notificationId, execution_run_id: runId });
       this.normalizer = undefined;
       this.drainNotifications();
     }
@@ -249,4 +279,14 @@ function requiredString(value: Record<string, unknown>, name: string): string {
   const item = value[name];
   if (typeof item !== "string" || !item) throw new Error(`${name} must be a string`);
   return item;
+}
+
+
+export function notificationWasDelivered(entries: SessionEntry[], runId: string): boolean {
+  return entries.some((item) =>
+    (item.type === "custom_message" && item.customType === "pyromind.external_task" &&
+      isObject(item.details) && (item.details.notification_run_id === runId ||
+        `callback:${item.details.task_id}:${item.details.status}` === runId)) ||
+    (item.type === "custom" && item.customType === "pyromind.notification.finished" &&
+      isObject(item.data) && item.data.runId === runId));
 }

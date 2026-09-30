@@ -204,3 +204,42 @@ def test_projector_accepts_environment_processing_kinds() -> None:
             ),
         )
         assert completed.status == "idle"
+
+
+def test_late_completion_preserves_new_run_and_message_command_id():
+    projector = SnapshotProjector()
+    snapshot = projector.reduce(
+        _snapshot(),
+        _event(1, "status.changed", {"status": "running"}).model_copy(
+            update={"run_id": "new"}
+        ),
+    )
+    snapshot = projector.reduce(
+        snapshot,
+        _event(2, "status.changed", {"status": "idle"}).model_copy(
+            update={"run_id": "old"}
+        ),
+    )
+    assert snapshot.status == "running"
+    snapshot = projector.reduce(
+        snapshot,
+        _event(
+            3,
+            "message.completed",
+            {
+                "message_id": "user-1",
+                "role": "user",
+                "command_id": "command-1",
+                "content": [],
+            },
+        ).model_copy(update={"run_id": "new"}),
+    )
+    assert snapshot.timeline[0].model_dump()["command_id"] == "command-1"
+    snapshot = projector.reduce(
+        snapshot,
+        _event(4, "status.changed", {"status": "idle"}).model_copy(
+            update={"run_id": "new"}
+        ),
+    )
+    assert snapshot.status == "idle"
+    assert snapshot.active_run_id is None

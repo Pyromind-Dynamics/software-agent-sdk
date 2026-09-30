@@ -273,8 +273,8 @@ async def test_runtime_persists_workflow_progress_and_authorizes_calls(
             ),
             context,
         )
-        assert receipt.status == "accepted"
-        assert not adapter.sent
+        assert receipt.status == "completed"
+        assert adapter.sent[0][1].command_id == "next"
         adapter.emit(
             "session",
             "run.finished",
@@ -291,6 +291,17 @@ async def test_runtime_persists_workflow_progress_and_authorizes_calls(
         assert len(operations) == 1
         assert operations[0].status == "completed"
         assert operations[0].output[0].type == "text"
+        assert len(adapter.external_task_notifications) == 1
+        notification = adapter.external_task_notifications[0][1]
+        assert notification.trigger_turn is True
+        assert notification.kind == "historical_experience"
+        assert "execution_path" in notification.hidden_text
+        assert "storage/" not in notification.hidden_text
+        await runtime.deliver_external_task_status(
+            "session", task_id=notification.task_id, status="succeeded"
+        )
+        assert len(adapter.external_task_notifications) == 1
+        assert snapshot.external_tasks[0].resume_pending is False
     finally:
         await runtime.close()
 

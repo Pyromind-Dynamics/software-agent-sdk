@@ -139,7 +139,14 @@ Storage for them, and do not read a platform failure out of local files.
 
 To show the user an image, HTML page, PDF, or another artifact, call
 get_storage_url on its paths and embed the returned URLs in your reply as
-Markdown. Showing a file never depends on image support in your own model."""
+Markdown. When delivering task outputs, including CSV, JSON, cleaned data and
+reports, resolve each requested artifact with get_storage_url and provide
+[descriptive filename](returned_url). Workspace paths such as public_data/...
+are supported: do not ask whether to copy an existing artifact to Storage just
+to deliver it, and do not move files unless requested. A sandbox path is not a
+download URL; never invent URLs. If resolution fails, report the actual failure
+and provide the verified path instead. Showing a file never depends on image
+support in your own model."""
 
 
 def _sandbox_system_prompt(mount_path: str) -> str:
@@ -1092,6 +1099,10 @@ class PiAdapter:
             session.running = True
             session.files.save_inflight({"run_id": run_id})
         elif kind == "run.finished":
+            active_run = session.files.load_inflight() or {}
+            if session.running and active_run.get("run_id") not in {None, run_id}:
+                logger.info("Ignoring stale Pi completion %s", run_id)
+                return
             if run_id in session.finished_runs:
                 return
             session.finished_runs.add(run_id)
