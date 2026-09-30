@@ -904,7 +904,10 @@ class ConversationRuntime:
 
     def _cancel_release(self, conversation_id: str) -> None:
         timer = self._release_timers.pop(conversation_id, None)
-        if timer is not None:
+        # ``_release`` runs inside the grace timer it is cancelling; cancelling
+        # the running task would deliver a CancelledError at the next await and
+        # abort the teardown (including the retention scheduling) it started.
+        if timer is not None and timer is not asyncio.current_task():
             timer.cancel()
 
     def _is_releasable(self, active: _ActiveConversation) -> bool:

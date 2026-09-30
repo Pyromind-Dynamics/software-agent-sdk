@@ -826,6 +826,39 @@ async def test_released_conversation_purges_after_retention_window(tmp_path) -> 
     await runtime.close()
 
 
+async def test_grace_release_still_schedules_retention(tmp_path) -> None:
+    """A timer-driven release must not cancel its own retention timer.
+
+    ``_release`` runs inside the grace timer task and used to cancel that very
+    task on entry, so the pending cancellation aborted the coroutine at its
+    first suspend point and the retention delete was never scheduled.
+    """
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(
+        conversations,
+        adapter,
+        release_grace_seconds=1,
+        resource_retention_seconds=2,
+    )
+    await _create(runtime, conversations, "conversation-grace-retain")
+    adapter.emit(
+        "conversation-grace-retain",
+        "run.finished",
+        {"status": "idle"},
+        run_id="run-1",
+        event_id="run-1:finished",
+    )
+
+    await asyncio.sleep(2.4)
+
+    assert "conversation-grace-retain" not in runtime._active
+    assert adapter.closed == ["conversation-grace-retain"]
+    assert adapter.purged == ["conversation-grace-retain"]
+    await runtime.close()
+
+
 async def test_reattach_before_retention_cancels_purge(tmp_path) -> None:
     conversations = tmp_path / "conversations"
     conversations.mkdir()
