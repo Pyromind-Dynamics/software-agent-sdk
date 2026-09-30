@@ -569,3 +569,27 @@ test("deny rules never hide the sandbox's own apply-seccomp binary", async () =>
     delete process.env.PYROMIND_PI_RUNTIME;
   }
 });
+
+test("OS policy protects verification against file tools, chmod, deletion and replacement", { skip: !osSandboxAvailable }, async () => {
+  const tree = await workspaceTree();
+  const protectedRoot = join(tree.workspace, "pi/genome-verification");
+  await mkdir(protectedRoot);
+  const verifier = join(protectedRoot, "verify.py");
+  await writeFile(verifier, "assert False");
+  const policy = await WorkspaceAccessPolicy.create({workspaceRoot:tree.workspace,readOnlyRoots:[protectedRoot]});
+  await assert.rejects(policy.resolvePath(verifier, "write"), /PATH_SCOPE_ERROR/);
+  const operations = createWorkspaceSandboxedBashOperations(policy, { userHome: tree.home, runtimeReadRoots: [] });
+  try {
+    for (const command of [
+      `printf hacked > ${JSON.stringify(verifier)}`,
+      `chmod 777 ${JSON.stringify(verifier)}`,
+      `rm ${JSON.stringify(verifier)}`,
+      `mv ${JSON.stringify(protectedRoot)} ${JSON.stringify(join(tree.publicData,'moved'))}`,
+      `python3 -c 'from pathlib import Path; Path(${JSON.stringify(verifier)}).write_text("passed")'`,
+    ]) {
+      const result = await operations.exec(command, tree.workspace, {onData:()=>{}});
+      assert.notEqual(result.exitCode, 0, command);
+      assert.equal(await readFile(verifier, "utf8"), "assert False");
+    }
+  } finally { await SandboxManager.reset(); }
+});

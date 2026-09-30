@@ -122,7 +122,7 @@ omit inference to reuse the frozen configuration. Only submit when execution
 has been requested. Evaluation configuration changes require a new full run.
 
 Call mode='full' only after the user confirms a successful local
-df_run_pipeline result for data processing. The tool freezes the local script
+terminal pipeline execution result for data processing. The tool freezes the local script
 and shared runtime
 in a per-run Storage directory. Set model_profile and output_schema explicitly
 for new standard runs. When the user supplies their own labeling gateway, pass
@@ -1372,7 +1372,7 @@ def _build_llm_env(
     model_profile: Literal["text", "vision"] = "text",
     gateway: LabelingModelGateway | None = None,
 ) -> dict[str, str]:
-    """Use the same model-profile resolver as local df_run_pipeline."""
+    """Use the same model-profile resolver as local terminal pipeline execution."""
 
     return build_dataflow_env(conversation, model_profile, gateway=gateway)
 

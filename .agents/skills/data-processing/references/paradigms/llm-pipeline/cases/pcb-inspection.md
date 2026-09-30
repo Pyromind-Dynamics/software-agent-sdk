@@ -16,7 +16,7 @@
 - `model`：该网关上的模型名，例如 `pcb_avi_sft_merge_v10`；
 - `api_key`：网关的 Bearer key。
 
-用户给了，就把三者作为 `labeling_gateway` 传给 `df_run_pipeline` 和
+CLI 的 `gateway` 配置只写 endpoint、model 和宿主密钥环境变量名，不能写密钥。平台提交使用 `labeling_gateway` 传给
 `df_submit_pipeline`（配 `model_profile="vision"`），本次预打标用用户的模型。
 用户说没有、或明确用平台默认时**不要**传 `labeling_gateway`，直接走平台的
 `DF_API_URL` / `DF_MODEL_NAME` / `DF_API_KEY` / `DF_API_BASE_URL`。

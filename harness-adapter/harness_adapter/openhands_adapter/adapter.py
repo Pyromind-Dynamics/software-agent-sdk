@@ -411,6 +411,11 @@ class OpenHandsAdapter:
             adapter_event_ref=result.rolled_back_to_event_id,
         )
 
+    async def execute_stage(
+        self, handle: SessionHandle, request: JsonObject, context: RequestContext
+    ) -> JsonObject:
+        raise NotImplementedError("This harness does not support workflow Agent stages")
+
     async def notify_external_task(
         self,
         handle: SessionHandle,

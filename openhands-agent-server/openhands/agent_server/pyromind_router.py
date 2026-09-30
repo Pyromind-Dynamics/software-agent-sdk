@@ -1419,17 +1419,6 @@ async def create_pyromind_conversation(
             *sandbox_tools,
             *storage_tools,
             Tool(name="dataset_download"),
-            Tool(
-                name="df_run_pipeline",
-                params={
-                    "runtime_dir": str(
-                        Path(skills_path)
-                        / "data-processing"
-                        / "scripts"
-                        / "preparation"
-                    )
-                },
-            ),
             Tool(name="df_convert"),
             validation_tool,
             analysis_tool,
@@ -1450,6 +1439,13 @@ async def create_pyromind_conversation(
         workflow_file.parent.mkdir(parents=True, exist_ok=True)
         workflow_file.write_text(workflow_dsl, encoding="utf-8")
 
+    from openhands.tools.data_preparation.runner import terminal_model_environment
+
+    terminal_secrets = {
+        name: StaticSecret(value=SecretStr(value))
+        for name, value in terminal_model_environment(llm).items()
+    }
+
     # 7. Assemble StartConversationRequest. Pyromind sends the initial message
     # after startup through EventService so the workflow snapshot hook can bind
     # the input snapshot to the generated user MessageEvent.id.
@@ -1460,6 +1456,7 @@ async def create_pyromind_conversation(
         conversation_id=conversation_id,
         initial_message=None,
         secrets={
+            **terminal_secrets,
             **validation_secrets,
             **analysis_secrets,
             **training_secrets,

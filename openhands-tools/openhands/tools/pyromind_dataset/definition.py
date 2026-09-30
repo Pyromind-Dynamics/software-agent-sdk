@@ -463,7 +463,7 @@ three selected sample folders. Use mode='materialize' to copy selected inputs
 in full for exact local analysis. Both modes preserve storage-relative layout
 and return workspace-relative local_sample_paths plus a sample_manifest_path.
 Pass the returned df_run_input_path (single input) or a selected
-local_sample_paths entry directly to df_run_pipeline; without a platform
+local_sample_paths entry directly to terminal pipeline execution; without a platform
 sandbox, storage source paths are not local workspace inputs. Image samples are
 sent to the configured DF vision model (normally Gemma) for OCR and a short
 visual summary.
@@ -473,7 +473,7 @@ the chat displays the image inline. Preserve the full signed URL.
 
 When the session runs its execution plane in a platform sandbox, user storage is
 mounted as 'storage/' and read with the file tools, so pass 'storage/...'
-straight to df_run_pipeline. sample/materialize work there too: the samples are
+straight to terminal pipeline execution. sample/materialize work there too: the samples are
 copied into the sandbox workspace under 'public_data/data-preparation/previews/'
 and the returned paths address that sandbox copy. Use mode='inspect' to look at
 shared-space datasets, which are not mounted.

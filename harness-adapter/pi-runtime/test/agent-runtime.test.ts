@@ -226,3 +226,39 @@ test("recovery recognizes native custom_message delivery and legacy receipts", (
   completed.appendCustomEntry("pyromind.notification.finished", { runId });
   assert.equal(notificationWasDelivered(completed.getBranch(), runId), true);
 });
+
+test("stage tasks queue behind replies, wait for their exact round, and cancel only their own work", async () => {
+  let calls = 0, aborts = 0;
+  let finish!: () => void;
+  const events: RunnerEvent[] = [];
+  const session = {
+    sessionManager: SessionManager.inMemory(), isStreaming: true, messages: [assistant("stop")],
+    sendCustomMessage: async () => { calls++; await new Promise<void>((resolve) => { finish = resolve; }); },
+    abort: async () => { aborts++; finish?.(); },
+  };
+  const runtime = new PiAgentRuntime({ emit: (event: RunnerEvent) => events.push(event) } as unknown as JsonlRpcPeer);
+  const state = runtime as unknown as { session: AgentSession; sessionId: string; drainNotifications(): void };
+  state.session = session as unknown as AgentSession;
+  state.sessionId = "s";
+  const queued = runtime.handle("stage.execute", { request_id: "cancel-before-start", prompt: "write report" });
+  await runtime.handle("stage.cancel", { request_id: "cancel-before-start" });
+  assert.equal((await queued as JsonObject).status, "cancelled");
+  assert.equal(aborts, 0);
+  const request = { request_id: "report", prompt: "write report" };
+  const running = runtime.handle("stage.execute", request);
+  let settled = false;
+  void running.then(() => { settled = true; });
+  session.isStreaming = false;
+  state.drainNotifications();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  assert.equal(settled, false);
+  finish();
+  const result = await running as JsonObject;
+  assert.equal(result.status, "completed");
+  assert.equal(result.execution_id, events.at(-1)?.runId);
+  assert.deepEqual(await runtime.handle("stage.execute", request), result);
+  assert.equal(calls, 1);
+  await runtime.handle("stage.cancel", { request_id: "report" });
+  assert.equal(aborts, 0);
+});

@@ -18,5 +18,6 @@ class HarnessCapabilities(ContractModel):
     fork: bool = False
     workflow_rollback: bool = False
     external_task_resume: bool = False
+    agent_stages: bool = False
     native_workspace_tools: frozenset[str] = frozenset()
     enforced_limits: frozenset[str] = frozenset()

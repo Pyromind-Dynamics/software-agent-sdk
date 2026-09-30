@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   buildCommandScript,
+  buildResumeLine,
   buildStartLine,
   buildWatchScript,
   SandboxTerminalOperations,
@@ -364,4 +365,21 @@ test("sandbox terminal url uses the cluster WebSocket scheme and carries the tok
   assert.equal(url.host, "cluster.example.com");
   assert.equal(url.pathname, "/sandboxes/sbx-1/terminal");
   assert.equal(url.searchParams.get("token"), "secret");
+});
+
+test("environment reaches remote commands without entering staged scripts or logs", () => {
+  const root = mkdtempSync(join(tmpdir(), "terminal-env-"));
+  try {
+    const runDir = join(root, "run");
+    const env = { ORDINARY: "space ' quote $value", PYROMIND_DATAFLOW_PROFILES: JSON.stringify({text:{DF_API_KEY:"very-private-key"}}) };
+    const command = "python3 -c 'import os,json; print(os.environ[\"ORDINARY\"]); print(json.loads(os.environ[\"PYROMIND_DATAFLOW_PROFILES\"])[\"text\"][\"DF_API_KEY\"])'";
+    const script = buildCommandScript(runDir, root, command, true);
+    const line = buildStartLine(runDir, "token", script, buildWatchScript(60).replace("stty echo 2>/dev/null", "true"), env);
+    assert.ok(line.split("\n").every((part) => Buffer.byteLength(part) < 1024));
+    execFileSync("sh", ["-c", 'stty() { :; }; setsid() { "$@"; };\n' + line], {timeout:10000});
+    assert.equal(readFileSync(join(runDir,"rc"),"utf8"), "0");
+    assert.equal(readFileSync(join(runDir,"out.log"),"utf8"), "space ' quote $value\n[REDACTED]\n");
+    assert.ok(!readFileSync(join(runDir,"cmd.sh"),"utf8").includes("very-private-key"));
+    assert.ok(!buildResumeLine(runDir,"token").includes("PYROMIND_DATAFLOW_PROFILES"));
+  } finally { rmSync(root,{recursive:true,force:true}); }
 });

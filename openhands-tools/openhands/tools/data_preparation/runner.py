@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import os
 import signal
 import subprocess
@@ -503,6 +504,22 @@ def build_dataflow_env(
     if api_key:
         resolved[ENV_DF_API_KEY] = api_key
     return resolved
+
+
+def terminal_model_environment(llm: Any) -> dict[str, str]:
+    """Session-scoped model profiles for terminal pipelines; never a run spec."""
+    from types import SimpleNamespace
+
+    conversation = SimpleNamespace(
+        state=SimpleNamespace(agent=SimpleNamespace(llm=llm))
+    )
+    profiles = {}
+    for profile in ("text", "vision"):
+        try:
+            profiles[profile] = build_dataflow_env(conversation, profile)
+        except ValueError:
+            profiles[profile] = {}
+    return {"PYROMIND_DATAFLOW_PROFILES": json.dumps(profiles)}
 
 
 def preflight_dataflow_llm(env: dict[str, str], *, timeout: float = 30.0) -> None:

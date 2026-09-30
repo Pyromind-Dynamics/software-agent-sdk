@@ -37,7 +37,6 @@ from openhands.sdk.workspace.base import BaseWorkspace
 from openhands.sdk.workspace.local import LocalWorkspace
 from openhands.tools.data_preparation import (
     DfCheckProgressTool,
-    DfRunPipelineTool,
     DfStopTaskTool,
     DfSubmitPipelineTool,
 )
@@ -317,9 +316,6 @@ class PyromindBusinessToolHost:
             RunDatasetCleaningTool.name: lambda context: RunDatasetCleaningTool.create(
                 **self._cleaning_params(context)
             )[0],
-            DfRunPipelineTool.name: lambda _context: DfRunPipelineTool.create(
-                runtime_dir=str(self._preparation_runtime)
-            )[0],
             DfSubmitPipelineTool.name: lambda context: DfSubmitPipelineTool.create(
                 **self._preparation_params(context)
             )[0],
@@ -383,6 +379,13 @@ class PyromindBusinessToolHost:
             )[0],
         }
 
+    def terminal_environment(self, context: ToolExecutionContext) -> dict[str, str]:
+        from openhands.tools.data_preparation.runner import terminal_model_environment
+
+        return terminal_model_environment(
+            _ToolConversationFacade(context).state.agent.llm
+        )
+
     def specs(self) -> list[dict[str, Any]]:
         specs = [validation_tool_spec()]
         tools: list[ToolDefinition[Any, Any]] = [
@@ -392,7 +395,6 @@ class PyromindBusinessToolHost:
             UploadFileToPyromindTool,
             GetStorageUrlTool,
             RunDatasetCleaningTool,
-            DfRunPipelineTool,
             DfSubmitPipelineTool,
             DfCheckProgressTool,
             DfStopTaskTool,

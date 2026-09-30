@@ -181,16 +181,49 @@ function markerLineEndingLength(buffer: Buffer, start: number): number | undefin
   return buffer[start + 1] === 0x0a ? 2 : 1;
 }
 
+// Credentials arrive only in launch-process memory, never in cmd.sh or run specs.
+const ENVIRONMENT_RUNNER = `import os,sys,json,base64,subprocess
+extra=json.loads(base64.b64decode(os.environ.pop("PYROMIND_TERMINAL_ENV")))
+secrets=[]
+def collect(values):
+ for key,value in values.items():
+  if isinstance(value,dict): collect(value)
+  elif isinstance(value,str) and any(s in key.upper() for s in ("KEY","TOKEN","SECRET","AUTHORIZATION")) and value: secrets.append(value)
+collect(extra)
+if "PYROMIND_DATAFLOW_PROFILES" in extra:
+ collect(json.loads(extra["PYROMIND_DATAFLOW_PROFILES"]))
+secrets.sort(key=len,reverse=True)
+process=subprocess.Popen(["sh","-c",sys.argv[1]],env={**os.environ,**extra},stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+# Redact before bytes enter the remote out.log, including split writes.
+pending=b""
+keys=[s.encode() for s in secrets]
+keep=max([len(s) for s in keys]+[1])-1
+def output(data,final=False):
+ while data and (final or len(data)>keep):
+  match=next((key for key in keys if data.startswith(key)),None)
+  if match: sys.stdout.buffer.write(b"[REDACTED]"); data=data[len(match):]
+  else: sys.stdout.buffer.write(data[:1]); data=data[1:]
+ sys.stdout.buffer.flush()
+ return data
+while True:
+ chunk=os.read(process.stdout.fileno(),65536)
+ if not chunk: break
+ pending=output(pending+chunk)
+output(pending,True)
+sys.exit(process.wait())
+`;
+
 export function buildCommandScript(
   runDir: string,
   workspacePath: string,
   command: string,
+  withEnvironment = false,
 ): string {
   return [
     "#!/bin/sh",
     `echo $$ > ${shellQuote(`${runDir}/pid`)}`,
     `cd ${shellQuote(workspacePath)} || exit 127`,
-    `sh -c ${shellQuote(command)}`,
+    withEnvironment ? `python3 -u -c ${shellQuote(ENVIRONMENT_RUNNER)} ${shellQuote(command)}` : `sh -c ${shellQuote(command)}`,
     "rc=$?",
     `printf '%s' "$rc" > ${shellQuote(`${runDir}/rc`)}`,
     "",
@@ -240,17 +273,29 @@ export function buildStartLine(
   token: string,
   commandScript: string,
   watchScript: string,
+  environment: NodeJS.ProcessEnv = {},
 ): string {
+  const values = Object.fromEntries(Object.entries(environment).filter(([, value]) => value !== undefined));
+  if (Object.keys(values).some((name) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) || Object.values(values).some((value) => value!.includes("\0"))) throw new Error("invalid process environment");
+  const encoded = Buffer.from(JSON.stringify(values)).toString("base64");
+  const assignments = ["PYROMIND_ENV_BUFFER=''"];
+  for (let at = 0; at < encoded.length; at += TERMINAL_SCRIPT_CHUNK_CHARS) {
+    assignments.push(`PYROMIND_ENV_BUFFER="$PYROMIND_ENV_BUFFER"${shellQuote(encoded.slice(at, at + TERMINAL_SCRIPT_CHUNK_CHARS))}`);
+  }
+  const prefix = Object.keys(values).length ? 'PYROMIND_TERMINAL_ENV="$PYROMIND_ENV_BUFFER" ' : "";
   const launch =
-    `{ setsid sh ${shellQuote(`${runDir}/cmd.sh`)} ` +
+    `{ ${prefix}setsid sh ${shellQuote(`${runDir}/cmd.sh`)} ` +
     `> ${shellQuote(`${runDir}/out.log`)} 2>&1 & }`;
   return (
     [
       "stty -echo 2>/dev/null",
+      "unset HISTFILE; set +x; HISTSIZE=0",
+      ...assignments,
       `mkdir -p ${shellQuote(runDir)}`,
       ...stageScriptLines(runDir, "cmd.sh", commandScript),
       ...stageScriptLines(runDir, "watch.sh", watchScript),
       launch,
+      "unset PYROMIND_ENV_BUFFER",
       `sh ${shellQuote(`${runDir}/watch.sh`)} ${shellQuote(runDir)} ${token}`,
     ].join("\n") + "\n"
   );
@@ -352,6 +397,7 @@ export class SandboxTerminalOperations implements BashOperations {
       onData: (data: Buffer) => void;
       signal?: AbortSignal;
       timeout?: number;
+      env?: NodeJS.ProcessEnv;
     },
   ): Promise<{ exitCode: number | null }> {
     options.signal?.throwIfAborted();
@@ -362,8 +408,9 @@ export class SandboxTerminalOperations implements BashOperations {
     const startLine = buildStartLine(
       runDir,
       token,
-      buildCommandScript(runDir, workspace, command),
+      buildCommandScript(runDir, workspace, command, Object.values(options.env ?? {}).some((value) => value !== undefined)),
       buildWatchScript(this.heartbeatTicks),
+      options.env,
     );
     const resumeLine = buildResumeLine(runDir, token);
     const deadline =

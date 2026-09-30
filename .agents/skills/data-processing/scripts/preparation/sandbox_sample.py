@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """Run one DataFlow sample inside the sandbox that owns the workspace.
 
-``df_run_pipeline`` executes on the agent-server host, which has no filesystem
-view of a sandbox workspace. When the conversation workspace is served by a
-platform sandbox, the tool uploads this script and one run spec instead of
-staging the input onto the host, and the whole sample sequence happens where the
-data already lives: resolve the DataFlow interpreter, run the pipeline, validate
-the output schema, generate the report, and print one JSON envelope the tool
-reads back.
+Invoke this script through terminal with --config and a non-secret JSON config.
+Input, output, model profiles and validation remain inside the execution sandbox.
+The legacy --spec transport remains available for older recorded executions.
 
 The interpreter is resolved in this order:
 
@@ -22,6 +18,7 @@ cross the sandbox boundary. Nothing is copied to the agent-server host.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import json
 import os
@@ -415,7 +412,12 @@ def _pipeline_args(spec: dict[str, Any]) -> list[str]:
 def _run(spec: dict[str, Any]) -> dict[str, Any]:
     marker = str(spec["marker"])
     profile = str(spec.get("model_profile", "text"))
-    env = {**os.environ, **{str(k): str(v) for k, v in spec["env"].items()}}
+    inherited = {
+        k: v
+        for k, v in os.environ.items()
+        if k != "PYROMIND_DATAFLOW_PROFILES" and not k.startswith("DF_")
+    }
+    env = {**inherited, **{str(k): str(v) for k, v in spec["env"].items()}}
     timeout = int(spec["timeout"])
     runtime_dir = Path(str(spec["runtime_dir"]))
     python_path = os.pathsep.join(
@@ -643,11 +645,210 @@ def _emit_envelope(envelope: dict[str, Any], marker: str) -> None:
     print(f"__PM_DF_END__{marker}")
 
 
+def validate_cli_image_pipeline(pipeline: Path) -> None:
+    """Keep managed vision pipelines declarative when called without a Tool."""
+    source = pipeline.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(pipeline))
+    compile(tree, str(pipeline), "exec")
+    helper = ast.parse((Path(__file__).parent / "image_utils.py").read_text())
+    public = next(
+        ast.literal_eval(n.value)
+        for n in helper.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "__all__" for t in n.targets)
+    )
+    forbidden = {
+        "base64",
+        "dataflow",
+        "httpx",
+        "openai",
+        "preparation_runtime",
+        "requests",
+        "urllib",
+    }
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.comprehension)):
+            raise ValueError(
+                "Managed image pipelines must be configuration-only; no loops"
+            )
+        if isinstance(node, ast.Import):
+            if any(
+                n.name.split(".")[0] in forbidden | {"image_utils"} for n in node.names
+            ):
+                raise ValueError("Use explicit supported image_utils imports")
+        if isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in forbidden:
+                raise ValueError(
+                    "Managed image pipelines cannot implement model transport"
+                )
+            if node.module == "image_utils":
+                names = {n.name for n in node.names}
+                if names - set(public):
+                    raise ValueError("Unsupported image_utils API")
+                imported.update(names)
+    if not {"ImagePipelineConfig", "run_image_pipeline_from_cli"} <= imported:
+        raise ValueError(
+            "Managed image pipelines require ImagePipelineConfig "
+            "and run_image_pipeline_from_cli"
+        )
+
+
+def cli_spec(config: dict[str, Any], workspace: Path) -> dict[str, Any]:
+    """Resolve the public CLI contract; credentials only come from process env."""
+    allowed = {
+        "pipeline_path",
+        "args",
+        "support_file_path",
+        "timeout",
+        "python",
+        "output_schema",
+        "model_profile",
+        "gateway",
+    }
+    if set(config) - allowed:
+        raise ValueError(
+            "unknown config fields; credentials and env must not be saved in config"
+        )
+    root = workspace.resolve()
+    public = root / "public_data"
+
+    def path(value: str, output: bool = False) -> Path:
+        p = (root / value).resolve()
+        storage = (root / "storage").resolve()
+        if not p.is_relative_to(public) and (output or not p.is_relative_to(storage)):
+            raise ValueError("paths must be in public_data/ or read-only storage/")
+        return p
+
+    pipeline = path(config["pipeline_path"], True)
+    if not pipeline.is_file():
+        raise ValueError("pipeline file does not exist")
+    args = config.get("args", [])
+    if not isinstance(args, list) or not all(isinstance(v, str) for v in args):
+        raise ValueError("args must be strings")
+    schema = config.get("output_schema")
+    supported = {
+        "text",
+        "dpo",
+        "vision",
+        "structured",
+        "multiturn",
+        "function_call",
+        "quality_evaluation",
+        "text2sql",
+        "artifacts",
+    }
+    if schema is not None and schema not in supported:
+        raise ValueError("unsupported output_schema")
+    if schema and len(args) < 2:
+        raise ValueError(
+            "schema validation requires input and output as first two args"
+        )
+    source = path(args[0]) if args else None
+    output = path(args[1], True) if len(args) > 1 else None
+    if source and not source.exists():
+        raise ValueError("input does not exist")
+    if (
+        source
+        and output
+        and (output == source or (source.is_dir() and output.is_relative_to(source)))
+    ):
+        raise ValueError("output must not overwrite input")
+    normalized = list(args)
+    if source:
+        normalized[0] = str(source)
+    if output:
+        normalized[1] = str(output)
+    support = (
+        path(config["support_file_path"]) if config.get("support_file_path") else None
+    )
+    if support:
+        if len(args) != 2:
+            raise ValueError("support_file_path requires exactly input and output args")
+        json.loads(support.read_text())
+    profile = config.get("model_profile", "none")
+    if profile not in {"none", "text", "vision"}:
+        raise ValueError("unsupported model_profile")
+    if profile == "vision":
+        validate_cli_image_pipeline(pipeline)
+    profiles = json.loads(os.environ.get("PYROMIND_DATAFLOW_PROFILES", "{}"))
+    environment = profiles.get(profile, {}) if profile != "none" else {}
+    gateway = config.get("gateway")
+    if gateway:
+        if profile != "vision" or set(gateway) != {"api_url", "model", "api_key_env"}:
+            raise ValueError(
+                "gateway requires vision profile, api_url, model and api_key_env"
+            )
+        key = os.environ.get(gateway["api_key_env"])
+        if not key:
+            raise ValueError("gateway key environment variable is not configured")
+        environment = {
+            "DF_API_URL": gateway["api_url"],
+            "DF_API_BASE_URL": gateway["api_url"].removesuffix("/chat/completions"),
+            "DF_MODEL_NAME": gateway["model"],
+            "DF_API_KEY": key,
+        }
+    if profile != "none" and not environment:
+        raise ValueError(
+            "model profile is not configured in the host execution environment"
+        )
+    timeout = config.get("timeout", 3600)
+    if not isinstance(timeout, int) or not 1 <= timeout <= 7200:
+        raise ValueError("timeout must be between 1 and 7200 seconds")
+    state = public / ".dataflow-runs" / __import__("uuid").uuid4().hex
+    log = output.parent if output else state
+    environment = {
+        **environment,
+        "DF_STATE_DIR": str(log),
+        "DF_LOG_DIR": str(log),
+        "DF_RESUME": "0",
+    }
+    if schema:
+        environment["DF_OUTPUT_SCHEMA"] = schema
+    return {
+        "marker": "cli",
+        "runtime_dir": str(Path(__file__).resolve().parent),
+        "python": config.get("python")
+        or os.environ.get("PYROMIND_SANDBOX_DATAFLOW_PYTHON"),
+        "venv": os.environ.get(
+            "PYROMIND_SANDBOX_DATAFLOW_VENV", "/tmp/pyromind-dataflow-venv-1.0.10"
+        ),
+        "dataflow_version": "1.0.10",
+        "packages": [
+            "open-dataflow==1.0.10",
+            "numpy==1.26.4",
+            "Pillow==12.1.1",
+            "opencv-python-headless==4.10.0.84",
+            "matplotlib==3.9.4",
+        ],
+        "pipeline": str(pipeline),
+        "cwd": str(root),
+        "args": normalized,
+        "model_profile": profile,
+        "env": environment,
+        "timeout": timeout,
+        "support_file": str(support) if support else None,
+        "support_dir": str(state / "support"),
+        "input_path": str(source) if source else None,
+        "output_path": str(output) if output else None,
+        "output_schema": schema,
+        "image_root": str(source if source and source.is_dir() else source.parent)
+        if source
+        else None,
+        "state_dir": str(state),
+        "log_dir": str(log),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--spec", required=True, type=Path)
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--spec", type=Path)
+    modes.add_argument("--config", type=Path)
     args = parser.parse_args()
-    spec = json.loads(args.spec.read_text(encoding="utf-8"))
+    config = args.config or args.spec
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    spec = cli_spec(payload, Path.cwd()) if args.config else payload
     marker = str(spec["marker"])
     try:
         envelope = _run(spec)
@@ -670,6 +871,9 @@ def main() -> int:
                 f"Sandbox sample runner failed: {type(exc).__name__}: {exc}"
             ),
         }
+    if args.config:
+        print(json.dumps(envelope, ensure_ascii=False))
+        return int(envelope["rc"])
     _emit_envelope(envelope, marker)
     return 0
 

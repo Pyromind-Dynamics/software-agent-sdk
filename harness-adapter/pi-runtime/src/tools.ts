@@ -1,4 +1,4 @@
-import { lstat, mkdir, writeFile } from "node:fs/promises";
+import { lstat, mkdir, writeFile, open } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -60,6 +60,7 @@ export interface SkillRootConfig {
 }
 
 export interface CreateToolsOptions {
+  terminalEnvironment?: Record<string, string>;
   onExecutionReady?: (access: ExecutionAccess) => void;
   skillsDirectory?: string;
   /** Present only when the session runs its execution plane in a sandbox. */
@@ -81,9 +82,11 @@ export async function createTools(
     return createSandboxTools(peer, businessTools, options);
   }
   const { skillsDirectory } = options;
+  const verificationRoot = join(workspaceRoot, "pi", "genome-verification");
+  await mkdir(verificationRoot, { recursive: true });
   const policy = await WorkspaceAccessPolicy.create({
     workspaceRoot,
-    readOnlyRoots: skillRoots.map((root) => root.path),
+    readOnlyRoots: [...skillRoots.map((root) => root.path), verificationRoot],
     skillsDirectory,
     knowledgeRoot,
   });
@@ -106,7 +109,17 @@ export async function createTools(
     { resourceLimits },
   );
   options.onExecutionReady?.({ operations: terminalOperations, cwd: workspaceRoot,
-    env: safeShellEnvironment(), confirmsAbort: true,
+    env: { ...safeShellEnvironment(), ...options.terminalEnvironment }, confirmsAbort: true,
+    protectedRoot: verificationRoot,
+    readFile: async (path, limit) => {
+      const file = await open(path, "r");
+      try {
+        const buffer = Buffer.alloc(limit + 1);
+        const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+        if (bytesRead > limit) throw new Error("file exceeds size limit");
+        return buffer.subarray(0, bytesRead);
+      } finally { await file.close(); }
+    },
     writeFile: async (path, content) => {
       await mkdir(dirname(path), { recursive: true });
       await writeFile(path, content);
@@ -124,7 +137,7 @@ export async function createTools(
     spawnHook: ({ command }) => ({
       command,
       cwd: workspaceRoot,
-      env: safeShellEnvironment(),
+      env: { ...safeShellEnvironment(), ...options.terminalEnvironment },
     }),
   });
   return [
@@ -216,11 +229,14 @@ async function createSandboxTools(
   });
   const terminalOperations = new LazySandboxTerminalOperations(endpoints);
   options.onExecutionReady?.({ operations: terminalOperations, cwd: sandboxCwd,
+    env: options.terminalEnvironment,
     writeFile: (path, content) => fileClient.write(path, content),
+    readFile: (path, limit) => fileClient.read(path, limit),
     resolvePath: async (path, operation) => (await resolvePolicy()).resolvePath(path, operation) });
   const bash = createBashTool(sandboxCwd, {
     operations: terminalOperations,
     exposeSessionEnvironment: false,
+    spawnHook: ({ command }) => ({ command, cwd: sandboxCwd, env: options.terminalEnvironment ?? {} }),
   });
   return [
     bindPathTool(
@@ -409,6 +425,8 @@ export async function safePath(
   const skills = (typeof skillRoots === "string"
     ? [{ name: "skill", path: skillRoots }]
     : skillRoots);
+  const verificationRoot = join(workspaceRoot, "pi", "genome-verification");
+  await mkdir(verificationRoot, { recursive: true });
   const policy = await WorkspaceAccessPolicy.create({
     workspaceRoot,
     readOnlyRoots: skills.map((root) => root.path),

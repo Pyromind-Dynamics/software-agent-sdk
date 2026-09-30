@@ -115,5 +115,5 @@ storage = storage.step()
 }
 ```
 
-先用 `df_run_pipeline(output_schema="dpo", model_profile="text")` 跑小样验证；用户确认
+先用 DataFlow CLI（配置 `output_schema: "dpo"`、`model_profile: "text"`，见 [terminal-cli](../../../terminal-cli.md)） 跑小样验证；用户确认
 后再 `df_submit_pipeline(output_schema="dpo", model_profile="text")`。

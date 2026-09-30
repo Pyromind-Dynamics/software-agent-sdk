@@ -9,7 +9,7 @@ type WorkflowCall = Callable[
     [str, str, JsonObject, str, RequestContext, str | None],
     Coroutine[Any, Any, JsonObject],
 ]
-type WorkflowEventSink = Callable[[JsonObject], Coroutine[Any, Any, None]]
+type WorkflowEventSink = Callable[[JsonObject], Coroutine[Any, Any, JsonObject | None]]
 
 
 class WorkflowBackend(Protocol):

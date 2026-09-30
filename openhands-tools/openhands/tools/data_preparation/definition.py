@@ -2617,5 +2617,5 @@ class DfConvertTool(ToolDefinition[DfConvertAction, DfConvertObservation]):
 
 
 register_tool("dataset_download", DatasetDownloadTool)
-register_tool("df_run_pipeline", DfRunPipelineTool)
+# Legacy Action/Observation types above remain readable; no active pipeline Tool.
 register_tool("df_convert", DfConvertTool)
