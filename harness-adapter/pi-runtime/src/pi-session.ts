@@ -1,4 +1,4 @@
-import { createGenomeExtension } from "@agentgenome/pi-extension";
+import { genomeHostAccess } from "./genome-host.js";
 import { WorkflowExecution, type ExecutionAccess } from "./workflow-execution.js";
 import { realpathSync } from "node:fs";
 import { join } from "node:path";
@@ -104,17 +104,15 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
             : []),
         ].sort((left, right) => right.host.length - left.host.length)
       : [];
+  const experienceHost = genomeHostAccess(peer, params.workflows_enabled === true);
   const resourceLoader = new DefaultResourceLoader({
     cwd: config.workspaceRoot,
     agentDir,
     settingsManager,
     systemPrompt: config.systemPrompt,
+    eventBus: experienceHost.eventBus,
+    additionalExtensionPaths: experienceHost.additionalExtensionPaths,
     extensionFactories: [
-      ...(params.workflows_enabled === true ? [createGenomeExtension({
-        invoke: async (action, args, callId, signal) => peer.request("workflow.invoke", {
-          action, arguments: JSON.parse(JSON.stringify(args)) as JsonObject, request_id: callId,
-        }, signal),
-      })] : []),
       createTerminalPermissionExtension(peer),
       createNoProgressGuardExtension(),
       (pi) => {
@@ -150,6 +148,7 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
     noContextFiles: true,
   });
   await resourceLoader.reload();
+  experienceHost.assertLoaded(resourceLoader);
   const sessionManager = SessionManager.open(
     config.sessionPath,
     join(config.workspaceRoot, "pi"),

@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from agentgenome import GenomeService, RunCancelled
+from agentgenome.dispatch import invoke as invoke_genome
 from core.ports import Ports, ShellResult
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.ports.workflows import WorkflowEventSink
@@ -225,35 +226,9 @@ class AgentGenomeBackend:
     async def invoke(
         self, scope: str, action: str, arguments: JsonObject, request_id: str
     ) -> JsonObject:
-        def invoke() -> JsonObject:
-            if action == "list":
-                return {"assets": [asset for asset in self.service.list()]}
-            if action == "get":
-                asset = self.service.get(
-                    str(arguments["asset_id"]), str(arguments["version"])
-                )
-                if not asset["published"]:
-                    raise ValueError("asset is not published")
-                return asset
-            if action == "run":
-                params = arguments.get("params")
-                if not isinstance(params, dict):
-                    raise ValueError("params must be an object")
-                return self.service.submit(
-                    scope,
-                    request_id,
-                    str(arguments["asset_id"]),
-                    str(arguments["version"]),
-                    params,
-                )
-            if action in {"status", "cancel"}:
-                method = (
-                    self.service.status if action == "status" else self.service.cancel
-                )
-                return method(scope, str(arguments["run_id"]))
-            raise ValueError("unknown workflow action")
-
-        return await asyncio.to_thread(invoke)
+        return await asyncio.to_thread(
+            invoke_genome, self.service, scope, action, arguments, request_id
+        )
 
     async def execute(
         self, scope: str, run_id: str, emit: WorkflowEventSink
