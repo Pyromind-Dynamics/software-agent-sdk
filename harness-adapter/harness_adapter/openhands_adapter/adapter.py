@@ -465,6 +465,14 @@ class OpenHandsAdapter:
         await session.event_service.unsubscribe_from_events(session.subscriber_id)
         session.queue.put_nowait(None)
 
+    async def purge(
+        self,
+        handle: SessionHandle,  # noqa: ARG002
+        context: RequestContext,  # noqa: ARG002
+    ) -> None:
+        """Nothing to discard: an OpenHands conversation lives in local files."""
+        return None
+
     def _session(self, conversation_id: str) -> _ActiveSession:
         session = self._sessions.get(conversation_id)
         if session is None:

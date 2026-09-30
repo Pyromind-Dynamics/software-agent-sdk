@@ -20,29 +20,34 @@ export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 
 export PYROMIND_HARNESS_BACKEND="pi"
 export APP_ENV="${APP_ENV:-dev}"
-export PYROMIND_PI_TERMINAL_BACKEND="sandbox"
+export PYROMIND_PI_TERMINAL_BACKEND="${PYROMIND_PI_TERMINAL_BACKEND:-sandbox}"
 export PYROMIND_AGENTGENOME_ENABLED=1
 
-case "$(uname -s)" in
-  Darwin)
-    if [[ ! -x /usr/bin/sandbox-exec ]]; then
-      echo "ERROR: Pi os-sandbox requires /usr/bin/sandbox-exec on macOS." >&2
-      exit 1
-    fi
-    ;;
-  Linux)
-    for sandbox_dependency in rg bwrap socat; do
-      if ! command -v "${sandbox_dependency}" >/dev/null 2>&1; then
-        echo "ERROR: Pi os-sandbox requires ${sandbox_dependency} on Linux." >&2
+# Only the os-sandbox backend binds tools to the host OS sandbox helpers;
+# the default platform sandbox runs in a remote container and needs none of
+# these binaries.
+if [[ "${PYROMIND_PI_TERMINAL_BACKEND}" == "os-sandbox" ]]; then
+  case "$(uname -s)" in
+    Darwin)
+      if [[ ! -x /usr/bin/sandbox-exec ]]; then
+        echo "ERROR: Pi os-sandbox requires /usr/bin/sandbox-exec on macOS." >&2
         exit 1
       fi
-    done
-    ;;
-  *)
-    echo "ERROR: Pi os-sandbox supports only Linux and macOS." >&2
-    exit 1
-    ;;
-esac
+      ;;
+    Linux)
+      for sandbox_dependency in rg bwrap socat; do
+        if ! command -v "${sandbox_dependency}" >/dev/null 2>&1; then
+          echo "ERROR: Pi os-sandbox requires ${sandbox_dependency} on Linux." >&2
+          exit 1
+        fi
+      done
+      ;;
+    *)
+      echo "ERROR: Pi os-sandbox supports only Linux and macOS." >&2
+      exit 1
+      ;;
+  esac
+fi
 
 # ----------------------------------------------------------
 # LLM Configuration
@@ -51,9 +56,10 @@ esac
 export LLM_MODEL="openai/deepseek-v4.1-flash"
 export LLM_BASE_URL="https://pre-token-plan-cn-east-1.pyromind.ai/v1"
 
+export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+
 # export LLM_MODEL="deepseek/deepseek-v4-flash-0731"
 # export LLM_BASE_URL="https://openrouter.ai/api/v1"
-#export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
 export LABEL_STUDIO_BASE_URL=https://pre-label-studio.pyromind.ai
 export LABEL_STUDIO_PORTAL_BASE_URL=https://pre-label-studio.pyromind.ai
@@ -269,4 +275,3 @@ uv run python -m pyromind_agent_server \
   --host 127.0.0.1 \
   --port 8000 \
   --reload
-

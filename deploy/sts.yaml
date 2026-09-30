@@ -41,13 +41,18 @@ spec:
                       - name: APP_ENV
                         value: pre
                       - name: PYROMIND_PI_TERMINAL_BACKEND
-                        value: os-sandbox
+                        value: sandbox
                       # Every live conversation holds one Node runner (~270MB
                       # RSS), so the process count has to stay inside the 8Gi
                       # limit. Runners are released five minutes after a run
                       # finishes, and the ceiling bounds the worst case.
                       - name: PYROMIND_CONVERSATION_RELEASE_GRACE_SECONDS
                         value: '300'
+                      # A released conversation keeps its paused platform
+                      # sandbox resumable for another half hour before the
+                      # container is deleted.
+                      - name: PYROMIND_SANDBOX_IDLE_DELETE_SECONDS
+                        value: '1800'
                       - name: PYROMIND_MAX_ACTIVE_CONVERSATIONS
                         value: '20'
                       # Runtime mode and LLM configuration, mirroring what the

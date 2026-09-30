@@ -39,6 +39,7 @@ from openhands.tools.data_preparation.runner import (
     summarize_dataflow_env,
     validate_managed_image_pipeline,
 )
+from openhands.tools.data_preparation.sandbox_execution import sandbox_read_text
 from openhands.tools.utils.dataflow_config import (
     DEFAULT_DATAFLOW_API_BASE_URL,
     DEFAULT_DATAFLOW_MODEL_NAME,
@@ -2267,6 +2268,36 @@ def _sandbox_conversation(workspace) -> Any:
     )()
 
 
+def test_sandbox_read_text_uses_the_file_port(
+    sandbox_workspace,
+    truncated_downloads,
+) -> None:
+    """A sandbox file read must not pick up the terminal's echoed transcript."""
+    pipeline = (
+        sandbox_workspace.workspace_dir
+        / "public_data"
+        / "data-preparation"
+        / "pipeline.py"
+    )
+    pipeline.parent.mkdir(parents=True)
+    source = (
+        '"""PCB prelabel pipeline."""\n'
+        "\n"
+        "from image_utils import ImagePipelineConfig, run_image_pipeline_from_cli\n"
+        "\n"
+        'CONFIG = ImagePipelineConfig(output_format="structured")\n'
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    run_image_pipeline_from_cli(CONFIG)\n"
+    )
+    pipeline.write_text(source, encoding="utf-8")
+    workspace = truncated_downloads(
+        sandbox_workspace, limit=10_000_000, echo_commands=True
+    )
+
+    assert sandbox_read_text(workspace, str(pipeline)) == source
+
+
 class _NoStorageRemoteWorkspace:
     """Remote workspace with a command port but no Storage mount.
 
@@ -3022,7 +3053,9 @@ def test_df_run_pipeline_sandbox_vision_reads_storage_images_without_transfers(
 
     assert not observation.is_error, observation.text
     assert observation.exit_code == 0
-    assert workspace.downloads == 0
+    # The preflight reads back only the small pipeline source; the 8 x 4096-byte
+    # Storage images stay in the sandbox.
+    assert workspace.downloads == 1
 
 
 def test_df_run_pipeline_sandbox_vision_missing_image_hint(

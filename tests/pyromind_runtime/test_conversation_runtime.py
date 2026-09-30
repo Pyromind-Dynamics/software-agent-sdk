@@ -811,6 +811,113 @@ async def test_promptless_conversation_is_released_after_grace(tmp_path) -> None
     await runtime.close()
 
 
+async def test_released_conversation_purges_after_retention_window(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, resource_retention_seconds=1)
+    await _create(runtime, conversations, "conversation-retain")
+    await runtime._release("conversation-retain", reason="test")
+
+    await asyncio.sleep(1.3)
+
+    assert adapter.purged == ["conversation-retain"]
+    assert "conversation-retain" not in runtime._retained
+    await runtime.close()
+
+
+async def test_grace_release_still_schedules_retention(tmp_path) -> None:
+    """A timer-driven release must not cancel its own retention timer.
+
+    ``_release`` runs inside the grace timer task and used to cancel that very
+    task on entry, so the pending cancellation aborted the coroutine at its
+    first suspend point and the retention delete was never scheduled.
+    """
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(
+        conversations,
+        adapter,
+        release_grace_seconds=1,
+        resource_retention_seconds=2,
+    )
+    await _create(runtime, conversations, "conversation-grace-retain")
+    adapter.emit(
+        "conversation-grace-retain",
+        "run.finished",
+        {"status": "idle"},
+        run_id="run-1",
+        event_id="run-1:finished",
+    )
+
+    await asyncio.sleep(2.4)
+
+    assert "conversation-grace-retain" not in runtime._active
+    assert adapter.closed == ["conversation-grace-retain"]
+    assert adapter.purged == ["conversation-grace-retain"]
+    await runtime.close()
+
+
+async def test_grace_release_retries_while_conversation_is_busy(tmp_path) -> None:
+    """A busy conversation keeps its runner, then is released once it idles.
+
+    The first expiry used to return without re-arming the timer, so a session
+    that was running when the grace window closed stayed resident until some
+    later turn re-scheduled the release.
+    """
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, release_grace_seconds=1)
+    await _create(runtime, conversations, "conversation-busy")
+    adapter.emit(
+        "conversation-busy",
+        "status.changed",
+        {"status": "running"},
+        event_id="busy:running",
+    )
+
+    await asyncio.sleep(1.3)
+
+    assert "conversation-busy" in runtime._active
+    assert adapter.closed == []
+
+    adapter.emit(
+        "conversation-busy",
+        "status.changed",
+        {"status": "idle"},
+        event_id="busy:idle",
+    )
+
+    await asyncio.sleep(1.3)
+
+    assert "conversation-busy" not in runtime._active
+    assert adapter.closed == ["conversation-busy"]
+    await runtime.close()
+
+
+async def test_reattach_before_retention_cancels_purge(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, resource_retention_seconds=1)
+    context = RequestContext(user_id="42")
+    await _create(runtime, conversations, "conversation-retain")
+    await runtime._release("conversation-retain", reason="test")
+
+    await runtime.submit_command(
+        "conversation-retain",
+        UserMessageCommand(command_id="command-1", content=(TextContent(text="hi"),)),
+        context,
+    )
+    await asyncio.sleep(1.3)
+
+    assert adapter.purged == []
+    assert runtime._retained == {}
+    await runtime.close()
+
+
 async def test_reads_do_not_reactivate_a_released_conversation(tmp_path) -> None:
     """Reads must not re-create a released session.
 

@@ -34,7 +34,9 @@ class PiSessionFiles:
         self.checkpoint_index_path = self.directory / "fork-index.json"
         self.completions_path = self.directory / "run-completions.json"
         self.sandbox_path = self.directory / "sandbox.json"
-        self.sandbox_fork_path = self.directory / "sandbox-fork.json"
+        # Stages what the next sandbox creation has to replay: an optional fork
+        # copy plus the workflow DSL. The file name predates workflow staging.
+        self.sandbox_staging_path = self.directory / "sandbox-fork.json"
         self.terminal_output_directory = self.directory / "terminal-output"
 
     def initialize(self, session: dict[str, Any]) -> None:
@@ -116,24 +118,24 @@ class PiSessionFiles:
     def clear_sandbox(self) -> None:
         self.sandbox_path.unlink(missing_ok=True)
 
-    def load_pending_sandbox_fork(self) -> dict[str, Any] | None:
-        if not self.sandbox_fork_path.is_file():
+    def load_pending_sandbox_staging(self) -> dict[str, Any] | None:
+        if not self.sandbox_staging_path.is_file():
             return None
-        return _load_object(self.sandbox_fork_path)
+        return _load_object(self.sandbox_staging_path)
 
-    def save_pending_sandbox_fork(
-        self, source_conversation_id: str | None, workflow_dsl: str
+    def save_pending_sandbox_staging(
+        self, *, source_conversation_id: str | None, workflow_dsl: str
     ) -> None:
         _atomic_json(
-            self.sandbox_fork_path,
+            self.sandbox_staging_path,
             {
                 "source_conversation_id": source_conversation_id,
                 "workflow_dsl": workflow_dsl,
             },
         )
 
-    def clear_pending_sandbox_fork(self) -> None:
-        self.sandbox_fork_path.unlink(missing_ok=True)
+    def clear_pending_sandbox_staging(self) -> None:
+        self.sandbox_staging_path.unlink(missing_ok=True)
 
     def save_business_tool_output(self, text: str) -> SavedToolOutput:
         normalized_text = normalize_utf8_text(text)

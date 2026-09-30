@@ -87,6 +87,16 @@ class _ActiveConversation:
         self.last_access = time.monotonic()
 
 
+@dataclass(slots=True)
+class _RetainedConversation:
+    """A released session whose resources await the retention timeout."""
+
+    handle: SessionHandle
+    adapter: HarnessAdapter
+    context: RequestContext
+    task: asyncio.Task[None]
+
+
 class ConversationRuntime:
     def __init__(
         self,
@@ -97,6 +107,7 @@ class ConversationRuntime:
         external_tasks: ExternalTaskRegistry | None = None,
         idle_eviction_seconds: int = 300,
         release_grace_seconds: int = 300,
+        resource_retention_seconds: int = 0,
         max_active_conversations: int = 0,
         resource_limits: ResourceLimits | None = None,
         workflows: WorkflowBackend | None = None,
@@ -118,9 +129,11 @@ class ConversationRuntime:
         )
         self._idle_eviction_seconds = max(0, int(idle_eviction_seconds))
         self._release_grace_seconds = max(0, int(release_grace_seconds))
+        self._resource_retention_seconds = max(0, int(resource_retention_seconds))
         self._max_active_conversations = max(0, int(max_active_conversations))
         self._evictor: asyncio.Task[None] | None = None
         self._release_timers: dict[str, asyncio.Task[None]] = {}
+        self._retained: dict[str, _RetainedConversation] = {}
         self._active: dict[str, _ActiveConversation] = {}
         self._activation_locks: dict[str, asyncio.Lock] = {}
         self._subscribers: dict[str, set[asyncio.Queue[ProductEvent]]] = {}
@@ -171,6 +184,7 @@ class ConversationRuntime:
         total_started_at = time.perf_counter()
         adapter = self._adapter(self.default_harness_id)
         adapter_started_at = time.perf_counter()
+        self._cancel_retention(spec.conversation_id)
         await self._make_room()
         if self._resource_limits is not None:
             spec = spec.model_copy(update={"resource_limits": self._resource_limits})
@@ -600,6 +614,9 @@ class ConversationRuntime:
         for timer in self._release_timers.values():
             timer.cancel()
         self._release_timers.clear()
+        for retained in self._retained.values():
+            retained.task.cancel()
+        self._retained.clear()
         active = tuple(self._active.values())
         self._active.clear()
         self._first_command_pending.clear()
@@ -678,6 +695,7 @@ class ConversationRuntime:
         context: RequestContext,
     ) -> FileProductStore:
         self._ensure_evictor()
+        self._cancel_retention(conversation_id)
         existing = self._active.get(conversation_id)
         if existing is not None:
             existing.touch()
@@ -960,7 +978,13 @@ class ConversationRuntime:
         try:
             await asyncio.sleep(grace)
             active = self._active.get(conversation_id)
-            if active is None or not self._is_releasable(active):
+            if active is None:
+                return
+            if not self._is_releasable(active):
+                # The conversation is mid-run or waiting on an external task.
+                # Re-arm the timer so the runner is still released once that
+                # work settles, instead of dropping the release for good.
+                self._schedule_release(conversation_id)
                 return
             await self._release(conversation_id, reason="run_finished_grace")
         except asyncio.CancelledError:
@@ -973,7 +997,10 @@ class ConversationRuntime:
 
     def _cancel_release(self, conversation_id: str) -> None:
         timer = self._release_timers.pop(conversation_id, None)
-        if timer is not None:
+        # ``_release`` runs inside the grace timer it is cancelling; cancelling
+        # the running task would deliver a CancelledError at the next await and
+        # abort the teardown (including the retention scheduling) it started.
+        if timer is not None and timer is not asyncio.current_task():
             timer.cancel()
 
     def _is_releasable(self, active: _ActiveConversation) -> bool:
@@ -1049,6 +1076,59 @@ class ConversationRuntime:
                 conversation_id,
             )
         await asyncio.gather(active.task, return_exceptions=True)
+        self._schedule_retention(active)
+
+    def _schedule_retention(self, active: _ActiveConversation) -> None:
+        """Delete harness resources once the conversation has idled long enough.
+
+        ``close`` only releases the runner; for harnesses that own remote
+        resources (a paused sandbox) that is not the same as discarding them.
+        The deadline is anchored to the last product access rather than to this
+        release, so the configured window is the total idle time the user sees.
+        """
+        if self._resource_retention_seconds <= 0:
+            return
+        conversation_id = active.handle.session_id
+        self._cancel_retention(conversation_id)
+        elapsed = time.monotonic() - active.last_access
+        remaining = max(0.0, self._resource_retention_seconds - elapsed)
+        self._retained[conversation_id] = _RetainedConversation(
+            handle=active.handle,
+            adapter=active.adapter,
+            context=active.context,
+            task=asyncio.create_task(
+                self._purge_after_retention(conversation_id, remaining),
+                name=f"product-retention-{conversation_id}",
+            ),
+        )
+
+    async def _purge_after_retention(
+        self, conversation_id: str, remaining: float
+    ) -> None:
+        try:
+            await asyncio.sleep(remaining)
+            retained = self._retained.get(conversation_id)
+            if retained is None:
+                return
+            logger.info(
+                "purging retained conversation %s harness=%s",
+                conversation_id,
+                retained.handle.harness_id,
+            )
+            await retained.adapter.purge(retained.handle, retained.context)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Resource purge failed for %s", conversation_id)
+        finally:
+            retained = self._retained.get(conversation_id)
+            if retained is not None and retained.task is asyncio.current_task():
+                self._retained.pop(conversation_id, None)
+
+    def _cancel_retention(self, conversation_id: str) -> None:
+        retained = self._retained.pop(conversation_id, None)
+        if retained is not None and not retained.task.done():
+            retained.task.cancel()
 
     def _store(self, conversation_id: str) -> FileProductStore:
         if not conversation_id or "/" in conversation_id or "\\" in conversation_id:

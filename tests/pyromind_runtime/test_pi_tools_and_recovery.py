@@ -32,7 +32,10 @@ from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.protocol import MAX_FRAME_BYTES, encode_frame
 from harness_adapter.pi_adapter.runner import PiRunnerExit, PlannedPiRunnerExitReason
-from harness_adapter.pi_adapter.sandbox_runtime import DEFAULT_MOUNT_PATH
+from harness_adapter.pi_adapter.sandbox_runtime import (
+    DEFAULT_MOUNT_PATH,
+    STORAGE_HOST_PATH,
+)
 from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
 from harness_adapter.pi_adapter.tool_output import (
     MIN_POLICY_INLINE_BYTES,
@@ -49,6 +52,7 @@ from pyromind_runtime.ports.harness import (
     ForkSpec,
     ProductCheckpoint,
     RestoreWorkflowSpec,
+    SessionHandle,
     SessionSpec,
 )
 
@@ -1029,6 +1033,48 @@ async def test_sandbox_session_prompt_steers_storage_reads(
         await adapter.close(handle)
 
 
+async def test_purge_deletes_the_paused_sandbox_and_clears_the_record(
+    tmp_path, monkeypatch
+) -> None:
+    calls: list[str] = []
+
+    class FakeClient:
+        base_url = "https://pre-api.pyromind.ai/api/v1"
+        api_key = "access-key"
+        cluster = "us-west-1"
+
+        def delete(self, sandbox_id: str) -> None:
+            calls.append(f"delete:{sandbox_id}")
+
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="sandbox")
+    monkeypatch.setattr(
+        adapter._sandbox, "_client_factory", lambda context: FakeClient()
+    )
+    files = PiSessionFiles(conversations / "conversation-purge")
+    files.initialize({"session_id": "conversation-purge"})
+    files.save_sandbox(
+        {
+            "sandbox_id": "sbx-1",
+            "workspace_path": f"{DEFAULT_MOUNT_PATH}/.pyromind-agent/conv",
+            "mount_path": DEFAULT_MOUNT_PATH,
+            "storage_host_path": STORAGE_HOST_PATH,
+        }
+    )
+    handle = SessionHandle(
+        session_id="conversation-purge",
+        adapter_session_ref="conversation-purge",
+        harness_id="pi",
+        capabilities=pi_adapter_module.PI_CAPABILITIES,
+    )
+
+    await adapter.purge(handle, RequestContext(user_id="42"))
+
+    assert calls == ["delete:sbx-1"]
+    assert files.load_sandbox() is None
+
+
 def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
     repository = Path(pi_adapter_module.__file__).parents[3]
     roots = [
@@ -1964,12 +2010,80 @@ async def test_sandbox_fork_marks_pending_when_source_never_materialized(
         context,
     )
 
-    pending = PiSessionFiles(conversations / "target").load_pending_sandbox_fork()
+    pending = PiSessionFiles(conversations / "target").load_pending_sandbox_staging()
     assert pending is not None
     assert pending["source_conversation_id"] is None
     assert pending["workflow_dsl"] == "workflow = InputNode()"
     await adapter.close(target_handle)
     await adapter.close(source_handle)
+
+
+async def test_sandbox_canvas_stage_does_not_create_the_container(
+    tmp_path, monkeypatch
+) -> None:
+    class RecordingManager:
+        def __init__(self) -> None:
+            self.workspace_calls: list[str] = []
+            self.paused: list[str] = []
+
+        async def workspace(self, context, _files):
+            self.workspace_calls.append(context.conversation_id)
+            raise AssertionError("staging a canvas must not create a sandbox")
+
+        async def ensure(self, context, _files, *, refresh: bool = False):
+            self.workspace_calls.append(context.conversation_id)
+            raise AssertionError("staging a canvas must not create a sandbox")
+
+        async def pause(self, context, _files) -> None:
+            self.paused.append(context.conversation_id)
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
+    monkeypatch.setattr(
+        pi_adapter_module,
+        "convert_xyflow_to_dsl",
+        lambda _xyflow: "workflow = InputNode()",
+    )
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="sandbox")
+    manager = RecordingManager()
+    adapter._sandbox = cast(Any, manager)
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="conversation-1",
+            user_id="42",
+            workspace_root=str(conversations / "conversation-1"),
+            workflow_xyflow={"name": "demo", "nodes": [{"id": "n1"}], "edges": []},
+            model_configuration={"model": "gpt-5", "api_key": "request-secret"},
+        ),
+        RequestContext(user_id="42"),
+    )
+
+    files = PiSessionFiles(conversations / "conversation-1")
+    staging = files.load_pending_sandbox_staging()
+    assert manager.workspace_calls == []
+    assert files.load_sandbox() is None
+    assert staging is not None
+    assert staging["workflow_dsl"] == "workflow = InputNode()"
+    await adapter.close(handle)
+
+
+async def test_sandbox_reads_staged_workflow_before_container_exists(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="sandbox")
+    root = conversations / "conversation-1"
+    files = PiSessionFiles(root)
+    files.initialize({"session_id": "conversation-1"})
+    files.save_pending_sandbox_staging(
+        source_conversation_id=None, workflow_dsl="workflow = InputNode()"
+    )
+    session = pi_adapter_module._PiSession(
+        "conversation-1", root, files, {}, RequestContext(user_id="42")
+    )
+
+    assert files.load_sandbox() is None
+    assert await adapter._read_workflow(session) == "workflow = InputNode()"
 
 
 async def test_sandbox_close_pauses_instead_of_deleting_the_container(
