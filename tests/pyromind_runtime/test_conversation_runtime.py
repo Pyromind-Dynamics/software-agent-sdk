@@ -859,6 +859,44 @@ async def test_grace_release_still_schedules_retention(tmp_path) -> None:
     await runtime.close()
 
 
+async def test_grace_release_retries_while_conversation_is_busy(tmp_path) -> None:
+    """A busy conversation keeps its runner, then is released once it idles.
+
+    The first expiry used to return without re-arming the timer, so a session
+    that was running when the grace window closed stayed resident until some
+    later turn re-scheduled the release.
+    """
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter, release_grace_seconds=1)
+    await _create(runtime, conversations, "conversation-busy")
+    adapter.emit(
+        "conversation-busy",
+        "status.changed",
+        {"status": "running"},
+        event_id="busy:running",
+    )
+
+    await asyncio.sleep(1.3)
+
+    assert "conversation-busy" in runtime._active
+    assert adapter.closed == []
+
+    adapter.emit(
+        "conversation-busy",
+        "status.changed",
+        {"status": "idle"},
+        event_id="busy:idle",
+    )
+
+    await asyncio.sleep(1.3)
+
+    assert "conversation-busy" not in runtime._active
+    assert adapter.closed == ["conversation-busy"]
+    await runtime.close()
+
+
 async def test_reattach_before_retention_cancels_purge(tmp_path) -> None:
     conversations = tmp_path / "conversations"
     conversations.mkdir()

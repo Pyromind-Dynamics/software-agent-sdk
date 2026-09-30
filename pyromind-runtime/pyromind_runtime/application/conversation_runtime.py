@@ -891,7 +891,13 @@ class ConversationRuntime:
         try:
             await asyncio.sleep(grace)
             active = self._active.get(conversation_id)
-            if active is None or not self._is_releasable(active):
+            if active is None:
+                return
+            if not self._is_releasable(active):
+                # The conversation is mid-run or waiting on an external task.
+                # Re-arm the timer so the runner is still released once that
+                # work settles, instead of dropping the release for good.
+                self._schedule_release(conversation_id)
                 return
             await self._release(conversation_id, reason="run_finished_grace")
         except asyncio.CancelledError:

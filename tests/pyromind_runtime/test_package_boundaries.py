@@ -72,17 +72,17 @@ def test_pyromind_start_scripts_use_composed_server_entrypoint() -> None:
         assert "python -m openhands.agent_server" not in script
 
 
-def test_inference_start_requires_os_sandbox_for_pi_terminal() -> None:
+def test_inference_start_defaults_to_platform_sandbox_for_pi_terminal() -> None:
     script = (ROOT / "start_inference.sh").read_text(encoding="utf-8")
 
     assert 'export APP_ENV="${APP_ENV:-dev}"' in script
     assert (
         "export PYROMIND_PI_TERMINAL_BACKEND="
-        '"${PYROMIND_PI_TERMINAL_BACKEND:-os-sandbox}"' in script
+        '"${PYROMIND_PI_TERMINAL_BACKEND:-sandbox}"' in script
     )
 
 
-def test_pre_deployment_uses_os_sandbox_for_pi_terminal() -> None:
+def test_pre_deployment_uses_platform_sandbox_for_pi_terminal() -> None:
     documents = yaml.safe_load_all(
         (ROOT / "deploy" / "sts.yaml").read_text(encoding="utf-8")
     )
@@ -94,7 +94,8 @@ def test_pre_deployment_uses_os_sandbox_for_pi_terminal() -> None:
 
     assert environment["PYROMIND_HARNESS_BACKEND"] == "pi"
     assert environment["APP_ENV"] == "pre"
-    assert environment["PYROMIND_PI_TERMINAL_BACKEND"] == "os-sandbox"
+    assert environment["PYROMIND_PI_TERMINAL_BACKEND"] == "sandbox"
+    assert environment["PYROMIND_SANDBOX_IDLE_DELETE_SECONDS"] == "1800"
 
 
 def test_product_image_defaults_to_os_sandbox_for_pi_terminal() -> None:
@@ -109,6 +110,9 @@ def test_product_image_defaults_to_os_sandbox_for_pi_terminal() -> None:
 def test_local_startup_checks_platform_specific_sandbox_dependencies() -> None:
     script = (ROOT / "start_inference.sh").read_text(encoding="utf-8")
 
+    # The checks belong to the os-sandbox backend only; the platform sandbox
+    # default must not require host sandbox binaries.
+    assert 'if [[ "${PYROMIND_PI_TERMINAL_BACKEND}" == "os-sandbox" ]]; then' in script
     assert "[[ ! -x /usr/bin/sandbox-exec ]]" in script
     assert "for sandbox_dependency in rg bwrap socat" in script
 
