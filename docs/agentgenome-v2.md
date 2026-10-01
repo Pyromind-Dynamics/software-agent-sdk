@@ -1,12 +1,12 @@
 # 历史经验 v2 接入与验证
 
-包依赖升级为 AgentGenome Python/npm 0.3.0，通过 vendor 安装，继续由 Pi 标准加载器加载默认入口。工具定义、节点回执、修订规则、冻结和重跑预算属于 AgentGenome；Runtime 使用通用 `execute_stage` 能力关联当前会话。上层没有 Pi 类型，公开 API 与原有 SSE 事件类型不变。SQLite 仅增加表，原资产及运行记录保留。
+包依赖升级为 AgentGenome Python/npm 0.3.0，通过 vendor 安装，继续由 Pi 标准加载器加载默认入口。工具定义、节点回执、修订规则、冻结和修订记录属于 AgentGenome；Runtime 使用通用 `execute_stage` 能力关联当前会话。上层没有 Pi 类型，公开 API 与原有 SSE 事件类型不变。SQLite 仅增加表，原资产及运行记录保留。
 
 本版使用 `os-sandbox` 的受保护目录保存验收代码，文件工具与终端均不能修改。执行前校验摘要，模型请求通过独立文件 API 交接，不占用终端。业务数据仍留在执行环境，产物链接继续通过 SDK Storage 工具获取。
 
-远程 `sandbox` 支持固定脚本及一次修订；验收约束由 AgentGenome 的工具说明和修订返回结果提示，不承诺运行目录只读。提交仅回收允许修改的业务脚本，验收文件继续使用冻结版本。Agent 节点和模型验收仍保持原有能力限制。
+远程 `sandbox` 支持固定脚本及连续修订；验收约束由 AgentGenome 的工具说明和修订返回结果提示，不承诺运行目录只读。提交仅回收允许修改的业务脚本，验收文件继续使用冻结版本。Agent 节点和模型验收仍保持原有能力限制。
 
-失败运行可直接申请修订；成功但结果不符合需求的运行须提供 `reason`。修订副本返回 `verification_protection`（`prompt` 或 `read_only`）。原因持久化到 AgentGenome 的修订记录，旧记录兼容；Pi 能力发现仍在 Adapter 下层，Runtime 和产品协议不增加专属分支。
+修订不设次数限制：Pi 使用最近的运行 ID，基于上次冻结副本继续修订，或自行判断交还 Skill。重复提交仍去重，旧版回归标准保持冻结；未通过验证的草稿用例可纠正后重新验证。失败运行可直接申请修订；成功但结果不符合需求的运行须提供 `reason`。修订副本返回 `verification_protection`（`prompt` 或 `read_only`）。原因持久化到 AgentGenome 的修订记录，旧记录兼容；Pi 能力发现仍在 Adapter 下层，Runtime 和产品协议不增加专属分支。
 
 ## 自动验证
 
@@ -20,7 +20,7 @@ uv run pytest tests/pyromind_runtime
 npm --prefix harness-adapter/pi-runtime test
 ```
 
-`test_genome_v2_integration.py` 使用安装的插件包、真实 Pi 会话与 OS 沙箱，通过本地模型替身验证两批 CSV、阶段回执、独立模型验收、一次参数修订、一次脚本修订和失败接手。它不访问业务平台或真实模型服务，不证明模型在真实业务数据上的判断质量。
+`test_genome_v2_integration.py` 使用安装的插件包、真实 Pi 会话与 OS 沙箱，通过本地模型替身验证两批 CSV、阶段回执、独立模型验收、参数修订、脚本修订和失败接手。它不访问业务平台或真实模型服务，不证明模型在真实业务数据上的判断质量。
 
 测试需要允许监听本地 HTTP 端口，并允许 OS 沙箱启动。AgentGenome 的原生服务测试还需要 Unix socket。测试只创建临时资产，不自动发布到共享业务资产目录。
 
