@@ -4,6 +4,7 @@ import { join, resolve, relative } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { JsonObject, JsonValue } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
+import { SandboxTerminalExecutionError, type TerminalExecutionEvidence } from "./sandbox-terminal.js";
 
 export interface ExecutionAccess {
   operations: BashOperations;
@@ -124,8 +125,15 @@ export class WorkflowExecution {
       await Promise.all(updates);
       if (judgeError) throw judgeError;
       if (transportError) throw transportError;
-      return { rc: result.exitCode, stdout: output, truncated };
+      const execution = (result as { execution?: TerminalExecutionEvidence }).execution;
+      return { rc: result.exitCode, stdout: output, truncated,
+        ...(execution ? { execution: { ...execution } } : {}) };
     } catch (error) {
+      if (error instanceof SandboxTerminalExecutionError) {
+        return { rc: null, stdout: output, truncated,
+          stopped: error.execution.stopped,
+          error: error.message, execution: { ...error.execution } };
+      }
       if (judgeError) throw judgeError;
       if (transportError) throw transportError;
       if (controller.signal.aborted && this.access.confirmsAbort && error instanceof Error

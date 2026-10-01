@@ -83,7 +83,7 @@ dependencies = [
     { name = "pyyaml" },
 ]
 wheels = [
-    { filename = "agentgenome-0.3.0-py3-none-any.whl", hash = "sha256:8c45fb25d9f5fb3bb9ff45e96d8c8b1aae38ecb23d8cf21ad4fbf3a65825e727" },
+    { filename = "agentgenome-0.3.0-py3-none-any.whl", hash = "sha256:6fa44c1ca329667f0b2be569bb41bc9cc1856a463cc88eabc45fc144bc8a3b18" },
 ]
 
 [package.metadata]

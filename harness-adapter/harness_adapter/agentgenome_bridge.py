@@ -276,6 +276,16 @@ class ExecutionHost:
         self, command: str, cwd: str | None, *, stream: bool
     ) -> dict[str, Any]:
         execution_id = uuid4().hex
+        await asyncio.to_thread(
+            self.emit,
+            {
+                "event": "execution",
+                "execution": {
+                    "request_id": execution_id,
+                    "phase": "executing" if stream else "preparing",
+                },
+            },
+        )
 
         async def output(event: JsonObject) -> None:
             async with self._output_lock:
@@ -310,11 +320,20 @@ class ExecutionHost:
                     await asyncio.wait_for(asyncio.shield(task), 10)
                     break
             result = await task
+            if isinstance(result.get("execution"), dict):
+                await asyncio.to_thread(
+                    self.emit,
+                    {"event": "execution", "execution": result["execution"]},
+                )
             if self.cancel.is_set():
                 if result.get("stopped") is True or isinstance(result.get("rc"), int):
                     raise RunCancelled()
                 raise RuntimeError(
                     "Cancellation requested; command termination is unconfirmed"
+                )
+            if result.get("error"):
+                raise RuntimeError(
+                    f"Execution infrastructure interrupted: {result['error']}"
                 )
             return result
         finally:

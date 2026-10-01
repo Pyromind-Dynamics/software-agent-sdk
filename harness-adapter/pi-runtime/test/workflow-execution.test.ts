@@ -3,8 +3,23 @@ import test from "node:test";
 import { PassThrough } from "node:stream";
 import { WorkflowExecution } from "../src/workflow-execution.js";
 import { JsonlRpcPeer } from "../src/rpc-peer.js";
+import { SandboxTerminalExecutionError } from "../src/sandbox-terminal.js";
 
 function peer() { return new JsonlRpcPeer(new PassThrough(), new PassThrough()); }
+
+test("remote infrastructure errors preserve safe evidence and do not claim cancellation", async () => {
+  const evidence = {execution_id: "remote-id", remote_run_dir: "/session/runs/remote-id",
+    phase: "starting" as const, started: false, stopped: false, error_code: "startup_timeout"};
+  const execution = new WorkflowExecution({
+    cwd: "/session", writeFile: async () => {}, resolvePath: async (path) => path,
+    operations: {async exec() {throw new SandboxTerminalExecutionError("timeout:300", evidence);}},
+  }, peer());
+  const result = await execution.handle("execution.run", {id:"one",command:"python3 helper.py"}) as Record<string, unknown>;
+  assert.deepEqual(result.execution, evidence);
+  assert.equal(result.stopped, false);
+  assert.equal(result.rc, null);
+  assert.match(String(result.error), /phase=starting/);
+});
 
 test("workflow execution uses host operations and quoted cwd, never another shell", async () => {
   const calls: unknown[] = [];

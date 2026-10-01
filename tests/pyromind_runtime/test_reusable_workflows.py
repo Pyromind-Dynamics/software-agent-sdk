@@ -14,6 +14,42 @@ from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
 from pyromind_runtime.application.reusable_workflows import ReusableWorkflows
 
 
+@pytest.mark.parametrize(
+    "cancelled,stopped", [(False, False), (True, False), (True, True)]
+)
+async def test_execution_host_reports_preparation_stop_evidence(cancelled, stopped):
+    from agentgenome.service import RunCancelled
+
+    evidence = {
+        "execution_id": "remote-1",
+        "phase": "environment",
+        "started": False,
+        "stopped": stopped,
+        "error_code": "startup_timeout",
+    }
+
+    async def request(method, payload):
+        return {
+            "rc": None,
+            "stopped": stopped,
+            "error": "startup timeout",
+            "execution": evidence,
+        }
+
+    events = []
+    subscriptions = []
+    host = ExecutionHost(request, lambda key, callback: subscriptions.append(callback))
+    host.emit = events.append
+    if cancelled:
+        host.cancel.set()
+    expected = RunCancelled if cancelled and stopped else RuntimeError
+    with pytest.raises(expected):
+        await host._run_async("mkdir run", ".", stream=False)
+    assert events[0]["execution"]["phase"] == "preparing"
+    assert events[-1]["execution"] == evidence
+    assert subscriptions[-1] is None
+
+
 @pytest.fixture
 async def setup_workflow(tmp_path):
     package = tmp_path / "source"

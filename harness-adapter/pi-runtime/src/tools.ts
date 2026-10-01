@@ -227,7 +227,9 @@ async function createSandboxTools(
       access: async (path) => fileOperations.edit.access(path),
     },
   });
-  const terminalOperations = new LazySandboxTerminalOperations(endpoints);
+  const terminalOperations = new LazySandboxTerminalOperations(endpoints, {
+    writeFile: (path, content) => fileClient.write(path, content),
+  });
   options.onExecutionReady?.({ operations: terminalOperations, cwd: sandboxCwd,
     env: options.terminalEnvironment,
     writeFile: (path, content) => fileClient.write(path, content),
