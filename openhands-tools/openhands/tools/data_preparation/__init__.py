@@ -1,12 +1,6 @@
-"""Data preparation tools: HF download, DataFlow pipelines, format convert."""
+"""Data preparation tools: DataFlow pipelines and platform task submission."""
 
 from openhands.tools.data_preparation.definition import (
-    DatasetDownloadAction,
-    DatasetDownloadObservation,
-    DatasetDownloadTool,
-    DfConvertAction,
-    DfConvertObservation,
-    DfConvertTool,
     DfRunPipelineAction,
     DfRunPipelineObservation,
     DfRunPipelineTool,
@@ -33,15 +27,9 @@ from openhands.tools.data_preparation.stop_task import (
 __all__ = [
     "DataPreparationTaskAssociation",
     "DataPreparationTaskStore",
-    "DatasetDownloadAction",
-    "DatasetDownloadObservation",
-    "DatasetDownloadTool",
     "DfCheckProgressAction",
     "DfCheckProgressObservation",
     "DfCheckProgressTool",
-    "DfConvertAction",
-    "DfConvertObservation",
-    "DfConvertTool",
     "DfRunPipelineAction",
     "DfRunPipelineObservation",
     "DfRunPipelineTool",

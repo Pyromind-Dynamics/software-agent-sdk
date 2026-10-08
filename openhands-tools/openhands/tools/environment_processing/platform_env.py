@@ -1,6 +1,6 @@
 """Shared platform control-plane env resolution for the edp submission tools.
 
-The data-plane tools (``preview_dataset``, node signatures, ``df_stop_task``)
+The data-plane tools (node signatures, ``df_stop_task``, Storage access)
 derive their endpoints from ``APP_ENV`` at construction time. The edp tools
 submit platform workflow tasks and additionally need the control-plane env
 (``prod`` / ``pre`` / ``pre2``); without a fallback they hard-fail whenever
