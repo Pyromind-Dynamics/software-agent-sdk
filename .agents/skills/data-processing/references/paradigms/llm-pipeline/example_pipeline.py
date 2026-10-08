@@ -138,7 +138,7 @@ def main(input_path: str, output_path: str) -> None:
         print(f"All {total} records already processed. Nothing to do.")
         return
 
-    # 3. Initialize LLM from environment variables (injected by df_run_pipeline
+    # 3. Initialize LLM from environment variables (injected by sandbox_sample.py --config
     #    or the platform runner). Wrap with LoggingLLMServing for full call
     #    traceability (writes llm_calls.jsonl to DF_LOG_DIR).
     raw_llm = APILLMServing_request(

@@ -85,11 +85,11 @@ export class SandboxFileError extends Error {
 export class SandboxFileClient {
   constructor(private readonly endpoints: SandboxEndpointSession) {}
 
-  async read(path: string): Promise<Buffer> {
+  async read(path: string, limit = SANDBOX_FILE_MAX_BYTES): Promise<Buffer> {
     return this.withEndpoint(async (endpoint) => {
       const url = this.url(endpoint, `/sandboxes/${endpoint.sandboxId}/files/read`);
       url.searchParams.set("path", path);
-      return this.bytes("GET", url, await this.fetch(endpoint, url));
+      return this.bytes("GET", url, await this.fetch(endpoint, url), limit);
     });
   }
 
@@ -173,9 +173,22 @@ export class SandboxFileClient {
     }
   }
 
-  private async bytes(method: string, url: URL, response: Response): Promise<Buffer> {
+  private async bytes(method: string, url: URL, response: Response, limit: number): Promise<Buffer> {
     try {
-      return Buffer.from(await response.arrayBuffer());
+      const reader = response.body?.getReader();
+      if (!reader) return Buffer.alloc(0);
+      const chunks: Buffer[] = [];
+      let total = 0;
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+          if (total > limit) throw new Error("file exceeds size limit");
+          chunks.push(Buffer.from(value));
+        }
+        return Buffer.concat(chunks);
+      } finally { await reader.cancel(); }
     } catch (error) {
       // A connection that dies mid-body is a transport failure too.
       throw transportError(method, url, error);

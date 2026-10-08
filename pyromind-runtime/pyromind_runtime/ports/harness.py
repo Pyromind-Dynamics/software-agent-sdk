@@ -71,6 +71,12 @@ class ExternalTaskNotification(ContractModel):
 
 
 class HarnessAdapter(Protocol):
+    async def execute_stage(
+        self, handle: SessionHandle, request: JsonObject, context: RequestContext
+    ) -> JsonObject:
+        """Execute a queued stage and wait for its exact round to finish."""
+        ...
+
     async def finalize_run(
         self,
         handle: SessionHandle,

@@ -1,6 +1,6 @@
 # image_utils API
 
-`image_utils.py` 由 `df_run_pipeline` 和 `df_submit_pipeline` 自动投递。Pipeline
+CLI 会把技能的运行库目录加入 Python 路径，`df_submit_pipeline` 会自动投递 `image_utils.py`。Pipeline
 只能显式导入以下 API：
 
 ```python

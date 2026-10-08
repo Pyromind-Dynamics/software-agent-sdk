@@ -31,7 +31,10 @@ class ReusableWorkflows:
         backend: WorkflowBackend,
         publish: Publish,
         complete: Callable[[str, JsonObject], Coroutine[Any, Any, None]] | None = None,
+        agent_task: Callable[[str, JsonObject], Coroutine[Any, Any, JsonObject]]
+        | None = None,
     ) -> None:
+        self.agent_task = agent_task
         self.complete = complete
         self.backend = backend
         self.publish = publish
@@ -100,8 +103,11 @@ class ReusableWorkflows:
         current_command = None
         result: JsonObject = {"id": run.run_id, "status": "interrupted"}
 
-        async def emit(event: JsonObject) -> None:
+        async def emit(event: JsonObject) -> JsonObject | None:
             nonlocal tail, sequence, last_output, current_node, current_command
+            if event.get("event") == "regression_started":
+                current_node = None
+                current_command = None
             if isinstance(event.get("node"), str):
                 if current_node != event["node"]:
                     current_command = None
@@ -115,6 +121,7 @@ class ReusableWorkflows:
                 if now - last_output < 0.25:
                     return
                 last_output = now
+            stage_request = event.get("request")
             sequence += 1
             await self.publish(
                 scope,
@@ -125,13 +132,56 @@ class ReusableWorkflows:
                     "output": [{"type": "text", "text": tail}],
                     "details": {
                         "workflow_run_id": run.run_id,
+                        "validation_case": event.get("validation_case"),
+                        "candidate_version": event.get("candidate_version"),
                         "node": current_node,
                         "command": current_command,
                         "verdict": event.get("verdict"),
                         "event": event.get("event"),
+                        "stage_request_id": stage_request.get("request_id")
+                        if isinstance(stage_request, dict)
+                        else None,
                     },
                 },
             )
+
+            if event.get("event") == "waiting_agent":
+                if self.agent_task is None:
+                    raise ValueError("Agent stages are not supported by this host")
+                request = event.get("request")
+                if not isinstance(request, dict):
+                    raise ValueError("invalid agent stage request")
+                task = asyncio.create_task(self.agent_task(scope, request))
+                try:
+                    while not task.done():
+                        await asyncio.wait({task}, timeout=0.1)
+                        if run.cancel_requested:
+                            task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+                            return {"status": "cancelled"}
+                    stage_result = await task
+                    sequence += 1
+                    await self.publish(
+                        scope,
+                        f"{operation_id}:{sequence}",
+                        "operation.progress",
+                        {
+                            "operation_id": operation_id,
+                            "details": {
+                                "workflow_run_id": run.run_id,
+                                "node": current_node,
+                                "event": "agent_stage_finished",
+                                "stage_request_id": request["request_id"],
+                                "stage_result": stage_result,
+                            },
+                        },
+                    )
+                    return stage_result
+                finally:
+                    if not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+            return None
 
         try:
             await run.ready.wait()

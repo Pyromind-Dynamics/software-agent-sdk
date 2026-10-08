@@ -3,8 +3,23 @@ import test from "node:test";
 import { PassThrough } from "node:stream";
 import { WorkflowExecution } from "../src/workflow-execution.js";
 import { JsonlRpcPeer } from "../src/rpc-peer.js";
+import { SandboxTerminalExecutionError } from "../src/sandbox-terminal.js";
 
 function peer() { return new JsonlRpcPeer(new PassThrough(), new PassThrough()); }
+
+test("remote infrastructure errors preserve safe evidence and do not claim cancellation", async () => {
+  const evidence = {execution_id: "remote-id", remote_run_dir: "/session/runs/remote-id",
+    phase: "starting" as const, started: false, stopped: false, error_code: "startup_timeout"};
+  const execution = new WorkflowExecution({
+    cwd: "/session", writeFile: async () => {}, resolvePath: async (path) => path,
+    operations: {async exec() {throw new SandboxTerminalExecutionError("timeout:300", evidence);}},
+  }, peer());
+  const result = await execution.handle("execution.run", {id:"one",command:"python3 helper.py"}) as Record<string, unknown>;
+  assert.deepEqual(result.execution, evidence);
+  assert.equal(result.stopped, false);
+  assert.equal(result.rc, null);
+  assert.match(String(result.error), /phase=starting/);
+});
 
 test("workflow execution uses host operations and quoted cwd, never another shell", async () => {
   const calls: unknown[] = [];
@@ -73,4 +88,40 @@ test("script upload uses the host file API with exact bytes and enforces path po
   assert.deepEqual(files.get("/session/public_data/run/script.py"), content);
   await assert.rejects(execution.handle("execution.write", { path: "/other/script.py", content: "" }), /PATH_SCOPE_ERROR/);
   assert.equal(files.size, 1);
+});
+
+test("verification files use a protected host directory and independent bounded reads", async () => {
+  const files = new Map<string, Buffer>();
+  const execution = new WorkflowExecution({
+    cwd: "/session", protectedRoot: "/session/pi/verification",
+    resolvePath: async (path, op) => {
+      if (op === "write" && !path.startsWith("/session/public_data/")) throw new Error("PATH_SCOPE_ERROR");
+      return path;
+    },
+    writeFile: async (path, content) => { files.set(path, content); },
+    readFile: async (path) => files.get(path)!,
+    operations: { async exec() { assert.fail("file transfer must not use terminal"); } },
+  }, peer());
+  const runId = "a".repeat(32);
+  const result = await execution.handle("execution.protect", { run_id: runId, files: [{path:"verify.py",content:Buffer.from("assert True").toString("base64")}] }) as {path:string};
+  const path = `${result.path}/verify.py`;
+  await assert.rejects(execution.handle("execution.write", { path, content: "" }), /PATH_SCOPE_ERROR/);
+  assert.deepEqual(await execution.handle("execution.read", {path,limit:32}), {content:Buffer.from("assert True").toString("base64")});
+  await assert.rejects(execution.handle("execution.read", {path,limit:2}), /size limit/);
+  await assert.rejects(execution.handle("execution.protect", {run_id:runId,files:[{path:"../escape",content:""}]}), /protected path/);
+});
+
+
+test("revision file capability does not require read-only verification or enable agent stages", async () => {
+  for (const readFile of [undefined, async () => Buffer.from("script")]) {
+    const execution = new WorkflowExecution({
+      cwd: "/session", readFile, writeFile: async () => {},
+      resolvePath: async (path) => path,
+      operations: { async exec() { assert.fail("capability discovery must not execute"); } },
+    }, peer());
+    assert.deepEqual(await execution.handle("execution.capabilities", {}), {
+      revision: !!readFile, file_read: !!readFile, protected_verification: false,
+      agent_task: false, model_judge: false,
+    });
+  }
 });

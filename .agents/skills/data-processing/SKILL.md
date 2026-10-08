@@ -11,7 +11,7 @@ license: MIT
 
 数据处理任务统一从本 skill 进入：先按路由表选定处理范式并读取对应 playbook
 （范式内按 case 路由表读取场景 case 文档），再按通用 SOP 执行。用户 Storage
-已挂载为 `storage/`，优先用 `read`/`terminal` 直接查看；`df_run_pipeline`
+已挂载为 `storage/`，优先用 `read`/`terminal` 直接查看；`sandbox_sample.py --config`
 也直接接受 `storage/...` 输入，不需要先物化到会话工作区。
 
 领域参考（如 PCB AVI/AOI）不内联在本文件：由对应 case 文档按需引入，并在那里
@@ -43,7 +43,7 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
    一次完成（列表 + schema + 样例）。
 2. **选型**：按上表读取范式 playbook；范式内按 case 路由表只读取当前场景
    相关 reference；领域参考由 case 文档按需引入。
-3. **小样执行**：Agent 按真实 schema 写 Python Pipeline。`df_run_pipeline`
+3. **小样执行**：Agent 按真实 schema 写 Python Pipeline。`sandbox_sample.py --config`
    完整处理传入的输入（可直接传 `storage/...`），不负责抽样；
    清洗/合成小样由所选输入和计划控制，精确分布统计可直接统计 `storage/`
    全量文件。执行发生在会话自己的平台沙箱内：Pipeline、输入和产物都不离开
@@ -53,12 +53,9 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
    就地读取它引用的图片；传目录会走目录发现，manifest 里的字段（`image_labels`
    等）不会被读取，只适用于无 manifest 的散图。图片确实缺失时，报错会说明缺
    什么、该改传什么。
-   依赖第三方库的探索性检查也通过该工具执行；通常不传 `python`，由工具使用
-   沙箱内解释器运行：镜像自带匹配版本的 `open-dataflow` 时直接用镜像解释器，
-   否则在沙箱 `/tmp` 建缓存 venv；可用 `PYROMIND_SANDBOX_DATAFLOW_PYTHON` 指定。
-   terminal 与 Pipeline 共用同一沙箱，但终端默认 Python 未必是运行 Pipeline 的
-   那个解释器，不能用终端导入失败判定 Pipeline 不可用。环境缺失以工具实际
-   预检/执行结果为准，再处理运行环境配置。
+   普通 Python 脚本直接通过 terminal 执行。需要 DataFlow 环境、模型配置、格式校验和报告时，
+   阅读 [terminal-cli.md](references/terminal-cli.md)，通过 terminal 调用运行脚本；
+   不要调用旧的专用执行 Tool。模型配置由 SDK 注入，不在命令或配置文件中填写密钥。
 4. **门禁**：Taxonomy 与合成小样通过后必须获得用户明确确认才提交后续全量；
    已有标签的确定性全量统计不设人工门禁，且模型调用必须为零。
 5. **全量**：需要平台执行时统一用 `df_submit_pipeline`；提交前先按

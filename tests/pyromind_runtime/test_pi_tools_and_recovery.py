@@ -965,7 +965,6 @@ async def test_runner_loads_sandbox_skills_and_business_tools(
             "upload_file_to_pyromind",
             "get_storage_url",
             "run_dataset_cleaning",
-            "df_run_pipeline",
             "df_submit_pipeline",
             "df_check_progress",
             "df_stop_task",
@@ -1023,7 +1022,8 @@ async def test_sandbox_session_prompt_steers_storage_reads(
     )
     try:
         prompt = captured["system_prompt"]
-        assert "df_run_pipeline" in prompt
+        assert "df_run_pipeline" not in prompt
+        assert "Python scripts through terminal" in prompt
         assert "every dataset this session" in prompt
         assert "Platform task state comes from the platform tools" in prompt
         assert "Do not search the filesystem or" in prompt
@@ -1083,7 +1083,7 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
     ]
     host = PyromindBusinessToolHost(roots)
     specs = host.specs()
-    assert len(specs) == 24
+    assert len(specs) == 23
     assert {"edp_render", "edp_submit", "edp_aggregate", "update_plan"} <= {
         spec["name"] for spec in specs
     }

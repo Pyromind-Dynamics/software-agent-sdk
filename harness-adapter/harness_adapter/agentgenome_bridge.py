@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import shlex
 import threading
@@ -30,6 +31,9 @@ class ExecutionHost:
         self.cancel = threading.Event()
         self.emit: Callable[[dict[str, Any]], None] = lambda _event: None
         self.root = ""
+        self.verification = None
+        self.model_judge = False
+        self.verification_files: dict[str, str] = {}
         self._output_lock = asyncio.Lock()
 
     def _call(self, method: str, payload: JsonObject) -> Any:
@@ -45,10 +49,19 @@ class ExecutionHost:
         path_parameters: list[str],
         cancel: threading.Event,
         emit: Callable[[dict[str, Any]], None],
+        *,
+        verification_package: Path | None = None,
     ) -> tuple[Ports, dict[str, Any]]:
         self.cancel, self.emit = cancel, emit
         self.root = self._resolve(f"public_data/workflow-runs/{run_id}", True)
         cwd = f"{self.root}/package"
+        capabilities = self._call("execution.capabilities", {})
+        manifest = json.loads((package / "manifest.json").read_text())
+        protected = (
+            set(manifest.get("revision", {}).get("verification_resources", []))
+            if capabilities.get("protected_verification")
+            else set()
+        )
         for file in sorted(package.rglob("*")):
             if file.is_symlink():
                 raise ValueError("package symlinks are not supported")
@@ -59,6 +72,8 @@ class ExecutionHost:
                 or file.name == ".DS_Store"
             ):
                 continue
+            if file.relative_to(package).as_posix() in protected:
+                continue
             target = f"{cwd}/{file.relative_to(package).as_posix()}"
             self._write(target, file.read_bytes())
         self._python(
@@ -68,7 +83,93 @@ class ExecutionHost:
             key: self._resolve(value, False) if key in path_parameters else value
             for key, value in params.items()
         }
-        return Ports(shell=self, artifacts=self, cwd=Path(cwd)), resolved
+        verification = None
+        if capabilities.get("protected_verification"):
+            verification = Path(self._protect(run_id, verification_package or package))
+        self.verification = str(verification) if verification else None
+        self.model_judge = capabilities.get("model_judge", False)
+        return Ports(
+            shell=self, artifacts=self, cwd=Path(cwd), verification_cwd=verification
+        ), resolved
+
+    def _protect(self, run_id: str, package: Path) -> str:
+        protected = ""
+        for file in sorted(package.rglob("*")):
+            if file.is_symlink():
+                raise ValueError("package symlinks are not supported")
+            if not file.is_file() or "__pycache__" in file.parts:
+                continue
+            content = file.read_bytes()
+            if len(content) > 256 * 1024:
+                raise ValueError("protected package file exceeds 256 KiB")
+            protected = self._call(
+                "execution.protect",
+                {
+                    "run_id": run_id,
+                    "files": [
+                        {
+                            "path": file.relative_to(package).as_posix(),
+                            "content": base64.b64encode(content).decode("ascii"),
+                        }
+                    ],
+                },
+            )["path"]
+            self.verification_files[
+                f"{protected}/{file.relative_to(package).as_posix()}"
+            ] = hashlib.sha256(content).hexdigest()
+        return protected
+
+    def prepare_revision(
+        self, revision_id: str, package: Path, allowed: list[str]
+    ) -> dict[str, Any]:
+        capabilities = self._call("execution.capabilities", {})
+        if not capabilities.get("revision"):
+            raise ValueError("host cannot prepare and collect revision files")
+        directory = self._resolve(f"public_data/workflow-revisions/{revision_id}", True)
+        self.root = directory
+        protected = (
+            self._protect(revision_id, package)
+            if capabilities.get("protected_verification")
+            else None
+        )
+        # Without OS protection, the full copy provides context for the Agent.
+        # Submission still collects only allowlisted business scripts.
+        names = (
+            allowed
+            if protected
+            else [
+                file.relative_to(package).as_posix()
+                for file in sorted(package.rglob("*"))
+                if file.is_file()
+            ]
+        )
+        for name in names:
+            file = package / name
+            if not file.is_file() or file.is_symlink():
+                raise ValueError("editable script is not a regular package file")
+            self._write(f"{directory}/{name}", file.read_bytes())
+        return {
+            "editable_dir": directory,
+            "verification_dir": protected or directory,
+            "verification_protection": "read_only" if protected else "prompt",
+        }
+
+    def collect_revision(
+        self, draft: dict[str, Any], allowed: list[str]
+    ) -> dict[str, bytes]:
+        return {
+            name: base64.b64decode(
+                self._call(
+                    "execution.read",
+                    {
+                        "path": f"{draft['editable_dir']}/{name}",
+                        "limit": 262144,
+                    },
+                )["content"],
+                validate=True,
+            )
+            for name in allowed
+        }
 
     def _resolve(self, path: str, write: bool) -> str:
         return self._call("execution.resolve", {"path": path, "write": write})["path"]
@@ -96,13 +197,8 @@ class ExecutionHost:
         return value
 
     def read_text(self, name: str) -> str:
-        result = self._python(
-            "import json\nfrom pathlib import Path\n"
-            f"p=Path({self.path(name)!r})\n"
-            "assert p.stat().st_size <= 65536, 'verification artifact exceeds 64 KiB'\n"
-            "print(json.dumps(p.read_text(encoding='utf-8'), ensure_ascii=False))"
-        )
-        return json.loads(result)
+        result = self._call("execution.read", {"path": self.path(name), "limit": 65536})
+        return base64.b64decode(result["content"], validate=True).decode("utf-8")
 
     def _write(self, path: str, content: bytes) -> None:
         if self.cancel.is_set():
@@ -148,6 +244,16 @@ class ExecutionHost:
 
     def execute(self, command: str, cwd: Path) -> ShellResult:
         started = time.monotonic()
+        if str(cwd) == self.verification:
+            for path, digest in self.verification_files.items():
+                content = base64.b64decode(
+                    self._call("execution.read", {"path": path, "limit": 262144})[
+                        "content"
+                    ],
+                    validate=True,
+                )
+                if hashlib.sha256(content).hexdigest() != digest:
+                    raise ValueError("frozen verification resource changed")
         result = self._run(command, str(cwd), stream=True)
         if result.get("rc") is None:
             raise RuntimeError("command exited without a confirmed exit status")
@@ -170,6 +276,16 @@ class ExecutionHost:
         self, command: str, cwd: str | None, *, stream: bool
     ) -> dict[str, Any]:
         execution_id = uuid4().hex
+        await asyncio.to_thread(
+            self.emit,
+            {
+                "event": "execution",
+                "execution": {
+                    "request_id": execution_id,
+                    "phase": "executing" if stream else "preparing",
+                },
+            },
+        )
 
         async def output(event: JsonObject) -> None:
             async with self._output_lock:
@@ -186,6 +302,11 @@ class ExecutionHost:
                     "command": command,
                     "cwd": cwd,
                     "stream": stream,
+                    **(
+                        {"judge_directory": f"{self.root}/.judge/{execution_id}"}
+                        if self.model_judge and cwd == self.verification
+                        else {}
+                    ),
                 },
             )
         )
@@ -199,11 +320,20 @@ class ExecutionHost:
                     await asyncio.wait_for(asyncio.shield(task), 10)
                     break
             result = await task
+            if isinstance(result.get("execution"), dict):
+                await asyncio.to_thread(
+                    self.emit,
+                    {"event": "execution", "execution": result["execution"]},
+                )
             if self.cancel.is_set():
                 if result.get("stopped") is True or isinstance(result.get("rc"), int):
                     raise RunCancelled()
                 raise RuntimeError(
                     "Cancellation requested; command termination is unconfirmed"
+                )
+            if result.get("error"):
+                raise RuntimeError(
+                    f"Execution infrastructure interrupted: {result['error']}"
                 )
             return result
         finally:
@@ -226,8 +356,20 @@ class AgentGenomeBackend:
     async def invoke(
         self, scope: str, action: str, arguments: JsonObject, request_id: str
     ) -> JsonObject:
+        host = self.host(scope)
+        capabilities = set()
+        if action in {"get", "status", "run", "prepare_revision"}:
+            available = await host.request("execution.capabilities", {})
+            capabilities = {key for key, value in available.items() if value is True}
         return await asyncio.to_thread(
-            invoke_genome, self.service, scope, action, arguments, request_id
+            invoke_genome,
+            self.service,
+            scope,
+            action,
+            arguments,
+            request_id,
+            capabilities=capabilities,
+            host=host,
         )
 
     async def execute(
@@ -236,7 +378,7 @@ class AgentGenomeBackend:
         loop = asyncio.get_running_loop()
         host = self.host(scope)
 
-        def event(payload: dict[str, Any]) -> None:
-            asyncio.run_coroutine_threadsafe(emit(payload), loop).result()
+        def event(payload: dict[str, Any]) -> Any:
+            return asyncio.run_coroutine_threadsafe(emit(payload), loop).result()
 
         return await asyncio.to_thread(self.service.execute, scope, run_id, host, event)

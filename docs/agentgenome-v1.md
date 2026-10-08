@@ -96,3 +96,22 @@ uv sync
 通知恢复识别 Pi 的原生 `custom_message` 和完成回执；每次续聊使用独立执行 ID，通知 ID 保持稳定以便去重。已有会话历史不自动重写。
 
 产物交付默认调用 `get_storage_url`，以 `[清洗结果](url)`、`[清洗报告](url)` 等 Markdown 链接回复。工作区产物可直接解析，无需先询问复制到 Storage；解析失败则说明原因并保留真实路径，不伪造 URL 或擅自移动文件。
+
+## 远端 Terminal 超时与停止确认
+
+共享 Terminal 通过沙箱文件接口上传 `cmd.sh`、`watch.sh` 和 `launch.sh`，PTY 只发送短控制命令。环境变量留在内存，关闭回显、历史记录和历史展开后按 512 字符分段确认。普通 terminal 与历史经验使用同一实现，能力留在 HarnessAdapter 下层。
+
+取得执行锁后计时：端点查询、连接、准备和启动共用 30 秒期限，计入默认 300 秒总期限。断线只恢复观察，不重发启动；取消或超时最多等待 10 秒确认进程组停止。无法确认时记录 `interrupted` 并阻止下一条命令，直到确认原进程停止。
+
+执行适配将执行 ID、阶段、启动/停止确认和远端目录转换为通用执行证据。AgentGenome 保存证据并保留中断状态；现有 API 和历史数据兼容，不增加自动重跑或 revision 入口。
+
+测试包括真实 POSIX PTY 的长脚本、大环境变量、分段确认丢失、无输出和进程组取消。可用 SDK 安装包在临时目录验证真实 `1.0.4` 资产：
+
+```bash
+uv run python scripts/validate_agentgenome.py \
+  --template workspace/agentgenome/assets/data-cleaning/1.0.4 \
+  --home /tmp/genome-terminal-check/assets \
+  --workspace /tmp/genome-terminal-check/conversation
+```
+
+真实远端验收沿用同一资产和执行入口，由 SDK 会话提供 `sandbox.ensure` 端点。使用专用测试沙箱，不将凭据写入脚本或命令历史；验证只操作指定临时资产目录和独立运行目录，不改公共 latest 或重放历史会话。

@@ -86,6 +86,7 @@ PI_CAPABILITIES = HarnessCapabilities(
     partial_message=True,
     fork=True,
     workflow_rollback=True,
+    agent_stages=True,
     external_task_resume=True,
     native_workspace_tools=frozenset({"read", "write", "edit", "terminal"}),
     enforced_limits=frozenset({"memory", "nproc"}),
@@ -128,8 +129,8 @@ _SANDBOX_SYSTEM_PROMPT = """
 This session runs its execution plane in a platform Sandbox with your Storage
 mounted at storage/, relative to the workspace root. That is the local copy of
 Storage: when the user asks about data or files, inspect and read them there
-with read, terminal commands, and scripts, and pass storage/... paths straight
-to df_run_pipeline. Treat storage/ as read-only; every dataset this session
+with read, terminal commands, and scripts. Pass storage/... paths directly to
+Python scripts through terminal. Treat storage/ as read-only; every dataset this session
 works on is a Storage path you can read directly.
 
 Platform task state comes from the platform tools, never from this workspace.
@@ -696,6 +697,21 @@ class PiAdapter:
             session.files.save_checkpoint_index(index)
         return RestoreWorkflowResult(workflow_file_action=action)
 
+    async def execute_stage(
+        self, handle: SessionHandle, request: JsonObject, context: RequestContext
+    ) -> JsonObject:
+        session = self._session(handle.session_id)
+        session.context = context
+        await self._ensure_runner(session)
+        assert session.runner is not None
+        try:
+            return await session.runner.request("stage.execute", request)
+        except asyncio.CancelledError:
+            await session.runner.request(
+                "stage.cancel", {"request_id": request["request_id"]}
+            )
+            raise
+
     async def notify_external_task(
         self,
         handle: SessionHandle,
@@ -900,6 +916,19 @@ class PiAdapter:
                 "system_prompt": system_prompt,
                 "model": {**session.config["model"], "api_key": api_key},
                 "tools": self._business_tools.specs(),
+                "terminal_environment": (
+                    self._business_tools.terminal_environment(
+                        replace(
+                            self._control_tool_context(session),
+                            model_configuration={
+                                **session.model_configuration,
+                                "api_key": api_key,
+                            },
+                        )
+                    )
+                    if hasattr(self._business_tools, "terminal_environment")
+                    else {}
+                ),
                 **(
                     {"resource_limits": session.config["resource_limits"]}
                     if "resource_limits" in session.config

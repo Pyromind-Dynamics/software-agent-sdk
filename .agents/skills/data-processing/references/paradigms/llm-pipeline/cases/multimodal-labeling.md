@@ -52,7 +52,7 @@ DataFlow checkpoint 决定已提交 batch；输出先写原子分片，再合并
 本地使用：
 
 ```text
-df_run_pipeline(model_profile="vision", output_schema="vision")
+配置 JSON 中填写 "model_profile": "vision", "output_schema": "vision"，再通过 terminal 执行 sandbox_sample.py --config <配置路径>
 ```
 
 用户确认后使用 `df_submit_pipeline(mode="full")`；提交前按 playbook 的

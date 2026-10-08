@@ -16,7 +16,7 @@
 ## 执行契约
 
 先探查 schema：直接读 `storage/<input_path>`。已有标签且源文件在本地可处理范围内
-时，生成纯 Python Pipeline，并以 `model_profile=none` 调用 `df_run_pipeline`
+时，生成纯 Python Pipeline，通过 terminal 直接执行；需要标准格式校验和报告时，使用 `model_profile=none` 的 DataFlow CLI
 对 `storage/` 源路径做全量聚合；超出本地可处理范围时，先对 sample 的逻辑小样验证
 同一脚本，再用 `df_submit_pipeline` 对 Storage 源路径全量执行。
 
@@ -25,7 +25,7 @@ Taxonomy 确认后，`N <= 1000` 全量标注；否则按 `sample_id`、固定 s
 FormatStrPromptedGenerator；图像或混合数据选 managed image runtime。模型输出
 必须符合严格 JSON Schema，解析失败、超时、unknown 写入 `failures.jsonl`。
 
-无标签的 3 条试标输入由直读 `storage/` 提供，不由 `df_run_pipeline` 截断。
+无标签的 3 条试标输入由直读 `storage/` 提供，不由 `sandbox_sample.py --config` 截断。
 Taxonomy 确认后，业务抽样中的全部记录都应进入打标。
 文本用 `model_profile=text`，图像用 `vision`；工具不接受 requirements。
 

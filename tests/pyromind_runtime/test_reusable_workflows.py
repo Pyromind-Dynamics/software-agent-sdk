@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+import shutil
 import signal
 from pathlib import Path
 from uuid import uuid4
@@ -11,6 +12,42 @@ from uuid import uuid4
 import pytest
 from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
 from pyromind_runtime.application.reusable_workflows import ReusableWorkflows
+
+
+@pytest.mark.parametrize(
+    "cancelled,stopped", [(False, False), (True, False), (True, True)]
+)
+async def test_execution_host_reports_preparation_stop_evidence(cancelled, stopped):
+    from agentgenome.service import RunCancelled
+
+    evidence = {
+        "execution_id": "remote-1",
+        "phase": "environment",
+        "started": False,
+        "stopped": stopped,
+        "error_code": "startup_timeout",
+    }
+
+    async def request(method, payload):
+        return {
+            "rc": None,
+            "stopped": stopped,
+            "error": "startup timeout",
+            "execution": evidence,
+        }
+
+    events = []
+    subscriptions = []
+    host = ExecutionHost(request, lambda key, callback: subscriptions.append(callback))
+    host.emit = events.append
+    if cancelled:
+        host.cancel.set()
+    expected = RunCancelled if cancelled and stopped else RuntimeError
+    with pytest.raises(expected):
+        await host._run_async("mkdir run", ".", stream=False)
+    assert events[0]["execution"]["phase"] == "preparing"
+    assert events[-1]["execution"] == evidence
+    assert subscriptions[-1] is None
 
 
 @pytest.fixture
@@ -59,6 +96,14 @@ node:
     async def request(method, params):
         assert len(json.dumps(params).encode()) < 1024 * 1024
         calls.append(method)
+        if method == "execution.capabilities":
+            return {"file_read": True, "revision": True}
+        if method == "execution.read":
+            path = Path(params["path"])
+            assert path.is_relative_to(workspace / "public_data")
+            content = path.read_bytes()
+            assert len(content) <= params["limit"]
+            return {"content": base64.b64encode(content).decode()}
         if method == "execution.resolve":
             path = (workspace / params["path"]).resolve()
             if not path.is_relative_to(workspace / "public_data"):
@@ -151,6 +196,51 @@ async def test_sdk_executes_artifacts_through_host_only(setup_workflow):
         await backend.invoke(
             "other-session", "status", {"run_id": state["id"]}, "query"
         )
+
+
+async def test_legacy_revision_needs_declarations_and_successful_run_can_be_handed_over(
+    setup_workflow,
+):
+    backend, _, calls = setup_workflow
+    asset = await backend.invoke(
+        "session", "get", {"asset_id": "sample", "version": "1.0.0"}, "inspect"
+    )
+    assert asset["revision_availability"]["available"]
+    state = await backend.invoke(
+        "session",
+        "run",
+        {
+            "asset_id": "sample",
+            "version": "1.0.0",
+            "params": {"data": "public_data/input.txt"},
+        },
+        "submit",
+    )
+
+    async def emit(_event):
+        pass
+
+    result = await backend.execute("session", state["id"], emit)
+    assert result["status"] == "succeeded"
+    with pytest.raises(ValueError, match="legacy package requires"):
+        await backend.invoke(
+            "session", "prepare_revision", {"run_id": state["id"]}, "draft"
+        )
+    before = calls.count("execution.run")
+    taken = await backend.invoke(
+        "session",
+        "takeover",
+        {"run_id": state["id"], "reason": "outputs do not meet the task"},
+        "takeover",
+    )
+    assert taken["taken_over"] and taken["status"] == "succeeded"
+    assert taken["result"] == result["result"]
+    status = await backend.invoke(
+        "session", "status", {"run_id": state["id"]}, "inspect-run"
+    )
+    assert not status["recovery"]["revision"]["available"]
+    assert status["recovery"]["takeover"]["taken_over"]
+    assert calls.count("execution.run") == before
 
 
 async def test_workflow_waits_for_turn_and_cancels_queued(setup_workflow):
@@ -337,3 +427,158 @@ async def test_cancellation_stops_inflight_script(setup_workflow, tmp_path):
     result = await asyncio.wait_for(execution, 5)
     assert result["status"] == "cancelled"
     await backend.close()
+
+
+async def test_stage_wait_does_not_block_status_and_cancel(setup_workflow):
+    backend, _, _ = setup_workflow
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+    events = []
+
+    async def agent_task(scope, request):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    class StageBackend:
+        async def invoke(self, scope, action, arguments, request_id):
+            return {
+                "id": "stage-run",
+                "status": "queued" if action == "run" else "cancelling",
+            }
+
+        async def execute(self, scope, run_id, emit):
+            result = await emit(
+                {
+                    "event": "waiting_agent",
+                    "node": "report",
+                    "request": {"request_id": "stage-request"},
+                }
+            )
+            assert result["status"] == "cancelled"
+            return {"id": run_id, "status": "cancelled"}
+
+        async def close(self):
+            pass
+
+    async def publish(*event):
+        events.append(event)
+
+    workflows = ReusableWorkflows(StageBackend(), publish, agent_task=agent_task)
+    await workflows.invoke("session", "run", {}, "start", "origin")
+    workflows.release("session", "origin")
+    await asyncio.wait_for(started.wait(), 2)
+    await workflows.invoke("session", "status", {}, "status")
+    await workflows.cancel("session")
+    await asyncio.wait_for(workflows.wait_idle("session"), 2)
+    assert stopped.is_set()
+    assert events[-1][2] == "operation.completed"
+    await workflows.close()
+
+
+@pytest.mark.parametrize("fix", ["parameter", "script"])
+async def test_remote_prompt_revision_executes_without_protection(setup_workflow, fix):
+    backend, workspace, calls = setup_workflow
+    source = backend.service.root / "revision-source"
+    shutil.copytree(backend.service.root / "assets/sample/1.0.0", source)
+    manifest = json.loads((source / "manifest.json").read_text())
+    manifest.update(
+        version="1.1.0",
+        revision={
+            "safe_to_rerun": True,
+            "editable_scripts": ["report.py"],
+            "verification_resources": [],
+        },
+    )
+    (source / "manifest.json").write_text(json.dumps(manifest))
+    backend.service.import_asset(source)
+    params = {
+        "data": "public_data/input.txt"
+        if fix == "script"
+        else "public_data/missing.txt"
+    }
+    state = backend.service.submit(
+        "session", "initial", "sample", "1.1.0", params, allow_draft=True
+    )
+
+    async def emit(_event):
+        pass
+
+    result = await backend.execute("session", state["id"], emit)
+    assert result["status"] == ("succeeded" if fix == "script" else "failed")
+    # Publish against a separate validation run for the failed-input case.
+    if fix == "parameter":
+        valid = backend.service.submit(
+            "validation",
+            "new-version",
+            "sample",
+            "1.1.0",
+            {"data": "public_data/input.txt"},
+            allow_draft=True,
+        )
+        assert (await backend.execute("validation", valid["id"], emit))[
+            "status"
+        ] == "succeeded"
+    backend.service.publish("sample", "1.1.0")
+    arguments = {"run_id": state["id"]}
+    if fix == "script":
+        arguments["reason"] = "count unique lines, not all lines"
+    draft = await backend.invoke("session", "prepare_revision", arguments, "draft")
+    assert draft["verification_protection"] == "prompt"
+    assert "不要修改验收脚本" in draft["instruction"]
+    assert (
+        await backend.invoke("session", "prepare_revision", arguments, "draft") == draft
+    )
+    if fix == "script":
+        (workspace / "public_data/input.txt").write_text("one\none\ntwo\n")
+        script = Path(draft["editable_dir"]) / "report.py"
+        script.write_text(
+            script.read_text().replace(
+                "len(Path(sys.argv[1]).read_text().splitlines())",
+                "len(set(Path(sys.argv[1]).read_text().splitlines()))",
+            )
+        )
+    original_graph = (source / "graph.yaml").read_bytes()
+    (Path(draft["editable_dir"]) / "graph.yaml").write_text("bypass all checks")
+    arguments = {
+        "revision_id": draft["revision_id"],
+        "params": {"data": "public_data/input.txt"},
+        "change_summary": fix,
+    }
+    if fix == "script":
+
+        def sample(case_id, text):
+            return {
+                "id": case_id,
+                "files": {"input.txt": text},
+                "params": {"data": "fixture:input.txt"},
+                "assertions": [
+                    {
+                        "node": "report",
+                        "output": "report",
+                        "kind": "json",
+                        "expected": {"rows": 2},
+                    }
+                ],
+            }
+
+        arguments.update(
+            baseline_cases=[sample("old", "one\ntwo\n")],
+            regression_cases=[sample("new", "one\none\ntwo\n")],
+        )
+    child = await backend.invoke("session", "run", arguments, "rerun")
+    assert (await backend.invoke("session", "run", arguments, "rerun"))["id"] == child[
+        "id"
+    ]
+    result = await backend.execute("session", child["id"], emit)
+    assert result["status"] == "succeeded", result
+    report = json.loads(
+        Path(result["result"]["outputs"]["report"]["execution_path"]).read_text()
+    )
+    assert report["rows"] == 2
+    revision = backend.service.revisions.for_run(child["id"])
+    assert (Path(revision["package"]) / "graph.yaml").read_bytes() == original_graph
+    assert "execution.protect" not in calls
+    assert "execution.read" in calls and "execution.write" in calls

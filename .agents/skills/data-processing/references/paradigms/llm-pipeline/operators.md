@@ -13,7 +13,7 @@ storage = storage.step()
 data = storage.read(output_type="dict")
 ```
 
-`df_run_pipeline` 注入凭证和模型配置。文本 serving 使用完整 endpoint
+`sandbox_sample.py --config` 注入凭证和模型配置。文本 serving 使用完整 endpoint
 `DF_API_URL`；VLM serving 使用 OpenAI-compatible 根地址 `DF_API_BASE_URL`；
 模型名使用 `DF_MODEL_NAME`，密钥环境变量名为 `DF_API_KEY`。脚本不得读取、打印或
 硬编码密钥。

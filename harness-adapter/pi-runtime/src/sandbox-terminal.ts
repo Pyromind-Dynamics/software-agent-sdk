@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { posix } from "node:path";
+import { bounded, TerminalChannel } from "./terminal-channel.js";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import type { SandboxEndpoint, SandboxEndpointSession } from "./sandbox-operations.js";
 
@@ -15,22 +16,32 @@ export const SANDBOX_RUNS_DIRNAME = ".pyromind-agent-runs";
 export const TERMINAL_BEGIN_MARKER = "__PM_BEGIN__";
 export const TERMINAL_HEARTBEAT_MARKER = "__PM_HB__";
 export const TERMINAL_END_MARKER = "__PM_END__";
-/**
- * Base64 characters written per `printf` line when staging a script.
- *
- * The TTY bridge feeds a canonical-mode terminal, which caps one input line
- * (Linux `MAX_CANON` is 4096 bytes) and discards whatever follows. Long start
- * lines therefore lose their tail, and the dropped `watch.sh` invocation is
- * what left commands pending forever. Keeping every staged chunk well under
- * that cap means no line can be truncated.
- */
+/** Environment chunks are acknowledged individually to avoid PTY backpressure. */
 export const TERMINAL_SCRIPT_CHUNK_CHARS = 512;
 
 const TERMINAL_COLS = 160;
 const TERMINAL_ROWS = 48;
 const DEFAULT_HEARTBEAT_SECONDS = 60;
 const DEFAULT_MAX_RECONNECTS = 2;
-const CANCEL_GRACE_MS = 1_000;
+const STARTUP_TIMEOUT_MS = 30_000;
+const STOP_TIMEOUT_MS = 10_000;
+const ACK_MARKER = "__PM_ACK__";
+
+export interface TerminalExecutionEvidence {
+  execution_id: string;
+  remote_run_dir: string;
+  phase: "preparing" | "connecting" | "environment" | "starting" | "observing" | "finished";
+  started: boolean;
+  stopped: boolean;
+  error_code?: string;
+}
+
+export class SandboxTerminalExecutionError extends Error {
+  constructor(message: string, readonly execution: TerminalExecutionEvidence) {
+    super(`${message} (phase=${execution.phase}, started=${execution.started}, stopped=${execution.stopped})`);
+    this.name = "SandboxTerminalExecutionError";
+  }
+}
 
 export interface SandboxTerminalSocket {
   send(data: string): void;
@@ -49,13 +60,25 @@ export interface SandboxTerminalOptions {
   heartbeatSeconds?: number;
   maxReconnects?: number;
   connect?: SandboxTerminalConnector;
+  writeFile?: (path: string, content: Buffer) => Promise<void>;
+  /** Testable deadlines; production defaults are 30s / 10s. */
+  startupTimeoutMs?: number;
+  stopTimeoutMs?: number;
 }
 
-type AttemptOutcome =
-  | { kind: "exit"; exitCode: number | null }
-  | { kind: "aborted" }
-  | { kind: "timeout" }
-  | { kind: "closed" };
+interface TerminalExecOptions {
+  onData: (data: Buffer) => void;
+  signal?: AbortSignal;
+  timeout?: number;
+  env?: NodeJS.ProcessEnv;
+  startupDeadline?: number;
+  deadline?: number;
+}
+
+interface TerminalExecResult {
+  exitCode: number | null;
+  execution: TerminalExecutionEvidence;
+}
 
 /**
  * Splits the terminal byte stream into model-visible output and control lines.
@@ -181,18 +204,51 @@ function markerLineEndingLength(buffer: Buffer, start: number): number | undefin
   return buffer[start + 1] === 0x0a ? 2 : 1;
 }
 
+// Credentials arrive only in launch-process memory, never in cmd.sh or run specs.
+const ENVIRONMENT_RUNNER = `import os,sys,json,base64,subprocess
+extra=json.loads(base64.b64decode(os.environ.pop("PYROMIND_TERMINAL_ENV")))
+secrets=[]
+def collect(values):
+ for key,value in values.items():
+  if isinstance(value,dict): collect(value)
+  elif isinstance(value,str) and any(s in key.upper() for s in ("KEY","TOKEN","SECRET","AUTHORIZATION")) and value: secrets.append(value)
+collect(extra)
+if "PYROMIND_DATAFLOW_PROFILES" in extra:
+ collect(json.loads(extra["PYROMIND_DATAFLOW_PROFILES"]))
+secrets.sort(key=len,reverse=True)
+process=subprocess.Popen(["sh","-c",sys.argv[1]],env={**os.environ,**extra},stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+# Redact before bytes enter the remote out.log, including split writes.
+pending=b""
+keys=[s.encode() for s in secrets]
+keep=max([len(s) for s in keys]+[1])-1
+def output(data,final=False):
+ while data and (final or len(data)>keep):
+  match=next((key for key in keys if data.startswith(key)),None)
+  if match: sys.stdout.buffer.write(b"[REDACTED]"); data=data[len(match):]
+  else: sys.stdout.buffer.write(data[:1]); data=data[1:]
+ sys.stdout.buffer.flush()
+ return data
+while True:
+ chunk=os.read(process.stdout.fileno(),65536)
+ if not chunk: break
+ pending=output(pending+chunk)
+output(pending,True)
+sys.exit(process.wait())
+`;
+
 export function buildCommandScript(
   runDir: string,
   workspacePath: string,
   command: string,
+  withEnvironment = false,
 ): string {
   return [
     "#!/bin/sh",
     `echo $$ > ${shellQuote(`${runDir}/pid`)}`,
+    `trap ${shellQuote(`rc=$?; printf "%s" "$rc" > ${shellQuote(`${runDir}/rc`)}`)} EXIT`,
     `cd ${shellQuote(workspacePath)} || exit 127`,
-    `sh -c ${shellQuote(command)}`,
-    "rc=$?",
-    `printf '%s' "$rc" > ${shellQuote(`${runDir}/rc`)}`,
+    withEnvironment ? `python3 -u -c ${shellQuote(ENVIRONMENT_RUNNER)} ${shellQuote(command)}` : `sh -c ${shellQuote(command)}`,
+    'exit "$?"',
     "",
   ].join("\n");
 }
@@ -235,64 +291,41 @@ export function buildWatchScript(heartbeatTicks: number): string {
   ].join("\n");
 }
 
-export function buildStartLine(
-  runDir: string,
-  token: string,
-  commandScript: string,
-  watchScript: string,
-): string {
-  const launch =
-    `{ setsid sh ${shellQuote(`${runDir}/cmd.sh`)} ` +
-    `> ${shellQuote(`${runDir}/out.log`)} 2>&1 & }`;
-  return (
-    [
-      "stty -echo 2>/dev/null",
-      `mkdir -p ${shellQuote(runDir)}`,
-      ...stageScriptLines(runDir, "cmd.sh", commandScript),
-      ...stageScriptLines(runDir, "watch.sh", watchScript),
-      launch,
-      `sh ${shellQuote(`${runDir}/watch.sh`)} ${shellQuote(runDir)} ${token}`,
-    ].join("\n") + "\n"
-  );
+function acknowledgement(token: string, stage: string, value = "ok"): string {
+  return `printf '%s%s:%s\\n' '${ACK_MARKER}' '${token}:${stage}' ${shellQuote(value)}`;
 }
 
-/**
- * Writes one script into `runDir` with short, self-contained shell lines.
- *
- * The terminal has no upload channel, so the script travels as base64 that the
- * remote shell appends to a staging file and decodes. Each line stays far below
- * the canonical input cap; see {@link TERMINAL_SCRIPT_CHUNK_CHARS}.
- */
-function stageScriptLines(
-  runDir: string,
-  name: string,
-  content: string,
-): string[] {
-  const staging = shellQuote(`${runDir}/${name}.b64`);
-  const target = shellQuote(`${runDir}/${name}`);
-  const encoded = Buffer.from(content, "utf8").toString("base64");
-  const lines = [`: > ${staging}`];
-  for (let at = 0; at < encoded.length; at += TERMINAL_SCRIPT_CHUNK_CHARS) {
-    const chunk = encoded.slice(at, at + TERMINAL_SCRIPT_CHUNK_CHARS);
-    lines.push(`printf '%s' ${shellQuote(chunk)} >> ${staging}`);
-  }
-  lines.push(`base64 -d < ${staging} > ${target} && rm -f ${staging}`);
-  return lines;
+export function buildLaunchScript(runDir: string): string {
+  // Atomic guard belongs to the remote execution, not the WebSocket connection.
+  // launch_pid is written by the controlling shell before it starts observing.
+  return `#!/bin/sh\nif mkdir ${shellQuote(`${runDir}/launched`)} 2>/dev/null; then { ` +
+    `setsid sh ${shellQuote(`${runDir}/cmd.sh`)} > ${shellQuote(`${runDir}/out.log`)} 2>&1 & }; ` +
+    `printf '%s' "$!" > ${shellQuote(`${runDir}/launch_pid`)}; fi\n`;
+}
+
+export function buildStartLine(runDir: string, token: string, withEnvironment = false): string {
+  return `${withEnvironment ? 'PYROMIND_TERMINAL_ENV="$PYROMIND_ENV_BUFFER" ' : ""}` +
+    `sh ${shellQuote(`${runDir}/launch.sh`)}; ` +
+    `unset PYROMIND_ENV_BUFFER; ${acknowledgement(token, "launch")}\n`;
 }
 
 export function buildResumeLine(runDir: string, token: string): string {
-  return (
-    `stty -echo 2>/dev/null; sh ${shellQuote(`${runDir}/watch.sh`)} ` +
-    `${shellQuote(runDir)} ${token}\n`
-  );
+  // Watcher BEGIN only indicates observation. First confirm the workload's pid
+  // or completed rc (also covers commands which finish before we reconnect).
+  return `if [ -s ${shellQuote(`${runDir}/pid`)} ] || [ -s ${shellQuote(`${runDir}/rc`)} ]; then ` +
+    `${acknowledgement(token, "started")}; else ${acknowledgement(token, "started", "pending")}; fi\n`;
 }
 
-export function buildCancelLine(runDir: string): string {
-  const pid = `"$(cat ${shellQuote(`${runDir}/pid`)} 2>/dev/null)"`;
-  return (
-    `kill -TERM -${pid} 2>/dev/null; sleep 1; kill -KILL -${pid} 2>/dev/null; ` +
-    `rm -f ${shellQuote(`${runDir}/rc`)}\n`
-  );
+export function buildCancelLine(runDir: string, token: string): string {
+  return `unset PYROMIND_ENV_BUFFER; ` +
+    `p=$(cat ${shellQuote(`${runDir}/launch_pid`)} 2>/dev/null); ` +
+    `case "$p" in ''|*[!0-9]*) ` +
+    `if mkdir ${shellQuote(`${runDir}/launched`)} 2>/dev/null; then ${acknowledgement(token, "stop", "yes")}; ` +
+    `else ${acknowledgement(token, "stop", "unknown")}; fi ;; *) ` +
+    `kill -TERM -"$p" 2>/dev/null; sleep 1; kill -KILL -"$p" 2>/dev/null; ` +
+    `i=0; while kill -0 -"$p" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i + 1)); done; ` +
+    `if kill -0 -"$p" 2>/dev/null; then ${acknowledgement(token, "stop", "unknown")}; ` +
+    `else ${acknowledgement(token, "stop", "yes")}; fi ;; esac\n`;
 }
 
 export function sandboxTerminalUrl(endpoint: SandboxEndpoint): string {
@@ -319,6 +352,7 @@ export class SandboxTerminalOperations implements BashOperations {
     private readonly endpoint: SandboxEndpoint,
     options: SandboxTerminalOptions = {},
   ) {
+    this.settings = options;
     this.runsRoot = options.runsRoot ?? `${endpoint.workspacePath}/${SANDBOX_RUNS_DIRNAME}`;
     this.heartbeatTicks = options.heartbeatSeconds ?? DEFAULT_HEARTBEAT_SECONDS;
     this.maxReconnects = options.maxReconnects ?? DEFAULT_MAX_RECONNECTS;
@@ -328,14 +362,9 @@ export class SandboxTerminalOperations implements BashOperations {
   exec(
     command: string,
     cwd: string,
-    options: {
-      onData: (data: Buffer) => void;
-      signal?: AbortSignal;
-      timeout?: number;
-      env?: NodeJS.ProcessEnv;
-    },
-  ): Promise<{ exitCode: number | null }> {
-    const run = (): Promise<{ exitCode: number | null }> =>
+    options: TerminalExecOptions,
+  ): Promise<TerminalExecResult> {
+    const run = (): Promise<TerminalExecResult> =>
       this.execute(command, cwd, options);
     const chained = this.tail.then(run, run);
     this.tail = chained.then(
@@ -345,123 +374,138 @@ export class SandboxTerminalOperations implements BashOperations {
     return chained;
   }
 
+  private quarantined: { runDir: string; token: string; execution: TerminalExecutionEvidence } | undefined;
+  private readonly settings: SandboxTerminalOptions;
+
+  private channel(): TerminalChannel {
+    return new TerminalChannel(this.connect(sandboxTerminalUrl(this.endpoint)));
+  }
+
+  private async stop(runDir: string, token: string, channel?: TerminalChannel): Promise<boolean> {
+    const deadline = Date.now() + (this.settings.stopTimeoutMs ?? STOP_TIMEOUT_MS);
+    let current = channel;
+    try {
+      if (current) {
+        current.interrupt();
+        // Ctrl-C must finish the foreground watcher before the shell reads stop.
+        await bounded(new Promise((resolve) => setTimeout(resolve, 50)), deadline);
+      } else current = this.channel();
+      return await current.acknowledge(buildCancelLine(runDir, token),
+        `${ACK_MARKER}${token}:stop:`, deadline) === "yes";
+    } catch {
+      current?.close();
+      if (!channel || Date.now() >= deadline) return false;
+      // A dead observation socket does not imply a stopped process.
+      try {
+        current = this.channel();
+        return await current.acknowledge(buildCancelLine(runDir, token),
+          `${ACK_MARKER}${token}:stop:`, deadline) === "yes";
+      } catch { return false; }
+    } finally { current?.close(); }
+  }
+
   private async execute(
     command: string,
     cwd: string,
-    options: {
-      onData: (data: Buffer) => void;
-      signal?: AbortSignal;
-      timeout?: number;
-    },
-  ): Promise<{ exitCode: number | null }> {
+    options: TerminalExecOptions,
+  ): Promise<TerminalExecResult> {
     options.signal?.throwIfAborted();
-    const callId = randomUUID().replace(/-/g, "").slice(0, 16);
+    if (this.quarantined) {
+      const previous = this.quarantined;
+      if (!await this.stop(previous.runDir, previous.token)) {
+        throw new SandboxTerminalExecutionError("terminal blocked: previous command termination is unconfirmed",
+          { ...previous.execution, error_code: "termination_unconfirmed" });
+      }
+      this.quarantined = undefined;
+    }
+    const callId = randomUUID().replace(/-/g, "");
     const token = randomBytes(9).toString("hex");
     const runDir = `${this.runsRoot}/${callId}`;
-    const workspace = resolveCwd(this.endpoint.workspacePath, cwd);
-    const startLine = buildStartLine(
-      runDir,
-      token,
-      buildCommandScript(runDir, workspace, command),
-      buildWatchScript(this.heartbeatTicks),
-    );
-    const resumeLine = buildResumeLine(runDir, token);
-    const deadline =
-      options.timeout !== undefined && options.timeout > 0
-        ? Date.now() + options.timeout * 1000
-        : undefined;
-
-    for (let attempt = 0; attempt <= this.maxReconnects; attempt += 1) {
-      const outcome = await this.attempt(
-        attempt === 0 ? startLine : resumeLine,
-        token,
-        runDir,
-        options,
-        deadline,
-      );
-      if (outcome.kind === "exit") return { exitCode: outcome.exitCode };
-      if (outcome.kind === "aborted") throw new Error("aborted");
-      if (outcome.kind === "timeout") {
-        throw new Error(`timeout:${options.timeout}`);
+    const timeout = options.timeout && options.timeout > 0 ? options.timeout : 300;
+    const deadline = options.deadline ?? Date.now() + timeout * 1000;
+    const startupDeadline = Math.min(deadline, options.startupDeadline ??
+      Date.now() + (this.settings.startupTimeoutMs ?? STARTUP_TIMEOUT_MS));
+    const evidence: TerminalExecutionEvidence = { execution_id: callId, remote_run_dir: runDir,
+      phase: "preparing", started: false, stopped: false };
+    let channel: TerminalChannel | undefined;
+    let dispatched = false;
+    try {
+      const values = Object.fromEntries(Object.entries(options.env ?? {}).filter(([, value]) => value !== undefined));
+      if (Object.keys(values).some((name) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) ||
+          Object.values(values).some((value) => value!.includes("\0"))) throw new Error("invalid process environment");
+      if (!this.settings.writeFile) throw new Error("sandbox terminal requires a file upload interface");
+      const withEnvironment = Object.keys(values).length > 0;
+      await bounded(this.settings.writeFile(`${runDir}/cmd.sh`, Buffer.from(buildCommandScript(
+        runDir, resolveCwd(this.endpoint.workspacePath, cwd), command, withEnvironment))), startupDeadline, options.signal);
+      await bounded(this.settings.writeFile(`${runDir}/watch.sh`, Buffer.from(buildWatchScript(this.heartbeatTicks))), startupDeadline, options.signal);
+      await bounded(this.settings.writeFile(`${runDir}/launch.sh`, Buffer.from(buildLaunchScript(runDir))), startupDeadline, options.signal);
+      evidence.phase = "connecting";
+      channel = this.channel();
+      // Fail closed if echo/history disabling cannot be confirmed. No secrets
+      // are sent before this acknowledgement, and no raw setup output is kept.
+      await channel.acknowledge(`stty -echo && unset HISTFILE && set +x && HISTSIZE=0 && ` +
+        `{ if [ -n "\${BASH_VERSION-}" ]; then set +H; fi; ` +
+        `if [ -n "\${ZSH_VERSION-}" ]; then unsetopt BANG_HIST; fi; } && ` +
+        `PYROMIND_ENV_BUFFER='' && ${acknowledgement(token, "ready")}\n`,
+        `${ACK_MARKER}${token}:ready:`, startupDeadline, options.signal);
+      evidence.phase = "environment";
+      const encoded = withEnvironment ? Buffer.from(JSON.stringify(values)).toString("base64") : "";
+      for (let at = 0; at < encoded.length; at += TERMINAL_SCRIPT_CHUNK_CHARS) {
+        const stage = `env${at}`;
+        await channel.acknowledge(`PYROMIND_ENV_BUFFER="$PYROMIND_ENV_BUFFER"${shellQuote(encoded.slice(at, at + TERMINAL_SCRIPT_CHUNK_CHARS))}; ` +
+          `${acknowledgement(token, stage)}\n`, `${ACK_MARKER}${token}:${stage}:`, startupDeadline, options.signal);
       }
-    }
-    throw new SandboxTerminalConnectionError(
-      "sandbox terminal connection lost before the command finished",
-    );
+      evidence.phase = "starting";
+      dispatched = true; // Once sent (or possibly sent), never launch it again.
+      await channel.acknowledge(buildStartLine(runDir, token, withEnvironment),
+        `${ACK_MARKER}${token}:launch:`, startupDeadline, options.signal);
+      for (let attempt = 0; attempt <= this.maxReconnects; attempt += 1) {
+        try {
+          while (!evidence.started) {
+            const state = await channel.acknowledge(buildResumeLine(runDir, token),
+              `${ACK_MARKER}${token}:started:`, startupDeadline, options.signal);
+            if (state === "ok") evidence.started = true;
+            else await bounded(new Promise((resolve) => setTimeout(resolve, 50)), startupDeadline, options.signal);
+          }
+          evidence.phase = "observing";
+          const scanner = new TerminalMarkerScanner(token);
+          const exitCode = await channel.receive<number | null>(
+            `sh ${shellQuote(`${runDir}/watch.sh`)} ${shellQuote(runDir)} ${token}\n`, deadline, options.signal,
+            (chunk, resolve) => {
+              const result = scanner.push(chunk);
+              if (result.output.length) options.onData(result.output);
+              if (scanner.done) resolve(result.exitCode ?? null);
+            });
+          // END proves an exit code, but cancellation additionally checks the
+          // process group. Normal completion preserves rc as durable evidence.
+          evidence.phase = "finished";
+          evidence.stopped = true;
+          return { exitCode, execution: { ...evidence } };
+        } catch (error) {
+          if (!(error instanceof Error) || error.message !== "closed" || attempt === this.maxReconnects) throw error;
+          channel.close();
+          channel = this.channel(); // Only observe, never resend the launch.
+        }
+      }
+      throw new Error("closed");
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "execution failed";
+      evidence.stopped = !dispatched;
+      if (channel || dispatched) {
+        const confirmed = await this.stop(runDir, token, channel);
+        evidence.stopped = !dispatched || confirmed;
+      }
+      evidence.error_code = reason === "timeout"
+        ? (evidence.phase === "observing" ? "execution_timeout" : "startup_timeout")
+        : reason === "aborted" ? "aborted" : reason === "closed" ? "connection_lost" : "preparation_failed";
+      if (!evidence.stopped) this.quarantined = { runDir, token, execution: evidence };
+      const message = reason === "timeout" ? `timeout:${timeout}`
+        : reason === "closed" ? "sandbox terminal connection lost before the command finished"
+        : reason === "aborted" ? "aborted" : "sandbox terminal preparation failed";
+      throw new SandboxTerminalExecutionError(message, evidence);
+    } finally { channel?.close(); }
   }
 
-  private attempt(
-    line: string,
-    token: string,
-    runDir: string,
-    options: {
-      onData: (data: Buffer) => void;
-      signal?: AbortSignal;
-    },
-    deadline: number | undefined,
-  ): Promise<AttemptOutcome> {
-    return new Promise<AttemptOutcome>((resolve) => {
-      const scanner = new TerminalMarkerScanner(token);
-      let socket: SandboxTerminalSocket | undefined;
-      let settled = false;
-      let timer: NodeJS.Timeout | undefined;
-      const finish = (outcome: AttemptOutcome): void => {
-        if (settled) return;
-        settled = true;
-        if (timer !== undefined) clearTimeout(timer);
-        options.signal?.removeEventListener("abort", onAbort);
-        try {
-          socket?.close();
-        } catch {
-          // Closing a dead socket is best effort.
-        }
-        resolve(outcome);
-      };
-      const cancel = (outcome: AttemptOutcome): void => {
-        if (settled) return;
-        try {
-          socket?.send("\u0003");
-          setTimeout(() => {
-            try {
-              socket?.send(buildCancelLine(runDir));
-            } catch {
-              // The socket may already be closed; the group kill is best effort.
-            }
-            finish(outcome);
-          }, CANCEL_GRACE_MS);
-        } catch {
-          finish(outcome);
-        }
-      };
-      const onAbort = (): void => cancel({ kind: "aborted" });
-
-      try {
-        socket = this.connect(sandboxTerminalUrl(this.endpoint));
-      } catch {
-        finish({ kind: "closed" });
-        return;
-      }
-      socket.onOpen(() => {
-        socket?.send(line);
-        if (deadline !== undefined) {
-          timer = setTimeout(
-            () => cancel({ kind: "timeout" }),
-            Math.max(0, deadline - Date.now()),
-          );
-        }
-        if (options.signal?.aborted) onAbort();
-        else options.signal?.addEventListener("abort", onAbort, { once: true });
-      });
-      socket.onMessage((data) => {
-        const chunk = typeof data === "string" ? Buffer.from(data, "utf8") : Buffer.from(data);
-        const { output, exitCode } = scanner.push(chunk);
-        if (output.byteLength > 0) options.onData(output);
-        if (scanner.done) finish({ kind: "exit", exitCode: exitCode ?? null });
-      });
-      socket.onError(() => finish({ kind: "closed" }));
-      socket.onClose(() => finish({ kind: "closed" }));
-    });
-  }
 }
 
 /**
@@ -485,18 +529,28 @@ export class LazySandboxTerminalOperations implements BashOperations {
   exec(
     command: string,
     cwd: string,
-    options: {
-      onData: (data: Buffer) => void;
-      signal?: AbortSignal;
-      timeout?: number;
-      env?: NodeJS.ProcessEnv;
-    },
-  ): Promise<{ exitCode: number | null }> {
-    const run = async (): Promise<{ exitCode: number | null }> => {
+    options: TerminalExecOptions,
+  ): Promise<TerminalExecResult> {
+    const run = async (): Promise<TerminalExecResult> => {
+      const deadline = Date.now() + (options.timeout && options.timeout > 0 ? options.timeout : 300) * 1000;
+      const startupDeadline = Math.min(deadline, Date.now() + (this.options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS));
       try {
-        return await (await this.operationsFor()).exec(command, cwd, options);
+        let operations: SandboxTerminalOperations;
+        try {
+          operations = await bounded(this.operationsFor(), startupDeadline, options.signal);
+        } catch (error) {
+          throw new SandboxTerminalExecutionError("sandbox terminal endpoint resolution failed", {
+            execution_id: randomUUID().replace(/-/g, ""), remote_run_dir: "",
+            phase: "connecting", started: false, stopped: true,
+            error_code: error instanceof Error && error.message === "timeout" ? "startup_timeout" :
+              error instanceof Error && error.message === "aborted" ? "aborted" : "connection_lost",
+          });
+        }
+        return await operations.exec(command, cwd, { ...options, startupDeadline, deadline });
       } catch (error) {
-        if (error instanceof SandboxTerminalConnectionError) {
+        if (error instanceof SandboxTerminalConnectionError ||
+            (error instanceof SandboxTerminalExecutionError && error.execution.stopped &&
+             error.execution.error_code === "connection_lost")) {
           this.operations = undefined;
           this.endpoints.invalidate();
         }

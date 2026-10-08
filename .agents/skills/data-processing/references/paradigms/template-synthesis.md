@@ -99,7 +99,7 @@ python <skill目录>/scripts/preparation/bundle_template_pipeline.py \
   <驱动.py> <新运行>/pipeline.py
 ```
 
-生成仍使用 df_run_pipeline / df_submit_pipeline，model_profile=none、
+生成仍使用 sandbox_sample.py --config / df_submit_pipeline，model_profile=none、
 output_schema=artifacts。平台仅上传单个 Pipeline 和固定 runtime；素材与计划
 必须在执行环境可访问。
 

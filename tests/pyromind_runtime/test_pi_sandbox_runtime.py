@@ -92,6 +92,20 @@ class _FakeSandboxClient:
         self.calls.append(f"resume:{sandbox_id}")
         return self._sandbox("running")
 
+    def wait_for_sandbox_status(
+        self,
+        sandbox_id: str,
+        target_status: str,
+        timeout: int = 300,
+        check_interval: int = 3,
+        intermediate_statuses: list[str] | None = None,
+    ) -> bool:
+        self.calls.append(f"wait:{sandbox_id}:{target_status}")
+        if self._status.strip().lower() in {"error", "failed"}:
+            return False
+        self._status = target_status
+        return True
+
     def delete(self, sandbox_id: str) -> None:
         self.calls.append(f"delete:{sandbox_id}")
 
@@ -391,7 +405,43 @@ def test_ensure_resumes_a_paused_sandbox(
 
     endpoint = asyncio.run(manager.ensure(_context(tmp_path), files))
 
-    assert client.lifecycle_calls == ["get:sbx-1", "resume:sbx-1"]
+    # resume() only accepts the request, so the manager polls until the pod is
+    # running before it touches the workspace.
+    assert client.lifecycle_calls == [
+        "get:sbx-1",
+        "resume:sbx-1",
+        "wait:sbx-1:running",
+        "get:sbx-1",
+    ]
+    assert endpoint["sandbox_id"] == "sbx-1"
+
+
+def test_ensure_waits_for_a_sandbox_that_is_still_starting(
+    tmp_path: Path, files: PiSessionFiles, monkeypatch
+) -> None:
+    files.save_sandbox(
+        {
+            "sandbox_id": "sbx-1",
+            "mount_path": DEFAULT_MOUNT_PATH,
+            "storage_host_path": STORAGE_HOST_PATH,
+        }
+    )
+
+    client = _FakeSandboxClient(status="Pending")
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
+        lambda **kwargs: ("", 0, False),
+    )
+    manager = SandboxExecutionManager(client_factory=lambda context: client)
+
+    endpoint = asyncio.run(manager.ensure(_context(tmp_path), files))
+
+    # A pod that is still coming up must not be torn down and recreated.
+    assert client.lifecycle_calls == [
+        "get:sbx-1",
+        "wait:sbx-1:running",
+        "get:sbx-1",
+    ]
     assert endpoint["sandbox_id"] == "sbx-1"
 
 

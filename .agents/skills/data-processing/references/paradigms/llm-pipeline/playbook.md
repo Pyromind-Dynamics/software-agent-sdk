@@ -1,6 +1,6 @@
 # 数据准备（llm-pipeline）
 
-- **基底**：沙箱小样（`df_run_pipeline` 在会话沙箱内隔离子进程执行 DataFlow 算子）→
+- **基底**：沙箱小样（`sandbox_sample.py --config` 在会话沙箱内隔离子进程执行 DataFlow 算子）→
   用户确认后平台全量（`df_submit_pipeline`）
 - **适用**：内容级处理——规则清洗（词数/语言/MinHash 去重/PII/毒性/HTML）、
   LLM 生成与改写、质量评分、格式化；覆盖 SFT、推理、代码、知识问答、
@@ -15,8 +15,8 @@
 
 - 工作区中间文件放在 `public_data/data-preparation/`。
 - Storage 挂载为 `storage/`，直接用 `read`/`terminal` 查看数据和平台产物，
-  `df_run_pipeline` 的输入也直接写 `storage/...`。
-- `df_run_pipeline` 只运行沙箱小样；用户确认前不得调用 `df_submit_pipeline`。
+  `sandbox_sample.py --config` 的输入也直接写 `storage/...`。
+- `sandbox_sample.py --config` 只运行沙箱小样；用户确认前不得调用 `df_submit_pipeline`。
 - 平台全量输入必须已经存在于 Storage：`df_submit_pipeline` 不接受工作区路径。
   工作区写好的 Manifest 用 `upload_file_to_pyromind` 落到图片所在的 Storage 目录
   （见[平台全量输入](#平台全量输入)），不要用 sandbox 搬运。
@@ -26,7 +26,7 @@
   算子能覆盖的环节，尽量不要手写重复实现。
 - 使用 LLM 的 DataFlow 算子必须由 `LoggingLLMServing` 包装。
 - 用户提供打标模型网关时，把 `api_url`/`model`/`api_key` 作为
-  `labeling_gateway` 传给 `df_run_pipeline` 与 `df_submit_pipeline`（配
+  CLI 使用 `gateway`（密钥只引用 `api_key_env`）；平台提交使用 `labeling_gateway` 传给 `df_submit_pipeline`（配
   `model_profile="vision"`），本地试跑和平台全量用同一个网关；用户没有网关时
   不要传，走平台 `DF_*` 配置。网关整体替换平台视觉模型，不与平台配置混用。
 - LLM 批处理必须分批调用（`BATCH_SIZE`，可用 `DF_BATCH_SIZE` 调整）、增量写入
@@ -54,7 +54,7 @@ Manifest 小文件；不要为此创建 sandbox。
 ## 执行流程
 
 1. 先确认结构：直接查看 `storage/<input_path>`（目录先 `ls`，再看 schema 和
-   最多 3 条样例），`df_run_pipeline` 直接以 `storage/<input_path>` 作为输入。
+   最多 3 条样例），`sandbox_sample.py --config` 直接以 `storage/<input_path>` 作为输入。
    Storage `source_path` 供全量提交与沙箱直读使用，不得复制 Sample
    到另一个文件。**vision 小样例外**：图片按 manifest 的相对路径解析，`storage/...`
    的 manifest 与工作区里的 manifest 都在原地解析其图片，工作区里的 manifest 要求
@@ -66,7 +66,7 @@ Manifest 小文件；不要为此创建 sandbox。
 3. 优先从 case 文档的 DataFlow 算子模板修改 Pipeline；只有图片任务使用
    [图片模板](multimodal_pipeline.py)，PCB 预标注使用其场景模板。case 文档中的算子链负责处理中间
    字段，Pipeline 末尾负责映射正式 Schema。
-4. 调用 `df_run_pipeline`，显式设置 `model_profile` 和 `output_schema`，检查
+4. 调用 `sandbox_sample.py --config`，显式设置 `model_profile` 和 `output_schema`，检查
    `processed.jsonl`、`validation.json` 和 `report.json`。
 5. Sample 结果不符合预期（质量、格式、字段映射等问题）时，直接修正 pipeline 并
    重新试跑，直到结果符合预期；迭代过程不向用户展示。

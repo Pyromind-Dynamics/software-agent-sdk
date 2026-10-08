@@ -29,7 +29,7 @@ test("SDK loads the package default entry, discovers its host, and retains it ac
     const extension = extensions[0];
     assert.ok(extension.resolvedPath.endsWith("@agentgenome/pi-extension/index.js"));
     assert.equal(extension.path.includes("inline"), false);
-    assert.equal(extension.tools.size, 5);
+    assert.equal(extension.tools.size, 8);
     assert.equal(extension.handlers.has("session_start"), false, "SDK must not initialize a native service");
     assert.equal(extension.commands.has("genome"), false, "SDK must not install a native Python environment");
     await extension.tools.get("genome_list")!.definition.execute("call", {}, undefined, undefined, {} as never);
@@ -100,7 +100,7 @@ test("a real SDK Pi turn invokes genome tools through the loaded package and exi
   assert.deepEqual(hostRequests.map((request) => request.request_id), ["list-call", "run-call"]);
   assert.deepEqual(hostRequests[1].arguments, { asset_id: "data-cleaning", version: "1.0.0", params: { data_file: "public_data/input.csv" } });
   const schemas = modelRequests[0].tools as Array<{ function: { name: string } }>;
-  assert.equal(schemas.filter((tool) => tool.function.name.startsWith("genome_")).length, 5);
+  assert.equal(schemas.filter((tool) => tool.function.name.startsWith("genome_")).length, 8);
   assert.equal(events.filter((event) => event.kind === "run.finished").length, 1);
   assert.match(JSON.stringify(modelRequests[2].messages), /sdk-run/);
 });

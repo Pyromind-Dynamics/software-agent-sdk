@@ -53,7 +53,13 @@ def _imports(package_root: Path) -> set[str]:
 
 def test_runtime_has_no_server_or_harness_dependencies() -> None:
     imports = _imports(ROOT / "pyromind-runtime" / "pyromind_runtime")
-    forbidden = ("fastapi", "openhands", "harness_adapter", "pyromind_agent_server")
+    forbidden = (
+        "fastapi",
+        "openhands",
+        "harness_adapter",
+        "pyromind_agent_server",
+        "agentgenome",
+    )
     assert not any(name.startswith(forbidden) for name in imports)
 
 

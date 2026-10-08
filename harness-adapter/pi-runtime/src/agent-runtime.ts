@@ -34,6 +34,11 @@ export class PiAgentRuntime {
     message: { customType: string; content: string; display: boolean; details: JsonObject };
   }> = [];
 
+  private readonly stages = new Map<string, {
+    executionId: string; request: JsonObject; state: "queued" | "running" | "finished";
+    promise: Promise<JsonValue>; resolve: (result: JsonValue) => void;
+  }>();
+
   constructor(private readonly peer: JsonlRpcPeer) {}
 
   async handle(method: string, params: JsonObject): Promise<JsonValue> {
@@ -41,6 +46,8 @@ export class PiAgentRuntime {
       if (!this.execution) throw new Error("execution host not ready");
       return this.execution.handle(method, params);
     }
+    if (method === "stage.execute") return this.executeStage(params);
+    if (method === "stage.cancel") return this.cancelStage(requiredString(params, "request_id"));
     if (method === "start") return this.start(params);
     if (method === "prompt") return this.prompt(params, false);
     if (method === "steer") return this.prompt(params, true);
@@ -250,8 +257,64 @@ export class PiAgentRuntime {
     }
   }
 
+  private executeStage(request: JsonObject): Promise<JsonValue> {
+    this.requireSession();
+    const id = requiredString(request, "request_id");
+    const previous = this.stages.get(id);
+    if (previous) {
+      if (JSON.stringify(previous.request) !== JSON.stringify(request)) throw new Error("conflicting stage request");
+      return previous.promise;
+    }
+    let resolve!: (result: JsonValue) => void;
+    const promise = new Promise<JsonValue>((done) => { resolve = done; });
+    this.stages.set(id, { executionId: `stage:${id}:${randomUUID()}`, request,
+      state: "queued", promise, resolve });
+    this.drainNotifications();
+    return promise;
+  }
+
+  private async cancelStage(id: string): Promise<JsonValue> {
+    const stage = this.stages.get(id);
+    if (!stage || stage.state === "finished") return { cancelled: false };
+    if (stage.state === "queued") {
+      stage.state = "finished";
+      stage.resolve({ status: "cancelled", execution_id: stage.executionId });
+    } else {
+      await this.requireSession().abort();
+      await stage.promise;
+    }
+    return { cancelled: true };
+  }
+
+  private async runStage(id: string): Promise<void> {
+    const stage = this.stages.get(id)!;
+    let result: RunOutcome;
+    try {
+      await this.requireSession().sendCustomMessage({ customType: "agentgenome.stage",
+        content: JSON.stringify(stage.request), display: false,
+        details: { request_id: id, execution_id: stage.executionId },
+      }, { triggerTurn: true });
+      result = this.outcome.normalize(this.requireSession().messages);
+    } catch (error) {
+      result = { status: "failed", message: error instanceof Error ? error.message : "stage failed" };
+    }
+    this.finishRun(stage.executionId, result);
+    stage.state = "finished";
+    this.normalizer = undefined;
+    stage.resolve({ status: result.status, execution_id: stage.executionId });
+    this.drainNotifications();
+  }
+
   private drainNotifications(): void {
     if (this.normalizer || this.requireSession().isStreaming) return;
+    for (const [id, stage] of this.stages) {
+      if (stage.state !== "queued") continue;
+      stage.state = "running";
+      this.normalizer = new PiEventNormalizer(this.sessionId!, stage.executionId, this.pendingCommandIds);
+      this.outcome.reset();
+      setImmediate(() => void this.runStage(id));
+      return;
+    }
     const next = this.pendingNotifications.shift();
     if (next) this.startNotification(next.runId, next.message);
   }
