@@ -67,7 +67,6 @@ from openhands.tools.pyromind_archive import ExtractArchiveTool
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     GetStorageUrlTool,
-    PreviewDatasetTool,
     UploadFileToPyromindTool,
 )
 from openhands.tools.pyromind_dataset.definition import (
@@ -493,7 +492,9 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert RunWorkflowTool.name not in tool_names
     assert ValidateWorkflowDslTool.name in tool_names
     assert TrainingAnalysisTool.name in tool_names
-    assert PreviewDatasetTool.name in tool_names
+    assert "preview_dataset" not in tool_names
+    assert "dataset_download" not in tool_names
+    assert "df_convert" not in tool_names
     assert UploadFileToPyromindTool.name in tool_names
     assert RunDatasetCleaningTool.name in tool_names
     assert {
@@ -554,11 +555,6 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         == cookie_header
     )
 
-    preview_tool = next(
-        tool
-        for tool in service.start_request.agent.tools
-        if tool.name == PreviewDatasetTool.name
-    )
     upload_tool = next(
         tool
         for tool in service.start_request.agent.tools
@@ -573,16 +569,12 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         "headers": {"x-cluster": "us-west-1#pre"},
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
-    expected_extraction_params = dict(expected_execution_params)
-    expected_extraction_params.pop("runtime_dir")
-    assert preview_tool.params == {
-        **expected_storage_params,
-        "extract_params": expected_extraction_params,
-    }
     assert upload_tool.params == expected_storage_params
     assert cleaning_tool.params == expected_execution_params
     assert "secret_headers" not in cleaning_tool.params
-    assert "session-token" not in str(preview_tool.params)
+    assert "session-token" not in str(
+        [tool.params for tool in service.start_request.agent.tools]
+    )
     assert (
         service.start_request.secrets["PYROMIND_STORAGE_AUTH_COOKIE"].get_value()
         == cookie_header
@@ -1126,7 +1118,6 @@ def test_pyromind_storage_tools_use_user_context_headers():
     )
 
     assert [tool.name for tool in tools] == [
-        PreviewDatasetTool.name,
         UploadFileToPyromindTool.name,
         GetStorageUrlTool.name,
         RunDatasetCleaningTool.name,
@@ -1146,7 +1137,7 @@ def test_pyromind_storage_tools_use_user_context_headers():
         "headers": {"x-cluster": "context-cluster"},
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
-    cleaning_params = tools[3].params
+    cleaning_params = tools[2].params
     assert cleaning_params == {
         "current_user": CurrentLoginUser(
             username="debug-user-42",
@@ -1167,12 +1158,7 @@ def test_pyromind_storage_tools_use_user_context_headers():
         "storage_headers": {"x-cluster": "context-cluster"},
         "storage_secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
-    expected_extraction_params = dict(cleaning_params)
-    expected_extraction_params.pop("runtime_dir")
-    assert tools[0].params == {
-        **expected_storage_params,
-        "extract_params": expected_extraction_params,
-    }
+    assert tools[0].params == expected_storage_params
     assert tools[1].params == expected_storage_params
     assert (
         secrets["PYROMIND_STORAGE_AUTH_COOKIE"].get_value()
