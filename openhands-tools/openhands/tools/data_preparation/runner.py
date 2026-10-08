@@ -417,8 +417,7 @@ def build_dataflow_env(
     Process-wide ``DF_*`` values configure the vision model without changing
     the conversation's main coding model. Text always uses the conversation
     model. Missing vision values fall back to ``LLM_BASE_URL``, then the
-    conversation LLM, then the DataFlow defaults (mirroring
-    ``_vision_api_config`` so preview and pipeline runs share one endpoint).
+    conversation LLM, then the DataFlow defaults.
 
     ``gateway`` is a per-run user-supplied labeling endpoint. When given it
     replaces the whole vision configuration rather than merging with it: a

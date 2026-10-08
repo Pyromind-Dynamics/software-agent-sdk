@@ -9,8 +9,9 @@ description: 分析带 ground truth 的测试集，制定确定性 rubric，通�
 
 ## 输入与评价标准
 
-使用 `preview_dataset` 确认测试集 JSONL、输入字段、GT、媒体路径和代表性样本。
-媒体相对路径基于 JSONL 所在目录；不要重复设置数据集目录为 `media_base_dir`。
+用 `read`/`terminal` 直读 `storage/` 下的测试集 JSONL，确认输入字段、GT、
+媒体路径和代表性样本。媒体相对路径基于 JSONL 所在目录；不要重复设置数据集
+目录为 `media_base_dir`。
 读取 [输入契约](references/input-contract.md) 和 [Rubric 编写](references/rubric-authoring.md)，
 在当前工作区写出 `public_data/inference_dataset_config.json` 和
 `public_data/inference_evaluation_config.json`。
@@ -36,7 +37,7 @@ output_schema 或 convert_format。不使用 workflow_debug 或 run_workflow。
 提交返回 task_id、run_id 和 output_dir。使用 `df_check_progress` 查询进度；用户要求停止时
 使用 `df_stop_task` 停止整个工作流。平台回调只代表任务终态，不代表业务指标达标。
 
-回调后通过 `preview_dataset` 读取 output_dir 下的 report.json 和 metrics.json，核对样本数、
+回调后直读 output_dir 下的 report.json 和 metrics.json，核对样本数、
 成功 prediction 数、完成评分数、通过率及执行错误。通过 `df_check_progress` 的 artifact_urls 获取 HTML 报告完整预览 URL，
 在最终回答中以 Markdown 链接 `[查看完整评测报告](完整预览URL)` 展示，原样保留完整 URL（含查询参数）。
 不要把容器路径当成用户可打开的地址，也不要编造签名下载链接。

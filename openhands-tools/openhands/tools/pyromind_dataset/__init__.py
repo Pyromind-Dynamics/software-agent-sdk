@@ -1,12 +1,9 @@
-"""Pyromind dataset tools: preview storage datasets and upload local files."""
+"""Pyromind dataset tools: upload local files and resolve Storage URLs."""
 
 from openhands.tools.pyromind_dataset.definition import (
     GetStorageUrlAction,
     GetStorageUrlObservation,
     GetStorageUrlTool,
-    PreviewDatasetAction,
-    PreviewDatasetObservation,
-    PreviewDatasetTool,
     StoragePreviewUrl,
     UploadFileToPyromindAction,
     UploadFileToPyromindObservation,
@@ -18,9 +15,6 @@ __all__ = [
     "GetStorageUrlAction",
     "GetStorageUrlObservation",
     "GetStorageUrlTool",
-    "PreviewDatasetAction",
-    "PreviewDatasetObservation",
-    "PreviewDatasetTool",
     "StoragePreviewUrl",
     "UploadFileToPyromindAction",
     "UploadFileToPyromindObservation",

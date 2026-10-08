@@ -141,7 +141,8 @@ _PREVIEW_REMOTE_DESCRIPTION = """Preview a dataset hosted on HuggingFace or Mode
 
 Use this tool when the user wants to preview/inspect a dataset from HuggingFace
 or ModelScope (e.g. 'openai/gsm8k', 'Qwen/Qwen2-Math-SFT'). If the dataset is
-already in Pyromind shared space or user storage, use `preview_dataset` instead.
+already in Pyromind shared space or user storage, read it from the mounted
+`storage/` directory with the file tools instead.
 
 When `source` is not specified, the tool auto-detects by trying HuggingFace
 first, then ModelScope. Use this auto mode when the user does not explicitly

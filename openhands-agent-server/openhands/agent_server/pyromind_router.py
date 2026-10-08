@@ -95,7 +95,6 @@ from openhands.tools.pyromind_archive import ExtractArchiveTool
 from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
 from openhands.tools.pyromind_dataset import (
     GetStorageUrlTool,
-    PreviewDatasetTool,
     UploadFileToPyromindTool,
 )
 from openhands.tools.pyromind_dataset.definition import (
@@ -258,8 +257,8 @@ The shared skill documents are available through the read-only logical path
 
 User paths are platform storage paths (e.g. `datasets/...`,
 `/.pyromind-agent/...`, or a `workspace/` prefix) — never this conversation's
-local files. Read them with `preview_dataset` directly, without searching
-local files. Only `public_data/...` paths are local.
+local files. In a sandbox session they are mounted read-only at `storage/`;
+read them there with the file tools. Only `public_data/...` paths are local.
 
 Skill usage rules:
 - Every user turn is preceded by a `<system_reminder>` stating whether
@@ -681,10 +680,6 @@ def _build_pyromind_storage_tools(
 
     return (
         [
-            Tool(
-                name=PreviewDatasetTool.name,
-                params={**params, "extract_params": extraction_params},
-            ),
             Tool(name=UploadFileToPyromindTool.name, params=dict(params)),
             Tool(name=GetStorageUrlTool.name, params=dict(params)),
             Tool(name=RunDatasetCleaningTool.name, params=cleaning_params),
@@ -1418,7 +1413,6 @@ async def create_pyromind_conversation(
             Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
             *sandbox_tools,
             *storage_tools,
-            Tool(name="dataset_download"),
             Tool(
                 name="df_run_pipeline",
                 params={
@@ -1430,7 +1424,6 @@ async def create_pyromind_conversation(
                     )
                 },
             ),
-            Tool(name="df_convert"),
             validation_tool,
             analysis_tool,
             training_tool,

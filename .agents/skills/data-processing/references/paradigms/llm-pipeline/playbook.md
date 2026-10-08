@@ -21,7 +21,7 @@
   工作区写好的 Manifest 用 `upload_file_to_pyromind` 落到图片所在的 Storage 目录
   （见[平台全量输入](#平台全量输入)），不要用 sandbox 搬运。
 - Sample 结果不符合预期时自行修正并重跑，迭代过程不向用户展示；只展示符合预期的结果。
-- 新链路直接生成规范 JSONL，不以 `df_convert` 或 Parquet 作为正式产物。
+- 新链路直接生成规范 JSONL，不以 Parquet 作为正式产物。
 - 新链路优先复用 DataFlow Storage 和 Operator 编排；生成、打分、过滤、去重等已有
   算子能覆盖的环节，尽量不要手写重复实现。
 - 使用 LLM 的 DataFlow 算子必须由 `LoggingLLMServing` 包装。

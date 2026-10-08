@@ -108,9 +108,8 @@ is appended automatically (data_1/, data_2/, ...) so existing files are never
 overwritten. Pass `output_dir` to choose an explicit target directory; it must
 not already exist in storage.
 
-When the terminal workflow callback resumes the conversation, use
-`preview_dataset` with the `output_dir` returned by this tool to inspect the
-extracted files.
+When the terminal workflow callback resumes the conversation, inspect the
+`output_dir` returned by this tool with the file tools or `terminal` commands.
 
 v1 extracts archives in a single pass. Nested archives inside the extracted
 output require a separate call.
