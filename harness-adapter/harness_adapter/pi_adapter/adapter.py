@@ -249,6 +249,9 @@ class PiAdapter:
         if self._apply_workspace_quota is not None:
             self._apply_workspace_quota(root, conversation_id)
 
+    def set_workflow_preparer(self, callback: Any) -> None:
+        self._business_tools.set_workflow_preparer(callback)
+
     def _prepare_session_workspace(self, root: Path, *, create: bool) -> None:
         return _prepare_workspace(
             root,

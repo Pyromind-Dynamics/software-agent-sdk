@@ -17,6 +17,7 @@ from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
 from pyromind_runtime.domain.events import ProductEvent, WorkflowRunState
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
+from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
 
 
 _DIR_MODE = 0o700
@@ -119,6 +120,38 @@ class FileProductStore:
         metadata = self._load_metadata()
         if metadata.user_id != user_id:
             raise PermissionError("conversation does not belong to current user")
+
+    def load_workflow_execution_requests(self) -> dict[str, WorkflowExecutionRequest]:
+        with self._lock():
+            return self._load_workflow_execution_requests()
+
+    def _load_workflow_execution_requests(self) -> dict[str, WorkflowExecutionRequest]:
+        path = self.directory / "workflow-execution-requests.json"
+        if not path.exists():
+            return {}
+        return TypeAdapter(dict[str, WorkflowExecutionRequest]).validate_json(
+            path.read_text(encoding="utf-8")
+        )
+
+    def save_workflow_execution_request(
+        self, state: WorkflowExecutionRequest, *, expected_revision: int | None
+    ) -> None:
+        with self._lock():
+            requests = self._load_workflow_execution_requests()
+            previous = requests.get(state.request_id)
+            if (previous.revision if previous else None) != expected_revision:
+                raise ValueError("workflow execution request changed concurrently")
+            if self._load_metadata().conversation_id != state.conversation_id:
+                raise ValueError(
+                    "workflow execution request belongs to another conversation"
+                )
+            requests[state.request_id] = state
+            self._atomic_write(
+                self.directory / "workflow-execution-requests.json",
+                TypeAdapter(dict[str, WorkflowExecutionRequest])
+                .dump_json(requests)
+                .decode(),
+            )
 
     def load_pipeline_runs(self) -> dict[str, PipelineRun]:
         with self._lock():

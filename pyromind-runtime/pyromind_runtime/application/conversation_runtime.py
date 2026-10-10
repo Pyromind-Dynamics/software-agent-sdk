@@ -17,6 +17,7 @@ from pyromind_runtime.application.workflow_completion import WorkflowCompletionH
 from pyromind_runtime.domain.capabilities import ResourceLimits
 from pyromind_runtime.domain.commands import (
     CommandReceipt,
+    PermissionResponseCommand,
     ProductCommand,
     RollbackWorkflowCommand,
     UserMessageCommand,
@@ -29,6 +30,7 @@ from pyromind_runtime.domain.snapshot import (
     ExternalTaskState,
     WorkflowState,
 )
+from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
 from pyromind_runtime.infrastructure.file_product_store import (
     FileProductStore,
     ProductStoreError,
@@ -43,6 +45,7 @@ from pyromind_runtime.ports.harness import (
     SessionHandle,
     SessionSpec,
 )
+from pyromind_runtime.ports.workflow_submission import WorkflowSubmissionPort
 
 
 logger = logging.getLogger(__name__)
@@ -107,6 +110,7 @@ class ConversationRuntime:
         resource_retention_seconds: int = 0,
         max_active_conversations: int = 0,
         resource_limits: ResourceLimits | None = None,
+        workflow_submission: WorkflowSubmissionPort | None = None,
     ) -> None:
         self.conversation_root = Path(conversation_root)
         self.adapters = (
@@ -119,6 +123,7 @@ class ConversationRuntime:
         self.default_harness_id = default_harness_id
         self._resource_limits = resource_limits
         self._external_tasks = external_tasks
+        self._workflow_submission = workflow_submission
         self._projector = ProductEventProjector()
         self._idle_eviction_seconds = max(0, int(idle_eviction_seconds))
         self._release_grace_seconds = max(0, int(release_grace_seconds))
@@ -132,6 +137,7 @@ class ConversationRuntime:
         self._subscribers: dict[str, set[asyncio.Queue[ProductEvent]]] = {}
         self._first_command_pending: set[str] = set()
         self._first_delta_started_at: dict[tuple[str, str], float] = {}
+        self._pending_task_registrations: dict[str, asyncio.Event] = {}
 
     async def create_conversation(
         self,
@@ -228,6 +234,19 @@ class ConversationRuntime:
                 return await self._rollback_workflow(
                     active, store, command, receipt, context
                 )
+            if isinstance(command, PermissionResponseCommand):
+                request = next(
+                    (
+                        item
+                        for item in store.load_workflow_execution_requests().values()
+                        if item.permission_id == command.permission_id
+                    ),
+                    None,
+                )
+                if request is not None:
+                    return await self._respond_to_workflow_execution(
+                        store, request, command, receipt, context
+                    )
             first_command = (
                 isinstance(command, UserMessageCommand)
                 and conversation_id in self._first_command_pending
@@ -267,6 +286,211 @@ class ConversationRuntime:
                 update={"status": "completed", "response": response}
             )
             return store.complete_command(completed)
+
+    async def prepare_workflow_execution(
+        self,
+        conversation_id: str,
+        workflow_path: str,
+        context: RequestContext,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        if self._workflow_submission is None:
+            raise ValueError("workflow submission is unavailable")
+        store = self._store(conversation_id)
+        store.authorize(context.user_id)
+        identity = request_id or uuid4().hex
+        previous = store.load_workflow_execution_requests().get(identity)
+        if previous is not None:
+            if previous.workflow_path != workflow_path:
+                raise ValueError("request id already belongs to another workflow")
+            return {
+                "request_id": identity,
+                "status": previous.status,
+                "summary": previous.summary,
+            }
+        prepared = await self._workflow_submission.prepare(workflow_path, context)
+        workflow = prepared.get("workflow")
+        summary = prepared.get("summary")
+        fingerprint = prepared.get("fingerprint")
+        if (
+            not isinstance(workflow, dict)
+            or not isinstance(summary, dict)
+            or not isinstance(fingerprint, str)
+        ):
+            raise ValueError("workflow preparation returned an invalid definition")
+        request = WorkflowExecutionRequest(
+            request_id=identity,
+            conversation_id=conversation_id,
+            permission_id=f"workflow-run:{identity}",
+            workflow_path=workflow_path,
+            fingerprint=fingerprint,
+            workflow=workflow,
+            summary=summary,
+        )
+        store.save_workflow_execution_request(request, expected_revision=None)
+        event, _ = store.append(
+            ProductEvent(
+                event_id=f"workflow-run:{identity}:permission",
+                conversation_id=conversation_id,
+                type="permission.requested",
+                payload={
+                    "permission_id": request.permission_id,
+                    "operation_ids": [identity],
+                    "description": (
+                        f"确认运行工作流 {summary.get('name', 'workflow')}？"
+                        f"节点数：{summary.get('node_count', '?')}；"
+                        f"版本：{fingerprint[:12]}；路径：{workflow_path}"
+                    ),
+                    "choices": ["allow_once", "deny"],
+                },
+            )
+        )
+        self._publish(event)
+        return {"request_id": identity, "status": request.status, "summary": summary}
+
+    async def _respond_to_workflow_execution(
+        self,
+        store: FileProductStore,
+        request: WorkflowExecutionRequest,
+        command: PermissionResponseCommand,
+        receipt: CommandReceipt,
+        context: RequestContext,
+    ) -> CommandReceipt:
+        if request.status != "awaiting_confirmation":
+            response = {
+                "request_id": request.request_id,
+                "status": request.status,
+                "task_id": request.task_id,
+            }
+            return store.complete_command(
+                receipt.model_copy(update={"status": "completed", "response": response})
+            )
+        next_status = "submitting" if command.decision == "allow_once" else "cancelled"
+        updated = request.model_copy(
+            update={"status": next_status, "revision": request.revision + 1}
+        )
+        try:
+            store.save_workflow_execution_request(
+                updated, expected_revision=request.revision
+            )
+        except ValueError:
+            latest = store.load_workflow_execution_requests()[request.request_id]
+            response = {
+                "request_id": latest.request_id,
+                "status": latest.status,
+                "task_id": latest.task_id,
+            }
+            return store.complete_command(
+                receipt.model_copy(update={"status": "completed", "response": response})
+            )
+        resolved, _ = store.append(
+            ProductEvent(
+                event_id=f"workflow-run:{request.request_id}:resolved",
+                conversation_id=request.conversation_id,
+                type="permission.resolved",
+                payload={
+                    "permission_id": request.permission_id,
+                    "decision": command.decision,
+                },
+            )
+        )
+        self._publish(resolved)
+        if next_status == "cancelled":
+            self._emit_workflow_execution_message(
+                store, request, "cancelled", "已取消运行工作流。"
+            )
+            response = {"request_id": request.request_id, "status": "cancelled"}
+            return store.complete_command(
+                receipt.model_copy(update={"status": "completed", "response": response})
+            )
+        assert self._workflow_submission is not None
+        try:
+            task_id = await self._workflow_submission.submit(
+                request.workflow, request.conversation_id, context
+            )
+        except Exception as exc:
+            logger.warning(
+                "workflow submission outcome uncertain: request_id=%s error=%s",
+                request.request_id,
+                type(exc).__name__,
+            )
+            uncertain = updated.model_copy(
+                update={
+                    "status": "uncertain",
+                    "revision": updated.revision + 1,
+                    "error": type(exc).__name__,
+                }
+            )
+            store.save_workflow_execution_request(
+                uncertain, expected_revision=updated.revision
+            )
+            message = "提交结果未确认，请先在平台核对是否已产生任务，避免重复运行。"
+            self._emit_workflow_execution_message(store, request, "uncertain", message)
+            response = {
+                "request_id": request.request_id,
+                "status": "uncertain",
+                "error": message,
+            }
+            return store.complete_command(
+                receipt.model_copy(update={"status": "completed", "response": response})
+            )
+        submitted = updated.model_copy(
+            update={
+                "status": "submitted",
+                "revision": updated.revision + 1,
+                "task_id": task_id,
+            }
+        )
+        now = datetime.now().astimezone().isoformat()
+        payload = {
+            "task_id": task_id,
+            "kind": "workflow_run",
+            "run_id": request.request_id,
+            "status": "pending",
+            "submitted_at": now,
+            "updated_at": now,
+            "resume_pending": False,
+        }
+        self.register_external_task(request.conversation_id, payload)
+        store.save_workflow_execution_request(
+            submitted, expected_revision=updated.revision
+        )
+        self._emit_workflow_execution_message(
+            store, request, "submitted", f"工作流已提交，taskId：{task_id}"
+        )
+        response = {
+            "request_id": request.request_id,
+            "status": "submitted",
+            "task_id": task_id,
+        }
+        return store.complete_command(
+            receipt.model_copy(update={"status": "completed", "response": response})
+        )
+
+    def _emit_workflow_execution_message(
+        self,
+        store: FileProductStore,
+        request: WorkflowExecutionRequest,
+        state: str,
+        text: str,
+    ) -> None:
+        message_id = f"workflow-run:{request.request_id}:{state}"
+        message_payload = {
+            "message_id": message_id,
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+        }
+        for event_type in ("message.started", "message.completed"):
+            event, _ = store.append(
+                ProductEvent(
+                    event_id=f"{message_id}:{event_type}",
+                    conversation_id=request.conversation_id,
+                    type=event_type,
+                    payload=message_payload,
+                )
+            )
+            self._publish(event)
 
     async def fork_conversation(
         self,
@@ -393,6 +617,24 @@ class ConversationRuntime:
                     ),
                     None,
                 )
+        if task is None and any(
+            request.status == "submitting"
+            for request in store.load_workflow_execution_requests().values()
+        ):
+            registration = self._pending_task_registrations.setdefault(
+                task_id, asyncio.Event()
+            )
+            try:
+                await asyncio.wait_for(registration.wait(), timeout=10)
+            except TimeoutError:
+                pass
+            finally:
+                self._pending_task_registrations.pop(task_id, None)
+            snapshot = store.load_snapshot()
+            task = next(
+                (item for item in snapshot.external_tasks if item.task_id == task_id),
+                None,
+            )
         if task is None:
             raise ValueError(f"unknown external task: {task_id}")
         normalized = _normalize_external_status(status)
@@ -449,6 +691,7 @@ class ConversationRuntime:
                             status=normalized,
                             error_summary=_controlled_error(error_summary),
                             auto_run=auto_run,
+                            has_training_node=_workflow_has_training_node(store, task),
                         ),
                         active.context,
                     )
@@ -497,6 +740,9 @@ class ConversationRuntime:
                 logger.exception("Could not register external task %s", task_id)
         if updated.through_seq != snapshot.through_seq:
             self._publish(persisted)
+        registration = self._pending_task_registrations.get(task_id)
+        if registration is not None:
+            registration.set()
         return persisted
 
     async def stream_events(
@@ -712,6 +958,7 @@ class ConversationRuntime:
                     status=task.status,
                     error_summary=task.error_summary,
                     auto_run=True,
+                    has_training_node=_workflow_has_training_node(store, task),
                 ),
                 active.context,
             )
@@ -1233,12 +1480,39 @@ def _build_external_task_notification(
     status: str,
     error_summary: str | None,
     auto_run: bool,
+    has_training_node: bool | None = None,
 ) -> ExternalTaskNotification:
     task_label = task.kind.replace("_", " ")
     visible_text: str | None = None
     reset_attempt_budget = task.kind == "workflow_debug" and status == "succeeded"
     trigger_turn = auto_run
-    if task.kind == "workflow_debug":
+    if task.kind == "workflow_run":
+        if status == "failed":
+            instruction = (
+                f"Production workflow task {task.task_id} failed. Call "
+                "analyze_task_failure with this task_id, report the node logs and "
+                "diagnosis, then stop. Do not edit or rerun the workflow."
+            )
+        elif status == "succeeded":
+            if has_training_node:
+                instruction = (
+                    f"Production workflow task {task.task_id} succeeded and includes "
+                    "training. Hand this task_id to the training-analysis skill "
+                    "and follow its analysis and reporting flow. Report the actual "
+                    "W&B run and metrics; do not claim all training stages were "
+                    "analyzed. Do not rerun automatically."
+                )
+            else:
+                instruction = (
+                    f"Production workflow task {task.task_id} succeeded without "
+                    "a training node. Report completion without W&B analysis."
+                )
+        else:
+            instruction = (
+                f"Production workflow task {task.task_id} ended with status "
+                f"{status}. Report the status without retrying."
+            )
+    elif task.kind == "workflow_debug":
         if status == "succeeded":
             visible_text = f"工作流调试运行成功\n\n- task_id: {task.task_id}"
             instruction = (
@@ -1278,3 +1552,12 @@ def _build_external_task_notification(
         trigger_turn=trigger_turn,
         reset_attempt_budget=reset_attempt_budget,
     )
+
+
+def _workflow_has_training_node(
+    store: FileProductStore, task: ExternalTaskState
+) -> bool | None:
+    if task.kind != "workflow_run":
+        return None
+    request = store.load_workflow_execution_requests().get(task.run_id or "")
+    return request.summary.get("has_training_node") is True if request else None

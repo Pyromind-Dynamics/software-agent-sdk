@@ -13,6 +13,7 @@ from pyromind_agent_server.bootstrap import install_product_api
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
+from pyromind_runtime.ports.harness import SessionSpec
 
 from openhands.agent_server.config import Config
 from openhands.agent_server.conversation_service import ConversationService
@@ -102,6 +103,56 @@ async def test_http_create_list_snapshot_and_command(tmp_path) -> None:
     assert command.json() == retry.json()
     assert adapter.created_specs[0].workspace_root == str(
         conversations / conversation_id
+    )
+    await runtime.close()
+
+
+async def test_http_workflow_execution_prepares_confirmation_without_submitting(
+    tmp_path,
+) -> None:
+    class Submission:
+        def __init__(self) -> None:
+            self.submitted = False
+
+        async def prepare(self, workflow_path, context):
+            return {
+                "workflow": {"name": "sft", "nodes": []},
+                "fingerprint": "abcdef1234567890",
+                "summary": {"name": "sft", "node_count": 0},
+            }
+
+        async def submit(self, workflow, conversation_id, context):
+            self.submitted = True
+            return "task-1"
+
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    submission = Submission()
+    runtime = ConversationRuntime(
+        conversations, FakeAdapter(), workflow_submission=submission
+    )
+    context = RequestContext(user_id="42")
+    await runtime.create_conversation(
+        SessionSpec(
+            conversation_id="workflow-api",
+            user_id="42",
+            workspace_root=str(conversations / "workflow-api"),
+        ),
+        context,
+    )
+    transport = httpx.ASGITransport(app=_app(tmp_path, runtime))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v2/pyromind/conversations/workflow-api/workflow-executions",
+            headers={"x-pyromind-debug-user-id": "42"},
+            json={"workflow_path": "storage/project/workflow.py", "request_id": "r"},
+        )
+    assert response.status_code == 200
+    assert response.json()["status"] == "awaiting_confirmation"
+    assert submission.submitted is False
+    assert (
+        len((await runtime.get_snapshot("workflow-api", context)).pending_permissions)
+        == 1
     )
     await runtime.close()
 

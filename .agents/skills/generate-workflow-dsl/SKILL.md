@@ -131,8 +131,8 @@ batch、grad accumulation、learning rate、epoch、LoRA rank 和 GRPO 的 max s
    探测，再据此生成正式工作流；不得用 `run_workflow` 探测。
 
 生成 Skill 不调用 `workflow_debug`、`run_workflow` 或 `run_dataset_cleaning`。只有不含配置修改的
-显式调试请求才转用 `debug-workflow`；“换模型/改参数后跑或看效果”本轮只修改并校验 DSL，正式
-执行由前端/平台触发。
+显式调试请求才转用 `debug-workflow`。用户要求“换模型/改参数后运行”时，先修改并校验 DSL，
+上传工作流后按 `workflow-execution` Skill 请求正式运行，由 Copilot 确认。
 
 ## 最终回复
 

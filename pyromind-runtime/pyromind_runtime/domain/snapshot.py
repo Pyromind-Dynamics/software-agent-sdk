@@ -127,6 +127,7 @@ class ExternalTaskState(ContractModel):
         "environment_processing",
         "environment_processing_render",
         "environment_processing_aggregate",
+        "workflow_run",
     ]
     run_id: str | None = None
     status: Literal[

@@ -99,6 +99,8 @@ class SnapshotProjector:
                 code="unsupported_status",
                 message=f"Unsupported conversation status: {status}",
             )
+        if snapshot.pending_permissions and status in {"idle", "finished"}:
+            return snapshot.model_copy(update={"status": "waiting_for_confirmation"})
         return snapshot.model_copy(update={"status": status})
 
     def _on_message_started(
@@ -268,7 +270,11 @@ class SnapshotProjector:
         return snapshot.model_copy(
             update={
                 "pending_permissions": pending,
-                "status": "waiting_for_confirmation" if pending else "running",
+                "status": "waiting_for_confirmation"
+                if pending
+                else "idle"
+                if permission_id.startswith("workflow-run:")
+                else "running",
             }
         )
 

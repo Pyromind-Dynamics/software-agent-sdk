@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from harness_adapter.openhands_adapter import OpenHandsAdapter
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
+from harness_adapter.workflow_submission import PlatformWorkflowSubmission
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.domain.capabilities import ResourceLimits
@@ -92,7 +93,10 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         resource_retention_seconds=resource_retention_seconds,
         max_active_conversations=max_active_conversations,
         resource_limits=resource_limits_from_environment(),
+        workflow_submission=PlatformWorkflowSubmission(),
     )
+    if backend == "pi":
+        adapters["pi"].set_workflow_preparer(runtime.prepare_workflow_execution)
     logger.info(
         "Pyromind product runtime ready: default_harness=%s "
         "PYROMIND_HARNESS_BACKEND=%s registered_harnesses=%s "
