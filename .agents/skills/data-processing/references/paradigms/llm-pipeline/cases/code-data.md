@@ -16,6 +16,12 @@ CodeInstructionGenerator
 ```
 
 ```python
+from dataflow.operators.code import (
+    CodeCodeToInstructionGenerator, CodeInstructionGenerator,
+    CodeInstructionToCodeGenerator, CodeQualitySampleEvaluator,
+    CodeQualityScoreFilter, CodeSandboxSampleEvaluator,
+)
+
 CodeInstructionToCodeGenerator(llm_serving=llm).run(
     storage=storage,
     input_instruction_key="instruction",
@@ -26,6 +32,14 @@ storage = storage.step()
 
 最终映射 `instruction → user_prompt`、`code → gt`；语言、质量分和来源进入
 `scenario_metrics.json`。
+
+输出契约（`output_schema="text"`）：
+
+```json
+{"id":"code-1","system_prompt":"You are helpful.","user_prompt":"问题","gt":"代码"}
+```
+
+四个字段均为非空字符串，根字段精确匹配，`id` 唯一。
 
 只做文本生成和静态/模型评分。禁止使用 `CodeSandboxSampleEvaluator`，不得执行、
 编译或安装生成代码。

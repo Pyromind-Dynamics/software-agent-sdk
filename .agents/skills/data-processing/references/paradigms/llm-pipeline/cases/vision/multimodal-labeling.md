@@ -1,9 +1,10 @@
 # 图片语义打标
 
-图片 Pipeline 只声明 `ImagePipelineConfig`，不要生成循环、HTTP、OpenAI Client、
-Base64、重试或 Checkpoint。完整字段见
-[image_utils API](../image-utils-api.md)，起始脚本见
-[配置模板](../multimodal_pipeline.py)。
+图片 Pipeline 只声明 `ImagePipelineConfig`（`from image_utils import
+ImagePipelineConfig, run_image_pipeline_from_cli`），不要生成循环、HTTP、OpenAI
+Client、Base64、重试或 Checkpoint。完整字段见
+[image_utils API](../../vision/image-utils-api.md)，起始脚本见
+[配置模板](../../vision/templates/multimodal_pipeline.py)。
 
 ## 输入
 
@@ -42,9 +43,9 @@ Base64、重试或 Checkpoint。完整字段见
 
 ## 执行与恢复
 
-运行时通过 DataFlow `APIVLMServing_openai` 完成多图请求，通过单个组合 Operator
-生成最终 Pyromind 行。结构化结果失败最多重试 3 次，任一记录最终失败时停止当前
-batch，不跳过数据。
+运行时（`image_utils.py` 内部）通过 DataFlow `APIVLMServing_openai` 完成多图请求，
+通过单个组合 Operator 生成最终 Pyromind 行；Pipeline 不需要导入这两者。结构化结果
+失败最多重试 3 次，任一记录最终失败时停止当前 batch，不跳过数据。
 
 DataFlow checkpoint 决定已提交 batch；输出先写原子分片，再合并为
 `processed.jsonl`。resume 复用原 Manifest 和已提交分片，不重新扫描输入目录。
@@ -52,15 +53,21 @@ DataFlow checkpoint 决定已提交 batch；输出先写原子分片，再合并
 本地使用：
 
 ```text
-配置 JSON 中填写 "model_profile": "vision", "output_schema": "vision"，再通过 terminal 执行 sandbox_sample.py --config <配置路径>
+通过 terminal 执行 sandbox_sample.py --pipeline <pipeline> --input <manifest> --output <public_data 路径>
+  --model-profile vision --output-schema vision
+只有 flags 覆盖不到的字段才用 --config，见 references/terminal-cli.md
 ```
 
 用户确认后使用 `df_submit_pipeline(mode="full")`；提交前按 playbook 的
-[平台全量输入](../playbook.md#平台全量输入)把 Manifest 与它引用的图片落到同一
+[平台全量输入](../../playbook.md#平台全量输入)把 Manifest 与它引用的图片落到同一
 Storage 目录树（目录输入按直接子项划分样本，多图样本用 Manifest）。平台产物在
 Kafka callback 后直接读 `storage/`。
 
 ## 输出
+
+输出契约（`output_schema="vision"`）：根字段只有 `messages`，消息固定按
+`system → user → assistant` 排列；图片以有序的 `image_url` block 放在 user 文本前，
+路径是相对 POSIX 路径；assistant 文本含一组非空 `think/answer`。
 
 ```json
 {

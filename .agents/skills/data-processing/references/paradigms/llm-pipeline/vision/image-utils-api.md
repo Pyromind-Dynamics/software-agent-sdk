@@ -87,8 +87,9 @@ Pipeline。需要程序化调用时可使用：
 run_image_pipeline(CONFIG, input_path, output_path, limit)
 ```
 
-`MultiImageSemanticLabelOperator` 是底层 DataFlow Operator，主要用于测试或受控扩展；
-常规 Agent Pipeline 不直接实例化。
+`MultiImageSemanticLabelOperator` 定义在 `image_utils.py` 内（不在 `dataflow.operators`
+里），导入路径是 `from image_utils import MultiImageSemanticLabelOperator`；它由
+`run_image_pipeline` 内部实例化，常规 Agent Pipeline 不直接使用。
 
 ## 来源与恢复
 

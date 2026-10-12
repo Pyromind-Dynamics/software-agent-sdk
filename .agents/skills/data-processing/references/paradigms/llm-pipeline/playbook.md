@@ -1,6 +1,7 @@
 # 数据准备（llm-pipeline）
 
-- **基底**：沙箱小样（`sandbox_sample.py --config` 在会话沙箱内隔离子进程执行 DataFlow 算子）→
+- **基底**：沙箱小样（`sandbox_sample.py` 直参优先，用法见 [terminal-cli](../../terminal-cli.md)；
+  它在会话沙箱内隔离子进程执行 DataFlow 算子）→
   用户确认后平台全量（`df_submit_pipeline`）
 - **适用**：内容级处理——规则清洗（词数/语言/MinHash 去重/PII/毒性/HTML）、
   LLM 生成与改写、质量评分、格式化；覆盖 SFT、推理、代码、知识问答、
@@ -15,8 +16,8 @@
 
 - 工作区中间文件放在 `public_data/data-preparation/`。
 - Storage 挂载为 `storage/`，直接用 `read`/`terminal` 查看数据和平台产物，
-  `sandbox_sample.py --config` 的输入也直接写 `storage/...`。
-- `sandbox_sample.py --config` 只运行沙箱小样；用户确认前不得调用 `df_submit_pipeline`。
+  `sandbox_sample.py` 的输入也直接写 `storage/...`。
+- `sandbox_sample.py` 只运行沙箱小样；用户确认前不得调用 `df_submit_pipeline`。
 - 平台全量输入必须已经存在于 Storage：`df_submit_pipeline` 不接受工作区路径。
   工作区写好的 Manifest 用 `upload_file_to_pyromind` 落到图片所在的 Storage 目录
   （见[平台全量输入](#平台全量输入)），不要用 sandbox 搬运。
@@ -54,7 +55,7 @@ Manifest 小文件；不要为此创建 sandbox。
 ## 执行流程
 
 1. 先确认结构：直接查看 `storage/<input_path>`（目录先 `ls`，再看 schema 和
-   最多 3 条样例），`sandbox_sample.py --config` 直接以 `storage/<input_path>` 作为输入。
+   最多 3 条样例），`sandbox_sample.py` 直接以 `storage/<input_path>` 作为输入。
    Storage `source_path` 供全量提交与沙箱直读使用，不得复制 Sample
    到另一个文件。**vision 小样例外**：图片按 manifest 的相对路径解析，`storage/...`
    的 manifest 与工作区里的 manifest 都在原地解析其图片，工作区里的 manifest 要求
@@ -62,13 +63,14 @@ Manifest 小文件；不要为此创建 sandbox。
    丢掉 `image_labels` 等 manifest 字段。同时按
    [terminal-cli.md](../../terminal-cli.md) 的「运行环境」后台启动一次 `--prepare`
    预热（同一沙箱只需一次；小样执行会在同一把锁上等它装完，不重复安装）。
-2. 按下表（运行规则）只读取相关场景 case 文档，同时读取
-   [通用约定](dataflow-common.md) 和
-   [输出契约](schema-conventions.md)。
+2. 按下表（运行规则）只读取相关场景 case 文档；写 Pipeline 需要导入路径、骨架和模式时
+   读 [pipeline-reference.md](pipeline-reference.md)。每个 schema 的输出契约写在对应
+   case 文档里。
 3. 优先从 case 文档的 DataFlow 算子模板修改 Pipeline；只有图片任务使用
-   [图片模板](multimodal_pipeline.py)，PCB 预标注使用其场景模板。case 文档中的算子链负责处理中间
+   [图片模板](vision/templates/multimodal_pipeline.py)，PCB 预标注使用
+   [场景模板](vision/templates/pcb_inspection_pipeline.py)。case 文档中的算子链负责处理中间
    字段，Pipeline 末尾负责映射正式 Schema。
-4. 调用 `sandbox_sample.py --config`，显式设置 `model_profile` 和 `output_schema`，检查
+4. 调用 `sandbox_sample.py`，用 `--model-profile`/`--output-schema` 显式设置模型和输出校验，检查
    `processed.jsonl`、`validation.json` 和 `report.json`。
 5. Sample 结果不符合预期（质量、格式、字段映射等问题）时，直接修正 pipeline 并
    重新试跑，直到结果符合预期；迭代过程不向用户展示。
@@ -104,13 +106,13 @@ Manifest 小文件；不要为此创建 sandbox。
 | 工具定义和调用轨迹 | [通用 LLM 处理](cases/generic-llm-processing.md)（暂无专属 case） | `function_call` |
 | 样本质量评分、保留、改写或丢弃 | [通用 LLM 处理](cases/generic-llm-processing.md)（暂无专属 case） | `quality_evaluation` |
 | 已有 SQLite Text2SQL 数据精炼 | [通用 LLM 处理](cases/generic-llm-processing.md)（暂无专属 case） | `text2sql` |
-| 图片 OCR、理解和多图语义标注 | [多模态标注](cases/multimodal-labeling.md) | `vision` |
-| PCB AVI/AOI 真点/假点预判、问题分类及区域定位 | [PCB 预打标](cases/pcb-inspection.md) | `structured` |
+| 图片 OCR、理解和多图语义标注 | [多模态标注](cases/vision/multimodal-labeling.md) | `vision` |
+| PCB AVI/AOI 真点/假点预判、问题分类及区域定位 | [PCB 预打标](cases/vision/pcb-inspection.md) | `structured` |
 | 从文本抽取 SMILES | [通用 LLM 处理](cases/generic-llm-processing.md)（暂无专属 case） | `text` |
 
 标注“暂无专属 case”的场景按[通用 LLM 处理](cases/generic-llm-processing.md)
-的流程执行，输出格式严格以[输出契约](schema-conventions.md)中对应
-schema 为准；专属 case 文档待补充。
+的流程执行，输出格式严格以该 case 文档「输出契约」中对应 schema 为准；专属 case
+文档待补充。
 
 PCB 预标注直接输出可读的标注 JSONL，具体结构按任务确定，使用 `output_format="structured"` 与
 `output_schema="structured"`；用户指定其他格式时调整响应 Schema。只有准备训练
@@ -142,6 +144,10 @@ messages 时选择 `vision`。具体完成标准见 PCB 场景文档。
 - `KBCChunkGenerator`、RDKit SMILES 等价评估、默认 CUDA 的质量过滤器。
 - `CodeSandboxSampleEvaluator`；不得执行生成代码。
 
+以上算子的导入路径同样见 [pipeline-reference.md](pipeline-reference.md) 的导入路径表
+（已列出 `KBCChunkGenerator`、`CodeSandboxSampleEvaluator`）；解禁前不要为了确认
+可用性去导入或翻源码。
+
 ## 图片补充参考
 
-- [image_utils API](image-utils-api.md)
+- [image_utils API](vision/image-utils-api.md)

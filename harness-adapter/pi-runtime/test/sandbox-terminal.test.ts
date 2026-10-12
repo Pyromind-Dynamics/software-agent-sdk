@@ -19,7 +19,9 @@ import {
   SandboxTerminalOperations,
   LazySandboxTerminalOperations,
   SANDBOX_ENVIRONMENT_FILE,
+  SANDBOX_SCRIPT_CHUNK_CHARS,
   sandboxTerminalFastPath,
+  sandboxTerminalScriptChunkChars,
   sandboxTerminalTrace,
   sandboxTerminalUrl,
   sandboxTerminalTimeouts,
@@ -55,6 +57,16 @@ test("operator timeouts come from the environment when configured", () => {
   }), { resolveTimeoutMs: 60_000, startupTimeoutMs: 90_000 });
   assert.throws(() => sandboxTerminalTimeouts({ PYROMIND_PI_TERMINAL_STARTUP_TIMEOUT_MS: "soon" }),
     /must be a positive number of milliseconds/);
+});
+
+test("the staging chunk comes from the environment when configured", () => {
+  assert.equal(sandboxTerminalScriptChunkChars({}), undefined);
+  assert.equal(sandboxTerminalScriptChunkChars({
+    PYROMIND_PI_TERMINAL_SCRIPT_CHUNK_CHARS: " 1024 ",
+  }), 1024);
+  assert.throws(() => sandboxTerminalScriptChunkChars({
+    PYROMIND_PI_TERMINAL_SCRIPT_CHUNK_CHARS: "many",
+  }), /must be a positive number of characters/);
 });
 
 test("endpoint resolution fails on its own deadline, not the startup budget", async () => {
@@ -744,6 +756,24 @@ test("staging bursts stay inside the PTY budget and check decoded bytes", () => 
   assert.equal(batches.at(-1)!.stage, "staged");
   assert.ok(batches.at(-1)!.command.includes(`= "${Buffer.byteLength(payload)}"`));
   assert.equal(buildStageBatches("/workspace/run", "token", { "cmd.sh": "true\n" }).length, 1);
+});
+
+test("a sandbox-sized chunk stages the same payload in fewer bursts", () => {
+  // A write tool call stages the base64 of a script which itself carries the
+  // file's base64, so a realistic staged payload is this size.
+  const payload = "x".repeat(16_000);
+  const files = { "cmd.sh": payload };
+  const runDir = "/target-workspace/.pyromind-agent/conv-1/public_data/data-preparation/" +
+    ".pyromind-agent-runs/0123456789abcdef0123456789abcdef";
+  const small = buildStageBatches(runDir, "token", files);
+  const sandbox = buildStageBatches(runDir, "token", files, TERMINAL_BATCH_BUDGET_BYTES, false,
+    SANDBOX_SCRIPT_CHUNK_CHARS);
+  assert.ok(sandbox.length < small.length, `${sandbox.length} bursts beat ${small.length}`);
+  assert.ok(sandbox.every((batch) => Buffer.byteLength(batch.command) <= TERMINAL_BATCH_BUDGET_BYTES));
+  assert.ok(sandbox.every((batch) => batch.command.split("\n")
+    .every((line) => Buffer.byteLength(line) < 4096)), "the sandbox PTY caps one line at 4096");
+  assert.equal(sandbox.at(-1)!.stage, "staged");
+  assert.ok(sandbox.at(-1)!.command.includes(`= "${Buffer.byteLength(payload)}"`));
 });
 
 test("a refused staging burst is repaired one acknowledged line at a time", async () => {

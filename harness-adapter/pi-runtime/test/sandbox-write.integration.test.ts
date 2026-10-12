@@ -151,6 +151,8 @@ test("sandbox write travels the terminal and recovers a replaced container", asy
   assert.match(script, /mkdir -p [^\n]*conv-1\/public_data/);
   assert.match(script, /aGVsbG8=/, "the payload travels as base64 over the TTY");
   assert.match(script, /openssl base64 -d -A/);
+  assert.ok(liveSockets[0]!.sent.every((line) => Buffer.byteLength(line) < 4096),
+    "the sandbox PTY caps one canonical line at 4096 bytes");
 });
 
 class FakeSocket implements SandboxTerminalSocket {

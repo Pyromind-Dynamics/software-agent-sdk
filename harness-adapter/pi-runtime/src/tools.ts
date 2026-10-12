@@ -29,6 +29,7 @@ import {
 import { SandboxPathPolicy, type SandboxReadMirror } from "./sandbox-paths.js";
 import {
   LazySandboxTerminalOperations,
+  SANDBOX_SCRIPT_CHUNK_CHARS,
   type SandboxTerminalConnector,
   type SandboxTerminalTimeouts,
 } from "./sandbox-terminal.js";
@@ -66,6 +67,8 @@ export interface SkillRootConfig {
 export interface CreateToolsOptions {
   terminalEnvironment?: Record<string, string>;
   terminalTimeouts?: SandboxTerminalTimeouts;
+  /** Base64 characters one staging line carries; see the sandbox transport. */
+  scriptChunkChars?: number;
   /** Test seam: the terminal socket used by a sandbox session. */
   terminalConnect?: SandboxTerminalConnector;
   onExecutionReady?: (access: ExecutionAccess) => void;
@@ -200,11 +203,15 @@ async function createSandboxTools(
   }
   const sandboxCwd = ".";
   const endpoints = new SandboxEndpointSession(provider);
+  // The sandbox PTY is the Linux one, so its staging lines may be far longer
+  // than the macOS-safe default the transport itself falls back to.
+  const scriptChunkChars = options.scriptChunkChars ?? SANDBOX_SCRIPT_CHUNK_CHARS;
   const terminalOperations = new LazySandboxTerminalOperations(endpoints, {
     connect: options.terminalConnect,
+    scriptChunkChars,
     ...options.terminalTimeouts,
   });
-  const fileClient = new SandboxTerminalFileClient(terminalOperations);
+  const fileClient = new SandboxTerminalFileClient(terminalOperations, { chunkChars: scriptChunkChars });
   const fileOperations = createSandboxFileOperations(fileClient, options.readMirror);
   let policy: SandboxPathPolicy | undefined;
   const resolvePolicy = async (): Promise<SandboxPathPolicy> => {
