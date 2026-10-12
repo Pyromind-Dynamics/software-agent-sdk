@@ -87,6 +87,21 @@ test("access reports a missing file as a failure", async () => {
   await assert.rejects(client.access("public_data/missing.py"), /sandbox terminal access failed/);
 });
 
+test("a larger chunk carries the same bytes in fewer script lines", async () => {
+  const content = "#!/usr/bin/env python3\n" + "y".repeat(9000);
+  const small = fakeTerminal();
+  await new SandboxTerminalFileClient(small.operations).write("public_data/large.py", content);
+  const large = fakeTerminal();
+  await new SandboxTerminalFileClient(large.operations, { chunkChars: 3072 })
+    .write("public_data/large.py", content);
+  const scriptLines = (commands: string[]): number => commands[0]!.split("\n").length;
+  assert.ok(scriptLines(large.commands) < scriptLines(small.commands));
+  assert.ok(large.commands.every((command) => command.split("\n")
+    .every((line) => Buffer.byteLength(line) < 4096)));
+  assert.deepEqual(await new SandboxTerminalFileClient(large.operations).read("public_data/large.py"),
+    Buffer.from(content));
+});
+
 function unquote(value: string): string {
   return value.replace(/^'|'$/g, "").replace(/'\\''/g, "'");
 }

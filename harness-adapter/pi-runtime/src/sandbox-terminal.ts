@@ -27,6 +27,16 @@ export const TERMINAL_END_MARKER = "__PM_END__";
  */
 export const TERMINAL_SCRIPT_CHUNK_CHARS = 512;
 /**
+ * Staging chunk for a transport whose PTY is the Linux sandbox's own queue.
+ *
+ * The sandbox PTY caps one line at 4096 bytes, and a chunk this size still
+ * leaves a line - chunk plus quoting - inside
+ * {@link TERMINAL_BATCH_BUDGET_BYTES}, so the same payload travels in far
+ * fewer bursts than the macOS-safe default allows. Every burst pays one round
+ * trip, which is what makes the burst count the cost of a staging transfer.
+ */
+export const SANDBOX_SCRIPT_CHUNK_CHARS = 3072;
+/**
  * Bytes of one staging burst written to the TTY before it is acknowledged.
  *
  * A burst is written while the shell is idle at a prompt, and the canonical
@@ -142,6 +152,14 @@ export interface SandboxTerminalOptions extends SandboxTerminalTimeouts {
    */
   batchBudgetBytes?: number;
   /**
+   * Base64 characters one staging line carries. Defaults to
+   * {@link TERMINAL_SCRIPT_CHUNK_CHARS}; a transport which knows its PTY is
+   * the sandbox's Linux queue raises it to
+   * {@link SANDBOX_SCRIPT_CHUNK_CHARS} and stages the same payload in fewer
+   * acknowledged bursts.
+   */
+  scriptChunkChars?: number;
+  /**
    * Budget for the handshake of a socket already used by this session.
    * Defaults to {@link DEFAULT_SESSION_PROBE_MS}.
    */
@@ -169,9 +187,23 @@ export interface SandboxTerminalOptions extends SandboxTerminalTimeouts {
  */
 export function sandboxTerminalTimeouts(env: NodeJS.ProcessEnv = process.env): SandboxTerminalTimeouts {
   return {
-    resolveTimeoutMs: timeoutMilliseconds(env, "PYROMIND_PI_TERMINAL_RESOLVE_TIMEOUT_MS"),
-    startupTimeoutMs: timeoutMilliseconds(env, "PYROMIND_PI_TERMINAL_STARTUP_TIMEOUT_MS"),
+    resolveTimeoutMs: positiveNumber(env, "PYROMIND_PI_TERMINAL_RESOLVE_TIMEOUT_MS", "milliseconds"),
+    startupTimeoutMs: positiveNumber(env, "PYROMIND_PI_TERMINAL_STARTUP_TIMEOUT_MS", "milliseconds"),
   };
+}
+
+/**
+ * Operator override for the staging chunk, in base64 characters.
+ *
+ * The runner process only inherits the variables the adapter forwards, so this
+ * name is mirrored in `harness_adapter.pi_adapter.runner._runner_environment`.
+ * Lowering it is the escape hatch for a transport whose PTY turns out to
+ * truncate lines earlier than its documented cap.
+ */
+export function sandboxTerminalScriptChunkChars(
+  env: NodeJS.ProcessEnv = process.env,
+): number | undefined {
+  return positiveNumber(env, "PYROMIND_PI_TERMINAL_SCRIPT_CHUNK_CHARS", "characters");
 }
 
 /**
@@ -195,12 +227,16 @@ export function sandboxTerminalTrace(env: NodeJS.ProcessEnv = process.env): bool
   return env.PYROMIND_PI_TERMINAL_TRACE === "1";
 }
 
-function timeoutMilliseconds(env: NodeJS.ProcessEnv, name: string): number | undefined {
+function positiveNumber(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  unit: string,
+): number | undefined {
   const raw = env[name];
   if (raw === undefined || raw.trim() === "") return undefined;
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) {
-    throw new Error(`${name} must be a positive number of milliseconds`);
+    throw new Error(`${name} must be a positive number of ${unit}`);
   }
   return value;
 }
@@ -478,6 +514,7 @@ function stagePayloadLines(
   dir: string,
   files: Record<string, string>,
   privateStaging = false,
+  chunkChars = TERMINAL_SCRIPT_CHUNK_CHARS,
 ): string[] {
   const lines: string[] = [];
   const names = Object.keys(files);
@@ -490,9 +527,9 @@ function stagePayloadLines(
   lines.push(names.map((name) => privateLine(`: > "$pm_dir/${name}.b64"`)).join("; "));
   for (const name of names) {
     const encoded = Buffer.from(files[name]!, "utf8").toString("base64");
-    for (let at = 0; at < encoded.length; at += TERMINAL_SCRIPT_CHUNK_CHARS) {
+    for (let at = 0; at < encoded.length; at += chunkChars) {
       lines.push(privateLine(
-        `printf '%s' ${shellQuote(encoded.slice(at, at + TERMINAL_SCRIPT_CHUNK_CHARS))} >> "$pm_dir/${name}.b64"`));
+        `printf '%s' ${shellQuote(encoded.slice(at, at + chunkChars))} >> "$pm_dir/${name}.b64"`));
     }
   }
   // The staging files are removed only when every decode succeeded.
@@ -524,8 +561,9 @@ export function buildStageLines(
   token: string,
   files: Record<string, string>,
   privateStaging = false,
+  chunkChars = TERMINAL_SCRIPT_CHUNK_CHARS,
 ): TerminalStageLine[] {
-  return stagePayloadLines(dir, files, privateStaging).map((command, index) => {
+  return stagePayloadLines(dir, files, privateStaging, chunkChars).map((command, index) => {
     const stage = `stage${index}`;
     return { stage, command: `${command}; ${acknowledgement(token, stage)}\n` };
   });
@@ -564,15 +602,17 @@ export function buildStageBatches(
   files: Record<string, string>,
   budgetBytes = TERMINAL_BATCH_BUDGET_BYTES,
   privateStaging = false,
+  chunkChars = TERMINAL_SCRIPT_CHUNK_CHARS,
 ): TerminalStageBatch[] {
   const check = buildStageCheckLine(dir, token, files).command;
   // The burst ends with the check which reads the decoded bytes back, so the
   // check's own length is part of the budget the payload is grouped against.
-  const payloadBudget = budgetBytes - Buffer.byteLength(check) - 1;
+  const checkBytes = Buffer.byteLength(check);
+  const payloadBudget = budgetBytes - checkBytes - 1;
   const groups: string[][] = [];
   let current: string[] = [];
   let currentBytes = 0;
-  for (const line of stagePayloadLines(dir, files, privateStaging)) {
+  for (const line of stagePayloadLines(dir, files, privateStaging, chunkChars)) {
     const bytes = Buffer.byteLength(line) + 1;
     if (current.length > 0 && currentBytes + bytes > payloadBudget) {
       groups.push(current);
@@ -607,11 +647,12 @@ export function buildLaunchBatchLine(
   token: string,
   files: Record<string, string>,
   withEnvironment = false,
+  chunkChars = TERMINAL_SCRIPT_CHUNK_CHARS,
 ): string {
   const environment = withEnvironment
     ? `PYROMIND_TERMINAL_ENV="$(cat ${shellQuote(`${harnessDir}/${SANDBOX_ENVIRONMENT_FILE}`)})" `
     : "";
-  return `${stagePayloadLines(runDir, files).join("\n")}\n` +
+  return `${stagePayloadLines(runDir, files, false, chunkChars).join("\n")}\n` +
     `pm_dir=${shellQuote(runDir)}; if ${stagedCondition(files)}; then ` +
     `${environment}sh ${shellQuote(`${harnessDir}/launch.sh`)} ${shellQuote(runDir)}; ` +
     `${acknowledgement(token, "launch")}; ` +
@@ -733,6 +774,7 @@ export class SandboxTerminalOperations implements BashOperations {
   private readonly maxReconnects: number;
   private readonly fastPath: boolean;
   private readonly batchBudgetBytes: number;
+  private readonly scriptChunkChars: number;
   private readonly probeTimeoutMs: number;
   private readonly trace: boolean;
   private readonly connect: SandboxTerminalConnector;
@@ -748,6 +790,7 @@ export class SandboxTerminalOperations implements BashOperations {
     this.maxReconnects = options.maxReconnects ?? DEFAULT_MAX_RECONNECTS;
     this.fastPath = options.fastPath ?? sandboxTerminalFastPath();
     this.batchBudgetBytes = options.batchBudgetBytes ?? TERMINAL_BATCH_BUDGET_BYTES;
+    this.scriptChunkChars = options.scriptChunkChars ?? TERMINAL_SCRIPT_CHUNK_CHARS;
     this.probeTimeoutMs = options.probeTimeoutMs ?? DEFAULT_SESSION_PROBE_MS;
     this.trace = options.trace ?? sandboxTerminalTrace();
     this.connect = options.connect ?? connectWebSocket;
@@ -911,10 +954,12 @@ export class SandboxTerminalOperations implements BashOperations {
     withEnvironment: boolean,
   ): "single" | "file" | "batches" | "lines" {
     if (!this.fastPath) return "lines";
-    if (Buffer.byteLength(buildLaunchBatchLine(harnessDir, runDir, token, scripts, withEnvironment)) <=
+    if (Buffer.byteLength(buildLaunchBatchLine(harnessDir, runDir, token, scripts, withEnvironment,
+      this.scriptChunkChars)) <=
         this.batchBudgetBytes) return "single";
     if (this.settings.writeFile !== undefined &&
-        buildStageBatches(runDir, token, scripts).length > TERMINAL_STAGING_MAX_BATCHES) return "file";
+        buildStageBatches(runDir, token, scripts, this.batchBudgetBytes, false, this.scriptChunkChars)
+          .length > TERMINAL_STAGING_MAX_BATCHES) return "file";
     return "batches";
   }
 
@@ -967,7 +1012,8 @@ export class SandboxTerminalOperations implements BashOperations {
     options: TerminalExecOptions,
     privateStaging = false,
   ): Promise<boolean> {
-    const batches = buildStageBatches(dir, token, files, this.batchBudgetBytes, privateStaging);
+    const batches = buildStageBatches(dir, token, files, this.batchBudgetBytes, privateStaging,
+      this.scriptChunkChars);
     let staged = false;
     for (let index = 0; index < batches.length; index += 1) {
       const batch = batches[index]!;
@@ -996,7 +1042,7 @@ export class SandboxTerminalOperations implements BashOperations {
     options: TerminalExecOptions,
     privateStaging = false,
   ): Promise<void> {
-    for (const line of buildStageLines(dir, token, files, privateStaging)) {
+    for (const line of buildStageLines(dir, token, files, privateStaging, this.scriptChunkChars)) {
       await this.acknowledge(channel, evidence, line.command,
         `${ACK_MARKER}${token}:${line.stage}:`, deadline, options.signal);
     }
@@ -1116,7 +1162,8 @@ export class SandboxTerminalOperations implements BashOperations {
             // lost acknowledgement is observed rather than replayed.
             dispatched = true;
             const launched = await this.acknowledge(channel, evidence,
-              buildLaunchBatchLine(harnessDir, runDir, token, scripts, withEnvironment),
+              buildLaunchBatchLine(harnessDir, runDir, token, scripts, withEnvironment,
+                this.scriptChunkChars),
               `${ACK_MARKER}${token}:launch:`, startupDeadline, options.signal);
             mark("launch", phase);
             if (launched === "ok") evidence.started = true;

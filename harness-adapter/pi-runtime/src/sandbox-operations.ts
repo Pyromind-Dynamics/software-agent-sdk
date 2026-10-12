@@ -73,6 +73,16 @@ export class SandboxEndpointSession {
 export const SANDBOX_FILE_MAX_BYTES = 1024 * 1024 * 1024;
 const UPLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 120_000;
+/**
+ * Budget for the file API's first request in a session.
+ *
+ * The portal domain is not cluster-direct, so a runner which cannot reach it
+ * has to learn that from one short request instead of spending the full
+ * request budget on every file call. Once a request has answered, later
+ * requests use the full budget: a large file read may legitimately outlive
+ * the probe.
+ */
+export const SANDBOX_FILE_PROBE_TIMEOUT_MS = 15_000;
 
 export class SandboxFileError extends Error {
   constructor(
@@ -85,9 +95,19 @@ export class SandboxFileError extends Error {
   }
 }
 
+export interface SandboxFileClientOptions {
+  /** See {@link SANDBOX_FILE_PROBE_TIMEOUT_MS}. */
+  probeTimeoutMs?: number;
+}
+
 /** Thin HTTP client for the sandbox file API (read / chunked write / delete). */
 export class SandboxFileClient {
-  constructor(private readonly endpoints: SandboxEndpointSession) {}
+  private portalProven = false;
+
+  constructor(
+    private readonly endpoints: SandboxEndpointSession,
+    private readonly options: SandboxFileClientOptions = {},
+  ) {}
 
   async read(path: string, limit = SANDBOX_FILE_MAX_BYTES): Promise<Buffer> {
     return this.withEndpoint(async (endpoint) => {
@@ -226,9 +246,12 @@ export class SandboxFileClient {
     if (endpoint.cluster) headers.set("X-Cluster", endpoint.cluster);
     let response: Response;
     try {
+      const timeoutMs = this.portalProven
+        ? REQUEST_TIMEOUT_MS
+        : (this.options.probeTimeoutMs ?? REQUEST_TIMEOUT_MS);
       const requestSignal = init.signal
-        ? AbortSignal.any([AbortSignal.timeout(REQUEST_TIMEOUT_MS), init.signal])
-        : AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+        ? AbortSignal.any([AbortSignal.timeout(timeoutMs), init.signal])
+        : AbortSignal.timeout(timeoutMs);
       response = await fetch(url, {
         ...init,
         headers,
@@ -237,6 +260,8 @@ export class SandboxFileClient {
     } catch (error) {
       throw transportError(init.method ?? "GET", url, error);
     }
+    // Any HTTP answer proves the portal is reachable, even an error status.
+    this.portalProven = true;
     if (!response.ok) {
       const detail = await response.text().catch(() => "");
       throw new SandboxFileError(
@@ -254,6 +279,66 @@ export class SandboxFileClient {
     const data = isRecord(payload.data) ? payload.data : payload;
     return data;
   }
+}
+
+/**
+ * File API first, terminal transport as the fallback.
+ *
+ * The file API is the cheap path when the runner can reach the portal: a read
+ * is one HTTP request and a write is three, while the terminal transport pays
+ * a command round trip for the same bytes. A portal the runner cannot reach
+ * must not cost every call its own timeout, so the first transport failure
+ * switches the session to the terminal transport for good.
+ */
+export class FallbackSandboxFileClient implements SandboxFileClientLike {
+  private terminalOnly = false;
+
+  constructor(
+    private readonly fileApi: SandboxFileClientLike,
+    private readonly terminal: SandboxFileClientLike,
+  ) {}
+
+  async read(path: string, limit?: number): Promise<Buffer> {
+    if (this.terminalOnly) return this.terminal.read(path, limit);
+    try {
+      return await this.fileApi.read(path, limit);
+    } catch (error) {
+      return this.fallback(error, () => this.terminal.read(path, limit));
+    }
+  }
+
+  async access(path: string): Promise<void> {
+    if (this.terminalOnly) return this.terminal.access(path);
+    try {
+      return await this.fileApi.access(path);
+    } catch (error) {
+      return this.fallback(error, () => this.terminal.access(path));
+    }
+  }
+
+  async write(path: string, content: string | Buffer, signal?: AbortSignal): Promise<void> {
+    if (this.terminalOnly) return this.terminal.write(path, content, signal);
+    try {
+      return await this.fileApi.write(path, content, signal);
+    } catch (error) {
+      // A caller which aborted is not a portal failure: the file API reports
+      // the abort as a transport error, and the terminal must not run instead.
+      if (signal?.aborted) throw error;
+      return this.fallback(error, () => this.terminal.write(path, content, signal));
+    }
+  }
+
+  private async fallback<T>(error: unknown, run: () => Promise<T>): Promise<T> {
+    if (!isFileApiUnavailable(error)) throw error;
+    this.terminalOnly = true;
+    return run();
+  }
+}
+
+/** A file API failure which the terminal transport can answer instead. */
+function isFileApiUnavailable(error: unknown): boolean {
+  return error instanceof SandboxFileError
+    && (error.status === undefined || error.status >= 500);
 }
 
 /**

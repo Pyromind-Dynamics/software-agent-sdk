@@ -78,13 +78,19 @@ CLI 的 `gateway` 配置只写 endpoint、model 和宿主密钥环境变量名�
 
 少量探索可直接看图；批量任务通过文件读取工具读取以下逻辑路径：
 
-- 图片执行 API：`.agents/skills/data-processing/references/paradigms/llm-pipeline/image-utils-api.md`
-- 可修改的配置示例：`.agents/skills/data-processing/references/paradigms/llm-pipeline/pcb_inspection_pipeline.py`
+- 图片执行 API：`.agents/skills/data-processing/references/paradigms/llm-pipeline/vision/image-utils-api.md`
+- 可修改的配置示例：`.agents/skills/data-processing/references/paradigms/llm-pipeline/vision/templates/pcb_inspection_pipeline.py`
 
 PCB 默认设置 `ImagePipelineConfig.output_format="structured"`，执行工具使用
 `model_profile="vision"`、`output_schema="structured"`，直接生成经过 Schema 校验的
 标注对象，不生成 messages。只有准备训练数据时选择 `vision` 输出模式。
 小样与全量沿用上层 playbook；恢复不得更换输出模式或 structured Schema。
+
+输出契约（`output_schema="structured"`）：每行是任务 `response_json_schema` 校验后的
+对象，业务字段由该 Schema 定义，模型不能返回或覆盖 `id`；运行时再注入源样本 `id` 和
+源图关联 `source_images`（用输入的图片角色做键，值是图片路径），所以整行自包含，
+下游拿这一行就能定位原图。structured 不走固定产物校验器，也不含训练 messages 包装；
+Label Studio 与训练格式转换在后续按需进行。
 
 输入准备需保留样本边界和原始路径映射。同目录多组图对不能直接套通用目录发现，
 它会把子目录中的所有图片合为一个样本；应提供显式 Manifest，并保留相对路径基准。

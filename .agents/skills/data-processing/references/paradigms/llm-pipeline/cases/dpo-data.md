@@ -29,6 +29,13 @@ system/system_prompt              -> system_prompt
 推荐链路：
 
 ```python
+from dataflow.operators.core_text import (
+    FormatStrPromptedGenerator, GeneralFilter, PandasOperator,
+)
+from dataflow.operators.general_text import ContentNullFilter, HashDeduplicateFilter
+from dataflow.prompts.core_text import FormatStrPrompt
+from dataflow.utils.storage import LazyFileStorage
+
 for key in ["user_prompt", "gt", "rejected_answer"]:
     ContentNullFilter().run(storage=storage, input_key=key)
     storage = storage.step()
@@ -86,12 +93,16 @@ storage = storage.step()
 链路。若模型返回无法解析、字段为空或两答案相同，该样本应丢弃并计入
 `scenario_metrics.json`。
 
-推荐从 [`dpo_pipeline.py`](../dpo_pipeline.py) 复制模板：它使用
+推荐从 [`dpo_pipeline.py`](../templates/dpo_pipeline.py) 复制模板：它使用
 `LazyFileStorage`、`PandasOperator`、`FormatStrPromptedGenerator`、`GeneralFilter`、
 `ContentNullFilter` 和 `HashDeduplicateFilter` 完成 input-only 到 DPO JSONL 的生成、
 过滤和去重。
 
 ## 可选打标与过滤
+
+```python
+from dataflow.operators.text_sft import AlpagasusFilter, RMFilter, RMSampleEvaluator
+```
 
 - 需要 LLM 判断偏好强弱时，用 `FormatStrPromptedGenerator` 对
   `user_prompt/gt/rejected_answer` 输出 `preference_label`、`reason` 和可选分数；
@@ -103,7 +114,9 @@ storage = storage.step()
 
 ## 输出验证
 
-最终 JSONL 只保留：
+输出契约（`output_schema="dpo"`）：最终 JSONL 只保留下面五个字段，均为非空字符串，
+根字段精确匹配，`id` 唯一；`gt` 是 chosen，`rejected_answer` 是 rejected，
+二者去除首尾空白后不能相同。
 
 ```json
 {

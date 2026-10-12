@@ -15,7 +15,7 @@ import {
   type SandboxTerminalSocket,
 } from "../src/sandbox-terminal.js";
 
-test("sandbox write travels the terminal and recovers a replaced container", async (context) => {
+test("sandbox write falls back to the terminal when the file API fails", async (context) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "pi-sandbox-write-")));
   const workspace = join(root, "conversation");
   const skillsDirectory = join(root, "skills");
@@ -28,8 +28,9 @@ test("sandbox write travels the terminal and recovers a replaced container", asy
     "utf8",
   );
 
-  // The file API stays mounted so the test can prove the write no longer
-  // touches it: every file request is a failure of the terminal transport.
+  // The first bundle is the container the platform has already replaced and
+  // the file API answers 500, so the write has to end up on the replacement
+  // container's terminal.
   const uploads: string[] = [];
   const fileApi = createServer((request, response) => {
     uploads.push(`${request.method} ${request.url ?? ""}`);
@@ -144,13 +145,18 @@ test("sandbox write travels the terminal and recovers a replaced container", asy
   ]).finally(() => clearTimeout(timeout));
 
   assert.deepEqual(ensures, [{ refresh: false }, { refresh: true }]);
-  assert.deepEqual(uploads, [], "the HTTP file API is never called");
+  // The file API is probed once; its failure is what hands the bytes to the
+  // terminal transport.
+  assert.equal(uploads.length, 1, "the file API is probed before the fallback");
+  assert.match(uploads[0]!, /^POST .*\/files\/chunks\/init\?/);
   assert.equal(liveSockets.length, 1, "the write is replayed on the replacement terminal");
-  assert.equal(deadSockets.length, 3, "the stale bundle is retried before it is dropped");
+  assert.equal(deadSockets.length, 0, "the file API refresh drops the stale bundle first");
   const script = decodeStagedScript(liveSockets[0]!.sent);
   assert.match(script, /mkdir -p [^\n]*conv-1\/public_data/);
   assert.match(script, /aGVsbG8=/, "the payload travels as base64 over the TTY");
   assert.match(script, /openssl base64 -d -A/);
+  assert.ok(liveSockets[0]!.sent.every((line) => Buffer.byteLength(line) < 4096),
+    "the sandbox PTY caps one canonical line at 4096 bytes");
 });
 
 class FakeSocket implements SandboxTerminalSocket {

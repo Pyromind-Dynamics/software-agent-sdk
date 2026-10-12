@@ -988,6 +988,7 @@ async def test_runner_loads_sandbox_skills_and_business_tools(
         assert (
             "Use update_plan for complex, multi-step work." in captured["system_prompt"]
         )
+        assert "/workspace/<path> does not resolve" not in captured["system_prompt"]
     finally:
         await adapter.close(handle)
 
@@ -1028,8 +1029,15 @@ async def test_sandbox_session_prompt_steers_storage_reads(
         assert "Platform task state comes from the platform tools" in prompt
         assert "Do not search the filesystem or" in prompt
         assert "Use the absolute form when a command has changed directory." in prompt
-        assert "/workspace/<path> is storage/<path> in this sandbox" in prompt
+        assert "so run storage/<path> instead" in prompt
+        assert "/workspace/<path> does not resolve" in prompt
         assert DEFAULT_MOUNT_PATH in prompt
+        assert (
+            f"{DEFAULT_MOUNT_PATH}/.pyromind-agent/sandbox-prompt/.agents/skills"
+            in prompt
+        )
+        assert ".agents/skills/<skill>/..." in prompt
+        assert "Never run find /" in prompt
     finally:
         await adapter.close(handle)
 

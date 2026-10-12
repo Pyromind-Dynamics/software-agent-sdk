@@ -1,5 +1,6 @@
 """DataFlow's public terminal entry, without the removed business Tool."""
 
+import argparse
 import importlib.util
 import json
 import subprocess
@@ -71,6 +72,91 @@ def test_cli_executes_validates_and_generates_report(workspace):
     assert (workspace / "public_data/output.jsonl").read_text() == (
         workspace / "storage/input.jsonl"
     ).read_text()
+
+
+def test_cli_direct_flags_run_without_a_config_file(workspace):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--pipeline",
+            "public_data/pipeline.py",
+            "--input",
+            "storage/input.jsonl",
+            "--output",
+            "public_data/output.jsonl",
+            "--model-profile",
+            "none",
+            "--output-schema",
+            "text",
+        ],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    envelope = json.loads(result.stdout.splitlines()[-1])
+    assert envelope["rc"] == 0 and envelope["validation_rc"] == 0
+    assert (workspace / "public_data/output.jsonl").read_text() == (
+        workspace / "storage/input.jsonl"
+    ).read_text()
+    assert not (workspace / "public_data/run.json").exists()
+
+
+def test_direct_flags_resolve_through_the_config_contract(
+    runtime, workspace, monkeypatch
+):
+    monkeypatch.setenv(
+        "PYROMIND_DATAFLOW_PROFILES",
+        json.dumps({"text": {"DF_API_KEY": "model-secret"}}),
+    )
+    args = argparse.Namespace(
+        pipeline="public_data/pipeline.py",
+        input="storage/input.jsonl",
+        output="public_data/output.jsonl",
+        arg=["--limit", "3"],
+        model_profile="text",
+        output_schema="text",
+        timeout=600,
+    )
+    spec = runtime.cli_spec(runtime.direct_config(args), workspace)
+    assert spec["args"] == [
+        str((workspace / "storage/input.jsonl").resolve()),
+        str((workspace / "public_data/output.jsonl").resolve()),
+        "--limit",
+        "3",
+    ]
+    assert spec["model_profile"] == "text" and spec["output_schema"] == "text"
+    assert spec["timeout"] == 600 and spec["env"]["DF_API_KEY"] == "model-secret"
+
+
+def test_direct_flags_forward_dash_prefixed_pipeline_arguments(workspace):
+    (workspace / "public_data/argv_pipeline.py").write_text(
+        "import json, sys\nfrom pathlib import Path\n"
+        "Path(sys.argv[2]).write_text(json.dumps(sys.argv[1:]))\n"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--pipeline",
+            "public_data/argv_pipeline.py",
+            "--input",
+            "storage/input.jsonl",
+            "--output",
+            "public_data/argv.jsonl",
+            "--arg=--limit",
+            "--arg=3",
+        ],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    recorded = json.loads((workspace / "public_data/argv.jsonl").read_text())
+    assert recorded[2:] == ["--limit", "3"]
 
 
 @pytest.mark.parametrize("profile", ["text", "vision"])

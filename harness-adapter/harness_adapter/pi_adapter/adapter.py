@@ -53,6 +53,7 @@ from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.protocol import PROTOCOL_VERSION
 from harness_adapter.pi_adapter.runner import PiRunnerExit, PiRunnerProcess
 from harness_adapter.pi_adapter.sandbox_runtime import (
+    PYROMIND_AGENT_STORAGE_ROOT,
     SandboxExecutionManager,
     SandboxSettings,
 )
@@ -152,16 +153,25 @@ report the actual failure and provide the verified path instead. Showing a file
 never depends on image support in your own model."""
 
 
-def _sandbox_system_prompt(mount_path: str) -> str:
-    """Add the absolute Storage mount, which survives a ``cd`` in terminal."""
+def _sandbox_system_prompt(mount_path: str, conversation_id: str) -> str:
+    """Add the sandbox's absolute paths, which survive a ``cd`` in terminal."""
     root = mount_path.rstrip("/")
+    workspace = f"{root}{PYROMIND_AGENT_STORAGE_ROOT}/{conversation_id}"
+    skills = f"{workspace}/.agents/skills"
     return (
         f"{_SANDBOX_SYSTEM_PROMPT}\n\nstorage/ is a symbolic link to the Storage "
         f"mount at {root}, so storage/<path> and {root}/<path> name the same "
-        "file. Platform-side paths under /workspace/<path> address the same "
-        "Storage: /workspace/<path> is storage/<path> in this sandbox, not a "
-        "container directory. Use the absolute form when a command has changed "
-        "directory."
+        "file. Use the absolute form when a command has changed directory.\n\n"
+        "The user may reference /workspace/<path>: that names the same Storage, "
+        "so run storage/<path> instead. /workspace/<path> does not resolve "
+        "inside this sandbox, so never run it and never search the filesystem "
+        "for the file: every dataset is storage/<path>.\n\n"
+        f"The skills tree is unpacked inside this sandbox (not outside the "
+        f"workspace) at {skills}. Every terminal call starts at the workspace "
+        "root, so .agents/skills/<skill>/... works as written, and "
+        f"{skills}/<skill>/... works after a cd. Never run find / or scan the "
+        "Storage mount to locate a skill script or a dataset: the skill "
+        "documentation names the path to use."
     )
 
 
@@ -913,7 +923,8 @@ class PiAdapter:
         system_prompt = _SYSTEM_PROMPT
         if self._terminal_backend == "sandbox":
             system_prompt += _sandbox_system_prompt(
-                SandboxSettings.from_extra(session.extra).mount_path
+                SandboxSettings.from_extra(session.extra).mount_path,
+                session.session_id,
             )
         await runner.start(
             {

@@ -10,6 +10,12 @@
 ## 推荐链路
 
 ```python
+from dataflow.operators.general_text import (
+    ContentNullFilter, HashDeduplicateFilter, HtmlUrlRemoverRefiner,
+    LanguageFilter, MinHashDeduplicateFilter, RemoveEmojiRefiner,
+    RemoveExtraSpacesRefiner, WordNumberFilter,
+)
+
 ContentNullFilter().run(storage=storage, input_key="text")
 storage = storage.step()
 HtmlUrlRemoverRefiner().run(storage=storage, input_key="text")
@@ -40,4 +46,6 @@ storage = storage.step()
 继续执行下游场景算子，再映射到下游 Schema。Sample 检查空值、短文本、HTML、混合
 语言和重复样本是否被正确处理。
 
-不使用需要本地模型或 CUDA 的语义去重、Presidio、Task2Vec 算子。
+不使用需要本地模型或 CUDA 的语义去重、Presidio、Task2Vec 算子；后两者同属
+`dataflow.operators.general_text`（`PresidioFilter`、`Task2VecDatasetEvaluator`），
+导入即拉起本地模型依赖，默认链路不引入。

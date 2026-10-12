@@ -7,17 +7,28 @@ import type { SandboxFileClientLike } from "./sandbox-operations.js";
 
 /** Directory holding the transient base64 staging file of a terminal write. */
 const STAGING_DIRNAME = ".pyromind-agent-staging";
-/** Base64 characters one staging line carries, below the smaller PTY line cap. */
+/**
+ * Base64 characters one line of the write script carries.
+ *
+ * The write script is decoded from a staged file and run by a shell, so its
+ * lines never reach the PTY and only the sandbox's own argument limits bound
+ * them; the default stays small because the payload is a script, not because
+ * of any terminal cap.
+ */
 const WRITE_CHUNK_CHARS = 512;
+
+export interface SandboxTerminalFileOptions {
+  /** Base64 characters one line of the write script carries. */
+  chunkChars?: number;
+}
 
 /**
  * Sandbox file transport over the terminal WebSocket.
  *
- * The file API is reached through a portal domain which is neither
- * cluster-direct nor reliable from every runner, while the terminal socket is
- * already open and cluster-direct. File bytes therefore travel the same channel
- * as commands: reads stream `base64` output back, writes stage base64 lines
- * into a transient file and decode it.
+ * This is the fallback for a runner which cannot reach the file API's portal
+ * domain, while the terminal socket is already open and cluster-direct. File
+ * bytes then travel the same channel as commands: reads stream `base64` output
+ * back, writes stage base64 lines into a transient file and decode it.
  *
  * A write is one command whose script carries the whole payload, so the
  * terminal's own staging decides how the bytes cross the socket. Staging the
@@ -25,7 +36,14 @@ const WRITE_CHUNK_CHARS = 512;
  * keeps one connection and one watched run per file instead of one per chunk.
  */
 export class SandboxTerminalFileClient implements SandboxFileClientLike {
-  constructor(private readonly terminal: BashOperations) {}
+  private readonly chunkChars: number;
+
+  constructor(
+    private readonly terminal: BashOperations,
+    options: SandboxTerminalFileOptions = {},
+  ) {
+    this.chunkChars = options.chunkChars ?? WRITE_CHUNK_CHARS;
+  }
 
   async read(path: string, limit = Number.MAX_SAFE_INTEGER): Promise<Buffer> {
     const chunks: Buffer[] = [];
@@ -70,7 +88,7 @@ export class SandboxTerminalFileClient implements SandboxFileClientLike {
       // terminal transport has to do it itself.
       `mkdir -p ${shellQuote(STAGING_DIRNAME)}; ` +
       `mkdir -p ${shellQuote(posix.dirname(path))}; : > ${quotedStaging}`,
-      ...stagingLines(encoded, staging),
+      ...stagingLines(encoded, staging, this.chunkChars),
       // `-A` accepts one continuous line; BSD base64 needs `-D`, so openssl is
       // the portable decoder for both sandbox families.
       `openssl base64 -d -A -in ${quotedStaging} -out ${quotedPath} && ` +
@@ -103,12 +121,12 @@ export class SandboxTerminalFileClient implements SandboxFileClientLike {
  * into acknowledged bursts, so the payload never has to be split into several
  * commands.
  */
-function stagingLines(encoded: string, staging: string): string[] {
+function stagingLines(encoded: string, staging: string, chunkChars: number): string[] {
   const quotedStaging = shellQuote(staging);
   const lines: string[] = [];
-  for (let at = 0; at < encoded.length; at += WRITE_CHUNK_CHARS) {
+  for (let at = 0; at < encoded.length; at += chunkChars) {
     lines.push(
-      `printf '%s' ${shellQuote(encoded.slice(at, at + WRITE_CHUNK_CHARS))} >> ${quotedStaging}`,
+      `printf '%s' ${shellQuote(encoded.slice(at, at + chunkChars))} >> ${quotedStaging}`,
     );
   }
   return lines;

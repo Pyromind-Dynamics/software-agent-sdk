@@ -11,8 +11,9 @@ license: MIT
 
 数据处理任务统一从本 skill 进入：先按路由表选定处理范式并读取对应 playbook
 （范式内按 case 路由表读取场景 case 文档），再按通用 SOP 执行。用户 Storage
-已挂载为 `storage/`，优先用 `read`/`terminal` 直接查看；`sandbox_sample.py --config`
-也直接接受 `storage/...` 输入，不需要先物化到会话工作区。
+已挂载为 `storage/`，优先用 `read`/`terminal` 直接查看；`sandbox_sample.py` 的
+`--input` 直接接受 `storage/...`，不需要先物化到会话工作区。参数形态与 `--config`
+的使用条件见 `references/terminal-cli.md`。
 
 领域参考（如 PCB AVI/AOI）不内联在本文件：由对应 case 文档按需引入，并在那里
 给出运行时知识库逻辑路径的读取方式。本地试跑只用于验证链路是否打通；正式批量
@@ -24,7 +25,7 @@ license: MIT
 |---|---|---|
 | 格式转换/字段映射/简单过滤，无 LLM、无跨行操作 | format-conversion | references/paradigms/format-conversion/playbook.md |
 | 内容级清洗/抽样/生成/评分，用 DataFlow 算子或 LLM | llm-pipeline | references/paradigms/llm-pipeline/playbook.md |
-| PCB AVI/AOI 真点/假点预判、问题分类及区域定位 | llm-pipeline（PCB 预打标，默认 structured JSONL） | references/paradigms/llm-pipeline/playbook.md → cases/pcb-inspection.md |
+| PCB AVI/AOI 真点/假点预判、问题分类及区域定位 | llm-pipeline（PCB 预打标，默认 structured JSONL） | references/paradigms/llm-pipeline/playbook.md → cases/vision/pcb-inspection.md |
 | 从源数据统计/推断标签分布并提出 Gap，不依赖 eval | distribution-analysis | references/paradigms/distribution-analysis.md |
 | 按已确认 Gap 合成文本或图片数据 | gap-driven-synthesis | references/paradigms/gap-driven-synthesis.md |
 | 单条数据要在特定环境（数据自带镜像）执行复杂流程（跑命令/测试/判定），需多阶段编排 | environment-processing | references/paradigms/environment-processing/playbook.md |
@@ -42,12 +43,16 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
 ## 通用 SOP（所有场景共享的控制面骨架）
 
 1. **探查**：直接用 `read`/`terminal` 查看 `storage/...`。目录条目很多时用
-   `ls`/`find`/`grep` 定位目标，不要反复整目录翻页；每个数据集的结构确认
-   一次完成（列表 + schema + 样例）。
+   `ls`/`find`/`grep` 在目标目录内定位，不要反复整目录翻页；每个数据集的结构
+   确认一次完成（列表 + schema + 样例）。数据集一律 `storage/<path>`，skill
+   脚本一律 `.agents/skills/<skill>/...`（terminal 每次从工作区根开始）；禁止
+   `find /` 或扫描 Storage 挂载——挂载里有很多会话目录，全盘扫描会跑满命令超时。
 2. **选型**：按上表读取范式 playbook；范式内按 case 路由表只读取当前场景
    相关 reference；领域参考由 case 文档按需引入。
-3. **小样执行**：Agent 按真实 schema 写 Python Pipeline。`sandbox_sample.py --config`
-   完整处理传入的输入（可直接传 `storage/...`），不负责抽样；
+3. **小样执行**：Agent 按真实 schema 写 Python Pipeline，用 `sandbox_sample.py`
+   直接传参（`--pipeline/--input/--output/--model-profile/--output-schema/--timeout`，
+   详见 `references/terminal-cli.md`），只有 flags 覆盖不到的字段才用 `--config`。
+   两种方式都完整处理传入的输入（可直接传 `storage/...`），不负责抽样；
    清洗/合成小样由所选输入和计划控制，精确分布统计可直接统计 `storage/`
    全量文件。执行发生在会话自己的平台沙箱内：Pipeline、输入和产物都不离开
    沙箱，只有日志尾部与最多 3 条样例记录回到对话。
@@ -62,6 +67,10 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
    运行 Pipeline 的解释器由脚本自身解析（镜像内置解释器 → 缓存 venv 首次安装）；
    terminal 的默认 `python3` 不是那个解释器，不要用 `import dataflow`、全盘 `find`
    或翻 site-packages 判断环境是否可用。要确认用 `--check`，要提前准备用 `--prepare`。
+   算子导入路径照抄
+   `references/paradigms/llm-pipeline/pipeline-reference.md` 的导入路径表，算子名、参数与
+   语义以 case 文档为准；不要用 `import dataflow` 加 `getattr` 探测，或翻
+   site-packages 反查算子签名。
 4. **门禁**：Taxonomy 与合成小样通过后必须获得用户明确确认才提交后续全量；
    已有标签的确定性全量统计不设人工门禁，且模型调用必须为零。
 5. **全量**：需要平台执行时统一用 `df_submit_pipeline`；提交前先按
@@ -73,7 +82,7 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
    resume 还是新 run；终止/失败不自动重提交，交用户决策。
    report.failures 非空时（failures.jsonl：无响应/截止/解析失败的记录），
    把其中的 input 行重组为子集输入补跑同一 pipeline 并合并产出，单条挂起
-   不再阻塞整轮（墙钟截止见 dataflow-common.md）。子集文件须与原 source
+   不再阻塞整轮（墙钟截止见 llm-pipeline 的 pipeline-reference.md）。子集文件须与原 source
    放在**同一目录** —— input 行保留的是相对图片路径，只有同目录才能解析
    回原图（绝对路径会被 pipeline 以"必须是相对 POSIX 路径"拒绝）。
 7. **交付**：展示产物与统计；场景内的产物契约与失败分类学以 playbook 为准。

@@ -25,7 +25,7 @@ Taxonomy 确认后，`N <= 1000` 全量标注；否则按 `sample_id`、固定 s
 FormatStrPromptedGenerator；图像或混合数据选 managed image runtime。模型输出
 必须符合严格 JSON Schema，解析失败、超时、unknown 写入 `failures.jsonl`。
 
-无标签的 3 条试标输入由直读 `storage/` 提供，不由 `sandbox_sample.py --config` 截断。
+无标签的 3 条试标输入由直读 `storage/` 提供，不由 `sandbox_sample.py` 截断。
 Taxonomy 确认后，业务抽样中的全部记录都应进入打标。
 文本用 `model_profile=text`，图像用 `vision`；工具不接受 requirements。
 

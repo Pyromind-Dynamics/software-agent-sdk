@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Run one DataFlow sample inside the sandbox that owns the workspace.
 
-Invoke this script through terminal with --config and a non-secret JSON config.
-Input, output, model profiles and validation remain inside the execution sandbox.
-The legacy --spec transport remains available for older recorded executions.
+Invoke this script through terminal either with the single-value flags
+(``--pipeline`` plus ``--input``/``--output``) or, when a run needs fields they
+do not carry, with ``--config`` and a non-secret JSON config. Input, output,
+model profiles and validation remain inside the execution sandbox. The legacy
+``--spec`` transport remains available for older recorded executions.
 
 The interpreter is resolved in this order:
 
@@ -958,11 +960,33 @@ def cli_spec(config: dict[str, Any], workspace: Path) -> dict[str, Any]:
     }
 
 
+def direct_config(args: argparse.Namespace) -> dict[str, Any]:
+    """The public config ``--config`` would carry, assembled from flags."""
+    arguments = [args.input] if args.input else []
+    if args.output:
+        arguments.append(args.output)
+    config: dict[str, Any] = {
+        "pipeline_path": args.pipeline,
+        "args": [*arguments, *args.arg],
+    }
+    if args.model_profile:
+        config["model_profile"] = args.model_profile
+    if args.output_schema:
+        config["output_schema"] = args.output_schema
+    if args.timeout is not None:
+        config["timeout"] = args.timeout
+    return config
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--spec", type=Path)
     modes.add_argument("--config", type=Path)
+    modes.add_argument(
+        "--pipeline",
+        help="workspace path of the pipeline script; runs it without a config file",
+    )
     modes.add_argument(
         "--check",
         action="store_true",
@@ -973,14 +997,63 @@ def main() -> int:
         action="store_true",
         help="resolve the DataFlow interpreter, installing the cached venv if needed",
     )
+    parser.add_argument(
+        "--input",
+        help="pipeline's first argument, read from storage/ or public_data/",
+    )
+    parser.add_argument(
+        "--output",
+        help="pipeline's second argument, written under public_data/",
+    )
+    parser.add_argument(
+        "--arg",
+        action="append",
+        default=[],
+        help=(
+            "further pipeline argument after input and output; repeatable, and a "
+            "value starting with '-' must be written as --arg=<value>"
+        ),
+    )
+    parser.add_argument(
+        "--model-profile",
+        choices=["none", "text", "vision"],
+        help="model configuration injected from the execution environment",
+    )
+    parser.add_argument(
+        "--output-schema",
+        help="validated output shape; see references/terminal-cli.md",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        help="seconds the pipeline may run, 1-7200",
+    )
     args = parser.parse_args()
     if args.check or args.prepare:
         report = _interpreter_report(_interpreter_spec(), prepare=bool(args.prepare))
         print(json.dumps(report, ensure_ascii=False))
         return 0 if report["ready"] else 1
-    config = args.config or args.spec
-    payload = json.loads(config.read_text(encoding="utf-8"))
-    spec = cli_spec(payload, Path.cwd()) if args.config else payload
+    direct = (
+        args.input,
+        args.output,
+        args.arg,
+        args.model_profile,
+        args.output_schema,
+        args.timeout,
+    )
+    if args.pipeline is None and any(direct):
+        parser.error(
+            "--input/--output/--arg/--model-profile/--output-schema/--timeout "
+            "require --pipeline"
+        )
+    if args.output and not args.input:
+        parser.error("--output requires --input")
+    if args.pipeline is not None:
+        spec = cli_spec(direct_config(args), Path.cwd())
+    else:
+        config = args.config or args.spec
+        payload = json.loads(config.read_text(encoding="utf-8"))
+        spec = cli_spec(payload, Path.cwd()) if args.config else payload
     marker = str(spec["marker"])
     try:
         envelope = _run(spec)
@@ -1003,7 +1076,9 @@ def main() -> int:
                 f"Sandbox sample runner failed: {type(exc).__name__}: {exc}"
             ),
         }
-    if args.config:
+    if args.spec is None:
+        # A pipeline may leave its last line unterminated; keep the envelope alone.
+        print()
         print(json.dumps(envelope, ensure_ascii=False))
         return int(envelope["rc"])
     _emit_envelope(envelope, marker)

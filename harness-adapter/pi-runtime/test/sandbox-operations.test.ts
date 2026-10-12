@@ -7,11 +7,13 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import {
   createSandboxFileOperations,
+  FallbackSandboxFileClient,
   SandboxEndpointSession,
   SandboxFileClient,
   SandboxFileError,
   type SandboxEndpoint,
   type SandboxEndpointRequest,
+  type SandboxFileClientLike,
 } from "../src/sandbox-operations.js";
 import { SandboxReadMirror } from "../src/sandbox-paths.js";
 
@@ -35,9 +37,12 @@ async function listen(
     baseUrl: `http://127.0.0.1:${port}`,
     requests,
     close: () =>
-      new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve())),
-      ),
+      new Promise<void>((resolve, reject) => {
+        // A request which the client abandoned mid-flight leaves its socket
+        // open, and `close` alone waits for it.
+        server.closeAllConnections();
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
   };
 }
 
@@ -227,4 +232,98 @@ test("sandbox file reads fall back to the file API when the host mirror misses",
     api.requests[0],
     /^GET \/sandboxes\/sbx-1\/files\/read\?path=/,
   );
+});
+
+/** Terminal transport stub recording the calls the fallback client makes. */
+class RecordingFileClient implements SandboxFileClientLike {
+  readonly reads: string[] = [];
+  readonly writes: string[] = [];
+  readonly accesses: string[] = [];
+  constructor(private readonly content = "from terminal") {}
+
+  async read(path: string): Promise<Buffer> {
+    this.reads.push(path);
+    return Buffer.from(this.content);
+  }
+
+  async access(path: string): Promise<void> {
+    this.accesses.push(path);
+  }
+
+  async write(path: string, content: string | Buffer): Promise<void> {
+    this.writes.push(`${path}:${content.toString()}`);
+  }
+}
+
+test("file tools use the file API when the portal answers", async (t) => {
+  const api = await listen((request, response) => {
+    if (request.url?.includes("/files/read")) {
+      response.writeHead(200, { "Content-Type": "application/octet-stream" });
+      response.end("from api");
+      return;
+    }
+    chunkedUpload(request, response);
+  });
+  t.after(api.close);
+  const session = new SandboxEndpointSession(async () => endpointFor(api.baseUrl));
+  const terminal = new RecordingFileClient();
+  const client = new FallbackSandboxFileClient(new SandboxFileClient(session), terminal);
+
+  assert.equal((await client.read("public_data/a.txt")).toString("utf8"), "from api");
+  await client.access("public_data/a.txt");
+  await client.write("public_data/a.txt", "hello");
+
+  assert.deepEqual(terminal.reads, []);
+  assert.deepEqual(terminal.accesses, []);
+  assert.deepEqual(terminal.writes, []);
+  assert.equal(api.requests.length, 5, "two reads and one three-request upload");
+});
+
+test("an unreachable file API switches the session to the terminal transport", async () => {
+  const resolves: SandboxEndpointRequest[] = [];
+  const session = new SandboxEndpointSession(async (request) => {
+    resolves.push(request);
+    return endpointFor(await deadBaseUrl());
+  });
+  const terminal = new RecordingFileClient();
+  const client = new FallbackSandboxFileClient(new SandboxFileClient(session), terminal);
+
+  assert.equal((await client.read("public_data/a.txt")).toString("utf8"), "from terminal");
+  assert.equal((await client.read("public_data/b.txt")).toString("utf8"), "from terminal");
+
+  assert.deepEqual(terminal.reads, ["public_data/a.txt", "public_data/b.txt"]);
+  // The portal is only probed once; every later call goes straight to the
+  // terminal transport instead of paying the file API timeout again.
+  assert.deepEqual(resolves, [{ refresh: false }, { refresh: true }]);
+});
+
+test("an unresponsive file API is bounded by the probe budget", async (t) => {
+  // The portal accepts the connection but never answers; the first request is
+  // what has to learn that, so it runs on the short probe budget instead of
+  // the full request budget.
+  const api = await listen(() => undefined);
+  t.after(api.close);
+  const session = new SandboxEndpointSession(async () => endpointFor(api.baseUrl));
+  const terminal = new RecordingFileClient();
+  const client = new FallbackSandboxFileClient(
+    new SandboxFileClient(session, { probeTimeoutMs: 50 }),
+    terminal,
+  );
+
+  assert.equal((await client.read("public_data/a.txt")).toString("utf8"), "from terminal");
+  assert.deepEqual(terminal.reads, ["public_data/a.txt"]);
+});
+
+test("a file API error the sandbox returned is not answered over the terminal", async (t) => {
+  const api = await listen((_request, response) => {
+    response.writeHead(404, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ detail: "missing" }));
+  });
+  t.after(api.close);
+  const session = new SandboxEndpointSession(async () => endpointFor(api.baseUrl));
+  const terminal = new RecordingFileClient();
+  const client = new FallbackSandboxFileClient(new SandboxFileClient(session), terminal);
+
+  await assert.rejects(client.read("public_data/missing.txt"), /404/);
+  assert.deepEqual(terminal.reads, []);
 });

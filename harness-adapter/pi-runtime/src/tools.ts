@@ -23,12 +23,16 @@ import { isRecord, type JsonObject } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
 import {
   createSandboxFileOperations,
+  FallbackSandboxFileClient,
+  SANDBOX_FILE_PROBE_TIMEOUT_MS,
   SandboxEndpointSession,
+  SandboxFileClient,
   type SandboxEndpointProvider,
 } from "./sandbox-operations.js";
 import { SandboxPathPolicy, type SandboxReadMirror } from "./sandbox-paths.js";
 import {
   LazySandboxTerminalOperations,
+  SANDBOX_SCRIPT_CHUNK_CHARS,
   type SandboxTerminalConnector,
   type SandboxTerminalTimeouts,
 } from "./sandbox-terminal.js";
@@ -66,6 +70,8 @@ export interface SkillRootConfig {
 export interface CreateToolsOptions {
   terminalEnvironment?: Record<string, string>;
   terminalTimeouts?: SandboxTerminalTimeouts;
+  /** Base64 characters one staging line carries; see the sandbox transport. */
+  scriptChunkChars?: number;
   /** Test seam: the terminal socket used by a sandbox session. */
   terminalConnect?: SandboxTerminalConnector;
   onExecutionReady?: (access: ExecutionAccess) => void;
@@ -181,9 +187,10 @@ export async function createTools(
 }
 
 /**
- * Sandbox execution plane: every tool drives the sandbox TTY, so file bytes and
- * commands travel the same cluster-direct socket. The endpoint is resolved on
- * first use so a conversation that never touches files never creates a sandbox.
+ * Sandbox execution plane: the terminal tool drives the sandbox TTY, and the
+ * file tools prefer the file API over the cluster-direct socket when the
+ * runner cannot reach the portal. The endpoint is resolved on first use so a
+ * conversation that never touches files never creates a sandbox.
  *
  * Every tool is created with a workspace-relative cwd (`"."`): the sandbox
  * operations resolve paths against the sandbox-side conversation root, so the
@@ -200,11 +207,18 @@ async function createSandboxTools(
   }
   const sandboxCwd = ".";
   const endpoints = new SandboxEndpointSession(provider);
+  // The sandbox PTY is the Linux one, so its staging lines may be far longer
+  // than the macOS-safe default the transport itself falls back to.
+  const scriptChunkChars = options.scriptChunkChars ?? SANDBOX_SCRIPT_CHUNK_CHARS;
   const terminalOperations = new LazySandboxTerminalOperations(endpoints, {
     connect: options.terminalConnect,
+    scriptChunkChars,
     ...options.terminalTimeouts,
   });
-  const fileClient = new SandboxTerminalFileClient(terminalOperations);
+  const fileClient = new FallbackSandboxFileClient(
+    new SandboxFileClient(endpoints, { probeTimeoutMs: SANDBOX_FILE_PROBE_TIMEOUT_MS }),
+    new SandboxTerminalFileClient(terminalOperations, { chunkChars: scriptChunkChars }),
+  );
   const fileOperations = createSandboxFileOperations(fileClient, options.readMirror);
   let policy: SandboxPathPolicy | undefined;
   const resolvePolicy = async (): Promise<SandboxPathPolicy> => {

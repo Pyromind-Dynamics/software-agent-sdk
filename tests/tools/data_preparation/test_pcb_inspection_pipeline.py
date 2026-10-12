@@ -18,7 +18,10 @@ from openhands.tools.data_preparation.runner import (
 
 
 SKILL = Path(__file__).parents[3] / ".agents/skills/data-processing"
-TEMPLATE = SKILL / "references/paradigms/llm-pipeline/pcb_inspection_pipeline.py"
+TEMPLATE = (
+    SKILL
+    / "references/paradigms/llm-pipeline/vision/templates/pcb_inspection_pipeline.py"
+)
 SCRIPTS = SKILL / "scripts/preparation"
 
 

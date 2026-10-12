@@ -24,6 +24,7 @@ import {
   SandboxReadMirror,
 } from "./sandbox-paths.js";
 import {
+  sandboxTerminalScriptChunkChars,
   sandboxTerminalTimeouts,
   type SandboxTerminalConnector,
 } from "./sandbox-terminal.js";
@@ -140,6 +141,7 @@ export async function createPiSession(
   const options: CreateToolsOptions = {
     terminalEnvironment: terminalEnvironment as Record<string, string>,
     terminalTimeouts: sandboxTerminalTimeouts(),
+    scriptChunkChars: sandboxTerminalScriptChunkChars(),
     onExecutionReady: (access) => { executionAccess = access; },
     skillsDirectory: config.skillsDirectory,
     ...(config.terminalBackend === "sandbox"

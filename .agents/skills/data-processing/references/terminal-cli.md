@@ -1,7 +1,24 @@
 # 通过 terminal 执行数据处理
 
 普通脚本直接执行，例如 `python3 public_data/clean.py storage/input.csv public_data/result.csv`。
-需要 DataFlow 算子、模型配置或标准输出校验时，先写一个不含密钥的 JSON 配置：
+需要 DataFlow 算子、模型配置或标准输出校验时，用 `sandbox_sample.py`，优先直接传参：
+
+```sh
+python3 .agents/skills/data-processing/scripts/preparation/sandbox_sample.py \
+  --pipeline public_data/pipeline.py \
+  --input storage/input.jsonl \
+  --output public_data/result.jsonl \
+  --model-profile text \
+  --output-schema text \
+  --timeout 3600
+```
+
+`--input`/`--output` 解析成 Pipeline 的前两个参数，`--arg` 可重复追加后续参数；
+以 `-` 开头的值写成 `--arg=--limit` 形式，避免被当作脚本自己的选项。
+一条命令即可完成，不需要 `run.json` 之类的中间文件。
+
+只有 flags 覆盖不到的字段（`support_file_path`、`python`、`gateway`）才写不含密钥的 JSON 配置，
+用 `--config` 执行：
 
 ```json
 {
@@ -13,12 +30,11 @@
 }
 ```
 
-在会话工作区根目录，通过 terminal 执行：
-
 ```sh
-PYROMIND_DATAFLOW_PROFILES="$PYROMIND_DATAFLOW_PROFILES" python3 .agents/skills/data-processing/scripts/preparation/sandbox_sample.py --config public_data/run.json
+python3 .agents/skills/data-processing/scripts/preparation/sandbox_sample.py --config public_data/run.json
 ```
 
+两种方式都在会话工作区根目录执行，模型配置由执行环境注入，不需要在命令里重复导出。
 OS 沙箱下技能资源可能位于工作区外，使用已知的技能绝对路径替换命令中的资源路径。
 
 ## 运行环境
@@ -47,6 +63,10 @@ nohup python3 .agents/skills/data-processing/scripts/preparation/sandbox_sample.
 预热进度看 `/tmp/pyromind-dataflow-prepare.log`。
 不要用 `import dataflow`、全盘 `find` 或翻 site-packages 判断环境是否可用：terminal 的默认
 `python3` 不是运行 Pipeline 的解释器，只有 `--check` 的结论算数。
+
+flags 与配置字段一一对应：`--pipeline` → `pipeline_path`，`--input`/`--output`/`--arg` → `args`，
+`--model-profile`/`--output-schema`/`--timeout` 与同名字段相同；`--config` 额外支持
+`support_file_path`、`python`、`gateway`。`--pipeline` 与 `--config` 互斥，直接传参时不要写配置文件。
 
 `model_profile`：`none` 为无模型的 Python，`text` 为会话模型，`vision` 为图片模型。
 SDK 在执行环境中注入配置。配置缺失时报告具体缺项，不读取服务端配置或把密钥写入脚本。
