@@ -25,11 +25,10 @@ export interface SandboxTerminalFileOptions {
 /**
  * Sandbox file transport over the terminal WebSocket.
  *
- * The file API is reached through a portal domain which is neither
- * cluster-direct nor reliable from every runner, while the terminal socket is
- * already open and cluster-direct. File bytes therefore travel the same channel
- * as commands: reads stream `base64` output back, writes stage base64 lines
- * into a transient file and decode it.
+ * This is the fallback for a runner which cannot reach the file API's portal
+ * domain, while the terminal socket is already open and cluster-direct. File
+ * bytes then travel the same channel as commands: reads stream `base64` output
+ * back, writes stage base64 lines into a transient file and decode it.
  *
  * A write is one command whose script carries the whole payload, so the
  * terminal's own staging decides how the bytes cross the socket. Staging the

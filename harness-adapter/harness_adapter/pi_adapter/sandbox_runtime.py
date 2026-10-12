@@ -1035,13 +1035,24 @@ class SandboxExecutionManager:
                     "--prepare",
                 ]
             )
+            # The install runs while the session is already serving commands, so
+            # it yields both CPU and disk to them instead of making the first
+            # interactive command wait behind a pip install. `ionice` is
+            # optional because a container may refuse the idle class, so the
+            # guard falls back to `nice` alone.
+            throttled = "nice -n 19 sh -c " + shlex.quote(
+                "if command -v ionice >/dev/null 2>&1 && "
+                "ionice -c 3 -n 7 true 2>/dev/null; then "
+                f"exec ionice -c 3 -n 7 {prepare}; "
+                f"else exec {prepare}; fi"
+            )
             # The terminal bridge drops an idle connection and a first install is
             # silent for minutes, so the install runs in the background and the
             # foreground keeps printing progress until the status file appears.
             status = f"/tmp/pi-dataflow-warmup-{secrets.token_hex(8)}.rc"
             quoted_status = shlex.quote(status)
             return (
-                f"({prepare}; printf '%s' \"$?\" > {quoted_status}) & "
+                f"({throttled}; printf '%s' \"$?\" > {quoted_status}) & "
                 f"pm_warm_rc=''; "
                 f'while [ -z "$pm_warm_rc" ]; do '
                 f"sleep {_DATAFLOW_WARMUP_HEARTBEAT_SECONDS}; "

@@ -835,6 +835,10 @@ def test_ensure_warms_the_dataflow_runtime_after_resources(
     ) in command
     assert "env PYROMIND_SANDBOX_DATAFLOW_VENV=/tmp/dataflow-venv" in command
     assert "PYROMIND_SANDBOX_SYSTEM_PYTHON=python3.12" in command
+    # The install yields CPU and disk to the interactive session instead of
+    # competing with the first command.
+    assert "nice -n 19" in command
+    assert "ionice -c 3 -n 7" in command
     # The install is silent for minutes; the heartbeat keeps the TTY alive.
     assert "sleep 20" in command
     assert manager._warmups == {}
