@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   applySandboxPathAliases,
+  applySandboxWorkingDirectory,
   insideSandboxPath,
+  SandboxReadMirror,
   SandboxPathPolicy,
 } from "../src/sandbox-paths.js";
 
@@ -127,4 +129,71 @@ test("system prompt skill locations use runtime aliases instead of host paths", 
       "<location>knowledge</location>",
     ].join("\n"),
   );
+});
+
+test("system prompt working directory never exposes the host conversation root", () => {
+  const hostCwd = "/Users/dev/conversations/conv-1";
+  const prompt = `Guidelines\nCurrent working directory: ${hostCwd}\n`;
+
+  const rewritten = applySandboxWorkingDirectory(prompt, hostCwd);
+
+  assert.equal(rewritten.includes(hostCwd), false);
+  assert.equal(rewritten.startsWith("Guidelines\n"), true);
+  assert.match(rewritten, /Current working directory: \./);
+});
+
+test("system prompt without a working directory line is left untouched", () => {
+  const prompt = "Guidelines\nNo directory here\n";
+
+  assert.equal(
+    applySandboxWorkingDirectory(prompt, "/Users/dev/conversations/conv-1"),
+    prompt,
+  );
+});
+
+test("sandbox read mirror answers skill and knowledge aliases from host roots", () => {
+  const mirror = new SandboxReadMirror([
+    { host: "/repo/.agents/skills", alias: ".agents/skills" },
+    { host: "/opt/extra/aoi-labeling", alias: ".agents/skills/aoi-labeling" },
+    { host: "/repo/knowledge", alias: "knowledge" },
+  ]);
+
+  assert.equal(
+    mirror.resolveAlias(".agents/skills/data-processing/SKILL.md"),
+    "/repo/.agents/skills/data-processing/SKILL.md",
+  );
+  assert.equal(
+    mirror.resolveAlias(".agents/skills/aoi-labeling/notes.md"),
+    "/opt/extra/aoi-labeling/notes.md",
+  );
+  assert.equal(
+    mirror.resolveAlias("knowledge/handbook.md"),
+    "/repo/knowledge/handbook.md",
+  );
+});
+
+test("sandbox read mirror leaves non-resource paths to the sandbox", () => {
+  const mirror = new SandboxReadMirror([
+    { host: "/repo/.agents/skills", alias: ".agents/skills" },
+  ]);
+
+  assert.equal(mirror.resolveAlias("public_data/train.csv"), undefined);
+  assert.equal(mirror.resolveAlias("/repo/.agents/skills/notes.md"), undefined);
+  assert.equal(
+    mirror.resolveAlias(".agents/skills/../../../etc/passwd"),
+    undefined,
+  );
+});
+
+test("sandbox read mirror only claims host files inside its roots", () => {
+  const mirror = new SandboxReadMirror([
+    { host: "/repo/.agents/skills", alias: ".agents/skills" },
+  ]);
+
+  assert.equal(
+    mirror.resolveHost("/repo/.agents/skills/data-processing/SKILL.md"),
+    "/repo/.agents/skills/data-processing/SKILL.md",
+  );
+  assert.equal(mirror.resolveHost("/repo/.agents/skills-other/notes.md"), undefined);
+  assert.equal(mirror.resolveHost("skills/notes.md"), undefined);
 });

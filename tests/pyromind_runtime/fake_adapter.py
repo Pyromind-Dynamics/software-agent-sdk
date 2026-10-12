@@ -60,6 +60,12 @@ class FakeAdapter:
             return None
         return WorkflowState.model_validate(workflow)
 
+    async def execute_stage(
+        self, handle: SessionHandle, request: JsonObject, context: RequestContext
+    ) -> JsonObject:
+        del handle, request, context
+        raise NotImplementedError("The fake harness does not support Agent stages")
+
     async def create_session(
         self, spec: SessionSpec, context: RequestContext
     ) -> SessionHandle:

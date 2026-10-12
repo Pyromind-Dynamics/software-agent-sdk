@@ -1028,6 +1028,7 @@ async def test_sandbox_session_prompt_steers_storage_reads(
         assert "Platform task state comes from the platform tools" in prompt
         assert "Do not search the filesystem or" in prompt
         assert "Use the absolute form when a command has changed directory." in prompt
+        assert "/workspace/<path> is storage/<path> in this sandbox" in prompt
         assert DEFAULT_MOUNT_PATH in prompt
     finally:
         await adapter.close(handle)
@@ -2066,6 +2067,47 @@ async def test_sandbox_canvas_stage_does_not_create_the_container(
     assert staging is not None
     assert staging["workflow_dsl"] == "workflow = InputNode()"
     await adapter.close(handle)
+
+
+async def test_sandbox_session_prewarms_the_execution_plane(
+    tmp_path, monkeypatch
+) -> None:
+    # A conversation which already carries its first message starts the
+    # container while the model reads that message, so the first tool call
+    # finds a prepared execution plane.
+    class RecordingManager:
+        def __init__(self) -> None:
+            self.prewarmed: list[str] = []
+
+        def prewarm(self, context, _files) -> None:
+            self.prewarmed.append(context.conversation_id)
+
+        async def pause(self, context, _files) -> None:
+            return None
+
+        async def delete(self, context, _files) -> None:
+            return None
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="sandbox")
+    manager = RecordingManager()
+    adapter._sandbox = cast(Any, manager)
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="conversation-1",
+            user_id="42",
+            workspace_root=str(conversations / "conversation-1"),
+            initial_message=(TextContent(text="预打标这批数据"),),
+            model_configuration={"model": "gpt-5", "api_key": "request-secret"},
+        ),
+        RequestContext(user_id="42"),
+    )
+
+    await adapter.close(handle)
+
+    assert manager.prewarmed == ["conversation-1"]
 
 
 async def test_sandbox_reads_staged_workflow_before_container_exists(tmp_path) -> None:

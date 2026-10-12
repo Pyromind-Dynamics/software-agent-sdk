@@ -86,7 +86,11 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
                 ) -> None:
                     pi_adapter.execution_subscribe(scope, execution_id, sink)
 
-                return ExecutionHost(pi_adapter.execution_request(scope), subscribe)
+                return ExecutionHost(
+                    pi_adapter.execution_request(scope),
+                    subscribe,
+                    service.conversations_dir / scope,
+                )
 
             workflows = AgentGenomeBackend(
                 Path(

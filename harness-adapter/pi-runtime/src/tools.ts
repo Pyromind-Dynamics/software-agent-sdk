@@ -23,12 +23,16 @@ import { isRecord, type JsonObject } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
 import {
   createSandboxFileOperations,
-  SandboxFileClient,
   SandboxEndpointSession,
   type SandboxEndpointProvider,
 } from "./sandbox-operations.js";
-import { SandboxPathPolicy } from "./sandbox-paths.js";
-import { LazySandboxTerminalOperations } from "./sandbox-terminal.js";
+import { SandboxPathPolicy, type SandboxReadMirror } from "./sandbox-paths.js";
+import {
+  LazySandboxTerminalOperations,
+  type SandboxTerminalConnector,
+  type SandboxTerminalTimeouts,
+} from "./sandbox-terminal.js";
+import { SandboxTerminalFileClient } from "./sandbox-terminal-files.js";
 import {
   createWorkspaceBashOperations,
   type PiTerminalBackend,
@@ -61,10 +65,18 @@ export interface SkillRootConfig {
 
 export interface CreateToolsOptions {
   terminalEnvironment?: Record<string, string>;
+  terminalTimeouts?: SandboxTerminalTimeouts;
+  /** Test seam: the terminal socket used by a sandbox session. */
+  terminalConnect?: SandboxTerminalConnector;
   onExecutionReady?: (access: ExecutionAccess) => void;
   skillsDirectory?: string;
   /** Present only when the session runs its execution plane in a sandbox. */
   sandbox?: SandboxEndpointProvider;
+  /**
+   * Host copies of the read-only resource roots, so a skill or knowledge read
+   * never has to reach the sandbox. Sandbox sessions only.
+   */
+  readMirror?: SandboxReadMirror;
 }
 
 export async function createTools(
@@ -169,9 +181,9 @@ export async function createTools(
 }
 
 /**
- * Sandbox execution plane: file tools talk to the sandbox file API and the
- * terminal tool drives the sandbox TTY. The endpoint is resolved on first use
- * so a conversation that never touches files never creates a sandbox.
+ * Sandbox execution plane: every tool drives the sandbox TTY, so file bytes and
+ * commands travel the same cluster-direct socket. The endpoint is resolved on
+ * first use so a conversation that never touches files never creates a sandbox.
  *
  * Every tool is created with a workspace-relative cwd (`"."`): the sandbox
  * operations resolve paths against the sandbox-side conversation root, so the
@@ -188,8 +200,12 @@ async function createSandboxTools(
   }
   const sandboxCwd = ".";
   const endpoints = new SandboxEndpointSession(provider);
-  const fileClient = new SandboxFileClient(endpoints);
-  const fileOperations = createSandboxFileOperations(fileClient);
+  const terminalOperations = new LazySandboxTerminalOperations(endpoints, {
+    connect: options.terminalConnect,
+    ...options.terminalTimeouts,
+  });
+  const fileClient = new SandboxTerminalFileClient(terminalOperations);
+  const fileOperations = createSandboxFileOperations(fileClient, options.readMirror);
   let policy: SandboxPathPolicy | undefined;
   const resolvePolicy = async (): Promise<SandboxPathPolicy> => {
     if (policy) return policy;
@@ -227,9 +243,6 @@ async function createSandboxTools(
       access: async (path) => fileOperations.edit.access(path),
     },
   });
-  const terminalOperations = new LazySandboxTerminalOperations(endpoints, {
-    writeFile: (path, content) => fileClient.write(path, content),
-  });
   options.onExecutionReady?.({ operations: terminalOperations, cwd: sandboxCwd,
     env: options.terminalEnvironment,
     writeFile: (path, content) => fileClient.write(path, content),
@@ -243,7 +256,13 @@ async function createSandboxTools(
   return [
     bindPathTool(
       read,
-      async (path, operation) => (await resolvePolicy()).resolvePath(path, operation),
+      async (path, operation) => {
+        // A mirrored resource read is answered from the host, so it must not
+        // resolve the endpoint: that would create a sandbox for a doc read.
+        const mirrored = options.readMirror?.resolveAlias(path);
+        if (mirrored !== undefined) return mirrored;
+        return (await resolvePolicy()).resolvePath(path, operation);
+      },
       "read",
       SANDBOX_READ_PATH_SCOPE,
     ),

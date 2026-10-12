@@ -164,6 +164,10 @@ server must also follow [rule.md](rule.md).
 - Agent server: [openhands-agent-server/AGENTS.md](openhands-agent-server/AGENTS.md)
 - Eval config: [.github/run-eval/AGENTS.md](.github/run-eval/AGENTS.md)
 
+## 关联项目：AgentGenome
+
+AgentGenome是一个pi的插件，用于把历史轨迹沉淀成graph和脚本，并且后续可以直接复用这套经验。这个插件希望后续可以开源，开发的时候需要注意pi插件后续的适配性。
+
 ## API compatibility pointers
 
 - For SDK Python API deprecation/removal policy, read

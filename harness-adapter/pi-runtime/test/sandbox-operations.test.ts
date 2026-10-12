@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import {
+  createSandboxFileOperations,
   SandboxEndpointSession,
   SandboxFileClient,
   SandboxFileError,
   type SandboxEndpoint,
   type SandboxEndpointRequest,
 } from "../src/sandbox-operations.js";
+import { SandboxReadMirror } from "../src/sandbox-paths.js";
 
 interface MockApi {
   baseUrl: string;
@@ -139,4 +144,87 @@ test("sandbox file write reports an API error without refreshing the endpoint", 
   assert.match(error.message, /401 \{"detail":"Invalid API key"\}/);
   assert.deepEqual(requests, [{ refresh: false }]);
   assert.equal(api.requests.length, 1);
+});
+
+test("sandbox file write stops on abort without refreshing the endpoint", async (t) => {
+  let initStarted = (): void => {};
+  const started = new Promise<void>((resolve) => {
+    initStarted = resolve;
+  });
+  const api = await listen(() => initStarted());
+  t.after(api.close);
+  const requests: SandboxEndpointRequest[] = [];
+  const session = new SandboxEndpointSession(async (request) => {
+    requests.push(request);
+    return endpointFor(api.baseUrl);
+  });
+  const controller = new AbortController();
+  const pending = new SandboxFileClient(session).write(
+    "public_data/out.txt",
+    "hello",
+    controller.signal,
+  );
+
+  await started;
+  controller.abort();
+
+  await assert.rejects(pending, /aborted/i);
+  assert.deepEqual(requests, [{ refresh: false }]);
+  assert.deepEqual(api.requests, [
+    "POST /sandboxes/sbx-1/files/chunks/init?total_size=5&total_chunks=1",
+  ]);
+});
+
+test("sandbox file reads answer mirrored resources without touching the sandbox", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-mirror-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const skill = join(root, "data-processing", "SKILL.md");
+  await mkdir(dirname(skill), { recursive: true });
+  await writeFile(skill, "mirrored\n");
+  const requests: SandboxEndpointRequest[] = [];
+  const session = new SandboxEndpointSession(async (request) => {
+    requests.push(request);
+    throw new Error("the sandbox must not be contacted for a mirrored read");
+  });
+  const mirror = new SandboxReadMirror([{ host: root, alias: ".agents/skills" }]);
+  const operations = createSandboxFileOperations(
+    new SandboxFileClient(session),
+    mirror,
+  );
+
+  const host = mirror.resolveAlias(".agents/skills/data-processing/SKILL.md");
+  assert.ok(host !== undefined);
+  assert.equal(host, skill);
+  // The read tool probes before it reads, so every stage must stay local.
+  await operations.read.access(host);
+  assert.equal(await operations.read.detectImageMimeType?.(host), undefined);
+  const buffer = await operations.read.readFile(host);
+
+  assert.equal(buffer.toString("utf8"), "mirrored\n");
+  assert.deepEqual(requests, []);
+});
+
+test("sandbox file reads fall back to the file API when the host mirror misses", async (t) => {
+  const api = await listen((_request, response) => {
+    response.writeHead(200, { "Content-Type": "application/octet-stream" });
+    response.end("from sandbox");
+  });
+  t.after(api.close);
+  const root = await mkdtemp(join(tmpdir(), "pi-mirror-miss-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const session = new SandboxEndpointSession(async () => endpointFor(api.baseUrl));
+  const mirror = new SandboxReadMirror([{ host: root, alias: ".agents/skills" }]);
+  const operations = createSandboxFileOperations(
+    new SandboxFileClient(session),
+    mirror,
+  );
+
+  const buffer = await operations.read.readFile(join(root, "missing.md"));
+
+  assert.equal(buffer.toString("utf8"), "from sandbox");
+  assert.equal(api.requests.length, 1);
+  assert.match(
+    api.requests[0],
+    /^GET \/sandboxes\/sbx-1\/files\/read\?path=/,
+  );
 });

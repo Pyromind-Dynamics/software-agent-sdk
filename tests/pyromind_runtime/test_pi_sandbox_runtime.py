@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import re
 import tarfile
 from pathlib import Path
@@ -15,6 +16,7 @@ from harness_adapter.pi_adapter.sandbox_runtime import (
     DEFAULT_CPU,
     DEFAULT_MEMORY,
     DEFAULT_MOUNT_PATH,
+    PYROMIND_AGENT_RESOURCES_ROOT,
     PYROMIND_AGENT_STORAGE_ROOT,
     STORAGE_ALIAS,
     STORAGE_HOST_PATH,
@@ -132,10 +134,12 @@ class _FakeSandboxClient:
         return {"path": path, "size": len(content)}
 
 
-def _context(tmp_path: Path, extra: dict | None = None) -> ToolExecutionContext:
+def _context(
+    tmp_path: Path, extra: dict | None = None, *, conversation_id: str = "conv-1"
+) -> ToolExecutionContext:
     return ToolExecutionContext(
-        conversation_id="conv-1",
-        workspace_root=tmp_path / "conv-1",
+        conversation_id=conversation_id,
+        workspace_root=tmp_path / conversation_id,
         request_context=RequestContext(
             user_id="user-1",
             x_cluster="us-west-1#pre",
@@ -158,22 +162,64 @@ def _uploaded_script(client: _FakeSandboxClient) -> str:
     return scripts[-1]
 
 
-def _unpack_resource_archives(client: _FakeSandboxClient) -> None:
-    """Apply the resource archive the way the sandbox's own tar would."""
-    for path in [name for name in client.files if name.startswith("/tmp/pi-sandbox-")]:
-        match = re.search(
-            r"tar -xzf (\S+) -C (\S+)", client.files[path].decode("utf-8")
-        )
-        if match is None:
-            continue
-        archive, workspace = match.group(1), match.group(2)
+_SCRIPT_COMMAND = re.compile(r"sh (/tmp/pi-sandbox-[0-9a-f]+\.sh)")
+_MOVE_LINE = re.compile(r"^mv (\S+) (\S+)$", re.MULTILINE)
+_TAR_LINE = re.compile(r"tar -xzf (\S+) -C (\S+)")
+_PROBE_SCRIPT = re.compile(r"test -f (\S+)\n")
+
+
+def _run_sandbox_script(
+    client: _FakeSandboxClient, script: str
+) -> tuple[str, int, bool]:
+    """Apply one uploaded script the way the sandbox's own shell would.
+
+    Only the shapes the resource staging uses are modelled: the cache probe,
+    the rename that publishes an uploaded archive, and the unpack. Everything
+    else is a success, which is all the tests assert about it.
+    """
+    probe = _PROBE_SCRIPT.fullmatch(script)
+    if probe is not None:
+        return ("", 0 if probe.group(1) in client.files else 1, False)
+    for source, destination in _MOVE_LINE.findall(script):
+        if source not in client.files:
+            return (f"mv: cannot stat '{source}'", 1, False)
+        client.files[destination] = client.files.pop(source)
+    for archive, workspace in _TAR_LINE.findall(script):
+        if archive not in client.files:
+            return (f"tar: {archive}: Cannot open", 1, False)
         with tarfile.open(fileobj=io.BytesIO(client.files[archive])) as tar:
             for member in tar.getmembers():
                 extracted = tar.extractfile(member) if member.isfile() else None
                 if extracted is None:
                     continue
                 client.files[f"{workspace}/{member.name}"] = extracted.read()
-        client.files.pop(archive, None)
+    return ("", 0, False)
+
+
+def _run_sandbox_command(
+    client: _FakeSandboxClient, command: str
+) -> tuple[str, int, bool]:
+    """Answer one manager command through the script it uploaded."""
+    match = _SCRIPT_COMMAND.match(command)
+    if match is None:
+        return ("", 0, False)
+    return _run_sandbox_script(client, client.files[match.group(1)].decode("utf-8"))
+
+
+def _dataflow_skills(tmp_path: Path) -> Path:
+    """Minimal skills tree the warm-up looks for."""
+    skills = tmp_path / "skills"
+    script = skills / "data-processing" / "scripts" / "preparation"
+    script.mkdir(parents=True)
+    (script / "sandbox_sample.py").write_text("", encoding="utf-8")
+    return skills
+
+
+def _warmup_command(commands: list[str]) -> str:
+    """The DataFlow warm-up command among the sandbox commands."""
+    warmups = [command for command in commands if "sandbox_sample.py" in command]
+    assert len(warmups) == 1, commands
+    return warmups[0]
 
 
 @pytest.fixture
@@ -181,6 +227,36 @@ def files(tmp_path: Path) -> PiSessionFiles:
     session_files = PiSessionFiles(tmp_path / "conv-1")
     session_files.initialize({"session_id": "conv-1"})
     return session_files
+
+
+@pytest.fixture(autouse=True)
+def _terminal_file_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mirror terminal file writes into the fake client's file store.
+
+    The manager writes scripts and staged files over the terminal WebSocket;
+    the sandbox-runtime tests keep inspecting ``client.files``, so the write
+    helper is redirected to the same store here. The terminal transport itself
+    is covered by the sandbox tool tests.
+    """
+
+    def write(
+        client: _FakeSandboxClient,
+        *,
+        ws_base_url: str,
+        sandbox_id: str,
+        path: str,
+        source: bytes | str | Path,
+        timeout_seconds: int = 60,
+    ) -> None:
+        content = (
+            Path(source).read_bytes() if isinstance(source, (str, Path)) else source
+        )
+        client.files[path] = content
+        client.calls.append(f"write:{path}")
+
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.write_sandbox_file", write
+    )
 
 
 def test_sandbox_settings_read_session_config_then_environment(monkeypatch) -> None:
@@ -262,6 +338,7 @@ def test_ensure_creates_and_prepares_a_sandbox(
     assert "__PM_" not in commands[0]
     script = _uploaded_script(client)
     assert f"mkdir -p {endpoint['workspace_path']}" in script
+    assert f"mkdir -p {endpoint['workspace_path']}/public_data" in script
     assert (
         f"ln -s {DEFAULT_MOUNT_PATH} {endpoint['workspace_path']}/{STORAGE_ALIAS}"
     ) in script
@@ -566,20 +643,24 @@ def test_ensure_adopts_the_container_left_behind_by_a_failed_create(
 def test_ensure_unpacks_resources_from_one_archive(
     tmp_path: Path, files: PiSessionFiles, monkeypatch
 ) -> None:
-    # The skills tree is hundreds of files, so it travels as one archive that
-    # the sandbox unpacks, which also carries the empty __init__.py files the
-    # chunked upload API cannot write.
+    # The skills tree is hundreds of files, so it travels as one archive the
+    # sandbox unpacks, which also carries the empty __init__.py files the
+    # chunked upload API cannot write. The archive is cached in the Storage
+    # mount, so the next conversation of this user does not upload it again.
     knowledge = tmp_path / "knowledge"
     knowledge.mkdir()
     (knowledge / "__init__.py").write_bytes(b"")
     (knowledge / "notes.md").write_bytes(b"hello\n")
+    cache = knowledge / "__pycache__"
+    cache.mkdir()
+    (cache / "notes.cpython-313.pyc").write_bytes(b"\x00")
     client = _FakeSandboxClient()
     commands: list[str] = []
 
     def run_terminal_command(**kwargs: object) -> tuple[str, int, bool]:
-        commands.append(str(kwargs["command"]))
-        _unpack_resource_archives(client)
-        return ("", 0, False)
+        command = str(kwargs["command"])
+        commands.append(command)
+        return _run_sandbox_command(client, command)
 
     monkeypatch.setattr(
         "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
@@ -595,12 +676,222 @@ def test_ensure_unpacks_resources_from_one_archive(
     workspace = f"{DEFAULT_MOUNT_PATH}{PYROMIND_AGENT_STORAGE_ROOT}/conv-1"
     assert client.files[f"{workspace}/knowledge/notes.md"] == b"hello\n"
     assert client.files[f"{workspace}/knowledge/__init__.py"] == b""
+    # Bytecode cached next to host scripts is not part of the sandbox tree.
+    assert (
+        f"{workspace}/knowledge/__pycache__/notes.cpython-313.pyc" not in client.files
+    )
     # The tree arrives in one archive: nothing is written file by file.
     assert [
         call for call in client.calls if call.startswith(f"write:{workspace}/")
     ] == []
-    assert client.calls.count("write:/tmp/pi-session-resources.tgz") == 1
-    assert "/tmp/pi-session-resources.tgz" not in client.files
+    cached = [
+        call
+        for call in client.calls
+        if call.startswith(
+            f"write:{DEFAULT_MOUNT_PATH}{PYROMIND_AGENT_RESOURCES_ROOT}/"
+        )
+    ]
+    assert len(cached) == 1
+    assert ".tgz.partial-" in cached[0]
+    published = [
+        name
+        for name in client.files
+        if name.startswith(f"{DEFAULT_MOUNT_PATH}{PYROMIND_AGENT_RESOURCES_ROOT}/")
+    ]
+    assert len(published) == 1
+    assert published[0].endswith("/pi-session-resources.tgz")
+
+
+def test_ensure_reuses_the_cached_resource_archive(
+    tmp_path: Path, files: PiSessionFiles, monkeypatch
+) -> None:
+    # The archive is named after the content of the resource tree, so a second
+    # conversation of the same user unpacks it from Storage instead of paying
+    # the upload again.
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    (knowledge / "notes.md").write_bytes(b"hello\n")
+    client = _FakeSandboxClient()
+
+    def run_terminal_command(**kwargs: object) -> tuple[str, int, bool]:
+        return _run_sandbox_command(client, str(kwargs["command"]))
+
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
+        run_terminal_command,
+    )
+    manager = SandboxExecutionManager(
+        client_factory=lambda context: client,
+        resource_roots=[("knowledge", knowledge)],
+    )
+
+    async def exercise() -> None:
+        await manager.ensure(_context(tmp_path), files)
+        second = PiSessionFiles(tmp_path / "conv-2")
+        second.initialize({"session_id": "conv-2"})
+        await manager.ensure(_context(tmp_path, conversation_id="conv-2"), second)
+
+    asyncio.run(exercise())
+
+    uploads = [
+        call
+        for call in client.calls
+        if call.startswith(
+            f"write:{DEFAULT_MOUNT_PATH}{PYROMIND_AGENT_RESOURCES_ROOT}/"
+        )
+    ]
+    assert len(uploads) == 1
+    workspace = f"{DEFAULT_MOUNT_PATH}{PYROMIND_AGENT_STORAGE_ROOT}/conv-2"
+    assert client.files[f"{workspace}/knowledge/notes.md"] == b"hello\n"
+
+
+def test_prewarm_starts_the_sandbox_before_the_first_touch(
+    tmp_path: Path, files: PiSessionFiles, monkeypatch
+) -> None:
+    # The container and its workspace are prepared while the model reads the
+    # first message, so the first tool call reuses them instead of waiting.
+    client = _FakeSandboxClient()
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
+        lambda **kwargs: _run_sandbox_command(client, str(kwargs["command"])),
+    )
+    manager = SandboxExecutionManager(client_factory=lambda context: client)
+
+    async def exercise() -> dict:
+        manager.prewarm(_context(tmp_path), files)
+        # A second request while the first one is in flight is not a second
+        # start.
+        manager.prewarm(_context(tmp_path), files)
+        await asyncio.sleep(0.1)
+        return await manager.ensure(_context(tmp_path), files)
+
+    endpoint = asyncio.run(exercise())
+
+    assert endpoint["sandbox_id"] == "sbx-1"
+    assert client.calls.count("create:running") == 1
+    assert manager._prewarms == {}
+
+
+def test_prewarm_can_be_switched_off(
+    tmp_path: Path, files: PiSessionFiles, monkeypatch
+) -> None:
+    monkeypatch.setenv("PYROMIND_SANDBOX_PREWARM", "0")
+    client = _FakeSandboxClient()
+    manager = SandboxExecutionManager(client_factory=lambda context: client)
+
+    async def exercise() -> None:
+        manager.prewarm(_context(tmp_path), files)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(exercise())
+
+    assert manager._prewarms == {}
+    assert client.lifecycle_calls == []
+    assert files.load_sandbox() is None
+
+
+def test_ensure_warms_the_dataflow_runtime_after_resources(
+    tmp_path: Path, files: PiSessionFiles, monkeypatch
+) -> None:
+    # The sandbox image ships without open-dataflow, so preparing the cached
+    # venv at sandbox start keeps the first data-processing run from paying for
+    # the install. The warm-up runs the same entry point a run would use.
+    monkeypatch.setenv("PYROMIND_SANDBOX_SYSTEM_PYTHON", "python3.12")
+    monkeypatch.setenv("PYROMIND_SANDBOX_DATAFLOW_VENV", "/tmp/dataflow-venv")
+    monkeypatch.delenv("PYROMIND_SANDBOX_DATAFLOW_PYTHON", raising=False)
+    client = _FakeSandboxClient()
+    commands: list[str] = []
+
+    def run_terminal_command(**kwargs: object) -> tuple[str, int, bool]:
+        command = str(kwargs["command"])
+        commands.append(command)
+        if "sandbox_sample.py" in command:
+            return ('{"ready": true, "source": "installed"}', 0, False)
+        return _run_sandbox_command(client, command)
+
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
+        run_terminal_command,
+    )
+    skills = _dataflow_skills(tmp_path)
+    manager = SandboxExecutionManager(
+        client_factory=lambda context: client,
+        resource_roots=[(".agents/skills", skills)],
+    )
+
+    async def exercise() -> None:
+        await manager.ensure(_context(tmp_path), files)
+        # The warm-up is a background task; let it finish before asserting.
+        await asyncio.sleep(0.1)
+
+    asyncio.run(exercise())
+
+    workspace = f"{DEFAULT_MOUNT_PATH}{PYROMIND_AGENT_STORAGE_ROOT}/conv-1"
+    command = _warmup_command(commands)
+    assert "--prepare" in command
+    assert (
+        f"{workspace}/.agents/skills/data-processing/scripts/preparation/"
+        "sandbox_sample.py"
+    ) in command
+    assert "env PYROMIND_SANDBOX_DATAFLOW_VENV=/tmp/dataflow-venv" in command
+    assert "PYROMIND_SANDBOX_SYSTEM_PYTHON=python3.12" in command
+    # The install is silent for minutes; the heartbeat keeps the TTY alive.
+    assert "sleep 20" in command
+    assert manager._warmups == {}
+
+
+def test_ensure_skips_the_dataflow_warmup_when_disabled(
+    tmp_path: Path, files: PiSessionFiles, monkeypatch
+) -> None:
+    monkeypatch.setenv("PYROMIND_SANDBOX_DATAFLOW_WARMUP", "0")
+    client = _FakeSandboxClient()
+    commands: list[str] = []
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
+        lambda **kwargs: (commands.append(kwargs["command"]) or "", 0, False),
+    )
+    manager = SandboxExecutionManager(
+        client_factory=lambda context: client,
+        resource_roots=[(".agents/skills", _dataflow_skills(tmp_path))],
+    )
+
+    asyncio.run(manager.ensure(_context(tmp_path), files))
+
+    assert "sandbox_sample.py" not in "\n".join(commands)
+    assert manager._warmups == {}
+
+
+def test_ensure_survives_a_failed_dataflow_warmup(
+    tmp_path: Path, files: PiSessionFiles, monkeypatch, caplog
+) -> None:
+    # A warm-up failure is not fatal: the run path still installs on demand.
+    client = _FakeSandboxClient()
+
+    def run_terminal_command(**kwargs: object) -> tuple[str, int, bool]:
+        if "sandbox_sample.py" in str(kwargs["command"]):
+            return ("could not install", 1, False)
+        return ("", 0, False)
+
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
+        run_terminal_command,
+    )
+    manager = SandboxExecutionManager(
+        client_factory=lambda context: client,
+        resource_roots=[(".agents/skills", _dataflow_skills(tmp_path))],
+    )
+
+    async def exercise() -> dict:
+        endpoint = await manager.ensure(_context(tmp_path), files)
+        await asyncio.sleep(0.1)
+        return endpoint
+
+    with caplog.at_level(logging.WARNING):
+        endpoint = asyncio.run(exercise())
+
+    assert endpoint["sandbox_id"] == "sbx-1"
+    assert "Pi DataFlow warm-up did not finish" in caplog.text
+    assert manager._warmups == {}
 
 
 def test_ensure_reports_prepare_failures_that_are_not_a_missing_mount(
@@ -738,6 +1029,12 @@ def test_sandbox_workspace_maps_paths_for_upload_download_and_execute(
     monkeypatch.setattr(
         "harness_adapter.pi_adapter.sandbox_workspace.run_terminal_command",
         lambda **kwargs: (commands.append(kwargs["command"]) or "ok", 0, False),
+    )
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_workspace.write_sandbox_file",
+        lambda client, **kwargs: client.files.__setitem__(
+            kwargs["path"], Path(kwargs["source"]).read_bytes()
+        ),
     )
     source = tmp_path / "script.py"
     source.write_text("print('hi')\n", encoding="utf-8")

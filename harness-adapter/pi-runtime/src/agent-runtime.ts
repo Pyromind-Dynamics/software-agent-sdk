@@ -6,7 +6,12 @@ import type { AgentSession, SessionEntry } from "@earendil-works/pi-coding-agent
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { PiEventNormalizer } from "./pi-events.js";
 import { PiOutcomeNormalizer } from "./pi-outcome.js";
-import { createPiSession, parsePromptContent, type ParsedPrompt } from "./pi-session.js";
+import {
+  createPiSession,
+  parsePromptContent,
+  type ParsedPrompt,
+  type PiSessionOptions,
+} from "./pi-session.js";
 import {
   PROTOCOL_VERSION,
   type JsonObject,
@@ -39,7 +44,10 @@ export class PiAgentRuntime {
     promise: Promise<JsonValue>; resolve: (result: JsonValue) => void;
   }>();
 
-  constructor(private readonly peer: JsonlRpcPeer) {}
+  constructor(
+    private readonly peer: JsonlRpcPeer,
+    private readonly sessionOptions: PiSessionOptions = {},
+  ) {}
 
   async handle(method: string, params: JsonObject): Promise<JsonValue> {
     if (method.startsWith("execution.")) {
@@ -61,7 +69,11 @@ export class PiAgentRuntime {
 
   private async start(params: JsonObject): Promise<JsonValue> {
     if (this.session) throw new Error("Pi session already started");
-    const { session, sessionId, execution } = await createPiSession(params, this.peer);
+    const { session, sessionId, execution } = await createPiSession(
+      params,
+      this.peer,
+      this.sessionOptions,
+    );
     this.execution = execution;
     session.subscribe((event) => {
       this.outcome.observe(event);

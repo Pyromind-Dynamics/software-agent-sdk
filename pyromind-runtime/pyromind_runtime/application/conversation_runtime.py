@@ -14,7 +14,10 @@ from typing import Any
 from uuid import uuid4
 
 from pyromind_runtime.application.event_projection import ProductEventProjector
-from pyromind_runtime.application.reusable_workflows import ReusableWorkflows
+from pyromind_runtime.application.reusable_workflows import (
+    ReusableWorkflows,
+    started_run,
+)
 from pyromind_runtime.application.workflow_completion import WorkflowCompletionHook
 from pyromind_runtime.domain.capabilities import ResourceLimits
 from pyromind_runtime.domain.commands import (
@@ -169,12 +172,12 @@ class ConversationRuntime:
         result = await self._workflows.invoke(
             conversation_id, action, arguments, request_id, origin_run_id
         )
-        if action == "run" and result.get("status") == "queued":
+        if (queued := started_run(action, result)) is not None:
             now = datetime.now().astimezone().isoformat()
             self.register_external_task(
                 conversation_id,
                 {
-                    "task_id": result["id"],
+                    "task_id": queued,
                     "kind": "historical_experience",
                     "run_id": origin_run_id,
                     "status": "pending",
@@ -1439,10 +1442,15 @@ def _build_external_task_notification(
         instruction = (
             "历史经验后台执行已结束。成功时使用文件工具读取结果引用中的实际产物，"
             "汇报结果并继续处理用户尚未完成的诉求；失败时解释原因。"
+            "结果含 capture 时，依据 capture.report_text 向用户说明发布状态、"
+            "泛化结论与草稿位置；report 是服务端磁盘路径，供用户直接查看，"
+            "不要用文件工具读取它。不要重放该 graph。"
             "交付用户要求的文件（含清洗结果和报告）时，调用 get_storage_url，"
             "使用 [清洗结果](返回的URL)、[清洗报告](返回的URL) 等 Markdown 链接。"
             "工具支持当前工作区产物路径，无需先询问是否复制到 Storage，"
             "也不要擅自移动文件。不要把执行路径当下载链接或编造 URL；"
+            "必须原样复制返回的 URL（含完整 ?X-Amz-... 签名参数），"
+            "去掉签名会返回 403，不要缩短或改写链接；"
             "链接获取失败时说明真实原因并保留已验证的路径。"
             "取消时仅记录上下文。不要原样重复提交或重放 graph；"
             "失败后的处理遵循结果中的修订预算与交接说明。"

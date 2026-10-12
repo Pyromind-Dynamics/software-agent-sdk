@@ -24,9 +24,12 @@ type Subscribe = Callable[[str, WorkflowEventSink | None], None]
 
 
 class ExecutionHost:
-    def __init__(self, request: Request, subscribe: Subscribe) -> None:
+    def __init__(
+        self, request: Request, subscribe: Subscribe, local_root: Path | None = None
+    ) -> None:
         self.request = request
         self.subscribe = subscribe
+        self.local_root = local_root
         self.loop = asyncio.get_running_loop()
         self.cancel = threading.Event()
         self.emit: Callable[[dict[str, Any]], None] = lambda _event: None
@@ -199,6 +202,30 @@ class ExecutionHost:
     def read_text(self, name: str) -> str:
         result = self._call("execution.read", {"path": self.path(name), "limit": 65536})
         return base64.b64decode(result["content"], validate=True).decode("utf-8")
+
+    def read(self, path: str) -> bytes:
+        """Read a workspace file (exported traces) through the host file API.
+
+        Pi exports traces with its own file APIs next to the conversation, while the
+        execution plane can be a remote sandbox. Mirror that host-local export into
+        the execution plane so the reader and the writer address the same bytes.
+        """
+        export = self._local_export(path)
+        if export is not None:
+            self._write(path, export.read_bytes())
+        result = self._call(
+            "execution.read", {"path": self._resolve(path, False), "limit": 262144}
+        )
+        return base64.b64decode(result["content"], validate=True)
+
+    def _local_export(self, path: str) -> Path | None:
+        if self.local_root is None:
+            return None
+        relative = PurePosixPath(path)
+        if relative.is_absolute() or ".." in relative.parts:
+            return None
+        candidate = self.local_root / relative
+        return candidate if candidate.is_file() else None
 
     def _write(self, path: str, content: bytes) -> None:
         if self.cancel.is_set():

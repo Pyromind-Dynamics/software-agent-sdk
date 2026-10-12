@@ -1,6 +1,8 @@
 # 历史经验 v2 接入与验证
 
-包依赖升级为 AgentGenome Python/npm 0.3.0，通过 vendor 安装，继续由 Pi 标准加载器加载默认入口。工具定义、节点回执、修订规则、冻结和修订记录属于 AgentGenome；Runtime 使用通用 `execute_stage` 能力关联当前会话。上层没有 Pi 类型，公开 API 与原有 SSE 事件类型不变。SQLite 仅增加表，原资产及运行记录保留。
+包依赖升级为 AgentGenome Python/npm 0.4.0，通过 vendor 安装，继续由 Pi 标准加载器加载默认入口。工具定义、节点回执、修订规则、冻结和修订记录属于 AgentGenome；Runtime 使用通用 `execute_stage` 能力关联当前会话。上层没有 Pi 类型，公开 API 与原有 SSE 事件类型不变。SQLite 仅增加表，原资产及运行记录保留。
+
+0.4.0 新增 `genome_distill`：会话里的步骤是内联代码、只读探测或脚本内部写出产物时，机械固化不会通过，agent 先把脚本落盘、把输入产出写到命令行上，再提交规范化链路；插件校验契约、编译 graph，并和 `genome_capture` 一样排队回放验证。`distill` 与 `capture` 共用同一道 origin turn 闸门和异步完成通知，SDK 侧不需要专属分支。
 
 本版使用 `os-sandbox` 的受保护目录保存验收代码，文件工具与终端均不能修改。执行前校验摘要，模型请求通过独立文件 API 交接，不占用终端。业务数据仍留在执行环境，产物链接继续通过 SDK Storage 工具获取。
 
@@ -26,7 +28,13 @@ npm --prefix harness-adapter/pi-runtime test
 
 ## 人工测试准备
 
-使用支持的 OS 沙箱环境启动：
+平台验证使用默认的远端执行面启动（不设置 `PYROMIND_PI_TERMINAL_BACKEND` 时即为 `sandbox`）：
+
+```sh
+./start_inference.sh
+```
+
+本地无平台凭据时改用支持的 OS 沙箱环境：
 
 ```sh
 PYROMIND_PI_TERMINAL_BACKEND=os-sandbox ./start_inference.sh
@@ -57,3 +65,5 @@ OH_CONVERSATIONS_PATH="$test_root/workspace/conversations" \
 ## terminal 数据处理
 
 新会话不再注册 `df_run_pipeline`，历史消息类型继续兼容。普通 Python 直接通过 terminal 执行；DataFlow 使用技能的 `sandbox_sample.py --config`，配置格式见技能 `references/terminal-cli.md`。模型配置由宿主在内存中注入，远程命令脚本和日志不保存密钥；重连只恢复观察。平台提交工具不变。
+
+远程终端按三段各自计时：端点解析（`sandbox.ensure`，含平台创建与工作区准备，默认 15 分钟）、准备（脚本落盘、TTY 握手、启动回执，默认 3 分钟）、命令执行（工具传入的 `timeout`，默认 300 秒）。落盘分三层：会话静态的 `watch.sh`、`launch.sh`、`env_runner.py` 和会话环境 `env.b64` + `env.sig` 每个会话只下一次，握手回执顺带报告它们在沙箱里是否齐全、环境签名是否匹配，命中时零额外往返，环境变化才重新落盘；每条命令只搬 `cmd.sh`，staging 行按字节预算打包，每批一条确认，整包（脚本 + 启动 + 字节校验）放得下时合成一跳完成 stage 与 launch，放不下才分批或走文件 API，文件 API 缺失、失败或超出准备预算时自动降级回 TTY，校验失败的批次退回逐行确认（`batch-fallback`）。启动回执本身就证明启动行执行过，正常路径不再轮询 `pid`/`rc`，只有重连后的观察路径才先确认启动。执行证据的 `staging`、`round_trips`、`timings_ms` 字段记录本次实际走的路径、往返次数和分段耗时；`PYROMIND_PI_TERMINAL_TRACE=1` 把每次确认的耗时（每条命令的首跳含建连）和每条命令的分段耗时各写一行 JSON 到 stderr，用来把平台侧延迟与命令自身耗时分开，stderr 不在协议通道上，行为与未开启时一致。前两段预算可用 `PYROMIND_PI_TERMINAL_RESOLVE_TIMEOUT_MS`、`PYROMIND_PI_TERMINAL_STARTUP_TIMEOUT_MS` 覆盖（毫秒），`PYROMIND_PI_TERMINAL_FAST_PATH=0` 可整体退回逐行确认的慢路径。

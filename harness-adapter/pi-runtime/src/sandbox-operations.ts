@@ -1,8 +1,12 @@
+import { readFile } from "node:fs/promises";
+
 import type {
   EditOperations,
   ReadOperations,
   WriteOperations,
 } from "@earendil-works/pi-coding-agent";
+
+import type { SandboxReadMirror } from "./sandbox-paths.js";
 
 /** Endpoint bundle handed to the runner by the control plane on demand. */
 export interface SandboxEndpoint {
@@ -97,15 +101,16 @@ export class SandboxFileClient {
     await this.read(path);
   }
 
-  async write(path: string, content: string | Buffer): Promise<void> {
+  async write(path: string, content: string | Buffer, signal?: AbortSignal): Promise<void> {
     const body = typeof content === "string" ? Buffer.from(content, "utf8") : content;
-    await this.withEndpoint((endpoint) => this.upload(endpoint, path, body));
+    await this.withEndpoint((endpoint) => this.upload(endpoint, path, body, signal), signal);
   }
 
   private async upload(
     endpoint: SandboxEndpoint,
     path: string,
     body: Buffer,
+    signal?: AbortSignal,
   ): Promise<void> {
     const base = this.url(endpoint, `/sandboxes/${endpoint.sandboxId}/files/chunks`);
     const totalChunks = Math.max(1, Math.ceil(body.byteLength / UPLOAD_CHUNK_BYTES));
@@ -113,7 +118,7 @@ export class SandboxFileClient {
     init.searchParams.set("total_size", String(body.byteLength));
     init.searchParams.set("total_chunks", String(totalChunks));
     const initialized = await this.json(
-      await this.fetch(endpoint, init, { method: "POST" }),
+      await this.fetch(endpoint, init, { method: "POST", signal }),
     );
     const uploadId = readString(initialized, "upload_id");
     try {
@@ -127,6 +132,7 @@ export class SandboxFileClient {
         await this.fetch(endpoint, part, {
           method: "PUT",
           body: new Uint8Array(chunk),
+          signal,
           // The body length is left to fetch: the runner imports the Pi
           // packages, whose undici installs a dispatcher that rejects an
           // explicitly set Content-Length on a byte-array body.
@@ -136,40 +142,50 @@ export class SandboxFileClient {
       const complete = new URL(`${base}/${encodeURIComponent(uploadId)}/complete`);
       complete.searchParams.set("path", path);
       complete.searchParams.set("total_chunks", String(totalChunks));
-      await this.fetch(endpoint, complete, { method: "POST" });
+      await this.fetch(endpoint, complete, { method: "POST", signal });
     } catch (error) {
       await this.fetch(endpoint, new URL(`${base}/${encodeURIComponent(uploadId)}`), {
         method: "DELETE",
+        signal,
       }).catch(() => undefined);
       throw error;
     }
   }
 
   /**
-   * Run one call against the current endpoint bundle.
+   * Run one call against the current endpoint bundle, escalating one step per
+   * failure.
    *
-   * A transport failure is the one error the control plane can repair: the
-   * sandbox may have been rebuilt or re-keyed since the bundle was fetched, so
-   * the call asks for the bundle again and retries once before reporting.
+   * A transport failure usually means the network blipped while the bundle was
+   * still good, so the same endpoint gets one retry. Only a failure which
+   * repeats is treated as a sandbox the control plane has already rebuilt or
+   * re-keyed, which is what asking for a fresh bundle repairs. An error the
+   * sandbox itself returned is the caller's to handle and never retried.
    */
   private async withEndpoint<T>(
     operation: (endpoint: SandboxEndpoint) => Promise<T>,
+    signal?: AbortSignal,
   ): Promise<T> {
     const endpoint = await this.endpoints.resolve();
     try {
       return await operation(endpoint);
     } catch (error) {
-      if (!(error instanceof SandboxFileError) || error.status !== undefined) throw error;
-      this.endpoints.invalidate();
-      try {
-        return await operation(await this.endpoints.resolve());
-      } catch (retryError) {
-        throw new SandboxFileError(
-          `${describeError(retryError)} (retried with a refreshed sandbox endpoint)`,
-          retryError instanceof SandboxFileError ? retryError.status : undefined,
-          { cause: retryError },
-        );
-      }
+      if (signal?.aborted || !isTransportFailure(error)) throw error;
+    }
+    try {
+      return await operation(endpoint);
+    } catch (error) {
+      if (signal?.aborted || !isTransportFailure(error)) throw error;
+    }
+    this.endpoints.invalidate();
+    try {
+      return await operation(await this.endpoints.resolve());
+    } catch (error) {
+      throw new SandboxFileError(
+        `${describeError(error)} (retried with a refreshed sandbox endpoint)`,
+        error instanceof SandboxFileError ? error.status : undefined,
+        { cause: error },
+      );
     }
   }
 
@@ -210,10 +226,13 @@ export class SandboxFileClient {
     if (endpoint.cluster) headers.set("X-Cluster", endpoint.cluster);
     let response: Response;
     try {
+      const requestSignal = init.signal
+        ? AbortSignal.any([AbortSignal.timeout(REQUEST_TIMEOUT_MS), init.signal])
+        : AbortSignal.timeout(REQUEST_TIMEOUT_MS);
       response = await fetch(url, {
         ...init,
         headers,
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: requestSignal,
       });
     } catch (error) {
       throw transportError(init.method ?? "GET", url, error);
@@ -251,6 +270,11 @@ function transportError(method: string, url: URL, error: unknown): SandboxFileEr
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** A failure which never reached the sandbox, so the bundle may still be good. */
+function isTransportFailure(error: unknown): boolean {
+  return error instanceof SandboxFileError && error.status === undefined;
 }
 
 function describeErrorChain(error: unknown): string {
@@ -300,38 +324,67 @@ export interface SandboxFileOperations {
 }
 
 /**
- * Pi file operations backed by the sandbox file API.
+ * The file surface both transports implement.
+ *
+ * `SandboxFileClient` reaches the file API over HTTP; the terminal transport
+ * reaches the same sandbox over the cluster-direct WebSocket. Pi's file tools
+ * only need these three calls.
+ */
+export interface SandboxFileClientLike {
+  read(path: string, limit?: number): Promise<Buffer>;
+  access(path: string): Promise<void>;
+  write(path: string, content: string | Buffer, signal?: AbortSignal): Promise<void>;
+}
+
+/**
+ * Pi file operations backed by a sandbox file transport.
  *
  * The read tool asks for the MIME type before reading the bytes, so the probe
- * keeps the last fetched buffer and lets `readFile` reuse it: one HTTP round
- * trip per read instead of two.
+ * keeps the last fetched buffer and lets `readFile` reuse it: one transport
+ * round trip per read instead of two.
  */
-export function createSandboxFileOperations(client: SandboxFileClient): SandboxFileOperations {
+export function createSandboxFileOperations(
+  client: SandboxFileClientLike,
+  mirror?: SandboxReadMirror,
+): SandboxFileOperations {
   let cached: { path: string; buffer: Buffer } | undefined;
+  const readBytes = async (path: string): Promise<Buffer> => {
+    const host = mirror?.resolveHost(path);
+    if (host !== undefined) {
+      const buffer = await readMirroredFile(host).catch((error: unknown) => {
+        if (isMissingFile(error)) return undefined;
+        throw error;
+      });
+      // A root the host does not have still exists in the sandbox, so a miss
+      // falls back to the file API instead of failing the read.
+      if (buffer !== undefined) return buffer;
+    }
+    return client.read(path);
+  };
   const read = async (path: string): Promise<Buffer> => {
     if (cached?.path === path) {
       const buffer = cached.buffer;
       cached = undefined;
       return buffer;
     }
-    return client.read(path);
+    return readBytes(path);
   };
   return {
     read: {
       readFile: read,
       access: async (path) => {
-        cached = { path, buffer: await client.read(path) };
+        cached = { path, buffer: await readBytes(path) };
       },
       detectImageMimeType: async (path) => {
-        const buffer = cached?.path === path ? cached.buffer : await client.read(path);
+        const buffer = cached?.path === path ? cached.buffer : await readBytes(path);
         cached = { path, buffer };
         return detectImageMimeType(buffer);
       },
     },
     write: {
       writeFile: (path, content) => client.write(path, content),
-      // The file API creates parent directories for every upload, so the
-      // explicit mkdir the write tool issues before writing is already covered.
+      // Both transports create parent directories for a write, so the explicit
+      // mkdir the write tool issues before writing is already covered.
       mkdir: async () => undefined,
     },
     edit: {
@@ -340,4 +393,21 @@ export function createSandboxFileOperations(client: SandboxFileClient): SandboxF
       access: (path) => client.access(path),
     },
   };
+}
+
+/** Read a file the runner already holds, under the file API's size limit. */
+async function readMirroredFile(path: string): Promise<Buffer> {
+  const buffer = await readFile(path);
+  if (buffer.byteLength > SANDBOX_FILE_MAX_BYTES) {
+    throw new Error("file exceeds size limit");
+  }
+  return buffer;
+}
+
+function isMissingFile(error: unknown): boolean {
+  const code =
+    error instanceof Error && "code" in error
+      ? (error as { code?: unknown }).code
+      : undefined;
+  return code === "ENOENT" || code === "ENOTDIR";
 }

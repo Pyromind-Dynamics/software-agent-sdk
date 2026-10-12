@@ -9,6 +9,7 @@ persisted ``sandbox.json``, or the logs.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import secrets
@@ -54,10 +55,15 @@ DEFAULT_MOUNT_PATH = "/target-workspace"
 # sees it when the create request asks for the mount.
 STORAGE_HOST_PATH = "/workspace"
 PYROMIND_AGENT_STORAGE_ROOT = "/.pyromind-agent"
+# Resource archives are cached inside the user's own Storage mount, next to the
+# conversation workspaces. The skills tree is identical for every conversation
+# of one deployment, so a conversation which finds its digest already there
+# unpacks it from the mount instead of uploading it again.
+PYROMIND_AGENT_RESOURCES_ROOT = "/.pyromind-agent-resources"
 # Workspace-relative alias for the mounted Storage root. The model reads data
 # through normal file/terminal tools instead of the Storage HTTP API.
 STORAGE_ALIAS = "storage"
-_WORKSPACE_LAYOUT_VERSION = 2
+_WORKSPACE_LAYOUT_VERSION = 3
 # The platform rejects a create request without memory; mirror the sandbox
 # tool's own fallback (platform minimum 4 vCPU, 1:2 vCPU:memory ratio).
 DEFAULT_CPU = "4"
@@ -82,6 +88,32 @@ _FAILURE_OUTPUT_CHARS = 500
 # The skills tree is hundreds of files, so it travels as one archive instead of
 # one HTTP round trip per file.
 _RESOURCE_ARCHIVE_NAME = "pi-session-resources.tgz"
+# Interpreter caches the agent host may have produced next to skill scripts;
+# they are stale bytecode for the sandbox and only bloat the upload.
+_SKIPPED_DIRECTORIES = frozenset({"__pycache__"})
+# Skills are staged under this workspace-relative alias.
+_SKILLS_ALIAS = ".agents/skills"
+# The DataFlow runtime is pre-installed as soon as the sandbox is prepared, so
+# the first data-processing run does not pay for it. The warm-up and the run
+# path take the venv's own install lock, so a run that arrives while the
+# warm-up is still installing waits for it instead of installing a second copy.
+_DATAFLOW_SKILL = "data-processing"
+_DATAFLOW_PREPARE_SCRIPT = "scripts/preparation/sandbox_sample.py"
+_DATAFLOW_WARMUP_HEARTBEAT_SECONDS = 20
+# Mirrors the data-processing tool's own bootstrap budget.
+_DATAFLOW_WARMUP_TIMEOUT_SECONDS = 1800
+_DATAFLOW_WARMUP_SWITCH = "PYROMIND_SANDBOX_DATAFLOW_WARMUP"
+# Creating the container, laying out the workspace, and staging the resources
+# takes tens of seconds, so a session which is about to run work starts that in
+# the background instead of making its first tool call pay for it. Set to 0 to
+# create the sandbox on first touch only.
+_PREWARM_SWITCH = "PYROMIND_SANDBOX_PREWARM"
+_DATAFLOW_WARMUP_ENV = (
+    "PYROMIND_SANDBOX_DATAFLOW_PYTHON",
+    "PYROMIND_SANDBOX_DATAFLOW_VENV",
+    "PYROMIND_SANDBOX_SYSTEM_PYTHON",
+)
+_DEFAULT_SANDBOX_SYSTEM_PYTHON = "python3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,20 +234,59 @@ def _failure_detail(output: str, exit_code: int | None, timed_out: bool) -> str:
     return " (" + ", ".join(detail) + ")"
 
 
+def _dataflow_warmup_env() -> dict[str, str]:
+    """Operator overrides the DataFlow runner would read, when they are set.
+
+    The runner resolves the same values from the run spec, so forwarding them
+    keeps the warm-up on the interpreter and venv path a run would pick.
+    """
+    values: dict[str, str] = {}
+    for name in _DATAFLOW_WARMUP_ENV:
+        value = os.environ.get(name, "").strip()
+        if value:
+            values[name] = value
+    return values
+
+
+def _resource_arcname(destination: str, workspace_path: str) -> str:
+    """Sandbox path of one resource file, relative to the workspace root."""
+    return PurePosixPath(destination).relative_to(workspace_path).as_posix()
+
+
 @contextmanager
 def _resource_archive(
     files: Sequence[tuple[str, str]],
     workspace_path: str,
 ) -> Iterator[Path]:
     """Pack resource files into one archive mirroring their sandbox layout."""
-    root = PurePosixPath(workspace_path)
     with tempfile.TemporaryDirectory(prefix="pi-session-resources-") as directory:
         archive = Path(directory) / _RESOURCE_ARCHIVE_NAME
         with tarfile.open(archive, "w:gz") as tar:
             for destination, local_path in files:
-                arcname = PurePosixPath(destination).relative_to(root).as_posix()
-                tar.add(local_path, arcname=arcname)
+                tar.add(
+                    local_path,
+                    arcname=_resource_arcname(destination, workspace_path),
+                )
         yield archive
+
+
+def _resource_digest(files: Sequence[tuple[str, str]], workspace_path: str) -> str:
+    """Content hash naming one version of the resource tree.
+
+    The archive bytes cannot name it: gzip stamps the packing time, so the same
+    tree packs differently on every build. Hashing the workspace-relative layout
+    with the file bytes gives a name a later conversation can match before it
+    uploads anything, and one the host can compare without unpacking.
+    """
+    digest = hashlib.sha256()
+    for destination, local_path in files:
+        digest.update(_resource_arcname(destination, workspace_path).encode("utf-8"))
+        digest.update(b"\0")
+        with open(local_path, "rb") as source:
+            for chunk in iter(lambda: source.read(1 << 20), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()[:32]
 
 
 class SandboxExecutionManager:
@@ -232,6 +303,8 @@ class SandboxExecutionManager:
         self._resource_roots = list(resource_roots or [])
         self._states: dict[str, _SandboxState] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._warmups: dict[str, asyncio.Task[None]] = {}
+        self._prewarms: dict[str, asyncio.Task[None]] = {}
 
     async def ensure(
         self,
@@ -256,9 +329,31 @@ class SandboxExecutionManager:
             client=state.client,
         )
 
+    def prewarm(self, context: ToolExecutionContext, files: PiSessionFiles) -> None:
+        """Start the execution plane while the model reads the first message.
+
+        The container, the workspace layout, and the resource staging all happen
+        before the first tool call needs them, so that call finds a ready
+        endpoint instead of paying for the whole preparation. Failures only log:
+        the first touch takes the same path and reports its own error.
+        """
+        if os.getenv(_PREWARM_SWITCH, "").strip() == "0":
+            return
+        conversation_id = context.conversation_id
+        running = self._prewarms.get(conversation_id)
+        if running is not None and not running.done():
+            return
+        task = asyncio.create_task(self._prewarm(context, files))
+        self._prewarms[conversation_id] = task
+        task.add_done_callback(
+            lambda finished: self._forget_prewarm(conversation_id, finished)
+        )
+
     async def delete(
         self, context: ToolExecutionContext, files: PiSessionFiles
     ) -> None:
+        self._cancel_warmup(context.conversation_id)
+        self._cancel_prewarm(context.conversation_id)
         state = self._states.pop(context.conversation_id, None)
         record = files.load_sandbox() or {}
         sandbox_id = state.endpoint["sandbox_id"] if state is not None else None
@@ -296,6 +391,8 @@ class SandboxExecutionManager:
 
     async def pause(self, context: ToolExecutionContext, files: PiSessionFiles) -> None:
         """Stop the container while keeping the execution workspace resumable."""
+        self._cancel_warmup(context.conversation_id)
+        self._cancel_prewarm(context.conversation_id)
         state = self._states.pop(context.conversation_id, None)
         record = files.load_sandbox() or {}
         sandbox_id = state.endpoint["sandbox_id"] if state is not None else None
@@ -327,6 +424,8 @@ class SandboxExecutionManager:
                 # A failed call means the container may have been rebuilt or
                 # re-keyed behind this process, so re-read the platform state and
                 # mint a fresh access key instead of returning the cached bundle.
+                self._cancel_warmup(context.conversation_id)
+                self._cancel_prewarm(context.conversation_id)
                 self._states.pop(context.conversation_id, None)
             pending_staging = files.load_pending_sandbox_staging()
             existing = self._states.get(context.conversation_id)
@@ -439,7 +538,14 @@ class SandboxExecutionManager:
                 client, sandbox.id, ws_base_url, mount_path, workspace_path
             )
             await self._upload_resources(
-                client, sandbox.id, ws_base_url, workspace_path
+                client, sandbox.id, ws_base_url, mount_path, workspace_path
+            )
+            self._start_dataflow_warmup(
+                context.conversation_id,
+                client,
+                sandbox.id,
+                ws_base_url,
+                workspace_path,
             )
             logger.info(
                 "Pi sandbox workspace ready conversation_id=%s sandbox_id=%s",
@@ -581,10 +687,12 @@ class SandboxExecutionManager:
         workspace_path: str,
     ) -> None:
         storage_link = f"{workspace_path}/{STORAGE_ALIAS}"
+        public_data = f"{workspace_path}/public_data"
         script = (
             f"if [ ! -d {shlex.quote(mount_path)} ]; then "
             f"exit {_MOUNT_MISSING_EXIT_CODE}; fi\n"
             f"mkdir -p {shlex.quote(workspace_path)} && "
+            f"mkdir -p {shlex.quote(public_data)} && "
             f"rm -rf {shlex.quote(storage_link)} && "
             f"ln -s {shlex.quote(mount_path)} {shlex.quote(storage_link)}\n"
         )
@@ -619,7 +727,12 @@ class SandboxExecutionManager:
         """
         remote_path = f"/tmp/pi-sandbox-{secrets.token_hex(8)}.sh"
         await asyncio.to_thread(
-            client.write_file, sandbox_id, remote_path, script.encode("utf-8")
+            write_sandbox_file,
+            client,
+            ws_base_url=ws_base_url,
+            sandbox_id=sandbox_id,
+            path=remote_path,
+            source=script.encode("utf-8"),
         )
         quoted = shlex.quote(remote_path)
         # The subshell propagates the script's status without ending the shell
@@ -685,10 +798,12 @@ class SandboxExecutionManager:
         workflow_path = f"{workspace_path}/public_data/workflow_canvas/workflow.py"
         if workflow_dsl.strip():
             await asyncio.to_thread(
-                client.write_file,
-                sandbox_id,
-                workflow_path,
-                workflow_dsl.encode("utf-8"),
+                write_sandbox_file,
+                client,
+                ws_base_url=ws_base_url,
+                sandbox_id=sandbox_id,
+                path=workflow_path,
+                source=workflow_dsl.encode("utf-8"),
             )
             return
         await asyncio.to_thread(
@@ -705,40 +820,64 @@ class SandboxExecutionManager:
         client: SandboxClientLike,
         sandbox_id: str,
         ws_base_url: str,
+        mount_path: str,
         workspace_path: str,
     ) -> None:
         files = self._resource_files(workspace_path)
         total = len(files)
         if not total:
             return
-        logger.info(
-            "Uploading Pi session resources sandbox_id=%s files=%d",
-            sandbox_id,
-            total,
+        digest = _resource_digest(files, workspace_path)
+        cached = (
+            f"{mount_path}{PYROMIND_AGENT_RESOURCES_ROOT}/{digest}/"
+            f"{_RESOURCE_ARCHIVE_NAME}"
         )
-        archive_path = f"/tmp/{_RESOURCE_ARCHIVE_NAME}"
-        with _resource_archive(files, workspace_path) as archive:
-            await asyncio.to_thread(
-                write_sandbox_file,
-                client,
-                ws_base_url=ws_base_url,
-                sandbox_id=sandbox_id,
-                path=archive_path,
-                source=archive,
-            )
-            script = (
-                "set -e\n"
-                f"mkdir -p {shlex.quote(workspace_path)}\n"
-                f"tar -xzf {shlex.quote(archive_path)} "
-                f"-C {shlex.quote(workspace_path)}\n"
-                f"rm -f {shlex.quote(archive_path)}\n"
-            )
-            output, exit_code, timed_out = await self._run_script(
-                client,
+        reused = await self._resource_archive_cached(
+            client, sandbox_id, ws_base_url, cached
+        )
+        staged: str | None = None
+        if not reused:
+            logger.info(
+                "Uploading Pi session resources sandbox_id=%s files=%d digest=%s",
                 sandbox_id,
-                ws_base_url,
-                script,
+                total,
+                digest,
             )
+            # The archive lands under a name of its own and is renamed into
+            # place, so a conversation which reads the cache while another one
+            # uploads it never opens a half-written archive.
+            staged = f"{cached}.partial-{secrets.token_hex(4)}"
+            with _resource_archive(files, workspace_path) as archive:
+                try:
+                    await asyncio.to_thread(
+                        write_sandbox_file,
+                        client,
+                        ws_base_url=ws_base_url,
+                        sandbox_id=sandbox_id,
+                        path=staged,
+                        source=archive,
+                    )
+                except Exception:
+                    await self._remove_sandbox_file(
+                        client, sandbox_id, ws_base_url, staged
+                    )
+                    raise
+        script = (
+            "set -e\n"
+            f"mkdir -p {shlex.quote(workspace_path)}\n"
+            + (
+                f"mv {shlex.quote(staged)} {shlex.quote(cached)}\n"
+                if staged is not None
+                else ""
+            )
+            + f"tar -xzf {shlex.quote(cached)} -C {shlex.quote(workspace_path)}\n"
+        )
+        output, exit_code, timed_out = await self._run_script(
+            client,
+            sandbox_id,
+            ws_base_url,
+            script,
+        )
         if exit_code != 0:
             raise RuntimeError(
                 "PI_SANDBOX_RESOURCE_UPLOAD_FAILED: cannot unpack session "
@@ -746,10 +885,203 @@ class SandboxExecutionManager:
                 f"{_failure_detail(output, exit_code, timed_out)}"
             )
         logger.info(
-            "Pi session resource upload complete sandbox_id=%s uploaded=%d",
+            "Pi session resource upload complete sandbox_id=%s uploaded=%d reused=%s",
             sandbox_id,
             total,
+            reused,
         )
+
+    async def _resource_archive_cached(
+        self,
+        client: SandboxClientLike,
+        sandbox_id: str,
+        ws_base_url: str,
+        cached: str,
+    ) -> bool:
+        """Whether the Storage mount already holds this resource archive."""
+        try:
+            _, exit_code, _ = await self._run_script(
+                client,
+                sandbox_id,
+                ws_base_url,
+                f"test -f {shlex.quote(cached)}\n",
+            )
+        except Exception as error:  # noqa: BLE001 - a failed probe re-uploads
+            logger.info(
+                "Pi session resource cache probe failed; staging again error=%s",
+                type(error).__name__,
+            )
+            return False
+        return exit_code == 0
+
+    async def _remove_sandbox_file(
+        self,
+        client: SandboxClientLike,
+        sandbox_id: str,
+        ws_base_url: str,
+        path: str,
+    ) -> None:
+        """Best-effort removal; cleanup never replaces the original failure."""
+        try:
+            await self._run_script(
+                client,
+                sandbox_id,
+                ws_base_url,
+                f"rm -f {shlex.quote(path)}\n",
+            )
+        except Exception as error:  # noqa: BLE001 - see the docstring
+            logger.warning(
+                "Pi sandbox file cleanup failed path=%s error=%s",
+                path,
+                type(error).__name__,
+            )
+
+    def _start_dataflow_warmup(
+        self,
+        conversation_id: str,
+        client: SandboxClientLike,
+        sandbox_id: str,
+        ws_base_url: str,
+        workspace_path: str,
+    ) -> None:
+        """Pre-install the DataFlow runtime without holding up the session.
+
+        The venv lives in the sandbox, so it survives for as long as the
+        container does and every later run reuses it. A warm-up which fails only
+        logs: the run path still installs on demand.
+        """
+        if os.getenv(_DATAFLOW_WARMUP_SWITCH, "").strip() == "0":
+            return
+        running = self._warmups.get(conversation_id)
+        if running is not None and not running.done():
+            return
+        command = self._dataflow_warmup_command(workspace_path)
+        if command is None:
+            return
+        task = asyncio.create_task(
+            self._warm_dataflow(
+                conversation_id, client, sandbox_id, ws_base_url, command
+            )
+        )
+        self._warmups[conversation_id] = task
+        task.add_done_callback(
+            lambda finished: self._forget_warmup(conversation_id, finished)
+        )
+
+    async def _warm_dataflow(
+        self,
+        conversation_id: str,
+        client: SandboxClientLike,
+        sandbox_id: str,
+        ws_base_url: str,
+        command: str,
+    ) -> None:
+        try:
+            output, exit_code, timed_out = await asyncio.to_thread(
+                run_terminal_command,
+                base_url=ws_base_url,
+                api_key=client.api_key,
+                sandbox_id=sandbox_id,
+                command=command,
+                timeout_seconds=_DATAFLOW_WARMUP_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - the run path still installs
+            logger.warning(
+                "Pi DataFlow warm-up failed conversation_id=%s error=%s",
+                conversation_id,
+                type(error).__name__,
+            )
+            return
+        if exit_code != 0:
+            logger.warning(
+                "Pi DataFlow warm-up did not finish conversation_id=%s%s",
+                conversation_id,
+                _failure_detail(output, exit_code, timed_out),
+            )
+            return
+        logger.info(
+            "Pi DataFlow environment ready conversation_id=%s report=%s",
+            conversation_id,
+            output.strip()[-_FAILURE_OUTPUT_CHARS:],
+        )
+
+    def _dataflow_warmup_command(self, workspace_path: str) -> str | None:
+        """One-line command preparing the DataFlow venv, when the skill is staged."""
+        for destination, source in self._resource_roots:
+            if destination != _SKILLS_ALIAS:
+                continue
+            script = Path(source) / _DATAFLOW_SKILL / _DATAFLOW_PREPARE_SCRIPT
+            if not script.is_file():
+                continue
+            remote = (
+                f"{workspace_path}/{_SKILLS_ALIAS}/{_DATAFLOW_SKILL}/"
+                f"{_DATAFLOW_PREPARE_SCRIPT}"
+            )
+            values = _dataflow_warmup_env()
+            system_python = (
+                values.get("PYROMIND_SANDBOX_SYSTEM_PYTHON")
+                or _DEFAULT_SANDBOX_SYSTEM_PYTHON
+            )
+            # ``env`` keeps the overrides as plain assignments instead of
+            # quoting each ``NAME=value`` pair into a command of its own.
+            prepare = " ".join(
+                [
+                    "env",
+                    *(f"{name}={shlex.quote(value)}" for name, value in values.items()),
+                    shlex.quote(system_python),
+                    shlex.quote(remote),
+                    "--prepare",
+                ]
+            )
+            # The terminal bridge drops an idle connection and a first install is
+            # silent for minutes, so the install runs in the background and the
+            # foreground keeps printing progress until the status file appears.
+            status = f"/tmp/pi-dataflow-warmup-{secrets.token_hex(8)}.rc"
+            quoted_status = shlex.quote(status)
+            return (
+                f"({prepare}; printf '%s' \"$?\" > {quoted_status}) & "
+                f"pm_warm_rc=''; "
+                f'while [ -z "$pm_warm_rc" ]; do '
+                f"sleep {_DATAFLOW_WARMUP_HEARTBEAT_SECONDS}; "
+                f"pm_warm_rc=$(cat {quoted_status} 2>/dev/null); "
+                f"[ -n \"$pm_warm_rc\" ] || printf '%s\\n' '...'; done; "
+                f'rm -f {quoted_status}; exit "$pm_warm_rc"'
+            )
+        return None
+
+    def _cancel_warmup(self, conversation_id: str) -> None:
+        task = self._warmups.pop(conversation_id, None)
+        if task is not None:
+            task.cancel()
+
+    def _forget_warmup(self, conversation_id: str, task: asyncio.Task[None]) -> None:
+        if self._warmups.get(conversation_id) is task:
+            self._warmups.pop(conversation_id, None)
+
+    async def _prewarm(
+        self, context: ToolExecutionContext, files: PiSessionFiles
+    ) -> None:
+        try:
+            await self.ensure(context, files)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - the first touch retries
+            logger.warning(
+                "Pi sandbox pre-warm failed conversation_id=%s error=%s",
+                context.conversation_id,
+                type(error).__name__,
+            )
+
+    def _cancel_prewarm(self, conversation_id: str) -> None:
+        task = self._prewarms.pop(conversation_id, None)
+        if task is not None:
+            task.cancel()
+
+    def _forget_prewarm(self, conversation_id: str, task: asyncio.Task[None]) -> None:
+        if self._prewarms.get(conversation_id) is task:
+            self._prewarms.pop(conversation_id, None)
 
     def _resource_files(self, workspace_path: str) -> list[tuple[str, str]]:
         """Local resource files paired with the sandbox path each one targets."""
@@ -758,7 +1090,10 @@ class SandboxExecutionManager:
             source = os.fspath(source_root)
             if not os.path.isdir(source):
                 continue
-            for directory, _, names in os.walk(source):
+            for directory, directories, names in os.walk(source):
+                directories[:] = [
+                    name for name in directories if name not in _SKIPPED_DIRECTORIES
+                ]
                 for name in names:
                     local_path = os.path.join(directory, name)
                     if os.path.islink(local_path) or not os.path.isfile(local_path):

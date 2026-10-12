@@ -34,7 +34,10 @@ license: MIT
 负向边界：仅创建/管理单个沙箱容器 → sandbox；训练效果/loss 分析 →
 training-analysis；生成训练工作流 → generate-workflow-dsl；工作流调试 →
 debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独立 sandbox 容器
-（Pi 会话自带的执行沙箱不属于此列）。路由不确定时 AskUserQuestion，不要猜。
+（Pi 会话自带的执行沙箱不属于此列）。路由不确定时先向用户提问确认，不要猜。
+
+本 skill 中的「向用户提问确认」：用文字把缺口/候选方案讲清楚并结束本轮，等用户
+回复后再继续，不要自行假设一个答案继续执行。
 
 ## 通用 SOP（所有场景共享的控制面骨架）
 
@@ -56,6 +59,9 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
    普通 Python 脚本直接通过 terminal 执行。需要 DataFlow 环境、模型配置、格式校验和报告时，
    阅读 [terminal-cli.md](references/terminal-cli.md)，通过 terminal 调用运行脚本；
    不要调用旧的专用执行 Tool。模型配置由 SDK 注入，不在命令或配置文件中填写密钥。
+   运行 Pipeline 的解释器由脚本自身解析（镜像内置解释器 → 缓存 venv 首次安装）；
+   terminal 的默认 `python3` 不是那个解释器，不要用 `import dataflow`、全盘 `find`
+   或翻 site-packages 判断环境是否可用。要确认用 `--check`，要提前准备用 `--prepare`。
 4. **门禁**：Taxonomy 与合成小样通过后必须获得用户明确确认才提交后续全量；
    已有标签的确定性全量统计不设人工门禁，且模型调用必须为零。
 5. **全量**：需要平台执行时统一用 `df_submit_pipeline`；提交前先按
@@ -72,7 +78,9 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
    回原图（绝对路径会被 pipeline 以"必须是相对 POSIX 路径"拒绝）。
 7. **交付**：展示产物与统计；场景内的产物契约与失败分类学以 playbook 为准。
    图片预览用 `get_storage_url` 取完整签名 URL 并以 Markdown 嵌入对话，让用户
-   直接看图；保留完整签名 URL，不放进代码块。仅在用户明确只要链接时改用普通链接。
+   直接看图；保留完整签名 URL，不放进代码块。非图片产物（CSV/JSON/报告等）同样
+   原样使用返回的 URL（含完整 `?X-Amz-...` 签名参数），去掉签名会 403，不要缩短
+   或改写链接。仅在用户明确只要链接时改用普通链接。
 
 一期边界：分布分析不读取 eval/rubric/badcase；不注册 Dataset Version 或
 SQLite 元数据；不处理音视频。图片合成可复用、组合或编写策略；适用条件、

@@ -35,6 +35,11 @@ export class TerminalChannel {
     if (this.closed) throw new Error("closed");
   }
 
+  /** True once the socket failed or closed; a dead channel is never reused. */
+  get dead(): boolean {
+    return this.closed;
+  }
+
   async acknowledge(
     command: string, marker: string, deadline: number, signal?: AbortSignal,
   ): Promise<string> {

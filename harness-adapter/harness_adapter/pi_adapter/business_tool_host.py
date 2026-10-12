@@ -41,6 +41,9 @@ from openhands.tools.data_preparation import (
     DfSubmitPipelineTool,
 )
 from openhands.tools.data_preparation.inference import InferencePipelineHandler
+from openhands.tools.data_preparation.sandbox_execution import (
+    ENV_SANDBOX_DATAFLOW_PYTHON,
+)
 from openhands.tools.environment_processing import (
     EdpAggregateTool,
     EdpRenderTool,
@@ -382,9 +385,13 @@ class PyromindBusinessToolHost:
     def terminal_environment(self, context: ToolExecutionContext) -> dict[str, str]:
         from openhands.tools.data_preparation.runner import terminal_model_environment
 
-        return terminal_model_environment(
+        environment = terminal_model_environment(
             _ToolConversationFacade(context).state.agent.llm
         )
+        interpreter = os.environ.get(ENV_SANDBOX_DATAFLOW_PYTHON, "").strip()
+        if interpreter:
+            environment[ENV_SANDBOX_DATAFLOW_PYTHON] = interpreter
+        return environment
 
     def specs(self) -> list[dict[str, Any]]:
         specs = [validation_tool_spec()]

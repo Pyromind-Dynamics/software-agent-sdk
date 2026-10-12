@@ -12,6 +12,7 @@ from uuid import uuid4
 import pytest
 from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
 from pyromind_runtime.application.reusable_workflows import ReusableWorkflows
+from pyromind_runtime.domain.content import JsonObject, JsonValue
 
 
 @pytest.mark.parametrize(
@@ -48,6 +49,42 @@ async def test_execution_host_reports_preparation_stop_evidence(cancelled, stopp
     assert events[0]["execution"]["phase"] == "preparing"
     assert events[-1]["execution"] == evidence
     assert subscriptions[-1] is None
+
+
+async def test_execution_host_mirrors_host_local_exports(tmp_path):
+    conversation = tmp_path / "conversation"
+    export = conversation / "public_data/agentgenome-traces/trace.json"
+    export.parent.mkdir(parents=True)
+    export.write_text('{"trace_id": "trace"}')
+    remote: dict[str, bytes] = {}
+    calls: list[str] = []
+
+    async def request(method, payload):
+        calls.append(method)
+        if method == "execution.write":
+            remote[payload["path"]] = base64.b64decode(payload["content"])
+            return {"path": payload["path"]}
+        if method == "execution.resolve":
+            return {"path": f"/sandbox/{payload['path']}"}
+        assert method == "execution.read"
+        content = remote.get(str(payload["path"]).removeprefix("/sandbox/"))
+        if content is None:
+            raise FileNotFoundError(payload["path"])
+        return {"content": base64.b64encode(content).decode("ascii")}
+
+    host = ExecutionHost(request, lambda *_: None, conversation)
+    # The bridge runs the genome service in a worker thread, so blocking on the
+    # loop is only safe away from the loop thread.
+    assert (
+        await asyncio.to_thread(host.read, "public_data/agentgenome-traces/trace.json")
+        == b'{"trace_id": "trace"}'
+    )
+    assert calls == ["execution.write", "execution.resolve", "execution.read"]
+
+    remote["public_data/data/raw.csv"] = b"a,b\n"
+    calls.clear()
+    assert await asyncio.to_thread(host.read, "public_data/data/raw.csv") == b"a,b\n"
+    assert calls == ["execution.resolve", "execution.read"]
 
 
 @pytest.fixture
@@ -243,6 +280,212 @@ async def test_legacy_revision_needs_declarations_and_successful_run_can_be_hand
     assert calls.count("execution.run") == before
 
 
+PRELABEL_SCRIPT = """import csv, json, sys
+
+prefix = json.load(open(sys.argv[2]))["prefix"]
+with open(sys.argv[1], newline="") as stream:
+    for row in csv.DictReader(stream):
+        print(json.dumps({"text": prefix + row["text"], "label": row["label"]}))
+"""
+
+CLEAN_SCRIPT = """import csv, json, sys
+
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+writer = csv.DictWriter(sys.stdout, fieldnames=["text", "label"])
+writer.writeheader()
+for row in rows:
+    writer.writerow(row)
+"""
+
+
+def write_capture_workspace(workspace: Path) -> list[JsonValue]:
+    """Scripts, data and exported traces the way the Pi extension leaves them."""
+    public = workspace / "public_data"
+    for name, source in (("prelabel", PRELABEL_SCRIPT), ("clean", CLEAN_SCRIPT)):
+        path = public / "scripts" / f"{name}.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+    (public / "rules.json").write_text('{"prefix": "p-"}')
+    for directory in ("data", "out", "agentgenome-traces"):
+        (public / directory).mkdir(parents=True, exist_ok=True)
+    (public / "data/raw.csv").write_text("text,label\none,a\n")
+    (public / "data/raw2.csv").write_text("text,label\nthree,c\n")
+    (public / "out/review.jsonl").write_text('{"text": "p-one", "label": "a"}\n')
+    (public / "out/review2.jsonl").write_text('{"text": "p-three", "label": "c"}\n')
+    commands = [
+        "python3 public_data/scripts/prelabel.py public_data/data/raw.csv "
+        "public_data/rules.json > public_data/out/prelabeled.jsonl",
+        "python3 public_data/scripts/clean.py public_data/out/review.jsonl "
+        "> public_data/out/clean.csv",
+    ]
+    refs: list[JsonValue] = []
+    for trace_id in ("s1", "s2"):
+        steps = [
+            {
+                "kind": "tool",
+                "entry_id": f"{trace_id}-{index}",
+                "tool": "bash",
+                "call_id": f"{trace_id}-{index}",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "args": {"command": command},
+                "result": {"is_error": False, "text": "ok"},
+            }
+            for index, command in enumerate(commands, start=1)
+        ]
+        relative = f"public_data/agentgenome-traces/{trace_id}.json"
+        (workspace / relative).write_text(
+            json.dumps(
+                {
+                    "trace_version": 1,
+                    "trace_id": trace_id,
+                    "session_id": trace_id,
+                    "step_count": len(steps),
+                    "steps": steps,
+                }
+            )
+        )
+        refs.append({"trace_id": trace_id, "path": relative})
+    return refs
+
+
+async def test_capture_freezes_a_graph_and_publishes_after_its_replay(setup_workflow):
+    backend, workspace, _ = setup_workflow
+    refs = write_capture_workspace(workspace)
+    events = []
+
+    async def publish(*event):
+        events.append(event)
+
+    workflows = ReusableWorkflows(backend, publish)
+    runs = backend.service.root / "runs"
+    executed = {path.name for path in runs.iterdir()} if runs.exists() else set()
+    plan = await workflows.invoke(
+        "session",
+        "capture",
+        {
+            "trace_refs": refs,
+            "label": "预打标到清洗",
+            "asset_id": "prelabel-clean",
+            "new_params": {
+                "raw": "public_data/data/raw2.csv",
+                "review": "public_data/out/review2.jsonl",
+                "rules": "public_data/rules.json",
+            },
+        },
+        "capture-1",
+        "origin-turn",
+    )
+    assert plan["reused"] is False
+    assert plan["run_id"]
+    # The capture call only freezes the package and queues replay A.
+    assert {path.name for path in runs.iterdir()} == executed
+    assert workflows.busy("session")
+    await asyncio.sleep(0)
+    assert not events
+    workflows.release("session", "origin-turn")
+    await asyncio.wait_for(workflows.wait_idle("session"), 30)
+
+    assert [event[2] for event in events].count("operation.completed") == 1
+    capture = backend.service.captures.status(plan["capture_id"])
+    assert capture["stage"] == "published"
+    assert capture["generalized"] is True
+    assert capture["run"]["status"] == "succeeded"
+    package = plan["package"]
+    assert isinstance(package, str)
+    assert json.loads(Path(package, "manifest.json").read_text())["parameters"]
+
+    again = await workflows.invoke(
+        "session",
+        "capture",
+        {"trace_refs": refs, "label": "预打标到清洗", "asset_id": "prelabel-clean"},
+        "capture-2",
+        "origin-turn",
+    )
+    assert again["reused"] is True
+    assert again["run_id"] is None
+    await workflows.close()
+
+
+async def test_distill_normalizes_a_chain_and_publishes_after_its_replay(
+    setup_workflow,
+):
+    backend, workspace, _ = setup_workflow
+    write_capture_workspace(workspace)
+    events = []
+
+    async def publish(*event):
+        events.append(event)
+
+    workflows = ReusableWorkflows(backend, publish)
+    arguments = {
+        "label": "预打标到清洗",
+        "asset_id": "prelabel-clean-distilled",
+        "final_artifact": "public_data/out/clean.csv",
+        "steps": [
+            {
+                "run": "python3 public_data/scripts/prelabel.py "
+                "public_data/data/raw.csv public_data/rules.json "
+                "> public_data/out/prelabeled.jsonl",
+                "from": "s1:1",
+            },
+            {
+                "run": "python3 public_data/scripts/clean.py "
+                "public_data/out/prelabeled.jsonl > public_data/out/clean.csv",
+                "from": "s1:2",
+            },
+        ],
+        "new_params": {
+            "raw": "public_data/data/raw2.csv",
+            "rules": "public_data/rules.json",
+        },
+    }
+    plan = await workflows.invoke(
+        "session", "distill", arguments, "distill-1", "origin-turn"
+    )
+    assert plan["reused"] is False
+    assert plan["run_id"]
+    distilled = plan["distilled"]
+    assert isinstance(distilled, dict)
+    trace_id = distilled["trace_id"]
+    assert isinstance(trace_id, str)
+    assert trace_id.startswith("distilled-")
+    nodes = distilled["nodes"]
+    assert isinstance(nodes, list)
+    assert [node["id"] for node in nodes if isinstance(node, dict)] == [
+        "prelabel",
+        "clean",
+    ]
+    assert distilled["auxiliary"] == []
+    # The distill call only freezes the package and queues replay A.
+    assert workflows.busy("session")
+    workflows.release("session", "origin-turn")
+    await asyncio.wait_for(workflows.wait_idle("session"), 30)
+
+    assert [event[2] for event in events].count("operation.completed") == 1
+    capture = backend.service.captures.status(plan["capture_id"])
+    assert capture["stage"] == "published"
+    assert capture["generalized"] is True
+    assert capture["run"]["status"] == "succeeded"
+
+    again = await workflows.invoke(
+        "session", "distill", arguments, "distill-2", "origin-turn"
+    )
+    assert again["reused"] is True
+    assert again["run_id"] is None
+    with pytest.raises(ValueError, match="内联代码"):
+        await workflows.invoke(
+            "session",
+            "distill",
+            {
+                **arguments,
+                "steps": [{"run": "python3 -c 'print(1)' > public_data/out/x.csv"}],
+            },
+            "distill-3",
+            "origin-turn",
+        )
+    await workflows.close()
+
+
 async def test_workflow_waits_for_turn_and_cancels_queued(setup_workflow):
     backend, _, _ = setup_workflow
     events = []
@@ -435,15 +678,22 @@ async def test_stage_wait_does_not_block_status_and_cancel(setup_workflow):
     stopped = asyncio.Event()
     events = []
 
-    async def agent_task(scope, request):
+    async def agent_task(scope: str, request: JsonObject) -> JsonObject:
         started.set()
         try:
             await asyncio.Event().wait()
         finally:
             stopped.set()
+        raise AssertionError("a cancelled stage must not resume the agent task")
 
     class StageBackend:
-        async def invoke(self, scope, action, arguments, request_id):
+        async def invoke(
+            self,
+            scope: str,
+            action: str,
+            arguments: JsonObject,
+            request_id: str,
+        ) -> JsonObject:
             return {
                 "id": "stage-run",
                 "status": "queued" if action == "run" else "cancelling",

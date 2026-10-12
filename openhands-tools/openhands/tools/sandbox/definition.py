@@ -24,6 +24,7 @@ import shlex
 import ssl
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 
 import certifi
@@ -638,6 +639,19 @@ class SandboxDeleteFileExecutor(
 
 
 _EXIT_MARKER = "__PYROMIND_TERMINAL_EXIT__"
+_ACK_MARKER = "__PM_ACK__"
+# Base64 characters one staging line carries. A canonical PTY silently drops a
+# line longer than its input cap and leaves the shell waiting for a quote which
+# never closes; the cap is 1024 bytes on macOS and 4096 on Linux, so the line -
+# chunk plus quoting - stays under the smaller one.
+_WRITE_CHUNK_CHARS = 512
+# Bytes of one staging burst written to the TTY before it is acknowledged. The
+# canonical input queue holds 4096 bytes, so the burst plus the short
+# acknowledgement line that trails it still fits; the Pi runtime stages under
+# the same budget so both transports acknowledge at the same cadence.
+_WRITE_BATCH_BUDGET_BYTES = 3584
+# Staging directory holding the transient base64 payload of one write.
+_WRITE_STAGING_DIRNAME = ".pyromind-agent-staging"
 _TERMINAL_COLS = 160
 _TERMINAL_ROWS = 48
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
@@ -780,15 +794,116 @@ class SandboxFileClient(Protocol):
 
     api_key: str
 
-    def write_file(
-        self, sandbox_id: str, path: str, source: str | os.PathLike[str] | bytes
-    ) -> Any: ...
+
+def _write_batches(encoded: str, staging: str) -> list[str]:
+    """Group the base64 payload into acknowledged staging bursts.
+
+    Each line stays below the PTY line cap; the bursts stay below the canonical
+    input queue so the shell can consume one before the next arrives.
+    """
+    quoted_staging = shlex.quote(staging)
+    batches: list[str] = []
+    lines: list[str] = []
+    size = 0
+    for at in range(0, len(encoded), _WRITE_CHUNK_CHARS):
+        chunk = encoded[at : at + _WRITE_CHUNK_CHARS]
+        line = f"printf '%s' {shlex.quote(chunk)} >> {quoted_staging}"
+        line_size = len(line.encode("utf-8")) + 1
+        if lines and size + line_size > _WRITE_BATCH_BUDGET_BYTES:
+            batches.append("\n".join(lines))
+            lines = []
+            size = 0
+        lines.append(line)
+        size += line_size
+    if lines:
+        batches.append("\n".join(lines))
+    return batches
 
 
-def _is_empty_source(source: str | os.PathLike[str] | bytes) -> bool:
+_WRITE_DECODER = (
+    "import base64,os,sys\n"
+    "src,dst,size=sys.argv[1],sys.argv[2],int(sys.argv[3])\n"
+    "data=base64.b64decode(open(src,'rb').read())\n"
+    "open(dst,'wb').write(data)\n"
+    "os.remove(src)\n"
+    "raise SystemExit(0 if len(data)==size else 1)\n"
+)
+
+
+def _acknowledgement(*, token: str, index: int) -> tuple[str, str]:
+    """Shell line acknowledging one burst, and the marker it prints.
+
+    The marker is split across two ``printf`` arguments, so the command line the
+    PTY echoes back never carries it: only the shell running the line does. An
+    echoed line would acknowledge the bytes reaching the input queue, not the
+    shell consuming them.
+    """
+    stage = f"{token}:{index}"
+    command = f"printf '%s%s:%s\\n' '{_ACK_MARKER}' '{stage}' ok"
+    return command, f"{_ACK_MARKER}{stage}:ok"
+
+
+def _write_script(*, path: str, staging: str, size: int) -> str:
+    """One shell line staging the payload, decoding it, and checking the size.
+
+    The caller appends the status echo, so the decode stays chained to the
+    directory creation: a failure reports its status instead of ending the
+    shell which prints it.
+    """
+    quoted_path = shlex.quote(path)
+    directory = posixpath.dirname(path)
+    quoted_directory = shlex.quote(directory) if directory else "."
+    return (
+        f"mkdir -p {quoted_directory} && "
+        f"python3 -c {shlex.quote(_WRITE_DECODER)} "
+        f"{shlex.quote(staging)} {quoted_path} {size}\n"
+    )
+
+
+def _read_source(source: str | os.PathLike[str] | bytes) -> bytes:
     if isinstance(source, bytes):
-        return not source
-    return os.path.getsize(source) == 0
+        return source
+    return Path(source).read_bytes()
+
+
+def _wait_for_marker(
+    terminal: Any,
+    buffer: bytearray,
+    *,
+    needle: bytes,
+    deadline: float,
+    exit_marker: str | None = None,
+) -> bool:
+    """Read terminal output until ``needle`` arrives before ``deadline``.
+
+    ``exit_marker`` additionally requires the exit code the shell printed,
+    because the echoed command line carries the marker text alone.
+    """
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        at = buffer.find(needle)
+        if at >= 0 and (
+            exit_marker is None
+            or _terminal_exit_code(buffer[at:].decode("utf-8", "replace"), exit_marker)
+            is not None
+        ):
+            return True
+        try:
+            message = terminal.recv(timeout=remaining)
+        except TimeoutError:
+            return False
+        if isinstance(message, str):
+            try:
+                control = json.loads(message)
+                if isinstance(control, dict) and control.get("type") == "pong":
+                    continue
+            except (json.JSONDecodeError, TypeError):
+                pass
+            buffer.extend(message.encode("utf-8", "replace"))
+        else:
+            buffer.extend(message)
 
 
 def write_sandbox_file(
@@ -800,30 +915,78 @@ def write_sandbox_file(
     source: str | os.PathLike[str] | bytes,
     timeout_seconds: int = 60,
 ) -> None:
-    """Write one file into a sandbox, including zero-byte files.
+    """Write one file into a sandbox through the terminal WebSocket.
 
-    ``SandboxClient.write_file`` splits the payload into chunks and the platform
-    rejects an init carrying zero chunks, so empty content is created through
-    the terminal bridge instead.
+    The file API is reached through a portal domain which is neither
+    cluster-direct nor reliable from every runner, while the terminal socket is
+    cluster-direct. The payload therefore travels the same channel as commands:
+    base64 lines are staged into a transient file in acknowledged bursts, then
+    decoded and size-checked in one command.
     """
-    if not _is_empty_source(source):
-        client.write_file(sandbox_id, path, source)
-        return
-    directory = posixpath.dirname(path) or "/"
-    command = f"mkdir -p {shlex.quote(directory)} && : > {shlex.quote(path)}"
-    output, exit_code, timed_out = run_terminal_command(
+    payload = _read_source(source)
+    encoded = base64.b64encode(payload).decode("ascii")
+    staging = f"{_WRITE_STAGING_DIRNAME}/payload-{secrets.token_hex(6)}.b64"
+    batches = _write_batches(encoded, staging)
+    script = _write_script(path=path, staging=staging, size=len(payload))
+    # One round trip per burst, so the deadline scales with the payload instead
+    # of failing a large write on the default command budget.
+    deadline = time.monotonic() + max(timeout_seconds, 30 + 5 * len(batches))
+    url = terminal_websocket_url(
         base_url=ws_base_url,
-        api_key=client.api_key,
         sandbox_id=sandbox_id,
-        command=command,
-        timeout_seconds=timeout_seconds,
+        api_key=client.api_key,
     )
-    if exit_code != 0:
-        raise RuntimeError(
-            f"PI_SANDBOX_WRITE_FAILED: cannot create empty file {path} "
-            f"(exit_code={exit_code}, timed_out={timed_out}, "
-            f"output={output.strip()[-200:]})"
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    token = secrets.token_hex(4)
+    buffer = bytearray()
+    timed_out = False
+    with connect(url, ssl=ssl_context, open_timeout=30, close_timeout=5) as terminal:
+        staged = True
+        # The staging file has to exist before the first burst is written, so
+        # an empty payload decodes from an empty file instead of failing.
+        terminal.send(
+            (
+                f"mkdir -p {shlex.quote(_WRITE_STAGING_DIRNAME)}\n"
+                f": > {shlex.quote(staging)}\r\n"
+            ).encode("ascii")
         )
+        for index, batch in enumerate(batches):
+            ack, ack_marker = _acknowledgement(token=token, index=index)
+            # The burst and its acknowledgement travel as one input, so the
+            # shell has consumed the whole burst when it prints the marker.
+            terminal.send((batch + f"\n{ack}\r\n").encode("utf-8", "replace"))
+            if not _wait_for_marker(
+                terminal,
+                buffer,
+                needle=ack_marker.encode("ascii"),
+                deadline=deadline,
+            ):
+                staged = False
+                break
+        marker = f"{_EXIT_MARKER}{token}"
+        if staged:
+            terminal.send((script + f"echo {marker}:$?\r\n").encode("utf-8", "replace"))
+            if not _wait_for_marker(
+                terminal,
+                buffer,
+                needle=marker.encode("ascii"),
+                deadline=deadline,
+                exit_marker=marker,
+            ):
+                timed_out = True
+        try:
+            terminal.send(b"exit\r\n")
+        except Exception:  # noqa: BLE001
+            pass
+    text = _strip_ansi(buffer.decode("utf-8", "replace"))
+    exit_code = _terminal_exit_code(text, marker)
+    if staged and not timed_out and exit_code == 0:
+        return
+    raise RuntimeError(
+        f"PI_SANDBOX_WRITE_FAILED: cannot write file {path} "
+        f"(exit_code={exit_code}, timed_out={timed_out}, "
+        f"output={text.strip()[-200:]})"
+    )
 
 
 class SandboxTerminalAction(Action):

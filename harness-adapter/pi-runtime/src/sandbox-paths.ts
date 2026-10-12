@@ -1,4 +1,6 @@
-import { posix } from "node:path";
+import { isAbsolute, posix, resolve } from "node:path";
+
+import { inside } from "./workspace-policy.js";
 
 export type SandboxPathOperation = "read" | "write";
 
@@ -7,6 +9,46 @@ export interface SandboxPathAlias {
   host: string;
   /** Runtime alias the execution plane resolves, e.g. `.agents/skills`. */
   alias: string;
+}
+
+/**
+ * Agent-host copies of the read-only resource roots a sandbox mirrors.
+ *
+ * Skill and knowledge files are uploaded into the sandbox from these very
+ * directories, so reading one from the host returns the same bytes without a
+ * sandbox round trip, and it still resolves when the sandbox copy is missing
+ * because the container predates the last upload. Reads only: writes to these
+ * roots stay with `SandboxPathPolicy`, which rejects them.
+ */
+export class SandboxReadMirror {
+  private readonly roots: readonly SandboxPathAlias[];
+
+  constructor(roots: readonly SandboxPathAlias[]) {
+    // A nested root has to win over the directory that contains it.
+    this.roots = [...roots].sort(
+      (left, right) => right.alias.split("/").length - left.alias.split("/").length,
+    );
+  }
+
+  /** Host file for a model-supplied alias, e.g. `.agents/skills/x/notes.md`. */
+  resolveAlias(input: string): string | undefined {
+    if (isAbsolute(input)) return undefined;
+    const parts = input.split("/").filter((part) => part !== "" && part !== ".");
+    for (const { alias, host } of this.roots) {
+      const aliasParts = alias.split("/");
+      if (parts.length < aliasParts.length) continue;
+      if (!aliasParts.every((part, index) => parts[index] === part)) continue;
+      const target = resolve(host, ...parts.slice(aliasParts.length));
+      return inside(target, host) ? target : undefined;
+    }
+    return undefined;
+  }
+
+  /** The same host file, for a path a caller already resolved into a root. */
+  resolveHost(path: string): string | undefined {
+    if (!isAbsolute(path)) return undefined;
+    return this.roots.some(({ host }) => inside(path, host)) ? path : undefined;
+  }
 }
 
 /**
@@ -25,6 +67,30 @@ export function applySandboxPathAliases(
     rewritten = rewritten.split(host).join(alias);
   }
   return rewritten;
+}
+
+/** Replaces the host working directory pi appends to the system prompt. */
+const SANDBOX_WORKING_DIRECTORY =
+  "Current working directory: . (the conversation root inside the sandbox " +
+  "execution environment; resolve every path relative to it, using relative " +
+  "paths such as storage/..., public_data/... and .agents/skills/...)";
+
+/**
+ * Point the model at the sandbox-side conversation root instead of the host
+ * directory pi appended.
+ *
+ * The execution plane resolves relative paths against the conversation root,
+ * so a host path in the prompt sends terminal commands to a directory that
+ * does not exist inside the sandbox.
+ */
+export function applySandboxWorkingDirectory(
+  systemPrompt: string,
+  workspaceRoot: string,
+): string {
+  return systemPrompt.replace(
+    `Current working directory: ${workspaceRoot.replace(/\\/g, "/")}`,
+    SANDBOX_WORKING_DIRECTORY,
+  );
 }
 
 export interface SandboxPathPolicyInput {

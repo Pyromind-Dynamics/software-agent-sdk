@@ -15,6 +15,21 @@ from pyromind_runtime.ports.workflows import WorkflowBackend
 type Publish = Callable[[str, str, str, JsonObject], Coroutine[Any, Any, None]]
 
 
+def started_run(action: str, result: JsonObject) -> str | None:
+    """The run a backend call just queued: a plain run, or a capture/distill replay."""
+    if action == "run":
+        if result.get("status") != "queued":
+            return None
+        run_id = result.get("id")
+        if not isinstance(run_id, str):
+            raise ValueError("workflow backend returned no run id")
+        return run_id
+    if action in {"capture", "distill"}:
+        run_id = result.get("run_id")
+        return run_id if isinstance(run_id, str) else None
+    return None
+
+
 @dataclass
 class _Run:
     run_id: str
@@ -53,10 +68,7 @@ class ReusableWorkflows:
         origin_run_id: str | None = None,
     ) -> JsonObject:
         result = await self.backend.invoke(scope, action, arguments, request_id)
-        if action == "run" and result.get("status") == "queued":
-            run_id = result.get("id")
-            if not isinstance(run_id, str):
-                raise ValueError("workflow backend returned no run id")
+        if (run_id := started_run(action, result)) is not None:
             if scope not in self.active or self.active[scope].run_id != run_id:
                 run = _Run(run_id, origin_run_id)
                 self.active[scope] = run

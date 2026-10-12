@@ -59,7 +59,9 @@ Manifest 小文件；不要为此创建 sandbox。
    到另一个文件。**vision 小样例外**：图片按 manifest 的相对路径解析，`storage/...`
    的 manifest 与工作区里的 manifest 都在原地解析其图片，工作区里的 manifest 要求
    图片与其同目录，`args[0]` 一律传 manifest 文件本身 —— 传目录会走目录发现，
-   丢掉 `image_labels` 等 manifest 字段。
+   丢掉 `image_labels` 等 manifest 字段。同时按
+   [terminal-cli.md](../../terminal-cli.md) 的「运行环境」后台启动一次 `--prepare`
+   预热（同一沙箱只需一次；小样执行会在同一把锁上等它装完，不重复安装）。
 2. 按下表（运行规则）只读取相关场景 case 文档，同时读取
    [通用约定](dataflow-common.md) 和
    [输出契约](schema-conventions.md)。

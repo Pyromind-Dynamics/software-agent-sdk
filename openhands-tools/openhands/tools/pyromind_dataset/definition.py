@@ -671,7 +671,10 @@ _GET_STORAGE_URL_DESCRIPTION = (
     "copy those into the workspace first (for example under `public_data/`) "
     "and call this tool again. "
     "URLs are temporary pre-signed links, so embed them in the reply instead "
-    "of keeping them for later.\n"
+    "of keeping them for later. Each result comes with a ready-to-paste "
+    "`markdown:` line: use it verbatim. The signature lives in the URL's query "
+    "string, so never shorten the link, drop the `?X-Amz-...` part, or reorder "
+    "its parameters - a URL without its signature returns 403.\n"
 )
 
 
@@ -798,7 +801,10 @@ class GetStorageUrlExecutor(
                 continue
             urls.append(StoragePreviewUrl(path=storage_path, url=url))
 
-        lines = [f"{entry.path} -> {entry.url}" for entry in urls]
+        lines: list[str] = []
+        for entry in urls:
+            lines.append(f"path: {entry.path}")
+            lines.append(f"markdown: [{PurePosixPath(entry.path).name}]({entry.url})")
         if failures:
             lines.append("--- failed ---")
             lines.extend(failures)

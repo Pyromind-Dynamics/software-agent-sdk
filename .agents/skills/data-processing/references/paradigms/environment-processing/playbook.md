@@ -92,7 +92,7 @@ agent 不需要做任何事。
 **调研纪律(硬约束)**:写模板前的调研只允许两类动作——查看数据(用
 `read`/`terminal` 直读 `storage/...`)与读本 skill 文档/源码。单文件超限时
 **不要**把全量数据拷进会话工作区查 schema——那会把全量数据拉回 agent 侧,
-违背三段平台化的控制面原则;正确动作是 AskUserQuestion 向用户说明缺口
+违背三段平台化的控制面原则;正确动作是先向用户提问,说明缺口
 与候选方案,由用户决策。字段来源表达不了时先查下方 spec 能力表
 (`message`/`storage_file` kind 与点号嵌套下钻覆盖 chat 格式、逐任务目录
 与 struct 嵌套形态),仍表达不了再问用户,不要绕开平台自行构造 manifest,
@@ -200,9 +200,9 @@ edp_submit(manifest=<render 输出的 batch-001/manifest.jsonl>, limit=3)
   sft/slime 即时产出——用户要看"构建出的数据"零等待,转换层信号
   (如 reward<1.0 的 usable 记录不进 SFT)在烧全量前就暴露
 
-**2.2 用户决策门禁(硬约束,AskUserQuestion)**
+**2.2 用户决策门禁(硬约束,须向用户提问确认)**
 
-smoke 终态回调并汇报 verdict 分布 + 单条均时后,**必须 AskUserQuestion
+smoke 终态回调并汇报 verdict 分布 + 单条均时后,**必须向用户提问确认,
 让用户三选一,禁止 agent 默认走全量**:
 
 - ① **串行全量**(默认;每次提交一片,终态回调后检查再提交下一片)
@@ -230,7 +230,7 @@ edp_submit(shards=<shards.json 路径>, shard_offset=<起始片>, shard_count=<�
 **2.4 批间确认(硬约束)**
 
 并发批全部片终态后:汇报本批统计(usable/error 分布、与前批对比、单条均时)
-→ **再次 AskUserQuestion:继续下一批 / 调整批容量 / 停止**。不自动推进
+→ **再次向用户提问确认:继续下一批 / 调整批容量 / 停止**。不自动推进
 下一批。与既有 `Terminated` 回调约定一致:终止/失败不得自动重提交,
 交用户决策;需介入时先 `df_stop_task(task_id)` 停平台任务,再改再提交。
 

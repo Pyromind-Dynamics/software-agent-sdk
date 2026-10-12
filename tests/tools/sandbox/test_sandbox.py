@@ -1,5 +1,10 @@
 """Tests for the Pyromind sandbox tools."""
 
+import base64
+import re
+import subprocess
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock
@@ -25,6 +30,7 @@ from openhands.tools.sandbox import (
     SandboxTerminalExecutor,
     SandboxWriteFileAction,
     SandboxWriteFileExecutor,
+    write_sandbox_file,
 )
 
 
@@ -68,10 +74,32 @@ def _patch_client(monkeypatch: pytest.MonkeyPatch, client: MagicMock) -> None:
 
 
 class _FakeTerminal:
-    def __init__(self, url: str, chunks: list[bytes]):
+    def __init__(
+        self,
+        url: str,
+        chunks: list[bytes],
+        workspace: str | None = None,
+    ):
         self.url = url
-        self.chunks = list(chunks)
         self.sent: list[bytes] = []
+        self.workspace = workspace
+        self._scripted = list(chunks)
+        self._pending: list[tuple[bytes | None, bytes]] = []
+
+    def _execute(self, script: str) -> None:
+        """Run one sent line the way the sandbox shell would."""
+        if self.workspace is None:
+            self.workspace = tempfile.mkdtemp(prefix="fake-sandbox-")
+        completed = subprocess.run(
+            ["sh", "-c", script],
+            cwd=self.workspace,
+            capture_output=True,
+            timeout=60,
+        )
+        if completed.stdout:
+            self._pending.append((None, completed.stdout))
+        if completed.stderr:
+            self._pending.append((None, completed.stderr))
 
     def _exit_marker(self) -> bytes:
         for data in self.sent:
@@ -87,25 +115,40 @@ class _FakeTerminal:
 
     def send(self, data: bytes) -> None:
         self.sent.append(data)
+        if self._scripted:
+            # Scripted terminals replay the chunks the test provides.
+            return
+        text = data.decode("utf-8", "replace").rstrip("\r\n")
+        # The PTY echoes the whole input as it reaches the line discipline,
+        # before the shell runs any of it. Acknowledgements and the status
+        # line are printed by the shell, so the echo alone never satisfies a
+        # wait.
+        self._pending.append((None, f"{text}\r\n".encode()))
+        self._execute(text)
 
     def recv(self, timeout: float) -> bytes:
-        if not self.chunks:
+        if self._scripted:
+            chunk = self._scripted.pop(0)
+            chunk = chunk.replace(b"<EXIT_MARKER>", self._exit_marker())
+            if b"<ECHO>" in chunk:
+                echoed = self.sent[1].strip() if len(self.sent) > 1 else b""
+                chunk = chunk.replace(b"<ECHO>", echoed)
+            return chunk
+        if not self._pending:
             raise TimeoutError
-        chunk = self.chunks.pop(0)
-        chunk = chunk.replace(b"<EXIT_MARKER>", self._exit_marker())
-        if b"<ECHO>" in chunk:
-            echoed = self.sent[1].strip() if len(self.sent) > 1 else b""
-            chunk = chunk.replace(b"<ECHO>", echoed)
+        _, chunk = self._pending.pop(0)
         return chunk
 
 
 def _fake_terminal(
-    monkeypatch: pytest.MonkeyPatch, chunks: list[bytes]
+    monkeypatch: pytest.MonkeyPatch,
+    chunks: list[bytes],
+    workspace: str | None = None,
 ) -> list[_FakeTerminal]:
     terminals: list[_FakeTerminal] = []
 
     def fake_connect(url: str, **kwargs: object) -> _FakeTerminal:
-        terminal = _FakeTerminal(url, chunks)
+        terminal = _FakeTerminal(url, chunks, workspace)
         terminals.append(terminal)
         return terminal
 
@@ -355,18 +398,66 @@ def test_sandbox_delete_other_errors_do_not_pause(
     client.sandboxes.pause.assert_not_called()
 
 
+def _shell_argument(text: str) -> str:
+    """The first shell word of ``text``, keeping quoted characters."""
+    value = ""
+    quote = ""
+    for index, char in enumerate(text):
+        if quote == "'" and char == "'":
+            quote = ""
+            continue
+        if quote == '"' and char == '"':
+            quote = ""
+            continue
+        if quote and char == "\\" and index + 1 < len(text):
+            value += text[index + 1]
+            continue
+        if not quote and char in {"'", '"'}:
+            quote = char
+            continue
+        if not quote and char == " ":
+            break
+        value += char
+    return value
+
+
+def _staged_payload(terminal: _FakeTerminal) -> bytes:
+    """Rebuild the bytes one write staged, in staging order."""
+    chunks = [
+        _shell_argument(match.group(1).decode())
+        for data in terminal.sent
+        for match in re.finditer(rb"printf '%s' (.*?) >> ", data)
+    ]
+    return base64.b64decode("".join(chunks))
+
+
+def _ack_needles(terminal: _FakeTerminal) -> list[bytes]:
+    """The marker each staged burst is acknowledged by."""
+    needles: list[bytes] = []
+    for data in terminal.sent:
+        match = re.search(rb"'__PM_ACK__' '([^']+)' ok", data)
+        if match is None:
+            continue
+        needle = b"__PM_ACK__" + match.group(1) + b":ok"
+        # The shell assembles the marker from separate words, so the command
+        # line the PTY echoes back never carries it.
+        assert needle not in data
+        needles.append(needle)
+    return needles
+
+
 def test_sandbox_write_file_creates_empty_files_through_the_terminal(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # The chunked upload API rejects an init with zero chunks, so empty content
-    # has to be created inside the container instead.
+    # The file API is reached through the portal domain, so even empty files
+    # travel the cluster-direct terminal socket.
     client = MagicMock()
     _patch_client(monkeypatch, client)
-    terminals = _fake_terminal(monkeypatch, [b"<EXIT_MARKER>:0\r\n"])
+    terminals = _fake_terminal(monkeypatch, [], str(tmp_path))
 
     observation = SandboxWriteFileExecutor(**_executor_kwargs())(
         SandboxWriteFileAction(
-            sandbox_id=_SANDBOX_ID, path="/data/pkg/__init__.py", content=""
+            sandbox_id=_SANDBOX_ID, path="pkg/__init__.py", content=""
         ),
         _fake_conversation(),
     )
@@ -375,29 +466,134 @@ def test_sandbox_write_file_creates_empty_files_through_the_terminal(
     assert observation.size == 0
     client.sandboxes.write_file.assert_not_called()
     assert len(terminals) == 1
-    assert (
-        terminals[0].sent[0] == b"mkdir -p /data/pkg && : > /data/pkg/__init__.py\r\n"
+    assert terminals[0].url.startswith("wss://pre-api.pyromind.ai")
+    assert any(b"mkdir -p pkg" in s for s in terminals[0].sent)
+    assert any(b"mkdir -p .pyromind-agent-staging" in s for s in terminals[0].sent)
+    assert any(
+        b"python3 -c" in s and b" pkg/__init__.py 0" in s for s in terminals[0].sent
     )
+    assert (tmp_path / "pkg" / "__init__.py").stat().st_size == 0
 
 
-def test_sandbox_write_file_uses_the_chunked_api_for_content(
-    monkeypatch: pytest.MonkeyPatch,
+def test_sandbox_write_file_stages_content_over_the_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client = MagicMock()
     _patch_client(monkeypatch, client)
+    terminals = _fake_terminal(monkeypatch, [], str(tmp_path))
 
     observation = SandboxWriteFileExecutor(**_executor_kwargs())(
-        SandboxWriteFileAction(
-            sandbox_id=_SANDBOX_ID, path="/data/notes.md", content="hi\n"
-        ),
+        SandboxWriteFileAction(sandbox_id=_SANDBOX_ID, path="notes.md", content="hi\n"),
         _fake_conversation(),
     )
 
     assert not observation.is_error
     assert observation.size == 3
-    client.sandboxes.write_file.assert_called_once_with(
-        _SANDBOX_ID, "/data/notes.md", b"hi\n"
+    client.sandboxes.write_file.assert_not_called()
+    assert _staged_payload(terminals[0]) == b"hi\n"
+    assert (tmp_path / "notes.md").read_bytes() == b"hi\n"
+
+
+def test_sandbox_write_file_batches_a_large_payload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = MagicMock()
+    _patch_client(monkeypatch, client)
+    terminals = _fake_terminal(monkeypatch, [], str(tmp_path))
+    content = "x" * 9000
+
+    observation = SandboxWriteFileExecutor(**_executor_kwargs())(
+        SandboxWriteFileAction(sandbox_id=_SANDBOX_ID, path="big.txt", content=content),
+        _fake_conversation(),
     )
+
+    assert not observation.is_error
+    # One acknowledgement per staged burst; the payload is not one huge line.
+    assert len(_ack_needles(terminals[0])) > 1
+    assert _staged_payload(terminals[0]) == content.encode()
+    assert (tmp_path / "big.txt").read_text(encoding="utf-8") == content
+
+
+def test_sandbox_write_file_surfaces_a_staging_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = MagicMock()
+    _patch_client(monkeypatch, client)
+    _fake_terminal(monkeypatch, [], str(tmp_path))
+
+    def broken_connect(url: str, **kwargs: object) -> object:
+        raise RuntimeError("ws refused")
+
+    monkeypatch.setattr("openhands.tools.sandbox.definition.connect", broken_connect)
+
+    observation = SandboxWriteFileExecutor(**_executor_kwargs())(
+        SandboxWriteFileAction(sandbox_id=_SANDBOX_ID, path="notes.md", content="hi\n"),
+        _fake_conversation(),
+    )
+
+    assert observation.is_error
+    assert "ws refused" in observation.text
+
+
+class _RealShellTerminal:
+    """A real shell behind the terminal interface, for transport checks."""
+
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        self.process = process
+
+    def __enter__(self) -> "_RealShellTerminal":
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        try:
+            assert self.process.stdin is not None
+            self.process.stdin.write(b"exit\n")
+            self.process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        return False
+
+    def send(self, data: bytes) -> None:
+        if data.startswith(b"exit"):
+            return
+        assert self.process.stdin is not None
+        self.process.stdin.write(data.replace(b"\r\n", b"\n"))
+        self.process.stdin.flush()
+
+    def recv(self, timeout: float) -> bytes:
+        assert self.process.stdout is not None
+        line = self.process.stdout.readline()
+        if not line:
+            raise TimeoutError
+        return line
+
+
+def test_sandbox_write_file_protocol_round_trips_through_a_shell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The staging protocol decodes to the exact bytes a real shell received."""
+    process = subprocess.Popen(
+        ["sh"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=tmp_path,
+    )
+    monkeypatch.setattr(
+        "openhands.tools.sandbox.definition.connect",
+        lambda url, **kwargs: _RealShellTerminal(process),
+    )
+    payload = ("hello 中文\n" * 200).encode()
+
+    write_sandbox_file(
+        cast(Any, SimpleNamespace(api_key="access-key-1")),
+        ws_base_url="https://pre-api.pyromind.ai/api/v1",
+        sandbox_id=_SANDBOX_ID,
+        path="out.bin",
+        source=payload,
+    )
+
+    assert (tmp_path / "out.bin").read_bytes() == payload
 
 
 def test_sandbox_read_file_text(monkeypatch: pytest.MonkeyPatch) -> None:

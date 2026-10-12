@@ -7,9 +7,22 @@ The legacy --spec transport remains available for older recorded executions.
 
 The interpreter is resolved in this order:
 
-1. ``python`` from the run spec, set by ``PYROMIND_SANDBOX_DATAFLOW_PYTHON``.
-2. The sandbox's own ``python3`` when ``open-dataflow`` matches the pin.
-3. A venv at ``venv`` in the run spec, created on first use and reused.
+1. ``python`` from the run spec, set by ``PYROMIND_SANDBOX_DATAFLOW_PYTHON``: it
+   wins when it exists in this sandbox and matches the pin, and is an error when
+   it exists with another version. A path that only exists on the agent host is
+   ignored, because the sandbox is a different filesystem.
+2. An interpreter baked into the sandbox image at one of the well-known paths,
+   when its ``open-dataflow`` matches the pin.
+3. The sandbox's own ``python3`` when ``open-dataflow`` matches the pin.
+4. A venv at ``venv`` in the run spec, created on first use and reused.
+
+``--check`` reports which interpreter the run would use without changing the
+sandbox; ``--prepare`` resolves the same interpreter and creates the cached venv
+when it is missing. Both exist so a caller never has to probe for the runtime
+with ``import dataflow`` or a filesystem search.
+
+The first-use install takes the lock next to the venv, so a warm-up and a real
+run sharing one sandbox cannot corrupt each other's venv.
 
 Only the envelope, the run's log tails, and the artifacts the pipeline writes
 cross the sandbox boundary. Nothing is copied to the agent-server host.
@@ -20,6 +33,7 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import fcntl
 import json
 import os
 import shutil
@@ -28,6 +42,8 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +52,23 @@ HEARTBEAT_SECONDS = 20
 LOG_TAIL_CHARS = 6000
 ENVELOPE_LINE_WIDTH = 120
 _PREFLIGHT_TIMEOUT_SECONDS = 30
+
+DATAFLOW_VERSION = "1.0.10"
+DATAFLOW_RUNTIME_PACKAGES = (
+    f"open-dataflow=={DATAFLOW_VERSION}",
+    "numpy==1.26.4",
+    "Pillow==12.1.1",
+    "opencv-python-headless==4.10.0.84",
+    "matplotlib==3.9.4",
+)
+DEFAULT_DATAFLOW_VENV = f"/tmp/pyromind-dataflow-venv-{DATAFLOW_VERSION}"
+# Interpreters a sandbox image may bake in at build time. They are probed in
+# order after the run spec's explicit ``python`` and win only when their
+# ``open-dataflow`` matches the pin.
+IMAGE_DATAFLOW_PYTHONS = (
+    "/opt/pyromind/dataflow-venv/bin/python",
+    "/home/openhands/dataflow-venv/bin/python",
+)
 
 
 def _log(message: str) -> None:
@@ -72,75 +105,167 @@ def _system_python(spec: dict[str, Any]) -> str:
     return shutil.which("python3") or sys.executable
 
 
+def _interpreter_spec() -> dict[str, Any]:
+    """Interpreter settings shared by the CLI config and the check entry."""
+    return {
+        "python": os.environ.get("PYROMIND_SANDBOX_DATAFLOW_PYTHON"),
+        "venv": os.environ.get("PYROMIND_SANDBOX_DATAFLOW_VENV", DEFAULT_DATAFLOW_VENV),
+        "dataflow_version": DATAFLOW_VERSION,
+        "packages": list(DATAFLOW_RUNTIME_PACKAGES),
+        "system_python": os.environ.get("PYROMIND_SANDBOX_SYSTEM_PYTHON"),
+    }
+
+
+def _image_interpreters() -> tuple[str, ...]:
+    """Candidate interpreters a prepared sandbox image may already provide."""
+    home = Path.home() / "dataflow-venv" / "bin" / "python"
+    return tuple(dict.fromkeys([str(home), *IMAGE_DATAFLOW_PYTHONS]))
+
+
+def _cached_venv_python(spec: dict[str, Any]) -> str | None:
+    """The cached venv interpreter when its stamp matches the pin."""
+    venv = Path(str(spec["venv"]))
+    python = venv / "bin" / "python"
+    stamp = venv / "open-dataflow-version"
+    if not python.is_file() or not stamp.is_file():
+        return None
+    try:
+        if stamp.read_text(encoding="utf-8").strip() != str(spec["dataflow_version"]):
+            return None
+    except OSError:
+        return None
+    return str(python)
+
+
+def _configured_python(configured: str) -> str | None:
+    """The configured interpreter when this sandbox actually has it.
+
+    The value can come from the agent host, where the same variable names a
+    different path, so a missing interpreter falls back to the rest of the
+    resolution order instead of failing the run.
+    """
+    if os.sep in configured:
+        return configured if Path(configured).is_file() else None
+    return shutil.which(configured)
+
+
+@contextmanager
+def _install_lock(venv: Path) -> Iterator[None]:
+    """Serialize first-use installs for one cached venv."""
+    lock_path = Path(f"{venv}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _bootstrap_venv(spec: dict[str, Any]) -> tuple[str | None, str]:
     """Create the cached DataFlow venv when it is missing or stale."""
     venv = Path(str(spec["venv"]))
     expected = str(spec["dataflow_version"])
     python = venv / "bin" / "python"
-    stamp = venv / "open-dataflow-version"
-    if python.is_file() and stamp.is_file():
+    with _install_lock(venv):
+        cached = _cached_venv_python(spec)
+        if cached is not None:
+            return cached, "reused"
+        system_python = _system_python(spec)
+        _log(f"installing open-dataflow=={expected} into {venv} (first use)")
+        venv.parent.mkdir(parents=True, exist_ok=True)
+        if venv.exists():
+            shutil.rmtree(venv, ignore_errors=True)
         try:
-            if stamp.read_text(encoding="utf-8").strip() == expected:
-                return str(python), "reused"
-        except OSError:
-            pass
-    system_python = _system_python(spec)
-    _log(f"installing open-dataflow=={expected} into {venv} (first use)")
-    venv.parent.mkdir(parents=True, exist_ok=True)
-    if venv.exists():
-        shutil.rmtree(venv, ignore_errors=True)
-    try:
-        created = subprocess.run(
-            [system_python, "-m", "venv", str(venv)],
+            created = subprocess.run(
+                [system_python, "-m", "venv", str(venv)],
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return None, f"could not create {venv}: {exc}"
+        if created.returncode != 0:
+            return None, (
+                f"could not create {venv}: "
+                f"{(created.stderr or created.stdout or '').strip()[-2000:]}"
+            )
+        packages = [str(name) for name in spec["packages"]]
+        installed = subprocess.run(
+            [
+                str(python),
+                "-m",
+                "pip",
+                "install",
+                "--quiet",
+                "--use-deprecated=legacy-resolver",
+                *packages,
+            ],
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=float(spec.get("install_timeout", 3600)),
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return None, f"could not create {venv}: {exc}"
-    if created.returncode != 0:
-        return None, (
-            f"could not create {venv}: "
-            f"{(created.stderr or created.stdout or '').strip()[-2000:]}"
-        )
-    packages = [str(name) for name in spec["packages"]]
-    installed = subprocess.run(
-        [
-            str(python),
-            "-m",
-            "pip",
-            "install",
-            "--quiet",
-            "--use-deprecated=legacy-resolver",
-            *packages,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=float(spec.get("install_timeout", 3600)),
-    )
-    if installed.returncode != 0:
-        shutil.rmtree(venv, ignore_errors=True)
-        detail = (installed.stderr or installed.stdout or "").strip()[-2000:]
-        return None, f"could not install {', '.join(packages)}: {detail}"
-    stamp.write_text(expected, encoding="utf-8")
-    return str(python), "installed"
+        if installed.returncode != 0:
+            shutil.rmtree(venv, ignore_errors=True)
+            detail = (installed.stderr or installed.stdout or "").strip()[-2000:]
+            return None, f"could not install {', '.join(packages)}: {detail}"
+        (venv / "open-dataflow-version").write_text(expected, encoding="utf-8")
+        return str(python), "installed"
 
 
-def _resolve_interpreter(spec: dict[str, Any]) -> tuple[str | None, str]:
+def _resolve_interpreter(
+    spec: dict[str, Any], *, bootstrap: bool = True
+) -> tuple[str | None, str]:
     expected = str(spec["dataflow_version"])
     configured = spec.get("python")
     if isinstance(configured, str) and configured:
-        found = _interpreter_version(configured)
-        if found != expected:
-            return None, (
-                f"configured interpreter {configured} has open-dataflow "
-                f"{found or 'missing'}, expected {expected}"
+        resolved = _configured_python(configured)
+        if resolved is None:
+            _log(
+                f"configured interpreter {configured} is not present in this "
+                "sandbox; resolving from the image instead"
             )
-        return configured, "configured"
+        else:
+            found = _interpreter_version(resolved)
+            if found != expected:
+                return None, (
+                    f"configured interpreter {configured} has open-dataflow "
+                    f"{found or 'missing'}, expected {expected}"
+                )
+            return resolved, "configured"
+    for candidate in _image_interpreters():
+        if _interpreter_version(candidate) == expected:
+            return candidate, "image"
     system_python = _system_python(spec)
     if _interpreter_version(system_python) == expected:
         return system_python, "image"
+    cached = _cached_venv_python(spec)
+    if cached is not None:
+        return cached, "reused"
+    if not bootstrap:
+        return None, (
+            f"no interpreter with open-dataflow=={expected} is available; "
+            f"run this script with --prepare to install {spec['venv']}"
+        )
     return _bootstrap_venv(spec)
+
+
+def _interpreter_report(spec: dict[str, Any], *, prepare: bool) -> dict[str, Any]:
+    """Describe the interpreter a run would use, optionally provisioning it."""
+    python, detail = _resolve_interpreter(spec, bootstrap=prepare)
+    report: dict[str, Any] = {
+        "marker": "prepare" if prepare else "check",
+        "ready": python is not None,
+        "expected": str(spec["dataflow_version"]),
+        "venv": str(spec["venv"]),
+    }
+    if python is None:
+        report["detail"] = detail
+        return report
+    report["interpreter"] = python
+    report["source"] = detail
+    report["version"] = _interpreter_version(python)
+    return report
 
 
 def _preflight(env: dict[str, str], profile: str) -> str | None:
@@ -455,8 +580,9 @@ def _run(spec: dict[str, Any]) -> dict[str, Any]:
             error_message=(
                 "The sandbox has no usable DataFlow runtime. "
                 f"{detail}\nInstall it into the sandbox image (set "
-                "PYROMIND_SANDBOX_DATAFLOW_PYTHON) or allow the sandbox to "
-                "reach PyPI so the tool can create its cached venv."
+                "PYROMIND_SANDBOX_DATAFLOW_PYTHON), or run this script with "
+                "--prepare once the sandbox can reach PyPI so it can build the "
+                "cached venv."
             ),
             interpreter=None,
             interpreter_source="unavailable",
@@ -805,22 +931,14 @@ def cli_spec(config: dict[str, Any], workspace: Path) -> dict[str, Any]:
     }
     if schema:
         environment["DF_OUTPUT_SCHEMA"] = schema
+    interpreter = _interpreter_spec()
     return {
         "marker": "cli",
         "runtime_dir": str(Path(__file__).resolve().parent),
-        "python": config.get("python")
-        or os.environ.get("PYROMIND_SANDBOX_DATAFLOW_PYTHON"),
-        "venv": os.environ.get(
-            "PYROMIND_SANDBOX_DATAFLOW_VENV", "/tmp/pyromind-dataflow-venv-1.0.10"
-        ),
-        "dataflow_version": "1.0.10",
-        "packages": [
-            "open-dataflow==1.0.10",
-            "numpy==1.26.4",
-            "Pillow==12.1.1",
-            "opencv-python-headless==4.10.0.84",
-            "matplotlib==3.9.4",
-        ],
+        "python": config.get("python") or interpreter["python"],
+        "venv": interpreter["venv"],
+        "dataflow_version": interpreter["dataflow_version"],
+        "packages": interpreter["packages"],
         "pipeline": str(pipeline),
         "cwd": str(root),
         "args": normalized,
@@ -845,7 +963,21 @@ def main() -> int:
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--spec", type=Path)
     modes.add_argument("--config", type=Path)
+    modes.add_argument(
+        "--check",
+        action="store_true",
+        help="report the DataFlow interpreter a run would use",
+    )
+    modes.add_argument(
+        "--prepare",
+        action="store_true",
+        help="resolve the DataFlow interpreter, installing the cached venv if needed",
+    )
     args = parser.parse_args()
+    if args.check or args.prepare:
+        report = _interpreter_report(_interpreter_spec(), prepare=bool(args.prepare))
+        print(json.dumps(report, ensure_ascii=False))
+        return 0 if report["ready"] else 1
     config = args.config or args.spec
     payload = json.loads(config.read_text(encoding="utf-8"))
     spec = cli_spec(payload, Path.cwd()) if args.config else payload

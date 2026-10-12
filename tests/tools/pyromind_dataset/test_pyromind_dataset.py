@@ -506,7 +506,12 @@ def test_get_storage_url_maps_workspace_and_storage_paths(
         calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
         return _Response(
             200,
-            {"success": True, "data": {"url": f"https://download.test{json['path']}"}},
+            {
+                "success": True,
+                "data": {
+                    "url": f"https://download.test{json['path']}?X-Amz-Signature=abc123"
+                },
+            },
         )
 
     monkeypatch.setattr(httpx, "post", fake_post)
@@ -530,8 +535,22 @@ def test_get_storage_url_maps_workspace_and_storage_paths(
     workspace_path = f"/.pyromind-agent/{_CONVERSATION_ID}/public_data/report.html"
     assert not observation.is_error
     assert [(entry.path, entry.url) for entry in observation.urls] == [
-        (workspace_path, f"https://download.test{workspace_path}"),
-        ("/datasets/img.png", "https://download.test/datasets/img.png"),
+        (
+            workspace_path,
+            f"https://download.test{workspace_path}?X-Amz-Signature=abc123",
+        ),
+        (
+            "/datasets/img.png",
+            "https://download.test/datasets/img.png?X-Amz-Signature=abc123",
+        ),
+    ]
+    assert observation.text.splitlines()[:4] == [
+        f"path: {workspace_path}",
+        f"markdown: [report.html](https://download.test{workspace_path}"
+        "?X-Amz-Signature=abc123)",
+        "path: /datasets/img.png",
+        "markdown: [img.png](https://download.test/datasets/img.png"
+        "?X-Amz-Signature=abc123)",
     ]
     assert [call["json"] for call in calls] == [
         {"path": workspace_path, "force_download": False},

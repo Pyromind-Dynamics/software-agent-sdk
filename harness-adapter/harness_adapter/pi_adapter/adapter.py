@@ -142,12 +142,14 @@ To show the user an image, HTML page, PDF, or another artifact, call
 get_storage_url on its paths and embed the returned URLs in your reply as
 Markdown. When delivering task outputs, including CSV, JSON, cleaned data and
 reports, resolve each requested artifact with get_storage_url and provide
-[descriptive filename](returned_url). Workspace paths such as public_data/...
-are supported: do not ask whether to copy an existing artifact to Storage just
-to deliver it, and do not move files unless requested. A sandbox path is not a
-download URL; never invent URLs. If resolution fails, report the actual failure
-and provide the verified path instead. Showing a file never depends on image
-support in your own model."""
+[descriptive filename](returned_url). Paste the URL exactly as returned,
+including its whole ?X-Amz-... query string: a link with the signature dropped
+returns 403, so never shorten it or reorder its parameters. Workspace paths such
+as public_data/... are supported: do not ask whether to copy an existing
+artifact to Storage just to deliver it, and do not move files unless requested.
+A sandbox path is not a download URL; never invent URLs. If resolution fails,
+report the actual failure and provide the verified path instead. Showing a file
+never depends on image support in your own model."""
 
 
 def _sandbox_system_prompt(mount_path: str) -> str:
@@ -156,7 +158,10 @@ def _sandbox_system_prompt(mount_path: str) -> str:
     return (
         f"{_SANDBOX_SYSTEM_PROMPT}\n\nstorage/ is a symbolic link to the Storage "
         f"mount at {root}, so storage/<path> and {root}/<path> name the same "
-        "file. Use the absolute form when a command has changed directory."
+        "file. Platform-side paths under /workspace/<path> address the same "
+        "Storage: /workspace/<path> is storage/<path> in this sandbox, not a "
+        "container directory. Use the absolute form when a command has changed "
+        "directory."
     )
 
 
@@ -346,6 +351,12 @@ class PiAdapter:
                 type(exc).__name__,
             )
 
+    def _prewarm_sandbox(self, session: _PiSession) -> None:
+        """Prepare the execution plane while the model reads the first message."""
+        if self._terminal_backend != "sandbox":
+            return
+        self._sandbox.prewarm(self._control_tool_context(session), session.files)
+
     async def _discard_sandbox(self, session: _PiSession) -> None:
         """Delete a sandbox that failed before it became usable."""
         if self._terminal_backend != "sandbox":
@@ -447,6 +458,8 @@ class PiAdapter:
                     session, dict(spec.workflow_xyflow)
                 )
             await self._start_runner(session, _api_key(spec.model_configuration))
+            if spec.initial_message:
+                self._prewarm_sandbox(session)
             if workflow_event_id is not None:
                 await self._append_workflow_context(session, workflow_event_id)
             session.queue.put_nowait(_history_synced(session.session_id))
@@ -495,6 +508,8 @@ class PiAdapter:
         try:
             await self._recover_inflight(session)
             await self._start_runner(session, _api_key({}))
+            if self._has_execution_workspace(session):
+                self._prewarm_sandbox(session)
             session.queue.put_nowait(_history_synced(conversation_id))
             return self._handle(conversation_id)
         except Exception:
@@ -976,7 +991,7 @@ class PiAdapter:
                 raise ValueError("invalid workflow request")
             inflight = session.files.load_inflight() or {}
             origin = inflight.get("run_id")
-            if action == "run" and not isinstance(origin, str):
+            if action in {"run", "capture", "distill"} and not isinstance(origin, str):
                 raise ValueError("workflow start requires an active originating turn")
             return await self._workflow_call(
                 session.session_id,

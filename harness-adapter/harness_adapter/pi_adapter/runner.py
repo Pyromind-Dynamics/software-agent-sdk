@@ -304,6 +304,12 @@ def _runner_environment() -> dict[str, str]:
         "SSL_CERT_DIR",
         "OH_SANDBOX_VMEM_LIMIT",
         "OH_SANDBOX_NPROC_LIMIT",
+        "PYROMIND_PI_TERMINAL_RESOLVE_TIMEOUT_MS",
+        "PYROMIND_PI_TERMINAL_STARTUP_TIMEOUT_MS",
+        "PYROMIND_PI_TERMINAL_FAST_PATH",
+        "PYROMIND_PI_TERMINAL_TRACE",
+        "PYROMIND_PI_MODEL_MAX_RETRIES",
+        "PYROMIND_PI_MODEL_RETRY_BASE_DELAY_MS",
     )
     environment = {name: os.environ[name] for name in allowed if name in os.environ}
     ca_bundle = os.environ.get("NODE_EXTRA_CA_CERTS") or _node_ca_bundle()

@@ -10,6 +10,7 @@ import {
   DefaultResourceLoader,
   SessionManager,
   SettingsManager,
+  type RetrySettings,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { createPiModelRuntime, type PiModelConfig } from "./pi-model.js";
@@ -17,7 +18,15 @@ import { createNoProgressGuardExtension } from "./no-progress-guard.js";
 import { isRecord, type JsonObject, type JsonValue } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
 import type { SandboxEndpoint, SandboxEndpointProvider } from "./sandbox-operations.js";
-import { applySandboxPathAliases } from "./sandbox-paths.js";
+import {
+  applySandboxPathAliases,
+  applySandboxWorkingDirectory,
+  SandboxReadMirror,
+} from "./sandbox-paths.js";
+import {
+  sandboxTerminalTimeouts,
+  type SandboxTerminalConnector,
+} from "./sandbox-terminal.js";
 import { inside } from "./workspace-policy.js";
 import {
   createTerminalPermissionExtension,
@@ -50,7 +59,52 @@ export interface ParsedPrompt {
   images: Array<{ type: "image"; data: string; mimeType: string }>;
 }
 
-export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): Promise<{
+export interface PiSessionOptions {
+  /** Test seam: the terminal socket used by a sandbox session. */
+  terminalConnect?: SandboxTerminalConnector;
+}
+
+const DEFAULT_MODEL_MAX_RETRIES = 2;
+const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 2_000;
+
+/**
+ * Retry policy for model calls.
+ *
+ * The transport retry re-issues the request before any message reaches the
+ * transcript, so a gateway which never answered is invisible. The session retry
+ * restarts the whole assistant turn, which is the only way to recover from a
+ * stream that dies after it started; that attempt stays in the session history,
+ * and a retried turn costs the full prompt again, so both budgets stay small.
+ *
+ * The runner process only inherits the variables the adapter forwards, so these
+ * names are mirrored in `harness_adapter.pi_adapter.runner._runner_environment`.
+ */
+export function modelRetrySettings(env: NodeJS.ProcessEnv = process.env): RetrySettings {
+  const maxRetries = retryBudget(env, "PYROMIND_PI_MODEL_MAX_RETRIES", DEFAULT_MODEL_MAX_RETRIES);
+  return {
+    enabled: maxRetries > 0,
+    maxRetries,
+    baseDelayMs: retryBudget(
+      env, "PYROMIND_PI_MODEL_RETRY_BASE_DELAY_MS", DEFAULT_MODEL_RETRY_BASE_DELAY_MS),
+    provider: { maxRetries },
+  };
+}
+
+function retryBudget(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return value;
+}
+
+export async function createPiSession(
+  params: JsonObject,
+  peer: JsonlRpcPeer,
+  sessionOptions: PiSessionOptions = {},
+): Promise<{
   session: AgentSession;
   sessionId: string;
   execution: WorkflowExecution;
@@ -61,37 +115,13 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
   let executionAccess: ExecutionAccess | undefined;
   const terminalEnvironment = params.terminal_environment ?? {};
   if (!isRecord(terminalEnvironment) || Object.values(terminalEnvironment).some((v) => typeof v !== "string")) throw new Error("invalid terminal environment");
-  const options: CreateToolsOptions = {
-    terminalEnvironment: terminalEnvironment as Record<string, string>,
-    onExecutionReady: (access) => { executionAccess = access; },
-    skillsDirectory: config.skillsDirectory,
-    ...(config.terminalBackend === "sandbox"
-      ? { sandbox: sandboxEndpointProvider(peer) }
-      : {}),
-  };
-  const tools = await createTools(
-    peer,
-    env,
-    config.workspaceRoot,
-    config.terminalBackend,
-    config.skillRoots,
-    config.knowledgeRoot,
-    config.resourceLimits,
-    config.tools,
-    options,
-  );
-  const settingsManager = SettingsManager.inMemory({
-    compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 20_000 },
-    retry: { enabled: false, maxRetries: 0 },
-    defaultThinkingLevel: config.thinkingLevel,
-  });
-  const agentDir = join(config.workspaceRoot, "pi", "agent");
   const skillPaths = [
     ...config.skillRoots.map((root) => root.path),
     ...(config.skillsDirectory ? [config.skillsDirectory] : []),
   ].map((path) => realpathSync(path));
   // Sandbox resources are uploaded under the runtime aliases, so the skill
-  // locations baked into the system prompt must not expose host paths.
+  // locations baked into the system prompt must not expose host paths. The
+  // same aliases let a resource read be answered from the host copy.
   const sandboxPathAliases =
     config.terminalBackend === "sandbox"
       ? [
@@ -107,6 +137,36 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
             : []),
         ].sort((left, right) => right.host.length - left.host.length)
       : [];
+  const options: CreateToolsOptions = {
+    terminalEnvironment: terminalEnvironment as Record<string, string>,
+    terminalTimeouts: sandboxTerminalTimeouts(),
+    onExecutionReady: (access) => { executionAccess = access; },
+    skillsDirectory: config.skillsDirectory,
+    ...(config.terminalBackend === "sandbox"
+      ? {
+          sandbox: sandboxEndpointProvider(peer),
+          readMirror: new SandboxReadMirror(sandboxPathAliases),
+          terminalConnect: sessionOptions.terminalConnect,
+        }
+      : {}),
+  };
+  const tools = await createTools(
+    peer,
+    env,
+    config.workspaceRoot,
+    config.terminalBackend,
+    config.skillRoots,
+    config.knowledgeRoot,
+    config.resourceLimits,
+    config.tools,
+    options,
+  );
+  const settingsManager = SettingsManager.inMemory({
+    compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 20_000 },
+    retry: modelRetrySettings(),
+    defaultThinkingLevel: config.thinkingLevel,
+  });
+  const agentDir = join(config.workspaceRoot, "pi", "agent");
   const experienceHost = genomeHostAccess(peer, params.workflows_enabled === true);
   const resourceLoader = new DefaultResourceLoader({
     cwd: config.workspaceRoot,
@@ -127,9 +187,11 @@ export async function createPiSession(params: JsonObject, peer: JsonlRpcPeer): P
           if (params.workflows_enabled === true) {
             systemPrompt += "\n历史经验的路径参数使用当前会话执行环境的路径：Storage 文件保留 storage/ 前缀（如 storage/agentTest/input.csv），会话文件使用 public_data/...。与 read/terminal 验证成功的路径保持一致；不要改成服务端路径、平台 /workspace 路径或省略 storage/。";
           }
-          return {
-            systemPrompt: applySandboxPathAliases(systemPrompt, sandboxPathAliases),
-          };
+          systemPrompt = applySandboxPathAliases(systemPrompt, sandboxPathAliases);
+          if (config.terminalBackend === "sandbox") {
+            systemPrompt = applySandboxWorkingDirectory(systemPrompt, config.workspaceRoot);
+          }
+          return { systemPrompt };
         });
       },
     ],
