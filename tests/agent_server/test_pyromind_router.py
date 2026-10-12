@@ -118,7 +118,7 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert len(skill_text.splitlines()) <= 140
     assert "## 资料索引" in skill_text
     assert "## DSL 与资料边界" in skill_text
-    assert "当前运行时原生的 Skill 读取能力" in skill_text
+    assert "给出的位置用 `read`" in skill_text
     assert "<available_skills>" in skill_text
     assert 'skills_read(skill_name="generate-workflow-dsl"' not in skill_text
     assert "单一事实源" not in skill_text
@@ -130,7 +130,11 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert "只生成并校验 DSL" in skill_text
     assert "不写 import" in skill_text
     assert "禁止用 Agent 本地 terminal 替代平台运行时" in skill_text
-    assert "只有校验明确暴露未覆盖的平台契约" in skill_text
+    assert "单节点工作流" in frontmatter
+    assert "单节点或其他非训练/评测工作流" in skill_text
+    assert "跳过训练专用的第 2、3、5、6 步" in skill_text
+    assert "`knowledge/index.md` 和匹配的节点原文" in skill_text
+    assert "不用 terminal `ls/find` 探索 Skill、reference 或知识库" in skill_text
     assert "同一轮不得重复读取同一路径" in skill_text
     assert "可程序验证只说明 reward 可构造" in skill_text
     assert "数据同时支持\n  SFT/GRPO 时默认 SFT" in skill_text
@@ -142,6 +146,7 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
         "data-routing.md",
         "workflow-contracts.md",
     }
+    assert all(f"`references/{name}`" in skill_text for name in references)
     assert not (skill_root / "references" / "example-workflows.md").exists()
     assert "PathJoinNode → LoadDataset" in references["data-routing.md"]
     assert "对原路径读一次 `storage/...` 取数据画像" in references["data-routing.md"]

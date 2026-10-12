@@ -1,15 +1,14 @@
 ---
 name: generate-workflow-dsl
 description: >-
-  为 Pyromind 生成、修改或校验模型训练与评测工作流。用户用自然语言要求“用这份数据训练模型”、
-  微调、基线评测、SFT/DPO/GRPO、修改画布、换模型跑 benchmark/看看效果或检查 workflow.py
-  时使用；负责读取 Storage 数据、推断训练阶段、整组决定参数、生成并上传自定义
-  Metrics/Reward、绑定阶段产物并校验 Python DSL。不执行正式训练，不在训练生成场景自动清洗数据。
+  为 Pyromind 生成、修改或校验工作流 Python DSL，包括单节点工作流、模型训练与评测。
+  用户要求修改画布、检查 workflow.py、SFT/DPO/GRPO、Benchmark 或其他平台节点工作流时使用；
+  负责按需读取节点契约、绑定产物并校验 DSL。不执行正式工作流，不在训练生成场景自动清洗数据。
 ---
 
 # 生成 Pyromind 工作流
 
-把工作流视为少量阶段模板的组合。先证明数据和参数可用，再写 DSL；不要从完整示例反推需求。
+按请求选择节点或阶段组合；训练任务先证明数据和参数可用，再写 DSL。不要从完整示例反推需求。
 
 ## DSL 与资料边界
 
@@ -18,15 +17,14 @@ description: >-
 - 数据、模型和训练产物通过输出端口绑定；禁止用 Agent 本地 terminal 替代平台运行时或查找数据副本。
 - Benchmark 最小骨架是数据配置 → 模型入口 → VLLM → Metric → Eval。
 - 每个 `MetricsConfigBuilderNode` 只输出一个 `metrics_config`；契约未声明的组合方式不得猜测。
-- 节点拓扑、输入输出、必填项和枚举先按 `references/workflow-contracts.md` 生成；运行时契约以
-  `validate_workflow_dsl` 的实时结果为准。`knowledge/` 只作为校验暴露未覆盖契约时的定向补充资料。
+- 常用训练与评测节点先按 `references/workflow-contracts.md` 生成；其中没有的节点先从
+  `knowledge/index.md` 定位，再读对应原文。运行时契约以 `validate_workflow_dsl` 的实时结果为准。
 - GPU 枚举、必填端口等平台契约会随迭代漂移；不确定时构造最小可验证 DSL 调一次
   `validate_workflow_dsl`，以返回的 `code`/`node_id`/`field` 为准，不要凭经验猜测。
 - Reference 是按缺失事实选择的索引，不是阅读清单；同一轮不得重复读取同一路径。
-- Skill 与 reference 足以生成初稿时不查 `knowledge/`。只有校验明确暴露未覆盖的平台契约时，
-  才能围绕该错误定向查询一次。
+- 已有契约足以生成初稿时不查 `knowledge/`；缺少节点契约或校验暴露未覆盖字段时才定向读取。
 
-## 资料索引
+## 资料索引（3 个 reference）
 
 | reference | 读取时机 |
 |---|---|
@@ -35,8 +33,8 @@ description: >-
 | `references/custom-python-assets.md` | 内置 Metrics/Reward 不适用，需要生成、上传并回填 Python 入口 |
 | 其他 Skill: `training-analysis` | 分析已有训练效果（loss 异常/对比/优化超参）时，先调该 skill 产出报告与探针实验，再整组落参数 |
 
-Reference 路径相对本 `SKILL.md` 所在目录。使用当前运行时原生的 Skill 读取能力打开精确路径；
-Pi 使用 `<available_skills>` 中的 Skill 位置并从该目录解析 reference，不要用 terminal 搜索 Skill。
+Reference 路径相对本 `SKILL.md` 所在目录。Pi 按 `<available_skills>` 给出的位置用 `read`
+打开精确路径；`knowledge/` 路径直接交给 `read`。不用 terminal `ls/find` 探索 Skill、reference 或知识库。
 
 ## 执行状态机
 
@@ -46,7 +44,7 @@ Pi 使用 `<available_skills>` 中的 Skill 位置并从该目录解析 referenc
 
 - 保留原变量名、节点 ID、下游连线和所有未被点名的参数；只写需求图差分。
 - 跳过数据画像、阶段选择和整组配参；不读 Storage，不读取 reference 或 `knowledge/`。
-- 只有缺少新节点契约或校验返回结构错误时，才读取一份最相关的 reference，然后修改并进入第 8 步。
+- 缺少新节点契约或校验返回结构错误时，按资料索引定向读取所需契约，然后修改并进入第 8 步。
 
 模型入口规则供快路径和完整生成共用：
 
@@ -62,6 +60,7 @@ Pi 使用 `<available_skills>` 中的 Skill 位置并从该目录解析 referenc
 ### 1. 锁定目标
 
 - 仅校验现有工作流：直接进入第 8 步，不改变有效配置。
+- 单节点或其他非训练/评测工作流：进入第 4 步选节点契约，跳过训练专用的第 2、3、5、6 步。
 - 明确要求 Benchmark：只组合评测所需阶段。
 - 要求训练或修改训练工作流：继续执行；用户不需要说出 SFT/DPO/GRPO。
 
@@ -89,8 +88,9 @@ Pi 使用 `<available_skills>` 中的 Skill 位置并从该目录解析 referenc
 
 ### 4. 决定契约与枚举
 
-使用第 3 步已读取的 `workflow-contracts.md`，不要为了参数、端口或枚举再次读取其他资料。
-局部修改只有缺少新节点契约时才读取该文件一次。
+训练与评测使用第 3 步已读的 `workflow-contracts.md`。其他工作流先查该文件；若目标节点
+不在其中，用 `read` 依次打开 `knowledge/index.md` 和匹配的节点原文，不猜字段或连线。
+局部修改仅在缺少新节点契约时读取所需资料。
 
 ### 5. 整组配参
 
@@ -136,5 +136,5 @@ batch、grad accumulation、learning rate、epoch、LoRA rank 和 GRPO 的 max s
 
 ## 最终回复
 
-简述数据入口与字段映射、所选阶段、基模、关键参数及校验结果。对训练请求，除非用户已明确
-跳过，补一句使用同一指标跑基模 Benchmark 的建议；不要复述完整 DSL。
+简述所选节点、关键输入及校验结果；训练任务再说明数据字段、阶段、基模与参数。对训练请求，
+除非用户已明确跳过，补一句使用同一指标跑基模 Benchmark 的建议；不要复述完整 DSL。

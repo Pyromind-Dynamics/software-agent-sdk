@@ -9,7 +9,7 @@ import type { JsonObject, JsonValue, RunnerEvent } from "../src/protocol.js";
 import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 import { PiAgentRuntime } from "../src/agent-runtime.js";
 
-test("AgentSession discovers skills and preserves resource aliases in prompts and file tools", async (context) => {
+test("AgentSession resolves an uncovered workflow node through the knowledge index without terminal", async (context) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "pi-runtime-test-")));
   const workspace = join(root, "conversation");
   const skillsDirectory = join(root, "configured-skills");
@@ -19,8 +19,10 @@ test("AgentSession discovers skills and preserves resource aliases in prompts an
   await mkdir(join(workspace, "public_data"), { recursive: true });
   await mkdir(join(workspace, "pi", "terminal-output"), { recursive: true });
   await mkdir(join(skill, "references"), { recursive: true });
-  await mkdir(knowledge);
-  await writeFile(join(knowledge, "domain.md"), "Shared domain knowledge.\n", "utf8");
+  await mkdir(join(knowledge, "nodes", "CustomCommandNode"), { recursive: true });
+  await writeFile(join(knowledge, "index.md"), "[CustomCommandNode](nodes/CustomCommandNode/CustomCommandNode.md)\n", "utf8");
+  await writeFile(join(knowledge, "nodes", "CustomCommandNode", "CustomCommandNode.md"),
+    "CustomCommandNode runs a shell command on the platform; required input: command.\n", "utf8");
   await mkdir(extraSkill);
   await writeFile(join(extraSkill, "SKILL.md"), "---\nname: extra-skill\ndescription: An explicitly configured skill.\n---\nExtra skill.\n");
   const shadowedSkill = join(skillsDirectory, "extra-skill");
@@ -35,11 +37,13 @@ test("AgentSession discovers skills and preserves resource aliases in prompts an
     "name: custom-workflow",
     "description: Generate and validate a workflow DSL.",
     "---",
-    "Read references/workflow-contracts.md, generate and validate the workflow.",
-    "Read knowledge/domain.md for shared domain knowledge.",
+    "Read references/workflow-contracts.md first. If the node is absent, read knowledge/index.md and its linked node page.",
+    "Generate and validate the workflow. Do not use terminal to discover resources or execute the node command.",
     "",
   ].join("\n"), "utf8");
-  await writeFile(join(skill, "references", "workflow-contracts.md"), "A workflow is valid when it defines workflow.\n", "utf8");
+  await writeFile(join(skill, "references", "workflow-contracts.md"), "Common training nodes only.\n", "utf8");
+
+  const workflowDsl = 'custom = CustomCommandNode(command=\'echo "hello world"\', cpu=1, memory=1, gpu_count=1, gpu_product="NVIDIA-H100-80GB-HBM3")\n';
 
   const requests: Array<{ url: string; body: JsonObject }> = [];
   const server = createServer(async (request, response) => {
@@ -47,15 +51,18 @@ test("AgentSession discovers skills and preserves resource aliases in prompts an
     requests.push({ url: request.url ?? "", body });
     if (requests.length === 1) sendToolCall(response, "read", { path: ".agents/skills/custom-workflow/SKILL.md" }, "call-skill");
     else if (requests.length === 2) sendToolCall(response, "read", { path: "./.agents/skills/custom-workflow/references/workflow-contracts.md" }, "call-contract");
-    else if (requests.length === 3) sendToolCall(response, "read", { path: "knowledge/domain.md" }, "call-knowledge");
-    else if (requests.length === 4) sendToolCall(response, "write", {
+    else if (requests.length === 3) sendToolCall(response, "read", { path: "knowledge/index.md" }, "call-index");
+    else if (requests.length === 4) sendToolCall(response, "read", {
+      path: "knowledge/nodes/CustomCommandNode/CustomCommandNode.md",
+    }, "call-node");
+    else if (requests.length === 5) sendToolCall(response, "write", {
       path: "public_data/workflow_canvas/workflow.py",
-      content: "workflow = SFTWorkflow()\n",
+      content: workflowDsl,
     }, "call-write");
-    else if (requests.length === 5) sendToolCall(response, "validate_workflow_dsl", {
+    else if (requests.length === 6) sendToolCall(response, "validate_workflow_dsl", {
       dsl_path: "public_data/workflow_canvas/workflow.py",
     }, "call-validate");
-    else sendText(response, "SFT workflow generated and validated.");
+    else sendText(response, "CustomCommandNode workflow generated and validated.");
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   context.after(() => server.close());
@@ -90,7 +97,7 @@ test("AgentSession discovers skills and preserves resource aliases in prompts an
     skills_directory: skillsDirectory,
     skill_roots: [{ name: "extra-skill", path: extraSkill }],
     knowledge_root: knowledge,
-    system_prompt: "Generate an SFT workflow by following the skill, then validate it.",
+    system_prompt: "Generate a single-node CustomCommandNode workflow by following the skill, then validate it.",
     model: {
       provider: "openai",
       id: "custom-chat-model",
@@ -110,7 +117,7 @@ test("AgentSession discovers skills and preserves resource aliases in prompts an
   });
   await runtime.handle("prompt", {
     run_id: "run-1",
-    content: [{ type: "text", text: "Generate an SFT workflow." }],
+    content: [{ type: "text", text: "Generate a CustomCommandNode workflow that runs echo hello world." }],
   });
 
   let timeout: NodeJS.Timeout | undefined;
@@ -124,7 +131,7 @@ test("AgentSession discovers skills and preserves resource aliases in prompts an
 
   const finishedEvents = events.filter((event) => event.kind === "run.finished");
   assert.equal(finishedEvents.length, 1, JSON.stringify({ events, requests }, null, 2));
-  assert.equal(finishedEvents[0]!.payload.workflow_dsl, "workflow = SFTWorkflow()\n");
+  assert.equal(finishedEvents[0]!.payload.workflow_dsl, workflowDsl);
   assert.equal(typeof finishedEvents[0]!.payload.checkpoint_entry_id, "string");
   const assistantStarts = events.filter((event) => event.kind === "message.started" && event.payload.role === "assistant");
   assert.equal(new Set(assistantStarts.map((event) => event.payload.message_id)).size, assistantStarts.length);
@@ -141,6 +148,7 @@ test("AgentSession discovers skills and preserves resource aliases in prompts an
       ? finishedEvents[0]!.payload.outcome.status
       : undefined, "completed");
   assert.equal(events.some((event) => event.kind === "tool.completed"), true);
+  assert.equal(events.some((event) => event.kind === "tool.started" && event.payload.tool_name === "terminal"), false);
   const writeCompleted = events.find((event) =>
     event.kind === "tool.completed" && event.payload.tool_name === "write"
   );
@@ -152,8 +160,8 @@ test("AgentSession discovers skills and preserves resource aliases in prompts an
       : undefined,
     "public_data/workflow_canvas/workflow.py",
   );
-  assert.equal(requests.length, 6);
-  assert.deepEqual(requests.map((request) => request.url), Array(6).fill("/v1/chat/completions"));
+  assert.equal(requests.length, 7);
+  assert.deepEqual(requests.map((request) => request.url), Array(7).fill("/v1/chat/completions"));
   for (const request of requests) {
     assert.equal(Object.hasOwn(request.body, "max_tokens"), false);
     assert.equal(Object.hasOwn(request.body, "max_completion_tokens"), false);
@@ -168,10 +176,10 @@ test("AgentSession discovers skills and preserves resource aliases in prompts an
   assert.equal(toolRequests[0]!.tool_name, "validate_workflow_dsl");
   assert.equal(
     await readFile(join(workspace, "public_data", "workflow_canvas", "workflow.py"), "utf8"),
-    "workflow = SFTWorkflow()\n",
+    workflowDsl,
   );
   const sessionLog = await readFile(join(workspace, "pi", "session.jsonl"), "utf8");
-  assert.equal(sessionLog.includes("SFT workflow generated and validated."), true);
+  assert.equal(sessionLog.includes("CustomCommandNode workflow generated and validated."), true);
   const firstRequest = JSON.stringify(requests[0]!.body);
   assert.equal(firstRequest.includes("<available_skills>"), true);
   assert.equal(firstRequest.includes(join(skill, "SKILL.md")), true);
@@ -179,8 +187,9 @@ test("AgentSession discovers skills and preserves resource aliases in prompts an
   assert.equal(firstRequest.includes("base-shadowed-description"), false);
   assert.equal(firstRequest.includes("escaped-skill-description"), false);
   assert.equal(JSON.stringify(requests[1]!.body).includes("Read references/workflow-contracts.md"), true);
-  assert.equal(JSON.stringify(requests[2]!.body).includes("A workflow is valid when it defines workflow."), true);
-  assert.equal(JSON.stringify(requests[3]!.body).includes("Shared domain knowledge."), true);
+  assert.equal(JSON.stringify(requests[2]!.body).includes("Common training nodes only."), true);
+  assert.equal(JSON.stringify(requests[3]!.body).includes("[CustomCommandNode](nodes/CustomCommandNode/CustomCommandNode.md)"), true);
+  assert.equal(JSON.stringify(requests[4]!.body).includes("CustomCommandNode runs a shell command on the platform"), true);
 
   const secondFinished = new Promise<void>((resolve) => { resolveFinished = resolve; });
   await runtime.handle("prompt", {
@@ -194,12 +203,12 @@ test("AgentSession discovers skills and preserves resource aliases in prompts an
       timeout.unref();
     }),
   ]).finally(() => clearTimeout(timeout));
-  assert.equal(requests.length, 7);
+  assert.equal(requests.length, 8);
   for (const request of requests) {
     const messages = request.body.messages as Array<{ role: string; content: string }>;
     const system = messages.find((message) => message.role === "system" || message.role === "developer");
     assert.ok(system);
-    assert.ok(system.content.includes("Generate an SFT workflow by following the skill, then validate it."));
+    assert.ok(system.content.includes("Generate a single-node CustomCommandNode workflow by following the skill, then validate it."));
     assert.ok(system.content.includes("<available_skills>"));
     assert.ok(system.content.includes("Paths starting with knowledge/ or .agents/skills/ are runtime resource aliases: pass them unchanged to file tools, without prepending the skill directory."));
     assert.ok(system.content.includes("For other relative paths referenced by a skill file, resolve them against the skill directory"));

@@ -86,7 +86,8 @@ original pages before answering.
 | [CloneAndCacheDataset](nodes/CloneAndCacheDataset/CloneAndCacheDataset.md) | CloneAndCacheDataset 节点的功能、输入输出、参数与运行说明 | nodes, cloneandcachedataset |
 | [CloneAndCacheModel](nodes/CloneAndCacheModel/CloneAndCacheModel.md) | CloneAndCacheModel 节点的功能、输入输出、参数与运行说明 | nodes, cloneandcachemodel |
 | [ContentPreview](nodes/ContentPreview/ContentPreview.md) | ContentPreview 节点的功能、输入输出、参数与运行说明 | nodes, contentpreview |
-| [CustomCommandNode](nodes/CustomCommandNode/CustomCommandNode.md) | CustomCommandNode 节点的功能、输入输出、参数与运行说明 | nodes, customcommandnode |
+| [CustomCommandCPUNode](nodes/CustomCommandCPUNode/CustomCommandCPUNode.md) | 使用 CPU 和内存执行自定义命令，返回命令输出 | nodes, customcommandcpunode |
+| [CustomCommandNode](nodes/CustomCommandNode/CustomCommandNode.md) | 按 CPU、内存和 GPU 资源执行自定义 shell 命令并返回输出 | nodes, customcommandnode, 自定义命令 |
 | [DataPreprocessLabelNode](nodes/DataPreprocessLabelNode/DataPreprocessLabelNode.md) | DataPreprocessLabelNode 节点的功能、输入输出、参数与运行说明 | nodes, datapreprocesslabelnode |
 | [DataPreprocessMergeNode](nodes/DataPreprocessMergeNode/DataPreprocessMergeNode.md) | DataPreprocessMergeNode 节点的功能、输入输出、参数与运行说明 | nodes, datapreprocessmergenode |
 | [DataPreprocessPromptExpandNode](nodes/DataPreprocessPromptExpandNode/DataPreprocessPromptExpandNode.md) | DataPreprocessPromptExpandNode 节点的功能、输入输出、参数与运行说明 | nodes, datapreprocesspromptexpandnode |
@@ -101,6 +102,7 @@ original pages before answering.
 | [DatasetValidatorNode](nodes/DatasetValidatorNode/DatasetValidatorNode.md) | DatasetValidatorNode 节点的功能、输入输出、参数与运行说明 | nodes, datasetvalidatornode |
 | [DownloadAndCacheDataset](nodes/DownloadAndCacheDataset/DownloadAndCacheDataset.md) | DownloadAndCacheDataset 节点的功能、输入输出、参数与运行说明 | nodes, downloadandcachedataset |
 | [DownloadAndCacheModel](nodes/DownloadAndCacheModel/DownloadAndCacheModel.md) | DownloadAndCacheModel 节点的功能、输入输出、参数与运行说明 | nodes, downloadandcachemodel |
+| [DownloadURLNode](nodes/DownloadURLNode/DownloadURLNode.md) | 从 URL 下载文件并返回工作区路径，支持断点续传与校验 | nodes, downloadurlnode |
 | [GRPOTrainingExtraConfigBuilderNode](nodes/GRPOTrainingExtraConfigBuilderNode/GRPOTrainingExtraConfigBuilderNode.md) | GRPOTrainingExtraConfigBuilderNode 节点的功能、输入输出、参数与运行说明 | nodes, grpotrainingextraconfigbuildernode |
 | [Inference](nodes/Inference/Inference.md) | Inference 节点的功能、输入输出、参数与运行说明 | nodes, inference |
 | [LoadAnythingFromFileNode](nodes/LoadAnythingFromFileNode/LoadAnythingFromFileNode.md) | LoadAnythingFromFileNode 节点的功能、输入输出、参数与运行说明 | nodes, loadanythingfromfilenode |
@@ -141,4 +143,3 @@ original pages before answering.
 | Page | Summary | Tags |
 |---|---|---|
 | [Dataset Processing Workflow](dataset_processing_workflow.py) | Pyromind Dataset Processing Workflow 示例 | examples, dataset-processing-workflow |
-

@@ -6,7 +6,7 @@ Agent 生产运行时通过 `PYROMIND_KNOWLEDGE_BASE_PATH`（默认指向本目�
 
 | 路径 | 内容 |
 |------|------|
-| `index.md` | 全量文档目录；检索子 Agent 先按标题、摘要和标签定位候选页面 |
+| [index.md](index.md) | 唯一的逐页文档大纲；按标题、摘要和标签定位候选页面 |
 | `basic/`、`sdk/`、`studio/`、`jupyterlab/` | 内嵌平台文档（Agent 运行时检索根目录） |
 | `nodes/<NodeType>/<NodeType>.md` | 节点 I/O、参数与端口定义 |
 | `business-domain/` | 跨 skill 共用的业务领域知识，如 PCB 裸板 AVI/AOI 数据与判别参考 |
@@ -16,8 +16,8 @@ Agent 生产运行时通过 `PYROMIND_KNOWLEDGE_BASE_PATH`（默认指向本目�
 
 ## Agent 检索路径
 
-Agent 首先读取 `index.md`，只在索引缺失或没有匹配条目时扫描分类目录；
-定位候选页面后，仍需打开原始页面确认内容，不能只根据索引回答。
+Agent 需要查知识库时，先用文件读取工具打开 `knowledge/index.md`，再打开匹配的原始页面；
+仅在索引缺失或没有匹配条目时扫描分类目录，不能只根据索引回答。
 
 **业务领域知识：** [PCB 裸板 AVI/AOI](business-domain/pcb-avi-aoi.md) 供数据理解、
 清洗、合成和标注按需引用；读取文档不触发任何 skill 的执行流程。
