@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
 from pyromind_runtime.domain.content import TextContent
@@ -29,6 +30,11 @@ from pyromind_agent_server.bootstrap import ensure_product_runtime
 
 
 _SSE_HEARTBEAT_SECONDS = 15.0
+
+
+class PrepareWorkflowExecutionBody(BaseModel):
+    workflow_path: str = Field(min_length=1)
+    request_id: str | None = None
 
 
 def get_product_runtime(request: Request) -> ConversationRuntime:
@@ -57,6 +63,26 @@ def create_product_router() -> APIRouter:
         tags=["Pyromind Product API"],
         dependencies=[Depends(check_session_api_key)],
     )
+
+    @router.post("/{conversation_id}/workflow-executions")
+    async def prepare_workflow_execution(
+        conversation_id: str,
+        body: PrepareWorkflowExecutionBody,
+        request: Request,
+    ) -> dict:
+        try:
+            return await get_product_runtime(request).prepare_workflow_execution(
+                conversation_id,
+                body.workflow_path,
+                request_context(request),
+                request_id=body.request_id,
+            )
+        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
+            raise _not_found(conversation_id) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
 
     @router.post("", response_model=ConversationSnapshot, status_code=201)
     async def create_conversation(

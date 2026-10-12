@@ -86,6 +86,7 @@ def submit_workflow_task(
     name: str,
     conversation_id: str,
     test_mode: bool = False,
+    retry_create: bool = True,
 ) -> TrainingTaskCreateResponse:
     """Create one Studio task with the standard conversation correlation ID.
 
@@ -102,7 +103,11 @@ def submit_workflow_task(
         workflow=workflow,
         out_id=out_id,
     )
-    response = _retry_transient(lambda: client.studio.create(request))
+    response = (
+        _retry_transient(lambda: client.studio.create(request))
+        if retry_create
+        else client.studio.create(request)
+    )
     if response is None:
         raise WorkflowTaskSubmissionError("Workflow create failed, response is None")
     if not response.task_id:

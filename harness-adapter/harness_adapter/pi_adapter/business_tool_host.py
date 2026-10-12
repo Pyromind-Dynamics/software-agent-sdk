@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -299,6 +299,7 @@ class PyromindBusinessToolHost:
             else None
         )
         self._pipeline_runs = pipeline_runs
+        self._workflow_preparer: Callable[..., Awaitable[dict[str, Any]]] | None = None
         for path in (
             self._cleaning_runtime,
             self._preparation_runtime,
@@ -395,6 +396,30 @@ class PyromindBusinessToolHost:
 
     def specs(self) -> list[dict[str, Any]]:
         specs = [validation_tool_spec()]
+        if self._workflow_preparer is not None:
+            specs.append(
+                BusinessToolSpec(
+                    "submit_workflow",
+                    "Request formal execution of a validated Storage workflow. "
+                    "This opens a user confirmation dialog. No platform task "
+                    "is created until the user confirms. Call only when the "
+                    "user asks to run the workflow.",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "workflow_path": {
+                                "type": "string",
+                                "description": (
+                                    "Existing Storage Python DSL path, such as "
+                                    "storage/project/workflow.py"
+                                ),
+                            }
+                        },
+                        "required": ["workflow_path"],
+                        "additionalProperties": False,
+                    },
+                ).as_dict()
+            )
         tools: list[ToolDefinition[Any, Any]] = [
             UpdatePlanTool.create(cast(Any, SimpleNamespace(persistence_dir=None)))[0]
         ]
@@ -432,6 +457,11 @@ class PyromindBusinessToolHost:
             )
         return specs
 
+    def set_workflow_preparer(
+        self, callback: Callable[..., Awaitable[dict[str, Any]]]
+    ) -> None:
+        self._workflow_preparer = callback
+
     async def execute(
         self,
         name: str,
@@ -440,6 +470,35 @@ class PyromindBusinessToolHost:
         tool_call_id: str | None = None,
     ) -> dict[str, Any]:
         started_at = time.perf_counter()
+        if name == "submit_workflow":
+            if self._workflow_preparer is None:
+                raise ValueError("workflow submission is unavailable")
+            workflow_path = arguments.get("workflow_path")
+            if not isinstance(workflow_path, str) or not workflow_path.strip():
+                raise ValueError("workflow_path is required")
+            try:
+                prepared = await self._workflow_preparer(
+                    context.conversation_id,
+                    workflow_path,
+                    context.request_context,
+                    request_id=tool_call_id,
+                )
+                return BusinessToolResult(
+                    is_error=False,
+                    content=[
+                        {
+                            "type": "text",
+                            "text": json.dumps(prepared, ensure_ascii=False),
+                        }
+                    ],
+                    details=prepared,
+                ).as_dict()
+            except ValueError as exc:
+                return BusinessToolResult(
+                    is_error=True,
+                    content=[{"type": "text", "text": str(exc)}],
+                    details={"error": str(exc)},
+                ).as_dict()
         if name == "validate_workflow_dsl":
             policy = ToolOutputPolicy()
             policy_source = "platform_default"

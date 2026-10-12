@@ -6,9 +6,18 @@ from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
 from pyromind_runtime.domain.events import ProductEvent, WorkflowRunState
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
+from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
 
 
 class ProductStore(Protocol):
+    def load_workflow_execution_requests(
+        self,
+    ) -> dict[str, WorkflowExecutionRequest]: ...
+
+    def save_workflow_execution_request(
+        self, state: WorkflowExecutionRequest, *, expected_revision: int | None
+    ) -> None: ...
+
     def load_pipeline_runs(self) -> dict[str, PipelineRun]: ...
 
     def save_pipeline_run(

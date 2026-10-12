@@ -106,6 +106,8 @@ class SnapshotProjector:
             and event.run_id != snapshot.active_run_id
         ):
             return snapshot
+        if snapshot.pending_permissions and status in {"idle", "finished"}:
+            status = "waiting_for_confirmation"
         return snapshot.model_copy(
             update={
                 "status": status,
@@ -286,7 +288,11 @@ class SnapshotProjector:
         return snapshot.model_copy(
             update={
                 "pending_permissions": pending,
-                "status": "waiting_for_confirmation" if pending else "running",
+                "status": "waiting_for_confirmation"
+                if pending
+                else "idle"
+                if permission_id.startswith("workflow-run:")
+                else "running",
             }
         )
 

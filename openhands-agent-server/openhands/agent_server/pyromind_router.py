@@ -122,6 +122,10 @@ from openhands.tools.workflow import (
 from openhands.tools.workflow.analyze_task_failure import AnalyzeTaskFailureTool
 from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 from openhands.tools.workflow.dsl_to_xyflow import convert_xyflow_to_dsl
+from openhands.tools.workflow.submit_workflow import (
+    PYROMIND_PRODUCT_USER_ID_SECRET,
+    SubmitWorkflowTool,
+)
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
@@ -716,6 +720,7 @@ async def apply_pyromind_validation_context(
     if current_user.cookie:
         secrets_update[PYROMIND_VALIDATE_AUTH_COOKIE_SECRET] = current_user.cookie
         secrets_update[PYROMIND_STORAGE_AUTH_COOKIE_SECRET] = current_user.cookie
+    secrets_update[PYROMIND_PRODUCT_USER_ID_SECRET] = str(current_user.user_id)
     if auth_token := parse_auth_token_from_cookie_header(current_user.cookie):
         secrets_update[PYROMIND_AUTH_TOKEN_SECRET] = auth_token
     if current_user.x_cluster:
@@ -1411,6 +1416,7 @@ async def create_pyromind_conversation(
             Tool(name="file_editor"),
             Tool(name=PyromindSubAgentTool.name),
             Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
+            Tool(name=SubmitWorkflowTool.name),
             *sandbox_tools,
             *storage_tools,
             validation_tool,
@@ -1458,6 +1464,15 @@ async def create_pyromind_conversation(
             **sandbox_secrets,
             **storage_secrets,
             **label_studio_secrets,
+            **(
+                {
+                    PYROMIND_PRODUCT_USER_ID_SECRET: StaticSecret(
+                        value=SecretStr(user_id)
+                    )
+                }
+                if user_id is not None
+                else {}
+            ),
         },
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
         user_id=user_id,

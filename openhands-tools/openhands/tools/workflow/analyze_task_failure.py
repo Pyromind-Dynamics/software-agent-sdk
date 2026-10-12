@@ -788,7 +788,7 @@ The observation returns task_status, all nodes, failed_nodes, logs
 condensed server-side from the node source and log tail when include_source=true
 and an auth token is available). Operator source is never returned to you;
 instead the tool condenses it into a concise root-cause + fix suggestion. Fix
-the workflow DSL if the error is deterministic, then re-run via workflow_debug.
+the workflow DSL if the error is deterministic. Do not rerun automatically.
 Source fetching and diagnosis are best-effort: a failed source fetch or failed
 diagnosis never fails the whole analysis (the log tail is always returned).
 When the platform has no usable log for a node, the observation says so and

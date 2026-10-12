@@ -53,13 +53,12 @@ fi
 # LLM Configuration
 # ----------------------------------------------------------
 # LiteLLM requires a provider prefix (e.g. openai/) for custom OpenAI-compatible endpoints.
-export LLM_MODEL="openai/deepseek-v4.1-flash"
-export LLM_BASE_URL="https://pre-token-plan-cn-east-1.pyromind.ai/v1"
-
+export LLM_MODEL="${LLM_MODEL:-openai/deepseek-v4.1-flash}"
+export LLM_BASE_URL="${LLM_BASE_URL:-https://pre-token-plan-cn-east-1.pyromind.ai/v1}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
-# export LLM_MODEL="deepseek/deepseek-v4-flash-0731"
-# export LLM_BASE_URL="https://openrouter.ai/api/v1"
+# For OpenRouter, set LLM_MODEL=deepseek/deepseek-v4.1-flash and
+# LLM_BASE_URL=https://openrouter.ai/api/v1 before launching.
 
 export LABEL_STUDIO_BASE_URL=https://pre-label-studio.pyromind.ai
 export LABEL_STUDIO_PORTAL_BASE_URL=https://pre-label-studio.pyromind.ai
