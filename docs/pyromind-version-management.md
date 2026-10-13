@@ -8,6 +8,8 @@
 - `runs`：每次实际提交一行。`spec_json` 固定本次轮次、输入版本和有效定义；`source_json` 关联现有请求、平台任务及 `retry_of`。不复制任务状态和日志。
 - `artifact_versions`：产物系列、版本号、生产 Run、登记幂等键、状态及 `manifest_json`。manifest 包含摘要、Storage 引用、父版本和登记恢复信息。
 
+三张表的新记录分别使用 `p1`、`r1`、`v1` 这样的短 ID，各自在整张表内递增，不按会话重新编号。字段仍为 `TEXT`，写入时在 `BEGIN IMMEDIATE` 事务内根据下一行编号分配，保证并发安全；不是 SQLite 的 `AUTOINCREMENT` 列，也不增加计数表。`version_no` 仍表示同一项目、类型和产物系列内的版本序号，与版本 ID 独立。旧 UUID 记录和引用继续可读，不需要删库或迁移；轮次、会话及平台任务 ID 保持原格式。
+
 实际 DDL 在 `pyromind-runtime/pyromind_runtime/infrastructure/sqlite_version_store.py`。Pydantic 模型在 `domain/versions.py`，用例在 `application/versions.py`，持久化及快照通过 `ports/versions.py` 访问。Server 装配服务，两个 Harness 仅包装通用工具，不向上暴露原生类型。
 
 现有会话、事件和外部任务继续使用原文件存储；公开命令、快照及 SSE 协议没有变化。新数据库只增加版本元数据，不迁移历史会话，也不会在 fork 后继承旧项目绑定。
@@ -55,7 +57,7 @@ Pi 和 OpenHands 均提供 `product_versions` 工具，入口是 `ConversationRu
 
 登记流程为：插入 `pending` → 事务外保存独占快照 → 提交 `ready`。失败保留同一版本 ID 和版本号，状态为 `failed`；恢复复用原快照目录。失败版本号不回收。最终版本禁止修改和删除。
 
-远端快照位于 `/.pyromind-agent/<conversation_id>/versions/<version_id>/`。文件内容先上传，manifest 最后上传；本地持久化暂存保证重试上传相同字节。每次选用、消费或比较冻结内容时校验摘要。
+远端快照位于 `/.pyromind-agent/<conversation_id>/versions/<version_id>/<snapshot_uuid>/`。独立的快照 UUID 在首次登记时生成并持久化，重试复用，避免开发时删库重建后短 ID 从头编号而误用旧快照。旧记录仍使用已保存的目录。文件内容先上传，manifest 最后上传；本地持久化暂存保证重试上传相同字节。每次选用、消费或比较冻结内容时校验摘要。
 
 支持的自动执行入口：
 

@@ -1,5 +1,6 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 from pyromind_runtime.application.versions import Versions, snapshot_result
@@ -41,6 +42,8 @@ def test_three_tables_lazy_project_and_idempotent_save(versions):
     assert service.project("pure-chat", context, create=False) is None
     first = service.save(project, "save-1", code_request(), context)
     replay = service.save(project, "save-1", code_request(), context)
+    assert project.id == "p1"
+    assert first.id == "v1"
     assert first.id == replay.id
     with pytest.raises(ValueError, match="different content"):
         service.save(project, "save-1", code_request("changed"), context)
@@ -65,9 +68,71 @@ def test_concurrent_numbers_and_same_key(versions):
     with ThreadPoolExecutor(max_workers=8) as pool:
         rows = list(pool.map(reserve, range(16)))
     assert sorted(v.version_no for v in rows) == list(range(1, 17))
+    assert {v.id for v in rows} == {f"v{i}" for i in range(1, 17)}
     with ThreadPoolExecutor(max_workers=8) as pool:
         rows = list(pool.map(lambda _: reserve(0), range(16)))
     assert len({v.id for v in rows}) == 1
+
+
+def test_project_and_run_ids_are_concurrent_and_survive_restart(versions):
+    service, _, project, context = versions
+    store = service.store
+
+    def create_project(index):
+        created = store.project(f"conversation-{index}", context.user_id, create=True)
+        assert created is not None
+        return created
+
+    def reserve_run(index):
+        return store.reserve_run(
+            project.id,
+            f"submit-{index}",
+            RunSpec(kind="train", iteration_id=project.context.current_iteration_id),
+            RunSource(kind="workflow", source_id=f"source-{index}"),
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        projects = list(pool.map(create_project, range(16)))
+        runs = list(pool.map(reserve_run, range(16)))
+    assert {p.id for p in projects} == {f"p{i}" for i in range(2, 18)}
+    assert {r.id for r in runs} == {f"r{i}" for i in range(1, 17)}
+    store = SQLiteVersionStore(store.path)
+    assert create_project(0) == projects[0]
+    assert reserve_run(0) == runs[0]
+    assert create_project(16).id == "p18"
+    assert reserve_run(16).id == "r17"
+
+
+def test_short_ids_preserve_legacy_uuid_project_and_iteration(versions):
+    service, _, project, context = versions
+    legacy_id = str(uuid4())
+    with service.store.connection(write=True) as db:
+        db.execute("UPDATE projects SET id=? WHERE id=?", (legacy_id, project.id))
+    legacy = service.project(project.conversation_id, context)
+    assert legacy.id == legacy_id
+    changed = service.store.new_iteration(legacy_id, "improve", "next", 0)
+    assert changed.context.current_iteration_id == str(
+        uuid5(UUID(legacy_id), "iteration:next")
+    )
+    assert service.store.new_iteration(legacy_id, "improve", "next", 0) == changed
+    version = service.save(legacy, "save", code_request(), context)
+    assert version.id == "v1"
+    assert version.project_id == legacy_id
+    assert service.project("new-conversation", context).id == "p2"
+
+
+def test_database_reset_does_not_reuse_old_snapshot(versions):
+    service, snapshots, project, context = versions
+    old = service.save(project, "save", code_request("old"), context)
+    service.store.path.unlink()
+    restarted = Versions(SQLiteVersionStore(service.store.path), snapshots)
+    recreated = restarted.project(project.conversation_id, context)
+    assert recreated is not None
+    new = restarted.save(recreated, "save", code_request("new"), context)
+    assert new.id == old.id == "v1"
+    assert new.manifest.target != old.manifest.target
+    assert snapshots.read_text(snapshot_result(new), context) == "new"
+    assert snapshots.read_text(snapshot_result(old), context) == "old"
 
 
 def test_snapshot_survives_source_change_restart_and_database_failure(

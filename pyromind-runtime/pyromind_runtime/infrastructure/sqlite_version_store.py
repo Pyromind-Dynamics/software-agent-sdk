@@ -6,7 +6,8 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from uuid import UUID, uuid5
+from typing import Literal
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pyromind_runtime.domain.versions import (
     ArtifactVersion,
@@ -150,6 +151,7 @@ class SQLiteVersionStore:
                 return None
             iteration = Iteration()
             project = VersionProject(
+                id=self._next_id(db, "p"),
                 conversation_id=conversation_id,
                 owner_user_id=user_id,
                 context=ProjectContext(
@@ -169,6 +171,16 @@ class SQLiteVersionStore:
                 ),
             )
             return project
+
+    @staticmethod
+    def _next_id(db: sqlite3.Connection, prefix: Literal["p", "r", "v"]) -> str:
+        # Call only inside BEGIN IMMEDIATE, before inserting the corresponding row.
+        queries = {
+            "p": "SELECT COALESCE(MAX(rowid), 0) + 1 FROM projects",
+            "r": "SELECT COALESCE(MAX(rowid), 0) + 1 FROM runs",
+            "v": "SELECT COALESCE(MAX(rowid), 0) + 1 FROM artifact_versions",
+        }
+        return f"{prefix}{db.execute(queries[prefix]).fetchone()[0]}"
 
     def bound_project(self, conversation_id: str) -> VersionProject | None:
         with self.connection() as db:
@@ -245,7 +257,7 @@ class SQLiteVersionStore:
                 "WHERE project_id=? AND kind=? AND logical_key=?",
                 (project.id, request.kind, request.logical_key),
             ).fetchone()[0]
-            identity = new_id()
+            identity = self._next_id(db, "v")
             version = ArtifactVersion(
                 id=identity,
                 project_id=project.id,
@@ -259,7 +271,10 @@ class SQLiteVersionStore:
                     output_role=request.output_role,
                     summary=request.summary,
                     source=request.source,
-                    target=f"/.pyromind-agent/{project.conversation_id}/versions/{identity}",
+                    target=(
+                        f"/.pyromind-agent/{project.conversation_id}/versions/"
+                        f"{identity}/{new_id()}"
+                    ),
                     request_digest=digest,
                 ),
             )
@@ -382,7 +397,12 @@ class SQLiteVersionStore:
     def new_iteration(
         self, project_id: str, goal: str, command_id: str, revision: int
     ) -> VersionProject:
-        identity = str(uuid5(UUID(project_id), "iteration:" + command_id))
+        namespace = (
+            uuid5(NAMESPACE_URL, project_id)
+            if project_id.startswith("p")
+            else UUID(project_id)
+        )
+        identity = str(uuid5(namespace, "iteration:" + command_id))
         with self.connection(write=True) as db:
             project = self._get_project(db, project_id)
             for item in project.context.iterations:
@@ -472,7 +492,11 @@ class SQLiteVersionStore:
                     "retry source belongs to another project or is missing"
                 )
             run = VersionRun(
-                project_id=project_id, request_key=key, spec=spec, source=source
+                id=self._next_id(db, "r"),
+                project_id=project_id,
+                request_key=key,
+                spec=spec,
+                source=source,
             )
             db.execute(
                 "INSERT INTO runs VALUES (?,?,?,?,?,?)",

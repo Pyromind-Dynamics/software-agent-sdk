@@ -96,7 +96,7 @@ class ProjectContext(ContractModel):
 
 
 class VersionProject(ContractModel):
-    id: str = Field(default_factory=new_id)
+    id: str
     conversation_id: str
     owner_user_id: str
     name: str = "模型项目"
@@ -124,7 +124,7 @@ class RunSource(ContractModel):
 
 
 class VersionRun(ContractModel):
-    id: str = Field(default_factory=new_id)
+    id: str
     project_id: str
     request_key: str
     spec: RunSpec
@@ -176,7 +176,7 @@ class VersionManifest(ContractModel):
 
 
 class ArtifactVersion(ContractModel):
-    id: str = Field(default_factory=new_id)
+    id: str
     project_id: str
     producer_run_id: str | None = None
     kind: ArtifactKind
