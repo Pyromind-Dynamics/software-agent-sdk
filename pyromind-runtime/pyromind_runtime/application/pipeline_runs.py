@@ -6,8 +6,15 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
+from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.content import JsonObject
+from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.pipeline import PipelineRun
+from pyromind_runtime.domain.versions import (
+    RunSource,
+    SaveVersion,
+    canonical,
+)
 from pyromind_runtime.ports.external_tasks import ExternalTaskRegistry
 from pyromind_runtime.ports.product_store import ProductStore
 
@@ -20,10 +27,158 @@ class PipelineRuns:
         conversation_id: str,
         store: ProductStore,
         registry: ExternalTaskRegistry,
+        versions: Versions | None = None,
+        context: RequestContext | None = None,
     ) -> None:
         self.conversation_id = conversation_id
         self._store = store
         self._registry = registry
+        self._versions = versions
+        self._context = context
+
+    def with_context(self, context: RequestContext) -> PipelineRuns:
+        return PipelineRuns(
+            self.conversation_id, self._store, self._registry, self._versions, context
+        )
+
+    def prepare_execution(
+        self, run_id: str, workflow: dict[str, Any], dsl: str, script: str
+    ) -> dict[str, Any]:
+        if self._versions is None:
+            return workflow
+        if self._context is None:
+            raise ValueError("versioned execution requires request credentials")
+        run = self._store.load_pipeline_runs()[run_id]
+        project = self._versions.project(self.conversation_id, self._context)
+        assert project is not None
+        prior = next(
+            (
+                item
+                for item in reversed(self._versions.store.list_runs(project.id))
+                if item.source.source_id == run_id
+                and item.source.execution_revision < run.execution_revision
+            ),
+            None,
+        )
+        key = f"pipeline:{run_id}:{run.execution_revision}"
+        existing = next(
+            (
+                item
+                for item in self._versions.store.list_runs(project.id)
+                if item.request_key == key
+            ),
+            None,
+        )
+        if existing is not None:
+            from pyromind_runtime.application.versions import snapshot_result
+
+            for identity in existing.spec.inputs.values():
+                version = self._versions.store.get_version(project.id, identity)
+                if version.state == "ready":
+                    self._versions.snapshots.verify(
+                        snapshot_result(version), self._context
+                    )
+            saved = existing.spec.parameters["definition"]
+            assert isinstance(saved, dict)
+            saved_workflow = saved["workflow"]
+            assert isinstance(saved_workflow, dict)
+            return saved_workflow
+        inputs: dict[str, str] = {}
+        effective_definition = self._versions.resolve_inputs(
+            project, run.definition, inputs, self._context, key
+        )
+        if prior is not None:
+            previous_spec = prior.spec.parameters.get("definition")
+            if (
+                isinstance(previous_spec, dict)
+                and previous_spec.get("definition") != effective_definition
+            ):
+                raise ValueError("selected inputs changed; use a new full run")
+        replacements: dict[str, str] = {}
+        original_inference = run.definition.get("inference", {})
+        effective_inference = effective_definition.get("inference", {})
+        assert isinstance(original_inference, dict) and isinstance(
+            effective_inference, dict
+        )
+        for old, new in (
+            (run.definition.get("input_path"), effective_definition.get("input_path")),
+            (
+                original_inference.get("model_path"),
+                effective_inference.get("model_path"),
+            ),
+        ):
+            if isinstance(old, str) and isinstance(new, str) and old != new:
+                replacements[old] = new
+        for role, filename, text, kind in (
+            (
+                "dataset_config",
+                "dataset_config.json",
+                canonical(effective_definition["dataset_config"]),
+                "config",
+            ),
+            (
+                "evaluation_config",
+                "evaluation_config.json",
+                canonical(effective_definition["evaluation_config"]),
+                "config",
+            ),
+            ("runtime_script", "evaluate_inference.py", script, "code"),
+        ):
+            version = self._versions.save(
+                project,
+                key + ":" + role,
+                SaveVersion.model_validate(
+                    {
+                        "kind": kind,
+                        "logical_key": role,
+                        "source": {"text": text, "filename": filename},
+                    }
+                ),
+                self._context,
+            )
+            inputs[role] = version.id
+            replacements[run.output_dir + "/" + filename] = (
+                version.manifest.storage_ref or ""
+            )
+
+        def rewrite(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {name: rewrite(item) for name, item in value.items()}
+            if isinstance(value, list):
+                return [rewrite(item) for item in value]
+            if isinstance(value, str):
+                for old, new in sorted(
+                    replacements.items(), key=lambda pair: -len(pair[0])
+                ):
+                    value = value.replace(old, new)
+            return value
+
+        workflow = rewrite(workflow)
+        dsl = rewrite(dsl)
+        record = self._versions.prepare_run(
+            self.conversation_id,
+            self._context,
+            f"pipeline:{run_id}:{run.execution_revision}",
+            RunSource(
+                kind="pipeline",
+                source_id=run_id,
+                execution_revision=run.execution_revision,
+                retry_of=prior.id if prior else None,
+            ),
+            {
+                "definition": effective_definition,
+                "workflow": workflow,
+                "runtime_script": script,
+            },
+            code=dsl,
+            kind="evaluate",
+            resolved_inputs=inputs,
+        )
+        effective = record.spec.parameters["definition"]
+        assert isinstance(effective, dict)
+        effective_workflow = effective["workflow"]
+        assert isinstance(effective_workflow, dict)
+        return effective_workflow
 
     def resolve(self, run_id: str) -> dict[str, Any] | None:
         run = self._store.load_pipeline_runs().get(str(UUID(run_id)))
@@ -44,6 +199,12 @@ class PipelineRuns:
             raise ValueError("unknown inference run in this conversation")
         expected_revision = None
         if previous is not None:
+            if self._versions is not None and self._context is not None:
+                project = self._versions.project(
+                    self.conversation_id, self._context, create=False
+                )
+                if project is not None:
+                    self._versions.guard_resume(project, str(previous["run_id"]))
             prior = PipelineRun.model_validate(previous)
             if prior.fingerprint != fingerprint:
                 raise ValueError("evaluation configuration changed; use a new full run")
@@ -132,6 +293,17 @@ class PipelineRuns:
                 "resume_pending": False,
             }
             self._registry.register(self.conversation_id, payload)
+            if self._versions is not None:
+                project = self._versions.store.bound_project(self.conversation_id)
+                if project is not None:
+                    for record in self._versions.store.list_runs(project.id):
+                        if (
+                            record.request_key
+                            == f"pipeline:{run_id}:{run.execution_revision}"
+                        ):
+                            self._versions.store.link_task(
+                                project.id, record.id, task_id
+                            )
 
     def task_for(
         self, task_id: str | None, run_id: str | None, output_dir: str | None

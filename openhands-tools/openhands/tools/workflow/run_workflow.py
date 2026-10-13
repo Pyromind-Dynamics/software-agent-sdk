@@ -192,6 +192,7 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
         self.current_user = current_user
         self._max_attempts = DEFAULT_MAX_ATTEMPTS  # 每轮最大提交次数
         self.headers = headers or {}
+        self.submission_handler = None
 
     def __call__(
         self,
@@ -295,6 +296,7 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
                 test_mode=test_mode,
                 attempt=attempt_number,
                 conversation_id=str(conversation.id),
+                source_code=action.dsl,
             )
             submit_ms = (time.monotonic() - submit_t0) * 1000
             logger.info(
@@ -345,6 +347,7 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
         test_mode: bool = False,
         attempt: int,
         conversation_id: str,
+        source_code: str | None = None,
     ) -> RunWorkflowObservation:
         """Submit the workflow run to the platform asynchronously.
 
@@ -424,6 +427,8 @@ class RunWorkflowExecutor(ToolExecutor[RunWorkflowAction, RunWorkflowObservation
                 name=_workflow_name,
                 conversation_id=conversation_id,
                 test_mode=test_mode,
+                submission_handler=self.submission_handler,
+                source_code=source_code,
             )
 
             if test_mode:

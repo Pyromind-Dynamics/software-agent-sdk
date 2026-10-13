@@ -38,6 +38,12 @@ from harness_adapter.openhands_adapter.session_factory import (
     LegacyPyromindSessionFactory,
     request_from_context,
 )
+from harness_adapter.version_tools import (
+    ExecutionCall,
+    ProductVersionsTool,
+    VersionCall,
+    submission_bridge,
+)
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.event_service import EventService
 from openhands.agent_server.models import ConfirmationResponseRequest, EventSortOrder
@@ -100,6 +106,54 @@ class OpenHandsAdapter:
         )
         self._sessions: dict[str, _ActiveSession] = {}
         self._lock = asyncio.Lock()
+        self._version_call: VersionCall | None = None
+        self._execution_call: ExecutionCall | None = None
+
+    def set_version_handler(
+        self, callback: VersionCall, execution: ExecutionCall | None = None
+    ) -> None:
+        self._version_call = callback
+        self._execution_call = execution
+
+    def _install_version_tool(
+        self, scope: str, service: EventService, context: RequestContext
+    ) -> None:
+        if self._version_call is None:
+            return
+        conversation = service.get_conversation()
+        if self._execution_call is not None:
+            from openhands.sdk.event import ActionEvent
+
+            for tool in conversation.agent.tools_map.values():
+                executor = tool.executor
+                if executor is None or not hasattr(executor, "submission_handler"):
+                    continue
+
+                def request_id(name: str = tool.name) -> str:
+                    for event in reversed(conversation.state.events):
+                        if isinstance(event, ActionEvent) and event.tool_name == name:
+                            return str(event.id)
+                    raise ValueError("submission requires a recorded tool action")
+
+                setattr(
+                    executor,
+                    "submission_handler",
+                    submission_bridge(
+                        self._execution_call,
+                        scope,
+                        request_id,
+                        context,
+                        asyncio.get_running_loop(),
+                    ),
+                )
+        conversation.agent.add_runtime_tools(
+            ProductVersionsTool.create(
+                callback=self._version_call,
+                scope=scope,
+                context=context,
+                loop=asyncio.get_running_loop(),
+            )
+        )
 
     async def describe(self) -> tuple[str, HarnessCapabilities]:
         return "openhands", OPENHANDS_CAPABILITIES
@@ -118,6 +172,7 @@ class OpenHandsAdapter:
             (time.perf_counter() - started_at) * 1000,
             conversation_id,
         )
+        self._install_version_tool(conversation_id, event_service, context)
         return await self._attach(conversation_id, event_service)
 
     async def attach_session(
@@ -143,6 +198,7 @@ class OpenHandsAdapter:
             raise FileNotFoundError(
                 f"OpenHands conversation not found: {conversation_id}"
             )
+        self._install_version_tool(conversation_id, event_service, context)
         return await self._attach(conversation_id, event_service)
 
     async def _reactivate(
@@ -185,6 +241,7 @@ class OpenHandsAdapter:
             stale_subscriber_id = session.subscriber_id
             session.event_service = event_service
             session.subscriber_id = subscriber_id
+        self._install_version_tool(conversation_id, event_service, context)
         if stale is not event_service:
             try:
                 await stale.unsubscribe_from_events(stale_subscriber_id)
@@ -277,6 +334,7 @@ class OpenHandsAdapter:
         context: RequestContext,
     ) -> JsonObject:
         session = self._session(handle.session_id)
+        self._install_version_tool(handle.session_id, session.event_service, context)
         if isinstance(command, UserMessageCommand):
             text = "\n".join(
                 block.text

@@ -346,12 +346,16 @@ class InferencePipelineHandler:
             canvas = workspace / "public_data/workflow_canvas/workflow.py"
             canvas.parent.mkdir(parents=True, exist_ok=True)
             canvas.write_text(dsl)
+            prepare_execution = getattr(self.runs, "prepare_execution", None)
+            if prepare_execution is not None:
+                workflow = prepare_execution(run_id, workflow, dsl, script.read_text())
             submitting = True
             response = submit_workflow_task(
                 client=client,
                 workflow=workflow,
                 name=str(workflow["name"]),
                 conversation_id=str(conversation.id),
+                retry_create=False,
             )
             task_id = response.task_id
             response_status = response.status

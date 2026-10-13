@@ -18,6 +18,7 @@ from pyromind_runtime.application.reusable_workflows import (
     ReusableWorkflows,
     started_run,
 )
+from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.application.workflow_completion import WorkflowCompletionHook
 from pyromind_runtime.domain.capabilities import ResourceLimits
 from pyromind_runtime.domain.commands import (
@@ -36,6 +37,13 @@ from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
     ExternalTaskState,
     WorkflowState,
+)
+from pyromind_runtime.domain.versions import (
+    RunSource,
+    SaveVersion,
+    SnapshotSource,
+    VersionToolRequest,
+    fingerprint,
 )
 from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
 from pyromind_runtime.infrastructure.file_product_store import (
@@ -120,6 +128,7 @@ class ConversationRuntime:
         resource_limits: ResourceLimits | None = None,
         workflows: WorkflowBackend | None = None,
         workflow_submission: WorkflowSubmissionPort | None = None,
+        versions: Versions | None = None,
     ) -> None:
         self.conversation_root = Path(conversation_root)
         self.adapters = (
@@ -133,6 +142,7 @@ class ConversationRuntime:
         self._resource_limits = resource_limits
         self._external_tasks = external_tasks
         self._workflow_submission = workflow_submission
+        self.versions = versions
         self._projector = ProductEventProjector()
         self._notification_resume_lock = asyncio.Lock()
         self._workflows = (
@@ -158,6 +168,210 @@ class ConversationRuntime:
         self._first_command_pending: set[str] = set()
         self._first_delta_started_at: dict[tuple[str, str], float] = {}
         self._pending_task_registrations: dict[str, asyncio.Event] = {}
+
+    async def version_call(
+        self,
+        conversation_id: str,
+        request: VersionToolRequest,
+        command_id: str,
+        context: RequestContext,
+    ) -> dict[str, Any]:
+        self._store(conversation_id).authorize(context.user_id)
+        if self.versions is None:
+            raise ValueError("version management is unavailable")
+        return await asyncio.to_thread(
+            self.versions.call, conversation_id, request, command_id, context
+        )
+
+    async def submit_versioned_workflow(
+        self,
+        conversation_id: str,
+        request_id: str,
+        workflow: JsonObject,
+        code: str | None,
+        context: RequestContext,
+    ) -> dict[str, Any]:
+        """Submit an already-authorized tool action through the durable product path."""
+        store = self._store(conversation_id)
+        store.authorize(context.user_id)
+        if self.versions is None or self._workflow_submission is None:
+            raise ValueError("versioned submission is unavailable")
+        identity = "tool:" + request_id
+        digest = fingerprint({"workflow": workflow, "code": code})
+        previous = store.load_workflow_execution_requests().get(identity)
+        if previous is not None:
+            if previous.fingerprint != digest:
+                raise ValueError("request id already used with different execution")
+            if previous.task_id:
+                return {"task_id": previous.task_id, "status": "Pending"}
+            raise ValueError(
+                "submission is in progress or uncertain; reconcile before retrying"
+            )
+        record = await asyncio.to_thread(
+            self.versions.prepare_run,
+            conversation_id,
+            context,
+            identity,
+            RunSource(kind="workflow", source_id=identity),
+            workflow,
+            code=code,
+        )
+        effective = record.spec.parameters["definition"]
+        assert isinstance(effective, dict)
+        request = WorkflowExecutionRequest(
+            request_id=identity,
+            conversation_id=conversation_id,
+            permission_id=identity,
+            workflow_path="version://" + record.id,
+            fingerprint=digest,
+            workflow=effective,
+            summary={"name": str(workflow.get("name", "workflow"))},
+            status="submitting",
+        )
+        store.save_workflow_execution_request(request, expected_revision=None)
+        try:
+            task_id = await self._workflow_submission.submit(
+                effective, conversation_id, context
+            )
+        except Exception as exc:
+            store.save_workflow_execution_request(
+                request.model_copy(
+                    update={
+                        "status": "uncertain",
+                        "revision": request.revision + 1,
+                        "error": type(exc).__name__,
+                    }
+                ),
+                expected_revision=request.revision,
+            )
+            raise ValueError(
+                "submission outcome uncertain; reconcile before retrying"
+            ) from None
+        self.register_external_task(
+            conversation_id,
+            {
+                "task_id": task_id,
+                "kind": "workflow_run",
+                "run_id": identity,
+                "status": "pending",
+                "submitted_at": datetime.now().astimezone().isoformat(),
+                "updated_at": datetime.now().astimezone().isoformat(),
+            },
+        )
+        store.save_workflow_execution_request(
+            request.model_copy(
+                update={
+                    "status": "submitted",
+                    "task_id": task_id,
+                    "revision": request.revision + 1,
+                }
+            ),
+            expected_revision=request.revision,
+        )
+        await self.reconcile_versions(conversation_id, context)
+        return {"task_id": task_id, "status": "Pending"}
+
+    async def recover_version_metadata(self) -> None:
+        if self.versions is None:
+            return
+        scopes = await asyncio.to_thread(self.versions.store.recovery_scopes)
+        for scope in scopes:
+            if self._store(scope).metadata_path.is_file():
+                await self.reconcile_versions(scope)
+
+    async def reconcile_versions(
+        self,
+        conversation_id: str,
+        context: RequestContext | None = None,
+    ) -> None:
+        if self.versions is None:
+            return
+        store = self._store(conversation_id)
+        if context is not None:
+            store.authorize(context.user_id)
+        versions = self.versions
+
+        def reconcile() -> None:
+            project = versions.store.bound_project(conversation_id)
+            if project is None:
+                return
+            requests = store.load_workflow_execution_requests()
+            pipelines = store.load_pipeline_runs()
+            tasks = store.load_snapshot().external_tasks
+            for run in versions.store.list_runs(project.id):
+                source = run.source
+                request = (
+                    requests.get(source.source_id)
+                    if source.kind == "workflow"
+                    else pipelines.get(source.source_id)
+                )
+                if (
+                    source.kind == "pipeline"
+                    and request is not None
+                    and getattr(request, "execution_revision", None)
+                    != source.execution_revision
+                ):
+                    request = None
+                task_id = source.task_id or (
+                    request.task_id if request is not None else None
+                )
+                if task_id is None and source.kind == "workflow":
+                    # The submitted event can survive a crash before the request file.
+                    task_id = next(
+                        (
+                            task.task_id
+                            for task in tasks
+                            if task.run_id == source.source_id
+                        ),
+                        None,
+                    )
+                if not task_id:
+                    continue
+                if source.task_id is None:
+                    versions.store.link_task(project.id, run.id, task_id)
+                task = next((item for item in tasks if item.task_id == task_id), None)
+                if task is None or task.status not in {
+                    "succeeded",
+                    "failed",
+                    "terminated",
+                    "stopped",
+                }:
+                    continue
+                raw_outputs = task.completion_result.get("artifacts", [])
+                outputs = (
+                    [SaveVersion.model_validate(item) for item in raw_outputs]
+                    if isinstance(raw_outputs, list)
+                    else []
+                )
+                if (
+                    not outputs
+                    and source.kind == "pipeline"
+                    and task.status == "succeeded"
+                    and task.output_dir
+                ):
+                    outputs = [
+                        SaveVersion(
+                            kind="evaluation",
+                            logical_key="evaluation-report",
+                            source=SnapshotSource(
+                                storage_ref=task.output_dir.rstrip("/") + "/report.json"
+                            ),
+                            output_role="report",
+                        )
+                    ]
+                if outputs:
+                    versions.register_outputs(project, run, outputs, context)
+            if context is not None:
+                versions.recover(project, context)
+
+        try:
+            await asyncio.to_thread(reconcile)
+        except Exception as exc:
+            logger.warning(
+                "Version reconciliation pending: conversation=%s error=%s",
+                conversation_id,
+                type(exc).__name__,
+            )
 
     async def workflow_call(
         self,
@@ -439,6 +653,20 @@ class ConversationRuntime:
             or not isinstance(fingerprint, str)
         ):
             raise ValueError("workflow preparation returned an invalid definition")
+        if self.versions is not None:
+            source_text = prepared.get("source")
+            version_run = await asyncio.to_thread(
+                self.versions.prepare_run,
+                conversation_id,
+                context,
+                f"workflow:{identity}",
+                RunSource(kind="workflow", source_id=identity),
+                workflow,
+                code=source_text if isinstance(source_text, str) else None,
+            )
+            effective = version_run.spec.parameters["definition"]
+            assert isinstance(effective, dict)
+            workflow = effective
         request = WorkflowExecutionRequest(
             request_id=identity,
             conversation_id=conversation_id,
@@ -486,6 +714,26 @@ class ConversationRuntime:
             return store.complete_command(
                 receipt.model_copy(update={"status": "completed", "response": response})
             )
+        if command.decision == "allow_once" and self.versions is not None:
+            from pyromind_runtime.application.versions import snapshot_result
+
+            project = self.versions.project(
+                request.conversation_id, context, create=False
+            )
+            if project is not None:
+                for run in self.versions.store.list_runs(project.id):
+                    if run.request_key != f"workflow:{request.request_id}":
+                        continue
+                    for version_id in run.spec.inputs.values():
+                        version = self.versions.store.get_version(
+                            project.id, version_id
+                        )
+                        if version.state == "ready":
+                            await asyncio.to_thread(
+                                self.versions.snapshots.verify,
+                                snapshot_result(version),
+                                context,
+                            )
         next_status = "submitting" if command.decision == "allow_once" else "cancelled"
         updated = request.model_copy(
             update={"status": next_status, "revision": request.revision + 1}
@@ -576,6 +824,7 @@ class ConversationRuntime:
         store.save_workflow_execution_request(
             submitted, expected_revision=updated.revision
         )
+        await self.reconcile_versions(request.conversation_id, context)
         self._emit_workflow_execution_message(
             store, request, "submitted", f"工作流已提交，taskId：{task_id}"
         )
@@ -796,6 +1045,10 @@ class ConversationRuntime:
                 logger.exception(
                     "Could not update external task registry for %s", task_id
                 )
+        if terminal:
+            await self.reconcile_versions(
+                conversation_id, active.context if active else None
+            )
         if updated_snapshot.through_seq == before_seq:
             logger.info(
                 "external_task.callback_duplicate conversation_id=%s task_id=%s "
@@ -1095,6 +1348,7 @@ class ConversationRuntime:
     async def _resume_pending_external_tasks(
         self, active: _ActiveConversation, store: FileProductStore
     ) -> None:
+        await self.reconcile_versions(active.handle.session_id, active.context)
         async with self._notification_resume_lock:
             await self._resume_notifications(active, store)
 

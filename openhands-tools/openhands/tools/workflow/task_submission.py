@@ -87,6 +87,9 @@ def submit_workflow_task(
     conversation_id: str,
     test_mode: bool = False,
     retry_create: bool = True,
+    submission_handler: Callable[[dict, str, str | None], TrainingTaskCreateResponse]
+    | None = None,
+    source_code: str | None = None,
 ) -> TrainingTaskCreateResponse:
     """Create one Studio task with the standard conversation correlation ID.
 
@@ -94,6 +97,8 @@ def submit_workflow_task(
     ``agent1#debug#<conversation_id>`` so Kafka callbacks can apply
     debug-only agent guidance. Production runs keep ``agent1#<conversation_id>``.
     """
+    if submission_handler is not None and not test_mode:
+        return submission_handler(workflow, name, source_code)
     if test_mode:
         out_id = f"agent1#debug#{conversation_id}"
     else:

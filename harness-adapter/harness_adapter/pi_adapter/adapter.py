@@ -61,6 +61,7 @@ from harness_adapter.pi_adapter.terminal_backend import validate_pi_terminal_bac
 from harness_adapter.pi_adapter.tool_output import (
     parse_business_tool_output_filename,
 )
+from harness_adapter.version_tools import ExecutionCall, VersionCall
 from openhands.agent_server.workflow_canvas_models import (
     SaveWorkflowCanvasEventSnapshotRequest,
 )
@@ -302,6 +303,12 @@ class PiAdapter:
     def _apply_quota(self, root: Path, conversation_id: str) -> None:
         if self._apply_workspace_quota is not None:
             self._apply_workspace_quota(root, conversation_id)
+
+    def set_version_handler(
+        self, callback: VersionCall, execution: ExecutionCall | None = None
+    ) -> None:
+        self._business_tools.version_call = callback
+        self._business_tools.execution_call = execution
 
     def set_workflow_preparer(self, callback: Any) -> None:
         self._business_tools.set_workflow_preparer(callback)

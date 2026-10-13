@@ -14,6 +14,7 @@ from typing import Any, cast
 from pydantic import SecretStr
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.versions import VersionToolRequest
 
 from harness_adapter.openhands_adapter.session_factory import current_user_from_context
 from harness_adapter.pi_adapter.business_tools import (
@@ -28,6 +29,13 @@ from harness_adapter.pi_adapter.tool_output import (
     normalize_utf8_text,
     resolve_tool_output_policy,
     truncate_tool_content,
+)
+from harness_adapter.version_tools import (
+    ExecutionCall,
+    ProductVersionsAction,
+    ProductVersionsTool,
+    VersionCall,
+    submission_bridge,
 )
 from openhands.agent_server.pyromind_auth import parse_auth_token_from_cookie_header
 from openhands.sdk.conversation.secret_registry import SecretRegistry
@@ -299,6 +307,8 @@ class PyromindBusinessToolHost:
             else None
         )
         self._pipeline_runs = pipeline_runs
+        self.version_call: VersionCall | None = None
+        self.execution_call: ExecutionCall | None = None
         self._workflow_preparer: Callable[..., Awaitable[dict[str, Any]]] | None = None
         for path in (
             self._cleaning_runtime,
@@ -396,6 +406,14 @@ class PyromindBusinessToolHost:
 
     def specs(self) -> list[dict[str, Any]]:
         specs = [validation_tool_spec()]
+        if self.version_call is not None:
+            specs.append(
+                BusinessToolSpec(
+                    ProductVersionsTool.name,
+                    ProductVersionsTool.create()[0].description,
+                    ProductVersionsAction.model_json_schema(),
+                ).as_dict()
+            )
         if self._workflow_preparer is not None:
             specs.append(
                 BusinessToolSpec(
@@ -470,6 +488,32 @@ class PyromindBusinessToolHost:
         tool_call_id: str | None = None,
     ) -> dict[str, Any]:
         started_at = time.perf_counter()
+        if name == ProductVersionsTool.name:
+            if self.version_call is None:
+                raise ValueError("version management is unavailable")
+            try:
+                action = ProductVersionsAction.model_validate(arguments)
+                result = await self.version_call(
+                    context.conversation_id,
+                    VersionToolRequest(
+                        action=action.action, arguments=action.arguments
+                    ),
+                    action.command_id,
+                    context.request_context,
+                )
+                return BusinessToolResult(
+                    is_error=False,
+                    content=[
+                        {"type": "text", "text": json.dumps(result, ensure_ascii=False)}
+                    ],
+                    details=result,
+                ).as_dict()
+            except ValueError as exc:
+                return BusinessToolResult(
+                    is_error=True,
+                    content=[{"type": "text", "text": str(exc)}],
+                    details={},
+                ).as_dict()
         if name == "submit_workflow":
             if self._workflow_preparer is None:
                 raise ValueError("workflow submission is unavailable")
@@ -525,6 +569,27 @@ class PyromindBusinessToolHost:
         if factory is None:
             raise ValueError(f"unsupported business tool: {name}")
         tool = factory(context)
+        if (
+            self.execution_call is not None
+            and tool.executor is not None
+            and hasattr(tool.executor, "submission_handler")
+        ):
+            inflight = PiSessionFiles(context.workspace_root).load_inflight() or {}
+            identity = str(inflight.get("run_id", "")) + ":" + str(tool_call_id or "")
+            if not tool_call_id:
+                raise ValueError("submission requires a stable tool call ID")
+            setattr(
+                tool.executor,
+                "submission_handler",
+                submission_bridge(
+                    self.execution_call,
+                    context.conversation_id,
+                    lambda: identity,
+                    context.request_context,
+                    asyncio.get_running_loop(),
+                ),
+            )
+
         policy = resolve_tool_output_policy(tool.meta)
         policy_source = (
             "tool_meta"
@@ -813,7 +878,9 @@ class PyromindBusinessToolHost:
         if self._pipeline_runs is not None and self._inference_runtime is not None:
             params["inference_handler"] = InferencePipelineHandler(
                 self._inference_runtime,
-                self._pipeline_runs(context.conversation_id),
+                self._pipeline_runs(context.conversation_id).with_context(
+                    context.request_context
+                ),
                 ValidateWorkflowDslExecutor(
                     secret_headers={"authorization": _VALIDATE_AUTHORIZATION_SECRET}
                     if context.request_context.authorization

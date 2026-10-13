@@ -122,9 +122,9 @@ omit inference to reuse the frozen configuration. Only submit when execution
 has been requested. Evaluation configuration changes require a new full run.
 
 Call mode='full' only after the user confirms a successful local
-terminal pipeline execution result for data processing. The tool freezes the local script
-and shared runtime
-in a per-run Storage directory. Set model_profile and output_schema explicitly
+terminal pipeline execution result for data processing. The tool freezes the
+local script and shared runtime in a per-run Storage directory.
+Set model_profile and output_schema explicitly
 for new standard runs. When the user supplies their own labeling gateway, pass
 it as labeling_gateway with model_profile='vision'; it replaces the managed
 vision model for this run.
@@ -545,6 +545,7 @@ class DfSubmitPipelineExecutor(
         self._storage_secret_headers = dict(storage_secret_headers or {})
         self._task_store_dir = Path(task_store_dir) if task_store_dir else None
         self._timeout = timeout
+        self.submission_handler = None
         self._inference_handler = inference_handler
 
     def __call__(
@@ -849,6 +850,7 @@ class DfSubmitPipelineExecutor(
                 workflow=workflow,
                 name=str(workflow["name"]),
                 conversation_id=str(conversation.id),
+                submission_handler=self.submission_handler,
             )
             task_id = response.task_id
         except Exception as exc:

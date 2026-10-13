@@ -8,15 +8,19 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
+from harness_adapter.artifact_snapshots import PlatformArtifactSnapshots
 from harness_adapter.openhands_adapter import OpenHandsAdapter
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.workflow_submission import PlatformWorkflowSubmission
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
+from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.capabilities import ResourceLimits
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.versions import VersionToolRequest
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
+from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import HarnessAdapter
 from pyromind_runtime.ports.workflows import WorkflowEventSink
 
@@ -40,9 +44,39 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     backend = (raw_backend or "openhands").strip().lower()
     if backend not in {"openhands", "pi"}:
         raise RuntimeError(f"Unsupported PYROMIND_HARNESS_BACKEND: {backend}")
-    adapters: dict[str, HarnessAdapter] = {
-        "openhands": OpenHandsAdapter(lambda: app.state.conversation_service),
-    }
+    openhands_adapter = OpenHandsAdapter(lambda: app.state.conversation_service)
+    adapters: dict[str, HarnessAdapter] = {"openhands": openhands_adapter}
+    version_path = Path(
+        os.getenv("PYROMIND_VERSION_DB_PATH")
+        or service.conversations_dir.parent / "product-versions" / "versions.sqlite3"
+    )
+    versions = Versions(
+        SQLiteVersionStore(version_path),
+        PlatformArtifactSnapshots(version_path.parent / "snapshot-staging"),
+    )
+
+    async def version_call(
+        scope: str,
+        request: VersionToolRequest,
+        command_id: str,
+        context: RequestContext,
+    ):
+        assert isinstance(runtime, ConversationRuntime)
+        return await runtime.version_call(scope, request, command_id, context)
+
+    async def execution_call(
+        scope: str,
+        request_id: str,
+        workflow: JsonObject,
+        code: str | None,
+        context: RequestContext,
+    ):
+        assert isinstance(runtime, ConversationRuntime)
+        return await runtime.submit_versioned_workflow(
+            scope, request_id, workflow, code, context
+        )
+
+    openhands_adapter.set_version_handler(version_call, execution_call)
     terminal_backend: str | None = None
     external_tasks = WorkflowExternalTaskRegistry(service.conversations_dir)
 
@@ -51,6 +85,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             conversation_id,
             FileProductStore(service.conversations_dir / conversation_id),
             external_tasks,
+            versions=versions,
         )
 
     workflows = None
@@ -78,6 +113,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             pipeline_runs=pipeline_runs,
             workflow_call=workflow_call if workflow_enabled else None,
         )
+        pi_adapter.set_version_handler(version_call, execution_call)
         adapters["pi"] = pi_adapter
         if workflow_enabled:
 
@@ -139,6 +175,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         resource_limits=resource_limits_from_environment(),
         workflows=workflows,
         workflow_submission=PlatformWorkflowSubmission(),
+        versions=versions,
     )
     if backend == "pi":
         adapter = adapters["pi"]
@@ -201,7 +238,9 @@ def install_product_api(app: FastAPI) -> FastAPI:
     @asynccontextmanager
     async def product_lifespan(current_app: FastAPI):
         async with original_lifespan(current_app):
-            ensure_product_runtime(current_app)
+            runtime = ensure_product_runtime(current_app)
+            if runtime is not None:
+                await runtime.recover_version_metadata()
             try:
                 yield
             finally:

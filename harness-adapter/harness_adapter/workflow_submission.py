@@ -85,6 +85,7 @@ class PlatformWorkflowSubmission:
             "workflow": workflow,
             "fingerprint": hashlib.sha256(source).hexdigest(),
             "summary": summary,
+            "source": dsl,
         }
 
     async def submit(

@@ -173,6 +173,7 @@ class RunDatasetCleaningExecutor(
         self._storage_secret_headers = dict(storage_secret_headers or {})
         self._task_store_dir = Path(task_store_dir) if task_store_dir else None
         self._timeout = timeout
+        self.submission_handler = None
 
     def __call__(
         self,
@@ -258,6 +259,7 @@ class RunDatasetCleaningExecutor(
                 workflow=workflow,
                 name=str(workflow["name"]),
                 conversation_id=str(conversation.id),
+                submission_handler=self.submission_handler,
             )
             task_id = response.task_id
         except Exception as exc:
