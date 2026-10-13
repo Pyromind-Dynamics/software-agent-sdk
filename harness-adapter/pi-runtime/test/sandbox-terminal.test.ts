@@ -100,6 +100,49 @@ test("a slow endpoint resolution does not consume the startup budget", async () 
   assert.equal(sockets.length, 1);
 });
 
+test("a rejected endpoint resolution is retried on the same budget", async () => {
+  const requests: { refresh: boolean }[] = [];
+  let attempts = 0;
+  const endpoints = new SandboxEndpointSession(async (request) => {
+    requests.push(request);
+    attempts += 1;
+    if (attempts === 1) throw new Error("request_failed: POST /api/v1/sandboxes -> 503");
+    return ENDPOINT;
+  });
+  const { connect, sockets } = scriptedConnector([
+    (socket, _line, token) => {
+      socket.emit(frames(token).begin);
+      socket.emit(frames(token).end(0));
+    },
+  ]);
+  const terminal = new LazySandboxTerminalOperations(endpoints, {
+    connect, writeFile: async () => {}, resolveRetryBaseMs: 1,
+  });
+  const completed = await terminal.exec("true", ".", { onData: () => {} });
+  assert.equal(completed.exitCode, 0);
+  assert.equal(attempts, 2);
+  assert.deepEqual(requests, [{ refresh: false }, { refresh: true }]);
+  assert.equal(sockets.length, 1);
+});
+
+test("a persistent endpoint resolution failure reports the control-plane error", async () => {
+  const cause = new Error("request_failed: POST /api/v1/sandboxes -> 503 too many 503 error responses");
+  const endpoints = new SandboxEndpointSession(async () => {
+    throw cause;
+  });
+  const terminal = new LazySandboxTerminalOperations(endpoints, {
+    resolveTimeoutMs: 60, resolveRetryBaseMs: 1,
+  });
+  await assert.rejects(terminal.exec("true", ".", { onData: () => {} }),
+    (error: unknown) => error instanceof SandboxTerminalExecutionError &&
+      error.execution.phase === "connecting" &&
+      error.execution.error_code === "connection_lost" &&
+      error.execution.started === false && error.execution.stopped === true &&
+      error.message.includes("too many 503 error responses") &&
+      error.message.includes("resolve budget exhausted") &&
+      error.cause === cause);
+});
+
 function countingEndpoints(): { endpoints: SandboxEndpointSession; resolved: () => number } {
   let resolved = 0;
   const endpoints = new SandboxEndpointSession(async () => {

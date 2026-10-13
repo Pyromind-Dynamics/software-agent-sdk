@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { posix } from "node:path";
 import { bounded, TerminalChannel } from "./terminal-channel.js";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
+import { describeErrorChain } from "./sandbox-operations.js";
 import type { SandboxEndpoint, SandboxEndpointSession } from "./sandbox-operations.js";
 
 /** Raised when the TTY bridge cannot stay connected for a whole command. */
@@ -73,6 +74,10 @@ const MAX_ENDPOINT_REFRESHES = 1;
  * them rather than the first thing to fail.
  */
 const DEFAULT_RESOLVE_TIMEOUT_MS = 900_000;
+/** First backoff between endpoint-resolution retries. */
+const DEFAULT_RESOLVE_RETRY_BASE_MS = 1_000;
+/** Cap on one backoff between endpoint-resolution retries. */
+const MAX_RESOLVE_RETRY_DELAY_MS = 30_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 180_000;
 const DEFAULT_COMMAND_TIMEOUT_SECONDS = 300;
 const STOP_TIMEOUT_MS = 10_000;
@@ -103,8 +108,15 @@ export interface TerminalExecutionEvidence {
 }
 
 export class SandboxTerminalExecutionError extends Error {
-  constructor(message: string, readonly execution: TerminalExecutionEvidence) {
-    super(`${message} (phase=${execution.phase}, started=${execution.started}, stopped=${execution.stopped})`);
+  constructor(
+    message: string,
+    readonly execution: TerminalExecutionEvidence,
+    options?: ErrorOptions,
+  ) {
+    super(
+      `${message} (phase=${execution.phase}, started=${execution.started}, stopped=${execution.stopped})`,
+      options,
+    );
     this.name = "SandboxTerminalExecutionError";
   }
 }
@@ -169,6 +181,12 @@ export interface SandboxTerminalOptions extends SandboxTerminalTimeouts {
    * See {@link sandboxTerminalTrace}.
    */
   trace?: boolean;
+  /**
+   * Base delay between endpoint-resolution retries, in milliseconds. Defaults
+   * to {@link DEFAULT_RESOLVE_RETRY_BASE_MS}; a rejection the control plane can
+   * repair is retried inside the resolve budget.
+   */
+  resolveRetryBaseMs?: number;
   connect?: SandboxTerminalConnector;
   /**
    * Optional file API used to upload a script too large to stage over the TTY.
@@ -1353,21 +1371,52 @@ export class LazySandboxTerminalOperations implements BashOperations {
   }
 
   private async resolveOperations(options: TerminalExecOptions): Promise<SandboxTerminalOperations> {
-    try {
-      const resolveDeadline =
-        Date.now() + (this.options.resolveTimeoutMs ?? DEFAULT_RESOLVE_TIMEOUT_MS);
-      return await bounded(this.operationsFor(), resolveDeadline, options.signal);
-    } catch (error) {
-      this.operations?.dispose();
-      this.operations = undefined;
-      this.endpoints.invalidate();
-      throw new SandboxTerminalExecutionError("sandbox terminal endpoint resolution failed", {
+    const resolveDeadline =
+      Date.now() + (this.options.resolveTimeoutMs ?? DEFAULT_RESOLVE_TIMEOUT_MS);
+    let lastError: unknown;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await bounded(this.operationsFor(), resolveDeadline, options.signal);
+      } catch (error) {
+        if (!isRetryableResolve(error, options.signal)) throw this.resolveFailure(error, lastError);
+        lastError = error;
+        // The control plane records a sandbox before its preparation finishes,
+        // and `sandbox.ensure` is idempotent, so a rejected resolve repairs the
+        // recorded sandbox on the next attempt instead of failing the call.
+        this.operations?.dispose();
+        this.operations = undefined;
+        this.endpoints.invalidate();
+        const delay = resolveRetryDelay(
+          attempt,
+          this.options.resolveRetryBaseMs ?? DEFAULT_RESOLVE_RETRY_BASE_MS,
+        );
+        try {
+          await bounded(sleep(delay), resolveDeadline, options.signal);
+        } catch (waitError) {
+          // A budget spent while backing off is reported as the failure which
+          // kept repeating, not as a bare timeout.
+          throw isTimeout(waitError)
+            ? this.resolveFailure(lastError, "resolve budget exhausted")
+            : this.resolveFailure(waitError, lastError);
+        }
+      }
+    }
+  }
+
+  private resolveFailure(error: unknown, prior?: unknown): SandboxTerminalExecutionError {
+    const detail = prior === undefined
+      ? describeErrorChain(error)
+      : `${describeErrorChain(error)} [${describeErrorChain(prior)}]`;
+    return new SandboxTerminalExecutionError(
+      `sandbox terminal endpoint resolution failed: ${detail}`,
+      {
         execution_id: randomUUID().replace(/-/g, ""), remote_run_dir: "",
         phase: "connecting", started: false, stopped: true,
-        error_code: error instanceof Error && error.message === "timeout" ? "startup_timeout" :
-          error instanceof Error && error.message === "aborted" ? "aborted" : "connection_lost",
-      });
-    }
+        error_code: isTimeout(error) ? "startup_timeout"
+          : isAborted(error) ? "aborted" : "connection_lost",
+      },
+      { cause: error },
+    );
   }
 
   private async operationsFor(): Promise<SandboxTerminalOperations> {
@@ -1419,6 +1468,32 @@ function isConnectionLost(error: unknown): boolean {
 /** A bounded exchange which ran out of budget without a socket error. */
 function isTimeout(error: unknown): boolean {
   return error instanceof Error && error.message === "timeout";
+}
+
+function isAborted(error: unknown): boolean {
+  return error instanceof Error && error.message === "aborted";
+}
+
+/**
+ * Whether an endpoint resolution may be asked for again.
+ *
+ * A rejected request is what a sandbox recorded before its preparation
+ * finished looks like, so it is retryable. A spent resolve budget and an
+ * aborted call are final: retrying either would spin until the caller gives up.
+ */
+function isRetryableResolve(error: unknown, signal: AbortSignal | undefined): boolean {
+  if (isTimeout(error) || isAborted(error)) return false;
+  return !(signal?.aborted ?? false);
+}
+
+function resolveRetryDelay(attempt: number, baseMs: number): number {
+  const base = Math.max(1, baseMs);
+  const backoff = Math.min(MAX_RESOLVE_RETRY_DELAY_MS, base * 3 ** attempt);
+  return backoff + Math.random() * base;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** A connection which dropped in a way the control plane can repair. */

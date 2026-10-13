@@ -362,7 +362,7 @@ function isTransportFailure(error: unknown): boolean {
   return error instanceof SandboxFileError && error.status === undefined;
 }
 
-function describeErrorChain(error: unknown): string {
+export function describeErrorChain(error: unknown): string {
   const parts: string[] = [];
   let current: unknown = error;
   while (current !== null && current !== undefined && parts.length < 5) {
