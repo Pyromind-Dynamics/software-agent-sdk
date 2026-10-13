@@ -24,6 +24,7 @@ from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionSt
 from pyromind_runtime.ports.harness import HarnessAdapter
 from pyromind_runtime.ports.workflows import WorkflowEventSink
 
+from openhands.agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
 from openhands.agent_server.run_workflow_callback import set_workflow_status_dispatcher
 from openhands.agent_server.storage_quota import ensure_conversation_quota
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
@@ -31,6 +32,53 @@ from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispa
 
 
 logger = logging.getLogger(__name__)
+
+AGENTGENOME_HOME_ENV = "AGENTGENOME_HOME"
+# Agent workspaces live under this directory inside the mounted user Storage, so
+# the sandbox sees the same tree at ``/target-workspace/.pyromind-agent``.
+AGENTGENOME_STORAGE_DIRNAME = ".pyromind-agent"
+AGENTGENOME_DIRNAME = "agentgenome"
+
+
+def _move_legacy_agentgenome_home(home: Path, legacy: Path) -> None:
+    """Adopt a registry written before the Storage-root layout."""
+    if home.exists() or not legacy.is_dir():
+        return
+    try:
+        home.parent.mkdir(parents=True, exist_ok=True)
+        legacy.rename(home)
+    except OSError:
+        logger.warning(
+            "AgentGenome registry at %s could not move to %s; set %s to keep using it",
+            legacy,
+            home,
+            AGENTGENOME_HOME_ENV,
+            exc_info=True,
+        )
+        return
+    logger.info("Moved AgentGenome registry %s -> %s", legacy, home)
+
+
+def agentgenome_home(conversations_dir: Path) -> Path:
+    """Registry root shared by every conversation of one user.
+
+    The default sits beside the conversation workspaces inside the mounted
+    Storage, which is also what the sandbox mounts, so a frozen package is
+    readable from both sides. ``AGENTGENOME_HOME`` still wins when set.
+    """
+    configured = os.getenv(AGENTGENOME_HOME_ENV)
+    if configured:
+        return Path(configured)
+    root = _workspace_root(conversations_dir)
+    home = root / AGENTGENOME_STORAGE_DIRNAME / AGENTGENOME_DIRNAME
+    _move_legacy_agentgenome_home(home, root / AGENTGENOME_DIRNAME)
+    return home
+
+
+def _workspace_root(conversations_dir: Path) -> Path:
+    """Mounted Storage root, which stays fixed when conversations move."""
+    configured = os.getenv(WORKSPACE_DIR_ENV) or os.getenv(WORKSPACE_DIR_ENV_UPPER)
+    return Path(configured) if configured else conversations_dir.parent
 
 
 def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
@@ -130,10 +178,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
                 )
 
             workflows = AgentGenomeBackend(
-                Path(
-                    os.getenv("AGENTGENOME_HOME")
-                    or service.conversations_dir.parent / "agentgenome"
-                ),
+                agentgenome_home(service.conversations_dir),
                 execution_host,
             )
     idle_eviction_seconds = int(

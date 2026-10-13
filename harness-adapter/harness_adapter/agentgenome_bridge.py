@@ -218,6 +218,32 @@ class ExecutionHost:
         )
         return base64.b64decode(result["content"], validate=True)
 
+    def head(self, path: str, limit: int) -> bytes:
+        """Read at most ``limit`` bytes from the start of a workspace file.
+
+        The file read API rejects anything larger than the requested window, so a
+        bounded head of a real dataset has to be cut in the execution plane; that
+        keeps capture-time sampling from pulling gigabytes across the bridge.
+        """
+        if not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        export = self._local_export(path)
+        if export is not None:
+            with export.open("rb") as stream:
+                return stream.read(limit)
+        resolved = self._resolve(path, False)
+        result = self._run(
+            f"head -c {max(limit, 0)} {shlex.quote(resolved)} | base64 | tr -d '\\n'",
+            None,
+            stream=False,
+        )
+        if result.get("truncated"):
+            raise RuntimeError("execution head output was truncated")
+        if result.get("rc") != 0:
+            raise FileNotFoundError(path)
+        content = result.get("stdout") or ""
+        return base64.b64decode(content, validate=True)
+
     def _local_export(self, path: str) -> Path | None:
         if self.local_root is None:
             return None

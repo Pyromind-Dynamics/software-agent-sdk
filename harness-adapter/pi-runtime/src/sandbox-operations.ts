@@ -440,9 +440,11 @@ export function createSandboxFileOperations(
         if (isMissingFile(error)) return undefined;
         throw error;
       });
-      // A root the host does not have still exists in the sandbox, so a miss
-      // falls back to the file API instead of failing the read.
       if (buffer !== undefined) return buffer;
+      // The sandbox copies are uploaded from these roots, so a host miss means
+      // the resource is absent. Handing the host path to the file API would
+      // only ask the sandbox to read a path that exists on neither side.
+      throw missingResource(mirror?.resolveHostAlias(host) ?? host);
     }
     return client.read(path);
   };
@@ -495,4 +497,8 @@ function isMissingFile(error: unknown): boolean {
       ? (error as { code?: unknown }).code
       : undefined;
   return code === "ENOENT" || code === "ENOTDIR";
+}
+
+function missingResource(alias: string): Error {
+  return new Error(`File not found: ${alias}`);
 }

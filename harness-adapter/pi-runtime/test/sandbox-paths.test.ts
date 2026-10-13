@@ -197,3 +197,26 @@ test("sandbox read mirror only claims host files inside its roots", () => {
   assert.equal(mirror.resolveHost("/repo/.agents/skills-other/notes.md"), undefined);
   assert.equal(mirror.resolveHost("skills/notes.md"), undefined);
 });
+
+test("sandbox read mirror names a host path back by its alias", () => {
+  const mirror = new SandboxReadMirror([
+    { host: "/repo/.agents/skills", alias: ".agents/skills" },
+    { host: "/opt/extra/aoi-labeling", alias: ".agents/skills/aoi-labeling" },
+    { host: "/repo/knowledge", alias: "knowledge" },
+  ]);
+
+  assert.equal(
+    mirror.resolveHostAlias("/repo/.agents/skills/data-processing/SKILL.md"),
+    ".agents/skills/data-processing/SKILL.md",
+  );
+  assert.equal(
+    mirror.resolveHostAlias("/opt/extra/aoi-labeling/notes.md"),
+    ".agents/skills/aoi-labeling/notes.md",
+  );
+  assert.equal(
+    mirror.resolveHostAlias("/repo/knowledge/handbook.md"),
+    "knowledge/handbook.md",
+  );
+  assert.equal(mirror.resolveHostAlias("/repo/.agents/skills-other/notes.md"), undefined);
+  assert.equal(mirror.resolveHostAlias("knowledge/handbook.md"), undefined);
+});

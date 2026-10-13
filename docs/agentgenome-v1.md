@@ -2,9 +2,9 @@
 
 AgentGenome 管共享资产、版本和图内状态。SDK Runtime 管会话、权限、排队和产品事件；HarnessAdapter 将执行请求接到当前 Pi 会话的终端后端。固定脚本直接执行，不经过第二次 LLM 调用。
 
-AgentGenome 0.2.0 在原生 Pi 与 SDK 中使用同一个默认插件入口。SDK 通过 Pi 的 `additionalExtensionPaths` 从已安装包读取插件，不再通过 `extensionFactories` 创建 AgentGenome。插件通过 Pi 事件总线发现 SDK 的宿主能力；工具定义、请求封装及 Python 操作分发都在 AgentGenome，SDK 只保留沙箱、权限、会话和通知适配。启动时校验插件已连到 SDK，失败不回退为本机执行。
+AgentGenome 在原生 Pi 与 SDK 中使用同一个默认插件入口。SDK 通过 Pi 的 `additionalExtensionPaths` 从已安装包读取插件，不再通过 `extensionFactories` 创建 AgentGenome。插件通过 Pi 事件总线发现 SDK 的宿主能力；工具定义、请求封装及 Python 操作分发都在 AgentGenome，SDK 只保留沙箱、权限、会话和通知适配。启动时校验插件已连到 SDK，失败不回退为本机执行。
 
-原生 Pi 的安装、`/genome setup` 和共享本地服务由 AgentGenome 自带，不需要修改 Pi。SDK 仍使用独立的 `workspace/agentgenome` 目录，不与正在运行的原生服务争用同一执行锁。对外产品协议和已有持久化模型不变。
+原生 Pi 的安装、`/genome setup` 和共享本地服务由 AgentGenome 自带，不需要修改 Pi。SDK 仍使用独立目录，不与正在运行的原生服务争用同一执行锁。对外产品协议和已有持久化模型不变。
 
 ## 名称与选用顺序
 
@@ -29,9 +29,9 @@ Storage 输入须保留 `storage/` 前缀，例如 `storage/agentTest/input.csv`
 
 这两个启动入口现在都走 Pi 标准插件加载链路。`pi-runtime` 的 `genome-plugin.integration.test.ts` 另外通过真实 Pi 会话和本地模拟模型验证 `genome_list/genome_run → SDK RPC`，覆盖包加载、宿主发现、重载、关闭开关和禁止本地回退。CSV 验证负责真实沙箱执行，不需要真实模型调用。
 
-模板会复制到 `workspace/agentgenome/assets/data-cleaning/1.0.0/`，验收后发布；测试输入和产物在 `workspace/genome-validation/`。重复测试创建新运行，不能用不同内容覆盖已发布版本。测试固定使用本地 `os-sandbox`；真实平台沙箱需在聊天中另测。
+模板会复制到 `workspace/.pyromind-agent/agentgenome/assets/data-cleaning/1.0.0/`，验收后发布；测试输入和产物在 `workspace/genome-validation/`。重复测试创建新运行，不能用不同内容覆盖已发布版本。测试固定使用本地 `os-sandbox`；真实平台沙箱需在聊天中另测。
 
-资产目录可通过 `AGENTGENOME_HOME` 配置，默认取 `OH_CONVERSATIONS_PATH` 的同级 `agentgenome` 目录；一份目录只能由一个 SDK 执行进程持有。非相邻仓库可配置 `AGENTGENOME_DIR`（SDK 入口）或 `SOFTWARE_AGENT_SDK_DIR`（AgentGenome 入口）。
+资产目录可通过 `AGENTGENOME_HOME` 配置，默认取 `OH_CONVERSATIONS_PATH` 同级的 `.pyromind-agent/agentgenome` 目录。在平台上该路径落在用户 Storage 挂载内（pod 的 `/workspace/.pyromind-agent/agentgenome`），沙箱内同一棵树在 `/target-workspace/.pyromind-agent/agentgenome`，所以 agent 既能用 `genome_*` 工具，也能直接读冻结包里的 `references/`。一份目录只能由一个 SDK 执行进程持有。非相邻仓库可配置 `AGENTGENOME_DIR`（SDK 入口）或 `SOFTWARE_AGENT_SDK_DIR`（AgentGenome 入口）。
 
 启动服务时，执行后端仍由 `PYROMIND_PI_TERMINAL_BACKEND` 决定。无启动选项时插件默认关闭，也可设置 `PYROMIND_AGENTGENOME_ENABLED=1` 启用。Python wheel 和 Pi 扩展 npm tarball 随 SDK 锁定；修改 AgentGenome 源码后需按下文重新打包，启动脚本不会跨仓库加载源码。
 
@@ -46,9 +46,14 @@ Storage 输入须保留 `storage/` 前缀，例如 `storage/agentTest/input.csv`
 在实际会话中，Pi 可通过以下工具使用资产：
 
 - `genome_list`：所有 latest 已发布包的简介。
-- `genome_get`：指定包版本的参数和产物说明。
+- `genome_get`：指定包版本的参数、产物说明、适用性（applies_when / input_contract）、gaps 与 references。
 - `genome_run`：传入 `asset_id`、`version`、`params`，立即返回运行 ID。
 - `genome_status` / `genome_cancel`：查询或取消本会话运行。
+- `genome_trace` / `genome_capture` / `genome_capture_status`：用户明说「沉淀一下」时，从会话轨迹沉淀历史经验；回放验证在后台跑，结论自动回到会话。
+- `genome_distill`：链路里含内联代码或只读探测、命令本身不干净时，由 agent 先把脚本落盘并把输入产出写到命令行上，再提交规范化链路（支持 `{参数名}` + `params` 绑定，并可按 `source_traces` 校验链路完整性）。
+- `genome_read_reference`：按需读取历史经验声明的文件 reference。
+
+历史经验的沉淀与复用是两层的：泛化资产描述一类任务，其 `references` 用 `asset_id` 指向真正跑过的具体 case 资产（完整链路，自带 `applies_when` / `input_contract` / `input_mapping`）。复用先匹配具体 case，命中直接 `genome_run`；都不命中才退到泛化资产，按 `gaps` / 文件 reference 补做 LLM 或人工步骤。完整设计见 AgentGenome 仓库的 `docs/v2-capture.md`。
 
 路径参数使用当前会话可访问的路径，如 `public_data/input.csv`；平台 sandbox 后端也支持 `storage/...`。不能传服务端任意路径。图启动前会冻结版本并校验参数，Pi 本轮结束后才开始运行。
 
@@ -70,7 +75,7 @@ Storage 输入须保留 `storage/` 前缀，例如 `storage/agentTest/input.csv`
 uv build --wheel --out-dir vendor ../AgentGenome
 cd harness-adapter/pi-runtime
 npm pack ../../../AgentGenome/pi-extension --pack-destination vendor
-npm install --ignore-scripts ./vendor/agentgenome-pi-extension-0.2.0.tgz
+npm install --ignore-scripts ./vendor/agentgenome-pi-extension-0.5.0.tgz
 npm run build
 cd ../..
 uv lock --upgrade-package agentgenome --refresh-package agentgenome
@@ -109,7 +114,7 @@ uv sync
 
 ```bash
 uv run python scripts/validate_agentgenome.py \
-  --template workspace/agentgenome/assets/data-cleaning/1.0.4 \
+  --template workspace/.pyromind-agent/agentgenome/assets/data-cleaning/1.0.4 \
   --home /tmp/genome-terminal-check/assets \
   --workspace /tmp/genome-terminal-check/conversation
 ```

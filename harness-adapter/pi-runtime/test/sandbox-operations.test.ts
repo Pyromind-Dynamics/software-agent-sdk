@@ -209,29 +209,25 @@ test("sandbox file reads answer mirrored resources without touching the sandbox"
   assert.deepEqual(requests, []);
 });
 
-test("sandbox file reads fall back to the file API when the host mirror misses", async (t) => {
-  const api = await listen((_request, response) => {
-    response.writeHead(200, { "Content-Type": "application/octet-stream" });
-    response.end("from sandbox");
-  });
-  t.after(api.close);
+test("sandbox file reads report a mirrored miss by alias without touching the sandbox", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "pi-mirror-miss-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const session = new SandboxEndpointSession(async () => endpointFor(api.baseUrl));
+  const requests: SandboxEndpointRequest[] = [];
+  const session = new SandboxEndpointSession(async (request) => {
+    requests.push(request);
+    throw new Error("the sandbox must not be contacted for a mirrored miss");
+  });
   const mirror = new SandboxReadMirror([{ host: root, alias: ".agents/skills" }]);
   const operations = createSandboxFileOperations(
     new SandboxFileClient(session),
     mirror,
   );
 
-  const buffer = await operations.read.readFile(join(root, "missing.md"));
-
-  assert.equal(buffer.toString("utf8"), "from sandbox");
-  assert.equal(api.requests.length, 1);
-  assert.match(
-    api.requests[0],
-    /^GET \/sandboxes\/sbx-1\/files\/read\?path=/,
+  await assert.rejects(
+    operations.read.readFile(join(root, "missing.md")),
+    /File not found: \.agents\/skills\/missing\.md/,
   );
+  assert.deepEqual(requests, []);
 });
 
 /** Terminal transport stub recording the calls the fallback client makes. */

@@ -34,7 +34,9 @@ description: >-
 | 其他 Skill: `training-analysis` | 分析已有训练效果（loss 异常/对比/优化超参）时，先调该 skill 产出报告与探针实验，再整组落参数 |
 
 Reference 路径相对本 `SKILL.md` 所在目录。Pi 按 `<available_skills>` 给出的位置用 `read`
-打开精确路径；`knowledge/` 路径直接交给 `read`。不用 terminal `ls/find` 探索 Skill、reference 或知识库。
+打开精确路径。`knowledge/` 不是 Skill 子目录，而是会话根下的顶层只读知识库：必须原样传
+`knowledge/index.md`，不得拼成 `.agents/skills/<skill>/knowledge/...`。
+不用 terminal `ls/find` 探索 Skill、reference 或知识库。
 
 ## 执行状态机
 

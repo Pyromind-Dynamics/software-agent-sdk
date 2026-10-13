@@ -1,4 +1,4 @@
-import { isAbsolute, posix, resolve } from "node:path";
+import { isAbsolute, posix, relative, resolve, sep } from "node:path";
 
 import { inside } from "./workspace-policy.js";
 
@@ -48,6 +48,23 @@ export class SandboxReadMirror {
   resolveHost(path: string): string | undefined {
     if (!isAbsolute(path)) return undefined;
     return this.roots.some(({ host }) => inside(path, host)) ? path : undefined;
+  }
+
+  /**
+   * The model-visible alias for a host path, so a read which finds nothing on
+   * the host is reported in the vocabulary the model used instead of a host
+   * path the sandbox cannot resolve.
+   */
+  resolveHostAlias(path: string): string | undefined {
+    if (!isAbsolute(path)) return undefined;
+    let match: SandboxPathAlias | undefined;
+    for (const root of this.roots) {
+      if (!inside(path, root.host)) continue;
+      if (match === undefined || root.host.length > match.host.length) match = root;
+    }
+    if (match === undefined) return undefined;
+    const suffix = relative(match.host, path).split(sep).filter(Boolean).join("/");
+    return suffix ? `${match.alias}/${suffix}` : match.alias;
   }
 }
 

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 from uuid import UUID
 
 import pytest
+from pyromind_sdk import PyroMindAPIError
 from pyromind_sdk.client.models import TrainingTaskCreateResponse
 
 from openhands.sdk import LocalConversation
@@ -328,6 +329,53 @@ def test_run_dataset_cleaning_submit_failure_omits_progress_fields(
     assert observation.run_id is None
     assert observation.output_dir is None
     assert "boom" in observation.text
+
+
+def test_run_dataset_cleaning_submit_failure_includes_platform_response(
+    monkeypatch,
+    tmp_path,
+):
+    mock_client = MagicMock()
+    mock_client.studio.create.side_effect = PyroMindAPIError(
+        message="POST /api/v1/studio/tasks failed: Bad Request (400)",
+        status_code=400,
+        response={
+            "success": False,
+            "error": {"code": "INVALID_WORKFLOW", "message": "unsupported node type"},
+        },
+    )
+    monkeypatch.setattr(
+        "openhands.tools.pyromind_cleaning.definition.create_workflow_api_client",
+        MagicMock(return_value=mock_client),
+    )
+    _patch_valid_script_preflight(monkeypatch)
+    monkeypatch.setattr(
+        "openhands.tools.pyromind_cleaning.definition.upload_local_file_to_pyromind",
+        MagicMock(
+            side_effect=lambda **kwargs: (
+                f"{kwargs['target_dir']}/{kwargs['local_path'].name}"
+            )
+        ),
+    )
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    (runtime_dir / "cleaning_utils.py").write_text("__all__ = []\n")
+    (runtime_dir / "validate_format.py").write_text("# validator\n")
+
+    observation = RunDatasetCleaningExecutor(
+        runtime_dir=str(runtime_dir),
+        task_store_dir=str(tmp_path / "tasks"),
+    )(
+        RunDatasetCleaningAction(
+            input_path="datasets/source.jsonl",
+            script_path="/agentTest/clean.py",
+        ),
+        cast(Any, _fake_conversation(tmp_path)),
+    )
+
+    assert observation.is_error
+    assert "Bad Request (400)" in observation.text
+    assert "INVALID_WORKFLOW: unsupported node type" in observation.text
 
 
 def test_run_dataset_cleaning_rejects_unknown_resume(tmp_path):

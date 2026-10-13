@@ -22,14 +22,3 @@
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
 | result | STRING | 命令捕获到的标准输出和标准错误。 |
-
-## 1.4 Workflow JSON 定义
-
-已脱敏的单节点 workflow 示例见 [workflow/CustomCommandNode/CustomCommandNode.json](../../workflow/CustomCommandNode/CustomCommandNode.json)。
-
-## 1.5 运行 Workflow
-
-~~~bash
-export PYROMIND_API_KEY=<your-api-key>
-python -m pyromind_sdk.test_run_workflow_cli workflow/CustomCommandNode/CustomCommandNode.json --pretty
-~~~

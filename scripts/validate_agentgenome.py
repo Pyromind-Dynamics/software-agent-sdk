@@ -15,6 +15,19 @@ from uuid import uuid4
 
 from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
 from harness_adapter.pi_adapter.runner import PiRunnerProcess
+from pyromind_runtime.domain.content import JsonObject
+
+
+def _execution_path(run: JsonObject) -> str:
+    result = run["result"]
+    assert isinstance(result, dict)
+    outputs = result["outputs"]
+    assert isinstance(outputs, dict)
+    report = outputs["report"]
+    assert isinstance(report, dict)
+    path = report["execution_path"]
+    assert isinstance(path, str)
+    return path
 
 
 async def validate(
@@ -130,11 +143,7 @@ async def validate(
                 )
                 wrong = await backend.execute(scope, original["id"], ignore)
                 assert wrong["status"] == "succeeded", wrong
-                report = json.loads(
-                    Path(
-                        wrong["result"]["outputs"]["report"]["execution_path"]
-                    ).read_text()
-                )
+                report = json.loads(Path(_execution_path(wrong)).read_text())
                 assert report["rows"] == 3 and report["columns"] == ["name;age"]
                 draft = await backend.invoke(
                     scope,
@@ -180,7 +189,7 @@ async def validate(
                             "content": base64.b64encode(script.encode()).decode(),
                         },
                     )
-                request = {
+                run_args = {
                     "revision_id": draft["revision_id"],
                     "params": params,
                     "change_summary": fix,
@@ -215,24 +224,25 @@ async def validate(
                             ],
                         }
 
-                    request.update(
+                    run_args.update(
                         baseline_cases=[case("comma", ",")],
                         regression_cases=[case("semicolon", ";")],
                     )
-                child = await backend.invoke(scope, "run", request, f"rerun-{fix}")
-                assert (await backend.invoke(scope, "run", request, f"rerun-{fix}"))[
+                child = await backend.invoke(scope, "run", run_args, f"rerun-{fix}")
+                child_id = child["id"]
+                assert isinstance(child_id, str)
+                assert (await backend.invoke(scope, "run", run_args, f"rerun-{fix}"))[
                     "id"
-                ] == child["id"]
-                revised = await backend.execute(scope, child["id"], ignore)
+                ] == child_id
+                revised = await backend.execute(scope, child_id, ignore)
                 assert revised["status"] == "succeeded", revised
-                report = json.loads(
-                    Path(
-                        revised["result"]["outputs"]["report"]["execution_path"]
-                    ).read_text()
-                )
+                report = json.loads(Path(_execution_path(revised)).read_text())
                 assert report["rows"] == 2 and report["columns"] == ["name", "age"]
                 if fix == "script":
-                    publication = revised["result"]["publication"]
+                    revised_result = revised["result"]
+                    assert isinstance(revised_result, dict)
+                    publication = revised_result["publication"]
+                    assert isinstance(publication, dict)
                     assert publication["status"] == "published", publication
                     assert (
                         backend.service.list()[0]["version"] == publication["version"]
@@ -256,7 +266,9 @@ async def validate(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--template", type=Path, required=True)
-    parser.add_argument("--home", type=Path, default=Path("workspace/agentgenome"))
+    parser.add_argument(
+        "--home", type=Path, default=Path("workspace/.pyromind-agent/agentgenome")
+    )
     parser.add_argument(
         "--workspace", type=Path, default=Path("workspace/genome-validation")
     )

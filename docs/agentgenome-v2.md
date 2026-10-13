@@ -1,6 +1,33 @@
 # 历史经验 v2 接入与验证
 
-包依赖升级为 AgentGenome Python/npm 0.4.0，通过 vendor 安装，继续由 Pi 标准加载器加载默认入口。工具定义、节点回执、修订规则、冻结和修订记录属于 AgentGenome；Runtime 使用通用 `execute_stage` 能力关联当前会话。上层没有 Pi 类型，公开 API 与原有 SSE 事件类型不变。SQLite 仅增加表，原资产及运行记录保留。
+包依赖升级为 AgentGenome Python/npm 0.6.3，通过 vendor 安装，继续由 Pi 标准加载器加载默认入口。工具定义、节点回执、修订规则、冻结和修订记录属于 AgentGenome；Runtime 使用通用 `execute_stage` 能力关联当前会话。上层没有 Pi 类型，公开 API 与原有 SSE 事件类型不变。SQLite 仅增加表，原资产及运行记录保留。
+
+0.6.3 把「自由裁量的 LLM 步骤」变成图节点，而不是丢进 gaps（设计见 AgentGenome 仓库 `docs/v2-capture.md` §6）：
+
+- `genome_distill` 的 `steps` 新增 llm 形态 `{llm, output, input?, verify?, from?}`。提示词里原样写出的输入/产出路径被替换成 `{input.*}` / `{artifact}`，节点编译成 `do: {llm}` 叶子，`verify` 默认 `test -s {output.<key>}`；
+- llm 节点由宿主的 `agent_task` 端口执行：宿主提示 agent 产出声明的 artifact，agent 写文件后回报 `genome_step_result`；`GenomeService._requires_agent` 在回放前自动给 manifest 补 `agent_task` 能力要求，SDK 桥接侧无需新增分支；
+- 硬边界由 `_check_llm_promotions` 把住：一条真实跑过的固定 shell 命令（哪怕脚本内部调用 LLM）写成 llm 节点、或把人工门禁/编辑工具产物写成 llm 节点，给了 `source_traces` 时会被直接拒绝——固定命令必须用 `run`，没有固定调用形式的步骤才进 `gaps`。
+
+0.6.0 给「具体 case 资产」补上输入证据与迭代稳定性（设计见 AgentGenome 仓库 `docs/v2-capture.md` §5.9）：
+
+- capture 冻结包时对**根输入**做有界采样（`agentgenome/capture/sample.py`）：CSV/TSV 取表头 + 前 20 行、JSONL 取前 20 条、文本取头部、二进制只留元数据，单文件 ≤ 32 KiB、总量 ≤ 512 KiB。采样走宿主读端口，落 `captures/<id>/samples/`，**不进包**（包字节是回放证据，事后改写会让发布失效）。`genome_get` 返回 `input_samples` 有界预览，`genome_list` 返回 `has_samples`；
+- 复用已发布资产时先用采样的 `format` / `required_fields` 机械核对本次根输入，不符直接拒绝并说明差异；`genome_run` 的 `allow_mismatch=true` 表示明知不符仍强行复用，差异记进 run 结果而不是中断；
+- 回放 A 成功后把采样输入 + 产物 `sha256` 固化成一条 `baseline-<capture_id>` 迭代基线（`agentgenome/capture/baseline.py`）。采样不完整（截断/二进制/读取失败）、参数与 manifest 不符或没有产物摘要时基线标记 `ready=false` 并写明原因；
+- 改脚本的修订自动继承该基线：`revisions.prepare` 在无已冻结 suite、也无未发布 pending 时用 `captures.baseline_cases(...)` 填充 `baseline_cases`，因此「改脚本 + 新用例」不再需要手工重造旧场景用例。回归执行新增 `kind=hash`，直接比对 checkpoint 里的产物摘要，天然适用大文件；
+- SDK 宿主适配新增 `ExecutionHost.head(path, limit)`：本地导出文件直接取头部，远端文件在执行面用 `head -c ... | base64` 截断后回传，避免把整份数据集拉过桥接。
+
+0.5.1 修掉了沉淀链路上两个「链路看起来沉淀成功、复用却跑不动」的洞（设计见 AgentGenome 仓库 `docs/v2-capture.md` §5.8）：
+
+- 脚本参数物化：`{参数名}` 指向 agent 写进工作区的脚本（`.py`/`.sh` 等）时，插件把脚本随包搬运、把命令改写成具体路径，并把它从 `params` 去掉（报告写「脚本参数已物化」）。此前这类脚本只能作为根输入留给复用方自带，包不自洽，复用必然要重写一遍；真实会话 `0e360d94d6704bbaab15437788e271b0` 沉淀出的 `question-filter-answer-sft@0.1.0` 就是这种窄口径资产；
+- 复用侧执行边界写进插件 prompt：graph 覆盖的确定性步骤只能交给 `genome_run` 执行，agent 不得用文件工具重写 graph 里的脚本、也不得手工跑等价命令替代，脚本确实不适用时走 `revision_id` 通道；此前复用会话会把 graph 里的转换脚本重写一遍（2358 字符 vs 原 1731 字符）而不是调用 `genome_run`；
+- 沉淀带根输入的链路时要求给 `new_params`（换一组真实输入或按 `input_contract` 造的小样本）跑回放 B，缺省时经验只能发布成未泛化的窄口径版本。
+
+0.5.0 的沉淀链路补齐了四件事（设计见 AgentGenome 仓库 `docs/v2-capture.md` §5.6 / §5.7）：
+
+- `genome_distill` 支持 `{参数名}` 占位符 + `params` 绑定，回放 A 用声明的真实值执行；
+- 传 `source_traces` 时校验链路完整性：计划读取的产物如果由会话里更早的成功步骤产出而该步未提交，直接报错并指出缺哪一步；占位符输入作为显式边界写进报告；
+- `references` 新增具体 case 资产指针 `{asset_id, version?, when?, input_mapping?}`：沉淀时解析到已发布版本并校验参数映射，不复制文件；
+- 复用按两层匹配：先命中具体 case 资产直接 `genome_run`，都不命中才退到泛化资产并按 `gaps` / 文件 reference 补做 LLM、人工步骤。`genome_list` 的 `reference_assets` 直接带 `when` / `input_mapping`。
 
 0.4.0 新增 `genome_distill`：会话里的步骤是内联代码、只读探测或脚本内部写出产物时，机械固化不会通过，agent 先把脚本落盘、把输入产出写到命令行上，再提交规范化链路；插件校验契约、编译 graph，并和 `genome_capture` 一样排队回放验证。`distill` 与 `capture` 共用同一道 origin turn 闸门和异步完成通知，SDK 侧不需要专属分支。
 

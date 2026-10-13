@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Self, cast
 
 from pydantic import Field
+from pyromind_sdk import PyroMindAPIError
 from rich.text import Text
 
 from openhands.sdk.conversation.state import ActiveLongTask
@@ -50,6 +51,26 @@ if TYPE_CHECKING:
 
 RUNTIME_FILENAMES = ("cleaning_utils.py", "validate_format.py")
 MAX_CLEANING_SCRIPT_BYTES = 1024 * 1024
+MAX_SUBMIT_ERROR_CHARS = 500
+
+
+def _submit_error_text(exc: Exception) -> str:
+    if not isinstance(exc, PyroMindAPIError) or not isinstance(exc.response, dict):
+        return str(exc)
+    response = exc.response
+    error = response.get("error")
+    detail = error.get("message") if isinstance(error, dict) else None
+    message = detail or response.get("message") or response.get("detail")
+    if not isinstance(message, str) or not message.strip():
+        return str(exc)
+    message = message.strip()
+    if isinstance(error, dict):
+        code = error.get("code")
+        if isinstance(code, str) and code.strip():
+            message = f"{code.strip()}: {message}"
+    if len(message) > MAX_SUBMIT_ERROR_CHARS:
+        message = message[:MAX_SUBMIT_ERROR_CHARS] + "..."
+    return f"{exc}\nPlatform response: {message}"
 
 
 class RunDatasetCleaningAction(Action):
@@ -264,7 +285,10 @@ class RunDatasetCleaningExecutor(
             task_id = response.task_id
         except Exception as exc:
             return RunDatasetCleaningObservation.from_text(
-                text=f"Failed to submit dataset cleaning workflow: {exc}",
+                text=(
+                    "Failed to submit dataset cleaning workflow: "
+                    f"{_submit_error_text(exc)}"
+                ),
                 status="Failed",
                 is_error=True,
             )

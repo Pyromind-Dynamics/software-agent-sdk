@@ -20,14 +20,3 @@
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
 | output_file_path | STRING | Python 脚本写入完成后的文件路径。 |
-
-## 1.4 Workflow JSON 定义
-
-已脱敏的单节点 workflow 示例见 [workflow/PythonFileProcessorNode/PythonFileProcessorNode.json](../../workflow/PythonFileProcessorNode/PythonFileProcessorNode.json)。
-
-## 1.5 运行 Workflow
-
-~~~bash
-export PYROMIND_API_KEY=<your-api-key>
-python -m pyromind_sdk.test_run_workflow_cli workflow/PythonFileProcessorNode/PythonFileProcessorNode.json --pretty
-~~~

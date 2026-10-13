@@ -22,23 +22,3 @@ Build grpo_extra_config YAML (GRPO-only training fields; use with shared trainin
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
 | grpo_extra_config | STRING\|GRPO_EXTRA_CONFIG | GRPO 专用额外训练配置 YAML |
-## 1.4 Workflow JSON 定义
-
-完整 workflow 定义见 [`workflow/GRPOTrainingExtraConfigBuilderNode/GRPOTrainingExtraConfigBuilderNode.json`](../../workflow/GRPOTrainingExtraConfigBuilderNode/GRPOTrainingExtraConfigBuilderNode.json)。
-
-## 1.5 运行 Workflow
-
-```bash
-export PYROMIND_API_KEY=<your-api-key>
-python -m pyromind_sdk.test_run_workflow_cli workflow/GRPOTrainingExtraConfigBuilderNode/GRPOTrainingExtraConfigBuilderNode.json [options]
-```
-
-| 选项 | 默认值 | 说明 |
-|------|--------|------|
-| `--name` | `gRPOTrainingExtraConfigBuilderNode` | 任务名称 |
-| `--output` | - | 输出结果文件 |
-| `--poll-interval` | 5 | 轮询间隔（秒） |
-| `--timeout` | 600 | 最大等待时间（秒） |
-| `--pretty` | false | 美化 JSON 输出 |
-| `--max-retries` | 0 | API 请求最大重试次数 |
-| `-h, --help` | - | 显示帮助信息 |

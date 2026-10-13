@@ -19,38 +19,3 @@
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
 | path | STRING | 下载完成后的本地文件路径。 |
-
-## 1.4 Workflow JSON 定义
-
-单节点 workflow 示例见 [workflow/DownloadURLNode/DownloadURLNode.json](../../workflow/DownloadURLNode/DownloadURLNode.json)。
-
-示例节点配置：
-
-```json
-{
-  "url": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/resolve/main/config.json",
-  "output_path": "/workspace/downloads/config.json",
-  "expected_sha256": ""
-}
-```
-
-## 1.5 运行 Workflow
-
-```bash
-export PYROMIND_API_KEY=<your-api-key>
-python -m pyromind_sdk.test_run_workflow_cli workflow/DownloadURLNode/DownloadURLNode.json [options]
-```
-
-| 选项 | 默认值 | 说明 |
-|------|--------|------|
-| `--name` | `DownloadURLNode example` | 任务名称 |
-| `--output` | - | 输出结果文件 |
-| `--poll-interval` | 5 | 轮询间隔（秒） |
-| `--timeout` | 600 | 最大等待时间（秒） |
-| `--pretty` | false | 美化 JSON 输出 |
-| `--max-retries` | 0 | API 请求最大重试次数 |
-| `-h, --help` | - | 显示帮助信息 |
-
-```bash
-python -m pyromind_sdk.test_run_workflow_cli workflow/DownloadURLNode/DownloadURLNode.json --pretty
-```

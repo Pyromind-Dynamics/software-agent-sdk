@@ -87,6 +87,59 @@ async def test_execution_host_mirrors_host_local_exports(tmp_path):
     assert calls == ["execution.resolve", "execution.read"]
 
 
+async def test_execution_host_reads_a_bounded_head(tmp_path):
+    conversation = tmp_path / "conversation"
+    export = conversation / "public_data/raw.csv"
+    export.parent.mkdir(parents=True)
+    export.write_bytes(b"header\n" + b"x" * 100)
+    calls: list[str] = []
+
+    async def request(method, payload):
+        calls.append(method)
+        if method == "execution.resolve":
+            return {"path": f"/sandbox/{payload['path']}"}
+        assert method == "execution.run"
+        return {"rc": 0, "stdout": base64.b64encode(b"header\n").decode("ascii")}
+
+    host = ExecutionHost(request, lambda *_: None, conversation)
+    # A host-local export is cut locally; the execution plane is never asked to
+    # move a whole dataset just so capture can look at its first rows.
+    assert await asyncio.to_thread(host.head, "public_data/raw.csv", 7) == b"header\n"
+    assert calls == []
+
+    calls.clear()
+    assert (
+        await asyncio.to_thread(host.head, "public_data/remote.csv", 7) == b"header\n"
+    )
+    assert calls == ["execution.resolve", "execution.run"]
+
+
+async def test_capture_sampling_reads_a_remote_input_through_the_execution_host(
+    tmp_path,
+):
+    from agentgenome.capture.sample import sample_inputs
+
+    body = b"text,label\none,a\ntwo,b\n"
+
+    async def request(method, payload):
+        if method == "execution.resolve":
+            return {"path": f"/sandbox/{payload['path']}"}
+        assert method == "execution.run"
+        window = int(payload["command"].split("head -c ")[1].split(" ")[0])
+        return {"rc": 0, "stdout": base64.b64encode(body[:window]).decode("ascii")}
+
+    host = ExecutionHost(request, lambda *_: None, tmp_path / "conversation")
+    directory = tmp_path / "samples"
+    index = await asyncio.to_thread(
+        sample_inputs, host, {"raw": "public_data/raw.csv"}, directory
+    )
+    entry = index["files"][0]
+    assert entry["format"] == "csv"
+    assert entry["schema"]["columns"] == ["text", "label"]
+    assert entry["rows"] == 2
+    assert (directory / entry["name"]).read_text() == "text,label\none,a\ntwo,b\n"
+
+
 @pytest.fixture
 async def setup_workflow(tmp_path):
     package = tmp_path / "source"

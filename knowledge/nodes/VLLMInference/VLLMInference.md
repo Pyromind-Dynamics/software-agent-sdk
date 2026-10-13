@@ -22,14 +22,3 @@
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
 | endpoint | STRING | 推理服务的端点地址 |
-
-## 1.4 Workflow JSON 定义
-
-完整 workflow 定义见 [`workflow/VLLMInference/VLLMInference.json`](../../workflow/VLLMInference/VLLMInference.json)。
-
-## 1.5 运行 Workflow
-
-```bash
-export PYROMIND_API_KEY=<your-api-key>
-export PYROMIND_CLUSTER=<your-cluster>
-```
