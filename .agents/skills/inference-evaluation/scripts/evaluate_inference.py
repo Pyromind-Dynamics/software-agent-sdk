@@ -7,7 +7,6 @@ import argparse
 import base64
 import concurrent.futures
 import hashlib
-import html
 import json
 import mimetypes
 import os
@@ -17,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -786,50 +786,481 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     temporary.replace(path)
 
 
-def _pretty(value: Any) -> str:
-    return html.escape(json.dumps(value, ensure_ascii=False, indent=2))
+REPORT_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Inference evaluation report</title>
+<style>__REPORT_CSS__</style>
+</head>
+<body>
+<main id="report"></main>
+<script id="report-data" type="application/json">__REPORT_DATA__</script>
+<script>__REPORT_JS__</script>
+<script>
+window.EvaluationReport.mount(document.getElementById("report"), {
+  dataElement: document.getElementById("report-data")
+});
+</script>
+</body>
+</html>
+"""
+
+REPORT_ASSET_NAMES = ("evaluation_report.css", "evaluation_report.js")
 
 
-def _media_html(
-    row: dict[str, Any], dataset_file: Path, dataset_config: dict[str, Any]
-) -> str:
-    figures = []
-    for index, value in enumerate(row.get("media", []), 1):
-        try:
-            url = _media_url(value, dataset_file, dataset_config)
-        except (OSError, ValueError):
+def _read_report_asset(name: str) -> str:
+    return Path(__file__).with_name(name).read_text(encoding="utf-8")
+
+
+def _runtime_sha256() -> str:
+    digest = hashlib.sha256()
+    for name in sorted((Path(__file__).name, *REPORT_ASSET_NAMES)):
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        with Path(__file__).with_name(name).open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+TEMPLATE_REGISTRY: dict[str, dict[str, Any]] = {
+    "evaluation-basic-v1": {
+        "template_version": "1.2.0",
+        "required_capabilities": ("structured_comparison",),
+        "allowed_panels": ("rubric", "annotation", "raw_output"),
+    },
+    "evaluation-media-v1": {
+        "template_version": "1.2.0",
+        "required_capabilities": ("structured_comparison", "media_gallery"),
+        "allowed_panels": ("rubric", "annotation", "raw_output", "media_compare"),
+    },
+}
+# Only machine-failed cases are reviewable in this release; the field exists so
+# a future review_scope="all" needs no annotation-record migration.
+REVIEW_SCOPE = "machine_failed"
+ANNOTATION_PRODUCT_STEMS = ("evaluation_annotations", "labeled_evaluation_results")
+REPORT_SPEC_FIELDS = frozenset(
+    {
+        "template_id",
+        "template_version",
+        "title",
+        "enabled_panels",
+        "media_roles",
+        "annotation_schema",
+        "review_scope",
+    }
+)
+
+
+def _report_case(
+    row: dict[str, Any],
+    dataset_file: Path,
+    dataset_config: dict[str, Any],
+    include_media_urls: bool,
+    validation_errors: list[str],
+    warnings: list[str],
+) -> dict[str, Any]:
+    media: list[dict[str, Any]] = []
+    for value in row.get("media", []):
+        if not include_media_urls:
+            media.append({"caption": value})
             continue
-        figures.append(
-            f'<figure><img loading="lazy" src="{html.escape(url)}" '
-            f'alt="media {index}"><figcaption>{html.escape(value)}</figcaption>'
-            "</figure>"
-        )
-    return f'<div class="media">{"".join(figures)}</div>' if figures else ""
+        try:
+            url: str | None = _media_url(value, dataset_file, dataset_config)
+        except (OSError, ValueError):
+            url = None
+        if url is None:
+            warnings.append(
+                f"case {row['id']}: media {value} could not be read;"
+                " showing the media path only"
+            )
+            media.append({"caption": value})
+        else:
+            media.append({"url": url, "caption": value})
+    return {
+        "id": row["id"],
+        "status": "passed" if row["passed"] else "failed",
+        "input": {
+            field: row.get("sample", {}).get(field)
+            for key in ("messages_field", "user_prompt_field", "system_prompt_field")
+            if isinstance(field := dataset_config.get(key), str)
+            and field in row.get("sample", {})
+        },
+        "media": media,
+        "rubric_items": [
+            {
+                "name": rubric["name"],
+                "passed": bool(rubric["passed"]),
+                "score": rubric["score"],
+                "weight": rubric["weight"],
+                "criterion": rubric["criterion"],
+                "evidence": list(rubric.get("evidence", [])),
+                "failure_reason": rubric.get("failure_reason") or "",
+            }
+            for rubric in row.get("rubric_results", [])
+        ],
+        "overall_score": row.get("overall_score"),
+        "reference": row["reference"],
+        "prediction": row["prediction"],
+        "detail": {"metrics": row["metrics"], "details": row["details"]},
+        "latency_seconds": row["latency_seconds"],
+        "error": row["error"],
+        "validation_errors": validation_errors,
+    }
 
 
-def _rubrics_html(row: dict[str, Any]) -> str:
-    items = []
-    for rubric in row.get("rubric_results", []):
-        status = "passed" if rubric["passed"] else "failed"
-        evidence = "".join(
-            f"<li>{html.escape(item)}</li>" for item in rubric.get("evidence", [])
+def _report_capabilities(rows: list[dict[str, Any]]) -> set[str]:
+    capabilities = {"structured_comparison"}
+    if any(row.get("media") for row in rows):
+        capabilities.add("media_gallery")
+    return capabilities
+
+
+def _case_validation_errors(
+    row: dict[str, Any], rubrics: list[dict[str, Any]]
+) -> list[str]:
+    """Reference/GT-side extraction and type checks for one evaluated case.
+
+    Execution-error rows are reviewable badcases rather than config defects, so
+    they yield nothing here. Prediction-side misses reflect model output quality
+    (already visible as ``<missing>`` evidence and ``passed=False``) and do not
+    invalidate the report; only the fixed GT/reference contract does.
+    """
+    if row.get("error") is not None:
+        return []
+    reference_root = _structured_value(row.get("reference"))
+    errors: list[str] = []
+    for rubric in rubrics:
+        evaluator = rubric["evaluator"]
+        kind = evaluator.get("type")
+        name = rubric["name"]
+        reference_path = evaluator.get("reference_path", "")
+        expected = _path_value(reference_root, reference_path)
+        if reference_path and expected is _MISSING:
+            errors.append(
+                f"rubric '{name}': reference_path '{reference_path}' did not"
+                " resolve (reference <missing>)"
+            )
+        elif kind in ("list_count_match", "bbox_iou") and not isinstance(
+            expected, list
+        ):
+            errors.append(
+                f"rubric '{name}': {kind} expects a list reference at"
+                f" '{reference_path or '<root>'}', got {type(expected).__name__}"
+            )
+    return errors
+
+
+def _prediction_path_errors(
+    results: list[dict[str, Any]], rubrics: list[dict[str, Any]]
+) -> list[str]:
+    """Flag prediction paths that never resolve, indicating a misconfigured rubric.
+
+    A prediction path missing on some cases is ordinary model variance; missing
+    on every evaluated case means the configured path does not match the model
+    output contract.
+    """
+    evaluated = [row for row in results if row.get("error") is None]
+    if not evaluated:
+        return []
+    errors: list[str] = []
+    for rubric in rubrics:
+        evaluator = rubric["evaluator"]
+        kind = evaluator.get("type")
+        prediction_path = evaluator.get("prediction_path", "")
+        if not prediction_path or kind in ("exact_match", "json_valid"):
+            continue
+        if all(
+            _path_value(_structured_value(row.get("prediction")), prediction_path)
+            is _MISSING
+            for row in evaluated
+        ):
+            errors.append(
+                f"rubric '{rubric['name']}': prediction_path '{prediction_path}'"
+                f" never resolved across {len(evaluated)} cases (likely"
+                " misconfigured)"
+            )
+    return errors
+
+
+def _evaluation_status(
+    results: list[dict[str, Any]],
+    rubrics: list[dict[str, Any]],
+    metrics: dict[str, Any],
+    predictions_rows: int,
+) -> tuple[str, dict[str, list[str]], list[str]]:
+    """Derive validated/invalid plus per-case and report-level validation errors.
+
+    Completeness compares the accounted rows (evaluated plus execution errors)
+    and the on-disk predictions.jsonl line count against the result row count,
+    so execution-error cases stay reviewable instead of invalidating the report.
+    """
+    case_errors = {
+        row["id"]: errors
+        for row in results
+        if (errors := _case_validation_errors(row, rubrics))
+    }
+    report_errors = _prediction_path_errors(results, rubrics)
+    total = len(results)
+    if predictions_rows != total:
+        report_errors.append(
+            f"completeness: predictions.jsonl has {predictions_rows} rows,"
+            f" expected {total}"
         )
-        failure = html.escape(rubric.get("failure_reason") or "")
-        items.append(
-            f'<section class="rubric {status}"><header>'
-            f"<strong>{html.escape(rubric['name'])}</strong>"
-            f"<span>{rubric['score']:.2f} × {rubric['weight']}</span></header>"
-            f"<p>{html.escape(rubric['criterion'])}</p>"
-            f"<ul>{evidence}</ul>"
-            f'<p class="failure">{failure}</p></section>'
+    accounted = metrics["evaluated_cases"] + metrics["api_or_evaluation_errors"]
+    if accounted != total:
+        report_errors.append(
+            f"completeness: evaluated_cases ({metrics['evaluated_cases']}) +"
+            f" errors ({metrics['api_or_evaluation_errors']}) != {total} rows"
         )
-    if not items:
-        return ""
-    score = row.get("overall_score")
-    score_text = f"{score:.3f}" if isinstance(score, (int, float)) else "n/a"
-    return (
-        '<div class="rubrics"><h3>Rubric evaluation '
-        f"· overall {score_text}</h3>{''.join(items)}</div>"
+    status = "invalid" if case_errors or report_errors else "validated"
+    return status, case_errors, report_errors
+
+
+def _spec_for(template_id: str) -> dict[str, Any]:
+    entry = TEMPLATE_REGISTRY[template_id]
+    return {
+        "template_id": template_id,
+        "template_version": entry["template_version"],
+        "title": "Inference evaluation report",
+        "enabled_panels": list(entry["allowed_panels"]),
+    }
+
+
+def _default_spec(capabilities: set[str]) -> dict[str, Any]:
+    return _spec_for(
+        "evaluation-media-v1"
+        if "media_gallery" in capabilities
+        else "evaluation-basic-v1"
+    )
+
+
+def _valid_labels(value: Any) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(item, str) and item.strip() for item in value
+    )
+
+
+def _resolve_report_spec(
+    report_spec_json: str | None, capabilities: set[str]
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate the agent-authored spec; any violation falls back to basic.
+
+    A missing spec keeps the capability-derived default (media when the results
+    carry media, otherwise basic); a present-but-invalid spec always falls back
+    to ``evaluation-basic-v1`` so an unrequested panel is never auto-enabled.
+    """
+    if not report_spec_json:
+        return _default_spec(capabilities), []
+    try:
+        value = json.loads(report_spec_json)
+    except json.JSONDecodeError as exc:
+        return _spec_for("evaluation-basic-v1"), [
+            f"report spec is not valid JSON ({exc}); using default template"
+        ]
+    if not isinstance(value, dict):
+        return _spec_for("evaluation-basic-v1"), [
+            "report spec must be a JSON object; using default template"
+        ]
+    unknown = sorted(set(value) - REPORT_SPEC_FIELDS)
+    if unknown:
+        return _spec_for("evaluation-basic-v1"), [
+            f"report spec has unknown fields {unknown}; using default template"
+        ]
+    template_id = value.get("template_id")
+    if not isinstance(template_id, str) or not template_id.strip():
+        return _spec_for("evaluation-basic-v1"), [
+            f"report spec template id {template_id!r} is not a non-empty"
+            " string; using default template"
+        ]
+    entry = TEMPLATE_REGISTRY.get(template_id)
+    if entry is None:
+        return _spec_for("evaluation-basic-v1"), [
+            f"report spec template {template_id!r} is not registered;"
+            " using default template"
+        ]
+    version = value.get("template_version")
+    if version is not None and version != entry["template_version"]:
+        return _spec_for("evaluation-basic-v1"), [
+            f"report spec template version {version!r} does not match"
+            " the registry; using default template"
+        ]
+    missing = [
+        capability
+        for capability in entry["required_capabilities"]
+        if capability not in capabilities
+    ]
+    if missing:
+        return _spec_for("evaluation-basic-v1"), [
+            f"report spec template {template_id!r} requires missing"
+            f" capabilities {missing}; using default template"
+        ]
+    panels = value.get("enabled_panels")
+    if panels is None:
+        panels = list(entry["allowed_panels"])
+    if (
+        not isinstance(panels, list)
+        or not all(isinstance(panel, str) for panel in panels)
+        or not set(panels) <= set(entry["allowed_panels"])
+    ):
+        return _spec_for("evaluation-basic-v1"), [
+            "report spec has unregistered panels; using default template"
+        ]
+    title = value.get("title", "Inference evaluation report")
+    if not isinstance(title, str) or not title.strip() or len(title) > 200:
+        return _spec_for("evaluation-basic-v1"), [
+            "report spec title must be a non-empty string of at most"
+            " 200 characters; using default template"
+        ]
+    media_roles = value.get("media_roles", {})
+    if not isinstance(media_roles, dict) or not all(
+        isinstance(key, str) and isinstance(role, str) and role.strip()
+        for key, role in media_roles.items()
+    ):
+        return _spec_for("evaluation-basic-v1"), [
+            "report spec media roles must map strings to strings;"
+            " using default template"
+        ]
+    annotation_schema = value.get("annotation_schema", {})
+    if (
+        not isinstance(annotation_schema, dict)
+        or not set(annotation_schema)
+        <= {
+            "taxonomy_labels",
+            "dispositions",
+        }
+        or not all(_valid_labels(items) for items in annotation_schema.values())
+    ):
+        return _spec_for("evaluation-basic-v1"), [
+            "report spec annotation schema allows only string lists under"
+            " taxonomy_labels and dispositions; using default template"
+        ]
+    review_scope = value.get("review_scope", REVIEW_SCOPE)
+    if review_scope != REVIEW_SCOPE:
+        return _spec_for("evaluation-basic-v1"), [
+            f"report spec review_scope {review_scope!r} is not supported"
+            f" (only {REVIEW_SCOPE!r}); using default template"
+        ]
+    spec = {
+        "template_id": template_id,
+        "template_version": entry["template_version"],
+        "title": title,
+        "enabled_panels": list(panels),
+        "review_scope": review_scope,
+    }
+    if media_roles:
+        spec["media_roles"] = media_roles
+    if annotation_schema:
+        spec["annotation_schema"] = annotation_schema
+    return spec, []
+
+
+REPORT_HTML_NAME = "evaluation_report.html"
+REPORT_CASES_MANIFEST_NAME = "evaluation_cases_manifest.json"
+REPORT_CASES_INDEX_NAME = "evaluation_cases_index.json"
+REPORT_CASES_DIRECTORY = "evaluation_cases"
+REPORT_MEDIA_DIRECTORY = "evaluation_media"
+REPORT_CASE_CHUNK_SIZE = 20
+
+
+def _media_suffix(mime_type: str) -> str:
+    return {
+        "image/gif": ".gif",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }.get(mime_type, ".bin")
+
+
+def _externalize_report_media(
+    case_payload: dict[str, Any],
+    *,
+    case_index: int,
+    media_output: Path,
+) -> dict[str, Any]:
+    media_items: list[dict[str, Any]] = []
+    for media_index, media in enumerate(case_payload.get("media", [])):
+        external = dict(media)
+        url = media.get("url")
+        if isinstance(url, str) and url.startswith("data:"):
+            header, separator, encoded = url.partition(",")
+            mime_type = header.removeprefix("data:").removesuffix(";base64")
+            if separator and header.endswith(";base64"):
+                media_id = (
+                    f"{case_index:08d}-{media_index:03d}{_media_suffix(mime_type)}"
+                )
+                (media_output / media_id).write_bytes(
+                    base64.b64decode(encoded, validate=True)
+                )
+                external.pop("url", None)
+                external.update({"media_id": media_id, "mime_type": mime_type})
+        media_items.append(external)
+    return {**case_payload, "media": media_items}
+
+
+def _write_report_case_products(
+    case_payloads: list[dict[str, Any]], output: Path
+) -> None:
+    cases_output = output / REPORT_CASES_DIRECTORY
+    media_output = output / REPORT_MEDIA_DIRECTORY
+    cases_output.mkdir(exist_ok=True)
+    media_output.mkdir(exist_ok=True)
+
+    externalized = [
+        _externalize_report_media(
+            case_payload,
+            case_index=case_index,
+            media_output=media_output,
+        )
+        for case_index, case_payload in enumerate(case_payloads)
+    ]
+    chunks: list[dict[str, Any]] = []
+    index: list[dict[str, Any]] = []
+    for chunk_index, start in enumerate(
+        range(0, len(externalized), REPORT_CASE_CHUNK_SIZE)
+    ):
+        items = externalized[start : start + REPORT_CASE_CHUNK_SIZE]
+        name = f"chunk-{chunk_index:05d}.json"
+        _atomic_json(cases_output / name, {"items": items})
+        chunks.append(
+            {
+                "name": f"{REPORT_CASES_DIRECTORY}/{name}",
+                "start": start,
+                "count": len(items),
+            }
+        )
+        index.extend(
+            {
+                "id": item["id"],
+                "chunk": chunk_index,
+                "offset": offset,
+                "media": [
+                    {
+                        "media_id": media["media_id"],
+                        "mime_type": media["mime_type"],
+                    }
+                    for media in item.get("media", [])
+                    if "media_id" in media and "mime_type" in media
+                ],
+            }
+            for offset, item in enumerate(items)
+        )
+
+    _atomic_json(
+        output / REPORT_CASES_INDEX_NAME,
+        {"schema_version": 1, "cases": index},
+    )
+    _atomic_json(
+        output / REPORT_CASES_MANIFEST_NAME,
+        {
+            "schema_version": 1,
+            "total": len(externalized),
+            "chunk_size": REPORT_CASE_CHUNK_SIZE,
+            "chunks": chunks,
+        },
     )
 
 
@@ -839,98 +1270,205 @@ def _build_html(
     dataset_file: Path,
     dataset_config: dict[str, Any],
     output: Path,
-) -> None:
-    cards = []
-    for row in sorted(rows, key=lambda item: (item["passed"], item["id"])):
-        status = "passed" if row["passed"] else "failed"
-        error = html.escape(row["error"] or "none")
-        cards.append(
-            f'<article class="case {status}" data-status="{status}">'
-            f"<header><code>{html.escape(row['id'])}</code>"
-            f"<strong>{status}</strong></header>"
-            f"{_media_html(row, dataset_file, dataset_config)}"
-            f"{_rubrics_html(row)}"
-            '<div class="columns"><section><h3>Reference</h3><pre>'
-            f"{_pretty(row['reference'])}</pre></section>"
-            "<section><h3>Prediction</h3><pre>"
-            f"{html.escape(row['prediction'] or '')}</pre></section></div>"
-            "<details><summary>Metrics and details</summary><pre>"
-            f"{_pretty({'metrics': row['metrics'], 'details': row['details']})}"
-            f'</pre></details><p class="meta">Latency: {row["latency_seconds"]}s · '
-            f"Error: {error}</p></article>"
+    spec: dict[str, Any],
+    evaluation_status: str,
+    case_errors: dict[str, list[str]],
+    run_id: str,
+    evaluation_config_sha256: str,
+) -> list[str]:
+    """Render the single-file badcase review report; return warnings.
+
+    Only machine-failed cases (including execution-error rows) are rendered:
+    annotation targets badcases, and skipping passed cases keeps the page
+    small and quick to load. Media are embedded as original bytes; files
+    that cannot be read degrade to a path caption.
+    """
+    include_media_urls = "media_compare" in spec["enabled_panels"]
+    warnings: list[str] = []
+    badcases = [row for row in rows if not row["passed"]]
+    case_payloads = [
+        _report_case(
+            row,
+            dataset_file,
+            dataset_config,
+            include_media_urls,
+            case_errors.get(row["id"], []),
+            warnings,
         )
-    aggregate = _pretty(metrics["aggregate_metrics"])
-    rubric_aggregate = _pretty(metrics["rubric_metrics"])
-    css = """
-    :root { color-scheme: light; font-family: system-ui, sans-serif; }
-    body { margin: 0; background: #f3f6fa; color: #172033; }
-    main { max-width: 1200px; margin: auto; padding: 28px 18px 60px; }
-    .hero, .case { background: white; border: 1px solid #dbe3ee;
-      border-radius: 14px; box-shadow: 0 8px 24px #14203712; }
-    .hero { padding: 24px; }
-    .summary { display: grid; grid-template-columns: repeat(4, 1fr);
-      gap: 10px; margin: 16px 0; }
-    .summary div { background: #f8fafc; border-radius: 10px; padding: 12px; }
-    .summary strong { display: block; font-size: 24px; }
-    .toolbar { position: sticky; top: 0; padding: 10px 0;
-      background: #f3f6faf2; }
-    button { border: 1px solid #cbd5e1; border-radius: 999px;
-      background: white; padding: 7px 12px; cursor: pointer; }
-    button.active { background: #172033; color: white; }
-    .case { margin-top: 14px; overflow: hidden; }
-    .case.passed { border-left: 5px solid #15803d; }
-    .case.failed { border-left: 5px solid #b42318; }
-    .case header { display: flex; justify-content: space-between;
-      padding: 12px 14px; background: #f8fafc; }
-    .columns, .media { display: grid; grid-template-columns: repeat(2, 1fr); }
-    .columns section, details, .meta { padding: 12px 14px; }
-    .rubrics { padding: 12px 14px; border-top: 1px solid #e2e8f0; }
-    .rubric { margin: 8px 0; padding: 10px 12px; border-radius: 9px;
-      background: #f8fafc; border-left: 4px solid #15803d; }
-    .rubric.failed { border-left-color: #b42318; }
-    .rubric header { padding: 0; background: transparent; }
-    .rubric p, .rubric ul { margin: 7px 0; }
-    .failure { color: #b42318; }
-    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-    figure { margin: 0; padding: 10px; border-top: 1px solid #e2e8f0; }
-    img { width: 100%; max-height: 420px; object-fit: contain; background: #111827; }
-    figcaption, .meta { color: #64748b; font-size: 12px; }
-    .hidden { display: none; }
-    @media (max-width: 700px) {
-      .summary, .columns, .media { grid-template-columns: 1fr; }
+        for row in badcases
+    ]
+    _write_report_case_products(case_payloads, output)
+    # allow_nan=False turns a NaN/Infinity anywhere in the payload into an
+    # explicit generation failure instead of a report page that dies in
+    # JSON.parse and renders blank.
+    payload = (
+        json.dumps(
+            {
+                "title": spec["title"],
+                "template_id": spec["template_id"],
+                "template_version": spec["template_version"],
+                "panels": spec["enabled_panels"],
+                "evaluation_status": evaluation_status,
+                "run_id": run_id,
+                "evaluation_config_sha256": evaluation_config_sha256,
+                "review_scope": spec.get("review_scope", REVIEW_SCOPE),
+                "annotation_schema": spec.get("annotation_schema", {}),
+                "dataset_path": str(metrics["dataset_path"]),
+                "summary": {
+                    "total": metrics["total"],
+                    "passed": metrics["passed"],
+                    "failed": metrics["failed"],
+                    "pass_rate": metrics["pass_rate"],
+                },
+                "aggregate_metrics": metrics["aggregate_metrics"],
+                "rubric_metrics": metrics["rubric_metrics"],
+                "case_delivery": "paged",
+                "case_count": len(case_payloads),
+                "cases": [],
+                "warnings": warnings,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+    document = (
+        REPORT_TEMPLATE.replace(
+            "__REPORT_CSS__", _read_report_asset("evaluation_report.css")
+        )
+        .replace("__REPORT_JS__", _read_report_asset("evaluation_report.js"))
+        .replace("__REPORT_DATA__", payload)
+    )
+    (output / REPORT_HTML_NAME).write_bytes(document.encode("utf-8"))
+    for stale in output.glob("evaluation_report_page_*.html"):
+        stale.unlink()
+    return warnings
+
+
+def canonical_annotation_jsonl(records: list[dict[str, Any]]) -> bytes:
+    if not records:
+        return b""
+    lines = [json.dumps(record, ensure_ascii=False) for record in records]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _machine_result(row: dict[str, Any]) -> dict[str, Any]:
+    """Authoritative machine result for one case, rebuilt from predictions."""
+    return {
+        "passed": bool(row.get("passed")),
+        "reference": row.get("reference"),
+        "prediction": row.get("prediction"),
+        "overall_score": row.get("overall_score"),
+        "failure_tags": [
+            rubric["name"]
+            for rubric in row.get("rubric_results") or []
+            if isinstance(rubric, dict)
+            and rubric.get("name")
+            and not rubric.get("passed")
+        ],
     }
+
+
+def _initial_annotation_records(
+    rows: list[dict[str, Any]], run_id: str, evaluation_config_sha256: str
+) -> list[dict[str, Any]]:
+    """Revision-0 annotation records: the failed set, all unreviewed.
+
+    Bytes are a pure function of predictions (no timestamps), so re-running
+    the evaluation reproduces identical r0 objects.
     """
-    script = """
-    const cards = [...document.querySelectorAll('.case')];
-    const buttons = [...document.querySelectorAll('button[data-filter]')];
-    function apply(filter) {
-      cards.forEach(card => card.classList.toggle('hidden',
-        filter !== 'all' && card.dataset.status !== filter));
-      buttons.forEach(button => button.classList.toggle('active',
-        button.dataset.filter === filter));
+    return [
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "evaluation_config_sha256": evaluation_config_sha256,
+            "case_id": row["id"],
+            "review_status": "unreviewed",
+            "machine_result": _machine_result(row),
+            "human_annotation": None,
+        }
+        for row in rows
+        if not row["passed"]
+    ]
+
+
+def _labeled_result_records(
+    rows: list[dict[str, Any]], run_id: str, evaluation_config_sha256: str
+) -> list[dict[str, Any]]:
+    """Revision-0 merged records covering the full evaluation set.
+
+    Each record is the complete original prediction row (inputs, rubric
+    results, errors, media, timings) plus run binding and the human-review
+    slot — not a reduced machine-result summary.
+    """
+    return [
+        {
+            **row,
+            "run_id": run_id,
+            "evaluation_config_sha256": evaluation_config_sha256,
+            "human_review": {
+                "review_status": (
+                    "unreviewed" if not row["passed"] else "not_in_scope"
+                ),
+                "annotation": None,
+            },
+        }
+        for row in rows
+    ]
+
+
+def _write_initial_annotation_products(
+    output: Path,
+    results: list[dict[str, Any]],
+    run_id: str,
+    evaluation_config_sha256: str,
+) -> None:
+    """Seed revision-0 annotation objects plus canonical-name views.
+
+    The ``*.r0.jsonl`` objects are the authoritative layer the annotation
+    save API builds on; the canonical-name files are convenience views
+    refreshed on every commit by the server. report.json deliberately does
+    not list them (revision-suffixed names change with every save).
+    """
+    # Heuristic guard: the eval pod cannot read the Product Store commit
+    # state, so file existence is the only signal available here. Any r{N>0}
+    # object — committed or left behind by a failed save — means the save
+    # service owns these artifacts; skipping is the conservative direction
+    # (init only matters for fresh runs) and never overwrites anything.
+    present = [
+        int(path.stem.rsplit(".r", 1)[1])
+        for path in output.glob("evaluation_annotations.r*.jsonl")
+    ]
+    if present and max(present) > 0:
+        return
+    annotation_records = _initial_annotation_records(
+        results, run_id, evaluation_config_sha256
+    )
+    labeled_records = _labeled_result_records(results, run_id, evaluation_config_sha256)
+    annotation_jsonl = canonical_annotation_jsonl(annotation_records)
+    labeled_jsonl = canonical_annotation_jsonl(labeled_records)
+    snapshot = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "evaluation_config_sha256": evaluation_config_sha256,
+        "revision": 0,
+        "exported_at": datetime.now(UTC).isoformat(),
+        "review_scope": REVIEW_SCOPE,
+        "total": len(annotation_records),
+        "reviewed": 0,
+        "in_progress": 0,
+        "unreviewed": len(annotation_records),
+        "annotations": annotation_records,
     }
-    buttons.forEach(button => button.addEventListener('click',
-      () => apply(button.dataset.filter)));
-    apply('failed');
-    """
-    document = f"""
-    <!doctype html><html lang="en"><head><meta charset="utf-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Inference evaluation report</title><style>{css}</style></head><body>
-    <main><section class="hero"><h1>Inference evaluation report</h1>
-    <p>{html.escape(str(metrics["dataset_path"]))}</p>
-    <div class="summary"><div>Total<strong>{metrics["total"]}</strong></div>
-    <div>Passed<strong>{metrics["passed"]}</strong></div>
-    <div>Failed<strong>{metrics["failed"]}</strong></div>
-    <div>Pass rate<strong>{metrics["pass_rate"] * 100:.1f}%</strong></div></div>
-    <details><summary>Aggregate metrics</summary><pre>{aggregate}</pre></details>
-    <details><summary>Rubric metrics</summary><pre>{rubric_aggregate}</pre></details>
-    </section><div class="toolbar"><button data-filter="all">All</button>
-    <button data-filter="failed">Failed</button>
-    <button data-filter="passed">Passed</button></div>{"".join(cards)}</main>
-    <script>{script}</script></body></html>
-    """
-    output.write_text(document, encoding="utf-8")
+    (output / "evaluation_annotations.r0.jsonl").write_bytes(annotation_jsonl)
+    (output / "labeled_evaluation_results.r0.jsonl").write_bytes(labeled_jsonl)
+    (output / "evaluation_annotations.jsonl").write_bytes(annotation_jsonl)
+    (output / "labeled_evaluation_results.jsonl").write_bytes(labeled_jsonl)
+    (output / "evaluation_annotations.json").write_bytes(
+        (json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    )
 
 
 def _file_digest(path: Path) -> str:
@@ -938,9 +1476,18 @@ def _file_digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def _config_digest(value: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    )
     temporary.replace(path)
 
 
@@ -963,6 +1510,8 @@ def evaluate_inference(
     dataset_config_json: str,
     evaluation_config_json: str,
     *,
+    run_id: str,
+    report_spec_json: str | None = None,
     workers: int = 4,
     max_tokens: int = 1024,
     temperature: float = 0.0,
@@ -971,6 +1520,8 @@ def evaluate_inference(
     limit: int = 0,
 ) -> dict[str, Any]:
     """Execute frozen rubrics, preserving predictions across identical runs."""
+    if not run_id:
+        raise ValueError("run_id is required")
     if workers < 1 or max_tokens < 1 or timeout_seconds < 1 or max_retries < 0:
         raise ValueError("invalid inference request settings")
     if limit < 0:
@@ -999,13 +1550,15 @@ def evaluate_inference(
                 media_digests[str(media)] = _file_digest(media)
     manifest = {
         "schema_version": 1,
+        "run_id": run_id,
+        "evaluation_config_sha256": _config_digest(evaluation),
         "dataset_sha256": _file_digest(dataset_file),
         "media_sha256": media_digests,
         "dataset_config": config,
         "evaluation_config": evaluation,
         "model": model,
         "model_reference": model_reference,
-        "runtime_sha256": _file_digest(Path(__file__)),
+        "runtime_sha256": _runtime_sha256(),
         "generation": {
             "workers": workers,
             "max_tokens": max_tokens,
@@ -1138,19 +1691,66 @@ def evaluate_inference(
     for name in ("predictions.jsonl", "processed.jsonl"):
         _write_jsonl(output / name, results)
     _atomic_json(output / "metrics.json", metrics)
-    report_path = output / "evaluation_report.html"
     valid = metrics["successful_predictions"] > 0 and metrics["evaluated_cases"] > 0
+    with (output / "predictions.jsonl").open(encoding="utf-8") as stream:
+        predictions_rows = sum(1 for line in stream if line.strip())
+    evaluation_status, case_errors, report_errors = _evaluation_status(
+        results, _configured_rubrics(evaluation), metrics, predictions_rows
+    )
+    if not valid:
+        evaluation_status = "invalid"
+    badcases = [row for row in results if not row["passed"]]
+    spec, report_warnings = _resolve_report_spec(
+        report_spec_json, _report_capabilities(badcases)
+    )
     if valid:
-        _build_html(results, metrics, dataset_file, config, report_path)
+        report_warnings.extend(
+            _build_html(
+                results,
+                metrics,
+                dataset_file,
+                config,
+                output,
+                spec,
+                evaluation_status,
+                case_errors,
+                run_id,
+                manifest["evaluation_config_sha256"],
+            )
+        )
+        _atomic_json(output / "resolved_report_spec.json", spec)
+        if evaluation_status == "validated":
+            _write_initial_annotation_products(
+                output, results, run_id, manifest["evaluation_config_sha256"]
+            )
     error = None if valid else "inference produced no successfully scored predictions"
     storage_dir = str(output).removeprefix("/workspace")
     summary = {
         "status": "succeeded" if valid else "failed",
+        "evaluation_status": evaluation_status,
         "metrics": metrics,
         "error": error,
+        "report_spec": {
+            "template_id": spec["template_id"],
+            "template_version": spec["template_version"],
+        },
+        "badcase_count": len(badcases),
+        "validation": {
+            "invalid_cases": sorted(case_errors),
+            "case_errors": case_errors,
+            "report_errors": report_errors,
+        },
+        "warnings": report_warnings,
         "artifacts": {
             name: f"{storage_dir}/{name}"
-            for name in ("metrics.json", "predictions.jsonl", "evaluation_report.html")
+            for name in (
+                "metrics.json",
+                "predictions.jsonl",
+                "resolved_report_spec.json",
+                REPORT_HTML_NAME,
+                REPORT_CASES_MANIFEST_NAME,
+                REPORT_CASES_INDEX_NAME,
+            )
             if (output / name).exists()
         },
     }
@@ -1169,6 +1769,8 @@ def main() -> None:
     parser.add_argument("--dataset-config", required=True)
     parser.add_argument("--evaluation-config", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--report-spec")
     args = parser.parse_args()
     output = Path(args.output_dir)
     try:
@@ -1181,6 +1783,10 @@ def main() -> None:
             output_dir=args.output_dir,
             dataset_config_json=Path(args.dataset_config).read_text(),
             evaluation_config_json=json.dumps(config),
+            run_id=args.run_id,
+            report_spec_json=(
+                Path(args.report_spec).read_text() if args.report_spec else None
+            ),
             **config.get("generation", {}),
         )
     except Exception as exc:

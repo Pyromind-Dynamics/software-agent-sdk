@@ -275,6 +275,9 @@ def resource_limits_from_environment() -> ResourceLimits:
 
 def install_product_api(app: FastAPI) -> FastAPI:
     """Compose Product API around the existing OpenHands application."""
+    from pyromind_agent_server.api.evaluation_runs import (
+        create_evaluation_runs_router,
+    )
     from pyromind_agent_server.api.router import create_product_router
 
     app.state.product_runtime = None
@@ -297,4 +300,5 @@ def install_product_api(app: FastAPI) -> FastAPI:
 
     app.router.lifespan_context = product_lifespan
     app.include_router(create_product_router())
+    app.include_router(create_evaluation_runs_router())
     return app

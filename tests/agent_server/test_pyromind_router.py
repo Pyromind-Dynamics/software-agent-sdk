@@ -1167,6 +1167,12 @@ def test_pyromind_storage_tools_use_user_context_headers():
     }
     assert tools[0].params == expected_storage_params
     assert tools[1].params == expected_storage_params
+    progress_tool = next(
+        tool for tool in tools if tool.name == DfCheckProgressTool.name
+    )
+    assert progress_tool.params == expected_storage_params
+    assert DfStopTaskTool.name in {tool.name for tool in tools}
+    assert "df_save_annotations" not in {tool.name for tool in tools}
     assert (
         secrets["PYROMIND_STORAGE_AUTH_COOKIE"].get_value()
         == f"{PYROMIND_AUTH_COOKIE_NAME}=context-token; other=value"

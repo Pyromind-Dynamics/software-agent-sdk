@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import shlex
+import subprocess
+import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openhands.sdk.conversation.state import ActiveLongTask
+from openhands.tools.data_preparation.runner import runtime_bundle_fingerprint
 from openhands.tools.data_preparation.workspace_paths import resolve_workspace_file
 from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
 from openhands.tools.workflow.task_submission import (
@@ -32,11 +34,34 @@ if TYPE_CHECKING:
     )
 
 
+INFERENCE_RUNTIME_FILENAMES = (
+    "evaluate_inference.py",
+    "evaluation_report.css",
+    "evaluation_report.js",
+)
+
+
+def _validate_report_ui_bundle(runtime_dir: Path) -> None:
+    result = subprocess.run(
+        [sys.executable, str(runtime_dir / "build_report_ui.py"), "--check"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError(
+            "evaluation report UI bundle is stale or its build check failed; run "
+            ".agents/skills/inference-evaluation/scripts/build_report_ui.py"
+        )
+
+
 class InferenceOptions(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     model_path: str = Field(min_length=1)
     dataset_config_path: str = Field(min_length=1)
     evaluation_config_path: str = Field(min_length=1)
+    report_spec_path: str | None = Field(default=None, min_length=1)
     served_model_name: str = Field(default="default", min_length=1)
     gpu_product: str = "NVIDIA-L40S"
     gpu_count: int = Field(default=1, ge=1)
@@ -180,13 +205,17 @@ def storage_path(value: str) -> str:
     return str(path)
 
 
-def build_inference_dsl(definition: dict[str, Any], output_dir: str) -> str:
+def build_inference_dsl(
+    definition: dict[str, Any], output_dir: str, run_id: str
+) -> str:
     options = definition["inference"]
     output = "/workspace" + storage_path(output_dir)
     command = " ".join(
         [
             "python3",
             shlex.quote(output + "/evaluate_inference.py"),
+            "--run-id",
+            shlex.quote(run_id),
             '--endpoint "$param"',
             "--model",
             shlex.quote(options["served_model_name"]),
@@ -198,6 +227,11 @@ def build_inference_dsl(definition: dict[str, Any], output_dir: str) -> str:
             shlex.quote(output + "/dataset_config.json"),
             "--evaluation-config",
             shlex.quote(output + "/evaluation_config.json"),
+            *(
+                ["--report-spec", shlex.quote(output + "/report_spec.json")]
+                if definition.get("report_spec")
+                else []
+            ),
             "--output-dir",
             shlex.quote(output),
         ]
@@ -258,8 +292,10 @@ class InferencePipelineHandler:
             if action.resume_run_id
             else None
         )
-        script = self.runtime_dir / "evaluate_inference.py"
-        runtime_hash = hashlib.sha256(script.read_bytes()).hexdigest()
+        _validate_report_ui_bundle(self.runtime_dir)
+        runtime_hash = runtime_bundle_fingerprint(
+            self.runtime_dir, INFERENCE_RUNTIME_FILENAMES
+        )
         if action.inference:
             options = action.inference
             dataset = DatasetMapping.model_validate_json(
@@ -273,13 +309,30 @@ class InferencePipelineHandler:
                 ).read_text()
             ).model_dump(exclude_none=True)
             inference = options.model_dump(
-                exclude={"dataset_config_path", "evaluation_config_path"}
+                exclude={
+                    "dataset_config_path",
+                    "evaluation_config_path",
+                    "report_spec_path",
+                }
             )
             inference["model_path"] = storage_path(options.model_path)
+            report_spec = None
+            if options.report_spec_path:
+                report_spec = resolve_workspace_file(
+                    conversation, options.report_spec_path
+                ).read_text()
+                try:
+                    json.loads(report_spec)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        "invalid report_spec JSON in "
+                        f"{options.report_spec_path}: {error}"
+                    ) from error
             definition = {
                 "inference": inference,
                 "dataset_config": dataset,
                 "evaluation_config": evaluation,
+                "report_spec": report_spec,
                 "input_path": storage_path(action.input_path),
                 "cpu": action.cpu,
                 "memory": action.memory,
@@ -306,7 +359,7 @@ class InferencePipelineHandler:
         response_status = "Pending"
         warning = ""
         try:
-            dsl = build_inference_dsl(definition, output_dir)
+            dsl = build_inference_dsl(definition, output_dir, run_id)
             workflow = convert_dsl_to_xyflow(dsl, name=f"agent-evaluation-{run_id[:8]}")
             validate_pipeline_topology(workflow)
             validation = self.validator(
@@ -336,19 +389,35 @@ class InferencePipelineHandler:
                     owner._stage_script(
                         str(path), output_dir, conversation, frozen_script_name=name
                     )
-            owner._stage_script(
-                str(script),
-                output_dir,
-                conversation,
-                frozen_script_name="evaluate_inference.py",
-            )
+                report_spec = definition.get("report_spec")
+                if report_spec:
+                    path = Path(directory) / "report_spec.json"
+                    path.write_text(report_spec)
+                    owner._stage_script(
+                        str(path),
+                        output_dir,
+                        conversation,
+                        frozen_script_name="report_spec.json",
+                    )
+            for filename in INFERENCE_RUNTIME_FILENAMES:
+                owner._stage_script(
+                    str(self.runtime_dir / filename),
+                    output_dir,
+                    conversation,
+                    frozen_script_name=filename,
+                )
             workspace = Path(cast(Any, conversation).workspace.working_dir)
             canvas = workspace / "public_data/workflow_canvas/workflow.py"
             canvas.parent.mkdir(parents=True, exist_ok=True)
             canvas.write_text(dsl)
             prepare_execution = getattr(self.runs, "prepare_execution", None)
             if prepare_execution is not None:
-                workflow = prepare_execution(run_id, workflow, dsl, script.read_text())
+                workflow = prepare_execution(
+                    run_id,
+                    workflow,
+                    dsl,
+                    (self.runtime_dir / "evaluate_inference.py").read_text(),
+                )
             submitting = True
             response = submit_workflow_task(
                 client=client,
