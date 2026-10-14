@@ -2,6 +2,12 @@
 
 包依赖升级为 AgentGenome Python/npm 0.6.3，通过 vendor 安装，继续由 Pi 标准加载器加载默认入口。工具定义、节点回执、修订规则、冻结和修订记录属于 AgentGenome；Runtime 使用通用 `execute_stage` 能力关联当前会话。上层没有 Pi 类型，公开 API 与原有 SSE 事件类型不变。SQLite 仅增加表，原资产及运行记录保留。
 
+0.6.5 把「llm 节点必须保留原始执行方式」变成默认蒸馏行为（设计见 AgentGenome 仓库 `docs/v2-capture.md` §5.10）：
+
+- llm 节点的提示词除原样包含声明路径外，还必须点名这一步原本由哪个 skill、以什么命令形态执行（脚本、`--pipeline`、模型 profile 等）。此前提示词只承载任务目标，回放的 agent 会绕开 skill 现场硬做，链路看似跑通但没沿原路径；
+- 约束写在插件 prompt 的三处（系统提示词、`genome_distill` 工具描述、`steps` schema），沉淀时不需要用户额外交代；
+- 只影响 llm 节点的提示词文本，`run` 节点的命令与宿主 `agent_task` 端口不变。
+
 0.6.3 把「自由裁量的 LLM 步骤」变成图节点，而不是丢进 gaps（设计见 AgentGenome 仓库 `docs/v2-capture.md` §6）：
 
 - `genome_distill` 的 `steps` 新增 llm 形态 `{llm, output, input?, verify?, from?}`。提示词里原样写出的输入/产出路径被替换成 `{input.*}` / `{artifact}`，节点编译成 `do: {llm}` 叶子，`verify` 默认 `test -s {output.<key>}`；
@@ -33,7 +39,7 @@
 
 本版使用 `os-sandbox` 的受保护目录保存验收代码，文件工具与终端均不能修改。执行前校验摘要，模型请求通过独立文件 API 交接，不占用终端。业务数据仍留在执行环境，产物链接继续通过 SDK Storage 工具获取。
 
-远程 `sandbox` 支持固定脚本及连续修订；验收约束由 AgentGenome 的工具说明和修订返回结果提示，不承诺运行目录只读。提交仅回收允许修改的业务脚本，验收文件继续使用冻结版本。Agent 节点和模型验收仍保持原有能力限制。
+远程 `sandbox` 支持固定脚本及连续修订；验收约束由 AgentGenome 的工具说明和修订返回结果提示，不承诺运行目录只读。提交仅回收允许修改的业务脚本，验收文件继续使用冻结版本。Agent 节点（`do.llm`）由 Pi 会话执行，不依赖只读验收目录，因此 sandbox 下同样可用（`execution.capabilities` 的 `agent_task` 不再跟随 `protectedRoot`）；模型验收仍要求只读验收目录，sandbox 下保持不可用。
 
 修订不设次数限制：Pi 使用最近的运行 ID，基于上次冻结副本继续修订，或自行判断交还 Skill。重复提交仍去重，旧版回归标准保持冻结；未通过验证的草稿用例可纠正后重新验证。失败运行可直接申请修订；成功但结果不符合需求的运行须提供 `reason`。修订副本返回 `verification_protection`（`prompt` 或 `read_only`）。原因持久化到 AgentGenome 的修订记录，旧记录兼容；Pi 能力发现仍在 Adapter 下层，Runtime 和产品协议不增加专属分支。
 

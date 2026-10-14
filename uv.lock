@@ -77,13 +77,13 @@ wheels = [
 
 [[package]]
 name = "agentgenome"
-version = "0.6.3"
-source = { path = "vendor/agentgenome-0.6.3-py3-none-any.whl" }
+version = "0.6.5"
+source = { path = "vendor/agentgenome-0.6.5-py3-none-any.whl" }
 dependencies = [
     { name = "pyyaml" },
 ]
 wheels = [
-    { filename = "agentgenome-0.6.3-py3-none-any.whl", hash = "sha256:9e3ac3ff50313094f6583a858d029d98e18e1270b6cc64a6a23e62b8374de3b1" },
+    { filename = "agentgenome-0.6.5-py3-none-any.whl", hash = "sha256:3e2aa007331cb950cf0efa7b4cfc9e113a9bdcf57ebc8623ee489df0f1458dd0" },
 ]
 
 [package.metadata]
@@ -1815,7 +1815,7 @@ openhands = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agentgenome", path = "vendor/agentgenome-0.6.3-py3-none-any.whl" },
+    { name = "agentgenome", path = "vendor/agentgenome-0.6.5-py3-none-any.whl" },
     { name = "openhands-agent-server", marker = "extra == 'openhands'", editable = "openhands-agent-server" },
     { name = "pyromind-runtime", editable = "pyromind-runtime" },
 ]

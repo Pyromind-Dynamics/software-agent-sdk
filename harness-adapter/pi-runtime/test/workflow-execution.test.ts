@@ -112,7 +112,7 @@ test("verification files use a protected host directory and independent bounded 
 });
 
 
-test("revision file capability does not require read-only verification or enable agent stages", async () => {
+test("capability discovery reports stages, revisions and protection independently", async () => {
   for (const readFile of [undefined, async () => Buffer.from("script")]) {
     const execution = new WorkflowExecution({
       cwd: "/session", readFile, writeFile: async () => {},
@@ -120,8 +120,8 @@ test("revision file capability does not require read-only verification or enable
       operations: { async exec() { assert.fail("capability discovery must not execute"); } },
     }, peer());
     assert.deepEqual(await execution.handle("execution.capabilities", {}), {
-      revision: !!readFile, file_read: !!readFile, protected_verification: false,
-      agent_task: false, model_judge: false,
+      agent_task: true, revision: !!readFile, file_read: !!readFile,
+      protected_verification: false, model_judge: false,
     });
   }
 });

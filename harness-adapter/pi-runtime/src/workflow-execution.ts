@@ -23,7 +23,9 @@ export class WorkflowExecution {
 
   async handle(method: string, params: JsonObject): Promise<JsonValue> {
     if (method === "execution.capabilities") return {
-      agent_task: !!this.access.protectedRoot,
+      // Agent stages run as Pi turns, so they do not depend on the read-only
+      // verification root that the remote sandbox backend cannot provide.
+      agent_task: true,
       protected_verification: !!this.access.protectedRoot,
       file_read: !!this.access.readFile,
       revision: !!this.access.readFile,
