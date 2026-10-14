@@ -29,9 +29,9 @@ def runtime():
 def workspace(tmp_path, monkeypatch):
     # Stub only the dependency probe; pipeline, validation and report subprocesses
     # still execute normally. No model or DataFlow operators are used here.
-    dist = tmp_path / "open_dataflow-1.0.10.dist-info"
+    dist = tmp_path / "open_dataflow-1.0.11.dist-info"
     dist.mkdir()
-    (dist / "METADATA").write_text("Name: open-dataflow\nVersion: 1.0.10\n")
+    (dist / "METADATA").write_text("Name: open-dataflow\nVersion: 1.0.11\n")
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     monkeypatch.setenv("PYROMIND_SANDBOX_DATAFLOW_PYTHON", sys.executable)
     (tmp_path / "public_data").mkdir()
@@ -211,8 +211,8 @@ def interpreter_spec(venv, **overrides):
     spec = {
         "python": None,
         "venv": str(venv),
-        "dataflow_version": "1.0.10",
-        "packages": ["open-dataflow==1.0.10"],
+        "dataflow_version": "1.0.11",
+        "packages": ["open-dataflow==1.0.11"],
         "system_python": sys.executable,
     }
     spec.update(overrides)
@@ -255,7 +255,7 @@ def test_configured_interpreter_with_the_wrong_version_is_an_error(
         interpreter_spec(tmp_path / "venv", python=sys.executable), bootstrap=False
     )
     assert python is None
-    assert "0.9.9" in detail and "expected 1.0.10" in detail
+    assert "0.9.9" in detail and "expected 1.0.11" in detail
 
 
 def test_cached_venv_is_reused_only_for_the_pinned_version(runtime, tmp_path):
@@ -265,7 +265,7 @@ def test_cached_venv_is_reused_only_for_the_pinned_version(runtime, tmp_path):
     stamp = venv / "open-dataflow-version"
     stamp.write_text("0.9.0")
     assert runtime._cached_venv_python(interpreter_spec(venv)) is None
-    stamp.write_text("1.0.10")
+    stamp.write_text("1.0.11")
     assert runtime._cached_venv_python(interpreter_spec(venv)) == str(
         venv / "bin/python"
     )
@@ -290,6 +290,6 @@ def test_prepare_installs_once_and_then_reuses_the_cached_venv(
     spec = interpreter_spec(venv, system_python=str(system_python))
     first = runtime._interpreter_report(spec, prepare=True)
     assert first["ready"] is True and first["source"] == "installed"
-    assert (venv / "open-dataflow-version").read_text() == "1.0.10"
+    assert (venv / "open-dataflow-version").read_text() == "1.0.11"
     second = runtime._interpreter_report(spec, prepare=True)
     assert second["ready"] is True and second["source"] == "reused"

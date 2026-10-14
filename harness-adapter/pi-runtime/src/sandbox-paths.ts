@@ -1,4 +1,5 @@
 import { isAbsolute, posix, relative, resolve, sep } from "node:path";
+import { realpath } from "node:fs/promises";
 
 import { inside } from "./workspace-policy.js";
 
@@ -48,6 +49,14 @@ export class SandboxReadMirror {
   resolveHost(path: string): string | undefined {
     if (!isAbsolute(path)) return undefined;
     return this.roots.some(({ host }) => inside(path, host)) ? path : undefined;
+  }
+
+  async containsCanonical(path: string): Promise<boolean> {
+    const target = await realpath(path);
+    for (const { host } of this.roots) {
+      if (inside(target, await realpath(host))) return true;
+    }
+    return false;
   }
 
   /**

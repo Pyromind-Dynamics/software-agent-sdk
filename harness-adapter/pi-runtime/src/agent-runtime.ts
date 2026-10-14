@@ -1,3 +1,4 @@
+import type { SubagentHost } from "./subagent-host.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -24,6 +25,9 @@ import type { JsonlRpcPeer } from "./rpc-peer.js";
 import type { WorkflowExecution } from "./workflow-execution.js";
 
 export class PiAgentRuntime {
+  private subagents?: SubagentHost;
+  private autonomousRunId?: string;
+  private cancelling = false;
   private execution: WorkflowExecution | undefined;
   private session: AgentSession | undefined;
   private sessionId: string | undefined;
@@ -69,16 +73,38 @@ export class PiAgentRuntime {
 
   private async start(params: JsonObject): Promise<JsonValue> {
     if (this.session) throw new Error("Pi session already started");
-    const { session, sessionId, execution } = await createPiSession(
+    const { session, sessionId, execution, subagents } = await createPiSession(
       params,
       this.peer,
       this.sessionOptions,
     );
     this.execution = execution;
+    this.subagents = subagents;
     session.subscribe((event) => {
+      if (event.type === "agent_start" && !this.normalizer) {
+        this.autonomousRunId = `extension:${randomUUID()}`;
+        this.normalizer = new PiEventNormalizer(sessionId, this.autonomousRunId, this.pendingCommandIds);
+        this.outcome.reset();
+      }
       this.outcome.observe(event);
+      if (event.type === "tool_execution_start" && event.toolName === "subagent") subagents.observeCall(event.toolCallId, event.args);
+      if (event.type === "tool_execution_update" && event.toolName === "subagent") subagents.observeProgress(event.partialResult, event.toolCallId);
+      if (event.type === "message_end" && event.message.role === "assistant") setImmediate(() => void subagents.refresh().catch(() => {}));
+      if (event.type === "tool_execution_end" && event.toolName === "subagent") subagents.observeResult(event.result, event.toolCallId, event.isError);
+      if (event.type === "agent_end" && this.autonomousRunId) {
+        const id = this.autonomousRunId;
+        setImmediate(() => void session.waitForIdle().then(() => {
+          if (this.autonomousRunId !== id) return;
+          this.finishRun(id, this.outcome.normalize(session.messages));
+          this.autonomousRunId = undefined;
+          this.normalizer = undefined;
+          this.drainNotifications();
+        }));
+      }
       if (!this.normalizer) return;
-      for (const translated of this.normalizer.translate(event)) this.peer.emit(translated);
+      for (const translated of this.normalizer.translate(event)) {
+        if (translated.kind !== "usage.updated") this.peer.emit(translated);
+      }
     });
     this.session = session;
     this.sessionId = sessionId;
@@ -95,6 +121,14 @@ export class PiAgentRuntime {
         customType: "pyromind.external_task", content: message.content, display: false,
         details: isObject(message.details) ? message.details : {},
       } });
+    }
+    try { await subagents.attach(session); }
+    catch (error) {
+      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      session.dispose();
+      await subagents.close();
+      this.session = undefined;
+      throw error;
     }
     setImmediate(() => this.drainNotifications());
     return { ready: true };
@@ -176,8 +210,11 @@ export class PiAgentRuntime {
   }
 
   private async cancel(): Promise<JsonValue> {
-    await this.requireSession().abort();
-    return { cancelled: true };
+    this.cancelling = true;
+    try {
+      await Promise.all([this.subagents?.stopAll(), this.requireSession().abort()]);
+      return { cancelled: true };
+    } finally { this.cancelling = false; }
   }
 
   private async notify(params: JsonObject): Promise<JsonValue> {
@@ -318,7 +355,7 @@ export class PiAgentRuntime {
   }
 
   private drainNotifications(): void {
-    if (this.normalizer || this.requireSession().isStreaming) return;
+    if (this.cancelling || this.normalizer || this.requireSession().isStreaming) return;
     for (const [id, stage] of this.stages) {
       if (stage.state !== "queued") continue;
       stage.state = "running";
@@ -335,7 +372,10 @@ export class PiAgentRuntime {
     const session = this.requireSession();
     await session.abort();
     await session.waitForIdle();
+    await this.subagents?.stopAll();
+    await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     session.dispose();
+    await this.subagents?.close();
     setImmediate(() => process.exit(0));
     return { closed: true };
   }

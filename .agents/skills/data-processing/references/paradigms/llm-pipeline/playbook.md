@@ -132,7 +132,7 @@ messages 时选择 `vision`。具体完成标准见 PCB 场景文档。
 - 目录形状只是弱信号，不是数据 Schema；混合结构或需要类别/异常/大小/命名模式
   覆盖时，先按实际目录结构确认样本边界，再决定输入形态。
 - Text2SQL Sample 使用 Python 3.10 的 `DATAFLOW_PYTHON`；Pyromind 固定
-  `open-dataflow==1.0.10`、CPU 执行。
+  `open-dataflow==1.0.11`、CPU 执行。
 - `processed.jsonl` 必须通过所选 Schema 校验，ID 唯一且不含运行审计字段。
 - Report 必须包含输出数、模型调用、失败、Checkpoint、校验、Revision，以及场景
   Pipeline 提供的可选 `scenario_metrics.json`。

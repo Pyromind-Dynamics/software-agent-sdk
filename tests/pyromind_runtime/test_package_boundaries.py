@@ -199,3 +199,24 @@ def test_sdk_agentgenome_uses_host_bridge_without_native_execution_fallback() ->
     assert 'peer.request("workflow.invoke"' not in session
     assert "NativeClient" not in session
     assert "nativeHost" not in session
+
+
+def test_subagent_lifecycle_has_no_harness_specific_product_branch() -> None:
+    source = (
+        ROOT / "pyromind-runtime/pyromind_runtime/application/conversation_runtime.py"
+    ).read_text()
+    tree = ast.parse(source)
+    guard = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_has_active_subagents"
+    )
+    literals = {
+        node.value
+        for node in ast.walk(guard)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert literals == {"subagent", "running"}
+    dockerfile = (ROOT / "Dockerfile").read_text()
+    assert "COPY harness-adapter/pi-runtime/agents ./agents" in dockerfile
+    assert "COPY harness-adapter/pi-runtime/scripts ./scripts" in dockerfile

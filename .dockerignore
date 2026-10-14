@@ -264,3 +264,9 @@ docs/
 # Pinned sandbox runtime wheels ship inside the skill bundle
 !.agents/skills/data-processing/scripts/edp/wheels/
 !.agents/skills/data-processing/scripts/edp/wheels/*.whl
+
+# Pi plugin roles and build assets
+!harness-adapter/pi-runtime/agents/
+!harness-adapter/pi-runtime/agents/*.md
+!harness-adapter/pi-runtime/scripts/
+!harness-adapter/pi-runtime/scripts/*.mjs

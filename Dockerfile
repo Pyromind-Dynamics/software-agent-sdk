@@ -95,6 +95,8 @@ COPY harness-adapter/pi-runtime/vendor ./vendor
 RUN npm ci --no-audit --no-fund
 COPY harness-adapter/pi-runtime/tsconfig.json ./
 COPY harness-adapter/pi-runtime/src ./src
+COPY harness-adapter/pi-runtime/agents ./agents
+COPY harness-adapter/pi-runtime/scripts ./scripts
 RUN npm run build && npm prune --omit=dev --no-audit --no-fund
 
 ####################################################################################
@@ -263,7 +265,7 @@ COPY --chown=${USERNAME}:${USERNAME} --from=knowledge-sync /sync/knowledge /agen
 # preshed (open-dataflow dep) has no cp313 linux wheel; use Python 3.12
 RUN uv python install 3.12 \
     && uv venv --python 3.12 ${HOME}/dataflow-venv \
-    && uv pip install --python ${HOME}/dataflow-venv/bin/python open-dataflow==1.0.10
+    && uv pip install --python ${HOME}/dataflow-venv/bin/python open-dataflow==1.0.11
 ENV DATAFLOW_PYTHON=/home/openhands/dataflow-venv/bin/python
 # DataFlow LLM defaults (overridden per-run by build_dataflow_env when a
 # conversation supplies its own model/endpoint)

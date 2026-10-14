@@ -199,6 +199,7 @@ class _PiSession:
     pending_permission: _PendingPermission | None = None
     finished_runs: set[str] = field(default_factory=set)
     active_external_tasks: dict[str, str] = field(default_factory=dict)
+    active_subagents: set[str] = field(default_factory=set)
     last_workflow_signature: str | None = None
 
 
@@ -888,6 +889,21 @@ class PiAdapter:
             if stale_callback:
                 return
             session.runner = None
+            if exit_result.reason == "unexpected":
+                for child_id in tuple(session.active_subagents):
+                    await self._runner_event(
+                        session,
+                        {
+                            "protocolVersion": PROTOCOL_VERSION,
+                            "type": "pi.event",
+                            "eventId": f"{child_id}:subagent.finished:interrupted",
+                            "sessionId": session.session_id,
+                            "runId": child_id,
+                            "occurredAt": datetime.now().astimezone().isoformat(),
+                            "kind": "subagent.finished",
+                            "payload": {"status": "interrupted"},
+                        },
+                    )
             if exit_result.reason != "unexpected" or inflight is None:
                 return
             run_id_value = inflight.get("run_id")
@@ -1052,6 +1068,15 @@ class PiAdapter:
             )
             self._emit_tool_signals(session, tool_name, result)
             return result
+        if method == "permission.cancel":
+            pending = session.pending_permission
+            if (
+                pending is not None
+                and pending.operation_id == params.get("tool_call_id")
+                and not pending.future.done()
+            ):
+                pending.future.set_result((False, "Subagent request cancelled"))
+            return {"cancelled": True}
         if method == "permission.check":
             arguments = params.get("arguments")
             tool_call_id = params.get("tool_call_id")
@@ -1223,6 +1248,17 @@ class PiAdapter:
         if not isinstance(payload, dict):
             payload = {}
         run_id = str(frame.get("runId") or "")
+        if isinstance(kind, str) and kind.startswith("subagent."):
+            if kind == "subagent.started":
+                session.active_subagents.add(run_id)
+            elif kind == "subagent.finished":
+                session.active_subagents.discard(run_id)
+            for event in translate_runner_event(frame):
+                session.queue.put_nowait(event)
+            if kind == "subagent.finished" and payload.get("mutated"):
+                # A child's workflow completion must not finish the parent run.
+                session.queue.put_nowait(await self._completion_event(session, frame))
+            return
         if kind == "agent.started":
             session.running = True
             session.files.save_inflight({"run_id": run_id})

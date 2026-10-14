@@ -36,6 +36,7 @@ from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
     ExternalTaskState,
+    TimelineOperation,
     WorkflowState,
 )
 from pyromind_runtime.domain.versions import (
@@ -1633,6 +1634,8 @@ class ConversationRuntime:
             snapshot = self._store(active.handle.session_id).load_snapshot()
         except (OSError, ProductStoreError):
             return False
+        if _has_active_subagents(snapshot):
+            return False
         if snapshot.status not in _EVICTABLE_STATUSES:
             return False
         return not any(
@@ -1877,7 +1880,12 @@ class ConversationRuntime:
         active_tasks = any(
             task.status in {"pending", "running"} for task in snapshot.external_tasks
         )
-        if snapshot.status == "running" or snapshot.pending_permissions or active_tasks:
+        if (
+            snapshot.status == "running"
+            or snapshot.pending_permissions
+            or active_tasks
+            or _has_active_subagents(snapshot)
+        ):
             raise ProductRuntimeError(
                 "conversation_busy",
                 "Conversation must be idle with no pending permission or task.",
@@ -2034,3 +2042,12 @@ def _workflow_has_training_node(
         return None
     request = store.load_workflow_execution_requests().get(task.run_id or "")
     return request.summary.get("has_training_node") is True if request else None
+
+
+def _has_active_subagents(snapshot: ConversationSnapshot) -> bool:
+    return any(
+        isinstance(item, TimelineOperation)
+        and item.category == "subagent"
+        and item.status == "running"
+        for item in snapshot.timeline
+    )

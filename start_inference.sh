@@ -225,8 +225,8 @@ print(f"DataFlow runtime ready: open-dataflow=={version}")
 # ----------------------------------------------------------
 PI_RUNTIME_DIR="${SOFTWARE_AGENT_SDK_DIR}/harness-adapter/pi-runtime"
 
-if ! command -v npm >/dev/null 2>&1; then
-  echo "Error: npm is required to install and build the Pi runtime." >&2
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+  echo "Error: node and npm are required to install and build the Pi runtime." >&2
   exit 127
 fi
 
@@ -236,10 +236,21 @@ if [[ ! -f "${PI_RUNTIME_DIR}/package.json" || ! -f "${PI_RUNTIME_DIR}/package-l
 fi
 
 echo "Installing Pi runtime dependencies..."
-npm --prefix "${PI_RUNTIME_DIR}" ci
+npm --prefix "${PI_RUNTIME_DIR}" ci --engine-strict
 
 echo "Building Pi runtime..."
 npm --prefix "${PI_RUNTIME_DIR}" run build
+
+node --input-type=module - "${PI_RUNTIME_DIR}" <<'JS'
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+console.log(`Pi runtime ready (Node ${process.versions.node}):`);
+for (const name of ["@earendil-works/pi-coding-agent", "pi-subagents", "@agentgenome/pi-extension"]) {
+  const manifest = JSON.parse(readFileSync(join(process.argv[2], "node_modules", name, "package.json"), "utf8"));
+  console.log(`  ${name}@${manifest.version}`);
+}
+JS
 
 # ----------------------------------------------------------
 # Start Agent Server

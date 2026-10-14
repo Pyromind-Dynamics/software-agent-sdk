@@ -2267,3 +2267,43 @@ async def test_pi_adapter_restores_workflow_and_resets_debug_budget(
     assert files.load_business_state() == {"pyromind_workflow_attempts": 0}
     assert [method for method, _params in requests] == ["context.append", "notify"]
     await adapter.close(handle)
+
+
+async def test_idle_runner_exit_terminates_subagent_operations(tmp_path, monkeypatch):
+    _LifecycleFakeRunner.instances.clear()
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="child-exit",
+            user_id="42",
+            workspace_root=str(conversations / "child-exit"),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    session = adapter._session(handle.session_id)
+    await session.queue.get()
+    await adapter._runner_event(
+        session,
+        {
+            "eventId": "child-start",
+            "sessionId": handle.session_id,
+            "runId": "child-1",
+            "kind": "subagent.started",
+            "payload": {"label": "search"},
+        },
+    )
+    assert (await session.queue.get()).type == "operation.started"
+    assert session.files.load_inflight() is None
+    runner = _LifecycleFakeRunner.instances[0]
+    runner.running = False
+    await runner.exit_handler(PiRunnerExit(returncode=-9, reason="unexpected"))
+    terminal = await session.queue.get()
+    assert terminal.type == "operation.failed"
+    assert terminal.payload["error_code"] == "subagent_interrupted"
+    assert session.active_subagents == set()
+    assert session.files.load_inflight() is None
+    await adapter.close(handle)

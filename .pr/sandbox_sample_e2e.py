@@ -42,7 +42,7 @@ RUNTIME_FILENAMES = (
     "validate_prepared_data.py",
 )
 RUNNER_FILENAME = "sandbox_sample.py"
-DATAFLOW_VERSION = "1.0.10"
+DATAFLOW_VERSION = "1.0.11"
 
 sys.path.insert(0, str(REPO_ROOT / "openhands-tools"))
 
