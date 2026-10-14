@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
+from pyromind_runtime.domain.evaluation import EvaluationCommitState
 from pyromind_runtime.domain.events import ProductEvent, WorkflowRunState
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
@@ -44,3 +45,15 @@ class ProductStore(Protocol):
     ) -> tuple[CommandReceipt, bool]: ...
 
     def complete_command(self, receipt: CommandReceipt) -> CommandReceipt: ...
+
+
+class EvaluationCommitStore(Protocol):
+    """Narrow Product Store view holding annotation save commit state.
+
+    Implementations (the conversation Product Store) guarantee the atomic
+    single-pointer semantics the save protocol relies on.
+    """
+
+    def load_evaluation_commit(self, run_id: str) -> EvaluationCommitState | None: ...
+
+    def save_evaluation_commit(self, state: EvaluationCommitState) -> None: ...

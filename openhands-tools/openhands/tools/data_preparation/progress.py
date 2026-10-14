@@ -9,7 +9,9 @@ platform job is still running.
 from __future__ import annotations
 
 import json
+import os
 import posixpath
+import uuid
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Self
 
@@ -64,6 +66,21 @@ long-running jobs.
 # ---------------------------------------------------------------------------
 # Action / Observation
 # ---------------------------------------------------------------------------
+
+
+def _default_public_api_base() -> str:
+    """Public agent-API origin used for stable report links.
+
+    Unlike the pre-signed Storage URLs (which expire), the stable link goes
+    through the product API with the user's own login. Deployments can
+    override via ``PYROMIND_PUBLIC_API_BASE``.
+    """
+    override = os.getenv("PYROMIND_PUBLIC_API_BASE", "").strip().rstrip("/")
+    if override:
+        return override
+    if os.getenv("APP_ENV", "dev").strip().lower() in {"prod", "production", "online"}:
+        return "https://agent.pyromind.ai"
+    return "https://pre-agent.pyromind.ai"
 
 
 class DfCheckProgressAction(Action):
@@ -123,6 +140,13 @@ class DfCheckProgressObservation(Observation):
         default_factory=dict,
         description="Fresh Storage download URLs for HTML artifacts in this run.",
     )
+    evaluation_report_url: str | None = Field(
+        default=None,
+        description=(
+            "Stable same-origin report link (login required, never expires);"
+            " the recommended way to open an evaluation report."
+        ),
+    )
 
     @property
     def visualize(self) -> Text:
@@ -152,6 +176,7 @@ class DfCheckProgressExecutor(
         timeout: float = 30.0,
         tail_bytes: int = DEFAULT_TAIL_BYTES,
         output_filename: str = OUTPUT_FILENAME,
+        public_api_base: str | None = None,
     ) -> None:
         self._storage_base_url = (
             storage_base_url or _default_storage_base_url()
@@ -161,6 +186,9 @@ class DfCheckProgressExecutor(
         self._timeout = timeout
         self._tail_bytes = tail_bytes
         self._output_filename = output_filename
+        self._public_api_base = (public_api_base or _default_public_api_base()).rstrip(
+            "/"
+        )
 
     def __call__(
         self,
@@ -227,7 +255,91 @@ class DfCheckProgressExecutor(
                     f"{name}: {url}" for name, url in artifact_urls.items()
                 )
         fields["artifact_urls"] = artifact_urls
+
+        evaluation_report_url = self._stable_report_link(
+            report, output_dir, conversation, headers
+        )
+        fields["evaluation_report_url"] = evaluation_report_url
+        if evaluation_report_url:
+            text += (
+                "\nStable report link (login required, does not expire): "
+                + evaluation_report_url
+            )
         return DfCheckProgressObservation.from_text(text=text, **fields)
+
+    def _stable_report_link(
+        self,
+        report: dict[str, Any] | None,
+        output_dir: str,
+        conversation: BaseConversation | None,
+        headers: dict[str, str],
+    ) -> str | None:
+        """Stable report link for evaluation runs; None when not applicable.
+
+        Only inference-evaluation reports qualify (evaluation_status +
+        report_spec markers), and only when the report API's own
+        preconditions hold as far as Storage can see: a UUID run_id (the
+        report route resolves runs through PipelineRuns, which requires
+        UUIDs), the report HTML artifact, and an output_dir following the
+        platform layout that names the run's owning conversation. The link
+        carries the OWNING conversation id — not the current chat's — so
+        checking an older run from another conversation still produces a
+        working link; ownership is finally enforced by the report API at
+        open time. The link goes through the product API with the user's
+        own login, so it never expires — unlike the pre-signed artifact
+        URLs above, which are the read-only fallback.
+        """
+        if not isinstance(report, dict):
+            return None
+        if not isinstance(report.get("evaluation_status"), str) or not isinstance(
+            report.get("report_spec"), dict
+        ):
+            return None
+        artifacts = report.get("artifacts")
+        if not isinstance(artifacts, dict) or not isinstance(
+            artifacts.get("evaluation_report.html"), str
+        ):
+            return None
+        if conversation is None:
+            return None
+        manifest = self._read_json_file(f"{output_dir}/run_manifest.json", headers)
+        run_id = manifest.get("run_id") if isinstance(manifest, dict) else None
+        if not isinstance(run_id, str):
+            return None
+        try:
+            uuid.UUID(run_id)
+        except ValueError:
+            return None
+        owner = self._owning_conversation_id(output_dir, run_id)
+        if owner is None:
+            return None
+        return (
+            f"{self._public_api_base}/api/v2/pyromind/conversations/"
+            f"{owner}/evaluation-runs/{run_id}/report"
+        )
+
+    @staticmethod
+    def _owning_conversation_id(output_dir: str, run_id: str) -> str | None:
+        """The conversation that owns the run, from the platform path layout.
+
+        The platform reserves ``/.pyromind-agent/<conversation_id>/
+        data_preparation/<run_id>`` for pipeline run outputs, and the report
+        route resolves the run under its owning conversation — that id, not
+        the current chat's, is what the link must carry. When the directory
+        does not follow the layout (or its run segment disagrees with the
+        manifest), no reliable link can be built and ``None`` is the honest
+        answer.
+        """
+        parts = output_dir.strip("/").split("/")
+        if (
+            len(parts) == 4
+            and parts[0] == ".pyromind-agent"
+            and parts[2] == "data_preparation"
+            and parts[1]
+            and parts[3] == run_id
+        ):
+            return parts[1]
+        return None
 
     # -- Storage primitives -------------------------------------------------
 

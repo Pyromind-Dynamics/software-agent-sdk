@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import shutil
+import threading
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from dataclasses import dataclass, field
@@ -13,6 +14,17 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from pyromind_runtime.application.evaluation_annotations import (
+    EvaluationAnnotationService,
+    EvaluationLockRegistry,
+    resolve_evaluation_run,
+)
+from pyromind_runtime.application.evaluation_cases import (
+    MANIFEST_NAME,
+    EvaluationCasePage,
+    EvaluationCaseService,
+    EvaluationMedia,
+)
 from pyromind_runtime.application.event_projection import ProductEventProjector
 from pyromind_runtime.application.reusable_workflows import (
     ReusableWorkflows,
@@ -31,7 +43,14 @@ from pyromind_runtime.domain.commands import (
 )
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.domain.errors import ProductRuntimeError
+from pyromind_runtime.domain.errors import (
+    ProductRuntimeError,
+)
+from pyromind_runtime.domain.evaluation import (
+    AnnotationLoadResult,
+    AnnotationSaveResult,
+    AnnotationSummaryResult,
+)
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
@@ -60,6 +79,10 @@ from pyromind_runtime.ports.harness import (
     RestoreWorkflowSpec,
     SessionHandle,
     SessionSpec,
+)
+from pyromind_runtime.ports.storage import (
+    EvaluationStorage,
+    EvaluationStorageMissingError,
 )
 from pyromind_runtime.ports.workflow_submission import WorkflowSubmissionPort
 from pyromind_runtime.ports.workflows import WorkflowBackend
@@ -168,6 +191,11 @@ class ConversationRuntime:
         self._subscribers: dict[str, set[asyncio.Queue[ProductEvent]]] = {}
         self._first_command_pending: set[str] = set()
         self._first_delta_started_at: dict[tuple[str, str], float] = {}
+        self._evaluation_locks = EvaluationLockRegistry()
+        self._evaluation_annotation_cache: dict[
+            tuple[str, str, int], dict[str, dict[str, Any]]
+        ] = {}
+        self._evaluation_annotation_cache_lock = threading.Lock()
         self._pending_task_registrations: dict[str, asyncio.Event] = {}
 
     async def version_call(
@@ -461,6 +489,219 @@ class ConversationRuntime:
             self._store(conversation_id).append, event
         )
         self._publish(persisted)
+
+    def _evaluation_run(
+        self,
+        conversation_id: str,
+        run_id: str,
+        context: RequestContext,
+        storage: EvaluationStorage,
+    ) -> tuple[str, str, EvaluationAnnotationService]:
+        return resolve_evaluation_run(
+            conversation_id=conversation_id,
+            store=self._store(conversation_id),
+            run_id=run_id,
+            context=context,
+            storage=storage,
+            locks=self._evaluation_locks,
+        )
+
+    def load_evaluation_annotations(
+        self,
+        conversation_id: str,
+        run_id: str,
+        context: RequestContext,
+        storage: EvaluationStorage,
+    ) -> AnnotationLoadResult:
+        canonical_run_id, output_dir, service = self._evaluation_run(
+            conversation_id, run_id, context, storage
+        )
+        return service.load(run_id=canonical_run_id, output_dir=output_dir)
+
+    def load_evaluation_annotation_summary(
+        self,
+        conversation_id: str,
+        run_id: str,
+        context: RequestContext,
+        storage: EvaluationStorage,
+    ) -> AnnotationSummaryResult:
+        canonical_run_id, output_dir, service = self._evaluation_run(
+            conversation_id, run_id, context, storage
+        )
+        return service.load_summary(run_id=canonical_run_id, output_dir=output_dir)
+
+    def save_evaluation_annotations(
+        self,
+        conversation_id: str,
+        run_id: str,
+        context: RequestContext,
+        storage: EvaluationStorage,
+        *,
+        save_id: str,
+        base_revision: int,
+        records: list[dict[str, Any]],
+        reviewer_id: str,
+    ) -> AnnotationSaveResult:
+        canonical_run_id, output_dir, service = self._evaluation_run(
+            conversation_id, run_id, context, storage
+        )
+        return service.save(
+            run_id=canonical_run_id,
+            output_dir=output_dir,
+            save_id=save_id,
+            base_revision=base_revision,
+            records=records,
+            reviewer_id=reviewer_id,
+        )
+
+    def save_evaluation_annotation_changes(
+        self,
+        conversation_id: str,
+        run_id: str,
+        context: RequestContext,
+        storage: EvaluationStorage,
+        *,
+        save_id: str,
+        base_revision: int,
+        changes: list[dict[str, Any]],
+        reviewer_id: str,
+    ) -> AnnotationSaveResult:
+        canonical_run_id, output_dir, service = self._evaluation_run(
+            conversation_id, run_id, context, storage
+        )
+        return service.save_changes(
+            run_id=canonical_run_id,
+            output_dir=output_dir,
+            save_id=save_id,
+            base_revision=base_revision,
+            changes=changes,
+            reviewer_id=reviewer_id,
+        )
+
+    def read_evaluation_report(
+        self,
+        conversation_id: str,
+        run_id: str,
+        context: RequestContext,
+        storage: EvaluationStorage,
+    ) -> bytes:
+        canonical_run_id, output_dir, _ = self._evaluation_run(
+            conversation_id, run_id, context, storage
+        )
+        return storage.read(f"{output_dir}/evaluation_report.html")
+
+    def list_evaluation_cases(
+        self,
+        conversation_id: str,
+        run_id: str,
+        context: RequestContext,
+        storage: EvaluationStorage,
+        *,
+        cursor: str | None,
+        limit: int,
+        query: str,
+        review_status: str = "all",
+    ) -> EvaluationCasePage:
+        canonical_run_id, output_dir, service = self._evaluation_run(
+            conversation_id, run_id, context, storage
+        )
+        summary = service.load_summary(run_id=canonical_run_id, output_dir=output_dir)
+        cache_key = (conversation_id, canonical_run_id, summary.revision)
+        with self._evaluation_annotation_cache_lock:
+            annotation_by_case = self._evaluation_annotation_cache.get(cache_key)
+        if annotation_by_case is None:
+            annotation_state = service.load(
+                run_id=canonical_run_id, output_dir=output_dir
+            )
+            cache_key = (conversation_id, canonical_run_id, annotation_state.revision)
+            annotation_by_case = {
+                record["case_id"]: record for record in annotation_state.records
+            }
+            with self._evaluation_annotation_cache_lock:
+                self._evaluation_annotation_cache[cache_key] = annotation_by_case
+                while len(self._evaluation_annotation_cache) > 8:
+                    self._evaluation_annotation_cache.pop(
+                        next(iter(self._evaluation_annotation_cache))
+                    )
+        allowed_case_ids = None
+        if review_status != "all":
+            allowed_case_ids = {
+                case_id
+                for case_id, record in annotation_by_case.items()
+                if record.get("review_status") == review_status
+            }
+        page = EvaluationCaseService(storage).list_page(
+            output_dir=output_dir,
+            cursor=cursor,
+            limit=limit,
+            query=query,
+            allowed_case_ids=allowed_case_ids,
+            selection_key=review_status,
+        )
+        items = []
+        for item in page.items:
+            record = annotation_by_case.get(item["id"], {})
+            items.append(
+                {
+                    **item,
+                    "review_status": record.get("review_status", "unreviewed"),
+                    "human_annotation": record.get("human_annotation"),
+                }
+            )
+        return EvaluationCasePage(
+            items=items,
+            next_cursor=page.next_cursor,
+            total=page.total,
+            filtered_total=page.filtered_total,
+            revision=cache_key[2],
+        )
+
+    def has_evaluation_case_products(
+        self,
+        conversation_id: str,
+        run_id: str,
+        context: RequestContext,
+        storage: EvaluationStorage,
+    ) -> bool:
+        _, output_dir, _ = self._evaluation_run(
+            conversation_id, run_id, context, storage
+        )
+        try:
+            storage.read(f"{output_dir}/{MANIFEST_NAME}")
+        except EvaluationStorageMissingError:
+            return False
+        return True
+
+    def read_evaluation_media(
+        self,
+        conversation_id: str,
+        run_id: str,
+        context: RequestContext,
+        storage: EvaluationStorage,
+        media_id: str,
+    ) -> EvaluationMedia:
+        _, output_dir, _ = self._evaluation_run(
+            conversation_id, run_id, context, storage
+        )
+        return EvaluationCaseService(storage).read_media(
+            output_dir=output_dir,
+            media_id=media_id,
+        )
+
+    def export_evaluation_annotations(
+        self,
+        conversation_id: str,
+        run_id: str,
+        context: RequestContext,
+        storage: EvaluationStorage,
+        filename: str,
+    ) -> bytes:
+        canonical_run_id, output_dir, service = self._evaluation_run(
+            conversation_id, run_id, context, storage
+        )
+        return service.export(
+            run_id=canonical_run_id, output_dir=output_dir, filename=filename
+        )
 
     async def create_conversation(
         self,

@@ -38,12 +38,25 @@ output_schema 或 convert_format。不使用 workflow_debug 或 run_workflow。
 使用 `df_stop_task` 停止整个工作流。平台回调只代表任务终态，不代表业务指标达标。
 
 回调后直读 output_dir 下的 report.json 和 metrics.json，核对样本数、
-成功 prediction 数、完成评分数、通过率及执行错误。通过 `df_check_progress` 的 artifact_urls 获取 HTML 报告完整预览 URL，
-在最终回答中以 Markdown 链接 `[查看完整评测报告](完整预览URL)` 展示，原样保留完整 URL（含查询参数）。
-不要把容器路径当成用户可打开的地址，也不要编造签名下载链接。
-若工具未返回可访问 URL，交付 Storage 位置及汇总，明确报告需从 Storage 打开。
+成功 prediction 数、完成评分数、通过率及执行错误。评测报告的**首选交付链接**是
+`df_check_progress` 返回的 `evaluation_report_url`（稳定链接，用户登录态打开、永不过期、
+支持页内打标自动保存）：在最终回答中以 Markdown 链接 `[查看完整评测报告](稳定链接)` 展示，
+原样保留完整 URL。`artifact_urls` 里的签名预览 URL 只是 artifact 级只读兜底
+（7 天过期、无打标），仅在稳定链接缺失时附带。
+不要把容器路径当成用户可打开的地址，也不要编造任何下载链接。
+若两者都未返回，交付 Storage 位置及汇总，明确报告暂不可在线打开。
 
 模式 `resume` 使用原 run_id，input_path 不变，可省略 inference 复用冻结配置。
 已有 prediction 不重复请求，仅补发缺失 prediction；业务不通过不等于需要重新推理。
 模型引用、数据内容、配置或评测脚本变化必须新建 full 运行。模型路径必须指向不可变版本。
 活跃任务需先停止，等待停止成功后再续跑；提交结果不确定时不要盲目重复提交。
+
+## 人工标注（badcase 复核）
+
+HTML 报告只渲染机器判定失败的 case（含推理报错行，正确 case 只进顶部汇总数字），
+供人工 Badcase 复核打标。打标依赖**稳定报告入口**（`df_check_progress` 的
+`evaluation_report_url`）与服务端标注 API：从该入口打开的报告页可编辑并自动
+保存；签名 URL 或其他渠道打开的页面没有在线标记，为**只读**（不可打标），
+不存在"本地暂存稍后回传"的替代路径。评测完成时 Storage 已初始化标注产物
+（`evaluation_annotations.r0.jsonl`、`labeled_evaluation_results.r0.jsonl` 及
+规范名视图）。
