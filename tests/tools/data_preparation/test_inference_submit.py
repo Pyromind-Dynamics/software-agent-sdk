@@ -150,6 +150,7 @@ def test_fixed_two_node_submission_and_frozen_resume(inference_submission):
     command = workflow["nodes"][1]["data"]["config"]["command"]
     assert '--endpoint "$param"' in command
     assert "--run-id" in command and result.run_id in command
+    assert f"--report-assets-dir /workspace{result.output_dir}" in command
     assert "pip install" not in command and "API_KEY" not in command
     assert len(ctx.uploads) == 5
     assert {name for name, _ in ctx.uploads} == {

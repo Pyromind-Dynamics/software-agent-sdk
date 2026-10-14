@@ -234,6 +234,8 @@ def build_inference_dsl(
             ),
             "--output-dir",
             shlex.quote(output),
+            "--report-assets-dir",
+            shlex.quote(output),
         ]
     )
     node_config = {

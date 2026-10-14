@@ -810,16 +810,22 @@ window.EvaluationReport.mount(document.getElementById("report"), {
 REPORT_ASSET_NAMES = ("evaluation_report.css", "evaluation_report.js")
 
 
-def _read_report_asset(name: str) -> str:
-    return Path(__file__).with_name(name).read_text(encoding="utf-8")
+def _read_report_asset(name: str, assets_dir: Path | None = None) -> str:
+    directory = assets_dir if assets_dir is not None else Path(__file__).parent
+    return (directory / name).read_text(encoding="utf-8")
 
 
-def _runtime_sha256() -> str:
+def _runtime_sha256(assets_dir: Path | None = None) -> str:
     digest = hashlib.sha256()
     for name in sorted((Path(__file__).name, *REPORT_ASSET_NAMES)):
         digest.update(name.encode("utf-8"))
         digest.update(b"\0")
-        with Path(__file__).with_name(name).open("rb") as source:
+        path = (
+            assets_dir / name
+            if assets_dir is not None and name in REPORT_ASSET_NAMES
+            else Path(__file__).with_name(name)
+        )
+        with path.open("rb") as source:
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(chunk)
         digest.update(b"\0")
@@ -1275,6 +1281,7 @@ def _build_html(
     case_errors: dict[str, list[str]],
     run_id: str,
     evaluation_config_sha256: str,
+    assets_dir: Path | None = None,
 ) -> list[str]:
     """Render the single-file badcase review report; return warnings.
 
@@ -1336,9 +1343,11 @@ def _build_html(
     )
     document = (
         REPORT_TEMPLATE.replace(
-            "__REPORT_CSS__", _read_report_asset("evaluation_report.css")
+            "__REPORT_CSS__", _read_report_asset("evaluation_report.css", assets_dir)
         )
-        .replace("__REPORT_JS__", _read_report_asset("evaluation_report.js"))
+        .replace(
+            "__REPORT_JS__", _read_report_asset("evaluation_report.js", assets_dir)
+        )
         .replace("__REPORT_DATA__", payload)
     )
     (output / REPORT_HTML_NAME).write_bytes(document.encode("utf-8"))
@@ -1512,6 +1521,7 @@ def evaluate_inference(
     *,
     run_id: str,
     report_spec_json: str | None = None,
+    report_assets_dir: str | None = None,
     workers: int = 4,
     max_tokens: int = 1024,
     temperature: float = 0.0,
@@ -1558,7 +1568,9 @@ def evaluate_inference(
         "evaluation_config": evaluation,
         "model": model,
         "model_reference": model_reference,
-        "runtime_sha256": _runtime_sha256(),
+        "runtime_sha256": _runtime_sha256(
+            Path(report_assets_dir) if report_assets_dir is not None else None
+        ),
         "generation": {
             "workers": workers,
             "max_tokens": max_tokens,
@@ -1716,6 +1728,7 @@ def evaluate_inference(
                 case_errors,
                 run_id,
                 manifest["evaluation_config_sha256"],
+                Path(report_assets_dir) if report_assets_dir is not None else None,
             )
         )
         _atomic_json(output / "resolved_report_spec.json", spec)
@@ -1771,6 +1784,7 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--report-spec")
+    parser.add_argument("--report-assets-dir")
     args = parser.parse_args()
     output = Path(args.output_dir)
     try:
@@ -1784,6 +1798,7 @@ def main() -> None:
             dataset_config_json=Path(args.dataset_config).read_text(),
             evaluation_config_json=json.dumps(config),
             run_id=args.run_id,
+            report_assets_dir=args.report_assets_dir,
             report_spec_json=(
                 Path(args.report_spec).read_text() if args.report_spec else None
             ),

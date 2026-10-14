@@ -124,6 +124,34 @@ def test_http_report_and_identical_resume(
     assert len((output / "processed.jsonl").read_text().splitlines()) == 1
 
 
+def test_versioned_script_uses_separate_report_assets(
+    evaluation_module, evaluation_inputs, inference_server, tmp_path, monkeypatch
+):
+    expected_hash = evaluation_module._runtime_sha256()
+    script = tmp_path / "version" / "evaluate_inference.py"
+    script.parent.mkdir()
+    shutil.copyfile(MODULE_PATH, script)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    for name in evaluation_module.REPORT_ASSET_NAMES:
+        shutil.copyfile(MODULE_PATH.with_name(name), assets / name)
+    monkeypatch.setattr(evaluation_module, "__file__", str(script))
+    evaluation_inputs["endpoint"] = inference_server[0]
+    evaluation_inputs["report_assets_dir"] = str(assets)
+
+    evaluation_module.evaluate_inference(**evaluation_inputs)
+
+    output = Path(evaluation_inputs["output_dir"])
+    html = (output / "evaluation_report.html").read_text()
+    for name in evaluation_module.REPORT_ASSET_NAMES:
+        assert (assets / name).read_text() in html
+    assert json.loads((output / "run_manifest.json").read_text())["runtime_sha256"] == (
+        expected_hash
+    )
+    resumed = evaluation_module.evaluate_inference(**evaluation_inputs)
+    assert resumed["metrics"]["current_request_count"] == 0
+
+
 def test_zero_business_score_is_successful_execution(
     evaluation_module, evaluation_inputs, inference_server
 ):
