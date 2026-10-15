@@ -2,12 +2,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { registerSubagentCapabilityCeiling } from "pi-subagents/capability-ceiling";
 import { registerRequiredChildExtensions } from "pi-subagents/required-child-extensions";
 import { serveSubagentIpc } from "./subagent-ipc.js";
+import { SubagentReports } from "./subagent-reports.js";
 import { isRecord, type JsonObject, type RunnerEvent, PROTOCOL_VERSION } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
 
@@ -41,6 +42,7 @@ Launch: {agent:"search"|"general_purpose",task:"...",async:true}. Background exe
 Include the goal, necessary background, relevant paths and expected result. Children have independent context. Handle simple operations directly and continue from the child's final handoff.
 Inspect: {action:"status",id:"<run-id>"}. Continue: {action:"resume",id:"<run-id>",message:"..."}. Stop: {action:"stop",id:"<run-id>"}. Discover roles: {action:"list"}.
 Resume restores the child session and returns a new run ID; use the latest returned ID. Native completion notifications deliver background results.
+When a result points to Full output in public_data/subagents/, use read with that exact path and paginate as needed. Do not rerun the child to retrieve a truncated report.
 Only these two exact role names and these calls are supported. Do not pass options, model, tools, cwd, workflow, tasks or chain overrides.\n`, { mode: 0o600 });
   writeFileSync(join(agentDir, "extensions", "subagent", "config.json"), JSON.stringify({
     toolActivation: "eager", toolDescriptionMode: "custom", asyncByDefault: true,
@@ -67,11 +69,15 @@ export class SubagentHost {
   private disposed = false;
   private monitor?: NodeJS.Timeout;
   private refreshPending?: Promise<void>;
+  private readonly reports: SubagentReports;
   readonly paths: ReturnType<typeof prepareSubagentEnvironment>;
 
   constructor(workspace: string, private sessionId: string, private peer: JsonlRpcPeer,
     private tools: AgentTool[], private modelRuntime: ModelRuntime, private model: Model<Api>, private instructions: string) {
     this.paths = prepareSubagentEnvironment(workspace);
+    const writer = tools.find(tool => tool.name === "write");
+    if (!writer) throw new Error("Subagent report delivery requires the conversation write tool");
+    this.reports = new SubagentReports(workspace, () => this.session!.sessionId, writer);
   }
 
   async start() {
@@ -105,6 +111,22 @@ export class SubagentHost {
 
   extension = (pi: ExtensionAPI) => {
     this.pi = pi;
+    pi.on("turn_start", () => this.reports.beginTurn());
+    pi.on("tool_result", async (event, ctx) => {
+      if (event.toolName !== "subagent") return;
+      return this.reports.transform(event.content, event.details, ctx.signal);
+    });
+    pi.on("context", async (event, ctx) => {
+      const messages: AgentMessage[] = [];
+      for (const message of event.messages) {
+        if (message.role === "toolResult" && message.toolName === "subagent") {
+          messages.push({ ...message, ...await this.reports.transform(message.content, message.details, ctx.signal) });
+        } else if (message.role === "custom" && message.customType === "subagent-notify") {
+          messages.push({ ...message, ...await this.reports.transform(message.content, message.details, ctx.signal) });
+        } else messages.push(message);
+      }
+      return { messages };
+    });
     pi.on("session_start", (_event, ctx) => {
       for (const registration of this.registrations) registration.dispose();
       this.registrations = [

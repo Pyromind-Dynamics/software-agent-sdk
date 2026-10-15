@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, mkdir, realpath, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { PiAgentRuntime } from "../src/agent-runtime.js";
@@ -17,7 +17,7 @@ test("two native child completions and a durable platform callback share one par
     const body=JSON.parse(input);requests.push(body);
     const parent=body.tools?.some((tool:any)=>tool.function.name==='subagent');
     let delta:any;let reason='stop';
-    if(!parent){children++;await gate;delta={content:'CHILD_DONE_'+children};}
+    if(!parent){children++;await gate;delta={content:'CHILD_DONE_'+children+'\n'+'Evidence 中文\n'.repeat(800)+'REPORT_END'};}
     else if(!body.messages.some((m:any)=>m.role==='tool') && !JSON.stringify(body.messages).includes('background') && !JSON.stringify(body.messages).includes('PLATFORM_CALLBACK')){
       delta={tool_calls:['one','two'].map((name,index)=>({index,id:'delegate-'+name,type:'function',function:{name:'subagent',arguments:JSON.stringify({agent:'search',task:'Answer task '+name,async:true})}}))};reason='tool_calls';
     }else delta={content:'PARENT_HANDOFF'};
@@ -49,6 +49,15 @@ test("two native child completions and a durable platform callback share one par
   const history=(await readFile(join(root,'pi','session.jsonl'),'utf8')).split('\n').filter(Boolean).map(line=>JSON.parse(line));
   assert.equal(history.filter(entry=>entry.type==='custom'&&entry.customType==='pyromind.notification').length,1);
   assert.ok(history.some(entry=>JSON.stringify(entry).includes('subagent-notify')));
+  const reportIds=await readdir(join(root,'public_data','subagents'));
+  assert.equal(reportIds.length,2);
+  for(const id of reportIds){
+    const path=`public_data/subagents/${id}/report.md`;
+    assert.match(await readFile(join(root,path),'utf8'),/REPORT_END/);
+    assert.ok(requests.some(body=>body.tools?.some((tool:any)=>tool.function.name==='subagent')&&JSON.stringify(body.messages).includes(path)),path);
+  }
+  const notices=history.filter(entry=>entry.type==='custom_message'&&entry.customType==='subagent-notify');
+  assert.ok(notices.every(entry=>!JSON.stringify(entry).includes('public_data/subagents/')),'native notification persistence remains unchanged');
   await eventually(()=>assert.ok(events.filter(event=>event.kind==='usage.updated').at(-1)?.payload.input_tokens>=4));
 });
 async function eventually(check:()=>void){const deadline=Date.now()+20000;for(;;){try{return check();}catch(error){if(Date.now()>deadline)throw error;await new Promise(resolve=>setTimeout(resolve,50));}}}

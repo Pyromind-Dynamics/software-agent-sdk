@@ -69,6 +69,21 @@ without ending a concurrent parent run. Native cost accounting supplies cumulati
 parent-plus-child usage. Full child traces remain in plugin sessions; the product
 receives operation status and bounded handoffs.
 
+Long final reports are copied to `public_data/subagents/<run-id>/report.md`
+through the existing policy-bound write tool and the shared mutation lane. Native
+artifact metadata must match the current parent session and role; only final
+output files are read, with canonical path checks and a 16 MiB bound. Search
+agents retain their read-only tool set. Short inline results do not cause copies.
+The `tool_result` hook waits for foreground copies. The `context` hook projects
+background notifications and retained results before a model request, without
+changing native notifications or their delivery bookkeeping. Native source
+artifacts remain authoritative; successful copies are cached only in memory.
+Failed copies preserve the summary and native references for a later-turn retry,
+never rerun the child, and never publish an unwritten workspace reference.
+After a runner restart, native metadata reconstructs the mapping for reports
+already referenced by workspace path. Report writes may initialize the sandbox;
+parent `read` and the public path policy are unchanged.
+
 All plugin directories live under the conversation's `pi/` directory. No public
 API, HTTP route or snapshot schema is added. Dependency direction remains:
 server -> adapter -> runtime; only the adapter imports Pi and pi-subagents.

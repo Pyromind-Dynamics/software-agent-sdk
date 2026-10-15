@@ -263,3 +263,12 @@ def test_subagent_lifecycle_has_no_harness_specific_product_branch() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text()
     assert "COPY harness-adapter/pi-runtime/agents ./agents" in dockerfile
     assert "COPY harness-adapter/pi-runtime/scripts ./scripts" in dockerfile
+
+
+def test_native_subagent_report_delivery_stays_in_adapter() -> None:
+    for package in ("pyromind-runtime", "pyromind-agent-server"):
+        for path in (ROOT / package).rglob("*.py"):
+            source = path.read_text()
+            assert "subagent-artifacts" not in source, path
+            assert "public_data/subagents/" not in source, path
+            assert "SubagentReports" not in source, path
