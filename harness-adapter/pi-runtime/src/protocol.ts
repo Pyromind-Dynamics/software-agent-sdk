@@ -17,6 +17,7 @@ export type RunnerEventKind =
   | "tool.failed"
   | "usage.updated"
   | "subagent.started"
+  | "subagent.progress"
   | "subagent.finished"
   | "subagent.workflow_modified";
 

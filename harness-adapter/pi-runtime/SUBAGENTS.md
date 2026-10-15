@@ -102,3 +102,23 @@ AgentGenome stage/judge workflow against Pi 0.87.0. No forced peer resolution is
 References: [plugin](https://github.com/nicobailon/pi-subagents),
 [roles](https://github.com/nicobailon/pi-subagents/blob/main/docs/agents.md),
 [host APIs](https://github.com/nicobailon/pi-subagents/blob/main/docs/extension-api.md).
+
+## Web display (optional operation details v1)
+
+The Adapter queries native `status` RPC (`view: transcript`, 200 lines), at most
+once per two seconds per active run with one request in flight. It publishes
+changed windows using existing `operation.progress`, not model tool calls.
+`details.subagent` carries `version: 1`, run/role/task, originating tool call,
+optional previous run, timestamps, native status, and a `trace` object (text,
+availability, truncation, update time, line/byte limits). Windows are capped at
+32 KiB; native metadata headers are removed. Unknown formats are unavailable.
+Completed foreground output never overwrites the last live trace. On restart,
+terminal reconciliation omits absent display details so saved windows survive.
+
+The frontend groups only proven tool-call/run relationships into one collapsed
+card, with bounded live activity and the final result. It never interprets native
+terminal text as structured tool events. The optional display convention uses
+existing JSON details: no HTTP endpoints, commands, ports, capabilities or
+snapshot migrations. Dependencies still point from Adapter to Product Runtime;
+plugin RPC and native format handling stay below the Adapter boundary. Polling
+continues while cards are collapsed; change detection bounds event volume.

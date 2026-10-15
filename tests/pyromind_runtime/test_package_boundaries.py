@@ -272,3 +272,12 @@ def test_native_subagent_report_delivery_stays_in_adapter() -> None:
             assert "subagent-artifacts" not in source, path
             assert "public_data/subagents/" not in source, path
             assert "SubagentReports" not in source, path
+
+
+def test_subagent_display_rpc_remains_adapter_private() -> None:
+    for package in ("pyromind-runtime", "pyromind-agent-server"):
+        for path in (ROOT / package).rglob("*.py"):
+            source = path.read_text()
+            assert "subagents:rpc:v1" not in source, path
+            assert "transcriptWindow" not in source, path
+            assert "subagent.progress" not in source, path

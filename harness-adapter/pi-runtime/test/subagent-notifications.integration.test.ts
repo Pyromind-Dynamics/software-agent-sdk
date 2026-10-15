@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, mkdir, realpath, readFile, readdir } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { PiAgentRuntime } from "../src/agent-runtime.js";
@@ -9,7 +9,7 @@ import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 test("two native child completions and a durable platform callback share one parent loop", {timeout:45000}, async (t) => {
   const root=await realpath(await mkdtemp('/tmp/pi-notifications-'));
   await mkdir(join(root,'pi','terminal-output'),{recursive:true});
-  await mkdir(join(root,'public_data')); await mkdir(join(root,'skills'));
+  await mkdir(join(root,'public_data')); await writeFile(join(root,'public_data','evidence.txt'),'TRACE_EVIDENCE'); await mkdir(join(root,'skills'));
   const requests:any[]=[]; const events:any[]=[]; let children=0;
   let release!:()=>void; const gate=new Promise<void>(resolve=>{release=resolve;});
   const server=createServer(async(req,res)=>{
@@ -17,7 +17,8 @@ test("two native child completions and a durable platform callback share one par
     const body=JSON.parse(input);requests.push(body);
     const parent=body.tools?.some((tool:any)=>tool.function.name==='subagent');
     let delta:any;let reason='stop';
-    if(!parent){children++;await gate;delta={content:'CHILD_DONE_'+children+'\n'+'Evidence 中文\n'.repeat(800)+'REPORT_END'};}
+    if(!parent && !body.messages.some((m:any)=>m.role==='tool')){delta={tool_calls:[{index:0,id:'child-read',type:'function',function:{name:'read',arguments:JSON.stringify({path:'public_data/evidence.txt'})}}]};reason='tool_calls';}
+    else if(!parent){children++;await gate;delta={content:'CHILD_DONE_'+children+'\n'+'Evidence 中文\n'.repeat(800)+'REPORT_END'};}
     else if(!body.messages.some((m:any)=>m.role==='tool') && !JSON.stringify(body.messages).includes('background') && !JSON.stringify(body.messages).includes('PLATFORM_CALLBACK')){
       delta={tool_calls:['one','two'].map((name,index)=>({index,id:'delegate-'+name,type:'function',function:{name:'subagent',arguments:JSON.stringify({agent:'search',task:'Answer task '+name,async:true})}}))};reason='tool_calls';
     }else delta={content:'PARENT_HANDOFF'};
@@ -32,6 +33,7 @@ test("two native child completions and a durable platform callback share one par
   await runtime.handle('start',{session_id:'mixed-notifications',workspace_root:root,terminal_backend:'os-sandbox',session_path:join(root,'pi','session.jsonl'),skills_directory:join(root,'skills'),skill_roots:[],system_prompt:'PRIVATE_PARENT_CONTEXT',model:{provider:'openai',id:'custom-chat-model',api_key:'test-key',base_url:`http://127.0.0.1:${(server.address() as any).port}/v1`},tools:[]});
   await runtime.handle('prompt',{run_id:'main',content:[{type:'text',text:'Delegate two searches'}]});
   await eventually(()=>assert.equal(children,2));
+  await eventually(()=>assert.equal(new Set(events.filter(event=>event.kind==='subagent.progress'&&JSON.stringify(event.payload.details).includes('TRACE_EVIDENCE')).map(event=>event.runId)).size,2));
   const callback={run_id:'platform-callback',content:'PLATFORM_CALLBACK',details:{task_id:'platform-task'}};
   assert.deepEqual(await runtime.handle('notify',callback),{accepted:true,queued:true});
   assert.deepEqual(await runtime.handle('notify',callback),{accepted:true,duplicate:true});
@@ -42,8 +44,13 @@ test("two native child completions and a durable platform callback share one par
   const starts=events.filter(event=>event.kind==='subagent.started');
   assert.equal(new Set(starts.map(event=>event.runId)).size,2);
   await eventually(()=>assert.equal(events.filter(event=>event.kind==='subagent.finished').length,2));
+  for (const terminal of events.filter(event=>event.kind==='subagent.finished')) {
+    assert.match(JSON.stringify(terminal.payload.details), /TRACE_EVIDENCE/);
+    assert.ok(terminal.payload.details.subagent.tool_call_id.startsWith('delegate-'));
+    assert.doesNotMatch(terminal.payload.result, /\"content\":/);
+  }
   const childRequests=requests.filter(body=>!body.tools?.some((tool:any)=>tool.function.name==='subagent'));
-  assert.equal(childRequests.length,2);
+  assert.equal(childRequests.length,4);
   assert.equal(childRequests.some(body=>JSON.stringify(body).includes('PRIVATE_PARENT_CONTEXT')),false);
   assert.equal(events.some(event=>event.kind==='message.completed'&&event.payload.role==='assistant'&&JSON.stringify(event.payload.content).includes('CHILD_DONE')),false);
   const history=(await readFile(join(root,'pi','session.jsonl'),'utf8')).split('\n').filter(Boolean).map(line=>JSON.parse(line));
@@ -54,6 +61,7 @@ test("two native child completions and a durable platform callback share one par
   for(const id of reportIds){
     const path=`public_data/subagents/${id}/report.md`;
     assert.match(await readFile(join(root,path),'utf8'),/REPORT_END/);
+    await eventually(()=>assert.ok(events.some(event=>event.runId===id&&typeof event.payload.result==='string'&&event.payload.result.includes(path)), 'card report reference '+id));
     assert.ok(requests.some(body=>body.tools?.some((tool:any)=>tool.function.name==='subagent')&&JSON.stringify(body.messages).includes(path)),path);
   }
   const notices=history.filter(entry=>entry.type==='custom_message'&&entry.customType==='subagent-notify');

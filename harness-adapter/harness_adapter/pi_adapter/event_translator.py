@@ -29,15 +29,22 @@ def translate_runner_event(frame: dict[str, Any]) -> tuple[HarnessEvent, ...]:
     }
     if kind == "subagent.workflow_modified":
         return (HarnessEvent(**common, type="workflow.modified", payload={}),)
-    if kind in {"subagent.started", "subagent.finished"}:
+    if kind in {"subagent.started", "subagent.progress", "subagent.finished"}:
         operation = {
             "operation_id": f"subagent:{common['run_id']}",
             "name": payload.get("label") or "Subagent",
             "category": "subagent",
+            **({"details": payload["details"]} if "details" in payload else {}),
         }
         if kind == "subagent.started":
             return (
                 HarnessEvent(**common, type="operation.started", payload=operation),
+            )
+        if kind == "subagent.progress":
+            if isinstance(payload.get("result"), str):
+                operation["output"] = [{"type": "text", "text": payload["result"]}]
+            return (
+                HarnessEvent(**common, type="operation.progress", payload=operation),
             )
         failed = payload.get("status") not in {"complete", "completed"}
         return (

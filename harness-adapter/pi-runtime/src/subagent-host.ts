@@ -8,6 +8,7 @@ import type { AgentSession, ExtensionAPI, ModelRuntime } from "@earendil-works/p
 import { registerSubagentCapabilityCeiling } from "pi-subagents/capability-ceiling";
 import { registerRequiredChildExtensions } from "pi-subagents/required-child-extensions";
 import { serveSubagentIpc } from "./subagent-ipc.js";
+import { SubagentDisplay, displayText, transcriptWindow } from "./subagent-display.js";
 import { SubagentReports } from "./subagent-reports.js";
 import { isRecord, type JsonObject, type RunnerEvent, PROTOCOL_VERSION } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
@@ -60,7 +61,14 @@ export class SubagentHost {
   private pi?: ExtensionAPI;
   private closeIpc?: () => Promise<void>;
   private registrations: Array<{ dispose(): void }> = [];
+  private readonly observedLive = new Set<string>();
   private readonly states = new Map<string, string>();
+  private readonly finalizing = new Map<string, Promise<void>>();
+  private readonly handoffs = new Map<string, string>();
+  private readonly launchInputs = new Map<string, Record<string, unknown>>();
+  private readonly display = new SubagentDisplay((method, params) => this.rpc(method, params), id => {
+    this.emit(id, "subagent.progress", { details: this.display.details(id) });
+  });
   private readonly launches = new Map<string, string | undefined>();
   private readonly backgroundIds = new Set<string>();
   private lastUsage = "";
@@ -140,7 +148,12 @@ export class SubagentHost {
       if (error) return { block: true, reason: error };
     });
     for (const event of ["subagent:async-started", "subagent:async-complete", "subagent:foreground-complete", "subagent:process-terminal", "subagent:child-status"]) {
-      pi.events.on(event, () => { void this.refresh().catch((error) => process.stderr.write(`Subagent status: ${error.message}\n`)); });
+      pi.events.on(event, (data) => {
+        void (async () => {
+          if (event === "subagent:async-complete") await this.observeCompletion(data);
+          await this.refresh();
+        })().catch((error) => process.stderr.write(`Subagent status: ${error.message}\n`));
+      });
     }
   };
 
@@ -167,14 +180,19 @@ export class SubagentHost {
   }
 
   observeCall(id: string, input: unknown) {
-    if (isRecord(input) && (!input.action || input.action === "resume")) this.launches.set(id, undefined);
+    if (isRecord(input) && (!input.action || input.action === "resume")) {
+      this.launches.set(id, undefined);
+      this.launchInputs.set(id, input);
+    }
   }
 
   observeProgress(result: unknown, callId: string) {
     if (!this.launches.has(callId)) return;
     if (isRecord(result) && isRecord(result.details) && typeof result.details.runId === "string") {
       this.launches.set(callId, result.details.runId);
+      this.linkRun(result.details.runId, callId);
       this.observe(result.details.runId, "running", "Subagent");
+      void this.display.poll(result.details.runId);
     }
   }
 
@@ -184,14 +202,16 @@ export class SubagentHost {
     this.launches.delete(callId);
     const details = isRecord(result) && isRecord(result.details) ? result.details : {};
     const id = typeof details.runId === "string" ? details.runId : retainedId;
-    if (!id) return;
+    if (!id) { this.launchInputs.delete(callId); return; }
+    this.linkRun(id, callId);
+    this.launchInputs.delete(callId);
     const background = typeof details.asyncId === "string";
     if (background) this.backgroundIds.add(id);
     const failed = isError || (isRecord(result) && result.isError === true);
     const label = String((details.results as any[])?.[0]?.agent ?? "Subagent");
-    const output = JSON.stringify(result) ?? "";
+    const output = displayText(result);
     const handoff = output.length > 16000 ? output.slice(0, 16000) + `\n[Truncated; query subagent status with id ${id}.]` : output;
-    this.observe(id, background ? "running" : failed ? "failed" : "complete", label, { result: handoff });
+    this.observe(id, background ? "running" : failed ? "failed" : "complete", label, background ? {} : { result: handoff });
     void this.refresh().catch(() => {});
   }
 
@@ -203,6 +223,10 @@ export class SubagentHost {
       const data = await this.rpc("status");
       for (const run of data.asyncSnapshot?.runs ?? []) {
         this.backgroundIds.add(run.id);
+        this.display.update(run.id, {
+          ...(typeof run.startedAt === "number" ? { started_at: new Date(run.startedAt).toISOString() } : {}),
+          ...(typeof run.endedAt === "number" ? { ended_at: new Date(run.endedAt).toISOString() } : {}),
+        });
         this.observe(run.id, run.state, run.label);
       }
       // Documented plugin lifecycle artifacts are authoritative after reconnect and
@@ -214,8 +238,18 @@ export class SubagentHost {
           const status = JSON.parse(readFileSync(join(runs, name, "status.json"), "utf8"));
           if (status.lifecycleArtifactVersion !== 3 || status.runId !== name || ![this.session!.sessionManager.getSessionFile(), this.session!.sessionId].includes(status.sessionId)) continue;
           this.backgroundIds.add(name);
+          this.display.update(name, {
+            ...(typeof status.startedAt === "number" ? { started_at: new Date(status.startedAt).toISOString() } : {}),
+            ...(typeof status.endedAt === "number" ? { ended_at: new Date(status.endedAt).toISOString() } : {}),
+            ...(typeof status.toolCallId === "string" ? { tool_call_id: status.toolCallId } : {}),
+            ...(typeof status.steps?.[0]?.task === "string" ? { task: status.steps[0].task } : {}),
+            ...(typeof status.steps?.[0]?.agent === "string" ? { role: status.steps[0].agent } : {}),
+          });
           this.observe(name, status.state, status.steps?.[0]?.agent ?? "Subagent");
         } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error; }
+      }
+      for (const [id, state] of this.states) {
+        if (["running", "queued"].includes(state)) void this.display.poll(id);
       }
       if (!this.usagePending) return;
       this.usagePending = false;
@@ -231,16 +265,79 @@ export class SubagentHost {
     return this.refreshPending;
   }
 
+  private async observeCompletion(data: unknown) {
+    if (!isRecord(data) || typeof data.runId !== "string" || typeof data.summary !== "string") return;
+    const id = data.runId;
+    // The native completion summary is the final handoff, not the activity window.
+    const transformed = await this.reports.transform([{ type: "text", text: data.summary }], data);
+    const handoff = displayText(transformed);
+    if (this.disposed || this.handoffs.get(id) === handoff) return;
+    this.handoffs.set(id, handoff);
+    if (this.states.has(id) && !this.finalizing.has(id)) {
+      this.emit(id, "subagent.progress", { result: handoff,
+        ...(this.observedLive.has(id) ? { details: this.display.details(id) } : {}) });
+    }
+  }
+
+  private linkRun(id: string, callId: string) {
+    const input = this.launchInputs.get(callId) ?? {};
+    const changed = this.display.update(id, {
+      tool_call_id: callId,
+      ...(typeof input.agent === "string" ? { role: input.agent } : {}),
+      ...(typeof input.task === "string" ? { task: input.task } : {}),
+      ...(input.action === "resume" && typeof input.id === "string" ? { previous_run_id: input.id } : {}),
+    });
+    if (changed && this.states.has(id)) this.emit(id, "subagent.progress", { details: this.display.details(id) });
+  }
+
   private observe(id: string, state: string, label: string, extra: JsonObject = {}) {
-    if (this.states.get(id) === state) return;
-    if (this.states.has(id) && !["running", "queued"].includes(this.states.get(id)!) && ["running", "queued"].includes(state)) return;
-    if (!this.states.has(id)) this.emit(id, "subagent.started", { label });
+    if (["running", "queued"].includes(state)) this.observedLive.add(id);
+    const outputChanged = typeof extra.result === "string" && this.handoffs.get(id) !== extra.result;
+    if (typeof extra.result === "string") this.handoffs.set(id, extra.result);
+    const previous = this.states.get(id);
+    if (previous && !["running", "queued"].includes(previous) && ["running", "queued"].includes(state)) return;
+    if (!previous) {
+      if (["running", "queued"].includes(state) && !this.display.value(id, "started_at")) this.display.update(id, { started_at: new Date().toISOString() });
+      this.emit(id, "subagent.started", { label, details: this.display.details(id) });
+    }
+    this.display.update(id, { status: state, ...(["search", "general_purpose"].includes(label) ? { role: label } : {}) });
+    if (previous === state) {
+      if (outputChanged && !this.finalizing.has(id)) this.emit(id, "subagent.progress", { details: this.display.details(id), result: this.handoffs.get(id)! });
+      return;
+    }
     this.states.set(id, state);
-    if (!["running", "queued"].includes(state)) this.emit(id, "subagent.finished", { status: state, label, mutated: label === "general_purpose" || this.mutatedSessions.size > 0, ...extra });
+    if (["running", "queued"].includes(state)) {
+      this.emit(id, "subagent.progress", { label, details: this.display.details(id) });
+    } else {
+      if (!this.display.value(id, "ended_at")) this.display.update(id, { ended_at: new Date().toISOString() });
+      const finish = this.finishDisplay(id, state, label, extra).finally(() => this.finalizing.delete(id));
+      this.finalizing.set(id, finish);
+    }
+  }
+
+  private async finishDisplay(id: string, state: string, label: string, extra: JsonObject) {
+    await this.display.settled(id);
+    let result = this.handoffs.get(id) ?? extra.result;
+    if (!result) {
+      try {
+        const native = await this.rpc("status", { id, view: "transcript", lines: 200 });
+        const window = transcriptWindow(displayText(native));
+        const text = window.text + (window.truncated ? "\n[preview truncated]" : "");
+        const transformed = await this.reports.transform([{ type: "text", text }], { runs: [{ runId: id }] });
+        result = displayText(transformed);
+      } catch { /* A terminal operation must still be delivered if artifacts are unavailable. */ }
+    }
+    await Promise.resolve();
+    result = this.handoffs.get(id) ?? result;
+    if (this.disposed) return;
+    this.emit(id, "subagent.finished", { status: state, label,
+      mutated: label === "general_purpose" || this.mutatedSessions.size > 0,
+      ...extra, result: typeof result === "string" ? result.slice(0, 32768) : "",
+      ...(this.observedLive.has(id) ? { details: this.display.details(id) } : {}) });
   }
 
   private emit(id: string, kind: RunnerEvent["kind"], payload: JsonObject) {
-    this.peer.emit({ protocolVersion: PROTOCOL_VERSION, type: "pi.event", eventId: `${id}:${kind}:${payload.status ?? ""}`, sessionId: this.sessionId, runId: id, occurredAt: new Date().toISOString(), kind, payload });
+    this.peer.emit({ protocolVersion: PROTOCOL_VERSION, type: "pi.event", eventId: kind === "subagent.progress" ? `${id}:${kind}:${randomUUID()}` : `${id}:${kind}:${payload.status ?? ""}`, sessionId: this.sessionId, runId: id, occurredAt: new Date().toISOString(), kind, payload });
   }
 
   async stopAll() {
@@ -254,6 +351,7 @@ export class SubagentHost {
         }
       }
     }
+    await Promise.all(this.finalizing.values());
     // Native stop acknowledges intent. Keep operations alive until native status is terminal.
     const deadline = Date.now() + 20_000;
     while ([...this.backgroundIds].some((id) => ["running", "queued"].includes(this.states.get(id) ?? ""))) {
@@ -261,10 +359,12 @@ export class SubagentHost {
       await new Promise((resolve) => setTimeout(resolve, 100));
       await this.refresh();
     }
+    await Promise.all(this.finalizing.values());
   }
 
   async close() {
     this.disposed = true;
+    this.display.close();
     clearInterval(this.monitor);
     for (const registration of this.registrations) registration.dispose();
     await this.closeIpc?.();
