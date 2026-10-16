@@ -16,8 +16,9 @@ type Publish = Callable[[str, str, str, JsonObject], Coroutine[Any, Any, None]]
 
 
 def started_run(action: str, result: JsonObject) -> str | None:
-    """The run a backend call just queued: a plain run, or a capture/distill replay."""
-    if action == "run":
+    """The run a backend call just queued: a plain run, a capture/distill replay, or a
+    parked run whose human gate has been answered."""
+    if action in {"run", "resume"}:
         if result.get("status") != "queued":
             return None
         run_id = result.get("id")
@@ -210,19 +211,26 @@ class ReusableWorkflows:
                 },
             )
             result = await self.backend.execute(scope, run.run_id, emit)
-            success = result.get("status") in {"succeeded", "cancelled"}
-            await self.publish(
-                scope,
-                f"{operation_id}:end",
-                "operation.completed" if success else "operation.failed",
-                {
-                    "operation_id": operation_id,
-                    "output": [
-                        {"type": "text", "text": json.dumps(result, ensure_ascii=False)}
-                    ],
-                    "details": result,
-                },
-            )
+            # A parked run is a pause, not a verdict: the chain keeps its checkpoint
+            # and the operation stays open until the human gate is answered and the
+            # same run reports back through genome_resume.
+            if result.get("status") != "waiting":
+                success = result.get("status") in {"succeeded", "cancelled"}
+                await self.publish(
+                    scope,
+                    f"{operation_id}:end",
+                    "operation.completed" if success else "operation.failed",
+                    {
+                        "operation_id": operation_id,
+                        "output": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(result, ensure_ascii=False),
+                            }
+                        ],
+                        "details": result,
+                    },
+                )
         except Exception as exc:
             result = {
                 "id": run.run_id,

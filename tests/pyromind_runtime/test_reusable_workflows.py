@@ -17,7 +17,10 @@ from harness_adapter.agentgenome_bridge import (
     ExecutionHost,
 )
 from harness_adapter.pi_adapter.runner import PiRunnerError
-from pyromind_runtime.application.reusable_workflows import ReusableWorkflows
+from pyromind_runtime.application.reusable_workflows import (
+    ReusableWorkflows,
+    started_run,
+)
 from pyromind_runtime.domain.content import JsonObject, JsonValue
 
 
@@ -1127,6 +1130,77 @@ async def test_cancellation_stops_inflight_script(setup_workflow, tmp_path):
     result = await asyncio.wait_for(execution, 5)
     assert result["status"] == "cancelled"
     await backend.close()
+
+
+def test_started_run_accepts_a_resumed_gate():
+    assert started_run("run", {"id": "r1", "status": "queued"}) == "r1"
+    assert started_run("resume", {"id": "r1", "status": "queued"}) == "r1"
+    assert started_run("resume", {"id": "r1", "status": "waiting"}) is None
+
+
+async def test_parked_run_keeps_the_operation_open_until_resume():
+    events = []
+    executions = []
+
+    class ParkedBackend:
+        async def invoke(
+            self,
+            scope: str,
+            action: str,
+            arguments: JsonObject,
+            request_id: str,
+        ) -> JsonObject:
+            if action == "run":
+                return {"id": "parked-run", "status": "queued"}
+            assert action == "resume"
+            return {"id": arguments["run_id"], "status": "queued"}
+
+        async def execute(self, scope, run_id, emit):
+            executions.append(run_id)
+            if len(executions) == 1:
+                return {
+                    "id": run_id,
+                    "status": "waiting",
+                    "result": {
+                        "waiting": {
+                            "node": "review",
+                            "question": "请到 Label Studio 复核",
+                            "artifact": f"/runs/{run_id}/review.out",
+                        }
+                    },
+                }
+            return {"id": run_id, "status": "succeeded", "result": {"outputs": {}}}
+
+        async def close(self):
+            pass
+
+    async def publish(*event):
+        events.append(event)
+
+    workflows = ReusableWorkflows(ParkedBackend(), publish)
+    queued = await workflows.invoke(
+        "session",
+        "run",
+        {"asset_id": "gate", "version": "1.0.0", "params": {}},
+        "run-1",
+        "origin-turn",
+    )
+    assert queued["status"] == "queued"
+    workflows.release("session", "origin-turn")
+    await asyncio.wait_for(workflows.wait_idle("session"), 5)
+    # A parked run is a pause, not a verdict: the operation stays open.
+    assert [event[2] for event in events] == ["operation.started"]
+
+    resumed = await workflows.invoke(
+        "session", "resume", {"run_id": "parked-run"}, "resume-1", "origin-turn"
+    )
+    assert resumed["status"] == "queued"
+    workflows.release("session", "origin-turn")
+    await asyncio.wait_for(workflows.wait_idle("session"), 5)
+    assert executions == ["parked-run", "parked-run"]
+    assert [event[2] for event in events][-1] == "operation.completed"
+    assert json.loads(events[-1][3]["output"][0]["text"])["status"] == "succeeded"
+    await workflows.close()
 
 
 async def test_stage_wait_does_not_block_status_and_cancel(setup_workflow):

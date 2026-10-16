@@ -133,7 +133,7 @@ class ExternalTaskState(ContractModel):
     ]
     run_id: str | None = None
     status: Literal[
-        "pending", "running", "succeeded", "failed", "terminated", "stopped"
+        "pending", "running", "waiting", "succeeded", "failed", "terminated", "stopped"
     ]
     output_dir: str | None = None
     attempt: int | None = Field(default=None, ge=0)

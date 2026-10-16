@@ -2,6 +2,15 @@
 
 包依赖升级为 AgentGenome Python/npm 0.6.3，通过 vendor 安装，继续由 Pi 标准加载器加载默认入口。工具定义、节点回执、修订规则、冻结和修订记录属于 AgentGenome；Runtime 使用通用 `execute_stage` 能力关联当前会话。上层没有 Pi 类型，公开 API 与原有 SSE 事件类型不变。SQLite 仅增加表，原资产及运行记录保留。
 
+0.6.9 新增人工门禁节点与沉淀范围复核（设计见 AgentGenome 仓库 `docs/v2-capture.md`）：
+
+- graph schema 新增 `do: {human: <问题模板>}`：人的复核、打标这类环节不再降级成 `gaps`，而是成为引擎直接执行的叶子节点。引擎停在该节点（`NodeWaiting`），把节点路径、问题、必须写入的 artifact 一起写进 run 状态（`status=waiting`），checkpoint 记 `waiting`，不占 worker，也不写假的产物；
+- 内核新增 `HumanPort` / `Ports.human`（`core/ports.py`）与 `Answer.pending`：宿主 `ask` 返回 `pending=true` 表示无人答复，引擎立即 park；唤醒时同一个节点重新进入，`prepare(..., resuming=<节点路径>)` 让宿主只批准那一个门禁，其后的门禁照旧 park；
+- 服务层新增 `resume(scope, run_id)`，对应插件第 14 个工具 `genome_resume`：`status` 暴露 `phase=waiting_human`，capture 回放停在人工节点时状态记 `waiting`、报告写明「人工完成后调用 genome_resume，本条经验在回放成功前不会发布」，`cancel` 对 parked run 同样有效；
+- SDK 宿主适配：`execution.capabilities` 增加 `human: true`，`ExecutionHost.ask` 没有 `resuming` 时一律 park；Runtime 把 `waiting` 当成终态之外的一档通知（有活动会话即时通知，没有活动会话则在下一次会话开始时补发），operation 保持打开直到 resume，通知里给出 node / question / artifact 并要求 agent 让用户完成后调 `genome_resume`；
+- `genome_distill` 新增范围复核：计划若漏掉会话里产出过文件的步骤（`_uncovered_steps` 以文件本身为证，不看 agent 写的 `from`），先按 `_scope_split` 分成两类——**和链路相连**的（产物喂给链路，或接在链路后面）以「链路范围需要用户复核」报错并列出，只有用户确认「这次只要后半段」时才带 `review_confirmed=true` + `review_reason` 重提，确认过的边界写进沉淀报告；**不相连的旁支**（本地试跑小样、只写调试文件的探测、被后续步骤取代的尝试）不挡沉淀，连命令一起写进报告的「旁支步骤（未进链路，链路不依赖它）」段与 payload 的 `branches`，agent 不必为它们问用户；
+- 人工判断本身无法机械验收：测试覆盖的是暂停/唤醒协议与 artifact 契约，人工节点的判断质量仍需真实会话验证。
+
 0.6.8 新增 `do: {tool}` 节点与宿主工具端口（设计见 AgentGenome 仓库 `docs/v2-capture.md` §5.12）：
 
 - graph schema 新增第四种节点形态 `do: {tool: {name, args}}`：平台提交（`df_submit_pipeline`）、Label Studio 导入建项目这类固定工具调用不再只能进 `gaps`，而是成为引擎直接执行的叶子节点，没有模型在环。`args` 里的字符串支持槽位替换，**精确等于槽位**的字符串保留 JSON 类型（路径参数仍是宿主路径），嵌在文本里的按字符串替换；

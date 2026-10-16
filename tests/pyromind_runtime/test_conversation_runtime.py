@@ -676,6 +676,95 @@ async def test_runtime_wakes_for_all_terminal_external_tasks(tmp_path) -> None:
     await runtime.close()
 
 
+def _parked_history_task() -> dict:
+    return {
+        "task_id": "graph-1",
+        "kind": "historical_experience",
+        "status": "running",
+        "submitted_at": "2026-09-30T00:00:00Z",
+        "updated_at": "2026-09-30T00:00:00Z",
+    }
+
+
+def _parked_history_result() -> dict:
+    return {
+        "id": "graph-1",
+        "status": "waiting",
+        "result": {
+            "waiting": {
+                "node": "review",
+                "question": "请到 Label Studio 复核",
+                "artifact": "/runs/graph-1/review.out",
+            }
+        },
+    }
+
+
+async def test_parked_history_run_notifies_the_live_conversation(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter("pi")
+    runtime = ConversationRuntime(
+        conversations, {"pi": adapter}, default_harness_id="pi"
+    )
+    context = RequestContext(user_id="42")
+    await runtime.create_conversation(
+        SessionSpec(
+            conversation_id="parked-live",
+            user_id="42",
+            workspace_root=str(conversations / "parked-live"),
+        ),
+        context,
+    )
+    runtime.register_external_task("parked-live", _parked_history_task())
+    await runtime.deliver_external_task_status(
+        "parked-live",
+        task_id="graph-1",
+        status="Waiting",
+        completion_result=_parked_history_result(),
+    )
+    notice = adapter.external_task_notifications[0][1]
+    assert notice.trigger_turn is True
+    assert "review.out" in notice.hidden_text
+    assert "genome_resume" in notice.hidden_text
+    assert "不要自己执行或重放 graph" in notice.hidden_text
+    await runtime.close()
+
+
+async def test_parked_history_run_survives_without_a_live_conversation(
+    tmp_path,
+) -> None:
+    (tmp_path / "parked-idle").mkdir()
+    store = FileProductStore(tmp_path / "parked-idle")
+    store.create(
+        ConversationSnapshot(
+            conversation_id="parked-idle", capabilities=HarnessCapabilities()
+        ),
+        user_id="42",
+        harness_id="pi",
+    )
+    adapter = FakeAdapter("pi")
+    runtime = ConversationRuntime(tmp_path, {"pi": adapter}, default_harness_id="pi")
+    runtime.register_external_task("parked-idle", _parked_history_task())
+    await runtime.deliver_external_task_status(
+        "parked-idle",
+        task_id="graph-1",
+        status="Waiting",
+        completion_result=_parked_history_result(),
+    )
+    # The gate is not lost with the conversation: it stays pending until the next
+    # session start delivers it.
+    assert not adapter.external_task_notifications
+    assert store.load_snapshot().external_tasks[0].resume_pending
+    await runtime.get_snapshot("parked-idle", RequestContext(user_id="42"))
+    notice = adapter.external_task_notifications[0][1]
+    assert notice.trigger_turn is True
+    assert "review.out" in notice.hidden_text
+    assert "genome_resume" in notice.hidden_text
+    assert not store.load_snapshot().external_tasks[0].resume_pending
+    await runtime.close()
+
+
 async def test_idle_conversation_is_evicted_and_reactivated(tmp_path) -> None:
     conversations = tmp_path / "conversations"
     conversations.mkdir()

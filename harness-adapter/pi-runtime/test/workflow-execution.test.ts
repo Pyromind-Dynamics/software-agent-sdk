@@ -153,7 +153,7 @@ test("capability discovery reports stages, revisions and protection independentl
       operations: { async exec() { assert.fail("capability discovery must not execute"); } },
     }, peer());
     assert.deepEqual(await execution.handle("execution.capabilities", {}), {
-      agent_task: true, revision: !!readFile, file_read: !!readFile,
+      agent_task: true, human: true, revision: !!readFile, file_read: !!readFile,
       protected_verification: false, model_judge: false, tool: true,
     });
   }

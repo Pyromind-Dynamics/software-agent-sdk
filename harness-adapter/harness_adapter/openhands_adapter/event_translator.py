@@ -505,6 +505,7 @@ def _external_task_status(value: object) -> str:
         "failed": "failed",
         "terminated": "terminated",
         "stopped": "stopped",
+        "waiting": "waiting",
         "running": "running",
         "pending": "pending",
     }.get(normalized, "pending")

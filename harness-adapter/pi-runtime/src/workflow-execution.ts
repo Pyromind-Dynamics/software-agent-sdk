@@ -26,6 +26,7 @@ export class WorkflowExecution {
       // Agent stages run as Pi turns, so they do not depend on the read-only
       // verification root that the remote sandbox backend cannot provide.
       agent_task: true,
+      human: true,
       protected_verification: !!this.access.protectedRoot,
       file_read: !!this.access.readFile,
       revision: !!this.access.readFile,

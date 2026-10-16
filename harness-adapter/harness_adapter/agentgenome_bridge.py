@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from agentgenome import GenomeService, RunCancelled
 from agentgenome.dispatch import invoke as invoke_genome
-from core.ports import PortError, Ports, ShellResult, ToolResult
+from core.ports import Answer, PortError, Ports, ShellResult, ToolResult
 from pyromind_runtime.domain.content import JsonObject, JsonValue
 from pyromind_runtime.ports.workflows import WorkflowEventSink
 
@@ -91,6 +91,7 @@ class ExecutionHost:
         self.verification = None
         self.model_judge = False
         self.verification_files: dict[str, str] = {}
+        self.resuming: str | None = None
         self._output_lock = asyncio.Lock()
         self._reads: dict[str, bytes] = {}
         self._missing: set[str] = set()
@@ -125,8 +126,13 @@ class ExecutionHost:
         emit: Callable[[dict[str, Any]], None],
         *,
         verification_package: Path | None = None,
+        resuming: str | None = None,
+        **options: Any,  # noqa: ARG002
     ) -> tuple[Ports, dict[str, Any]]:
         self.cancel, self.emit = cancel, emit
+        # The parked node a wakeup already answered: this attempt approves exactly
+        # that gate and parks again on any later one.
+        self.resuming = resuming
         self.root = self._resolve(f"public_data/workflow-runs/{run_id}", True)
         cwd = f"{self.root}/package"
         capabilities = self._call("execution.capabilities", {})
@@ -168,7 +174,22 @@ class ExecutionHost:
             cwd=Path(cwd),
             verification_cwd=verification,
             tool=BridgeTool(self),
+            human=self,
         ), resolved
+
+    def ask(self, question: str, evidence: dict[str, Any]) -> Answer:  # noqa: ARG002
+        """A human node pauses the run; the person answers out of band.
+
+        Nothing is asked through the bridge: the run parks with the question and the
+        artifact path in its waiting payload, the conversation tells the user what to
+        do, and the resume call comes back through ``prepare(resuming=...)``.
+        """
+        if self.resuming is not None and evidence.get("node") == self.resuming:
+            return Answer(approve=True)
+        return Answer(pending=True)
+
+    def capabilities(self) -> dict[str, Any]:
+        return {"interactive": True}
 
     def _protect(self, run_id: str, package: Path) -> str:
         protected = ""
