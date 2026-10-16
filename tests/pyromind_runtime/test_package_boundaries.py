@@ -68,6 +68,49 @@ def test_adapter_does_not_depend_on_pyromind_server() -> None:
     assert not any(name.startswith("pyromind_agent_server") for name in imports)
 
 
+def test_evaluation_routes_delegate_to_product_runtime() -> None:
+    route = ROOT / "pyromind-agent-server/pyromind_agent_server/api/evaluation_runs.py"
+    tree = ast.parse(route.read_text(encoding="utf-8"), filename=str(route))
+    imports = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert not imports.intersection(
+        {
+            "pyromind_runtime.infrastructure.file_product_store",
+            "pyromind_runtime.application.pipeline_runs",
+            "pyromind_agent_server.external_task_registry",
+        }
+    )
+    imported_names = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert {
+        "EvaluationAnnotationService",
+        "EvaluationLockRegistry",
+        "PyromindEvaluationStorage",
+    }.isdisjoint(imported_names)
+    assert "build_evaluation_storage" in imported_names
+    calls = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "get_product_runtime"
+    }
+    assert {
+        "load_evaluation_annotations",
+        "save_evaluation_annotations",
+        "read_evaluation_report",
+        "export_evaluation_annotations",
+    } <= calls
+
+
 def test_pyromind_start_scripts_use_composed_server_entrypoint() -> None:
     for script_name in ("start.sh", "start_inference.sh"):
         script = (ROOT / script_name).read_text(encoding="utf-8")
@@ -199,3 +242,42 @@ def test_sdk_agentgenome_uses_host_bridge_without_native_execution_fallback() ->
     assert 'peer.request("workflow.invoke"' not in session
     assert "NativeClient" not in session
     assert "nativeHost" not in session
+
+
+def test_subagent_lifecycle_has_no_harness_specific_product_branch() -> None:
+    source = (
+        ROOT / "pyromind-runtime/pyromind_runtime/application/conversation_runtime.py"
+    ).read_text()
+    tree = ast.parse(source)
+    guard = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_has_active_subagents"
+    )
+    literals = {
+        node.value
+        for node in ast.walk(guard)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert literals == {"subagent", "running"}
+    dockerfile = (ROOT / "Dockerfile").read_text()
+    assert "COPY harness-adapter/pi-runtime/agents ./agents" in dockerfile
+    assert "COPY harness-adapter/pi-runtime/scripts ./scripts" in dockerfile
+
+
+def test_native_subagent_report_delivery_stays_in_adapter() -> None:
+    for package in ("pyromind-runtime", "pyromind-agent-server"):
+        for path in (ROOT / package).rglob("*.py"):
+            source = path.read_text()
+            assert "subagent-artifacts" not in source, path
+            assert "public_data/subagents/" not in source, path
+            assert "SubagentReports" not in source, path
+
+
+def test_subagent_display_rpc_remains_adapter_private() -> None:
+    for package in ("pyromind-runtime", "pyromind-agent-server"):
+        for path in (ROOT / package).rglob("*.py"):
+            source = path.read_text()
+            assert "subagents:rpc:v1" not in source, path
+            assert "transcriptWindow" not in source, path
+            assert "subagent.progress" not in source, path

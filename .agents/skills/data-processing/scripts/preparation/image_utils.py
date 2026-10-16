@@ -46,7 +46,7 @@ except ImportError:  # DataFlow normally installs it transitively.
     _Draft202012Validator = None
 
 
-SUPPORTED_DATAFLOW_VERSION = "1.0.10"
+SUPPORTED_DATAFLOW_VERSION = "1.0.11"
 IMAGE_UTILS_API_VERSION = "4"
 NATIVE_VLM_SUFFIXES = {".jpg", ".jpeg", ".png"}
 CONVERTIBLE_VLM_SUFFIXES = {".gif", ".webp", ".bmp"}

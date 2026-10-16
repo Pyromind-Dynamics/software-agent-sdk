@@ -3,13 +3,8 @@ import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
-  createEditTool,
-  createReadTool,
-  createWriteTool,
-  type AgentHarnessTool,
   type AgentTool,
   type ExecutionEnv,
-  type ExecutionToolContext,
 } from "@earendil-works/pi-agent-core";
 import { type ImageContent, type TextContent, type TSchema } from "@earendil-works/pi-ai";
 import {
@@ -17,7 +12,6 @@ import {
   createEditTool as createCodingEditTool,
   createReadTool as createCodingReadTool,
   createWriteTool as createCodingWriteTool,
-  type InlineExtension,
 } from "@earendil-works/pi-coding-agent";
 import { isRecord, type JsonObject } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
@@ -118,9 +112,9 @@ export async function createTools(
   process.env.TMPDIR = runtimeTmp;
   process.env.TMP = runtimeTmp;
   process.env.TEMP = runtimeTmp;
-  const read = createReadTool();
-  const write = createWriteTool();
-  const edit = createEditTool();
+  const read = createCodingReadTool(workspaceRoot);
+  const write = createCodingWriteTool(workspaceRoot);
+  const edit = createCodingEditTool(workspaceRoot);
   const terminalOperations = await createWorkspaceBashOperations(
     terminalBackend,
     policy,
@@ -160,17 +154,17 @@ export async function createTools(
   });
   return [
     bindPathTool(
-      bindNative(read, env),
+      read,
       (path, operation) => policy.resolvePath(path, operation),
       "read",
     ),
     bindPathTool(
-      bindNative(write, env),
+      write,
       (path, operation) => policy.resolvePath(path, operation),
       "write",
     ),
     bindPathTool(
-      bindNative(edit, env),
+      edit,
       (path, operation) => policy.resolvePath(path, operation),
       "write",
     ),
@@ -302,38 +296,6 @@ async function createSandboxTools(
     },
     ...businessTools.map((config) => businessTool(peer, config)),
   ];
-}
-
-export function createTerminalPermissionExtension(peer: JsonlRpcPeer): InlineExtension {
-  return (pi) => {
-    pi.on("tool_call", async (event) => {
-      if (event.toolName !== "terminal") return undefined;
-      const decision = await peer.request("permission.check", {
-        tool_call_id: event.toolCallId,
-        tool_name: "terminal",
-        arguments: JSON.parse(JSON.stringify(event.input)) as JsonObject,
-      });
-      if (!isRecord(decision) || typeof decision.allow !== "boolean") {
-        throw new Error("invalid permission response");
-      }
-      return decision.allow ? undefined : {
-        block: true,
-        reason: typeof decision.reason === "string" ? decision.reason : "User denied terminal command",
-      };
-    });
-  };
-}
-
-function bindNative(
-  tool: AgentHarnessTool<ExecutionToolContext, any, any>,
-  env: ExecutionEnv,
-): AgentTool<any, any> {
-  return {
-    ...tool,
-    async execute(callId, params, signal, onUpdate) {
-      return tool.execute(callId, params, signal, onUpdate, { env });
-    },
-  };
 }
 
 function bindPathTool(
@@ -470,7 +432,7 @@ export async function safePath(
   return policy.resolvePath(input, allowReadOnlyResources ? "read" : "write");
 }
 
-function safeShellEnvironment(): Record<string, string> {
+export function safeShellEnvironment(): Record<string, string> {
   const names = ["PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"];
   return Object.fromEntries(names.flatMap((name) => process.env[name] ? [[name, process.env[name]!]] : []));
 }

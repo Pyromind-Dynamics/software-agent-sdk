@@ -27,6 +27,48 @@ def translate_runner_event(frame: dict[str, Any]) -> tuple[HarnessEvent, ...]:
         "run_id": str(frame.get("runId")),
         "occurred_at": _occurred_at(frame.get("occurredAt")),
     }
+    if kind == "subagent.workflow_modified":
+        return (HarnessEvent(**common, type="workflow.modified", payload={}),)
+    if kind in {"subagent.started", "subagent.progress", "subagent.finished"}:
+        operation = {
+            "operation_id": f"subagent:{common['run_id']}",
+            "name": payload.get("label") or "Subagent",
+            "category": "subagent",
+            **({"details": payload["details"]} if "details" in payload else {}),
+        }
+        if kind == "subagent.started":
+            return (
+                HarnessEvent(**common, type="operation.started", payload=operation),
+            )
+        if kind == "subagent.progress":
+            if isinstance(payload.get("result"), str):
+                operation["output"] = [{"type": "text", "text": payload["result"]}]
+            return (
+                HarnessEvent(**common, type="operation.progress", payload=operation),
+            )
+        failed = payload.get("status") not in {"complete", "completed"}
+        return (
+            HarnessEvent(
+                **common,
+                type="operation.failed" if failed else "operation.completed",
+                payload={
+                    **operation,
+                    "output": [
+                        {
+                            "type": "text",
+                            "text": str(
+                                payload.get("result") or payload.get("status") or ""
+                            ),
+                        }
+                    ],
+                    **(
+                        {"error_code": "subagent_" + str(payload.get("status"))}
+                        if failed
+                        else {}
+                    ),
+                },
+            ),
+        )
     if kind == "agent.started":
         return (
             HarnessEvent(

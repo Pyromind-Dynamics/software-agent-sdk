@@ -42,7 +42,7 @@ OS 沙箱下技能资源可能位于工作区外，使用已知的技能绝对�
 Pipeline 用的解释器由脚本自己解析，顺序为：`PYROMIND_SANDBOX_DATAFLOW_PYTHON` 指定的
 解释器（在本沙箱内存在且版本匹配时）→ 镜像内置解释器（`/opt/pyromind/dataflow-venv/bin/python`、
 `/home/openhands/dataflow-venv/bin/python`、`~/dataflow-venv/bin/python`）→ 沙箱自带
-`python3`（版本匹配时）→ `/tmp/pyromind-dataflow-venv-1.0.10` 缓存 venv，缺失时按 pin 安装。
+`python3`（版本匹配时）→ `/tmp/pyromind-dataflow-venv-1.0.11` 缓存 venv，缺失时按 pin 安装。
 首次安装需要沙箱能访问 PyPI，通常几分钟；同一沙箱内后续运行直接复用，沙箱重建后重新准备。
 沙箱初始化完成后会在后台自动执行一次 `--prepare`，所以通常不需要手工预热；
 预热失败不影响后续运行，执行小样时会按需重新安装。可用

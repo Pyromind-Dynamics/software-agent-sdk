@@ -1,4 +1,6 @@
+import importlib.util
 import json
+import shutil
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -147,10 +149,14 @@ def test_fixed_two_node_submission_and_frozen_resume(inference_submission):
     assert "test_mode" not in ctx.submit.call_args.kwargs
     command = workflow["nodes"][1]["data"]["config"]["command"]
     assert '--endpoint "$param"' in command
+    assert "--run-id" in command and result.run_id in command
+    assert f"--report-assets-dir /workspace{result.output_dir}" in command
     assert "pip install" not in command and "API_KEY" not in command
-    assert len(ctx.uploads) == 3
+    assert len(ctx.uploads) == 5
     assert {name for name, _ in ctx.uploads} == {
         "evaluate_inference.py",
+        "evaluation_report.css",
+        "evaluation_report.js",
         "dataset_config.json",
         "evaluation_config.json",
     }
@@ -175,6 +181,120 @@ def test_fixed_two_node_submission_and_frozen_resume(inference_submission):
     assert resumed.output_dir == result.output_dir
     assert resumed.task_id == "task-2"
     assert resumed.execution_revision == 2
+
+
+def test_stale_report_ui_bundle_is_rejected(tmp_path):
+    runtime = Path(__file__).parents[3] / ".agents/skills/inference-evaluation/scripts"
+    copied_runtime = tmp_path / "runtime"
+    shutil.copytree(runtime, copied_runtime)
+    index = copied_runtime / "report_ui/index.js"
+    index.write_text(index.read_text() + "\n// stale\n")
+
+    with pytest.raises(ValueError, match="report UI bundle is stale"):
+        inference_module._validate_report_ui_bundle(copied_runtime)
+
+
+def _load_skill_script(name: str) -> Any:
+    scripts = Path(__file__).parents[3] / ".agents/skills/inference-evaluation/scripts"
+    spec = importlib.util.spec_from_file_location(
+        name.removesuffix(".py"), scripts / name
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_report_ui_build_recipe_matches_consumers():
+    build = _load_skill_script("build_report_ui.py")
+    evaluation = _load_skill_script("evaluate_inference.py")
+
+    assert build.SOURCE.name == "report_ui"
+    inference_module._validate_report_ui_bundle(build.ROOT)
+    assert set(inference_module.INFERENCE_RUNTIME_FILENAMES) == {
+        "evaluate_inference.py",
+        build.JAVASCRIPT_OUTPUT.name,
+        build.CSS_OUTPUT.name,
+    }
+    assert set(evaluation.REPORT_ASSET_NAMES) == {
+        build.JAVASCRIPT_OUTPUT.name,
+        build.CSS_OUTPUT.name,
+    }
+
+
+def test_runtime_hash_matches_script_side_bundle_hash():
+    scripts = Path(__file__).parents[3] / ".agents/skills/inference-evaluation/scripts"
+    evaluation = _load_skill_script("evaluate_inference.py")
+
+    assert evaluation._runtime_sha256() == inference_module.runtime_bundle_fingerprint(
+        scripts, inference_module.INFERENCE_RUNTIME_FILENAMES
+    )
+
+
+def test_invalid_report_spec_json_names_the_file(inference_submission):
+    ctx = inference_submission
+    (ctx.workspace / "public_data" / "report_spec.json").write_text("{oops")
+    ctx.action.inference.report_spec_path = "public_data/report_spec.json"
+
+    result = ctx.executor(ctx.action, cast(Any, ctx.conversation))
+
+    assert result.is_error
+    assert "invalid report_spec JSON in public_data/report_spec.json" in result.text
+    assert ctx.uploads == []
+    ctx.submit.assert_not_called()
+
+
+def test_report_spec_is_staged_and_passed_to_command(inference_submission):
+    ctx = inference_submission
+    (ctx.workspace / "public_data" / "report_spec.json").write_text(
+        json.dumps({"template_id": "evaluation-basic-v1"})
+    )
+    ctx.action.inference.report_spec_path = "public_data/report_spec.json"
+    result = ctx.executor(ctx.action, cast(Any, ctx.conversation))
+    assert not result.is_error, result.text
+    workflow = ctx.submit.call_args.kwargs["workflow"]
+    command = workflow["nodes"][1]["data"]["config"]["command"]
+    assert "--report-spec" in command
+    assert len(ctx.uploads) == 6
+    assert {name for name, _ in ctx.uploads} == {
+        "evaluate_inference.py",
+        "evaluation_report.css",
+        "evaluation_report.js",
+        "dataset_config.json",
+        "evaluation_config.json",
+        "report_spec.json",
+    }
+
+
+def test_report_spec_is_frozen_into_definition_for_resume(inference_submission):
+    ctx = inference_submission
+    spec_file = ctx.workspace / "public_data" / "report_spec.json"
+    spec_file.write_text(json.dumps({"template_id": "evaluation-basic-v1"}))
+    ctx.action.inference.report_spec_path = "public_data/report_spec.json"
+    result = ctx.executor(ctx.action, cast(Any, ctx.conversation))
+    assert not result.is_error, result.text
+    staged = dict(ctx.uploads)["report_spec.json"]
+    assert json.loads(staged)["template_id"] == "evaluation-basic-v1"
+    # Mutate the workspace copy after submission: resume must reuse the frozen
+    # spec content from the definition, not re-read the (now different) file.
+    spec_file.write_text(json.dumps({"template_id": "evaluation-media-v1"}))
+    ctx.uploads.clear()
+    ctx.registry.update_status(ctx.conversation.id, "task-1", "failed")
+    ctx.submit.return_value.task_id = "task-2"
+    resumed = ctx.executor(
+        DfSubmitPipelineAction(
+            input_path=ctx.action.input_path,
+            mode="resume",
+            resume_run_id=result.run_id,
+        ),
+        cast(Any, ctx.conversation),
+    )
+    assert not resumed.is_error, resumed.text
+    assert dict(ctx.uploads)["report_spec.json"] == staged
+    command = ctx.submit.call_args.kwargs["workflow"]["nodes"][1]["data"]["config"][
+        "command"
+    ]
+    assert "--report-spec" in command
 
 
 def test_platform_contract_failure_does_not_upload_or_submit(inference_submission):
@@ -270,7 +390,9 @@ async def test_pi_host_exposes_inference_through_existing_submit_tool(
         pipeline_runs=lambda conversation_id: ctx.runs,
     )
     names = {spec["name"] for spec in host.specs()}
-    assert "df_submit_pipeline" in names and "run_workflow" not in names
+    assert "df_submit_pipeline" in names
+    assert "df_save_annotations" not in names
+    assert "run_workflow" not in names
     result = await host.execute(
         "df_submit_pipeline",
         ctx.action.model_dump(mode="json", exclude_unset=True),

@@ -451,3 +451,37 @@ def test_run_finished_is_the_only_harness_terminal_mapping(
     assert all("stop_reason" not in event.payload for event in events)
     if status == "future-outcome":
         assert events[0].payload["code"] == "unknown_pi_outcome"
+
+
+def test_subagent_display_uses_existing_operation_events():
+    details = {
+        "subagent": {
+            "version": 1,
+            "run_id": "child-1",
+            "tool_call_id": "launch-1",
+            "status": "running",
+            "trace": {"text": "Tool: read", "availability": "available"},
+        }
+    }
+    for native, public in [
+        ("subagent.started", "operation.started"),
+        ("subagent.progress", "operation.progress"),
+        ("subagent.finished", "operation.completed"),
+    ]:
+        (event,) = translate_runner_event(
+            {
+                "eventId": native,
+                "sessionId": "parent",
+                "runId": "child-1",
+                "kind": native,
+                "payload": {
+                    "details": details,
+                    "status": "complete",
+                    "result": "Evidence",
+                },
+            }
+        )
+        assert event.type == public
+        assert event.payload["category"] == "subagent"
+        assert event.payload["operation_id"] == "subagent:child-1"
+        assert event.payload["details"] == details

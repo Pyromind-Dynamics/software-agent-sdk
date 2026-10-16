@@ -9,7 +9,7 @@
 
 - 普通文本：PromptedGenerator / FormatStrPromptedGenerator。
 - SFT：CondorGenerator → CondorRefiner → AlpagasusFilter。
-- 推理、代码、多轮、Function Call：选 DataFlow 1.0.10 对应 Generator/Filter。
+- 推理、代码、多轮、Function Call：选 DataFlow 1.0.11 对应 Generator/Filter。
 - 图片输入生成问答、描述或回答：managed image runtime。
 - 图片新像素：根据正常底图、真实异常、标注及业务定义，复用、组合或编写
   Python 策略。无现成策略不等于不能合成；缺少业务依据也不能靠绘图猜类别。

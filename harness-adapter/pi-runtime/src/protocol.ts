@@ -15,7 +15,11 @@ export type RunnerEventKind =
   | "tool.progress"
   | "tool.completed"
   | "tool.failed"
-  | "usage.updated";
+  | "usage.updated"
+  | "subagent.started"
+  | "subagent.progress"
+  | "subagent.finished"
+  | "subagent.workflow_modified";
 
 export type RunOutcomeStatus = "completed" | "failed" | "cancelled" | "suspended";
 
