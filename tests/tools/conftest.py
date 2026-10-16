@@ -140,6 +140,67 @@ class TruncatingDownloadWorkspace:
         return result
 
 
+class MountPathSandboxWorkspace(HostBackedSandboxWorkspace):
+    """Sandbox double whose port speaks the container's mount path.
+
+    The container addresses mounted Storage as ``/target-workspace`` and the
+    conversation workspace as a directory inside it. Neither path exists on the
+    host, so a tool that writes to ``working_dir`` directly fails here exactly
+    as it does against a real sandbox. Port calls map the mount onto the host
+    directory that backs it.
+    """
+
+    def __init__(
+        self,
+        backing_root: Path,
+        storage_dir: Path,
+        *,
+        conversation_id: str,
+        mount_path: str = "/target-workspace",
+    ) -> None:
+        super().__init__(backing_root, storage_dir)
+        self.backing_root = Path(backing_root)
+        self.mount_path = mount_path
+        self.storage_path = mount_path
+        self.working_dir = f"{mount_path}/.pyromind-agent/{conversation_id}"
+
+    @property
+    def host_workspace_dir(self) -> Path:
+        """Host directory backing :attr:`working_dir`."""
+        return Path(self._to_host(self.working_dir))
+
+    def _to_host(self, path: str | Path) -> str:
+        value = str(path)
+        if value == self.mount_path:
+            return str(self.backing_root)
+        prefix = f"{self.mount_path}/"
+        if value.startswith(prefix):
+            return str(self.backing_root / value[len(prefix) :])
+        return value
+
+    def execute_command(
+        self,
+        command: str,
+        cwd: str | Path | None = None,
+        timeout: float = 30.0,
+    ) -> CommandResult:
+        return super().execute_command(
+            command.replace(self.mount_path, str(self.backing_root)),
+            cwd=self._to_host(cwd or self.working_dir),
+            timeout=timeout,
+        )
+
+    def file_upload(
+        self, source_path: str | Path, destination_path: str | Path
+    ) -> FileOperationResult:
+        return super().file_upload(source_path, self._to_host(destination_path))
+
+    def file_download(
+        self, source_path: str | Path, destination_path: str | Path
+    ) -> FileOperationResult:
+        return super().file_download(self._to_host(source_path), destination_path)
+
+
 @pytest.fixture
 def sandbox_workspace(tmp_path: Path) -> HostBackedSandboxWorkspace:
     workspace_dir = tmp_path / "execution"
@@ -147,6 +208,17 @@ def sandbox_workspace(tmp_path: Path) -> HostBackedSandboxWorkspace:
     workspace_dir.mkdir()
     storage_dir.mkdir()
     return HostBackedSandboxWorkspace(workspace_dir, storage_dir)
+
+
+@pytest.fixture
+def mount_path_sandbox_workspace(tmp_path: Path) -> MountPathSandboxWorkspace:
+    backing_root = tmp_path / "host-storage"
+    storage_dir = tmp_path / "storage"
+    backing_root.mkdir()
+    storage_dir.mkdir()
+    return MountPathSandboxWorkspace(
+        backing_root, storage_dir, conversation_id="a" * 32
+    )
 
 
 @pytest.fixture

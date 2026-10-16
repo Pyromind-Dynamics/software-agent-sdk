@@ -211,6 +211,35 @@ def test_submission_reads_configs_from_sandbox_workspace(
     assert {"dataset_config.json", "evaluation_config.json"} <= staged
 
 
+def test_evaluation_canvas_reaches_mount_path_sandbox(
+    inference_submission, mount_path_sandbox_workspace
+) -> None:
+    """The canvas is published through the workspace port, not the mount path."""
+    ctx = inference_submission
+    sandbox = mount_path_sandbox_workspace
+    public = sandbox.host_workspace_dir / "public_data"
+    public.mkdir(parents=True)
+    for name in ("dataset.json", "evaluation.json"):
+        (public / name).write_text((ctx.workspace / "public_data" / name).read_text())
+    conversation = _ToolConversationFacade(
+        ToolExecutionContext(
+            conversation_id=ctx.conversation.id,
+            workspace_root=sandbox.host_workspace_dir,
+            request_context=RequestContext(
+                user_id="test", authorization="Bearer test-token"
+            ),
+            model_configuration={},
+            workspace=cast(Any, sandbox),
+        )
+    )
+
+    result = ctx.executor(ctx.action, cast(Any, conversation))
+
+    assert not result.is_error, result.text
+    canvas = sandbox.host_workspace_dir / "public_data/workflow_canvas/workflow.py"
+    assert canvas.read_text() == ctx.validator.call_args.args[0].dsl
+
+
 def test_stale_report_ui_bundle_is_rejected(tmp_path):
     runtime = Path(__file__).parents[3] / ".agents/skills/inference-evaluation/scripts"
     copied_runtime = tmp_path / "runtime"

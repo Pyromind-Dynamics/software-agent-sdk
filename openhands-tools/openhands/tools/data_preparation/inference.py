@@ -12,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openhands.sdk.conversation.state import ActiveLongTask
 from openhands.tools.data_preparation.runner import runtime_bundle_fingerprint
+from openhands.tools.utils.workspace_staging import publish_workspace_path
+from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
@@ -403,10 +405,16 @@ class InferencePipelineHandler:
                     conversation,
                     frozen_script_name=filename,
                 )
-            workspace = Path(cast(Any, conversation).workspace.working_dir)
-            canvas = workspace / "public_data/workflow_canvas/workflow.py"
-            canvas.parent.mkdir(parents=True, exist_ok=True)
-            canvas.write_text(dsl)
+            # A sandbox workspace has no host filesystem, so the canvas only
+            # reaches it through the workspace port.
+            with tempfile.TemporaryDirectory(prefix="inference-canvas-") as directory:
+                canvas = Path(directory) / "workflow.py"
+                canvas.write_text(dsl)
+                publish_workspace_path(
+                    cast(Any, conversation).workspace,
+                    canvas,
+                    WORKFLOW_RELATIVE_PATH,
+                )
             prepare_execution = getattr(self.runs, "prepare_execution", None)
             if prepare_execution is not None:
                 workflow = prepare_execution(
