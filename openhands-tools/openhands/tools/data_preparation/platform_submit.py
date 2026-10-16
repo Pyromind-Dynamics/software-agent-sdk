@@ -581,7 +581,7 @@ class DfSubmitPipelineExecutor(
                     raise ValueError("inference evaluation is not configured")
                 try:
                     return DfSubmitPipelineObservation.from_text(
-                        **handler.submit(self, action, conversation)
+                        **handler.submit(self, action, conversation, files)
                     )
                 except Exception as exc:
                     return DfSubmitPipelineObservation.from_text(
@@ -1422,6 +1422,10 @@ class _SubmissionFiles:
             else relative.as_posix()
         )
         return staged, display
+
+    def read_text(self, path: str) -> str:
+        """Return the text of a workspace file that the submission reads."""
+        return self.resolve(path)[0].read_text()
 
 
 @contextmanager

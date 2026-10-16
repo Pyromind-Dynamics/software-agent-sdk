@@ -183,6 +183,34 @@ def test_fixed_two_node_submission_and_frozen_resume(inference_submission):
     assert resumed.execution_revision == 2
 
 
+def test_submission_reads_configs_from_sandbox_workspace(
+    inference_submission, sandbox_workspace
+) -> None:
+    """A sandbox conversation stages the evaluation configs off the remote FS."""
+    ctx = inference_submission
+    public = sandbox_workspace.workspace_dir / "public_data"
+    public.mkdir(parents=True)
+    for name in ("dataset.json", "evaluation.json"):
+        (public / name).write_text((ctx.workspace / "public_data" / name).read_text())
+    conversation = _ToolConversationFacade(
+        ToolExecutionContext(
+            conversation_id=ctx.conversation.id,
+            workspace_root=sandbox_workspace.workspace_dir,
+            request_context=RequestContext(
+                user_id="test", authorization="Bearer test-token"
+            ),
+            model_configuration={},
+            workspace=sandbox_workspace,
+        )
+    )
+
+    result = ctx.executor(ctx.action, cast(Any, conversation))
+
+    assert not result.is_error, result.text
+    staged = {name for name, _ in ctx.uploads}
+    assert {"dataset_config.json", "evaluation_config.json"} <= staged
+
+
 def test_stale_report_ui_bundle_is_rejected(tmp_path):
     runtime = Path(__file__).parents[3] / ".agents/skills/inference-evaluation/scripts"
     copied_runtime = tmp_path / "runtime"

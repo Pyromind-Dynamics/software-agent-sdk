@@ -12,7 +12,6 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openhands.sdk.conversation.state import ActiveLongTask
 from openhands.tools.data_preparation.runner import runtime_bundle_fingerprint
-from openhands.tools.data_preparation.workspace_paths import resolve_workspace_file
 from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
@@ -31,6 +30,7 @@ if TYPE_CHECKING:
     from openhands.tools.data_preparation.platform_submit import (
         DfSubmitPipelineAction,
         DfSubmitPipelineExecutor,
+        _SubmissionFiles,
     )
 
 
@@ -269,6 +269,7 @@ class InferencePipelineHandler:
         owner: DfSubmitPipelineExecutor,
         action: DfSubmitPipelineAction,
         conversation: BaseConversation,
+        files: _SubmissionFiles,
     ) -> dict[str, Any]:
         if any(
             (
@@ -301,14 +302,10 @@ class InferencePipelineHandler:
         if action.inference:
             options = action.inference
             dataset = DatasetMapping.model_validate_json(
-                resolve_workspace_file(
-                    conversation, options.dataset_config_path
-                ).read_text()
+                files.read_text(options.dataset_config_path)
             ).model_dump(exclude_none=True)
             evaluation = EvaluationConfig.model_validate_json(
-                resolve_workspace_file(
-                    conversation, options.evaluation_config_path
-                ).read_text()
+                files.read_text(options.evaluation_config_path)
             ).model_dump(exclude_none=True)
             inference = options.model_dump(
                 exclude={
@@ -320,9 +317,7 @@ class InferencePipelineHandler:
             inference["model_path"] = storage_path(options.model_path)
             report_spec = None
             if options.report_spec_path:
-                report_spec = resolve_workspace_file(
-                    conversation, options.report_spec_path
-                ).read_text()
+                report_spec = files.read_text(options.report_spec_path)
                 try:
                     json.loads(report_spec)
                 except json.JSONDecodeError as error:
