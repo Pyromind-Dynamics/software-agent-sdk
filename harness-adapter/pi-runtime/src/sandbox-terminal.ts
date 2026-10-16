@@ -899,11 +899,14 @@ export class SandboxTerminalOperations implements BashOperations {
   }
 
   /**
-   * Preparation gets a fresh startup budget per attempt; the command deadline
-   * still caps it so a short command timeout stays short.
+   * Preparation gets a fresh startup budget per attempt.
+   *
+   * The budget is the harness's own: a cold sandbox stages the harness and
+   * launches the run before the caller's command timeout starts, so charging
+   * that work to the caller's timeout fails a command which never ran.
    */
-  private prepareDeadline(deadline: number): number {
-    return Math.min(deadline, Date.now() + (this.settings.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS));
+  private prepareDeadline(): number {
+    return Date.now() + (this.settings.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS);
   }
 
   /**
@@ -992,12 +995,11 @@ export class SandboxTerminalOperations implements BashOperations {
   private async uploadScripts(
     runDir: string,
     scripts: RunScripts,
-    deadline: number,
     options: TerminalExecOptions,
   ): Promise<void> {
     const writeFile = this.settings.writeFile;
     if (writeFile === undefined) throw new Error("sandbox file API unavailable");
-    const uploadDeadline = this.prepareDeadline(deadline);
+    const uploadDeadline = this.prepareDeadline();
     const upload = new AbortController();
     const signal = options.signal
       ? AbortSignal.any([upload.signal, options.signal])
@@ -1076,14 +1078,6 @@ export class SandboxTerminalOperations implements BashOperations {
     options: TerminalExecOptions,
   ): Promise<TerminalExecResult> {
     options.signal?.throwIfAborted();
-    if (this.quarantined) {
-      const previous = this.quarantined;
-      if (!await this.stop(previous.runDir, previous.token)) {
-        throw new SandboxTerminalExecutionError("terminal blocked: previous command termination is unconfirmed",
-          { ...previous.execution, error_code: "termination_unconfirmed" });
-      }
-      this.quarantined = undefined;
-    }
     const callId = randomUUID().replace(/-/g, "");
     // Every preparation attempt gets its own token: a socket reused across
     // commands can still deliver a late acknowledgement, and a token only this
@@ -1092,7 +1086,20 @@ export class SandboxTerminalOperations implements BashOperations {
     const runDir = `${this.runsRoot}/${callId}`;
     const timeout = options.timeout && options.timeout > 0
       ? options.timeout : DEFAULT_COMMAND_TIMEOUT_SECONDS;
-    const deadline = Date.now() + timeout * 1000;
+    if (this.quarantined) {
+      const previous = this.quarantined;
+      if (!await this.stop(previous.runDir, previous.token)) {
+        // The session cannot confirm that the run it still carries has stopped,
+        // so this command never reaches a shell of its own. Reporting it as a
+        // launch which never happened is what lets the caller retire the bundle
+        // and replay the command, instead of refusing every later command on a
+        // bundle whose session may already be gone.
+        throw new SandboxTerminalExecutionError("terminal blocked: previous command termination is unconfirmed",
+          { execution_id: callId, remote_run_dir: runDir, phase: "connecting",
+            started: false, stopped: true, error_code: "termination_unconfirmed" });
+      }
+      this.quarantined = undefined;
+    }
     const evidence: TerminalExecutionEvidence = { execution_id: callId, remote_run_dir: runDir,
       phase: "preparing", started: false, stopped: false };
     const openedAt = Date.now();
@@ -1131,7 +1138,7 @@ export class SandboxTerminalOperations implements BashOperations {
         // Tokens are always 18 hex characters, so the transport decision taken
         // above still describes the burst this attempt builds.
         token = randomBytes(9).toString("hex");
-        const startupDeadline = this.prepareDeadline(deadline);
+        const startupDeadline = this.prepareDeadline();
         channel = this.channel();
         // A socket this session already used carries no open cost, but it can
         // have been dropped without a close frame while it sat idle. Its
@@ -1197,13 +1204,13 @@ export class SandboxTerminalOperations implements BashOperations {
             phase = Date.now();
             if (transport === "file") {
               try {
-                await this.uploadScripts(runDir, scripts, deadline, options);
+                await this.uploadScripts(runDir, scripts, options);
               } catch (error) {
                 if (options.signal?.aborted ||
                     (error instanceof Error && error.message === "aborted")) throw error;
                 evidence.staging = "batch-fallback";
                 await this.stageOverTerminal(channel, evidence, runDir, token, scripts,
-                  this.prepareDeadline(deadline), options);
+                  this.prepareDeadline(), options);
               }
             } else if (transport === "lines") {
               await this.stageOverTerminal(channel, evidence, runDir, token, scripts, startupDeadline, options);
@@ -1247,16 +1254,19 @@ export class SandboxTerminalOperations implements BashOperations {
           if (attempt === this.maxReconnects) throw error;
         }
       }
+      // Preparation is done and the run is dispatched: the caller's timeout
+      // bounds the command from here, not the staging a cold sandbox paid for.
+      const deadline = Date.now() + timeout * 1000;
       for (let attempt = 0; attempt <= this.maxReconnects; attempt += 1) {
         try {
           while (!evidence.started) {
             // Only a socket which replaced a dispatched run reaches this poll:
             // the launch acknowledgement was lost with the old socket, so the
             // replacement confirms the pid or the exit code before observing.
-            // Every poll gets its own budget, so a reconnect is never starved by
-            // a startup budget which already elapsed on the previous socket; the
-            // command deadline stays the outer bound.
-            const pollDeadline = this.prepareDeadline(deadline);
+            // Every poll gets its own startup budget, so a reconnect is never
+            // starved by one which already elapsed on the previous socket, while
+            // the command deadline stays the outer bound.
+            const pollDeadline = Math.min(deadline, this.prepareDeadline());
             const phase = Date.now();
             const state = await this.acknowledge(channel, evidence, buildResumeLine(runDir, token),
               `${ACK_MARKER}${token}:started:`, pollDeadline, options.signal);
@@ -1496,9 +1506,19 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * A session which cannot confirm the previous run stopped has no shell another
+ * command may share, so the bundle is retired like a dropped connection.
+ */
+function isTerminationUnconfirmed(error: unknown): boolean {
+  return error instanceof SandboxTerminalExecutionError &&
+    error.execution.error_code === "termination_unconfirmed";
+}
+
 /** A connection which dropped in a way the control plane can repair. */
 function isStaleTerminal(error: unknown): boolean {
   return error instanceof SandboxTerminalConnectionError ||
+    isTerminationUnconfirmed(error) ||
     (error instanceof SandboxTerminalExecutionError && error.execution.stopped &&
      error.execution.error_code === "connection_lost");
 }

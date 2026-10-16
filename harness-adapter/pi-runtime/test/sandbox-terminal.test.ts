@@ -682,6 +682,32 @@ test("a dropped connection is still observed after the startup budget has elapse
   assert.equal(sockets.length, 2);
 });
 
+test("a command timeout does not cap the cold-start preparation", async () => {
+  const socket = new FakeSocket();
+  socket.onSend = (line) => {
+    if (line === "\u0003") return;
+    const ack = /'__PM_ACK__' '([0-9a-f]{18}):([^']+)' '([^']+)'/.exec(line);
+    if (ack) {
+      const value = ack[2] === "stop" ? "yes" : ack[2] === "ready" ? "missing" : ack[3];
+      // Staging the harness is what a cold sandbox pays before any command runs.
+      const delay = /^staged/.test(ack[2]) ? 80 : 0;
+      setTimeout(() => socket.emit(`__PM_ACK__${ack[1]}:${ack[2]}:${value}\n`), delay);
+      return;
+    }
+    const token = /([0-9a-f]{18})\s*$/.exec(line)?.[1];
+    assert.ok(token, "watch line carries the run token");
+    socket.emit(frames(token).begin);
+    socket.emit(frames(token).end(0));
+  };
+  const operations = new SandboxTerminalOperations(ENDPOINT, {
+    connect: () => {queueMicrotask(() => socket.open()); return socket;},
+    writeFile: async () => {},
+    startupTimeoutMs: 5_000,
+  });
+  const completed = await operations.exec("true", "", { timeout: 0.05, onData: () => {} });
+  assert.equal(completed.exitCode, 0);
+});
+
 test("terminal operations abort by cancelling the process group", async () => {
   const controller = new AbortController();
   const { result, sockets } = run(
@@ -933,6 +959,51 @@ test("unconfirmed termination blocks new commands until the same process is conf
   stopped = true;
   assert.equal((await operations.exec("true", "", {onData: () => {}})).exitCode, 0);
   assert.equal(launches, 2);
+});
+
+test("an unconfirmed termination retires the bundle and replays the command", async () => {
+  const sockets: FakeSocket[] = [];
+  let launches = 0;
+  let resolutions = 0;
+  const controller = new AbortController();
+  const endpoints = new SandboxEndpointSession(async () => {
+    resolutions += 1;
+    return ENDPOINT;
+  });
+  const connect: SandboxTerminalConnector = () => {
+    const socket = new FakeSocket();
+    sockets.push(socket);
+    socket.onSend = (line) => {
+      if (line === "\u0003") return;
+      const ack = /'__PM_ACK__' '([0-9a-f]{18}):([^']+)' '([^']+)'/.exec(line);
+      if (ack) {
+        // The bridge answers every exchange but never confirms the stop.
+        const value = ack[2] === "stop" ? "unknown" : ack[2] === "ready" ? "missing" : ack[3];
+        if (ack[2] === "launch") launches += 1;
+        socket.emit(`__PM_ACK__${ack[1]}:${ack[2]}:${value}\n`);
+        return;
+      }
+      const token = /([0-9a-f]{18})\s*$/.exec(line)?.[1];
+      assert.ok(token, "watch line carries the run token");
+      socket.emit(frames(token).begin);
+      if (launches === 1) queueMicrotask(() => controller.abort());
+      else socket.emit(frames(token).end(0));
+    };
+    queueMicrotask(() => socket.open());
+    return socket;
+  };
+  const terminal = new LazySandboxTerminalOperations(endpoints, {
+    connect, writeFile: async () => {}, stopTimeoutMs: 100,
+  });
+  await assert.rejects(
+    terminal.exec("sleep 30", ".", {signal: controller.signal, onData: () => {}}),
+    (error: unknown) => error instanceof SandboxTerminalExecutionError && !error.execution.stopped);
+  const completed = await terminal.exec("touch /must-not-start", ".", {onData: () => {}});
+  assert.equal(completed.exitCode, 0);
+  // A blocked session is not reusable, so the command is replayed on a bundle
+  // resolved after the one which could not confirm the stop was retired.
+  assert.equal(resolutions, 2);
+  assert.equal(sockets.length, 3);
 });
 
 test("lost launch acknowledgement does not dispatch a second launch", async () => {
