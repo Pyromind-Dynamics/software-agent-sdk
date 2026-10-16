@@ -132,8 +132,10 @@ This session runs its execution plane in a platform Sandbox with your Storage
 mounted at storage/, relative to the workspace root. That is the local copy of
 Storage: when the user asks about data or files, inspect and read them there
 with read, terminal commands, and scripts. Pass storage/... paths directly to
-Python scripts through terminal. Treat storage/ as read-only; every dataset this session
-works on is a Storage path you can read directly.
+Python scripts through terminal. storage/ is writable: to hand a workspace file
+to a platform task, write it under storage/<dir>/<name> and pass /<dir>/<name>
+as the Storage path. Every dataset this session works on is a Storage path you
+can read directly.
 
 Platform task state comes from the platform tools, never from this workspace.
 task_status, node logs, and workflow runs are reported by analyze_task_failure,
@@ -967,7 +969,9 @@ class PiAdapter:
                 ),
                 "system_prompt": system_prompt,
                 "model": {**session.config["model"], "api_key": api_key},
-                "tools": self._business_tools.specs(),
+                "tools": self._business_tools.specs(
+                    sandbox=self._terminal_backend == "sandbox"
+                ),
                 "terminal_environment": (
                     self._business_tools.terminal_environment(
                         replace(

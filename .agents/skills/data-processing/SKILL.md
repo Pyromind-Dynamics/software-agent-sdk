@@ -75,7 +75,8 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
    已有标签的确定性全量统计不设人工门禁，且模型调用必须为零。
 5. **全量**：需要平台执行时统一用 `df_submit_pipeline`；提交前先按
    llm-pipeline playbook 的「平台全量输入」确认 `input_path` 已指向 Storage 输入，
-   工作区文件用 `upload_file_to_pyromind` 落位。DataFlow/EDP 平台任务（含具身
+   工作区文件直接写入 `storage/<dir>/` 落位（Storage 已挂载且可写，对应
+   Storage 路径为 `/<dir>/<name>`）。DataFlow/EDP 平台任务（含具身
    case 的逐 episode 执行）等待终态回调，运行中用 df_check_progress 观察。
    需介入平台任务时先 df_stop_task 停任务。
 6. **分诊**：回调后先看 report.json / validation / verdicts，按失败分类决定

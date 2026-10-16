@@ -263,19 +263,20 @@ class ConversationRuntime:
                 effective, conversation_id, context
             )
         except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
             store.save_workflow_execution_request(
                 request.model_copy(
                     update={
                         "status": "uncertain",
                         "revision": request.revision + 1,
-                        "error": type(exc).__name__,
+                        "error": detail,
                     }
                 ),
                 expected_revision=request.revision,
             )
             raise ValueError(
-                "submission outcome uncertain; reconcile before retrying"
-            ) from None
+                f"submission outcome uncertain; reconcile before retrying ({detail})"
+            ) from exc
         self.register_external_task(
             conversation_id,
             {

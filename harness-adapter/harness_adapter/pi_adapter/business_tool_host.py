@@ -404,7 +404,13 @@ class PyromindBusinessToolHost:
             environment[ENV_SANDBOX_DATAFLOW_PYTHON] = interpreter
         return environment
 
-    def specs(self) -> list[dict[str, Any]]:
+    def specs(self, *, sandbox: bool = False) -> list[dict[str, Any]]:
+        """Tool specs this session exposes.
+
+        ``sandbox`` sessions mount the user's Storage, so they publish
+        workspace files by writing to ``storage/...`` and have no use for the
+        host-side presigned upload tool.
+        """
         specs = [validation_tool_spec()]
         if self.version_call is not None:
             specs.append(
@@ -464,6 +470,8 @@ class PyromindBusinessToolHost:
             TrainingAnalysisTool,
             LabelStudioProjectTool,
         ):
+            if sandbox and tool_type is UploadFileToPyromindTool:
+                continue
             tools.append(tool_type.create()[0])
         for tool in tools:
             definition = tool.to_mcp_tool()

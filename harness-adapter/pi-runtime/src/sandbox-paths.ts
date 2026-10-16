@@ -134,9 +134,10 @@ export interface SandboxPathPolicyInput {
  *
  * The local `WorkspaceAccessPolicy` canonicalizes through the host filesystem,
  * which cannot see the sandbox. This mirrors its model-visible vocabulary
- * (relative paths start at the conversation root, `public_data/` is writable,
- * `.agents/skills/`, `knowledge/`, and `storage/` are read-only aliases) using
- * pure string arithmetic so it works without any filesystem access.
+ * (relative paths start at the conversation root, `public_data/` and the
+ * mounted Storage alias `storage/` are writable, `.agents/skills/` and
+ * `knowledge/` are read-only aliases) using pure string arithmetic so it works
+ * without any filesystem access.
  */
 export class SandboxPathPolicy {
   private constructor(
@@ -184,13 +185,12 @@ export class SandboxPathPolicy {
       operation === "write"
         ? [this.publicDataPath]
         : [this.publicDataPath, ...this.readOnlyRoots];
-    const storageRead =
-      operation === "read" &&
+    const storageAccess =
       resolved.storageAlias &&
       this.storageRoot !== undefined &&
       insideSandboxPath(target, this.storageRoot);
     if (
-      !storageRead &&
+      !storageAccess &&
       !allowedRoots.some((root) => insideSandboxPath(target, root))
     ) {
       throw pathScopeError(operation);
@@ -251,7 +251,7 @@ export function insideSandboxPath(target: string, root: string): boolean {
 function pathScopeError(operation: SandboxPathOperation): Error {
   const scope =
     operation === "write"
-      ? "write and edit paths must stay within public_data/"
+      ? "write and edit paths must stay within public_data/ or the mounted Storage under storage/"
       : "read paths must stay within public_data/, storage/, configured skill directories, or knowledge/";
   return new Error(`PATH_SCOPE_ERROR: ${scope}`);
 }

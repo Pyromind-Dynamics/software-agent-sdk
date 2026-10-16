@@ -46,9 +46,9 @@ import type { ExecutionAccess } from "./workflow-execution.js";
 const OPENHANDS_ERROR_HEADER = "[An error occurred during execution.]";
 const OMITTED_IMAGE_TEXT = "[Image omitted: Pi only accepts inline base64 image data.]";
 const SANDBOX_READ_PATH_SCOPE =
-  "Mounted Storage is read-only and addressed as storage/... . Conversation files are read from public_data/. Configured skill directories and knowledge are read-only; .agents/skills/ and knowledge/ address their configured resource directories.";
+  "Mounted Storage is addressed as storage/... and is writable there. Conversation files are read from public_data/. Configured skill directories and knowledge are read-only; .agents/skills/ and knowledge/ address their configured resource directories.";
 const SANDBOX_WRITE_PATH_SCOPE =
-  "Write and edit paths must stay within public_data/. Mounted Storage under storage/... is read-only.";
+  "Write and edit paths must stay within public_data/ or the mounted Storage under storage/... .";
 
 export interface BusinessToolConfig {
   name: string;

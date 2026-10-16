@@ -83,11 +83,14 @@ async def test_uncertain_submission_never_auto_retries(version_runtime, monkeypa
         raise TimeoutError("platform may have accepted it")
 
     monkeypatch.setattr(runtime._workflow_submission, "submit", timeout)
-    for _ in range(2):
-        with pytest.raises(ValueError, match="uncertain"):
-            await runtime.submit_versioned_workflow(
-                "c", "same-call", {"name": "train"}, None, context
-            )
+    with pytest.raises(ValueError, match="platform may have accepted it"):
+        await runtime.submit_versioned_workflow(
+            "c", "same-call", {"name": "train"}, None, context
+        )
+    with pytest.raises(ValueError, match="uncertain"):
+        await runtime.submit_versioned_workflow(
+            "c", "same-call", {"name": "train"}, None, context
+        )
     assert len(calls) == 1
 
 

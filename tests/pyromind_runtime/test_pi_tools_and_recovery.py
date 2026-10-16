@@ -1023,9 +1023,13 @@ async def test_sandbox_session_prompt_steers_storage_reads(
     )
     try:
         prompt = captured["system_prompt"]
+        assert "upload_file_to_pyromind" not in {
+            item["name"] for item in captured["tools"]
+        }
         assert "df_run_pipeline" not in prompt
         assert "Python scripts through terminal" in prompt
-        assert "every dataset this session" in prompt
+        assert "storage/ is writable" in prompt
+        assert "Every dataset this session" in prompt
         assert "Platform task state comes from the platform tools" in prompt
         assert "Do not search the filesystem or" in prompt
         assert "Use the absolute form when a command has changed directory." in prompt
@@ -1097,6 +1101,10 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
         spec["name"] for spec in specs
     }
     assert all(spec["input_schema"].get("type") == "object" for spec in specs)
+
+    sandbox_specs = host.specs(sandbox=True)
+    assert len(sandbox_specs) == len(specs) - 1
+    assert "upload_file_to_pyromind" not in {spec["name"] for spec in sandbox_specs}
 
 
 async def test_pi_host_bridges_update_plan_and_persists_snapshot(tmp_path) -> None:
@@ -2296,12 +2304,15 @@ async def test_idle_runner_exit_terminates_subagent_operations(tmp_path, monkeyp
             "payload": {"label": "search"},
         },
     )
-    assert (await session.queue.get()).type == "operation.started"
+    started = await session.queue.get()
+    assert started is not None
+    assert started.type == "operation.started"
     assert session.files.load_inflight() is None
     runner = _LifecycleFakeRunner.instances[0]
     runner.running = False
     await runner.exit_handler(PiRunnerExit(returncode=-9, reason="unexpected"))
     terminal = await session.queue.get()
+    assert terminal is not None
     assert terminal.type == "operation.failed"
     assert terminal.payload["error_code"] == "subagent_interrupted"
     assert session.active_subagents == set()

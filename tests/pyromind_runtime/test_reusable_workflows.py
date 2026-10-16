@@ -10,9 +10,26 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
+from core.ports import PortError, ToolResult
+from harness_adapter.agentgenome_bridge import (
+    AgentGenomeBackend,
+    BridgeTool,
+    ExecutionHost,
+)
+from harness_adapter.pi_adapter.runner import PiRunnerError
 from pyromind_runtime.application.reusable_workflows import ReusableWorkflows
 from pyromind_runtime.domain.content import JsonObject, JsonValue
+
+
+def missing_file_error(path: Path | str) -> PiRunnerError:
+    """The sandbox file API's wording for a file that is not there."""
+    return PiRunnerError(
+        "request_failed: sandbox file request failed: GET "
+        "/api/v1/sandboxes/sb-1/files/read -> 400 "
+        '{"success":false,"error":{"code":"FILE_READ_ERROR","message":'
+        f"\"Cannot read file '{path}': ls: cannot access '{path}': "
+        'No such file or directory"}}'
+    )
 
 
 @pytest.mark.parametrize(
@@ -51,7 +68,7 @@ async def test_execution_host_reports_preparation_stop_evidence(cancelled, stopp
     assert subscriptions[-1] is None
 
 
-async def test_execution_host_mirrors_host_local_exports(tmp_path):
+async def test_execution_host_reads_host_local_exports_without_the_plane(tmp_path):
     conversation = tmp_path / "conversation"
     export = conversation / "public_data/agentgenome-traces/trace.json"
     export.parent.mkdir(parents=True)
@@ -75,16 +92,74 @@ async def test_execution_host_mirrors_host_local_exports(tmp_path):
     host = ExecutionHost(request, lambda *_: None, conversation)
     # The bridge runs the genome service in a worker thread, so blocking on the
     # loop is only safe away from the loop thread.
-    assert (
-        await asyncio.to_thread(host.read, "public_data/agentgenome-traces/trace.json")
-        == b'{"trace_id": "trace"}'
-    )
-    assert calls == ["execution.write", "execution.resolve", "execution.read"]
+    relative = "public_data/agentgenome-traces/trace.json"
+    assert await asyncio.to_thread(host.read, relative) == b'{"trace_id": "trace"}'
+    # The bytes are on this host already, so neither a single read nor a batch
+    # read pays an upload and a read-back for them.
+    assert calls == []
+    assert await asyncio.to_thread(host.read_many, [relative]) == {
+        relative: b'{"trace_id": "trace"}'
+    }
+    assert calls == []
 
     remote["public_data/data/raw.csv"] = b"a,b\n"
-    calls.clear()
     assert await asyncio.to_thread(host.read, "public_data/data/raw.csv") == b"a,b\n"
     assert calls == ["execution.resolve", "execution.read"]
+
+
+async def test_execution_host_batches_reads_and_reuses_answers(tmp_path):
+    pages = [
+        {
+            "files": [
+                {"path": "scripts/a.py", "content": base64.b64encode(b"a").decode()},
+                {"path": "scripts/ghost.py", "content": None},
+            ],
+            "remaining": ["scripts/b.py"],
+        },
+        {
+            "files": [
+                {"path": "scripts/b.py", "content": base64.b64encode(b"b").decode()},
+            ],
+            "remaining": [],
+        },
+    ]
+    calls: list[tuple[str, list[str]]] = []
+
+    async def request(method, payload):
+        calls.append((method, list(payload["paths"])))
+        assert method == "execution.read_many"
+        return pages.pop(0)
+
+    host = ExecutionHost(request, lambda *_: None, tmp_path / "conversation")
+    wanted = ["scripts/a.py", "scripts/ghost.py", "scripts/b.py"]
+    answers = await asyncio.to_thread(host.read_many, wanted)
+    assert answers == {
+        "scripts/a.py": b"a",
+        "scripts/ghost.py": None,
+        "scripts/b.py": b"b",
+    }
+    assert calls == [
+        ("execution.read_many", wanted),
+        ("execution.read_many", ["scripts/b.py"]),
+    ]
+    calls.clear()
+    # Everything the host already answered is served without touching the plane.
+    assert await asyncio.to_thread(host.read_many, wanted) == answers
+    assert calls == []
+
+
+async def test_execution_host_bounds_a_wedged_read(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYROMIND_AGENTGENOME_CALL_TIMEOUT_SECONDS", "0.05")
+
+    async def request(method, payload):
+        await asyncio.sleep(60)
+
+    host = ExecutionHost(request, lambda *_: None, tmp_path / "conversation")
+    with pytest.raises(TimeoutError, match="did not answer"):
+        await asyncio.to_thread(host.read, "scripts/clean.py")
+    with pytest.raises(TimeoutError, match="did not answer"):
+        await asyncio.to_thread(host.read_many, ["scripts/clean.py"])
+    await asyncio.sleep(0.01)
 
 
 async def test_execution_host_reads_a_bounded_head(tmp_path):
@@ -112,6 +187,37 @@ async def test_execution_host_reads_a_bounded_head(tmp_path):
         await asyncio.to_thread(host.head, "public_data/remote.csv", 7) == b"header\n"
     )
     assert calls == ["execution.resolve", "execution.run"]
+
+
+async def test_execution_host_reports_a_missing_remote_file_as_not_found(tmp_path):
+    """Capture probes for optional files, so a "no such file" answer is an `OSError`.
+
+    The sandbox file API words that answer as a 400 request error; callers that probe
+    for a script's runtime siblings must not have to know that.
+    """
+
+    async def request(method, payload):
+        if method == "execution.resolve":
+            return {"path": f"/sandbox/{payload['path']}"}
+        assert method == "execution.read"
+        raise missing_file_error("/sandbox/scripts/__init__.py")
+
+    host = ExecutionHost(request, lambda *_: None, tmp_path / "conversation")
+    with pytest.raises(FileNotFoundError):
+        await asyncio.to_thread(host.read, "scripts/__init__.py")
+
+
+async def test_execution_host_keeps_other_runner_errors(tmp_path):
+    async def request(method, payload):
+        if method == "execution.resolve":
+            return {"path": f"/sandbox/{payload['path']}"}
+        raise PiRunnerError(
+            "request_failed: sandbox file request failed: GET /x -> 500 boom"
+        )
+
+    host = ExecutionHost(request, lambda *_: None, tmp_path / "conversation")
+    with pytest.raises(PiRunnerError):
+        await asyncio.to_thread(host.read, "scripts/clean.py")
 
 
 async def test_capture_sampling_reads_a_remote_input_through_the_execution_host(
@@ -187,13 +293,32 @@ node:
         assert len(json.dumps(params).encode()) < 1024 * 1024
         calls.append(method)
         if method == "execution.capabilities":
-            return {"file_read": True, "revision": True}
+            return {"file_read": True, "revision": True, "tool": True}
         if method == "execution.read":
             path = Path(params["path"])
             assert path.is_relative_to(workspace / "public_data")
+            if not path.is_file():
+                # The real file API reports a missing file as a request error.
+                raise missing_file_error(path)
             content = path.read_bytes()
             assert len(content) <= params["limit"]
             return {"content": base64.b64encode(content).decode()}
+        if method == "execution.read_many":
+            files = []
+            for raw in params["paths"]:
+                path = (workspace / raw).resolve()
+                if (
+                    not path.is_relative_to(workspace / "public_data")
+                    or not path.is_file()
+                ):
+                    files.append({"path": raw, "content": None})
+                    continue
+                content = path.read_bytes()
+                assert len(content) <= params["limit"]
+                files.append(
+                    {"path": raw, "content": base64.b64encode(content).decode()}
+                )
+            return {"files": files, "remaining": []}
         if method == "execution.resolve":
             path = (workspace / params["path"]).resolve()
             if not path.is_relative_to(workspace / "public_data"):
@@ -208,6 +333,18 @@ node:
         if method == "execution.cancel":
             os.killpg(processes[params["id"]].pid, signal.SIGTERM)
             return {"requested": True}
+        if method == "execution.tool":
+            if params["name"] == "df_submit_pipeline":
+                return {
+                    "is_error": False,
+                    "content": [{"type": "text", "text": "submitted task-1"}],
+                    "details": {"task_id": "task-1"},
+                }
+            return {
+                "is_error": True,
+                "content": [{"type": "text", "text": f"unknown tool {params['name']}"}],
+                "details": {"code": "TASK_REJECTED"},
+            }
         assert method == "execution.run"
         assert "base64" not in params["command"]
         assert "python3 -c" not in params["command"]
@@ -286,6 +423,179 @@ async def test_sdk_executes_artifacts_through_host_only(setup_workflow):
         await backend.invoke(
             "other-session", "status", {"run_id": state["id"]}, "query"
         )
+
+
+async def test_bridge_tool_calls_the_execution_plane_tool_port():
+    calls: list[tuple[str, JsonObject]] = []
+
+    async def request(method: str, payload: JsonObject) -> JsonValue:
+        calls.append((method, payload))
+        return {
+            "is_error": False,
+            "content": [
+                {"type": "text", "text": "submitted"},
+                {"type": "text", "text": "task-1"},
+            ],
+            "details": {"task_id": "task-1"},
+        }
+
+    result = await asyncio.to_thread(
+        BridgeTool(ExecutionHost(request, lambda *_: None)).call,
+        "df_submit_pipeline",
+        {"dataset": "storage/a.csv"},
+    )
+    assert result == ToolResult(False, {"task_id": "task-1"}, "submitted\ntask-1")
+    method, payload = calls[0]
+    assert method == "execution.tool"
+    assert payload["name"] == "df_submit_pipeline"
+    assert payload["arguments"] == {"dataset": "storage/a.csv"}
+    # The call id only routes signals back to this node, so it is the bridge's own.
+    assert str(payload["tool_call_id"]).startswith("genome-")
+
+    async def broken(_method: str, _payload: JsonObject) -> JsonValue:
+        return {"accepted": True}
+
+    with pytest.raises(PortError, match="invalid response"):
+        await asyncio.to_thread(
+            BridgeTool(ExecutionHost(broken, lambda *_: None)).call,
+            "df_submit_pipeline",
+            {},
+        )
+
+
+TOOL_GRAPH = """version: "gt/1.0"
+node:
+  id: pretag-sop
+  mode: sequence
+  input:
+    dataset: {type: path, from: params.dataset}
+  output:
+    submission: {type: json, compose: [submit.output.submission]}
+  verify:
+    - metric: "submission.task_id"
+  children:
+    - id: submit
+      input:
+        dataset: {type: path, from: pretag-sop.input.dataset}
+      do:
+        tool:
+          name: __TOOL__
+          args:
+            dataset: "{input.dataset}"
+            task_name: pretag
+            retries: 2
+      output:
+        submission: {type: json}
+      verify:
+        - metric: "submission.task_id"
+"""
+
+
+def write_tool_package(root: Path, asset_id: str, tool_name: str) -> Path:
+    """The package distill emits for one fixed host tool call."""
+    package = root / asset_id
+    package.mkdir()
+    (package / "manifest.json").write_text(
+        json.dumps(
+            {
+                "id": asset_id,
+                "version": "1.0.0",
+                "name": "Platform submission",
+                "description": "Submit a dataset through a host tool",
+                "parameters": {"dataset": {"type": "path"}},
+            }
+        )
+    )
+    (package / "graph.yaml").write_text(TOOL_GRAPH.replace("__TOOL__", tool_name))
+    return package
+
+
+def read_ledger(backend: AgentGenomeBackend, run_id: str) -> list[dict[str, object]]:
+    path = backend.service.root / "runs" / run_id / "ledger.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+async def test_tool_nodes_run_through_the_host_tool_port(setup_workflow, tmp_path):
+    backend, workspace, _ = setup_workflow
+    backend.service.import_asset(
+        write_tool_package(tmp_path, "pretag-submit", "df_submit_pipeline")
+    )
+    (workspace / "public_data/pretag.csv").write_text("question\nhow?\n")
+    params = {"dataset": "public_data/pretag.csv"}
+
+    async def ignore(_event):
+        pass
+
+    draft = backend.service.submit(
+        "validation", uuid4().hex, "pretag-submit", "1.0.0", params, allow_draft=True
+    )
+    replay = await backend.execute("validation", draft["id"], ignore)
+    assert replay["status"] == "succeeded", replay
+    backend.service.publish("pretag-submit", "1.0.0")
+    state = await backend.invoke(
+        "session",
+        "run",
+        {"asset_id": "pretag-submit", "version": "1.0.0", "params": params},
+        uuid4().hex,
+    )
+    result = await backend.execute("session", state["id"], ignore)
+    assert result["status"] == "succeeded", result
+    submission = result["result"]["outputs"]["submission"]
+    assert json.loads(Path(submission["execution_path"]).read_text()) == {
+        "task_id": "task-1"
+    }
+    call = next(
+        item
+        for item in read_ledger(backend, state["id"])
+        if item["event"] == "call_tool"
+    )
+    assert call["tool"] == "df_submit_pipeline"
+    assert call["is_error"] is False
+    # The graph slot carries the execution plane's own path for the parameter,
+    # not the workspace-relative string the caller submitted.
+    assert call["arguments"] == {
+        "dataset": str((workspace / "public_data/pretag.csv").resolve()),
+        "task_name": "pretag",
+        "retries": 2,
+    }
+
+
+async def test_tool_node_errors_fail_the_node_and_keep_its_artifact(
+    setup_workflow, tmp_path
+):
+    backend, workspace, _ = setup_workflow
+    backend.service.import_asset(
+        write_tool_package(tmp_path, "label-import", "df_import_labels")
+    )
+    (workspace / "public_data/pretag.csv").write_text("question\nhow?\n")
+    state = backend.service.submit(
+        "session",
+        uuid4().hex,
+        "label-import",
+        "1.0.0",
+        {"dataset": "public_data/pretag.csv"},
+        allow_draft=True,
+    )
+
+    async def ignore(_event):
+        pass
+
+    result = await backend.execute("session", state["id"], ignore)
+    assert result["status"] == "failed", result
+    assert result["result"]["failure"]["stage"] == "do"
+    call = next(
+        item
+        for item in read_ledger(backend, state["id"])
+        if item["event"] == "call_tool"
+    )
+    assert call["is_error"] is True
+    artifact = (
+        workspace
+        / "public_data/workflow-runs"
+        / state["id"]
+        / "artifacts/pretag-sop--submit.out"
+    )
+    assert json.loads(artifact.read_text()) == {"code": "TASK_REJECTED"}
 
 
 async def test_legacy_revision_needs_declarations_and_successful_run_can_be_handed_over(
@@ -536,6 +846,100 @@ async def test_distill_normalizes_a_chain_and_publishes_after_its_replay(
             "distill-3",
             "origin-turn",
         )
+    await workflows.close()
+
+
+async def test_distill_pairs_a_placeholder_write_with_a_literal_read(
+    setup_workflow,
+):
+    """The plan may spell one file two ways, and a script may name absent helpers.
+
+    The plan writes `{filtered_jsonl}` but reads the path that placeholder binds to;
+    the capture must link those as one file instead of calling the read an input the
+    plan dropped. The script also names runtime helpers that are not on disk, which a
+    real sandbox answers with a request error rather than `FileNotFoundError`.
+    """
+    backend, workspace, _ = setup_workflow
+    refs = write_capture_workspace(workspace)
+    clean = workspace / "public_data/scripts/clean.py"
+    clean.write_text(
+        CLEAN_SCRIPT + "\n# serving helpers: dataflow/serving/__init__.py, "
+        "serving/api_llm_serving_request.py\n"
+    )
+    events = []
+
+    async def publish(*event):
+        events.append(event)
+
+    workflows = ReusableWorkflows(backend, publish)
+    arguments = {
+        "label": "预打标到清洗",
+        "asset_id": "prelabel-clean-tokens",
+        "trace_refs": refs,
+        "final_artifact": "public_data/out/clean.csv",
+        "steps": [
+            {
+                "run": "python3 public_data/scripts/prelabel.py "
+                "public_data/data/raw.csv public_data/rules.json "
+                "> {filtered_jsonl}",
+                "from": "s1:1",
+            },
+            {
+                "run": "python3 public_data/scripts/clean.py "
+                "public_data/out/prelabeled.jsonl > {sft_messages}",
+                "from": "s1:2",
+            },
+        ],
+        "params": {
+            "raw": "public_data/data/raw.csv",
+            "rules": "public_data/rules.json",
+            "filtered_jsonl": "public_data/out/prelabeled.jsonl",
+            "sft_messages": "public_data/out/clean.csv",
+        },
+        "new_params": {
+            "raw": "public_data/data/raw2.csv",
+            "rules": "public_data/rules.json",
+        },
+    }
+    plan = await workflows.invoke(
+        "session", "distill", arguments, "distill-1", "origin-turn"
+    )
+    assert plan["reused"] is False
+    assert plan["run_id"]
+    distilled = plan["distilled"]
+    assert isinstance(distilled, dict)
+    assert distilled["chain"] == {
+        "checked": True,
+        "traces": ["s1", "s2"],
+        "boundaries": [],
+    }
+    params = distilled["params"]
+    assert isinstance(params, list)
+    assert [item["key"] for item in params if isinstance(item, dict)] == [
+        "raw",
+        "rules",
+    ]
+    scripts = distilled["scripts"]
+    assert isinstance(scripts, list)
+    assert [item["package"] for item in scripts if isinstance(item, dict)] == [
+        "scripts/clean.py",
+        "scripts/prelabel.py",
+    ]
+    nodes = distilled["nodes"]
+    assert isinstance(nodes, list)
+    assert [node["id"] for node in nodes if isinstance(node, dict)] == [
+        "prelabel",
+        "clean",
+    ]
+
+    workflows.release("session", "origin-turn")
+    await asyncio.wait_for(workflows.wait_idle("session"), 30)
+
+    assert [event[2] for event in events].count("operation.completed") == 1
+    capture = backend.service.captures.status(plan["capture_id"])
+    assert capture["stage"] == "published"
+    assert capture["run"]["status"] == "succeeded"
+    assert capture["generalized"] is True
     await workflows.close()
 
 

@@ -4,23 +4,74 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import shlex
 import threading
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import uuid4
 
 from agentgenome import GenomeService, RunCancelled
 from agentgenome.dispatch import invoke as invoke_genome
-from core.ports import Ports, ShellResult
-from pyromind_runtime.domain.content import JsonObject
+from core.ports import PortError, Ports, ShellResult, ToolResult
+from pyromind_runtime.domain.content import JsonObject, JsonValue
 from pyromind_runtime.ports.workflows import WorkflowEventSink
+
+from harness_adapter.pi_adapter.runner import PiRunnerError
 
 
 type Request = Callable[[str, JsonObject], Coroutine[Any, Any, Any]]
 type Subscribe = Callable[[str, WorkflowEventSink | None], None]
+
+
+def _is_missing_file(error: Exception) -> bool:
+    """Whether the execution plane answered "that file is not there".
+
+    The sandbox file API reports a missing file as a 400 request error, and only the
+    portal's own wording says which failure it was.
+    """
+    message = str(error)
+    return "FILE_READ_ERROR" in message and "No such file or directory" in message
+
+
+class BridgeTool:
+    """Run a graph's fixed tool call through the same bridge the agent's tools use.
+
+    The call travels Python → Pi runtime → adapter, so the tool executes with the
+    conversation's own context, permissions and signals instead of a second
+    implementation of the same business tool.
+    """
+
+    def __init__(self, host: ExecutionHost) -> None:
+        self.host = host
+
+    def call(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        response = self.host._call(
+            "execution.tool",
+            {
+                "name": name,
+                "arguments": arguments,
+                "tool_call_id": f"genome-{uuid4().hex}",
+            },
+        )
+        if not isinstance(response, dict) or not isinstance(
+            response.get("is_error"), bool
+        ):
+            raise PortError(
+                "tool bridge returned an invalid response", kind="bad_output"
+            )
+        details = response.get("details")
+        text = "\n".join(
+            block["text"]
+            for block in response.get("content") or []
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ).strip()
+        return ToolResult(
+            response["is_error"], details if isinstance(details, dict) else {}, text
+        )
 
 
 class ExecutionHost:
@@ -32,17 +83,37 @@ class ExecutionHost:
         self.local_root = local_root
         self.loop = asyncio.get_running_loop()
         self.cancel = threading.Event()
+        self.call_timeout = float(
+            os.getenv("PYROMIND_AGENTGENOME_CALL_TIMEOUT_SECONDS", "180")
+        )
         self.emit: Callable[[dict[str, Any]], None] = lambda _event: None
         self.root = ""
         self.verification = None
         self.model_judge = False
         self.verification_files: dict[str, str] = {}
         self._output_lock = asyncio.Lock()
+        self._reads: dict[str, bytes] = {}
+        self._missing: set[str] = set()
 
     def _call(self, method: str, payload: JsonObject) -> Any:
-        return asyncio.run_coroutine_threadsafe(
+        """One bounded bridge round trip from the genome worker thread.
+
+        The execution plane can answer a file request by retrying transports for
+        minutes, so an unbounded wait turns one wedged read into a distill that
+        never returns. Optional probes treat the timeout as "not there" and a
+        required read reports it.
+        """
+        future = asyncio.run_coroutine_threadsafe(
             self.request(method, payload), self.loop
-        ).result()
+        )
+        try:
+            return future.result(self.call_timeout)
+        except FuturesTimeoutError:
+            future.cancel()
+            raise TimeoutError(
+                f"{method} did not answer within {self.call_timeout:.0f}s; "
+                "the execution plane is unreachable or still preparing"
+            ) from None
 
     def prepare(
         self,
@@ -92,7 +163,11 @@ class ExecutionHost:
         self.verification = str(verification) if verification else None
         self.model_judge = capabilities.get("model_judge", False)
         return Ports(
-            shell=self, artifacts=self, cwd=Path(cwd), verification_cwd=verification
+            shell=self,
+            artifacts=self,
+            cwd=Path(cwd),
+            verification_cwd=verification,
+            tool=BridgeTool(self),
         ), resolved
 
     def _protect(self, run_id: str, package: Path) -> str:
@@ -203,20 +278,81 @@ class ExecutionHost:
         result = self._call("execution.read", {"path": self.path(name), "limit": 65536})
         return base64.b64decode(result["content"], validate=True).decode("utf-8")
 
+    def write_text(self, name: str, text: str) -> None:
+        self._write(self.path(name), text.encode("utf-8"))
+
     def read(self, path: str) -> bytes:
-        """Read a workspace file (exported traces) through the host file API.
+        """Read a workspace file, answering host-local exports from disk.
 
         Pi exports traces with its own file APIs next to the conversation, while the
-        execution plane can be a remote sandbox. Mirror that host-local export into
-        the execution plane so the reader and the writer address the same bytes.
+        execution plane can be a remote sandbox. Those exports are already on this
+        host, so read them here; mirroring them into the execution plane first only
+        paid a second transport for bytes the reader already holds.
         """
         export = self._local_export(path)
         if export is not None:
-            self._write(path, export.read_bytes())
-        result = self._call(
-            "execution.read", {"path": self._resolve(path, False), "limit": 262144}
-        )
-        return base64.b64decode(result["content"], validate=True)
+            return export.read_bytes()
+        if path in self._reads:
+            return self._reads[path]
+        try:
+            result = self._call(
+                "execution.read", {"path": self._resolve(path, False), "limit": 262144}
+            )
+        except PiRunnerError as error:
+            # Callers probe for optional files; keep the exception faithful to the
+            # filesystem so a probe does not have to know how the portal words it.
+            if _is_missing_file(error):
+                raise FileNotFoundError(path) from error
+            raise
+        content = base64.b64decode(result["content"], validate=True)
+        self._reads[path] = content
+        return content
+
+    def read_many(self, paths: Sequence[str]) -> dict[str, bytes | None]:
+        """Answer many workspace reads with as few bridge round trips as possible.
+
+        Freezing a chain reads every script it runs, and a chain is built twice
+        (draft and capture), so a read per file turns one slow sandbox into dozens
+        of them. Answer from what this host already read, ask for the rest in
+        batches, and report a file the plane could not read as ``None``.
+        """
+        wanted = list(dict.fromkeys(str(path) for path in paths))
+        answers: dict[str, bytes | None] = {}
+        pending: list[str] = []
+        for path in wanted:
+            export = self._local_export(path)
+            if export is not None:
+                answers[path] = export.read_bytes()
+            elif path in self._reads:
+                answers[path] = self._reads[path]
+            elif path in self._missing:
+                answers[path] = None
+            else:
+                pending.append(path)
+        while pending:
+            pending_paths: list[JsonValue] = [str(path) for path in pending]
+            result = self._call(
+                "execution.read_many", {"paths": pending_paths, "limit": 262144}
+            )
+            answered = 0
+            for item in result.get("files") or []:
+                path = item.get("path")
+                if not isinstance(path, str):
+                    continue
+                answered += 1
+                content = item.get("content")
+                if isinstance(content, str):
+                    decoded = base64.b64decode(content, validate=True)
+                    self._reads[path] = decoded
+                    answers[path] = decoded
+                else:
+                    self._missing.add(path)
+                    answers[path] = None
+            remaining = [str(path) for path in (result.get("remaining") or [])]
+            if not remaining or answered == 0:
+                break
+            pending = remaining
+        return answers
 
     def head(self, path: str, limit: int) -> bytes:
         """Read at most ``limit`` bytes from the start of a workspace file.

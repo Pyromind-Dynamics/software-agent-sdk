@@ -36,10 +36,10 @@
    Utils 契约。读取它和 [example_clean_script.py](example_clean_script.py)
    后编写字段映射；不要查看、搜索或反复读取 `cleaning_utils.py` 实现。只有用户明确
    要求维护 Skill/运行时，或平台行为与 API 契约矛盾时，才检查实现。
-2. 用 `upload_file_to_pyromind` 上传脚本，再调用 `run_dataset_cleaning`，传
+2. 把脚本写到 `storage/<dir>/<name>`，再调用 `run_dataset_cleaning`，传
    `script_path`、`input_path` 和 `limit=3`。不要自行传 `output_dir`。
    `input_path`、`script_path` 都是 Storage 根路径（以 `/` 开头），不是工作区
-   路径；工作区里的脚本必须先上传再引用。
+   路径；工作区里的脚本先落到 `storage/` 再引用。
 3. 收到通用 callback 后，从最近一次工具 Observation 取得 `run_id` 和
    `output_dir`，直接读取 `storage/<output_dir>/report.json` 和
    `output.jsonl`。

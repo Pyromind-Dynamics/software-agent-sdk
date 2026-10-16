@@ -104,6 +104,127 @@ def test_cli_direct_flags_run_without_a_config_file(workspace):
     assert not (workspace / "public_data/run.json").exists()
 
 
+def test_cli_resolves_the_layout_from_a_nested_run_package(workspace):
+    package = workspace / "public_data/workflow-runs/run-1/package"
+    (package / "scripts").mkdir(parents=True)
+    (package / "scripts/pipeline.py").write_text(
+        "import sys\nfrom pathlib import Path\n"
+        "Path(sys.argv[2]).write_text(Path(sys.argv[1]).read_text())\n"
+    )
+    source = package / "artifacts/kept.jsonl"
+    source.parent.mkdir()
+    source.write_text((workspace / "storage/input.jsonl").read_text())
+    output = workspace / "public_data/workflow-runs/run-1/artifacts/final.jsonl"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--pipeline",
+            "scripts/pipeline.py",
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--model-profile",
+            "none",
+            "--output-schema",
+            "text",
+        ],
+        cwd=package,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    envelope = json.loads(result.stdout.splitlines()[-1])
+    assert envelope["rc"] == 0 and envelope["validation_rc"] == 0
+    assert envelope["input_alias"] is None
+    assert output.read_text() == source.read_text()
+
+
+def test_cli_aliases_a_produced_artifact_for_the_dataflow_reader(workspace):
+    package = workspace / "public_data/workflow-runs/run-2/package"
+    (package / "scripts").mkdir(parents=True)
+    (package / "scripts/reader.py").write_text(
+        "import sys\nfrom pathlib import Path\n"
+        "source = Path(sys.argv[1])\n"
+        "assert source.suffix == '.jsonl', source\n"
+        "Path(sys.argv[2]).write_text(source.read_text())\n"
+    )
+    source = package / "artifacts/filtered.out"
+    source.parent.mkdir()
+    source.write_text((workspace / "storage/input.jsonl").read_text())
+    output = workspace / "public_data/workflow-runs/run-2/artifacts/answers.jsonl"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--pipeline",
+            "scripts/reader.py",
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--model-profile",
+            "none",
+            "--output-schema",
+            "text",
+        ],
+        cwd=package,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    envelope = json.loads(result.stdout.splitlines()[-1])
+    assert envelope["rc"] == 0 and envelope["validation_rc"] == 0
+    assert envelope["input_alias"]["source"] == str(source)
+    assert envelope["input_alias"]["type"] == "jsonl"
+    assert envelope["input_alias"]["path"].endswith("/filtered.jsonl")
+    assert source.read_text() == output.read_text()
+
+
+def test_cli_keeps_the_storage_whitelist_when_run_from_a_package(runtime, workspace):
+    package = workspace / "public_data/workflow-runs/run-3/package"
+    package.mkdir(parents=True)
+    outside = workspace / "project/secret.jsonl"
+    outside.parent.mkdir()
+    outside.write_text("{}\n")
+    config = {
+        "pipeline_path": str(workspace / "public_data/pipeline.py"),
+        "args": [str(outside), str(package / "out.jsonl")],
+        "model_profile": "none",
+    }
+    with pytest.raises(ValueError, match="public_data"):
+        runtime.cli_spec(config, package)
+
+
+def test_input_alias_sniffs_the_content_type(runtime, tmp_path):
+    cases = {
+        "records.jsonl": ('{"id": 1}\n{"id": 2}\n', "jsonl"),
+        "records.json": ('[\n  {"id": 1}\n]\n', "json"),
+        "table.csv": ("id,name\n1,Ada\n", "csv"),
+        "notes.txt": ("just prose\n", "txt"),
+        "empty": ("", None),
+    }
+    for name, (content, expected) in cases.items():
+        path = tmp_path / name
+        path.write_text(content)
+        assert runtime._sniff_suffix(path) == (
+            None if expected is None else f".{expected}"
+        ), name
+    assert runtime._sniff_suffix(tmp_path / "missing.out") is None
+
+
+def test_input_alias_leaves_known_types_and_directories_alone(runtime, tmp_path):
+    known = tmp_path / "records.jsonl"
+    known.write_text('{"id": 1}\n')
+    alias = tmp_path / "alias"
+    assert runtime._alias_input(known, alias) is None
+    assert runtime._alias_input(tmp_path, alias) is None
+    assert not alias.exists()
+
+
 def test_direct_flags_resolve_through_the_config_contract(
     runtime, workspace, monkeypatch
 ):

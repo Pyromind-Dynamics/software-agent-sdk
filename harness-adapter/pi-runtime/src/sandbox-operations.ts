@@ -81,8 +81,12 @@ const REQUEST_TIMEOUT_MS = 120_000;
  * request budget on every file call. Once a request has answered, later
  * requests use the full budget: a large file read may legitimately outlive
  * the probe.
+ *
+ * Kept short because the client retries this budget while the portal is
+ * unproven, and every retry is time the terminal transport could already be
+ * serving the call.
  */
-export const SANDBOX_FILE_PROBE_TIMEOUT_MS = 15_000;
+export const SANDBOX_FILE_PROBE_TIMEOUT_MS = 5_000;
 
 export class SandboxFileError extends Error {
   constructor(
@@ -282,26 +286,48 @@ export class SandboxFileClient {
 }
 
 /**
+ * How long one file API failure keeps the client on the terminal transport.
+ *
+ * A portal the runner cannot reach must not cost every call its own timeout,
+ * but one blip must not pin the whole session to the slow transport either:
+ * the terminal pays an acknowledged round trip per staging burst where the
+ * file API pays one request for the same bytes. After this cooldown the client
+ * probes the file API again and drops the fallback as soon as it answers.
+ */
+const FILE_API_RETRY_MS = 30_000;
+
+export interface FallbackSandboxFileClientOptions {
+  /** See {@link FILE_API_RETRY_MS}. */
+  retryFileApiMs?: number;
+}
+
+/**
  * File API first, terminal transport as the fallback.
  *
  * The file API is the cheap path when the runner can reach the portal: a read
  * is one HTTP request and a write is three, while the terminal transport pays
- * a command round trip for the same bytes. A portal the runner cannot reach
- * must not cost every call its own timeout, so the first transport failure
- * switches the session to the terminal transport for good.
+ * a command round trip per staging burst for the same bytes. A transport
+ * failure switches the session to the terminal transport, and the client
+ * re-probes the file API after {@link FILE_API_RETRY_MS}.
  */
 export class FallbackSandboxFileClient implements SandboxFileClientLike {
-  private terminalOnly = false;
+  private readonly retryFileApiMs: number;
+  private terminalOnlyUntil = 0;
 
   constructor(
     private readonly fileApi: SandboxFileClientLike,
     private readonly terminal: SandboxFileClientLike,
-  ) {}
+    options: FallbackSandboxFileClientOptions = {},
+  ) {
+    this.retryFileApiMs = options.retryFileApiMs ?? FILE_API_RETRY_MS;
+  }
 
   async read(path: string, limit?: number): Promise<Buffer> {
     if (this.terminalOnly) return this.terminal.read(path, limit);
     try {
-      return await this.fileApi.read(path, limit);
+      const content = await this.fileApi.read(path, limit);
+      this.recovered();
+      return content;
     } catch (error) {
       return this.fallback(error, () => this.terminal.read(path, limit));
     }
@@ -310,7 +336,8 @@ export class FallbackSandboxFileClient implements SandboxFileClientLike {
   async access(path: string): Promise<void> {
     if (this.terminalOnly) return this.terminal.access(path);
     try {
-      return await this.fileApi.access(path);
+      await this.fileApi.access(path);
+      this.recovered();
     } catch (error) {
       return this.fallback(error, () => this.terminal.access(path));
     }
@@ -319,7 +346,8 @@ export class FallbackSandboxFileClient implements SandboxFileClientLike {
   async write(path: string, content: string | Buffer, signal?: AbortSignal): Promise<void> {
     if (this.terminalOnly) return this.terminal.write(path, content, signal);
     try {
-      return await this.fileApi.write(path, content, signal);
+      await this.fileApi.write(path, content, signal);
+      this.recovered();
     } catch (error) {
       // A caller which aborted is not a portal failure: the file API reports
       // the abort as a transport error, and the terminal must not run instead.
@@ -328,9 +356,18 @@ export class FallbackSandboxFileClient implements SandboxFileClientLike {
     }
   }
 
+  /** Whether the file API is inside the cooldown one failure bought it. */
+  private get terminalOnly(): boolean {
+    return this.terminalOnlyUntil > Date.now();
+  }
+
+  private recovered(): void {
+    this.terminalOnlyUntil = 0;
+  }
+
   private async fallback<T>(error: unknown, run: () => Promise<T>): Promise<T> {
     if (!isFileApiUnavailable(error)) throw error;
-    this.terminalOnly = true;
+    this.terminalOnlyUntil = Date.now() + this.retryFileApiMs;
     return run();
   }
 }
@@ -456,12 +493,16 @@ export function createSandboxFileOperations(
     }
     return readBytes(path);
   };
+  // The read and edit tools both probe before they read, so priming the cache
+  // lets the read that follows reuse the probe's bytes instead of paying a
+  // second transport round trip for the same file.
+  const primeRead = async (path: string): Promise<void> => {
+    cached = { path, buffer: await readBytes(path) };
+  };
   return {
     read: {
       readFile: read,
-      access: async (path) => {
-        cached = { path, buffer: await readBytes(path) };
-      },
+      access: primeRead,
       detectImageMimeType: async (path) => {
         const buffer = cached?.path === path ? cached.buffer : await readBytes(path);
         cached = { path, buffer };
@@ -477,7 +518,7 @@ export function createSandboxFileOperations(
     edit: {
       readFile: read,
       writeFile: (path, content) => client.write(path, content),
-      access: (path) => client.access(path),
+      access: primeRead,
     },
   };
 }

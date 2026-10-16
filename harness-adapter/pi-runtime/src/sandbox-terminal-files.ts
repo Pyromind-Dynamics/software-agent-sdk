@@ -89,9 +89,12 @@ export class SandboxTerminalFileClient implements SandboxFileClientLike {
       `mkdir -p ${shellQuote(STAGING_DIRNAME)}; ` +
       `mkdir -p ${shellQuote(posix.dirname(path))}; : > ${quotedStaging}`,
       ...stagingLines(encoded, staging, this.chunkChars),
-      // `-A` accepts one continuous line; BSD base64 needs `-D`, so openssl is
-      // the portable decoder for both sandbox families.
-      `openssl base64 -d -A -in ${quotedStaging} -out ${quotedPath} && ` +
+      // `-A` accepts the staging file's one continuous line. openssl is the
+      // portable decoder when the image ships a working one; the platform
+      // base64 covers images that do not, where GNU takes `-d` and BSD `-D`.
+      `if ! openssl base64 -d -A -in ${quotedStaging} -out ${quotedPath} 2>/dev/null; then ` +
+      `base64 -d < ${quotedStaging} > ${quotedPath} 2>/dev/null || ` +
+      `base64 -D < ${quotedStaging} > ${quotedPath}; fi; ` +
       `[ "$(wc -c < ${quotedPath} | tr -d ' ')" = "${body.byteLength}" ] && ` +
       `rm -f ${quotedStaging}`,
     ];

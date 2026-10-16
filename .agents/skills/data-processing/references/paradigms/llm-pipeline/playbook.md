@@ -19,8 +19,8 @@
   `sandbox_sample.py` 的输入也直接写 `storage/...`。
 - `sandbox_sample.py` 只运行沙箱小样；用户确认前不得调用 `df_submit_pipeline`。
 - 平台全量输入必须已经存在于 Storage：`df_submit_pipeline` 不接受工作区路径。
-  工作区写好的 Manifest 用 `upload_file_to_pyromind` 落到图片所在的 Storage 目录
-  （见[平台全量输入](#平台全量输入)），不要用 sandbox 搬运。
+  工作区写好的 Manifest 直接写到图片所在的 Storage 目录 `storage/<dir>/`
+  （见[平台全量输入](#平台全量输入)）。
 - Sample 结果不符合预期时自行修正并重跑，迭代过程不向用户展示；只展示符合预期的结果。
 - 新链路直接生成规范 JSONL，不以 Parquet 作为正式产物。
 - 新链路优先复用 DataFlow Storage 和 Operator 编排；生成、打分、过滤、去重等已有
@@ -47,10 +47,10 @@
 - **Manifest 输入**：Manifest 必须与它引用的图片处于同一 Storage 目录树内 —— 运行时
   按 Manifest 所在目录解析其中的相对图片路径，越出该目录的路径会被拒绝。
 
-工作区写好的 Manifest 用
-`upload_file_to_pyromind(file_path=..., target_dir=<图片所在的 Storage 目录>)` 上传，
-把返回的 Storage 路径直接作为 `input_path`。源数据本来就在 Storage 时，只需要落一个
-Manifest 小文件；不要为此创建 sandbox。
+工作区写好的 Manifest 直接写到
+`storage/<图片所在的 Storage 目录>/<name>`，把对应的 Storage 根路径
+`/<图片所在的 Storage 目录>/<name>` 直接作为 `input_path`。源数据本来就在 Storage
+时，只需要落一个 Manifest 小文件；不要为此创建 sandbox。
 
 ## 执行流程
 

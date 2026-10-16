@@ -230,6 +230,17 @@ test("sandbox file reads report a mirrored miss by alias without touching the sa
   assert.deepEqual(requests, []);
 });
 
+test("an edit probe reuses its bytes for the read that follows", async () => {
+  const client = new RecordingFileClient();
+  const operations = createSandboxFileOperations(client);
+
+  await operations.edit.access("public_data/a.py");
+  const buffer = await operations.edit.readFile("public_data/a.py");
+
+  assert.equal(buffer.toString("utf8"), "from terminal");
+  assert.deepEqual(client.reads, ["public_data/a.py"]);
+});
+
 /** Terminal transport stub recording the calls the fallback client makes. */
 class RecordingFileClient implements SandboxFileClientLike {
   readonly reads: string[] = [];
@@ -288,9 +299,39 @@ test("an unreachable file API switches the session to the terminal transport", a
   assert.equal((await client.read("public_data/b.txt")).toString("utf8"), "from terminal");
 
   assert.deepEqual(terminal.reads, ["public_data/a.txt", "public_data/b.txt"]);
-  // The portal is only probed once; every later call goes straight to the
-  // terminal transport instead of paying the file API timeout again.
+  // The portal is probed once per cooldown window; calls inside it go straight
+  // to the terminal transport instead of paying the file API timeout again.
   assert.deepEqual(resolves, [{ refresh: false }, { refresh: true }]);
+});
+
+test("the file API is probed again once the fallback cooldown passes", async (t) => {
+  let attempts = 0;
+  const api = await listen((request, response) => {
+    // One file API call survives three transport failures at most: the client
+    // retries the same endpoint once, then once more on a refreshed bundle.
+    if (attempts++ < 3) {
+      request.destroy();
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "application/octet-stream" });
+    response.end("from api");
+  });
+  t.after(api.close);
+  const session = new SandboxEndpointSession(async () => endpointFor(api.baseUrl));
+  const terminal = new RecordingFileClient();
+  const client = new FallbackSandboxFileClient(
+    new SandboxFileClient(session),
+    terminal,
+    { retryFileApiMs: 0 },
+  );
+
+  assert.equal((await client.read("public_data/a.txt")).toString("utf8"), "from terminal");
+  assert.deepEqual(terminal.reads, ["public_data/a.txt"]);
+
+  // A blip must not pin the session to the slow transport: once the cooldown
+  // has passed the portal answers again and the client uses it.
+  assert.equal((await client.read("public_data/b.txt")).toString("utf8"), "from api");
+  assert.deepEqual(terminal.reads, ["public_data/a.txt"]);
 });
 
 test("an unresponsive file API is bounded by the probe budget", async (t) => {

@@ -36,6 +36,7 @@ import argparse
 import ast
 import base64
 import fcntl
+import hashlib
 import json
 import os
 import shutil
@@ -54,6 +55,12 @@ HEARTBEAT_SECONDS = 20
 LOG_TAIL_CHARS = 6000
 ENVELOPE_LINE_WIDTH = 120
 _PREFLIGHT_TIMEOUT_SECONDS = 30
+# Suffixes DataFlow's file storages can pick a reader for. A produced artifact that
+# carries any other name is aliased to the type its content actually is.
+_DATAFLOW_SUFFIXES = frozenset(
+    {".json", ".jsonl", ".csv", ".parquet", ".pickle", ".xlsx"}
+)
+_SNIFF_BYTES = 65536
 
 DATAFLOW_VERSION = "1.0.11"
 DATAFLOW_RUNTIME_PACKAGES = (
@@ -406,18 +413,46 @@ def _run_step(
     )
 
 
-def _fingerprint(python: str, script: Path, target: str) -> tuple[str | None, str]:
-    if not script.is_file():
-        return None, f"missing runtime helper {script}"
-    result = subprocess.run(
-        [python, str(script), target],
-        capture_output=True,
-        text=True,
-        timeout=600,
+def _source_digest(target: str) -> str:
+    path = Path(target)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    digest = hashlib.sha256()
+    files = (
+        [path]
+        if path.is_file()
+        else sorted(item for item in path.rglob("*") if item.is_file())
     )
-    if result.returncode != 0:
-        return None, (result.stderr or "").strip()[-2000:]
-    return (result.stdout or "").strip(), ""
+    for item in files:
+        if path.is_dir():
+            digest.update(item.relative_to(path).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+        with item.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fingerprint(python: str, script: Path, target: str) -> tuple[str | None, str]:
+    """Fingerprint the source so the run can prove it stayed read-only.
+
+    A frozen package can carry this CLI without its sibling helper, so a missing
+    helper falls back to hashing inline instead of failing the run.
+    """
+    if script.is_file():
+        result = subprocess.run(
+            [python, str(script), target],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if result.returncode != 0:
+            return None, (result.stderr or "").strip()[-2000:]
+        return (result.stdout or "").strip(), ""
+    try:
+        return _source_digest(target), ""
+    except OSError as exc:
+        return None, str(exc)
 
 
 def _read_output_records(path: str | None, limit: int = 3) -> tuple[list[Any], int]:
@@ -754,6 +789,7 @@ def _run(spec: dict[str, Any]) -> dict[str, Any]:
         interpreter=python,
         interpreter_source=detail,
         output_exists=bool(output_path) and Path(str(output_path)).is_file(),
+        input_alias=spec.get("input_alias"),
     )
 
 
@@ -822,6 +858,86 @@ def validate_cli_image_pipeline(pipeline: Path) -> None:
         )
 
 
+def _layout_root(cwd: Path) -> Path:
+    """The directory that owns ``public_data/``, for the storage whitelist.
+
+    A run started by a caller that owns the workspace runs with the workspace root
+    as its cwd. A caller replaying a frozen graph runs a package directory nested
+    inside it (``public_data/workflow-runs/<run>/package``), so the whitelist is
+    anchored at the nearest ancestor carrying ``public_data/`` instead of cwd.
+    """
+    for candidate in (cwd, *cwd.parents):
+        if (candidate / "public_data").is_dir():
+            return candidate
+    return cwd
+
+
+def _is_json_document(line: str) -> bool:
+    try:
+        json.loads(line)
+    except (json.JSONDecodeError, RecursionError):
+        return False
+    return True
+
+
+def _sniff_suffix(path: Path) -> str | None:
+    """Guess the DataFlow file type of a file whose name does not carry one."""
+    try:
+        with path.open("rb") as stream:
+            head = stream.read(_SNIFF_BYTES)
+    except OSError:
+        return None
+    text = head.decode("utf-8", "replace")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    first = lines[0]
+    if first in {"{", "["} or first.startswith("["):
+        return ".json"
+    if len(lines) > 1 and all(_is_json_document(line) for line in lines[:-1]):
+        return ".jsonl"
+    if _is_json_document(first):
+        return ".jsonl"
+    if _is_json_document(text):
+        return ".json"
+    return ".csv" if "," in first or "\t" in first else ".txt"
+
+
+def _alias_input(source: Path, directory: Path) -> dict[str, Any] | None:
+    """Expose an unknown-extension input under the type its content is.
+
+    DataFlow picks its reader from the file extension, so an artifact produced by
+    an earlier graph node (``artifacts/<node>.out``) cannot be read as-is. The
+    original file stays untouched; the pipeline is handed a link that carries the
+    sniffed suffix.
+    """
+    if not source.is_file() or source.suffix.lower() in _DATAFLOW_SUFFIXES:
+        return None
+    suffix = _sniff_suffix(source)
+    if suffix is None:
+        return None
+    directory.mkdir(parents=True, exist_ok=True)
+    alias = directory / f"{source.stem or 'input'}{suffix}"
+    for link in (os.symlink, os.link):
+        try:
+            link(source, alias)
+        except OSError:
+            continue
+        return {
+            "source": str(source),
+            "path": str(alias),
+            "type": suffix.lstrip("."),
+            "link": link.__name__,
+        }
+    shutil.copyfile(source, alias)
+    return {
+        "source": str(source),
+        "path": str(alias),
+        "type": suffix.lstrip("."),
+        "link": "copy",
+    }
+
+
 def cli_spec(config: dict[str, Any], workspace: Path) -> dict[str, Any]:
     """Resolve the public CLI contract; credentials only come from process env."""
     allowed = {
@@ -838,11 +954,12 @@ def cli_spec(config: dict[str, Any], workspace: Path) -> dict[str, Any]:
         raise ValueError(
             "unknown config fields; credentials and env must not be saved in config"
         )
-    root = workspace.resolve()
+    cwd = workspace.resolve()
+    root = _layout_root(cwd)
     public = root / "public_data"
 
     def path(value: str, output: bool = False) -> Path:
-        p = (root / value).resolve()
+        p = (cwd / value).resolve()
         storage = (root / "storage").resolve()
         if not p.is_relative_to(public) and (output or not p.is_relative_to(storage)):
             raise ValueError("paths must be in public_data/ or read-only storage/")
@@ -882,9 +999,16 @@ def cli_spec(config: dict[str, Any], workspace: Path) -> dict[str, Any]:
         and (output == source or (source.is_dir() and output.is_relative_to(source)))
     ):
         raise ValueError("output must not overwrite input")
+    state = public / ".dataflow-runs" / __import__("uuid").uuid4().hex
+    alias = _alias_input(source, state / "input") if source else None
+    if alias is not None:
+        _log(
+            f"input alias: {alias['source']} -> {alias['path']} "
+            f"(type {alias['type']}, {alias['link']})"
+        )
     normalized = list(args)
     if source:
-        normalized[0] = str(source)
+        normalized[0] = str(alias["path"]) if alias else str(source)
     if output:
         normalized[1] = str(output)
     support = (
@@ -923,7 +1047,6 @@ def cli_spec(config: dict[str, Any], workspace: Path) -> dict[str, Any]:
     timeout = config.get("timeout", 3600)
     if not isinstance(timeout, int) or not 1 <= timeout <= 7200:
         raise ValueError("timeout must be between 1 and 7200 seconds")
-    state = public / ".dataflow-runs" / __import__("uuid").uuid4().hex
     log = output.parent if output else state
     environment = {
         **environment,
@@ -949,8 +1072,11 @@ def cli_spec(config: dict[str, Any], workspace: Path) -> dict[str, Any]:
         "timeout": timeout,
         "support_file": str(support) if support else None,
         "support_dir": str(state / "support"),
-        "input_path": str(source) if source else None,
+        "input_path": str(alias["path"])
+        if alias
+        else (str(source) if source else None),
         "output_path": str(output) if output else None,
+        "input_alias": alias,
         "output_schema": schema,
         "image_root": str(source if source and source.is_dir() else source.parent)
         if source

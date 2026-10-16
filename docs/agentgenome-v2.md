@@ -2,6 +2,38 @@
 
 包依赖升级为 AgentGenome Python/npm 0.6.3，通过 vendor 安装，继续由 Pi 标准加载器加载默认入口。工具定义、节点回执、修订规则、冻结和修订记录属于 AgentGenome；Runtime 使用通用 `execute_stage` 能力关联当前会话。上层没有 Pi 类型，公开 API 与原有 SSE 事件类型不变。SQLite 仅增加表，原资产及运行记录保留。
 
+0.6.8 新增 `do: {tool}` 节点与宿主工具端口（设计见 AgentGenome 仓库 `docs/v2-capture.md` §5.12）：
+
+- graph schema 新增第四种节点形态 `do: {tool: {name, args}}`：平台提交（`df_submit_pipeline`）、Label Studio 导入建项目这类固定工具调用不再只能进 `gaps`，而是成为引擎直接执行的叶子节点，没有模型在环。`args` 里的字符串支持槽位替换，**精确等于槽位**的字符串保留 JSON 类型（路径参数仍是宿主路径），嵌在文本里的按字符串替换；
+- 内核新增 `ToolPort` / `Ports.tool`（`core/ports.py`）：引擎把填充后的参数交给宿主，把返回 JSON 写成节点 artifact（`artifacts/<node>.out`，可用 `artifact: {ext: json}` 改后缀），随后照常走 `output` / `verify`；`is_error=true` 按 `do` 阶段失败处理并保留 artifact，`danger: true` 沿用既有 gate；
+- 宿主能力位新增 `tool`：`execution.capabilities` 返回 `tool: true`，`GenomeService.check_capabilities` 按 `_requires_tool` 自动补依赖；没有工具端口的宿主在 handshake 阶段报 `E_NEEDS_PORT_ABSENT`；
+- SDK 桥接侧：`BridgeTool` 走 `execution.tool` → Pi runtime → 适配器既有的 `tool.execute` 分支，图里的固定调用与 agent 手调是同一个业务工具（同一套会话上下文、权限与信号），不另写实现；`ExecutionHost` 补上 `write_text`，tool 节点的 artifact 由此落盘；
+- `genome_distill` 的 `steps` 新增 tool 形态 `{tool, args, output, input?, from?}`：`output` 必填，`input` 必须出现在 `args` 里，`args` 里的路径自动成为该步 reads；scripts-first 政策对称化——会话里真实发生过的固定工具调用，声明成 `gaps` 或包装成 llm 节点都会被拒，只能用 tool 步骤提交。
+
+0.6.7 之后的文件通道修复（SDK 宿主适配侧）：
+
+- 宿主导出的 trace 不再镜像进沙箱：`ExecutionHost.read` / `read_many` 命中 `_local_export` 时直接读本地文件。此前每次 capture/distill 都把整份 trace（≤240 KiB）经桥接写进执行面再读回来，terminal 降级下等于 base64 后 48 行 staging、每 3584 字节一个 ACK 往返，一份 trace 就是几十秒，而且每次沉淀都重传一遍；
+- `FallbackSandboxFileClient` 的 terminal 降级改为半开恢复：一次 file API 失败只把会话切到 terminal 一段时间（`retryFileApiMs`，默认 30 秒），cooldown 过后重新探测 file API，答复即恢复。此前一次抖动就把整个会话永久钉在慢通道上；
+- terminal 写文件的解码不再依赖 `openssl`：`openssl base64 -d -A` 失败时回退到平台 `base64 -d` / `-D`。此前镜像里没有可用的 openssl 会让整条 staging 链以非零码结束（观察到的 126）。
+
+0.6.7 修复「沉淀链路」反复失败的三处契约缺口（设计见 AgentGenome 仓库 `docs/v2-capture.md` §5.6）：
+
+- 同一个文件在计划里允许两种写法：某一步写 `{filtered_jsonl}`、下一步读它绑定的字面路径（或反过来）。反向切片、产出配对（`emit._Plan.file_of`）与链路完整性校验（`distill._check_chain`）统一经 `trace.canonical_path` 归一后比较，不再把写法差异当成「缺上游步骤」或假根输入；`prepare_capture` 新增 `bindings` 参数，distill 复用 capture 时把同一份绑定传过去，否则第二次构建会漏掉切片里的上游节点、回放报「参数不匹配」；
+- `final_artifact` 与步骤产出的写法不再要求逐字一致：字面路径与 `{参数名}` 指向同一个文件即可，`_check_final_artifact` 返回计划里实际写下的那个 token，`dispatch` 用这个 token 交给 capture 切片；
+- `params` 不再要求与占位符集合完全一致：必须覆盖链路的根输入，链路中间产物的 `{参数名}` 可以一并给出（不是根输入、不进 graph 参数）；
+- 运行期同目录辅助文件探测把「读不到」当成答案而不是失败：`emit.read_many` 把任何读取失败折叠成 `None`；SDK 桥接侧 `ExecutionHost.read` 把沙箱文件接口的 `FILE_READ_ERROR`/`No such file or directory` 转成 `FileNotFoundError`，其它 runner 错误照旧抛出。此前脚本注释或字符串里提到的 `serving/api_llm_serving_request.py` 之类不存在的 sibling 会让整个 distill 以 `PiRunnerError` 崩溃；
+- 沉淀不再卡死在读取上：冻结一条链路要搬运脚本 + 同目录辅助文件，且 distill 与 capture 各构建一次包，逐文件读取把慢沙箱放大成几十次往返。AgentGenome 侧新增 `BatchSource.read_many` 批量读协议（`capture/emit.py` 的 `read_many` 帮助函数，`LocalSource` 直接实现）：脚本搬运、runtime sibling 探测按波次批量读，`distill._materialize_scripts` 的候选脚本一次批量读；SDK 桥接 `ExecutionHost.read_many` 转发 `execution.read_many` 并缓存已读文件，同一会话第二次构建零往返；Node 侧 `workflow-execution.ts` 实现 `execution.read_many`（单批上限 64 条，剩余路径分页返回）。`ExecutionHost._call` 同时改为有界等待：`PYROMIND_AGENTGENOME_CALL_TIMEOUT_SECONDS`（默认 180 秒）超时即报错，单次读取打滑不再让整个 distill 无限挂起；`execution.run` 不设上限，命令本身仍可长时间执行；
+- 插件 prompt（系统提示词与 `genome_distill` 描述）同步：产出必须显式声明（`>`、`--out`、`--output` 之类），位置参数 `python3 脚本.py 输入 产出` 一律按输入识别；`params` 覆盖根输入即可，中间占位符可一并给出。
+
+0.6.6 把「固定命令伪装成 llm 节点」的后门机械堵上，并给图产物补上类型后缀（设计见 AgentGenome 仓库 `docs/v2-capture.md` §5.11）：
+
+- 固化策略 `policy` 新增到 `genome_distill` / `genome_capture`，默认 `scripts-first`：llm 节点必须带 `from` 指向会话里真正来源的步骤，`from` 缺失、不在轨迹里、或来源是固定命令/人工门禁/编辑写入都会直接报错并列出可选的会话步骤；把固定命令声明成 `gaps` 同样被拒绝。`adaptive-first` 显式信任 agent 的判断，保留 0.6.5 及以前的行为；
+- 蒸馏报告新增「固化策略」一行，payload 带回 `policy` 字段；
+- graph 叶子节点可声明 `artifact: {ext: jsonl}`，引擎按声明后缀命名产物（此前统一命名 `.out`，DataFlow 的 `LazyFileStorage` 按扩展名推断类型时直接报 `Unsupported file type`）；`emit` 从会话里该步骤真实产出的路径推断后缀，agent 不声明也不会丢类型；
+- 搬运脚本时，脚本按文件名调用的同目录辅助文件（`.py`/`.sh`）传递性一起进包、文件名不变（`capture/emit.py`，上限 32 个）。技能 CLI 不是单文件：`sandbox_sample.py` 依赖同目录的 `source_fingerprint.py`、`validate_prepared_data.py`、`generate_report.py`，并把自身目录放进 `PYTHONPATH` 供 pipeline 导入 `df_logging`；只冻结 CLI 会让包在复用时报缺 helper；
+- 配套的 SDK 侧修复（不属于插件本体）：`sandbox_sample.py` 支持在 `public_data/workflow-runs/<run>/package` 这类嵌套 cwd 下执行，白名单锚点改为向上查找最近的 `public_data/`；未知扩展名的输入先嗅探类型（json/jsonl/csv/txt）并在状态目录建别名（symlink→hardlink→copy，原文件不动），DataFlow 按别名扩展名读取。
+- 另一处 SDK 侧修复：`sandbox_sample.py` 的源文件指纹在缺少同目录 `source_fingerprint.py`（冻结包场景）时内联计算，不再让整条 pipeline 失败。
+
 0.6.5 把「llm 节点必须保留原始执行方式」变成默认蒸馏行为（设计见 AgentGenome 仓库 `docs/v2-capture.md` §5.10）：
 
 - llm 节点的提示词除原样包含声明路径外，还必须点名这一步原本由哪个 skill、以什么命令形态执行（脚本、`--pipeline`、模型 profile 等）。此前提示词只承载任务目标，回放的 agent 会绕开 skill 现场硬做，链路看似跑通但没沿原路径；

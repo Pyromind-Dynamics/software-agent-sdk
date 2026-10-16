@@ -55,9 +55,9 @@ test("sandbox paths map the storage alias to the mounted Storage root", () => {
     policy().resolvePath("storage/datasets/train.jsonl", "read"),
     `${STORAGE}/datasets/train.jsonl`,
   );
-  assert.throws(
-    () => policy().resolvePath("storage/datasets/out.json", "write"),
-    /PATH_SCOPE_ERROR/,
+  assert.equal(
+    policy().resolvePath("storage/datasets/out.json", "write"),
+    `${STORAGE}/datasets/out.json`,
   );
   assert.throws(
     () => policy({ storageRoot: undefined }).resolvePath("storage/datasets/train.jsonl", "read"),
@@ -72,7 +72,6 @@ test("sandbox paths reject writes outside public_data", () => {
     `${WORKSPACE}/pi/session.jsonl`,
     "/etc/passwd",
     "knowledge/handbook.md",
-    "storage/datasets/out.json",
   ]) {
     assert.throws(
       () => policy().resolvePath(target, "write"),

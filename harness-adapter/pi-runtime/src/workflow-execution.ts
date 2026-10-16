@@ -30,6 +30,7 @@ export class WorkflowExecution {
       file_read: !!this.access.readFile,
       revision: !!this.access.readFile,
       model_judge: !!this.access.protectedRoot && !!this.modelJudge,
+      tool: true,
     };
     if (method === "execution.protect") {
       const { run_id, files } = params;
@@ -54,6 +55,27 @@ export class WorkflowExecution {
       if (content.length > limit) throw new Error("file exceeds size limit");
       return { content: content.toString("base64") };
     }
+    if (method === "execution.read_many") {
+      if (!this.access.readFile || !Array.isArray(params.paths)) throw new Error("file reading is unavailable");
+      const limit = params.limit;
+      if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 262144) throw new Error("invalid file size limit");
+      const files: Array<{ path: string; content: string | null }> = [];
+      const remaining: string[] = [];
+      for (const [index, entry] of params.paths.entries()) {
+        if (typeof entry !== "string") throw new Error("file path is required");
+        // Keep one batch inside a single bridge round trip while still letting the
+        // caller page through long plans.
+        if (index >= 64) { remaining.push(entry); continue; }
+        try {
+          const path = await this.access.resolvePath(entry, "read");
+          const content = await this.access.readFile(path, limit);
+          files.push({ path: entry, content: content.length > limit ? null : content.toString("base64") });
+        } catch {
+          files.push({ path: entry, content: null });
+        }
+      }
+      return { files, remaining };
+    }
     if (method === "execution.resolve") {
       if (typeof params.path !== "string") throw new Error("path is required");
       return { path: await this.access.resolvePath(params.path, params.write === true ? "write" : "read") };
@@ -65,6 +87,24 @@ export class WorkflowExecution {
       const path = await this.access.resolvePath(params.path, "write");
       await this.access.writeFile(path, Buffer.from(params.content, "base64"));
       return { path };
+    }
+    if (method === "execution.tool") {
+      // A graph's fixed tool call is the same business tool the agent calls, so it
+      // goes back through the adapter's tool port instead of a second implementation.
+      const { name, arguments: toolArguments, tool_call_id } = params;
+      if (typeof name !== "string" || !toolArguments || typeof toolArguments !== "object"
+          || Array.isArray(toolArguments)) {
+        throw new Error("tool name and arguments are required");
+      }
+      const response = await this.peer.request("tool.execute", {
+        tool_name: name,
+        arguments: toolArguments as JsonObject,
+        ...(typeof tool_call_id === "string" ? { tool_call_id } : {}),
+      });
+      if (!response || typeof response !== "object" || Array.isArray(response)) {
+        throw new Error("invalid Python tool response");
+      }
+      return response as JsonValue;
     }
     const id = params.id;
     if (typeof id !== "string") throw new Error("execution id is required");

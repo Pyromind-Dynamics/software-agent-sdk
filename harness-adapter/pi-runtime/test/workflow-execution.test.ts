@@ -3,6 +3,7 @@ import test from "node:test";
 import { PassThrough } from "node:stream";
 import { WorkflowExecution } from "../src/workflow-execution.js";
 import { JsonlRpcPeer } from "../src/rpc-peer.js";
+import type { JsonObject, JsonValue } from "../src/protocol.js";
 import { SandboxTerminalExecutionError } from "../src/sandbox-terminal.js";
 
 function peer() { return new JsonlRpcPeer(new PassThrough(), new PassThrough()); }
@@ -111,6 +112,38 @@ test("verification files use a protected host directory and independent bounded 
   await assert.rejects(execution.handle("execution.protect", {run_id:runId,files:[{path:"../escape",content:""}]}), /protected path/);
 });
 
+test("batched reads answer every path, report missing files, and page long lists", async () => {
+  const files = new Map<string, Buffer>([["/session/scripts/a.py", Buffer.from("assert True")]]);
+  const execution = new WorkflowExecution({
+    cwd: "/session",
+    resolvePath: async (path) => `/session/${path}`,
+    readFile: async (path) => {
+      const content = files.get(path);
+      if (!content) throw new Error("FILE_READ_ERROR");
+      return content;
+    },
+    writeFile: async () => {},
+    operations: { async exec() { assert.fail("batched reads must not use terminal"); } },
+  }, peer());
+  const result = await execution.handle("execution.read_many",
+    { paths: ["scripts/a.py", "scripts/ghost.py"], limit: 32 }) as
+    { files: Array<{ path: string; content: string | null }>; remaining: string[] };
+  assert.deepEqual(result, {
+    files: [
+      { path: "scripts/a.py", content: Buffer.from("assert True").toString("base64") },
+      { path: "scripts/ghost.py", content: null },
+    ],
+    remaining: [],
+  });
+  const many = Array.from({ length: 65 }, (_, index) => `scripts/f${index}.py`);
+  const paged = await execution.handle("execution.read_many", { paths: many, limit: 32 }) as
+    { files: unknown[]; remaining: string[] };
+  assert.equal(paged.files.length, 64);
+  assert.deepEqual(paged.remaining, ["scripts/f64.py"]);
+  await assert.rejects(execution.handle("execution.read_many",
+    { paths: ["scripts/a.py"], limit: 0 }), /invalid file size limit/);
+});
+
 
 test("capability discovery reports stages, revisions and protection independently", async () => {
   for (const readFile of [undefined, async () => Buffer.from("script")]) {
@@ -121,7 +154,43 @@ test("capability discovery reports stages, revisions and protection independentl
     }, peer());
     assert.deepEqual(await execution.handle("execution.capabilities", {}), {
       agent_task: true, revision: !!readFile, file_read: !!readFile,
-      protected_verification: false, model_judge: false,
+      protected_verification: false, model_judge: false, tool: true,
     });
   }
+});
+
+test("a graph's fixed tool call runs through the adapter tool port, never the terminal", async () => {
+  const calls: Array<[string, JsonObject]> = [];
+  const answer: JsonObject = {
+    is_error: false,
+    content: [{ type: "text", text: "submitted" }],
+    details: { task_id: "task-1" },
+  };
+  const peer = {
+    request: async (method: string, params: JsonObject): Promise<JsonValue> => {
+      calls.push([method, params]);
+      return answer;
+    },
+  } as unknown as JsonlRpcPeer;
+  const execution = new WorkflowExecution({
+    cwd: "/session", writeFile: async () => {},
+    resolvePath: async (path) => path,
+    operations: { async exec() { assert.fail("tool calls must not use the terminal"); } },
+  }, peer);
+  assert.deepEqual(await execution.handle("execution.tool", {
+    name: "df_submit_pipeline", arguments: { dataset: "/storage/a.csv" },
+    tool_call_id: "genome-1",
+  }), answer);
+  assert.deepEqual(calls, [["tool.execute", {
+    tool_name: "df_submit_pipeline", arguments: { dataset: "/storage/a.csv" },
+    tool_call_id: "genome-1",
+  }]]);
+  // The tool call id only exists so the adapter can correlate signals; a caller
+  // without one must not send an empty string.
+  await execution.handle("execution.tool", { name: "df_get_task", arguments: {} });
+  assert.deepEqual(calls[1], ["tool.execute", { tool_name: "df_get_task", arguments: {} }]);
+  await assert.rejects(execution.handle("execution.tool", { name: "df_get_task" }),
+    /tool name and arguments are required/);
+  await assert.rejects(execution.handle("execution.tool", { name: "", arguments: [] }),
+    /tool name and arguments are required/);
 });
