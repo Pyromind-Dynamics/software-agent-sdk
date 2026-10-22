@@ -209,6 +209,14 @@ async function createSandboxTools(
     scriptChunkChars,
     ...options.terminalTimeouts,
   });
+  // The graph executes in the same sandbox but on its own channel: a long `run`
+  // node (or a workflow shell command) must not queue the terminal the agent is
+  // using, which is exactly how a chat turn used to look frozen.
+  const executionOperations = new LazySandboxTerminalOperations(endpoints, {
+    connect: options.terminalConnect,
+    scriptChunkChars,
+    ...options.terminalTimeouts,
+  });
   const fileClient = new FallbackSandboxFileClient(
     new SandboxFileClient(endpoints, { probeTimeoutMs: SANDBOX_FILE_PROBE_TIMEOUT_MS }),
     new SandboxTerminalFileClient(terminalOperations, { chunkChars: scriptChunkChars }),
@@ -251,7 +259,7 @@ async function createSandboxTools(
       access: async (path) => fileOperations.edit.access(path),
     },
   });
-  options.onExecutionReady?.({ operations: terminalOperations, cwd: sandboxCwd,
+  options.onExecutionReady?.({ operations: executionOperations, cwd: sandboxCwd,
     env: options.terminalEnvironment,
     writeFile: (path, content) => fileClient.write(path, content),
     readFile: (path, limit) => fileClient.read(path, limit),

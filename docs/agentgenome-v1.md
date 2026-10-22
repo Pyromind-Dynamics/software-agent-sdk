@@ -31,7 +31,7 @@ Storage 输入须保留 `storage/` 前缀，例如 `storage/agentTest/input.csv`
 
 模板会复制到 `workspace/.pyromind-agent/agentgenome/assets/data-cleaning/1.0.0/`，验收后发布；测试输入和产物在 `workspace/genome-validation/`。重复测试创建新运行，不能用不同内容覆盖已发布版本。测试固定使用本地 `os-sandbox`；真实平台沙箱需在聊天中另测。
 
-资产目录可通过 `AGENTGENOME_HOME` 配置，默认取 `OH_CONVERSATIONS_PATH` 同级的 `.pyromind-agent/agentgenome` 目录。在平台上该路径落在用户 Storage 挂载内（pod 的 `/workspace/.pyromind-agent/agentgenome`），沙箱内同一棵树在 `/target-workspace/.pyromind-agent/agentgenome`，所以 agent 既能用 `genome_*` 工具，也能直接读冻结包里的 `references/`。一份目录只能由一个 SDK 执行进程持有。非相邻仓库可配置 `AGENTGENOME_DIR`（SDK 入口）或 `SOFTWARE_AGENT_SDK_DIR`（AgentGenome 入口）。
+资产目录可通过 `AGENTGENOME_HOME` 配置，默认取 `OH_CONVERSATIONS_PATH` 同级的 `.pyromind-agent/agentgenome` 目录。在平台上该路径落在用户 Storage 挂载内（pod 的 `/workspace/.pyromind-agent/agentgenome`），沙箱内同一棵树在 `/target-workspace/.pyromind-agent/agentgenome`，所以 agent 既能用 `genome_*` 工具，也能直接读冻结包里的脚本与 `graph.yaml`。一份目录只能由一个 SDK 执行进程持有。非相邻仓库可配置 `AGENTGENOME_DIR`（SDK 入口）或 `SOFTWARE_AGENT_SDK_DIR`（AgentGenome 入口）。
 
 启动服务时，执行后端仍由 `PYROMIND_PI_TERMINAL_BACKEND` 决定。无启动选项时插件默认关闭，也可设置 `PYROMIND_AGENTGENOME_ENABLED=1` 启用。Python wheel 和 Pi 扩展 npm tarball 随 SDK 锁定；修改 AgentGenome 源码后需按下文重新打包，启动脚本不会跨仓库加载源码。
 
@@ -46,14 +46,14 @@ Storage 输入须保留 `storage/` 前缀，例如 `storage/agentTest/input.csv`
 在实际会话中，Pi 可通过以下工具使用资产：
 
 - `genome_list`：所有 latest 已发布包的简介。
-- `genome_get`：指定包版本的参数、产物说明、适用性（applies_when / input_contract）、gaps 与 references。
+- `genome_get`：指定包版本的参数、产物说明、适用性（applies_when / input_contract）与沉淀时的输入采样。
 - `genome_run`：传入 `asset_id`、`version`、`params`，立即返回运行 ID。
 - `genome_status` / `genome_cancel`：查询或取消本会话运行。
 - `genome_trace` / `genome_capture` / `genome_capture_status`：用户明说「沉淀一下」时，从会话轨迹沉淀历史经验；回放验证在后台跑，结论自动回到会话。
 - `genome_distill`：链路里含内联代码或只读探测、命令本身不干净时，由 agent 先把脚本落盘并把输入产出写到命令行上，再提交规范化链路（支持 `{参数名}` + `params` 绑定，并可按 `source_traces` 校验链路完整性）。
-- `genome_read_reference`：按需读取历史经验声明的文件 reference。
+- `genome_resume`：run 停在人工节点（Label Studio 复核这类）时，用户做完人工步骤后唤醒同一条 run。
 
-历史经验的沉淀与复用是两层的：泛化资产描述一类任务，其 `references` 用 `asset_id` 指向真正跑过的具体 case 资产（完整链路，自带 `applies_when` / `input_contract` / `input_mapping`）。复用先匹配具体 case，命中直接 `genome_run`；都不命中才退到泛化资产，按 `gaps` / 文件 reference 补做 LLM 或人工步骤。完整设计见 AgentGenome 仓库的 `docs/v2-capture.md`。
+历史经验只收完整固化的链路：每条经验都是一个能重跑的 graph，步骤形态只有固定命令（`run`）、宿主工具调用（`tool`）、agent 裁量（`llm`）和人工门禁（`human`）四种。固不下来的步骤不会被声明进 manifest 蒙混过关，沉淀直接失败并列出原因。适用范围靠 `applies_when` / `not_applies_when` / `input_contract` 声明，不靠把具体步骤泛化成描述。完整设计见 AgentGenome 仓库的 `docs/v2-capture.md`。
 
 路径参数使用当前会话可访问的路径，如 `public_data/input.csv`；平台 sandbox 后端也支持 `storage/...`。不能传服务端任意路径。图启动前会冻结版本并校验参数，Pi 本轮结束后才开始运行。
 

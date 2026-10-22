@@ -37,7 +37,9 @@ class LabelStudioProjectAction(Action):
             "User storage path. Required for operation='create'. A directory of "
             "sample directories for the directory adapters, or one JSON Lines "
             "object for adapter='jsonl' -- a pipeline's own output file is "
-            "imported as written, without being reshaped first."
+            "imported as written, without being reshaped first. A Genome run's "
+            "public_data/workflow-runs/<run-id>/artifacts/*.out JSONL artifact is "
+            "staged into this conversation's Storage before import."
         ),
     )
     label_config_path: str | None = Field(

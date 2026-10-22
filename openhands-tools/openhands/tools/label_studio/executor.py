@@ -191,7 +191,10 @@ class LabelStudioProjectExecutor(
         if not action.label_config_path:
             raise ValueError("label_config_path is required for operation='create'.")
 
-        dataset_path = _normalize_storage_path(action.dataset_path, "dataset_path")
+        dataset_path = self._dataset_storage_path(
+            action.adapter, action.dataset_path, conversation
+        )
+        dataset_path = _normalize_storage_path(dataset_path, "dataset_path")
         xml_content = self._read_workspace_file(action.label_config_path, conversation)
         if xml_content is None:
             raise ValueError(
@@ -374,6 +377,54 @@ class LabelStudioProjectExecutor(
                 f"invalid field map {action.field_map_path}: {exc}"
             ) from exc
         return field_map, field_map_digest(field_map)
+
+    def _dataset_storage_path(
+        self,
+        adapter: str,
+        dataset_path: str,
+        conversation: BaseConversation | None,
+    ) -> str:
+        """Stage a Genome run artifact before a Storage-only adapter consumes it.
+
+        `label_studio_project` imports datasets from Pyromind Storage, while a
+        preceding Genome node writes into the isolated conversation workspace.
+        For the explicit JSONL run-artifact shape, copy the bounded file into this
+        conversation's Storage namespace and pass that real object path downstream.
+        Ordinary user-supplied Storage paths keep their existing behavior.
+        """
+        relative = PurePosixPath(dataset_path)
+        parts = relative.parts
+        if (
+            adapter != "jsonl"
+            or relative.is_absolute()
+            or ".." in parts
+            or len(parts) != 5
+            or parts[:2] != ("public_data", "workflow-runs")
+            or len(parts[2]) != 32
+            or any(character not in "0123456789abcdef" for character in parts[2])
+            or parts[3] != "artifacts"
+            or not parts[4].endswith(".out")
+        ):
+            return dataset_path
+        if conversation is None:
+            raise ValueError(
+                "A Genome-generated JSONL dataset needs an active conversation."
+            )
+        content = self._read_workspace_file(
+            dataset_path, conversation, max_bytes=DATASET_FILE_MAX_BYTES
+        )
+        if content is None:
+            raise ValueError(
+                f"Genome-generated dataset is missing or exceeds "
+                f"{DATASET_FILE_MAX_BYTES} bytes: {dataset_path}"
+            )
+        digest = hashlib.sha256(content).hexdigest()
+        storage_path = (
+            f"{PYROMIND_AGENT_STORAGE_ROOT}/{conversation.id}/genome-inputs/"
+            f"{parts[2]}/{digest}.jsonl"
+        )
+        self._upload_to_storage(storage_path, content, conversation)
+        return storage_path
 
     def _read_dataset_file(
         self,
@@ -916,7 +967,11 @@ class LabelStudioProjectExecutor(
         return headers
 
     def _read_workspace_file(
-        self, relative_path: str, conversation: BaseConversation | None
+        self,
+        relative_path: str,
+        conversation: BaseConversation | None,
+        *,
+        max_bytes: int | None = None,
     ) -> bytes | None:
         if conversation is None:
             return None
@@ -924,11 +979,17 @@ class LabelStudioProjectExecutor(
         if is_remote_workspace(workspace):
             try:
                 with staged_remote_path(workspace, relative_path) as staged:
-                    return staged.read_bytes() if staged.is_file() else None
+                    if not staged.is_file():
+                        return None
+                    if max_bytes is not None and staged.stat().st_size > max_bytes:
+                        return None
+                    return staged.read_bytes()
             except WorkspaceStagingError:
                 return None
         file_path = Path(workspace.working_dir) / relative_path
         if not file_path.is_file():
+            return None
+        if max_bytes is not None and file_path.stat().st_size > max_bytes:
             return None
         return file_path.read_bytes()
 

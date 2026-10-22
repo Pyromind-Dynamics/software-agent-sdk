@@ -1032,7 +1032,9 @@ class PiAdapter:
                 raise ValueError("invalid workflow request")
             inflight = session.files.load_inflight() or {}
             origin = inflight.get("run_id")
-            if action in {"run", "capture", "distill"} and not isinstance(origin, str):
+            if action in {"run", "capture", "confirm_distill"} and not isinstance(
+                origin, str
+            ):
                 raise ValueError("workflow start requires an active originating turn")
             return await self._workflow_call(
                 session.session_id,
@@ -1072,6 +1074,14 @@ class PiAdapter:
             )
             self._emit_tool_signals(session, tool_name, result)
             return result
+        if method == "tool.cancel":
+            tool_call_id = params.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+                raise ValueError("tool_call_id must be a non-empty string")
+            return self._business_tools.cancel_call(
+                session.session_id,
+                tool_call_id,
+            )
         if method == "permission.cancel":
             pending = session.pending_permission
             if (

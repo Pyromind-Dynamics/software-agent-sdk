@@ -6,6 +6,13 @@ import type { JsonObject, JsonValue } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
 import { SandboxTerminalExecutionError, type TerminalExecutionEvidence } from "./sandbox-terminal.js";
 
+// One execution.read answers at most this many bytes; the base64 reply still
+// fits the 1 MiB frame limit (512 KiB encodes to ~683 KiB).
+export const MAX_READ_BYTES = 512 * 1024;
+// read_many packs many files into one reply, so the batch also carries a byte
+// budget: files past it page into `remaining` instead of overflowing the frame.
+export const READ_BATCH_BUDGET_BYTES = 768 * 1024;
+
 export interface ExecutionAccess {
   operations: BashOperations;
   readFile?(path: string, limit: number): Promise<Buffer>;
@@ -50,7 +57,7 @@ export class WorkflowExecution {
     if (method === "execution.read") {
       if (!this.access.readFile || typeof params.path !== "string") throw new Error("file reading is unavailable");
       const limit = params.limit;
-      if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 262144) throw new Error("invalid file size limit");
+      if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > MAX_READ_BYTES) throw new Error("invalid file size limit");
       const path = await this.access.resolvePath(params.path, "read");
       const content = await this.access.readFile(path, limit);
       if (content.length > limit) throw new Error("file exceeds size limit");
@@ -59,18 +66,23 @@ export class WorkflowExecution {
     if (method === "execution.read_many") {
       if (!this.access.readFile || !Array.isArray(params.paths)) throw new Error("file reading is unavailable");
       const limit = params.limit;
-      if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 262144) throw new Error("invalid file size limit");
+      if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > MAX_READ_BYTES) throw new Error("invalid file size limit");
       const files: Array<{ path: string; content: string | null }> = [];
       const remaining: string[] = [];
+      let budget = READ_BATCH_BUDGET_BYTES;
       for (const [index, entry] of params.paths.entries()) {
         if (typeof entry !== "string") throw new Error("file path is required");
-        // Keep one batch inside a single bridge round trip while still letting the
-        // caller page through long plans.
-        if (index >= 64) { remaining.push(entry); continue; }
+        // Keep one batch inside a single bridge round trip (entry count and byte
+        // budget) while still letting the caller page through long plans.
+        if (index >= 64 || budget <= 0) { remaining.push(entry); continue; }
         try {
           const path = await this.access.resolvePath(entry, "read");
           const content = await this.access.readFile(path, limit);
-          files.push({ path: entry, content: content.length > limit ? null : content.toString("base64") });
+          if (content.length > limit) { files.push({ path: entry, content: null }); continue; }
+          const encoded = content.toString("base64");
+          if (encoded.length > budget) { remaining.push(entry); continue; }
+          budget -= encoded.length;
+          files.push({ path: entry, content: encoded });
         } catch {
           files.push({ path: entry, content: null });
         }
@@ -104,6 +116,19 @@ export class WorkflowExecution {
       });
       if (!response || typeof response !== "object" || Array.isArray(response)) {
         throw new Error("invalid Python tool response");
+      }
+      return response as JsonValue;
+    }
+    if (method === "execution.cancel_tool") {
+      const toolCallId = params.tool_call_id;
+      if (typeof toolCallId !== "string" || !toolCallId.trim()) {
+        throw new Error("tool call id is required");
+      }
+      const response = await this.peer.request("tool.cancel", {
+        tool_call_id: toolCallId,
+      });
+      if (!response || typeof response !== "object" || Array.isArray(response)) {
+        throw new Error("invalid Python cancellation response");
       }
       return response as JsonValue;
     }

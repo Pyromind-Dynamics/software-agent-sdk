@@ -32,6 +32,7 @@ from openhands.tools.workflow.analyze_task_failure import (
     PRE_API_BASE,
     PROD_API_BASE,
     USER_AGENT,
+    task_state,
 )
 
 
@@ -828,3 +829,19 @@ def test_tool_is_registered_and_creates_executor():
 def test_create_rejects_unknown_params():
     with pytest.raises(ValueError, match="unknown params"):
         AnalyzeTaskFailureTool.create(bogus_param=1)
+
+
+def test_task_state_recognises_success_positively() -> None:
+    """`Running` must not pass as done.
+
+    The failure check answers "not failed", which is also true of a running task.
+    A waiting step needs a positive success marker, or it reads an empty product.
+    """
+    assert task_state("Success") == "succeeded"
+    assert task_state("SUCCEEDED") == "succeeded"
+    assert task_state("completed") == "succeeded"
+    assert task_state("Running") == "running"
+    assert task_state("Pending") == "running"
+    assert task_state("Failed") == "failed"
+    assert task_state("Error") == "failed"
+    assert task_state(None) == "unknown"

@@ -66,6 +66,118 @@ def executor() -> LabelStudioProjectExecutor:
     )
 
 
+def test_genome_jsonl_artifact_is_staged_to_storage_before_import(
+    executor: LabelStudioProjectExecutor,
+    conversation: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Genome artifacts live in public_data, but Label Studio reads Storage."""
+    run_id = "a" * 32
+    relative = f"public_data/workflow-runs/{run_id}/artifacts/add-verdict.out"
+    artifact = tmp_path / relative
+    artifact.parent.mkdir(parents=True)
+    content = b'{"images":["/datasets/pcb/a.bmp"],"quality":"defect"}' + b"\n"
+    artifact.write_bytes(content)
+    uploaded: list[tuple[str, bytes]] = []
+    monkeypatch.setattr(
+        executor,
+        "_upload_to_storage",
+        lambda path, data, _conversation: uploaded.append((path, data)),
+    )
+
+    storage_path = executor._dataset_storage_path("jsonl", relative, conversation)
+
+    assert storage_path.startswith(
+        "/.pyromind-agent/test-conversation-id/genome-inputs/"
+    )
+    assert storage_path.endswith(".jsonl")
+    assert uploaded == [(storage_path, content)]
+    assert (
+        executor._dataset_storage_path("jsonl", "/datasets/user.jsonl", conversation)
+        == "/datasets/user.jsonl"
+    )
+
+
+def test_create_imports_a_genome_artifact_from_its_staged_storage_object(
+    executor: LabelStudioProjectExecutor,
+    conversation: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_id = "c" * 32
+    relative = f"public_data/workflow-runs/{run_id}/artifacts/add-verdict.out"
+    artifact = tmp_path / relative
+    artifact.parent.mkdir(parents=True)
+    content = b'{"quality":"defect"}' + b"\n"
+    artifact.write_bytes(content)
+    uploaded: list[tuple[str, bytes]] = []
+    read_datasets: list[str] = []
+    monkeypatch.setattr(
+        executor,
+        "_upload_to_storage",
+        lambda path, data, _conversation: uploaded.append((path, data)),
+    )
+    monkeypatch.setattr(
+        executor, "_resolve_field_map", lambda *_: (MagicMock(), "field-hash")
+    )
+    monkeypatch.setattr(executor, "_validate_with_label_studio", lambda *_: None)
+    monkeypatch.setattr(
+        executor,
+        "_read_dataset_file",
+        lambda _adapter, path, _conversation: read_datasets.append(path) or content,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_load_state",
+        lambda project_ref, _conversation: ProjectState(
+            project_ref=project_ref,
+            project_id=42,
+            dataset_path=read_datasets[0],
+            adapter="jsonl",
+            status="READY",
+            total_tasks=1,
+            imported_count=1,
+        ),
+    )
+
+    observation = executor(
+        _action(
+            operation="create",
+            adapter="jsonl",
+            dataset_path=relative,
+            label_config_path="label_config.xml",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error
+    assert len(read_datasets) == 1
+    assert read_datasets[0].startswith(
+        "/.pyromind-agent/test-conversation-id/genome-inputs/"
+    )
+    assert uploaded == [(read_datasets[0], content)]
+
+
+def test_genome_jsonl_artifact_staging_rejects_oversized_files(
+    executor: LabelStudioProjectExecutor,
+    conversation: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "b" * 32
+    relative = f"public_data/workflow-runs/{run_id}/artifacts/add-verdict.out"
+    artifact = tmp_path / relative
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"too large")
+    monkeypatch.setattr(
+        "openhands.tools.label_studio.executor.DATASET_FILE_MAX_BYTES", 4
+    )
+
+    with pytest.raises(ValueError, match="missing or exceeds 4 bytes"):
+        executor._dataset_storage_path("jsonl", relative, conversation)
+
+
 def test_read_workspace_file_stages_remote_workspace_file(
     executor: LabelStudioProjectExecutor,
     sandbox_workspace,

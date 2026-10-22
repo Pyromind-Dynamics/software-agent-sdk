@@ -1304,6 +1304,40 @@ def _tool_context(tmp_path: Path, conversation_id: str) -> ToolExecutionContext:
     )
 
 
+def test_business_tool_cancel_only_interrupts_the_matching_call() -> None:
+    host = _business_tool_host()
+    interrupted: list[str] = []
+    host._active_executors[("conversation-1", "call-1")] = SimpleNamespace(
+        interrupt=lambda: interrupted.append("call-1") or True
+    )
+    host._active_executors[("conversation-1", "call-2")] = SimpleNamespace(
+        interrupt=lambda: interrupted.append("call-2") or True
+    )
+    host._active_executors[("conversation-2", "call-1")] = SimpleNamespace(
+        interrupt=lambda: interrupted.append("other-conversation") or True
+    )
+
+    result = host.cancel_call("conversation-1", "call-1")
+    assert result["requested"] is True
+    assert result["confirmed"] is True
+    assert interrupted == ["call-1"]
+
+    host._active_executors[("conversation-1", "call-1")] = SimpleNamespace(
+        interrupt=lambda: interrupted.append("unconfirmed") or None
+    )
+    result = host.cancel_call("conversation-1", "call-1")
+    assert result["requested"] is True
+    assert result["confirmed"] is False
+    assert result["detail"] == (
+        "tool call interrupt requested; termination is unconfirmed"
+    )
+    assert interrupted == ["call-1", "unconfirmed"]
+
+    missing = host.cancel_call("conversation-2", "call-2")
+    assert missing["requested"] is False
+    assert missing["confirmed"] is False
+
+
 async def test_business_tool_host_rejects_invalid_output_policy_during_call(
     tmp_path: Path,
 ) -> None:

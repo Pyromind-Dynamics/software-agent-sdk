@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { PassThrough } from "node:stream";
-import { WorkflowExecution } from "../src/workflow-execution.js";
+import { MAX_READ_BYTES, WorkflowExecution } from "../src/workflow-execution.js";
 import { JsonlRpcPeer } from "../src/rpc-peer.js";
 import type { JsonObject, JsonValue } from "../src/protocol.js";
 import { SandboxTerminalExecutionError } from "../src/sandbox-terminal.js";
@@ -144,6 +144,33 @@ test("batched reads answer every path, report missing files, and page long lists
     { paths: ["scripts/a.py"], limit: 0 }), /invalid file size limit/);
 });
 
+test("reads serve up to the raised ceiling and page batches past the byte budget", async () => {
+  const big = Buffer.alloc(300 * 1024, "x");
+  const files = new Map<string, Buffer>([["/session/big.bin", big]]);
+  for (let index = 0; index < 5; index += 1) {
+    files.set(`/session/scripts/f${index}.py`, Buffer.alloc(200 * 1024, "y"));
+  }
+  const execution = new WorkflowExecution({
+    cwd: "/session",
+    resolvePath: async (path) => `/session/${path}`,
+    readFile: async (path) => files.get(path)!,
+    writeFile: async () => {},
+    operations: { async exec() { assert.fail("reads must not use terminal"); } },
+  }, peer());
+  const single = await execution.handle("execution.read",
+    { path: "big.bin", limit: MAX_READ_BYTES }) as { content: string };
+  assert.equal(Buffer.from(single.content, "base64").length, big.length);
+  await assert.rejects(execution.handle("execution.read",
+    { path: "big.bin", limit: MAX_READ_BYTES + 1 }), /invalid file size limit/);
+  const batch = await execution.handle("execution.read_many",
+    { paths: Array.from({ length: 5 }, (_, index) => `scripts/f${index}.py`),
+      limit: MAX_READ_BYTES }) as
+    { files: Array<{ path: string; content: string | null }>; remaining: string[] };
+  assert.equal(batch.files.length, 2);
+  assert.ok(batch.files.every((file) => file.content !== null));
+  assert.deepEqual(batch.remaining, ["scripts/f2.py", "scripts/f3.py", "scripts/f4.py"]);
+});
+
 
 test("capability discovery reports stages, revisions and protection independently", async () => {
   for (const readFile of [undefined, async () => Buffer.from("script")]) {
@@ -193,4 +220,14 @@ test("a graph's fixed tool call runs through the adapter tool port, never the te
     /tool name and arguments are required/);
   await assert.rejects(execution.handle("execution.tool", { name: "", arguments: [] }),
     /tool name and arguments are required/);
+
+  assert.deepEqual(
+    await execution.handle("execution.cancel_tool", { tool_call_id: "genome-1" }),
+    answer,
+  );
+  assert.deepEqual(calls.at(-1), ["tool.cancel", { tool_call_id: "genome-1" }]);
+  await assert.rejects(
+    execution.handle("execution.cancel_tool", { tool_call_id: " " }),
+    /tool call id is required/,
+  );
 });

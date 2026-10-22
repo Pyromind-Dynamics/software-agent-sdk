@@ -80,6 +80,7 @@ const DEFAULT_RESOLVE_RETRY_BASE_MS = 1_000;
 const MAX_RESOLVE_RETRY_DELAY_MS = 30_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 180_000;
 const DEFAULT_COMMAND_TIMEOUT_SECONDS = 300;
+const DEFAULT_QUEUE_TIMEOUT_MS = 30_000;
 const STOP_TIMEOUT_MS = 10_000;
 const ACK_MARKER = "__PM_ACK__";
 /**
@@ -143,6 +144,8 @@ export interface SandboxTerminalTimeouts {
    * handshake, the launch, and the start acknowledgement.
    */
   startupTimeoutMs?: number;
+  /** Budget for waiting behind another command using the same terminal. */
+  queueTimeoutMs?: number;
   /** Budget for confirming that a cancelled process group stopped. */
   stopTimeoutMs?: number;
 }
@@ -207,6 +210,7 @@ export function sandboxTerminalTimeouts(env: NodeJS.ProcessEnv = process.env): S
   return {
     resolveTimeoutMs: positiveNumber(env, "PYROMIND_PI_TERMINAL_RESOLVE_TIMEOUT_MS", "milliseconds"),
     startupTimeoutMs: positiveNumber(env, "PYROMIND_PI_TERMINAL_STARTUP_TIMEOUT_MS", "milliseconds"),
+    queueTimeoutMs: positiveNumber(env, "PYROMIND_PI_TERMINAL_QUEUE_TIMEOUT_MS", "milliseconds"),
   };
 }
 
@@ -269,6 +273,72 @@ interface TerminalExecOptions {
 interface TerminalExecResult {
   exitCode: number | null;
   execution: TerminalExecutionEvidence;
+}
+
+interface TerminalQueueOptions {
+  timeoutMs: number;
+  signal?: AbortSignal;
+  timeoutError: () => Error;
+}
+
+function terminalQueueTimeout(timeoutMs: number): SandboxTerminalExecutionError {
+  return new SandboxTerminalExecutionError(
+    `terminal queue remained busy for ${timeoutMs / 1000}s; command was not started`,
+    {
+      execution_id: randomUUID().replace(/-/g, ""),
+      remote_run_dir: "",
+      phase: "connecting",
+      started: false,
+      stopped: true,
+      error_code: "queue_timeout",
+    },
+  );
+}
+
+/** Serialize terminal calls without letting a queued call wait forever. */
+function serializeTerminalCall<T>(
+  tail: Promise<unknown>,
+  run: () => Promise<T>,
+  options: TerminalQueueOptions,
+): { result: Promise<T>; tail: Promise<void> } {
+  let started = false;
+  let rejected: Error | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let rejectWaiting!: (error: Error) => void;
+  const waiting = new Promise<T>((_resolve, reject) => {
+    rejectWaiting = reject;
+  });
+  const cleanup = (): void => {
+    if (timer !== undefined) clearTimeout(timer);
+    options.signal?.removeEventListener("abort", abort);
+  };
+  const abort = (): void => {
+    if (started || rejected) return;
+    rejected = new Error("aborted");
+    rejectWaiting(rejected);
+  };
+  timer = setTimeout(() => {
+    if (started) return;
+    rejected = options.timeoutError();
+    rejectWaiting(rejected);
+  }, options.timeoutMs);
+  options.signal?.addEventListener("abort", abort, { once: true });
+  if (options.signal?.aborted) abort();
+
+  const execute = async (): Promise<T> => {
+    if (rejected) throw rejected;
+    if (options.signal?.aborted) throw new Error("aborted");
+    started = true;
+    cleanup();
+    return run();
+  };
+  const queued = tail.then(execute, execute);
+  const result = Promise.race([queued, waiting]).finally(cleanup);
+  const nextTail = queued.then(
+    () => undefined,
+    () => undefined,
+  );
+  return { result, tail: nextTail };
 }
 
 /**
@@ -819,14 +889,18 @@ export class SandboxTerminalOperations implements BashOperations {
     cwd: string,
     options: TerminalExecOptions,
   ): Promise<TerminalExecResult> {
-    const run = (): Promise<TerminalExecResult> =>
-      this.execute(command, cwd, options);
-    const chained = this.tail.then(run, run);
-    this.tail = chained.then(
-      () => undefined,
-      () => undefined,
+    const queueTimeoutMs = this.settings.queueTimeoutMs ?? DEFAULT_QUEUE_TIMEOUT_MS;
+    const queued = serializeTerminalCall(
+      this.tail,
+      () => this.execute(command, cwd, options),
+      {
+        timeoutMs: queueTimeoutMs,
+        signal: options.signal,
+        timeoutError: () => terminalQueueTimeout(queueTimeoutMs),
+      },
     );
-    return chained;
+    this.tail = queued.tail;
+    return queued.result;
   }
 
   private quarantined: { runDir: string; token: string; execution: TerminalExecutionEvidence } | undefined;
@@ -1372,12 +1446,14 @@ export class LazySandboxTerminalOperations implements BashOperations {
         }
       }
     };
-    const chained = this.tail.then(run, run);
-    this.tail = chained.then(
-      () => undefined,
-      () => undefined,
-    );
-    return chained;
+    const queueTimeoutMs = this.options.queueTimeoutMs ?? DEFAULT_QUEUE_TIMEOUT_MS;
+    const queued = serializeTerminalCall(this.tail, run, {
+      timeoutMs: queueTimeoutMs,
+      signal: options.signal,
+      timeoutError: () => terminalQueueTimeout(queueTimeoutMs),
+    });
+    this.tail = queued.tail;
+    return queued.result;
   }
 
   private async resolveOperations(options: TerminalExecOptions): Promise<SandboxTerminalOperations> {

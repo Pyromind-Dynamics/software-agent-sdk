@@ -130,8 +130,12 @@ class ExternalTaskState(ContractModel):
         "environment_processing_render",
         "environment_processing_aggregate",
         "workflow_run",
+        "graph_await",
     ]
     run_id: str | None = None
+    # The graph run parked on this task. A terminal callback resumes that run
+    # from its checkpoint instead of asking the agent to poll or resubmit.
+    graph_run_id: str | None = None
     status: Literal[
         "pending", "running", "waiting", "succeeded", "failed", "terminated", "stopped"
     ]
