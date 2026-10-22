@@ -274,6 +274,19 @@ def validate_label_config_xml(
         bindings = DEFAULT_FIELD_MAPS.get(adapter)
     if bindings is not None:
         check_field_map(bindings, objects, controls)
+        image_fields = {binding.field for binding in bindings.images}
+        for elem in root.iter("Image"):
+            name = elem.get("name", "")
+            value = elem.get("value", "")
+            if name in image_fields and value != f"${name}":
+                raise LabelConfigValidationError(
+                    f"Image '{name}' must bind value='${name}', found {value!r}."
+                )
+            if value.startswith("$") and value[1:] not in image_fields:
+                raise LabelConfigValidationError(
+                    f"Image '{name}' references unbound task field {value!r}; "
+                    "declare it in field_map.images."
+                )
     return controls
 
 

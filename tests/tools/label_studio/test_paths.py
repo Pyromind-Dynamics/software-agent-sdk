@@ -39,10 +39,14 @@ def test_workspace_file_uses_conversation_storage_namespace():
 
 
 def test_storage_directory_named_storage_is_not_removed():
-    assert resolve_storage_input("/storage/datasets/a").resolved == "/storage/datasets/a"
+    assert (
+        resolve_storage_input("/storage/datasets/a").resolved == "/storage/datasets/a"
+    )
 
 
-@pytest.mark.parametrize("path", ["", "/", ".", "storage/", "../a", "storage/../a", "a\nb"])
+@pytest.mark.parametrize(
+    "path", ["", "/", ".", "storage/", "../a", "storage/../a", "a\nb"]
+)
 def test_invalid_paths_are_rejected_before_resolution(path):
     with pytest.raises(ValueError):
         resolve_storage_input(path)

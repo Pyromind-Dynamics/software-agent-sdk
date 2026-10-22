@@ -9,7 +9,8 @@ description: >-
 # Label Studio 标注集成
 
 把用户 Storage 里的数据集导入 Label Studio 做人工标注；认证由服务端管理，
-不需要用户提供 Token 或 UID。
+不需要用户提供 Token 或 UID。已有 badcase 可直接创建标注项目，完整数据分布和重新评分
+不是打标的前置条件；只有用户需要评分、分布分析或报告时才交给对应能力。
 
 本文件只放路由、能力边界和控制面 SOP。数据形状、绑定写法、操作细节按路由表
 按需读取对应 reference，不要提前全读；领域参考（如 PCB 裸板 AVI/AOI 的标签
@@ -22,7 +23,7 @@ description: >-
 
 | 源数据 / 需求 | 走向 | 读取 |
 |---|---|---|
-| 模型 badcase / 冻结评分结果的人工复核 | 使用独立 `products.operation=review`，引用完整分布分析与评分版本；复用现有界面和标签 | ../inference-evaluation/references/review-tasks.md |
+| 模型 badcase / 已有评分结果的人工打标 | 按样本形状选择 adapter，用 `label_studio_project` 创建标注项目；字段差异用 `field_map_path` | references/adapters.md、references/custom-bindings.md |
 | 预处理/清洗产出的 JSONL（一行一个样本、行内自带图片路径，如 data-processing 的 `source_images`） | `adapter=jsonl` 直接导入，不再做格式转换 | references/adapters.md |
 | 样本目录含 `meta_vlm.json`（`quality` / `findings`） | `adapter=avi_train`（内置绑定） | references/adapters.md |
 | 样本目录含 `meta.json`（`vlm_verdict` / `note`，无 bbox） | `adapter=aoi_export`（内置绑定） | references/adapters.md |
@@ -78,12 +79,10 @@ Label Studio 本身支持的控件（画笔、多边形、关键点）转换器�
 5. **创建**：`label_studio_project(operation="create", ...)`。
 6. **交付**：给项目名、导入样本数，和一个能点的标注入口（格式见下）。
 
-路径契约：dataset、XML、field map 和图片字段均支持 `storage/...` 别名、
+路径契约：dataset、XML、field map 支持 `storage/...` 别名、
 实际 Storage 挂载路径和规范 `/datasets/...` 对象路径。XML/field map 也可用
-工作区相对路径；保留上游图片字段，通过 field map 声明绑定。
-创建前工具检查绑定与每个图片槽位的代表性媒体访问；按返回的路径和错误类型
-修复，不通过复制文件或反复创建项目绕过。已有项目使用 `refresh_media` 更新
-媒体字段，保留项目与标注；rubric 变化则创建新的评分及复核任务。
+工作区相对路径；保留上游图片字段，通过 field map 声明绑定。图片字段保持
+Label Studio 可识别的原始格式，由 Label Studio 侧完成链接转换。
 
 ## 回复用户的链接格式
 

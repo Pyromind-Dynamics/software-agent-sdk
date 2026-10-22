@@ -1,6 +1,10 @@
 # 独立分布分析、复核与报告契约
 
-统一通过 `df_submit_pipeline(input_path=来源Storage路径, products=...)` 提交单个
+已有 badcase 人工打标使用 [label-studio](../../label-studio/SKILL.md) 的
+`label_studio_project`，无需本契约的 profile 或 review 作业。
+本契约用于用户明确要求远端分布统计、报告生成或评测报告内的复核界面。
+
+这些远端产物通过 `df_submit_pipeline(input_path=来源Storage路径, products=...)` 提交单个
 CPU 作业。`products` 与 inference、evaluation、清洗脚本互斥。提交返回 run_id、
 output_dir；复核 run_id 同时是独立 review_id。使用 df_check_progress 查询及取得稳定链接。
 这些入口均不调用模型；review/report 不执行用户评分脚本。

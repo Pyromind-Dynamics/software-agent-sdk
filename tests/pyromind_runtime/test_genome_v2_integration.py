@@ -9,6 +9,7 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -112,7 +113,7 @@ with open(sys.argv[1]) as file:
     stage_calls = 0
 
     class Model(BaseHTTPRequestHandler):
-        def log_message(self, *_args):
+        def log_message(self, format, *args):
             pass
 
         def do_POST(self):
@@ -159,7 +160,7 @@ with open(sys.argv[1]) as file:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
-            delta = {"role": "assistant"}
+            delta: dict[str, Any] = {"role": "assistant"}
             if tool:
                 delta["tool_calls"] = [
                     {
@@ -191,7 +192,7 @@ with open(sys.argv[1]) as file:
     server_thread.start()
     sinks = {}
 
-    async def on_request(method, arguments):
+    async def on_request(method: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if method == "workflow.invoke":
             assert arguments["action"] == "step_result"
             return await backend.invoke(
@@ -274,30 +275,46 @@ with open(sys.argv[1]) as file:
                 backend.execute("session", state["id"], emit), 30
             )
             assert result["status"] == "succeeded", result
-            assert (
-                json.loads(
-                    Path(
-                        result["result"]["outputs"]["report"]["execution_path"]
-                    ).read_text()
-                )["rows"]
-                == expected_rows
-            )
+            output = result["result"]
+            assert isinstance(output, dict)
+            outputs = output["outputs"]
+            assert isinstance(outputs, dict)
+            report = outputs["report"]
+            assert isinstance(report, dict)
+            report_path = report["execution_path"]
+            assert isinstance(report_path, str)
+            assert json.loads(Path(report_path).read_text())["rows"] == expected_rows
         backend.service.publish("report", "1.0.0")
         for case in ["parameter", "script", "takeover"]:
             data = workspace / f"public_data/{case}.csv"
             data.write_text("name;age\nAda;36\n")
             if case == "script":
                 data = data.rename(data.with_suffix(".txt"))
-            state = await backend.invoke(
+            plan = await backend.invoke(
                 "session",
-                "run",
+                "prepare_run",
                 {
                     "asset_id": "report",
                     "version": "1.0.0",
                     "params": {"data_file": str(data), "delimiter": ","},
+                    "execution_scope": {
+                        "mode": "full",
+                        "description": "Execute the complete synthetic test fixture",
+                    },
                 },
                 case,
             )
+            assert plan["status"] == "planned"
+            assert plan["run_id"] is None
+            confirmed = await backend.invoke(
+                "session",
+                "confirm_run",
+                {"plan_id": plan["plan_id"], "digest": plan["digest"]},
+                f"confirm-{case}",
+            )
+            state = confirmed["run"]
+            assert isinstance(state, dict)
+            assert isinstance(state["id"], str)
             failed = await asyncio.wait_for(
                 backend.execute("session", state["id"], emit), 30
             )
@@ -383,6 +400,7 @@ with open(sys.argv[1]) as file:
                 },
                 f"rerun-{case}",
             )
+            assert isinstance(child["id"], str)
             result = await asyncio.wait_for(
                 backend.execute("session", child["id"], emit), 30
             )

@@ -97,8 +97,8 @@ validation_examples 是 `{"record": 原始样例, "passed": 预期布尔值}` �
 批次目录提供 `batch_result.json`、`checkpoint_selection.json`、
 `iteration_context.json` 和总览报告。每个 `steps/n/` 目录有独立 run_id、
 metrics、逐条预测/评分和可选 HTML 报告，沿用稳定报告入口。清单 render_reports=false
-可仅评分；报告故障不丢弃评分结果。评分不创建人工标注，批次的 dataset_profile.json
-可被独立复核任务复用，参考 [复核任务契约](review-tasks.md)。
+可仅评分；报告故障不丢弃评分结果。评分不创建人工标注；已有 badcase 打标使用
+[label-studio](../../label-studio/SKILL.md) 的 `label_studio_project`，无需额外提交 profile 或 review 作业。
 总览区分最佳 eval 与最佳已保存 checkpoint；不存在同 step 模型时不取邻近 checkpoint。
 LoRA 模型引用包含 adapter 与基模，后续推理合并该 step，不使用训练末尾的默认 merge。
 

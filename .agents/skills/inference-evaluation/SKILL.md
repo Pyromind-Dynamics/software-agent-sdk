@@ -92,12 +92,14 @@ Storage 模型使用不可变版本；clone/download 恢复仍执行同一准备
 只保证来源声明和配置一致，不承诺远端同名模型内容不变。
 活跃任务需先停止，等待停止成功后再续跑；提交结果不确定时不要盲目重复提交。
 
-## 独立分布分析、人工复核和报告
+## 人工打标与独立报告
 
-按 [独立产物契约](references/review-tasks.md) 使用 df_submit_pipeline 的 products 入口。
-profile 全量统计 train/validation，可选 test；review 将已有评分 badcase 或外部清单导入
-现有标注系统；report 只渲染已有结果。三者均使用 CPU，不启动模型、不重算评分。
-复核前必须有匹配数据版本和类别映射的完整分布；评分本身不受分布缺失阻塞。
-复用内置标注组件、标签定义及保存协议，不生成自定义标注网页。
-rubric 变化后新建评分运行及复核任务；旧任务和旧标注保留，不覆盖、不迁移。
-复核任务的稳定入口由 df_check_progress 返回；签名 HTML 预览仍只读。
+已有 badcase 的人工打标交给 [label-studio](../label-studio/SKILL.md)，通过
+`label_studio_project` 创建标注项目，保留样本、GT、预测和评分来源。
+打标无需启动分布分析、重新评分或远端工作流。
+
+用户明确需要全量分布统计或单独生成报告时，按
+[独立产物契约](references/review-tasks.md) 使用 `df_submit_pipeline(products=...)`。
+profile 统计数据分布，report 渲染已有结果，均使用 CPU，不调用模型。
+评测报告内的独立复核运行仅用于用户明确选择该报告界面的场景，不能替代 Label Studio 打标。
+rubric 变化后新建评分版本，保留旧结果和人工标注。

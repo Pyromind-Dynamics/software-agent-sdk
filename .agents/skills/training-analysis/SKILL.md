@@ -49,7 +49,8 @@ loss 只能提示问题，不能证明某个类别缺样，也不能直接据此
 执行训练的完成回调还需按原任务衔接 [inference-evaluation](../inference-evaluation/SKILL.md)：
 用户未排除评测时，先复用训练 eval 产物选择 checkpoint，已有基线按同口径复用评分。仅 train + val 不新增模型推理；独立 test 在验证集选模后
 使用所选 checkpoint 推理评分，不参与选模；LoRA 合并所选 step。
-人工复核先完成分布分析，再导入现有标注组件创建独立任务，不依赖完整评测报告。
+人工打标交给 [label-studio](../label-studio/SKILL.md)，用 `label_studio_project`
+导入已有 badcase；不以分布分析、重新评分或完整评测报告作为打标前置条件。
 已有可比基线直接复用。只分析已有 run 或明确不评测时不新增任务；缺少验证集、GT 或可用产物时
 说明缺口，不以训练集或训练 loss 宣称效果通过。W&B 取数失败不阻止已有模型产物的效果评测。
 训练参数调整仍按单变量探针进行；用户确认后交给工作流生成能力，并在新

@@ -75,10 +75,11 @@ class LabelStudioProjectAction(Action):
         ),
         ge=1,
     )
-    adapter: str = Field(
+    adapter: Literal["avi_train", "aoi_export", "jsonl"] = Field(
         default="avi_train",
         description=(
-            "Dataset layout used during project creation: 'avi_train' reads "
+            "Dataset layout for create; defaults to 'avi_train'. "
+            "Set 'jsonl' explicitly for a JSON Lines file. 'avi_train' reads "
             "meta_vlm.json (quality/findings) from each sample directory; "
             "'aoi_export' reads meta.json (whole-sample vlm_verdict/note) from "
             "each sample directory; 'jsonl' reads one task per line of a JSON "
@@ -159,6 +160,13 @@ class LabelStudioProjectObservation(Observation):
 
 TOOL_DESCRIPTION = """Create, inspect, update, or export a Label Studio annotation project.
 
+Required create inputs: dataset_path (source data), label_config_path (label XML).
+For a JSON Lines file, call with operation='create', adapter='jsonl',
+dataset_path='storage/datasets/badcase.jsonl',
+label_config_path='public_data/label_config.xml'.
+Add field_map_path when custom bindings are needed. output_path is an export
+destination only; it cannot replace either create input.
+
 Use operation='create' to import a user-storage dataset after inspecting its
 structure and after generating a validated label_config.xml in the workspace.
 The dataset is a directory of sample directories, or one JSON Lines file when
@@ -191,8 +199,6 @@ Label Studio keeps whichever URL the import produced and never renews it, but th
 portal serves that URL for as long as the account it names can still act, so the
 images do not go stale on their own. Refreshing keeps task IDs, annotations, and
 predictions, and is safe to run again.
-It resolves Storage aliases and mount paths, validates representative images in
-every slot, and updates only media URLs and their backing paths.
 
 Do not pass user IDs, API tokens, or credentials. Do not call Label Studio REST
 APIs with terminal or HTTP tools; this tool owns server-side auth and format

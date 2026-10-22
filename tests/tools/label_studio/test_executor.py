@@ -3,14 +3,12 @@
 import json
 import logging
 import re
-from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-import httpx
 
 from openhands.tools.label_studio.api_client import LabelStudioAPIError
 from openhands.tools.label_studio.converter import (
@@ -25,6 +23,7 @@ from openhands.tools.label_studio.executor import (
     _normalize_storage_path,
 )
 from openhands.tools.label_studio.export_ticket import PortalExportTicketProvider
+from openhands.tools.label_studio.field_map import default_field_map
 from openhands.tools.label_studio.models import ProjectState
 from openhands.tools.label_studio.skill_helpers import extract_control_values
 from openhands.tools.label_studio.token_provider import PortalTokenProvider
@@ -66,6 +65,23 @@ def executor() -> LabelStudioProjectExecutor:
         ls_token_secret="LABEL_STUDIO_TOKEN",
         storage_base_url="http://storage.example.com",
     )
+
+
+@pytest.mark.parametrize("output_path", [None, "/datasets/badcases.jsonl"])
+def test_create_reports_all_missing_inputs_before_accessing_services(
+    executor: LabelStudioProjectExecutor, output_path: str | None
+) -> None:
+    observation = executor(
+        LabelStudioProjectAction(
+            operation="create", adapter="jsonl", output_path=output_path
+        )
+    )
+
+    assert observation.is_error
+    assert "dataset_path is required" in observation.text
+    assert "label_config_path is required" in observation.text
+    if output_path:
+        assert "output_path is only used for operation='export'" in observation.text
 
 
 def test_genome_jsonl_artifact_is_staged_to_storage_before_import(
@@ -121,7 +137,9 @@ def test_create_imports_a_genome_artifact_from_its_staged_storage_object(
         lambda path, data, _conversation: uploaded.append((path, data)),
     )
     monkeypatch.setattr(
-        executor, "_resolve_field_map", lambda *_: (MagicMock(), "field-hash")
+        executor,
+        "_resolve_field_map",
+        lambda *_: (default_field_map("jsonl"), "field-hash"),
     )
     monkeypatch.setattr(executor, "_validate_with_label_studio", lambda *_: None)
     monkeypatch.setattr(
@@ -195,6 +213,22 @@ def test_read_workspace_file_stages_remote_workspace_file(
         VALID_XML.encode()
     )
     assert executor._read_workspace_file("missing.xml", conversation) is None
+
+
+@pytest.mark.parametrize("path", ["storage/review/config.xml", "/review/config.xml"])
+def test_storage_config_access_error_keeps_path_diagnostics(
+    executor, conversation, monkeypatch, path
+):
+    def download(*args, **kwargs):
+        raise ValueError("Storage returned HTTP 403")
+
+    monkeypatch.setattr(executor, "_download_from_storage", download)
+    with pytest.raises(ValueError) as error:
+        executor._read_workspace_file(path, conversation)
+    message = str(error.value)
+    assert f"original={path!r}" in message
+    assert "resolved='/review/config.xml'" in message
+    assert "path_type=" in message and "403" in message
 
 
 def _mock_ls_api(
@@ -1596,8 +1630,6 @@ def _refresh(
     state: ProjectState,
     ls_api: MagicMock,
     signer: MagicMock,
-    *,
-    media_response: httpx.Response | None = None,
 ):
     with (
         patch.object(executor, "_load_state", return_value=state),
@@ -1606,13 +1638,7 @@ def _refresh(
         patch.object(executor, "_save_state"),
         patch(
             "httpx.stream",
-            side_effect=lambda *a, **k: nullcontext(
-                media_response
-                if media_response is not None
-                else httpx.Response(
-                    200, headers={"content-type": "image/jpeg"}, content=b"image"
-                )
-            ),
+            side_effect=AssertionError("Media access belongs to Label Studio"),
         ),
     ):
         return executor(
@@ -1621,7 +1647,7 @@ def _refresh(
 
 
 def test_refresh_media_resigns_the_urls_and_keeps_the_rest_of_the_data(conversation):
-    """Normalize the media path and URL; keep all non-media fields."""
+    """Only the rendered URL changes; the path and the labels stay untouched."""
     executor = _create_executor(portal_base_url=PORTAL)
     signer = _mock_media_signer()
     ls_api = _mock_ls_api()
@@ -1637,13 +1663,13 @@ def test_refresh_media_resigns_the_urls_and_keeps_the_rest_of_the_data(conversat
     obs = _refresh(executor, conversation, _ready_state(), ls_api, signer)
 
     assert not obs.is_error
-    assert signer.sign_many.call_args.args[0] == ["/exports/10_B1/defect.jpg"]
+    assert signer.sign_many.call_args.args[0] == ["exports/10_B1/defect.jpg"]
     written = ls_api.update_task_data.call_args.kwargs
     assert written["task_id"] == 1
     assert written["data"]["defect_image"].endswith("media_token=fresh")
     # Label Studio replaces the whole data object, so everything else has to
     # travel with the new URL.
-    assert written["data"]["defect_image_path"] == "/exports/10_B1/defect.jpg"
+    assert written["data"]["defect_image_path"] == "exports/10_B1/defect.jpg"
     assert written["data"]["sample_id"] == "10_B1"
     assert "refreshed=1/1" in obs.text
 
@@ -1676,7 +1702,7 @@ def test_refresh_media_signs_each_path_once(conversation):
 
     _refresh(executor, conversation, _ready_state(), ls_api, signer)
 
-    assert signer.sign_many.call_args.args[0] == ["/exports/a.jpg"]
+    assert signer.sign_many.call_args.args[0] == ["exports/a.jpg"]
     assert ls_api.update_task_data.call_count == 2
 
 

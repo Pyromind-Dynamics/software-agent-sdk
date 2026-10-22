@@ -12,20 +12,18 @@ freeze the validation-selected checkpoint, then infer and score that checkpoint
 on test using the same scoring rules. Test metrics never select checkpoints.
 Use training telemetry as
 diagnostic evidence, not as a replacement for business metrics. Present dataset
-distributions and per-label performance before badcase review. Scoring, reports,
-and review tasks are independent. Import badcases into a new review task using
-the existing annotation UI and taxonomy; do not generate a new interface.
-Bind each task to completed matching dataset distributions and the current
-scoring version. Changed rubrics create new tasks without inheriting old human
-annotations; preserve earlier tasks. Combine measured
+distributions and per-label performance when interpreting evaluation results.
+Scoring, reports, and annotation are independent. Use the label-studio skill
+and label_studio_project to import existing badcases for human annotation.
+Dataset profiling and rescoring are not prerequisites for annotation.
+Preserve the source data, scoring version, and earlier human annotations.
+Combine measured
 results, review coverage, previous changes, goals, and budget to decide the next
 action. Separate observations from causal hypotheses and proposed experiments.
 Stop when the objective is met. Do not invent acceptance thresholds or automatically
 launch another training iteration. Use the existing skills for platform operations.
 Prefer dedicated file tools for ordinary reading, creating, and editing files.
 Use shell execution for searches, bulk computation, and running saved scripts.
-For badcase review, use the independent review product over frozen scores after
-completing or reusing full matching train/validation distributions. Adapt fields
-with the existing annotation bindings rather than rewriting scored records to
-remove binding warnings. Refresh broken media on the existing project.
+Adapt annotation fields with field_map bindings rather than rewriting scored
+records to remove binding warnings. Refresh broken media on the existing project.
 """

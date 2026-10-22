@@ -2641,9 +2641,11 @@ def _build_external_task_notification(
                     "train + validation only, do not start extra GPU inference. "
                     "If independent test exists, evaluate the validation-selected "
                     "checkpoint on test; test never participates in selection. "
-                    "Present complete label distributions before creating a new "
-                    "badcase review task with the existing annotation UI and use "
-                    "the iteration context to decide the next action. Report "
+                    "Present available label distributions and use the iteration "
+                    "context to decide the next action. For requested badcase "
+                    "annotation, use the label-studio skill and "
+                    "label_studio_project over existing samples; no profiling "
+                    "or rescoring job is required to open annotation. Report "
                     "missing evidence without guessing. Do not rerun automatically."
                 )
             else:
@@ -2684,11 +2686,12 @@ def _build_external_task_notification(
             "read checkpoint_selection.json "
             "and iteration_context.json, link the overview and selected step report, "
             "and distinguish the best saved candidate from meeting acceptance targets. "
-            "Scoring does not create annotation tasks. For human review, use "
-            "df_submit_pipeline products.operation=review with a completed matching "
-            "profile. Reuse existing annotation components and taxonomy, never "
-            "generate a new UI. Rubric changes create new scoring and review runs "
-            "without overwriting or inheriting earlier human annotations."
+            "Scoring does not create annotation projects. For requested human "
+            "annotation, use the label-studio skill and label_studio_project over "
+            "existing badcases, without submitting a profiling or rescoring job. "
+            "Reuse annotation bindings and preserve earlier human annotations. "
+            "Changed rubrics require a new scoring version when rescoring is "
+            "requested."
         )
     if error_summary:
         instruction += f" Controlled error summary: {error_summary}"

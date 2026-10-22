@@ -85,6 +85,20 @@ def test_valid_xml_returns_controls():
     assert extract_control_names(VALID_XML) == names
 
 
+def test_image_value_must_match_the_bound_task_field():
+    xml = VALID_XML.replace('value="$defect_image"', 'value="$missing_image"')
+    with pytest.raises(LabelConfigValidationError, match="must bind value"):
+        validate_label_config_xml(xml, adapter="avi_train")
+
+
+def test_extra_image_slot_requires_a_field_binding():
+    xml = VALID_XML.replace(
+        "</View>", '<Image name="reference" value="$unbound_reference"/></View>'
+    )
+    with pytest.raises(LabelConfigValidationError, match="unbound task field"):
+        validate_label_config_xml(xml, adapter="avi_train")
+
+
 def test_malformed_xml_raises():
     with pytest.raises(LabelConfigValidationError, match="Malformed XML"):
         validate_label_config_xml("<View><unclosed>")

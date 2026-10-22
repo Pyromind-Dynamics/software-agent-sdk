@@ -38,7 +38,6 @@ from openhands.tools.label_studio.field_map import (
     parse_field_map,
 )
 from openhands.tools.label_studio.media_signer import PortalMediaSigner
-from openhands.tools.label_studio.media_validation import validate_task_media
 from openhands.tools.label_studio.models import ProjectState
 from openhands.tools.label_studio.paths import StorageInput, resolve_storage_input
 from openhands.tools.label_studio.skill_helpers import (
@@ -188,10 +187,24 @@ class LabelStudioProjectExecutor(
         action: LabelStudioProjectAction,
         conversation: BaseConversation | None,
     ) -> LabelStudioProjectObservation:
-        if not action.dataset_path:
-            raise ValueError("dataset_path is required for operation='create'.")
-        if not action.label_config_path:
-            raise ValueError("label_config_path is required for operation='create'.")
+        missing = [
+            name
+            for name, value in (
+                ("dataset_path", action.dataset_path),
+                ("label_config_path", action.label_config_path),
+            )
+            if not value
+        ]
+        if missing:
+            errors = [f"{name} is required for operation='create'." for name in missing]
+            if action.output_path:
+                errors.append(
+                    "output_path is only used for operation='export'; "
+                    "pass the input dataset as dataset_path and the label XML "
+                    "as label_config_path."
+                )
+            raise ValueError(" ".join(errors))
+        assert action.dataset_path and action.label_config_path
 
         dataset_path = self._dataset_storage_path(
             action.adapter, action.dataset_path, conversation
@@ -202,7 +215,9 @@ class LabelStudioProjectExecutor(
         if xml_content is None:
             raise ValueError(
                 "label_config.xml not found: "
-                + self._resolve_input(action.label_config_path, conversation).diagnostic()
+                + self._resolve_input(
+                    action.label_config_path, conversation
+                ).diagnostic()
             )
 
         # Both halves of the contract are read before anything is uploaded: the
@@ -470,12 +485,6 @@ class LabelStudioProjectExecutor(
     ) -> tuple[ConvertedManifest, ProjectState, WidenedConfig]:
         """Convert the dataset, persist its artifacts, and create the LS project."""
         xml_text = xml_content.decode("utf-8")
-        image_inputs: dict[str, str] = {}
-
-        def resolve_image(path: str) -> str:
-            resolved = self._resolve_input(path, conversation)
-            image_inputs[resolved.resolved] = resolved.diagnostic()
-            return resolved.resolved
 
         converter = AVITrainToLabelStudioConverter(
             dataset_path=dataset_path,
@@ -491,18 +500,8 @@ class LabelStudioProjectExecutor(
             field_map_path=action.field_map_path,
             config_values=extract_control_values(xml_text),
             dataset_content=dataset_content,
-            image_path_resolver=resolve_image,
         )
         manifest = converter.convert()
-        validate_task_media(
-            (
-                task
-                for _, payload, _ in manifest.batch_payloads
-                for task in json.loads(payload)
-            ),
-            float(self._timeout),
-            image_inputs,
-        )
 
         # The template names the controls; the values come from the data. A value
         # the config does not list would import as a pre-annotation that draws
@@ -764,12 +763,9 @@ class LabelStudioProjectExecutor(
 
         ls_api = self._build_ls_api(conversation)
         tasks = ls_api.list_project_tasks(state.project_id)
-        resolved = {
-            path: self._resolve_input(path, conversation).resolved
-            for task in tasks
-            for _, path in _media_fields(_task_data(task))
-        }
-        paths = sorted(set(resolved.values()))
+        paths = sorted(
+            {path for task in tasks for _, path in _media_fields(_task_data(task))}
+        )
         if not paths:
             raise ValueError(
                 "No media paths found in the task data of this project, so its "
@@ -777,22 +773,7 @@ class LabelStudioProjectExecutor(
             )
 
         urls = signer.sign_many(paths)
-        original_urls = {path: urls[target] for path, target in resolved.items()}
-        updated_tasks = [
-            {**task, "data": _resigned_data(_task_data(task), original_urls, resolved)[0]}
-            for task in tasks
-        ]
-        validate_task_media(
-            updated_tasks,
-            float(self._timeout),
-            {
-                target: self._resolve_input(path, conversation).diagnostic()
-                for path, target in resolved.items()
-            },
-        )
-        refreshed, failed, first_error = self._refresh_task_media(
-            tasks, original_urls, ls_api, resolved
-        )
+        refreshed, failed, first_error = self._refresh_task_media(tasks, urls, ls_api)
         if refreshed == 0:
             return self._error(
                 "refresh_media",
@@ -817,7 +798,6 @@ class LabelStudioProjectExecutor(
         tasks: list[dict[str, Any]],
         urls: dict[str, str],
         ls_api: LabelStudioAPIClient,
-        resolved_paths: dict[str, str] | None = None,
     ) -> tuple[int, int, str]:
         """Write fresh media URLs back into each task's data, concurrently.
 
@@ -829,7 +809,7 @@ class LabelStudioProjectExecutor(
         pending: list[tuple[int, dict[str, Any]]] = []
         for task in tasks:
             task_id = task.get("id")
-            data, changed = _resigned_data(_task_data(task), urls, resolved_paths)
+            data, changed = _resigned_data(_task_data(task), urls)
             if isinstance(task_id, int) and changed:
                 pending.append((task_id, data))
 
@@ -1034,6 +1014,8 @@ class LabelStudioProjectExecutor(
                 )
             except StorageFileNotFoundError:
                 return None
+            except ValueError as exc:
+                raise ValueError(f"{resolved.diagnostic()}: {exc}") from exc
         if is_remote_workspace(workspace):
             try:
                 with staged_remote_path(workspace, relative_path) as staged:
@@ -1237,9 +1219,7 @@ def _media_fields(data: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def _resigned_data(
-    data: dict[str, Any],
-    urls: dict[str, str],
-    resolved_paths: dict[str, str] | None = None,
+    data: dict[str, Any], urls: dict[str, str]
 ) -> tuple[dict[str, Any], bool]:
     """Copy task data, replacing every baked media URL with a fresh one.
 
@@ -1253,8 +1233,6 @@ def _resigned_data(
         if url is None:
             continue
         refreshed[field] = url
-        if resolved_paths is not None:
-            refreshed[field + _MEDIA_PATH_SUFFIX] = resolved_paths.get(path, path)
         changed = True
     return refreshed, changed
 
