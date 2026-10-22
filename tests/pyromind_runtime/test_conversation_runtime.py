@@ -233,6 +233,56 @@ async def test_command_forwards_ephemeral_cookie_and_cluster(tmp_path) -> None:
     await runtime.close()
 
 
+async def test_legacy_conversation_retains_storage_route_without_credentials(
+    tmp_path,
+) -> None:
+    conversation_id = "legacy-route"
+    (tmp_path / conversation_id).mkdir()
+    store = FileProductStore(tmp_path / conversation_id)
+    store.create(
+        ConversationSnapshot(
+            conversation_id=conversation_id, capabilities=HarnessCapabilities()
+        ),
+        user_id="42",
+    )
+    metadata = json.loads(store.metadata_path.read_text())
+    metadata.pop("x_cluster")
+    store.metadata_path.write_text(json.dumps(metadata))
+    runtime = ConversationRuntime(tmp_path, FakeAdapter())
+    assert (
+        runtime.evaluation_storage_context(
+            conversation_id, RequestContext(user_id="anonymous")
+        ).x_cluster
+        is None
+    )
+    await runtime.get_snapshot(
+        conversation_id,
+        RequestContext(
+            user_id="42", x_cluster="us-west-2#pre", cookie="auth_token=old-secret"
+        ),
+    )
+    await runtime.get_snapshot(conversation_id, RequestContext(user_id="42"))
+    with pytest.raises(PermissionError):
+        await runtime.get_snapshot(
+            conversation_id, RequestContext(user_id="43", x_cluster="other-cluster")
+        )
+    await runtime.close()
+
+    restored = ConversationRuntime(tmp_path, FakeAdapter())
+    current = RequestContext(
+        user_id="anonymous",
+        cookie="auth_token=current-secret",
+        authorization="Bearer current",
+    )
+    resolved = restored.evaluation_storage_context(conversation_id, current)
+    assert resolved.x_cluster == "us-west-2#pre"
+    assert resolved.cookie == current.cookie
+    assert resolved.authorization == current.authorization
+    assert "secret" not in store.metadata_path.read_text()
+    assert not restored._active
+    await restored.close()
+
+
 async def test_stream_replays_then_continues_without_sequence_gap(tmp_path) -> None:
     conversations = tmp_path / "conversations"
     conversations.mkdir()
@@ -881,6 +931,65 @@ async def test_finished_run_releases_runner_after_grace_period(tmp_path) -> None
     await runtime.close()
 
 
+async def test_reactivation_waits_for_runner_release(tmp_path) -> None:
+    closing = asyncio.Event()
+    finish_close = asyncio.Event()
+
+    class BlockingCloseAdapter(FakeAdapter):
+        async def close(self, handle) -> None:
+            if handle.session_id == "releasing" and not finish_close.is_set():
+                closing.set()
+                await finish_close.wait()
+            await super().close(handle)
+
+        async def attach_session(self, conversation_id, context):
+            if conversation_id == "releasing":
+                assert finish_close.is_set(), "previous runner still owns its socket"
+            return await super().attach_session(conversation_id, context)
+
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = BlockingCloseAdapter()
+    runtime = ConversationRuntime(
+        conversations, adapter, release_grace_seconds=0, resource_retention_seconds=60
+    )
+    context = RequestContext(user_id="42")
+    await _create(runtime, conversations, "releasing")
+    await _create(runtime, conversations, "other")
+    release = asyncio.create_task(runtime._release("releasing", reason="idle"))
+    command = None
+    try:
+        await asyncio.wait_for(closing.wait(), timeout=1)
+        command = asyncio.create_task(
+            runtime.submit_command(
+                "releasing",
+                UserMessageCommand(
+                    command_id="resume", content=(TextContent(text="hi"),)
+                ),
+                context,
+            )
+        )
+        await runtime.submit_command(
+            "other",
+            UserMessageCommand(command_id="other", content=(TextContent(text="hi"),)),
+            context,
+        )
+        await asyncio.sleep(0)
+        assert not command.done()
+        assert "releasing" not in adapter.attached
+        finish_close.set()
+        await asyncio.wait_for(asyncio.gather(release, command), timeout=1)
+        assert adapter.closed == ["releasing"]
+        assert adapter.attached.count("releasing") == 1
+        assert "releasing" not in runtime._retained
+    finally:
+        finish_close.set()
+        await asyncio.gather(
+            release, *([command] if command else []), return_exceptions=True
+        )
+        await runtime.close()
+
+
 async def test_promptless_conversation_is_released_after_grace(tmp_path) -> None:
     """A conversation created without a prompt has no run to end the session.
 
@@ -1308,4 +1417,27 @@ async def test_history_result_recovers_once_without_reexecuting(
     assert "public_data/report.json" in notice.hidden_text
     assert '"asset_id": "clean"' in notice.hidden_text
     assert not store.load_snapshot().external_tasks[0].resume_pending
+    await runtime.close()
+
+
+@pytest.mark.parametrize("harness", ["pi", "openhands"])
+async def test_runtime_supplies_same_shared_flywheel_instructions(tmp_path, harness):
+    from pyromind_runtime.application.product_instructions import (
+        DATA_FLYWHEEL_INSTRUCTIONS,
+    )
+
+    adapter = FakeAdapter(harness)
+    runtime = ConversationRuntime(tmp_path, adapter, default_harness_id=harness)
+    await runtime.create_conversation(
+        SessionSpec(
+            conversation_id="flywheel",
+            user_id="u",
+            workspace_root=str(tmp_path),
+            product_instructions="Additional business context.",
+        ),
+        RequestContext(user_id="u"),
+    )
+    assert adapter.created_specs[0].product_instructions == (
+        DATA_FLYWHEEL_INSTRUCTIONS + "\nAdditional business context."
+    )
     await runtime.close()

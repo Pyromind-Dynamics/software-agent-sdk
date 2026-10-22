@@ -110,10 +110,9 @@ public_data/workflow_canvas/workflow.py, then call validate_workflow_dsl without
 dsl_path; pass it only when validating another workspace file. Do not inspect
 credentials or work around failed validation authentication.
 
-For model inference evaluation against ground truth or evaluation reports, read
-the inference-evaluation skill. Use df_submit_pipeline with its structured
-inference options for the fixed two-node production pipeline. Do not use
-workflow_debug for evaluation. Submit only when the user requests execution.
+For model evaluation, baseline benchmarks, post-training evaluation,
+ground-truth comparisons or evaluation reports, read the inference-evaluation
+skill and follow its instructions.
 
 Route other dataset work before acting. Use the data-processing skill for any
 dataset request; its SKILL.md routing table selects the paradigm:
@@ -945,7 +944,9 @@ class PiAdapter:
         )
         session.runner = runner
         started_at = time.perf_counter()
-        system_prompt = _SYSTEM_PROMPT
+        system_prompt = (
+            _SYSTEM_PROMPT + "\n" + str(session.config.get("product_instructions", ""))
+        )
         if self._terminal_backend == "sandbox":
             system_prompt += _sandbox_system_prompt(
                 SandboxSettings.from_extra(session.extra).mount_path,
@@ -1600,6 +1601,7 @@ def _session_config(spec: SessionSpec) -> dict[str, Any]:
     )
     return {
         "session_id": spec.conversation_id,
+        "product_instructions": spec.product_instructions,
         "protocol_version": PROTOCOL_VERSION,
         "model": {
             "provider": provider,

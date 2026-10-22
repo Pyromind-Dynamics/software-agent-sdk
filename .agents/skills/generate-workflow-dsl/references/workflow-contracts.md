@@ -3,6 +3,9 @@
 本文件覆盖常用训练与评测阶段的拓扑和节点契约。未列出的节点先从 `knowledge/index.md`
 定位并读取原文，再以 `validate_workflow_dsl` 的实时结果纠正漂移契约；不要猜字段或连线。
 
+下文 Benchmark、训后评测及 Metric/Eval 契约仅供检查已有工作流。
+新的独立模型效果评测统一交给 inference-evaluation，不按这些旧拓扑生成评测阶段。
+
 章节：阶段目录｜数据与模型入口｜数据与模型配置｜训练配置与阶段｜Reward 与 Metric｜
 Merge、推理与评测｜平台边界。
 
@@ -17,7 +20,7 @@ Merge、推理与评测｜平台边界。
 | LoRA 训后评测 | 训练 → Merge → VLLM → Metric → Eval | `benchmark_output_path` |
 | Full 训后评测 | 训练 → VLLM → Metric → Eval | `benchmark_output_path` |
 
-训练阶段由主 Skill 的“选择阶段”唯一决定；本文件只在阶段锁定后提供对应拓扑。
+训练阶段按主 Skill 中的数据与训练决策选择；本文件提供对应拓扑。
 明确要求 Benchmark 时不添加训练节点。训练前后比较必须复用同一数据切分、字段映射、Metric
 和 `max_samples`。
 
@@ -34,8 +37,16 @@ Merge、推理与评测｜平台边界。
 | CloneAndCacheModel | model, target_path（使用 `/workspace/models/`） | `model_path` |
 | DownloadAndCacheModel | modelname, cache_dir, download_source | `model_path` |
 
-`download_source` 只允许 `huggingface`、`modelscope`。主 Skill 列出的推荐模型走 Clone；其他
-开源模型走 Download。两者都必须通过 `model_path` 连接下游，禁止重复写死缓存路径。
+`download_source` 只允许 `huggingface`、`modelscope`。
+`Qwen/Qwen3-0.6B`、`Qwen/Qwen3-1.7B`、`Qwen/Qwen3-4B`、
+`Qwen/Qwen3-VL-2B-Instruct`、`Qwen/Qwen3-VL-4B-Instruct` 使用 Clone，
+`target_path="/workspace/models/"`。其他开源模型默认 Download，
+`cache_dir="/workspace/models/<org>/<model>"`、`download_source="huggingface"`，用户指定来源时遵从。
+`qwen3.5-2b` 对应 `Qwen/Qwen3.5-2B`，缓存目录为 `/workspace/models/Qwen/Qwen3.5-2B`。
+两者都通过输出 `model_path` 连接下游，不重复写死缓存路径。
+
+已确认的文件可用 `PathJoinNode.joined_path` 直接连接数据配置；仅需目录检查时使用
+`LoadDataset`，其 `source_dir` 接目录，具体文件从 `dataset_path` 拼接。路径示例见 `data-routing.md`。
 
 ## 数据与模型配置
 
@@ -48,11 +59,39 @@ Merge、推理与评测｜平台边界。
 | DatasetConfigBuilderNode | train_data_path | val_data_path, dataset_kind_config, dataset_extra_config | `dataset_config` |
 | ModelConfigBuilderNode | model_path | model_type | `model_config` |
 
-Text 的 assistant 默认 `gt`，rejected 默认 `rejected_answer`；Message 的 `messages_field` 必填、
-rejected 默认 `rejected_messages`；Vision 的 `image_field` 必填，填数据画像里的真实图片列名。
-字段名一律以数据画像里的真实列名为准，禁止按常见名猜测。`model_type` 只用
-`auto`、`qwen3vl`、`qwen3.5`。`max_seq_length` 默认取 `min(P95, 4096)`；P95 未知时用 4096
-并在最终回复声明该假设。
+按实际数据选择 Builder，不要求统一转换为 messages：
+
+| 数据形态 | 配置 |
+|---|---|
+| 文本输入与监督答案分列 | Text，映射实际 system/user/assistant 字段 |
+| 已有对话数组 | Message，`messages_field` 指向实际对话列 |
+| 图片与文本分列 | Vision，映射图片列和文本列 |
+| 偏好对 | 对应 Builder 的 assistant/chosen 与 `rejected_field`；训练阶段为 DPO |
+| prompt 加可验证信号 | 对应 Builder 加 Reward，按主 Skill 选择训练阶段 |
+
+Text 的 assistant 默认 `gt`，rejected 默认 `rejected_answer`；Message 的 `messages_field` 必填，
+rejected 默认 `rejected_messages`；Vision 的 `image_field` 必填。字段名以真实样本或已有有效映射为准。
+已有 messages 保留原格式，媒体内容按实际节点契约配置，不套用平铺字段默认值。
+
+平铺 Vision 示例（图片路径以训练加载器的解析基准为准）：
+
+```json
+{"images":["images/a.png"],"system_prompt":"你是图像质检专家。","user_prompt":"判断图中缺陷。","gt":"存在划痕。"}
+```
+
+```python
+dataset_kind = DatasetConfigBuilderVisionNode(
+    id="6",
+    image_field="images",
+    system_prompt_field="system_prompt",
+    user_prompt_field="user_prompt",
+    assistant_response_field="gt",
+)
+```
+
+`model_type` 只用 `auto`、`qwen3vl`、`qwen3.5`。`max_seq_length` 优先遵从用户要求与已有有效配置，
+其余结合模型、数据和资源选择。需要评估截断或容量时，多模态长度包括媒体展开和模板 token；
+估算应说明依据，不能把字符数当作实测 token 数。生成 DSL 不要求先运行实际 processor/collator。
 
 ## 训练配置与阶段
 

@@ -3,16 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
-from pyromind_runtime.application.versions import Versions
+from pyromind_runtime.application.versions import Versions, snapshot_result
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.versions import (
     RunSource,
     SaveVersion,
+    SnapshotSource,
     canonical,
 )
 from pyromind_runtime.ports.external_tasks import ExternalTaskRegistry
@@ -43,9 +44,9 @@ class PipelineRuns:
 
     def prepare_execution(
         self, run_id: str, workflow: dict[str, Any], dsl: str, script: str
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], str]:
         if self._versions is None:
-            return workflow
+            return workflow, dsl
         if self._context is None:
             raise ValueError("versioned execution requires request credentials")
         run = self._store.load_pipeline_runs()[run_id]
@@ -70,8 +71,6 @@ class PipelineRuns:
             None,
         )
         if existing is not None:
-            from pyromind_runtime.application.versions import snapshot_result
-
             for identity in existing.spec.inputs.values():
                 version = self._versions.store.get_version(project.id, identity)
                 if version.state == "ready":
@@ -82,11 +81,76 @@ class PipelineRuns:
             assert isinstance(saved, dict)
             saved_workflow = saved["workflow"]
             assert isinstance(saved_workflow, dict)
-            return saved_workflow
+            code = self._versions.store.get_version(
+                project.id, existing.spec.inputs["code"]
+            )
+            saved_dsl = self._versions.snapshots.read_text(
+                snapshot_result(code), self._context
+            )
+            return saved_workflow, saved_dsl
         inputs: dict[str, str] = {}
-        effective_definition = self._versions.resolve_inputs(
-            project, run.definition, inputs, self._context, key
+        input_definition = run.definition
+        evaluation = run.definition.get("evaluation_config", {})
+        assert isinstance(evaluation, dict)
+        source = evaluation.get("model_source", {})
+        assert isinstance(source, dict)
+        selected_checkpoint = source.get("type") == "checkpoint"
+        generated_model = source.get("type") in {"clone", "download", "checkpoint"}
+        original_inference = run.definition.get("inference", {})
+        assert isinstance(original_inference, dict)
+        if generated_model:
+            input_definition = {
+                **run.definition,
+                "inference": {
+                    key: value
+                    for key, value in original_inference.items()
+                    if key != "model_path"
+                },
+            }
+        if selected_checkpoint:
+            input_definition = {
+                **input_definition,
+                "evaluation_config": {
+                    **evaluation,
+                    "model_source": {
+                        k: v for k, v in source.items() if k != "base_model"
+                    },
+                },
+            }
+            for role, reference in (
+                ("selected_checkpoint", original_inference["model_path"]),
+                ("base_model", source.get("base_model")),
+            ):
+                if isinstance(reference, str):
+                    version = self._versions.save(
+                        project,
+                        key + ":" + role,
+                        SaveVersion(
+                            kind="model",
+                            logical_key=role,
+                            source=SnapshotSource(
+                                storage_ref=reference.removeprefix("/workspace"),
+                                reference_only=True,
+                            ),
+                        ),
+                        self._context,
+                    )
+                    inputs[role] = version.id
+        effective_definition = (
+            input_definition
+            if run.definition.get("kind")
+            in {"prediction_evaluation", "evaluation_products", "badcase_review"}
+            or run.definition.get("dataset_role") == "test"
+            else self._versions.resolve_inputs(
+                project, input_definition, inputs, self._context, key
+            )
         )
+        if selected_checkpoint:
+            effective_definition["evaluation_config"] = evaluation
+        effective_inference = effective_definition.get("inference", {})
+        assert isinstance(effective_inference, dict)
+        if generated_model:
+            effective_inference["model_path"] = original_inference["model_path"]
         if prior is not None:
             previous_spec = prior.spec.parameters.get("definition")
             if (
@@ -95,11 +159,6 @@ class PipelineRuns:
             ):
                 raise ValueError("selected inputs changed; use a new full run")
         replacements: dict[str, str] = {}
-        original_inference = run.definition.get("inference", {})
-        effective_inference = effective_definition.get("inference", {})
-        assert isinstance(original_inference, dict) and isinstance(
-            effective_inference, dict
-        )
         for old, new in (
             (run.definition.get("input_path"), effective_definition.get("input_path")),
             (
@@ -123,6 +182,60 @@ class PipelineRuns:
                 "config",
             ),
             ("runtime_script", "evaluate_inference.py", script, "code"),
+            *(
+                (
+                    (
+                        "scoring_script",
+                        "score_eval.py",
+                        str(effective_definition["scoring_script"]),
+                        "code",
+                    ),
+                    (
+                        "prediction_evaluation",
+                        "prediction_evaluation.json",
+                        canonical(
+                            {
+                                "source_manifest": effective_definition[
+                                    "source_manifest"
+                                ],
+                                "scoring_spec": effective_definition["scoring_spec"],
+                            }
+                        ),
+                        "config",
+                    ),
+                )
+                if effective_definition.get("kind") == "prediction_evaluation"
+                else ()
+            ),
+            *(
+                (
+                    (
+                        "products_definition",
+                        "products_definition.json",
+                        canonical(effective_definition),
+                        "config",
+                    ),
+                )
+                if effective_definition.get("products_operation")
+                else ()
+            ),
+            *(
+                (
+                    (
+                        "business_scoring",
+                        "business_scoring.json",
+                        canonical(
+                            {
+                                **cast(dict, effective_definition["business_scoring"]),
+                                "test_source": effective_definition["test_source"],
+                            }
+                        ),
+                        "config",
+                    ),
+                )
+                if effective_definition.get("business_scoring")
+                else ()
+            ),
         ):
             version = self._versions.save(
                 project,
@@ -178,7 +291,7 @@ class PipelineRuns:
         assert isinstance(effective, dict)
         effective_workflow = effective["workflow"]
         assert isinstance(effective_workflow, dict)
-        return effective_workflow
+        return effective_workflow, dsl
 
     def resolve(self, run_id: str) -> dict[str, Any] | None:
         run = self._store.load_pipeline_runs().get(str(UUID(run_id)))
@@ -191,6 +304,23 @@ class PipelineRuns:
     def reserve(
         self, definition: dict[str, Any], resume_run_id: str | None
     ) -> dict[str, Any]:
+        from pyromind_runtime.application.test_evaluation import final_test_definition
+        from pyromind_runtime.domain.versions import check_persistable
+
+        check_persistable(definition)
+        definition = final_test_definition(
+            self._store, self.conversation_id, definition
+        )
+        if definition.get("kind") == "prediction_evaluation":
+            from pyromind_runtime.domain.training_evaluation import (
+                CheckpointSelectionPolicy,
+            )
+            from pyromind_runtime.domain.versions import check_persistable
+
+            check_persistable(definition)
+            CheckpointSelectionPolicy.model_validate(
+                definition["scoring_spec"].get("selection", {})
+            )
         fingerprint = hashlib.sha256(
             json.dumps(definition, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()

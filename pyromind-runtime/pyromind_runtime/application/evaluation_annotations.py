@@ -31,7 +31,6 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
-from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.errors import (
     EvaluationRunNotFoundError,
     EvaluationRunUnavailableError,
@@ -214,7 +213,7 @@ def request_content_hash(
     records: list[dict[str, Any]],
     reviewer_id: str,
 ) -> str:
-    """Pure function of the save request body + authenticated reviewer.
+    """Pure function of the save request body and supplied reviewer label.
 
     Including reviewer_id prevents cross-user replay: the same save_id and
     records submitted by different users must produce distinct hashes, so
@@ -1221,7 +1220,6 @@ def resolve_evaluation_run(
     conversation_id: str,
     store: FileProductStore,
     run_id: str,
-    context: RequestContext,
     storage: EvaluationStorage,
     locks: EvaluationLockRegistry,
 ) -> tuple[str, str, EvaluationAnnotationService]:
@@ -1229,18 +1227,15 @@ def resolve_evaluation_run(
 
     The URL-supplied ``run_id`` is parsed exactly once; the canonical form is
     what addresses the commit state, so an alternate spelling of the same UUID
-    can never fork a second revision history. Confirmed absence/ownership
+    can never fork a second revision history. Confirmed absence
     becomes :class:`EvaluationRunNotFoundError`; an unreadable Product Store
     becomes :class:`EvaluationRunUnavailableError`.
     """
     if not store.metadata_path.is_file():
         raise EvaluationRunNotFoundError(f"conversation {conversation_id} not found")
     try:
-        store.authorize(context.user_id)
-    except PermissionError as exc:
-        raise EvaluationRunNotFoundError(
-            "conversation does not belong to current user"
-        ) from exc
+        # Validate persisted metadata without using its owner as an access gate.
+        store.harness_id()
     except ProductStoreError as exc:
         raise EvaluationRunUnavailableError(
             f"conversation {conversation_id} state is unreadable"
@@ -1262,5 +1257,18 @@ def resolve_evaluation_run(
         raise EvaluationRunNotFoundError(
             f"evaluation run {canonical_run_id} not found in this conversation"
         )
+    output_dir = run.output_dir.rstrip("/")
+    # Cached annotation summaries still require current Storage access.
+    manifest_bytes = storage.read(f"{output_dir}/{RUN_MANIFEST_NAME}")
+    try:
+        manifest = json.loads(manifest_bytes)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise EvaluationRunUnavailableError(
+            f"evaluation run {canonical_run_id} manifest is unreadable"
+        ) from exc
+    if not isinstance(manifest, dict) or manifest.get("run_id") != canonical_run_id:
+        raise EvaluationRunUnavailableError(
+            f"evaluation run {canonical_run_id} manifest does not match the run"
+        )
     service = EvaluationAnnotationService(storage=storage, commits=store, locks=locks)
-    return canonical_run_id, run.output_dir.rstrip("/"), service
+    return canonical_run_id, output_dir, service

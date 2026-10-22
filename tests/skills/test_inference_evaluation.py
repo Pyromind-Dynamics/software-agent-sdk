@@ -310,6 +310,140 @@ def test_required_rubric_and_bbox(evaluation_module):
     ) == pytest.approx(2 / 3)
 
 
+def test_classification_and_box_metrics_include_failed_predictions(
+    evaluation_module, evaluation_inputs, monkeypatch
+):
+    box = [0, 0, 10, 10]
+    cases = [
+        ("miss", "fail", [box]),
+        ("error", "fail", [box]),
+        ("defect", "defect", [box]),
+        ("malformed", "pass", []),
+        ("pass", "pass", []),
+    ]
+    dataset = Path(evaluation_inputs["dataset_path"])
+    dataset.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "id": case_id,
+                    "prompt": case_id,
+                    "gt": "<think>evidence</think>\n"
+                    + json.dumps(
+                        {
+                            "result": label,
+                            "boxes": boxes,
+                        }
+                    ),
+                }
+            )
+            + "\n"
+            for case_id, label, boxes in cases
+        )
+    )
+    rubrics = [
+        {
+            "name": "category",
+            "type": "field_equals",
+            "prediction_path": "result",
+            "reference_path": "result",
+        },
+        {"name": "format", "type": "json_valid"},
+        {
+            "name": "location",
+            "type": "bbox_iou",
+            "prediction_path": "boxes",
+            "reference_path": "boxes",
+        },
+    ]
+    evaluation_inputs["evaluation_config_json"] = json.dumps(
+        {
+            "mode": "agent_rubric",
+            "rubrics": [
+                {
+                    "name": entry["name"],
+                    "criterion": entry["name"],
+                    "weight": 1,
+                    "evaluator": {
+                        key: value for key, value in entry.items() if key != "name"
+                    },
+                }
+                for entry in rubrics
+            ],
+        }
+    )
+    replies = {
+        "miss": json.dumps({"result": "pass", "boxes": []}),
+        "defect": json.dumps({"result": "defect", "boxes": [box, [20, 20, 30, 30]]}),
+        "malformed": "not JSON",
+        "pass": json.dumps({"result": "pass", "boxes": []}),
+    }
+
+    def call(endpoint, payload, api_key, timeout):
+        case_id = payload["messages"][-1]["content"][-1]["text"]
+        if case_id not in replies:
+            raise OSError("unreachable")
+        return {"choices": [{"message": {"content": replies[case_id]}}]}, 0.1
+
+    mock_call = Mock(side_effect=call)
+    monkeypatch.setattr(evaluation_module, "_call_api", mock_call)
+    result = evaluation_module.evaluate_inference(**evaluation_inputs)
+    metrics = result["metrics"]["rubric_metrics"]
+    category = metrics["category"]["classification"]
+    assert category["accuracy"] == pytest.approx(0.4)
+    assert category["macro_f1"] == pytest.approx(0.5)
+    assert category["per_class"]["fail"]["support"] == 2
+    assert category["per_class"]["fail"]["recall"] == 0
+    assert category["per_class"]["fail"]["unclassified"] == 1
+    assert category["per_class"]["fail"]["prediction_rates"]["pass"] == 0.5
+    assert category["confusion_matrix"]["fail"]["pass"] == 1
+    assert metrics["format"]["valid_rate"] == pytest.approx(0.6)
+    location = metrics["location"]["localization"]
+    assert location["matched_boxes"] == 1
+    assert location["predicted_boxes"] == 2
+    assert location["reference_boxes"] == 3
+    assert location["precision"] == pytest.approx(0.5)
+    assert location["recall"] == pytest.approx(1 / 3)
+    assert location["f1"] == pytest.approx(0.4)
+    assert location["invalid_predictions"] == 2
+    output = Path(evaluation_inputs["output_dir"])
+    data = _report_data((output / "evaluation_report.html").read_text())
+    assert data["rubric_metrics"] == metrics
+    assert data["mean_latency_seconds"] == 0.1
+
+    # A resume repairs just the API failure and recomputes the same denominators.
+    replies["error"] = json.dumps({"result": "fail", "boxes": [box]})
+    resumed = evaluation_module.evaluate_inference(**evaluation_inputs)
+    assert mock_call.call_count == 6
+    assert resumed["metrics"]["reused_predictions"] == 4
+    assert resumed["metrics"]["rubric_metrics"]["category"]["classification"][
+        "per_class"
+    ]["fail"]["recall"] == pytest.approx(0.5)
+
+
+def test_task_metrics_account_for_unknown_labels_and_empty_boxes(evaluation_module):
+    metrics = evaluation_module._classification_metrics(
+        [
+            ("unexpected", "fail"),
+            (None, "fail"),
+            ("pass", "pass"),
+            ("pass", None),
+        ]
+    )
+    assert metrics["excluded_references"] == 1
+    assert metrics["confusion_matrix"]["fail"]["unexpected"] == 1
+    assert metrics["per_class"]["fail"]["support"] == 2
+    assert metrics["per_class"]["fail"]["unclassified"] == 1
+    assert metrics["per_class"]["pass"]["precision"] == 1
+    assert metrics["macro_f1"] == 0.5
+    assert evaluation_module._classification_metrics([])["macro_f1"] is None
+    boxes = evaluation_module._localization_metrics([([], []), ([], None)], 0.5)
+    assert boxes["reference_boxes"] == 0
+    assert boxes["f1"] == 0
+    assert boxes["excluded_references"] == 1
+    assert evaluation_module._bbox_score([], [], 0.5) == 1
+
+
 def test_scoring_error_reuses_prediction(
     evaluation_module, evaluation_inputs, monkeypatch
 ):
@@ -685,7 +819,7 @@ def _stub_api(
     )
 
 
-def test_report_data_carries_annotation_binding(
+def test_read_only_report_preserves_binding_without_initializing_review(
     evaluation_module, evaluation_inputs, monkeypatch
 ):
     _stub_api(evaluation_module, monkeypatch, content="goodbye")
@@ -705,7 +839,10 @@ def test_report_data_carries_annotation_binding(
     assert data["evaluation_config_sha256"] == digest
     assert data["evaluation_status"] == "validated"
     assert data["annotation_schema"] == {}
-    assert "annotation" in data["panels"]
+    assert "annotation" not in data["panels"]
+    assert not list(
+        Path(evaluation_inputs["output_dir"]).glob("evaluation_annotations.*")
+    )
     assert data["case_delivery"] == "paged"
     assert data["case_count"] == 1
     assert data["cases"] == []
@@ -857,7 +994,7 @@ def test_html_embeds_annotation_frontend(
     assert "(data.warnings || [])" in html
 
 
-def test_initial_annotation_products_written_on_success(
+def test_annotation_initialization_is_explicit_and_preserves_existing_schema(
     evaluation_module, evaluation_inputs, monkeypatch
 ):
     dataset = Path(evaluation_inputs["dataset_path"])
@@ -876,6 +1013,16 @@ def test_initial_annotation_products_written_on_success(
     result = evaluation_module.evaluate_inference(**evaluation_inputs)
     assert result["status"] == "succeeded"
     output = Path(evaluation_inputs["output_dir"])
+
+    assert not (output / "evaluation_annotations.r0.jsonl").exists()
+    prediction_rows = [
+        json.loads(line)
+        for line in (output / "predictions.jsonl").read_text().splitlines()
+    ]
+    binding = json.loads((output / "run_manifest.json").read_text())
+    evaluation_module._write_initial_annotation_products(
+        output, prediction_rows, binding["run_id"], binding["evaluation_config_sha256"]
+    )
 
     # Revision-0 annotation objects cover exactly the machine-failed set.
     annotations_r0 = [

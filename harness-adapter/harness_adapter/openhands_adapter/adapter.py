@@ -6,8 +6,10 @@ import shutil
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from uuid import UUID
 
+from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import (
     CancelCommand,
@@ -106,8 +108,12 @@ class OpenHandsAdapter:
         )
         self._sessions: dict[str, _ActiveSession] = {}
         self._lock = asyncio.Lock()
+        self._pipeline_runs: Callable[[str], PipelineRuns] | None = None
         self._version_call: VersionCall | None = None
         self._execution_call: ExecutionCall | None = None
+
+    def set_pipeline_runs(self, factory: Callable[[str], PipelineRuns]) -> None:
+        self._pipeline_runs = factory
 
     def set_version_handler(
         self, callback: VersionCall, execution: ExecutionCall | None = None
@@ -121,6 +127,46 @@ class OpenHandsAdapter:
         if self._version_call is None:
             return
         conversation = service.get_conversation()
+        if self._pipeline_runs is not None:
+            from openhands.tools.data_preparation.inference import (
+                InferencePipelineHandler,
+            )
+            from openhands.tools.data_preparation.platform_submit import (
+                DfSubmitPipelineExecutor,
+            )
+            from openhands.tools.training_analysis import TrainingAnalysisExecutor
+            from openhands.tools.workflow.validate_workflow_dsl import (
+                ValidateWorkflowDslExecutor,
+            )
+
+            executors = [
+                tool.executor for tool in conversation.agent.tools_map.values()
+            ]
+            training = next(
+                (
+                    item
+                    for item in executors
+                    if isinstance(item, TrainingAnalysisExecutor)
+                ),
+                None,
+            )
+            validator = next(
+                (
+                    item
+                    for item in executors
+                    if isinstance(item, ValidateWorkflowDslExecutor)
+                ),
+                None,
+            )
+            if training is not None and validator is not None:
+                for executor in executors:
+                    if isinstance(executor, DfSubmitPipelineExecutor):
+                        executor._inference_handler = InferencePipelineHandler(
+                            Path(training.runtime_dir).parent.parent
+                            / "inference-evaluation/scripts",
+                            self._pipeline_runs(scope).with_context(context),
+                            validator,
+                        )
         if self._execution_call is not None:
             from openhands.sdk.event import ActionEvent
 
@@ -482,9 +528,17 @@ class OpenHandsAdapter:
     ) -> JsonObject:
         del context
         session = self._session(handle.session_id)
-        removed = await session.event_service.remove_active_long_task(
-            notification.task_id
-        )
+        removed = None
+        if notification.status.lower() in {
+            "succeeded",
+            "failed",
+            "terminated",
+            "stopped",
+            "cancelled",
+        }:
+            removed = await session.event_service.remove_active_long_task(
+                notification.task_id
+            )
         trigger_turn = notification.trigger_turn
         if removed is not None and removed.status == "Stopped":
             trigger_turn = False

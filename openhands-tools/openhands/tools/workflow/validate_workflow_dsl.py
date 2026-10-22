@@ -39,7 +39,12 @@ _PROD_APP_ENVS = {"prod", "production", "online"}
 _MAX_DSL_FILE_BYTES = 2 * 1024 * 1024
 
 
-def _default_validate_url() -> str:
+def _default_validate_url(env: str | None = None) -> str:
+    if env is not None:
+        from_env = env.strip().lower()
+        if from_env == "pre2":
+            return PRE_VALIDATE_URL.replace("pre-api-portal", "pre2-api-portal")
+        return PROD_VALIDATE_URL if from_env in _PROD_APP_ENVS else PRE_VALIDATE_URL
     app_env = os.getenv("APP_ENV", "dev").strip().lower()
     if app_env in _PROD_APP_ENVS:
         return PROD_VALIDATE_URL
@@ -291,8 +296,10 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
         headers: Mapping[str, str] | None = None,
         secret_headers: Mapping[str, str] | None = None,
         timeout: float = 30.0,
+        *,
+        env: str | None = None,
     ) -> None:
-        self._endpoint_url = endpoint_url or _default_validate_url()
+        self._endpoint_url = endpoint_url or _default_validate_url(env)
         self._headers = dict(headers or {})
         self._secret_headers = dict(secret_headers or {})
         self._timeout = timeout

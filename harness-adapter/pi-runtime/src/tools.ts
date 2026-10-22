@@ -8,7 +8,6 @@ import {
 } from "@earendil-works/pi-agent-core";
 import { type ImageContent, type TextContent, type TSchema } from "@earendil-works/pi-ai";
 import {
-  createBashTool,
   createEditTool as createCodingEditTool,
   createReadTool as createCodingReadTool,
   createWriteTool as createCodingWriteTool,
@@ -42,8 +41,8 @@ import {
 } from "./workspace-policy.js";
 
 import type { ExecutionAccess } from "./workflow-execution.js";
+import { createTerminalTool } from "./terminal-tool.js";
 
-const OPENHANDS_ERROR_HEADER = "[An error occurred during execution.]";
 const OMITTED_IMAGE_TEXT = "[Image omitted: Pi only accepts inline base64 image data.]";
 const SANDBOX_READ_PATH_SCOPE =
   "Mounted Storage is addressed as storage/... and is writable there. Conversation files are read from public_data/. Configured skill directories and knowledge are read-only; .agents/skills/ and knowledge/ address their configured resource directories.";
@@ -143,7 +142,7 @@ export async function createTools(
   process.env.TMPDIR = terminalOutputTemp;
   process.env.TMP = terminalOutputTemp;
   process.env.TEMP = terminalOutputTemp;
-  const bash = createBashTool(workspaceRoot, {
+  const terminal = createTerminalTool(workspaceRoot, {
     operations: terminalOperations,
     exposeSessionEnvironment: false,
     spawnHook: ({ command }) => ({
@@ -168,14 +167,7 @@ export async function createTools(
       (path, operation) => policy.resolvePath(path, operation),
       "write",
     ),
-    {
-      ...bash,
-      name: "terminal",
-      label: "terminal",
-      async execute(callId, params: any, signal, onUpdate) {
-        return bash.execute(callId, params, signal, onUpdate);
-      },
-    },
+    terminal,
     ...businessTools.map((config) => businessTool(peer, config)),
   ];
 }
@@ -256,7 +248,7 @@ async function createSandboxTools(
     writeFile: (path, content) => fileClient.write(path, content),
     readFile: (path, limit) => fileClient.read(path, limit),
     resolvePath: async (path, operation) => (await resolvePolicy()).resolvePath(path, operation) });
-  const bash = createBashTool(sandboxCwd, {
+  const terminal = createTerminalTool(sandboxCwd, {
     operations: terminalOperations,
     exposeSessionEnvironment: false,
     spawnHook: ({ command }) => ({ command, cwd: sandboxCwd, env: options.terminalEnvironment ?? {} }),
@@ -286,14 +278,7 @@ async function createSandboxTools(
       "write",
       SANDBOX_WRITE_PATH_SCOPE,
     ),
-    {
-      ...bash,
-      name: "terminal",
-      label: "terminal",
-      async execute(callId, params: any, signal, onUpdate) {
-        return bash.execute(callId, params, signal, onUpdate);
-      },
-    },
+    terminal,
     ...businessTools.map((config) => businessTool(peer, config)),
   ];
 }
@@ -343,15 +328,13 @@ function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig): AgentTool
         throw new Error("invalid Python tool response");
       }
       const content = normalizeBusinessToolContent(response.content);
-      if (response.is_error) {
-        const message = content
-          .filter((block): block is TextContent => block.type === "text")
-          .map((block) => block.text.trim())
-          .filter((text) => text && text !== OPENHANDS_ERROR_HEADER)
-          .join("\n");
-        throw new Error(message || "tool failed");
-      }
-      return { content, details: isRecord(response.details) ? response.details : undefined };
+      return {
+        content,
+        details: {
+          ...(isRecord(response.details) ? response.details : {}),
+          resultCategory: response.is_error ? "failure" : "success",
+        },
+      };
     },
   };
 }

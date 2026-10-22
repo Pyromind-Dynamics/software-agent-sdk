@@ -219,6 +219,27 @@ def test_stable_report_link_works_for_the_current_chat_too() -> None:
     )
 
 
+def test_stable_report_link_has_no_routing_or_credentials() -> None:
+    executor = _make_executor(_eval_files(OWNER_DIR, RUN_ID))
+    executor._public_api_base = "http://localhost:5173"
+    executor._headers = {
+        "x-cluster": "us-west-2#pre",
+        "cookie": "auth_token=storage-secret",
+        "authorization": "Bearer storage-secret",
+    }
+    obs = executor(
+        DfCheckProgressAction(output_dir=OWNER_DIR),
+        conversation=cast(Any, _FakeConversation()),
+    )
+    assert obs.evaluation_report_url == (
+        "http://localhost:5173/api/v2/pyromind/conversations/conv-owner-9"
+        f"/evaluation-runs/{RUN_ID}/report"
+    )
+    assert isinstance(obs.evaluation_report_url, str)
+    assert "storage-secret" not in obs.evaluation_report_url
+    assert "?" not in obs.evaluation_report_url
+
+
 def test_stable_report_link_absent_when_output_dir_layout_unknown() -> None:
     # Without the platform layout the owning conversation cannot be
     # inferred, and a link built from the current chat would 404 — emit none.

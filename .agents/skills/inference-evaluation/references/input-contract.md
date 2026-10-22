@@ -1,7 +1,13 @@
 # 数据与配置
 
 `input_path` 是 Storage JSONL 绝对路径，每行是独立测试 case。
-模型引用也是 Storage 绝对路径；容器挂载前缀 `/workspace` 由工具统一添加。
+模型来源只写在评测配置 JSON 的 model_source 中，不在工具参数里新增字段。
+省略或 `{"type":"storage"}` 时，inference.model_path 是 Storage 绝对路径；
+`{"type":"clone"}` 时是中心仓模型标识；
+`{"type":"download","download_source":"modelscope"}` 时是外部仓模型名称。
+download_source 支持 huggingface（默认）、modelscope。
+容器挂载前缀、Clone 目标目录和 Download 缓存目录由工具处理；
+准备节点的 model_path 输出绑定下游，不把模型仓库标识伪装成 Storage 路径。
 
 数据映射示例：
 ```json

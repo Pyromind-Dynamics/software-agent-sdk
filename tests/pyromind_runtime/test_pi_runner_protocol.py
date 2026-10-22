@@ -217,6 +217,46 @@ def test_runner_tool_event_has_product_operation_shape_and_object_details() -> N
     assert events[0].payload["details"] is None
 
 
+@pytest.mark.parametrize("error_code", [None, "ENUM_VALUE_INVALID"])
+def test_failed_tool_details_survive_product_snapshot_round_trip(error_code):
+    details = {
+        "resultCategory": "failure",
+        "failure_stage": "platform_schema",
+        "retryable": False,
+        "errors": [{"field": "gpu_product", "allowed_values": ["available-gpu"]}],
+    }
+    (harness_event,) = translate_runner_event(
+        {
+            "protocolVersion": PROTOCOL_VERSION,
+            "type": "pi.event",
+            "eventId": "failed-tool",
+            "sessionId": "s1",
+            "runId": "r1",
+            "occurredAt": "2026-10-20T00:00:00Z",
+            "kind": "tool.failed",
+            "payload": {
+                "tool_call_id": "t1",
+                "tool_name": "business_tool",
+                "content": [{"type": "text", "text": "GPU is unsupported"}],
+                "details": details,
+                **({"error_code": error_code} if error_code else {}),
+            },
+        }
+    )
+    product_event = ProductEventProjector().project("s1", harness_event)
+    assert product_event is not None
+    snapshot = SnapshotProjector().reduce(
+        ConversationSnapshot(conversation_id="s1", capabilities=HarnessCapabilities()),
+        product_event.model_copy(update={"seq": 1}),
+    )
+    restored = ConversationSnapshot.model_validate_json(snapshot.model_dump_json())
+    operation = restored.timeline[0]
+    assert isinstance(operation, TimelineOperation)
+    assert operation.status == "failed"
+    assert operation.details == details
+    assert operation.error_code == (error_code or "tool_execution_failed")
+
+
 def test_runner_update_plan_event_emits_structured_plan_update() -> None:
     events = translate_runner_event(
         {

@@ -27,6 +27,7 @@ from pyromind_runtime.ports.workflows import WorkflowEventSink
 from openhands.agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
 from openhands.agent_server.run_workflow_callback import set_workflow_status_dispatcher
 from openhands.agent_server.storage_quota import ensure_conversation_quota
+from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 
@@ -136,6 +137,8 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             versions=versions,
         )
 
+    openhands_adapter.set_pipeline_runs(pipeline_runs)
+
     workflows = None
     workflow_enabled = os.getenv("PYROMIND_AGENTGENOME_ENABLED", "0") == "1"
 
@@ -221,6 +224,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         workflows=workflows,
         workflow_submission=PlatformWorkflowSubmission(),
         versions=versions,
+        evaluation_storage_factory=build_evaluation_storage,
     )
     if backend == "pi":
         adapter = adapters["pi"]

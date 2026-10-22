@@ -5,17 +5,20 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
 import threading
 from collections.abc import Sequence
 from contextlib import ExitStack
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
 from pydantic import Field, model_validator
 
+from openhands.sdk.llm import TextContent
 from openhands.sdk.tool import (
     Action,
     Observation,
@@ -102,6 +105,16 @@ def _redact_text(value: str, payload: Any) -> str:
 
 
 def _redact_value(value: Any, payload: Any, key: str = "", depth: int = 0) -> Any:
+    public_count = key in {
+        "max_tokens",
+        "max_new_tokens",
+        "min_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+    }
+    if public_count and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
     if _REDACTED_KEY.search(key):
         return "[REDACTED]"
     if depth >= 10:
@@ -119,12 +132,18 @@ def _redact_value(value: Any, payload: Any, key: str = "", depth: int = 0) -> An
 
 
 class TrainingAnalysisAction(Action):
-    operation: Literal["probe", "analyze", "report"] = Field(
+    operation: Literal["probe", "analyze", "report", "artifacts"] = Field(
         description="Analysis operation to run."
     )
     task_id: str = Field(
         min_length=1,
-        description="Pyromind training task id used to resolve the training run.",
+        description=(
+            "Numeric Pyromind platform task ID as a string, e.g. '1050', "
+            "from a confirmed submission or product_versions run source."
+        ),
+    )
+    training_node_id: str | None = Field(
+        default=None, description="Select one training node when a task has several."
     )
     run_url: str | None = Field(
         default=None,
@@ -162,7 +181,7 @@ class TrainingAnalysisAction(Action):
 
 
 class TrainingAnalysisObservation(Observation):
-    operation: Literal["probe", "analyze", "report"]
+    operation: Literal["probe", "analyze", "report", "artifacts"]
     target: dict[str, Any] = Field(default_factory=dict)
     result: dict[str, Any] = Field(default_factory=dict)
     report_path: str | None = None
@@ -173,6 +192,9 @@ class TrainingAnalysisObservation(Observation):
 
 TOOL_DESCRIPTION = """Analyze a Pyromind training run through a controlled worker.
 
+Use operation=artifacts first to resolve the executed output_path and discover
+same-step checkpoints/eval JSONL files without W&B. Use training_node_id when
+multiple training nodes exist. Inspect returned samples before writing scoring code.
 Use this tool for W&B metric discovery, loss/NaN/divergence/overfitting analysis,
 four-stage reports, and run comparisons. Call operation=probe to discover keys,
 operation=analyze for structured diagnostics, and operation=report to write a
@@ -210,6 +232,15 @@ class TrainingAnalysisExecutor(
         action: TrainingAnalysisAction,
         conversation: BaseConversation | None = None,
     ) -> TrainingAnalysisObservation:
+        if re.fullmatch(r"[0-9]+", action.task_id.strip()) is None:
+            return self._error(
+                action.operation,
+                "input_resolution",
+                "invalid_platform_task_id",
+                "task_id must be the numeric platform task ID, not a workflow "
+                "name or output directory. Retrieve it from the confirmed "
+                "submission context or product_versions run source before retrying.",
+            )
         if conversation is None:
             return self._error(
                 action.operation,
@@ -221,6 +252,10 @@ class TrainingAnalysisExecutor(
         with ExitStack() as stack:
             host_root = _host_analysis_root(workspace, stack)
             observation = self._analyze(action, conversation, host_root)
+            if action.operation == "artifacts" and not observation.is_error:
+                observation = self._discover_artifacts(
+                    observation, workspace, host_root
+                )
             try:
                 _publish_analysis_report(workspace, host_root, observation)
             except WorkspaceStagingError as exc:
@@ -231,6 +266,82 @@ class TrainingAnalysisExecutor(
                     str(exc),
                 )
             return observation
+
+    def _discover_artifacts(
+        self,
+        observation: TrainingAnalysisObservation,
+        workspace: Any,
+        host_root: Path,
+    ) -> TrainingAnalysisObservation:
+        source = (self.runtime_dir / "training_artifacts.py").read_text()
+        discovered = deepcopy(observation.result)
+        marker = "__TRAINING_ARTIFACTS__:"
+        for node in discovered.get("training_nodes", []):
+            if not node.get("output_path"):
+                continue
+            call = (
+                "\nprint("
+                + repr(marker)
+                + " + json.dumps(discover("
+                + repr(node["output_path"])
+                + ", base_model="
+                + repr(
+                    node.get("inputs", {}).get("base_model")
+                    or node.get("inputs", {}).get("model_path")
+                )
+                + ")))"
+            )
+            try:
+                if is_remote_workspace(workspace):
+                    result = workspace.execute_command(
+                        "python3 -c " + shlex.quote(source + call),
+                        timeout=self.timeout_seconds,
+                    )
+                    code, stdout, stderr = (
+                        result.exit_code,
+                        result.stdout,
+                        result.stderr,
+                    )
+                else:
+                    result = subprocess.run(
+                        [sys.executable, "-c", source + call],
+                        cwd=host_root,
+                        capture_output=True,
+                        text=True,
+                        timeout=self.timeout_seconds,
+                        check=False,
+                    )
+                    code, stdout, stderr = (
+                        result.returncode,
+                        result.stdout,
+                        result.stderr,
+                    )
+                if code != 0:
+                    raise ValueError(str(stderr or stdout)[-1000:])
+                payload = next(
+                    (
+                        line.removeprefix(marker)
+                        for line in stdout.splitlines()
+                        if line.startswith(marker)
+                    ),
+                    "",
+                )
+                artifacts = json.loads(payload)
+                if not isinstance(artifacts, dict):
+                    raise ValueError("Artifact discovery returned a non-object result")
+                node.update(artifacts)
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                node.setdefault("issues", []).append(
+                    f"artifact_discovery_failed: {exc}"
+                )
+        return observation.model_copy(
+            update={
+                "result": discovered,
+                "content": [
+                    TextContent(text=json.dumps(discovered, ensure_ascii=False))
+                ],
+            }
+        )
 
     def _analyze(
         self,
@@ -436,7 +547,8 @@ class TrainingAnalysisExecutor(
             headers[name] = value
         return {
             "operation": action.operation,
-            "task_id": action.task_id,
+            "task_id": action.task_id.strip(),
+            "training_node_id": action.training_node_id,
             "run_url": action.run_url,
             "data_source": action.data_source,
             "metric": action.metric,
@@ -499,7 +611,7 @@ class TrainingAnalysisExecutor(
 
     @staticmethod
     def _error(
-        operation: Literal["probe", "analyze", "report"],
+        operation: Literal["probe", "analyze", "report", "artifacts"],
         stage: str,
         code: str,
         message: str,

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pyromind_agent_server.api.evaluation_runs as evaluation_routes
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -16,9 +17,11 @@ from pyromind_agent_server.api.evaluation_runs import (
     create_evaluation_runs_router,
     get_evaluation_storage,
 )
+from pyromind_agent_server.api.router import create_product_router
 from pyromind_agent_server.evaluation_storage import PyromindEvaluationStorage
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
+from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.evaluation import EvaluationCommitState
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
@@ -172,35 +175,201 @@ def reviewed_record() -> dict[str, Any]:
     }
 
 
-def test_unauthenticated_request_is_rejected(environment) -> None:
-    client, _ = environment
-    response = client.get(f"{base_url()}/annotations")
-    assert response.status_code == 401
-
-
-def test_session_api_key_without_identity_is_rejected(
-    environment, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"X-Session-API-Key": "not-a-local-key"},
+        {
+            "Cookie": "auth_token=opaque-storage-token; other=value",
+            "Authorization": "Bearer storage-token",
+            "x-cluster": "us-west-2#pre",
+        },
+    ],
+)
+def test_evaluation_only_uses_request_storage_credentials(
+    environment, monkeypatch: pytest.MonkeyPatch, headers
 ) -> None:
-    client, _ = environment
-    monkeypatch.delenv("APP_ENV", raising=False)
-    response = client.get(
-        f"{base_url()}/annotations",
-        headers={"X-Session-API-Key": "session-key"},
+    client, storage = environment
+    monkeypatch.setenv("APP_ENV", "pre")
+    client.app.state.config = client.app.state.config.model_copy(
+        update={"enable_pyromind_jwt_auth": True}
     )
-    assert response.status_code == 401
-    assert "verified login user" in response.json()["detail"]
+    received = []
+
+    def build_storage(context: RequestContext):
+        received.append(context)
+        return storage
+
+    monkeypatch.setattr(evaluation_routes, "build_evaluation_storage", build_storage)
+    client.app.dependency_overrides.pop(get_evaluation_storage)
+    storage.files[f"{OUTPUT_DIR}/evaluation_report.html"] = (
+        b"<html><head></head></html>"
+    )
+    response = client.get(f"{base_url()}/report", headers=headers)
+    assert response.status_code == 200
+    assert received == [
+        RequestContext(
+            user_id="anonymous",
+            cookie=headers.get("Cookie"),
+            authorization=headers.get("Authorization"),
+            x_cluster=headers.get("x-cluster"),
+        )
+    ]
+    assert "opaque-storage-token" not in response.text
+    assert "storage-token" not in response.text
+    # A later request must not inherit the preceding request's credentials.
+    assert client.get(f"{base_url()}/report").status_code == 200
+    assert received[-1].user_id == "anonymous"
+    assert received[-1].authorization is None
+    assert "opaque-storage-token" not in (received[-1].cookie or "")
+    assert received[-1].x_cluster is None
 
 
-def test_conversation_of_another_user_is_not_found(
+def test_bare_report_uses_conversation_route_after_restart(
     environment, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    client, storage = environment
+    client.app.include_router(create_product_router())
+    snapshot = client.get(
+        f"/api/v2/pyromind/conversations/{CONVERSATION_ID}/snapshot",
+        headers={**DEV_HEADERS, "x-cluster": "us-west-2#pre"},
+    )
+    assert snapshot.status_code == 200
+    assert storage.pipeline_runs_file is not None
+    conversations = storage.pipeline_runs_file.parents[2]
+    client.app.state.product_runtime = ConversationRuntime(conversations, MagicMock())
+    received = []
+
+    def build_storage(context: RequestContext):
+        received.append(context)
+        return storage
+
+    monkeypatch.setattr(evaluation_routes, "build_evaluation_storage", build_storage)
+    client.app.dependency_overrides.pop(get_evaluation_storage)
+    client.cookies.set("auth_token", "opaque-storage-cookie")
+    storage.files[f"{OUTPUT_DIR}/evaluation_report.html"] = b"<html></html>"
+    report = client.get(f"{base_url()}/report")
+    assert report.status_code == 200
+    assert received[-1].x_cluster == "us-west-2#pre"
+    assert "set-cookie" not in report.headers
+    assert not report.url.query
+
+    for endpoint in (
+        "annotations",
+        "annotations/summary",
+        "exports/evaluation_annotations.jsonl",
+    ):
+        response = client.get(f"{base_url()}/{endpoint}")
+        assert response.status_code == 200
+        assert received[-1].x_cluster == "us-west-2#pre"
+        assert "auth_token=opaque-storage-cookie" in received[-1].cookie
+
+    override = client.get(
+        f"{base_url()}/annotations", headers={"x-cluster": "us-west-1#pre2"}
+    )
+    assert override.status_code == 200
+    assert received[-1].x_cluster == "us-west-1#pre2"
+
+    other_id = "conv-eval-other"
+    (conversations / other_id).mkdir()
+    FileProductStore(conversations / other_id).create(
+        ConversationSnapshot(
+            conversation_id=other_id, capabilities=HarnessCapabilities()
+        ),
+        user_id="42",
+    )
+    missing = client.get(f"{base_url(conversation_id=other_id)}/report")
+    assert missing.status_code == 404
+    assert received[-1].x_cluster is None
+
+
+def test_evaluation_user_label_does_not_restrict_access(environment) -> None:
     client, _ = environment
-    monkeypatch.setenv("APP_ENV", "dev")
     response = client.get(
         f"{base_url()}/annotations",
         headers={**DEV_HEADERS, "x-pyromind-debug-user-id": "43"},
     )
-    assert response.status_code == 404
+    assert response.status_code == 200
+
+
+def test_non_evaluation_routes_still_require_auth(environment) -> None:
+    client, _ = environment
+    client.app.state.config = client.app.state.config.model_copy(
+        update={"enable_pyromind_jwt_auth": True}
+    )
+    client.app.include_router(create_product_router())
+    response = client.get(f"/api/v2/pyromind/conversations/{CONVERSATION_ID}/snapshot")
+    assert response.status_code == 401
+
+
+def test_anonymous_annotation_save_and_replay(environment) -> None:
+    client, storage = environment
+    payload = {
+        "save_id": "anonymous-1",
+        "base_revision": 0,
+        "records": [reviewed_record()],
+    }
+    first = client.put(f"{base_url()}/annotations", json=payload)
+    assert first.status_code == 200
+    assert first.json()["revision"] == 1
+    replay = client.put(f"{base_url()}/annotations", json=payload)
+    assert replay.status_code == 200
+    assert replay.json()["revision"] == 1
+    saved = json.loads(storage.files[f"{OUTPUT_DIR}/evaluation_annotations.r1.jsonl"])
+    assert saved["human_annotation"]["reviewer_id"] == "anonymous"
+    exported = client.get(f"{base_url()}/exports/evaluation_annotations.jsonl")
+    assert exported.status_code == 200
+    assert json.loads(exported.text)["human_annotation"]["reviewer_id"] == "anonymous"
+
+
+@pytest.mark.parametrize("failure", ["missing", "expired", "forbidden"])
+def test_storage_rejection_cannot_be_bypassed_by_local_summary(
+    environment, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    client, storage = environment
+    saved = client.put(
+        f"{base_url()}/annotations",
+        json={"save_id": "warmup", "base_revision": 0, "records": [reviewed_record()]},
+    )
+    assert saved.status_code == 200
+    assert client.get(f"{base_url()}/annotations/summary").status_code == 200
+    original_read = storage.read
+
+    def rejected_read(path: str) -> bytes:
+        if path == f"{OUTPUT_DIR}/run_manifest.json":
+            raise EvaluationStorageUnavailableError(failure)
+        return original_read(path)
+
+    monkeypatch.setattr(storage, "read", rejected_read)
+    assert client.get(f"{base_url()}/annotations/summary").status_code == 503
+    rejected = client.patch(
+        f"{base_url()}/annotations",
+        json={
+            "save_id": "blocked",
+            "base_revision": 1,
+            "changes": [
+                {
+                    "case_id": "b",
+                    "human_annotation": reviewed_record()["human_annotation"],
+                }
+            ],
+        },
+    )
+    assert rejected.status_code == 503
+    assert f"{OUTPUT_DIR}/evaluation_annotations.r2.jsonl" not in storage.files
+
+
+@pytest.mark.parametrize("manifest", [b"{broken", b"[]", b'{"run_id":"another-run"}'])
+def test_report_requires_manifest_bound_to_registered_run(
+    environment, manifest
+) -> None:
+    client, storage = environment
+    storage.files[f"{OUTPUT_DIR}/run_manifest.json"] = manifest
+    storage.files[f"{OUTPUT_DIR}/evaluation_report.html"] = b"<html></html>"
+    response = client.get(f"{base_url()}/report")
+    assert response.status_code == 500
+    assert "currently unavailable" in response.json()["detail"]
 
 
 def test_unknown_run_is_not_found(environment) -> None:
@@ -543,20 +712,18 @@ def test_cases_are_paginated_and_media_is_whitelisted(environment) -> None:
         json.dumps(alpha) + "\n" + json.dumps(beta) + "\n"
     ).encode()
 
-    first = client.get(f"{base_url()}/cases?limit=1", headers=DEV_HEADERS)
+    first = client.get(f"{base_url()}/cases?limit=1")
     assert first.status_code == 200
     assert [item["id"] for item in first.json()["items"]] == ["alpha"]
     assert first.json()["items"][0]["review_status"] == "reviewed"
     assert first.json()["items"][0]["human_annotation"] is not None
-    summary = client.get(f"{base_url()}/annotations/summary", headers=DEV_HEADERS)
+    summary = client.get(f"{base_url()}/annotations/summary")
     assert summary.status_code == 200
     assert summary.json()["reviewed"] == 1
     assert summary.json()["unreviewed"] == 1
     assert "records" not in summary.json()
     cursor = first.json()["next_cursor"]
-    second = client.get(
-        f"{base_url()}/cases", headers=DEV_HEADERS, params={"cursor": cursor}
-    )
+    second = client.get(f"{base_url()}/cases", params={"cursor": cursor})
     assert second.status_code == 200
     assert [item["id"] for item in second.json()["items"]] == ["beta"]
 
@@ -569,12 +736,12 @@ def test_cases_are_paginated_and_media_is_whitelisted(environment) -> None:
     assert [item["id"] for item in filtered.json()["items"]] == ["beta"]
     assert filtered.json()["filtered_total"] == 1
 
-    media = client.get(f"{base_url()}/media/00000000-000.png", headers=DEV_HEADERS)
+    media = client.get(f"{base_url()}/media/00000000-000.png")
     assert media.status_code == 200
     assert media.content == b"png"
     assert media.headers["content-type"] == "image/png"
     assert "private" in media.headers["cache-control"]
-    missing = client.get(f"{base_url()}/media/not-listed.png", headers=DEV_HEADERS)
+    missing = client.get(f"{base_url()}/media/not-listed.png")
     assert missing.status_code == 404
 
 
@@ -616,8 +783,7 @@ def test_report_without_storage_object_is_not_found(environment) -> None:
 
 
 def test_not_found_bodies_do_not_distinguish_existence(environment) -> None:
-    """All resolution 404s share one body: "missing" vs "someone else's"
-    must be indistinguishable, or the 404 contract leaks existence."""
+    """All missing or invalid run references retain the same public body."""
     client, _ = environment
     urls = [
         (
@@ -633,12 +799,6 @@ def test_not_found_bodies_do_not_distinguish_existence(environment) -> None:
         response = client.get(url, headers=DEV_HEADERS)
         assert response.status_code == 404
         bodies.append(response.text)
-    foreign = client.get(
-        f"{base_url()}/annotations",
-        headers={**DEV_HEADERS, "x-pyromind-debug-user-id": "43"},
-    )
-    assert foreign.status_code == 404
-    bodies.append(foreign.text)
     assert len(set(bodies)) == 1
     assert "not found" in bodies[0]
 

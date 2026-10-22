@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 from rich.text import Text
 
 from openhands.sdk.conversation.state import ActiveLongTask
+from openhands.sdk.llm import ImageContent, TextContent
 from openhands.sdk.tool import (
     Action,
     Observation,
@@ -31,10 +32,17 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
+from openhands.tools.data_preparation.evaluation_products import (
+    EvaluationProductsOptions,
+)
 from openhands.tools.data_preparation.inference import (
+    EvaluationConfigurationError,
     InferenceOptions,
     InferencePipelineHandler,
     validate_pipeline_topology,
+)
+from openhands.tools.data_preparation.prediction_evaluation import (
+    PredictionEvaluationOptions,
 )
 from openhands.tools.data_preparation.runner import (
     DATAFLOW_RUNTIME_PACKAGES,
@@ -76,6 +84,7 @@ from openhands.tools.workflow.task_submission import (
     create_workflow_api_client,
     submit_workflow_task,
 )
+from openhands.tools.workflow.validate_workflow_dsl import WorkflowValidationIssue
 
 
 if TYPE_CHECKING:
@@ -112,10 +121,39 @@ DATA_PROCESSING_PACKAGES = DATAFLOW_RUNTIME_PACKAGES
 TOOL_DESCRIPTION = """\
 Submit an agent-authored Python pipeline for asynchronous execution on Pyromind.
 
-For Storage model evaluation, pass inference with model_path and workspace
-dataset_config_path / evaluation_config_path. This builds exactly one
-VLLMInference connected to one CustomCommandCPUNode with the built-in rubric
-evaluator. No local GPU sample, script_path, model_profile, output_schema or
+For existing predictions, pass evaluation with source_manifest_path,
+scoring_spec_path and scoring_script_path (workspace files). Inspect real samples
+first; the script defines parse_record and score_case. This freezes one CPU-only
+batch across all listed eval steps. Scoring never initializes human annotations.
+It never starts inference. evaluation and inference are mutually exclusive;
+changed scoring rules require a new run, unchanged resume reuses frozen inputs.
+
+For independent distribution analysis, badcase review import, or report rendering,
+pass products with operation='profile'|'review'|'report' and manifest_path.
+profile also requires extraction_script_path defining parse_record.
+review requires a completed profile matching train/validation data fingerprints,
+and a frozen scoring source or imported badcase list. It creates a NEW task using
+the existing annotation UI and taxonomy; never generate a new annotation interface.
+Rubric changes create new review tasks; old human annotations are not inherited.
+products, evaluation, and inference are mutually exclusive.
+
+With train + validation only, use saved eval_step predictions; do not launch
+additional inference. An independent test dataset is evaluated only after
+validation selects a checkpoint: pass inference.selection_run_id for that batch.
+Test metrics never participate in checkpoint selection.
+
+For model evaluation and baseline/post-training benchmarks, read the
+inference-evaluation skill and pass inference with model_path and workspace
+dataset_config_path / evaluation_config_path. The evaluation config JSON selects
+model_source: storage (default), clone, download, or checkpoint. model_path is
+an absolute Storage path, a central catalog identifier, or a repository name.
+For checkpoint, model_path is the exact checkpoint-n Storage directory; LoRA
+requires its base_model Storage path and merges that adapter before inference.
+The tool generates workflow.py with optional ModelMergeLoraNode,
+CloneAndCacheModel or
+DownloadAndCacheModel feeding VLLMInference, connected to one
+CustomCommandCPUNode with the built-in rubric evaluator.
+No local GPU sample, script_path, model_profile, output_schema or
 format conversion is needed in this mode. Read report.json and its HTML artifact
 after the callback. Inference resume requires unchanged configuration and data;
 omit inference to reuse the frozen configuration. Only submit when execution
@@ -180,6 +218,16 @@ class ReuseAssessment(BaseModel):
 
 class DfSubmitPipelineAction(Action):
     """Submit a DataFlow-compatible Python pipeline to Pyromind Studio."""
+
+    products: EvaluationProductsOptions | None = None
+
+    evaluation: PredictionEvaluationOptions | None = Field(
+        default=None,
+        description=(
+            "Score saved predictions on CPU with one frozen business script; "
+            "mutually exclusive with inference."
+        ),
+    )
 
     inference: InferenceOptions | None = Field(
         default=None,
@@ -294,6 +342,27 @@ class DfSubmitPipelineObservation(Observation):
     execution_revision: int | None = Field(default=None)
     failure_stage: str | None = Field(default=None)
     retryable: bool | None = Field(default=None)
+    validation_errors: list[WorkflowValidationIssue] = Field(default_factory=list)
+    validation_warnings: list[WorkflowValidationIssue] = Field(default_factory=list)
+
+    @property
+    def to_llm_content(self) -> Sequence[TextContent | ImageContent]:
+        content = list(super().to_llm_content)
+        if self.failure_stage or self.validation_errors or self.validation_warnings:
+            content.append(
+                TextContent(
+                    text=self.model_dump_json(
+                        include={
+                            "failure_stage",
+                            "retryable",
+                            "validation_errors",
+                            "validation_warnings",
+                        },
+                        exclude_none=True,
+                    )
+                )
+            )
+        return content
 
     @property
     def visualize(self) -> Text:
@@ -576,7 +645,22 @@ class DfSubmitPipelineExecutor(
                 and action.resume_run_id is not None
                 and handler.runs.resolve(str(action.resume_run_id)) is not None
             )
-            if action.inference is not None or inference_resume:
+            if (
+                sum(
+                    value is not None
+                    for value in (action.inference, action.evaluation, action.products)
+                )
+                > 1
+            ):
+                raise ValueError(
+                    "evaluation, products and inference are mutually exclusive"
+                )
+            if (
+                action.inference is not None
+                or action.evaluation is not None
+                or action.products is not None
+                or inference_resume
+            ):
                 if handler is None:
                     raise ValueError("inference evaluation is not configured")
                 try:
@@ -585,9 +669,15 @@ class DfSubmitPipelineExecutor(
                     )
                 except Exception as exc:
                     return DfSubmitPipelineObservation.from_text(
-                        text=f"Inference evaluation submission failed: {exc}",
+                        text=f"Evaluation submission failed: {exc}",
                         status="Failed",
                         is_error=True,
+                        failure_stage="config_validation"
+                        if isinstance(exc, EvaluationConfigurationError)
+                        else None,
+                        retryable=False
+                        if isinstance(exc, EvaluationConfigurationError)
+                        else None,
                     )
             input_path = _normalize_storage_path(action.input_path, "input_path")
             task_store = self._task_store(conversation)

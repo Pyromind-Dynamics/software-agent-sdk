@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import shlex
 import subprocess
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from openhands.sdk.conversation.state import ActiveLongTask
+from openhands.sdk.logger import get_logger
 from openhands.tools.data_preparation.runner import runtime_bundle_fingerprint
 from openhands.tools.utils.workspace_staging import publish_workspace_path
 from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
@@ -23,6 +26,7 @@ from openhands.tools.workflow.task_submission import (
 from openhands.tools.workflow.validate_workflow_dsl import (
     ValidateWorkflowDslAction,
     ValidateWorkflowDslExecutor,
+    ValidateWorkflowDslObservation,
 )
 
 
@@ -34,6 +38,9 @@ if TYPE_CHECKING:
         DfSubmitPipelineExecutor,
         _SubmissionFiles,
     )
+
+
+logger = get_logger(__name__)
 
 
 INFERENCE_RUNTIME_FILENAMES = (
@@ -60,7 +67,19 @@ def _validate_report_ui_bundle(runtime_dir: Path) -> None:
 
 class InferenceOptions(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    model_path: str = Field(min_length=1)
+    model_path: str = Field(
+        min_length=1,
+        description=(
+            "Model reference interpreted by model_source in the evaluation config "
+            "JSON: an absolute Storage path for storage (default), a central "
+            "catalog model identifier for clone (exact enum value, including its "
+            "namespace), or a repository name for download."
+        ),
+    )
+    selection_run_id: str | None = Field(
+        default=None,
+        description="Validation selection batch authorizing this independent test run.",
+    )
     dataset_config_path: str = Field(min_length=1)
     evaluation_config_path: str = Field(min_length=1)
     report_spec_path: str | None = Field(default=None, min_length=1)
@@ -139,6 +158,45 @@ class GenerationOptions(BaseModel):
     limit: int = Field(default=0, ge=0)
 
 
+class StorageModelSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["storage"] = "storage"
+
+
+class CloneModelSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["clone"]
+
+
+class DownloadModelSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["download"]
+    download_source: Literal["huggingface", "modelscope"] = "huggingface"
+
+
+class CheckpointModelSource(BaseModel):
+    """Explicit saved checkpoint; its reference must never be rebound to latest."""
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["checkpoint"]
+    kind: Literal["full", "lora"]
+    base_model: str | None = None
+
+    @model_validator(mode="after")
+    def lora_base(self):
+        if self.kind == "lora":
+            if not self.base_model:
+                raise ValueError("LoRA requires its resolved base_model Storage path")
+            storage_path(self.base_model, "model_source.base_model")
+        return self
+
+
+ModelSource = Annotated[
+    StorageModelSource | CloneModelSource | DownloadModelSource | CheckpointModelSource,
+    Field(discriminator="type"),
+]
+
+
 class EvaluationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     mode: Literal["agent_rubric"]
@@ -146,6 +204,7 @@ class EvaluationConfig(BaseModel):
     pass_threshold: float = Field(default=0.7, ge=0, le=1)
     rubric_pass_threshold: float = Field(default=0.7, ge=0, le=1)
     generation: GenerationOptions = Field(default_factory=GenerationOptions)
+    model_source: ModelSource = Field(default_factory=StorageModelSource)
 
     @model_validator(mode="after")
     def unique_names(self) -> EvaluationConfig:
@@ -170,47 +229,113 @@ class PipelineRunBackend(Protocol):
         status: Literal["submitted", "failed", "uncertain"],
     ) -> None: ...
 
+    def prepare_execution(
+        self, run_id: str, workflow: dict[str, Any], dsl: str, script: str
+    ) -> tuple[dict[str, Any], str]: ...
 
-ALLOWED_NODE_TYPES = frozenset({"CustomCommandCPUNode", "VLLMInference"})
+
+MODEL_PREPARATION_NODES = frozenset(
+    {"CloneAndCacheModel", "DownloadAndCacheModel", "ModelMergeLoraNode"}
+)
 
 
-def validate_pipeline_topology(workflow: dict[str, Any]) -> None:
+def validate_pipeline_topology(
+    workflow: dict[str, Any], *, require_inference: bool = False
+) -> None:
     nodes, edges = workflow.get("nodes", []), workflow.get("edges", [])
     kinds = [node["data"]["nodeType"] for node in nodes]
-    if not set(kinds) <= ALLOWED_NODE_TYPES:
-        raise ValueError("pipeline contains a node outside the server allowlist")
-    if kinds == ["CustomCommandCPUNode"] and not edges:
+    if not require_inference and kinds == ["CustomCommandCPUNode"] and not edges:
         return
-    if sorted(kinds) != ["CustomCommandCPUNode", "VLLMInference"] or len(edges) != 1:
-        raise ValueError("only one CPU node or inference -> CPU is allowed")
+    preparation = [
+        node for node in nodes if node["data"]["nodeType"] in MODEL_PREPARATION_NODES
+    ]
+    expected = ["CustomCommandCPUNode", "VLLMInference"]
+    if len(preparation) == 1:
+        expected.append(preparation[0]["data"]["nodeType"])
+    if sorted(kinds) != sorted(expected) or len(edges) != len(nodes) - 1:
+        raise ValueError(
+            "evaluation requires inference -> CPU with at most one "
+            "clone or download node"
+        )
+    if len({str(node["id"]) for node in nodes}) != len(nodes):
+        raise ValueError("evaluation node IDs must be unique")
     source = next(node for node in nodes if node["data"]["nodeType"] == "VLLMInference")
     target = next(
         node for node in nodes if node["data"]["nodeType"] == "CustomCommandCPUNode"
     )
-    edge = edges[0]
-    if (
-        str(source["id"]) == str(target["id"])
-        or str(edge.get("source")) != str(source["id"])
-        or str(edge.get("target")) != str(target["id"])
-        or edge.get("sourceHandle") != "endpoint"
-        or edge.get("targetHandle") != "param"
-    ):
-        raise ValueError("pipeline must connect inference.endpoint to CPU.param")
+    expected_edges = {(str(source["id"]), str(target["id"]), "endpoint", "param")}
+    if preparation:
+        expected_edges.add(
+            (
+                str(preparation[0]["id"]),
+                str(source["id"]),
+                "merged_model_path"
+                if preparation[0]["data"]["nodeType"] == "ModelMergeLoraNode"
+                else "model_path",
+                "model_path",
+            )
+        )
+    actual_edges = {
+        (
+            str(edge.get("source")),
+            str(edge.get("target")),
+            edge.get("sourceHandle"),
+            edge.get("targetHandle"),
+        )
+        for edge in edges
+    }
+    if actual_edges != expected_edges:
+        raise ValueError(
+            "pipeline must connect preparation.model_path to inference.model_path "
+            "and inference.endpoint to CPU.param"
+        )
 
 
-def storage_path(value: str) -> str:
+def storage_path(value: str, field: str = "Storage path") -> str:
     if value == "/workspace" or value.startswith("/workspace/"):
         value = value[len("/workspace") :] or "/"
     path = PurePosixPath(value)
     if not path.is_absolute() or ".." in path.parts or str(path) == "/":
-        raise ValueError("expected an absolute Storage path without traversal")
+        raise ValueError(
+            f"{field}: expected an absolute Storage path without traversal; "
+            f"received {value!r}"
+        )
     return str(path)
+
+
+def model_reference(value: str, source: ModelSource) -> str:
+    if source.type == "checkpoint":
+        reference = storage_path(value, "inference.model_path")
+        if not re.fullmatch(r"checkpoint-\d+", PurePosixPath(reference).name):
+            raise ValueError("selected model must reference an exact checkpoint-n")
+        return reference
+    if source.type == "storage":
+        return storage_path(value, "inference.model_path (model_source.type=storage)")
+    path = PurePosixPath(value)
+    if (
+        value != value.strip()
+        or not value
+        or path.is_absolute()
+        or ".." in path.parts
+        or "\\" in value
+        or any(ord(character) < 32 for character in value)
+        or str(path) in {".", "/"}
+    ):
+        raise ValueError(
+            f"inference.model_path (model_source.type={source.type}): "
+            f"expected a model identifier, received {value!r}"
+        )
+    return value
 
 
 def build_inference_dsl(
     definition: dict[str, Any], output_dir: str, run_id: str
 ) -> str:
     options = definition["inference"]
+    source = EvaluationConfig.model_validate(
+        definition["evaluation_config"]
+    ).model_source
+    reference = model_reference(options["model_path"], source)
     output = "/workspace" + storage_path(output_dir)
     command = " ".join(
         [
@@ -238,6 +363,11 @@ def build_inference_dsl(
             shlex.quote(output),
             "--report-assets-dir",
             shlex.quote(output),
+            *(
+                ["--business-scoring", shlex.quote(output + "/business_scoring.json")]
+                if definition.get("business_scoring")
+                else []
+            ),
         ]
     )
     node_config = {
@@ -245,14 +375,89 @@ def build_inference_dsl(
         for key in ("port", "gpu_count", "gpu_product", "max_model_len")
         if options.get(key) is not None
     }
-    node_config["model_path"] = "/workspace" + options["model_path"]
+    preparation = ""
+    if source.type == "checkpoint" and source.kind == "lora":
+        base = "/workspace" + storage_path(source.base_model or "")
+        merged = output + "/merged-model"
+        preparation = (
+            f"model = ModelMergeLoraNode(id=3, lora_path={'/workspace' + reference!r}, "
+            f"model_path={base!r}, output_path={merged!r}, "
+            f"gpu_count={options['gpu_count']!r}, "
+            f"gpu_product={options['gpu_product']!r})\n\n"
+        )
+        model_input = "model.merged_model_path"
+    elif source.type in {"storage", "checkpoint"}:
+        model_input = repr("/workspace" + reference)
+    elif source.type == "clone":
+        preparation = (
+            f"model = CloneAndCacheModel(id=3, model={reference!r}, "
+            "target_path='/workspace/models/')\n\n"
+        )
+        model_input = "model.model_path"
+    else:
+        assert isinstance(source, DownloadModelSource)
+        cache_dir = "/workspace/models/" + reference
+        preparation = (
+            f"model = DownloadAndCacheModel(id=3, modelname={reference!r}, "
+            f"cache_dir={cache_dir!r}, "
+            f"download_source={source.download_source!r})\n\n"
+        )
+        model_input = "model.model_path"
     args = ", ".join(f"{key}={value!r}" for key, value in node_config.items())
     return (
-        f"inference = VLLMInference(id=1, {args})\n\n"
+        preparation
+        + f"inference = VLLMInference(id=1, model_path={model_input}, {args})\n\n"
         f"evaluation = CustomCommandCPUNode(id=2, command={command!r}, "
         f"cpu={definition['cpu']}, memory={definition['memory']}, "
         "param=inference.endpoint)\n"
     )
+
+
+class EvaluationConfigurationError(ValueError):
+    pass
+
+
+def read_evaluation_config(files, path: str) -> EvaluationConfig:
+    try:
+        raw = json.loads(files.read_text(path))
+    except json.JSONDecodeError as exc:
+        raise EvaluationConfigurationError(
+            f"{path}: JSON line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
+    allowed = {
+        "exact_match": {"type", "prediction_path", "reference_path", "case_sensitive"},
+        "json_valid": {"type", "prediction_path"},
+        "required_fields": {"type", "prediction_paths"},
+        "field_equals": {"type", "prediction_path", "reference_path", "case_sensitive"},
+        "non_empty": {"type", "prediction_path"},
+        "number_range": {"type", "prediction_path", "min", "max"},
+        "list_count_match": {"type", "prediction_path", "reference_path"},
+        "bbox_iou": {"type", "prediction_path", "reference_path", "iou_threshold"},
+    }
+    for index, rubric in enumerate(
+        raw.get("rubrics", []) if isinstance(raw, dict) else []
+    ):
+        evaluator = rubric.get("evaluator", {}) if isinstance(rubric, dict) else {}
+        kind = evaluator.get("type") if isinstance(evaluator, dict) else None
+        if kind in allowed and set(evaluator) - allowed[kind]:
+            extra = sorted(set(evaluator) - allowed[kind])
+            raise EvaluationConfigurationError(
+                f"{path}: rubrics.{index}.evaluator rubric={rubric.get('name')!r}: "
+                f"unsupported fields {extra}; {kind} accepts: "
+                f"{', '.join(sorted(allowed[kind]))}"
+            )
+    try:
+        return EvaluationConfig.model_validate(raw)
+    except ValidationError as exc:
+        raise EvaluationConfigurationError(
+            f"{path}: {exc.errors(include_url=False)}"
+        ) from exc
+
+
+class _WorkflowValidationError(ValueError):
+    def __init__(self, validation: ValidateWorkflowDslObservation) -> None:
+        super().__init__(f"platform rejected evaluation workflow: {validation.text}")
+        self.validation = validation
 
 
 class InferencePipelineHandler:
@@ -265,6 +470,39 @@ class InferencePipelineHandler:
         self.runtime_dir = runtime_dir
         self.runs = runs
         self.validator = validator
+
+    def _validate(
+        self,
+        dsl: str,
+        conversation: BaseConversation,
+        *,
+        env: str | None,
+        cluster: str | None,
+    ) -> ValidateWorkflowDslObservation:
+        validation = self.validator(ValidateWorkflowDslAction(dsl=dsl), conversation)
+        logger.info(
+            "evaluation.dsl_validation env=%s cluster=%s dsl_sha256=%s "
+            "valid=%s errors=%d is_error=%s failure_stage=%s",
+            env,
+            cluster,
+            hashlib.sha256(dsl.encode()).hexdigest(),
+            validation.valid,
+            len(validation.errors),
+            validation.is_error,
+            validation.failure_stage,
+        )
+        if validation.is_error or validation.valid is not True or validation.errors:
+            raise _WorkflowValidationError(validation)
+        return validation
+
+    @staticmethod
+    def _publish_canvas(conversation: BaseConversation, dsl: str) -> None:
+        with tempfile.TemporaryDirectory(prefix="inference-canvas-") as directory:
+            canvas = Path(directory) / "workflow.py"
+            canvas.write_text(dsl)
+            publish_workspace_path(
+                cast(Any, conversation).workspace, canvas, WORKFLOW_RELATIVE_PATH
+            )
 
     def submit(
         self,
@@ -297,18 +535,70 @@ class InferencePipelineHandler:
             if action.resume_run_id
             else None
         )
+        saved_predictions = action.evaluation is not None or bool(
+            prior and prior["definition"].get("kind") == "prediction_evaluation"
+        )
+        products = action.products is not None or bool(
+            prior
+            and prior["definition"].get("kind")
+            in {"badcase_review", "evaluation_products"}
+        )
+        cpu_only = saved_predictions or products
+        final_test = bool(
+            action.inference
+            and action.inference.selection_run_id
+            or prior
+            and prior["definition"].get("business_scoring")
+        )
+        if cpu_only and action.inference is not None:
+            raise ValueError("cannot change evaluation kind on resume")
+        assets = {name: self.runtime_dir / name for name in INFERENCE_RUNTIME_FILENAMES}
+        if cpu_only or final_test:
+            assets["evaluate_predictions.py"] = (
+                self.runtime_dir / "evaluate_predictions.py"
+            )
+            assets["training_artifacts.py"] = (
+                self.runtime_dir.parent.parent
+                / "training-analysis/scripts/training_artifacts.py"
+            )
+        if products:
+            assets["evaluation_products.py"] = (
+                self.runtime_dir / "evaluation_products.py"
+            )
         _validate_report_ui_bundle(self.runtime_dir)
         runtime_hash = runtime_bundle_fingerprint(
             self.runtime_dir, INFERENCE_RUNTIME_FILENAMES
         )
-        if action.inference:
+        if cpu_only or final_test:
+            runtime_hash = hashlib.sha256(
+                "".join(
+                    name + hashlib.sha256(path.read_bytes()).hexdigest()
+                    for name, path in sorted(assets.items())
+                ).encode()
+            ).hexdigest()
+        if action.products:
+            from openhands.tools.data_preparation.evaluation_products import (
+                prepare_products,
+            )
+
+            definition = prepare_products(action, files, runtime_hash)
+        elif action.evaluation:
+            from openhands.tools.data_preparation.prediction_evaluation import (
+                prepare_definition,
+            )
+
+            definition = prepare_definition(action, files, runtime_hash)
+        elif action.inference:
             options = action.inference
             dataset = DatasetMapping.model_validate_json(
                 files.read_text(options.dataset_config_path)
             ).model_dump(exclude_none=True)
-            evaluation = EvaluationConfig.model_validate_json(
-                files.read_text(options.evaluation_config_path)
-            ).model_dump(exclude_none=True)
+            evaluation_options = read_evaluation_config(
+                files, options.evaluation_config_path
+            )
+            evaluation = evaluation_options.model_dump(exclude_none=True)
+            if "model_source" not in evaluation_options.model_fields_set:
+                evaluation.pop("model_source")
             inference = options.model_dump(
                 exclude={
                     "dataset_config_path",
@@ -316,7 +606,9 @@ class InferencePipelineHandler:
                     "report_spec_path",
                 }
             )
-            inference["model_path"] = storage_path(options.model_path)
+            inference["model_path"] = model_reference(
+                options.model_path, evaluation_options.model_source
+            )
             report_spec = None
             if options.report_spec_path:
                 report_spec = files.read_text(options.report_spec_path)
@@ -332,14 +624,16 @@ class InferencePipelineHandler:
                 "dataset_config": dataset,
                 "evaluation_config": evaluation,
                 "report_spec": report_spec,
-                "input_path": storage_path(action.input_path),
+                "input_path": storage_path(action.input_path, "input_path"),
                 "cpu": action.cpu,
                 "memory": action.memory,
                 "runtime_sha256": runtime_hash,
             }
         elif prior:
             definition = dict(prior["definition"])
-            if definition["input_path"] != storage_path(action.input_path):
+            if definition["input_path"] != storage_path(
+                action.input_path, "input_path"
+            ):
                 raise ValueError("input_path changed; use a new full run")
             for resource in ("cpu", "memory"):
                 if resource in action.model_fields_set:
@@ -351,22 +645,57 @@ class InferencePipelineHandler:
         run = self.runs.reserve(
             definition, str(action.resume_run_id) if action.resume_run_id else None
         )
+        definition = run["definition"]
+        if definition.get("business_scoring"):
+            assets["evaluate_predictions.py"] = (
+                self.runtime_dir / "evaluate_predictions.py"
+            )
+            assets["training_artifacts.py"] = (
+                self.runtime_dir.parent.parent
+                / "training-analysis/scripts/training_artifacts.py"
+            )
         run_id, output_dir = run["run_id"], run["output_dir"]
         revision = run["revision"]
         submitting = False
         task_id = None
         response_status = "Pending"
         warning = ""
+        validation: ValidateWorkflowDslObservation | None = None
         try:
-            dsl = build_inference_dsl(definition, output_dir, run_id)
+            if products:
+                from openhands.tools.data_preparation.evaluation_products import (
+                    build_products_dsl,
+                )
+
+                dsl = build_products_dsl(definition, output_dir, run_id)
+            elif saved_predictions:
+                from openhands.tools.data_preparation.prediction_evaluation import (
+                    build_prediction_evaluation_dsl,
+                )
+
+                dsl = build_prediction_evaluation_dsl(definition, output_dir, run_id)
+            else:
+                dsl = build_inference_dsl(definition, output_dir, run_id)
             workflow = convert_dsl_to_xyflow(dsl, name=f"agent-evaluation-{run_id[:8]}")
-            validate_pipeline_topology(workflow)
-            validation = self.validator(
-                ValidateWorkflowDslAction(dsl=dsl), conversation
+            validate_pipeline_topology(workflow, require_inference=not cpu_only)
+            self._publish_canvas(conversation, dsl)
+            validation = self._validate(
+                dsl, conversation, env=owner._env, cluster=owner._cluster
             )
-            if validation.is_error or validation.valid is not True:
-                raise ValueError(
-                    f"platform rejected evaluation workflow: {validation.text}"
+            workflow, effective_dsl = self.runs.prepare_execution(
+                run_id,
+                workflow,
+                dsl,
+                (self.runtime_dir / "evaluate_inference.py").read_text(),
+            )
+            if effective_dsl != dsl:
+                dsl = effective_dsl
+                if convert_dsl_to_xyflow(dsl, name=workflow["name"]) != workflow:
+                    raise ValueError("frozen evaluation DSL and workflow differ")
+                validate_pipeline_topology(workflow, require_inference=not cpu_only)
+                self._publish_canvas(conversation, dsl)
+                validation = self._validate(
+                    dsl, conversation, env=owner._env, cluster=owner._cluster
                 )
             state = cast("ConversationState", conversation.state)
             client = create_workflow_api_client(
@@ -382,12 +711,58 @@ class InferencePipelineHandler:
                 for name, config in (
                     ("dataset_config.json", definition["dataset_config"]),
                     ("evaluation_config.json", definition["evaluation_config"]),
+                    *(
+                        (
+                            (
+                                "business_scoring.json",
+                                {
+                                    **definition["business_scoring"],
+                                    "test_source": definition["test_source"],
+                                },
+                            ),
+                        )
+                        if definition.get("business_scoring")
+                        else ()
+                    ),
                 ):
                     path = Path(directory) / name
                     path.write_text(json.dumps(config, ensure_ascii=False))
                     owner._stage_script(
                         str(path), output_dir, conversation, frozen_script_name=name
                     )
+                if saved_predictions:
+                    for name, content in (
+                        (
+                            "prediction_evaluation.json",
+                            json.dumps(
+                                {
+                                    "source_manifest": definition["source_manifest"],
+                                    "scoring_spec": definition["scoring_spec"],
+                                },
+                                ensure_ascii=False,
+                            ),
+                        ),
+                        ("score_eval.py", definition["scoring_script"]),
+                    ):
+                        path = Path(directory) / name
+                        path.write_text(content)
+                        owner._stage_script(
+                            str(path), output_dir, conversation, frozen_script_name=name
+                        )
+                if products:
+                    contents = {
+                        "products_definition.json": json.dumps(
+                            definition, ensure_ascii=False
+                        )
+                    }
+                    if definition.get("extraction_script"):
+                        contents["extract_dataset.py"] = definition["extraction_script"]
+                    for name, content in contents.items():
+                        path = Path(directory) / name
+                        path.write_text(content)
+                        owner._stage_script(
+                            str(path), output_dir, conversation, frozen_script_name=name
+                        )
                 report_spec = definition.get("report_spec")
                 if report_spec:
                     path = Path(directory) / "report_spec.json"
@@ -398,30 +773,12 @@ class InferencePipelineHandler:
                         conversation,
                         frozen_script_name="report_spec.json",
                     )
-            for filename in INFERENCE_RUNTIME_FILENAMES:
+            for filename, asset_path in assets.items():
                 owner._stage_script(
-                    str(self.runtime_dir / filename),
+                    str(asset_path),
                     output_dir,
                     conversation,
                     frozen_script_name=filename,
-                )
-            # A sandbox workspace has no host filesystem, so the canvas only
-            # reaches it through the workspace port.
-            with tempfile.TemporaryDirectory(prefix="inference-canvas-") as directory:
-                canvas = Path(directory) / "workflow.py"
-                canvas.write_text(dsl)
-                publish_workspace_path(
-                    cast(Any, conversation).workspace,
-                    canvas,
-                    WORKFLOW_RELATIVE_PATH,
-                )
-            prepare_execution = getattr(self.runs, "prepare_execution", None)
-            if prepare_execution is not None:
-                workflow = prepare_execution(
-                    run_id,
-                    workflow,
-                    dsl,
-                    (self.runtime_dir / "evaluate_inference.py").read_text(),
                 )
             submitting = True
             response = submit_workflow_task(
@@ -454,6 +811,16 @@ class InferencePipelineHandler:
                     "output_dir": output_dir,
                     "resumed": action.mode == "resume",
                     "execution_revision": run["execution_revision"],
+                    **(
+                        {
+                            "failure_stage": exc.validation.failure_stage,
+                            "retryable": exc.validation.retryable,
+                            "validation_errors": exc.validation.errors,
+                            "validation_warnings": exc.validation.warnings,
+                        }
+                        if isinstance(exc, _WorkflowValidationError)
+                        else {}
+                    ),
                 }
             warning = (
                 " Platform accepted the task, but saving its association failed; "
@@ -477,4 +844,5 @@ class InferencePipelineHandler:
             "status": response_status,
             "resumed": action.mode == "resume",
             "execution_revision": run["execution_revision"],
+            "validation_warnings": validation.warnings if validation else [],
         }

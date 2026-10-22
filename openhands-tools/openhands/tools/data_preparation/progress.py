@@ -72,7 +72,7 @@ def _default_public_api_base() -> str:
     """Public agent-API origin used for stable report links.
 
     Unlike the pre-signed Storage URLs (which expire), the stable link goes
-    through the product API with the user's own login. Deployments can
+    through the product API with the caller's Storage credentials. Deployments can
     override via ``PYROMIND_PUBLIC_API_BASE``.
     """
     override = os.getenv("PYROMIND_PUBLIC_API_BASE", "").strip().rstrip("/")
@@ -143,7 +143,7 @@ class DfCheckProgressObservation(Observation):
     evaluation_report_url: str | None = Field(
         default=None,
         description=(
-            "Stable same-origin report link (login required, never expires);"
+            "Stable report link (Storage credentials required, never expires);"
             " the recommended way to open an evaluation report."
         ),
     )
@@ -262,7 +262,7 @@ class DfCheckProgressExecutor(
         fields["evaluation_report_url"] = evaluation_report_url
         if evaluation_report_url:
             text += (
-                "\nStable report link (login required, does not expire): "
+                "\nStable report link (Storage credentials required, does not expire): "
                 + evaluation_report_url
             )
         return DfCheckProgressObservation.from_text(text=text, **fields)
@@ -284,10 +284,10 @@ class DfCheckProgressExecutor(
         platform layout that names the run's owning conversation. The link
         carries the OWNING conversation id — not the current chat's — so
         checking an older run from another conversation still produces a
-        working link; ownership is finally enforced by the report API at
-        open time. The link goes through the product API with the user's
-        own login, so it never expires — unlike the pre-signed artifact
-        URLs above, which are the read-only fallback.
+        link for the registered run. Storage enforces access with the
+        current request's credentials; the report API does not require a
+        local login or match the conversation owner. The stable URL does
+        not expire — unlike the pre-signed, read-only artifact URLs above.
         """
         if not isinstance(report, dict):
             return None
@@ -313,9 +313,15 @@ class DfCheckProgressExecutor(
         owner = self._owning_conversation_id(output_dir, run_id)
         if owner is None:
             return None
+        assert isinstance(manifest, dict)
+        resource = (
+            "review-tasks"
+            if manifest.get("kind") == "badcase_review"
+            else "evaluation-runs"
+        )
         return (
             f"{self._public_api_base}/api/v2/pyromind/conversations/"
-            f"{owner}/evaluation-runs/{run_id}/report"
+            f"{owner}/{resource}/{run_id}/report"
         )
 
     @staticmethod

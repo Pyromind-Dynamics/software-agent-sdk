@@ -43,11 +43,20 @@ class LegacyPyromindSessionFactory:
             if not isinstance(block, TextContent):
                 raise ValueError("the legacy OpenHands create route accepts text only")
             message_parts.append(block.text)
+        extra = dict(spec.extra)
+        extra["custom_instructions"] = "\n".join(
+            part
+            for part in (
+                spec.product_instructions,
+                str(extra.get("custom_instructions", "")),
+            )
+            if part
+        )
         body = PyromindCreateConversationRequest(
             llm=PyromindLLMConfig.model_validate(spec.model_configuration),
             message="\n".join(message_parts) if message_parts else None,
             workflow_xyflow=spec.workflow_xyflow,
-            extra=dict(spec.extra),
+            extra=extra,
         )
         service = self._conversation_service_provider()
         info = await create_pyromind_conversation(

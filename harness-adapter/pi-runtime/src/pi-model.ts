@@ -1,4 +1,4 @@
-import { type Api, InMemoryCredentialStore, type Model, type Models } from "@earendil-works/pi-ai";
+import { type Api, clampThinkingLevel, InMemoryCredentialStore, type Model, type Models } from "@earendil-works/pi-ai";
 import { stream as streamModel, streamSimple as streamModelSimple } from "@earendil-works/pi-ai/compat";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
@@ -25,27 +25,22 @@ export async function createPiModelRuntime(config: PiModelConfig): Promise<{
       name: config.provider,
       baseUrl: model.baseUrl,
       api: model.api,
-      streamSimple: (requestModel, context, options) =>
-        requestModel.api === "openai-completions"
-          ? streamModel(
-            requestModel,
-            context,
-            // Do not derive max_tokens from context usage for custom Chat
-            // Completions servers.
-            options ? { ...options } : undefined,
-          )
-          : streamModelSimple(requestModel, context, options),
+      streamSimple: (requestModel, context, options) => {
+        if (requestModel.api !== "openai-completions") {
+          return streamModelSimple(requestModel, context, options);
+        }
+        const reasoning = options?.reasoning
+          ? clampThinkingLevel(requestModel, options.reasoning)
+          : undefined;
+        // Keep explicit output limits without deriving max_tokens from context usage.
+        return streamModel(requestModel, context, {
+          ...options,
+          reasoningEffort: reasoning === "off" ? undefined : reasoning,
+        });
+      },
       models: [{
-        id: model.id,
-        name: model.name,
-        api: model.api,
-        baseUrl: model.baseUrl,
-        reasoning: model.reasoning,
+        ...model,
         input: [...model.input],
-        cost: model.cost,
-        contextWindow: model.contextWindow,
-        maxTokens: model.maxTokens,
-        compat: model.compat,
       }],
     });
     model = modelRuntime.getModel(config.provider, config.modelId) ?? model;

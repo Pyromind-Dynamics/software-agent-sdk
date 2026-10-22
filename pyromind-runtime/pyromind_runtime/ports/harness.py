@@ -23,6 +23,7 @@ class SessionSpec(ContractModel):
     model_configuration: JsonObject = Field(default_factory=dict)
     resource_limits: ResourceLimits | None = None
     extra: JsonObject = Field(default_factory=dict)
+    product_instructions: str = ""
 
 
 class SessionHandle(ContractModel):

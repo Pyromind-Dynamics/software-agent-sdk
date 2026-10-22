@@ -1758,6 +1758,18 @@
           ? "标签不一致：GT 与模型判断不同，请结合" + (textMode ? "原始输入" : "图片") + "复核"
           : "评测未通过：" + failures.map((rubric) => rubric.name).join("、")));
       }
+      const distribution = item.detail?.details?.distribution_context;
+      if (distribution) {
+        const context = mk("section", "distribution-context");
+        context.appendChild(mk("strong", null, "类别数据与效果：" + distribution.label));
+        for (const [name, value] of [["训练集", distribution.train], ["验证集", distribution.validation]]) {
+          context.appendChild(mk("p", null, name + (value ? `：${value.count} 条，占比 ${(value.ratio * 100).toFixed(1)}%` : "：暂无统计")));
+        }
+        if (distribution.performance) context.appendChild(mk("p", null,
+          `本类通过率 ${(distribution.performance.pass_rate * 100).toFixed(1)}%，共 ${distribution.performance.support} 条`));
+        context.appendChild(mk("p", "meta", "样本量用于判断原因假设，不能单独证明数据不足。"));
+        article.appendChild(context);
+      }
       article.appendChild(summary);
       const details = mk("section", "review-details");
       if (!textMode && item.input && Object.keys(item.input).length) {
@@ -1888,14 +1900,31 @@
     datasetLabel.title = data.dataset_path;
     heroTitle.appendChild(datasetLabel);
     hero.appendChild(heroTitle);
+    if (data.classification) {
+      main.appendChild(fold("业务分类指标与混淆矩阵", pretty(data.classification)));
+    }
+    if (data.original_label_metrics) {
+      main.appendChild(fold("原始标签表现", pretty(data.original_label_metrics)));
+    }
+    if (data.integrity_issues?.length) {
+      main.appendChild(fold("数据完整性问题（不可用于选模）", pretty(data.integrity_issues)));
+    }
+    if (data.dataset_distribution && Object.keys(data.dataset_distribution).length) {
+      main.appendChild(fold("训练集与验证集标签分布", pretty(data.dataset_distribution)));
+    }
     const summary = data.summary;
     const grid = mk("div", "summary");
     grid.appendChild(stat("总数", summary.total));
-    grid.appendChild(stat("通过", summary.passed));
+    if (data.metrics_available !== false) grid.appendChild(stat("通过", summary.passed));
     grid.appendChild(stat("待复核", summary.failed));
-    grid.appendChild(stat("通过率", (summary.pass_rate * 100).toFixed(1) + "%"));
+    if (data.metrics_available !== false && summary.pass_rate != null)
+      grid.appendChild(stat("通过率", (summary.pass_rate * 100).toFixed(1) + "%"));
     hero.appendChild(grid);
     main.appendChild(hero);
+    main.appendChild(fold("评测指标（全部样本）", () => pretty({
+      rubric_metrics: data.rubric_metrics,
+      mean_latency_seconds: data.mean_latency_seconds,
+    })));
 
     const notices = mk("div", "notices");
     main.appendChild(notices);

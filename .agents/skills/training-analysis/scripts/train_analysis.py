@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import ssl
@@ -36,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from analysis_helpers import diagnose_run
+from analysis_helpers import diagnose_run, metric_series
 from data_sources import create_data_source, detect_data_source
 
 
@@ -76,6 +77,10 @@ TRAIN_NODE_KEYWORDS = ("Train", "train")
 
 class WandbAnalysisError(Exception):
     """脚本内可预期错误,以友好消息退出。"""
+
+
+class InvalidPlatformTaskId(ValueError):
+    """The platform task reference is not a numeric ID."""
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -141,6 +146,13 @@ class PlatformClient:
 
     def task_workflow_result(self, task_id: str) -> dict[str, Any]:
         """返回任务工作流信息(节点列表来源)。"""
+        task_id = task_id.strip()
+        if re.fullmatch(r"[0-9]+", task_id) is None:
+            raise InvalidPlatformTaskId(
+                "task_id must be the numeric platform task ID, not a workflow "
+                "name or output directory. Retrieve it from the confirmed "
+                "submission context or product_versions run source before retrying."
+            )
         return self._get("api/task_workflow_result", {"task_id": task_id})
 
     def node_log(self, node_id: str, task_id: str) -> str:
@@ -163,6 +175,12 @@ class PlatformClient:
 def _extract_log_text(data: Any) -> str:
     """从节点日志 API 响应中提取纯文本;真实响应为 entries[].m 数组。"""
     if isinstance(data, str):
+        try:
+            decoded = json.loads(data)
+        except ValueError:
+            return data
+        if isinstance(decoded, dict):
+            return _extract_log_text(decoded)
         return data
     if isinstance(data, dict):
         entries = data.get("entries")
@@ -172,15 +190,12 @@ def _extract_log_text(data: Any) -> str:
                 for e in entries
                 if isinstance(e, dict) and isinstance(e.get("m"), str)
             ]
-            if parts:
-                return "".join(parts)
+            return "".join(parts)
         for key in ("log", "logs", "content", "data", "stdout", "text", "raw"):
-            if isinstance(data.get(key), str):
-                return data[key]
-        # 深层遍历找第一个字符串值
-        for value in data.values():
-            if isinstance(value, str):
-                return value
+            if isinstance(data.get(key), (dict, str)):
+                text = _extract_log_text(data[key])
+                if text:
+                    return text
     return ""
 
 
@@ -212,6 +227,11 @@ def _find_nodes(payload: dict[str, Any]) -> list[dict[str, Any]]:
     for candidate in candidates:
         if candidate and all(isinstance(item, dict) for item in candidate):
             return candidate
+    for key in ("workflow", "data"):
+        if isinstance(payload.get(key), dict):
+            nested = _find_nodes(payload[key])
+            if nested:
+                return nested
     return []
 
 
@@ -238,7 +258,10 @@ def _node_type(node: dict[str, Any]) -> str:
 
 
 def _is_train_node(node: dict[str, Any]) -> bool:
-    return any(keyword in _node_type(node) for keyword in TRAIN_NODE_KEYWORDS)
+    kind = _node_type(node)
+    return "Config" not in kind and any(
+        keyword in kind for keyword in TRAIN_NODE_KEYWORDS
+    )
 
 
 def _credential_file() -> Path:
@@ -278,7 +301,7 @@ def _history_stats(values: list[float]) -> dict[str, Any]:
     if not values:
         return {"count": 0}
     nans = sum(1 for v in values if v != v)
-    clean = [v for v in values if v == v]
+    clean = [v for v in values if math.isfinite(v)]
     if not clean:
         return {"count": len(values), "nan": nans}
     min_v = min(clean)
@@ -291,6 +314,7 @@ def _history_stats(values: list[float]) -> dict[str, Any]:
     return {
         "count": len(values),
         "nan": nans,
+        "inf": sum(math.isinf(v) for v in values),
         "min": min_v,
         "max": max_v,
         "final": final_v,
@@ -369,9 +393,7 @@ def _redact_value_for_error(value: Any, key: str = "", depth: int = 0) -> Any:
             for name, child in list(value.items())[:100]
         }
     if isinstance(value, list):
-        return [
-            _redact_value_for_error(child, key, depth + 1) for child in value[:200]
-        ]
+        return [_redact_value_for_error(child, key, depth + 1) for child in value[:200]]
     if isinstance(value, str):
         return _INLINE_CREDENTIAL.sub(r"\1[REDACTED]", value[:100_000])
     return value
@@ -415,11 +437,14 @@ class TrainingAnalysisService:
         task_id: str,
         run_url: str = "",
         creds_out: str = "",
+        training_node_id: str | None = None,
     ) -> dict[str, Any]:
         """Resolve a task to a data-source run and optionally write credentials."""
         _ = creds_file  # retained for CLI compatibility
         if not task_id.strip():
             raise ValueError("task_id is required")
+        task_id = task_id.strip()
+        run_url_entity, run_url_project, run_url_id = _parse_run_url(run_url)
         client = PlatformClient(
             base_url=api_base or _default_api_base(),
             cookie=cookie,
@@ -437,6 +462,22 @@ class TrainingAnalysisService:
                 f"{safe_payload[:800]}"
             )
 
+        train_nodes = [node for node in nodes if _is_train_node(node)]
+        if training_node_id:
+            train_nodes = [
+                node
+                for node in train_nodes
+                if _node_identifier(node) == training_node_id
+            ]
+            if not train_nodes:
+                raise WandbAnalysisError(
+                    "No matching training_node_id in the executed task"
+                )
+        elif len(train_nodes) > 1 and not run_url_id:
+            raise WandbAnalysisError(
+                "Multiple training nodes; provide training_node_id: "
+                + ", ".join(str(_node_identifier(node)) for node in train_nodes)
+            )
         source_name = data_source or detect_data_source(nodes)
         if not source_name:
             raise WandbAnalysisError(
@@ -445,7 +486,6 @@ class TrainingAnalysisService:
             )
         source = create_data_source(source_name)
         creds = source.extract_creds(nodes, client=client, task_id=task_id) or {}
-        extracted_creds = bool(creds)
         effective_api_key = (
             api_key
             or creds.get("WANDB_API_KEY", "")
@@ -454,31 +494,29 @@ class TrainingAnalysisService:
         if effective_api_key:
             creds["WANDB_API_KEY"] = effective_api_key
 
-        run_id = ""
-        run_entity = ""
-        run_project = ""
-        for node in nodes:
+        run_id = run_url_id
+        run_entity = run_url_entity
+        run_project = run_url_project
+        log_diagnostics = []
+        for node in train_nodes if not run_id else []:
             node_id = _node_identifier(node)
-            if not node_id or not _is_train_node(node):
+            if not node_id:
                 continue
-            if run_id:
-                break
-            info = source.extract_run_ref(client.node_log(node_id, task_id))
+            log_text = client.node_log(node_id, task_id)
+            attempts = 1
+            # The platform can return HTTP 200 with empty entries on log failure.
+            if not log_text.strip():
+                log_text = client.node_log(node_id, task_id)
+                attempts += 1
+            info = source.extract_run_ref(log_text)
+            log_diagnostics.append(
+                f"node={node_id}, log_chars={len(log_text)}, reads={attempts}, "
+                f"run_ref_found={bool(info)}"
+            )
             if info and info[2]:
                 run_entity, run_project, run_id = info
-
-        if not run_id and not extracted_creds:
-            raise WandbAnalysisError(
-                "未能从平台 API 定位 run:训练节点日志无数据源 run 记录,"
-                "且未在节点 config 找到凭证。请提供 --run-url 或检查 task_id。"
-            )
-
-        run_url_entity, run_url_project, run_url_id = _parse_run_url(run_url)
-        if run_url_id and not run_id:
-            run_id = run_url_id
-        if run_url_entity and not run_entity:
-            run_entity = run_url_entity
-        project = creds.get("WANDB_PROJECT") or run_project or run_url_project
+                break
+        project = run_project or creds.get("WANDB_PROJECT")
         resolved_entity = creds.get("WANDB_ENTITY") or run_entity or entity
         if effective_api_key and project:
             try:
@@ -489,9 +527,34 @@ class TrainingAnalysisService:
             except Exception:
                 pass
 
+        missing = [
+            name
+            for name, value in (
+                ("entity", resolved_entity),
+                ("project", project),
+                ("run_id", run_id),
+            )
+            if not value
+        ]
+        if missing:
+            hint_status = (
+                "invalid run_url ignored; expected /entity/project/runs/run_id. "
+                if run_url and not run_url_id
+                else ""
+            )
+            raise WandbAnalysisError(
+                f"Cannot resolve W&B target for task_id={task_id}: "
+                f"missing {','.join(missing)}. {hint_status}"
+                f"Log discovery: {'; '.join(log_diagnostics) or 'not performed'}. "
+                "Unavailable logs or an unparsed run reference do not prove "
+                "that the task has no W&B run."
+            )
+
         result: dict[str, Any] = {
             "task_id": task_id,
             "data_source": source_name,
+            "training_node_id": training_node_id
+            or (_node_identifier(train_nodes[0]) if len(train_nodes) == 1 else None),
             "entity": resolved_entity,
             "project": project,
             "run_id": run_id,
@@ -580,6 +643,12 @@ class TrainingAnalysisService:
             "metric": selected_metric or None,
         }
         history = data["history"]
+        report["metric_series"] = {
+            key: metric_series(history, key) for key in history_keys
+        }
+        report["step_alignment"] = (
+            "Training step is explicit per point; log_step is not a checkpoint step."
+        )
         if history:
             if selected_metric in history_keys:
                 values = _history_float_values(history, selected_metric)
@@ -700,8 +769,7 @@ class TrainingAnalysisService:
             f"- entity/project: `{entity_project}`",
             f"- run id: `{run_id}`",
             f"- 指标键: `{selected_metric or 'N/A'}`",
-            f"- 数据来源: {source_name} 数据源,"
-            "凭证来自平台节点 config/输出",
+            f"- 数据来源: {source_name} 数据源,凭证来自平台节点 config/输出",
         ]
         output = _redact_report("\n".join(lines) + "\n", creds)
         if output_path:

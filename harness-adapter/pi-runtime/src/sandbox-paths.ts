@@ -95,30 +95,6 @@ export function applySandboxPathAliases(
   return rewritten;
 }
 
-/** Replaces the host working directory pi appends to the system prompt. */
-const SANDBOX_WORKING_DIRECTORY =
-  "Current working directory: . (the conversation root inside the sandbox " +
-  "execution environment; resolve every path relative to it, using relative " +
-  "paths such as storage/..., public_data/... and .agents/skills/...)";
-
-/**
- * Point the model at the sandbox-side conversation root instead of the host
- * directory pi appended.
- *
- * The execution plane resolves relative paths against the conversation root,
- * so a host path in the prompt sends terminal commands to a directory that
- * does not exist inside the sandbox.
- */
-export function applySandboxWorkingDirectory(
-  systemPrompt: string,
-  workspaceRoot: string,
-): string {
-  return systemPrompt.replace(
-    `Current working directory: ${workspaceRoot.replace(/\\/g, "/")}`,
-    SANDBOX_WORKING_DIRECTORY,
-  );
-}
-
 export interface SandboxPathPolicyInput {
   /** Sandbox-side conversation root, e.g. `/target-workspace/.pyromind-agent/<id>`. */
   workspacePath: string;

@@ -49,6 +49,7 @@ class CommandConflictError(ProductStoreError):
 class _Metadata(ContractModel):
     conversation_id: str
     user_id: str
+    x_cluster: str | None = None
     harness_id: str = Field(default="openhands", min_length=1)
     capabilities: HarnessCapabilities
     last_sequence: int = Field(default=0, ge=0)
@@ -121,6 +122,19 @@ class FileProductStore:
         metadata = self._load_metadata()
         if metadata.user_id != user_id:
             raise PermissionError("conversation does not belong to current user")
+
+    def load_x_cluster(self) -> str | None:
+        return self._load_metadata().x_cluster
+
+    def save_x_cluster(self, x_cluster: str | None) -> None:
+        if not x_cluster or not x_cluster.strip():
+            return
+        with self._lock():
+            metadata = self._load_metadata()
+            if metadata.x_cluster == x_cluster:
+                return
+            metadata = metadata.model_copy(update={"x_cluster": x_cluster})
+            self._atomic_write(self.metadata_path, metadata.model_dump_json())
 
     def load_workflow_execution_requests(self) -> dict[str, WorkflowExecutionRequest]:
         with self._lock():

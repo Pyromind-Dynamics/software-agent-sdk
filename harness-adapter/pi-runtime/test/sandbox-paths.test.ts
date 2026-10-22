@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   applySandboxPathAliases,
-  applySandboxWorkingDirectory,
   insideSandboxPath,
   SandboxReadMirror,
   SandboxPathPolicy,
@@ -127,26 +126,6 @@ test("system prompt skill locations use runtime aliases instead of host paths", 
       "<location>.agents/skills</location>",
       "<location>knowledge</location>",
     ].join("\n"),
-  );
-});
-
-test("system prompt working directory never exposes the host conversation root", () => {
-  const hostCwd = "/Users/dev/conversations/conv-1";
-  const prompt = `Guidelines\nCurrent working directory: ${hostCwd}\n`;
-
-  const rewritten = applySandboxWorkingDirectory(prompt, hostCwd);
-
-  assert.equal(rewritten.includes(hostCwd), false);
-  assert.equal(rewritten.startsWith("Guidelines\n"), true);
-  assert.match(rewritten, /Current working directory: \./);
-});
-
-test("system prompt without a working directory line is left untouched", () => {
-  const prompt = "Guidelines\nNo directory here\n";
-
-  assert.equal(
-    applySandboxWorkingDirectory(prompt, "/Users/dev/conversations/conv-1"),
-    prompt,
   );
 });
 

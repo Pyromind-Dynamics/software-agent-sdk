@@ -33,7 +33,8 @@ license: MIT
 | 编排任务无匹配 ProcessingProfile（一次性/探索性） | environment-processing（模式 B） | 同上 |
 
 负向边界：仅创建/管理单个沙箱容器 → sandbox；训练效果/loss 分析 →
-training-analysis；生成训练工作流 → generate-workflow-dsl；工作流调试 →
+training-analysis；模型效果评测 → inference-evaluation；
+生成训练工作流 → generate-workflow-dsl；工作流调试 →
 debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独立 sandbox 容器
 （Pi 会话自带的执行沙箱不属于此列）。路由不确定时先向用户提问确认，不要猜。
 

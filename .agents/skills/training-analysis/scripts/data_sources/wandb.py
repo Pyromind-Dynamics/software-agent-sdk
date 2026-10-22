@@ -19,13 +19,13 @@ import re
 from pathlib import Path
 from typing import Any
 
+from platform_output import parse_node_output, strip_terminal_codes
+
 from .base import RunData
 
 
 RUN_SETUP_RE = re.compile(r"wandb:\s+setting up run\s+(\w+)")
-RUN_URL_RE = re.compile(
-    r"View run at\s+https://wandb\.ai/([^/\s]+)/([^/\s]+)/runs/(\w+)"
-)
+RUN_URL_RE = re.compile(r"https://wandb\.ai/([^/\s]+)/([^/\s]+)/runs/([A-Za-z0-9_-]+)")
 RUN_PATH_RE = re.compile(r"run-\d{8}_\d{6}-(\w+)")
 CONFIG_LINE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*$")
 
@@ -118,9 +118,14 @@ class WandbDataSource:
         elif isinstance(config_value, str):
             merge_text(config_value)
 
-        for key in ("wandb_api_key", "wandb_project", "wandb_name"):
-            if output.get(key) is not None:
-                result["WANDB_" + key.removeprefix("wandb_").upper()] = str(output[key])
+        for key, value in output.items():
+            name = key.upper()
+            if (
+                name.startswith("WANDB_")
+                and name != "WANDB_CONFIG"
+                and value is not None
+            ):
+                result[name] = str(value)
 
         entries = output.get("entries")
         if isinstance(entries, list):
@@ -174,9 +179,7 @@ class WandbDataSource:
 
     def _collect_output_env(self, output: dict[str, Any]) -> dict[str, str]:
         """从 node_output 接口响应提取凭证。"""
-        if isinstance(output, dict):
-            return self._collect_wandb_env(output)
-        return {}
+        return self._collect_wandb_env(parse_node_output(output))
 
     # ------------------------------------------------------------------
     # run 定位
@@ -184,6 +187,7 @@ class WandbDataSource:
 
     def extract_run_ref(self, log_text: str) -> tuple[str, str, str] | None:
         """从日志中提取 (entity, project, run_id);URL 行优先,其次 setting up run。"""
+        log_text = strip_terminal_codes(log_text)
         for match in RUN_URL_RE.finditer(log_text):
             return match.group(1), match.group(2), match.group(3)
         match = RUN_SETUP_RE.search(log_text)
@@ -328,13 +332,26 @@ class WandbDataSource:
         """按显式 metric keys 读取 history 行(大项目必须限制 keys)。"""
         if not keys:
             raise ValueError("keys is required — never scan without explicit keys")
-        rows: list[dict[str, Any]] = []
-        scanner = run.scan_history(keys=keys, page_size=min(max_rows or 10_000, 10_000))
-        for row in scanner:
-            rows.append(dict(row))
-            if max_rows is not None and len(rows) >= max_rows:
-                break
-        return rows
+        # W&B intersects requested keys. Scan each sparse metric independently,
+        # then attach training-step records only at the exact same logging step.
+        from analysis_helpers import TRAINING_STEP_KEYS
+
+        merged: dict[Any, dict[str, Any]] = {}
+        for key in dict.fromkeys([*keys, *TRAINING_STEP_KEYS]):
+            count = 0
+            for raw in run.scan_history(
+                keys=list(dict.fromkeys([key, "_step"])),
+                page_size=min(max_rows or 10_000, 10_000),
+            ):
+                row = dict(raw)
+                identity = row.get("_step")
+                if identity is None:
+                    identity = (key, count)
+                merged.setdefault(identity, {}).update(row)
+                count += 1
+                if max_rows is not None and count >= max_rows:
+                    break
+        return sorted(merged.values(), key=lambda row: row.get("_step", float("inf")))
 
     @staticmethod
     def _json_safe(value: Any) -> Any:

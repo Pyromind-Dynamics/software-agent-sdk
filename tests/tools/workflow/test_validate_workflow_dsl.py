@@ -125,6 +125,36 @@ def test_validate_workflow_dsl_defaults_to_prod_endpoint_for_online_envs(
         assert urls[-1] == PROD_VALIDATE_URL
 
 
+@pytest.mark.parametrize(
+    "env,endpoint",
+    [
+        ("pre", PRE_VALIDATE_URL),
+        ("pre2", PRE_VALIDATE_URL.replace("pre-api-portal", "pre2-api-portal")),
+        ("prod", PROD_VALIDATE_URL),
+        ("production", PROD_VALIDATE_URL),
+    ],
+)
+def test_explicit_validation_env_and_endpoint_override_app_env(
+    monkeypatch, env, endpoint
+):
+    urls = []
+
+    def fake_post(url, **kwargs):
+        urls.append(url)
+        return _valid_response()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setenv("APP_ENV", "prod" if env.startswith("pre") else "dev")
+    action = ValidateWorkflowDslAction(dsl="# workflow: demo\n")
+    assert ValidateWorkflowDslExecutor(env=env)(action).valid is True
+    assert urls[-1] == endpoint
+    custom = "https://validator.example/dsl/validate"
+    assert (
+        ValidateWorkflowDslExecutor(env=env, endpoint_url=custom)(action).valid is True
+    )
+    assert urls[-1] == custom
+
+
 def test_validate_workflow_dsl_posts_payload_and_preserves_issue_fields(monkeypatch):
     calls: dict[str, Any] = {}
 

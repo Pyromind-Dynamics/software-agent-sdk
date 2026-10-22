@@ -19,12 +19,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { createPiModelRuntime, type PiModelConfig } from "./pi-model.js";
 import { createNoProgressGuardExtension } from "./no-progress-guard.js";
+import { createToolResultExtension } from "./tool-results.js";
 import { isRecord, type JsonObject, type JsonValue } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
 import type { SandboxEndpoint, SandboxEndpointProvider } from "./sandbox-operations.js";
 import {
   applySandboxPathAliases,
-  applySandboxWorkingDirectory,
   SandboxReadMirror,
 } from "./sandbox-paths.js";
 import {
@@ -195,26 +195,49 @@ export async function createPiSession(
     agentDir,
     settingsManager,
     systemPrompt: config.systemPrompt,
+    appendSystemPrompt: params.workflows_enabled === true
+      ? ["历史经验的路径参数使用当前会话执行环境的路径：Storage 文件保留 storage/ 前缀（如 storage/agentTest/input.csv），会话文件使用 public_data/...。与 read/terminal 验证成功的路径保持一致；不要改成服务端路径、平台 /workspace 路径或省略 storage/。"]
+      : [],
     eventBus: experienceHost.eventBus,
     additionalExtensionPaths: [...experienceHost.additionalExtensionPaths, fileURLToPath(import.meta.resolve("pi-subagents"))],
     extensionFactories: [
       subagents.extension,
+      createToolResultExtension(),
       createNoProgressGuardExtension(),
       (pi) => {
+        if (config.terminalBackend !== "sandbox") return;
         pi.on("before_agent_start", (event) => {
-          let systemPrompt = event.systemPrompt.replace(
-            "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
-            "Paths starting with knowledge/ or .agents/skills/ are runtime resource aliases: pass them unchanged to file tools, without prepending the skill directory. For other relative paths referenced by a skill file, resolve them against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
-          );
-          if (params.workflows_enabled === true) {
-            systemPrompt += "\n历史经验的路径参数使用当前会话执行环境的路径：Storage 文件保留 storage/ 前缀（如 storage/agentTest/input.csv），会话文件使用 public_data/...。与 read/terminal 验证成功的路径保持一致；不要改成服务端路径、平台 /workspace 路径或省略 storage/。";
+          const prompt = event.systemPromptOptions;
+          prompt.cwd = ".";
+          prompt.skills = prompt.skills.map((skill) => ({
+            ...skill,
+            filePath: applySandboxPathAliases(skill.filePath, sandboxPathAliases),
+            baseDir: applySandboxPathAliases(skill.baseDir, sandboxPathAliases),
+          }));
+          if (prompt.forceSystemPrompt !== undefined) {
+            prompt.forceSystemPrompt = applySandboxPathAliases(prompt.forceSystemPrompt, [
+              ...sandboxPathAliases,
+              { host: config.workspaceRoot, alias: "." },
+            ]);
           }
-          systemPrompt = applySandboxPathAliases(systemPrompt, sandboxPathAliases);
-          if (config.terminalBackend === "sandbox") {
-            systemPrompt = applySandboxWorkingDirectory(systemPrompt, config.workspaceRoot);
-          }
-          return { systemPrompt };
         });
+        // Native /skill expansion reads the host file; only its model-facing paths change.
+        pi.on("context", (event) => ({
+          messages: event.messages.map((message) => {
+            if (message.role !== "user") return message;
+            const rewrite = (text: string) => text.startsWith("<skill name=")
+              ? applySandboxPathAliases(text, sandboxPathAliases)
+              : text;
+            return {
+              ...message,
+              content: typeof message.content === "string"
+                ? rewrite(message.content)
+                : message.content.map((block) => block.type === "text"
+                  ? { ...block, text: rewrite(block.text) }
+                  : block),
+            };
+          }),
+        }));
       },
     ],
     additionalSkillPaths: skillPaths,

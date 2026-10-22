@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Literal, cast
 from uuid import UUID, uuid4
 
+import pytest
 from harness_adapter.openhands_adapter import OpenHandsAdapter
 from harness_adapter.openhands_adapter.event_translator import (
     TranslationState,
@@ -196,7 +197,8 @@ async def test_attach_session_reactivates_service_reclaimed_by_idle_eviction() -
     await adapter.close(handle)
 
 
-async def test_adapter_notifies_openhands_through_formal_harness_port() -> None:
+@pytest.mark.parametrize("status", ["succeeded", "pending"])
+async def test_adapter_notifies_openhands_through_formal_harness_port(status) -> None:
     conversation_id = uuid4()
     event_service = _EventService()
     service = _ConversationService(conversation_id, event_service)
@@ -211,18 +213,19 @@ async def test_adapter_notifies_openhands_through_formal_harness_port() -> None:
             task_id="task-1",
             kind="data_cleaning",
             run_id="run-1",
-            status="succeeded",
+            status=status,
             output_dir="/outputs/run-1",
             visible_text="Task succeeded",
             hidden_text="<system_reminder>continue</system_reminder>",
+            trigger_turn=status == "succeeded",
         ),
         RequestContext(user_id="42"),
     )
 
     assert result == {"accepted": True}
-    assert event_service.removed_tasks == ["task-1"]
+    assert event_service.removed_tasks == (["task-1"] if status == "succeeded" else [])
     assert event_service.notification is not None
-    assert event_service.notification["run"] is True
+    assert event_service.notification["run"] is (status == "succeeded")
     assert event_service.notification["visible"] is True
     await adapter.close(handle)
 

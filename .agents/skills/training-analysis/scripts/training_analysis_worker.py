@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -33,6 +34,16 @@ def _sanitized(
     depth: int = 0,
     secrets: tuple[str, ...] = (),
 ) -> Any:
+    public_count = key in {
+        "max_tokens",
+        "max_new_tokens",
+        "min_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+    }
+    if public_count and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
     if _SECRET.search(key):
         return "[REDACTED]"
     if depth >= 10:
@@ -47,6 +58,8 @@ def _sanitized(
     if isinstance(value, str):
         limit = _MAX_ERROR_LENGTH if key == "error_message" else 100_000
         return _redact_text(value, secrets)[:limit]
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return str(value)
@@ -89,7 +102,7 @@ def _redact_text(value: str, secrets: tuple[str, ...]) -> str:
 
 def _validate_payload(payload: dict[str, Any]) -> None:
     operation = payload.get("operation")
-    if operation not in {"probe", "analyze", "report"}:
+    if operation not in {"probe", "analyze", "report", "artifacts"}:
         raise ValueError("operation must be probe, analyze, or report")
     task_id = payload.get("task_id")
     if not isinstance(task_id, str) or not task_id.strip():
@@ -161,6 +174,7 @@ def _resolve_from_task(payload: dict[str, Any], creds_path: Path) -> dict[str, A
         task_id=str(payload["task_id"]),
         run_url=str(payload.get("run_url") or ""),
         creds_out=str(creds_path),
+        training_node_id=payload.get("training_node_id"),
     )
     if creds_path.exists():
         os.chmod(creds_path, 0o600)
@@ -191,9 +205,7 @@ def _operation(
         )
     if operation == "analyze":
         service = train_analysis.TrainingAnalysisService()
-        analyze = getattr(service, "analyze", None) or getattr(
-            service, "analyze_run"
-        )
+        analyze = getattr(service, "analyze", None) or getattr(service, "analyze_run")
         return analyze(
             **common,
             entity_project=entity_project,
@@ -241,6 +253,33 @@ def main() -> int:
         payload = loaded
         _validate_payload(payload)
         _validate_report_target(payload)
+        if payload["operation"] == "artifacts":
+            from training_artifacts import resolve_artifacts
+
+            headers = payload.get("headers") or {}
+            client = train_analysis.PlatformClient(
+                base_url=payload.get("api_base") or train_analysis._default_api_base(),
+                cookie=headers.get("cookie", ""),
+                authorization=headers.get("authorization", ""),
+                cluster=headers.get("x-cluster", ""),
+            )
+            result = resolve_artifacts(
+                client, payload["task_id"], payload.get("training_node_id")
+            )
+            print(
+                json.dumps(
+                    _sanitized(
+                        {
+                            "ok": True,
+                            "target": {"task_id": payload["task_id"]},
+                            "result": result,
+                        },
+                        secrets=_secret_values(payload),
+                    ),
+                    ensure_ascii=False,
+                )
+            )
+            return 0
         with tempfile.TemporaryDirectory(prefix="pyromind-training-") as directory:
             creds_path = Path(directory) / "creds.json"
             target = _resolve_from_task(payload, creds_path)
@@ -299,6 +338,13 @@ def main() -> int:
             "error_code": "training_credentials_unavailable",
             "error_message": str(exc)[:_MAX_ERROR_LENGTH],
         }
+    except train_analysis.InvalidPlatformTaskId as exc:
+        response = {
+            "ok": False,
+            "failure_stage": "input_resolution",
+            "error_code": "invalid_platform_task_id",
+            "error_message": str(exc)[:_MAX_ERROR_LENGTH],
+        }
     except train_analysis.WandbAnalysisError as exc:
         response = {
             "ok": False,
@@ -326,8 +372,7 @@ def main() -> int:
                 response,
                 secrets=tuple(
                     sorted(
-                        set(_secret_values(payload))
-                        | set(_credential_values(creds)),
+                        set(_secret_values(payload)) | set(_credential_values(creds)),
                         key=len,
                         reverse=True,
                     )

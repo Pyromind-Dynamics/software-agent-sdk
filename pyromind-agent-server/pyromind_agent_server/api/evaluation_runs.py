@@ -7,12 +7,10 @@ Route family (mounted under the product conversations prefix):
     PUT  /api/v2/pyromind/conversations/{cid}/evaluation-runs/{rid}/annotations
     GET  /api/v2/pyromind/conversations/{cid}/evaluation-runs/{rid}/exports/{name}
 
-Authorization is three-layered: a verified login identity is
-required (session API keys pass the base chain but carry no identity and are
-rejected), the conversation must belong to the caller (runtime user
-isolation), and the run must resolve inside that conversation. Storage is
-accessed with the caller's own request context; the server holds no
-credentials of its own.
+Storage authorizes access using the current request's credentials. This
+route family does not authenticate a local user or enforce user ownership.
+The run must still resolve inside its conversation. The server holds no
+credentials of its own; an optional user label only attributes annotations.
 
 The ``report`` endpoint is the only sanctioned way to open a new report: it
 serves the Storage HTML same-origin and injects the online marker that
@@ -25,14 +23,12 @@ exclusion requires conversation affinity or an external single-writer guarantee.
 Status codes (the runtime translates store/Storage failures into typed
 domain exceptions; this router maps them):
 
-- 401: no verified login identity (session API keys included).
 - 403: cross-origin write without a trusted origin.
-- 404: confirmed absence only — unknown conversation, foreign conversation,
+- 404: confirmed absence only — unknown conversation,
   malformed run id, unknown or foreign run, never-initialized annotations,
   a Storage object the backend reports as absent, an unknown export name.
   Resolution failures share one uniform body ("evaluation run not found"):
-  the reason is logged server-side so clients cannot distinguish a missing
-  conversation from one owned by someone else.
+  the specific resolution failure is logged server-side.
 - 409: ``base_revision`` behind the committed revision.
 - 422: annotation record validation failure or replay-content mismatch.
 - 500/503: sanitized availability failures (Storage transport errors,
@@ -76,10 +72,8 @@ from pyromind_runtime.ports.storage import (
 )
 from starlette.concurrency import run_in_threadpool
 
-from openhands.agent_server.dependencies import check_session_api_key
-from openhands.agent_server.pyromind_auth import CurrentLoginUser
 from pyromind_agent_server.api.router import get_product_runtime
-from pyromind_agent_server.auth_context import request_context
+from pyromind_agent_server.auth_context import evaluation_request_context
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 
 
@@ -94,7 +88,7 @@ EXPORT_NAMES = frozenset(
 )
 # The single-file report needs inline script/style; CSP is a
 # blast-radius limiter after a hypothetical injection, not a permission
-# boundary (server-side authorization stays the final gate).
+# boundary (Storage enforces access to the underlying files).
 REPORT_CSP = (
     "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
     "img-src 'self' data: http: https:; connect-src 'self'; form-action 'none'; "
@@ -104,25 +98,6 @@ REPORT_CSP = (
 
 class EvaluationRunHttpError(HTTPException):
     pass
-
-
-def require_current_login_user(
-    request: Request,
-    _base_auth: Annotated[None, Depends(check_session_api_key)] = None,
-) -> CurrentLoginUser:
-    """Reject requests without a verified login identity (HTTP 401).
-
-    The base auth chain (``check_session_api_key``) runs first and populates
-    ``request.state.current_user`` for dev-header and JWT-cookie requests;
-    session API keys authenticate without an identity and are rejected here.
-    """
-    current_user = getattr(request.state, "current_user", None)
-    if not isinstance(current_user, CurrentLoginUser):
-        raise EvaluationRunHttpError(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="verified login user required",
-        )
-    return current_user
 
 
 class SaveAnnotationsBody(BaseModel):
@@ -137,8 +112,17 @@ class SaveAnnotationChangesBody(BaseModel):
     changes: list[dict[str, Any]] = Field(min_length=1)
 
 
-def get_evaluation_storage(request: Request) -> EvaluationStorage:
-    return build_evaluation_storage(request_context(request))
+async def get_evaluation_storage(
+    conversation_id: str, request: Request
+) -> EvaluationStorage:
+    context = await _execute(
+        partial(
+            get_product_runtime(request).evaluation_storage_context,
+            conversation_id,
+            evaluation_request_context(request),
+        )
+    )
+    return build_evaluation_storage(context)
 
 
 async def _execute[T](operation: Callable[[], T]) -> T:
@@ -146,8 +130,7 @@ async def _execute[T](operation: Callable[[], T]) -> T:
 
     404 is reserved for confirmed absence (resolution failures and
     explicitly-missing Storage objects) and its body is uniform: the
-    specific reason is logged, never returned, so callers cannot tell a
-    missing conversation from someone else's. Availability failures become
+    specific reason is logged, never returned. Availability failures become
     sanitized 5xx responses with the cause logged server-side; annotation
     protocol errors stay typed so each endpoint can apply its own mapping.
     """
@@ -235,9 +218,26 @@ def create_evaluation_runs_router() -> APIRouter:
     router = APIRouter(
         prefix="/api/v2/pyromind/conversations",
         tags=["Pyromind Evaluation Runs"],
-        dependencies=[Depends(require_current_login_user)],
     )
 
+    @router.get("/{conversation_id}/review-tasks/{run_id}")
+    async def get_review_task(
+        conversation_id: str,
+        run_id: str,
+        request: Request,
+        storage: Annotated[EvaluationStorage, Depends(get_evaluation_storage)],
+    ) -> dict[str, Any]:
+        return await _execute(
+            partial(
+                get_product_runtime(request).read_review_task,
+                conversation_id,
+                run_id,
+                evaluation_request_context(request),
+                storage,
+            )
+        )
+
+    @router.get("/{conversation_id}/review-tasks/{run_id}/annotations")
     @router.get(
         "/{conversation_id}/evaluation-runs/{run_id}/annotations",
     )
@@ -245,7 +245,6 @@ def create_evaluation_runs_router() -> APIRouter:
         conversation_id: str,
         run_id: str,
         request: Request,
-        _user: Annotated[CurrentLoginUser, Depends(require_current_login_user)],
         storage: Annotated[EvaluationStorage, Depends(get_evaluation_storage)],
     ) -> dict[str, Any]:
         try:
@@ -254,7 +253,7 @@ def create_evaluation_runs_router() -> APIRouter:
                     get_product_runtime(request).load_evaluation_annotations,
                     conversation_id,
                     run_id,
-                    request_context(request),
+                    evaluation_request_context(request),
                     storage,
                 ),
             )
@@ -274,6 +273,7 @@ def create_evaluation_runs_router() -> APIRouter:
             ) from exc
         return result.model_dump(mode="json")
 
+    @router.get("/{conversation_id}/review-tasks/{run_id}/annotations/summary")
     @router.get(
         "/{conversation_id}/evaluation-runs/{run_id}/annotations/summary",
     )
@@ -281,7 +281,6 @@ def create_evaluation_runs_router() -> APIRouter:
         conversation_id: str,
         run_id: str,
         request: Request,
-        _user: Annotated[CurrentLoginUser, Depends(require_current_login_user)],
         storage: Annotated[EvaluationStorage, Depends(get_evaluation_storage)],
     ) -> dict[str, Any]:
         try:
@@ -290,7 +289,7 @@ def create_evaluation_runs_router() -> APIRouter:
                     get_product_runtime(request).load_evaluation_annotation_summary,
                     conversation_id,
                     run_id,
-                    request_context(request),
+                    evaluation_request_context(request),
                     storage,
                 )
             )
@@ -308,6 +307,7 @@ def create_evaluation_runs_router() -> APIRouter:
             ) from exc
         return result.model_dump(mode="json")
 
+    @router.put("/{conversation_id}/review-tasks/{run_id}/annotations")
     @router.put(
         "/{conversation_id}/evaluation-runs/{run_id}/annotations",
     )
@@ -316,7 +316,6 @@ def create_evaluation_runs_router() -> APIRouter:
         run_id: str,
         request: Request,
         body: SaveAnnotationsBody,
-        user: Annotated[CurrentLoginUser, Depends(require_current_login_user)],
         storage: Annotated[EvaluationStorage, Depends(get_evaluation_storage)],
     ) -> dict[str, Any]:
         _reject_cross_origin_write(request)
@@ -326,18 +325,19 @@ def create_evaluation_runs_router() -> APIRouter:
                     get_product_runtime(request).save_evaluation_annotations,
                     conversation_id,
                     run_id,
-                    request_context(request),
+                    evaluation_request_context(request),
                     storage,
                     save_id=body.save_id,
                     base_revision=body.base_revision,
                     records=body.records,
-                    reviewer_id=str(user.user_id),
+                    reviewer_id=evaluation_request_context(request).user_id,
                 ),
             )
         except EvaluationAnnotationError as exc:
             raise _save_http_error(exc) from exc
         return result.model_dump(mode="json")
 
+    @router.patch("/{conversation_id}/review-tasks/{run_id}/annotations")
     @router.patch(
         "/{conversation_id}/evaluation-runs/{run_id}/annotations",
     )
@@ -346,7 +346,6 @@ def create_evaluation_runs_router() -> APIRouter:
         run_id: str,
         request: Request,
         body: SaveAnnotationChangesBody,
-        user: Annotated[CurrentLoginUser, Depends(require_current_login_user)],
         storage: Annotated[EvaluationStorage, Depends(get_evaluation_storage)],
     ) -> dict[str, Any]:
         _reject_cross_origin_write(request)
@@ -356,18 +355,19 @@ def create_evaluation_runs_router() -> APIRouter:
                     get_product_runtime(request).save_evaluation_annotation_changes,
                     conversation_id,
                     run_id,
-                    request_context(request),
+                    evaluation_request_context(request),
                     storage,
                     save_id=body.save_id,
                     base_revision=body.base_revision,
                     changes=body.changes,
-                    reviewer_id=str(user.user_id),
+                    reviewer_id=evaluation_request_context(request).user_id,
                 ),
             )
         except EvaluationAnnotationError as exc:
             raise _save_http_error(exc) from exc
         return result.model_dump(mode="json")
 
+    @router.get("/{conversation_id}/review-tasks/{run_id}/cases")
     @router.get(
         "/{conversation_id}/evaluation-runs/{run_id}/cases",
     )
@@ -375,7 +375,6 @@ def create_evaluation_runs_router() -> APIRouter:
         conversation_id: str,
         run_id: str,
         request: Request,
-        _user: Annotated[CurrentLoginUser, Depends(require_current_login_user)],
         storage: Annotated[EvaluationStorage, Depends(get_evaluation_storage)],
         cursor: str | None = None,
         limit: Annotated[int, Query(ge=1, le=100)] = 20,
@@ -388,7 +387,7 @@ def create_evaluation_runs_router() -> APIRouter:
                     get_product_runtime(request).list_evaluation_cases,
                     conversation_id,
                     run_id,
-                    request_context(request),
+                    evaluation_request_context(request),
                     storage,
                     cursor=cursor,
                     limit=limit,
@@ -414,6 +413,7 @@ def create_evaluation_runs_router() -> APIRouter:
             "revision": page.revision,
         }
 
+    @router.get("/{conversation_id}/review-tasks/{run_id}/media/{media_id}")
     @router.get(
         "/{conversation_id}/evaluation-runs/{run_id}/media/{media_id}",
     )
@@ -422,7 +422,6 @@ def create_evaluation_runs_router() -> APIRouter:
         run_id: str,
         media_id: str,
         request: Request,
-        _user: Annotated[CurrentLoginUser, Depends(require_current_login_user)],
         storage: Annotated[EvaluationStorage, Depends(get_evaluation_storage)],
     ) -> Response:
         try:
@@ -431,7 +430,7 @@ def create_evaluation_runs_router() -> APIRouter:
                     get_product_runtime(request).read_evaluation_media,
                     conversation_id,
                     run_id,
-                    request_context(request),
+                    evaluation_request_context(request),
                     storage,
                     media_id,
                 )
@@ -452,6 +451,7 @@ def create_evaluation_runs_router() -> APIRouter:
             headers={"Cache-Control": "private, max-age=86400, immutable"},
         )
 
+    @router.get("/{conversation_id}/review-tasks/{run_id}/report")
     @router.get(
         "/{conversation_id}/evaluation-runs/{run_id}/report",
         response_class=HTMLResponse,
@@ -460,7 +460,6 @@ def create_evaluation_runs_router() -> APIRouter:
         conversation_id: str,
         run_id: str,
         request: Request,
-        _user: Annotated[CurrentLoginUser, Depends(require_current_login_user)],
         storage: Annotated[EvaluationStorage, Depends(get_evaluation_storage)],
     ) -> Response:
         # _execute owns the failure mapping: confirmed-absent report → 404,
@@ -470,7 +469,7 @@ def create_evaluation_runs_router() -> APIRouter:
                 get_product_runtime(request).read_evaluation_report,
                 conversation_id,
                 run_id,
-                request_context(request),
+                evaluation_request_context(request),
                 storage,
             ),
         )
@@ -479,7 +478,7 @@ def create_evaluation_runs_router() -> APIRouter:
                 get_product_runtime(request).has_evaluation_case_products,
                 conversation_id,
                 run_id,
-                request_context(request),
+                evaluation_request_context(request),
                 storage,
             )
         )
@@ -507,6 +506,7 @@ def create_evaluation_runs_router() -> APIRouter:
             headers={"Content-Security-Policy": REPORT_CSP},
         )
 
+    @router.get("/{conversation_id}/review-tasks/{run_id}/exports/{filename}")
     @router.get(
         "/{conversation_id}/evaluation-runs/{run_id}/exports/{filename}",
     )
@@ -515,7 +515,6 @@ def create_evaluation_runs_router() -> APIRouter:
         run_id: str,
         filename: str,
         request: Request,
-        _user: Annotated[CurrentLoginUser, Depends(require_current_login_user)],
         storage: Annotated[EvaluationStorage, Depends(get_evaluation_storage)],
     ) -> Response:
         if filename not in EXPORT_NAMES:
@@ -528,7 +527,7 @@ def create_evaluation_runs_router() -> APIRouter:
                     get_product_runtime(request).export_evaluation_annotations,
                     conversation_id,
                     run_id,
-                    request_context(request),
+                    evaluation_request_context(request),
                     storage,
                     filename,
                 ),

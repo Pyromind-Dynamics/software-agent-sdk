@@ -7,8 +7,8 @@ import logging
 import shutil
 import threading
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping
-from dataclasses import dataclass, field
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,7 @@ from pyromind_runtime.application.evaluation_cases import (
     EvaluationMedia,
 )
 from pyromind_runtime.application.event_projection import ProductEventProjector
+from pyromind_runtime.application.product_instructions import DATA_FLYWHEEL_INSTRUCTIONS
 from pyromind_runtime.application.reusable_workflows import (
     ReusableWorkflows,
     started_run,
@@ -44,6 +45,8 @@ from pyromind_runtime.domain.commands import (
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.errors import (
+    EvaluationRunNotFoundError,
+    EvaluationRunUnavailableError,
     ProductRuntimeError,
 )
 from pyromind_runtime.domain.evaluation import (
@@ -52,6 +55,7 @@ from pyromind_runtime.domain.evaluation import (
     AnnotationSummaryResult,
 )
 from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
     ExternalTaskState,
@@ -122,6 +126,7 @@ class _ActiveConversation:
     context: RequestContext
     last_access: float = field(default_factory=time.monotonic)
     inflight: int = 0
+    workflow_task_context: set[str] = field(default_factory=set)
 
     def touch(self) -> None:
         self.last_access = time.monotonic()
@@ -153,6 +158,8 @@ class ConversationRuntime:
         workflows: WorkflowBackend | None = None,
         workflow_submission: WorkflowSubmissionPort | None = None,
         versions: Versions | None = None,
+        evaluation_storage_factory: Callable[[RequestContext], EvaluationStorage]
+        | None = None,
     ) -> None:
         self.conversation_root = Path(conversation_root)
         self.adapters = (
@@ -167,6 +174,7 @@ class ConversationRuntime:
         self._external_tasks = external_tasks
         self._workflow_submission = workflow_submission
         self.versions = versions
+        self._evaluation_storage_factory = evaluation_storage_factory
         self._projector = ProductEventProjector()
         self._notification_resume_lock = asyncio.Lock()
         self._workflows = (
@@ -309,11 +317,95 @@ class ConversationRuntime:
             if self._store(scope).metadata_path.is_file():
                 await self.reconcile_versions(scope)
 
+    async def reconcile_training_evaluations(
+        self, conversation_id: str, context: RequestContext | None
+    ) -> None:
+        if context is None or self._evaluation_storage_factory is None:
+            return
+        store = self._store(conversation_id)
+        store.authorize(context.user_id)
+        completed = {
+            task.task_id
+            for task in store.load_snapshot().external_tasks
+            if task.status == "succeeded"
+        }
+        for run in store.load_pipeline_runs().values():
+            if (
+                run.definition.get("kind") != "prediction_evaluation"
+                or run.task_id not in completed
+            ):
+                continue
+            try:
+                await asyncio.to_thread(
+                    self.finalize_training_evaluation,
+                    conversation_id,
+                    str(run.run_id),
+                    context,
+                    self._evaluation_storage_factory(context),
+                )
+            except Exception:
+                logger.exception(
+                    "Training evaluation reconciliation pending for %s", run.run_id
+                )
+
+    def finalize_training_evaluation(
+        self,
+        conversation_id: str,
+        run_id: str,
+        context: RequestContext,
+        storage: EvaluationStorage,
+    ) -> dict[str, Any]:
+        from pyromind_runtime.application.training_evaluations import (
+            TrainingEvaluations,
+        )
+
+        store = self._store(conversation_id)
+        store.authorize(context.user_id)
+        with self._evaluation_annotation_cache_lock:
+            return TrainingEvaluations(store, storage).finalize(run_id)
+
+    def _refresh_iteration_review(
+        self,
+        conversation_id: str,
+        run_id: str,
+        _context: RequestContext,
+        storage: EvaluationStorage,
+    ) -> None:
+        run = self._store(conversation_id).load_pipeline_runs().get(run_id)
+        if run is not None and run.definition.get("kind") == "badcase_review":
+            from pyromind_runtime.application.review_tasks import ReviewTasks
+
+            try:
+                with self._evaluation_annotation_cache_lock:
+                    ReviewTasks(self._store(conversation_id), storage).refresh_context(
+                        run_id
+                    )
+            except Exception:
+                logger.exception("Review saved; context refresh pending for %s", run_id)
+            return
+        if run is not None and run.definition.get("parent_run_id"):
+            try:
+                from pyromind_runtime.application.training_evaluations import (
+                    TrainingEvaluations,
+                )
+
+                # The annotation route has already resolved the conversation/run
+                # and authorized Storage access; it intentionally has no user login.
+                with self._evaluation_annotation_cache_lock:
+                    TrainingEvaluations(self._store(conversation_id), storage).finalize(
+                        str(run.definition["parent_run_id"])
+                    )
+            except Exception:
+                logger.exception(
+                    "Review saved; iteration context refresh pending for %s", run_id
+                )
+
     async def reconcile_versions(
         self,
         conversation_id: str,
         context: RequestContext | None = None,
     ) -> None:
+        await self.reconcile_training_evaluations(conversation_id, context)
         if self.versions is None:
             return
         store = self._store(conversation_id)
@@ -389,6 +481,50 @@ class ConversationRuntime:
                             output_role="report",
                         )
                     ]
+                if source.kind == "pipeline" and isinstance(request, PipelineRun):
+                    config = request.definition.get("evaluation_config", {})
+                    model_source = (
+                        config.get("model_source", {})
+                        if isinstance(config, dict)
+                        else {}
+                    )
+                    if (
+                        task.status == "succeeded"
+                        and isinstance(model_source, dict)
+                        and model_source.get("type") == "checkpoint"
+                        and model_source.get("kind") == "lora"
+                    ):
+                        outputs.append(
+                            SaveVersion(
+                                kind="model",
+                                logical_key="merged-selected-checkpoint",
+                                source=SnapshotSource(
+                                    storage_ref=request.output_dir + "/merged-model",
+                                    reference_only=True,
+                                ),
+                                summary={
+                                    "parent_checkpoint": request.definition.get(
+                                        "inference", {}
+                                    ),
+                                    "base_model": model_source.get("base_model"),
+                                },
+                                output_role="merged_model",
+                            )
+                        )
+                    selection = getattr(request, "result", {})
+                    model = selection.get("model")
+                    if isinstance(model, dict) and isinstance(model.get("path"), str):
+                        outputs.append(
+                            SaveVersion(
+                                kind="model",
+                                logical_key="selected-checkpoint",
+                                source=SnapshotSource(
+                                    storage_ref=model["path"], reference_only=True
+                                ),
+                                summary={"checkpoint": model, "selection": selection},
+                                output_role="selected_checkpoint",
+                            )
+                        )
                 if outputs:
                     versions.register_outputs(project, run, outputs, context)
             if context is not None:
@@ -491,21 +627,70 @@ class ConversationRuntime:
         )
         self._publish(persisted)
 
+    def evaluation_storage_context(
+        self, conversation_id: str, context: RequestContext
+    ) -> RequestContext:
+        if context.x_cluster:
+            return context
+        try:
+            store = self._store(conversation_id)
+        except ValueError as exc:
+            raise EvaluationRunNotFoundError("invalid conversation id") from exc
+        if not store.metadata_path.is_file():
+            raise EvaluationRunNotFoundError(
+                f"conversation {conversation_id} not found"
+            )
+        try:
+            cluster = store.load_x_cluster()
+            if not cluster:
+                session = self._active.get(conversation_id) or self._retained.get(
+                    conversation_id
+                )
+                if session is not None:
+                    cluster = session.context.x_cluster
+                    store.save_x_cluster(cluster)
+        except ProductStoreError as exc:
+            raise EvaluationRunUnavailableError(
+                f"conversation {conversation_id} routing is unreadable"
+            ) from exc
+        return replace(context, x_cluster=cluster)
+
     def _evaluation_run(
+        self,
+        conversation_id: str,
+        run_id: str,
+        _context: RequestContext,
+        storage: EvaluationStorage,
+    ) -> tuple[str, str, EvaluationAnnotationService]:
+        resolved = resolve_evaluation_run(
+            conversation_id=conversation_id,
+            store=self._store(conversation_id),
+            run_id=run_id,
+            storage=storage,
+            locks=self._evaluation_locks,
+        )
+        run = self._store(conversation_id).load_pipeline_runs()[resolved[0]]
+        if run.definition.get("kind") == "badcase_review":
+            from pyromind_runtime.application.review_tasks import ReviewTasks
+
+            with self._evaluation_annotation_cache_lock:
+                ReviewTasks(self._store(conversation_id), storage).ready(resolved[0])
+        return resolved
+
+    def read_review_task(
         self,
         conversation_id: str,
         run_id: str,
         context: RequestContext,
         storage: EvaluationStorage,
-    ) -> tuple[str, str, EvaluationAnnotationService]:
-        return resolve_evaluation_run(
-            conversation_id=conversation_id,
-            store=self._store(conversation_id),
-            run_id=run_id,
-            context=context,
-            storage=storage,
-            locks=self._evaluation_locks,
+    ) -> dict[str, Any]:
+        canonical_id, _, _ = self._evaluation_run(
+            conversation_id, run_id, context, storage
         )
+        run = self._store(conversation_id).load_pipeline_runs()[canonical_id]
+        if run.definition.get("kind") != "badcase_review":
+            raise ValueError("not an independent review task")
+        return dict(run.result)
 
     def load_evaluation_annotations(
         self,
@@ -546,7 +731,7 @@ class ConversationRuntime:
         canonical_run_id, output_dir, service = self._evaluation_run(
             conversation_id, run_id, context, storage
         )
-        return service.save(
+        result = service.save(
             run_id=canonical_run_id,
             output_dir=output_dir,
             save_id=save_id,
@@ -554,6 +739,10 @@ class ConversationRuntime:
             records=records,
             reviewer_id=reviewer_id,
         )
+        self._refresh_iteration_review(
+            conversation_id, canonical_run_id, context, storage
+        )
+        return result
 
     def save_evaluation_annotation_changes(
         self,
@@ -570,7 +759,7 @@ class ConversationRuntime:
         canonical_run_id, output_dir, service = self._evaluation_run(
             conversation_id, run_id, context, storage
         )
-        return service.save_changes(
+        result = service.save_changes(
             run_id=canonical_run_id,
             output_dir=output_dir,
             save_id=save_id,
@@ -578,6 +767,10 @@ class ConversationRuntime:
             changes=changes,
             reviewer_id=reviewer_id,
         )
+        self._refresh_iteration_review(
+            conversation_id, canonical_run_id, context, storage
+        )
+        return result
 
     def read_evaluation_report(
         self,
@@ -589,6 +782,17 @@ class ConversationRuntime:
         canonical_run_id, output_dir, _ = self._evaluation_run(
             conversation_id, run_id, context, storage
         )
+        run = self._store(conversation_id).load_pipeline_runs().get(canonical_run_id)
+        if run is not None and run.definition.get("kind") == "prediction_evaluation":
+            from pyromind_runtime.application.training_evaluations import (
+                TrainingEvaluations,
+            )
+
+            # Recover a completed batch even if its callback arrived while offline.
+            with self._evaluation_annotation_cache_lock:
+                TrainingEvaluations(self._store(conversation_id), storage).finalize(
+                    canonical_run_id
+                )
         return storage.read(f"{output_dir}/evaluation_report.html")
 
     def list_evaluation_cases(
@@ -606,7 +810,24 @@ class ConversationRuntime:
         canonical_run_id, output_dir, service = self._evaluation_run(
             conversation_id, run_id, context, storage
         )
-        summary = service.load_summary(run_id=canonical_run_id, output_dir=output_dir)
+        from pyromind_runtime.application.evaluation_annotations import (
+            AnnotationNotInitializedError,
+        )
+
+        try:
+            summary = service.load_summary(
+                run_id=canonical_run_id, output_dir=output_dir
+            )
+        except AnnotationNotInitializedError:
+            # A score/report can expose cases without owning a review task.
+            return EvaluationCaseService(storage).list_page(
+                output_dir=output_dir,
+                cursor=cursor,
+                limit=limit,
+                query=query,
+                allowed_case_ids=None if review_status == "all" else set(),
+                selection_key=review_status,
+            )
         cache_key = (conversation_id, canonical_run_id, summary.revision)
         with self._evaluation_annotation_cache_lock:
             annotation_by_case = self._evaluation_annotation_cache.get(cache_key)
@@ -716,6 +937,15 @@ class ConversationRuntime:
         await self._make_room()
         if self._resource_limits is not None:
             spec = spec.model_copy(update={"resource_limits": self._resource_limits})
+        spec = spec.model_copy(
+            update={
+                "product_instructions": "\n".join(
+                    part
+                    for part in (DATA_FLYWHEEL_INSTRUCTIONS, spec.product_instructions)
+                    if part
+                )
+            }
+        )
         handle = await adapter.create_session(spec, context)
         self._log_timing(
             "adapter.create_session_ms",
@@ -739,6 +969,7 @@ class ConversationRuntime:
                 user_id=context.user_id,
                 harness_id=handle.harness_id,
             )
+            store.save_x_cluster(context.x_cluster)
             store.append(
                 ProductEvent(
                     event_id=f"{handle.session_id}:created",
@@ -790,6 +1021,7 @@ class ConversationRuntime:
     ) -> CommandReceipt:
         store = await self._ensure_active(conversation_id, context)
         store.authorize(context.user_id)
+        store.save_x_cluster(context.x_cluster)
         receipt, claimed = store.claim_command(command)
         if not claimed:
             return receipt
@@ -1071,6 +1303,10 @@ class ConversationRuntime:
         self._emit_workflow_execution_message(
             store, request, "submitted", f"工作流已提交，taskId：{task_id}"
         )
+        active = self._active.get(request.conversation_id)
+        if active is not None:
+            async with self._notification_resume_lock:
+                await self._sync_workflow_task_context(active, store)
         response = {
             "request_id": request.request_id,
             "status": "submitted",
@@ -1483,6 +1719,7 @@ class ConversationRuntime:
         if conversation_id in self._active or self._has_pending_external_work(store):
             store = await self._ensure_active(conversation_id, context)
         store.authorize(context.user_id)
+        store.save_x_cluster(context.x_cluster)
         return store
 
     def _has_pending_external_work(self, store: FileProductStore) -> bool:
@@ -1514,6 +1751,9 @@ class ConversationRuntime:
             return self._store(conversation_id)
         lock = self._activation_locks.setdefault(conversation_id, asyncio.Lock())
         async with lock:
+            # A release may have scheduled retention while activation waited
+            # for the old runner to finish closing.
+            self._cancel_retention(conversation_id)
             existing = self._active.get(conversation_id)
             if existing is not None:
                 existing.touch()
@@ -1599,7 +1839,50 @@ class ConversationRuntime:
     ) -> None:
         await self.reconcile_versions(active.handle.session_id, active.context)
         async with self._notification_resume_lock:
+            await self._sync_workflow_task_context(active, store)
             await self._resume_notifications(active, store)
+
+    async def _sync_workflow_task_context(
+        self, active: _ActiveConversation, store: FileProductStore
+    ) -> None:
+        tasks = {task.task_id: task for task in store.load_snapshot().external_tasks}
+        for request in store.load_workflow_execution_requests().values():
+            if (
+                request.status != "submitted"
+                or not request.task_id
+                or request.request_id in active.workflow_task_context
+            ):
+                continue
+            task = tasks.get(request.task_id)
+            reference = {
+                "request_id": request.request_id,
+                "task_id": request.task_id,
+                "workflow_path": request.workflow_path,
+                "status": task.status if task else "pending",
+            }
+            try:
+                await active.adapter.notify_external_task(
+                    active.handle,
+                    ExternalTaskNotification(
+                        task_id=request.task_id,
+                        kind="workflow_run",
+                        run_id=request.request_id,
+                        status=reference["status"],
+                        hidden_text=(
+                            "Submitted workflow task reference: "
+                            + json.dumps(reference, ensure_ascii=False)
+                        ),
+                        trigger_turn=False,
+                    ),
+                    active.context,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not synchronize workflow task %s; retrying on next access",
+                    request.task_id,
+                )
+            else:
+                active.workflow_task_context.add(request.request_id)
 
     async def _resume_notifications(
         self, active: _ActiveConversation, store: FileProductStore
@@ -1920,6 +2203,14 @@ class ConversationRuntime:
             await self._release(oldest.handle.session_id, reason="capacity")
 
     async def _release(self, conversation_id: str, *, reason: str) -> None:
+        # Keep the activation lock until the harness has released its resources.
+        # Removing _active alone must not allow a second runner to start while
+        # the previous runner still owns its IPC socket or execution workspace.
+        lock = self._activation_locks.setdefault(conversation_id, asyncio.Lock())
+        async with lock:
+            await self._release_locked(conversation_id, reason=reason)
+
+    async def _release_locked(self, conversation_id: str, *, reason: str) -> None:
         active = self._active.pop(conversation_id, None)
         if active is None:
             return
@@ -2249,7 +2540,20 @@ def _build_external_task_notification(
                     "training. Hand this task_id to the training-analysis skill "
                     "and follow its analysis and reporting flow. Report the actual "
                     "W&B run and metrics; do not claim all training stages were "
-                    "analyzed. Do not rerun automatically."
+                    "analyzed. Unless evaluation was explicitly excluded, continue "
+                    "with training_analysis(operation=artifacts) to discover saved "
+                    "checkpoint-n and eval_step_n.jsonl from the executed task. "
+                    "Inspect samples, establish the business scoring rule, then use "
+                    "inference-evaluation to score every saved eval with one frozen "
+                    "script through df_submit_pipeline evaluation. Compare only "
+                    "same-step complete checkpoints using validation only. With "
+                    "train + validation only, do not start extra GPU inference. "
+                    "If independent test exists, evaluate the validation-selected "
+                    "checkpoint on test; test never participates in selection. "
+                    "Present complete label distributions before creating a new "
+                    "badcase review task with the existing annotation UI and use "
+                    "the iteration context to decide the next action. Report "
+                    "missing evidence without guessing. Do not rerun automatically."
                 )
             else:
                 instruction = (
@@ -2285,7 +2589,15 @@ def _build_external_task_notification(
             f"The Pyromind {task_label} task is {status}. Follow the matching "
             "skill's callback contract. Inspect the reported output_dir under "
             "storage/ with the file tools; do not assume the callback payload "
-            "contains data."
+            "contains data. For a saved-prediction batch, "
+            "read checkpoint_selection.json "
+            "and iteration_context.json, link the overview and selected step report, "
+            "and distinguish the best saved candidate from meeting acceptance targets. "
+            "Scoring does not create annotation tasks. For human review, use "
+            "df_submit_pipeline products.operation=review with a completed matching "
+            "profile. Reuse existing annotation components and taxonomy, never "
+            "generate a new UI. Rubric changes create new scoring and review runs "
+            "without overwriting or inheriting earlier human annotations."
         )
     if error_summary:
         instruction += f" Controlled error summary: {error_summary}"

@@ -13,6 +13,27 @@ test("agent_end is lifecycle-only and never emits a terminal event", () => {
   assert.deepEqual(normalizer.translate(event), []);
 });
 
+test("failed tools retain structured error codes, with fallback for legacy or invalid details", () => {
+  const normalizer = new PiEventNormalizer("s1", "r1");
+  for (const errorCode of ["ENUM_VALUE_INVALID", "", "  ", 0, null, undefined]) {
+    const details = { error_code: errorCode, retryable: false, errors: [{ field: "gpu_product" }] };
+    const event = normalizer.translate({
+      type: "tool_execution_end", toolCallId: "call-1", toolName: "business_tool",
+      result: { content: [{ type: "text", text: "unsupported GPU" }], details }, isError: true,
+    } as unknown as AgentSessionEvent)[0]!;
+    assert.equal(event.kind, "tool.failed");
+    assert.equal(event.payload.error_code, errorCode === "ENUM_VALUE_INVALID" ? errorCode : "tool_execution_failed");
+    assert.equal((event.payload.details as Record<string, unknown>).retryable, false);
+    assert.deepEqual((event.payload.details as Record<string, unknown>).errors, details.errors);
+  }
+  const legacy = normalizer.translate({
+    type: "tool_execution_end", toolCallId: "old-call", toolName: "read",
+    result: { content: [], details: undefined }, isError: true,
+  } as unknown as AgentSessionEvent)[0]!;
+  assert.equal(legacy.payload.error_code, "tool_execution_failed");
+  assert.equal(legacy.payload.details, null);
+});
+
 test("tool completion reports generic arguments without workflow semantics", () => {
   const normalizer = new PiEventNormalizer("s1", "r1");
   normalizer.translate({

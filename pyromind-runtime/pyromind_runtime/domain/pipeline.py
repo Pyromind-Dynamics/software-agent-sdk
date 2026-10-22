@@ -14,6 +14,7 @@ class PipelineRun(ContractModel):
     run_id: UUID
     conversation_id: str
     definition: JsonObject
+    result: JsonObject = Field(default_factory=dict)
     fingerprint: str
     output_dir: str
     revision: int = Field(default=1, ge=1)

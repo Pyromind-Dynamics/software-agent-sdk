@@ -29,7 +29,7 @@ test("SDK loads the package default entry, discovers its host, and retains it ac
     const extension = extensions[0];
     assert.ok(extension.resolvedPath.endsWith("@agentgenome/pi-extension/index.js"));
     assert.equal(extension.path.includes("inline"), false);
-    assert.equal(extension.tools.size, 14);
+    assert.equal(extension.tools.size, 13);
     assert.equal(extension.handlers.has("session_start"), false, "SDK must not initialize a native service");
     assert.equal(extension.commands.has("genome"), false, "SDK must not install a native Python environment");
     await extension.tools.get("genome_list")!.definition.execute("call", {}, undefined, undefined, {} as never);
@@ -64,7 +64,7 @@ test("a real SDK Pi turn invokes genome tools through the loaded package and exi
     for await (const chunk of request) text += chunk;
     modelRequests.push(JSON.parse(text));
     const step = modelRequests.length;
-    if (step === 1) reply(response, "genome_list", {}, "list-call");
+    if (step === 1) reply(response, "genome_list", { action: "list", foo: "bar" }, "list-call");
     else if (step === 2) reply(response, "genome_run", {
       asset_id: "data-cleaning", version: "1.0.0", params: { data_file: "public_data/input.csv" },
     }, "run-call");
@@ -98,12 +98,13 @@ test("a real SDK Pi turn invokes genome tools through the loaded package and exi
   })]).finally(() => clearTimeout(timeout));
   assert.deepEqual(hostRequests.map((request) => request.action), ["list", "run"]);
   assert.deepEqual(hostRequests.map((request) => request.request_id), ["list-call", "run-call"]);
+  assert.deepEqual(hostRequests[0].arguments, {});
   assert.deepEqual(hostRequests[1].arguments, { asset_id: "data-cleaning", version: "1.0.0", params: { data_file: "public_data/input.csv" } });
   const schemas = modelRequests[0].tools as Array<{ function: { name: string } }>;
   assert.deepEqual(
     schemas.map((tool) => tool.function.name).filter((name) => name.startsWith("genome_")).sort(),
     ["genome_cancel", "genome_capture", "genome_capture_status", "genome_distill",
-      "genome_get", "genome_list", "genome_prepare_revision", "genome_read_reference",
+      "genome_get", "genome_list", "genome_prepare_revision",
       "genome_resume", "genome_run", "genome_status", "genome_step_result", "genome_takeover",
       "genome_trace"],
   );

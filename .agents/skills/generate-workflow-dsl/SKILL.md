@@ -1,142 +1,60 @@
 ---
 name: generate-workflow-dsl
 description: >-
-  为 Pyromind 生成、修改或校验工作流 Python DSL，包括单节点工作流、模型训练与评测。
-  用户要求修改画布、检查 workflow.py、SFT/DPO/GRPO、Benchmark 或其他平台节点工作流时使用；
+  为 Pyromind 生成、修改或校验工作流 Python DSL，包括单节点工作流和模型训练。
+  用于修改画布、检查 workflow.py、SFT/DPO/GRPO 或其他平台节点工作流；
+  基模 Benchmark、训后效果评测、GT 对比和报告统一使用 inference-evaluation。
   负责按需读取节点契约、绑定产物并校验 DSL。不执行正式工作流，不在训练生成场景自动清洗数据。
 ---
 
 # 生成 Pyromind 工作流
 
-按请求选择节点或阶段组合；训练任务先证明数据和参数可用，再写 DSL。不要从完整示例反推需求。
+从用户目标和已有资产出发，只补足影响当前工作流正确生成的信息缺口。优先复用有效数据与配置，额外准备由实际输入约束或用户要求决定。
+
+本 Skill 生成、修改并校验 DSL。独立模型效果评测交给 `inference-evaluation`；执行训练默认衔接同验证集的基模与训后评测，明确只生成或不评测时遵从。不在这里新建 Metric/Eval 链。
+训练生成负责准备最终模型产物，LoRA 评测前需合并；不默认增加试用半成品的独立部署阶段。
+
+## 数据与训练决策
+
+已有数据、字段映射和有效配置足以落图时，直接生成。需要了解数据时按信息缺口查看样本、目录或统计，复用仍适用的读取结果。完整数据画像、processor/collator 实测和依赖安装不是生成 DSL 的前置条件；用户要求精确分析或实际兼容性问题需要时再做。
+
+数据形态和 Builder 映射见 `references/workflow-contracts.md`，来源及挂载路径见 `references/data-routing.md`。训练节点支持的原始数据直接映射字段；合并文件或转换格式应有实际输入约束或用户需求作为依据。缺少数据源、必要监督信号或节点契约时指出具体缺口，不用占位数据或猜测补齐。
+
+阶段优先遵从用户指定或已有工作流。未指定时，偏好对选择 DPO，示范答案选择 SFT，仅有 prompt 加 ground truth/reward 时考虑 GRPO；同时支持 SFT/GRPO 时默认 SFT。自动选择 GRPO 需要指令/SFT checkpoint 或上游 SFT 产物；用户明确要求基模 GRPO 时遵从并说明冷启动风险。
+
+参数优先级：**用户明确要求 > 当前工作流有效值 > 用户提供的同任务已用配置 > 数据、模型和资源推理 > 平台默认值**。只调整本次要求或有证据不兼容的部分，区分估算与实测，不为生成工作流强求精确长度或容量结论。需要分析已有训练效果时使用 `training-analysis`。
+
+局部修改先读取现有文件，保留变量名、节点 ID、下游连线及未涉及的配置，仅修改相关节点和连线；仅校验时直接调用校验工具。文件不存在时说明缺失。
 
 ## DSL 与资料边界
 
-- `workflow.py` 直接声明节点实例，不写 import，也不能当普通 Python 在 Agent 本地执行。
-- 本 Skill 只生成并校验 DSL；数据处理、Benchmark、训练和推理由 Pyromind 平台节点执行。
-- 数据、模型和训练产物通过输出端口绑定；禁止用 Agent 本地 terminal 替代平台运行时或查找数据副本。
-- Benchmark 最小骨架是数据配置 → 模型入口 → VLLM → Metric → Eval。
-- 每个 `MetricsConfigBuilderNode` 只输出一个 `metrics_config`；契约未声明的组合方式不得猜测。
-- 常用训练与评测节点先按 `references/workflow-contracts.md` 生成；其中没有的节点先从
-  `knowledge/index.md` 定位，再读对应原文。运行时契约以 `validate_workflow_dsl` 的实时结果为准。
-- GPU 枚举、必填端口等平台契约会随迭代漂移；不确定时构造最小可验证 DSL 调一次
-  `validate_workflow_dsl`，以返回的 `code`/`node_id`/`field` 为准，不要凭经验猜测。
-- Reference 是按缺失事实选择的索引，不是阅读清单；同一轮不得重复读取同一路径。
-- 已有契约足以生成初稿时不查 `knowledge/`；缺少节点契约或校验暴露未覆盖字段时才定向读取。
+- 文件固定为 `public_data/workflow_canvas/workflow.py`；直接声明节点实例，不写 import，不当普通 Python 在 Agent 本地执行。
+- 数据处理、训练和推理由 Pyromind 平台节点执行；上游数据、模型及训练产物通过输出端口绑定，不写死下游产物路径，不用 Agent 本地运行替代平台节点。
+- SFT/DPO/GRPO 的 `wandb_config`、`accelerate_config` 当前按必填校验，连接对应 Builder 输出。WandB 仅写 Secret 名，不写明文凭据。
+- 内置 Metric/Reward 不满足目标时才读取 `custom-python-assets.md`；脚本校验并上传成功后，使用真实返回的 Storage 路径填写入口，上传失败停止，不伪造路径。
+- 节点契约以 `validate_workflow_dsl` 的实时结果为准。缺少契约时先查下列 reference，再从 `knowledge/index.md` 定向读取节点原文；已有信息足够时直接落图。
 
-## 资料索引（3 个 reference）
+## 资料索引
 
-| reference | 读取时机 |
+| reference | 用途 |
 |---|---|
-| `references/data-routing.md` | 判断数据源、数据画像、训练格式、字段映射或训练类型 |
-| `references/workflow-contracts.md` | 完整生成或组合阶段时查拓扑、节点参数、端口、枚举和平台覆盖项 |
-| `references/custom-python-assets.md` | 内置 Metrics/Reward 不适用，需要生成、上传并回填 Python 入口 |
-| 其他 Skill: `training-analysis` | 分析已有训练效果（loss 异常/对比/优化超参）时，先调该 skill 产出报告与探针实验，再整组落参数 |
+| `references/data-routing.md` | 数据来源、文件与目录入口、Storage 和训练环境的路径语义 |
+| `references/workflow-contracts.md` | 数据字段映射、模型入口、节点参数、输出端口和平台约束 |
+| `references/custom-python-assets.md` | 自定义 Metric/Reward 的接口、上传和入口绑定 |
 
-Reference 路径相对本 `SKILL.md` 所在目录。Pi 按 `<available_skills>` 给出的位置用 `read`
-打开精确路径。`knowledge/` 不是 Skill 子目录，而是会话根下的顶层只读知识库：必须原样传
-`knowledge/index.md`，不得拼成 `.agents/skills/<skill>/knowledge/...`。
-不用 terminal `ls/find` 探索 Skill、reference 或知识库。
+Reference 路径相对本 `SKILL.md` 所在目录；按 `<available_skills>` 的位置用 `read` 打开。
+`knowledge/` 是会话根下的顶层只读知识库，使用 `knowledge/index.md`，不要拼到 Skill 目录下。
+按缺失事实读取资料，复用已读内容，不用 terminal `ls/find` 探索 Skill 或知识库。
 
-## 执行状态机
+## 校验与交付
 
-### 0. 先判定局部修改
+每次写入后调用 `validate_workflow_dsl()`，缺省校验工作区 `workflow.py`，不传 DSL 全文：
 
-若请求只改已有节点参数，或把一个节点替换为输出端口兼容的单节点，走快路径：
+1. `valid=true`：完成；最终回复简述 warnings。
+2. `valid=false`：按 `code`、`node_id`、`field` 和 `detail.*_node_code` 最小修复。平台契约漂移以返回结果为准；生成任务只修改当前 DSL，不编辑 Skill 或知识库。
+3. `retryable=false`（包括 401）：停止，不重复校验或探测凭据。`retryable=true` 最多重试两次，仍失败则说明平台校验未完成。
+4. 最多修改五轮；同一错误连续两轮未消失则报告阻塞。GPU 枚举或必填端口不确定时，可用只含目标节点与最小依赖的 DSL 做一次校验探测，不用 `run_workflow` 探测。
 
-- 保留原变量名、节点 ID、下游连线和所有未被点名的参数；只写需求图差分。
-- 跳过数据画像、阶段选择和整组配参；不读 Storage，不读取 reference 或 `knowledge/`。
-- 缺少新节点契约或校验返回结构错误时，按资料索引定向读取所需契约，然后修改并进入第 8 步。
+生成任务不调用 `workflow_debug`、`run_workflow` 或 `run_dataset_cleaning`。无配置修改的显式调试请求使用 `debug-workflow`；要求运行时，校验通过后转入 `workflow-execution`，上传实际生成的文件并按其约定提交，由 Copilot 确认。
 
-模型入口规则供快路径和完整生成共用：
-
-- `Qwen/Qwen3-0.6B`、`Qwen/Qwen3-1.7B`、`Qwen/Qwen3-4B`、
-  `Qwen/Qwen3-VL-2B-Instruct`、`Qwen/Qwen3-VL-4B-Instruct` 使用
-  `CloneAndCacheModel(model=..., target_path="/workspace/models/")`。
-- 用户指定其他开源模型时使用
-  `DownloadAndCacheModel(modelname=..., cache_dir="/workspace/models/<org>/<model>", download_source="huggingface")`；
-  它与 Clone 都输出 `model_path`，不得改下游绑定。
-- 将 `qwen3.5-2b` 规范化为 `Qwen/Qwen3.5-2B`，缓存到
-  `/workspace/models/Qwen/Qwen3.5-2B`；用户指定其他来源时再覆盖默认 Hugging Face。
-
-### 1. 锁定目标
-
-- 仅校验现有工作流：直接进入第 8 步，不改变有效配置。
-- 单节点或其他非训练/评测工作流：进入第 4 步选节点契约，跳过训练专用的第 2、3、5、6 步。
-- 明确要求 Benchmark：只组合评测所需阶段。
-- 要求训练或修改训练工作流：继续执行；用户不需要说出 SFT/DPO/GRPO。
-
-### 2. 建立数据画像
-
-- Storage 相对路径：按 `data-routing.md` 获取或复用数据画像。
-- 平台预置或外部数据集标识：选择 Clone/Download，不去读 Storage。
-- 未提供数据：先索要 Storage 路径；用户明确要求演示/模板时直接使用公开测试集标识，不枚举用户 Storage。
-- 内部记录数据源、实际训练文件、N、P95 长度 L、字段、模态和样本形态，不向用户展示冗长清单。
-
-若数据不满足 `data-routing.md` 的训练格式，停止生成，指出缺失字段并给目标 JSONL 样例。
-禁止调用 `run_dataset_cleaning`，也禁止静默改用测试集。
-
-### 3. 选择阶段
-
-- 用户明确指定阶段时遵从；仅修改已有训练工作流时保留原阶段。否则，有 chosen/rejected
-  偏好对时选 DPO；存在 response/assistant 示范目标时选 SFT；仅有 prompt 加 ground truth
-  或 reward 时才考虑 GRPO。
-- 可程序验证只说明 reward 可构造，不能把监督样本改判为 GRPO；未明确阶段且数据同时支持
-  SFT/GRPO 时默认 SFT。自动选择 GRPO 还要求当前模型是 SFT/指令 checkpoint 或上游 SFT
-  产物；缺少该条件时说明冷启动缺口。用户明确要求基模 GRPO 时遵从并提示风险。
-- 完整生成或组合阶段时读取一次 `workflow-contracts.md`，按其中契约落图，不复制整套案例。
-- 用户要求训练时本轮仍生成训练 DSL。用户未说跳过基线时，在最终回复建议用同一数据切分和
-  指标先跑基模 Benchmark；这不是生成门禁。
-
-### 4. 决定契约与枚举
-
-训练与评测使用第 3 步已读的 `workflow-contracts.md`。其他工作流先查该文件；若目标节点
-不在其中，用 `read` 依次打开 `knowledge/index.md` 和匹配的节点原文，不猜字段或连线。
-局部修改仅在缺少新节点契约时读取所需资料。
-
-### 5. 整组配参
-
-阶段锁定后，结合数据规模、P95 长度、模型规模和可用资源，一次性整组决定 max sequence length、
-batch、grad accumulation、learning rate、epoch、LoRA rank 和 GRPO 的 max steps、num generations
-与生成长度。平台默认值与 DSL 字段约束以 `workflow-contracts.md` 为准，其余调参自行推理。
-
-参数优先级：**用户明确要求 > 修改任务中已有有效值 > 数据与资源决策 > 模型兜底**。
-不要只改一个相互依赖参数，也不要用模板覆盖无关配置。
-
-### 6. 准备自定义资产
-
-阶段锁定后，只有内置 Metric/Reward 不满足业务目标时才读取 `custom-python-assets.md`。必须先在工作区写脚本、
-校验接口、调用 `upload_file_to_pyromind` 成功取得 Storage 路径，再把
-`<storage_path>:<function>` 写入 DSL。上传失败就停止，不得伪造路径。
-
-### 7. 写入或局部修改
-
-- 文件固定为 `public_data/workflow_canvas/workflow.py`；新建或整体生成直接写入该工作区相对路径。
-- 仅局部修改时先读取现有文件，列出内部“需求验收项”和“图差分”，仅替换相关节点与连线；文件不存在时直接停止并说明。
-- 所有上游产物都通过输出端口绑定。不得把 SFT、Merge、GRPO、Inference 之间的模型路径写死。
-- SFT/DPO/GRPO 的 `wandb_config`、`accelerate_config` 平台当前按必填校验：必须由对应 Builder
-  的输出端口连接，不得省略或写空串。WandB 仅写 Secret 名；不得把 API Key、Cookie、集群凭证或
-  其他明文 Secret 写入 DSL。
-
-### 8. 校验闭环
-
-每次写入后立即调用 `validate_workflow_dsl()`（缺省即校验工作区 `workflow.py`）；不要传 DSL 全文：
-
-1. `valid=true`：结束；warnings 只在最终回复简述。
-2. `valid=false`：按 `code`、`node_id`、`field` 和 `detail.*_node_code` 做唯一片段最小修改。
-   平台契约漂移（如 `MISSING_REQUIRED_INPUT`、`ENUM_VALUE_INVALID`）以校验返回为准，不得照搬
-   skill 旧表格；只修改当前 DSL，不在生成任务中编辑 Skill、reference 或 knowledge。
-3. `retryable=false`（包括 401）：立即停止，不重复校验，也不得用 terminal 探测凭证。
-4. `retryable=true`：最多重试两次；仍失败则停止并说明平台校验未完成。
-5. 最多修改五轮；同一错误连续两轮不消失时停止并报告。
-6. 对 GPU 枚举、必填端口等不确定契约，可构造只含目标节点和最小依赖的最小 DSL 单独调一次校验
-   探测，再据此生成正式工作流；不得用 `run_workflow` 探测。
-
-生成 Skill 不调用 `workflow_debug`、`run_workflow` 或 `run_dataset_cleaning`。只有不含配置修改的
-显式调试请求才转用 `debug-workflow`。用户要求“换模型/改参数后运行”时，先修改并校验 DSL，
-上传工作流后按 `workflow-execution` Skill 请求正式运行，由 Copilot 确认。
-
-## 最终回复
-
-简述所选节点、关键输入及校验结果；训练任务再说明数据字段、阶段、基模与参数。对训练请求，
-除非用户已明确跳过，补一句使用同一指标跑基模 Benchmark 的建议；不要复述完整 DSL。
+最终简述所选节点、关键输入、参数依据和校验结果；说明影响执行的假设及未验证项，不复述完整 DSL。训练效果由独立评测报告判断。

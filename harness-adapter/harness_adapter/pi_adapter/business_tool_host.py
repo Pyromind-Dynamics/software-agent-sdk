@@ -890,6 +890,7 @@ class PyromindBusinessToolHost:
                     context.request_context
                 ),
                 ValidateWorkflowDslExecutor(
+                    env=params["env"],
                     secret_headers={"authorization": _VALIDATE_AUTHORIZATION_SECRET}
                     if context.request_context.authorization
                     else None,

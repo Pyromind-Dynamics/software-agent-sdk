@@ -37,10 +37,15 @@ export class PiEventNormalizer {
       case "tool_execution_end": {
         const arguments_ = this.toolArguments.get(event.toolCallId);
         this.toolArguments.delete(event.toolCallId);
+        const result = resultPayload(event.result);
+        const details = isRecord(event.result) ? event.result.details : undefined;
+        const errorCode = isRecord(details) &&
+          typeof details.error_code === "string" && details.error_code.trim()
+          ? details.error_code.slice(0, MAX_STRING) : "tool_execution_failed";
         return [this.make(event.isError ? "tool.failed" : "tool.completed", {
-          tool_call_id: event.toolCallId, tool_name: visibleToolName(event.toolName), ...resultPayload(event.result),
+          tool_call_id: event.toolCallId, tool_name: visibleToolName(event.toolName), ...result,
           ...(arguments_ !== undefined ? { arguments: arguments_ } : {}),
-          ...(event.isError ? { error_code: "tool_execution_failed" } : {}),
+          ...(event.isError ? { error_code: errorCode } : {}),
         })];
       }
       default: return [];

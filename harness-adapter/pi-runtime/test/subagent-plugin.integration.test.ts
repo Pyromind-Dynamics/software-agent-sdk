@@ -22,8 +22,9 @@ test("real plugin bridges tools and model, resumes persisted history, and owns b
     if (!isParent && JSON.stringify(request.messages).includes("WAIT_FOR_STOP")) { stalled++; return; }
     const hasRead = isParent || request.messages.some((message: any) => message.role === "tool" && JSON.stringify(message).includes("CHILD_EVIDENCE_937"));
     const isWriter = !isParent && request.tools?.some((tool: any) => tool.function.name === "write");
+    const isTerminalCheck = !isParent && JSON.stringify(request.messages).includes("CHECK_FAILED_TERMINAL");
     const wrote = request.messages.some((m: any) => m.role === "tool");
-    const delta = isWriter && !wrote ? {tool_calls:[{index:0,id:"write-1",type:"function",function:{name:"write",arguments:JSON.stringify({path:"public_data/child-output.txt",content:"written by child"})}}]} : (hasRead || wrote) ? { content: `CHILD_EVIDENCE_937; users=${request.messages.filter((m: any) => m.role === "user").length}` } : { tool_calls: [{ index: 0, id: "read-1", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "public_data/evidence.txt" }) } }] };
+    const delta = isTerminalCheck && !wrote ? {tool_calls:[{index:0,id:"terminal-1",type:"function",function:{name:"terminal",arguments:JSON.stringify({command:"exit 7"})}}]} : isWriter && !wrote ? {tool_calls:[{index:0,id:"write-1",type:"function",function:{name:"write",arguments:JSON.stringify({path:"public_data/child-output.txt",content:"written by child"})}}]} : (hasRead || wrote) ? { content: `CHILD_EVIDENCE_937; users=${request.messages.filter((m: any) => m.role === "user").length}` } : { tool_calls: [{ index: 0, id: "read-1", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "public_data/evidence.txt" }) } }] };
     res.writeHead(200, { "content-type": "text/event-stream" });
     for (const [d, reason] of [[{role:"assistant"}, null], [delta,null], [{},(hasRead || wrote) ? "stop" : "tool_calls"]]) res.write(`data: ${JSON.stringify({id:"test",object:"chat.completion.chunk",created:1,model:request.model,choices:[{index:0,delta:d,finish_reason:reason}]})}\n\n`);
     res.end("data: [DONE]\n\n");
@@ -72,6 +73,8 @@ test("real plugin bridges tools and model, resumes persisted history, and owns b
   const writer: any = await execute({agent:"general_purpose",task:"Write the assigned output",async:false});
   assert.ok(!writer.isError,JSON.stringify(writer));
   assert.equal(await readFile(join(root,"public_data/child-output.txt"),"utf8"),"written by child");
+  const terminalCheck: any = await execute({agent:"general_purpose",task:"CHECK_FAILED_TERMINAL",async:false});
+  assert.ok(!terminalCheck.isError, JSON.stringify(terminalCheck));
   assert.ok(events.some(event=>event.kind==="subagent.workflow_modified"));
   assert.equal(session.messages.some((m: any)=>m.role==="toolResult"&&m.toolName==="read"),false);
   await subagents.stopAll(); await session.abort(); await session.waitForIdle();
@@ -87,7 +90,27 @@ test("real plugin bridges tools and model, resumes persisted history, and owns b
   await subagents.stopAll();
   const stoppedState=JSON.parse(await readFile(join(subagents.paths.stateRoot,"async-subagent-runs",stopped.details.asyncId,"status.json"),"utf8"));
   assert.ok(["stopped","failed"].includes(stoppedState.state),JSON.stringify(stoppedState));
-  const scan = async (dir: string): Promise<void> => {for (const entry of await readdir(dir,{withFileTypes:true})) {const path=join(dir,entry.name);if(entry.isDirectory())await scan(path);else if(entry.isFile())assert.equal((await readFile(path)).includes(Buffer.from("PRIVATE_TEST_CREDENTIAL_824")),false,path);}};
+  const terminalResults: any[] = [];
+  const scan = async (dir: string): Promise<void> => {
+    for (const entry of await readdir(dir,{withFileTypes:true})) {
+      const path=join(dir,entry.name);
+      if(entry.isDirectory()) await scan(path);
+      else if(entry.isFile()) {
+        const content = await readFile(path);
+        assert.equal(content.includes(Buffer.from("PRIVATE_TEST_CREDENTIAL_824")),false,path);
+        if (entry.name === "session.jsonl") for (const line of content.toString().trim().split("\n").filter(Boolean)) {
+          const record = JSON.parse(line);
+          if (record.message?.role === "toolResult" && record.message.toolName === "terminal") terminalResults.push(record.message);
+        }
+      }
+    }
+  };
   await scan(join(root,"pi"));
+  assert.ok(terminalResults.length > 0);
+  for (const result of terminalResults) {
+    assert.equal(result.isError, true);
+    assert.equal(result.details.exitCode, 7);
+    assert.equal(result.details.resultCategory, "failure");
+  }
 });
 async function eventually(check:()=>Promise<void>) {const deadline=Date.now()+15000;for(;;){try{return await check();}catch(error){if(Date.now()>deadline)throw error;await new Promise(resolve=>setTimeout(resolve,100));}}}

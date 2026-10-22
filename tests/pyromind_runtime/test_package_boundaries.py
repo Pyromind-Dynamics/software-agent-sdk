@@ -1,16 +1,100 @@
 import ast
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import Mock
 
+import httpx
+import pytest
 import yaml
+from fastapi.dependencies.models import Dependant
+from fastapi.routing import APIRoute
+from harness_adapter.pi_adapter.business_tool_host import (
+    PyromindBusinessToolHost,
+    ToolExecutionContext,
+    _ToolConversationFacade,
+)
+from pyromind_agent_server.api.evaluation_runs import (
+    create_evaluation_runs_router,
+    get_evaluation_storage,
+)
+from pyromind_agent_server.api.router import create_product_router
 from pyromind_runtime.application.event_projection import ProductEventProjector
 from pyromind_runtime.application.snapshot_projector import SnapshotProjector
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
+from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 
+from openhands.agent_server.dependencies import check_session_api_key
+from openhands.tools.data_preparation.inference import InferenceOptions
+from openhands.tools.data_preparation.platform_submit import DfSubmitPipelineAction
+from openhands.tools.workflow.validate_workflow_dsl import ValidateWorkflowDslAction
+
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_evaluation_auth_boundary_is_separate_from_product_api() -> None:
+    def dependency_calls(dependant: Dependant):
+        yield dependant.call
+        for dependency in dependant.dependencies:
+            yield from dependency_calls(dependency)
+
+    for route in create_evaluation_runs_router().routes:
+        assert isinstance(route, APIRoute)
+        calls = set(dependency_calls(route.dependant))
+        assert get_evaluation_storage in calls
+        assert check_session_api_key not in calls
+
+    snapshot = next(
+        route
+        for route in create_product_router().routes
+        if isinstance(route, APIRoute) and route.path.endswith("/snapshot")
+    )
+    assert check_session_api_key in dependency_calls(snapshot.dependant)
+
+
+@pytest.mark.parametrize("env", ["pre", "pre2", "prod"])
+def test_evaluation_validation_shares_submission_route_and_identity(
+    tmp_path, monkeypatch, env
+):
+    monkeypatch.setenv("APP_ENV", "prod" if env.startswith("pre") else "dev")
+    context = ToolExecutionContext(
+        conversation_id="test-conversation",
+        workspace_root=tmp_path,
+        request_context=RequestContext(
+            user_id="test",
+            authorization="Bearer test-token",
+            cookie="auth_token=test-cookie",
+            x_cluster=f"test-cluster#{env}",
+        ),
+        model_configuration={},
+    )
+    host = PyromindBusinessToolHost(
+        [], skills_directory=ROOT / ".agents/skills", pipeline_runs=Mock()
+    )
+    params = host._preparation_params(context)
+    requests = []
+
+    def post(url, **kwargs):
+        requests.append((url, kwargs["headers"]))
+        return httpx.Response(200, json={"success": True, "data": {"valid": True}})
+
+    monkeypatch.setattr(httpx, "post", post)
+    result = params["inference_handler"].validator(
+        ValidateWorkflowDslAction(dsl="# workflow: test"),
+        _ToolConversationFacade(context),
+    )
+    assert result.valid is True
+    assert params["env"] == env and params["cluster"] == "test-cluster"
+    prefix = "" if env == "prod" else f"{env}-"
+    assert requests[0][0] == (
+        f"https://{prefix}api-portal.pyromind.ai/std2/studio_api/api/workflows/dsl/validate"
+    )
+    headers = requests[0][1]
+    assert headers["x-cluster"] == params["headers"]["x-cluster"]
+    assert headers["authorization"] == "Bearer test-token"
+    assert headers["cookie"] == "auth_token=test-cookie"
 
 
 def test_activity_timestamp_flows_through_generic_event_contract() -> None:
@@ -66,6 +150,19 @@ def test_runtime_has_no_server_or_harness_dependencies() -> None:
 def test_adapter_does_not_depend_on_pyromind_server() -> None:
     imports = _imports(ROOT / "harness-adapter" / "harness_adapter")
     assert not any(name.startswith("pyromind_agent_server") for name in imports)
+
+
+def test_evaluation_model_sources_stay_out_of_harness_and_tool_protocol() -> None:
+    assert "model_source" not in InferenceOptions.model_fields
+    assert "model_source" not in DfSubmitPipelineAction.model_fields
+    preparation_nodes = {"CloneAndCacheModel", "DownloadAndCacheModel"}
+    for path in (ROOT / "harness-adapter/harness_adapter").rglob("*.py"):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                assert node.attr != "model_source", str(path)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                assert node.value not in preparation_nodes, str(path)
 
 
 def test_evaluation_routes_delegate_to_product_runtime() -> None:
@@ -239,6 +336,8 @@ def test_sdk_agentgenome_uses_host_bridge_without_native_execution_fallback() ->
         assert "createBridgeHost" not in source, path
     host = (adapter / "pi-runtime/src/genome-host.ts").read_text()
     assert "provideGenomeHost" in host
+    assert "prepareArguments" not in host
+    assert "validateToolArguments" not in host
     assert 'peer.request("workflow.invoke"' not in session
     assert "NativeClient" not in session
     assert "nativeHost" not in session
@@ -281,3 +380,34 @@ def test_subagent_display_rpc_remains_adapter_private() -> None:
             assert "subagents:rpc:v1" not in source, path
             assert "transcriptWindow" not in source, path
             assert "subagent.progress" not in source, path
+
+
+def test_generated_business_scoring_only_executes_in_cpu_worker():
+    runtime = ROOT / "pyromind-runtime/pyromind_runtime"
+    for path in runtime.rglob("*.py"):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        imports = {
+            node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+        }
+        assert not {
+            "evaluate_predictions",
+            "evaluation_products",
+            "frozen_business_scoring",
+        }.intersection(imports)
+        if path.name in {
+            "checkpoint_selection.py",
+            "training_evaluations.py",
+            "review_tasks.py",
+            "test_evaluation.py",
+        }:
+            calls = [
+                node.func.id
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            ]
+            assert not {"eval", "exec", "compile", "__import__"}.intersection(calls)
+    from pyromind_runtime.ports.harness import SessionSpec
+
+    assert SessionSpec.model_fields["product_instructions"].default == ""
+    assert "evaluation" in DfSubmitPipelineAction.model_fields
+    assert "products" in DfSubmitPipelineAction.model_fields

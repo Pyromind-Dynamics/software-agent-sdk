@@ -162,7 +162,6 @@ export class PiAgentRuntime {
       const session = this.requireSession();
       await session.prompt(prompt.text, {
         images: prompt.images,
-        expandPromptTemplates: false,
       });
       this.finishRun(runId, this.outcome.normalize(session.messages));
     } catch (error) {

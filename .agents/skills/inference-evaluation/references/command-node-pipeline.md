@@ -1,4 +1,4 @@
-# 固定两节点提交
+# 模型推理评测提交
 
 ```json
 {
@@ -18,10 +18,19 @@
 }
 ```
 
+上例省略 model_source，默认 Storage 模型。评测配置 JSON 仍含 mode、rubrics 等评价规则：
+添加 `"model_source":{"type":"clone"}` 时，inference.model_path 填中心仓模型标识；
+添加 `"model_source":{"type":"download","download_source":"huggingface"}` 时填外部仓模型名称。
+下载源还支持 modelscope，省略时默认 huggingface。model_source 不放在工具入参里。
+
 max_model_len 可按模型约束指定。平台实时校验资源；不支持时修正明确的配置，不切换节点类型。
 served_model_name 来自服务契约，默认 default，不从 checkpoint 路径猜测。
 
-服务端固定连接 VLLMInference.endpoint 与 CustomCommandCPUNode.param，CPU 通过
+工具先生成 workflow.py，再校验、冻结并提交。storage 使用 Inference → CPU；
+clone 使用 CloneAndCacheModel → Inference → CPU；
+download 使用 DownloadAndCacheModel → Inference → CPU。
+准备节点的 model_path 输出连接 Inference.model_path。
+服务端连接 VLLMInference.endpoint 与 CustomCommandCPUNode.param，CPU 通过
 直接的小写 `$param` 请求内部服务。CPU 不启动或安装 vLLM，不需要外部部署 API Key。
 生成的 DSL 同步到画布，提交的是同一份规范转换得到的工作流。
 
@@ -30,4 +39,5 @@ served_model_name 来自服务契约，默认 default，不从 checkpoint 路径
 reused_predictions 是复用的 prediction 数。业务不通过与请求/评分异常分别统计。
 
 同配置恢复：`mode="resume"`、`resume_run_id="原 run_id"`、`input_path="原路径"`。
-省略 inference、cpu、memory 可复用原配置。新运行有独立 output_dir；不同配置不可混用结果。
+省略 inference、cpu、memory 可复用包含模型来源的原配置。
+新运行有独立 output_dir；来源、模型或评测配置变化不能混用已有结果。

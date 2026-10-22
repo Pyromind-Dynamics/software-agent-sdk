@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -371,15 +372,15 @@ def _intersection_over_union(
     return intersection / union if union else 0.0
 
 
-def _bbox_score(prediction: Any, reference: Any, threshold: float) -> float:
+def _bbox_counts(
+    prediction: Any, reference: Any, threshold: float
+) -> tuple[int, int, int] | None:
     if not isinstance(prediction, list) or not isinstance(reference, list):
-        return 0.0
+        return None
     predicted = [box for item in prediction if (box := _box_coordinates(item))]
     expected = [box for item in reference if (box := _box_coordinates(item))]
     if len(predicted) != len(prediction) or len(expected) != len(reference):
-        return 0.0
-    if not expected or not predicted:
-        return 1.0 if not expected and not predicted else 0.0
+        return None
     unmatched = set(range(len(predicted)))
     matches = 0
     for expected_box in expected:
@@ -393,9 +394,15 @@ def _bbox_score(prediction: Any, reference: Any, threshold: float) -> float:
         if score >= threshold:
             unmatched.remove(index)
             matches += 1
-    precision = matches / len(predicted)
-    recall = matches / len(expected)
-    return 2 * precision * recall / (precision + recall) if matches else 0.0
+    return matches, len(predicted), len(expected)
+
+
+def _bbox_score(prediction: Any, reference: Any, threshold: float) -> float:
+    counts = _bbox_counts(prediction, reference, threshold)
+    if counts is None:
+        return 0.0
+    matches, predicted, expected = counts
+    return 2 * matches / (predicted + expected) if predicted + expected else 1.0
 
 
 def _score_configured_rubric(
@@ -718,7 +725,88 @@ def _evaluate_case(
     }
 
 
-def _metrics(rows: list[dict[str, Any]], metadata: dict[str, Any]) -> dict[str, Any]:
+def _classification_metrics(pairs: list[tuple[Any, Any]]) -> dict[str, Any]:
+    # Missing/invalid predictions remain in GT support, so failed requests and
+    # malformed answers cannot improve recall by disappearing from the sample.
+    valid = [
+        (actual, expected) for actual, expected in pairs if isinstance(expected, str)
+    ]
+    supports = Counter(expected for _, expected in valid)
+    predictions = Counter(actual for actual, _ in valid if isinstance(actual, str))
+    labels = sorted(supports)
+    confusion = {label: {label: 0} for label in labels}
+    per_class = {}
+    for actual, expected in valid:
+        if isinstance(actual, str):
+            confusion[expected][actual] = confusion[expected].get(actual, 0) + 1
+    for label in labels:
+        support = supports[label]
+        predicted = predictions[label]
+        correct = confusion[label][label]
+        per_class[label] = {
+            "support": support,
+            "precision": correct / predicted if predicted else 0.0,
+            "recall": correct / support,
+            "f1": 2 * correct / (predicted + support),
+            "unclassified": support - sum(confusion[label].values()),
+            "prediction_rates": {
+                key: count / support for key, count in confusion[label].items()
+            },
+        }
+    return {
+        "labels": labels,
+        "confusion_matrix": confusion,
+        "per_class": per_class,
+        "accuracy": (
+            sum(actual == expected for actual, expected in valid) / len(valid)
+            if valid
+            else None
+        ),
+        "macro_f1": (
+            statistics.mean(value["f1"] for value in per_class.values())
+            if per_class
+            else None
+        ),
+        "excluded_references": len(pairs) - len(valid),
+    }
+
+
+def _localization_metrics(
+    pairs: list[tuple[Any, Any]], threshold: float
+) -> dict[str, Any]:
+    matched = predicted = expected = invalid = excluded = 0
+    for actual, reference in pairs:
+        if not isinstance(reference, list) or any(
+            _box_coordinates(box) is None for box in reference
+        ):
+            excluded += 1
+            continue
+        counts = _bbox_counts(actual, reference, threshold)
+        if counts is None:
+            invalid += 1
+            counts = (0, len(actual) if isinstance(actual, list) else 0, len(reference))
+        matches, prediction_count, reference_count = counts
+        matched += matches
+        predicted += prediction_count
+        expected += reference_count
+    return {
+        "iou_threshold": threshold,
+        "matched_boxes": matched,
+        "predicted_boxes": predicted,
+        "reference_boxes": expected,
+        "precision": matched / predicted if predicted else 0.0,
+        "recall": matched / expected if expected else 0.0,
+        "f1": 2 * matched / (predicted + expected) if predicted + expected else 0.0,
+        "invalid_predictions": invalid,
+        "excluded_references": excluded,
+    }
+
+
+def _metrics(
+    rows: list[dict[str, Any]],
+    metadata: dict[str, Any],
+    rubrics: list[dict[str, Any]],
+) -> dict[str, Any]:
     total = len(rows)
     passed = sum(row["passed"] for row in rows)
     errors = sum(row["error"] is not None for row in rows)
@@ -753,6 +841,43 @@ def _metrics(rows: list[dict[str, Any]], metadata: dict[str, Any]) -> dict[str, 
         }
         for name, values in sorted(rubric_values.items())
     }
+    for rubric in rubrics:
+        evaluator = rubric["evaluator"]
+        kind = evaluator["type"]
+        pairs = [
+            (
+                _path_value(
+                    _structured_value(row.get("prediction")),
+                    evaluator.get("prediction_path", ""),
+                )
+                if row.get("error") is None
+                else _MISSING,
+                _path_value(
+                    _structured_value(row.get("reference")),
+                    evaluator.get("reference_path", ""),
+                ),
+            )
+            for row in rows
+        ]
+        summary = rubric_metrics.setdefault(
+            rubric["name"], {"count": 0, "mean_score": None, "pass_rate": None}
+        )
+        if kind == "field_equals" and any(isinstance(ref, str) for _, ref in pairs):
+            summary["classification"] = _classification_metrics(pairs)
+        elif kind == "bbox_iou":
+            summary["localization"] = _localization_metrics(
+                pairs, float(evaluator.get("iou_threshold", 0.5))
+            )
+        elif kind == "json_valid":
+            summary["valid_rate"] = (
+                sum(
+                    isinstance(_structured_value(row.get("prediction")), dict)
+                    for row in rows
+                )
+                / total
+                if total
+                else 0.0
+            )
     overall_scores = [
         float(row["overall_score"])
         for row in rows
@@ -894,7 +1019,8 @@ def _report_case(
             for key in ("messages_field", "user_prompt_field", "system_prompt_field")
             if isinstance(field := dataset_config.get(key), str)
             and field in row.get("sample", {})
-        },
+        }
+        or row.get("sample", {}),
         "media": media,
         "rubric_items": [
             {
@@ -1327,8 +1453,15 @@ def _build_html(
                     "failed": metrics["failed"],
                     "pass_rate": metrics["pass_rate"],
                 },
+                "dataset_distribution": metrics.get("dataset_distribution", {}),
+                "review_only": metrics.get("review_only", False),
+                "metrics_available": metrics.get("metrics_available", True),
+                "classification": metrics.get("classification"),
+                "original_label_metrics": metrics.get("original_label_metrics"),
+                "integrity_issues": metrics.get("integrity_issues", []),
                 "aggregate_metrics": metrics["aggregate_metrics"],
                 "rubric_metrics": metrics["rubric_metrics"],
+                "mean_latency_seconds": metrics.get("mean_latency_seconds"),
                 "case_delivery": "paged",
                 "case_count": len(case_payloads),
                 "cases": [],
@@ -1528,6 +1661,7 @@ def evaluate_inference(
     timeout_seconds: int = 240,
     max_retries: int = 3,
     limit: int = 0,
+    business_scoring: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute frozen rubrics, preserving predictions across identical runs."""
     if not run_id:
@@ -1550,6 +1684,32 @@ def evaluate_inference(
     ids = [_case_id(row, config, index) for index, row in enumerate(rows, 1)]
     if len(set(ids)) != len(ids):
         raise ValueError("dataset case IDs must be unique")
+    business_cases = {}
+    business_module = None
+    if business_scoring is not None:
+        import types
+
+        from evaluate_predictions import stable_case, validate_script
+
+        if (
+            limit
+            or _file_digest(dataset_file) != business_scoring["test_source"]["sha256"]
+        ):
+            raise ValueError("final test must use the complete frozen test dataset")
+        business_module = types.ModuleType("frozen_test_scoring")
+        # This entry point runs in the existing CPU worker, never in Runtime/HTTP.
+        exec(
+            compile(business_scoring["script"], "score_eval.py", "exec"),
+            business_module.__dict__,
+        )
+        validate_script(business_module, business_scoring["spec"])
+        for identity, raw in zip(ids, rows, strict=True):
+            case = stable_case(raw, business_module, {"source": "test"})
+            if case["id"] != identity:
+                raise ValueError(
+                    "test mapping and frozen scoring script disagree on IDs"
+                )
+            business_cases[identity] = case
     media_digests = {}
     for row in rows:
         for value in _input_media(row, config):
@@ -1561,7 +1721,9 @@ def evaluate_inference(
     manifest = {
         "schema_version": 1,
         "run_id": run_id,
-        "evaluation_config_sha256": _config_digest(evaluation),
+        "evaluation_config_sha256": _config_digest(
+            business_scoring["spec"] if business_scoring else evaluation
+        ),
         "dataset_sha256": _file_digest(dataset_file),
         "media_sha256": media_digests,
         "dataset_config": config,
@@ -1579,6 +1741,11 @@ def evaluate_inference(
             "max_retries": max_retries,
             "limit": limit,
         },
+        **(
+            {"business_scoring": business_scoring, "dataset_role": "test"}
+            if business_scoring is not None
+            else {}
+        ),
     }
     output = Path(output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -1680,6 +1847,28 @@ def evaluate_inference(
                     os.fsync(stream.fileno())
             write_progress()
     results = [completed[key] for key in ids]
+    if business_module is not None and business_scoring is not None:
+        from evaluate_predictions import score
+
+        rescored = []
+        for row in results:
+            case = {
+                **business_cases[row["id"]],
+                "prediction": None if row.get("error") else row["prediction"],
+                "media": row.get("media", []),
+                "sample": row.get("sample", {}),
+            }
+            result = score(case, business_module, business_scoring["spec"])
+            rescored.append(
+                {
+                    **row,
+                    **result,
+                    "error": row.get("error"),
+                    "latency_seconds": row.get("latency_seconds"),
+                    "rubric_results": result["rubric_results"],
+                }
+            )
+        results = rescored
     metrics = _metrics(
         results,
         {
@@ -1688,6 +1877,7 @@ def evaluate_inference(
             "dataset_path": str(dataset_file),
             "evaluation_mode": "agent_rubric",
         },
+        [] if business_scoring else _configured_rubrics(evaluation),
     )
     metrics.update(
         {
@@ -1700,47 +1890,103 @@ def evaluate_inference(
             "evaluated_cases": sum(row.get("error") is None for row in results),
         }
     )
+    if business_scoring is not None:
+        metrics.update(
+            dataset_role="test",
+            selection_run_id=business_scoring["selection_run_id"],
+            scoring_spec_sha256=_config_digest(business_scoring["spec"]),
+            classification=_classification_metrics(
+                [
+                    (row.get("prediction_label"), row.get("reference_label"))
+                    for row in results
+                ]
+            ),
+        )
+        metrics["macro_f1"] = metrics["classification"]["macro_f1"]
+    return write_evaluation_products(
+        results,
+        metrics,
+        dataset_file,
+        config,
+        output,
+        run_id,
+        manifest["evaluation_config_sha256"],
+        [] if business_scoring else _configured_rubrics(evaluation),
+        report_spec_json,
+        report_assets_dir,
+    )
+
+
+def write_evaluation_products(
+    results: list[dict[str, Any]],
+    metrics: dict[str, Any],
+    dataset_file: Path,
+    config: dict[str, Any],
+    output: Path,
+    run_id: str,
+    evaluation_config_sha256: str,
+    rubrics: list[dict[str, Any]],
+    report_spec_json: str | None = None,
+    report_assets_dir: str | None = None,
+    integrity_issues: list[str] | None = None,
+    render_invalid: bool = False,
+    render_report: bool = True,
+) -> dict[str, Any]:
+    """Write scores and optionally render a report; never initialize human review."""
+    output.mkdir(parents=True, exist_ok=True)
     for name in ("predictions.jsonl", "processed.jsonl"):
         _write_jsonl(output / name, results)
     _atomic_json(output / "metrics.json", metrics)
-    valid = metrics["successful_predictions"] > 0 and metrics["evaluated_cases"] > 0
+    valid = metrics["evaluated_cases"] > 0 and (
+        metrics["successful_predictions"] > 0
+        or metrics.get("evaluation_mode") == "saved_predictions"
+    )
     with (output / "predictions.jsonl").open(encoding="utf-8") as stream:
         predictions_rows = sum(1 for line in stream if line.strip())
     evaluation_status, case_errors, report_errors = _evaluation_status(
-        results, _configured_rubrics(evaluation), metrics, predictions_rows
+        results, rubrics, metrics, predictions_rows
     )
-    if not valid:
+    if not valid or integrity_issues:
         evaluation_status = "invalid"
+    report_errors.extend(integrity_issues or [])
     badcases = [row for row in results if not row["passed"]]
     spec, report_warnings = _resolve_report_spec(
         report_spec_json, _report_capabilities(badcases)
     )
-    if valid:
-        report_warnings.extend(
-            _build_html(
-                results,
-                metrics,
-                dataset_file,
-                config,
-                output,
-                spec,
-                evaluation_status,
-                case_errors,
-                run_id,
-                manifest["evaluation_config_sha256"],
-                Path(report_assets_dir) if report_assets_dir is not None else None,
+    # Human editing belongs to independently created review tasks.
+    spec["enabled_panels"] = [
+        panel for panel in spec["enabled_panels"] if panel != "annotation"
+    ]
+    report_status = "not_requested"
+    try:
+        if render_report and (valid or render_invalid):
+            report_warnings.extend(
+                _build_html(
+                    results,
+                    metrics,
+                    dataset_file,
+                    config,
+                    output,
+                    spec,
+                    evaluation_status,
+                    case_errors,
+                    run_id,
+                    evaluation_config_sha256,
+                    Path(report_assets_dir) if report_assets_dir is not None else None,
+                )
             )
-        )
-        _atomic_json(output / "resolved_report_spec.json", spec)
-        if evaluation_status == "validated":
-            _write_initial_annotation_products(
-                output, results, run_id, manifest["evaluation_config_sha256"]
-            )
+            _atomic_json(output / "resolved_report_spec.json", spec)
+        if render_report and (valid or render_invalid):
+            report_status = "ready"
+    except Exception as exc:
+        report_status = "failed"
+        report_errors.append(f"report_render_error:{type(exc).__name__}:{exc}")
     error = None if valid else "inference produced no successfully scored predictions"
     storage_dir = str(output).removeprefix("/workspace")
     summary = {
         "status": "succeeded" if valid else "failed",
         "evaluation_status": evaluation_status,
+        "report_status": report_status,
         "metrics": metrics,
         "error": error,
         "report_spec": {
@@ -1785,6 +2031,7 @@ def main() -> None:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--report-spec")
     parser.add_argument("--report-assets-dir")
+    parser.add_argument("--business-scoring")
     args = parser.parse_args()
     output = Path(args.output_dir)
     try:
@@ -1799,6 +2046,11 @@ def main() -> None:
             evaluation_config_json=json.dumps(config),
             run_id=args.run_id,
             report_assets_dir=args.report_assets_dir,
+            business_scoring=(
+                json.loads(Path(args.business_scoring).read_text())
+                if args.business_scoring
+                else None
+            ),
             report_spec_json=(
                 Path(args.report_spec).read_text() if args.report_spec else None
             ),

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -210,11 +210,107 @@ test("AgentSession resolves an uncovered workflow node through the knowledge ind
     assert.ok(system);
     assert.ok(system.content.includes("Generate a single-node CustomCommandNode workflow by following the skill, then validate it."));
     assert.ok(system.content.includes("<available_skills>"));
-    assert.ok(system.content.includes("Paths starting with knowledge/ or .agents/skills/ are runtime resource aliases: pass them unchanged to file tools, without prepending the skill directory."));
-    assert.ok(system.content.includes("For other relative paths referenced by a skill file, resolve them against the skill directory"));
-    assert.ok(!system.content.includes("When a skill file references a relative path, resolve it against the skill directory"));
+    assert.ok(system.content.includes("When a skill file references a relative path, resolve it against the skill directory"));
+    assert.ok(!system.content.includes("Paths starting with knowledge/ or .agents/skills/ are runtime resource aliases"));
   }
 });
+
+for (const workflowsEnabled of [false, true]) {
+  test(`native skill commands load sandbox resources with experience tools ${workflowsEnabled ? "enabled" : "disabled"}`, async (context) => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-native-skill-")));
+    const workspace = join(root, "conversation");
+    const skillsDirectory = join(root, "skills");
+    const skill = join(skillsDirectory, "custom-workflow");
+    await mkdir(join(workspace, "public_data"), { recursive: true });
+    await mkdir(join(skill, "references"), { recursive: true });
+    await writeFile(join(skill, "SKILL.md"), [
+      "---",
+      "name: custom-workflow",
+      "description: Generate a workflow using its node contracts.",
+      "---",
+      "Read references/workflow-contracts.md before generating the workflow.",
+    ].join("\n"));
+    await writeFile(join(skill, "references", "workflow-contracts.md"), "Native skill reference loaded.\n");
+
+    const requests: JsonObject[] = [];
+    const server = createServer(async (request, response) => {
+      requests.push(await readJson(request));
+      if (requests.length === 1) {
+        sendToolCall(response, "read", {
+          path: ".agents/skills/custom-workflow/references/workflow-contracts.md",
+        }, "call-native-reference");
+      } else {
+        sendText(response, "Skill and reference loaded.");
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    context.after(() => server.close());
+    const address = server.address() as AddressInfo;
+    const events: RunnerEvent[] = [];
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => { finish = resolve; });
+    const peer = {
+      request: async (): Promise<JsonValue> => {
+        throw new Error("Skill reads must not create a sandbox or invoke a business tool");
+      },
+      emit: (event: RunnerEvent): void => {
+        events.push(event);
+        if (event.kind === "run.finished") finish();
+      },
+    } as unknown as JsonlRpcPeer;
+    const runtime = new PiAgentRuntime(peer);
+    await runtime.handle("start", {
+      session_id: "native-skill-session",
+      workspace_root: workspace,
+      terminal_backend: "sandbox",
+      session_path: join(workspace, "pi", "session.jsonl"),
+      skills_directory: skillsDirectory,
+      skill_roots: [],
+      workflows_enabled: workflowsEnabled,
+      system_prompt: "Follow the selected skill.",
+      model: {
+        provider: "openai",
+        id: "custom-chat-model",
+        api_key: "test-key",
+        base_url: `http://127.0.0.1:${address.port}/v1`,
+      },
+      tools: [],
+    });
+    await runtime.handle("prompt", {
+      run_id: "native-skill-run",
+      content: [{ type: "text", text: "/skill:custom-workflow Generate the requested workflow." }],
+    });
+    let timeout: NodeJS.Timeout | undefined;
+    await Promise.race([
+      finished,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("native skill turn timed out")), 5_000);
+        timeout.unref();
+      }),
+    ]).finally(() => clearTimeout(timeout));
+
+    assert.equal(requests.length, 2);
+    const messages = requests[0]!.messages as Array<{ role: string; content: string }>;
+    const system = messages.filter((message) => message.role === "system" || message.role === "developer")
+      .map((message) => message.content).join("\n");
+    const user = JSON.stringify(messages.filter((message) => message.role === "user"));
+    assert.match(system, /<location>\.agents\/skills\/custom-workflow\/SKILL\.md<\/location>/);
+    assert.match(system, /<cwd>\n\.\n<\/cwd>/);
+    assert.match(system, /When a skill file references a relative path, resolve it against the skill directory/);
+    assert.equal(JSON.stringify(messages).includes(root), false);
+    assert.ok(user.includes('<skill name=\\"custom-workflow\\"'));
+    assert.ok(user.includes("References are relative to .agents/skills/custom-workflow."));
+    assert.ok(user.includes("Read references/workflow-contracts.md before generating the workflow."));
+    assert.ok(user.includes("Generate the requested workflow."));
+    assert.ok(!user.includes("/skill:custom-workflow"));
+    assert.ok(JSON.stringify(requests[1]!.messages).includes("Native skill reference loaded."));
+    assert.equal(events.some((event) => event.kind === "tool.failed"), false);
+    if (workflowsEnabled) {
+      assert.ok(system.includes("genome_list"));
+      assert.ok(system.includes("历史经验的路径参数使用当前会话执行环境的路径"));
+    }
+  });
+}
 
 test("a persistent length stop finishes as output_truncated, never completed", async (context) => {
   const server = createServer(async (request, response) => {
@@ -285,6 +381,117 @@ test("a persistent length stop finishes as output_truncated, never completed", a
   assert.equal(outcome.status, "failed");
   assert.equal(outcome.stop_reason, "length");
   assert.equal(outcome.error_code, "output_truncated");
+});
+
+test("business failures retain details through real hooks, events, persistence and legacy resume", async (context) => {
+  // The runner exits on close; this test reopens it in the same process.
+  context.mock.method(process, "exit", () => undefined);
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), "pi-result-session-")));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(join(workspace, "skills"));
+  const sessionPath = join(workspace, "pi/session.jsonl");
+  const requests: JsonObject[] = [];
+  const calls = ["invalid", "invalid", "valid", "rpc", "malformed"];
+  const server = createServer(async (request, response) => {
+    requests.push(await readJson(request));
+    const value = calls[requests.length - 1];
+    if (value) sendToolCall(response, "test_tool", { value }, `call-${requests.length}`);
+    else sendText(response, "Finished checking tools.");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  context.after(() => server.close());
+  const address = server.address() as AddressInfo;
+  const events: RunnerEvent[] = [];
+  let completion = Promise.withResolvers<void>();
+  const failureDetails = {
+    error_code: "ENUM_VALUE_INVALID", failure_stage: "platform_schema", retryable: false,
+    errors: [{ field: "gpu_product", allowed_values: ["available-gpu"] }],
+    output_truncation: { path: "public_data/tool-output.txt", truncated: true },
+  };
+  const peer = {
+    async request(method: string, params: JsonObject): Promise<JsonValue> {
+      assert.equal(method, "tool.execute");
+      const args = params.arguments as JsonObject;
+      if (args.value === "rpc") throw new Error("RPC unavailable");
+      if (args.value === "malformed") return { is_error: "wrong type", content: [] };
+      const failed = args.value === "invalid";
+      return {
+        is_error: failed,
+        content: [{ type: "text", text: failed ? "GPU is unsupported" : "accepted" }],
+        details: failed ? failureDetails : { accepted: true },
+      };
+    },
+    emit(event: RunnerEvent) {
+      events.push(event);
+      if (event.kind === "run.finished") completion.resolve();
+    },
+  } as unknown as JsonlRpcPeer;
+  const start: JsonObject = {
+    session_id: "result-session", workspace_root: workspace, terminal_backend: "sandbox",
+    session_path: sessionPath, skills_directory: join(workspace, "skills"), skill_roots: [],
+    system_prompt: "Check the supplied tool.",
+    model: { provider: "openai", id: "custom-chat-model", api_key: "test-key", base_url: `http://127.0.0.1:${address.port}/v1` },
+    tools: [{
+      name: "test_tool", description: "Test a value.",
+      input_schema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
+    }],
+  };
+  let runtime = new PiAgentRuntime(peer);
+  const close = async () => {
+    await runtime.handle("close", {});
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  };
+  context.after(close);
+  const run = async (id: string) => {
+    completion = Promise.withResolvers<void>();
+    await runtime.handle("prompt", { run_id: id, content: [{ type: "text", text: "Check tools." }] });
+    let timeout: NodeJS.Timeout | undefined;
+    await Promise.race([
+      completion.promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("result session timed out")), 10_000);
+      }),
+    ]).finally(() => clearTimeout(timeout));
+  };
+  await runtime.handle("start", start);
+  await run("run-1");
+
+  const outcomes = events.filter((event) => event.kind === "tool.failed" || event.kind === "tool.completed");
+  assert.deepEqual(outcomes.map((event) => event.kind), [
+    "tool.failed", "tool.failed", "tool.completed", "tool.failed", "tool.failed",
+  ]);
+  for (const event of outcomes.slice(0, 2)) {
+    assert.equal(event.payload.error_code, "ENUM_VALUE_INVALID");
+    assert.deepEqual(event.payload.details, { ...failureDetails, resultCategory: "failure" });
+  }
+  assert.match(JSON.stringify(outcomes[1]!.payload.content), /no new information/);
+  assert.deepEqual(outcomes[2]!.payload.details, { accepted: true, resultCategory: "success" });
+  assert.equal(outcomes[2]!.payload.error_code, undefined);
+  for (const event of outcomes.slice(3)) {
+    assert.equal(event.payload.error_code, "tool_execution_failed");
+    assert.deepEqual(event.payload.details, {});
+  }
+  assert.match(JSON.stringify(outcomes[3]!.payload.content), /RPC unavailable/);
+  assert.match(JSON.stringify(outcomes[4]!.payload.content), /invalid Python tool response/);
+
+  const records = (await readFile(sessionPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  const messages = records.filter((record) => record.message?.role === "toolResult").map((record) => record.message);
+  assert.deepEqual(messages.map((message) => message.isError), [true, true, false, true, true]);
+  assert.deepEqual(messages[0].details, { ...failureDetails, resultCategory: "failure" });
+  assert.match(JSON.stringify(messages[1].content), /no new information/);
+  assert.match(JSON.stringify(requests.at(-1)), /GPU is unsupported/);
+  await close();
+
+  // Pre-extension transcripts have no category; their recorded status is authoritative.
+  for (const message of messages) delete message.details.resultCategory;
+  await writeFile(sessionPath, records.map((record) => JSON.stringify(record)).join("\n") + "\n");
+  runtime = new PiAgentRuntime(peer);
+  await runtime.handle("start", start);
+  await run("run-2");
+  const restored = (await readFile(sessionPath, "utf8")).trim().split("\n")
+    .map((line) => JSON.parse(line)).filter((record) => record.message?.role === "toolResult");
+  assert.deepEqual(restored.map((record) => record.message.isError), messages.map((message) => message.isError));
+  assert.deepEqual(restored[0].message.details, failureDetails);
 });
 
 async function readJson(request: IncomingMessage): Promise<JsonObject> {

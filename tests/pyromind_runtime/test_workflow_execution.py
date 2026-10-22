@@ -10,7 +10,11 @@ from harness_adapter.pi_adapter.business_tool_host import (
     ToolExecutionContext,
 )
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
-from pyromind_runtime.domain.commands import PermissionResponseCommand
+from pyromind_runtime.domain.commands import (
+    PermissionResponseCommand,
+    UserMessageCommand,
+)
+from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.harness import SessionSpec
@@ -42,13 +46,13 @@ class FakeSubmission:
         return "task-123"
 
 
-async def _runtime(tmp_path, *, training: bool = True):
-    adapter = FakeAdapter("pi")
+async def _runtime(tmp_path, *, training: bool = True, harness_id: str = "pi"):
+    adapter = FakeAdapter(harness_id)
     submission = FakeSubmission(training=training)
     runtime = ConversationRuntime(
         tmp_path,
-        {"pi": adapter},
-        default_harness_id="pi",
+        {harness_id: adapter},
+        default_harness_id=harness_id,
         workflow_submission=submission,
     )
     context = RequestContext(user_id="42", cookie="auth_token=ephemeral")
@@ -63,8 +67,14 @@ async def _runtime(tmp_path, *, training: bool = True):
     return runtime, adapter, submission, context
 
 
-async def test_confirmed_workflow_submits_once_and_resumes_training_analysis(tmp_path):
-    runtime, adapter, submission, context = await _runtime(tmp_path)
+@pytest.mark.parametrize("training", [True, False])
+@pytest.mark.parametrize("harness_id", ["pi", "openhands"])
+async def test_confirmed_workflow_submits_once_and_resumes_followup(
+    tmp_path, training, harness_id
+):
+    runtime, adapter, submission, context = await _runtime(
+        tmp_path, training=training, harness_id=harness_id
+    )
     conversation_id = "workflow-conversation"
     prepared = await runtime.prepare_workflow_execution(
         conversation_id,
@@ -96,6 +106,18 @@ async def test_confirmed_workflow_submits_once_and_resumes_training_analysis(tmp
         )
     ]
     assert adapter.sent == []
+    assert len(adapter.external_task_notifications) == 1
+    submitted = adapter.external_task_notifications[0][1]
+    assert submitted.task_id == "task-123"
+    assert submitted.trigger_turn is False
+    assert submitted.visible_text is None
+    reference = json.loads(submitted.hidden_text.split(": ", 1)[1])
+    assert reference == {
+        "request_id": "request-1",
+        "task_id": "task-123",
+        "workflow_path": "storage/.pyromind-agent/workflow.py",
+        "status": "pending",
+    }
     assert (
         await runtime.get_snapshot(conversation_id, context)
     ).pending_permissions == ()
@@ -111,19 +133,80 @@ async def test_confirmed_workflow_submits_once_and_resumes_training_analysis(tmp
     )
     assert repeated.response["task_id"] == "task-123"
     assert len(submission.submissions) == 1
+    assert len(adapter.external_task_notifications) == 1
 
     await runtime.deliver_external_task_status(
         conversation_id, task_id="task-123", status="Succeeded"
     )
     notification = adapter.external_task_notifications[-1][1]
     assert notification.trigger_turn is True
-    assert "training-analysis skill" in notification.hidden_text
+    if training:
+        assert "training-analysis skill" in notification.hidden_text
+        assert "inference-evaluation" in notification.hidden_text
+        assert "evaluation was explicitly excluded" in notification.hidden_text
+        assert "same-step complete checkpoints" in notification.hidden_text
+        assert "do not start extra GPU inference" in notification.hidden_text
+        assert "Do not rerun automatically" in notification.hidden_text
+    else:
+        assert "inference-evaluation" not in notification.hidden_text
+        assert "without a training node" in notification.hidden_text
     assert "task-123" in notification.hidden_text
     product_text = (
         tmp_path / conversation_id / "product" / "workflow-execution-requests.json"
     ).read_text()
     assert "auth_token=ephemeral" not in product_text
     assert json.loads(product_text)["request-1"]["task_id"] == "task-123"
+    await runtime.close()
+
+
+@pytest.mark.parametrize("fail_initial_sync", [False, True])
+async def test_workflow_task_reference_is_recovered_before_next_user_turn(
+    tmp_path, monkeypatch, fail_initial_sync
+):
+    runtime, adapter, submission, context = await _runtime(tmp_path)
+    original_notify = adapter.notify_external_task
+
+    async def unavailable(*args, **kwargs):
+        raise RuntimeError("harness temporarily unavailable")
+
+    if fail_initial_sync:
+        monkeypatch.setattr(adapter, "notify_external_task", unavailable)
+    await runtime.prepare_workflow_execution(
+        "workflow-conversation", "storage/project/workflow.py", context, request_id="r"
+    )
+    receipt = await runtime.submit_command(
+        "workflow-conversation",
+        PermissionResponseCommand(
+            command_id="answer", permission_id="workflow-run:r", decision="allow_once"
+        ),
+        context,
+    )
+    assert receipt.response["status"] == "submitted"
+    assert len(submission.submissions) == 1
+    if fail_initial_sync:
+        assert adapter.external_task_notifications == []
+        monkeypatch.setattr(adapter, "notify_external_task", original_notify)
+    else:
+        await runtime.close()
+        adapter = FakeAdapter("pi")
+        runtime = ConversationRuntime(
+            tmp_path, {"pi": adapter}, default_harness_id="pi"
+        )
+
+    await runtime.submit_command(
+        "workflow-conversation",
+        UserMessageCommand(
+            command_id="check-task",
+            content=(TextContent(text="查看执行情况"),),
+        ),
+        context,
+    )
+    assert len(adapter.external_task_notifications) == 1
+    reference = adapter.external_task_notifications[0][1]
+    assert reference.trigger_turn is False
+    assert reference.task_id == "task-123"
+    assert "storage/project/workflow.py" in reference.hidden_text
+    assert adapter.sent[-1][1].command_id == "check-task"
     await runtime.close()
 
 

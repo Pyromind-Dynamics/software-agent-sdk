@@ -12,13 +12,22 @@ from harness_adapter.version_tools import (
     ProductVersionsTool,
     submission_bridge,
 )
+from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.application.versions import Versions
+from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.domain.versions import SnapshotSource, VersionToolRequest
+from pyromind_runtime.domain.snapshot import ConversationSnapshot
+from pyromind_runtime.domain.versions import (
+    SaveVersion,
+    SnapshotSource,
+    VersionToolRequest,
+)
 from pyromind_runtime.infrastructure.file_artifact_snapshots import (
     FileArtifactSnapshots,
 )
+from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import SessionSpec
 
@@ -307,15 +316,8 @@ async def test_confirmation_checks_snapshot_before_platform_submit(version_runti
     assert submission.submissions == []
 
 
-def test_pipeline_execution_uses_frozen_script_and_config(tmp_path):
-    from pyromind_agent_server.external_task_registry import (
-        WorkflowExternalTaskRegistry,
-    )
-    from pyromind_runtime.application.pipeline_runs import PipelineRuns
-    from pyromind_runtime.domain.capabilities import HarnessCapabilities
-    from pyromind_runtime.domain.snapshot import ConversationSnapshot
-    from pyromind_runtime.infrastructure.file_product_store import FileProductStore
-
+@pytest.mark.parametrize("model_source", ["storage", "clone", "download"])
+def test_pipeline_execution_uses_frozen_script_and_config(tmp_path, model_source):
     root = tmp_path / "c"
     root.mkdir()
     product = FileProductStore(root)
@@ -336,11 +338,32 @@ def test_pipeline_execution_uses_frozen_script_and_config(tmp_path):
     runs = PipelineRuns(
         "c", product, WorkflowExternalTaskRegistry(tmp_path), service, context
     )
+    project = service.project("c", context)
+    assert project is not None
+    selected = service.store.reserve_version(
+        project,
+        "selected-model",
+        SaveVersion(
+            kind="model",
+            logical_key="model",
+            source=SnapshotSource(storage_ref="/model"),
+        ),
+    )
+    selected = service.finish(selected, context)
+    service.store.select(
+        project.id,
+        "model",
+        selected.id,
+        "select-model",
+        "previous model",
+        project.revision,
+    )
+    reference = "/model" if model_source == "storage" else "Unlisted/Model"
     definition = {
         "input_path": "/data.jsonl",
-        "inference": {"model_path": "/model"},
+        "inference": {"model_path": reference},
         "dataset_config": {"field": "prompt"},
-        "evaluation_config": {"rubrics": []},
+        "evaluation_config": {"rubrics": [], "model_source": {"type": model_source}},
     }
     run = runs.reserve(definition, None)
     directory = run["output_dir"]
@@ -350,18 +373,30 @@ def test_pipeline_execution_uses_frozen_script_and_config(tmp_path):
             f"--dataset-config /workspace{directory}/dataset_config.json"
         )
     }
-    effective = runs.prepare_execution(
-        run["run_id"], workflow, "dsl", "print('frozen')"
+    effective, effective_dsl = runs.prepare_execution(
+        run["run_id"], workflow, workflow["command"], "print('frozen')"
     )
     assert directory not in effective["command"]
     assert "/versions/" in effective["command"]
-    assert (
-        runs.prepare_execution(run["run_id"], workflow, "dsl", "print('frozen')")
-        == effective
-    )
+    assert effective_dsl == effective["command"]
+    assert runs.prepare_execution(
+        run["run_id"], workflow, workflow["command"], "print('frozen')"
+    ) == (effective, effective_dsl)
     project = service.store.bound_project("c")
     assert project is not None
     record = service.store.list_runs(project.id)[0]
     assert "runtime_script" in record.spec.inputs
+    saved = record.spec.parameters["definition"]
+    assert isinstance(saved, dict)
+    saved_definition = saved["definition"]
+    assert isinstance(saved_definition, dict)
+    saved_inference = saved_definition["inference"]
+    assert isinstance(saved_inference, dict)
+    assert saved_inference["model_path"] == (
+        selected.manifest.storage_ref if model_source == "storage" else reference
+    )
+    assert ("input.inference.model_path" in record.spec.inputs) == (
+        model_source == "storage"
+    )
     runs.finish_submission(run["run_id"], run["revision"], "task", "submitted")
     assert service.store.list_runs(project.id)[0].source.task_id == "task"
