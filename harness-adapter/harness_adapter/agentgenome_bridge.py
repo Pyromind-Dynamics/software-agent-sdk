@@ -8,7 +8,7 @@ import os
 import shlex
 import threading
 import time
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -16,7 +16,15 @@ from uuid import uuid4
 
 from agentgenome import GenomeService, RunCancelled
 from agentgenome.dispatch import invoke as invoke_genome
-from core.ports import Answer, PortError, Ports, ShellResult, ToolResult
+from core.ports import (
+    Answer,
+    AwaitResult,
+    PortError,
+    Ports,
+    ShellResult,
+    ToolCancellation,
+    ToolResult,
+)
 from pyromind_runtime.domain.content import JsonObject, JsonValue
 from pyromind_runtime.ports.workflows import WorkflowEventSink
 
@@ -37,6 +45,253 @@ def _is_missing_file(error: Exception) -> bool:
     return "FILE_READ_ERROR" in message and "No such file or directory" in message
 
 
+_SANDBOX_ALIASES = ("storage", "public_data", ".agents", "knowledge")
+# Agent workspaces live at ``<storage mount>/.pyromind-agent/<conversation>``, so
+# the mount is whatever sits above that directory.
+_AGENT_DIRECTORY = "/.pyromind-agent/"
+_SLOW_CALLS = frozenset({"execution.write", "execution.protect", "execution.read_many"})
+# Not base64, so a real head can never be mistaken for the directory report.
+_DIRECTORY_MARK = "<dir/>"
+# One execution-plane read window; mirrors the runtime's per-file ceiling
+# (512 KiB encodes under the 1 MiB frame limit).
+_READ_LIMIT = 512 * 1024
+# Vision pipelines resolve the images a manifest names relative to the manifest
+# itself, so a manifest staged away from its images only fails minutes later on
+# the platform. The preflight reports that before the submission is paid for,
+# reading the same bounded head (50 records, 200 images) the data-preparation
+# tool stages, and running in the plane because that is where the files live.
+_MANIFEST_PRECHECK = """\
+import json, sys
+from pathlib import Path
+
+suffixes = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+record_limit = 50
+image_limit = 200
+
+
+def strings(value, depth=0):
+    if depth > 3:
+        return
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for nested in value.values():
+            yield from strings(nested, depth + 1)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from strings(nested, depth + 1)
+
+
+manifest = Path(sys.argv[1])
+root = manifest.parent
+missing, seen, records = [], set(), 0
+try:
+    handle = open(manifest, encoding="utf-8")
+except OSError:
+    print(json.dumps({"records": 0}))
+    raise SystemExit(0)
+with handle:
+    for index, line in enumerate(handle):
+        if index >= record_limit:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        records += 1
+        for value in strings(record):
+            candidate = value.strip()
+            if (
+                not candidate
+                or "://" in candidate
+                or candidate.startswith("/")
+                or candidate in seen
+            ):
+                continue
+            if Path(candidate).suffix.lower() not in suffixes:
+                continue
+            seen.add(candidate)
+            if len(seen) > image_limit:
+                break
+            if not (root / candidate).exists():
+                missing.append(candidate)
+print(json.dumps({"records": records, "missing": missing[:5]}))
+"""
+_METADATA_PROBE_MANY = """\
+import json, sys
+from pathlib import Path
+
+answers = {}
+for raw in json.loads(sys.argv[1]):
+    path = Path(raw)
+    try:
+        if not path.exists():
+            answers[raw] = {"exists": False}
+            continue
+        stat = path.stat()
+        answers[raw] = {
+            "exists": True,
+            "is_file": path.is_file(),
+            "is_dir": path.is_dir(),
+            "size": stat.st_size,
+        }
+    except OSError as error:
+        answers[raw] = {"error": f"{type(error).__name__}: {error}"}
+print(json.dumps(answers))
+"""
+
+
+_METADATA_PROBE = """\
+import json, sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+try:
+    exists = p.exists()
+except OSError as error:
+    print(json.dumps({"error": f"{type(error).__name__}: {error}"}))
+    raise SystemExit(2)
+if not exists:
+    print(json.dumps({"exists": False}))
+else:
+    try:
+        stat = p.stat()
+    except OSError as error:
+        print(json.dumps({"error": f"{type(error).__name__}: {error}"}))
+        raise SystemExit(2)
+    print(json.dumps({
+        "exists": True,
+        "is_file": p.is_file(),
+        "is_dir": p.is_dir(),
+        "size": stat.st_size,
+    }))
+"""
+
+
+def _storage_alias(path: str) -> str | None:
+    """The sandbox spelling of a Storage path that a business tool declared.
+
+    Platform tools address Storage without the sandbox alias (`/datasets/...`,
+    `datasets/...`), while the sandbox path policy only admits `storage/...`.
+    """
+    stripped = path.lstrip("/")
+    if not stripped:
+        return None
+    if not path.startswith("/") and stripped.split("/", 1)[0] in _SANDBOX_ALIASES:
+        return None
+    return f"storage/{stripped}"
+
+
+def _tool_path(
+    value: str,
+    declared: Mapping[str, str],
+    workspace: str,
+    package: str,
+    mount: str | None = None,
+) -> str:
+    """Restate one graph path in the vocabulary a business tool reads.
+
+    A run step hands the same value to shell commands and to business tools, and
+    those read paths in different vocabularies: the shell needs a sandbox path,
+    while a tool resolves `storage/...` and `public_data/...` itself. Give each
+    tool back the spelling the graph declared, and make run-directory paths
+    workspace-relative so they survive a remote workspace. A Storage artifact
+    pinned beside its input is absolute in the sandbox, so it loses the mount
+    prefix the platform tool never sees.
+    """
+    original = declared.get(value)
+    if original is not None:
+        return original
+    # A path parameter resolved for the sandbox becomes `/storage/...`, which is not
+    # an object the platform can look up: it addresses Storage without the alias
+    # (`/datasets/...`). The bare `storage/...` form is left alone, because a
+    # business tool resolves that spelling itself.
+    if value.startswith("/storage/"):
+        return value[len("/storage") :]
+    if (
+        mount
+        and value.startswith(f"{mount}/")
+        and not value.startswith(f"{workspace}/")
+    ):
+        return value[len(mount) :]
+    if workspace and value.startswith(f"{workspace}/"):
+        return value[len(workspace) + 1 :]
+    if not value.startswith("/") and value.split("/", 1)[0] == "scripts":
+        return f"{package}/{value}"
+    return value
+
+
+class BridgeAwait:
+    """Answer one await probe from the platform's own terminal report.
+
+    The graph parks on the receipt; this port is the only place that knows a
+    Pyromind run writes ``report.json`` next to its product. Every probe is a
+    couple of short reads, so a parked run costs nothing while it waits.
+    """
+
+    def __init__(self, host: ExecutionHost) -> None:
+        self.host = host
+
+    def probe(self, receipt_path: str) -> AwaitResult:
+        receipt = self._json(receipt_path)
+        if not isinstance(receipt, dict):
+            return AwaitResult("pending", detail={"receipt": receipt_path})
+        task_id = receipt.get("task_id")
+        task_id = task_id if isinstance(task_id, str) and task_id else None
+        directory = receipt.get("output_dir")
+        if not isinstance(directory, str) or not directory.strip():
+            return AwaitResult(
+                "pending", detail={"receipt": receipt_path, "task_id": task_id}
+            )
+        target = self._sandbox_path(directory.strip().rstrip("/"))
+        report = self._json(f"{target}/report.json")
+        if not isinstance(report, dict):
+            return AwaitResult(
+                "pending", detail={"output_dir": target, "task_id": task_id}
+            )
+        status = str(report.get("status") or "").strip().lower()
+        detail = {"output_dir": target, "status": status, "task_id": task_id}
+        if status in {"failed", "cancelled", "canceled", "error", "terminated"}:
+            return AwaitResult("failed", error=f"platform run {status}", detail=detail)
+        if status != "succeeded":
+            return AwaitResult("pending", detail=detail)
+        product = f"{target}/processed.jsonl"
+        if not self.host.exists(product):
+            return AwaitResult("pending", detail=detail)
+        return AwaitResult("completed", product=product, detail=detail)
+
+    def _json(self, path: str) -> Any:
+        raw = self.host.read_optional(path, 65536)
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return None
+
+    def _sandbox_path(self, directory: str) -> str:
+        """A Storage-absolute path as the sandbox sees it.
+
+        The run directory sits at ``<mount>/.pyromind-agent/<conversation>``, so the
+        mount is whatever precedes that segment; anything else is already a path the
+        execution plane can read.
+        """
+        if not directory.startswith("/"):
+            return self.host._resolve(directory, False)
+        marker = "/.pyromind-agent/"
+        if marker in directory:
+            workspace = self.host.workspace or ""
+            mount = workspace.split(marker, 1)[0]
+            if mount:
+                return mount + directory
+        return directory
+
+
 class BridgeTool:
     """Run a graph's fixed tool call through the same bridge the agent's tools use.
 
@@ -48,13 +303,30 @@ class BridgeTool:
     def __init__(self, host: ExecutionHost) -> None:
         self.host = host
 
-    def call(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+    def call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        execution_id: str,
+    ) -> ToolResult:
+        if not execution_id.strip():
+            raise ValueError("execution_id must be a non-empty string")
+        if name == "df_submit_pipeline":
+            input_path = arguments.get("input_path")
+            if isinstance(input_path, str):
+                problem = self.host.precheck_submission(input_path)
+                if problem is not None:
+                    return ToolResult(True, {}, problem)
+            tool_arguments = self.host.df_submit_arguments(arguments)
+        else:
+            tool_arguments = self.host.tool_arguments(arguments)
         response = self.host._call(
             "execution.tool",
             {
                 "name": name,
-                "arguments": arguments,
-                "tool_call_id": f"genome-{uuid4().hex}",
+                "arguments": tool_arguments,
+                "tool_call_id": execution_id,
             },
         )
         if not isinstance(response, dict) or not isinstance(
@@ -73,6 +345,25 @@ class BridgeTool:
             response["is_error"], details if isinstance(details, dict) else {}, text
         )
 
+    def cancel(self, execution_id: str) -> ToolCancellation:
+        if not execution_id.strip():
+            raise ValueError("execution_id must be a non-empty string")
+        response = self.host._call(
+            "execution.cancel_tool",
+            {"tool_call_id": execution_id},
+        )
+        if not isinstance(response, dict):
+            raise PortError(
+                "tool bridge returned an invalid cancellation response",
+                kind="bad_output",
+            )
+        confirmed = response.get("confirmed") is True
+        detail = response.get("detail")
+        return ToolCancellation(
+            confirmed,
+            detail if isinstance(detail, str) else "",
+        )
+
 
 class ExecutionHost:
     def __init__(
@@ -86,15 +377,27 @@ class ExecutionHost:
         self.call_timeout = float(
             os.getenv("PYROMIND_AGENTGENOME_CALL_TIMEOUT_SECONDS", "180")
         )
+        self.slow_call_timeout = float(
+            os.getenv("PYROMIND_AGENTGENOME_SLOW_CALL_TIMEOUT_SECONDS", "600")
+        )
+        # A graph step may wait for an asynchronous platform job, which outlives the
+        # runtime's 300s default for one command.
+        self.shell_timeout = float(
+            os.getenv("PYROMIND_AGENTGENOME_SHELL_TIMEOUT_SECONDS", "1800")
+        )
         self.emit: Callable[[dict[str, Any]], None] = lambda _event: None
         self.root = ""
+        self.workspace = ""
+        self.package = ""
         self.verification = None
         self.model_judge = False
         self.verification_files: dict[str, str] = {}
         self.resuming: str | None = None
+        self.human_artifact: str | None = None
         self._output_lock = asyncio.Lock()
         self._reads: dict[str, bytes] = {}
         self._missing: set[str] = set()
+        self._declared_paths: dict[str, str] = {}
 
     def _call(self, method: str, payload: JsonObject) -> Any:
         """One bounded bridge round trip from the genome worker thread.
@@ -102,17 +405,19 @@ class ExecutionHost:
         The execution plane can answer a file request by retrying transports for
         minutes, so an unbounded wait turns one wedged read into a distill that
         never returns. Optional probes treat the timeout as "not there" and a
-        required read reports it.
+        required read reports it. Uploads carry the whole package and stay
+        bounded by the slow budget instead.
         """
+        timeout = self.slow_call_timeout if method in _SLOW_CALLS else self.call_timeout
         future = asyncio.run_coroutine_threadsafe(
             self.request(method, payload), self.loop
         )
         try:
-            return future.result(self.call_timeout)
+            return future.result(timeout)
         except FuturesTimeoutError:
             future.cancel()
             raise TimeoutError(
-                f"{method} did not answer within {self.call_timeout:.0f}s; "
+                f"{method} did not answer within {timeout:.0f}s; "
                 "the execution plane is unreachable or still preparing"
             ) from None
 
@@ -127,16 +432,36 @@ class ExecutionHost:
         *,
         verification_package: Path | None = None,
         resuming: str | None = None,
+        human_artifact: str | None = None,
         **options: Any,  # noqa: ARG002
     ) -> tuple[Ports, dict[str, Any]]:
         self.cancel, self.emit = cancel, emit
         # The parked node a wakeup already answered: this attempt approves exactly
         # that gate and parks again on any later one.
         self.resuming = resuming
-        self.root = self._resolve(f"public_data/workflow-runs/{run_id}", True)
+        # The file the person produced out of band, landed on the declared artifact
+        # when this attempt re-enters the gate they answered.
+        self.human_artifact = human_artifact
+        run_root = f"public_data/workflow-runs/{run_id}"
+        self.root = self._resolve(run_root, True)
+        self.workspace = (
+            self.root[: -len(run_root) - 1]
+            if self.root.endswith(f"/{run_root}")
+            else ""
+        )
+        self.package = f"{run_root}/package"
+        self._declared_paths = {}
         cwd = f"{self.root}/package"
         capabilities = self._call("execution.capabilities", {})
         manifest = json.loads((package / "manifest.json").read_text())
+        declared_parameters = manifest.get("parameters")
+        path_parameters = [
+            key
+            for key in path_parameters
+            if isinstance(declared_parameters, Mapping)
+            and isinstance(declared_parameters.get(key), Mapping)
+            and declared_parameters[key].get("type") == "path"
+        ]
         protected = (
             set(manifest.get("revision", {}).get("verification_resources", []))
             if capabilities.get("protected_verification")
@@ -156,11 +481,18 @@ class ExecutionHost:
                 continue
             target = f"{cwd}/{file.relative_to(package).as_posix()}"
             self._write(target, file.read_bytes())
+        # A resumed run re-enters prepare over an existing run directory, so the
+        # artifact directory has to tolerate the second visit.
         self._python(
-            f"from pathlib import Path; Path({self.root + '/artifacts'!r}).mkdir()"
+            "from pathlib import Path\n"
+            f"Path({self.root + '/artifacts'!r}).mkdir(parents=True, exist_ok=True)"
         )
         resolved = {
-            key: self._resolve(value, False) if key in path_parameters else value
+            key: (
+                self._resolve_param(value)
+                if key in path_parameters and isinstance(value, str) and value
+                else value
+            )
             for key, value in params.items()
         }
         verification = None
@@ -168,6 +500,18 @@ class ExecutionHost:
             verification = Path(self._protect(run_id, verification_package or package))
         self.verification = str(verification) if verification else None
         self.model_judge = capabilities.get("model_judge", False)
+        emit(
+            {
+                "event": "execution_prepared",
+                "execution": {
+                    "execution_domain": "sandbox",
+                    "execution_path": self.root,
+                    "workspace": self.workspace,
+                    "package": self.package,
+                    "artifacts_dir": f"{self.root}/artifacts",
+                },
+            }
+        )
         return Ports(
             shell=self,
             artifacts=self,
@@ -175,6 +519,7 @@ class ExecutionHost:
             verification_cwd=verification,
             tool=BridgeTool(self),
             human=self,
+            await_port=BridgeAwait(self),
         ), resolved
 
     def ask(self, question: str, evidence: dict[str, Any]) -> Answer:  # noqa: ARG002
@@ -185,8 +530,39 @@ class ExecutionHost:
         do, and the resume call comes back through ``prepare(resuming=...)``.
         """
         if self.resuming is not None and evidence.get("node") == self.resuming:
+            artifact = evidence.get("artifact")
+            if self.human_artifact and isinstance(artifact, str):
+                self._land_human_artifact(artifact)
             return Answer(approve=True)
         return Answer(pending=True)
+
+    def _land_human_artifact(self, artifact: str) -> None:
+        """Move the file the person exported onto the artifact the graph declared.
+
+        The person works outside the run directory, so their export has to be in
+        place where the graph's downstream steps read it before the gate opens.
+        """
+        source = self.human_artifact
+        assert source is not None
+        if source == artifact:
+            return
+        export = self._local_export(source)
+        if export is not None:
+            self._write(artifact, export.read_bytes())
+            return
+        resolved = self._resolve_aliased(source)
+        target = PurePosixPath(artifact)
+        result = self._run(
+            f"mkdir -p {shlex.quote(str(target.parent))} && "
+            f"cp -f {shlex.quote(resolved)} {shlex.quote(str(target))}",
+            None,
+            stream=False,
+        )
+        if result.get("rc") != 0:
+            raise FileNotFoundError(
+                f"human artifact {source!r} could not be copied to the gate: "
+                f"{result.get('stdout')}"
+            )
 
     def capabilities(self) -> dict[str, Any]:
         return {"interactive": True}
@@ -224,8 +600,16 @@ class ExecutionHost:
         capabilities = self._call("execution.capabilities", {})
         if not capabilities.get("revision"):
             raise ValueError("host cannot prepare and collect revision files")
-        directory = self._resolve(f"public_data/workflow-revisions/{revision_id}", True)
+        revision_root = f"public_data/workflow-revisions/{revision_id}"
+        directory = self._resolve(revision_root, True)
         self.root = directory
+        self.workspace = (
+            directory[: -len(revision_root) - 1]
+            if directory.endswith(f"/{revision_root}")
+            else ""
+        )
+        self.package = revision_root
+        self._declared_paths = {}
         protected = (
             self._protect(revision_id, package)
             if capabilities.get("protected_verification")
@@ -262,7 +646,7 @@ class ExecutionHost:
                     "execution.read",
                     {
                         "path": f"{draft['editable_dir']}/{name}",
-                        "limit": 262144,
+                        "limit": _READ_LIMIT,
                     },
                 )["content"],
                 validate=True,
@@ -273,11 +657,163 @@ class ExecutionHost:
     def _resolve(self, path: str, write: bool) -> str:
         return self._call("execution.resolve", {"path": path, "write": write})["path"]
 
+    def _resolve_aliased(self, value: str) -> str:
+        """Resolve a read path, retrying the Storage spelling a business tool declared.
+
+        Platform tools name Storage without the sandbox alias (`/datasets/...`),
+        which the sandbox path policy rejects, so retry those under `storage/`.
+        An artifact pinned beside a Storage input is mount-absolute for the same
+        reason and takes the alias before the first attempt.
+        """
+        try:
+            return self._resolve(self._plane_spelling(value), False)
+        except Exception as error:
+            alias = _storage_alias(value)
+            if alias is None or "PATH_SCOPE_ERROR" not in str(error):
+                raise
+            try:
+                return self._resolve(alias, False)
+            except Exception as aliased:
+                raise aliased from error
+
+    def _resolve_param(self, value: str) -> str:
+        """Resolve one graph path for the sandbox and keep its tool spelling."""
+        path = self._resolve_aliased(value)
+        self._declared_paths[path] = value
+        return path
+
+    def tool_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Restate a graph's fixed tool call in the vocabulary the tool reads."""
+        return {key: self._tool_value(value) for key, value in arguments.items()}
+
+    def df_submit_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Adapt the DataFlow submission's three path fields independently.
+
+        ``input_path`` names a Storage object, while the script and support file
+        are workspace files that the submission tool stages. Running every string
+        through the generic graph-path adapter rewrites ``input_path`` twice and
+        can give the two package paths the wrong base.
+        """
+        adapted = dict(arguments)
+        input_path = arguments.get("input_path")
+        if isinstance(input_path, str):
+            adapted["input_path"] = self.platform_input_path(input_path)
+        for key in ("script_path", "support_file_path"):
+            value = arguments.get(key)
+            if isinstance(value, str):
+                adapted[key] = _tool_path(
+                    value,
+                    {},
+                    self.workspace,
+                    self.package,
+                )
+        return adapted
+
+    def platform_input_path(self, value: str) -> str:
+        """Give DataFlow a Storage path to a graph-produced input.
+
+        The remote conversation workspace is a directory within the platform's
+        Storage mount. DataFlow interprets input_path relative to that mount,
+        not to the conversation workspace, so an absolute Storage path is
+        restated mount-relative and a run-directory artifact keeps its
+        conversation prefix instead of turning into a nonexistent /public_data/...
+        file.
+        """
+        mount = self._storage_mount()
+        if mount is not None and value.startswith(f"{mount}/"):
+            return value[len(mount) :]
+        if value.startswith(f"{self.root}/"):
+            raise ValueError(
+                "DataFlow cannot access a graph-produced input outside the shared "
+                "Storage mount; stage the input in Storage before submission"
+            )
+        return self._tool_value(value)
+
+    def precheck_submission(self, value: str) -> str | None:
+        """Why the platform would reject this submission's own input, if known.
+
+        A vision pipeline resolves the images a manifest names relative to the
+        manifest itself, so a manifest that left its images behind only fails
+        minutes later inside the platform run. Read a bounded head here and report
+        the missing images while the submission is still local.
+        """
+        try:
+            path = self._resolve_aliased(value)
+            result = self._run(
+                f"python3 -c {shlex.quote(_MANIFEST_PRECHECK)} {shlex.quote(path)}",
+                None,
+                stream=False,
+            )
+        except RunCancelled:
+            raise
+        except Exception:  # noqa: BLE001 - a probe, not a required read
+            return None
+        if result.get("rc") != 0 or result.get("truncated"):
+            return None
+        try:
+            report = json.loads(result.get("stdout") or "")
+        except json.JSONDecodeError:
+            return None
+        missing = report.get("missing")
+        if not isinstance(missing, list) or not missing:
+            return None
+        shown = "、".join(str(item) for item in missing[:3])
+        return (
+            f"提交前预检失败：清单 `{value}` 中相对图片路径找不到文件（例如 {shown}）。"
+            "视觉 pipeline 按清单所在目录解析图片：请让清单和图片待在同一个 "
+            "Storage 目录，或让产出该清单的节点用 artifact.at 把产物钉在输入旁边。"
+        )
+
+    def _tool_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return _tool_path(
+                value,
+                self._declared_paths,
+                self.workspace,
+                self.package,
+                self._storage_mount(),
+            )
+        if isinstance(value, list):
+            return [self._tool_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._tool_value(item) for key, item in value.items()}
+        return value
+
+    def _storage_mount(self) -> str | None:
+        """The Storage mount root, when this session has one mounted.
+
+        A sandbox conversation lives under ``<mount>/.pyromind-agent/<id>``; the
+        local execution plane has no mount and answers ``None``.
+        """
+        head, separator, _ = self.workspace.partition(_AGENT_DIRECTORY)
+        return head if separator else None
+
+    def _plane_spelling(self, path: str) -> str:
+        """The spelling the sandbox path policy admits for one artifact path.
+
+        Paths inside the conversation workspace are readable and writable as they
+        are. An artifact pinned beside a Storage input sits outside it, and the
+        policy only admits Storage under its ``storage/`` alias.
+        """
+        mount = self._storage_mount()
+        if mount is None or not path.startswith(f"{mount}/"):
+            return path
+        if path.startswith(f"{self.workspace}/"):
+            return path
+        return f"storage/{path[len(mount) + 1 :]}"
+
     def path(self, name: str) -> str:
+        """The sandbox path of a graph artifact, inside or outside the run directory.
+
+        Most artifacts are named relative to the run directory. A node can also pin
+        its product beside a Storage input, and that name is already absolute.
+        """
         path = PurePosixPath(name)
-        if path.is_absolute() or ".." in path.parts:
+        if ".." in path.parts:
             raise ValueError("artifact path escapes run directory")
-        return str(PurePosixPath(self.root) / path)
+        if not path.is_absolute():
+            return str(PurePosixPath(self.root) / path)
+        return self._resolve(self._plane_spelling(name), True)
 
     def describe(self, name: str) -> dict[str, Any]:
         result = self._python(
@@ -296,11 +832,45 @@ class ExecutionHost:
         return value
 
     def read_text(self, name: str) -> str:
-        result = self._call("execution.read", {"path": self.path(name), "limit": 65536})
+        path = self._plane_spelling(self.path(name))
+        result = self._call("execution.read", {"path": path, "limit": 65536})
         return base64.b64decode(result["content"], validate=True).decode("utf-8")
 
     def write_text(self, name: str, text: str) -> None:
-        self._write(self.path(name), text.encode("utf-8"))
+        self._write(self._plane_spelling(self.path(name)), text.encode("utf-8"))
+
+    def link(self, name: str, source: str) -> None:
+        """Land an external product on a graph artifact path.
+
+        A hardlink keeps a large product out of the run directory; a filesystem
+        boundary falls back to a copy, which is what the old wait script did.
+        """
+        target = self._plane_spelling(self.path(name))
+        self._python(
+            "import os,shutil\n"
+            f"t={target!r}\ns={source!r}\n"
+            "os.makedirs(os.path.dirname(t), exist_ok=True)\n"
+            "if os.path.exists(t): os.remove(t)\n"
+            "try: os.link(s,t)\n"
+            "except OSError: shutil.copyfile(s,t)\n"
+        )
+
+    def read_optional(self, path: str, limit: int) -> bytes | None:
+        """Read a file the execution plane may not have written yet."""
+        try:
+            result = self._call(
+                "execution.read",
+                {"path": self._plane_spelling(path), "limit": limit},
+            )
+        except Exception:
+            return None
+        try:
+            return base64.b64decode(result["content"], validate=True)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def exists(self, path: str) -> bool:
+        return self.read_optional(path, 1) is not None
 
     def read(self, path: str) -> bytes:
         """Read a workspace file, answering host-local exports from disk.
@@ -317,7 +887,8 @@ class ExecutionHost:
             return self._reads[path]
         try:
             result = self._call(
-                "execution.read", {"path": self._resolve(path, False), "limit": 262144}
+                "execution.read",
+                {"path": self._resolve(path, False), "limit": _READ_LIMIT},
             )
         except PiRunnerError as error:
             # Callers probe for optional files; keep the exception faithful to the
@@ -353,7 +924,7 @@ class ExecutionHost:
         while pending:
             pending_paths: list[JsonValue] = [str(path) for path in pending]
             result = self._call(
-                "execution.read_many", {"paths": pending_paths, "limit": 262144}
+                "execution.read_many", {"paths": pending_paths, "limit": _READ_LIMIT}
             )
             answered = 0
             for item in result.get("files") or []:
@@ -381,6 +952,8 @@ class ExecutionHost:
         The file read API rejects anything larger than the requested window, so a
         bounded head of a real dataset has to be cut in the execution plane; that
         keeps capture-time sampling from pulling gigabytes across the bridge.
+        A root input may be a directory (a folder of images): the same command
+        reports that instead of asking the plane to read a directory as a file.
         """
         if not isinstance(limit, int) or limit < 0:
             raise ValueError("limit must be a non-negative integer")
@@ -388,9 +961,11 @@ class ExecutionHost:
         if export is not None:
             with export.open("rb") as stream:
                 return stream.read(limit)
-        resolved = self._resolve(path, False)
+        resolved = self._resolve_aliased(path)
+        quoted = shlex.quote(resolved)
         result = self._run(
-            f"head -c {max(limit, 0)} {shlex.quote(resolved)} | base64 | tr -d '\\n'",
+            f"if [ -d {quoted} ]; then printf '%s' {shlex.quote(_DIRECTORY_MARK)}; "
+            f"else head -c {max(limit, 0)} {quoted} | base64 | tr -d '\\n'; fi",
             None,
             stream=False,
         )
@@ -399,15 +974,160 @@ class ExecutionHost:
         if result.get("rc") != 0:
             raise FileNotFoundError(path)
         content = result.get("stdout") or ""
+        if content.strip() == _DIRECTORY_MARK:
+            raise IsADirectoryError(path)
         return base64.b64decode(content, validate=True)
 
-    def _local_export(self, path: str) -> Path | None:
+    def metadata_many(self, paths: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Describe many paths in one execution-plane call.
+
+        `metadata` is a full sandbox command, and a plan review probes every root
+        input; at sandbox latency a handful of files costs minutes. One probe for
+        the whole batch keeps the review in the millisecond range.
+        """
+        wanted = list(dict.fromkeys(str(path) for path in paths))
+        answers: dict[str, dict[str, Any]] = {}
+        pending: list[str] = []
+        for path in wanted:
+            local = self._local_candidate(path)
+            if local is None:
+                pending.append(path)
+                continue
+            try:
+                stat = local.stat()
+            except OSError:
+                # Not on the host disk does not mean absent: Storage paths live in
+                # the mount the execution plane sees, so ask the plane.
+                pending.append(path)
+                continue
+            answers[path] = {
+                "exists": True,
+                "is_file": local.is_file(),
+                "is_dir": local.is_dir(),
+                "size": stat.st_size,
+            }
+        if not pending:
+            return answers
+        # Resolving each path is itself a bridge round trip, and a plan review
+        # probes a dozen of them; at sandbox latency that is minutes. The alias a
+        # path may need is pure string logic, so try both spellings inside one
+        # probe and keep whichever exists.
+        candidates: dict[str, list[str]] = {}
+        for path in pending:
+            options = [path]
+            if path.startswith("storage/"):
+                options.append(path[len("storage/") :])
+            elif path.startswith("/storage/"):
+                options.append(path[len("/storage") :])
+            else:
+                alias = _storage_alias(path)
+                if alias is not None and alias != path:
+                    options.append(alias)
+            candidates[path] = options
+        flat = [spelling for options in candidates.values() for spelling in options]
+        result = self._run(
+            f"python3 -c {shlex.quote(_METADATA_PROBE_MANY)} "
+            f"{shlex.quote(json.dumps(flat))}",
+            None,
+            stream=False,
+        )
+        if result.get("rc") != 0 or result.get("truncated"):
+            stdout = str(result.get("stdout") or "")[:500]
+            raise RuntimeError(
+                f"metadata batch probe failed; rc={result.get('rc')!r}, "
+                f"stdout={stdout!r}"
+            )
+        try:
+            mapping = json.loads(result.get("stdout") or "")
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"metadata batch probe returned no JSON: {error}"
+            ) from error
+        for original, options in candidates.items():
+            found = next(
+                (
+                    mapping[spelling]
+                    for spelling in options
+                    if isinstance(mapping.get(spelling), dict)
+                    and mapping[spelling].get("exists")
+                ),
+                None,
+            )
+            answers[original] = found or {"exists": False}
+        return answers
+
+    def metadata(self, path: str) -> dict[str, Any]:
+        """Describe an execution-plane path without reading its contents."""
+        local = self._local_candidate(path)
+        if local is not None:
+            try:
+                stat = local.stat()
+            except OSError:
+                pass
+            else:
+                return {
+                    "exists": True,
+                    "is_file": local.is_file(),
+                    "is_dir": local.is_dir(),
+                    "size": stat.st_size,
+                }
+        try:
+            resolved = self._resolve_aliased(path)
+            result = self._run(
+                f"python3 -c {shlex.quote(_METADATA_PROBE)} {shlex.quote(resolved)}",
+                None,
+                stream=False,
+            )
+        except Exception as error:  # noqa: BLE001 - optional planning probe
+            if "PATH_SCOPE_ERROR" in str(error) or _is_missing_file(error):
+                return {"exists": False}
+            raise
+        stdout = result.get("stdout")
+        if result.get("truncated"):
+            raise RuntimeError(
+                f"metadata probe for {path!r} was truncated; "
+                f"resolved path={resolved!r}, rc={result.get('rc')!r}, "
+                f"stdout={str(stdout or '')[:500]!r}"
+            )
+        rc = result.get("rc")
+        if rc != 0:
+            raise RuntimeError(
+                f"metadata probe for {path!r} failed; "
+                f"resolved path={resolved!r}, rc={rc!r}, "
+                f"stdout={str(stdout or '')[:500]!r}"
+            )
+        try:
+            value = json.loads(stdout or "")
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"metadata probe for {path!r} returned invalid JSON; "
+                f"resolved path={resolved!r}, stdout={str(stdout or '')[:500]!r}"
+            ) from error
+        if not isinstance(value, dict) or "exists" not in value:
+            raise RuntimeError(
+                f"metadata probe for {path!r} returned an invalid result; "
+                f"resolved path={resolved!r}, value={value!r}"
+            )
+        detail = value.get("error")
+        if isinstance(detail, str) and detail:
+            raise RuntimeError(
+                f"metadata probe for {path!r} failed; "
+                f"resolved path={resolved!r}, error={detail}"
+            )
+        return value
+
+    def _local_candidate(self, path: str) -> Path | None:
         if self.local_root is None:
             return None
         relative = PurePosixPath(path)
         if relative.is_absolute() or ".." in relative.parts:
             return None
-        candidate = self.local_root / relative
+        return self.local_root / relative
+
+    def _local_export(self, path: str) -> Path | None:
+        candidate = self._local_candidate(path)
+        if candidate is None:
+            return None
         return candidate if candidate.is_file() else None
 
     def _write(self, path: str, content: bytes) -> None:
@@ -457,7 +1177,7 @@ class ExecutionHost:
         if str(cwd) == self.verification:
             for path, digest in self.verification_files.items():
                 content = base64.b64decode(
-                    self._call("execution.read", {"path": path, "limit": 262144})[
+                    self._call("execution.read", {"path": path, "limit": _READ_LIMIT})[
                         "content"
                     ],
                     validate=True,
@@ -512,6 +1232,7 @@ class ExecutionHost:
                     "command": command,
                     "cwd": cwd,
                     "stream": stream,
+                    "timeout": self.shell_timeout,
                     **(
                         {"judge_directory": f"{self.root}/.judge/{execution_id}"}
                         if self.model_judge and cwd == self.verification
@@ -568,7 +1289,14 @@ class AgentGenomeBackend:
     ) -> JsonObject:
         host = self.host(scope)
         capabilities = set()
-        if action in {"get", "status", "run", "prepare_revision"}:
+        if action in {
+            "get",
+            "status",
+            "run",
+            "prepare_run",
+            "confirm_run",
+            "prepare_revision",
+        }:
             available = await host.request("execution.capabilities", {})
             capabilities = {key for key, value in available.items() if value is True}
         return await asyncio.to_thread(

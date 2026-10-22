@@ -58,7 +58,7 @@ async def validate(
         request_handler=request, event_handler=ignore, exit_handler=ignore
     )
     backend = AgentGenomeBackend(
-        home, lambda _scope: ExecutionHost(runner.request, subscribe)
+        home, lambda _scope: ExecutionHost(runner.request, subscribe, workspace)
     )
     try:
         await runner.start(

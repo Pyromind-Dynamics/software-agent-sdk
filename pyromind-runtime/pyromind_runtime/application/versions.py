@@ -72,16 +72,20 @@ class Versions:
     ) -> ArtifactVersion:
         if version.state in {"ready", "reference_only"}:
             return version
+        stage = "snapshot_save"
         try:
             result = self.snapshots.save(
                 version.manifest.source, version.manifest.target, context
             )
+            stage = "version_commit"
             return self.store.complete_version(version.project_id, version.id, result)
         except Exception as exc:
             self.store.fail_version(version.project_id, version.id, type(exc).__name__)
+            # Do not expose remote service errors or paths in a tool response. The
+            # stage and version id identify the failing operation for diagnosis.
             raise ValueError(
-                f"snapshot not completed ({type(exc).__name__}); "
-                "retry the same operation"
+                f"snapshot not completed ({type(exc).__name__}, {stage}, "
+                f"version={version.id}); retry the same operation"
             ) from None
 
     def call(

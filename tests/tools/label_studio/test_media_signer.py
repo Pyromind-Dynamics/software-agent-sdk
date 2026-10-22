@@ -137,3 +137,17 @@ def test_sign_many_omits_an_empty_cluster(monkeypatch):
     _signer().sign_many(["a"])
 
     assert bodies == [{"paths": ["a"]}]
+
+
+def test_relative_media_url_uses_issuing_service_origin(monkeypatch):
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda *a, **k: _Response(
+            200, {"urls": {"/datasets/a.jpg": "/label_studio/media?media_token=abc"}}
+        ),
+    )
+    assert _signer().sign_many(["/datasets/a.jpg"]) == {
+        "/datasets/a.jpg":
+        "https://console.example.com/label_studio/media?media_token=abc"
+    }

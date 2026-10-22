@@ -31,7 +31,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePosixPath
 from typing import Any, Protocol
@@ -445,6 +445,7 @@ class AVITrainToLabelStudioConverter:
         field_map_path: str | None = None,
         config_values: Mapping[str, Collection[str]] | None = None,
         dataset_content: bytes | None = None,
+        image_path_resolver: Callable[[str], str] | None = None,
     ) -> None:
         if adapter not in _SUPPORTED_ADAPTERS:
             raise ConversionError(
@@ -455,6 +456,7 @@ class AVITrainToLabelStudioConverter:
         self._meta_filename = _META_FILENAMES.get(adapter, "")
         # A file dataset the caller already read, so it is not fetched twice.
         self._dataset_content = dataset_content
+        self._image_path_resolver = image_path_resolver
         self._field_map = (
             field_map if field_map is not None else default_field_map(adapter)
         )
@@ -694,7 +696,9 @@ class AVITrainToLabelStudioConverter:
                             f"{binding.field!r}"
                         )
                     continue
-                files[binding.field] = path
+                files[binding.field] = (
+                    self._image_path_resolver(path) if self._image_path_resolver else path
+                )
             bound[index] = files
         return bound
 

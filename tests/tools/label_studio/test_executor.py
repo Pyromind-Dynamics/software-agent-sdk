@@ -3,12 +3,14 @@
 import json
 import logging
 import re
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+import httpx
 
 from openhands.tools.label_studio.api_client import LabelStudioAPIError
 from openhands.tools.label_studio.converter import (
@@ -64,6 +66,118 @@ def executor() -> LabelStudioProjectExecutor:
         ls_token_secret="LABEL_STUDIO_TOKEN",
         storage_base_url="http://storage.example.com",
     )
+
+
+def test_genome_jsonl_artifact_is_staged_to_storage_before_import(
+    executor: LabelStudioProjectExecutor,
+    conversation: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Genome artifacts live in public_data, but Label Studio reads Storage."""
+    run_id = "a" * 32
+    relative = f"public_data/workflow-runs/{run_id}/artifacts/add-verdict.out"
+    artifact = tmp_path / relative
+    artifact.parent.mkdir(parents=True)
+    content = b'{"images":["/datasets/pcb/a.bmp"],"quality":"defect"}' + b"\n"
+    artifact.write_bytes(content)
+    uploaded: list[tuple[str, bytes]] = []
+    monkeypatch.setattr(
+        executor,
+        "_upload_to_storage",
+        lambda path, data, _conversation: uploaded.append((path, data)),
+    )
+
+    storage_path = executor._dataset_storage_path("jsonl", relative, conversation)
+
+    assert storage_path.startswith(
+        "/.pyromind-agent/test-conversation-id/genome-inputs/"
+    )
+    assert storage_path.endswith(".jsonl")
+    assert uploaded == [(storage_path, content)]
+    assert (
+        executor._dataset_storage_path("jsonl", "/datasets/user.jsonl", conversation)
+        == "/datasets/user.jsonl"
+    )
+
+
+def test_create_imports_a_genome_artifact_from_its_staged_storage_object(
+    executor: LabelStudioProjectExecutor,
+    conversation: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_id = "c" * 32
+    relative = f"public_data/workflow-runs/{run_id}/artifacts/add-verdict.out"
+    artifact = tmp_path / relative
+    artifact.parent.mkdir(parents=True)
+    content = b'{"quality":"defect"}' + b"\n"
+    artifact.write_bytes(content)
+    uploaded: list[tuple[str, bytes]] = []
+    read_datasets: list[str] = []
+    monkeypatch.setattr(
+        executor,
+        "_upload_to_storage",
+        lambda path, data, _conversation: uploaded.append((path, data)),
+    )
+    monkeypatch.setattr(
+        executor, "_resolve_field_map", lambda *_: (MagicMock(), "field-hash")
+    )
+    monkeypatch.setattr(executor, "_validate_with_label_studio", lambda *_: None)
+    monkeypatch.setattr(
+        executor,
+        "_read_dataset_file",
+        lambda _adapter, path, _conversation: read_datasets.append(path) or content,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_load_state",
+        lambda project_ref, _conversation: ProjectState(
+            project_ref=project_ref,
+            project_id=42,
+            dataset_path=read_datasets[0],
+            adapter="jsonl",
+            status="READY",
+            total_tasks=1,
+            imported_count=1,
+        ),
+    )
+
+    observation = executor(
+        _action(
+            operation="create",
+            adapter="jsonl",
+            dataset_path=relative,
+            label_config_path="label_config.xml",
+        ),
+        conversation,
+    )
+
+    assert not observation.is_error
+    assert len(read_datasets) == 1
+    assert read_datasets[0].startswith(
+        "/.pyromind-agent/test-conversation-id/genome-inputs/"
+    )
+    assert uploaded == [(read_datasets[0], content)]
+
+
+def test_genome_jsonl_artifact_staging_rejects_oversized_files(
+    executor: LabelStudioProjectExecutor,
+    conversation: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "b" * 32
+    relative = f"public_data/workflow-runs/{run_id}/artifacts/add-verdict.out"
+    artifact = tmp_path / relative
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"too large")
+    monkeypatch.setattr(
+        "openhands.tools.label_studio.executor.DATASET_FILE_MAX_BYTES", 4
+    )
+
+    with pytest.raises(ValueError, match="missing or exceeds 4 bytes"):
+        executor._dataset_storage_path("jsonl", relative, conversation)
 
 
 def test_read_workspace_file_stages_remote_workspace_file(
@@ -1482,12 +1596,24 @@ def _refresh(
     state: ProjectState,
     ls_api: MagicMock,
     signer: MagicMock,
+    *,
+    media_response: httpx.Response | None = None,
 ):
     with (
         patch.object(executor, "_load_state", return_value=state),
         patch.object(executor, "_build_ls_api", return_value=ls_api),
         patch.object(executor, "_build_media_signer", return_value=signer),
         patch.object(executor, "_save_state"),
+        patch(
+            "httpx.stream",
+            side_effect=lambda *a, **k: nullcontext(
+                media_response
+                if media_response is not None
+                else httpx.Response(
+                    200, headers={"content-type": "image/jpeg"}, content=b"image"
+                )
+            ),
+        ),
     ):
         return executor(
             _action(operation="refresh_media", project_ref="abc"), conversation
@@ -1495,7 +1621,7 @@ def _refresh(
 
 
 def test_refresh_media_resigns_the_urls_and_keeps_the_rest_of_the_data(conversation):
-    """Only the rendered URL changes; the path and the labels stay untouched."""
+    """Normalize the media path and URL; keep all non-media fields."""
     executor = _create_executor(portal_base_url=PORTAL)
     signer = _mock_media_signer()
     ls_api = _mock_ls_api()
@@ -1511,13 +1637,13 @@ def test_refresh_media_resigns_the_urls_and_keeps_the_rest_of_the_data(conversat
     obs = _refresh(executor, conversation, _ready_state(), ls_api, signer)
 
     assert not obs.is_error
-    assert signer.sign_many.call_args.args[0] == ["exports/10_B1/defect.jpg"]
+    assert signer.sign_many.call_args.args[0] == ["/exports/10_B1/defect.jpg"]
     written = ls_api.update_task_data.call_args.kwargs
     assert written["task_id"] == 1
     assert written["data"]["defect_image"].endswith("media_token=fresh")
     # Label Studio replaces the whole data object, so everything else has to
     # travel with the new URL.
-    assert written["data"]["defect_image_path"] == "exports/10_B1/defect.jpg"
+    assert written["data"]["defect_image_path"] == "/exports/10_B1/defect.jpg"
     assert written["data"]["sample_id"] == "10_B1"
     assert "refreshed=1/1" in obs.text
 
@@ -1550,7 +1676,7 @@ def test_refresh_media_signs_each_path_once(conversation):
 
     _refresh(executor, conversation, _ready_state(), ls_api, signer)
 
-    assert signer.sign_many.call_args.args[0] == ["exports/a.jpg"]
+    assert signer.sign_many.call_args.args[0] == ["/exports/a.jpg"]
     assert ls_api.update_task_data.call_count == 2
 
 

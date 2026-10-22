@@ -22,4 +22,10 @@ results, review coverage, previous changes, goals, and budget to decide the next
 action. Separate observations from causal hypotheses and proposed experiments.
 Stop when the objective is met. Do not invent acceptance thresholds or automatically
 launch another training iteration. Use the existing skills for platform operations.
+Prefer dedicated file tools for ordinary reading, creating, and editing files.
+Use shell execution for searches, bulk computation, and running saved scripts.
+For badcase review, use the independent review product over frozen scores after
+completing or reusing full matching train/validation distributions. Adapt fields
+with the existing annotation bindings rather than rewriting scored records to
+remove binding warnings. Refresh broken media on the existing project.
 """

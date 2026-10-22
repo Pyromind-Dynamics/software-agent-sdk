@@ -17,15 +17,25 @@ type Publish = Callable[[str, str, str, JsonObject], Coroutine[Any, Any, None]]
 
 def started_run(action: str, result: JsonObject) -> str | None:
     """The run a backend call just queued: a plain run, a capture/distill replay, or a
-    parked run whose human gate has been answered."""
-    if action in {"run", "resume"}:
+    parked run whose human gate has been answered or requeued."""
+    if action == "confirm_run" or (
+        action == "run" and isinstance(result.get("run"), dict)
+    ):
+        run = result.get("run")
+        if not isinstance(run, dict) or run.get("status") != "queued":
+            return None
+        run_id = run.get("id")
+        if not isinstance(run_id, str):
+            raise ValueError("workflow backend returned no run id")
+        return run_id
+    if action in {"run", "resume", "replay_requeue"}:
         if result.get("status") != "queued":
             return None
         run_id = result.get("id")
         if not isinstance(run_id, str):
             raise ValueError("workflow backend returned no run id")
         return run_id
-    if action in {"capture", "distill"}:
+    if action in {"capture", "distill", "confirm_distill"}:
         run_id = result.get("run_id")
         return run_id if isinstance(run_id, str) else None
     return None

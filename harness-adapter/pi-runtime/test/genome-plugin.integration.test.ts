@@ -29,7 +29,7 @@ test("SDK loads the package default entry, discovers its host, and retains it ac
     const extension = extensions[0];
     assert.ok(extension.resolvedPath.endsWith("@agentgenome/pi-extension/index.js"));
     assert.equal(extension.path.includes("inline"), false);
-    assert.equal(extension.tools.size, 13);
+    assert.equal(extension.tools.size, 17);
     assert.equal(extension.handlers.has("session_start"), false, "SDK must not initialize a native service");
     assert.equal(extension.commands.has("genome"), false, "SDK must not install a native Python environment");
     await extension.tools.get("genome_list")!.definition.execute("call", {}, undefined, undefined, {} as never);
@@ -53,6 +53,65 @@ test("SDK loads the package default entry, discovers its host, and retains it ac
   assert.equal(disabledLoader.getExtensions().extensions.length, 0);
 });
 
+test("SDK forwards a reviewed distillation plan and its confirmation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "sdk-genome-distill-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const requests: JsonObject[] = [];
+  const peer = {
+    request: async (method: string, payload: JsonObject): Promise<JsonValue> => {
+      assert.equal(method, "workflow.invoke");
+      requests.push(payload);
+      if (payload.action === "distill") {
+        return {
+          plan_id: "distill-plan", digest: "distill-digest", status: "planned",
+          requires_confirmation: true, review: { steps: [{ step: "clean", kind: "run" }] },
+        };
+      }
+      assert.equal(payload.action, "confirm_distill");
+      return {
+        capture_id: "capture-distill-plan", status: "draft",
+        distill_plan: { plan_id: "distill-plan", digest: "distill-digest", status: "confirmed" },
+      };
+    },
+  } as unknown as JsonlRpcPeer;
+  const host = genomeHostAccess(peer, true);
+  const loader = new DefaultResourceLoader({
+    cwd: root, agentDir: join(root, "agent"),
+    settingsManager: SettingsManager.inMemory({}), eventBus: host.eventBus,
+    additionalExtensionPaths: host.additionalExtensionPaths, noExtensions: true,
+    noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+  });
+  await loader.reload();
+  host.assertLoaded(loader);
+  const extension = loader.getExtensions().extensions[0];
+  const distillArgs = { label: "clean.csv", source_traces: [] };
+  await extension.tools.get("genome_distill")!.definition.execute(
+    "distill-call", distillArgs, undefined, undefined, {} as never,
+  );
+  await extension.tools.get("genome_confirm_distill")!.definition.execute(
+    "confirm-distill-call",
+    { plan_id: "distill-plan", digest: "distill-digest" },
+    undefined,
+    undefined,
+    {} as never,
+  );
+  assert.deepEqual(requests.map((request) => request.action), ["distill", "confirm_distill"]);
+  assert.deepEqual(
+    requests.map((request) => request.request_id),
+    ["distill-call", "confirm-distill-call"],
+  );
+  assert.deepEqual(requests[0].arguments, distillArgs);
+  assert.equal(
+    (requests[0].arguments as JsonObject).steps,
+    undefined,
+    "the first distill call must let the plugin derive candidate steps",
+  );
+  assert.deepEqual(requests[1].arguments, {
+    plan_id: "distill-plan",
+    digest: "distill-digest",
+  });
+});
+
 test("a real SDK Pi turn invokes genome tools through the loaded package and existing RPC host", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "sdk-genome-turn-"));
   await mkdir(join(root, "public_data"));
@@ -65,9 +124,13 @@ test("a real SDK Pi turn invokes genome tools through the loaded package and exi
     modelRequests.push(JSON.parse(text));
     const step = modelRequests.length;
     if (step === 1) reply(response, "genome_list", { action: "list", foo: "bar" }, "list-call");
-    else if (step === 2) reply(response, "genome_run", {
+    else if (step === 2) reply(response, "genome_prepare_run", {
       asset_id: "data-cleaning", version: "1.0.0", params: { data_file: "public_data/input.csv" },
-    }, "run-call");
+      execution_scope: { mode: "full", description: "用户确认全量执行" },
+    }, "prepare-call");
+    else if (step === 3) reply(response, "genome_confirm_run", {
+      plan_id: "sdk-plan", digest: "plan-digest",
+    }, "confirm-call");
     else reply(response);
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -78,8 +141,12 @@ test("a real SDK Pi turn invokes genome tools through the loaded package and exi
     request: async (method: string, payload: JsonObject): Promise<JsonValue> => {
       assert.equal(method, "workflow.invoke");
       hostRequests.push(payload);
-      return payload.action === "list" ? { assets: [{ id: "data-cleaning", version: "1.0.0" }] }
-        : { id: "sdk-run", status: "queued" };
+      if (payload.action === "list") return { assets: [{ id: "data-cleaning", version: "1.0.0" }] };
+      if (payload.action === "prepare_run") return {
+        plan_id: "sdk-plan", digest: "plan-digest", status: "planned", requires_confirmation: true,
+      };
+      assert.equal(payload.action, "confirm_run");
+      return { plan: { plan_id: "sdk-plan" }, run: { id: "sdk-run", status: "queued" } };
     },
     emit: (event: RunnerEvent) => { events.push(event); if (event.kind === "run.finished") finish(); },
   } as unknown as JsonlRpcPeer;
@@ -96,20 +163,26 @@ test("a real SDK Pi turn invokes genome tools through the loaded package and exi
   await Promise.race([finished, new Promise<never>((_resolve, reject) => {
     timeout = setTimeout(() => reject(new Error("plugin tool turn did not finish")), 10000);
   })]).finally(() => clearTimeout(timeout));
-  assert.deepEqual(hostRequests.map((request) => request.action), ["list", "run"]);
-  assert.deepEqual(hostRequests.map((request) => request.request_id), ["list-call", "run-call"]);
+  assert.deepEqual(hostRequests.map((request) => request.action), ["list", "prepare_run", "confirm_run"]);
+  assert.deepEqual(hostRequests.map((request) => request.request_id),
+    ["list-call", "prepare-call", "confirm-call"]);
   assert.deepEqual(hostRequests[0].arguments, {});
-  assert.deepEqual(hostRequests[1].arguments, { asset_id: "data-cleaning", version: "1.0.0", params: { data_file: "public_data/input.csv" } });
+  assert.deepEqual(hostRequests[1].arguments, {
+    asset_id: "data-cleaning", version: "1.0.0", params: { data_file: "public_data/input.csv" },
+    execution_scope: { mode: "full", description: "用户确认全量执行" },
+  });
+  assert.deepEqual(hostRequests[2].arguments, { plan_id: "sdk-plan", digest: "plan-digest" });
   const schemas = modelRequests[0].tools as Array<{ function: { name: string } }>;
   assert.deepEqual(
     schemas.map((tool) => tool.function.name).filter((name) => name.startsWith("genome_")).sort(),
-    ["genome_cancel", "genome_capture", "genome_capture_status", "genome_distill",
-      "genome_get", "genome_list", "genome_prepare_revision",
-      "genome_resume", "genome_run", "genome_status", "genome_step_result", "genome_takeover",
-      "genome_trace"],
+    ["genome_cancel", "genome_capture", "genome_capture_status",
+      "genome_confirm_distill", "genome_confirm_run", "genome_distill", "genome_get",
+      "genome_list", "genome_prepare_revision", "genome_prepare_run",
+      "genome_replay_requeue", "genome_resume", "genome_run", "genome_status",
+      "genome_step_result", "genome_takeover", "genome_trace"],
   );
   assert.equal(events.filter((event) => event.kind === "run.finished").length, 1);
-  assert.match(JSON.stringify(modelRequests[2].messages), /sdk-run/);
+  assert.match(JSON.stringify(modelRequests[3].messages), /sdk-run/);
 });
 
 function reply(response: ServerResponse, name?: string, args: JsonObject = {}, id?: string): void {

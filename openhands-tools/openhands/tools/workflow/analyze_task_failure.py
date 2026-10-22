@@ -151,6 +151,14 @@ class AnalyzeTaskFailureAction(Action):
         le=300,
         description="Maximum source code lines returned per node.",
     )
+    status_only: bool = Field(
+        default=False,
+        description=(
+            "Only report the task's own terminal state. Skips the node list, node "
+            "logs and operator source, so a caller that just needs 'is it done yet' "
+            "pays one request instead of a full failure analysis."
+        ),
+    )
 
     @property
     def visualize(self) -> Text:
@@ -185,6 +193,14 @@ class AnalyzeTaskFailureObservation(Observation):
 
     task_status: str | None = Field(
         default=None, description="task_status from the task workflow result."
+    )
+    task_state: Literal["succeeded", "failed", "running", "unknown"] | None = Field(
+        default=None,
+        description=(
+            "Terminal state derived from task_status. `running` covers every "
+            "status that is neither a success marker nor a failure marker, so a "
+            "caller can wait on it without guessing."
+        ),
     )
     nodes: list[TaskNodeInfo] = Field(
         default_factory=list, description="All workflow nodes found in the task result."
@@ -367,6 +383,26 @@ def _looks_failed(status: str | None) -> bool:
     return any(marker in lowered for marker in _FAILURE_MARKERS)
 
 
+# A terminal success has to be recognised positively. `_looks_failed` answers
+# "not failed", which is also true of `Running`; waiting on that would let a
+# running task through.
+_SUCCESS_MARKERS = ("success", "succeed", "completed", "complete", "finished", "done")
+
+
+def task_state(
+    status: str | None,
+) -> Literal["succeeded", "failed", "running", "unknown"]:
+    """The state a caller may wait on, from the platform's free-text status."""
+    if not status:
+        return "unknown"
+    lowered = status.lower()
+    if any(marker in lowered for marker in _FAILURE_MARKERS):
+        return "failed"
+    if any(marker in lowered for marker in _SUCCESS_MARKERS):
+        return "succeeded"
+    return "running"
+
+
 def _extract_log_text(data: Any) -> str:
     """Join node log text from the raw API response (entries[].m array)."""
     if isinstance(data, str):
@@ -442,6 +478,15 @@ class AnalyzeTaskFailureExecutor(
             return self._error(payload)
 
         task_status = _status_text(payload.get("task_status"))
+        state = task_state(task_status)
+        if action.status_only:
+            # One request, no node list, no operator source: this is the call a
+            # waiting step makes while the platform is still running.
+            return AnalyzeTaskFailureObservation.from_text(
+                text=f"task_status={task_status or 'unknown'} state={state}",
+                task_status=task_status,
+                task_state=state,
+            )
         nodes = [
             TaskNodeInfo(
                 node_id=node_id,
@@ -515,6 +560,7 @@ class AnalyzeTaskFailureExecutor(
         return AnalyzeTaskFailureObservation.from_text(
             text=text,
             task_status=task_status,
+            task_state=state,
             nodes=nodes,
             failed_nodes=failed_nodes,
             logs=logs,

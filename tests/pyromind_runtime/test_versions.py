@@ -171,12 +171,32 @@ def test_failed_snapshot_retains_number_and_can_recover(versions):
         logical_key="train",
         source=SnapshotSource(storage_ref="/missing.py"),
     )
-    with pytest.raises(ValueError, match="snapshot not completed"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"snapshot not completed "
+            r"\(FileNotFoundError, snapshot_save, version=v1\)"
+        ),
+    ):
         service.save(project, "missing", request, context)
     second = service.save(project, "next", code_request(), context)
     assert second.version_no == 2
     snapshots.path("/missing.py", context).write_text("recovered")
     assert service.recover(project, context)[0]["state"] == "ready"
+
+
+def test_commit_failure_names_the_commit_stage(versions, monkeypatch):
+    service, _, project, context = versions
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("store is gone")
+
+    monkeypatch.setattr(service.store, "complete_version", boom)
+    with pytest.raises(
+        ValueError,
+        match=r"snapshot not completed \(RuntimeError, version_commit, version=v1\)",
+    ):
+        service.save(project, "save", code_request(), context)
 
 
 def test_cross_project_references_and_sql_producer_fk(versions):

@@ -38,7 +38,9 @@ from openhands.tools.label_studio.field_map import (
     parse_field_map,
 )
 from openhands.tools.label_studio.media_signer import PortalMediaSigner
+from openhands.tools.label_studio.media_validation import validate_task_media
 from openhands.tools.label_studio.models import ProjectState
+from openhands.tools.label_studio.paths import StorageInput, resolve_storage_input
 from openhands.tools.label_studio.skill_helpers import (
     WidenedConfig,
     extract_control_names,
@@ -50,13 +52,13 @@ from openhands.tools.label_studio.token_provider import PortalTokenProvider
 from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_AGENT_STORAGE_ROOT,
     StorageFileNotFoundError,
-    _strip_workspace_prefix,
     download_file_from_pyromind,
     upload_local_file_to_pyromind,
 )
 from openhands.tools.utils.workspace_staging import (
     WorkspaceStagingError,
     is_remote_workspace,
+    resolve_workspace_path,
     staged_remote_path,
 )
 
@@ -191,11 +193,16 @@ class LabelStudioProjectExecutor(
         if not action.label_config_path:
             raise ValueError("label_config_path is required for operation='create'.")
 
-        dataset_path = _normalize_storage_path(action.dataset_path, "dataset_path")
+        dataset_path = self._dataset_storage_path(
+            action.adapter, action.dataset_path, conversation
+        )
+        dataset_input = self._resolve_input(dataset_path, conversation)
+        dataset_path = dataset_input.resolved
         xml_content = self._read_workspace_file(action.label_config_path, conversation)
         if xml_content is None:
             raise ValueError(
-                f"label_config.xml not found in workspace: {action.label_config_path}"
+                "label_config.xml not found: "
+                + self._resolve_input(action.label_config_path, conversation).diagnostic()
             )
 
         # Both halves of the contract are read before anything is uploaded: the
@@ -207,9 +214,12 @@ class LabelStudioProjectExecutor(
         # well-formed one the converter could not pre-annotate against.
         validate_label_config_xml(xml_text, adapter=action.adapter, field_map=field_map)
         config_hash = hashlib.sha256(xml_content).hexdigest()
-        dataset_content = self._read_dataset_file(
-            action.adapter, dataset_path, conversation
-        )
+        try:
+            dataset_content = self._read_dataset_file(
+                action.adapter, dataset_path, conversation
+            )
+        except ValueError as exc:
+            raise ValueError(f"{dataset_input.diagnostic()}: {exc}") from exc
         project_ref = _project_ref(
             self._ls_base_url,
             self._cluster,
@@ -359,7 +369,8 @@ class LabelStudioProjectExecutor(
         raw = self._read_workspace_file(action.field_map_path, conversation)
         if raw is None:
             raise ValueError(
-                f"field map not found in workspace: {action.field_map_path}"
+                "field map not found: "
+                + self._resolve_input(action.field_map_path, conversation).diagnostic()
             )
         try:
             declared = json.loads(raw.decode("utf-8"))
@@ -374,6 +385,54 @@ class LabelStudioProjectExecutor(
                 f"invalid field map {action.field_map_path}: {exc}"
             ) from exc
         return field_map, field_map_digest(field_map)
+
+    def _dataset_storage_path(
+        self,
+        adapter: str,
+        dataset_path: str,
+        conversation: BaseConversation | None,
+    ) -> str:
+        """Stage a Genome run artifact before a Storage-only adapter consumes it.
+
+        `label_studio_project` imports datasets from Pyromind Storage, while a
+        preceding Genome node writes into the isolated conversation workspace.
+        For the explicit JSONL run-artifact shape, copy the bounded file into this
+        conversation's Storage namespace and pass that real object path downstream.
+        Ordinary user-supplied Storage paths keep their existing behavior.
+        """
+        relative = PurePosixPath(dataset_path)
+        parts = relative.parts
+        if (
+            adapter != "jsonl"
+            or relative.is_absolute()
+            or ".." in parts
+            or len(parts) != 5
+            or parts[:2] != ("public_data", "workflow-runs")
+            or len(parts[2]) != 32
+            or any(character not in "0123456789abcdef" for character in parts[2])
+            or parts[3] != "artifacts"
+            or not parts[4].endswith(".out")
+        ):
+            return dataset_path
+        if conversation is None:
+            raise ValueError(
+                "A Genome-generated JSONL dataset needs an active conversation."
+            )
+        content = self._read_workspace_file(
+            dataset_path, conversation, max_bytes=DATASET_FILE_MAX_BYTES
+        )
+        if content is None:
+            raise ValueError(
+                f"Genome-generated dataset is missing or exceeds "
+                f"{DATASET_FILE_MAX_BYTES} bytes: {dataset_path}"
+            )
+        digest = hashlib.sha256(content).hexdigest()
+        storage_path = (
+            f"{PYROMIND_AGENT_STORAGE_ROOT}/{conversation.id}/genome-inputs/"
+            f"{parts[2]}/{digest}.jsonl"
+        )
+        self._upload_to_storage(storage_path, content, conversation)
+        return storage_path
 
     def _read_dataset_file(
         self,
@@ -411,6 +470,13 @@ class LabelStudioProjectExecutor(
     ) -> tuple[ConvertedManifest, ProjectState, WidenedConfig]:
         """Convert the dataset, persist its artifacts, and create the LS project."""
         xml_text = xml_content.decode("utf-8")
+        image_inputs: dict[str, str] = {}
+
+        def resolve_image(path: str) -> str:
+            resolved = self._resolve_input(path, conversation)
+            image_inputs[resolved.resolved] = resolved.diagnostic()
+            return resolved.resolved
+
         converter = AVITrainToLabelStudioConverter(
             dataset_path=dataset_path,
             storage_base_url=self._storage_base_url,
@@ -425,8 +491,18 @@ class LabelStudioProjectExecutor(
             field_map_path=action.field_map_path,
             config_values=extract_control_values(xml_text),
             dataset_content=dataset_content,
+            image_path_resolver=resolve_image,
         )
         manifest = converter.convert()
+        validate_task_media(
+            (
+                task
+                for _, payload, _ in manifest.batch_payloads
+                for task in json.loads(payload)
+            ),
+            float(self._timeout),
+            image_inputs,
+        )
 
         # The template names the controls; the values come from the data. A value
         # the config does not list would import as a pre-annotation that draws
@@ -688,9 +764,12 @@ class LabelStudioProjectExecutor(
 
         ls_api = self._build_ls_api(conversation)
         tasks = ls_api.list_project_tasks(state.project_id)
-        paths = sorted(
-            {path for task in tasks for _, path in _media_fields(_task_data(task))}
-        )
+        resolved = {
+            path: self._resolve_input(path, conversation).resolved
+            for task in tasks
+            for _, path in _media_fields(_task_data(task))
+        }
+        paths = sorted(set(resolved.values()))
         if not paths:
             raise ValueError(
                 "No media paths found in the task data of this project, so its "
@@ -698,7 +777,22 @@ class LabelStudioProjectExecutor(
             )
 
         urls = signer.sign_many(paths)
-        refreshed, failed, first_error = self._refresh_task_media(tasks, urls, ls_api)
+        original_urls = {path: urls[target] for path, target in resolved.items()}
+        updated_tasks = [
+            {**task, "data": _resigned_data(_task_data(task), original_urls, resolved)[0]}
+            for task in tasks
+        ]
+        validate_task_media(
+            updated_tasks,
+            float(self._timeout),
+            {
+                target: self._resolve_input(path, conversation).diagnostic()
+                for path, target in resolved.items()
+            },
+        )
+        refreshed, failed, first_error = self._refresh_task_media(
+            tasks, original_urls, ls_api, resolved
+        )
         if refreshed == 0:
             return self._error(
                 "refresh_media",
@@ -723,6 +817,7 @@ class LabelStudioProjectExecutor(
         tasks: list[dict[str, Any]],
         urls: dict[str, str],
         ls_api: LabelStudioAPIClient,
+        resolved_paths: dict[str, str] | None = None,
     ) -> tuple[int, int, str]:
         """Write fresh media URLs back into each task's data, concurrently.
 
@@ -734,7 +829,7 @@ class LabelStudioProjectExecutor(
         pending: list[tuple[int, dict[str, Any]]] = []
         for task in tasks:
             task_id = task.get("id")
-            data, changed = _resigned_data(_task_data(task), urls)
+            data, changed = _resigned_data(_task_data(task), urls, resolved_paths)
             if isinstance(task_id, int) and changed:
                 pending.append((task_id, data))
 
@@ -916,21 +1011,55 @@ class LabelStudioProjectExecutor(
         return headers
 
     def _read_workspace_file(
-        self, relative_path: str, conversation: BaseConversation | None
+        self,
+        relative_path: str,
+        conversation: BaseConversation | None,
+        *,
+        max_bytes: int | None = None,
     ) -> bytes | None:
         if conversation is None:
             return None
         workspace = cast(Any, conversation).workspace
+        resolved = self._resolve_input(relative_path, conversation)
+        try:
+            relative, from_storage = resolve_workspace_path(workspace, relative_path)
+        except WorkspaceStagingError:
+            relative, from_storage = PurePosixPath(), True
+        if from_storage or relative_path.startswith("storage/"):
+            try:
+                return self._download_from_storage(
+                    resolved.resolved,
+                    conversation,
+                    max_bytes=max_bytes or _MANIFEST_BATCH_MAX_BYTES,
+                )
+            except StorageFileNotFoundError:
+                return None
         if is_remote_workspace(workspace):
             try:
                 with staged_remote_path(workspace, relative_path) as staged:
-                    return staged.read_bytes() if staged.is_file() else None
+                    if not staged.is_file():
+                        return None
+                    if max_bytes is not None and staged.stat().st_size > max_bytes:
+                        return None
+                    return staged.read_bytes()
             except WorkspaceStagingError:
                 return None
-        file_path = Path(workspace.working_dir) / relative_path
+        file_path = Path(workspace.working_dir) / relative
         if not file_path.is_file():
             return None
+        if max_bytes is not None and file_path.stat().st_size > max_bytes:
+            return None
         return file_path.read_bytes()
+
+    @staticmethod
+    def _resolve_input(
+        path: str, conversation: BaseConversation | None
+    ) -> StorageInput:
+        return resolve_storage_input(
+            path,
+            cast(Any, conversation).workspace if conversation is not None else None,
+            str(conversation.id) if conversation is not None else "",
+        )
 
     def _upload_to_storage(
         self,
@@ -1108,7 +1237,9 @@ def _media_fields(data: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def _resigned_data(
-    data: dict[str, Any], urls: dict[str, str]
+    data: dict[str, Any],
+    urls: dict[str, str],
+    resolved_paths: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Copy task data, replacing every baked media URL with a fresh one.
 
@@ -1122,6 +1253,8 @@ def _resigned_data(
         if url is None:
             continue
         refreshed[field] = url
+        if resolved_paths is not None:
+            refreshed[field + _MEDIA_PATH_SUFFIX] = resolved_paths.get(path, path)
         changed = True
     return refreshed, changed
 
@@ -1172,18 +1305,7 @@ def _project_description(
 
 
 def _normalize_storage_path(value: str, field_name: str) -> str:
-    raw = value.strip()
-    if not raw:
-        raise ValueError(f"{field_name} must be a non-empty storage path.")
-    if any(ord(character) < 32 for character in raw):
-        raise ValueError(f"{field_name} contains control characters.")
-    # Callers quote platform workspace paths (`/workspace/exports/...`) as readily
-    # as storage paths, and both name the same objects.
-    parts = [
-        part
-        for part in _strip_workspace_prefix(raw).split("/")
-        if part not in {"", "."}
-    ]
-    if not parts or ".." in parts:
-        raise ValueError(f"{field_name} must not be the root or contain '..'.")
-    return "/" + "/".join(parts)
+    try:
+        return resolve_storage_input(value).resolved
+    except ValueError as exc:
+        raise ValueError(f"{field_name}: {exc}") from exc

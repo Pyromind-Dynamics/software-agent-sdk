@@ -50,6 +50,7 @@ const ENDPOINT: SandboxEndpoint = {
 test("operator timeouts come from the environment when configured", () => {
   assert.deepEqual(sandboxTerminalTimeouts({}), {
     resolveTimeoutMs: undefined, startupTimeoutMs: undefined,
+    queueTimeoutMs: undefined,
   });
   assert.deepEqual(sandboxTerminalTimeouts({
     PYROMIND_PI_TERMINAL_RESOLVE_TIMEOUT_MS: "60000",

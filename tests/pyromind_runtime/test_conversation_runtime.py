@@ -777,7 +777,44 @@ async def test_parked_history_run_notifies_the_live_conversation(tmp_path) -> No
     assert notice.trigger_turn is True
     assert "review.out" in notice.hidden_text
     assert "genome_resume" in notice.hidden_text
+    assert "open_url" in notice.hidden_text
+    assert "artifact 路径只是回执位置" in notice.hidden_text
     assert "不要自己执行或重放 graph" in notice.hidden_text
+    await runtime.close()
+
+
+async def test_a_failed_history_replay_offers_the_requeue_path(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter("pi")
+    runtime = ConversationRuntime(
+        conversations, {"pi": adapter}, default_harness_id="pi"
+    )
+    context = RequestContext(user_id="42")
+    await runtime.create_conversation(
+        SessionSpec(
+            conversation_id="failed-live",
+            user_id="42",
+            workspace_root=str(conversations / "failed-live"),
+        ),
+        context,
+    )
+    runtime.register_external_task("failed-live", _parked_history_task())
+    await runtime.deliver_external_task_status(
+        "failed-live",
+        task_id="graph-1",
+        status="Failed",
+        completion_result={
+            "id": "graph-1",
+            "status": "failed",
+            "result": {"error": "sandbox was recycled"},
+        },
+    )
+    notice = adapter.external_task_notifications[0][1]
+    assert notice.trigger_turn is True
+    assert "genome_replay_requeue" in notice.hidden_text
+    assert "不要重新沉淀" in notice.hidden_text
+    assert "已发布的资产不能重排" in notice.hidden_text
     await runtime.close()
 
 

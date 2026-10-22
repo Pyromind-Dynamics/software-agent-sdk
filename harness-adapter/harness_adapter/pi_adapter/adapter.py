@@ -95,7 +95,9 @@ PI_CAPABILITIES = HarnessCapabilities(
 )
 _WORKFLOW_PATH = Path("public_data/workflow_canvas/workflow.py")
 _SYSTEM_PROMPT = """You are a coding agent inside one conversation workspace.
-Use read, write, edit, and terminal for workspace operations. Keep generated files
+Prefer read for ordinary file inspection, write for file creation, and edit for
+targeted changes. Use terminal for searching, bulk computation, and executing saved
+scripts. Keep generated files
 under public_data/. Every terminal call starts at the workspace root (`.`). You may
 use cd within one command, but never rely on a directory change from an earlier call.
 Workspace files use public_data/... paths; authorized absolute paths are also accepted.
@@ -130,7 +132,8 @@ _SANDBOX_SYSTEM_PROMPT = """
 This session runs its execution plane in a platform Sandbox with your Storage
 mounted at storage/, relative to the workspace root. That is the local copy of
 Storage: when the user asks about data or files, inspect and read them there
-with read, terminal commands, and scripts. Pass storage/... paths directly to
+with read; use terminal for searches, bulk computation, and saved scripts.
+Pass storage/... paths directly to
 Python scripts through terminal. storage/ is writable: to hand a workspace file
 to a platform task, write it under storage/<dir>/<name> and pass /<dir>/<name>
 as the Storage path. Every dataset this session works on is a Storage path you
@@ -1033,7 +1036,9 @@ class PiAdapter:
                 raise ValueError("invalid workflow request")
             inflight = session.files.load_inflight() or {}
             origin = inflight.get("run_id")
-            if action in {"run", "capture", "distill"} and not isinstance(origin, str):
+            if action in {"run", "capture", "confirm_distill"} and not isinstance(
+                origin, str
+            ):
                 raise ValueError("workflow start requires an active originating turn")
             return await self._workflow_call(
                 session.session_id,
@@ -1073,6 +1078,14 @@ class PiAdapter:
             )
             self._emit_tool_signals(session, tool_name, result)
             return result
+        if method == "tool.cancel":
+            tool_call_id = params.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+                raise ValueError("tool_call_id must be a non-empty string")
+            return self._business_tools.cancel_call(
+                session.session_id,
+                tool_call_id,
+            )
         if method == "permission.cancel":
             pending = session.pending_permission
             if (

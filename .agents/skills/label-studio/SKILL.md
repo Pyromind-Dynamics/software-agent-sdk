@@ -22,12 +22,13 @@ description: >-
 
 | 源数据 / 需求 | 走向 | 读取 |
 |---|---|---|
+| 模型 badcase / 冻结评分结果的人工复核 | 使用独立 `products.operation=review`，引用完整分布分析与评分版本；复用现有界面和标签 | ../inference-evaluation/references/review-tasks.md |
 | 预处理/清洗产出的 JSONL（一行一个样本、行内自带图片路径，如 data-processing 的 `source_images`） | `adapter=jsonl` 直接导入，不再做格式转换 | references/adapters.md |
 | 样本目录含 `meta_vlm.json`（`quality` / `findings`） | `adapter=avi_train`（内置绑定） | references/adapters.md |
 | 样本目录含 `meta.json`（`vlm_verdict` / `note`，无 bbox） | `adapter=aoi_export`（内置绑定） | references/adapters.md |
 | 形状命中上表，但要改控件名、图片槽位或坐标量纲 | 自定义绑定（`field_map_path`） | references/custom-bindings.md |
 | 形状不在上表（混合布局、要第 4 张图、行内字段名与内置绑定不同） | 先自定义绑定；能力表外的直接说缺什么 | references/custom-bindings.md |
-| 改已有项目的配置，或取回标注结果 | `update_config` / `export` | references/operations.md |
+| 改已有项目配置、修复图片或取回标注 | `update_config` / `refresh_media` / `export` | references/operations.md |
 
 负向边界：领域标签语义与预打标产出（如 PCB AVI/AOI）→ data-processing，
 领域参考的运行时路径和读取方式由那里的 case 文档给出；训练格式转换 →
@@ -58,7 +59,7 @@ Label Studio 本身支持的控件（画笔、多边形、关键点）转换器�
 
 ## 控制面 SOP
 
-1. **探查**：用 `read`/`terminal` 读 `storage/<dataset_path>` 先看清数据结构
+1. **探查**：用 `read` 读 `storage/<dataset_path>` 先看清数据结构
    （样本目录 + meta 字段，或 JSONL 行内字段和图片路径）；一次看完多个样本，
    不要一个样本调一次。
 2. **路由**：按上表命中一条 reference 并读取；不命中则进入自定义绑定分支。
@@ -76,6 +77,13 @@ Label Studio 本身支持的控件（画笔、多边形、关键点）转换器�
    create 会在转换**之前**做同样的校验并返回可读错误。
 5. **创建**：`label_studio_project(operation="create", ...)`。
 6. **交付**：给项目名、导入样本数，和一个能点的标注入口（格式见下）。
+
+路径契约：dataset、XML、field map 和图片字段均支持 `storage/...` 别名、
+实际 Storage 挂载路径和规范 `/datasets/...` 对象路径。XML/field map 也可用
+工作区相对路径；保留上游图片字段，通过 field map 声明绑定。
+创建前工具检查绑定与每个图片槽位的代表性媒体访问；按返回的路径和错误类型
+修复，不通过复制文件或反复创建项目绕过。已有项目使用 `refresh_media` 更新
+媒体字段，保留项目与标注；rubric 变化则创建新的评分及复核任务。
 
 ## 回复用户的链接格式
 

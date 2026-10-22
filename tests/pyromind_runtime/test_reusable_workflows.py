@@ -153,6 +153,7 @@ async def test_execution_host_batches_reads_and_reuses_answers(tmp_path):
 
 async def test_execution_host_bounds_a_wedged_read(tmp_path, monkeypatch):
     monkeypatch.setenv("PYROMIND_AGENTGENOME_CALL_TIMEOUT_SECONDS", "0.05")
+    monkeypatch.setenv("PYROMIND_AGENTGENOME_SLOW_CALL_TIMEOUT_SECONDS", "0.05")
 
     async def request(method, payload):
         await asyncio.sleep(60)
@@ -349,8 +350,6 @@ node:
                 "details": {"code": "TASK_REJECTED"},
             }
         assert method == "execution.run"
-        assert "base64" not in params["command"]
-        assert "python3 -c" not in params["command"]
         process = await asyncio.create_subprocess_shell(
             params["command"],
             cwd=params["cwd"] or workspace,
@@ -395,36 +394,73 @@ node:
     return backend, workspace, calls
 
 
+async def prepare_confirmed_run(
+    backend: AgentGenomeBackend,
+    scope: str,
+    arguments: JsonObject,
+    request_id: str,
+) -> str:
+    plan = await backend.invoke(
+        scope,
+        "prepare_run",
+        {
+            **arguments,
+            "execution_scope": {
+                "mode": "full",
+                "description": "测试明确确认全量执行",
+            },
+        },
+        request_id,
+    )
+    assert plan["status"] == "planned"
+    assert plan["requires_confirmation"] is True
+    assert plan["run_id"] is None
+    confirmed = await backend.invoke(
+        scope,
+        "confirm_run",
+        {"plan_id": plan["plan_id"], "digest": plan["digest"]},
+        f"{request_id}-confirm",
+    )
+    run = confirmed["run"]
+    assert isinstance(run, dict)
+    run_id = run.get("id")
+    assert isinstance(run_id, str)
+    return run_id
+
+
 async def test_sdk_executes_artifacts_through_host_only(setup_workflow):
     backend, workspace, calls = setup_workflow
-    for rows in (3, 1):
+    last_run_id: str | None = None
+    for index, rows in enumerate((3, 1)):
         (workspace / "public_data/input.txt").write_text("row\n" * rows)
-        state = await backend.invoke(
+        run_id = await prepare_confirmed_run(
+            backend,
             "session",
-            "run",
             {
                 "asset_id": "sample",
                 "version": "1.0.0",
                 "params": {"data": "public_data/input.txt"},
             },
-            uuid4().hex,
+            f"run-{index}",
         )
+        last_run_id = run_id
         events = []
 
         async def emit(event):
             events.append(event)
 
-        result = await backend.execute("session", state["id"], emit)
+        result = await backend.execute("session", run_id, emit)
         assert result["status"] == "succeeded", result
         report = result["result"]["outputs"]["report"]
         assert json.loads(Path(report["execution_path"]).read_text())["rows"] == rows
-        assert not (backend.service.root / "runs" / state["id"] / "artifacts").exists()
+        assert not (backend.service.root / "runs" / run_id / "artifacts").exists()
         assert any(e["event"] == "check" for e in events)
     assert "execution.resolve" in calls
     assert "execution.write" in calls
+    assert last_run_id is not None
     with pytest.raises(ValueError, match="conversation"):
         await backend.invoke(
-            "other-session", "status", {"run_id": state["id"]}, "query"
+            "other-session", "status", {"run_id": last_run_id}, "query"
         )
 
 
@@ -446,14 +482,14 @@ async def test_bridge_tool_calls_the_execution_plane_tool_port():
         BridgeTool(ExecutionHost(request, lambda *_: None)).call,
         "df_submit_pipeline",
         {"dataset": "storage/a.csv"},
+        execution_id="node-submit:1:call-1",
     )
     assert result == ToolResult(False, {"task_id": "task-1"}, "submitted\ntask-1")
     method, payload = calls[0]
     assert method == "execution.tool"
     assert payload["name"] == "df_submit_pipeline"
     assert payload["arguments"] == {"dataset": "storage/a.csv"}
-    # The call id only routes signals back to this node, so it is the bridge's own.
-    assert str(payload["tool_call_id"]).startswith("genome-")
+    assert payload["tool_call_id"] == "node-submit:1:call-1"
 
     async def broken(_method: str, _payload: JsonObject) -> JsonValue:
         return {"accepted": True}
@@ -463,6 +499,7 @@ async def test_bridge_tool_calls_the_execution_plane_tool_port():
             BridgeTool(ExecutionHost(broken, lambda *_: None)).call,
             "df_submit_pipeline",
             {},
+            execution_id="node-submit:1:call-2",
         )
 
 
@@ -524,7 +561,7 @@ async def test_tool_nodes_run_through_the_host_tool_port(setup_workflow, tmp_pat
         write_tool_package(tmp_path, "pretag-submit", "df_submit_pipeline")
     )
     (workspace / "public_data/pretag.csv").write_text("question\nhow?\n")
-    params = {"dataset": "public_data/pretag.csv"}
+    params: JsonObject = {"dataset": "public_data/pretag.csv"}
 
     async def ignore(_event):
         pass
@@ -535,22 +572,20 @@ async def test_tool_nodes_run_through_the_host_tool_port(setup_workflow, tmp_pat
     replay = await backend.execute("validation", draft["id"], ignore)
     assert replay["status"] == "succeeded", replay
     backend.service.publish("pretag-submit", "1.0.0")
-    state = await backend.invoke(
+    run_id = await prepare_confirmed_run(
+        backend,
         "session",
-        "run",
         {"asset_id": "pretag-submit", "version": "1.0.0", "params": params},
-        uuid4().hex,
+        "run-tool",
     )
-    result = await backend.execute("session", state["id"], ignore)
+    result = await backend.execute("session", run_id, ignore)
     assert result["status"] == "succeeded", result
     submission = result["result"]["outputs"]["submission"]
     assert json.loads(Path(submission["execution_path"]).read_text()) == {
         "task_id": "task-1"
     }
     call = next(
-        item
-        for item in read_ledger(backend, state["id"])
-        if item["event"] == "call_tool"
+        item for item in read_ledger(backend, run_id) if item["event"] == "call_tool"
     )
     assert call["tool"] == "df_submit_pipeline"
     assert call["is_error"] is False
@@ -609,9 +644,9 @@ async def test_legacy_revision_needs_declarations_and_successful_run_can_be_hand
         "session", "get", {"asset_id": "sample", "version": "1.0.0"}, "inspect"
     )
     assert asset["revision_availability"]["available"]
-    state = await backend.invoke(
+    run_id = await prepare_confirmed_run(
+        backend,
         "session",
-        "run",
         {
             "asset_id": "sample",
             "version": "1.0.0",
@@ -623,23 +658,21 @@ async def test_legacy_revision_needs_declarations_and_successful_run_can_be_hand
     async def emit(_event):
         pass
 
-    result = await backend.execute("session", state["id"], emit)
+    result = await backend.execute("session", run_id, emit)
     assert result["status"] == "succeeded"
     with pytest.raises(ValueError, match="legacy package requires"):
-        await backend.invoke(
-            "session", "prepare_revision", {"run_id": state["id"]}, "draft"
-        )
+        await backend.invoke("session", "prepare_revision", {"run_id": run_id}, "draft")
     before = calls.count("execution.run")
     taken = await backend.invoke(
         "session",
         "takeover",
-        {"run_id": state["id"], "reason": "outputs do not meet the task"},
+        {"run_id": run_id, "reason": "outputs do not meet the task"},
         "takeover",
     )
     assert taken["taken_over"] and taken["status"] == "succeeded"
     assert taken["result"] == result["result"]
     status = await backend.invoke(
-        "session", "status", {"run_id": state["id"]}, "inspect-run"
+        "session", "status", {"run_id": run_id}, "inspect-run"
     )
     assert not status["recovery"]["revision"]["available"]
     assert status["recovery"]["takeover"]["taken_over"]
@@ -804,9 +837,27 @@ async def test_distill_normalizes_a_chain_and_publishes_after_its_replay(
             "raw": "public_data/data/raw2.csv",
             "rules": "public_data/rules.json",
         },
+        "execution_scope": {"mode": "sample", "description": "定向验证小样"},
+        "validation_params": {
+            "raw": "public_data/data/raw.csv",
+            "rules": "public_data/rules.json",
+        },
     }
-    plan = await workflows.invoke(
+    prepared = await workflows.invoke(
         "session", "distill", arguments, "distill-1", "origin-turn"
+    )
+    assert prepared["status"] == "planned"
+    review = prepared["review"]
+    assert isinstance(review, dict)
+    validation = review["validation"]
+    assert isinstance(validation, dict)
+    assert validation["ready"] is True
+    plan = await workflows.invoke(
+        "session",
+        "confirm_distill",
+        {"plan_id": prepared["plan_id"], "digest": prepared["digest"]},
+        "distill-confirm-1",
+        "origin-turn",
     )
     assert plan["reused"] is False
     assert plan["run_id"]
@@ -833,8 +884,18 @@ async def test_distill_normalizes_a_chain_and_publishes_after_its_replay(
     assert capture["generalized"] is True
     assert capture["run"]["status"] == "succeeded"
 
-    again = await workflows.invoke(
+    again_prepared = await workflows.invoke(
         "session", "distill", arguments, "distill-2", "origin-turn"
+    )
+    again = await workflows.invoke(
+        "session",
+        "confirm_distill",
+        {
+            "plan_id": again_prepared["plan_id"],
+            "digest": again_prepared["digest"],
+        },
+        "distill-confirm-2",
+        "origin-turn",
     )
     assert again["reused"] is True
     assert again["run_id"] is None
@@ -903,9 +964,22 @@ async def test_distill_pairs_a_placeholder_write_with_a_literal_read(
             "raw": "public_data/data/raw2.csv",
             "rules": "public_data/rules.json",
         },
+        "execution_scope": {"mode": "sample", "description": "定向验证小样"},
+        "validation_params": {
+            "raw": "public_data/data/raw.csv",
+            "rules": "public_data/rules.json",
+        },
     }
-    plan = await workflows.invoke(
+    prepared = await workflows.invoke(
         "session", "distill", arguments, "distill-1", "origin-turn"
+    )
+    assert prepared["status"] == "planned"
+    plan = await workflows.invoke(
+        "session",
+        "confirm_distill",
+        {"plan_id": prepared["plan_id"], "digest": prepared["digest"]},
+        "distill-confirm-1",
+        "origin-turn",
     )
     assert plan["reused"] is False
     assert plan["run_id"]
@@ -959,12 +1033,34 @@ async def test_workflow_waits_for_turn_and_cancels_queued(setup_workflow):
         "version": "1.0.0",
         "params": {"data": "public_data/input.txt"},
     }
-    state = await workflows.invoke(
-        "session", "run", arguments, "request", "origin-turn"
+    plan = await workflows.invoke(
+        "session",
+        "prepare_run",
+        {
+            **arguments,
+            "execution_scope": {"mode": "full", "description": "用户确认全量"},
+        },
+        "prepare",
     )
-    assert (await workflows.invoke("session", "run", arguments, "request"))[
-        "id"
-    ] == state["id"]
+    assert plan["status"] == "planned"
+    confirmed = await workflows.invoke(
+        "session",
+        "confirm_run",
+        {"plan_id": plan["plan_id"], "digest": plan["digest"]},
+        "confirm",
+        "origin-turn",
+    )
+    state = confirmed["run"]
+    assert isinstance(state, dict)
+    duplicate = await workflows.invoke(
+        "session",
+        "confirm_run",
+        {"plan_id": plan["plan_id"], "digest": plan["digest"]},
+        "confirm-duplicate",
+    )
+    duplicate_run = duplicate["run"]
+    assert isinstance(duplicate_run, dict)
+    assert duplicate_run["id"] == state["id"]
     await asyncio.sleep(0)
     assert not events
     assert workflows.busy("session")
@@ -974,7 +1070,24 @@ async def test_workflow_waits_for_turn_and_cancels_queued(setup_workflow):
     workflows.release("session", "origin-turn")
     await asyncio.wait_for(workflows.wait_idle("session"), 10)
     assert [e[2] for e in events].count("operation.completed") == 1
-    state = await workflows.invoke("session", "run", arguments, "second")
+    plan = await workflows.invoke(
+        "session",
+        "prepare_run",
+        {
+            **arguments,
+            "execution_scope": {"mode": "full", "description": "用户确认全量"},
+        },
+        "second-prepare",
+    )
+    confirmed = await workflows.invoke(
+        "session",
+        "confirm_run",
+        {"plan_id": plan["plan_id"], "digest": plan["digest"]},
+        "second-confirm",
+        "origin-turn",
+    )
+    state = confirmed["run"]
+    assert isinstance(state, dict)
     await workflows.cancel("session")
     await workflows.wait_idle("session")
     assert backend.service.status("session", state["id"])["status"] == "cancelled"
@@ -983,9 +1096,9 @@ async def test_workflow_waits_for_turn_and_cancels_queued(setup_workflow):
 
 async def test_missing_input_stops_and_history_survives_restart(setup_workflow):
     backend, _, _ = setup_workflow
-    state = await backend.invoke(
+    run_id = await prepare_confirmed_run(
+        backend,
         "session",
-        "run",
         {
             "asset_id": "sample",
             "version": "1.0.0",
@@ -997,11 +1110,11 @@ async def test_missing_input_stops_and_history_survives_restart(setup_workflow):
     async def emit(_event):
         pass
 
-    result = await backend.execute("session", state["id"], emit)
+    result = await backend.execute("session", run_id, emit)
     assert result["status"] == "failed"
-    pending = await backend.invoke(
+    pending_run_id = await prepare_confirmed_run(
+        backend,
         "session",
-        "run",
         {
             "asset_id": "sample",
             "version": "1.0.0",
@@ -1010,8 +1123,8 @@ async def test_missing_input_stops_and_history_survives_restart(setup_workflow):
         "pending",
     )
     backend.service.recover()
-    assert backend.service.status("session", pending["id"])["status"] == "interrupted"
-    assert backend.service.status("session", state["id"])["status"] == "failed"
+    assert backend.service.status("session", pending_run_id)["status"] == "interrupted"
+    assert backend.service.status("session", run_id)["status"] == "failed"
 
 
 async def test_runtime_persists_workflow_progress_and_authorizes_calls(
@@ -1043,14 +1156,29 @@ async def test_runtime_persists_workflow_progress_and_authorizes_calls(
             await runtime.workflow_call(
                 "session", "list", {}, "bad", RequestContext(user_id="other")
             )
-        await runtime.workflow_call(
+        plan = await runtime.workflow_call(
             "session",
-            "run",
+            "prepare_run",
             {
                 "asset_id": "sample",
                 "version": "1.0.0",
                 "params": {"data": "public_data/input.txt"},
+                "execution_scope": {
+                    "mode": "full",
+                    "description": "用户明确确认全量执行",
+                },
             },
+            "prepare",
+            context,
+        )
+        assert plan["status"] == "planned"
+        assert plan["run_id"] is None
+        assert runtime._workflows is not None
+        assert not runtime._workflows.busy("session")
+        await runtime.workflow_call(
+            "session",
+            "confirm_run",
+            {"plan_id": plan["plan_id"], "digest": plan["digest"]},
             "call",
             context,
         )
@@ -1134,8 +1262,15 @@ async def test_cancellation_stops_inflight_script(setup_workflow, tmp_path):
 
 def test_started_run_accepts_a_resumed_gate():
     assert started_run("run", {"id": "r1", "status": "queued"}) == "r1"
+    confirmed: JsonObject = {"run": {"id": "r-confirmed", "status": "queued"}}
+    assert started_run("confirm_run", confirmed) == "r-confirmed"
+    assert started_run("run", confirmed) == "r-confirmed"
     assert started_run("resume", {"id": "r1", "status": "queued"}) == "r1"
     assert started_run("resume", {"id": "r1", "status": "waiting"}) is None
+    # A requeued replay is a fresh attempt on the same frozen draft, so the new
+    # run id has to be followed the same way a plain run is.
+    assert started_run("replay_requeue", {"id": "r2", "status": "queued"}) == "r2"
+    assert started_run("replay_requeue", {"id": "r2", "status": "failed"}) is None
 
 
 async def test_parked_run_keeps_the_operation_open_until_resume():

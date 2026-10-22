@@ -34,23 +34,27 @@ class LabelStudioProjectAction(Action):
     dataset_path: str | None = Field(
         default=None,
         description=(
-            "User storage path. Required for operation='create'. A directory of "
+            "Storage object path, storage/... alias, or absolute Storage mount "
+            "path. Required for operation='create'. A directory of "
             "sample directories for the directory adapters, or one JSON Lines "
             "object for adapter='jsonl' -- a pipeline's own output file is "
-            "imported as written, without being reshaped first."
+            "imported as written, without being reshaped first. A Genome run's "
+            "public_data/workflow-runs/<run-id>/artifacts/*.out JSONL artifact is "
+            "staged into this conversation's Storage before import."
         ),
     )
     label_config_path: str | None = Field(
         default=None,
         description=(
-            "Workspace-relative label_config.xml path. Required for "
+            "label_config.xml in the workspace or Storage (object path, "
+            "storage/... alias, or absolute mount path). Required for "
             "operation='create' and 'update_config'."
         ),
     )
     field_map_path: str | None = Field(
         default=None,
         description=(
-            "Optional workspace-relative JSON path declaring how meta fields and "
+            "Optional workspace or Storage JSON path declaring how meta fields and "
             "image files bind to the label config's controls. Omit to use the "
             "adapter's built-in bindings; declare one to rename a control, bind "
             "an extra or optional image, or pin a coordinate unit. Only for "
@@ -187,6 +191,8 @@ Label Studio keeps whichever URL the import produced and never renews it, but th
 portal serves that URL for as long as the account it names can still act, so the
 images do not go stale on their own. Refreshing keeps task IDs, annotations, and
 predictions, and is safe to run again.
+It resolves Storage aliases and mount paths, validates representative images in
+every slot, and updates only media URLs and their backing paths.
 
 Do not pass user IDs, API tokens, or credentials. Do not call Label Studio REST
 APIs with terminal or HTTP tools; this tool owns server-side auth and format

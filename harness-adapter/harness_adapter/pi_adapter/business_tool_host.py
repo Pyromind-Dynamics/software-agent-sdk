@@ -806,6 +806,26 @@ class PyromindBusinessToolHost:
             if owner == conversation_id:
                 executor.interrupt()
 
+    def cancel_call(self, conversation_id: str, tool_call_id: str) -> dict[str, Any]:
+        executor = self._active_executors.get((conversation_id, tool_call_id))
+        if executor is None:
+            return {
+                "requested": False,
+                "confirmed": False,
+                "detail": "tool call is not active in this conversation",
+            }
+        interrupted = executor.interrupt()
+        confirmed = interrupted is True
+        return {
+            "requested": True,
+            "confirmed": confirmed,
+            "detail": (
+                "tool call interrupt confirmed"
+                if confirmed
+                else "tool call interrupt requested; termination is unconfirmed"
+            ),
+        }
+
     @staticmethod
     def reset_attempt_budget(workspace_root: Path) -> None:
         PiSessionFiles(workspace_root).save_business_state(

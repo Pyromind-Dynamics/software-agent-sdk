@@ -10,6 +10,7 @@ signatures.
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -106,4 +107,11 @@ class PortalMediaSigner:
         expires_in = payload.get("expires_in")
         if isinstance(expires_in, int) and expires_in > 0:
             self._expires_in = expires_in
-        return {path: str(urls[path]) for path in paths}
+        resolved: dict[str, str] = {}
+        for path in paths:
+            url = urljoin(self._portal_base_url + "/", str(urls[path]))
+            parsed = urlsplit(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ConversionError(f"Portal returned an invalid media URL for {path}")
+            resolved[path] = url
+        return resolved
