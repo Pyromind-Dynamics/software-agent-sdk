@@ -86,7 +86,7 @@ def test_build_dataflow_command_structure() -> None:
         image_utils_api_version="1",
     )
     assert "python3 -m venv /tmp/df-venv" in cmd
-    assert "open-dataflow==1.0.11" in cmd
+    assert "open-dataflow==1.0.13" in cmd
     assert "opencv-python-headless==4.10.0.84" in cmd
     assert "source_fingerprint.py" in cmd
     assert "mkdir -p" in cmd

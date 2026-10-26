@@ -28,7 +28,7 @@ def test_three_image_import_preserves_references_without_media_requests(
     )
     slots = ("defect_image", "diff_image", "gt_image")
     sources = {
-        "defect_image": "storage/datasets/pcb/defect.jpg",
+        "defect_image": str(mount / "datasets/pcb/defect.jpg"),
         "diff_image": str(mount / "datasets/pcb/diff.jpg"),
         "gt_image": "/datasets/pcb/gt.jpg",
     }
@@ -87,7 +87,7 @@ def test_three_image_import_preserves_references_without_media_requests(
     action = LabelStudioProjectAction(
         operation="create",
         adapter="jsonl",
-        dataset_path="storage/reviews/badcase.jsonl",
+        dataset_path=str(mount / "reviews/badcase.jsonl"),
         label_config_path=str(mount / "reviews/label_config.xml"),
         field_map_path="/reviews/field_map.json",
     )

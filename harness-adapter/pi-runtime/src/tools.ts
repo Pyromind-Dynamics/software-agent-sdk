@@ -45,9 +45,9 @@ import { createTerminalTool } from "./terminal-tool.js";
 
 const OMITTED_IMAGE_TEXT = "[Image omitted: Pi only accepts inline base64 image data.]";
 const SANDBOX_READ_PATH_SCOPE =
-  "Mounted Storage is addressed as storage/... and is writable there. Conversation files are read from public_data/. Configured skill directories and knowledge are read-only; .agents/skills/ and knowledge/ address their configured resource directories.";
+  "The user Storage mount is addressed by its absolute path and is writable there. Conversation files are read from public_data/. Configured skill directories and knowledge are read-only; .agents/skills/ and knowledge/ address their configured resource directories.";
 const SANDBOX_WRITE_PATH_SCOPE =
-  "Write and edit paths must stay within public_data/ or the mounted Storage under storage/... .";
+  "Write and edit paths must stay within public_data/ or the user Storage mount, addressed by its absolute path.";
 
 export interface BusinessToolConfig {
   name: string;

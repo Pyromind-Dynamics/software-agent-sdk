@@ -17,23 +17,37 @@ from harness_adapter.agentgenome_bridge import (
 )
 
 
-def test_platform_storage_spelling_gains_the_sandbox_alias() -> None:
+MOUNT = "/target-workspace"
+
+
+def test_platform_storage_spelling_gains_the_sandbox_mount() -> None:
     assert (
-        _storage_alias("/datasets/test_100/images")
-        == "storage/datasets/test_100/images"
+        _storage_alias("/datasets/test_100/images", MOUNT)
+        == "/target-workspace/datasets/test_100/images"
     )
     assert (
-        _storage_alias("datasets/test_100/prelabel_manifest.jsonl")
-        == "storage/datasets/test_100/prelabel_manifest.jsonl"
+        _storage_alias("datasets/test_100/prelabel_manifest.jsonl", MOUNT)
+        == "/target-workspace/datasets/test_100/prelabel_manifest.jsonl"
     )
 
 
 def test_sandbox_aliases_are_already_resolvable() -> None:
-    assert _storage_alias("storage/datasets/x.jsonl") is None
-    assert _storage_alias("public_data/label-studio/field_map.json") is None
-    assert _storage_alias(".agents/skills/data-processing/SKILL.md") is None
-    assert _storage_alias("knowledge/nodes/x.md") is None
-    assert _storage_alias("") is None
+    assert _storage_alias("public_data/label-studio/field_map.json", MOUNT) is None
+    assert _storage_alias(".agents/skills/data-processing/SKILL.md", MOUNT) is None
+    assert _storage_alias("knowledge/nodes/x.md", MOUNT) is None
+    assert _storage_alias("", MOUNT) is None
+    # No mount in the local execution plane, so there is nothing to add.
+    assert _storage_alias("/datasets/x.jsonl", None) is None
+
+
+def test_the_removed_storage_prefix_is_not_remapped() -> None:
+    """The alias is gone, so the policy's own removal error must surface.
+
+    Remapping it to the mount here would turn a clear "alias was removed" into a
+    "file not found" somewhere further along.
+    """
+
+    assert _storage_alias("storage/datasets/x.jsonl", MOUNT) is None
 
 
 def test_a_tool_reads_back_the_path_the_graph_declared() -> None:
@@ -65,31 +79,26 @@ def test_run_directory_paths_become_workspace_relative() -> None:
     assert _tool_path("vision", {}, workspace, package) == "vision"
 
 
-def test_a_storage_alias_path_loses_the_alias_for_a_tool() -> None:
-    """`/storage/...` 不是平台对象路径，工具按对象路径查会 not found。
+def test_a_removed_alias_path_is_not_rewritten_for_a_tool() -> None:
+    """The alias is gone, so the bridge must not invent a platform path from it.
 
-    回放把参数解析成 `/storage/datasets/...` 交给 Label Studio，平台报
-    `storage object not found`；去掉别名才是 `/datasets/...`。裸 `storage/...`
-    保持原样，业务工具自己会解析这种拼写。
+    Rewriting `storage/...` here would hide the removal behind a lookup that
+    fails later; leaving it alone lets the tool report the removal itself.
     """
     workspace = "/target-workspace/.pyromind-agent/abc"
     package = "public_data/workflow-runs/run/package"
 
     assert (
-        _tool_path("/storage/datasets/test_100/review.jsonl", {}, workspace, package)
-        == "/datasets/test_100/review.jsonl"
-    )
-    assert (
         _tool_path("storage/datasets/test_100/review.jsonl", {}, workspace, package)
         == "storage/datasets/test_100/review.jsonl"
     )
-    # 已声明的拼写仍然优先。
+    # A path the graph already declared keeps that spelling.
     declared = {
-        "/storage/datasets/test_100/review.jsonl": "datasets/test_100/review.jsonl"
+        "storage/datasets/test_100/review.jsonl": "datasets/test_100/review.jsonl"
     }
     assert (
         _tool_path(
-            "/storage/datasets/test_100/review.jsonl",
+            "storage/datasets/test_100/review.jsonl",
             declared,
             workspace,
             package,
@@ -229,11 +238,13 @@ class FakePlane:
             if self.scope_error_for and path.startswith(self.scope_error_for):
                 raise RuntimeError(
                     "request_failed: PATH_SCOPE_ERROR: read paths must stay within "
-                    "public_data/, storage/, configured skill directories, "
-                    "or knowledge/"
+                    "public_data/, the user Storage mount, configured skill "
+                    "directories, or knowledge/"
                 )
             self.resolved.append(path)
-            return {"path": f"/target-workspace/{path}"}
+            return {
+                "path": path if path.startswith("/") else f"/target-workspace/{path}"
+            }
         if method == "execution.run":
             self.commands.append(str(payload["command"]))
             self.runs.append(dict(payload))
@@ -246,6 +257,7 @@ def sample(plane: FakePlane, path: str) -> bytes:
 
     async def call() -> bytes:
         host = ExecutionHost(plane.request, lambda *_: None)
+        host.workspace = "/target-workspace/.pyromind-agent/conv"
         return await asyncio.to_thread(host.head, path, 64)
 
     return asyncio.run(call())
@@ -257,11 +269,8 @@ def test_head_retries_the_storage_spelling_a_tool_declared() -> None:
     )
 
     assert sample(plane, "datasets/test_100/manifest.jsonl") == b"{}"
-    assert plane.resolved == ["storage/datasets/test_100/manifest.jsonl"]
-    assert (
-        "/target-workspace/storage/datasets/test_100/manifest.jsonl"
-        in plane.commands[0]
-    )
+    assert plane.resolved == ["/target-workspace/datasets/test_100/manifest.jsonl"]
+    assert "/target-workspace/datasets/test_100/manifest.jsonl" in plane.commands[0]
 
 
 def test_head_reports_a_directory_instead_of_reading_it() -> None:
@@ -303,6 +312,8 @@ class RecordingPlane:
         path = str(payload["path"])
         self.calls.append((method, path))
         if method == "execution.resolve":
+            if path.startswith("/"):
+                return {"path": path}
             if path.startswith("storage/"):
                 return {"path": f"/target-workspace/{path.removeprefix('storage/')}"}
             return {"path": f"/target-workspace/.pyromind-agent/conv/{path}"}
@@ -328,6 +339,8 @@ class SandboxShapePlane:
         if method == "execution.resolve":
             path = str(payload["path"])
             self.resolved.append(path)
+            if path.startswith("/"):
+                return {"path": path}
             if path.startswith("storage/"):
                 return {"path": f"{self.mount}/{path.removeprefix('storage/')}"}
             return {"path": f"{self.workspace}/{path}"}
@@ -391,8 +404,8 @@ def test_metadata_reports_a_failed_probe_instead_of_claiming_the_file_is_missing
         asyncio.run(call())
 
 
-def test_an_artifact_pinned_beside_a_storage_input_travels_under_the_alias() -> None:
-    """The path policy admits Storage as `storage/...`, never as a mount path."""
+def test_an_artifact_pinned_beside_a_storage_input_travels_under_the_mount() -> None:
+    """The path policy admits Storage by its mount path, as the file already is."""
     plane = RecordingPlane()
     pinned = "/target-workspace/datasets/m/manifest_10.jsonl"
 
@@ -407,12 +420,12 @@ def test_an_artifact_pinned_beside_a_storage_input_travels_under_the_alias() -> 
 
     path, text = asyncio.run(call())
     assert path == pinned
-    assert ("execution.write", "storage/datasets/m/manifest_10.jsonl") in plane.calls
-    assert ("execution.read", "storage/datasets/m/manifest_10.jsonl") in plane.calls
+    assert ("execution.write", pinned) in plane.calls
+    assert ("execution.read", pinned) in plane.calls
     assert text == "row\n"
 
 
-def test_a_pinned_artifact_is_sampled_under_the_storage_alias() -> None:
+def test_a_pinned_artifact_is_sampled_under_the_mount() -> None:
     """Sampling and preflights resolve the mount path the same way reads do."""
     plane = RecordingPlane()
     pinned = "/target-workspace/datasets/m/manifest_10.jsonl"
@@ -424,10 +437,7 @@ def test_a_pinned_artifact_is_sampled_under_the_storage_alias() -> None:
         return await asyncio.to_thread(host.head, pinned, 64)
 
     assert asyncio.run(call()) == b"row\n"
-    assert plane.calls[0] == (
-        "execution.resolve",
-        "storage/datasets/m/manifest_10.jsonl",
-    )
+    assert plane.calls[0] == ("execution.resolve", pinned)
     assert pinned in plane.commands[0]
 
 
@@ -824,20 +834,25 @@ def test_metadata_many_falls_back_to_the_plane_when_the_host_has_no_file(
     "missing" without asking the plane — which turned every Storage input into a
     blocking "输入不存在" during a plan review.
     """
-    plane = LocalPlane(tmp_path / "plane")
-    data = plane.root / "datasets/data.csv"
+    mount = tmp_path / "mount"
+    plane = LocalPlane(mount)
+    data = mount / "datasets/data.csv"
     data.parent.mkdir(parents=True)
     data.write_text("question\nhello\n")
-    conversation = tmp_path / "conversation"
-    conversation.mkdir()
+    conversation = mount / ".pyromind-agent" / "conversation"
+    conversation.mkdir(parents=True)
 
     async def call() -> dict[str, Any]:
         host = ExecutionHost(plane.request, lambda *_: None, conversation)
+        # The third argument is the host-local root; the workspace is what tells
+        # the bridge where Storage is mounted.
+        host.workspace = str(conversation)
         return await asyncio.to_thread(
             host.metadata_many,
-            ["datasets/data.csv", "storage/datasets/data.csv"],
+            # The platform spelling of the file, and one that really is missing.
+            ["/datasets/data.csv", "/datasets/missing.csv"],
         )
 
     answers = asyncio.run(call())
-    assert answers["datasets/data.csv"]["exists"] is True
-    assert answers["storage/datasets/data.csv"]["exists"] is True
+    assert answers["/datasets/data.csv"]["exists"] is True
+    assert answers["/datasets/missing.csv"]["exists"] is False

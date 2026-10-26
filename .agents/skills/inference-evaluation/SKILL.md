@@ -26,7 +26,7 @@ parse_record 应支持 context.source=test，标识必须与 dataset_config 一�
 
 ## 输入与评价标准
 
-用 `read`/`terminal` 直读 `storage/` 下的测试集 JSONL，确认输入字段、GT、
+用 `read`/`terminal` 直读 `/target-workspace` 下的测试集 JSONL，确认输入字段、GT、
 媒体路径和代表性样本。媒体相对路径基于 JSONL 所在目录；不要重复设置数据集
 目录为 `media_base_dir`。
 读取 [输入契约](references/input-contract.md) 和 [Rubric 编写](references/rubric-authoring.md)，

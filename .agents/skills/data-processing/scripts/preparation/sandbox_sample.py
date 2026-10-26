@@ -62,7 +62,7 @@ _DATAFLOW_SUFFIXES = frozenset(
 )
 _SNIFF_BYTES = 65536
 
-DATAFLOW_VERSION = "1.0.11"
+DATAFLOW_VERSION = "1.0.13"
 DATAFLOW_RUNTIME_PACKAGES = (
     f"open-dataflow=={DATAFLOW_VERSION}",
     "numpy==1.26.4",
@@ -872,6 +872,17 @@ def _layout_root(cwd: Path) -> Path:
     return cwd
 
 
+def _storage_root(workspace_root: Path) -> Path | None:
+    """The user Storage mount, when this workspace sits inside one.
+
+    The layout is ``<mount>/.pyromind-agent/<conversation>``, so a workspace
+    whose parent is the agent directory has Storage one level further up. Any
+    other layout is a local run with no mount.
+    """
+    agent_area = workspace_root.parent
+    return agent_area.parent if agent_area.name == ".pyromind-agent" else None
+
+
 def _is_json_document(line: str) -> bool:
     try:
         json.loads(line)
@@ -960,9 +971,22 @@ def cli_spec(config: dict[str, Any], workspace: Path) -> dict[str, Any]:
 
     def path(value: str, output: bool = False) -> Path:
         p = (cwd / value).resolve()
-        storage = (root / "storage").resolve()
-        if not p.is_relative_to(public) and (output or not p.is_relative_to(storage)):
-            raise ValueError("paths must be in public_data/ or read-only storage/")
+        in_public = p.is_relative_to(public)
+        storage = _storage_root(root)
+        if storage is None:
+            in_storage = False
+        else:
+            # Sibling workspaces and conversation state live inside the mount
+            # but are not Storage: only this conversation's public_data/ is
+            # exposed from the agent area.
+            in_agent_area = (
+                p.is_relative_to(storage / ".pyromind-agent") and not in_public
+            )
+            in_storage = p.is_relative_to(storage) and not in_agent_area
+        if not in_public and (output or not in_storage):
+            raise ValueError(
+                "paths must be in public_data/, or read-only under the Storage mount"
+            )
         return p
 
     pipeline = path(config["pipeline_path"], True)
@@ -1125,7 +1149,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--input",
-        help="pipeline's first argument, read from storage/ or public_data/",
+        help=("pipeline's first argument, read from the Storage mount or public_data/"),
     )
     parser.add_argument(
         "--output",

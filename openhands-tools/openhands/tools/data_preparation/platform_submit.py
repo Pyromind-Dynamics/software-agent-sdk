@@ -71,8 +71,11 @@ from openhands.tools.utils.dataflow_config import (
     ENV_DF_API_URL,
     ENV_DF_MODEL_NAME,
 )
+from openhands.tools.utils.storage_paths import (
+    StoragePathError,
+    to_tool_storage_path,
+)
 from openhands.tools.utils.workspace_staging import (
-    STORAGE_ALIAS,
     WorkspaceStagingError,
     is_remote_workspace,
     resolve_workspace_path,
@@ -1506,9 +1509,10 @@ class _SubmissionFiles:
         except WorkspaceStagingError as exc:
             raise ValueError(str(exc)) from exc
         relative, from_storage = resolve_workspace_path(self._workspace, path)
+        mount = getattr(self._workspace, "storage_path", None)
         display = (
-            f"{STORAGE_ALIAS}/{relative.as_posix()}"
-            if from_storage
+            f"{str(mount).rstrip('/')}/{relative.as_posix()}"
+            if from_storage and mount
             else relative.as_posix()
         )
         return staged, display
@@ -1640,15 +1644,10 @@ def _resolve_execution_target(
 
 
 def _normalize_storage_path(value: str, field_name: str) -> str:
-    raw = value.strip()
-    if not raw:
-        raise ValueError(f"{field_name} must be a non-empty storage path.")
-    if any(ord(character) < 32 for character in raw):
-        raise ValueError(f"{field_name} contains control characters.")
-    parts = [part for part in raw.split("/") if part not in {"", "."}]
-    if not parts or ".." in parts:
-        raise ValueError(f"{field_name} must not be the root or contain '..'.")
-    return "/" + "/".join(parts)
+    try:
+        return to_tool_storage_path(value, field=field_name)
+    except StoragePathError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _pod_path(storage_path: str) -> str:

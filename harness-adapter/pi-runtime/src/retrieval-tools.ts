@@ -80,12 +80,24 @@ export function createRetrievalTools(access: ExecutionAccess, mirror?: SandboxRe
   }));
 }
 
+
+/** The Storage mount a conversation workspace sits inside, when it has one. */
+function storageMount(cwd: string | undefined): string | undefined {
+  const marker = "/.pyromind-agent/";
+  const index = cwd ? cwd.indexOf(marker) : -1;
+  return index > 0 && cwd ? cwd.slice(0, index) : undefined;
+}
+
 async function runRetrieval(access: ExecutionAccess, mirror: SandboxReadMirror | undefined, args: Record<string, unknown>, kind: string, signal?: AbortSignal): Promise<{ lines: string[]; truncated: boolean }> {
   const label = typeof args.path === "string" ? args.path : "public_data";
   const host = mirror?.resolveAlias(label);
   const root = host ? await realpath(host) : await access.resolvePath(label, "read");
   if (host && !await mirror!.containsCanonical(root)) throw new Error("search resource symlink escapes its configured root");
-  const allowedRoots = host ? [root] : (await Promise.all(["public_data", "knowledge", ".agents/skills", "storage"].map(async (path) => {
+  // The conversation workspace and the Storage mount it sits inside, plus the
+  // read-only resource roots. The removed `storage/` alias is not a scope.
+  const scopes = ["public_data", "knowledge", ".agents/skills", storageMount(access.cwd)]
+    .filter((path): path is string => typeof path === "string");
+  const allowedRoots = host ? [root] : (await Promise.all(scopes.map(async (path) => {
     try { return await access.resolvePath(path, "read"); } catch { return undefined; }
   }))).filter((path): path is string => path !== undefined);
   const query = JSON.stringify({ ...args, kind, label, root, allowedRoots, limit: Math.min(200, Math.max(1, Number(args.limit ?? 100))) });

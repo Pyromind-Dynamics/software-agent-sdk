@@ -1027,14 +1027,16 @@ async def test_sandbox_session_prompt_steers_storage_reads(
             item["name"] for item in captured["tools"]
         }
         assert "df_run_pipeline" not in prompt
-        assert "Python scripts through terminal" in prompt
-        assert "storage/ is writable" in prompt
+        assert "Read data and run scripts" in prompt
+        assert "Storage is writable" in prompt
         assert "Every dataset this session" in prompt
         assert "Platform task state comes from the platform tools" in prompt
         assert "Do not search the filesystem or" in prompt
-        assert "Use the absolute form when a command has changed directory." in prompt
-        assert "so run storage/<path> instead" in prompt
+        assert f"so use {DEFAULT_MOUNT_PATH}/<path> instead" in prompt
         assert "/workspace/<path> does not resolve" in prompt
+        # The removed alias must not come back through the prompt.
+        assert "storage/ is" not in prompt
+        assert "storage/<path>" not in prompt
         assert DEFAULT_MOUNT_PATH in prompt
         assert (
             f"{DEFAULT_MOUNT_PATH}/.pyromind-agent/sandbox-prompt/.agents/skills"

@@ -37,6 +37,10 @@ from openhands.tools.pyromind_dataset.definition import (
     upload_local_file_to_pyromind,
 )
 from openhands.tools.utils.conversation_dirs import conversation_state_dir
+from openhands.tools.utils.storage_paths import (
+    StoragePathError,
+    to_tool_storage_path,
+)
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
     create_workflow_api_client,
@@ -593,15 +597,10 @@ def _resolve_execution_target(
 
 
 def _normalize_storage_path(value: str, field_name: str) -> str:
-    raw = value.strip()
-    if not raw:
-        raise ValueError(f"{field_name} must be a non-empty storage path.")
-    if any(ord(character) < 32 for character in raw):
-        raise ValueError(f"{field_name} contains control characters.")
-    parts = [part for part in raw.split("/") if part not in {"", "."}]
-    if not parts or ".." in parts:
-        raise ValueError(f"{field_name} must not be the root or contain '..'.")
-    return "/" + "/".join(parts)
+    try:
+        return to_tool_storage_path(value, field=field_name)
+    except StoragePathError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _pod_path(storage_path: str) -> str:

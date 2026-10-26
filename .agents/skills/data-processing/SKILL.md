@@ -11,8 +11,8 @@ license: MIT
 
 数据处理任务统一从本 skill 进入：先按路由表选定处理范式并读取对应 playbook
 （范式内按 case 路由表读取场景 case 文档），再按通用 SOP 执行。用户 Storage
-已挂载为 `storage/`，优先用 `read`/`terminal` 直接查看；`sandbox_sample.py` 的
-`--input` 直接接受 `storage/...`，不需要先物化到会话工作区。参数形态与 `--config`
+已挂载为 `/target-workspace`，优先用 `read`/`terminal` 直接查看；`sandbox_sample.py` 的
+`--input` 直接接受 `/target-workspace/...`，不需要先物化到会话工作区。参数形态与 `--config`
 的使用条件见 `references/terminal-cli.md`。
 
 领域参考（如 PCB AVI/AOI）不内联在本文件：由对应 case 文档按需引入，并在那里
@@ -43,9 +43,9 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
 
 ## 通用 SOP（所有场景共享的控制面骨架）
 
-1. **探查**：直接用 `read`/`terminal` 查看 `storage/...`。目录条目很多时用
+1. **探查**：直接用 `read`/`terminal` 查看 `/target-workspace/...`。目录条目很多时用
    `ls`/`find`/`grep` 在目标目录内定位，不要反复整目录翻页；每个数据集的结构
-   确认一次完成（列表 + schema + 样例）。数据集一律 `storage/<path>`，skill
+   确认一次完成（列表 + schema + 样例）。数据集一律 `/target-workspace/<path>`，skill
    脚本一律 `.agents/skills/<skill>/...`（terminal 每次从工作区根开始）；禁止
    `find /` 或扫描 Storage 挂载——挂载里有很多会话目录，全盘扫描会跑满命令超时。
 2. **选型**：按上表读取范式 playbook；范式内按 case 路由表只读取当前场景
@@ -53,8 +53,8 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
 3. **小样执行**：Agent 按真实 schema 写 Python Pipeline，用 `sandbox_sample.py`
    直接传参（`--pipeline/--input/--output/--model-profile/--output-schema/--timeout`，
    详见 `references/terminal-cli.md`），只有 flags 覆盖不到的字段才用 `--config`。
-   两种方式都完整处理传入的输入（可直接传 `storage/...`），不负责抽样；
-   清洗/合成小样由所选输入和计划控制，精确分布统计可直接统计 `storage/`
+   两种方式都完整处理传入的输入（可直接传 `/target-workspace/...`），不负责抽样；
+   清洗/合成小样由所选输入和计划控制，精确分布统计可直接统计 `/target-workspace`
    全量文件。执行发生在会话自己的平台沙箱内：Pipeline、输入和产物都不离开
    沙箱，只有日志尾部与最多 3 条样例记录回到对话。
    图片 Pipeline（`model_profile="vision"`）按相对 manifest 的路径读图：manifest
@@ -76,7 +76,7 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
    已有标签的确定性全量统计不设人工门禁，且模型调用必须为零。
 5. **全量**：需要平台执行时统一用 `df_submit_pipeline`；提交前先按
    llm-pipeline playbook 的「平台全量输入」确认 `input_path` 已指向 Storage 输入，
-   工作区文件直接写入 `storage/<dir>/` 落位（Storage 已挂载且可写，对应
+   工作区文件直接写入 `/target-workspace/<dir>/` 落位（Storage 已挂载且可写，对应
    Storage 路径为 `/<dir>/<name>`）。DataFlow/EDP 平台任务（含具身
    case 的逐 episode 执行）等待终态回调，运行中用 df_check_progress 观察。
    需介入平台任务时先 df_stop_task 停任务。

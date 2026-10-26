@@ -3,7 +3,7 @@ name: label-studio
 description: >-
   使用 label_studio_project 工具将用户数据集创建为 Label Studio
   标注项目。用户要求创建标注项目、标注数据、打标、review 图片质检
-  结果时使用。需要先看清 `storage/` 里的数据结构再生成 XML。
+  结果时使用。需要先看清 `/target-workspace` 里的数据结构再生成 XML。
 ---
 
 # Label Studio 标注集成
@@ -60,7 +60,7 @@ Label Studio 本身支持的控件（画笔、多边形、关键点）转换器�
 
 ## 控制面 SOP
 
-1. **探查**：用 `read` 读 `storage/<dataset_path>` 先看清数据结构
+1. **探查**：用 `read` 读 `/target-workspace/<dataset_path>` 先看清数据结构
    （样本目录 + meta 字段，或 JSONL 行内字段和图片路径）；一次看完多个样本，
    不要一个样本调一次。
 2. **路由**：按上表命中一条 reference 并读取；不命中则进入自定义绑定分支。
@@ -79,8 +79,8 @@ Label Studio 本身支持的控件（画笔、多边形、关键点）转换器�
 5. **创建**：`label_studio_project(operation="create", ...)`。
 6. **交付**：给项目名、导入样本数，和一个能点的标注入口（格式见下）。
 
-路径契约：dataset、XML、field map 支持 `storage/...` 别名、
-实际 Storage 挂载路径和规范 `/datasets/...` 对象路径。XML/field map 也可用
+路径契约：dataset、XML、field map 支持实际 Storage 挂载路径
+（`/target-workspace/...`）和规范 `/datasets/...` 对象路径。XML/field map 也可用
 工作区相对路径；保留上游图片字段，通过 field map 声明绑定。图片字段保持
 Label Studio 可识别的原始格式，由 Label Studio 侧完成链接转换。
 

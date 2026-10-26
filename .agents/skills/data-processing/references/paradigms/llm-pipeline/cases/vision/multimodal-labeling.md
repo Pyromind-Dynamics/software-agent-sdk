@@ -8,7 +8,7 @@ Client、Base64、重试或 Checkpoint。完整字段见
 
 ## 输入
 
-图片原始数据集格式不可预设。直接用 `read`/`terminal` 列 `storage/` 目录、查看
+图片原始数据集格式不可预设。直接用 `read`/`terminal` 列 `/target-workspace` 目录、查看
 实际文件和 metadata 判断结构：
 
 - 目录形状只是弱信号；查看实际文件和 metadata 后再决定 Prompt/字段映射。
@@ -18,7 +18,7 @@ Client、Base64、重试或 Checkpoint。完整字段见
   挑选样本目录，再按选中范围建 Manifest。
 - 目录形状只是弱信号，不是 Schema；Pipeline 仍以真实字段为准。
 
-小样验证输入直接用 `storage/...` 目录或 Manifest。默认字段：
+小样验证输入直接用 `/target-workspace/...` 目录或 Manifest。默认字段：
 
 ```json
 {
@@ -61,7 +61,7 @@ DataFlow checkpoint 决定已提交 batch；输出先写原子分片，再合并
 用户确认后使用 `df_submit_pipeline(mode="full")`；提交前按 playbook 的
 [平台全量输入](../../playbook.md#平台全量输入)把 Manifest 与它引用的图片落到同一
 Storage 目录树（目录输入按直接子项划分样本，多图样本用 Manifest）。平台产物在
-Kafka callback 后直接读 `storage/`。
+Kafka callback 后直接读 `/target-workspace`。
 
 ## 输出
 

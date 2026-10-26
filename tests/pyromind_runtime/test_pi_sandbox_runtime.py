@@ -16,9 +16,9 @@ from harness_adapter.pi_adapter.sandbox_runtime import (
     DEFAULT_CPU,
     DEFAULT_MEMORY,
     DEFAULT_MOUNT_PATH,
+    LEGACY_STORAGE_ALIAS,
     PYROMIND_AGENT_RESOURCES_ROOT,
     PYROMIND_AGENT_STORAGE_ROOT,
-    STORAGE_ALIAS,
     STORAGE_HOST_PATH,
     SandboxExecutionManager,
     SandboxSettings,
@@ -339,9 +339,10 @@ def test_ensure_creates_and_prepares_a_sandbox(
     script = _uploaded_script(client)
     assert f"mkdir -p {endpoint['workspace_path']}" in script
     assert f"mkdir -p {endpoint['workspace_path']}/public_data" in script
-    assert (
-        f"ln -s {DEFAULT_MOUNT_PATH} {endpoint['workspace_path']}/{STORAGE_ALIAS}"
-    ) in script
+    # Storage is addressed by its mount path, so the old symlink must be gone:
+    # the script only clears one an older runtime left behind.
+    assert "ln -s" not in script
+    assert (f"if [ -L {endpoint['workspace_path']}/{LEGACY_STORAGE_ALIAS} ]") in script
     record = files.load_sandbox()
     assert record is not None
     assert "api_key" not in json.dumps(record)
@@ -434,7 +435,7 @@ def test_ensure_refreshes_a_cached_endpoint_bundle_on_request(
     assert refreshed["sandbox_id"] == first["sandbox_id"] == "sbx-1"
 
 
-def test_ensure_upgrades_a_running_sandbox_to_the_storage_alias_layout(
+def test_ensure_clears_the_legacy_storage_alias_from_a_running_sandbox(
     tmp_path: Path, files: PiSessionFiles, monkeypatch
 ) -> None:
     files.save_sandbox(
@@ -457,7 +458,9 @@ def test_ensure_upgrades_a_running_sandbox_to_the_storage_alias_layout(
 
     assert endpoint["storage_path"] == DEFAULT_MOUNT_PATH
     assert len(commands) == 1
-    assert "ln -s" in _uploaded_script(client)
+    script = _uploaded_script(client)
+    assert "ln -s" not in script
+    assert (f"if [ -L {endpoint['workspace_path']}/{LEGACY_STORAGE_ALIAS} ]") in script
     record = files.load_sandbox()
     assert record is not None
     assert record["workspace_version"] == _WORKSPACE_LAYOUT_VERSION
@@ -939,7 +942,7 @@ def test_ensure_applies_pending_fork_from_materialized_source(
 
     scripts = _uploaded_scripts(client)
     assert any("cp -a" in script for script in scripts)
-    assert "ln -s" in scripts[-1]
+    assert "ln -s" not in scripts[-1]
     assert (
         client.files[
             f"{DEFAULT_MOUNT_PATH}{PYROMIND_AGENT_STORAGE_ROOT}/conv-1"
