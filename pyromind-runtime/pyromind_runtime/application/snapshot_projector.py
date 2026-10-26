@@ -22,6 +22,7 @@ from pyromind_runtime.domain.snapshot import (
     UsageState,
     WorkflowState,
 )
+from pyromind_runtime.domain.user_input import PendingUserInput
 
 
 _CONTENT = TypeAdapter(tuple[ContentBlock, ...])
@@ -31,6 +32,7 @@ _STATUSES = frozenset(
         "running",
         "paused",
         "waiting_for_confirmation",
+        "waiting_for_input",
         "waiting_for_external_task",
         "finished",
         "error",
@@ -39,10 +41,14 @@ _STATUSES = frozenset(
         "closed",
     }
 )
+# Background task completion events must not overwrite terminal states with idle or
+# running.
+_SETTLED_STATUSES = frozenset({"paused", "error", "stuck", "deleting", "closed"})
 _MessageRole = Literal["user", "assistant", "system"]
 _OperationCategory = Literal["tool", "subagent", "observation"]
 _CompactionStatus = Literal["started", "completed", "skipped", "failed"]
 _NoticeSeverity = Literal["info", "warning", "error"]
+_InputOutcome = Literal["answered", "cancelled", "interrupted"]
 
 
 class SnapshotProjectionError(RuntimeError):
@@ -106,12 +112,22 @@ class SnapshotProjector:
             and event.run_id != snapshot.active_run_id
         ):
             return snapshot
+        if snapshot.pending_inputs:
+            waiting_run = snapshot.active_run_id or snapshot.pending_inputs[0].run_id
+            if event.run_id is not None and event.run_id != waiting_run:
+                return snapshot
+            if status in {"running", "idle", "finished"}:
+                status = "waiting_for_input"
         if snapshot.pending_permissions and status in {"idle", "finished"}:
             status = "waiting_for_confirmation"
         return snapshot.model_copy(
             update={
                 "status": status,
-                "active_run_id": event.run_id if status == "running" else None,
+                "active_run_id": (
+                    event.run_id or snapshot.active_run_id
+                    if status in {"running", "waiting_for_input"}
+                    else None
+                ),
             }
         )
 
@@ -252,6 +268,17 @@ class SnapshotProjector:
             )
         if "details" in event.payload:
             update["details"] = event.payload["details"]
+        if item.name == "ask_user" and isinstance(item.details, dict):
+            user_input = item.details.get("user_input")
+            if isinstance(user_input, dict) and user_input.get("status") in {
+                "cancelled",
+                "interrupted",
+            }:
+                details = update.get("details", item.details)
+                update["details"] = {
+                    **(details if isinstance(details, dict) else {}),
+                    "user_input": user_input,
+                }
         if "error_code" in event.payload:
             error_code = event.payload["error_code"]
             update["error_code"] = error_code if isinstance(error_code, str) else None
@@ -269,9 +296,16 @@ class SnapshotProjector:
             for item in snapshot.pending_permissions
             if item.permission_id != permission.permission_id
         )
+        # Input and permission requests are independent; show input waiting when
+        # present.
+        status = (
+            "waiting_for_input"
+            if snapshot.pending_inputs
+            else "waiting_for_confirmation"
+        )
         return snapshot.model_copy(
             update={
-                "status": "waiting_for_confirmation",
+                "status": status,
                 "pending_permissions": (*pending, permission),
             }
         )
@@ -285,16 +319,134 @@ class SnapshotProjector:
             for item in snapshot.pending_permissions
             if item.permission_id != permission_id
         )
+        if snapshot.pending_inputs:
+            status = "waiting_for_input"
+        elif pending:
+            status = "waiting_for_confirmation"
+        else:
+            status = "idle" if permission_id.startswith("workflow-run:") else "running"
+        return snapshot.model_copy(
+            update={"pending_permissions": pending, "status": status}
+        )
+
+    def _on_input_requested(
+        self, snapshot: ConversationSnapshot, event: ProductEvent
+    ) -> ConversationSnapshot:
+        pending = PendingUserInput.model_validate(
+            {**event.payload, "run_id": event.run_id}
+        )
+        if (
+            snapshot.active_run_id is not None
+            and pending.run_id != snapshot.active_run_id
+        ):
+            return snapshot
+        if any(
+            item.request_id == pending.request_id for item in snapshot.pending_inputs
+        ):
+            return snapshot
+        # Keep the owning active_run_id while waiting; the run is active and awaiting
+        # user input.
         return snapshot.model_copy(
             update={
-                "pending_permissions": pending,
-                "status": "waiting_for_confirmation"
-                if pending
-                else "idle"
-                if permission_id.startswith("workflow-run:")
-                else "running",
+                "pending_inputs": (*snapshot.pending_inputs, pending),
+                "status": "waiting_for_input",
+                "active_run_id": pending.run_id,
             }
         )
+
+    def _on_input_resolved(
+        self, snapshot: ConversationSnapshot, event: ProductEvent
+    ) -> ConversationSnapshot:
+        request_id = self._string(event.payload, "request_id")
+        outcome = self._string(event.payload, "outcome")
+        if outcome not in {"answered", "cancelled", "interrupted"}:
+            return self._notice(
+                snapshot,
+                event,
+                code="invalid_input_outcome",
+                message=f"Invalid input resolution outcome: {outcome}",
+            )
+        remaining = tuple(
+            item for item in snapshot.pending_inputs if item.request_id != request_id
+        )
+        resolved = next(
+            (item for item in snapshot.pending_inputs if item.request_id == request_id),
+            None,
+        )
+        if resolved is None or (
+            event.run_id is not None and event.run_id != resolved.run_id
+        ):
+            return snapshot
+        run_id = event.run_id or (resolved.run_id if resolved is not None else None)
+        if remaining:
+            status: str = "waiting_for_input"
+            update: dict[str, object] = {"pending_inputs": remaining, "status": status}
+        elif snapshot.pending_permissions:
+            update = {"pending_inputs": remaining, "status": "waiting_for_confirmation"}
+        elif outcome == "answered":
+            update = {
+                "pending_inputs": remaining,
+                "status": "running",
+                "active_run_id": run_id,
+            }
+        elif outcome == "cancelled":
+            # Persist cancellation and suspension together; the run-end event confirms
+            # paused after abort.
+            update = {
+                "pending_inputs": remaining,
+                "status": "paused",
+                "active_run_id": None,
+            }
+        else:
+            update = {
+                "pending_inputs": remaining,
+                "status": "paused",
+                "active_run_id": None,
+            }
+        if outcome != "answered":
+            # Persist the gate with the resolution so a crash before the
+            # execution.policy.updated event cannot reopen automatic turns.
+            update["automatic_turns_suspended"] = True
+            operation = (
+                self._find(snapshot, "operation", resolved.operation_id)
+                if resolved.operation_id is not None
+                else None
+            )
+            if (
+                isinstance(operation, TimelineOperation)
+                and operation.name == "ask_user"
+            ):
+                details = (
+                    operation.details if isinstance(operation.details, dict) else {}
+                )
+                snapshot = self._replace(
+                    snapshot,
+                    operation.model_copy(
+                        update={
+                            "details": {
+                                **details,
+                                "user_input": {
+                                    "request_id": request_id,
+                                    "status": outcome,
+                                },
+                            }
+                        }
+                    ),
+                )
+        return snapshot.model_copy(update=update)
+
+    def _on_execution_policy_updated(
+        self, snapshot: ConversationSnapshot, event: ProductEvent
+    ) -> ConversationSnapshot:
+        suspended = event.payload.get("automatic_turns_suspended")
+        if not isinstance(suspended, bool):
+            return self._notice(
+                snapshot,
+                event,
+                code="invalid_execution_policy",
+                message="automatic_turns_suspended must be a boolean",
+            )
+        return snapshot.model_copy(update={"automatic_turns_suspended": suspended})
 
     def _on_plan_updated(
         self, snapshot: ConversationSnapshot, event: ProductEvent
@@ -401,13 +553,13 @@ class SnapshotProjector:
             for existing in snapshot.external_tasks
             if existing.task_id != task.task_id
         )
+        status = snapshot.status
+        if not self._background_status_locked(snapshot) and (
+            task.kind != "historical_experience"
+        ):
+            status = "waiting_for_external_task"
         return snapshot.model_copy(
-            update={
-                "external_tasks": (*tasks, task),
-                "status": snapshot.status
-                if task.kind == "historical_experience"
-                else "waiting_for_external_task",
-            }
+            update={"external_tasks": (*tasks, task), "status": status}
         )
 
     def _on_external_task_updated(
@@ -421,11 +573,22 @@ class SnapshotProjector:
         updated = self._update_external_task(snapshot, event)
         if event.payload.get("kind") == "historical_experience":
             return updated
+        if self._background_status_locked(updated):
+            return updated
         running = any(
             task.status in {"pending", "running"} for task in updated.external_tasks
         )
         return updated.model_copy(
             update={"status": "waiting_for_external_task" if running else "idle"}
+        )
+
+    @staticmethod
+    def _background_status_locked(snapshot: ConversationSnapshot) -> bool:
+        """Keep paused, settled, and input-waiting states during background updates."""
+        return (
+            snapshot.status in _SETTLED_STATUSES
+            or snapshot.status == "waiting_for_input"
+            or bool(snapshot.pending_inputs)
         )
 
     def _update_external_task(

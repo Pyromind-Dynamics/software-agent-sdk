@@ -8,16 +8,21 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from pydantic import Field, TypeAdapter, ValidationError
+from pydantic import Field, TypeAdapter, ValidationError, model_serializer
 
 from pyromind_runtime.application.snapshot_projector import SnapshotProjector
 from pyromind_runtime.domain.base import ContractModel
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
-from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
+from pyromind_runtime.domain.commands import (
+    CommandReceipt,
+    InputResponseCommand,
+    ProductCommand,
+)
 from pyromind_runtime.domain.evaluation import EvaluationCommitState
 from pyromind_runtime.domain.events import ProductEvent, WorkflowRunState
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
+from pyromind_runtime.domain.user_input import UserInputResolution
 from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
 
 
@@ -55,10 +60,29 @@ class _Metadata(ContractModel):
     last_sequence: int = Field(default=0, ge=0)
 
 
+class CommandIntent(ContractModel):
+    """Recoverable description of a claimed command.
+
+    The ledger records fingerprints and receipts only; the intent carries the
+    minimum needed to reconcile input-response receipts after a crash.
+    """
+
+    type: str = Field(min_length=1)
+    request_id: str | None = None
+
+
 class _StoredCommand(ContractModel):
     command_id: str
     fingerprint: str
     receipt: CommandReceipt
+    intent: CommandIntent | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_intent(self, handler):
+        data = handler(self)
+        if self.intent is None:
+            data.pop("intent", None)
+        return data
 
 
 class FileProductStore:
@@ -73,6 +97,7 @@ class FileProductStore:
         self.commands_path = self.directory / "commands.jsonl"
         self.lock_path = self.directory / ".lock"
         self._thread_lock = threading.RLock()
+        self._lock_depth = threading.local()
         self._projector = SnapshotProjector()
 
     def create(
@@ -384,6 +409,9 @@ class FileProductStore:
 
     def claim_command(self, command: ProductCommand) -> tuple[CommandReceipt, bool]:
         fingerprint = self._fingerprint(command)
+        intent = None
+        if isinstance(command, InputResponseCommand):
+            intent = CommandIntent(type="input_response", request_id=command.request_id)
         with self._lock():
             commands = self._load_commands(repair_tail=True)
             existing = commands.get(command.command_id)
@@ -401,9 +429,64 @@ class FileProductStore:
                     command_id=command.command_id,
                     fingerprint=fingerprint,
                     receipt=receipt,
+                    intent=intent,
                 ).model_dump_json(),
             )
             return receipt, True
+
+    def load_input_command_receipts(
+        self,
+    ) -> dict[str, tuple[CommandReceipt, str | None]]:
+        """command_id -> (receipt, request_id) for every input-response command."""
+        with self._lock():
+            commands = self._load_commands(repair_tail=True)
+            return {
+                record.command_id: (
+                    record.receipt,
+                    record.intent.request_id if record.intent is not None else None,
+                )
+                for record in commands.values()
+                if record.intent is not None and record.intent.type == "input_response"
+            }
+
+    def resolve_pending_input(
+        self, resolution: UserInputResolution
+    ) -> tuple[ProductEvent | None, ConversationSnapshot]:
+        """Append one input resolution if its request is still pending.
+
+        Runs under the store lock so the pending check and the append are one
+        step: exactly one resolution ever wins for a request. Returns the
+        persisted event and updated snapshot, or ``(None, snapshot)`` when the
+        request was already resolved.
+        """
+        with self._lock():
+            metadata = self._load_metadata()
+            snapshot = self.load_snapshot()
+            pending = next(
+                (
+                    item
+                    for item in snapshot.pending_inputs
+                    if item.request_id == resolution.request_id
+                ),
+                None,
+            )
+            if pending is None:
+                return None, snapshot
+            payload = dict(resolution.model_dump(mode="json"))
+            if pending.operation_id is not None:
+                payload.setdefault("operation_id", pending.operation_id)
+            event = ProductEvent(
+                conversation_id=metadata.conversation_id,
+                event_id=f"input:{resolution.request_id}:{resolution.outcome}",
+                type="input.resolved",
+                run_id=pending.run_id,
+                payload=payload,
+                # All resolutions for one request share this identity, so the
+                # command path, the event pump and recovery dedupe to one record.
+                source_event_id=f"input:{resolution.request_id}:resolution",
+            )
+            persisted, updated = self.append(event)
+            return persisted, updated
 
     def complete_command(self, receipt: CommandReceipt) -> CommandReceipt:
         if receipt.status == "accepted":
@@ -425,16 +508,30 @@ class FileProductStore:
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
+        """Serialize store access per thread and across processes.
+
+        ``flock`` guards one open file description, so a nested acquisition on
+        the same thread must reuse the outer lock instead of opening a second
+        descriptor — that would block against itself.
+        """
         if not self.directory.is_dir():
             raise ProductStoreError("product store does not exist")
         with self._thread_lock:
-            fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, _FILE_MODE)
-            try:
+            depth = getattr(self._lock_depth, "value", 0)
+            fd = None
+            if depth == 0:
+                fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, _FILE_MODE)
                 fcntl.flock(fd, fcntl.LOCK_EX)
+            self._lock_depth.value = depth + 1
+            try:
                 yield
             finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
+                self._lock_depth.value = depth
+                if fd is not None:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    finally:
+                        os.close(fd)
 
     def _load_metadata(self) -> _Metadata:
         try:

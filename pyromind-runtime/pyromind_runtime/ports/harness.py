@@ -22,6 +22,8 @@ class SessionSpec(ContractModel):
     workflow_xyflow: JsonObject | None = None
     model_configuration: JsonObject = Field(default_factory=dict)
     resource_limits: ResourceLimits | None = None
+    # Explicitly enable user input; disabled by default and immutable at runtime.
+    user_input_enabled: bool = False
     extra: JsonObject = Field(default_factory=dict)
     product_instructions: str = ""
 
@@ -45,6 +47,24 @@ class ForkSpec(ContractModel):
     target_conversation_id: str = Field(min_length=1)
     event_id: str = Field(min_length=1)
     title: str | None = None
+
+
+class InterruptedInputRecord(ContractModel):
+    """A leftover ask_user call whose execution died before a tool result."""
+
+    request_id: str = Field(min_length=1)
+    operation_id: str | None = None
+
+
+class AttachRecovery(ContractModel):
+    """Execution policy and input coordination applied before first scheduling.
+
+    Defaults keep the previous attach behaviour, so adapters without user-input
+    support accept the parameter unchanged.
+    """
+
+    automatic_turns_suspended: bool = False
+    interrupted_inputs: tuple[InterruptedInputRecord, ...] = ()
 
 
 class RestoreWorkflowSpec(ContractModel):
@@ -97,6 +117,7 @@ class HarnessAdapter(Protocol):
         self,
         conversation_id: str,
         context: RequestContext,
+        recovery: AttachRecovery | None = None,
     ) -> SessionHandle: ...
 
     async def send(

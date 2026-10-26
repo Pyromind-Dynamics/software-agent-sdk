@@ -66,6 +66,8 @@ export interface ParsedPrompt {
 export interface PiSessionOptions {
   /** Test seam: the terminal socket used by a sandbox session. */
   terminalConnect?: SandboxTerminalConnector;
+  /** The runner-local ask_user tool, present only for input-enabled sessions. */
+  askUserTool?: AgentTool;
 }
 
 const DEFAULT_MODEL_MAX_RETRIES = 2;
@@ -167,6 +169,7 @@ export async function createPiSession(
     config.tools,
     options,
   );
+  if (sessionOptions.askUserTool) rawTools.push(sessionOptions.askUserTool);
   if (!executionAccess) throw new Error("execution environment was not initialized");
   const coordinator = new ToolCoordinator();
   const tools = rawTools.map((tool) => coordinator.wrap(tool, peer));

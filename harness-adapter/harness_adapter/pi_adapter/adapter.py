@@ -23,6 +23,7 @@ from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import (
     CancelCommand,
+    InputResponseCommand,
     PermissionResponseCommand,
     ProductCommand,
     RollbackWorkflowCommand,
@@ -30,11 +31,15 @@ from pyromind_runtime.domain.commands import (
 )
 from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.snapshot import ConversationSnapshot, WorkflowState
+from pyromind_runtime.domain.user_input import UserInputRequest
 from pyromind_runtime.ports.harness import (
+    AttachRecovery,
     ExternalTaskNotification,
     ForkSpec,
+    InterruptedInputRecord,
     ProductCheckpoint,
     RestoreWorkflowResult,
     RestoreWorkflowSpec,
@@ -51,7 +56,11 @@ from harness_adapter.pi_adapter.event_translator import translate_runner_event
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.protocol import PROTOCOL_VERSION
-from harness_adapter.pi_adapter.runner import PiRunnerExit, PiRunnerProcess
+from harness_adapter.pi_adapter.runner import (
+    PiRunnerError,
+    PiRunnerExit,
+    PiRunnerProcess,
+)
 from harness_adapter.pi_adapter.sandbox_runtime import (
     PYROMIND_AGENT_STORAGE_ROOT,
     SandboxExecutionManager,
@@ -90,8 +99,32 @@ PI_CAPABILITIES = HarnessCapabilities(
     workflow_rollback=True,
     agent_stages=True,
     external_task_resume=True,
+    user_input_reply=True,
     native_workspace_tools=frozenset({"read", "write", "edit", "terminal"}),
     enforced_limits=frozenset({"memory", "nproc"}),
+)
+
+ASK_USER_TOOL_DESCRIPTION = (
+    "Ask the user one to three structured questions when a decision or missing "
+    "information genuinely requires their input. Each question offers options "
+    "the user picks one of, or answers as free text; a question without options "
+    "is free text only. For choice questions, normally offer two to four "
+    "distinct, mutually exclusive options. The UI provides custom text input "
+    "automatically; do not add an 'Other' or catch-all option. "
+    "Batch independent questions needed for the next step in one call, never "
+    "more than three; prioritize blocking decisions and defer questions that "
+    "are not needed yet. Reuse information and answers already in the "
+    "conversation; ask again only to resolve a material ambiguity or conflict. "
+    "For low-impact, reversible choices, propose a reasonable default instead "
+    "of blocking on a question. Stop asking once you have enough information "
+    "for the user's requested next step; summarize or proceed within their "
+    "authorized scope. When you have a clear recommendation, put that option first, "
+    "mark its label as recommended in the user's language, and explain why in "
+    "its description. Do not invent a recommendation when there is no clear "
+    "preference. Use this tool only for requirement clarification, "
+    "preference selection, and decisions only the user can make; find anything "
+    "you can determine yourself with tools or context first. The tool waits "
+    "until the user answers or cancels; their answers arrive as the tool result."
 )
 _WORKFLOW_PATH = Path("public_data/workflow_canvas/workflow.py")
 _SYSTEM_PROMPT = """You are a coding agent inside one conversation workspace.
@@ -205,6 +238,14 @@ class _PiSession:
     active_external_tasks: dict[str, str] = field(default_factory=dict)
     active_subagents: set[str] = field(default_factory=set)
     last_workflow_signature: str | None = None
+    # -- user-input execution state (product state stays in the store) --
+    user_input_enabled: bool = False
+    pending_user_inputs: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict
+    )
+    attach_recovery: AttachRecovery | None = None
+    input_calls: dict[str, tuple[str | None, str]] = field(default_factory=dict)
+    message_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class PiAdapter:
@@ -475,6 +516,7 @@ class PiAdapter:
                 context,
                 model_configuration=dict(spec.model_configuration),
                 extra=dict(spec.extra),
+                user_input_enabled=spec.user_input_enabled,
             )
             await self._register(session)
             workflow_event_id = None
@@ -492,7 +534,7 @@ class PiAdapter:
                 await self._prompt(
                     session, uuid4().hex, _runner_content(spec.initial_message)
                 )
-            return self._handle(session.session_id)
+            return self._handle(session)
         except Exception:
             if session is not None:
                 await self._remove(session.session_id)
@@ -507,12 +549,15 @@ class PiAdapter:
             raise
 
     async def attach_session(
-        self, conversation_id: str, context: RequestContext
+        self,
+        conversation_id: str,
+        context: RequestContext,
+        recovery: AttachRecovery | None = None,
     ) -> SessionHandle:
         existing = self._sessions.get(conversation_id)
         if existing is not None:
             existing.context = context
-            return self._handle(conversation_id)
+            return self._handle(existing)
         root = self._safe_conversation_dir(conversation_id)
         self._prepare_session_workspace(root, create=False)
         _prepare_pi_runtime_directories(root)
@@ -528,6 +573,8 @@ class PiAdapter:
             model_configuration=_restored_model_configuration(config),
             extra=dict(config.get("extra") or {}),
             active_external_tasks=_restore_active_external_tasks(root),
+            user_input_enabled=bool(config.get("user_input_enabled")),
+            attach_recovery=recovery,
         )
         await self._register(session)
         try:
@@ -536,7 +583,7 @@ class PiAdapter:
             if self._has_execution_workspace(session):
                 self._prewarm_sandbox(session)
             session.queue.put_nowait(_history_synced(conversation_id))
-            return self._handle(conversation_id)
+            return self._handle(session)
         except Exception:
             await self._remove(conversation_id)
             try:
@@ -552,12 +599,7 @@ class PiAdapter:
         session = self._session(handle.session_id)
         session.context = context
         if isinstance(command, UserMessageCommand):
-            if command.workflow_xyflow is not None:
-                await self._sync_xyflow(session, dict(command.workflow_xyflow))
-            await self._ensure_runner(session)
-            return await self._prompt(
-                session, command.command_id, _runner_content(command.content)
-            )
+            return await self._send_user_message(session, command)
         if isinstance(command, CancelCommand):
             self._business_tools.cancel(session.session_id)
             pending = session.pending_permission
@@ -569,6 +611,7 @@ class PiAdapter:
                     await session.runner.request("cancel", {})
                 except Exception as exc:
                     runner_cancel_error = type(exc).__name__
+            self._interrupt_session_inputs(session)
             stop_results = []
             for task_id in tuple(session.active_external_tasks):
                 stop_result = await self._business_tools.stop_platform_task(
@@ -592,9 +635,178 @@ class PiAdapter:
                     (command.decision == "allow_once", command.reason)
                 )
             return {"resolved": True}
+        if isinstance(command, InputResponseCommand):
+            return await self._respond_to_input(session, command)
         if isinstance(command, RollbackWorkflowCommand):
             raise TypeError("workflow rollback is orchestrated by ConversationRuntime")
         raise TypeError(f"unsupported command: {type(command).__name__}")
+
+    async def _send_user_message(
+        self, session: _PiSession, command: UserMessageCommand
+    ) -> JsonObject:
+        if not session.user_input_enabled:
+            if command.workflow_xyflow is not None:
+                await self._sync_xyflow(session, dict(command.workflow_xyflow))
+            await self._ensure_runner(session)
+            return await self._prompt(
+                session, command.command_id, _runner_content(command.content)
+            )
+        async with session.message_lock:
+            if session.pending_user_inputs:
+                raise ProductRuntimeError(
+                    "input_pending", "Answer or cancel the pending question first."
+                )
+            await self._ensure_runner(session)
+            assert session.runner is not None
+            runner = session.runner
+            prepared = False
+            accepted = False
+            content = _runner_content(command.content)
+            try:
+                if session.user_input_enabled:
+                    prepared = True
+                    await runner.request(
+                        "prompt.prepare",
+                        {"run_id": command.command_id, "content": content},
+                    )
+                if command.workflow_xyflow is not None:
+                    await self._sync_xyflow(session, dict(command.workflow_xyflow))
+                result = await self._prompt(session, command.command_id, content)
+                accepted = True
+                if session.attach_recovery is not None:
+                    session.attach_recovery = session.attach_recovery.model_copy(
+                        update={"automatic_turns_suspended": False}
+                    )
+                return result
+            except PiRunnerError as exc:
+                if exc.code == "input_pending":
+                    raise ProductRuntimeError("input_pending", str(exc)) from exc
+                raise
+            finally:
+                if prepared and not accepted and runner.running:
+                    await runner.request(
+                        "prompt.cancel", {"run_id": command.command_id}
+                    )
+
+    async def _respond_to_input(
+        self, session: _PiSession, command: InputResponseCommand
+    ) -> JsonObject:
+        if command.status == "cancelled":
+            self._suspend_inputs(session)
+            await self._ensure_runner(session)
+            assert session.runner is not None
+            # Runtime persists the resolution and suspension policy first. Prevent
+            # new scheduling and abort this Agent run; submitted platform tasks remain.
+            result = await session.runner.request("run.suspend", {})
+            self._resolve_input_wait(
+                session, command.request_id, {"status": "cancelled"}
+            )
+            return result if isinstance(result, dict) else {"suspended": True}
+        future = session.pending_user_inputs.get(command.request_id)
+        if future is None or future.done():
+            raise ValueError(f"input request is not waiting: {command.request_id}")
+        future.set_result(
+            {
+                "status": "answered",
+                "answers": [
+                    answer.model_dump(mode="json") for answer in command.answers
+                ],
+            }
+        )
+        return {"resolved": True}
+
+    def _resolve_input_wait(
+        self, session: _PiSession, request_id: str, outcome: dict[str, Any]
+    ) -> None:
+        future = session.pending_user_inputs.pop(request_id, None)
+        if future is not None and not future.done():
+            future.set_result(outcome)
+
+    @staticmethod
+    def _suspend_inputs(session: _PiSession) -> None:
+        previous = session.attach_recovery or AttachRecovery()
+        session.attach_recovery = previous.model_copy(
+            update={"automatic_turns_suspended": True}
+        )
+
+    def _end_input_wait(
+        self, session: _PiSession, request_id: str, *, cancelled: bool = False
+    ) -> None:
+        if request_id not in session.pending_user_inputs:
+            return
+        self._suspend_inputs(session)
+        call = session.input_calls.get(request_id)
+        run_id = call[0] if call is not None else None
+        outcome = "cancelled" if cancelled else "interrupted"
+        self._resolve_input_wait(session, request_id, {"status": outcome})
+        session.queue.put_nowait(
+            HarnessEvent(
+                session_id=session.session_id,
+                run_id=run_id,
+                type="input.resolved",
+                payload={
+                    "request_id": request_id,
+                    "outcome": outcome,
+                    "reason": "The execution ended while waiting for an answer.",
+                },
+                source_event_id=f"input:{request_id}:resolution",
+            )
+        )
+
+    def _interrupt_session_inputs(self, session: _PiSession) -> None:
+        """Close every live input wait as interrupted and record the outcome.
+
+        The resolutions share the request identity with the product-store
+        records, so the event log keeps exactly one durable resolution even
+        when the runtime later coordinates the same leftovers.
+        """
+        for request_id in tuple(session.pending_user_inputs):
+            self._end_input_wait(session, request_id)
+
+    async def _handle_input_request(
+        self, session: _PiSession, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        request_id = params.get("request_id")
+        tool_call_id = params.get("tool_call_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("input request_id must be a non-empty string")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            raise ValueError("input tool_call_id must be a non-empty string")
+        if not session.user_input_enabled:
+            raise ValueError("user input is not enabled for this session")
+        request = UserInputRequest.model_validate(
+            {"questions": params.get("questions")}
+        )
+        if request_id in session.pending_user_inputs:
+            raise ValueError(f"input request already waiting: {request_id}")
+        future: asyncio.Future[dict[str, Any]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        session.pending_user_inputs[request_id] = future
+        inflight = session.files.load_inflight() or {}
+        run_id = inflight.get("run_id")
+        session.input_calls[request_id] = (
+            run_id if isinstance(run_id, str) else None,
+            tool_call_id,
+        )
+        session.queue.put_nowait(
+            HarnessEvent(
+                event_id=f"input:{request_id}:requested",
+                session_id=session.session_id,
+                type="input.requested",
+                run_id=run_id if isinstance(run_id, str) and run_id else None,
+                payload={
+                    "request_id": request_id,
+                    "operation_id": tool_call_id,
+                    "questions": request.model_dump(mode="json")["questions"],
+                },
+            )
+        )
+        try:
+            return await future
+        finally:
+            session.pending_user_inputs.pop(request_id, None)
+            session.input_calls.pop(request_id, None)
 
     async def fork(
         self,
@@ -671,11 +883,14 @@ class PiAdapter:
                 context,
                 model_configuration=dict(source.model_configuration),
                 extra=dict(source.extra),
+                # Fork inherits the enabled setting, but not pending requests or
+                # waiters.
+                user_input_enabled=source.user_input_enabled,
             )
             await self._register(target)
             await self._start_runner(target, _api_key(source.model_configuration))
             target.queue.put_nowait(_history_synced(target.session_id))
-            return self._handle(target.session_id)
+            return self._handle(target)
         except Exception:
             if target is not None:
                 await self._remove(target.session_id)
@@ -805,6 +1020,7 @@ class PiAdapter:
                 await session.runner.close()
             await self._pause_sandbox(session)
         finally:
+            self._interrupt_session_inputs(session)
             session.queue.put_nowait(None)
 
     async def purge(self, handle: SessionHandle, context: RequestContext) -> None:
@@ -872,10 +1088,13 @@ class PiAdapter:
         runner: PiRunnerProcess
 
         async def on_request(method: str, params: dict[str, Any]) -> Any:
+            if session.runner is not runner:
+                raise PiRunnerError("Request from a replaced Pi runner")
             return await self._runner_request(session, method, params)
 
         async def on_event(frame: dict[str, Any]) -> None:
-            await self._runner_event(session, frame)
+            if session.runner is runner:
+                await self._runner_event(session, frame)
 
         async def on_exit(exit_result: PiRunnerExit) -> None:
             inflight = session.files.load_inflight()
@@ -893,6 +1112,22 @@ class PiAdapter:
             if stale_callback:
                 return
             session.runner = None
+            if session.pending_user_inputs:
+                records = tuple(
+                    InterruptedInputRecord(
+                        request_id=request_id,
+                        operation_id=session.input_calls.get(request_id, (None, None))[
+                            1
+                        ],
+                    )
+                    for request_id in session.pending_user_inputs
+                )
+                self._suspend_inputs(session)
+                assert session.attach_recovery is not None
+                session.attach_recovery = session.attach_recovery.model_copy(
+                    update={"interrupted_inputs": records}
+                )
+            self._interrupt_session_inputs(session)
             if exit_result.reason == "unexpected":
                 for child_id in tuple(session.active_subagents):
                     await self._runner_event(
@@ -955,10 +1190,34 @@ class PiAdapter:
                 SandboxSettings.from_extra(session.extra).mount_path,
                 session.session_id,
             )
+        recovery = session.attach_recovery
         await runner.start(
             {
                 "session_id": session.session_id,
                 "workflows_enabled": self._workflow_call is not None,
+                "execution_policy": {
+                    "automatic_turns_suspended": bool(
+                        recovery and recovery.automatic_turns_suspended
+                    ),
+                },
+                "pending_input_records": [
+                    record.model_dump(mode="json")
+                    for record in (recovery.interrupted_inputs if recovery else ())
+                ],
+                **(
+                    {
+                        "user_input": {
+                            "enabled": True,
+                            "tool": {
+                                "name": "ask_user",
+                                "description": ASK_USER_TOOL_DESCRIPTION,
+                                "input_schema": UserInputRequest.tool_json_schema(),
+                            },
+                        }
+                    }
+                    if session.user_input_enabled
+                    else {}
+                ),
                 "workspace_root": str(session.workspace_root),
                 "terminal_backend": self._terminal_backend,
                 "session_path": str(session.files.session_log_path),
@@ -1086,6 +1345,16 @@ class PiAdapter:
                 session.session_id,
                 tool_call_id,
             )
+        if method == "input.request":
+            return await self._handle_input_request(session, params)
+        if method == "input.cancel":
+            request_id = params.get("request_id")
+            if not isinstance(request_id, str) or not request_id:
+                raise ValueError("input cancel request_id must be a non-empty string")
+            # Ordered JSONL dispatch registers input.request before its first await,
+            # so an unknown or completed request needs no cancellation marker.
+            self._end_input_wait(session, request_id, cancelled=True)
+            return {"cancelled": True}
         if method == "permission.cancel":
             pending = session.pending_permission
             if (
@@ -1586,12 +1855,16 @@ class PiAdapter:
         return workflow
 
     @staticmethod
-    def _handle(session_id: str) -> SessionHandle:
+    def _handle(session: _PiSession) -> SessionHandle:
         return SessionHandle(
-            session_id=session_id,
-            adapter_session_ref=session_id,
+            session_id=session.session_id,
+            adapter_session_ref=session.session_id,
             harness_id="pi",
-            capabilities=PI_CAPABILITIES,
+            # The capability is active only when the adapter supports it and the
+            # session explicitly enables it.
+            capabilities=PI_CAPABILITIES.model_copy(
+                update={"user_input_reply": session.user_input_enabled}
+            ),
         )
 
 
@@ -1630,6 +1903,7 @@ def _session_config(spec: SessionSpec) -> dict[str, Any]:
             if spec.resource_limits is not None
             else {}
         ),
+        "user_input_enabled": spec.user_input_enabled,
         "extra": _safe_session_extra(spec.extra),
     }
 

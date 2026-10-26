@@ -12,6 +12,8 @@ type ProductErrorCode = Literal[
     "fork_target_conflict",
     "capacity_exceeded",
     "harness_operation_failed",
+    "input_not_pending",
+    "input_pending",
 ]
 
 
@@ -22,6 +24,10 @@ class ProductRuntimeError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class UserInputValidationError(ValueError):
+    """Invalid answer structure or semantics (HTTP 422, the request stays pending)."""
 
 
 class EvaluationRunNotFoundError(RuntimeError):

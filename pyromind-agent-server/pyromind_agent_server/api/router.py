@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
 from pyromind_runtime.domain.content import TextContent
-from pyromind_runtime.domain.errors import ProductRuntimeError
+from pyromind_runtime.domain.errors import ProductRuntimeError, UserInputValidationError
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 from pyromind_runtime.infrastructure.file_product_store import (
     CommandConflictError,
@@ -99,6 +99,7 @@ def create_product_router() -> APIRouter:
             initial_message=((TextContent(text=body.message),) if body.message else ()),
             workflow_xyflow=body.workflow_xyflow,
             model_configuration=body.llm.model_dump(mode="json"),
+            user_input_enabled=body.user_input_enabled,
             extra=body.extra,
         )
         try:
@@ -108,7 +109,9 @@ def create_product_router() -> APIRouter:
 
     @router.get("", response_model=tuple[ConversationSnapshot, ...])
     async def list_conversations(request: Request) -> tuple[ConversationSnapshot, ...]:
-        return get_product_runtime(request).list_snapshots(request_context(request))
+        return await get_product_runtime(request).list_snapshots(
+            request_context(request)
+        )
 
     @router.get("/{conversation_id}/snapshot", response_model=ConversationSnapshot)
     async def get_snapshot(
@@ -148,6 +151,12 @@ def create_product_router() -> APIRouter:
             ) from exc
         except ProductRuntimeError as exc:
             raise _product_error(exc) from exc
+        except UserInputValidationError as exc:
+            # Invalid answers return 422 and leave the question pending.
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "invalid_input", "message": str(exc)},
+            ) from exc
         except (
             FileNotFoundError,
             PermissionError,
@@ -229,6 +238,8 @@ def _product_error(error: ProductRuntimeError) -> HTTPException:
         "checkpoint_not_found": status.HTTP_404_NOT_FOUND,
         "capacity_exceeded": status.HTTP_429_TOO_MANY_REQUESTS,
         "harness_operation_failed": status.HTTP_502_BAD_GATEWAY,
+        "input_not_pending": status.HTTP_409_CONFLICT,
+        "input_pending": status.HTTP_409_CONFLICT,
     }.get(error.code, status.HTTP_409_CONFLICT)
     return HTTPException(
         status_code=status_code,

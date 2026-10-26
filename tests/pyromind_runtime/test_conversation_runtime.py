@@ -22,7 +22,9 @@ from pyromind_runtime.ports.harness import SessionSpec
 from .fake_adapter import FakeAdapter
 
 
-def test_list_orders_by_activity_and_recovers_legacy_timestamps(tmp_path) -> None:
+async def test_list_orders_by_activity_and_recovers_legacy_timestamps(
+    tmp_path,
+) -> None:
     runtime = ConversationRuntime(tmp_path, FakeAdapter())
     context = RequestContext(user_id="42")
     for conversation_id, day, count in [("old", 1, 3), ("recent", 2, 1)]:
@@ -49,10 +51,10 @@ def test_list_orders_by_activity_and_recovers_legacy_timestamps(tmp_path) -> Non
         legacy.pop("updated_at")
         store.snapshot_path.write_text(json.dumps(legacy))
 
-    snapshots = runtime.list_snapshots(context)
+    snapshots = await runtime.list_snapshots(context)
     assert [item.conversation_id for item in snapshots] == ["recent", "old"]
     assert snapshots[0].updated_at == datetime(2026, 9, 2, tzinfo=UTC)
-    assert runtime.list_snapshots(context) == snapshots
+    assert await runtime.list_snapshots(context) == snapshots
 
 
 def _write_event_without_offset(path, index: int) -> None:
@@ -64,7 +66,7 @@ def _write_event_without_offset(path, index: int) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
-def test_list_recovers_legacy_naive_event_timestamps(tmp_path) -> None:
+async def test_list_recovers_legacy_naive_event_timestamps(tmp_path) -> None:
     """Events persisted without an offset must not abort the whole listing.
 
     ``max(snapshot.updated_at, event.occurred_at)`` compared an aware and a
@@ -97,13 +99,15 @@ def test_list_recovers_legacy_naive_event_timestamps(tmp_path) -> None:
     legacy.pop("updated_at")
     store.snapshot_path.write_text(json.dumps(legacy))
 
-    snapshots = runtime.list_snapshots(context)
+    snapshots = await runtime.list_snapshots(context)
 
     assert [item.conversation_id for item in snapshots] == ["legacy"]
     assert snapshots[0].updated_at == datetime(2026, 9, 2, tzinfo=UTC)
 
 
-def test_list_skips_conversation_that_fails_to_load(tmp_path, monkeypatch) -> None:
+async def test_list_skips_conversation_that_fails_to_load(
+    tmp_path, monkeypatch
+) -> None:
     """A single unreadable conversation must not take the listing down."""
     runtime = ConversationRuntime(tmp_path, FakeAdapter())
     context = RequestContext(user_id="42")
@@ -135,7 +139,7 @@ def test_list_skips_conversation_that_fails_to_load(tmp_path, monkeypatch) -> No
 
     monkeypatch.setattr(FileProductStore, "load_snapshot", flaky)
 
-    snapshots = runtime.list_snapshots(context)
+    snapshots = await runtime.list_snapshots(context)
 
     assert [item.conversation_id for item in snapshots] == ["healthy"]
 
@@ -979,10 +983,10 @@ async def test_reactivation_waits_for_runner_release(tmp_path) -> None:
                 await finish_close.wait()
             await super().close(handle)
 
-        async def attach_session(self, conversation_id, context):
+        async def attach_session(self, conversation_id, context, recovery=None):
             if conversation_id == "releasing":
                 assert finish_close.is_set(), "previous runner still owns its socket"
-            return await super().attach_session(conversation_id, context)
+            return await super().attach_session(conversation_id, context, recovery)
 
     conversations = tmp_path / "conversations"
     conversations.mkdir()

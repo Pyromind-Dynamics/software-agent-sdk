@@ -21,7 +21,7 @@ def workflow_session(tmp_path):
     adapter = PiAdapter(tmp_path, terminal_backend="os-sandbox")
     session = _PiSession("conversation", root, files, {}, RequestContext(user_id="42"))
     adapter._sessions[session.session_id] = session
-    handle = adapter._handle(session.session_id)
+    handle = adapter._handle(session)
     store = FileProductStore(root)
     store.create(
         ConversationSnapshot(
@@ -214,7 +214,7 @@ async def test_recovery_retries_persisted_completion_without_duplicate_output(
         await hook.accept(completion)
     recovered_store = FileProductStore(session.workspace_root)
     recovered = WorkflowCompletionHook(
-        recovered_store, adapter, adapter._handle(session.session_id)
+        recovered_store, adapter, adapter._handle(session)
     )
     await recovered.recover()
     await recovered.accept(completion)

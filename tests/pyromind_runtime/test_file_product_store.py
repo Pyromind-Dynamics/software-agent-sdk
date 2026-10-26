@@ -1,9 +1,14 @@
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import ValidationError, create_model
+from pyromind_runtime.domain.base import ContractModel
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
-from pyromind_runtime.domain.commands import CommandReceipt, UserMessageCommand
+from pyromind_runtime.domain.commands import (
+    CommandReceipt,
+    InputResponseCommand,
+    UserMessageCommand,
+)
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
@@ -254,6 +259,55 @@ def test_command_idempotency_checks_payload(tmp_path: Path) -> None:
     completed = receipt.model_copy(update={"status": "completed"})
     assert store.complete_command(completed) == completed
     assert isinstance(completed, CommandReceipt)
+
+
+def test_ordinary_command_ledger_can_be_read_with_legacy_schema(tmp_path: Path) -> None:
+    legacy_record = create_model(
+        "LegacyStoredCommand",
+        __base__=ContractModel,
+        command_id=(str, ...),
+        fingerprint=(str, ...),
+        receipt=(CommandReceipt, ...),
+    )
+    store = _store(tmp_path)
+    command = UserMessageCommand(
+        command_id="ordinary", content=(TextContent(text="hello"),)
+    )
+    receipt, _ = store.claim_command(command)
+    completed = receipt.model_copy(
+        update={"status": "completed", "response": {"optional": None}}
+    )
+    store.complete_command(completed)
+
+    records = [
+        legacy_record.model_validate_json(line)
+        for line in store.commands_path.read_text().splitlines()
+    ]
+    assert [record.model_dump()["receipt"] for record in records] == [
+        receipt.model_dump(),
+        completed.model_dump(),
+    ]
+    assert FileProductStore(store.conversation_dir).claim_command(command) == (
+        completed,
+        False,
+    )
+
+
+def test_input_command_intent_survives_completion_and_reload(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    receipt, _ = store.claim_command(
+        InputResponseCommand(
+            command_id="answer", request_id="input-1", status="cancelled"
+        )
+    )
+    assert FileProductStore(store.conversation_dir).load_input_command_receipts() == {
+        "answer": (receipt, "input-1")
+    }
+    completed = receipt.model_copy(update={"status": "completed"})
+    store.complete_command(completed)
+    assert FileProductStore(store.conversation_dir).load_input_command_receipts() == {
+        "answer": (completed, "input-1")
+    }
 
 
 def test_missing_harness_metadata_defaults_to_openhands(tmp_path: Path) -> None:

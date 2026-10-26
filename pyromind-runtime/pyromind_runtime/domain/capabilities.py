@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, model_serializer
 
 from pyromind_runtime.domain.base import ContractModel
 
@@ -19,5 +19,14 @@ class HarnessCapabilities(ContractModel):
     workflow_rollback: bool = False
     external_task_resume: bool = False
     agent_stages: bool = False
+    user_input_reply: bool = False
     native_workspace_tools: frozenset[str] = frozenset()
     enforced_limits: frozenset[str] = frozenset()
+
+    @model_serializer(mode="wrap")
+    def _omit_default_user_input(self, handler):
+        # Omit false for disabled sessions to keep older strict clients compatible.
+        data = handler(self)
+        if not self.user_input_reply:
+            data.pop("user_input_reply", None)
+        return data

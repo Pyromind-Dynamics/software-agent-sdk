@@ -1,3 +1,4 @@
+import pytest
 from pyromind_runtime.application import SnapshotProjector
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.events import ProductEvent
@@ -243,3 +244,51 @@ def test_late_completion_preserves_new_run_and_message_command_id():
     )
     assert snapshot.status == "idle"
     assert snapshot.active_run_id is None
+
+
+@pytest.mark.parametrize("outcome", ["cancelled", "interrupted"])
+@pytest.mark.parametrize("failure_first", [False, True])
+def test_input_resolution_preserves_history_outcome(outcome, failure_first):
+    projector = SnapshotProjector()
+    snapshot = projector.reduce(
+        _snapshot(),
+        _event(1, "operation.started", {"operation_id": "ask-1", "name": "ask_user"}),
+    )
+    snapshot = projector.reduce(
+        snapshot,
+        _event(
+            2,
+            "input.requested",
+            {
+                "request_id": "input-1",
+                "operation_id": "ask-1",
+                "questions": [{"id": "format", "prompt": "Format?"}],
+            },
+        ),
+    )
+    resolution = (
+        "input.resolved",
+        {"request_id": "input-1", "outcome": outcome},
+    )
+    failure = (
+        "operation.failed",
+        {
+            "operation_id": "ask-1",
+            "output": [{"type": "text", "text": "This operation was aborted"}],
+            "details": {"trace": "native-result"},
+            "error_code": "tool_execution_failed",
+        },
+    )
+    ordered = [failure, resolution] if failure_first else [resolution, failure]
+    for seq, (event_type, payload) in enumerate(ordered, start=3):
+        snapshot = projector.reduce(snapshot, _event(seq, event_type, payload))
+    restored = ConversationSnapshot.model_validate_json(snapshot.model_dump_json())
+    operation = restored.timeline[0]
+    assert isinstance(operation, TimelineOperation)
+    assert operation.details == {
+        "trace": "native-result",
+        "user_input": {"request_id": "input-1", "status": outcome},
+    }
+    assert operation.error_code == "tool_execution_failed"
+    assert restored.status == "paused"
+    assert not restored.pending_inputs

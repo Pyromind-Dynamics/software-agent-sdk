@@ -24,6 +24,10 @@ from harness_adapter.pi_adapter.protocol import (
 
 logger = logging.getLogger(__name__)
 _STREAM_LIMIT = MAX_FRAME_BYTES + 2
+_CONTROL_RPC_TIMEOUT = 5.0
+_CONTROL_METHODS = frozenset(
+    {"close", "cancel", "run.suspend", "prompt.prepare", "prompt.cancel"}
+)
 RequestHandler = Callable[[str, dict[str, Any]], Awaitable[Any]]
 EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
 PiRunnerExitReason = Literal["shutdown", "restart", "unexpected"]
@@ -40,7 +44,9 @@ ExitHandler = Callable[[PiRunnerExit], Awaitable[None]]
 
 
 class PiRunnerError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class PiRunnerProcess:
@@ -65,6 +71,9 @@ class PiRunnerProcess:
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
+        # Handler tasks for runner-initiated requests (e.g. input.request,
+        # which waits for a human answer); they must end with the runner.
+        self._request_tasks: set[asyncio.Task[None]] = set()
         self._pending: dict[str, asyncio.Future[Any]] = {}
         self._write_lock = asyncio.Lock()
         self._planned_exit_reason: PlannedPiRunnerExitReason | None = None
@@ -113,6 +122,19 @@ class PiRunnerProcess:
             raise
 
     async def request(self, method: str, params: dict[str, Any]) -> Any:
+        if method not in _CONTROL_METHODS:
+            return await self._request(method, params)
+        try:
+            return await asyncio.wait_for(
+                self._request(method, params), _CONTROL_RPC_TIMEOUT
+            )
+        except TimeoutError as exc:
+            await self.terminate(
+                reason="shutdown" if method == "close" else "unexpected"
+            )
+            raise PiRunnerError(f"Pi control RPC timed out: {method}") from exc
+
+    async def _request(self, method: str, params: dict[str, Any]) -> Any:
         process = self._process
         if process is None or process.returncode is not None or process.stdin is None:
             raise PiRunnerError("Pi runner is not running")
@@ -138,14 +160,15 @@ class PiRunnerProcess:
         if not self.running:
             await self.terminate(reason=reason)
             return
-        with contextlib.suppress(Exception):
-            await self.request("close", {})
-        await self.terminate(reason=reason)
+        try:
+            with contextlib.suppress(Exception):
+                await self.request("close", {})
+        finally:
+            await self.terminate(reason=reason)
 
-    async def terminate(
-        self, *, reason: PlannedPiRunnerExitReason = "shutdown"
-    ) -> None:
-        self._mark_planned_exit(reason)
+    async def terminate(self, *, reason: PiRunnerExitReason = "shutdown") -> None:
+        if reason != "unexpected":
+            self._mark_planned_exit(reason)
         process = self._process
         if process is not None and process.returncode is None:
             self._signal_process(process, signal.SIGTERM)
@@ -157,12 +180,17 @@ class PiRunnerProcess:
         current = asyncio.current_task()
         tasks = tuple(
             task
-            for task in (self._reader_task, self._stderr_task)
+            for task in (
+                self._reader_task,
+                self._stderr_task,
+                *self._request_tasks,
+            )
             if task is not None and task is not current
         )
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        self._request_tasks.clear()
         if process is not None:
             await self._notify_exit(process.returncode)
         self._process = None
@@ -213,6 +241,11 @@ class PiRunnerProcess:
                 if not future.done():
                     future.set_exception(failure)
             await self._notify_exit(code)
+            tasks = tuple(self._request_tasks)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._request_tasks.difference_update(tasks)
 
     async def _notify_exit(self, code: int | None) -> None:
         if self._exit_notified:
@@ -244,7 +277,8 @@ class PiRunnerProcess:
                 future.set_exception(
                     PiRunnerError(
                         f"{error.get('code', 'runner_error')}: "
-                        f"{error.get('message', 'runner request failed')}"
+                        f"{error.get('message', 'runner request failed')}",
+                        code=str(error.get("code", "runner_error")),
                     )
                 )
             else:
@@ -254,7 +288,9 @@ class PiRunnerProcess:
             await self._event_handler(frame)
             return
         if frame_type == "request":
-            asyncio.create_task(self._answer_request(frame))
+            task = asyncio.create_task(self._answer_request(frame))
+            self._request_tasks.add(task)
+            task.add_done_callback(self._request_tasks.discard)
             return
         raise PiProtocolError("unexpected runner frame")
 
@@ -312,6 +348,7 @@ def _runner_environment() -> dict[str, str]:
         "PYROMIND_PI_TERMINAL_TRACE",
         "PYROMIND_PI_MODEL_MAX_RETRIES",
         "PYROMIND_PI_MODEL_RETRY_BASE_DELAY_MS",
+        "PYROMIND_PI_MODEL_IDLE_TIMEOUT_MS",
     )
     environment = {name: os.environ[name] for name in allowed if name in os.environ}
     ca_bundle = os.environ.get("NODE_EXTRA_CA_CERTS") or _node_ca_bundle()

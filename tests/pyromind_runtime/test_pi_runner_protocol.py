@@ -5,6 +5,7 @@ import os
 import signal
 
 import certifi
+import harness_adapter.pi_adapter.runner as runner_module
 import pytest
 from harness_adapter.pi_adapter.event_translator import translate_runner_event
 from harness_adapter.pi_adapter.protocol import (
@@ -14,6 +15,7 @@ from harness_adapter.pi_adapter.protocol import (
     encode_frame,
 )
 from harness_adapter.pi_adapter.runner import (
+    PiRunnerError,
     PiRunnerExit,
     PiRunnerProcess,
     _runner_environment,
@@ -22,6 +24,95 @@ from pyromind_runtime.application import SnapshotProjector
 from pyromind_runtime.application.event_projection import ProductEventProjector
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.snapshot import ConversationSnapshot, TimelineOperation
+
+
+@pytest.mark.parametrize("method", ["close", "run.suspend", "cancel"])
+async def test_control_rpc_timeout_terminates_real_runner(
+    tmp_path, monkeypatch, method
+) -> None:
+    entrypoint = tmp_path / "unresponsive.mjs"
+    entrypoint.write_text("""
+import { createInterface } from 'node:readline';
+for await (const line of createInterface({input: process.stdin})) {
+ const request = JSON.parse(line);
+ if (request.method === 'start') console.log(JSON.stringify({
+   protocolVersion:2,type:'response',requestId:request.requestId,
+   result:{ready:true}
+ }));
+}
+""")
+    monkeypatch.setattr(runner_module, "_CONTROL_RPC_TIMEOUT", 0.03)
+    exits = []
+
+    async def noop(*args):
+        pass
+
+    async def on_exit(result):
+        exits.append(result)
+
+    runner = PiRunnerProcess(
+        request_handler=noop,
+        event_handler=noop,
+        exit_handler=on_exit,
+        entrypoint=entrypoint,
+    )
+    try:
+        await runner.start({})
+        async with asyncio.timeout(2):
+            if method == "close":
+                await runner.close()
+            else:
+                with pytest.raises(PiRunnerError, match="timed out"):
+                    await runner.request(method, {})
+        assert not runner.running
+        assert len(exits) == 1
+        assert exits[0].reason == ("shutdown" if method == "close" else "unexpected")
+        assert not runner._pending
+        assert not runner._request_tasks
+    finally:
+        await runner.terminate()
+
+
+async def test_unexpected_exit_reaps_runner_request_handlers(tmp_path) -> None:
+    entrypoint = tmp_path / "exit-with-request.mjs"
+    entrypoint.write_text("""
+import { createInterface } from 'node:readline';
+for await (const line of createInterface({input: process.stdin})) {
+ const request = JSON.parse(line);
+ console.log(JSON.stringify({protocolVersion:2,type:'response',requestId:request.requestId,result:{ready:true}}));
+ console.log(JSON.stringify({protocolVersion:2,type:'request',requestId:'human',method:'input.request',params:{}}));
+ setTimeout(() => process.exit(1), 40);
+}
+""")
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def wait_for_human(*args):
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    async def noop(*args):
+        pass
+
+    runner = PiRunnerProcess(
+        request_handler=wait_for_human,
+        event_handler=noop,
+        exit_handler=noop,
+        entrypoint=entrypoint,
+    )
+    try:
+        await runner.start({})
+        async with asyncio.timeout(2):
+            await started.wait()
+            await cancelled.wait()
+            assert runner._reader_task is not None
+            await runner._reader_task
+        assert not runner._request_tasks
+    finally:
+        await runner.terminate()
 
 
 def test_protocol_round_trip_and_frame_limit() -> None:
@@ -73,6 +164,7 @@ def test_runner_environment_forwards_operator_tunables(monkeypatch) -> None:
     monkeypatch.setenv("PYROMIND_PI_TERMINAL_TRACE", "1")
     monkeypatch.setenv("PYROMIND_PI_MODEL_MAX_RETRIES", "1")
     monkeypatch.setenv("PYROMIND_PI_MODEL_RETRY_BASE_DELAY_MS", "500")
+    monkeypatch.setenv("PYROMIND_PI_MODEL_IDLE_TIMEOUT_MS", "120000")
 
     environment = _runner_environment()
 
@@ -82,6 +174,7 @@ def test_runner_environment_forwards_operator_tunables(monkeypatch) -> None:
     assert environment["PYROMIND_PI_TERMINAL_TRACE"] == "1"
     assert environment["PYROMIND_PI_MODEL_MAX_RETRIES"] == "1"
     assert environment["PYROMIND_PI_MODEL_RETRY_BASE_DELAY_MS"] == "500"
+    assert environment["PYROMIND_PI_MODEL_IDLE_TIMEOUT_MS"] == "120000"
 
 
 async def test_runner_start_uses_a_new_process_session_on_posix(

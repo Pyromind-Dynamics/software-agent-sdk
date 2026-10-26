@@ -21,6 +21,12 @@ import {
   type RunnerEvent,
 } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
+import {
+  createAskUserTool,
+  InputWaitRegistry,
+  inputPendingError,
+  type AskUserToolSpec,
+} from "./user-input.js";
 
 import type { WorkflowExecution } from "./workflow-execution.js";
 
@@ -34,8 +40,14 @@ export class PiAgentRuntime {
   private workspaceRoot: string | undefined;
   private terminalBackend: string | undefined;
   private normalizer: PiEventNormalizer | undefined;
+  /** Blocks automatic scheduling (notifications, stages) until a user prompt. */
+  private executionSuspended = false;
+  private suspensionRevision = 0;
+  private readonly userInput = new InputWaitRegistry();
   private readonly outcome = new PiOutcomeNormalizer();
   private readonly finishedRuns = new Set<string>();
+  private activeRunId: string | undefined;
+  private readonly cancelledRuns = new Set<string>();
   private readonly pendingCommandIds: string[] = [];
   private readonly notificationIds = new Set<string>();
   private readonly pendingNotifications: Array<{
@@ -61,9 +73,21 @@ export class PiAgentRuntime {
     if (method === "stage.execute") return this.executeStage(params);
     if (method === "stage.cancel") return this.cancelStage(requiredString(params, "request_id"));
     if (method === "start") return this.start(params);
+    if (method === "prompt.prepare") {
+      const session = this.requireSession();
+      parsePromptContent(params.content);
+      if (this.normalizer && !session.isStreaming) throw new Error("Pi agent is already running");
+      this.userInput.reservePrompt(requiredString(params, "run_id"));
+      return { admitted: true };
+    }
+    if (method === "prompt.cancel") {
+      this.userInput.releasePrompt(requiredString(params, "run_id"));
+      return { released: true };
+    }
     if (method === "prompt") return this.prompt(params, false);
     if (method === "steer") return this.prompt(params, true);
     if (method === "cancel") return this.cancel();
+    if (method === "run.suspend") return this.suspendRun();
     if (method === "notify") return this.notify(params);
     if (method === "context.append") return this.appendContext(params);
     if (method === "fork") return this.fork(params);
@@ -73,16 +97,23 @@ export class PiAgentRuntime {
 
   private async start(params: JsonObject): Promise<JsonValue> {
     if (this.session) throw new Error("Pi session already started");
+    const policy = isObject(params.execution_policy)
+      ? params.execution_policy.automatic_turns_suspended === true
+      : false;
+    // Attach applies the recovered policy before the first automatic schedule.
+    this.executionSuspended = policy;
+    const askUserTool = this.createAskUserTool(params.user_input);
     const { session, sessionId, execution, subagents } = await createPiSession(
       params,
       this.peer,
-      this.sessionOptions,
+      askUserTool ? { ...this.sessionOptions, askUserTool } : this.sessionOptions,
     );
     this.execution = execution;
     this.subagents = subagents;
     session.subscribe((event) => {
       if (event.type === "agent_start" && !this.normalizer) {
         this.autonomousRunId = `extension:${randomUUID()}`;
+        this.activeRunId = this.autonomousRunId;
         this.normalizer = new PiEventNormalizer(sessionId, this.autonomousRunId, this.pendingCommandIds);
         this.outcome.reset();
       }
@@ -130,26 +161,132 @@ export class PiAgentRuntime {
       this.session = undefined;
       throw error;
     }
+    this.repairInterruptedInputs(session, params.pending_input_records);
     setImmediate(() => this.drainNotifications());
     return { ready: true };
   }
 
+  private createAskUserTool(
+    config: JsonValue | undefined,
+  ): ReturnType<typeof createAskUserTool> | undefined {
+    if (!isObject(config) || config.enabled !== true) return undefined;
+    const specRecord = isObject(config.tool) ? config.tool : {};
+    const spec: AskUserToolSpec = {
+      description:
+        typeof specRecord.description === "string" && specRecord.description
+          ? specRecord.description
+          : "Ask the user structured questions when only they can decide.",
+      inputSchema: isObject(specRecord.input_schema) ? specRecord.input_schema : { type: "object" },
+    };
+    // Expose the tool only during ordinary main-agent turns; stages must not wait
+    // for human input.
+    return createAskUserTool(this.peer, spec, this.userInput, () => !this.stageRunning());
+  }
+
+  /**
+   * Append interrupted tool results for ask_user calls whose run died before
+   * the answer arrived. Idempotent: pairs already carrying a result are left
+   * alone, and the repair runs before any turn is scheduled.
+   */
+  private repairInterruptedInputs(
+    session: AgentSession,
+    records: JsonValue | undefined,
+  ): void {
+    const answered = new Set<string>();
+    const dangling: string[] = [];
+    for (const entry of session.sessionManager.getBranch()) {
+      if (entry.type !== "message") continue;
+      const message: { role?: string; content?: unknown[]; toolCallId?: string } =
+        entry.message as unknown as {
+          role?: string;
+          content?: unknown[];
+          toolCallId?: string;
+        };
+      if (message.role === "assistant" && Array.isArray(message.content)) {
+        for (const block of message.content) {
+          if (
+            isObject(block) &&
+            (block as { type?: unknown }).type === "toolCall" &&
+            (block as { name?: unknown }).name === "ask_user" &&
+            typeof (block as { id?: unknown }).id === "string"
+          ) {
+            dangling.push((block as { id: string }).id);
+          }
+        }
+      } else if (message.role === "toolResult" && typeof message.toolCallId === "string") {
+        answered.add(message.toolCallId);
+      }
+    }
+    const byOperationId = new Map<string, string>();
+    if (Array.isArray(records)) {
+      for (const record of records) {
+        if (!isObject(record)) continue;
+        const requestId = record.request_id;
+        const operationId = record.operation_id;
+        if (typeof requestId === "string" && typeof operationId === "string") {
+          byOperationId.set(operationId, requestId);
+        }
+      }
+    }
+    for (const toolCallId of dangling) {
+      if (answered.has(toolCallId)) continue;
+      const requestId = byOperationId.get(toolCallId) ?? null;
+      session.sessionManager.appendMessage({
+        role: "toolResult",
+        toolCallId,
+        toolName: "ask_user",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              status: "interrupted",
+              request_id: requestId,
+              message: "The question was interrupted before the user answered.",
+            }),
+          },
+        ],
+        isError: true,
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  private stageRunning(): boolean {
+    for (const stage of this.stages.values()) {
+      if (stage.state === "running") return true;
+    }
+    return false;
+  }
+
   private async prompt(params: JsonObject, forceSteer: boolean): Promise<JsonValue> {
     const session = this.requireSession();
-    const runId = requiredString(params, "run_id");
-    const prompt = parsePromptContent(params.content);
-    if (forceSteer || session.isStreaming) {
-      this.pendingCommandIds.push(runId);
-      try { await session.steer(prompt.text, prompt.images); }
-      catch (error) { this.discardCommand(runId); throw error; }
-      return { accepted: true, steered: true };
+    // Real-time admission: an ask_user wait may exist before the product
+    // snapshot projects input.requested, so guard here as well.
+    if (this.userInput.hasActive()) {
+      throw inputPendingError();
     }
-    if (this.normalizer) throw new Error("Pi agent is already running");
-    this.normalizer = new PiEventNormalizer(this.sessionId!, runId, this.pendingCommandIds);
-    this.outcome.reset();
-    this.pendingCommandIds.push(runId);
-    setImmediate(() => void this.runPrompt(runId, prompt));
-    return { accepted: true, steered: false };
+    const runId = requiredString(params, "run_id");
+    try {
+      const prompt = parsePromptContent(params.content);
+      if (forceSteer || session.isStreaming) {
+        const suspensionRevision = this.suspensionRevision;
+        this.pendingCommandIds.push(runId);
+        try { await session.steer(prompt.text, prompt.images); }
+        catch (error) { this.discardCommand(runId); throw error; }
+        if (this.suspensionRevision === suspensionRevision) this.executionSuspended = false;
+        return { accepted: true, steered: true };
+      }
+      if (this.normalizer) throw new Error("Pi agent is already running");
+      this.normalizer = new PiEventNormalizer(this.sessionId!, runId, this.pendingCommandIds);
+      this.activeRunId = runId;
+      this.executionSuspended = false;
+      this.outcome.reset();
+      this.pendingCommandIds.push(runId);
+      setImmediate(() => void this.runPrompt(runId, prompt));
+      return { accepted: true, steered: false };
+    } finally {
+      this.userInput.releasePrompt(runId);
+    }
   }
 
   private discardCommand(commandId: string): void {
@@ -159,6 +296,7 @@ export class PiAgentRuntime {
 
   private async runPrompt(runId: string, prompt: ParsedPrompt): Promise<void> {
     try {
+      if (this.cancelledRuns.has(runId)) return this.finishRun(runId, { status: "cancelled" });
       const session = this.requireSession();
       await session.prompt(prompt.text, {
         images: prompt.images,
@@ -180,6 +318,8 @@ export class PiAgentRuntime {
   private finishRun(runId: string, outcome: RunOutcome): void {
     if (!this.sessionId || this.finishedRuns.has(runId)) return;
     this.finishedRuns.add(runId);
+    if (this.cancelledRuns.delete(runId)) outcome = { status: "cancelled", stop_reason: "aborted" };
+    if (this.activeRunId === runId) this.activeRunId = undefined;
     const event: RunnerEvent = {
       protocolVersion: PROTOCOL_VERSION,
       type: "pi.event",
@@ -210,10 +350,35 @@ export class PiAgentRuntime {
 
   private async cancel(): Promise<JsonValue> {
     this.cancelling = true;
+    if (this.userInput.hasActive()) {
+      this.executionSuspended = true;
+      this.suspensionRevision++;
+    }
+    if (this.activeRunId) this.cancelledRuns.add(this.activeRunId);
     try {
       await Promise.all([this.subagents?.stopAll(), this.requireSession().abort()]);
       return { cancelled: true };
     } finally { this.cancelling = false; }
+  }
+
+  /**
+   * Suspend this conversation's execution: block automatic scheduling first,
+   * then abort the main agent and subagents. Platform tasks are not touched —
+   * they belong to the control plane.
+   */
+  private async suspendRun(): Promise<JsonValue> {
+    this.executionSuspended = true;
+    this.suspensionRevision++;
+    if (this.activeRunId) this.cancelledRuns.add(this.activeRunId);
+    for (const stage of this.stages.values()) {
+      if (stage.state !== "queued") continue;
+      stage.state = "finished";
+      stage.resolve({ status: "cancelled", execution_id: stage.executionId });
+    }
+    const session = this.requireSession();
+    await Promise.all([this.subagents?.stopAll(), session.abort()]);
+    await session.waitForIdle();
+    return { suspended: true };
   }
 
   private async notify(params: JsonObject): Promise<JsonValue> {
@@ -230,7 +395,7 @@ export class PiAgentRuntime {
     };
     session.sessionManager.appendCustomEntry("pyromind.notification", { runId, message });
     this.notificationIds.add(runId);
-    if (session.isStreaming || this.normalizer) {
+    if (this.executionSuspended || session.isStreaming || this.normalizer) {
       this.pendingNotifications.push({ runId, message });
       return { accepted: true, queued: true };
     }
@@ -277,6 +442,7 @@ export class PiAgentRuntime {
   ): void {
     const executionRunId = `${runId}:${randomUUID()}`;
     this.normalizer = new PiEventNormalizer(this.sessionId!, executionRunId, this.pendingCommandIds);
+    this.activeRunId = executionRunId;
     this.outcome.reset();
     setImmediate(() => void this.runNotification(executionRunId, message, runId));
   }
@@ -286,6 +452,12 @@ export class PiAgentRuntime {
     message: { customType: string; content: string; display: boolean; details: JsonObject },
     notificationId: string,
   ): Promise<void> {
+    if (this.cancelledRuns.has(runId)) {
+      this.pendingNotifications.unshift({ runId: notificationId, message });
+      this.finishRun(runId, { status: "cancelled" });
+      this.normalizer = undefined;
+      return;
+    }
     try {
       const session = this.requireSession();
       await session.sendCustomMessage(message, {
@@ -338,6 +510,13 @@ export class PiAgentRuntime {
     const stage = this.stages.get(id)!;
     let result: RunOutcome;
     try {
+      if (this.cancelledRuns.has(stage.executionId)) {
+        this.finishRun(stage.executionId, { status: "cancelled" });
+        stage.state = "finished";
+        this.normalizer = undefined;
+        stage.resolve({ status: "cancelled", execution_id: stage.executionId });
+        return;
+      }
       await this.requireSession().sendCustomMessage({ customType: "agentgenome.stage",
         content: JSON.stringify(stage.request), display: false,
         details: { request_id: id, execution_id: stage.executionId },
@@ -346,6 +525,7 @@ export class PiAgentRuntime {
     } catch (error) {
       result = { status: "failed", message: error instanceof Error ? error.message : "stage failed" };
     }
+    if (this.cancelledRuns.has(stage.executionId)) result = { status: "cancelled" };
     this.finishRun(stage.executionId, result);
     stage.state = "finished";
     this.normalizer = undefined;
@@ -354,11 +534,12 @@ export class PiAgentRuntime {
   }
 
   private drainNotifications(): void {
-    if (this.cancelling || this.normalizer || this.requireSession().isStreaming) return;
+    if (this.cancelling || this.executionSuspended || this.normalizer || this.requireSession().isStreaming) return;
     for (const [id, stage] of this.stages) {
       if (stage.state !== "queued") continue;
       stage.state = "running";
       this.normalizer = new PiEventNormalizer(this.sessionId!, stage.executionId, this.pendingCommandIds);
+      this.activeRunId = stage.executionId;
       this.outcome.reset();
       setImmediate(() => void this.runStage(id));
       return;
@@ -368,6 +549,9 @@ export class PiAgentRuntime {
   }
 
   private async close(): Promise<JsonValue> {
+    this.executionSuspended = true;
+    this.suspensionRevision++;
+    if (this.activeRunId) this.cancelledRuns.add(this.activeRunId);
     const session = this.requireSession();
     await session.abort();
     await session.waitForIdle();
