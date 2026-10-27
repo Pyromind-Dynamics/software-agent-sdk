@@ -89,6 +89,17 @@ test("sandbox paths keep conversation state out of reach under the mount", () =>
   }
 });
 
+test("this conversation's own tool staging stays readable under the mount", () => {
+  // `df_run_pipeline` writes its runs here, outside public_data/.
+  const run = `${WORKSPACE}/data_preparation/d495ecbf/processed.jsonl`;
+
+  assert.equal(policy().resolvePath(run, "read"), run);
+  assert.equal(
+    policy().resolvePath(`${WORKSPACE}/public_data/train.csv`, "read"),
+    `${WORKSPACE}/public_data/train.csv`,
+  );
+});
+
 test("sandbox paths reject writes outside public_data", () => {
   for (const target of [
     "product/report.json",

@@ -160,11 +160,16 @@ export class SandboxPathPolicy {
   resolvePath(input: string, operation: SandboxPathOperation): string {
     if (!input) throw pathScopeError(operation, this.storageRoot);
     const target = posix.resolve(this.resolveInput(input));
-    if (this.insideAgentArea(target) && !this.exposedInsideAgentArea(target)) {
-      // The agent's own area holds conversation state and other conversations'
-      // workspaces. Only this conversation's public_data/ and its read-only
-      // resource roots are reachable, whichever spelling led here.
-      throw pathScopeError(operation, this.storageRoot);
+    if (this.insideAgentArea(target)) {
+      const refusal = this.agentAreaRefusal(target);
+      if (refusal !== undefined) {
+        throw new Error(`PATH_SCOPE_ERROR: ${target} is ${refusal}`);
+      }
+      if (operation === "write" && !insideSandboxPath(target, this.publicDataPath)) {
+        // The conversation's own directories are readable, but the agent only
+        // writes public_data/; tool staging is written by the tools themselves.
+        throw pathScopeError(operation, this.storageRoot);
+      }
     }
     const storageRoots = this.storageRoot ? [this.storageRoot] : [];
     const allowedRoots =
@@ -182,11 +187,25 @@ export class SandboxPathPolicy {
     return insideSandboxPath(target, posix.dirname(this.workspacePath));
   }
 
-  private exposedInsideAgentArea(target: string): boolean {
-    return (
-      insideSandboxPath(target, this.publicDataPath) ||
-      this.readOnlyRoots.some((root) => insideSandboxPath(target, root))
-    );
+  /**
+   * Why a path inside the agent directory stays closed, or undefined when it is
+   * reachable.
+   *
+   * This conversation's own directory is fair game: `public_data/`, the tool
+   * staging under `data_preparation/`, and the product state all live there.
+   * The runner's `pi/` bookkeeping and the loose files at the workspace root
+   * are not, and a sibling conversation is never reachable at all.
+   */
+  private agentAreaRefusal(target: string): string | undefined {
+    if (!insideSandboxPath(target, this.workspacePath)) {
+      return "inside another conversation's workspace";
+    }
+    if (insideSandboxPath(target, posix.join(this.workspacePath, RUNNER_STATE_DIRNAME))) {
+      return `the runner's session state (${RUNNER_STATE_DIRNAME}/)`;
+    }
+    const relative = posix.relative(this.workspacePath, target);
+    if (!relative.includes("/")) return "conversation metadata";
+    return undefined;
   }
 
   private resolveInput(input: string): string {
@@ -221,6 +240,9 @@ export function insideSandboxPath(target: string, root: string): boolean {
 
 /** The removed workspace symlink; kept only so a stale habit gets a clear error. */
 const LEGACY_STORAGE_ALIAS = "storage";
+
+/** The runner's own bookkeeping inside the conversation workspace. */
+const RUNNER_STATE_DIRNAME = "pi";
 
 function legacyStorageAliasError(storageRoot: string | undefined): string {
   const target = storageRoot
