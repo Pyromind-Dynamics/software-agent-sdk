@@ -27,6 +27,19 @@ def translate_runner_event(frame: dict[str, Any]) -> tuple[HarnessEvent, ...]:
         "run_id": str(frame.get("runId")),
         "occurred_at": _occurred_at(frame.get("occurredAt")),
     }
+    if kind == "execution.policy.updated":
+        if not isinstance(payload.get("automatic_turns_suspended"), bool):
+            raise ValueError("automatic_turns_suspended must be a boolean")
+        return (
+            HarnessEvent(
+                **common,
+                type="execution.policy.updated",
+                payload={
+                    "automatic_turns_suspended": payload["automatic_turns_suspended"],
+                    "reason": payload.get("reason"),
+                },
+            ),
+        )
     if kind == "subagent.workflow_modified":
         return (HarnessEvent(**common, type="workflow.modified", payload={}),)
     if kind in {"subagent.started", "subagent.progress", "subagent.finished"}:
