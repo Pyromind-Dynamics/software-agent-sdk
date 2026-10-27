@@ -19,6 +19,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { createPiModelRuntime, type PiModelConfig } from "./pi-model.js";
 import { createNoProgressGuardExtension } from "./no-progress-guard.js";
+import { createNoSpinExtension } from "./no-spin-extension.js";
 import { createToolResultExtension } from "./tool-results.js";
 import { isRecord, type JsonObject, type JsonValue } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
@@ -64,6 +65,7 @@ export interface ParsedPrompt {
 }
 
 export interface PiSessionOptions {
+  onRepetitionDetected?: () => void;
   /** Test seam: the terminal socket used by a sandbox session. */
   terminalConnect?: SandboxTerminalConnector;
   /** The runner-local ask_user tool, present only for input-enabled sessions. */
@@ -207,6 +209,7 @@ export async function createPiSession(
       subagents.extension,
       createToolResultExtension(),
       createNoProgressGuardExtension(),
+      { name: "no-spin", factory: createNoSpinExtension(sessionOptions.onRepetitionDetected) },
       (pi) => {
         if (config.terminalBackend !== "sandbox") return;
         pi.on("before_agent_start", (event) => {
@@ -262,6 +265,10 @@ export async function createPiSession(
   });
   await resourceLoader.reload();
   experienceHost.assertLoaded(resourceLoader);
+  const extensions = resourceLoader.getExtensions();
+  if (!extensions.extensions.some((extension) => extension.path === "<inline:no-spin>")) {
+    throw new Error(`Repetition protection failed to load: ${JSON.stringify(extensions.errors)}`);
+  }
   const sessionManager = SessionManager.open(
     config.sessionPath,
     join(config.workspaceRoot, "pi"),
