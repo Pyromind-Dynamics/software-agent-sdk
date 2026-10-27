@@ -51,7 +51,8 @@ DEFAULT_TAIL_BYTES = 64 * 1024
 TOOL_DESCRIPTION = """\
 Check the live progress of an asynchronous data-processing pipeline run.
 
-Pass the `output_dir` returned by `df_submit_pipeline`. The tool reads the
+Pass the `output_dir` returned by either `df_submit_pipeline` or
+`df_submit_evaluation`. The tool reads the
 run's `progress.json` snapshot (total / processed / succeeded / failed /
 ETA), the most recent records from `processed.jsonl`, and `report.json` when
 available, so you can report progress and verify output quality.
@@ -90,7 +91,7 @@ class DfCheckProgressAction(Action):
         description=(
             "Storage output directory of the run, e.g. "
             "'/.pyromind-agent/<conversation_id>/data_preparation/<run_id>' "
-            "(the `output_dir` returned by df_submit_pipeline)."
+            "(the `output_dir` returned by df_submit_pipeline or df_submit_evaluation)."
         )
     )
     tail_lines: int = Field(

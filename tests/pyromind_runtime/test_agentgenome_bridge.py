@@ -180,6 +180,49 @@ def test_tool_cancellation_forwards_only_the_exact_execution_id() -> None:
     ]
 
 
+@pytest.mark.parametrize("model_path", ["/models/checkpoint-100", "Qwen/Qwen3-32B"])
+def test_evaluation_maps_configs_but_keeps_the_model_reference(model_path):
+    workspace = "/target-workspace/.pyromind-agent/conversation"
+    package = "public_data/workflow-runs/run/package"
+    calls = []
+
+    async def request(method, payload):
+        assert method == "execution.tool"
+        calls.append(payload)
+        return {"is_error": False, "content": [], "details": {}}
+
+    async def invoke():
+        host = ExecutionHost(request, lambda *_: None)
+        host.workspace = workspace
+        host.root = f"{workspace}/public_data/workflow-runs/run"
+        host.package = package
+        await asyncio.to_thread(
+            BridgeTool(host).call,
+            "df_submit_evaluation",
+            {
+                "operation": "inference",
+                "input_path": "/target-workspace/datasets/test.jsonl",
+                "model_path": model_path,
+                "dataset_config_path": "configs/dataset.json",
+                "evaluation_config_path": "configs/evaluation.json",
+                "report_spec_path": "configs/report.json",
+                "served_model_name": "default",
+            },
+            execution_id="evaluate:1",
+        )
+
+    asyncio.run(invoke())
+    assert calls[0]["arguments"] == {
+        "operation": "inference",
+        "input_path": "/datasets/test.jsonl",
+        "model_path": model_path,
+        "dataset_config_path": f"{package}/configs/dataset.json",
+        "evaluation_config_path": f"{package}/configs/evaluation.json",
+        "report_spec_path": f"{package}/configs/report.json",
+        "served_model_name": "default",
+    }
+
+
 def test_tool_bridge_rejects_an_empty_execution_id() -> None:
     async def request(method: str, payload: dict[str, Any]) -> Any:
         raise AssertionError(f"no bridge call expected: {method} {payload}")

@@ -80,6 +80,7 @@ from openhands.tools.data_preparation import (
     DfCheckProgressAction,
     DfCheckProgressTool,
     DfStopTaskTool,
+    DfSubmitEvaluationTool,
     DfSubmitPipelineTool,
 )
 from openhands.tools.data_preparation.progress import DfCheckProgressExecutor
@@ -688,6 +689,14 @@ def _build_pyromind_storage_tools(
             Tool(name=GetStorageUrlTool.name, params=dict(params)),
             Tool(name=RunDatasetCleaningTool.name, params=cleaning_params),
             Tool(name=DfSubmitPipelineTool.name, params=preparation_params),
+            Tool(
+                name=DfSubmitEvaluationTool.name,
+                params={
+                    key: value
+                    for key, value in preparation_params.items()
+                    if key not in {"runtime_dir", "output_root"}
+                },
+            ),
             Tool(name=EdpSubmitTool.name, params=edp_params),
             Tool(name=EdpRenderTool.name, params=edp_params),
             Tool(name=EdpAggregateTool.name, params=edp_params),

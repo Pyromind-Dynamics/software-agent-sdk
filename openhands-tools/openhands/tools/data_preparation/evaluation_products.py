@@ -15,10 +15,17 @@ class EvaluationProductsOptions(BaseModel):
     extraction_script_path: str | None = None
 
 
-def prepare_products(action, files, runtime_hash: str) -> dict:
+def prepare_products(
+    options: EvaluationProductsOptions,
+    files,
+    runtime_hash: str,
+    *,
+    input_path: str,
+    cpu: int,
+    memory: int,
+) -> dict:
     from openhands.tools.data_preparation.inference import storage_path
 
-    options = action.products
     manifest = json.loads(files.read_text(options.manifest_path))
     script = None
     if options.operation == "profile":
@@ -55,11 +62,11 @@ def prepare_products(action, files, runtime_hash: str) -> dict:
         "products_operation": options.operation,
         "products_manifest": manifest,
         "extraction_script": script,
-        "input_path": storage_path(action.input_path),
+        "input_path": storage_path(input_path),
         "dataset_config": {},
         "evaluation_config": {},
-        "cpu": action.cpu,
-        "memory": action.memory,
+        "cpu": cpu,
+        "memory": memory,
         "runtime_sha256": runtime_hash,
     }
 

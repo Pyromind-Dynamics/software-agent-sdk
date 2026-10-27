@@ -4,8 +4,8 @@
 `label_studio_project`，无需本契约的 profile 或 review 作业。
 本契约用于用户明确要求远端分布统计、报告生成或评测报告内的复核界面。
 
-这些远端产物通过 `df_submit_pipeline(input_path=来源Storage路径, products=...)` 提交单个
-CPU 作业。`products` 与 inference、evaluation、清洗脚本互斥。提交返回 run_id、
+这些远端产物通过 `df_submit_evaluation` 提交单个 CPU 作业，
+在顶层填写 operation、input_path 和下述参数，不使用 products 外层对象。提交返回 run_id、
 output_dir；复核 run_id 同时是独立 review_id。使用 df_check_progress 查询及取得稳定链接。
 这些入口均不调用模型；review/report 不执行用户评分脚本。
 
@@ -14,6 +14,7 @@ output_dir；复核 run_id 同时是独立 review_id。使用 df_check_progress 
 ```json
 {
   "operation": "profile",
+  "input_path": "/datasets/train.jsonl",
   "manifest_path": "public_data/profile.json",
   "extraction_script_path": "public_data/extract_dataset.py"
 }
@@ -39,7 +40,7 @@ profile.json：
 ## 复核任务
 
 ```json
-{"operation": "review", "manifest_path": "public_data/review.json"}
+{"operation": "review", "input_path": "/scores/steps/100/predictions.jsonl", "manifest_path": "public_data/review.json"}
 ```
 
 review.json 的评分来源示例：
@@ -89,13 +90,13 @@ annotation r0 文件和现有标注界面。稳定入口 `/review-tasks/{review_
 annotations、cases、exports 接口复用现有保存及分页协议。评分源的 run_id 不等于 review_id。
 
 评分规则变化：新建评分运行，再创建新复核任务。旧任务和标注保留，不展示、不继承。
-恢复使用原 resume_run_id 和冻结配置；新来源/规则/分布必须新建任务。
+恢复使用 operation="resume"、不变的 input_path 和原 resume_run_id，不传 manifest 等配置；新来源/规则/分布必须新建任务。
 渲染失败时评分和已初始化的复核数据仍保留；恢复原任务可重试渲染，不会重置已保存标注。
 
 ## 单独生成报告
 
 ```json
-{"operation": "report", "manifest_path": "public_data/report.json"}
+{"operation": "report", "input_path": "/scores/steps/100/predictions.jsonl", "manifest_path": "public_data/report.json"}
 ```
 
 manifest 使用与复核相同的 source、scoring_manifest、可选 metrics 和 report_spec，

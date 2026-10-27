@@ -32,6 +32,9 @@ from openhands.sdk.event import (
     StreamingDeltaEvent,
 )
 from openhands.sdk.llm import Message, TextContent
+from openhands.tools.data_preparation.evaluation_submit import (
+    DfSubmitEvaluationObservation,
+)
 from openhands.tools.data_preparation.platform_submit import (
     DfSubmitPipelineObservation,
 )
@@ -381,7 +384,16 @@ def test_translator_preserves_structured_update_plan_steps() -> None:
     }
 
 
-def test_translator_projects_openhands_external_task_lifecycle() -> None:
+@pytest.mark.parametrize(
+    "tool_name,observation_type",
+    [
+        ("df_submit_pipeline", DfSubmitPipelineObservation),
+        ("df_submit_evaluation", DfSubmitEvaluationObservation),
+    ],
+)
+def test_translator_projects_openhands_external_task_lifecycle(
+    tool_name, observation_type
+) -> None:
     state = TranslationState(session_id="conversation-1")
     submitted = translate_event(
         state,
@@ -389,9 +401,9 @@ def test_translator_projects_openhands_external_task_lifecycle() -> None:
             id="submit-observation",
             source="environment",
             action_id="submit-action",
-            tool_name="df_submit_pipeline",
+            tool_name=tool_name,
             tool_call_id="submit-call",
-            observation=DfSubmitPipelineObservation.from_text(
+            observation=observation_type.from_text(
                 "submitted",
                 status="Running",
                 task_id="task-1",

@@ -16,11 +16,11 @@ description: 模型效果评测的统一入口，包括基模 Benchmark、训后
 
 有 eval_step_n.jsonl 或已有基线 prediction 时，先读真实样例并明确业务判分含义，
 按 [已有预测评分契约](references/saved-predictions.md) 生成本轮解析、评分脚本和说明，
-通过 `df_submit_pipeline(evaluation=...)` 在 CPU 评分所有 step。此入口计算评分，可生成报告，不初始化人工标注，也不调用模型。评分规则变化时复用原始预测，新建评分运行。
+通过 `df_submit_evaluation(operation="score", ...)` 在 CPU 评分所有 step。此入口计算评分，可生成报告，不初始化人工标注，也不调用模型。评分规则变化时复用原始预测，新建评分运行。
 训练集与验证集标签分布随报告展示；优先查看所选 checkpoint 的 badcase。
 `iteration_context.json` 汇总目标、数据、step 对比、选模和人工反馈，供下一轮判断；
 原因假设由 Agent 结合证据提出，不套用固定的补数据或重训规则。
-独立 test 使用下面的推理入口，传 inference.selection_run_id 绑定验证集选模批次；
+独立 test 使用下面的推理入口，传 selection_run_id 绑定验证集选模批次；
 Runtime 校验所选 checkpoint、test 来源和独立性，CPU 使用该批次冻结的 Python 评分脚本。
 parse_record 应支持 context.source=test，标识必须与 dataset_config 一致。LoRA 合并使用所选 step。
 
@@ -44,17 +44,18 @@ parse_record 应支持 context.source=test，标识必须与 dataset_config 一�
 ## 执行
 
 只讨论方案或评价标准时，完成配置与说明即可。用户要求实际评测或生成报告时调用
-`df_submit_pipeline`，传入 `input_path` 和结构化 `inference` 参数，参见
+`df_submit_evaluation(operation="inference", ...)`，将 `input_path`、`model_path`、
+`dataset_config_path`、`evaluation_config_path` 放在顶层，参见
 [执行契约](references/command-node-pipeline.md)。
 
 GPU 按任务实际需求选择：结合模型规模与精度、上下文长度、媒体分辨率和并发估算显存，
 优先满足需求的最小卡型、最少卡数，并考虑平台资源可用性和排队情况。
-在 inference 中明确填写 gpu_product、gpu_count；执行契约中的单张 L40S 仅为示例。
+在工具顶层明确填写 gpu_product、gpu_count；执行契约中的单张 L40S 仅为示例。
 不要默认使用 H200；仅在较小卡无法满足显存或必要性能要求，或用户明确指定时选用，
 并简述选卡依据。样本量大不直接等于需要大卡，可通过分批、降低并发控制资源需求。
 
 模型来源只写在 evaluation_config_path 指向的 JSON 的 model_source 中，不是工具参数。
-storage 仅用于 Storage 中已有的模型文件，inference.model_path 为其 Storage 绝对路径。
+storage 仅用于 Storage 中已有的模型文件，model_path 为其 Storage 绝对路径。
 Storage 中没有目标模型文件时，使用 clone（Clone Model）或 download（Download Model）节点准备模型。
 clone 时该字段为中心仓模型标识；download 时为外部仓模型名称，
 download_source 支持 huggingface（默认）和 modelscope。
@@ -85,7 +86,7 @@ output_schema 或 convert_format。不使用 workflow_debug 或 run_workflow。
 若两者都未返回，交付 Storage 位置及汇总，明确报告暂不可在线打开。
 报告入口不要求本服务登录或 JWT 验签；Storage 拒绝访问时应检查当前浏览器的 Storage 凭据。
 
-模式 `resume` 使用原 run_id，input_path 不变，可省略 inference 复用冻结配置。
+`operation="resume"` 配合原 `resume_run_id`，input_path 不变，不再传模型或配置参数，复用冻结配置。
 已有 prediction 不重复请求，仅补发缺失 prediction；业务不通过不等于需要重新推理。
 模型来源、模型引用、数据内容、配置或评测脚本变化必须新建 full 运行。
 Storage 模型使用不可变版本；clone/download 恢复仍执行同一准备节点，由平台处理缓存，
@@ -99,7 +100,7 @@ Storage 模型使用不可变版本；clone/download 恢复仍执行同一准备
 打标无需启动分布分析、重新评分或远端工作流。
 
 用户明确需要全量分布统计或单独生成报告时，按
-[独立产物契约](references/review-tasks.md) 使用 `df_submit_pipeline(products=...)`。
+[独立产物契约](references/review-tasks.md) 使用 `df_submit_evaluation(operation="profile" 或 "report", ...)`。
 profile 统计数据分布，report 渲染已有结果，均使用 CPU，不调用模型。
 评测报告内的独立复核运行仅用于用户明确选择该报告界面的场景，不能替代 Label Studio 打标。
 rubric 变化后新建评分版本，保留旧结果和人工标注。

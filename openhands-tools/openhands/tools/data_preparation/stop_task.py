@@ -4,7 +4,7 @@ When a user previews partial output and decides the run is not what they
 want, the agent should stop the platform-side task before adjusting the
 pipeline and resubmitting. The task is identified by ``task_id`` directly,
 or resolved from a ``run_id`` / ``output_dir`` recorded by
-``df_submit_pipeline``.
+``df_submit_pipeline`` or ``df_submit_evaluation``.
 """
 
 from __future__ import annotations
@@ -51,8 +51,8 @@ _PROD_APP_ENVS = {"prod", "production", "online"}
 TOOL_DESCRIPTION = """\
 Stop a running DataFlow pipeline task on the platform.
 
-Identify the task with `task_id` (from df_submit_pipeline), or pass the
-`run_id` / `output_dir` returned by df_submit_pipeline and the tool resolves
+Identify the task with `task_id` (from either submission tool), or pass the
+`run_id` / `output_dir` returned by either submission tool and the tool resolves
 the task for you. Call this when the user previews partial output, decides
 the run is not what they want, and asks to adjust the pipeline — stop the
 running task first, then edit and resubmit.
@@ -77,17 +77,17 @@ class DfStopTaskAction(Action):
     task_id: str | None = Field(
         default=None,
         description=(
-            "Platform task id returned by df_submit_pipeline. Preferred when available."
+            "Platform task id from either submission tool. Preferred when available."
         ),
     )
     run_id: str | None = Field(
         default=None,
-        description="Run id returned by df_submit_pipeline, used to look up the task.",
+        description="Run id from either submission tool, used to look up the task.",
     )
     output_dir: str | None = Field(
         default=None,
         description=(
-            "Storage output directory returned by df_submit_pipeline, used to "
+            "Storage output directory returned by either submission tool, used to "
             "look up the task."
         ),
     )
@@ -159,7 +159,7 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
             return DfStopTaskObservation.from_text(
                 text=(
                     "Could not resolve a task to stop. Provide task_id, or the "
-                    "run_id / output_dir returned by df_submit_pipeline."
+                    "run_id / output_dir returned by either submission tool."
                 ),
                 task_id=None,
                 stopped=False,
