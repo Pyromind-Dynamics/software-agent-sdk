@@ -1533,6 +1533,11 @@ class PiAdapter:
         if not isinstance(payload, dict):
             payload = {}
         run_id = str(frame.get("runId") or "")
+        if (
+            kind == "execution.policy.updated"
+            and payload.get("automatic_turns_suspended") is True
+        ):
+            self._suspend_inputs(session)
         if isinstance(kind, str) and kind.startswith("subagent."):
             if kind == "subagent.started":
                 session.active_subagents.add(run_id)

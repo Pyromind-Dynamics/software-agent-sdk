@@ -7,6 +7,7 @@ import type { AgentSession, SessionEntry } from "@earendil-works/pi-coding-agent
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { PiEventNormalizer } from "./pi-events.js";
 import { PiOutcomeNormalizer } from "./pi-outcome.js";
+import { REPETITION_ERROR } from "./no-spin-extension.js";
 import {
   createPiSession,
   parsePromptContent,
@@ -106,7 +107,8 @@ export class PiAgentRuntime {
     const { session, sessionId, execution, subagents } = await createPiSession(
       params,
       this.peer,
-      askUserTool ? { ...this.sessionOptions, askUserTool } : this.sessionOptions,
+      { ...this.sessionOptions, ...(askUserTool ? { askUserTool } : {}),
+        onRepetitionDetected: () => this.suspendRepetitiveGeneration() },
     );
     this.execution = execution;
     this.subagents = subagents;
@@ -361,6 +363,20 @@ export class PiAgentRuntime {
     } finally { this.cancelling = false; }
   }
 
+  private suspendRepetitiveGeneration(): void {
+    this.executionSuspended = true;
+    this.suspensionRevision++;
+    this.session?.clearQueue();
+    this.pendingCommandIds.length = 0;
+    if (!this.sessionId || !this.activeRunId) return;
+    this.peer.emit({
+      protocolVersion: PROTOCOL_VERSION, type: "pi.event", eventId: randomUUID(),
+      sessionId: this.sessionId, runId: this.activeRunId, occurredAt: new Date().toISOString(),
+      kind: "execution.policy.updated",
+      payload: { automatic_turns_suspended: true, reason: REPETITION_ERROR },
+    });
+  }
+
   /**
    * Suspend this conversation's execution: block automatic scheduling first,
    * then abort the main agent and subagents. Platform tasks are not touched —
@@ -407,7 +423,7 @@ export class PiAgentRuntime {
     const session = this.requireSession();
     const content = requiredString(params, "content");
     const details = isObject(params.details) ? params.details : {};
-    const triggerTurn = params.trigger_turn === true;
+    const triggerTurn = params.trigger_turn === true && !this.executionSuspended;
     await session.sendCustomMessage(
       {
         customType: "pyromind.context",

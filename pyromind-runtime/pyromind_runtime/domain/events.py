@@ -13,6 +13,7 @@ type HarnessEventType = Literal[
     "history.synced",
     "workflow.modified",
     "run.finished",
+    "execution.policy.updated",
     "status.changed",
     "message.started",
     "message.delta",
