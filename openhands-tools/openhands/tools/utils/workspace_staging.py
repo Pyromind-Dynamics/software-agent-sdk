@@ -9,8 +9,7 @@ content.
 
 Paths under the sandbox Storage mount resolve against it instead of the
 workspace, which lets a run read user Storage without materializing it through
-the conversation first. The removed ``storage/...`` alias is still accepted and
-read as the mount.
+the conversation first. The removed ``storage/...`` alias is rejected.
 """
 
 from __future__ import annotations
