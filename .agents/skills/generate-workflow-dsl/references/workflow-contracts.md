@@ -98,10 +98,16 @@ dataset_kind = DatasetConfigBuilderVisionNode(
 | Builder | 常用输入 | 输出 |
 |---|---|---|
 | LoraConfigBuilderNode | lora_rank, lora_dropout, target_modules, exclude_modules | `lora_config` |
-| TrainingConfigBuilderNode | num_epochs, batch_size, grad_accum, learning_rate, lr_scheduler_type, logging/save/eval steps, seed, max_grad_norm | `training_config` |
+| TrainingConfigBuilderNode | num_epochs, batch_size, grad_accum, learning_rate, lr_scheduler_type, logging/save/eval steps, save_total_limit, seed, max_grad_norm | `training_config` |
 | AccelerateConfigBuilderNode | zero_stage | `accelerate_config` |
 | WandbConfigBuilderNode | wandb_api_key, wandb_project, wandb_name | `wandb_config` |
 | GRPOTrainingExtraConfigBuilderNode | max_steps, num_generations, max_prompt_length, max_completion_length, temperature, enable_chord, enable_hint | `grpo_extra_config` |
+
+`TrainingConfigBuilderNode.save_total_limit` 显式填写：未指定保留策略时使用 `300`，避免平台默认 `3`
+清理训后选模所需的 checkpoint。也可结合训练数据量、epoch、有效 batch 或明确的 `max_steps`
+估算总优化步数，按 `ceil(total_steps / save_steps) + 1` 预留保留数量。
+需要逐次评估选模时，保存间隔与 `eval_steps` 对齐（通常 `save_steps=eval_steps`），确保候选 step
+有对应 checkpoint；用户明确指定的保留策略优先。
 
 SFT/DPO/GRPO 的 `wandb_config` 平台当前按必填校验：必须连接 `WandbConfigBuilderNode.wandb_config`。
 `WandbConfigBuilderNode.wandb_api_key` 只填 Secret 名，不填明文 Key；`wandb_project` 必填，
