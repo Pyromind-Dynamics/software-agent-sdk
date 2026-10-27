@@ -9,7 +9,7 @@
 
 - 普通文本：PromptedGenerator / FormatStrPromptedGenerator。
 - SFT：CondorGenerator → CondorRefiner → AlpagasusFilter。
-- 推理、代码、多轮、Function Call：选 DataFlow 1.0.11 对应 Generator/Filter。
+- 推理、代码、多轮、Function Call：选 DataFlow 1.0.13 对应 Generator/Filter。
 - 图片输入生成问答、描述或回答：managed image runtime。
 - 图片新像素：根据正常底图、真实异常、标注及业务定义，复用、组合或编写
   Python 策略。无现成策略不等于不能合成；缺少业务依据也不能靠绘图猜类别。
@@ -39,7 +39,7 @@ GT 提供正常结构，实拍可信区域提供材料色调与纹理，标注�
 
 ## 执行与复核
 
-沿用通用 SOP 和已有执行工具。`sandbox_sample.py` 输入直接用 `storage/...`。
+沿用通用 SOP 和已有执行工具。`sandbox_sample.py` 输入直接用 `/target-workspace/...`。
 输入覆盖计划采用的策略和目标类别，数量由输入和派生小样计划控制，执行器不截断
 输入。`sandbox_sample.py` 运行纯图片生成时使用 `model_profile=none`；
 视觉复核使用 [固定入口](../../scripts/preparation/image_synthesis_review.py)

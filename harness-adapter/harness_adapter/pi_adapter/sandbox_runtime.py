@@ -60,10 +60,14 @@ PYROMIND_AGENT_STORAGE_ROOT = "/.pyromind-agent"
 # of one deployment, so a conversation which finds its digest already there
 # unpacks it from the mount instead of uploading it again.
 PYROMIND_AGENT_RESOURCES_ROOT = "/.pyromind-agent-resources"
-# Workspace-relative alias for the mounted Storage root. The model reads data
-# through normal file/terminal tools instead of the Storage HTTP API.
-STORAGE_ALIAS = "storage"
-_WORKSPACE_LAYOUT_VERSION = 3
+# The workspace symlink that used to expose the Storage mount under a short
+# relative name. Storage is addressed by its mount path now, so the link is only
+# remembered here to clear it out of workspaces laid out by an older runtime.
+LEGACY_STORAGE_ALIAS = "storage"
+# Bumped when the workspace layout changes, so an existing sandbox re-runs the
+# prepare script. 4: the Storage symlink is no longer created, and workspaces
+# laid out by version 3 still carry it until they are prepared again.
+_WORKSPACE_LAYOUT_VERSION = 4
 # The platform rejects a create request without memory; mirror the sandbox
 # tool's own fallback (platform minimum 4 vCPU, 1:2 vCPU:memory ratio).
 DEFAULT_CPU = "4"
@@ -686,15 +690,17 @@ class SandboxExecutionManager:
         mount_path: str,
         workspace_path: str,
     ) -> None:
-        storage_link = f"{workspace_path}/{STORAGE_ALIAS}"
+        legacy_link = f"{workspace_path}/{LEGACY_STORAGE_ALIAS}"
         public_data = f"{workspace_path}/public_data"
         script = (
             f"if [ ! -d {shlex.quote(mount_path)} ]; then "
             f"exit {_MOUNT_MISSING_EXIT_CODE}; fi\n"
             f"mkdir -p {shlex.quote(workspace_path)} && "
             f"mkdir -p {shlex.quote(public_data)} && "
-            f"rm -rf {shlex.quote(storage_link)} && "
-            f"ln -s {shlex.quote(mount_path)} {shlex.quote(storage_link)}\n"
+            # Drop the alias an older runtime left behind. Only a symlink is
+            # removed, so a real directory of that name is never touched.
+            f"if [ -L {shlex.quote(legacy_link)} ]; then "
+            f"rm -f {shlex.quote(legacy_link)}; fi\n"
         )
         output, exit_code, timed_out = await self._run_script(
             client, sandbox_id, ws_base_url, script

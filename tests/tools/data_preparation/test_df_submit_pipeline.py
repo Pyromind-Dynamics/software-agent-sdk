@@ -45,9 +45,9 @@ def test_normalize_storage_path_basic() -> None:
 
 
 def test_normalize_storage_path_errors() -> None:
-    with pytest.raises(ValueError, match="non-empty"):
+    with pytest.raises(ValueError, match="must not be empty"):
         _normalize_storage_path("", "field")
-    with pytest.raises(ValueError, match="non-empty"):
+    with pytest.raises(ValueError, match="must not be empty"):
         _normalize_storage_path("   ", "field")
     with pytest.raises(ValueError, match="control characters"):
         _normalize_storage_path("/foo\x00bar", "field")
@@ -88,7 +88,7 @@ def test_build_dataflow_command_structure() -> None:
         image_utils_api_version="1",
     )
     assert "python3 -m venv /tmp/df-venv" in cmd
-    assert "open-dataflow==1.0.11" in cmd
+    assert "open-dataflow==1.0.13" in cmd
     assert "opencv-python-headless==4.10.0.84" in cmd
     assert "source_fingerprint.py" in cmd
     assert "mkdir -p" in cmd
@@ -905,6 +905,27 @@ def test_remote_workspace_submission_stages_pipeline_script(
     saved = DataPreparationTaskStore(tmp_path / "tasks").get("task-remote")
     assert saved is not None
     assert saved.script_path == "public_data/data-preparation/pipeline.py"
+
+
+@pytest.mark.parametrize("from_storage", [False, True])
+def test_submission_files_preserve_remote_source_path(
+    tmp_path: Path, sandbox_workspace, from_storage: bool
+) -> None:
+    root = (
+        sandbox_workspace.storage_dir
+        if from_storage
+        else sandbox_workspace.workspace_dir
+    )
+    script = root / "pipeline.py"
+    script.write_text("print('sandbox')")
+    conversation = _make_conversation_with_llm()
+    conversation.workspace = sandbox_workspace
+    files = _SubmissionFiles(conversation, staging=tmp_path / "staging")
+
+    staged, display = files.resolve(str(script))
+
+    assert staged.read_text() == "print('sandbox')"
+    assert display == (str(script) if from_storage else "pipeline.py")
 
 
 def test_pipeline_path_compatibility_is_normalized(tmp_path: Path) -> None:

@@ -38,7 +38,7 @@ from openhands.tools.utils.dataflow_config import (
 )
 
 
-SUPPORTED_DATAFLOW_VERSION = "1.0.11"
+SUPPORTED_DATAFLOW_VERSION = "1.0.13"
 
 # Platform runs and sandbox samples must agree on the DataFlow runtime, so both
 # install this pinned set.

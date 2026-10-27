@@ -35,9 +35,7 @@ PYROMIND_PRODUCT_USER_ID_SECRET = "pyromind_product_user_id"
 class SubmitWorkflowAction(Action):
     workflow_path: str = Field(
         min_length=1,
-        description=(
-            "Existing Storage workflow DSL path, e.g. storage/project/workflow.py."
-        ),
+        description=("Existing Storage workflow DSL path, e.g. /project/workflow.py."),
     )
 
 

@@ -9,7 +9,7 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -304,17 +304,19 @@ with open(sys.argv[1]) as file:
                 },
                 case,
             )
-            assert plan["status"] == "planned"
-            assert plan["run_id"] is None
+            plan_state = cast(dict[str, Any], plan)
+            assert plan_state["status"] == "planned", plan
+            assert plan_state["run_id"] is None
             confirmed = await backend.invoke(
                 "session",
                 "confirm_run",
-                {"plan_id": plan["plan_id"], "digest": plan["digest"]},
+                {
+                    "plan_id": plan_state["plan_id"],
+                    "digest": plan_state["digest"],
+                },
                 f"confirm-{case}",
             )
-            state = confirmed["run"]
-            assert isinstance(state, dict)
-            assert isinstance(state["id"], str)
+            state = cast(dict[str, Any], confirmed["run"])
             failed = await asyncio.wait_for(
                 backend.execute("session", state["id"], emit), 30
             )

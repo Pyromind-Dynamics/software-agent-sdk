@@ -30,7 +30,7 @@ def test_prepare_uses_storage_dsl_validation_and_marks_training(monkeypatch):
         },
     )
     result = module.PlatformWorkflowSubmission._prepare(
-        "storage/.pyromind-agent/conversation/workflow.py",
+        "/target-workspace/.pyromind-agent/conversation/workflow.py",
         RequestContext(user_id="42", cookie="auth_token=ephemeral"),
     )
     assert downloaded == ["/.pyromind-agent/conversation/workflow.py"]
@@ -41,8 +41,50 @@ def test_prepare_uses_storage_dsl_validation_and_marks_training(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        # The sandbox spelling and the Storage spelling are both accepted.
+        ("/target-workspace/project/workflow.py", "/project/workflow.py"),
+        ("/project/workflow.py", "/project/workflow.py"),
+    ],
+)
+def test_prepare_accepts_every_spelling_of_the_same_workflow(
+    monkeypatch, path, expected
+):
+    downloaded: list[str] = []
+    monkeypatch.setattr(module, "_default_storage_base_url", lambda: "https://storage")
+    monkeypatch.setattr(
+        module,
+        "download_file_from_pyromind",
+        lambda **kwargs: (
+            downloaded.append(kwargs["storage_path"]) or b"workflow = 'sft'"
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "ValidateWorkflowDslExecutor",
+        lambda **kwargs: lambda action: SimpleNamespace(is_error=False, valid=True),
+    )
+    monkeypatch.setattr(
+        module,
+        "convert_dsl_to_xyflow",
+        lambda dsl, name: {"name": name, "nodes": []},
+    )
+
+    module.PlatformWorkflowSubmission._prepare(path, RequestContext(user_id="42"))
+
+    assert downloaded == [expected]
+
+
+@pytest.mark.parametrize(
     "path",
-    ["/tmp/workflow.py", "storage/../workflow.py", "storage/project/file.txt"],
+    [
+        "storage/../workflow.py",
+        "storage/project/file.txt",
+        "/workflow.py",
+        # The removed alias is no longer a way to name a workflow.
+        "storage/project/workflow.py",
+    ],
 )
 def test_prepare_rejects_non_storage_workflow(path):
     with pytest.raises(ValueError, match="workflow_path"):

@@ -51,7 +51,7 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
 **数据源索引**：LeRobot v2.1 源用 `meta/episodes/chunk-*.parquet`；
 **S2 自采集源没有 episode 索引**——先用 Terminal 从 episode 目录清单构建一个
 索引 parquet（列：episode_id）并写到 Storage
-（`storage/episodes_index/episodes_index.parquet`），渲染 `data_source` 指向它。
+（`/target-workspace/episodes_index/episodes_index.parquet`），渲染 `data_source` 指向它。
 构建 parquet 需要 pyarrow；本地默认 Python 没有且无外网时，改用
 `$DATAFLOW_PYTHON`（即 `/home/openhands/dataflow-venv/bin/python`，镜像内
 自带 pyarrow）。`data_source` 必须指向 Parquet 文件，指向 JSONL 会在
@@ -108,7 +108,7 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
 
 ## 门禁与流程
 
-1. 预览探查（直读 `storage/`）→ 确认源形态
+1. 预览探查（直读 `/target-workspace`）→ 确认源形态
    （LeRobot v2.1 / S2 自采集）；
    自采集源先构建并上传 episode 索引（见上）。
 0. **无需 wheel 预置**：runtime wheel 已内置于 skill bundle，由 edp_submit
@@ -123,4 +123,4 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
 6. 用户确认后默认串行全量提交（每次一片，终态后再提交下一片）；仅当
    用户明确要求时才并发 2-5 片。`df_check_progress` 观察进度。
 7. 全部 episode 终态后提交 merge 记录（`embodied-cleaning-merge`），
-   Kafka 回调后校验 target 发布物与聚合 report（直读 `storage/`）。
+   Kafka 回调后校验 target 发布物与聚合 report（直读 `/target-workspace`）。

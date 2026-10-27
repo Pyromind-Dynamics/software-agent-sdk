@@ -162,13 +162,13 @@ Never start both full-run paths for one request."""
 # user's Storage is mounted and reading data is a local operation.
 _SANDBOX_SYSTEM_PROMPT = """
 
-This session runs its execution plane in a platform Sandbox with your Storage
-mounted at storage/, relative to the workspace root. That is the local copy of
-Storage: when the user asks about data or files, inspect and read them there
-with read; use terminal for searches, bulk computation, and saved scripts.
-Pass storage/... paths directly to
-Python scripts through terminal. storage/ is writable: to hand a workspace file
-to a platform task, write it under storage/<dir>/<name> and pass /<dir>/<name>
+This session runs its execution plane in a platform Sandbox with the user's
+Storage mounted at {root}. That mount is the Storage root: {root}/<path> is the
+Storage path /<path> the user and the platform see. When the user asks about
+data or files, inspect and read them there with read; use terminal for searches,
+bulk computation, and saved scripts. Pass {root}/<path> paths directly to
+Python scripts through terminal. Storage is writable: to hand a workspace file
+to a platform task, write it under {root}/<dir>/<name> and pass /<dir>/<name>
 as the Storage path. Every dataset this session works on is a Storage path you
 can read directly.
 
@@ -197,13 +197,11 @@ def _sandbox_system_prompt(mount_path: str, conversation_id: str) -> str:
     workspace = f"{root}{PYROMIND_AGENT_STORAGE_ROOT}/{conversation_id}"
     skills = f"{workspace}/.agents/skills"
     return (
-        f"{_SANDBOX_SYSTEM_PROMPT}\n\nstorage/ is a symbolic link to the Storage "
-        f"mount at {root}, so storage/<path> and {root}/<path> name the same "
-        "file. Use the absolute form when a command has changed directory.\n\n"
+        f"{_SANDBOX_SYSTEM_PROMPT.replace('{root}', root)}\n\n"
         "The user may reference /workspace/<path>: that names the same Storage, "
-        "so run storage/<path> instead. /workspace/<path> does not resolve "
+        f"so use {root}/<path> instead. /workspace/<path> does not resolve "
         "inside this sandbox, so never run it and never search the filesystem "
-        "for the file: every dataset is storage/<path>.\n\n"
+        "for the file.\n\n"
         f"The skills tree is unpacked inside this sandbox (not outside the "
         f"workspace) at {skills}. Every terminal call starts at the workspace "
         "root, so .agents/skills/<skill>/... works as written, and "

@@ -11,6 +11,7 @@ from openhands.tools.pyromind_dataset.definition import (
     _storage_path_for,
     _strip_workspace_prefix,
 )
+from openhands.tools.utils.storage_paths import REMOVED_ALIAS
 from openhands.tools.utils.workspace_staging import (
     WorkspaceStagingError,
     resolve_workspace_path,
@@ -52,9 +53,10 @@ def resolve_storage_input(
                     _storage_path_for(workspace, conversation_id, raw),
                     "storage_mount" if from_storage else "workspace",
                 )
-    if raw.startswith("storage/"):
-        return StorageInput(
-            value, _storage_path(PurePosixPath(raw[len("storage/") :])), "storage_alias"
+    if raw.startswith(f"{REMOVED_ALIAS}/"):
+        raise ValueError(
+            f"the '{REMOVED_ALIAS}/' alias was removed: original={value!r}; "
+            "address Storage by its mount path or its Storage path"
         )
     return StorageInput(
         value,

@@ -412,7 +412,7 @@ class PyromindBusinessToolHost:
         """Tool specs this session exposes.
 
         ``sandbox`` sessions mount the user's Storage, so they publish
-        workspace files by writing to ``storage/...`` and have no use for the
+        workspace files by writing under the mount and have no use for the
         host-side presigned upload tool.
         """
         specs = [validation_tool_spec()]
@@ -439,7 +439,7 @@ class PyromindBusinessToolHost:
                                 "type": "string",
                                 "description": (
                                     "Existing Storage Python DSL path, such as "
-                                    "storage/project/workflow.py"
+                                    "/project/workflow.py"
                                 ),
                             }
                         },

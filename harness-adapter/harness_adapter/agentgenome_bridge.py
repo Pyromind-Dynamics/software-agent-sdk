@@ -29,6 +29,7 @@ from pyromind_runtime.domain.content import JsonObject, JsonValue
 from pyromind_runtime.ports.workflows import WorkflowEventSink
 
 from harness_adapter.pi_adapter.runner import PiRunnerError
+from openhands.tools.utils.storage_paths import REMOVED_ALIAS
 
 
 type Request = Callable[[str, JsonObject], Coroutine[Any, Any, Any]]
@@ -45,7 +46,7 @@ def _is_missing_file(error: Exception) -> bool:
     return "FILE_READ_ERROR" in message and "No such file or directory" in message
 
 
-_SANDBOX_ALIASES = ("storage", "public_data", ".agents", "knowledge")
+_SANDBOX_ALIASES = ("public_data", ".agents", "knowledge")
 # Agent workspaces live at ``<storage mount>/.pyromind-agent/<conversation>``, so
 # the mount is whatever sits above that directory.
 _AGENT_DIRECTORY = "/.pyromind-agent/"
@@ -173,18 +174,27 @@ else:
 """
 
 
-def _storage_alias(path: str) -> str | None:
+def _storage_alias(path: str, mount: str | None) -> str | None:
     """The sandbox spelling of a Storage path that a business tool declared.
 
-    Platform tools address Storage without the sandbox alias (`/datasets/...`,
-    `datasets/...`), while the sandbox path policy only admits `storage/...`.
+    Platform tools address Storage without the mount prefix (`/datasets/...`,
+    `datasets/...`), while the sandbox reads Storage under its mount
+    (`/target-workspace/datasets/...`). A path the sandbox can already resolve
+    is left alone.
     """
+    if mount is None:
+        return None
     stripped = path.lstrip("/")
     if not stripped:
         return None
-    if not path.startswith("/") and stripped.split("/", 1)[0] in _SANDBOX_ALIASES:
+    head = stripped.split("/", 1)[0]
+    if not path.startswith("/") and head in _SANDBOX_ALIASES:
         return None
-    return f"storage/{stripped}"
+    if not path.startswith("/") and head == REMOVED_ALIAS:
+        # The sandbox path policy reports the removal itself; remapping it here
+        # would hide that error behind a "file not found".
+        return None
+    return f"{mount.rstrip('/')}/{stripped}"
 
 
 def _tool_path(
@@ -198,7 +208,7 @@ def _tool_path(
 
     A run step hands the same value to shell commands and to business tools, and
     those read paths in different vocabularies: the shell needs a sandbox path,
-    while a tool resolves `storage/...` and `public_data/...` itself. Give each
+    while a tool resolves `public_data/...` itself. Give each
     tool back the spelling the graph declared, and make run-directory paths
     workspace-relative so they survive a remote workspace. A Storage artifact
     pinned beside its input is absolute in the sandbox, so it loses the mount
@@ -207,12 +217,6 @@ def _tool_path(
     original = declared.get(value)
     if original is not None:
         return original
-    # A path parameter resolved for the sandbox becomes `/storage/...`, which is not
-    # an object the platform can look up: it addresses Storage without the alias
-    # (`/datasets/...`). The bare `storage/...` form is left alone, because a
-    # business tool resolves that spelling itself.
-    if value.startswith("/storage/"):
-        return value[len("/storage") :]
     if (
         mount
         and value.startswith(f"{mount}/")
@@ -662,15 +666,15 @@ class ExecutionHost:
     def _resolve_aliased(self, value: str) -> str:
         """Resolve a read path, retrying the Storage spelling a business tool declared.
 
-        Platform tools name Storage without the sandbox alias (`/datasets/...`),
-        which the sandbox path policy rejects, so retry those under `storage/`.
+        Platform tools name Storage without the mount prefix (`/datasets/...`),
+        which the sandbox path policy rejects, so retry those under the mount.
         An artifact pinned beside a Storage input is mount-absolute for the same
-        reason and takes the alias before the first attempt.
+        reason and takes the prefix before the first attempt.
         """
         try:
-            return self._resolve(self._plane_spelling(value), False)
+            return self._resolve(value, False)
         except Exception as error:
-            alias = _storage_alias(value)
+            alias = _storage_alias(value, self._storage_mount())
             if alias is None or "PATH_SCOPE_ERROR" not in str(error):
                 raise
             try:
@@ -816,20 +820,6 @@ class ExecutionHost:
         head, separator, _ = self.workspace.partition(_AGENT_DIRECTORY)
         return head if separator else None
 
-    def _plane_spelling(self, path: str) -> str:
-        """The spelling the sandbox path policy admits for one artifact path.
-
-        Paths inside the conversation workspace are readable and writable as they
-        are. An artifact pinned beside a Storage input sits outside it, and the
-        policy only admits Storage under its ``storage/`` alias.
-        """
-        mount = self._storage_mount()
-        if mount is None or not path.startswith(f"{mount}/"):
-            return path
-        if path.startswith(f"{self.workspace}/"):
-            return path
-        return f"storage/{path[len(mount) + 1 :]}"
-
     def path(self, name: str) -> str:
         """The sandbox path of a graph artifact, inside or outside the run directory.
 
@@ -841,7 +831,7 @@ class ExecutionHost:
             raise ValueError("artifact path escapes run directory")
         if not path.is_absolute():
             return str(PurePosixPath(self.root) / path)
-        return self._resolve(self._plane_spelling(name), True)
+        return self._resolve(name, True)
 
     def describe(self, name: str) -> dict[str, Any]:
         result = self._python(
@@ -860,12 +850,12 @@ class ExecutionHost:
         return value
 
     def read_text(self, name: str) -> str:
-        path = self._plane_spelling(self.path(name))
+        path = self.path(name)
         result = self._call("execution.read", {"path": path, "limit": 65536})
         return base64.b64decode(result["content"], validate=True).decode("utf-8")
 
     def write_text(self, name: str, text: str) -> None:
-        self._write(self._plane_spelling(self.path(name)), text.encode("utf-8"))
+        self._write(self.path(name), text.encode("utf-8"))
 
     def link(self, name: str, source: str) -> None:
         """Land an external product on a graph artifact path.
@@ -873,7 +863,7 @@ class ExecutionHost:
         A hardlink keeps a large product out of the run directory; a filesystem
         boundary falls back to a copy, which is what the old wait script did.
         """
-        target = self._plane_spelling(self.path(name))
+        target = self.path(name)
         self._python(
             "import os,shutil\n"
             f"t={target!r}\ns={source!r}\n"
@@ -888,7 +878,7 @@ class ExecutionHost:
         try:
             result = self._call(
                 "execution.read",
-                {"path": self._plane_spelling(path), "limit": limit},
+                {"path": path, "limit": limit},
             )
         except Exception:
             return None
@@ -1037,20 +1027,16 @@ class ExecutionHost:
         if not pending:
             return answers
         # Resolving each path is itself a bridge round trip, and a plan review
-        # probes a dozen of them; at sandbox latency that is minutes. The alias a
-        # path may need is pure string logic, so try both spellings inside one
-        # probe and keep whichever exists.
+        # probes a dozen of them; at sandbox latency that is minutes. The mount
+        # prefix a path may need is pure string logic, so try both spellings
+        # inside one probe and keep whichever exists.
+        mount = self._storage_mount()
         candidates: dict[str, list[str]] = {}
         for path in pending:
             options = [path]
-            if path.startswith("storage/"):
-                options.append(path[len("storage/") :])
-            elif path.startswith("/storage/"):
-                options.append(path[len("/storage") :])
-            else:
-                alias = _storage_alias(path)
-                if alias is not None and alias != path:
-                    options.append(alias)
+            alias = _storage_alias(path, mount)
+            if alias is not None and alias != path:
+                options.append(alias)
             candidates[path] = options
         flat = [spelling for options in candidates.values() for spelling in options]
         result = self._run(

@@ -101,7 +101,7 @@ export interface SandboxPathPolicyInput {
   readOnlyRoots: string[];
   skillsDirectory?: string;
   knowledgeRoot?: string;
-  /** Sandbox-side Storage mount root; the model addresses it as `storage/`. */
+  /** Sandbox-side Storage mount root; the model addresses it absolutely. */
   storageRoot?: string;
 }
 
@@ -110,10 +110,14 @@ export interface SandboxPathPolicyInput {
  *
  * The local `WorkspaceAccessPolicy` canonicalizes through the host filesystem,
  * which cannot see the sandbox. This mirrors its model-visible vocabulary
- * (relative paths start at the conversation root, `public_data/` and the
- * mounted Storage alias `storage/` are writable, `.agents/skills/` and
- * `knowledge/` are read-only aliases) using pure string arithmetic so it works
- * without any filesystem access.
+ * (relative paths start at the conversation root, `public_data/` is writable,
+ * `.agents/skills/` and `knowledge/` are read-only aliases) using pure string
+ * arithmetic so it works without any filesystem access.
+ *
+ * The user Storage mount is addressed by its absolute path. It used to be
+ * reachable through a `storage/` symlink in the workspace; that alias is gone,
+ * because one file then had two spellings and every path handed to a platform
+ * tool had to drop the prefix by hand.
  */
 export class SandboxPathPolicy {
   private constructor(
@@ -154,30 +158,38 @@ export class SandboxPathPolicy {
   }
 
   resolvePath(input: string, operation: SandboxPathOperation): string {
-    if (!input) throw pathScopeError(operation);
-    const resolved = this.resolveInput(input);
-    const target = posix.resolve(resolved.path);
+    if (!input) throw pathScopeError(operation, this.storageRoot);
+    const target = posix.resolve(this.resolveInput(input));
+    if (this.insideAgentArea(target) && !this.exposedInsideAgentArea(target)) {
+      // The agent's own area holds conversation state and other conversations'
+      // workspaces. Only this conversation's public_data/ and its read-only
+      // resource roots are reachable, whichever spelling led here.
+      throw pathScopeError(operation, this.storageRoot);
+    }
+    const storageRoots = this.storageRoot ? [this.storageRoot] : [];
     const allowedRoots =
       operation === "write"
-        ? [this.publicDataPath]
-        : [this.publicDataPath, ...this.readOnlyRoots];
-    const storageAccess =
-      resolved.storageAlias &&
-      this.storageRoot !== undefined &&
-      insideSandboxPath(target, this.storageRoot);
-    if (
-      !storageAccess &&
-      !allowedRoots.some((root) => insideSandboxPath(target, root))
-    ) {
-      throw pathScopeError(operation);
+        ? [...storageRoots, this.publicDataPath]
+        : [...storageRoots, this.publicDataPath, ...this.readOnlyRoots];
+    if (!allowedRoots.some((root) => insideSandboxPath(target, root))) {
+      throw pathScopeError(operation, this.storageRoot);
     }
     return target;
   }
 
-  private resolveInput(input: string): {
-    path: string;
-    storageAlias: boolean;
-  } {
+  /** True for the mount's agent directory: this workspace and its siblings. */
+  private insideAgentArea(target: string): boolean {
+    return insideSandboxPath(target, posix.dirname(this.workspacePath));
+  }
+
+  private exposedInsideAgentArea(target: string): boolean {
+    return (
+      insideSandboxPath(target, this.publicDataPath) ||
+      this.readOnlyRoots.some((root) => insideSandboxPath(target, root))
+    );
+  }
+
+  private resolveInput(input: string): string {
     const parts = input.split("/").filter((part) => part !== "" && part !== ".");
     if (!input.startsWith("/") && parts[0] === ".agents" && parts[1] === "skills") {
       if (!this.skillsDirectory) {
@@ -185,10 +197,7 @@ export class SandboxPathPolicy {
           "PATH_SCOPE_ERROR: .agents/skills/ is not configured for this Pi session",
         );
       }
-      return {
-        path: posix.join(this.skillsDirectory, ...parts.slice(2)),
-        storageAlias: false,
-      };
+      return posix.join(this.skillsDirectory, ...parts.slice(2));
     }
     if (!input.startsWith("/") && parts[0] === "knowledge") {
       if (!this.knowledgeRoot) {
@@ -196,26 +205,12 @@ export class SandboxPathPolicy {
           "PATH_SCOPE_ERROR: knowledge/ is not configured for this Pi session",
         );
       }
-      return {
-        path: posix.join(this.knowledgeRoot, ...parts.slice(1)),
-        storageAlias: false,
-      };
+      return posix.join(this.knowledgeRoot, ...parts.slice(1));
     }
-    if (!input.startsWith("/") && parts[0] === "storage") {
-      if (!this.storageRoot) {
-        throw new Error(
-          "PATH_SCOPE_ERROR: storage/ requires Storage to be mounted for this Pi session",
-        );
-      }
-      return {
-        path: posix.join(this.storageRoot, ...parts.slice(1)),
-        storageAlias: true,
-      };
+    if (!input.startsWith("/") && parts[0] === LEGACY_STORAGE_ALIAS) {
+      throw new Error(legacyStorageAliasError(this.storageRoot));
     }
-    return {
-      path: input.startsWith("/") ? input : posix.join(this.workspacePath, input),
-      storageAlias: false,
-    };
+    return input.startsWith("/") ? input : posix.join(this.workspacePath, input);
   }
 }
 
@@ -224,10 +219,26 @@ export function insideSandboxPath(target: string, root: string): boolean {
   return target.startsWith(root.endsWith("/") ? root : `${root}/`);
 }
 
-function pathScopeError(operation: SandboxPathOperation): Error {
+/** The removed workspace symlink; kept only so a stale habit gets a clear error. */
+const LEGACY_STORAGE_ALIAS = "storage";
+
+function legacyStorageAliasError(storageRoot: string | undefined): string {
+  const target = storageRoot
+    ? `user Storage is addressed by its absolute path (${storageRoot}/<path>)`
+    : "this session has no Storage mount";
+  return `PATH_SCOPE_ERROR: the storage/ alias was removed; ${target}`;
+}
+
+function pathScopeError(
+  operation: SandboxPathOperation,
+  storageRoot: string | undefined,
+): Error {
+  const mount = storageRoot
+    ? `the user Storage mount (${storageRoot})`
+    : "the user Storage mount";
   const scope =
     operation === "write"
-      ? "write and edit paths must stay within public_data/ or the mounted Storage under storage/"
-      : "read paths must stay within public_data/, storage/, configured skill directories, or knowledge/";
+      ? `write and edit paths must stay within public_data/ or ${mount}`
+      : `read paths must stay within public_data/, ${mount}, configured skill directories, or knowledge/`;
   return new Error(`PATH_SCOPE_ERROR: ${scope}`);
 }

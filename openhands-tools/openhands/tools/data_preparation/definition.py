@@ -60,7 +60,6 @@ from openhands.tools.data_preparation.sandbox_execution import (
 from openhands.tools.data_preparation.workspace_paths import resolve_workspace_file
 from openhands.tools.utils import default_path_access_policy
 from openhands.tools.utils.workspace_staging import (
-    STORAGE_ALIAS,
     WorkspaceArchiveTruncatedError,
     WorkspaceStagingError,
     is_remote_workspace,
@@ -225,7 +224,7 @@ class DfRunPipelineAction(Action):
             "and args[1] are workspace-relative input/output paths and are "
             "normalized before execution. With model_profile='vision', pass the "
             "manifest file as args[0] and keep its images beside it, either in "
-            "the same workspace directory or the same 'storage/...' directory."
+            "the same workspace directory or the same Storage directory."
         ),
     )
     support_file_path: str | None = Field(
@@ -467,9 +466,9 @@ class _WorkspaceRun:
     run where the data already is, so its paths stay sandbox paths. Any other
     remote workspace has no host filesystem view, so every path the run touches
     is staged into a private host directory first and the produced artifacts are
-    published back afterwards. ``storage/...`` arguments resolve against the
-    sandbox Storage mount, which is what lets a run read user Storage without
-    materializing it into the conversation.
+    published back afterwards. Arguments under the Storage mount resolve against
+    it, which is what lets a run read user Storage without materializing it into
+    the conversation.
     """
 
     def __init__(self, conversation: Any, *, sandbox_execution: bool = False) -> None:
@@ -517,7 +516,7 @@ class _WorkspaceRun:
         return self._staged(path, label="pipeline")
 
     def input_path(self, path: str, *, with_siblings: bool = False) -> Path:
-        """Stage a readable file or directory, including ``storage/...``.
+        """Stage a readable file or directory, including Storage mount paths.
 
         ``with_siblings`` keeps the input's containing workspace directory in
         the staged run, so a pipeline that resolves assets relative to its
@@ -538,7 +537,7 @@ class _WorkspaceRun:
         return sandbox_target(self._workspace, path)
 
     def sandbox_input(self, path: str) -> SandboxTarget:
-        """Resolve a readable input inside the sandbox, including ``storage/``."""
+        """Resolve a readable input inside the sandbox, including Storage."""
         return sandbox_target(self._workspace, path)
 
     def sandbox_support_file(self, path: str) -> SandboxTarget:
@@ -547,12 +546,14 @@ class _WorkspaceRun:
     def sandbox_output(self, path: str) -> SandboxTarget:
         """Resolve a writable output inside the sandbox.
 
-        Outputs stay inside ``public_data/``, because ``storage/`` is read-only.
+        Outputs stay inside ``public_data/``: the Storage mount is read-only for
+        a run's own output, which the conversation publishes explicitly.
         """
         target = sandbox_target(self._workspace, path)
         if target.from_storage:
             raise WorkspaceStagingError(
-                "storage/ is read-only; write outputs inside public_data/."
+                "Storage is read-only for run output; write outputs inside "
+                "public_data/."
             )
         if not target.relative.parts or target.relative.parts[0] != "public_data":
             raise WorkspaceStagingError(
@@ -587,9 +588,11 @@ class _WorkspaceRun:
         if not references:
             return
         assert self._stage is not None
+        mount = getattr(self._workspace, "storage_path", None)
+        assert mount is not None
         stage_workspace_members(
             self._workspace,
-            PurePosixPath(STORAGE_ALIAS, *directory.parts).as_posix(),
+            (PurePosixPath(str(mount)) / directory).as_posix(),
             references,
             destination=self._stage,
         )
@@ -628,7 +631,8 @@ class _WorkspaceRun:
         relative, from_storage = resolve_workspace_path(self._workspace, path)
         if from_storage:
             raise WorkspaceStagingError(
-                "storage/ is read-only; write outputs inside public_data/."
+                "Storage is read-only for run output; write outputs inside "
+                "public_data/."
             )
         if not relative.parts or relative.parts[0] != "public_data":
             raise WorkspaceStagingError(
@@ -1682,7 +1686,7 @@ class DfRunPipelineTool(ToolDefinition[DfRunPipelineAction, DfRunPipelineObserva
                     "— the agent must NOT create or copy them manually. For standard "
                     "runs with output_schema, input/output arguments are resolved "
                     "from the workspace root, and read-only inputs may also be "
-                    "addressed as 'storage/...' against the mounted Storage; legacy "
+                    "addressed by their Storage mount path; legacy "
                     "arguments remain unchanged. When the conversation runs on a "
                     "platform sandbox, the sample executes inside that sandbox and "
                     "the same paths resolve there. The tool returns textual status "

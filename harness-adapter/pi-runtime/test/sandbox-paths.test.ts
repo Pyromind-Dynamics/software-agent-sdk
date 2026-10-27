@@ -49,19 +49,44 @@ test("sandbox paths map the skills and knowledge aliases to their roots", () => 
   );
 });
 
-test("sandbox paths map the storage alias to the mounted Storage root", () => {
+test("sandbox paths address the Storage mount by its absolute path", () => {
   assert.equal(
-    policy().resolvePath("storage/datasets/train.jsonl", "read"),
+    policy().resolvePath(`${STORAGE}/datasets/train.jsonl`, "read"),
     `${STORAGE}/datasets/train.jsonl`,
   );
   assert.equal(
-    policy().resolvePath("storage/datasets/out.json", "write"),
+    policy().resolvePath(`${STORAGE}/datasets/out.json`, "write"),
     `${STORAGE}/datasets/out.json`,
   );
   assert.throws(
-    () => policy({ storageRoot: undefined }).resolvePath("storage/datasets/train.jsonl", "read"),
+    () => policy({ storageRoot: undefined }).resolvePath(`${STORAGE}/datasets/train.jsonl`, "read"),
     /PATH_SCOPE_ERROR/,
   );
+});
+
+test("the removed storage/ alias fails loudly instead of landing in the workspace", () => {
+  assert.throws(
+    () => policy().resolvePath("storage/datasets/train.jsonl", "read"),
+    /storage\/ alias was removed/,
+  );
+  assert.throws(
+    () => policy().resolvePath("storage/datasets/out.json", "write"),
+    /PATH_SCOPE_ERROR/,
+  );
+});
+
+test("sandbox paths keep conversation state out of reach under the mount", () => {
+  for (const target of [
+    `${WORKSPACE}/pi/session.jsonl`,
+    `${WORKSPACE}/meta.json`,
+    "/target-workspace/.pyromind-agent/conv-2/public_data/train.csv",
+  ]) {
+    assert.throws(
+      () => policy().resolvePath(target, "read"),
+      /PATH_SCOPE_ERROR/,
+      target,
+    );
+  }
 });
 
 test("sandbox paths reject writes outside public_data", () => {

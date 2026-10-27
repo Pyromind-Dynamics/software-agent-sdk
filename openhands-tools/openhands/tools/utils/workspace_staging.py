@@ -7,9 +7,10 @@ copying the paths the run touches into a staging directory and pushing the
 results back afterwards; the sandbox stays the single authority for workspace
 content.
 
-Paths addressed as ``storage/...`` resolve against the sandbox Storage mount
-instead of the workspace, which lets a run read user Storage without
-materializing it through the conversation first.
+Paths under the sandbox Storage mount resolve against it instead of the
+workspace, which lets a run read user Storage without materializing it through
+the conversation first. The removed ``storage/...`` alias is still accepted and
+read as the mount.
 """
 
 from __future__ import annotations
@@ -28,9 +29,13 @@ from typing import Any
 
 from openhands.sdk.workspace.base import BaseWorkspace
 from openhands.sdk.workspace.local import LocalWorkspace
+from openhands.tools.utils.storage_paths import REMOVED_ALIAS
 
 
-STORAGE_ALIAS = "storage"
+# Directory the staged copy of a Storage file lands in. It keeps Storage files
+# apart from the workspace mirror inside one staging root; it is a host layout
+# detail, not a spelling the model uses.
+STORAGE_STAGE_DIRNAME = "storage"
 DEFAULT_TIMEOUT_SECONDS = 600.0
 _ARCHIVE_NAME = "workspace.tgz"
 _STAGE_PREFIX = "pyromind-stage-"
@@ -67,18 +72,22 @@ def resolve_workspace_path(
 ) -> tuple[PurePosixPath, bool]:
     """Normalize ``path`` to a workspace-relative path.
 
-    Accepts a workspace-relative path, the ``storage/`` alias, and absolute
-    paths inside either the workspace root or the Storage mount. The returned
-    flag is True when the path addresses Storage rather than the workspace.
+    Accepts a workspace-relative path and absolute paths inside either the
+    workspace root or the Storage mount. The returned flag is True when the path
+    addresses Storage rather than the workspace. The removed ``storage/`` alias
+    is rejected rather than read as a workspace directory of that name.
     """
     candidate = _posix(path)
     if candidate.is_absolute():
         return _split_absolute(workspace, candidate, path)
     if not candidate.parts or ".." in candidate.parts:
         raise WorkspaceStagingError(f"Path must stay inside the workspace: {path!r}")
-    if candidate.parts[0] != STORAGE_ALIAS or _storage_mount(workspace) is None:
-        return candidate, False
-    return PurePosixPath(*candidate.parts[1:]), True
+    if candidate.parts[0] == REMOVED_ALIAS:
+        raise WorkspaceStagingError(
+            f"Path {path!r} uses the removed 'storage/' alias; address Storage by "
+            "its mount path or its Storage path instead."
+        )
+    return candidate, False
 
 
 def stage_workspace_path(
@@ -91,9 +100,9 @@ def stage_workspace_path(
     """Copy ``path`` into ``destination`` and return the staged host path.
 
     Workspace-relative paths keep their layout, so a pipeline that reads
-    siblings through relative paths still resolves them. ``storage/...`` paths
-    land under a ``storage/`` directory inside the staging root, mirroring the
-    symlink the sandbox shell sees.
+    siblings through relative paths still resolves them. Storage paths land
+    under a ``storage/`` directory inside the staging root, keeping their
+    layout distinct from the workspace.
     """
     relative, from_storage = resolve_workspace_path(workspace, path)
     if not relative.parts:
@@ -104,7 +113,9 @@ def stage_workspace_path(
         str(workspace.storage_path) if from_storage else str(workspace.working_dir)
     )
     staged_relative = (
-        PurePosixPath(STORAGE_ALIAS, *relative.parts) if from_storage else relative
+        PurePosixPath(STORAGE_STAGE_DIRNAME, *relative.parts)
+        if from_storage
+        else relative
     )
     target = destination / staged_relative
     if isinstance(workspace, LocalWorkspace):
@@ -130,7 +141,7 @@ def stage_workspace_members(
     """Copy selected members of one workspace directory into ``destination``.
 
     ``directory`` is addressed like any other workspace path, including the
-    ``storage/`` alias. Only the named members travel, so a Storage tree that is
+    Storage mount. Only the named members travel, so a Storage tree that is
     too large to stage whole still yields the files a manifest references, and
     members keep the layout :func:`stage_workspace_path` produces.
     """
@@ -138,7 +149,7 @@ def stage_workspace_members(
     source_root = (
         str(workspace.storage_path) if from_storage else str(workspace.working_dir)
     )
-    prefix = PurePosixPath(STORAGE_ALIAS) if from_storage else PurePosixPath()
+    prefix = PurePosixPath(STORAGE_STAGE_DIRNAME) if from_storage else PurePosixPath()
     clean: list[str] = []
     for member in members:
         candidate = _posix(member)
