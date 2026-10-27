@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import shlex
 import subprocess
 import threading
 from pathlib import Path
@@ -899,3 +900,85 @@ def test_metadata_many_falls_back_to_the_plane_when_the_host_has_no_file(
     answers = asyncio.run(call())
     assert answers["/datasets/data.csv"]["exists"] is True
     assert answers["/datasets/missing.csv"]["exists"] is False
+
+
+def test_metadata_many_maps_object_paths_before_any_workflow_has_run() -> None:
+    """A distill probes its inputs before `workspace` is set by a run.
+
+    The mount has to come from the execution plane; without it every Storage
+    object path is probed literally, reads as missing, and the plan can never
+    pass its review.
+    """
+    resolved: list[str] = []
+    spellings: list[list[str]] = []
+
+    async def request(method: str, payload: dict[str, Any]) -> Any:
+        if method == "execution.resolve":
+            path = str(payload["path"])
+            resolved.append(path)
+            return {"path": f"/target-workspace/.pyromind-agent/conv/{path}"}
+        if method == "execution.run":
+            probed = json.loads(shlex.split(str(payload["command"]))[-1])
+            spellings.append(probed)
+            answers = {
+                spelling: {"exists": spelling.startswith("/target-workspace/")}
+                for spelling in probed
+            }
+            return {"rc": 0, "stdout": json.dumps(answers), "truncated": False}
+        raise AssertionError(f"unexpected bridge call: {method}")
+
+    async def run() -> tuple[dict[str, Any], str]:
+        host = ExecutionHost(request, lambda *_: None)
+        assert host.workspace == ""
+        answers = await asyncio.to_thread(host.metadata_many, ["/datasets/a.jsonl"])
+        # One round trip for the whole session, not one per probe.
+        assert host._probe_mount() == "/target-workspace"
+        return answers, host.workspace
+
+    answers, workspace = asyncio.run(run())
+
+    assert answers["/datasets/a.jsonl"]["exists"] is True
+    assert "/target-workspace/datasets/a.jsonl" in spellings[0]
+    assert workspace == "/target-workspace/.pyromind-agent/conv"
+    assert resolved == ["public_data"]
+
+
+def test_storage_mount_stays_unset_on_a_plane_without_one() -> None:
+    """The local execution plane has no mount; nothing may be invented."""
+
+    async def request(method: str, payload: dict[str, Any]) -> Any:
+        assert method == "execution.resolve"
+        return {"path": f"/Users/someone/conversations/conv/{payload['path']}"}
+
+    async def run() -> tuple[str | None, str]:
+        host = ExecutionHost(request, lambda *_: None)
+        return await asyncio.to_thread(host._probe_mount), host.workspace
+
+    mount, workspace = asyncio.run(run())
+
+    assert mount is None
+    assert workspace == ""
+
+
+def test_a_failed_mount_probe_is_retried_instead_of_sticking() -> None:
+    """A transient resolve failure must not blind the rest of the session."""
+    attempts: list[str] = []
+
+    async def request(method: str, payload: dict[str, Any]) -> Any:
+        assert method == "execution.resolve"
+        attempts.append(str(payload["path"]))
+        if len(attempts) == 1:
+            raise RuntimeError("request_failed: sandbox is starting")
+        return {"path": "/target-workspace/.pyromind-agent/conv/public_data"}
+
+    async def run() -> tuple[str | None, str | None]:
+        host = ExecutionHost(request, lambda *_: None)
+        first = await asyncio.to_thread(host._probe_mount)
+        second = await asyncio.to_thread(host._probe_mount)
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert first is None
+    assert second == "/target-workspace"
+    assert len(attempts) == 2
