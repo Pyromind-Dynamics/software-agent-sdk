@@ -129,11 +129,11 @@ class OpenHandsAdapter:
             return
         conversation = service.get_conversation()
         if self._pipeline_runs is not None:
+            from openhands.tools.data_preparation.evaluation_submit import (
+                DfSubmitEvaluationExecutor,
+            )
             from openhands.tools.data_preparation.inference import (
                 InferencePipelineHandler,
-            )
-            from openhands.tools.data_preparation.platform_submit import (
-                DfSubmitPipelineExecutor,
             )
             from openhands.tools.training_analysis import TrainingAnalysisExecutor
             from openhands.tools.workflow.validate_workflow_dsl import (
@@ -161,8 +161,8 @@ class OpenHandsAdapter:
             )
             if training is not None and validator is not None:
                 for executor in executors:
-                    if isinstance(executor, DfSubmitPipelineExecutor):
-                        executor._inference_handler = InferencePipelineHandler(
+                    if isinstance(executor, DfSubmitEvaluationExecutor):
+                        executor.inference_handler = InferencePipelineHandler(
                             Path(training.runtime_dir).parent.parent
                             / "inference-evaluation/scripts",
                             self._pipeline_runs(scope).with_context(context),

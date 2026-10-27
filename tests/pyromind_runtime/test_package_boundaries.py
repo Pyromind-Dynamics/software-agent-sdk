@@ -26,6 +26,7 @@ from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 
 from openhands.agent_server.dependencies import check_session_api_key
+from openhands.tools.data_preparation.evaluation_submit import DfSubmitEvaluationAction
 from openhands.tools.data_preparation.inference import InferenceOptions
 from openhands.tools.data_preparation.platform_submit import DfSubmitPipelineAction
 from openhands.tools.workflow.validate_workflow_dsl import ValidateWorkflowDslAction
@@ -73,7 +74,7 @@ def test_evaluation_validation_shares_submission_route_and_identity(
     host = PyromindBusinessToolHost(
         [], skills_directory=ROOT / ".agents/skills", pipeline_runs=Mock()
     )
-    params = host._preparation_params(context)
+    params = host._evaluation_params(context)
     requests = []
 
     def post(url, **kwargs):
@@ -409,5 +410,12 @@ def test_generated_business_scoring_only_executes_in_cpu_worker():
     from pyromind_runtime.ports.harness import SessionSpec
 
     assert SessionSpec.model_fields["product_instructions"].default == ""
-    assert "evaluation" in DfSubmitPipelineAction.model_fields
-    assert "products" in DfSubmitPipelineAction.model_fields
+    assert not {"inference", "evaluation", "products"}.intersection(
+        DfSubmitPipelineAction.model_fields
+    )
+    assert {
+        "operation",
+        "model_path",
+        "scoring_script_path",
+        "manifest_path",
+    } <= DfSubmitEvaluationAction.model_fields.keys()

@@ -966,6 +966,7 @@ async def test_runner_loads_sandbox_skills_and_business_tools(
             "get_storage_url",
             "run_dataset_cleaning",
             "df_submit_pipeline",
+            "df_submit_evaluation",
             "df_check_progress",
             "df_stop_task",
             "edp_render",
@@ -1098,7 +1099,7 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
     ]
     host = PyromindBusinessToolHost(roots)
     specs = host.specs()
-    assert len(specs) == 23
+    assert len(specs) == 24
     assert {"edp_render", "edp_submit", "edp_aggregate", "update_plan"} <= {
         spec["name"] for spec in specs
     }

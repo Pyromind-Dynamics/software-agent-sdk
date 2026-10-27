@@ -46,6 +46,7 @@ from openhands.sdk.workspace.local import LocalWorkspace
 from openhands.tools.data_preparation import (
     DfCheckProgressTool,
     DfStopTaskTool,
+    DfSubmitEvaluationTool,
     DfSubmitPipelineTool,
 )
 from openhands.tools.data_preparation.inference import InferencePipelineHandler
@@ -333,6 +334,9 @@ class PyromindBusinessToolHost:
             DfSubmitPipelineTool.name: lambda context: DfSubmitPipelineTool.create(
                 **self._preparation_params(context)
             )[0],
+            DfSubmitEvaluationTool.name: lambda context: DfSubmitEvaluationTool.create(
+                **self._evaluation_params(context)
+            )[0],
             DfCheckProgressTool.name: lambda context: DfCheckProgressTool.create(
                 **self._storage_params(context)
             )[0],
@@ -452,6 +456,7 @@ class PyromindBusinessToolHost:
             GetStorageUrlTool,
             RunDatasetCleaningTool,
             DfSubmitPipelineTool,
+            DfSubmitEvaluationTool,
             DfCheckProgressTool,
             DfStopTaskTool,
             EdpRenderTool,
@@ -903,6 +908,10 @@ class PyromindBusinessToolHost:
     def _preparation_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         params = self._execution_params(context)
         params["runtime_dir"] = str(self._preparation_runtime)
+        return params
+
+    def _evaluation_params(self, context: ToolExecutionContext) -> dict[str, Any]:
+        params = self._execution_params(context)
         if self._pipeline_runs is not None and self._inference_runtime is not None:
             params["inference_handler"] = InferencePipelineHandler(
                 self._inference_runtime,

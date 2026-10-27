@@ -11,38 +11,21 @@ from __future__ import annotations
 import hashlib
 import json
 import shlex
-import tempfile
 import uuid
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from rich.text import Text
 
-from openhands.sdk.conversation.state import ActiveLongTask
-from openhands.sdk.llm import ImageContent, TextContent
 from openhands.sdk.tool import (
     Action,
-    Observation,
     ToolAnnotations,
     ToolDefinition,
     ToolExecutor,
     register_tool,
-)
-from openhands.tools.data_preparation.evaluation_products import (
-    EvaluationProductsOptions,
-)
-from openhands.tools.data_preparation.inference import (
-    EvaluationConfigurationError,
-    InferenceOptions,
-    InferencePipelineHandler,
-    validate_pipeline_topology,
-)
-from openhands.tools.data_preparation.prediction_evaluation import (
-    PredictionEvaluationOptions,
 )
 from openhands.tools.data_preparation.runner import (
     DATAFLOW_RUNTIME_PACKAGES,
@@ -52,15 +35,21 @@ from openhands.tools.data_preparation.runner import (
     runtime_public_names,
     validate_managed_image_pipeline,
 )
-from openhands.tools.data_preparation.workspace_paths import (
-    resolve_workspace_file,
-    workspace_relative_path,
+from openhands.tools.data_preparation.submission import (
+    SubmissionConfig,
+    SubmissionFiles,
+    SubmissionObservation,
+    register_submitted_task,
+    resolved_storage_headers,
+    stage_submission_file,
+    submission_client,
+    submission_config,
+    submission_files,
+    validate_pipeline_topology,
 )
 from openhands.tools.pyromind_dataset.definition import (
     PYROMIND_AGENT_STORAGE_ROOT,
     _default_storage_base_url,
-    _resolve_conversation_headers,
-    _resolve_secret_headers,
     storage_file_names,
     upload_local_file_to_pyromind,
 )
@@ -75,19 +64,9 @@ from openhands.tools.utils.storage_paths import (
     StoragePathError,
     to_tool_storage_path,
 )
-from openhands.tools.utils.workspace_staging import (
-    WorkspaceStagingError,
-    is_remote_workspace,
-    resolve_workspace_path,
-    stage_workspace_path,
-    staged_remote_dir,
-)
 from openhands.tools.workflow.task_submission import (
-    PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
-    create_workflow_api_client,
     submit_workflow_task,
 )
-from openhands.tools.workflow.validate_workflow_dsl import WorkflowValidationIssue
 
 
 if TYPE_CHECKING:
@@ -123,44 +102,6 @@ DATA_PROCESSING_PACKAGES = DATAFLOW_RUNTIME_PACKAGES
 
 TOOL_DESCRIPTION = """\
 Submit an agent-authored Python pipeline for asynchronous execution on Pyromind.
-
-For existing predictions, pass evaluation with source_manifest_path,
-scoring_spec_path and scoring_script_path (workspace files). Inspect real samples
-first; the script defines parse_record and score_case. This freezes one CPU-only
-batch across all listed eval steps. Scoring never initializes human annotations.
-It never starts inference. evaluation and inference are mutually exclusive;
-changed scoring rules require a new run, unchanged resume reuses frozen inputs.
-
-For independent distribution analysis, badcase review import, or report rendering,
-pass products with operation='profile'|'review'|'report' and manifest_path.
-profile also requires extraction_script_path defining parse_record.
-review requires a completed profile matching train/validation data fingerprints,
-and a frozen scoring source or imported badcase list. It creates a NEW task using
-the existing annotation UI and taxonomy; never generate a new annotation interface.
-Rubric changes create new review tasks; old human annotations are not inherited.
-products, evaluation, and inference are mutually exclusive.
-
-With train + validation only, use saved eval_step predictions; do not launch
-additional inference. An independent test dataset is evaluated only after
-validation selects a checkpoint: pass inference.selection_run_id for that batch.
-Test metrics never participate in checkpoint selection.
-
-For model evaluation and baseline/post-training benchmarks, read the
-inference-evaluation skill and pass inference with model_path and workspace
-dataset_config_path / evaluation_config_path. The evaluation config JSON selects
-model_source: storage (default), clone, download, or checkpoint. model_path is
-an absolute Storage path, a central catalog identifier, or a repository name.
-For checkpoint, model_path is the exact checkpoint-n Storage directory; LoRA
-requires its base_model Storage path and merges that adapter before inference.
-The tool generates workflow.py with optional ModelMergeLoraNode,
-CloneAndCacheModel or
-DownloadAndCacheModel feeding VLLMInference, connected to one
-CustomCommandCPUNode with the built-in rubric evaluator.
-No local GPU sample, script_path, model_profile, output_schema or
-format conversion is needed in this mode. Read report.json and its HTML artifact
-after the callback. Inference resume requires unchanged configuration and data;
-omit inference to reuse the frozen configuration. Only submit when execution
-has been requested. Evaluation configuration changes require a new full run.
 
 Call mode='full' only after the user confirms a successful local
 terminal pipeline execution result for data processing. The tool freezes the
@@ -221,21 +162,6 @@ class ReuseAssessment(BaseModel):
 
 class DfSubmitPipelineAction(Action):
     """Submit a DataFlow-compatible Python pipeline to Pyromind Studio."""
-
-    products: EvaluationProductsOptions | None = None
-
-    evaluation: PredictionEvaluationOptions | None = Field(
-        default=None,
-        description=(
-            "Score saved predictions on CPU with one frozen business script; "
-            "mutually exclusive with inference."
-        ),
-    )
-
-    inference: InferenceOptions | None = Field(
-        default=None,
-        description="Storage model evaluation with a fixed inference -> CPU topology.",
-    )
 
     script_path: str | None = Field(
         default=None,
@@ -326,6 +252,19 @@ class DfSubmitPipelineAction(Action):
         ),
     )
 
+    @model_validator(mode="after")
+    def execution_options(self) -> Self:
+        if self.mode == "full" and self.script_path is None:
+            raise ValueError(
+                "df_submit_pipeline full requires script_path; "
+                "use df_submit_evaluation for model evaluation"
+            )
+        if self.mode == "resume" and self.resume_run_id is None:
+            raise ValueError("resume requires resume_run_id")
+        if self.mode == "full" and self.resume_run_id is not None:
+            raise ValueError("resume_run_id is only valid when mode='resume'")
+        return self
+
     @property
     def visualize(self) -> Text:
         content = Text()
@@ -334,50 +273,8 @@ class DfSubmitPipelineAction(Action):
         return content
 
 
-class DfSubmitPipelineObservation(Observation):
-    """Result of a platform pipeline submission."""
-
-    status: str = Field(default="Unknown")
-    task_id: str | None = Field(default=None)
-    run_id: str | None = Field(default=None)
-    output_dir: str | None = Field(default=None)
-    resumed: bool = Field(default=False)
-    execution_revision: int | None = Field(default=None)
-    failure_stage: str | None = Field(default=None)
-    retryable: bool | None = Field(default=None)
-    validation_errors: list[WorkflowValidationIssue] = Field(default_factory=list)
-    validation_warnings: list[WorkflowValidationIssue] = Field(default_factory=list)
-
-    @property
-    def to_llm_content(self) -> Sequence[TextContent | ImageContent]:
-        content = list(super().to_llm_content)
-        if self.failure_stage or self.validation_errors or self.validation_warnings:
-            content.append(
-                TextContent(
-                    text=self.model_dump_json(
-                        include={
-                            "failure_stage",
-                            "retryable",
-                            "validation_errors",
-                            "validation_warnings",
-                        },
-                        exclude_none=True,
-                    )
-                )
-            )
-        return content
-
-    @property
-    def visualize(self) -> Text:
-        text = Text()
-        style = "green" if self.status != "Failed" else "red"
-        text.append(f"Pipeline submit: {self.status}\n", style=style)
-        if self.run_id:
-            text.append(f"run_id={self.run_id}\n")
-        if self.output_dir:
-            text.append(f"output_dir={self.output_dir}\n")
-        text.append(self.text)
-        return text
+class DfSubmitPipelineObservation(SubmissionObservation):
+    """Result of a script pipeline submission."""
 
 
 # ---------------------------------------------------------------------------
@@ -599,26 +496,30 @@ class DfSubmitPipelineExecutor(
         storage_secret_headers: dict[str, str] | None = None,
         task_store_dir: str | None = None,
         timeout: int = 30,
-        inference_handler: InferencePipelineHandler | None = None,
     ) -> None:
-        self._env = env
-        self._cluster = cluster
+        self._submission_config = SubmissionConfig(
+            env=env,
+            cluster=cluster,
+            headers=dict(headers or {}),
+            storage_base_url=(storage_base_url or _default_storage_base_url()).rstrip(
+                "/"
+            ),
+            storage_headers=dict(storage_headers or {}),
+            storage_secret_headers=dict(storage_secret_headers or {}),
+            timeout=timeout,
+        )
         self._output_root = (
             _normalize_storage_path(output_root, "output_root")
             if output_root is not None
             else None
         )
-        self._headers = dict(headers or {})
         self._runtime_dir = Path(runtime_dir) if runtime_dir else None
         self._storage_base_url = (
             storage_base_url or _default_storage_base_url()
         ).rstrip("/")
-        self._storage_headers = dict(storage_headers or {})
-        self._storage_secret_headers = dict(storage_secret_headers or {})
         self._task_store_dir = Path(task_store_dir) if task_store_dir else None
         self._timeout = timeout
         self.submission_handler = None
-        self._inference_handler = inference_handler
 
     def __call__(
         self,
@@ -631,57 +532,16 @@ class DfSubmitPipelineExecutor(
                 status="Failed",
                 is_error=True,
             )
-        with _submission_files(conversation) as files:
+        with submission_files(conversation) as files:
             return self._submit(action, conversation, files)
 
     def _submit(
         self,
         action: DfSubmitPipelineAction,
         conversation: BaseConversation,
-        files: _SubmissionFiles,
+        files: SubmissionFiles,
     ) -> DfSubmitPipelineObservation:
         try:
-            handler = self._inference_handler
-            inference_resume = (
-                handler is not None
-                and action.mode == "resume"
-                and action.resume_run_id is not None
-                and handler.runs.resolve(str(action.resume_run_id)) is not None
-            )
-            if (
-                sum(
-                    value is not None
-                    for value in (action.inference, action.evaluation, action.products)
-                )
-                > 1
-            ):
-                raise ValueError(
-                    "evaluation, products and inference are mutually exclusive"
-                )
-            if (
-                action.inference is not None
-                or action.evaluation is not None
-                or action.products is not None
-                or inference_resume
-            ):
-                if handler is None:
-                    raise ValueError("inference evaluation is not configured")
-                try:
-                    return DfSubmitPipelineObservation.from_text(
-                        **handler.submit(self, action, conversation, files)
-                    )
-                except Exception as exc:
-                    return DfSubmitPipelineObservation.from_text(
-                        text=f"Evaluation submission failed: {exc}",
-                        status="Failed",
-                        is_error=True,
-                        failure_stage="config_validation"
-                        if isinstance(exc, EvaluationConfigurationError)
-                        else None,
-                        retryable=False
-                        if isinstance(exc, EvaluationConfigurationError)
-                        else None,
-                    )
             input_path = _normalize_storage_path(action.input_path, "input_path")
             task_store = self._task_store(conversation)
             resumed = action.mode == "resume"
@@ -891,17 +751,7 @@ class DfSubmitPipelineExecutor(
             )
 
         try:
-            state = cast("ConversationState", conversation.state)
-            auth_token = state.secret_registry.get_secret_value(
-                PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET
-            )
-            client = create_workflow_api_client(
-                env=self._env,
-                cluster=self._cluster,
-                auth_token=auth_token,
-                headers=self._headers,
-                timeout=self._timeout,
-            )
+            client = submission_client(self._submission_config, conversation)
             node_available = self._node_capability_available(client)
             if node_available is False:
                 return DfSubmitPipelineObservation.from_text(
@@ -1003,13 +853,7 @@ class DfSubmitPipelineExecutor(
         # Register the task on the conversation so it stays presented as
         # running while the task is in flight, and can be stopped together
         # with the conversation.
-        conversation.register_active_long_task(
-            ActiveLongTask(
-                task_id=task_id,
-                kind="data_preparation",
-                status=response.status,
-            )
-        )
+        register_submitted_task(conversation, task_id, response.status)
         return DfSubmitPipelineObservation.from_text(
             text=(
                 "Python pipeline submitted. "
@@ -1125,35 +969,18 @@ class DfSubmitPipelineExecutor(
         *,
         frozen_script_name: str,
     ) -> None:
-        """Upload a local pipeline script under its immutable revision name."""
-        headers = self._resolved_storage_headers(conversation)
-        local = Path(script_path)
-        try:
-            with tempfile.TemporaryDirectory(prefix="data-preparation-script-") as tmp:
-                target = Path(tmp) / frozen_script_name
-                target.write_bytes(local.read_bytes())
-                upload_local_file_to_pyromind(
-                    local_path=target,
-                    target_dir=output_dir,
-                    storage_base_url=self._storage_base_url,
-                    headers=headers,
-                    timeout=float(self._timeout),
-                )
-        except (OSError, ValueError) as exc:
-            raise ValueError(
-                f"Failed to stage pipeline script into {output_dir}: {exc}"
-            ) from exc
+        stage_submission_file(
+            self._submission_config,
+            script_path,
+            output_dir,
+            conversation,
+            frozen_script_name=frozen_script_name,
+        )
 
     def _resolved_storage_headers(
-        self,
-        conversation: BaseConversation,
+        self, conversation: BaseConversation
     ) -> dict[str, str]:
-        headers = {"accept": "*/*", **self._storage_headers}
-        headers.update(_resolve_conversation_headers(conversation))
-        headers.update(
-            _resolve_secret_headers(conversation, self._storage_secret_headers)
-        )
-        return headers
+        return resolved_storage_headers(self._submission_config, conversation)
 
 
 # ---------------------------------------------------------------------------
@@ -1172,38 +999,13 @@ class DfSubmitPipelineTool(
         conv_state: ConversationState | None = None,  # noqa: ARG003
         **params: Any,
     ) -> Sequence[Self]:
-        env_value = params.pop("env", None)
-        env = str(env_value) if env_value is not None else None
-        cluster_value = params.pop("cluster", None)
-        cluster = str(cluster_value) if cluster_value is not None else None
-        params.pop("current_user", None)
-        output_root_value = params.pop("output_root", None)
-        output_root = str(output_root_value) if output_root_value is not None else None
-        headers = _normalize_headers(params.pop("headers", None))
-        runtime_dir_value = params.pop("runtime_dir", None)
-        runtime_dir = str(runtime_dir_value) if runtime_dir_value is not None else None
-        storage_base_url_value = params.pop("storage_base_url", None)
-        storage_base_url = (
-            str(storage_base_url_value) if storage_base_url_value is not None else None
-        )
-        storage_headers = _normalize_headers(params.pop("storage_headers", None))
-        legacy_secret_headers = params.pop("secret_headers", None)
-        storage_secret_headers = _normalize_headers(
-            params.pop("storage_secret_headers", legacy_secret_headers)
-        )
-        env, cluster = _resolve_execution_target(env, cluster, headers)
-        params.pop("endpoint_url", None)
-        task_store_dir_value = params.pop("task_store_dir", None)
-        task_store_dir = (
-            str(task_store_dir_value) if task_store_dir_value is not None else None
-        )
-        timeout = int(params.pop("timeout", 30))
-        inference_handler = params.pop("inference_handler", None)
+        config = submission_config(params)
+        output_root = params.pop("output_root", None)
+        runtime_dir = params.pop("runtime_dir", None)
+        task_store_dir = params.pop("task_store_dir", None)
         if params:
             names = ", ".join(sorted(params))
             raise ValueError(f"DfSubmitPipelineTool got unknown params: {names}")
-        if timeout <= 0:
-            raise ValueError("timeout must be greater than 0")
         if output_root is not None:
             _normalize_storage_path(output_root, "output_root")
         return [
@@ -1212,17 +1014,16 @@ class DfSubmitPipelineTool(
                 action_type=DfSubmitPipelineAction,
                 observation_type=DfSubmitPipelineObservation,
                 executor=DfSubmitPipelineExecutor(
-                    env=env,
-                    cluster=cluster,
+                    env=config.env,
+                    cluster=config.cluster,
                     output_root=output_root,
-                    headers=headers,
+                    headers=config.headers,
                     runtime_dir=runtime_dir,
-                    storage_base_url=storage_base_url,
-                    storage_headers=storage_headers,
-                    storage_secret_headers=storage_secret_headers,
+                    storage_base_url=config.storage_base_url,
+                    storage_headers=config.storage_headers,
+                    storage_secret_headers=config.storage_secret_headers,
                     task_store_dir=task_store_dir,
-                    timeout=timeout,
-                    inference_handler=inference_handler,
+                    timeout=config.timeout,
                 ),
                 annotations=ToolAnnotations(
                     title="df_submit_pipeline",
@@ -1476,63 +1277,7 @@ class PipelineResolutionError(ValueError):
     pass
 
 
-class _SubmissionFiles:
-    """Resolve submission inputs to host paths.
-
-    Local workspaces resolve in place. A remote (sandbox) workspace has no host
-    filesystem, so inputs are staged into a private host directory that lives
-    for the duration of the submission.
-    """
-
-    def __init__(
-        self,
-        conversation: BaseConversation,
-        staging: Path | None,
-    ) -> None:
-        self._conversation = conversation
-        self._workspace = cast(Any, conversation).workspace
-        self._staging = staging
-
-    def resolve(self, path: str) -> tuple[Path, str]:
-        """Return the host path holding ``path`` and its workspace-relative form."""
-        if self._staging is None:
-            resolved = resolve_workspace_file(
-                self._conversation,
-                path,
-                allow_virtual_conversation_path=True,
-            )
-            return resolved, workspace_relative_path(self._conversation, resolved)
-        try:
-            staged = stage_workspace_path(
-                self._workspace, path, destination=self._staging
-            )
-        except WorkspaceStagingError as exc:
-            raise ValueError(str(exc)) from exc
-        relative, from_storage = resolve_workspace_path(self._workspace, path)
-        mount = getattr(self._workspace, "storage_path", None)
-        display = (
-            f"{str(mount).rstrip('/')}/{relative.as_posix()}"
-            if from_storage and mount
-            else relative.as_posix()
-        )
-        return staged, display
-
-    def read_text(self, path: str) -> str:
-        """Return the text of a workspace file that the submission reads."""
-        return self.resolve(path)[0].read_text()
-
-
-@contextmanager
-def _submission_files(conversation: BaseConversation) -> Iterator[_SubmissionFiles]:
-    workspace = cast(Any, conversation).workspace
-    if not is_remote_workspace(workspace):
-        yield _SubmissionFiles(conversation, staging=None)
-        return
-    with staged_remote_dir() as staging:
-        yield _SubmissionFiles(conversation, staging=staging)
-
-
-def _validate_pipeline(files: _SubmissionFiles, script_path: str) -> tuple[str, str]:
+def _validate_pipeline(files: SubmissionFiles, script_path: str) -> tuple[str, str]:
     try:
         path, relative = files.resolve(script_path)
     except ValueError as exc:
@@ -1543,7 +1288,7 @@ def _validate_pipeline(files: _SubmissionFiles, script_path: str) -> tuple[str, 
 
 
 def _validate_support_file(
-    files: _SubmissionFiles,
+    files: SubmissionFiles,
     support_file_path: str,
 ) -> tuple[str, str]:
     try:
@@ -1612,35 +1357,6 @@ def _changed_dimensions(
     ):
         changed.append("schema")
     return changed
-
-
-def _normalize_headers(value: Any) -> dict[str, str] | None:
-    if not value:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError("headers must be a dictionary when provided")
-    return {str(name): str(header_value) for name, header_value in value.items()}
-
-
-def _resolve_execution_target(
-    env: str | None,
-    cluster: str | None,
-    headers: dict[str, str] | None,
-) -> tuple[str | None, str | None]:
-    routed_cluster = next(
-        (
-            value
-            for name, value in (headers or {}).items()
-            if name.lower() == "x-cluster"
-        ),
-        None,
-    )
-    if not routed_cluster:
-        return env, cluster
-    cluster_part, separator, env_part = routed_cluster.partition("#")
-    resolved_cluster = cluster or cluster_part.strip() or None
-    resolved_env = env or (env_part.strip().lower() if separator else "prod")
-    return resolved_env, resolved_cluster
 
 
 def _normalize_storage_path(value: str, field_name: str) -> str:

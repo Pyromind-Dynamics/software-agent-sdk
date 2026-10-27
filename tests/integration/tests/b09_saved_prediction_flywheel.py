@@ -30,12 +30,12 @@ from openhands.sdk import AgentContext
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.skills import load_skills_from_dir
 from openhands.sdk.tool import Tool, ToolExecutor, register_tool
-from openhands.tools.data_preparation.inference import validate_pipeline_topology
-from openhands.tools.data_preparation.platform_submit import (
-    DfSubmitPipelineAction,
-    DfSubmitPipelineObservation,
-    DfSubmitPipelineTool,
+from openhands.tools.data_preparation.evaluation_submit import (
+    DfSubmitEvaluationAction,
+    DfSubmitEvaluationObservation,
+    DfSubmitEvaluationTool,
 )
+from openhands.tools.data_preparation.inference import validate_pipeline_topology
 from openhands.tools.data_preparation.prediction_evaluation import (
     build_prediction_evaluation_dsl,
     prepare_definition,
@@ -56,7 +56,7 @@ INSTRUCTION = """分析刚完成的 PCB AVI 训练任务 1051，选模型并准�
 业务规则：pass 与 defect 属于可放行，fail 必须拦截；GT=defect、预测=pass 和
 GT=pass、预测=defect 都算通过，GT=fail、预测=defect 不通过。以业务通过率选优，
 希望达到 95%。目前没有独立测试集。请交付实际指标、模型引用、复核报告及下一轮建议。
-本环境的 training_analysis 和 df_submit_pipeline 使用隔离的历史任务回放，CPU
+本环境的 training_analysis 和 df_submit_evaluation 使用隔离的历史任务回放，CPU
 提交同步返回实际评分结果。文件仍通过 storage/ 挂载，禁止访问生产平台或外网。
 """
 
@@ -110,29 +110,34 @@ class ReplayTraining(ToolExecutor[TrainingAnalysisAction, TrainingAnalysisObserv
         )
 
 
-class ReplaySubmit(ToolExecutor[DfSubmitPipelineAction, DfSubmitPipelineObservation]):
+class ReplaySubmit(
+    ToolExecutor[DfSubmitEvaluationAction, DfSubmitEvaluationObservation]
+):
     def __init__(self, test):
         self.test = test
 
     def __call__(self, action, conversation=None):
         self.test.submissions.append(action.model_dump(mode="json"))
-        if action.products is not None and action.inference is None:
+        if action.operation in {"profile", "review", "report"}:
             return self._products(action)
-        if action.evaluation is None or action.inference is not None:
-            return DfSubmitPipelineObservation.from_text(
+        if action.operation != "score":
+            return DfSubmitEvaluationObservation.from_text(
                 text="Recorded unnecessary inference request",
                 status="Failed",
                 is_error=True,
             )
         try:
             definition = prepare_definition(
-                action,
+                action.request().options,
                 SimpleNamespace(
                     read_text=lambda path: (
                         Path(self.test.workspace) / path
                     ).read_text()
                 ),
                 "replay-runtime",
+                input_path=action.input_path,
+                cpu=action.request().cpu,
+                memory=action.request().memory,
             )
             run_id = str(uuid4())
             output_ref = f"/evaluation/{run_id}"
@@ -174,7 +179,7 @@ class ReplaySubmit(ToolExecutor[DfSubmitPipelineAction, DfSubmitPipelineObservat
                 self.test.store, LocalStorage(self.test.mount)
             ).finalize(run_id)
             self.test.selections.append(result)
-            return DfSubmitPipelineObservation.from_text(
+            return DfSubmitEvaluationObservation.from_text(
                 text=json.dumps(
                     {
                         "selection": result,
@@ -187,7 +192,7 @@ class ReplaySubmit(ToolExecutor[DfSubmitPipelineAction, DfSubmitPipelineObservat
                 status="Succeeded",
             )
         except Exception as exc:
-            return DfSubmitPipelineObservation.from_text(
+            return DfSubmitEvaluationObservation.from_text(
                 text=f"{type(exc).__name__}: {exc}", status="Failed", is_error=True
             )
 
@@ -199,13 +204,16 @@ class ReplaySubmit(ToolExecutor[DfSubmitPipelineAction, DfSubmitPipelineObservat
 
         try:
             definition = prepare_products(
-                action,
+                action.request().options,
                 SimpleNamespace(
                     read_text=lambda path: (
                         Path(self.test.workspace) / path
                     ).read_text()
                 ),
                 "replay-runtime",
+                input_path=action.input_path,
+                cpu=action.request().cpu,
+                memory=action.request().memory,
             )
             run_id = str(uuid4())
             output_ref = f"/evaluation/{run_id}"
@@ -249,7 +257,7 @@ class ReplaySubmit(ToolExecutor[DfSubmitPipelineAction, DfSubmitPipelineObservat
                 ),
                 expected_revision=None,
             )
-            return DfSubmitPipelineObservation.from_text(
+            return DfSubmitEvaluationObservation.from_text(
                 text=(output / "report.json").read_text(),
                 task_id="replay-cpu-products",
                 run_id=run_id,
@@ -257,7 +265,7 @@ class ReplaySubmit(ToolExecutor[DfSubmitPipelineAction, DfSubmitPipelineObservat
                 status="Succeeded",
             )
         except Exception as exc:
-            return DfSubmitPipelineObservation.from_text(
+            return DfSubmitEvaluationObservation.from_text(
                 text=f"{type(exc).__name__}: {exc}", status="Failed", is_error=True
             )
 
@@ -338,7 +346,7 @@ class SavedPredictionFlywheelTest(BaseIntegrationTest):
                 ignore=shutil.ignore_patterns("__pycache__"),
             )
         _, _, skills = load_skills_from_dir(workspace / ".agents/skills")
-        submit = DfSubmitPipelineTool.create()[0].model_copy(
+        submit = DfSubmitEvaluationTool.create()[0].model_copy(
             update={"executor": ReplaySubmit(self)}
         )
         analysis = TrainingAnalysisTool.create()[0].model_copy(

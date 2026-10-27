@@ -12,15 +12,12 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from openhands.sdk.conversation.state import ActiveLongTask
 from openhands.sdk.logger import get_logger
 from openhands.tools.data_preparation.runner import runtime_bundle_fingerprint
 from openhands.tools.utils.workspace_staging import publish_workspace_path
 from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
 from openhands.tools.workflow.task_submission import (
-    PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
-    create_workflow_api_client,
     submit_workflow_task,
 )
 from openhands.tools.workflow.validate_workflow_dsl import (
@@ -32,12 +29,23 @@ from openhands.tools.workflow.validate_workflow_dsl import (
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation.base import BaseConversation
-    from openhands.sdk.conversation.state import ConversationState
-    from openhands.tools.data_preparation.platform_submit import (
-        DfSubmitPipelineAction,
-        DfSubmitPipelineExecutor,
-        _SubmissionFiles,
-    )
+    from openhands.tools.data_preparation.evaluation_submit import EvaluationRequest
+
+
+from openhands.tools.data_preparation.evaluation_products import (
+    EvaluationProductsOptions,
+)
+from openhands.tools.data_preparation.prediction_evaluation import (
+    PredictionEvaluationOptions,
+)
+from openhands.tools.data_preparation.submission import (
+    SubmissionConfig,
+    SubmissionFiles,
+    register_submitted_task,
+    stage_submission_file,
+    submission_client,
+    validate_pipeline_topology as validate_pipeline_topology,
+)
 
 
 logger = get_logger(__name__)
@@ -232,63 +240,6 @@ class PipelineRunBackend(Protocol):
     def prepare_execution(
         self, run_id: str, workflow: dict[str, Any], dsl: str, script: str
     ) -> tuple[dict[str, Any], str]: ...
-
-
-MODEL_PREPARATION_NODES = frozenset(
-    {"CloneAndCacheModel", "DownloadAndCacheModel", "ModelMergeLoraNode"}
-)
-
-
-def validate_pipeline_topology(
-    workflow: dict[str, Any], *, require_inference: bool = False
-) -> None:
-    nodes, edges = workflow.get("nodes", []), workflow.get("edges", [])
-    kinds = [node["data"]["nodeType"] for node in nodes]
-    if not require_inference and kinds == ["CustomCommandCPUNode"] and not edges:
-        return
-    preparation = [
-        node for node in nodes if node["data"]["nodeType"] in MODEL_PREPARATION_NODES
-    ]
-    expected = ["CustomCommandCPUNode", "VLLMInference"]
-    if len(preparation) == 1:
-        expected.append(preparation[0]["data"]["nodeType"])
-    if sorted(kinds) != sorted(expected) or len(edges) != len(nodes) - 1:
-        raise ValueError(
-            "evaluation requires inference -> CPU with at most one "
-            "clone or download node"
-        )
-    if len({str(node["id"]) for node in nodes}) != len(nodes):
-        raise ValueError("evaluation node IDs must be unique")
-    source = next(node for node in nodes if node["data"]["nodeType"] == "VLLMInference")
-    target = next(
-        node for node in nodes if node["data"]["nodeType"] == "CustomCommandCPUNode"
-    )
-    expected_edges = {(str(source["id"]), str(target["id"]), "endpoint", "param")}
-    if preparation:
-        expected_edges.add(
-            (
-                str(preparation[0]["id"]),
-                str(source["id"]),
-                "merged_model_path"
-                if preparation[0]["data"]["nodeType"] == "ModelMergeLoraNode"
-                else "model_path",
-                "model_path",
-            )
-        )
-    actual_edges = {
-        (
-            str(edge.get("source")),
-            str(edge.get("target")),
-            edge.get("sourceHandle"),
-            edge.get("targetHandle"),
-        )
-        for edge in edges
-    }
-    if actual_edges != expected_edges:
-        raise ValueError(
-            "pipeline must connect preparation.model_path to inference.model_path "
-            "and inference.endpoint to CPU.param"
-        )
 
 
 def storage_path(value: str, field: str = "Storage path") -> str:
@@ -506,51 +457,45 @@ class InferencePipelineHandler:
 
     def submit(
         self,
-        owner: DfSubmitPipelineExecutor,
-        action: DfSubmitPipelineAction,
+        config: SubmissionConfig,
+        request: EvaluationRequest,
         conversation: BaseConversation,
-        files: _SubmissionFiles,
+        files: SubmissionFiles,
     ) -> dict[str, Any]:
-        if any(
-            (
-                action.script_path,
-                action.support_file_path,
-                action.output_schema,
-                action.model_profile,
-                action.reuse_assessment,
-                action.prompt_fingerprint,
-            )
-        ):
-            raise ValueError(
-                "inference uses frozen built-in scripts and no cleaning options"
-            )
-        if action.convert_format != "none":
-            raise ValueError("inference does not support format conversion")
-        if action.mode == "full" and action.resume_run_id:
-            raise ValueError("resume_run_id requires mode=resume")
-        if action.mode == "resume" and not action.resume_run_id:
-            raise ValueError("resume requires resume_run_id")
-        prior = (
-            self.runs.resolve(str(action.resume_run_id))
-            if action.resume_run_id
+        inference_options = (
+            request.options if isinstance(request.options, InferenceOptions) else None
+        )
+        evaluation_options = (
+            request.options
+            if isinstance(request.options, PredictionEvaluationOptions)
             else None
         )
-        saved_predictions = action.evaluation is not None or bool(
+        products_options = (
+            request.options
+            if isinstance(request.options, EvaluationProductsOptions)
+            else None
+        )
+        prior = (
+            self.runs.resolve(str(request.resume_run_id))
+            if request.resume_run_id
+            else None
+        )
+        saved_predictions = evaluation_options is not None or bool(
             prior and prior["definition"].get("kind") == "prediction_evaluation"
         )
-        products = action.products is not None or bool(
+        products = products_options is not None or bool(
             prior
             and prior["definition"].get("kind")
             in {"badcase_review", "evaluation_products"}
         )
         cpu_only = saved_predictions or products
         final_test = bool(
-            action.inference
-            and action.inference.selection_run_id
+            inference_options
+            and inference_options.selection_run_id
             or prior
             and prior["definition"].get("business_scoring")
         )
-        if cpu_only and action.inference is not None:
+        if cpu_only and inference_options is not None:
             raise ValueError("cannot change evaluation kind on resume")
         assets = {name: self.runtime_dir / name for name in INFERENCE_RUNTIME_FILENAMES}
         if cpu_only or final_test:
@@ -576,20 +521,34 @@ class InferencePipelineHandler:
                     for name, path in sorted(assets.items())
                 ).encode()
             ).hexdigest()
-        if action.products:
+        if products_options:
             from openhands.tools.data_preparation.evaluation_products import (
                 prepare_products,
             )
 
-            definition = prepare_products(action, files, runtime_hash)
-        elif action.evaluation:
+            definition = prepare_products(
+                products_options,
+                files,
+                runtime_hash,
+                input_path=request.input_path,
+                cpu=request.cpu,
+                memory=request.memory,
+            )
+        elif evaluation_options:
             from openhands.tools.data_preparation.prediction_evaluation import (
                 prepare_definition,
             )
 
-            definition = prepare_definition(action, files, runtime_hash)
-        elif action.inference:
-            options = action.inference
+            definition = prepare_definition(
+                evaluation_options,
+                files,
+                runtime_hash,
+                input_path=request.input_path,
+                cpu=request.cpu,
+                memory=request.memory,
+            )
+        elif inference_options:
+            options = inference_options
             dataset = DatasetMapping.model_validate_json(
                 files.read_text(options.dataset_config_path)
             ).model_dump(exclude_none=True)
@@ -624,26 +583,26 @@ class InferencePipelineHandler:
                 "dataset_config": dataset,
                 "evaluation_config": evaluation,
                 "report_spec": report_spec,
-                "input_path": storage_path(action.input_path, "input_path"),
-                "cpu": action.cpu,
-                "memory": action.memory,
+                "input_path": storage_path(request.input_path, "input_path"),
+                "cpu": request.cpu,
+                "memory": request.memory,
                 "runtime_sha256": runtime_hash,
             }
         elif prior:
             definition = dict(prior["definition"])
             if definition["input_path"] != storage_path(
-                action.input_path, "input_path"
+                request.input_path, "input_path"
             ):
                 raise ValueError("input_path changed; use a new full run")
             for resource in ("cpu", "memory"):
-                if resource in action.model_fields_set:
-                    definition[resource] = getattr(action, resource)
+                if resource in request.resource_overrides:
+                    definition[resource] = getattr(request, resource)
             if definition["runtime_sha256"] != runtime_hash:
                 raise ValueError("evaluation runtime changed; use a new full run")
         else:
             raise ValueError("inference options are required for a new evaluation")
         run = self.runs.reserve(
-            definition, str(action.resume_run_id) if action.resume_run_id else None
+            definition, str(request.resume_run_id) if request.resume_run_id else None
         )
         definition = run["definition"]
         if definition.get("business_scoring"):
@@ -680,7 +639,7 @@ class InferencePipelineHandler:
             validate_pipeline_topology(workflow, require_inference=not cpu_only)
             self._publish_canvas(conversation, dsl)
             validation = self._validate(
-                dsl, conversation, env=owner._env, cluster=owner._cluster
+                dsl, conversation, env=config.env, cluster=config.cluster
             )
             workflow, effective_dsl = self.runs.prepare_execution(
                 run_id,
@@ -695,20 +654,11 @@ class InferencePipelineHandler:
                 validate_pipeline_topology(workflow, require_inference=not cpu_only)
                 self._publish_canvas(conversation, dsl)
                 validation = self._validate(
-                    dsl, conversation, env=owner._env, cluster=owner._cluster
+                    dsl, conversation, env=config.env, cluster=config.cluster
                 )
-            state = cast("ConversationState", conversation.state)
-            client = create_workflow_api_client(
-                env=owner._env,
-                cluster=owner._cluster,
-                headers=owner._headers,
-                timeout=owner._timeout,
-                auth_token=state.secret_registry.get_secret_value(
-                    PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET
-                ),
-            )
+            client = submission_client(config, conversation)
             with tempfile.TemporaryDirectory(prefix="inference-config-") as directory:
-                for name, config in (
+                for name, frozen_config in (
                     ("dataset_config.json", definition["dataset_config"]),
                     ("evaluation_config.json", definition["evaluation_config"]),
                     *(
@@ -726,9 +676,13 @@ class InferencePipelineHandler:
                     ),
                 ):
                     path = Path(directory) / name
-                    path.write_text(json.dumps(config, ensure_ascii=False))
-                    owner._stage_script(
-                        str(path), output_dir, conversation, frozen_script_name=name
+                    path.write_text(json.dumps(frozen_config, ensure_ascii=False))
+                    stage_submission_file(
+                        config,
+                        str(path),
+                        output_dir,
+                        conversation,
+                        frozen_script_name=name,
                     )
                 if saved_predictions:
                     for name, content in (
@@ -746,8 +700,12 @@ class InferencePipelineHandler:
                     ):
                         path = Path(directory) / name
                         path.write_text(content)
-                        owner._stage_script(
-                            str(path), output_dir, conversation, frozen_script_name=name
+                        stage_submission_file(
+                            config,
+                            str(path),
+                            output_dir,
+                            conversation,
+                            frozen_script_name=name,
                         )
                 if products:
                     contents = {
@@ -760,21 +718,27 @@ class InferencePipelineHandler:
                     for name, content in contents.items():
                         path = Path(directory) / name
                         path.write_text(content)
-                        owner._stage_script(
-                            str(path), output_dir, conversation, frozen_script_name=name
+                        stage_submission_file(
+                            config,
+                            str(path),
+                            output_dir,
+                            conversation,
+                            frozen_script_name=name,
                         )
                 report_spec = definition.get("report_spec")
                 if report_spec:
                     path = Path(directory) / "report_spec.json"
                     path.write_text(report_spec)
-                    owner._stage_script(
+                    stage_submission_file(
+                        config,
                         str(path),
                         output_dir,
                         conversation,
                         frozen_script_name="report_spec.json",
                     )
             for filename, asset_path in assets.items():
-                owner._stage_script(
+                stage_submission_file(
+                    config,
                     str(asset_path),
                     output_dir,
                     conversation,
@@ -809,7 +773,7 @@ class InferencePipelineHandler:
                     "is_error": True,
                     "run_id": run_id,
                     "output_dir": output_dir,
-                    "resumed": action.mode == "resume",
+                    "resumed": request.resume_run_id is not None,
                     "execution_revision": run["execution_revision"],
                     **(
                         {
@@ -826,13 +790,7 @@ class InferencePipelineHandler:
                 " Platform accepted the task, but saving its association failed; "
                 "do not submit it again."
             )
-        conversation.register_active_long_task(
-            ActiveLongTask(
-                task_id=task_id,
-                kind="data_preparation",
-                status=response_status,
-            )
-        )
+        register_submitted_task(conversation, task_id, response_status)
         return {
             "text": (
                 f"Evaluation submitted: {task_id}. Check {output_dir}/report.json "
@@ -842,7 +800,7 @@ class InferencePipelineHandler:
             "run_id": run_id,
             "output_dir": output_dir,
             "status": response_status,
-            "resumed": action.mode == "resume",
+            "resumed": request.resume_run_id is not None,
             "execution_revision": run["execution_revision"],
             "validation_warnings": validation.warnings if validation else [],
         }

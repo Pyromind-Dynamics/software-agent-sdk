@@ -323,6 +323,8 @@ class BridgeTool:
                 if problem is not None:
                     return ToolResult(True, {}, problem)
             tool_arguments = self.host.df_submit_arguments(arguments)
+        elif name == "df_submit_evaluation":
+            tool_arguments = self.host.evaluation_submit_arguments(arguments)
         else:
             tool_arguments = self.host.tool_arguments(arguments)
         response = self.host._call(
@@ -711,6 +713,32 @@ class ExecutionHost:
                     self.workspace,
                     self.package,
                 )
+        return adapted
+
+    def evaluation_submit_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Map configs and Storage inputs while preserving model references."""
+        adapted = dict(arguments)
+        input_path = arguments.get("input_path")
+        if isinstance(input_path, str):
+            adapted["input_path"] = self.platform_input_path(input_path)
+        for key in (
+            "dataset_config_path",
+            "evaluation_config_path",
+            "report_spec_path",
+            "source_manifest_path",
+            "scoring_spec_path",
+            "scoring_script_path",
+            "manifest_path",
+            "extraction_script_path",
+        ):
+            value = arguments.get(key)
+            if isinstance(value, str):
+                path = _tool_path(value, {}, self.workspace, self.package)
+                if path == value and not value.startswith(
+                    ("/", "storage/", "public_data/", ".agents/", "knowledge/")
+                ):
+                    path = f"{self.package}/{value}"
+                adapted[key] = path
         return adapted
 
     def platform_input_path(self, value: str) -> str:

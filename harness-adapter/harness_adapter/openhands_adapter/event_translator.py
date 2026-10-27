@@ -413,6 +413,7 @@ def _external_task_submission(
 ) -> HarnessEvent | None:
     kinds = {
         "df_submit_pipeline": "data_preparation",
+        "df_submit_evaluation": "data_preparation",
         "run_dataset_cleaning": "data_cleaning",
         "workflow_debug": "workflow_debug",
     }

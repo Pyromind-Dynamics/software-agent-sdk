@@ -24,10 +24,12 @@ from openhands.tools.data_preparation.platform_submit import (
     _model_fingerprint,
     _normalize_storage_path,
     _pod_path,
-    _SubmissionFiles,
     _validate_pipeline,
 )
 from openhands.tools.data_preparation.runner import LabelingModelGateway
+from openhands.tools.data_preparation.submission import (
+    SubmissionFiles as _SubmissionFiles,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -43,9 +45,9 @@ def test_normalize_storage_path_basic() -> None:
 
 
 def test_normalize_storage_path_errors() -> None:
-    with pytest.raises(ValueError, match="non-empty"):
+    with pytest.raises(ValueError, match="must not be empty"):
         _normalize_storage_path("", "field")
-    with pytest.raises(ValueError, match="non-empty"):
+    with pytest.raises(ValueError, match="must not be empty"):
         _normalize_storage_path("   ", "field")
     with pytest.raises(ValueError, match="control characters"):
         _normalize_storage_path("/foo\x00bar", "field")
@@ -514,7 +516,7 @@ def test_executor_submit_failure_omits_progress_fields(
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.platform_submit.create_workflow_api_client",
+        "openhands.tools.data_preparation.submission.create_workflow_api_client",
         lambda **kwargs: object(),
     )
 
@@ -559,7 +561,7 @@ def test_executor_missing_node_fails_before_upload(
     client = MagicMock()
     client.studio.get_node_info.return_value = {}
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.platform_submit.create_workflow_api_client",
+        "openhands.tools.data_preparation.submission.create_workflow_api_client",
         lambda **kwargs: client,
     )
     submit = MagicMock()
@@ -698,7 +700,7 @@ def test_strict_resume_reuses_legacy_absolute_script_path(
     stage_script = MagicMock()
     monkeypatch.setattr(executor, "_stage_script", stage_script)
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.platform_submit.create_workflow_api_client",
+        "openhands.tools.data_preparation.submission.create_workflow_api_client",
         lambda **kwargs: object(),
     )
     response = MagicMock()
@@ -750,7 +752,7 @@ def test_compatible_resume_accepts_agent_assessment(
         lambda *args, **kwargs: staged.append(kwargs["frozen_script_name"]),
     )
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.platform_submit.create_workflow_api_client",
+        "openhands.tools.data_preparation.submission.create_workflow_api_client",
         lambda **kwargs: object(),
     )
     response = MagicMock()
@@ -810,7 +812,7 @@ def test_new_full_run_uses_conversation_scoped_output_root(
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.platform_submit.create_workflow_api_client",
+        "openhands.tools.data_preparation.submission.create_workflow_api_client",
         lambda **kwargs: object(),
     )
     response = MagicMock()
@@ -868,7 +870,7 @@ def test_remote_workspace_submission_stages_pipeline_script(
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.platform_submit.create_workflow_api_client",
+        "openhands.tools.data_preparation.submission.create_workflow_api_client",
         lambda **kwargs: object(),
     )
     response = MagicMock()
@@ -885,7 +887,7 @@ def test_remote_workspace_submission_stages_pipeline_script(
         return "/.pyromind-agent/conv-1/data_preparation/pipeline.py"
 
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.platform_submit.upload_local_file_to_pyromind",
+        "openhands.tools.data_preparation.submission.upload_local_file_to_pyromind",
         _capture_upload,
     )
 
@@ -903,6 +905,27 @@ def test_remote_workspace_submission_stages_pipeline_script(
     saved = DataPreparationTaskStore(tmp_path / "tasks").get("task-remote")
     assert saved is not None
     assert saved.script_path == "public_data/data-preparation/pipeline.py"
+
+
+@pytest.mark.parametrize("from_storage", [False, True])
+def test_submission_files_preserve_remote_source_path(
+    tmp_path: Path, sandbox_workspace, from_storage: bool
+) -> None:
+    root = (
+        sandbox_workspace.storage_dir
+        if from_storage
+        else sandbox_workspace.workspace_dir
+    )
+    script = root / "pipeline.py"
+    script.write_text("print('sandbox')")
+    conversation = _make_conversation_with_llm()
+    conversation.workspace = sandbox_workspace
+    files = _SubmissionFiles(conversation, staging=tmp_path / "staging")
+
+    staged, display = files.resolve(str(script))
+
+    assert staged.read_text() == "print('sandbox')"
+    assert display == (str(script) if from_storage else "pipeline.py")
 
 
 def test_pipeline_path_compatibility_is_normalized(tmp_path: Path) -> None:

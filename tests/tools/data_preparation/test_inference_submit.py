@@ -29,15 +29,17 @@ from pyromind_runtime.infrastructure.file_artifact_snapshots import (
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 
-from openhands.tools.data_preparation import inference as inference_module
+from openhands.tools.data_preparation import (
+    inference as inference_module,
+    submission as submission_module,
+)
+from openhands.tools.data_preparation.evaluation_submit import (
+    DfSubmitEvaluationAction,
+    DfSubmitEvaluationExecutor,
+)
 from openhands.tools.data_preparation.inference import (
-    InferenceOptions,
     InferencePipelineHandler,
     validate_pipeline_topology,
-)
-from openhands.tools.data_preparation.platform_submit import (
-    DfSubmitPipelineAction,
-    DfSubmitPipelineExecutor,
 )
 from openhands.tools.data_preparation.stop_task import (
     DfStopTaskAction,
@@ -45,6 +47,7 @@ from openhands.tools.data_preparation.stop_task import (
     DfStopTaskObservation,
     DfStopTaskTool,
 )
+from openhands.tools.data_preparation.submission import SubmissionConfig
 from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
 from openhands.tools.workflow.validate_workflow_dsl import (
     ValidateWorkflowDslExecutor,
@@ -110,30 +113,28 @@ def inference_submission(tmp_path, monkeypatch):
         )
     )
     handler = InferencePipelineHandler(runtime, runs, validator)
-    executor = DfSubmitPipelineExecutor(
-        env="pre",
-        cluster="test",
+    executor = DfSubmitEvaluationExecutor(
+        config=SubmissionConfig(env="pre", cluster="test"),
         inference_handler=handler,
     )
     uploads = []
     monkeypatch.setattr(
-        executor,
-        "_stage_script",
-        lambda path, output, conv, frozen_script_name: uploads.append(
+        inference_module,
+        "stage_submission_file",
+        lambda config, path, output, conv, frozen_script_name: uploads.append(
             (frozen_script_name, Path(path).read_text())
         ),
     )
     create = Mock(return_value=object())
     submit = Mock(return_value=SimpleNamespace(task_id="task-1", status="Pending"))
-    monkeypatch.setattr(inference_module, "create_workflow_api_client", create)
+    monkeypatch.setattr(submission_module, "create_workflow_api_client", create)
     monkeypatch.setattr(inference_module, "submit_workflow_task", submit)
-    action = DfSubmitPipelineAction(
+    action = DfSubmitEvaluationAction(
+        operation="inference",
         input_path="/datasets/cases.jsonl",
-        inference=InferenceOptions(
-            model_path="/models/v1",
-            dataset_config_path="public_data/dataset.json",
-            evaluation_config_path="public_data/evaluation.json",
-        ),
+        model_path="/models/v1",
+        dataset_config_path="public_data/dataset.json",
+        evaluation_config_path="public_data/evaluation.json",
     )
     return SimpleNamespace(
         executor=executor,
@@ -161,7 +162,9 @@ def configure_model_source(inference_submission):
         config["model_source"] = source
         path.write_text(json.dumps(config))
         if source.get("type") != "storage":
-            ctx.action.inference.model_path = "Unlisted/Example-Model"
+            ctx.action = ctx.action.model_copy(
+                update={"model_path": "Unlisted/Example-Model"}
+            )
 
     return configure
 
@@ -183,18 +186,16 @@ def test_products_submit_cpu_only_without_model_or_scoring(
     (ctx.workspace / "public_data/extract.py").write_text(
         "def parse_record(raw, context): return raw\n"
     )
-    action = DfSubmitPipelineAction.model_validate(
+    action = DfSubmitEvaluationAction.model_validate(
         {
             "input_path": "/badcases",
-            "products": {
-                "operation": operation,
-                "manifest_path": "public_data/products.json",
-                **(
-                    {"extraction_script_path": "public_data/extract.py"}
-                    if operation == "profile"
-                    else {}
-                ),
-            },
+            "operation": operation,
+            "manifest_path": "public_data/products.json",
+            **(
+                {"extraction_script_path": "public_data/extract.py"}
+                if operation == "profile"
+                else {}
+            ),
         }
     )
     response = ctx.executor(action, ctx.conversation)
@@ -259,8 +260,8 @@ def test_final_test_requires_selected_checkpoint_and_independent_data(
     configure_model_source(
         {"type": "checkpoint", "kind": "lora", "base_model": "/base"}
     )
-    ctx.action.inference.model_path = "/models/checkpoint-100"
-    ctx.action.inference.selection_run_id = selection_id
+    ctx.action = ctx.action.model_copy(update={"model_path": "/models/checkpoint-100"})
+    ctx.action = ctx.action.model_copy(update={"selection_run_id": selection_id})
     result = ctx.executor(ctx.action, ctx.conversation)
     if not with_test:
         assert result.is_error
@@ -277,7 +278,7 @@ def test_final_test_requires_selected_checkpoint_and_independent_data(
     assert "business_scoring.json" in dict(ctx.uploads)
     assert "checkpoint-100" in json.dumps(ctx.submit.call_args.kwargs["workflow"])
     # A caller cannot sneak a different checkpoint into the final-test path.
-    ctx.action.inference.model_path = "/models/checkpoint-200"
+    ctx.action = ctx.action.model_copy(update={"model_path": "/models/checkpoint-200"})
     ctx.submit.reset_mock()
     rejected = ctx.executor(ctx.action, ctx.conversation)
     assert rejected.is_error and "validation-selected checkpoint" in rejected.text
@@ -366,9 +367,9 @@ def test_bbox_evaluation_preserves_frozen_default_fields_on_resume(
     ctx.submit.return_value.task_id = "task-2"
 
     resumed = ctx.executor(
-        DfSubmitPipelineAction(
+        DfSubmitEvaluationAction(
+            operation="resume",
             input_path=ctx.action.input_path,
-            mode="resume",
             resume_run_id=result.run_id,
         ),
         cast(Any, ctx.conversation),
@@ -473,8 +474,10 @@ def test_model_sources_generate_bound_workflows_and_frozen_resume(
     ctx.registry.update_status(ctx.conversation.id, "task-1", "failed")
     ctx.submit.return_value.task_id = "task-2"
     resumed = ctx.executor(
-        DfSubmitPipelineAction(
-            input_path=ctx.action.input_path, mode="resume", resume_run_id=result.run_id
+        DfSubmitEvaluationAction(
+            operation="resume",
+            input_path=ctx.action.input_path,
+            resume_run_id=result.run_id,
         ),
         cast(Any, ctx.conversation),
     )
@@ -518,7 +521,7 @@ def test_model_reference_error_identifies_field_and_source(
 ):
     ctx = inference_submission
     configure_model_source(source)
-    ctx.action.inference.model_path = reference
+    ctx.action = ctx.action.model_copy(update={"model_path": reference})
     result = ctx.executor(ctx.action, cast(Any, ctx.conversation))
     assert result.is_error
     assert "inference.model_path" in result.text
@@ -532,7 +535,7 @@ def test_clone_validation_preserves_node_error_and_allows_corrected_identifier(
 ):
     ctx = inference_submission
     configure_model_source({"type": "clone"})
-    ctx.action.inference.model_path = "Qwen3-VL-4B-Instruct"
+    ctx.action = ctx.action.model_copy(update={"model_path": "Qwen3-VL-4B-Instruct"})
     issue = WorkflowValidationIssue(
         node_id="3",
         node_type="CloneAndCacheModel",
@@ -566,7 +569,9 @@ def test_clone_validation_preserves_node_error_and_allows_corrected_identifier(
     ctx.create.assert_not_called()
     ctx.submit.assert_not_called()
 
-    ctx.action.inference.model_path = "Qwen/Qwen3-VL-4B-Instruct"
+    ctx.action = ctx.action.model_copy(
+        update={"model_path": "Qwen/Qwen3-VL-4B-Instruct"}
+    )
     warning = WorkflowValidationIssue(level="warning", message="Non-blocking warning")
     ctx.validator.return_value = ValidateWorkflowDslObservation.from_text(
         text="valid", valid=True, warnings=[warning]
@@ -652,7 +657,7 @@ def test_resume_rejects_changed_model_source_reference_or_rubric(
     if change == "source":
         configure_model_source({"type": "download"})
     elif change == "model":
-        ctx.action.inference.model_path = "Another/Model"
+        ctx.action = ctx.action.model_copy(update={"model_path": "Another/Model"})
     else:
         path = ctx.workspace / "public_data/evaluation.json"
         config = json.loads(path.read_text())
@@ -660,11 +665,11 @@ def test_resume_rejects_changed_model_source_reference_or_rubric(
         path.write_text(json.dumps(config))
     resumed = ctx.executor(
         ctx.action.model_copy(
-            update={"mode": "resume", "resume_run_id": result.run_id}
+            update={"operation": "resume", "resume_run_id": UUID(result.run_id)}
         ),
         cast(Any, ctx.conversation),
     )
-    assert resumed.is_error and "configuration changed" in resumed.text
+    assert resumed.is_error and "operation=resume does not accept" in resumed.text
     ctx.submit.assert_called_once()
 
 
@@ -701,9 +706,9 @@ def test_fixed_two_node_submission_and_frozen_resume(inference_submission):
     ctx.registry.update_status(ctx.conversation.id, "task-1", "failed")
     ctx.submit.return_value.task_id = "task-2"
     resumed = ctx.executor(
-        DfSubmitPipelineAction(
+        DfSubmitEvaluationAction(
+            operation="resume",
             input_path=ctx.action.input_path,
-            mode="resume",
             resume_run_id=result.run_id,
         ),
         cast(Any, ctx.conversation),
@@ -832,7 +837,9 @@ def test_runtime_hash_matches_script_side_bundle_hash():
 def test_invalid_report_spec_json_names_the_file(inference_submission):
     ctx = inference_submission
     (ctx.workspace / "public_data" / "report_spec.json").write_text("{oops")
-    ctx.action.inference.report_spec_path = "public_data/report_spec.json"
+    ctx.action = ctx.action.model_copy(
+        update={"report_spec_path": "public_data/report_spec.json"}
+    )
 
     result = ctx.executor(ctx.action, cast(Any, ctx.conversation))
 
@@ -847,7 +854,9 @@ def test_report_spec_is_staged_and_passed_to_command(inference_submission):
     (ctx.workspace / "public_data" / "report_spec.json").write_text(
         json.dumps({"template_id": "evaluation-basic-v1"})
     )
-    ctx.action.inference.report_spec_path = "public_data/report_spec.json"
+    ctx.action = ctx.action.model_copy(
+        update={"report_spec_path": "public_data/report_spec.json"}
+    )
     result = ctx.executor(ctx.action, cast(Any, ctx.conversation))
     assert not result.is_error, result.text
     workflow = ctx.submit.call_args.kwargs["workflow"]
@@ -868,7 +877,9 @@ def test_report_spec_is_frozen_into_definition_for_resume(inference_submission):
     ctx = inference_submission
     spec_file = ctx.workspace / "public_data" / "report_spec.json"
     spec_file.write_text(json.dumps({"template_id": "evaluation-basic-v1"}))
-    ctx.action.inference.report_spec_path = "public_data/report_spec.json"
+    ctx.action = ctx.action.model_copy(
+        update={"report_spec_path": "public_data/report_spec.json"}
+    )
     result = ctx.executor(ctx.action, cast(Any, ctx.conversation))
     assert not result.is_error, result.text
     staged = dict(ctx.uploads)["report_spec.json"]
@@ -880,9 +891,9 @@ def test_report_spec_is_frozen_into_definition_for_resume(inference_submission):
     ctx.registry.update_status(ctx.conversation.id, "task-1", "failed")
     ctx.submit.return_value.task_id = "task-2"
     resumed = ctx.executor(
-        DfSubmitPipelineAction(
+        DfSubmitEvaluationAction(
+            operation="resume",
             input_path=ctx.action.input_path,
-            mode="resume",
             resume_run_id=result.run_id,
         ),
         cast(Any, ctx.conversation),
@@ -919,9 +930,10 @@ def test_platform_contract_failure_does_not_upload_or_submit(inference_submissio
 )
 def test_rejects_cleaning_options_for_inference(inference_submission, field, value):
     ctx = inference_submission
-    action = ctx.action.model_copy(update={field: value})
-    result = ctx.executor(action, cast(Any, ctx.conversation))
-    assert result.is_error
+    with pytest.raises(ValueError, match=field):
+        DfSubmitEvaluationAction.model_validate(
+            {**ctx.action.model_dump(), field: value}
+        )
     ctx.validator.assert_not_called()
     ctx.submit.assert_not_called()
 
@@ -991,7 +1003,7 @@ async def test_pi_host_exposes_inference_through_existing_submit_tool(
         lambda **kwargs: ctx.validator,
     )
     monkeypatch.setattr(
-        DfSubmitPipelineExecutor, "_stage_script", lambda *args, **kwargs: None
+        inference_module, "stage_submission_file", lambda *args, **kwargs: None
     )
     host = PyromindBusinessToolHost(
         [],
@@ -999,11 +1011,11 @@ async def test_pi_host_exposes_inference_through_existing_submit_tool(
         pipeline_runs=lambda conversation_id: ctx.runs,
     )
     names = {spec["name"] for spec in host.specs()}
-    assert "df_submit_pipeline" in names
+    assert "df_submit_evaluation" in names
     assert "df_save_annotations" not in names
     assert "run_workflow" not in names
     result = await host.execute(
-        "df_submit_pipeline",
+        "df_submit_evaluation",
         ctx.action.model_dump(mode="json", exclude_unset=True),
         ToolExecutionContext(
             conversation_id=ctx.conversation.id,
@@ -1026,8 +1038,8 @@ def test_ambiguous_platform_submission_is_not_repeated(inference_submission):
     assert result.is_error and result.run_id
     assert "uncertain" in result.text
     resumed = ctx.executor(
-        DfSubmitPipelineAction(
-            mode="resume",
+        DfSubmitEvaluationAction(
+            operation="resume",
             resume_run_id=result.run_id,
             input_path=ctx.action.input_path,
         ),
@@ -1040,9 +1052,6 @@ def test_ambiguous_platform_submission_is_not_repeated(inference_submission):
 def test_saved_prediction_submission_is_cpu_only_and_freezes_scoring(
     inference_submission,
 ):
-    from openhands.tools.data_preparation.prediction_evaluation import (
-        PredictionEvaluationOptions,
-    )
 
     ctx = inference_submission
     public = ctx.workspace / "public_data"
@@ -1067,13 +1076,12 @@ def test_saved_prediction_submission_is_cpu_only_and_freezes_scoring(
         'def score_case(case, spec): return {"passed": True}\n'
     )
     (public / "score.py").write_text(script)
-    action = DfSubmitPipelineAction(
+    action = DfSubmitEvaluationAction(
+        operation="score",
         input_path="/train",
-        evaluation=PredictionEvaluationOptions(
-            source_manifest_path="public_data/source.json",
-            scoring_spec_path="public_data/spec.json",
-            scoring_script_path="public_data/score.py",
-        ),
+        source_manifest_path="public_data/source.json",
+        scoring_spec_path="public_data/spec.json",
+        scoring_script_path="public_data/score.py",
     )
     result = ctx.executor(action, cast(Any, ctx.conversation))
     assert not result.is_error, result.text
@@ -1092,7 +1100,7 @@ def test_saved_prediction_submission_is_cpu_only_and_freezes_scoring(
     # A changed script cannot silently mutate a reserved scoring run.
     (public / "score.py").write_text(script + "# changed rule\n")
     changed = action.model_copy(
-        update={"mode": "resume", "resume_run_id": result.run_id}
+        update={"operation": "resume", "resume_run_id": UUID(result.run_id)}
     )
     failed = ctx.executor(changed, cast(Any, ctx.conversation))
     assert failed.is_error
@@ -1108,7 +1116,7 @@ def test_selected_checkpoint_preparation_binds_exact_step(inference_submission, 
     if kind == "lora":
         config["model_source"]["base_model"] = "/models/base"
     path.write_text(json.dumps(config))
-    ctx.action.inference.model_path = "/train/checkpoint-100"
+    ctx.action = ctx.action.model_copy(update={"model_path": "/train/checkpoint-100"})
     result = ctx.executor(ctx.action, cast(Any, ctx.conversation))
     assert not result.is_error, result.text
     workflow = ctx.submit.call_args.kwargs["workflow"]
@@ -1171,7 +1179,7 @@ def test_checkpoint_versioning_never_rebinds_to_default_model(
         "base_model": "/models/base",
     }
     config_file.write_text(json.dumps(config))
-    ctx.action.inference.model_path = "/train/checkpoint-100"
+    ctx.action = ctx.action.model_copy(update={"model_path": "/train/checkpoint-100"})
     result = ctx.executor(ctx.action, cast(Any, ctx.conversation))
     assert not result.is_error, result.text
     canvas = (ctx.workspace / "public_data/workflow_canvas/workflow.py").read_text()
