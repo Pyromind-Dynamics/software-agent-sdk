@@ -404,6 +404,8 @@ class ExecutionHost:
         self._reads: dict[str, bytes] = {}
         self._missing: set[str] = set()
         self._declared_paths: dict[str, str] = {}
+        self._mount_cache: str | None = None
+        self._mount_probed = False
 
     def _call(self, method: str, payload: JsonObject) -> Any:
         """One bounded bridge round trip from the genome worker thread.
@@ -674,7 +676,7 @@ class ExecutionHost:
         try:
             return self._resolve(value, False)
         except Exception as error:
-            alias = _storage_alias(value, self._storage_mount())
+            alias = _storage_alias(value, self._probe_mount())
             if alias is None or "PATH_SCOPE_ERROR" not in str(error):
                 raise
             try:
@@ -819,6 +821,38 @@ class ExecutionHost:
         """
         head, separator, _ = self.workspace.partition(_AGENT_DIRECTORY)
         return head if separator else None
+
+    def _probe_mount(self) -> str | None:
+        """The mount for a planning probe, which runs before any workflow does.
+
+        A distill probes the plan's inputs while ``workspace`` is still empty,
+        so asking the execution plane for the conversation root once keeps
+        Storage object paths (`/datasets/...`) resolvable there. Without it every
+        Storage input reads as missing and the plan can never pass its review.
+        """
+        mount = self._storage_mount()
+        if mount is not None:
+            return mount
+        if self._mount_probed:
+            return self._mount_cache
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            # A blocking round trip here would deadlock the loop thread.
+            return None
+        try:
+            resolved = self._resolve("public_data", False)
+        except Exception:  # noqa: BLE001 - a hiccup must not stick to the session
+            return None
+        self._mount_probed = True
+        head, separator, _ = resolved.partition(_AGENT_DIRECTORY)
+        if not separator or not resolved.endswith("/public_data"):
+            return None
+        self.workspace = resolved[: -len("/public_data")]
+        self._mount_cache = head
+        return head
 
     def path(self, name: str) -> str:
         """The sandbox path of a graph artifact, inside or outside the run directory.
@@ -1030,7 +1064,7 @@ class ExecutionHost:
         # probes a dozen of them; at sandbox latency that is minutes. The mount
         # prefix a path may need is pure string logic, so try both spellings
         # inside one probe and keep whichever exists.
-        mount = self._storage_mount()
+        mount = self._probe_mount()
         candidates: dict[str, list[str]] = {}
         for path in pending:
             options = [path]
