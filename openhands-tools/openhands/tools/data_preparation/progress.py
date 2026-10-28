@@ -116,6 +116,10 @@ class DfCheckProgressObservation(Observation):
     progress_found: bool = Field(
         default=False, description="Whether progress.json was found and parsed."
     )
+    progress_error: str | None = Field(
+        default=None, description="Storage or JSON read failure; distinct from absence."
+    )
+    report_error: str | None = Field(default=None)
     total: int | None = Field(default=None)
     processed: int | None = Field(default=None)
     succeeded: int | None = Field(default=None)
@@ -205,12 +209,18 @@ class DfCheckProgressExecutor(
         processed_path = f"{output_dir}/{self._output_filename}"
         report_path = f"{output_dir}/report.json"
 
-        progress = self._read_json_file(progress_path, headers)
-        report = self._read_json_file(report_path, headers)
+        progress_result = self._read_json_file(progress_path, headers)
+        report_result = self._read_json_file(report_path, headers)
+        progress = progress_result if isinstance(progress_result, dict) else None
+        report = report_result if isinstance(report_result, dict) else None
         latest, tail_error = self._read_tail(processed_path, headers, action.tail_lines)
 
         fields: dict[str, Any] = {
             "output_dir": output_dir,
+            "progress_error": progress_result
+            if isinstance(progress_result, str)
+            else None,
+            "report_error": report_result if isinstance(report_result, str) else None,
             "latest_records": latest,
             "report_found": isinstance(report, dict),
             "report": report if isinstance(report, dict) else None,
@@ -266,7 +276,11 @@ class DfCheckProgressExecutor(
                 "\nStable report link (Storage credentials required, does not expire): "
                 + evaluation_report_url
             )
-        return DfCheckProgressObservation.from_text(text=text, **fields)
+        return DfCheckProgressObservation.from_text(
+            text=text,
+            is_error=bool(fields["progress_error"] and report is None),
+            **fields,
+        )
 
     def _stable_report_link(
         self,
@@ -379,18 +393,8 @@ class DfCheckProgressExecutor(
         self, path: str, headers: dict[str, str]
     ) -> tuple[int | None, str] | str:
         size = self._live_size(path, headers)
-        if size is None:
-            # file_list could not see the file: fall back to HEAD metadata so
-            # a missing file still surfaces a real error (the size may be a
-            # stale cached value, but the caller then reports not-found).
-            meta_result = self._post_json("get_file_metadata", {"path": path}, headers)
-            if isinstance(meta_result, str):
-                return meta_result
-            meta = _extract_api_data("get_file_metadata", meta_result)
-            if isinstance(meta, str):
-                return meta
-            size = _optional_int(meta.get("size"))
-
+        # File size is advisory. A broken metadata endpoint must not prevent
+        # reading an object through its download URL.
         url_result = self._post_json("get_url", {"path": path}, headers)
         if isinstance(url_result, str):
             return url_result
@@ -455,16 +459,17 @@ class DfCheckProgressExecutor(
 
     def _read_json_file(
         self, path: str, headers: dict[str, str]
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any] | str | None:
         result = self._get_size_and_url(path, headers)
         if isinstance(result, str):
-            return None
+            return None if self._confirmed_missing(result) else result
         size, url = result
         # Prefer a size-derived Range: it forces the CDN/gateway to revalidate
         # against the live object (a plain full GET can be served from a stale
         # cache), and the size now comes from file_list (live metadata), not
         # the HEAD API's cached attr. A full GET remains as a fallback.
         parsed = None
+        content: bytes | str = b""
         if size is not None and size > 0:
             content = self._download_range(url, 0, size - 1)
             if not isinstance(content, str):
@@ -473,7 +478,15 @@ class DfCheckProgressExecutor(
             content = self._download_range(url, None, None)
             if not isinstance(content, str):
                 parsed = self._try_parse_json(content)
-        return parsed
+        if parsed is not None:
+            return parsed
+        if isinstance(content, str):
+            return None if self._confirmed_missing(content) else content
+        return f"Invalid JSON object in {path}."
+
+    @staticmethod
+    def _confirmed_missing(error: str) -> bool:
+        return error.startswith("not found:") or "returned HTTP 404:" in error
 
     @staticmethod
     def _try_parse_json(data: bytes) -> dict[str, Any] | None:
@@ -490,7 +503,9 @@ class DfCheckProgressExecutor(
         if isinstance(result, str):
             return [], result
         size, url = result
-        if size is None or size <= 0:
+        if size is None:
+            return [], "Storage file size unavailable; processed output was not read."
+        if size <= 0:
             return [], None
 
         start = max(0, size - self._tail_bytes)
@@ -524,10 +539,21 @@ class DfCheckProgressExecutor(
     ) -> str:
         parts: list[str] = []
         if progress is None:
-            parts.append(
-                "progress.json not found yet — the pipeline may not have "
-                "started processing. Try again shortly."
-            )
+            if fields.get("progress_error"):
+                parts.append(
+                    "Could not read progress.json: " + fields["progress_error"]
+                )
+                parts.append(
+                    "Progress could not be read; this does not establish that the file "
+                    "is missing or that processing has not started."
+                )
+            elif isinstance(fields.get("report"), dict):
+                parts.append("progress.json is absent; a report is available below.")
+            else:
+                parts.append(
+                    "progress.json not found yet — the pipeline may not have "
+                    "started processing. Try again shortly."
+                )
         else:
             percent = fields.get("percent")
             pct_text = f" ({percent:.1f}%)" if percent is not None else ""
@@ -549,6 +575,8 @@ class DfCheckProgressExecutor(
             if fields.get("updated_at"):
                 parts.append(f"updated_at={fields['updated_at']}")
 
+        if fields.get("report_error"):
+            parts.append("Could not read report.json: " + fields["report_error"])
         report = fields.get("report")
         if isinstance(report, dict):
             status = report.get("status") or report.get("overall_status")

@@ -33,6 +33,7 @@ from pyromind_runtime.ports.harness import (
     SessionSpec,
 )
 
+from harness_adapter.checkpoint_tools import CheckpointCall, CheckpointEvaluationsTool
 from harness_adapter.openhands_adapter.event_translator import (
     TranslationState,
     translate_event,
@@ -109,9 +110,13 @@ class OpenHandsAdapter:
         )
         self._sessions: dict[str, _ActiveSession] = {}
         self._lock = asyncio.Lock()
+        self._checkpoint_call: CheckpointCall | None = None
         self._pipeline_runs: Callable[[str], PipelineRuns] | None = None
         self._version_call: VersionCall | None = None
         self._execution_call: ExecutionCall | None = None
+
+    def set_checkpoint_handler(self, callback: CheckpointCall) -> None:
+        self._checkpoint_call = callback
 
     def set_pipeline_runs(self, factory: Callable[[str], PipelineRuns]) -> None:
         self._pipeline_runs = factory
@@ -128,6 +133,15 @@ class OpenHandsAdapter:
         if self._version_call is None:
             return
         conversation = service.get_conversation()
+        if self._checkpoint_call is not None:
+            conversation.agent.add_runtime_tools(
+                CheckpointEvaluationsTool.create(
+                    callback=self._checkpoint_call,
+                    scope=scope,
+                    context=context,
+                    loop=asyncio.get_running_loop(),
+                )
+            )
         if self._pipeline_runs is not None:
             from openhands.tools.data_preparation.evaluation_submit import (
                 DfSubmitEvaluationExecutor,

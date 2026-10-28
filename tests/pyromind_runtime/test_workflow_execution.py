@@ -144,8 +144,8 @@ async def test_confirmed_workflow_submits_once_and_resumes_followup(
         assert "training-analysis skill" in notification.hidden_text
         assert "inference-evaluation" in notification.hidden_text
         assert "evaluation was explicitly excluded" in notification.hidden_text
-        assert "same-step complete checkpoints" in notification.hidden_text
-        assert "do not start extra GPU inference" in notification.hidden_text
+        assert "checkpoint_evaluations" in notification.hidden_text
+        assert "do not duplicate" in notification.hidden_text
         assert "Do not rerun automatically" in notification.hidden_text
     else:
         assert "inference-evaluation" not in notification.hidden_text

@@ -48,6 +48,7 @@ from pyromind_runtime.ports.harness import (
 )
 from pyromind_runtime.ports.workflows import WorkflowCall, WorkflowEventSink
 
+from harness_adapter.checkpoint_tools import CheckpointCall
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,
@@ -347,6 +348,9 @@ class PiAdapter:
     def _apply_quota(self, root: Path, conversation_id: str) -> None:
         if self._apply_workspace_quota is not None:
             self._apply_workspace_quota(root, conversation_id)
+
+    def set_checkpoint_handler(self, callback: CheckpointCall) -> None:
+        self._business_tools.checkpoint_call = callback
 
     def set_version_handler(
         self, callback: VersionCall, execution: ExecutionCall | None = None

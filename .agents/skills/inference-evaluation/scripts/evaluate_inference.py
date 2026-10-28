@@ -1662,6 +1662,7 @@ def evaluate_inference(
     max_retries: int = 3,
     limit: int = 0,
     business_scoring: dict[str, Any] | None = None,
+    dataset_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute frozen rubrics, preserving predictions across identical runs."""
     if not run_id:
@@ -1684,6 +1685,11 @@ def evaluate_inference(
     ids = [_case_id(row, config, index) for index, row in enumerate(rows, 1)]
     if len(set(ids)) != len(ids):
         raise ValueError("dataset case IDs must be unique")
+    dataset_role = (dataset_provenance or {}).get("dataset_role", "validation")
+    if dataset_provenance is not None and (
+        limit or _file_digest(dataset_file) != dataset_provenance["sha256"]
+    ):
+        raise ValueError("evaluation requires the complete frozen dataset")
     business_cases = {}
     business_module = None
     if business_scoring is not None:
@@ -1691,12 +1697,13 @@ def evaluate_inference(
 
         from evaluate_predictions import stable_case, validate_script
 
-        if (
-            limit
-            or _file_digest(dataset_file) != business_scoring["test_source"]["sha256"]
-        ):
-            raise ValueError("final test must use the complete frozen test dataset")
-        business_module = types.ModuleType("frozen_test_scoring")
+        dataset_role = business_scoring.get("dataset_role", "test")
+        source = (
+            business_scoring.get("dataset_source") or business_scoring["test_source"]
+        )
+        if limit or _file_digest(dataset_file) != source["sha256"]:
+            raise ValueError("evaluation must use the complete frozen dataset")
+        business_module = types.ModuleType("frozen_business_scoring")
         # This entry point runs in the existing CPU worker, never in Runtime/HTTP.
         exec(
             compile(business_scoring["script"], "score_eval.py", "exec"),
@@ -1704,10 +1711,10 @@ def evaluate_inference(
         )
         validate_script(business_module, business_scoring["spec"])
         for identity, raw in zip(ids, rows, strict=True):
-            case = stable_case(raw, business_module, {"source": "test"})
+            case = stable_case(raw, business_module, {"source": dataset_role})
             if case["id"] != identity:
                 raise ValueError(
-                    "test mapping and frozen scoring script disagree on IDs"
+                    "dataset mapping and frozen scoring script disagree on IDs"
                 )
             business_cases[identity] = case
     media_digests = {}
@@ -1742,7 +1749,7 @@ def evaluate_inference(
             "limit": limit,
         },
         **(
-            {"business_scoring": business_scoring, "dataset_role": "test"}
+            {"business_scoring": business_scoring, "dataset_role": dataset_role}
             if business_scoring is not None
             else {}
         ),
@@ -1892,8 +1899,8 @@ def evaluate_inference(
     )
     if business_scoring is not None:
         metrics.update(
-            dataset_role="test",
-            selection_run_id=business_scoring["selection_run_id"],
+            dataset_role=dataset_role,
+            selection_run_id=business_scoring.get("selection_run_id"),
             scoring_spec_sha256=_config_digest(business_scoring["spec"]),
             classification=_classification_metrics(
                 [
@@ -2032,6 +2039,7 @@ def main() -> None:
     parser.add_argument("--report-spec")
     parser.add_argument("--report-assets-dir")
     parser.add_argument("--business-scoring")
+    parser.add_argument("--dataset-provenance")
     args = parser.parse_args()
     output = Path(args.output_dir)
     try:
@@ -2046,6 +2054,11 @@ def main() -> None:
             evaluation_config_json=json.dumps(config),
             run_id=args.run_id,
             report_assets_dir=args.report_assets_dir,
+            dataset_provenance=(
+                json.loads(Path(args.dataset_provenance).read_text())
+                if args.dataset_provenance
+                else None
+            ),
             business_scoring=(
                 json.loads(Path(args.business_scoring).read_text())
                 if args.business_scoring

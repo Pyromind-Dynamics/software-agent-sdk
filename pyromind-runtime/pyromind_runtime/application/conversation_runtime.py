@@ -12,8 +12,13 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
+from pyromind_runtime.application.checkpoint_evaluations import (
+    KIND as CHECKPOINT_EVALUATION_KIND,
+    CheckpointEvaluationCoordinator,
+    job_state,
+)
 from pyromind_runtime.application.evaluation_annotations import (
     EvaluationAnnotationService,
     EvaluationLockRegistry,
@@ -35,6 +40,7 @@ from pyromind_runtime.application.user_input_coordinator import UserInputCoordin
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.application.workflow_completion import WorkflowCompletionHook
 from pyromind_runtime.domain.capabilities import ResourceLimits
+from pyromind_runtime.domain.checkpoint_evaluation import CheckpointEvaluationRequest
 from pyromind_runtime.domain.commands import (
     CancelCommand,
     CommandReceipt,
@@ -77,6 +83,7 @@ from pyromind_runtime.infrastructure.file_product_store import (
     FileProductStore,
     ProductStoreError,
 )
+from pyromind_runtime.ports.checkpoint_evaluation import CheckpointEvaluationPlatform
 from pyromind_runtime.ports.external_tasks import ExternalTaskRegistry
 from pyromind_runtime.ports.harness import (
     ExternalTaskNotification,
@@ -162,6 +169,7 @@ class ConversationRuntime:
         workflows: WorkflowBackend | None = None,
         workflow_submission: WorkflowSubmissionPort | None = None,
         versions: Versions | None = None,
+        checkpoint_platform: CheckpointEvaluationPlatform | None = None,
         evaluation_storage_factory: Callable[[RequestContext], EvaluationStorage]
         | None = None,
     ) -> None:
@@ -175,6 +183,10 @@ class ConversationRuntime:
             raise ValueError(f"default harness is not registered: {default_harness_id}")
         self.default_harness_id = default_harness_id
         self._resource_limits = resource_limits
+        self._checkpoint_platform = checkpoint_platform
+        self._checkpoint_contexts: dict[str, RequestContext] = {}
+        self._checkpoint_locks: dict[str, asyncio.Lock] = {}
+        self.checkpoint_wakeup = asyncio.Event()
         self._external_tasks = external_tasks
         self._workflow_submission = workflow_submission
         self.versions = versions
@@ -319,6 +331,182 @@ class ConversationRuntime:
         )
         await self.reconcile_versions(conversation_id, context)
         return {"task_id": task_id, "status": "Pending"}
+
+    def refresh_checkpoint_credentials(
+        self, conversation_id: str, context: RequestContext
+    ) -> None:
+        self._store(conversation_id).authorize(context.user_id)
+        if self._checkpoint_platform is not None and (
+            context.cookie or context.authorization
+        ):
+            previous = self._checkpoint_contexts.get(conversation_id)
+            self._checkpoint_contexts[conversation_id] = context
+            if previous != context:
+                self.checkpoint_wakeup.set()
+
+    def _checkpoint_coordinator(
+        self, conversation_id: str
+    ) -> CheckpointEvaluationCoordinator:
+        if self._checkpoint_platform is None or self._external_tasks is None:
+            raise ValueError("checkpoint evaluation is not configured")
+        return CheckpointEvaluationCoordinator(
+            self._store(conversation_id),
+            self._external_tasks,
+            self._checkpoint_platform,
+        )
+
+    async def checkpoint_evaluation_call(
+        self,
+        conversation_id: str,
+        action: str,
+        arguments: dict[str, Any],
+        request_id: str,
+        context: RequestContext,
+    ) -> dict[str, Any]:
+        self.refresh_checkpoint_credentials(conversation_id, context)
+        lock = self._checkpoint_locks.setdefault(conversation_id, asyncio.Lock())
+        async with lock:
+            coordinator = self._checkpoint_coordinator(conversation_id)
+            if action == "register":
+                identity = uuid5(
+                    UUID(request_id), f"checkpoint-selection:{conversation_id}"
+                )
+                run = await coordinator.register(
+                    identity,
+                    conversation_id,
+                    CheckpointEvaluationRequest.model_validate(arguments),
+                    context,
+                )
+                parent_task = f"checkpoint-selection:{run.run_id}"
+                if not any(
+                    t.task_id == parent_task
+                    for t in self._store(conversation_id).load_snapshot().external_tasks
+                ):
+                    now = datetime.now().astimezone().isoformat()
+                    self.register_external_task(
+                        conversation_id,
+                        {
+                            "task_id": parent_task,
+                            "run_id": str(run.run_id),
+                            "kind": "data_preparation",
+                            "status": "running",
+                            "output_dir": run.output_dir,
+                            "submitted_at": now,
+                            "updated_at": now,
+                            "keep_ui_lock": False,
+                        },
+                    )
+                self.checkpoint_wakeup.set()
+            else:
+                runs = self._store(conversation_id).load_pipeline_runs()
+                run = runs.get(str(UUID(str(arguments["run_id"]))))
+                if (
+                    run is None
+                    or run.definition.get("kind") != CHECKPOINT_EVALUATION_KIND
+                ):
+                    raise ValueError(
+                        "unknown checkpoint evaluation in this conversation"
+                    )
+                if action == "cancel":
+                    run = coordinator.cancel(run)
+                    self.checkpoint_wakeup.set()
+                elif action == "reconcile":
+                    run = await coordinator.reconcile(
+                        run, int(arguments["step"]), str(arguments["task_id"]), context
+                    )
+                    self.checkpoint_wakeup.set()
+                elif action != "get":
+                    raise ValueError(
+                        "action must be register, get, cancel or reconcile"
+                    )
+            return {
+                "run_id": str(run.run_id),
+                "output_dir": run.output_dir,
+                **run.result,
+            }
+
+    async def poll_checkpoint_evaluations(self) -> None:
+        if self._checkpoint_platform is None or not self.conversation_root.is_dir():
+            return
+        for directory in self.conversation_root.iterdir():
+            if not (directory / "product/meta.json").is_file():
+                continue
+            scope = directory.name
+            lock = self._checkpoint_locks.setdefault(scope, asyncio.Lock())
+            if lock.locked():
+                continue
+            async with lock:
+                try:
+                    coordinator = self._checkpoint_coordinator(scope)
+                    for run in self._store(scope).load_pipeline_runs().values():
+                        if run.definition.get("kind") != CHECKPOINT_EVALUATION_KIND:
+                            continue
+                        before = job_state(run)
+                        context = self._checkpoint_contexts.get(scope)
+                        if context is not None:
+                            self._store(scope).authorize(context.user_id)
+                        updated = await coordinator.tick(run, context)
+                        state = job_state(updated)
+                        if updated.revision == run.revision and state.status not in {
+                            "completed",
+                            "cancelled",
+                        }:
+                            continue
+                        if state.status in {"completed", "cancelled"}:
+                            task_id = f"checkpoint-selection:{run.run_id}"
+                            if any(
+                                task.task_id == task_id
+                                and task.status in {"succeeded", "stopped"}
+                                for task in self._store(scope)
+                                .load_snapshot()
+                                .external_tasks
+                            ):
+                                continue
+                            await self.deliver_external_task_status(
+                                scope,
+                                task_id=f"checkpoint-selection:{run.run_id}",
+                                status="succeeded"
+                                if state.status == "completed"
+                                else "stopped",
+                                completion_result={
+                                    "run_id": str(run.run_id),
+                                    "output_dir": run.output_dir,
+                                    "selection": updated.result,
+                                },
+                            )
+                        elif (
+                            state.status != before.status
+                            or state.error != before.error
+                            or (
+                                state.selection.selected_step
+                                if state.selection
+                                else None
+                            )
+                            != (
+                                before.selection.selected_step
+                                if before.selection
+                                else None
+                            )
+                            or {k: c.status for k, c in state.candidates.items()}
+                            != {k: c.status for k, c in before.candidates.items()}
+                        ):
+                            event = ProductEvent(
+                                conversation_id=scope,
+                                type="notice.raised",
+                                payload={
+                                    "code": "checkpoint_evaluation_progress",
+                                    "severity": "warning" if state.error else "info",
+                                    "message": state.error
+                                    or f"Checkpoint evaluation: {state.status}",
+                                    "run_id": str(run.run_id),
+                                },
+                            )
+                            persisted, _ = self._store(scope).append(event)
+                            self._publish(persisted)
+                except Exception:
+                    logger.exception(
+                        "Checkpoint evaluation polling failed for %s", scope
+                    )
 
     async def recover_version_metadata(self) -> None:
         if self.versions is None:
@@ -1102,6 +1290,7 @@ class ConversationRuntime:
         context: RequestContext,
     ) -> ConversationSnapshot:
         store = await self._read_store(conversation_id, context)
+        self.refresh_checkpoint_credentials(conversation_id, context)
         return store.load_snapshot()
 
     async def submit_command(
@@ -1112,6 +1301,7 @@ class ConversationRuntime:
     ) -> CommandReceipt:
         store = await self._ensure_active(conversation_id, context)
         store.authorize(context.user_id)
+        self.refresh_checkpoint_credentials(conversation_id, context)
         store.save_x_cluster(context.x_cluster)
         receipt, claimed = store.claim_command(command)
         if not claimed:
@@ -1756,7 +1946,13 @@ class ConversationRuntime:
         terminal = normalized in {"succeeded", "failed", "terminated", "stopped"}
         # A parked run is not finished, but the agent still has to act on it: the
         # human gate needs a person, and only the agent can tell the user what to do.
-        notify = terminal or normalized == "waiting"
+        managed_checkpoint = any(
+            run.task_id == task_id
+            and run.definition.get("parent_run_id")
+            and run.definition.get("dataset_role") == "validation"
+            for run in store.load_pipeline_runs().values()
+        )
+        notify = (terminal or normalized == "waiting") and not managed_checkpoint
         active = self._active.get(conversation_id)
         # With no live conversation the gate waits for the next session start, so a
         # parked run never loses its notification.
@@ -1768,7 +1964,8 @@ class ConversationRuntime:
             **task.model_dump(mode="json"),
             "status": normalized,
             "updated_at": datetime.now().astimezone().isoformat(),
-            "resume_pending": terminal or deferred or blocked,
+            "resume_pending": (terminal or deferred or blocked)
+            and not managed_checkpoint,
             "resume_auto_run": auto_run,
             "completion_result": {**task.completion_result, **completion_result}
             if completion_result is not None
@@ -1799,7 +1996,9 @@ class ConversationRuntime:
                 logger.exception(
                     "Could not update external task registry for %s", task_id
                 )
-        if terminal:
+        if managed_checkpoint:
+            self.checkpoint_wakeup.set()
+        if terminal and not managed_checkpoint:
             await self.reconcile_versions(
                 conversation_id, active.context if active else None
             )
@@ -1926,6 +2125,7 @@ class ConversationRuntime:
         # Release admission waiters first so shutdown can fail them immediately
         # instead of blocking on a suspended graph.
         self._closing = True
+        self._checkpoint_contexts.clear()
         for wakeup in self._auto_execution_wakeups.values():
             wakeup.set()
         await asyncio.gather(*tuple(self._input_response_tasks), return_exceptions=True)
@@ -2948,14 +3148,13 @@ def _build_external_task_notification(
                     "W&B run and metrics; do not claim all training stages were "
                     "analyzed. Unless evaluation was explicitly excluded, continue "
                     "with training_analysis(operation=artifacts) to discover saved "
-                    "checkpoint-n and eval_step_n.jsonl from the executed task. "
-                    "Inspect samples, establish the business scoring rule, then use "
-                    "inference-evaluation to score every saved eval with one frozen "
-                    "script through df_submit_pipeline evaluation. Compare only "
-                    "same-step complete checkpoints using validation only. With "
-                    "train + validation only, do not start extra GPU inference. "
-                    "If independent test exists, evaluate the validation-selected "
-                    "checkpoint on test; test never participates in selection. "
+                    "checkpoint-n from the executed task. Use inference-evaluation "
+                    "to register checkpoint_evaluations with a frozen validation "
+                    "template if requested and not already registered. "
+                    "Existing selection continues independently; do not duplicate it. "
+                    "Saved eval_step predictions can still be scored on CPU. "
+                    "Independent test follows completed validation selection; "
+                    "test never participates in selection. "
                     "Present available label distributions and use the iteration "
                     "context to decide the next action. For requested badcase "
                     "annotation, use the label-studio skill and "
