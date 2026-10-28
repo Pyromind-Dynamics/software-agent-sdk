@@ -397,6 +397,7 @@ def test_generated_business_scoring_only_executes_in_cpu_worker():
         }.intersection(imports)
         if path.name in {
             "checkpoint_selection.py",
+            "checkpoint_evaluations.py",
             "training_evaluations.py",
             "review_tasks.py",
             "test_evaluation.py",
@@ -419,3 +420,30 @@ def test_generated_business_scoring_only_executes_in_cpu_worker():
         "scoring_script_path",
         "manifest_path",
     } <= DfSubmitEvaluationAction.model_fields.keys()
+
+
+def test_checkpoint_polling_is_a_shared_runtime_service():
+    from harness_adapter.checkpoint_tools import CheckpointEvaluationsTool
+    from pyromind_runtime.domain.checkpoint_evaluation import (
+        CheckpointEvaluationRequest,
+    )
+
+    runtime = ROOT / "pyromind-runtime/pyromind_runtime"
+    for path in (
+        runtime / "application/checkpoint_evaluations.py",
+        runtime / "domain/checkpoint_evaluation.py",
+        runtime / "ports/checkpoint_evaluation.py",
+    ):
+        tree = ast.parse(path.read_text())
+        imports = {
+            node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+        }
+        assert not any(
+            name and name.startswith(("openhands", "harness_adapter", "fastapi"))
+            for name in imports
+        )
+    fields = CheckpointEvaluationRequest.model_fields
+    assert "training_task_id" in fields and "template" in fields
+    tool = CheckpointEvaluationsTool.create()[0]
+    assert tool.name == "checkpoint_evaluations"
+    assert tool.executor is None

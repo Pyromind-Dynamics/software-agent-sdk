@@ -711,7 +711,9 @@ def test_real_agent_replay_transport_smoke(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    from openhands.tools.data_preparation.platform_submit import DfSubmitPipelineAction
+    from openhands.tools.data_preparation.evaluation_submit import (
+        DfSubmitEvaluationAction,
+    )
     from tests.integration.tests import b09_saved_prediction_flywheel as replay
 
     test = replay.SavedPredictionFlywheelTest.__new__(
@@ -768,14 +770,13 @@ def score_case(case, spec):
         (tmp_path / name).write_text(json.dumps(value))
     (tmp_path / "scorer.py").write_text(script)
     result = replay.ReplaySubmit(test)(
-        DfSubmitPipelineAction.model_validate(
+        DfSubmitEvaluationAction.model_validate(
             {
                 "input_path": "/training/1051",
-                "evaluation": {
-                    "source_manifest_path": "sources.json",
-                    "scoring_spec_path": "spec.json",
-                    "scoring_script_path": "scorer.py",
-                },
+                "operation": "score",
+                "source_manifest_path": "sources.json",
+                "scoring_spec_path": "spec.json",
+                "scoring_script_path": "scorer.py",
             }
         )
     )

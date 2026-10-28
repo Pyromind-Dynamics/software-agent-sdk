@@ -2,6 +2,7 @@
 
 from typing import Any
 
+from pyromind_runtime.application.checkpoint_evaluations import KIND, job_state
 from pyromind_runtime.ports.product_store import ProductStore
 
 
@@ -16,19 +17,20 @@ def final_test_definition(
     if (
         parent is None
         or parent.conversation_id != conversation_id
-        or parent.definition.get("kind") != "prediction_evaluation"
+        or parent.definition.get("kind") not in {"prediction_evaluation", KIND}
         or not parent.result.get("model")
     ):
         raise ValueError("final test requires a completed validation selection")
-    manifest = parent.definition["source_manifest"]
+    continuous = parent.definition.get("kind") == KIND
+    if continuous and job_state(parent).status != "completed":
+        raise ValueError("final test requires the checkpoint selection to finish")
+    manifest = parent.definition if continuous else parent.definition["source_manifest"]
     assert isinstance(manifest, dict)
     datasets = manifest.get("datasets", {})
     assert isinstance(datasets, dict)
     test = datasets.get("test")
     if not isinstance(test, dict) or not test.get("sha256"):
-        raise ValueError(
-            "train + validation only: reuse saved predictions; no test run"
-        )
+        raise ValueError("no test run: no independent test dataset was declared")
     for role in ("train", "validation"):
         entry = datasets.get(role)
         if not isinstance(entry, dict):
@@ -49,6 +51,37 @@ def final_test_definition(
         raise ValueError("final test must use the validation-selected checkpoint")
     if definition["evaluation_config"].get("generation", {}).get("limit", 0):
         raise ValueError("final test requires the complete test dataset")
+    if continuous:
+        template = parent.definition["template"]
+        assert isinstance(template, dict)
+        frozen_evaluation = template["evaluation_config"]
+        assert isinstance(frozen_evaluation, dict)
+        supplied = definition["evaluation_config"]
+        if {k: v for k, v in supplied.items() if k != "model_source"} != {
+            k: v for k, v in frozen_evaluation.items() if k != "model_source"
+        }:
+            raise ValueError(
+                "final test must use frozen evaluation rules and generation settings"
+            )
+        scoring = template.get("business_scoring")
+        return {
+            **definition,
+            "dataset_role": "test",
+            "test_source": test,
+            "dataset_provenance": {**test, "dataset_role": "test"},
+            **(
+                {
+                    "business_scoring": {
+                        **scoring,
+                        "dataset_role": "test",
+                        "dataset_source": test,
+                        "selection_run_id": selection_id,
+                    }
+                }
+                if isinstance(scoring, dict)
+                else {}
+            ),
+        }
     return {
         **definition,
         "dataset_role": "test",

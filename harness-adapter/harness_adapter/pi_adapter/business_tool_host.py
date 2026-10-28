@@ -16,6 +16,11 @@ from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.versions import VersionToolRequest
 
+from harness_adapter.checkpoint_tools import (
+    CheckpointCall,
+    CheckpointEvaluationsAction,
+    CheckpointEvaluationsTool,
+)
 from harness_adapter.openhands_adapter.session_factory import current_user_from_context
 from harness_adapter.pi_adapter.business_tools import (
     execute_validation_tool,
@@ -308,6 +313,7 @@ class PyromindBusinessToolHost:
             else None
         )
         self._pipeline_runs = pipeline_runs
+        self.checkpoint_call: CheckpointCall | None = None
         self.version_call: VersionCall | None = None
         self.execution_call: ExecutionCall | None = None
         self._workflow_preparer: Callable[..., Awaitable[dict[str, Any]]] | None = None
@@ -416,6 +422,14 @@ class PyromindBusinessToolHost:
         host-side presigned upload tool.
         """
         specs = [validation_tool_spec()]
+        if self.checkpoint_call is not None:
+            specs.append(
+                BusinessToolSpec(
+                    CheckpointEvaluationsTool.name,
+                    CheckpointEvaluationsTool.create()[0].description,
+                    CheckpointEvaluationsAction.model_json_schema(),
+                ).as_dict()
+            )
         if self.version_call is not None:
             specs.append(
                 BusinessToolSpec(
@@ -501,6 +515,29 @@ class PyromindBusinessToolHost:
         tool_call_id: str | None = None,
     ) -> dict[str, Any]:
         started_at = time.perf_counter()
+        if name == CheckpointEvaluationsTool.name:
+            if self.checkpoint_call is None:
+                raise ValueError("checkpoint evaluation is unavailable")
+            tool = CheckpointEvaluationsTool.create(
+                callback=self.checkpoint_call,
+                scope=context.conversation_id,
+                context=context.request_context,
+                loop=asyncio.get_running_loop(),
+            )[0]
+            assert tool.executor is not None
+            observation = await asyncio.to_thread(
+                tool.executor,
+                CheckpointEvaluationsAction.model_validate(arguments),
+                cast(Any, _ToolConversationFacade(context)),
+            )
+            return BusinessToolResult(
+                is_error=observation.is_error,
+                content=[
+                    block.model_dump(mode="json")
+                    for block in observation.to_llm_content
+                ],
+                details={},
+            ).as_dict()
         if name == ProductVersionsTool.name:
             if self.version_call is None:
                 raise ValueError("version management is unavailable")

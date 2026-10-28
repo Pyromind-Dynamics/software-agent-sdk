@@ -8,9 +8,12 @@ description: 模型效果评测的统一入口，包括基模 Benchmark、训后
 当前 Agent 负责理解任务和制定 rubric；被测模型只生成 prediction，固定的评测脚本负责评分。
 业务效果评测统一走本 Skill，包括训练前后的独立评测；不通过 generate-workflow-dsl
 另建 Metric/Eval 评测链。训练工作流负责训练及模型产物准备；已有预测评分不需要加载或合并模型。
-训练后按数据集角色处理：只有 train + val 时，复用已有 eval_step_n.jsonl 评分选模，
-不额外启动模型推理。存在独立 test 时，先用 val 选择 checkpoint，再对该模型执行 test
-推理和同口径评分；test 不参与选模。缺少已有预测时报告缺口，不自动补跑 GPU。
+训练选模使用验证集对各 checkpoint 独立推理和评分；训练负责保存模型，
+不要求产生 eval_step_n.jsonl。先冻结评测模板，训练提交成功取得 task_id 后，
+用 `checkpoint_evaluations` 注册持续选模任务，也可补挂已有训练。
+参见 [持续 checkpoint 选模](references/checkpoint-selection.md)。服务端发现产物、排队评测和收尾，
+Agent 不循环查询、不为每个 checkpoint 重写工作流。W&B 用于诊断与训练进度，业务指标决定排名。
+有独立 test 时，在选模结束后对所选模型使用同口径评测；test 不参与选模。
 
 ## 已有预测与训练产物
 
@@ -20,7 +23,7 @@ description: 模型效果评测的统一入口，包括基模 Benchmark、训后
 训练集与验证集标签分布随报告展示；优先查看所选 checkpoint 的 badcase。
 `iteration_context.json` 汇总目标、数据、step 对比、选模和人工反馈，供下一轮判断；
 原因假设由 Agent 结合证据提出，不套用固定的补数据或重训规则。
-独立 test 使用下面的推理入口，传 selection_run_id 绑定验证集选模批次；
+独立 test 使用下面的推理入口，传 selection_run_id 绑定已完成的验证集选模任务或评分批次；
 Runtime 校验所选 checkpoint、test 来源和独立性，CPU 使用该批次冻结的 Python 评分脚本。
 parse_record 应支持 context.source=test，标识必须与 dataset_config 一致。LoRA 合并使用所选 step。
 

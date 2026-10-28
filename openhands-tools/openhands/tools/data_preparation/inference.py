@@ -315,6 +315,14 @@ def build_inference_dsl(
             "--report-assets-dir",
             shlex.quote(output),
             *(
+                [
+                    "--dataset-provenance",
+                    shlex.quote(output + "/dataset_provenance.json"),
+                ]
+                if definition.get("dataset_provenance")
+                else []
+            ),
+            *(
                 ["--business-scoring", shlex.quote(output + "/business_scoring.json")]
                 if definition.get("business_scoring")
                 else []
@@ -662,12 +670,21 @@ class InferencePipelineHandler:
                     ("dataset_config.json", definition["dataset_config"]),
                     ("evaluation_config.json", definition["evaluation_config"]),
                     *(
+                        (("dataset_provenance.json", definition["dataset_provenance"]),)
+                        if definition.get("dataset_provenance")
+                        else ()
+                    ),
+                    *(
                         (
                             (
                                 "business_scoring.json",
                                 {
                                     **definition["business_scoring"],
-                                    "test_source": definition["test_source"],
+                                    **(
+                                        {"test_source": definition["test_source"]}
+                                        if definition.get("test_source")
+                                        else {}
+                                    ),
                                 },
                             ),
                         )

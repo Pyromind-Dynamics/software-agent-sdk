@@ -3,6 +3,8 @@
 import json
 from typing import Any, ClassVar, cast
 
+import pytest
+
 from openhands.tools.data_preparation.progress import (
     DfCheckProgressAction,
     DfCheckProgressExecutor,
@@ -341,3 +343,94 @@ def test_stable_report_link_absent_when_manifest_missing() -> None:
     )
 
     assert obs.evaluation_report_url is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "Pyromind storage get_url API returned HTTP 503: unavailable",
+        "Pyromind storage get_url API returned HTTP 403: denied",
+        "Failed to call Pyromind storage get_url API: ReadTimeout",
+    ],
+)
+def test_storage_failure_is_not_reported_as_missing_progress(monkeypatch, error):
+    executor = _make_executor({})
+    monkeypatch.setattr(executor, "_get_size_and_url", lambda *args: error)
+    result = executor(DfCheckProgressAction(output_dir="/run"))
+    assert result.is_error
+    assert result.progress_error == error
+    assert result.report_error == error
+    assert not result.progress_found
+    assert "Could not read progress.json" in result.text
+    assert "not found yet" not in result.text
+    assert "Try again shortly" not in result.text
+
+
+def test_progress_reads_without_metadata_endpoint_when_listing_is_unavailable(
+    monkeypatch,
+):
+    executor = DfCheckProgressExecutor(storage_base_url="https://storage.test/api")
+    calls = []
+
+    def post(route, body, headers):
+        calls.append(route)
+        if route == "file_list":
+            return "Pyromind storage file_list API returned HTTP 503: unavailable"
+        assert route == "get_url"
+        return {"success": True, "data": {"url": "https://cdn.test" + body["path"]}}
+
+    monkeypatch.setattr(executor, "_post_json", post)
+    monkeypatch.setattr(
+        executor,
+        "_download_range",
+        lambda url, *args: (
+            b'{"total":411,"processed":411,"succeeded":411,"failed":0}'
+            if url.endswith("/progress.json")
+            else b'{"status":"succeeded"}'
+        ),
+    )
+    result = executor(DfCheckProgressAction(output_dir="/run"))
+    assert result.progress_found and result.percent == 100
+    assert result.report_found and not result.is_error
+    assert result.progress_error is None
+    assert "get_file_metadata" not in calls
+
+
+def test_invalid_progress_json_is_distinct_from_missing_file():
+    executor = _make_executor({"/run/progress.json": b"incomplete {"})
+    result = executor(DfCheckProgressAction(output_dir="/run"))
+    assert result.is_error
+    assert result.progress_error is not None
+    assert "Invalid JSON" in result.progress_error
+    assert "not found yet" not in result.text
+
+
+def test_confirmed_absence_keeps_the_existing_waiting_behavior(monkeypatch):
+    executor = _make_executor({})
+    monkeypatch.setattr(
+        executor,
+        "_get_size_and_url",
+        lambda *args: "Pyromind storage get_url API returned HTTP 404: not found",
+    )
+    result = executor(DfCheckProgressAction(output_dir="/run"))
+    assert not result.is_error and not result.progress_found
+    assert result.progress_error is None
+    assert "not found yet" in result.text
+
+
+def test_available_report_is_returned_even_when_progress_read_fails(monkeypatch):
+    executor = _make_executor({"/run/report.json": b'{"status":"succeeded"}'})
+    lookup = executor._get_size_and_url
+    monkeypatch.setattr(
+        executor,
+        "_get_size_and_url",
+        lambda path, headers: (
+            "Pyromind storage get_url API returned HTTP 503: unavailable"
+            if path.endswith("/progress.json")
+            else lookup(path, headers)
+        ),
+    )
+    result = executor(DfCheckProgressAction(output_dir="/run"))
+    assert result.report_found and not result.is_error
+    assert result.progress_error is not None
+    assert "report.status=succeeded" in result.text

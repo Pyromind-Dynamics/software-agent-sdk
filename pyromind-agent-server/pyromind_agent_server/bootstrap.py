@@ -9,6 +9,10 @@ from pathlib import Path
 from fastapi import FastAPI
 from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
 from harness_adapter.artifact_snapshots import PlatformArtifactSnapshots
+from harness_adapter.checkpoint_evaluation import (
+    PlatformCheckpointEvaluation,
+    checkpoint_skills_root,
+)
 from harness_adapter.openhands_adapter import OpenHandsAdapter
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.workflow_submission import PlatformWorkflowSubmission
@@ -27,6 +31,7 @@ from pyromind_runtime.ports.workflows import WorkflowEventSink
 from openhands.agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
 from openhands.agent_server.run_workflow_callback import set_workflow_status_dispatcher
 from openhands.agent_server.storage_quota import ensure_conversation_quota
+from pyromind_agent_server.checkpoint_scheduler import CheckpointScheduler
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
@@ -125,6 +130,19 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             scope, request_id, workflow, code, context
         )
 
+    async def checkpoint_call(
+        scope: str,
+        action: str,
+        arguments: dict,
+        request_id: str,
+        context: RequestContext,
+    ) -> dict:
+        assert isinstance(runtime, ConversationRuntime)
+        return await runtime.checkpoint_evaluation_call(
+            scope, action, arguments, request_id, context
+        )
+
+    openhands_adapter.set_checkpoint_handler(checkpoint_call)
     openhands_adapter.set_version_handler(version_call, execution_call)
     terminal_backend: str | None = None
     external_tasks = WorkflowExternalTaskRegistry(service.conversations_dir)
@@ -164,6 +182,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             pipeline_runs=pipeline_runs,
             workflow_call=workflow_call if workflow_enabled else None,
         )
+        pi_adapter.set_checkpoint_handler(checkpoint_call)
         pi_adapter.set_version_handler(version_call, execution_call)
         adapters["pi"] = pi_adapter
         if workflow_enabled:
@@ -225,6 +244,11 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         workflow_submission=PlatformWorkflowSubmission(),
         versions=versions,
         evaluation_storage_factory=build_evaluation_storage,
+        checkpoint_platform=PlatformCheckpointEvaluation(
+            checkpoint_skills_root(),
+            _workspace_root(service.conversations_dir),
+            build_evaluation_storage,
+        ),
     )
     if backend == "pi":
         adapter = adapters["pi"]
@@ -248,6 +272,12 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     )
     set_workflow_status_dispatcher(WorkflowStatusDispatcher(runtime).dispatch)
     app.state.product_runtime = runtime
+    if getattr(app.state, "product_lifespan_started", False):
+        scheduler = CheckpointScheduler(
+            runtime, service.conversations_dir / ".checkpoint-scheduler.lock"
+        )
+        scheduler.start()
+        app.state.checkpoint_scheduler = scheduler
     return runtime
 
 
@@ -290,12 +320,17 @@ def install_product_api(app: FastAPI) -> FastAPI:
     @asynccontextmanager
     async def product_lifespan(current_app: FastAPI):
         async with original_lifespan(current_app):
+            current_app.state.product_lifespan_started = True
             runtime = ensure_product_runtime(current_app)
             if runtime is not None:
                 await runtime.recover_version_metadata()
             try:
                 yield
             finally:
+                scheduler = getattr(current_app.state, "checkpoint_scheduler", None)
+                if isinstance(scheduler, CheckpointScheduler):
+                    await scheduler.close()
+                current_app.state.product_lifespan_started = False
                 runtime = getattr(current_app.state, "product_runtime", None)
                 if isinstance(runtime, ConversationRuntime):
                     await runtime.close()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
-from typing import Annotated
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
@@ -30,6 +30,12 @@ from pyromind_agent_server.bootstrap import ensure_product_runtime
 
 
 _SSE_HEARTBEAT_SECONDS = 15.0
+
+
+class CheckpointEvaluationBody(BaseModel):
+    action: Literal["register", "get", "cancel", "reconcile"]
+    request_id: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
 
 
 class PrepareWorkflowExecutionBody(BaseModel):
@@ -63,6 +69,27 @@ def create_product_router() -> APIRouter:
         tags=["Pyromind Product API"],
         dependencies=[Depends(check_session_api_key)],
     )
+
+    @router.post("/{conversation_id}/checkpoint-evaluations")
+    async def checkpoint_evaluation(
+        conversation_id: str,
+        body: CheckpointEvaluationBody,
+        request: Request,
+    ) -> dict:
+        try:
+            return await get_product_runtime(request).checkpoint_evaluation_call(
+                conversation_id,
+                body.action,
+                body.arguments,
+                body.request_id,
+                request_context(request),
+            )
+        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
+            raise _not_found(conversation_id) from exc
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
 
     @router.post("/{conversation_id}/workflow-executions")
     async def prepare_workflow_execution(
