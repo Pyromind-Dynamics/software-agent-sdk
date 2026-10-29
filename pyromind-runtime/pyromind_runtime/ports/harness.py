@@ -132,6 +132,17 @@ class HarnessAdapter(Protocol):
         context: RequestContext,
     ) -> JsonObject: ...
 
+    async def read_workspace_text(
+        self,
+        handle: SessionHandle,
+        path: str,
+        context: RequestContext,
+        *,
+        max_bytes: int | None = None,
+    ) -> str | None:
+        """Read a workspace-relative UTF-8 file, or return None if absent."""
+        ...
+
     async def fork(
         self,
         handle: SessionHandle,

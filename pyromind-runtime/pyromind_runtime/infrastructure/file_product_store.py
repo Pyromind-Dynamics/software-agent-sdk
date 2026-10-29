@@ -187,6 +187,19 @@ class FileProductStore:
             metadata = metadata.model_copy(update={"x_cluster": x_cluster})
             self._atomic_write(self.metadata_path, metadata.model_dump_json())
 
+    def assign_profile_id_if_missing(self, *, user_id: str, profile_id: str) -> bool:
+        with self._lock():
+            metadata = self._load_metadata()
+            if metadata.user_id != user_id:
+                return False
+            if metadata.profile_id == profile_id:
+                return True
+            if metadata.profile_id is not None:
+                return False
+            metadata = metadata.model_copy(update={"profile_id": profile_id})
+            self._atomic_write(self.metadata_path, metadata.model_dump_json())
+            return True
+
     def load_workflow_execution_requests(self) -> dict[str, WorkflowExecutionRequest]:
         with self._lock():
             return self._load_workflow_execution_requests()

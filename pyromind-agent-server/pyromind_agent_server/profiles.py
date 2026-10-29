@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from pyromind_runtime.application.product_instructions import DATA_FLYWHEEL_INSTRUCTIONS
 
+from openhands.agent_server.agent_profiles.echomind import ECHOMIND_PROFILE
 from openhands.agent_server.agent_profiles.echomind_manager import (
     ECHOMIND_MANAGER_PROFILE,
 )
@@ -18,6 +19,7 @@ class ConversationProfile:
     tool_allowlist: tuple[str, ...] | None = None
     skill_allowlist: tuple[str, ...] | None = None
     command_allowlist: tuple[str, ...] | None = None
+    conversation_marker: str | None = None
 
 
 _PRODUCT_ROUTING_INSTRUCTIONS = """For Pyromind workflow requests, read the matching
@@ -57,4 +59,15 @@ ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
         "confirm_experiment_plan",
         "reject_experiment_plan",
     ),
+    conversation_marker=ECHOMIND_MANAGER_PROFILE.usage_id,
+)
+
+ECHOMIND_CHAT_PROFILE = ConversationProfile(
+    route_prefix="/api/echomind/conversations",
+    profile_id=ECHOMIND_PROFILE.name,
+    harness_id="pi",
+    instructions=ECHOMIND_PROFILE.system_prompt or "",
+    tool_allowlist=ECHOMIND_PROFILE.tool_allowlist,
+    skill_allowlist=ECHOMIND_PROFILE.skill_allowlist,
+    conversation_marker=ECHOMIND_PROFILE.tag_value,
 )

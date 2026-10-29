@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Literal
 from uuid import UUID
@@ -22,10 +23,18 @@ from openhands.agent_server.echomind_projects import (
     read_project_request,
 )
 from openhands.agent_server.echomind_stage_executors import (
-    ProjectNodeExecutionResult,
-    execute_project_node,
+    get_project_node_executor,
 )
+from openhands.agent_server.echomind_stage_runs import (
+    ProjectArtifactDocument,
+    ProjectRunStore,
+    StageRun,
+    run_project_node,
+)
+from openhands.agent_server.pyromind_auth import CurrentLoginUser
 from openhands.agent_server.pyromind_constants import PYROMIND_AGENT_PROFILE_TAG_KEY
+from openhands.agent_server.pyromind_router import apply_pyromind_validation_context
+from openhands.sdk import TextContent
 
 
 projects_router = APIRouter(prefix="/echomind", tags=["EchoMind Projects"])
@@ -36,6 +45,63 @@ class CreateEchoMindProjectRequest(BaseModel):
     confirmed: Literal[True]
 
     model_config = {"extra": "forbid"}
+
+
+class StartEchoMindProjectNodeResponse(BaseModel):
+    schema_version: Literal[1] = 1
+    project_id: str
+    graph_id: str
+    node_id: str
+    conversation_id: str
+    event_id: str
+    status: Literal["started"] = "started"
+
+
+def _build_dataset_start_context(
+    project: ProjectInfo,
+    node_id: str,
+) -> str:
+    node = next(item for item in project.graph.nodes if item.id == node_id)
+    context = {
+        "project": {
+            "project_id": project.project.project_id,
+            "graph_id": project.graph.graph_id,
+            "name": project.project.name,
+            "description": project.project.description,
+            "skill": project.project.skill,
+            "lifecycle": project.graph.lifecycle,
+            "requirements": {
+                requirement.key: requirement.value
+                for requirement in project.project.requirements
+            },
+        },
+        "stage": {
+            "node_id": node.id,
+            "node_type": node.type,
+            "title": node.title,
+            "launch_mode": node.launch_mode,
+            "config": node.config,
+        },
+    }
+    return (
+        "A user explicitly started this Project stage from the EchoMind UI.\n\n"
+        "Server-generated Project and Stage context:\n"
+        f"{json.dumps(context, ensure_ascii=False, indent=2)}\n\n"
+        "Continue in this existing EchoMind conversation and develop only the "
+        "Dataset stage. Use the `data-processing` Skill as the source of truth.\n"
+        "Required development sequence:\n"
+        "1. Inspect the referenced dataset in Storage and determine its actual "
+        "structure. Treat `input_hint` as a hint, not verified metadata.\n"
+        "2. Select the matching data-processing paradigm, create the Pipeline, "
+        "and run a small sample in the conversation sandbox.\n"
+        "3. Show the sample result and wait for explicit user confirmation before "
+        "submitting a full validation task.\n"
+        "4. If the user confirms, submit the validation task through the "
+        "data-processing platform flow and report its task/run/output identifiers.\n\n"
+        "Do not create another Project, do not write `graph.json`, do not invent "
+        "server identifiers, and do not start Inference, Evaluator, or Train. "
+        "Those stages are outside this Dataset development action."
+    )
 
 
 @projects_router.post(
@@ -115,8 +181,92 @@ async def get_echomind_project(
 
 
 @projects_router.post(
+    "/projects/{project_id}/nodes/{node_id}/start",
+    response_model=StartEchoMindProjectNodeResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={404: {"description": "Project or node not found"}},
+)
+async def start_echomind_project_node(
+    project_id: str,
+    node_id: str,
+    http_request: Request,
+    conversation_service: ConversationService = Depends(get_conversation_service),
+) -> StartEchoMindProjectNodeResponse:
+    """Start Agent-led development for one Project stage."""
+    user_id = get_current_user_id(http_request)
+    store = ProjectStore.for_conversations_dir(conversation_service.conversations_dir)
+    try:
+        project = store.load(project_id, owner_user_id=user_id)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {project_id}",
+        ) from exc
+
+    node = next((item for item in project.graph.nodes if item.id == node_id), None)
+    if node is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project node not found: {node_id}",
+        )
+    if project.graph.lifecycle != "development":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Frozen Projects cannot start Agent-led stage development.",
+        )
+    if node.type != "dataset" or node.launch_mode != "agent":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Project node is not Agent-led Dataset development: {node_id}",
+        )
+    if node.config.get("capability") != "data-processing":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Dataset node is not bound to the data-processing capability.",
+        )
+
+    try:
+        conversation_id = UUID(project.project.echomind_conversation_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Project's EchoMind conversation is unavailable.",
+        ) from exc
+    event_service = await conversation_service.get_event_service(
+        conversation_id,
+        user_id=user_id,
+    )
+    if (
+        event_service is None
+        or event_service.stored.tags.get(PYROMIND_AGENT_PROFILE_TAG_KEY)
+        != ECHOMIND_PROFILE.tag_value
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Project's EchoMind conversation is unavailable.",
+        )
+
+    current_user = getattr(http_request.state, "current_user", None)
+    if isinstance(current_user, CurrentLoginUser):
+        await apply_pyromind_validation_context(event_service, current_user)
+
+    event_id = await event_service.send_internal_context(
+        [TextContent(text=_build_dataset_start_context(project, node_id))],
+        run=True,
+    )
+    return StartEchoMindProjectNodeResponse(
+        project_id=project.project.project_id,
+        graph_id=project.graph.graph_id,
+        node_id=node.id,
+        conversation_id=str(conversation_id),
+        event_id=event_id,
+    )
+
+
+@projects_router.post(
     "/projects/{project_id}/nodes/{node_id}/run",
-    response_model=ProjectNodeExecutionResult,
+    response_model=StageRun,
+    status_code=status.HTTP_201_CREATED,
     responses={404: {"description": "Project or node not found"}},
 )
 async def run_echomind_project_node(
@@ -124,8 +274,8 @@ async def run_echomind_project_node(
     node_id: str,
     http_request: Request,
     conversation_service: ConversationService = Depends(get_conversation_service),
-) -> ProjectNodeExecutionResult:
-    """Resolve one stage executor; current implementations are explicit shells."""
+) -> StageRun:
+    """Start one stage and persist its run and artifacts."""
     store = ProjectStore.for_conversations_dir(conversation_service.conversations_dir)
     try:
         project = store.load(
@@ -144,10 +294,80 @@ async def run_echomind_project_node(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Project node not found: {node_id}",
         )
+    if node.launch_mode == "agent":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Agent-led Project nodes must use the start endpoint.",
+        )
     try:
-        return execute_project_node(project=project, node=node)
+        get_project_node_executor(node.executor)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
+        ) from exc
+    return run_project_node(
+        project=project,
+        node=node,
+        run_store=ProjectRunStore(store.root),
+    )
+
+
+@projects_router.get(
+    "/projects/{project_id}/runs",
+    response_model=list[StageRun],
+    responses={404: {"description": "Project not found"}},
+)
+async def list_echomind_project_runs(
+    project_id: str,
+    http_request: Request,
+    conversation_service: ConversationService = Depends(get_conversation_service),
+) -> list[StageRun]:
+    """List persisted stage runs for one Project."""
+    store = ProjectStore.for_conversations_dir(conversation_service.conversations_dir)
+    try:
+        store.load(
+            project_id,
+            owner_user_id=get_current_user_id(http_request),
+        )
+    except ProjectNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {project_id}",
+        ) from exc
+    return ProjectRunStore(store.root).list(project_id)
+
+
+@projects_router.get(
+    "/projects/{project_id}/artifacts/{artifact_id}",
+    response_model=ProjectArtifactDocument,
+    responses={404: {"description": "Project or artifact not found"}},
+)
+async def get_echomind_project_artifact(
+    project_id: str,
+    artifact_id: str,
+    http_request: Request,
+    conversation_service: ConversationService = Depends(get_conversation_service),
+) -> ProjectArtifactDocument:
+    """Read one persisted Project artifact."""
+    store = ProjectStore.for_conversations_dir(conversation_service.conversations_dir)
+    try:
+        store.load(
+            project_id,
+            owner_user_id=get_current_user_id(http_request),
+        )
+    except ProjectNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {project_id}",
+        ) from exc
+    try:
+        return ProjectRunStore(store.root).load_artifact(
+            project_id=project_id,
+            artifact_id=artifact_id,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Artifact not found: {artifact_id}",
         ) from exc

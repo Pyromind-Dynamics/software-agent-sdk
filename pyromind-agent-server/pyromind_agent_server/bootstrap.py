@@ -30,7 +30,10 @@ from openhands.agent_server.storage_quota import ensure_conversation_quota
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.plan_database import build_experiment_plan_store
-from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
+from pyromind_agent_server.profiles import (
+    ECHOMIND_CHAT_PROFILE,
+    ECHOMIND_PRODUCT_PROFILE,
+)
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 
 
@@ -283,6 +286,9 @@ def resource_limits_from_environment() -> ResourceLimits:
 
 def install_product_api(app: FastAPI) -> FastAPI:
     """Compose Product API around the existing OpenHands application."""
+    from pyromind_agent_server.api.echomind_projects import (
+        router as echomind_projects_router,
+    )
     from pyromind_agent_server.api.evaluation_runs import (
         create_evaluation_runs_router,
     )
@@ -309,5 +315,7 @@ def install_product_api(app: FastAPI) -> FastAPI:
     app.router.lifespan_context = product_lifespan
     app.include_router(create_product_router())
     app.include_router(create_product_router(ECHOMIND_PRODUCT_PROFILE))
+    app.include_router(create_product_router(ECHOMIND_CHAT_PROFILE))
+    app.include_router(echomind_projects_router)
     app.include_router(create_evaluation_runs_router())
     return app

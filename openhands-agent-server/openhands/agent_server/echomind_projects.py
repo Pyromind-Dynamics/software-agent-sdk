@@ -21,6 +21,8 @@ PROJECT_REQUEST_RELATIVE_PATH = Path("public_data/project_request.json")
 _MAX_PROJECT_REQUEST_BYTES = 1024 * 1024
 
 ProjectNodeType = Literal["dataset", "inference", "evaluator", "train"]
+ProjectLifecycle = Literal["development", "frozen"]
+ProjectNodeLaunchMode = Literal["agent", "executor"]
 RequirementStatus = Literal["confirmed", "missing"]
 ProjectNodeStatus = Literal[
     "idle",
@@ -52,7 +54,8 @@ class ProjectNode(BaseModel):
     type: ProjectNodeType
     title: str = Field(min_length=1, max_length=256)
     status: ProjectNodeStatus = "idle"
-    executor: str = Field(default="shell", min_length=1, max_length=128)
+    launch_mode: ProjectNodeLaunchMode = "executor"
+    executor: str = Field(default="contract_probe", min_length=1, max_length=128)
     config: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -120,6 +123,8 @@ class ProjectRecord(BaseModel):
     requirements: list[ProjectRequirement]
     owner_user_id: str | None = None
     echomind_conversation_id: str
+    lifecycle: ProjectLifecycle = "development"
+    frozen_at: datetime | None = None
     created_at: datetime = Field(default_factory=_utc_now)
 
 
@@ -130,6 +135,7 @@ class ProjectGraph(BaseModel):
     graph_id: str
     project_id: str
     template: str | None = None
+    lifecycle: ProjectLifecycle = "development"
     nodes: list[ProjectNode] = Field(default_factory=list)
     edges: list[ProjectEdge] = Field(default_factory=list)
 
@@ -172,6 +178,14 @@ class ProjectInfo(BaseModel):
     project: ProjectRecord
     graph: ProjectGraph
 
+    @model_validator(mode="after")
+    def require_matching_lifecycle(self) -> ProjectInfo:
+        if self.project.lifecycle != self.graph.lifecycle:
+            raise ValueError("project and graph lifecycle must match")
+        if self.project.project_id != self.graph.project_id:
+            raise ValueError("project graph belongs to another project")
+        return self
+
 
 class ProjectRequestNotFoundError(FileNotFoundError):
     pass
@@ -191,14 +205,20 @@ def read_project_request(conversation_working_dir: Path | str) -> ProjectRequest
         raise ProjectRequestNotFoundError(str(PROJECT_REQUEST_RELATIVE_PATH))
     if path.stat().st_size > _MAX_PROJECT_REQUEST_BYTES:
         raise ProjectRequestInvalidError("project request is too large")
+    return read_project_request_text(path.read_text(encoding="utf-8"))
+
+
+def read_project_request_text(content: str) -> ProjectRequest:
+    if len(content.encode("utf-8")) > _MAX_PROJECT_REQUEST_BYTES:
+        raise ProjectRequestInvalidError("project request is too large")
     try:
-        return ProjectRequest.model_validate_json(path.read_text(encoding="utf-8"))
+        return ProjectRequest.model_validate_json(content)
     except ValueError as exc:
         raise ProjectRequestInvalidError(str(exc)) from exc
 
 
 class ProjectStore:
-    """File-backed Project store with a Project-owned Graph shell."""
+    """File-backed Project store with a Project-owned Graph."""
 
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
@@ -224,6 +244,7 @@ class ProjectStore:
             requirements=request.requirements,
             owner_user_id=owner_user_id,
             echomind_conversation_id=echomind_conversation_id,
+            lifecycle="development",
         )
         requirement_values = {
             requirement.key: requirement.value for requirement in request.requirements
@@ -238,6 +259,7 @@ class ProjectStore:
             template=(
                 "avi-single-turn/v1" if request.skill == AVI_SINGLE_TURN_SKILL else None
             ),
+            lifecycle="development",
             nodes=[
                 ProjectNode.model_validate(node_payload)
                 for node_payload in node_payloads

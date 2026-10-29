@@ -35,12 +35,16 @@ def build_graph_payload(
             node_id="dataset",
             node_type="dataset",
             title="Dataset",
+            launch_mode="agent",
             config={
-                "dataset_uri": requirements["dataset_uri"],
-                "format": requirements["dataset_format"],
-                "image_roles": requirements["image_roles"],
-                "label_schema": requirements["label_schema"],
-                "split_policy": requirements["split_policy"],
+                "capability": "data-processing",
+                "platform_task_kind": "data_preparation",
+                "input_hint": requirements["dataset_uri"],
+                "validation": {
+                    "status": "draft",
+                    "validation_run_id": None,
+                    "candidate_execution_spec": None,
+                },
             },
         ),
         _node(
@@ -87,6 +91,7 @@ def _node(
     node_id: str,
     node_type: Literal["dataset", "inference", "evaluator", "train"],
     title: str,
+    launch_mode: Literal["agent", "executor"] = "executor",
     config: dict[str, Any],
 ) -> dict[str, Any]:
     return {
@@ -94,6 +99,7 @@ def _node(
         "type": node_type,
         "title": title,
         "status": "idle",
-        "executor": "shell",
+        "launch_mode": launch_mode,
+        "executor": "contract_probe",
         "config": config,
     }

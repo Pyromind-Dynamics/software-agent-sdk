@@ -79,7 +79,7 @@ from openhands.sdk.workspace.base import BaseWorkspace
 from openhands.sdk.workspace.local import LocalWorkspace
 from openhands.tools.utils.workspace_files import (
     WorkspaceFileNotFoundError,
-    read_workspace_text,
+    read_workspace_text as read_workspace_text_file,
 )
 from openhands.tools.workflow.dsl_to_xyflow import (
     convert_dsl_to_xyflow,
@@ -470,7 +470,42 @@ class PiAdapter:
         workspace = await self._workspace(session)
         try:
             return await asyncio.to_thread(
-                read_workspace_text, workspace, _WORKFLOW_PATH.as_posix()
+                read_workspace_text_file, workspace, _WORKFLOW_PATH.as_posix()
+            )
+        except WorkspaceFileNotFoundError:
+            return None
+        except ValueError as exc:
+            raise OSError(str(exc)) from exc
+
+    async def read_workspace_text(
+        self,
+        handle: SessionHandle,
+        path: str,
+        context: RequestContext,
+        *,
+        max_bytes: int | None = None,
+    ) -> str | None:
+        session = self._sessions.get(handle.session_id)
+        if session is None:
+            session = self._restored_session(
+                handle.session_id,
+                context,
+                None,
+                require_api_key=False,
+            )
+        else:
+            session.context = context
+        if self._terminal_backend == "sandbox" and not self._has_execution_workspace(
+            session
+        ):
+            return None
+        workspace = await self._workspace(session)
+        try:
+            return await asyncio.to_thread(
+                read_workspace_text_file,
+                workspace,
+                path,
+                max_bytes=max_bytes,
             )
         except WorkspaceFileNotFoundError:
             return None
@@ -579,24 +614,7 @@ class PiAdapter:
         if existing is not None:
             existing.context = context
             return self._handle(existing)
-        root = self._safe_conversation_dir(conversation_id)
-        self._prepare_session_workspace(root, create=False)
-        _prepare_pi_runtime_directories(root)
-        files = PiSessionFiles(root)
-        config = files.load_session()
-        files.ensure_session_log()
-        session = _PiSession(
-            conversation_id,
-            root,
-            files,
-            config,
-            context,
-            model_configuration=_restored_model_configuration(config),
-            extra=dict(config.get("extra") or {}),
-            active_external_tasks=_restore_active_external_tasks(root),
-            user_input_enabled=bool(config.get("user_input_enabled")),
-            attach_recovery=recovery,
-        )
+        session = self._restored_session(conversation_id, context, recovery)
         await self._register(session)
         try:
             await self._recover_inflight(session)
@@ -613,6 +631,36 @@ class PiAdapter:
             finally:
                 await self._discard_sandbox(session)
             raise
+
+    def _restored_session(
+        self,
+        conversation_id: str,
+        context: RequestContext,
+        recovery: AttachRecovery | None,
+        *,
+        require_api_key: bool = True,
+    ) -> _PiSession:
+        root = self._safe_conversation_dir(conversation_id)
+        self._prepare_session_workspace(root, create=False)
+        _prepare_pi_runtime_directories(root)
+        files = PiSessionFiles(root)
+        config = files.load_session()
+        files.ensure_session_log()
+        return _PiSession(
+            conversation_id,
+            root,
+            files,
+            config,
+            context,
+            model_configuration=_restored_model_configuration(
+                config,
+                require_api_key=require_api_key,
+            ),
+            extra=dict(config.get("extra") or {}),
+            active_external_tasks=_restore_active_external_tasks(root),
+            user_input_enabled=bool(config.get("user_input_enabled")),
+            attach_recovery=recovery,
+        )
 
     async def send(
         self, handle: SessionHandle, command: ProductCommand, context: RequestContext
@@ -1065,7 +1113,10 @@ class PiAdapter:
             conversation_id=conversation_id,
             workspace_root=root,
             request_context=context,
-            model_configuration=_restored_model_configuration(config),
+            model_configuration=_restored_model_configuration(
+                config,
+                require_api_key=False,
+            ),
             extra=dict(config.get("extra") or {}),
         )
         try:
@@ -1998,17 +2049,23 @@ def _safe_session_extra(extra: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
-def _restored_model_configuration(config: dict[str, Any]) -> dict[str, Any]:
+def _restored_model_configuration(
+    config: dict[str, Any],
+    *,
+    require_api_key: bool = True,
+) -> dict[str, Any]:
     model = config.get("model")
     if not isinstance(model, dict):
         return {}
-    return {
+    configuration = {
         "model": model.get("id"),
         "base_url": model.get("base_url"),
         "api": model.get("api"),
         "context_window": model.get("context_window"),
-        "api_key": _api_key({}),
     }
+    if require_api_key:
+        configuration["api_key"] = _api_key({})
+    return configuration
 
 
 def _resolve_model(model: str, base_url: str | None) -> tuple[str, str]:

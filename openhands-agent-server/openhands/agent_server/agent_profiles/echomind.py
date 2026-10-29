@@ -1,6 +1,40 @@
 from openhands.agent_server.agent_profiles.spec import AgentProfileSpec
 
 
+ECHOMIND_TOOL_ALLOWLIST = (
+    "read",
+    "write",
+    "edit",
+    "terminal",
+    "subagent",
+    "update_plan",
+    "validate_workflow_dsl",
+    "product_versions",
+    "submit_workflow",
+    "get_storage_url",
+    "upload_file_to_pyromind",
+    "run_dataset_cleaning",
+    "df_submit_pipeline",
+    "df_submit_evaluation",
+    "df_check_progress",
+    "df_stop_task",
+    "edp_render",
+    "edp_submit",
+    "edp_aggregate",
+    "sandbox_create",
+    "sandbox_delete",
+    "sandbox_read_file",
+    "sandbox_write_file",
+    "sandbox_delete_file",
+    "sandbox_terminal",
+    "sandbox_upload",
+    "sandbox_download",
+    "workflow_debug",
+    "analyze_task_failure",
+    "training_analysis",
+    "label_studio_project",
+)
+
 ECHOMIND_SYSTEM_PROMPT = """\
 You are the EchoMind Agent.
 
@@ -30,12 +64,21 @@ Workflow:
    platform capability set as the original Agent. Do not force Project creation
    when the user is asking to inspect, modify, validate, debug, or run existing
    work.
+8. When a server-generated Project stage context starts the Dataset stage, treat
+   that context as authoritative. Use the `data-processing` Skill for the whole
+   dataset workflow: inspect the real Storage data, choose a data-processing
+   paradigm, build the Pipeline, run a small sample, and stop for explicit user
+   confirmation before submitting a full validation task. Do not infer dataset
+   schema from `input_hint` alone.
 
 Hard boundaries:
 - Do not create, guess, or write `project_id`, `graph_id`, Run IDs, task IDs, or
   any other server-generated identifier.
 - Do not create or write `graph.json`, nodes, edges, or any Project-owned file
   before the user has explicitly created the Project.
+- After a Project exists, do not write Project or Graph JSON directly and do not
+  invent Project, Graph, node, Run, task, or Artifact identifiers. Use only the
+  server-provided stage context and platform tool results.
 - You may create and use a remote sandbox for development checks when the user
   asks or the selected Skill requires it. A sandbox check is not a production
   run; report its result and limitations clearly.
@@ -80,48 +123,19 @@ ECHOMIND_PROFILE = AgentProfileSpec(
     system_prompt=ECHOMIND_SYSTEM_PROMPT,
     skill_allowlist=(
         "avi-single-turn",
-        "generate-workflow-dsl",
-        "debug-workflow",
+        "cross-repo-testing",
         "data-processing",
-        "sandbox",
-        "training-analysis",
+        "debug-test-examples-workflow",
+        "debug-workflow",
+        "feature-release-rollout",
+        "generate-workflow-dsl",
+        "inference-evaluation",
         "label-studio",
+        "manage-evals",
+        "sandbox",
+        "sdk-release",
+        "training-analysis",
+        "workflow-execution",
     ),
-    tool_allowlist=(
-        "terminal",
-        "apply_patch",
-        "update_plan",
-        "skills_list",
-        "skills_read",
-        "grep",
-        "file_editor",
-        "subagent",
-        "workflow_debug",
-        "submit_workflow",
-        "sandbox_create",
-        "sandbox_read_file",
-        "sandbox_write_file",
-        "sandbox_terminal",
-        "sandbox_upload",
-        "sandbox_download",
-        "sandbox_delete_file",
-        "sandbox_delete",
-        "get_storage_url",
-        "upload_file_to_pyromind",
-        "preview_remote_dataset",
-        "df_submit_pipeline",
-        "df_submit_evaluation",
-        "df_check_progress",
-        "df_stop_task",
-        "run_dataset_cleaning",
-        "extract_archive",
-        "edp_submit",
-        "edp_aggregate",
-        "edp_render",
-        "validate_workflow_dsl",
-        "analyze_task_failure",
-        "training_analysis",
-        "label_studio_project",
-        "run_workflow",
-    ),
+    tool_allowlist=ECHOMIND_TOOL_ALLOWLIST,
 )

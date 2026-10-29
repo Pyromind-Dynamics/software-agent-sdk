@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import replace
+from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
 
@@ -16,6 +17,7 @@ from pyromind_runtime.domain.errors import ProductRuntimeError, UserInputValidat
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 from pyromind_runtime.infrastructure.file_product_store import (
     CommandConflictError,
+    FileProductStore,
     ProductStoreError,
 )
 from pyromind_runtime.ports.harness import SessionSpec
@@ -59,11 +61,18 @@ def get_conversation_service(request: Request) -> ConversationService:
     return service
 
 
+_AGENT_PROFILE_MARKER = ".agent-profile"
+
+
+def context_for_profile(request: Request, profile: ConversationProfile):
+    return replace(request_context(request), profile_id=profile.profile_id)
+
+
 def create_product_router(
     profile: ConversationProfile = DEFAULT_PRODUCT_PROFILE,
 ) -> APIRouter:
     def context_for(request: Request):
-        return replace(request_context(request), profile_id=profile.profile_id)
+        return context_for_profile(request, profile)
 
     router = APIRouter(
         prefix=profile.route_prefix,
@@ -77,6 +86,7 @@ def create_product_router(
         body: PrepareWorkflowExecutionBody,
         request: Request,
     ) -> dict:
+        _require_profile(request, conversation_id, profile)
         try:
             return await get_product_runtime(request).prepare_workflow_execution(
                 conversation_id,
@@ -122,19 +132,50 @@ def create_product_router(
             command_allowlist=profile.command_allowlist,
         )
         try:
-            return await get_product_runtime(request).create_conversation(spec, context)
+            snapshot = await get_product_runtime(request).create_conversation(
+                spec, context
+            )
+            _write_profile_marker(
+                get_conversation_service(request), snapshot.conversation_id, profile
+            )
+            return snapshot
         except ProductRuntimeError as exc:
             raise _product_error(exc) from exc
 
     @router.get("", response_model=tuple[ConversationSnapshot, ...])
     async def list_conversations(request: Request) -> tuple[ConversationSnapshot, ...]:
-        return await get_product_runtime(request).list_snapshots(context_for(request))
+        service = get_conversation_service(request)
+        if (
+            profile.conversation_marker is not None
+            and service.conversations_dir.is_dir()
+        ):
+            for conversation_dir in service.conversations_dir.iterdir():
+                if conversation_dir.is_dir() and _profile_matches(
+                    service, conversation_dir.name, profile
+                ):
+                    _assign_profile_id(
+                        service,
+                        conversation_dir.name,
+                        profile,
+                        context_for(request).user_id,
+                    )
+        snapshots = await get_product_runtime(request).list_snapshots(
+            context_for(request)
+        )
+        if profile.conversation_marker is None:
+            return snapshots
+        return tuple(
+            snapshot
+            for snapshot in snapshots
+            if _profile_matches(service, snapshot.conversation_id, profile)
+        )
 
     @router.get("/{conversation_id}/snapshot", response_model=ConversationSnapshot)
     async def get_snapshot(
         conversation_id: str,
         request: Request,
     ) -> ConversationSnapshot:
+        _require_profile(request, conversation_id, profile)
         try:
             return await get_product_runtime(request).get_snapshot(
                 conversation_id, context_for(request)
@@ -159,6 +200,7 @@ def create_product_router(
         command: ProductCommand,
         request: Request,
     ) -> CommandReceipt:
+        _require_profile(request, conversation_id, profile)
         try:
             return await get_product_runtime(request).submit_command(
                 conversation_id, command, context_for(request)
@@ -195,6 +237,7 @@ def create_product_router(
         cursor = _resolve_cursor(after_seq, last_event_id)
         context = context_for(request)
         runtime = get_product_runtime(request)
+        _require_profile(request, conversation_id, profile)
         try:
             await runtime.get_snapshot(conversation_id, context)
         except ProductRuntimeError as exc:
@@ -222,6 +265,7 @@ def create_product_router(
         request: Request,
         revision: Annotated[int | None, Query(ge=1)] = None,
     ):
+        _require_profile(request, conversation_id, profile)
         try:
             return await get_product_runtime(request).get_experiment_plan(
                 conversation_id, context_for(request), revision
@@ -243,14 +287,19 @@ def create_product_router(
         body: ForkConversationRequest,
         request: Request,
     ) -> ConversationSnapshot:
+        _require_profile(request, conversation_id, profile)
         context = context_for(request)
         try:
-            return await get_product_runtime(request).fork_conversation(
+            snapshot = await get_product_runtime(request).fork_conversation(
                 conversation_id,
                 event_id=body.event_id,
                 title=body.title,
                 context=context,
             )
+            _write_profile_marker(
+                get_conversation_service(request), snapshot.conversation_id, profile
+            )
+            return snapshot
         except ProductRuntimeError as exc:
             raise _product_error(exc) from exc
         except (
@@ -261,6 +310,73 @@ def create_product_router(
             raise _not_found(conversation_id) from exc
 
     return router
+
+
+def _profile_marker_path(service: ConversationService, conversation_id: str) -> Path:
+    return service.conversations_dir / conversation_id / _AGENT_PROFILE_MARKER
+
+
+def _profile_matches(
+    service: ConversationService,
+    conversation_id: str,
+    profile: ConversationProfile,
+) -> bool:
+    marker = _profile_marker_path(service, conversation_id)
+    try:
+        stored_profile: str | None = marker.read_text(encoding="utf-8").strip() or None
+    except FileNotFoundError:
+        stored_profile = None
+    if profile.conversation_marker is None:
+        return stored_profile is None
+    return stored_profile == profile.conversation_marker
+
+
+def _require_profile(
+    request: Request,
+    conversation_id: str,
+    profile: ConversationProfile,
+) -> None:
+    if not _profile_matches(
+        get_conversation_service(request), conversation_id, profile
+    ):
+        raise _not_found(conversation_id)
+    if not _assign_profile_id(
+        get_conversation_service(request),
+        conversation_id,
+        profile,
+        context_for_profile(request, profile).user_id,
+    ):
+        raise _not_found(conversation_id)
+
+
+def _assign_profile_id(
+    service: ConversationService,
+    conversation_id: str,
+    profile: ConversationProfile,
+    user_id: str,
+) -> bool:
+    if profile.profile_id is None:
+        return True
+    store = FileProductStore(service.conversations_dir / conversation_id)
+    try:
+        return store.assign_profile_id_if_missing(
+            user_id=user_id,
+            profile_id=profile.profile_id,
+        )
+    except (FileNotFoundError, OSError, ProductStoreError):
+        return False
+
+
+def _write_profile_marker(
+    service: ConversationService,
+    conversation_id: str,
+    profile: ConversationProfile,
+) -> None:
+    if profile.conversation_marker is None:
+        return
+    marker = _profile_marker_path(service, conversation_id)
+    marker.write_text(profile.conversation_marker, encoding="utf-8")
+    marker.chmod(0o600)
 
 
 def _not_found(conversation_id: str) -> HTTPException:

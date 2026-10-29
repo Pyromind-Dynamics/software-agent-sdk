@@ -1301,6 +1301,42 @@ class ConversationRuntime:
             snapshot = snapshot.model_copy(update={"experiment_plan": view})
         return snapshot
 
+    async def read_workspace_text(
+        self,
+        conversation_id: str,
+        path: str,
+        context: RequestContext,
+        *,
+        max_bytes: int | None = None,
+    ) -> str | None:
+        store = await self._read_store(conversation_id, context)
+        active = self._active.get(conversation_id)
+        if active is not None:
+            try:
+                async with self._use(conversation_id) as current:
+                    return await current.adapter.read_workspace_text(
+                        current.handle,
+                        path,
+                        context,
+                        max_bytes=max_bytes,
+                    )
+            finally:
+                self._schedule_release(conversation_id)
+
+        snapshot = store.load_snapshot()
+        handle = SessionHandle(
+            session_id=conversation_id,
+            adapter_session_ref=conversation_id,
+            harness_id=store.harness_id(),
+            capabilities=snapshot.capabilities,
+        )
+        return await self._adapter(handle.harness_id).read_workspace_text(
+            handle,
+            path,
+            context,
+            max_bytes=max_bytes,
+        )
+
     async def submit_command(
         self,
         conversation_id: str,

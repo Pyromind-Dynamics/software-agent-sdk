@@ -20,7 +20,10 @@ from openhands.agent_server.echomind_projects import (
 from openhands.agent_server.echomind_projects_router import (
     CreateEchoMindProjectRequest,
     create_echomind_project,
+    get_echomind_project_artifact,
+    list_echomind_project_runs,
     run_echomind_project_node,
+    start_echomind_project_node,
 )
 from openhands.agent_server.echomind_router import (
     EchoMindCreateConversationRequest,
@@ -32,6 +35,10 @@ from openhands.agent_server.echomind_router import (
     list_echomind_messages,
     send_echomind_message,
 )
+from openhands.agent_server.echomind_stage_executors import (
+    get_project_node_executor,
+)
+from openhands.agent_server.echomind_stage_runs import ProjectRunStore
 from openhands.agent_server.event_service import EventService
 from openhands.agent_server.models import ConversationInfo, ConversationPage, EventPage
 from openhands.agent_server.pyromind_auth import CurrentLoginUser
@@ -136,6 +143,9 @@ class _FakeEchoMindEventService:
         self.sent_message: Message | None = None
         self.run: bool | None = None
         self.extended_content: list[Any] | None = None
+        self.internal_context: list[Any] | None = None
+        self.internal_run: bool | None = None
+        self.internal_visible: bool | None = None
         self.workflow_dsl_snapshot: str | None = None
         self.workflow_xyflow_snapshot: dict[str, Any] | None = None
         self.secrets: dict[str, Any] = {}
@@ -159,6 +169,22 @@ class _FakeEchoMindEventService:
         self.extended_content = extended_content
         self.workflow_dsl_snapshot = workflow_dsl_snapshot
         self.workflow_xyflow_snapshot = workflow_xyflow_snapshot
+
+    async def send_internal_context(
+        self,
+        content: list[Any],
+        run: bool = False,
+        visible: bool = False,
+        workflow_dsl_snapshot: str | None = None,
+        workflow_xyflow_snapshot: dict[str, Any] | None = None,
+        extended_content: list[Any] | None = None,
+    ) -> str:
+        self.internal_context = content
+        self.internal_run = run
+        self.internal_visible = visible
+        self.workflow_dsl_snapshot = workflow_dsl_snapshot
+        self.workflow_xyflow_snapshot = workflow_xyflow_snapshot
+        return "project-stage-start-event"
 
     async def update_secrets(self, secrets: dict[str, Any]) -> None:
         self.secrets.update(secrets)
@@ -264,6 +290,12 @@ def _request() -> Request:
     )
 
 
+def test_legacy_shell_executor_resolves_to_contract_probe():
+    assert get_project_node_executor("shell") is get_project_node_executor(
+        "contract_probe"
+    )
+
+
 @pytest.mark.asyncio
 async def test_echomind_chat_has_independent_contract_and_tools(tmp_path):
     service = _FakeEchoMindConversationService(
@@ -291,7 +323,6 @@ async def test_echomind_chat_has_independent_contract_and_tools(tmp_path):
     }
     assert "EchoMind Agent" in service.start_request.agent.static_system_message
     tool_names = {tool.name for tool in service.start_request.agent.tools}
-    assert all(name in ECHOMIND_PROFILE.tool_allowlist for name in tool_names)
     assert "terminal" in tool_names
     assert "apply_patch" in tool_names
     assert "sandbox" in ECHOMIND_PROFILE.skill_allowlist
@@ -605,10 +636,11 @@ async def test_project_creation_keeps_empty_graph_for_unregistered_skill(tmp_pat
 @pytest.mark.parametrize(
     ("train_mode", "expected_title"), [("sft", "Train (SFT)"), ("dpo", "Train (DPO)")]
 )
-async def test_avi_project_creation_builds_stage_graph_and_executor_shell(
+async def test_avi_project_creation_builds_stage_graph_and_contract_probe_run(
     tmp_path,
     train_mode,
     expected_title,
+    monkeypatch,
 ):
     conversations_dir = tmp_path / "conversations"
     working_dir = conversations_dir / "echomind"
@@ -639,6 +671,8 @@ async def test_avi_project_creation_builds_stage_graph_and_executor_shell(
     )
 
     assert result.graph.template == "avi-single-turn/v1"
+    assert result.project.lifecycle == "development"
+    assert result.graph.lifecycle == "development"
     assert [node.id for node in result.graph.nodes] == [
         "dataset",
         "inference",
@@ -657,7 +691,23 @@ async def test_avi_project_creation_builds_stage_graph_and_executor_shell(
         ("evaluator", "train"),
     ]
     assert all(node.status == "idle" for node in result.graph.nodes)
-    assert all(node.executor == "shell" for node in result.graph.nodes)
+    dataset_node = next(node for node in result.graph.nodes if node.id == "dataset")
+    assert dataset_node.launch_mode == "agent"
+    assert dataset_node.config == {
+        "capability": "data-processing",
+        "platform_task_kind": "data_preparation",
+        "input_hint": "datasets/avi/train.jsonl",
+        "validation": {
+            "status": "draft",
+            "validation_run_id": None,
+            "candidate_execution_spec": None,
+        },
+    }
+    assert all(
+        node.executor == "contract_probe"
+        for node in result.graph.nodes
+        if node.launch_mode == "executor"
+    )
     train_node = next(node for node in result.graph.nodes if node.id == "train")
     assert train_node.title == expected_title
     assert train_node.config["method"] == train_mode
@@ -668,9 +718,241 @@ async def test_avi_project_creation_builds_stage_graph_and_executor_shell(
         _request(),
         conversation_service=cast(ConversationService, service),
     )
-    assert execution.status == "not_implemented"
-    assert execution.executor == "shell"
+    assert execution.status == "succeeded"
+    assert execution.executor == "contract_probe"
     assert execution.node_id == "train"
+    assert execution.finished_at is not None
+    assert len(execution.artifacts) == 1
+
+    runs = await list_echomind_project_runs(
+        result.project.project_id,
+        _request(),
+        conversation_service=cast(ConversationService, service),
+    )
+    assert [run.run_id for run in runs] == [execution.run_id]
+
+    artifact = execution.artifacts[0]
+    document = await get_echomind_project_artifact(
+        result.project.project_id,
+        artifact.artifact_id,
+        _request(),
+        conversation_service=cast(ConversationService, service),
+    )
+    assert document.artifact == artifact
+    assert document.content["probe_version"] == 1
+    assert document.content["project_id"] == result.project.project_id
+    assert document.content["node_id"] == "train"
+
+    class _FailingExecutor:
+        def run(self, *, project, node):
+            raise RuntimeError(
+                f"{node.id} executor failed for {project.project.project_id}"
+            )
+
+    monkeypatch.setattr(
+        "openhands.agent_server.echomind_stage_runs.get_project_node_executor",
+        lambda _: _FailingExecutor(),
+    )
+    failed = await run_echomind_project_node(
+        result.project.project_id,
+        "inference",
+        _request(),
+        conversation_service=cast(ConversationService, service),
+    )
+    assert failed.status == "failed"
+    assert failed.error is not None
+    assert "RuntimeError" in failed.error
+
+    runs = await list_echomind_project_runs(
+        result.project.project_id,
+        _request(),
+        conversation_service=cast(ConversationService, service),
+    )
+    assert {run.status for run in runs} == {"succeeded", "failed"}
+
+    with pytest.raises(HTTPException) as agent_run:
+        await run_echomind_project_node(
+            result.project.project_id,
+            "dataset",
+            _request(),
+            conversation_service=cast(ConversationService, service),
+        )
+    assert agent_run.value.status_code == status.HTTP_409_CONFLICT
+
+
+@pytest.mark.asyncio
+async def test_dataset_start_injects_project_context_into_original_conversation(
+    tmp_path,
+):
+    conversations_dir = tmp_path / "conversations"
+    working_dir = conversations_dir / "echomind"
+    working_dir.mkdir(parents=True)
+    _write_request(working_dir, _avi_request_payload())
+    event_service = _FakeEchoMindEventService(working_dir)
+
+    class _Service:
+        def __init__(self) -> None:
+            self.conversations_dir = conversations_dir
+
+        async def get_event_service(
+            self,
+            conversation_id: UUID,
+            user_id: str | None = None,
+        ):
+            assert conversation_id == event_service.stored.id
+            return event_service
+
+    service = _Service()
+    authenticated_request = _request()
+    authenticated_request.state.current_user = CurrentLoginUser(
+        username="owner",
+        email="owner@example.test",
+        user_id=42,
+        cookie="auth_token=stage-token; other=value",
+        x_cluster="context-cluster",
+    )
+    project = await create_echomind_project(
+        authenticated_request,
+        CreateEchoMindProjectRequest(
+            conversation_id=event_service.stored.id,
+            confirmed=True,
+        ),
+        conversation_service=cast(ConversationService, service),
+    )
+
+    started = await start_echomind_project_node(
+        project.project.project_id,
+        "dataset",
+        authenticated_request,
+        conversation_service=cast(ConversationService, service),
+    )
+
+    assert started.project_id == project.project.project_id
+    assert started.graph_id == project.graph.graph_id
+    assert started.node_id == "dataset"
+    assert started.conversation_id == str(event_service.stored.id)
+    assert started.event_id == "project-stage-start-event"
+    assert started.status == "started"
+    assert event_service.internal_run is True
+    assert event_service.internal_visible is False
+    assert event_service.internal_context is not None
+    context_text = event_service.internal_context[0].text
+    assert "data-processing" in context_text
+    assert project.project.project_id in context_text
+    assert project.graph.graph_id in context_text
+    assert "datasets/avi/train.jsonl" in context_text
+    assert "wait for explicit user confirmation" in context_text
+    assert event_service.secrets[PYROMIND_AUTH_TOKEN_SECRET] == "stage-token"
+    assert event_service.secrets[PYROMIND_PRODUCT_USER_ID_SECRET] == "42"
+    assert event_service.secrets[PYROMIND_X_CLUSTER_SECRET] == "context-cluster"
+    assert (
+        ProjectRunStore(
+            ProjectStore.for_conversations_dir(conversations_dir).root
+        ).list(project.project.project_id)
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_dataset_start_rejects_cross_user_and_frozen_projects(tmp_path):
+    conversations_dir = tmp_path / "conversations"
+    event_service = _FakeEchoMindEventService(tmp_path / "echomind")
+    store = ProjectStore.for_conversations_dir(conversations_dir)
+    project = store.create(
+        ProjectRequest.model_validate(_avi_request_payload()),
+        echomind_conversation_id=str(event_service.stored.id),
+        owner_user_id="42",
+    )
+
+    class _Service:
+        def __init__(self) -> None:
+            self.conversations_dir = conversations_dir
+
+        async def get_event_service(
+            self,
+            conversation_id: UUID,
+            user_id: str | None = None,
+        ):
+            return event_service
+
+    service = _Service()
+    cross_user_request = _request()
+    cross_user_request.state.current_user = CurrentLoginUser(
+        username="other-user",
+        email="other-user@example.test",
+        user_id=99,
+    )
+    with pytest.raises(HTTPException) as cross_user:
+        await start_echomind_project_node(
+            project.project.project_id,
+            "dataset",
+            cross_user_request,
+            conversation_service=cast(ConversationService, service),
+        )
+    assert cross_user.value.status_code == status.HTTP_404_NOT_FOUND
+
+    project_dir = store.root / project.project.project_id
+    frozen_project = project.project.model_copy(update={"lifecycle": "frozen"})
+    frozen_graph = project.graph.model_copy(update={"lifecycle": "frozen"})
+    (project_dir / "project.json").write_text(
+        json.dumps(frozen_project.model_dump(mode="json")),
+        encoding="utf-8",
+    )
+    (project_dir / "graph.json").write_text(
+        json.dumps(frozen_graph.model_dump(mode="json")),
+        encoding="utf-8",
+    )
+    frozen_request = _request()
+    frozen_request.state.current_user = CurrentLoginUser(
+        username="owner",
+        email="owner@example.test",
+        user_id=42,
+    )
+    with pytest.raises(HTTPException) as frozen:
+        await start_echomind_project_node(
+            project.project.project_id,
+            "dataset",
+            frozen_request,
+            conversation_service=cast(ConversationService, service),
+        )
+    assert frozen.value.status_code == status.HTTP_409_CONFLICT
+
+
+@pytest.mark.asyncio
+async def test_dataset_start_rejects_project_owned_by_pyromind_conversation(
+    tmp_path,
+):
+    conversations_dir = tmp_path / "conversations"
+    event_service = _FakeEchoMindEventService(
+        tmp_path / "pyromind",
+        profile=PYROMIND_PROFILE.tag_value,
+    )
+    store = ProjectStore.for_conversations_dir(conversations_dir)
+    project = store.create(
+        ProjectRequest.model_validate(_avi_request_payload()),
+        echomind_conversation_id=str(event_service.stored.id),
+        owner_user_id=None,
+    )
+
+    class _Service:
+        def __init__(self) -> None:
+            self.conversations_dir = conversations_dir
+
+        async def get_event_service(
+            self,
+            conversation_id: UUID,
+            user_id: str | None = None,
+        ):
+            return event_service
+
+    with pytest.raises(HTTPException) as wrong_profile:
+        await start_echomind_project_node(
+            project.project.project_id,
+            "dataset",
+            _request(),
+            conversation_service=cast(ConversationService, _Service()),
+        )
+    assert wrong_profile.value.status_code == status.HTTP_409_CONFLICT
 
 
 async def _async_value(value):

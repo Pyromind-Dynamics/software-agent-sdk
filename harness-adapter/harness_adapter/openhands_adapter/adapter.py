@@ -59,6 +59,10 @@ from openhands.agent_server.pyromind_router import (
 )
 from openhands.sdk.event import Event
 from openhands.sdk.llm import TextContent as OpenHandsTextContent
+from openhands.tools.utils.workspace_files import (
+    WorkspaceFileNotFoundError,
+    read_workspace_text,
+)
 from openhands.tools.workflow.run_workflow import WORKFLOW_ATTEMPT_STATE_KEY
 
 
@@ -523,6 +527,41 @@ class OpenHandsAdapter:
         self, handle: SessionHandle, request: JsonObject, context: RequestContext
     ) -> JsonObject:
         raise NotImplementedError("This harness does not support workflow Agent stages")
+
+    async def read_workspace_text(
+        self,
+        handle: SessionHandle,
+        path: str,
+        context: RequestContext,
+        *,
+        max_bytes: int | None = None,
+    ) -> str | None:
+        session = self._sessions.get(handle.session_id)
+        if session is not None:
+            workspace = session.event_service.get_conversation().workspace
+        else:
+            event_service = (
+                await self._conversation_service_provider().get_event_service(
+                    UUID(handle.adapter_session_ref),
+                    user_id=None if context.user_id == "anonymous" else context.user_id,
+                )
+            )
+            if event_service is None:
+                raise FileNotFoundError(
+                    f"OpenHands conversation not found: {handle.session_id}"
+                )
+            workspace = event_service.get_conversation().workspace
+        try:
+            return await asyncio.to_thread(
+                read_workspace_text,
+                workspace,
+                path,
+                max_bytes=max_bytes,
+            )
+        except WorkspaceFileNotFoundError:
+            return None
+        except ValueError as exc:
+            raise OSError(str(exc)) from exc
 
     async def notify_external_task(
         self,

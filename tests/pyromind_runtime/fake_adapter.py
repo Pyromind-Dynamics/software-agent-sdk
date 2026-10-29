@@ -21,6 +21,12 @@ from pyromind_runtime.ports.harness import (
     SessionSpec,
 )
 
+from openhands.sdk.workspace.local import LocalWorkspace
+from openhands.tools.utils.workspace_files import (
+    WorkspaceFileNotFoundError,
+    read_workspace_text,
+)
+
 
 class FakeAdapter:
     capabilities = HarnessCapabilities(
@@ -128,6 +134,35 @@ class FakeAdapter:
                 raise RuntimeError("input delivery failed")
             return {"resolved": True}
         return {"accepted": True}
+
+    async def read_workspace_text(
+        self,
+        handle: SessionHandle,
+        path: str,
+        context: RequestContext,
+        *,
+        max_bytes: int | None = None,
+    ) -> str | None:
+        del context
+        spec = next(
+            spec
+            for spec in self.created_specs
+            if spec.conversation_id == handle.session_id
+        )
+        workspace_root = Path(spec.workspace_root)
+        if workspace_root.name != handle.session_id:
+            workspace_root /= handle.session_id
+        try:
+            return await asyncio.to_thread(
+                read_workspace_text,
+                LocalWorkspace(working_dir=str(workspace_root)),
+                path,
+                max_bytes=max_bytes,
+            )
+        except WorkspaceFileNotFoundError:
+            return None
+        except ValueError as exc:
+            raise OSError(str(exc)) from exc
 
     async def fork(
         self,

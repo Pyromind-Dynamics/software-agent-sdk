@@ -11,8 +11,12 @@
 
 | Agent | 对外入口 | 继续使用原入口的客户端 |
 |---|---|---|
-| Pyromind Agent | `/api/pyromind/conversations` | 原 Workbench Chat |
+| Pyromind Agent | `/api/v2/pyromind/conversations` | 原 Workbench Chat 的 Product Runtime |
 | EchoMind Agent | `/api/echomind/conversations` | 新的 EchoMind Chat |
+
+旧 Workbench 直连入口 `/api/pyromind/conversations` 继续保留兼容，但它不属于新的
+Product Runtime Router。EchoMind 的 Manager 计划接口位于
+`/api/v2/echomind/conversations`，是同一个 EchoMind Agent 下的计划能力，不是第三个 Agent。
 
 “两个 Agent”准确指两个服务端固定的 **Agent Profile / 执行契约**，不是两套 SDK、
 两套 Agent Runtime 或两套 Tool 框架。两个 Agent 共享底层运行时和通用能力实现，
@@ -55,7 +59,7 @@ flowchart LR
     U1[Workbench 用户] --> FE1[Workbench Chat]
     U2[EchoMind 用户] --> FE2[EchoMind Chat]
 
-    FE1 --> API1["/api/pyromind/conversations"]
+    FE1 --> API1["/api/v2/pyromind/conversations"]
     FE2 --> API2["/api/echomind/conversations"]
 
     API1 --> P1[Pyromind Profile]
@@ -79,7 +83,7 @@ flowchart LR
 | 维度 | Pyromind Agent | EchoMind Agent |
 |---|---|---|
 | 产品定位 | 原工作台开发 Agent | 训练与实验场景入口 Agent |
-| 入口 | `/api/pyromind/conversations` | `/api/echomind/conversations` |
+| 入口 | `/api/v2/pyromind/conversations`；旧直连入口继续兼容 | `/api/echomind/conversations` |
 | System Prompt | 原 Pyromind 工作台契约 | EchoMind 独立契约 |
 | Profile tag | `pyromind` | `echomind` |
 | LLM usage id | `pyromind-agent` | `echomind-agent` |
@@ -93,7 +97,14 @@ Workbench Chat 是前端页面名称，不是第三个 Agent。
 
 ## 6. Profile 是唯一的能力装配清单
 
-服务端通过 `AgentProfileSpec` 描述一个 Agent 的固定契约：
+Profile 分成两层，避免把 Agent 能力声明和 Product Router 装配混成一份大配置：
+
+- `AgentProfileSpec`：Agent 自己的固定能力契约，定义名称、标签、LLM usage id、
+  System Prompt、Skill 白名单和 Tool 白名单。
+- `ConversationProfile`：Product Runtime 的 Router 绑定，声明路由前缀、使用哪个
+  `profile_id` 和 Harness、传给会话的指令与 allowlist，以及用于会话隔离的 marker。
+
+`AgentProfileSpec` 的形状是：
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -106,10 +117,29 @@ class AgentProfileSpec:
     tool_allowlist: tuple[str, ...]
 ```
 
-当前有两个显式清单：
+`ConversationProfile` 在 Product 层补充路由信息：
 
-- `PYROMIND_PROFILE`
-- `ECHOMIND_PROFILE`
+```python
+@dataclass(frozen=True, slots=True)
+class ConversationProfile:
+    route_prefix: str
+    profile_id: str | None = None
+    harness_id: str | None = None
+    instructions: str = ""
+    tool_allowlist: tuple[str, ...] | None = None
+    skill_allowlist: tuple[str, ...] | None = None
+    command_allowlist: tuple[str, ...] | None = None
+    conversation_marker: str | None = None
+```
+
+当前有两个 Agent 清单和三个 Product 装配入口：
+
+- `PYROMIND_PROFILE` -> `DEFAULT_PRODUCT_PROFILE`
+- `ECHOMIND_PROFILE` -> `ECHOMIND_CHAT_PROFILE`
+- `ECHOMIND_MANAGER_PROFILE` -> `ECHOMIND_PRODUCT_PROFILE`
+
+最后一项属于 EchoMind Agent 的计划能力面，不是第三个 Agent。Manager 与 Chat 使用
+同一个 EchoMind `profile_id`，因此 Router 还通过 conversation marker 区分二者。
 
 设计意图是把一个 Agent 的差异集中到一份可检查的配置里，而不是散落在 Router、
 Tool 实现和 Prompt 字符串中。
@@ -131,12 +161,19 @@ EchoMind Agent 当前 Skill 白名单：
 
 ```text
 avi-single-turn
-generate-workflow-dsl
-debug-workflow
+cross-repo-testing
 data-processing
-sandbox
-training-analysis
+debug-test-examples-workflow
+debug-workflow
+feature-release-rollout
+generate-workflow-dsl
+inference-evaluation
 label-studio
+manage-evals
+sandbox
+sdk-release
+training-analysis
+workflow-execution
 ```
 
 Pyromind Agent 使用同一组通用开发 Skill，但不包含 `avi-single-turn`。
@@ -162,45 +199,78 @@ Pyromind Agent 使用同一组通用开发 Skill，但不包含 `avi-single-turn
 - Tool 行为必须保持通用；如果未来确实需要不同行为，应新增通用 Tool 能力，
   而不是在旧 Tool 内按 Agent 名称分支。
 
-Tool 白名单在 Agent 构建完成后统一过滤：
-
-```python
-allowed_tools = set(profile.tool_allowlist)
-tools = [tool for tool in agent.tools if tool.name in allowed_tools]
-agent = agent.model_copy(update={"tools": tools})
-```
+`tool_allowlist` 使用 Product Runtime/Pi 执行面的工具名，由新会话创建时传给
+Pi session。旧 `/api/pyromind/conversations` 的 OpenHands 直连构建路径继续装配其
+原有完整工具集，不使用这份 Pi 工具清单做二次过滤。
 
 ## 7. 服务端构建与路由
 
-两个 Router 独立注册：
+Product Runtime 通过同一个 Router 工厂生成互相独立的执行入口：
 
 ```text
-api_router.include_router(pyromind_router)
-api_router.include_router(echomind_router)
+app.include_router(create_product_router(DEFAULT_PRODUCT_PROFILE))
+app.include_router(create_product_router(ECHOMIND_PRODUCT_PROFILE))
+app.include_router(create_product_router(ECHOMIND_CHAT_PROFILE))
+app.include_router(echomind_projects_router)
 ```
 
-### 7.1 Pyromind 入口
+共享 Router 工厂只复用请求校验、命令、SSE、快照和鉴权装配；每个入口使用自己的
+`ConversationProfile`，不会因此共享会话或 Agent 上下文。
+
+### 7.1 Pyromind Product Runtime 入口
+
+Workbench Chat 使用：
 
 ```text
-POST /api/pyromind/conversations
-POST /api/pyromind/conversations/{conversation_id}/messages
+POST /api/v2/pyromind/conversations
+GET  /api/v2/pyromind/conversations
+GET  /api/v2/pyromind/conversations/{conversation_id}/snapshot
+POST /api/v2/pyromind/conversations/{conversation_id}/commands
+GET  /api/v2/pyromind/conversations/{conversation_id}/events
 ```
 
-### 7.2 EchoMind 会话入口
+旧 Workbench OpenHands 直连入口 `/api/pyromind/conversations` 及其 messages 接口
+继续兼容，不迁移已有会话。
+
+### 7.2 EchoMind Chat 入口
 
 ```text
 POST /api/echomind/conversations
 GET  /api/echomind/conversations
-GET  /api/echomind/conversations/{conversation_id}
-GET  /api/echomind/conversations/{conversation_id}/messages
-POST /api/echomind/conversations/{conversation_id}/messages
+GET  /api/echomind/conversations/{conversation_id}/snapshot
+POST /api/echomind/conversations/{conversation_id}/commands
+GET  /api/echomind/conversations/{conversation_id}/events
+GET  /api/echomind/conversations/{conversation_id}/project-request
 ```
 
 EchoMind 客户端不需要调用 Pyromind 的 Chat 接口来列会话、恢复历史或发送消息。
 
-### 7.3 共用构建函数，不共用执行契约
+### 7.3 EchoMind Manager 计划入口
 
-两个入口可以复用底层 Agent 构建函数，但必须传入自己的 Profile：
+```text
+POST /api/v2/echomind/conversations
+GET  /api/v2/echomind/conversations/{conversation_id}/experiment-plans
+```
+
+这是 EchoMind Agent 的版本化计划能力，不是第三个 Agent，也不与 EchoMind Chat
+互相读取会话。
+
+### 7.4 Project 入口
+
+```text
+POST /api/echomind/projects
+GET  /api/echomind/projects/{project_id}
+POST /api/echomind/projects/{project_id}/nodes/{node_id}/start
+POST /api/echomind/projects/{project_id}/nodes/{node_id}/run
+GET  /api/echomind/projects/{project_id}/runs
+```
+
+Project 创建必须由用户显式确认；Project 创建后才生成 Graph。
+
+### 7.5 共用构建函数，不共用执行契约
+
+旧 Workbench 直连路径可以复用 `_build_agent_with_profile`，但必须显式传入自己的
+Profile：
 
 ```python
 agent, secrets = _build_agent_with_profile(
@@ -211,32 +281,35 @@ agent, secrets = _build_agent_with_profile(
 )
 ```
 
-```python
-agent, secrets = _build_agent_with_profile(
-    http_request,
-    request=request,
-    profile=ECHOMIND_PROFILE,
-    ...
-)
-```
-
 共享构建函数只负责装配通用能力，不负责让两个 Agent 共享上下文。
 
 ## 8. Conversation 隔离
 
-每个 Conversation 在创建时写入 Profile 标签：
+Runtime 的 `profile_id` 负责第一层隔离。由于 EchoMind Manager 与 EchoMind Chat
+共用同一个 `profile_id`，Product Router 还会在 conversation 目录写入 marker：
 
-```json
-{
-  "app": "pyromind",
-  "agentprofile": "echomind"
-}
+```text
+<conversations>/<conversation_id>/.agent-profile
 ```
 
-服务端在每个受限入口校验该标签：
+当前 marker：
 
-- Pyromind 消息接口只接受 Pyromind/legacy Workbench 会话。
-- EchoMind 会话、消息和历史接口只接受 `echomind` 会话。
+| 入口 | Runtime profile_id | conversation marker |
+|---|---|---|
+| Pyromind Product Runtime | `None` | 无；通过“无 marker”兼容旧会话 |
+| EchoMind Chat | `echomind` | `echomind` |
+| EchoMind Manager | `echomind` | `echomind-manager` |
+
+旧 Workbench 直连会话继续使用 `app=pyromind`、`agentprofile=pyromind` 的标签兼容；
+没有 marker 的 Product Runtime 会话按 Pyromind 处理。带正确 marker、但历史元数据
+缺少 `profile_id` 的 EchoMind 会话会在首次访问时补齐 `profile_id`。
+
+服务端在每个受限入口同时校验 Runtime profile 和 Router marker：
+
+- Pyromind Product Router 只接受无 marker 的 Pyromind 会话。
+- EchoMind Chat 只接受 `echomind` marker。
+- EchoMind Manager 只接受 `echomind-manager` marker。
+- EchoMind Project API 只读取 `echomind` marker 会话中的 Project request。
 - 跨 Profile 请求返回 `404`，不暴露另一个 Agent 的会话是否存在。
 
 隔离规则：
@@ -300,7 +373,8 @@ if agent_profile == "echomind" and scenario == "avi":
 
 ## 11. 兼容性
 
-- 原 `/api/pyromind/conversations` 接口继续存在。
+- 新 Workbench 使用 `/api/v2/pyromind/conversations`。
+- 旧 `/api/pyromind/conversations` 接口继续存在。
 - 原 Workbench Chat 的会话和历史不受 EchoMind 改动影响。
 - Pyromind Profile 兼容历史会话：没有 Profile 标签或标签为 `workbench` 的旧会话
   仍视为 Pyromind 会话。
@@ -351,7 +425,7 @@ if agent_profile == "echomind" and scenario == "avi":
 
 | 阶段 | 内容 | 独立验证 |
 |---|---|---|
-| P0-1 | 抽取 `AgentProfileSpec` 和两个 Profile 清单 | Profile 加载、Skill/Tool 白名单 |
+| P0-1 | 抽取 `AgentProfileSpec`、`ConversationProfile` 和两个 Agent 清单 | Profile 加载、Skill/Tool 白名单 |
 | P0-2 | 新增 EchoMind Router 和 Conversation tag | 创建会话、跨 Profile 404 |
 | P0-3 | 新增 EchoMind 会话列表、详情和历史接口 | 列表隔离、刷新恢复 |
 | P0-4 | 前端新增 EchoMind API 客户端和独立入口 | 创建、发送、切换、刷新 |
@@ -365,10 +439,12 @@ if agent_profile == "echomind" and scenario == "avi":
 | Profile 契约 | `openhands-agent-server/openhands/agent_server/agent_profiles/spec.py` |
 | Pyromind Profile | `openhands-agent-server/openhands/agent_server/agent_profiles/pyromind.py` |
 | EchoMind Profile | `openhands-agent-server/openhands/agent_server/agent_profiles/echomind.py` |
+| EchoMind Manager Profile | `openhands-agent-server/openhands/agent_server/agent_profiles/echomind_manager.py` |
+| Product Router 与隔离 | `pyromind-agent-server/pyromind_agent_server/api/router.py` |
+| Product Profile 装配 | `pyromind-agent-server/pyromind_agent_server/profiles.py` |
+| Router 注册 | `pyromind-agent-server/pyromind_agent_server/bootstrap.py` |
 | 共用 Agent 构建 | `openhands-agent-server/openhands/agent_server/pyromind_router.py` |
-| Pyromind Router | `openhands-agent-server/openhands/agent_server/pyromind_router.py` |
-| EchoMind Router | `openhands-agent-server/openhands/agent_server/echomind_router.py` |
-| Router 注册 | `openhands-agent-server/openhands/agent_server/api.py` |
+| EchoMind Project API | `pyromind-agent-server/pyromind_agent_server/api/echomind_projects.py` |
 | EchoMind 前端 | `minimal-chat-frontend/src/EchoMindChat.tsx` |
 | EchoMind API 契约 | `minimal-chat-frontend/src/echomindContract.ts` |
 | 双 Agent 测试 | `tests/agent_server/test_echomind_router.py` |
