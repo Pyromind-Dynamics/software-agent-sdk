@@ -32,6 +32,7 @@ type HarnessEventType = Literal[
     "usage.updated",
     "notice.raised",
     "external_task.submitted",
+    "external_task.bound",
     "external_task.updated",
     "external_task.completed",
 ]
@@ -57,6 +58,7 @@ type ProductEventType = Literal[
     "usage.updated",
     "notice.raised",
     "external_task.submitted",
+    "external_task.bound",
     "external_task.updated",
     "external_task.completed",
 ]

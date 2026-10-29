@@ -567,6 +567,27 @@ class SnapshotProjector:
     ) -> ConversationSnapshot:
         return self._update_external_task(snapshot, event)
 
+    def _on_external_task_bound(
+        self, snapshot: ConversationSnapshot, event: ProductEvent
+    ) -> ConversationSnapshot:
+        task_id = self._string(event.payload, "task_id")
+        graph_run_id = self._string(event.payload, "graph_run_id")
+        tasks = list(snapshot.external_tasks)
+        for index, existing in enumerate(tasks):
+            if existing.task_id != task_id:
+                continue
+            update = {
+                "kind": "graph_await",
+                "run_id": graph_run_id,
+                "graph_run_id": graph_run_id,
+            }
+            output_dir = event.payload.get("output_dir")
+            if isinstance(output_dir, str) and output_dir:
+                update["output_dir"] = output_dir
+            tasks[index] = existing.model_copy(update=update)
+            return snapshot.model_copy(update={"external_tasks": tuple(tasks)})
+        return snapshot
+
     def _on_external_task_completed(
         self, snapshot: ConversationSnapshot, event: ProductEvent
     ) -> ConversationSnapshot:

@@ -338,6 +338,56 @@ async def test_blocked_graph_backlog_is_retried_after_continue(tmp_path) -> None
         await runtime.close()
 
 
+async def test_parked_await_rebinds_a_terminal_task_and_resumes_once(tmp_path) -> None:
+    runtime, _adapter, backend, _context, store = await _graph_runtime(tmp_path)
+    runtime.register_external_task(
+        "conversation-1",
+        {
+            "task_id": "platform-1",
+            "kind": "workflow_run",
+            "run_id": "submission-1",
+            "status": "succeeded",
+            "submitted_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:01:00Z",
+        },
+    )
+    runtime.register_external_task(
+        "conversation-1",
+        {
+            "task_id": "graph-run",
+            "kind": "historical_experience",
+            "run_id": "agent-run-1",
+            "status": "waiting",
+            "submitted_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:01:00Z",
+            "completion_result": {
+                "id": "graph-run",
+                "status": "waiting",
+                "waiting": {
+                    "kind": "external",
+                    "node": "chain.wait",
+                    "task_id": "platform-1",
+                    "output_dir": "/.pyromind-agent/conversation-1/data/run-1",
+                },
+            },
+        },
+    )
+    try:
+        await runtime._repair_parked_await_bindings("conversation-1")
+
+        platform = next(
+            task
+            for task in store.load_snapshot().external_tasks
+            if task.task_id == "platform-1"
+        )
+        assert platform.kind == "graph_await"
+        assert platform.graph_run_id == "graph-run"
+        assert platform.status == "succeeded"
+        assert backend.invocations == [("resume", {"run_id": "graph-run"})]
+    finally:
+        await runtime.close()
+
+
 async def test_callback_keeps_failed_graph_resume_pending_until_retry(tmp_path) -> None:
     runtime, _adapter, backend, context, store = await _graph_runtime(tmp_path)
     assert runtime._workflows is not None

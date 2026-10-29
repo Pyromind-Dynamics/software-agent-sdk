@@ -1332,6 +1332,11 @@ class PiAdapter:
                     if isinstance(params.get("tool_call_id"), str)
                     else None
                 ),
+                origin_run_id=(
+                    params.get("origin_run_id")
+                    if isinstance(params.get("origin_run_id"), str)
+                    else None
+                ),
             )
             self._emit_tool_signals(session, tool_name, result)
             return result

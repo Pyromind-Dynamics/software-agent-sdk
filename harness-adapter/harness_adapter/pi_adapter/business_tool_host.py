@@ -499,6 +499,7 @@ class PyromindBusinessToolHost:
         arguments: dict[str, Any],
         context: ToolExecutionContext,
         tool_call_id: str | None = None,
+        origin_run_id: str | None = None,
     ) -> dict[str, Any]:
         started_at = time.perf_counter()
         if name == ProductVersionsTool.name:
@@ -600,6 +601,7 @@ class PyromindBusinessToolHost:
                     lambda: identity,
                     context.request_context,
                     asyncio.get_running_loop(),
+                    graph_run_id=origin_run_id,
                 ),
             )
 

@@ -206,11 +206,11 @@ test("a graph's fixed tool call runs through the adapter tool port, never the te
   }, peer);
   assert.deepEqual(await execution.handle("execution.tool", {
     name: "df_submit_pipeline", arguments: { dataset: "/storage/a.csv" },
-    tool_call_id: "genome-1",
+    tool_call_id: "genome-1", origin_run_id: "graph-run-1",
   }), answer);
   assert.deepEqual(calls, [["tool.execute", {
     tool_name: "df_submit_pipeline", arguments: { dataset: "/storage/a.csv" },
-    tool_call_id: "genome-1",
+    tool_call_id: "genome-1", origin_run_id: "graph-run-1",
   }]]);
   // The tool call id only exists so the adapter can correlate signals; a caller
   // without one must not send an empty string.

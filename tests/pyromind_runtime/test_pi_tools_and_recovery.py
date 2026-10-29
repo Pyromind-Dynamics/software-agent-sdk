@@ -1028,7 +1028,7 @@ async def test_sandbox_session_prompt_steers_storage_reads(
             item["name"] for item in captured["tools"]
         }
         assert "df_run_pipeline" not in prompt
-        assert "Read data and run scripts" in prompt
+        assert "Prefer read for ordinary file inspection" in prompt
         assert "Storage is writable" in prompt
         assert "Every dataset this session" in prompt
         assert "Platform task state comes from the platform tools" in prompt

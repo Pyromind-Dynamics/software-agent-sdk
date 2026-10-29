@@ -119,10 +119,16 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         workflow: JsonObject,
         code: str | None,
         context: RequestContext,
+        graph_run_id: str | None,
     ):
         assert isinstance(runtime, ConversationRuntime)
         return await runtime.submit_versioned_workflow(
-            scope, request_id, workflow, code, context
+            scope,
+            request_id,
+            workflow,
+            code,
+            context,
+            graph_run_id=graph_run_id,
         )
 
     openhands_adapter.set_version_handler(version_call, execution_call)

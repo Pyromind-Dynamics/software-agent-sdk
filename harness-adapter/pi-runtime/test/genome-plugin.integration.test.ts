@@ -123,7 +123,7 @@ test("a real SDK Pi turn invokes genome tools through the loaded package and exi
     for await (const chunk of request) text += chunk;
     modelRequests.push(JSON.parse(text));
     const step = modelRequests.length;
-    if (step === 1) reply(response, "genome_list", { action: "list", foo: "bar" }, "list-call");
+    if (step === 1) reply(response, "genome_list", {}, "list-call");
     else if (step === 2) reply(response, "genome_prepare_run", {
       asset_id: "data-cleaning", version: "1.0.0", params: { data_file: "public_data/input.csv" },
       execution_scope: { mode: "full", description: "用户确认全量执行" },

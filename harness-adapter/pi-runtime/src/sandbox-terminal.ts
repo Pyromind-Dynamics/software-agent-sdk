@@ -1438,7 +1438,14 @@ export class LazySandboxTerminalOperations implements BashOperations {
         try {
           return await operations.exec(command, cwd, options);
         } catch (error) {
-          if (!isStaleTerminal(error)) throw error;
+          if (!isStaleTerminal(error) && !isUnstartedTerminalFailure(error)) {
+            throw error;
+          }
+          // The endpoint bundle can outlive the pod it names: a rescheduled
+          // container leaves this runner dialling an address nobody answers,
+          // which only shows up as a connect that never completes. Dropping the
+          // bundle makes the next call ask the control plane again, which
+          // rebuilds a sandbox whose pod is gone.
           this.operations?.dispose();
           this.operations = undefined;
           this.endpoints.invalidate();
@@ -1597,6 +1604,19 @@ function isStaleTerminal(error: unknown): boolean {
     isTerminationUnconfirmed(error) ||
     (error instanceof SandboxTerminalExecutionError && error.execution.stopped &&
      error.execution.error_code === "connection_lost");
+}
+
+/**
+ * A call which never reached a shell, so nothing can have run.
+ *
+ * A pod the control plane has rescheduled leaves the endpoint bundle pointing
+ * at an address nothing answers: the connect simply times out, with no
+ * execution record to classify it by. Nothing has to be replayed for that, but
+ * the bundle still has to go.
+ */
+export function isUnstartedTerminalFailure(error: unknown): boolean {
+  if (error instanceof SandboxTerminalExecutionError) return !error.execution.started;
+  return isTimeout(error) || isConnectionLost(error);
 }
 
 /** A drop before the launch line left no process group behind to repeat. */

@@ -11,8 +11,10 @@ from typing import Any
 
 import pytest
 from harness_adapter.agentgenome_bridge import (
+    BridgeAwait,
     BridgeTool,
     ExecutionHost,
+    ProbeRead,
     _storage_alias,
     _tool_path,
 )
@@ -147,6 +149,7 @@ def test_dataflow_receives_the_conversation_scoped_storage_path() -> None:
         host.workspace = workspace
         host.root = f"{workspace}/public_data/workflow-runs/run"
         host.package = "public_data/workflow-runs/run/package"
+        host.graph_run_id = "graph-run-1"
         await asyncio.to_thread(
             BridgeTool(host).call,
             "df_submit_pipeline",
@@ -160,6 +163,7 @@ def test_dataflow_receives_the_conversation_scoped_storage_path() -> None:
         "script_path": "public_data/workflow-runs/run/package/scripts/pipeline.py",
     }
     assert calls[0]["tool_call_id"] == "node-clean:1:call-1"
+    assert calls[0]["origin_run_id"] == "graph-run-1"
     # DataFlow's pod path adds the mount back; it must find the *same* file.
     assert "/target-workspace" + calls[0]["arguments"]["input_path"] == artifact
 
@@ -940,7 +944,9 @@ def test_metadata_many_maps_object_paths_before_any_workflow_has_run() -> None:
     assert answers["/datasets/a.jsonl"]["exists"] is True
     assert "/target-workspace/datasets/a.jsonl" in spellings[0]
     assert workspace == "/target-workspace/.pyromind-agent/conv"
-    assert resolved == ["public_data"]
+    # The workspace root itself is refused as conversation metadata, so the probe
+    # resolves a child of public_data and strips it back off.
+    assert resolved == ["public_data/.agentgenome-mount-probe"]
 
 
 def test_storage_mount_stays_unset_on_a_plane_without_one() -> None:
@@ -969,7 +975,7 @@ def test_a_failed_mount_probe_is_retried_instead_of_sticking() -> None:
         attempts.append(str(payload["path"]))
         if len(attempts) == 1:
             raise RuntimeError("request_failed: sandbox is starting")
-        return {"path": "/target-workspace/.pyromind-agent/conv/public_data"}
+        return {"path": f"/target-workspace/.pyromind-agent/conv/{payload['path']}"}
 
     async def run() -> tuple[str | None, str | None]:
         host = ExecutionHost(request, lambda *_: None)
@@ -982,3 +988,223 @@ def test_a_failed_mount_probe_is_retried_instead_of_sticking() -> None:
     assert first is None
     assert second == "/target-workspace"
     assert len(attempts) == 2
+
+
+class _AwaitHost:
+    """Just enough host for the await probe: a file map and a workspace root."""
+
+    def __init__(
+        self,
+        files: dict[str, bytes],
+        workspace: str = f"{MOUNT}/.pyromind-agent/conv",
+        errors: dict[str, str] | None = None,
+    ):
+        self.files = files
+        self.workspace = workspace
+        self.errors = errors or {}
+        self.read_limits: list[int] = []
+        self.read_paths: list[str] = []
+        self.metadata_calls: list[str] = []
+
+    def read_probe(self, path: str, limit: int) -> ProbeRead:
+        self.read_paths.append(path)
+        self.read_limits.append(limit)
+        if path in self.errors:
+            return ProbeRead(None, self.errors[path])
+        raw = self.files.get(path)
+        if raw is None:
+            return ProbeRead(None)
+        if len(raw) > limit:
+            # Match the sandbox file API: it streams the whole object and then
+            # rejects it. `limit` is not a ranged-read offset.
+            return ProbeRead(
+                None,
+                "PiRunnerError: request_failed: file exceeds size limit",
+            )
+        return ProbeRead(raw, None)
+
+    def metadata(self, path: str) -> dict[str, Any]:
+        self.metadata_calls.append(path)
+        if path in self.errors:
+            raise RuntimeError(self.errors[path])
+        raw = self.files.get(path)
+        if raw is None:
+            return {"exists": False}
+        return {
+            "exists": True,
+            "is_file": True,
+            "is_dir": False,
+            "size": len(raw),
+        }
+
+    def _resolve(self, path: str, write: bool) -> str:
+        del write
+        return path
+
+    def exists(self, path: str) -> bool:
+        return bool(self.metadata(path)["exists"])
+
+
+def _receipt(output_dir: str) -> bytes:
+    return json.dumps(
+        {
+            "status": "Pending",
+            "task_id": "9391",
+            "output_dir": output_dir,
+        }
+    ).encode()
+
+
+DIR = "/.pyromind-agent/conv/data_preparation/run-1"
+SANDBOX_DIR = f"{MOUNT}{DIR}"
+
+
+def test_a_finished_platform_run_completes_the_await() -> None:
+    """平台用 FINISHED 而不是 succeeded 时，await 也必须认。"""
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.json": json.dumps({"status": "FINISHED"}).encode(),
+            f"{SANDBOX_DIR}/processed.jsonl": b"{}\n",
+        }
+    )
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+    assert result.status == "completed"
+    assert result.product == f"{SANDBOX_DIR}/processed.jsonl"
+    assert max(host.read_limits) == 512 * 1024
+    assert f"{SANDBOX_DIR}/processed.jsonl" in host.metadata_calls
+    assert f"{SANDBOX_DIR}/processed.jsonl" not in host.read_paths
+
+
+def test_a_status_envelope_avoids_reading_an_oversized_report() -> None:
+    """A compact terminal status stays readable when the detailed report is large."""
+    report = json.dumps({"status": "succeeded", "rows": ["x" * 200] * 4000}).encode()
+    assert len(report) > 512 * 1024
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.status.json": json.dumps(
+                {"status": "succeeded", "product": "processed.jsonl"}
+            ).encode(),
+            f"{SANDBOX_DIR}/report.json": report,
+            f"{SANDBOX_DIR}/processed.jsonl": b"{}\n",
+        }
+    )
+
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+
+    assert result.status == "completed"
+    assert result.detail["status_source"] == "status"
+    assert f"{SANDBOX_DIR}/report.status.json" in host.read_paths
+    assert f"{SANDBOX_DIR}/report.json" not in host.read_paths
+
+
+def test_an_oversized_legacy_report_requires_a_status_envelope() -> None:
+    report = json.dumps({"status": "succeeded", "rows": ["x" * 200] * 4000}).encode()
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.json": report,
+        }
+    )
+
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+
+    assert result.status == "failed"
+    assert "report.status.json" in str(result.error)
+    assert not host.metadata_calls
+
+
+def test_the_receipt_status_is_not_the_verdict() -> None:
+    """受理单里的 Pending 只是提交快照；判定看 report.json。"""
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.json": json.dumps({"status": "succeeded"}).encode(),
+            f"{SANDBOX_DIR}/processed.jsonl": b"{}\n",
+        }
+    )
+    assert BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json").status == "completed"
+
+
+def test_an_oversized_report_is_still_read() -> None:
+    """报告超过旧的 64KB 上限时不能永远 pending。"""
+    report = json.dumps({"status": "succeeded", "rows": ["x" * 200] * 800}).encode()
+    assert len(report) > 65536
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.json": report,
+            f"{SANDBOX_DIR}/processed.jsonl": b"{}\n",
+        }
+    )
+    assert BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json").status == "completed"
+
+
+def test_the_product_path_comes_from_the_report_when_it_names_one() -> None:
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.json": json.dumps(
+                {"status": "succeeded", "product": "out/result.jsonl"}
+            ).encode(),
+            f"{SANDBOX_DIR}/out/result.jsonl": b"{}\n",
+        }
+    )
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+    assert result.status == "completed"
+    assert result.product == f"{SANDBOX_DIR}/out/result.jsonl"
+
+
+def test_an_already_sandbox_absolute_output_dir_is_not_prefixed_twice() -> None:
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(SANDBOX_DIR),
+            f"{SANDBOX_DIR}/report.json": json.dumps({"status": "succeeded"}).encode(),
+            f"{SANDBOX_DIR}/processed.jsonl": b"{}\n",
+        }
+    )
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+    assert result.status == "completed"
+    assert result.product == f"{SANDBOX_DIR}/processed.jsonl"
+
+
+def test_an_unreadable_report_says_so_instead_of_silently_pending() -> None:
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.json": b'{"status": "succeeded"',
+        }
+    )
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+    assert result.status == "failed"
+    assert "无法解析" in str(result.error)
+
+
+@pytest.mark.parametrize("placeholder", [[], None, "running", 0])
+def test_a_non_object_report_is_pending_until_the_final_report(
+    placeholder: object,
+) -> None:
+    """平台运行期可能先写合法 JSON 占位，不能被当成终态失败。"""
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.json": json.dumps(placeholder).encode(),
+        }
+    )
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+    assert result.status == "pending"
+    assert result.detail["task_id"] == "9391"
+    assert result.detail["output_dir"] == SANDBOX_DIR
+
+
+def test_a_report_read_error_is_not_reported_as_pending() -> None:
+    host = _AwaitHost(
+        {f"{MOUNT}/run/receipt.json": _receipt(DIR)},
+        errors={
+            f"{SANDBOX_DIR}/report.json": "TimeoutError: execution plane unavailable"
+        },
+    )
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+    assert result.status == "failed"
+    assert "unreadable" in str(result.error)

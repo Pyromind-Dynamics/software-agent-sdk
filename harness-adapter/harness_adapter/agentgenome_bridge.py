@@ -4,14 +4,16 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import shlex
 import threading
 import time
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
 
 from agentgenome import GenomeService, RunCancelled
@@ -32,8 +34,22 @@ from harness_adapter.pi_adapter.runner import PiRunnerError
 from openhands.tools.utils.storage_paths import REMOVED_ALIAS
 
 
+logger = logging.getLogger(__name__)
+
+# A planning probe resolves one child of `public_data` because the workspace root
+# itself is refused as conversation metadata: the policy only opens entries that
+# live *inside* it. Nothing is read; only the mount prefix is wanted.
+_MOUNT_PROBE = "public_data/.agentgenome-mount-probe"
+
+
 type Request = Callable[[str, JsonObject], Coroutine[Any, Any, Any]]
 type Subscribe = Callable[[str, WorkflowEventSink | None], None]
+
+
+@dataclass(frozen=True)
+class ProbeRead:
+    content: bytes | None
+    error: str | None = None
 
 
 def _is_missing_file(error: Exception) -> bool:
@@ -46,16 +62,59 @@ def _is_missing_file(error: Exception) -> bool:
     return "FILE_READ_ERROR" in message and "No such file or directory" in message
 
 
+def _missing_read(error: str | None) -> bool:
+    if not error:
+        return False
+    message = error.lower()
+    return (
+        "no such file" in message
+        or "not found" in message
+        or "does not exist" in message
+        or "cannot read file" in message
+    )
+
+
+def _oversized_read(error: str | None) -> bool:
+    return bool(error) and "file exceeds size limit" in error.lower()
+
+
 _SANDBOX_ALIASES = ("public_data", ".agents", "knowledge")
 # Agent workspaces live at ``<storage mount>/.pyromind-agent/<conversation>``, so
 # the mount is whatever sits above that directory.
 _AGENT_DIRECTORY = "/.pyromind-agent/"
 _SLOW_CALLS = frozenset({"execution.write", "execution.protect", "execution.read_many"})
+# A finished platform run's own words for "done". The probe used to accept only
+# `succeeded`, so any other spelling parked the run for ever.
+_PLATFORM_SUCCEEDED_STATUSES = frozenset(
+    {
+        "succeeded",
+        "success",
+        "finished",
+        "completed",
+        "complete",
+        "done",
+        "ok",
+        "passed",
+    }
+)
+_PLATFORM_FAILED_STATUSES = frozenset(
+    {
+        "failed",
+        "failure",
+        "cancelled",
+        "canceled",
+        "error",
+        "terminated",
+        "timeout",
+        "killed",
+    }
+)
 # Not base64, so a real head can never be mistaken for the directory report.
 _DIRECTORY_MARK = "<dir/>"
 # One execution-plane read window; mirrors the runtime's per-file ceiling
 # (512 KiB encodes under the 1 MiB frame limit).
 _READ_LIMIT = 512 * 1024
+_STATUS_REPORT = "report.status.json"
 # Vision pipelines resolve the images a manifest names relative to the manifest
 # itself, so a manifest staged away from its images only fails minutes later on
 # the platform. The preflight reports that before the submission is paid for,
@@ -230,6 +289,16 @@ def _tool_path(
     return value
 
 
+class _AwaitHost(Protocol):
+    workspace: str
+
+    def read_probe(self, path: str, limit: int) -> ProbeRead: ...
+
+    def metadata(self, path: str) -> dict[str, Any]: ...
+
+    def _resolve(self, path: str, write: bool) -> str: ...
+
+
 class BridgeAwait:
     """Answer one await probe from the platform's own terminal report.
 
@@ -238,11 +307,17 @@ class BridgeAwait:
     couple of short reads, so a parked run costs nothing while it waits.
     """
 
-    def __init__(self, host: ExecutionHost) -> None:
+    def __init__(self, host: _AwaitHost) -> None:
         self.host = host
 
     def probe(self, receipt_path: str) -> AwaitResult:
-        receipt = self._json(receipt_path)
+        receipt, error = self._json_probe(receipt_path, 65536)
+        if error is not None:
+            return AwaitResult(
+                "failed",
+                error=f"receipt is unreadable: {error}",
+                detail={"receipt": receipt_path},
+            )
         if not isinstance(receipt, dict):
             return AwaitResult("pending", detail={"receipt": receipt_path})
         task_id = receipt.get("task_id")
@@ -253,30 +328,116 @@ class BridgeAwait:
                 "pending", detail={"receipt": receipt_path, "task_id": task_id}
             )
         target = self._sandbox_path(directory.strip().rstrip("/"))
-        report = self._json(f"{target}/report.json")
-        if not isinstance(report, dict):
+        report, error = self._json_probe(f"{target}/{_STATUS_REPORT}", 65536)
+        if error is not None:
             return AwaitResult(
-                "pending", detail={"output_dir": target, "task_id": task_id}
+                "failed",
+                error=f"platform status report is unreadable: {error}",
+                detail={"output_dir": target, "task_id": task_id},
+            )
+        source = "status"
+        if not isinstance(report, dict):
+            report, error = self._json_probe(f"{target}/report.json")
+            source = "report"
+            if error is not None:
+                if _oversized_read(error):
+                    return AwaitResult(
+                        "failed",
+                        error=(
+                            "platform report exceeds the 512 KiB host read limit "
+                            "and report.status.json is missing"
+                        ),
+                        detail={"output_dir": target, "task_id": task_id},
+                    )
+                if _missing_read(error):
+                    return AwaitResult(
+                        "pending",
+                        detail={"output_dir": target, "task_id": task_id},
+                    )
+                return AwaitResult(
+                    "failed",
+                    error=f"platform report is unreadable: {error}",
+                    detail={"output_dir": target, "task_id": task_id},
+                )
+        if not isinstance(report, dict):
+            # A running platform task can expose a valid JSON placeholder before
+            # the final report object is written. Only malformed JSON is a probe
+            # failure; a non-object is still an in-flight state.
+            return AwaitResult(
+                "pending",
+                detail={
+                    "output_dir": target,
+                    "task_id": task_id,
+                    "report_type": type(report).__name__,
+                    "status_source": source,
+                },
             )
         status = str(report.get("status") or "").strip().lower()
-        detail = {"output_dir": target, "status": status, "task_id": task_id}
-        if status in {"failed", "cancelled", "canceled", "error", "terminated"}:
+        detail = {
+            "output_dir": target,
+            "status": status,
+            "task_id": task_id,
+            "status_source": source,
+        }
+        if status in _PLATFORM_FAILED_STATUSES:
             return AwaitResult("failed", error=f"platform run {status}", detail=detail)
-        if status != "succeeded":
+        if status not in _PLATFORM_SUCCEEDED_STATUSES:
             return AwaitResult("pending", detail=detail)
-        product = f"{target}/processed.jsonl"
-        if not self.host.exists(product):
-            return AwaitResult("pending", detail=detail)
+        product = self._report_product(report, target)
+        try:
+            product_metadata = self.host.metadata(product)
+        except Exception as error:  # noqa: BLE001 - a probe must report its cause
+            if _missing_read(str(error)):
+                return AwaitResult("pending", detail={**detail, "product": product})
+            return AwaitResult(
+                "failed",
+                error=f"succeeded platform run product metadata is unreadable: {error}",
+                detail={**detail, "product": product},
+            )
+        if not product_metadata.get("exists"):
+            return AwaitResult("pending", detail={**detail, "product": product})
         return AwaitResult("completed", product=product, detail=detail)
 
-    def _json(self, path: str) -> Any:
-        raw = self.host.read_optional(path, 65536)
-        if raw is None:
-            return None
+    def _report_product(self, report: dict[str, Any], target: str) -> str:
+        """The file a finished run leaves behind.
+
+        The platform names its product in the report; the old hard-coded
+        ``processed.jsonl`` only matched one pipeline shape. Fall back to it so
+        existing chains keep working.
+        """
+        for key in (
+            "product",
+            "product_path",
+            "output_path",
+            "result_path",
+            "processed_path",
+            "artifact",
+        ):
+            value = report.get(key)
+            if isinstance(value, str) and value.strip():
+                path = value.strip()
+                return (
+                    self._sandbox_path(path)
+                    if path.startswith("/")
+                    else (f"{target}/{path.lstrip('./')}")
+                )
+        return f"{target}/processed.jsonl"
+
+    def _json_probe(
+        self, path: str, limit: int = _READ_LIMIT
+    ) -> tuple[Any, str | None]:
+        """Read a small JSON file, telling "absent" apart from "unreadable"."""
+        read = self.host.read_probe(path, limit)
+        if read.error is not None:
+            if _missing_read(read.error):
+                return None, None
+            return None, f"{path} 无法读取：{read.error}"[:300]
+        if read.content is None:
+            return None, None
         try:
-            return json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            return None
+            return json.loads(read.content.decode("utf-8")), None
+        except (UnicodeDecodeError, ValueError) as exc:
+            return None, f"{path} 无法解析：{exc}"[:300]
 
     def _sandbox_path(self, directory: str) -> str:
         """A Storage-absolute path as the sandbox sees it.
@@ -291,7 +452,7 @@ class BridgeAwait:
         if marker in directory:
             workspace = self.host.workspace or ""
             mount = workspace.split(marker, 1)[0]
-            if mount:
+            if mount and not directory.startswith(f"{mount}/"):
                 return mount + directory
         return directory
 
@@ -327,14 +488,14 @@ class BridgeTool:
             tool_arguments = self.host.evaluation_submit_arguments(arguments)
         else:
             tool_arguments = self.host.tool_arguments(arguments)
-        response = self.host._call(
-            "execution.tool",
-            {
-                "name": name,
-                "arguments": tool_arguments,
-                "tool_call_id": execution_id,
-            },
-        )
+        payload: JsonObject = {
+            "name": name,
+            "arguments": tool_arguments,
+            "tool_call_id": execution_id,
+        }
+        if self.host.graph_run_id:
+            payload["origin_run_id"] = self.host.graph_run_id
+        response = self.host._call("execution.tool", payload)
         if not isinstance(response, dict) or not isinstance(
             response.get("is_error"), bool
         ):
@@ -395,6 +556,7 @@ class ExecutionHost:
         self.root = ""
         self.workspace = ""
         self.package = ""
+        self.graph_run_id: str | None = None
         self.verification = None
         self.model_judge = False
         self.verification_files: dict[str, str] = {}
@@ -444,6 +606,7 @@ class ExecutionHost:
         **options: Any,  # noqa: ARG002
     ) -> tuple[Ports, dict[str, Any]]:
         self.cancel, self.emit = cancel, emit
+        self.graph_run_id = run_id
         # The parked node a wakeup already answered: this attempt approves exactly
         # that gate and parks again on any later one.
         self.resuming = resuming
@@ -841,17 +1004,30 @@ class ExecutionHost:
             pass
         else:
             # A blocking round trip here would deadlock the loop thread.
+            logger.info("Pi storage mount probe skipped: called on the event loop")
             return None
         try:
-            resolved = self._resolve("public_data", False)
-        except Exception:  # noqa: BLE001 - a hiccup must not stick to the session
+            resolved = self._resolve(_MOUNT_PROBE, False)
+        except Exception as error:  # noqa: BLE001 - a hiccup must not stick
+            logger.info(
+                "Pi storage mount probe failed error=%s: %s",
+                type(error).__name__,
+                error,
+            )
             return None
         self._mount_probed = True
-        head, separator, _ = resolved.partition(_AGENT_DIRECTORY)
-        if not separator or not resolved.endswith("/public_data"):
+        leaf = "/" + _MOUNT_PROBE.rsplit("/", 1)[1]
+        if not resolved.endswith(leaf):
+            logger.info("Pi storage mount probe found no mount resolved=%s", resolved)
             return None
-        self.workspace = resolved[: -len("/public_data")]
+        workspace = resolved[: -len(leaf)]
+        head, separator, _ = workspace.partition(_AGENT_DIRECTORY)
+        if not separator or not workspace.endswith("/public_data"):
+            logger.info("Pi storage mount probe found no mount resolved=%s", resolved)
+            return None
+        self.workspace = workspace[: -len("/public_data")]
         self._mount_cache = head
+        logger.info("Pi storage mount probe resolved mount=%s", head)
         return head
 
     def path(self, name: str) -> str:
@@ -909,20 +1085,27 @@ class ExecutionHost:
 
     def read_optional(self, path: str, limit: int) -> bytes | None:
         """Read a file the execution plane may not have written yet."""
+        return self.read_probe(path, limit).content
+
+    def read_probe(self, path: str, limit: int) -> ProbeRead:
+        """Read a file while preserving whether it was absent or unreadable."""
         try:
             result = self._call(
                 "execution.read",
                 {"path": path, "limit": limit},
             )
-        except Exception:
-            return None
+        except Exception as exc:
+            return ProbeRead(None, f"{type(exc).__name__}: {exc}"[:300])
         try:
-            return base64.b64decode(result["content"], validate=True)
-        except (KeyError, TypeError, ValueError):
-            return None
+            return ProbeRead(
+                base64.b64decode(result["content"], validate=True),
+                None,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return ProbeRead(None, f"invalid execution.read response: {exc}"[:300])
 
     def exists(self, path: str) -> bool:
-        return self.read_optional(path, 1) is not None
+        return self.read_probe(path, 1).content is not None
 
     def read(self, path: str) -> bytes:
         """Read a workspace file, answering host-local exports from disk.
