@@ -2,6 +2,7 @@
 
 PYROMIND_APP_TAG_KEY = "app"
 PYROMIND_APP_TAG_VALUE = "pyromind"
+PYROMIND_AGENT_PROFILE_TAG_KEY = "agentprofile"
 PYROMIND_WORKFLOW_EVENT_KEY = "pyromind_workflow"
 
 PYROMIND_TERMINAL_PARAMS: dict[str, object] = {

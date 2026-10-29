@@ -56,7 +56,7 @@ from pyromind_runtime.ports.harness import (
     SessionSpec,
 )
 
-from openhands.agent_server.pyromind_router import PyromindLLMConfig
+from openhands.agent_server.pyromind_router import AgentLLMConfig
 from openhands.sdk.workspace.local import LocalWorkspace
 
 
@@ -1759,12 +1759,12 @@ def test_session_config_persists_model_api_resolution() -> None:
 
 def test_pyromind_llm_config_rejects_unknown_model_api() -> None:
     with pytest.raises(ValidationError):
-        PyromindLLMConfig(model="gpt-5", api=cast(Any, "other"))
+        AgentLLMConfig(model="gpt-5", api=cast(Any, "other"))
 
 
 def test_pyromind_llm_config_rejects_invalid_context_window() -> None:
     with pytest.raises(ValidationError):
-        PyromindLLMConfig(model="gpt-5", context_window=0)
+        AgentLLMConfig(model="gpt-5", context_window=0)
 
 
 async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:

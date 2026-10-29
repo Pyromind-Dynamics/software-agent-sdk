@@ -16,8 +16,8 @@ from openhands.agent_server.pyromind_auth import (
     parse_auth_token_from_cookie_header,
 )
 from openhands.agent_server.pyromind_router import (
+    AgentLLMConfig,
     PyromindCreateConversationRequest,
-    PyromindLLMConfig,
     create_pyromind_conversation,
 )
 
@@ -53,7 +53,7 @@ class LegacyPyromindSessionFactory:
             if part
         )
         body = PyromindCreateConversationRequest(
-            llm=PyromindLLMConfig.model_validate(spec.model_configuration),
+            llm=AgentLLMConfig.model_validate(spec.model_configuration),
             message="\n".join(message_parts) if message_parts else None,
             workflow_xyflow=spec.workflow_xyflow,
             extra=extra,

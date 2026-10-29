@@ -8,6 +8,12 @@ from openhands.sdk.conversation.base import BaseConversation
 from openhands.tools.workflow import submit_workflow as module
 
 
+def test_submit_workflow_tool_resolves_without_parameters():
+    tools = module.SubmitWorkflowTool.create(conv_state=None)
+
+    assert [tool.name for tool in tools] == ["submit_workflow"]
+
+
 def test_submit_workflow_tool_stages_confirmation_with_current_identity(monkeypatch):
     captured: dict = {}
 

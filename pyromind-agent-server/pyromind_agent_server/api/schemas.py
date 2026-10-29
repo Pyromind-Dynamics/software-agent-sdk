@@ -5,13 +5,13 @@ from typing import Any
 from pydantic import AliasChoices, BaseModel, Field
 from pyromind_runtime.domain.content import JsonObject
 
-from openhands.agent_server.pyromind_router import PyromindLLMConfig
+from openhands.agent_server.pyromind_router import AgentLLMConfig
 
 
 class CreateConversationRequest(BaseModel):
     """The proven Pyromind create inputs, exposed through the Product API."""
 
-    llm: PyromindLLMConfig
+    llm: AgentLLMConfig
     message: str | None = None
     workflow_xyflow: JsonObject | None = Field(
         default=None,

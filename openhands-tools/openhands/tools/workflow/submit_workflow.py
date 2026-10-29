@@ -108,7 +108,11 @@ class SubmitWorkflowTool(
     ToolDefinition[SubmitWorkflowAction, SubmitWorkflowObservation]
 ):
     @classmethod
-    def create(cls, **params: Any) -> Sequence[Self]:
+    def create(
+        cls,
+        conv_state: ConversationState | None = None,  # noqa: ARG003
+        **params: Any,
+    ) -> Sequence[Self]:
         if params:
             raise ValueError("submit_workflow takes no tool configuration")
         return [

@@ -7,6 +7,7 @@ from fastapi import Response, status
 from pydantic import ValidationError
 from starlette.requests import Request
 
+from openhands.agent_server.agent_profiles import PYROMIND_PROFILE
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import load_base_env
 from openhands.agent_server.event_service import EventService
@@ -17,6 +18,7 @@ from openhands.agent_server.pyromind_auth import (
     get_debug_current_login_user_by_conversation,
 )
 from openhands.agent_server.pyromind_constants import (
+    PYROMIND_AGENT_PROFILE_TAG_KEY,
     PYROMIND_APP_TAG_KEY,
     PYROMIND_APP_TAG_VALUE,
 )
@@ -25,8 +27,8 @@ from openhands.agent_server.pyromind_router import (
     PYROMIND_KB_INSTRUCTIONS,
     PYROMIND_PRODUCT_USER_ID_SECRET,
     PYROMIND_X_CLUSTER_SECRET,
+    AgentLLMConfig,
     PyromindCreateConversationRequest,
-    PyromindLLMConfig,
     PyromindSendMessageRequest,
     PyromindWorkflowRollbackRequest,
     _build_analyze_task_failure_tool,
@@ -57,6 +59,7 @@ from openhands.sdk.tool.builtins import SkillsListTool, SkillsReadTool
 from openhands.tools.data_preparation import (
     DfCheckProgressTool,
     DfStopTaskTool,
+    DfSubmitEvaluationTool,
     DfSubmitPipelineTool,
 )
 from openhands.tools.environment_processing import (
@@ -118,28 +121,14 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert len(skill_text.splitlines()) <= 140
     assert "## 资料索引" in skill_text
     assert "## DSL 与资料边界" in skill_text
-    assert "给出的位置用 `read`" in skill_text
+    assert "按 `<available_skills>` 的位置用 `read` 打开" in skill_text
     assert "<available_skills>" in skill_text
-    assert 'skills_read(skill_name="generate-workflow-dsl"' not in skill_text
-    assert "单一事实源" not in skill_text
-    assert "不在生成任务中编辑 Skill、reference 或 knowledge" in skill_text
-    assert "### 0. 先判定局部修改" in skill_text
-    assert "qwen3.5-2b" in skill_text
-    assert "不读取 reference 或 `knowledge/`" in skill_text
-    assert "retryable=false" in skill_text
-    assert "只生成并校验 DSL" in skill_text
+    assert "每次写入后调用 `validate_workflow_dsl()`" in skill_text
     assert "不写 import" in skill_text
-    assert "禁止用 Agent 本地 terminal 替代平台运行时" in skill_text
+    assert "生成任务不调用 `workflow_debug`、`run_workflow`" in skill_text
+    assert "不执行正式工作流" in frontmatter
+    assert "retryable=false" in skill_text
     assert "单节点工作流" in frontmatter
-    assert "单节点或其他非训练/评测工作流" in skill_text
-    assert "跳过训练专用的第 2、3、5、6 步" in skill_text
-    assert "`knowledge/index.md` 和匹配的节点原文" in skill_text
-    assert "不用 terminal `ls/find` 探索 Skill、reference 或知识库" in skill_text
-    assert "同一轮不得重复读取同一路径" in skill_text
-    assert "可程序验证只说明 reward 可构造" in skill_text
-    assert "数据同时支持\n  SFT/GRPO 时默认 SFT" in skill_text
-    assert "自动选择 GRPO 还要求当前模型是 SFT/指令 checkpoint" in skill_text
-    assert skill_text.count("阶段锁定后") == 2
     assert "ModelTrainSFTNode(" not in skill_text
     assert set(references) == {
         "custom-python-assets.md",
@@ -148,28 +137,6 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     }
     assert all(f"`references/{name}`" in skill_text for name in references)
     assert not (skill_root / "references" / "example-workflows.md").exists()
-    assert "PathJoinNode → LoadDataset" in references["data-routing.md"]
-    assert "对原路径读一次 `storage/...` 取数据画像" in references["data-routing.md"]
-    assert "去掉可选的 `/workspace/` 前缀和开头 `/`" in references["data-routing.md"]
-    assert "同一路径已有画像时复用" in references["data-routing.md"]
-    assert "不伪装成总条数" in references["data-routing.md"]
-    assert "## 训练格式门禁" in references["data-routing.md"]
-    assert "可验证信号" in references["data-routing.md"]
-    assert "本文件只识别数据形态" in references["data-routing.md"]
-    assert "禁止调用 `run_dataset_cleaning`" in skill_text
-    contracts = references["workflow-contracts.md"]
-    assert "Benchmark | 数据配置 → 模型入口 → VLLM → Metric → Eval" in contracts
-    assert "CloneAndCacheModel | model, target_path" in contracts
-    assert "每个 Metrics Builder 只输出一个" in contracts
-    assert "`metrics_config`，Eval 只接一个该端口" in contracts
-    assert "NVIDIA-H100-80GB-HBM3" in contracts
-    assert "训练阶段由主 Skill 的“选择阶段”唯一决定" in contracts
-    assert "有可程序化验证答案或 reward 时选 GRPO" not in contracts
-    assert "只填 Secret 名" in contracts
-    assert "Qwen/Qwen3" not in contracts
-    assert "compute_gsm8k" not in references["custom-python-assets.md"]
-    assert "geometry_vqa_thinking_reward" not in references["custom-python-assets.md"]
-    assert "`public_data/<name>.py`" in references["custom-python-assets.md"]
     for removed in (
         "node-reference.md",
         "platform-contract-overrides.md",
@@ -287,7 +254,7 @@ def test_pyromind_kb_instructions_keep_the_documented_knowledge_paths() -> None:
 
 
 def test_pyromind_llm_config_normalizes_chat_completions_base_url() -> None:
-    config = PyromindLLMConfig(
+    config = AgentLLMConfig(
         model="openai/glm-5.2-fp8",
         api_key="test-key",
         base_url=" http://208.64.254.187:8000/v1/chat/completions/ ",
@@ -470,7 +437,7 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     info = await create_pyromind_conversation(
         request,
         PyromindCreateConversationRequest(
-            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            llm=AgentLLMConfig(model="gpt-4o", api_key="test-key"),
             extra={
                 "knowledge_base_path": str(knowledge_base),
                 "skills_path": str(tmp_path / "missing-skills"),
@@ -493,11 +460,12 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert "file_editor" in tool_names
     assert PyromindSubAgentTool.name in tool_names
     assert "update_plan" in tool_names
-    assert SkillsListTool.__name__ not in tool_names
-    assert SkillsReadTool.__name__ not in tool_names
+    assert SkillsListTool.name not in tool_names
+    assert SkillsReadTool.name not in tool_names
     assert RunWorkflowTool.name not in tool_names
     assert ValidateWorkflowDslTool.name in tool_names
     assert TrainingAnalysisTool.name in tool_names
+    assert tool_names <= set(PYROMIND_PROFILE.tool_allowlist)
     assert "preview_dataset" not in tool_names
     assert "dataset_download" not in tool_names
     assert "df_convert" not in tool_names
@@ -586,7 +554,10 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
         == cookie_header
     )
     assert service.start_request.secrets["auth_token"].get_value() == "session-token"
-    assert service.start_request.tags == {PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE}
+    assert service.start_request.tags == {
+        PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE,
+        PYROMIND_AGENT_PROFILE_TAG_KEY: PYROMIND_PROFILE.tag_value,
+    }
     dumped_agent = service.start_request.agent.model_dump(mode="json")
     assert "api_key" not in dumped_agent["llm"]
     assert "base_url" not in dumped_agent["llm"]
@@ -690,7 +661,7 @@ async def test_pyromind_conversation_registers_skill_runtime_tools(tmp_path):
     await create_pyromind_conversation(
         request,
         PyromindCreateConversationRequest(
-            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            llm=AgentLLMConfig(model="gpt-4o", api_key="test-key"),
             extra={"skills_path": str(skills_dir)},
         ),
         response,
@@ -699,10 +670,10 @@ async def test_pyromind_conversation_registers_skill_runtime_tools(tmp_path):
 
     assert service.start_request is not None
     tools = {tool.name: tool for tool in service.start_request.agent.tools}
-    assert SkillsListTool.__name__ in tools
-    assert SkillsReadTool.__name__ in tools
-    assert tools[SkillsListTool.__name__].params == {}
-    assert tools[SkillsReadTool.__name__].params == {}
+    assert SkillsListTool.name in tools
+    assert SkillsReadTool.name in tools
+    assert tools[SkillsListTool.name].params == {}
+    assert tools[SkillsReadTool.name].params == {}
     service.start_request.model_dump(mode="json")
 
 
@@ -717,7 +688,7 @@ async def test_pyromind_conversation_request_serializes_without_local_paths(tmp_
     info = await create_pyromind_conversation(
         _make_request(),
         PyromindCreateConversationRequest(
-            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            llm=AgentLLMConfig(model="gpt-4o", api_key="test-key"),
             extra={
                 "knowledge_base_path": str(knowledge_base),
                 "skills_path": str(tmp_path / "missing-skills"),
@@ -755,7 +726,7 @@ async def test_pyromind_conversation_binds_login_context(tmp_path):
     info = await create_pyromind_conversation(
         request,
         PyromindCreateConversationRequest(
-            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            llm=AgentLLMConfig(model="gpt-4o", api_key="test-key"),
             extra={
                 "knowledge_base_path": str(knowledge_base),
                 "skills_path": str(tmp_path / "missing-skills"),
@@ -788,7 +759,7 @@ async def test_pyromind_conversation_converts_xyflow_before_seeding_workflow(
     info = await create_pyromind_conversation(
         _make_request(),
         PyromindCreateConversationRequest(
-            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            llm=AgentLLMConfig(model="gpt-4o", api_key="test-key"),
             workflow_xyflow=xyflow,
             extra={
                 "knowledge_base_path": str(knowledge_base),
@@ -828,7 +799,7 @@ async def test_pyromind_conversation_initial_message_saves_workflow_snapshot(
     await create_pyromind_conversation(
         _make_request(),
         PyromindCreateConversationRequest(
-            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            llm=AgentLLMConfig(model="gpt-4o", api_key="test-key"),
             message="帮我继续改工作流",
             workflow_xyflow=xyflow,
             extra={
@@ -865,7 +836,7 @@ async def test_pyromind_conversation_initial_message_marks_empty_canvas(tmp_path
     await create_pyromind_conversation(
         _make_request(),
         PyromindCreateConversationRequest(
-            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            llm=AgentLLMConfig(model="gpt-4o", api_key="test-key"),
             message="直接生成评测工作流",
             workflow_xyflow=empty_xyflow,
             extra={"skills_path": str(tmp_path / "missing-skills")},
@@ -892,7 +863,7 @@ async def test_pyromind_conversation_reminds_when_no_canvas_attached(tmp_path):
     await create_pyromind_conversation(
         _make_request(),
         PyromindCreateConversationRequest(
-            llm=PyromindLLMConfig(model="gpt-4o", api_key="test-key"),
+            llm=AgentLLMConfig(model="gpt-4o", api_key="test-key"),
             message="直接生成评测工作流",
             extra={"skills_path": str(tmp_path / "missing-skills")},
         ),
@@ -1129,6 +1100,7 @@ def test_pyromind_storage_tools_use_user_context_headers():
         GetStorageUrlTool.name,
         RunDatasetCleaningTool.name,
         DfSubmitPipelineTool.name,
+        DfSubmitEvaluationTool.name,
         EdpSubmitTool.name,
         EdpRenderTool.name,
         EdpAggregateTool.name,

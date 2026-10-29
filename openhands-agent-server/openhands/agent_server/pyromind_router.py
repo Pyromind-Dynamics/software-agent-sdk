@@ -5,6 +5,8 @@ system prompt, tools, and workspace on the server side so that the
 frontend only needs to pass minimal configuration fields.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import uuid
@@ -21,6 +23,10 @@ from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator
 # from the agent tool surface still deserialize on restart. It is not added
 # to the agent's extra_tools below.
 import openhands.tools.node_signature  # noqa: F401
+from openhands.agent_server.agent_profiles import PYROMIND_PROFILE, AgentProfileSpec
+from openhands.agent_server.agent_profiles.pyromind import (
+    PYROMIND_KB_INSTRUCTIONS,
+)
 from openhands.agent_server.conversation_service import (
     ConversationForkAtEventConflictError,
     ConversationForkAtEventSourceNotFoundError,
@@ -45,9 +51,9 @@ from openhands.agent_server.pyromind_auth import (
     parse_auth_token_from_cookie_header,
 )
 from openhands.agent_server.pyromind_constants import (
+    PYROMIND_AGENT_PROFILE_TAG_KEY,
     PYROMIND_APP_TAG_KEY,
     PYROMIND_APP_TAG_VALUE,
-    PYROMIND_RUNTIME_CONTRACT,
     PYROMIND_TERMINAL_PARAMS,
 )
 from openhands.agent_server.pyromind_subagent import (
@@ -65,7 +71,7 @@ from openhands.agent_server.workflow_canvas_store import (
     WorkflowCanvasStoreError,
     WorkflowCanvasVersionNotFoundError,
 )
-from openhands.sdk import LLM, AgentContext, TextContent, Tool, register_tool
+from openhands.sdk import LLM, Agent, AgentContext, TextContent, Tool, register_tool
 from openhands.sdk.conversation.request import (
     StartConversationRequest,
 )
@@ -141,10 +147,16 @@ _OPENAI_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 
 logger = logging.getLogger(__name__)
 
+_LEGACY_PYROMIND_PROFILE_TAGS = frozenset({"workbench"})
+
 # Register skill-runtime tools at module level so persisted conversations
 # that reference them can resolve the tools on resume after a server restart.
+# The class-name aliases preserve conversations created before the runtime
+# names became the explicit Tool spec keys.
 register_tool(SkillsListTool.__name__, SkillsListTool)
 register_tool(SkillsReadTool.__name__, SkillsReadTool)
+register_tool(SkillsListTool.name, SkillsListTool)
+register_tool(SkillsReadTool.name, SkillsReadTool)
 
 _PUBLIC_READ_ALIAS_NAMES = {alias: alias for alias, _, _, _ in PUBLIC_READ_ALIASES}
 _KNOWLEDGE_ALIAS = _PUBLIC_READ_ALIAS_NAMES["knowledge"]
@@ -167,15 +179,6 @@ _DEFAULT_SKILLS_PATH = os.environ.get(
     str(Path(__file__).resolve().parents[3] / ".agents" / "skills"),
 )
 
-# Only load these skills for Pyromind (avoids loading unrelated SDK skills)
-_PYROMIND_SKILL_NAMES = [
-    "generate-workflow-dsl",
-    "debug-workflow",
-    "data-processing",
-    "sandbox",
-    "training-analysis",
-    "label-studio",
-]
 _LABEL_STUDIO_TOKEN_SECRET = "LABEL_STUDIO_TOKEN"
 _PYROMIND_VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
 _PYROMIND_VALIDATE_FORWARD_HEADERS = ("x-cluster", "accept-language")
@@ -240,116 +243,6 @@ def _build_label_studio_tool(
     return Tool(name=LabelStudioProjectTool.name, params=params), secrets
 
 
-# Knowledge-base retrieval guidance layered on top of the codex base prompt via
-# get_codex_agent(custom_instructions=...). Match the Codex flow: prefer the
-# matching skill first; then use skill/runtime reads for skill docs; delegate
-# free-form knowledge-base research and complex workspace work to isolated,
-# blocking subagents.
-PYROMIND_KB_INSTRUCTIONS = """\
-The Pyromind platform knowledge base is available through the read-only logical
-path `{knowledge_alias}/`. Do not use or request its host filesystem path.
-
-Knowledge base layout:
-- basic/: platform basics
-- jupyterlab/: JupyterLab and script-based training
-- sdk/: Python SDK and script-based workflow APIs
-- studio/: Studio workflow documentation
-- nodes/<NodeType>/<NodeType>.md: node parameters, I/O, and ports
-- dataset_processing_workflow.py: workflow DSL example
-
-The shared skill documents are available through the read-only logical path
-`{skills_alias}/`. Do not use or request their host filesystem path.
-
-User paths are platform storage paths (e.g. `datasets/...`,
-`/.pyromind-agent/...`, or a `workspace/` prefix) — never this conversation's
-local files. In a sandbox session they are mounted read-only at `storage/`;
-read them there with the file tools. Only `public_data/...` paths are local.
-
-Skill usage rules:
-- Every user turn is preceded by a `<system_reminder>` stating whether
-  `public_data/workflow_canvas/workflow.py` exists. It is authoritative; never
-  run a command or read another file to confirm it. When the workflow exists,
-  read it in full with `file_editor` before asking for information or answering
-  any request that may inspect, modify, validate, test, or run the current
-  workflow, including short contextual requests that presuppose it, and reuse
-  the dataset/model identifiers and topology already in the file instead of
-  asking the user to provide them again.
-- Then invoke the matching listed skill, and read only the exact `references/`
-  resource that the skill requires. For a local workflow edit, do not inspect
-  general `knowledge/` before invoking the skill, and do not inspect it
-  afterward unless the skill explicitly requires it.
-- For requests that do not involve a current workflow, invoke a matching listed
-  skill before searching the knowledge base.
-- Data processing: invoke the `data-processing` skill for any dataset
-  cleaning, preparation, or environment-dependent processing request; its
-  SKILL.md routing table selects the processing paradigm (format-conversion
-  for deterministic format/structure transformation, llm-pipeline for
-  content-level processing with DataFlow operators or LLM). If the user
-  explicitly names a mode ("DataFlow"/"脚本清洗"/"格式转换"), follow their
-  choice. If the intent is genuinely ambiguous, ask the user before invoking.
-- Treat any requested node, model, parameter, data, or topology change as a
-  `generate-workflow-dsl` request, including phrases such as "换个模型跑一下"
-  or "跑下 <model> 的效果". Modify and validate the DSL, then stop; do not
-  invoke `debug-workflow` or `workflow_debug` in the same turn. Use
-  `debug-workflow` only for an explicit test/debug request that contains no
-  configuration change.
-- For skill document lookup, use `invoke_skill` first, then `skills_read` only
-  for `SKILL.md`, `references/**`, or assets explicitly referenced by the skill.
-- For skill-linked resources, read the exact relative path from the skill root;
-  do not manually search `references/`, `scripts/`, or `assets/` with grep.
-- Treat `scripts/` as executable helpers. Do not read, grep, or summarize
-  `scripts/` source during normal tasks; run the script or platform tool named
-  by `SKILL.md` instead.
-
-__PYROMIND_RUNTIME_CONTRACT__
-
-Create and edit the workflow DSL at the relative path
-`public_data/workflow_canvas/workflow.py` from the current working directory.
-Prefer `apply_patch` for workflow changes. It accepts only the `patch` argument;
-never pass a separate `path` argument. Put the full relative path in the patch
-header, e.g.
-`*** Add File: public_data/workflow_canvas/workflow.py` or
-`*** Update File: public_data/workflow_canvas/workflow.py` — never use the
-bare name `workflow.py`.
-
-The separate `file_editor` tool does accept `path`. When using it for this file,
-set `path` to `public_data/workflow_canvas/workflow.py`; the runtime resolves
-conversation-relative paths to host-absolute paths. Do not hand-author long absolute
-paths, and do not use `/workspace/...` or `workspace/conversations/...` as a
-`file_editor.path` for the workflow file.
-After creating or modifying the workflow file, stop normally; the server sends
-the workflow to the frontend once the run finishes. Do not say the workflow has
-been generated unless a tool call actually created or modified the workflow file.
-
-- Invoke listed skills with `invoke_skill`. Do not invoke a workflow-generation
-  skill for an article lookup alone.
-- For skill documents, continue to use `skills_list` and `skills_read`; do not
-  send skill-document lookup to the search subagent.
-- Whenever a direct question or an intermediate step requires searching,
-  grepping, or reading general `knowledge/` documentation, delegate the lookup
-  to `subagent(type="search")`. The parent must not inspect those documents with
-  grep, terminal, or file-reading tools.
-- Make at most one `subagent(type="search")` call per parent-agent turn. Combine
-  all related knowledge-base subquestions into one self-contained task. Do not
-  split searches by topic, directory, expected source, or answer section, and
-  never issue multiple or parallel search subagent calls in the same turn.
-- Continue the parent task from the search subagent's sourced handoff. The
-  subagent reads `knowledge/index.md` first and opens the selected source pages.
-- Do not repeat the search subagent's work in the main conversation. Use its
-  sourced result directly unless it reports that the knowledge base is missing
-  the requested information.
-- For a genuinely complex, multi-step workspace task whose intermediate reads,
-  edits, and test output would clutter the main context, call `subagent` with
-  `type="general_purpose"` and a self-contained task. The call is blocking and
-  returns only the subagent's final handoff. Keep simple reads and edits in the
-  main agent.
-- For workflow generation, use the matching skill and its exact resources.
-  Do not consult `knowledge/` before validation. Only when validation identifies
-  a specific platform contract missing from those resources may you make one
-  targeted `subagent(type="search")` call for that error.
-""".replace("__PYROMIND_RUNTIME_CONTRACT__", PYROMIND_RUNTIME_CONTRACT.rstrip())
-
-
 # ---------------------------------------------------------------------------
 # Skill loading utilities
 # ---------------------------------------------------------------------------
@@ -386,6 +279,159 @@ def _load_agent_skills(
         logger.info(f"Loaded skill: {name}")
 
     return selected
+
+
+def _require_pyromind_tags(tags: dict[str, str]) -> None:
+    profile = tags.get(PYROMIND_AGENT_PROFILE_TAG_KEY)
+    if profile is not None and (
+        profile != PYROMIND_PROFILE.tag_value
+        and profile not in _LEGACY_PYROMIND_PROFILE_TAGS
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pyromind Agent conversation not found.",
+        )
+
+
+def _build_agent_llm(config: AgentLLMConfig, *, usage_id: str) -> LLM:
+    return LLM(
+        usage_id=usage_id,
+        model=config.model,
+        api_key=config.api_key,
+        base_url=config.base_url,
+        stream=True,
+        timeout=config.timeout or 60,
+        persist_runtime_config=False,
+    )
+
+
+def _build_agent_with_profile(
+    http_request: Request,
+    *,
+    request: PyromindCreateConversationRequest,
+    profile: AgentProfileSpec,
+    instructions_prefix: str | None,
+    llm: LLM,
+    conversation_dir: Path,
+    knowledge_base_path: str,
+) -> tuple[Agent, dict[str, SecretSource]]:
+    """Build the full platform capability set for one server-owned Profile."""
+    platform_instructions = PYROMIND_KB_INSTRUCTIONS.format(
+        working_dir=str(conversation_dir),
+        knowledge_alias=_KNOWLEDGE_ALIAS,
+        skills_alias=_SKILLS_ALIAS,
+    )
+    custom_instructions = (
+        f"{instructions_prefix}\n\n{platform_instructions}"
+        if instructions_prefix
+        else platform_instructions
+    )
+    extra_instructions = request.extra.get("custom_instructions")
+    if extra_instructions:
+        custom_instructions += f"\n\n补充说明：{extra_instructions}"
+
+    configure_subagents(conversation_dir, Path(knowledge_base_path))
+
+    skills_path = request.extra.get("skills_path", _DEFAULT_SKILLS_PATH)
+    skills = _load_agent_skills(
+        skills_path,
+        allow_list=list(profile.skill_allowlist),
+    )
+    agent_context = AgentContext(skills=skills) if skills else None
+
+    validation_tool, validation_secrets = _build_workflow_validation_tool(
+        http_request, request.extra
+    )
+    analysis_tool, analysis_secrets = _build_analyze_task_failure_tool(
+        http_request, request.extra
+    )
+    training_tool, training_secrets = _build_training_analysis_tool(
+        http_request, request.extra, skills_path
+    )
+    _run_tool, run_secrets = _build_workflow_run_tool(http_request)
+    debug_tool, debug_secrets = _build_workflow_debug_tool(http_request)
+    sandbox_tools, sandbox_secrets = _build_sandbox_tools(
+        http_request,
+        request.extra,
+    )
+    storage_tools, storage_secrets = _build_pyromind_storage_tools(
+        http_request, request.extra, skills_path
+    )
+    label_studio_tool, label_studio_secrets = _build_label_studio_tool(
+        http_request, request.extra
+    )
+
+    agent = get_codex_agent(
+        llm=llm,
+        cli_mode=True,
+        agent_context=agent_context,
+        custom_instructions=custom_instructions,
+        terminal_params=dict(PYROMIND_TERMINAL_PARAMS),
+        extra_tools=[
+            *(
+                [
+                    Tool(name=SkillsListTool.name),
+                    Tool(name=SkillsReadTool.name),
+                ]
+                if skills
+                else []
+            ),
+            Tool(name="grep"),
+            Tool(name="file_editor"),
+            Tool(name=PyromindSubAgentTool.name),
+            Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
+            Tool(name=SubmitWorkflowTool.name),
+            *sandbox_tools,
+            *storage_tools,
+            validation_tool,
+            analysis_tool,
+            training_tool,
+            *([label_studio_tool] if label_studio_tool is not None else []),
+        ],
+    )
+
+    from openhands.tools.data_preparation.runner import terminal_model_environment
+
+    terminal_secrets = {
+        name: StaticSecret(value=SecretStr(value))
+        for name, value in terminal_model_environment(llm).items()
+    }
+    secrets: dict[str, SecretSource] = {
+        **terminal_secrets,
+        **validation_secrets,
+        **analysis_secrets,
+        **training_secrets,
+        **run_secrets,
+        **debug_secrets,
+        **sandbox_secrets,
+        **storage_secrets,
+        **label_studio_secrets,
+    }
+    allowed_tools = set(profile.tool_allowlist)
+    tools = [tool for tool in agent.tools if tool.name in allowed_tools]
+    return agent.model_copy(update={"tools": tools}), secrets
+
+
+def _build_agent_start_request(
+    *,
+    agent: Agent,
+    workspace: LocalWorkspace,
+    conversation_id: UUID,
+    secrets: dict[str, SecretSource],
+    tags: dict[str, str],
+    user_id: str | None,
+) -> StartConversationRequest:
+    return StartConversationRequest(
+        agent=agent,
+        workspace=workspace,
+        conversation_id=conversation_id,
+        initial_message=None,
+        secrets=secrets,
+        tags=tags,
+        user_id=user_id,
+        confirmation_policy=ConfirmRisky(),
+        security_analyzer=PatternSecurityAnalyzer(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -772,7 +818,7 @@ def _get_validation_cookie_header(http_request: Request) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-class PyromindLLMConfig(BaseModel):
+class AgentLLMConfig(BaseModel):
     """LLM configuration passed from the frontend."""
 
     model: str = Field(
@@ -817,7 +863,7 @@ class PyromindCreateConversationRequest(BaseModel):
     without breaking the API contract.
     """
 
-    llm: PyromindLLMConfig
+    llm: AgentLLMConfig
     message: str | None = Field(
         default=None,
         description="Optional initial user message to start the conversation.",
@@ -1349,93 +1395,23 @@ async def create_pyromind_conversation(
     conversation_dir.mkdir(parents=True, exist_ok=True)
     conversation_dir.chmod(0o700)
     (conversation_dir / "public_data").mkdir(mode=0o700, exist_ok=True)
-    configure_subagents(conversation_dir, Path(knowledge_base_path))
 
-    # 2. Assemble the pyromind KB instructions (layered on the codex base prompt)
-    custom_instructions = PYROMIND_KB_INSTRUCTIONS.format(
-        working_dir=str(conversation_dir),
-        knowledge_alias=_KNOWLEDGE_ALIAS,
-        skills_alias=_SKILLS_ALIAS,
+    # 2. Build the original Pyromind Agent profile and its owned capability set.
+    llm = _build_agent_llm(
+        request.llm,
+        usage_id=PYROMIND_PROFILE.usage_id,
     )
-
-    # Append extra custom instructions from the request if provided
-    extra_instructions = request.extra.get("custom_instructions")
-    if extra_instructions:
-        custom_instructions += f"\n\n补充说明：{extra_instructions}"
-
-    # 3. Load available skills as real Skill objects. Placing them on an
-    #    AgentContext makes the SDK auto-attach InvokeSkillTool so the model can
-    #    actually call invoke_skill(...) (prompt text alone does not attach it).
-    skills_path = request.extra.get("skills_path", _DEFAULT_SKILLS_PATH)
-    skills = _load_agent_skills(skills_path, allow_list=_PYROMIND_SKILL_NAMES)
-    agent_context = AgentContext(skills=skills) if skills else None
-    validation_tool, validation_secrets = _build_workflow_validation_tool(
-        http_request, request.extra
-    )
-    analysis_tool, analysis_secrets = _build_analyze_task_failure_tool(
-        http_request, request.extra
-    )
-    training_tool, training_secrets = _build_training_analysis_tool(
-        http_request, request.extra, skills_path
-    )
-
-    # run_workflow / workflow_debug reuse validate auth/header wiring
-    run_tool, run_secrets = _build_workflow_run_tool(http_request)
-    debug_tool, debug_secrets = _build_workflow_debug_tool(http_request)
-    sandbox_tools, sandbox_secrets = _build_sandbox_tools(
+    agent, agent_secrets = _build_agent_with_profile(
         http_request,
-        request.extra,
-    )
-    # storage
-    storage_tools, storage_secrets = _build_pyromind_storage_tools(
-        http_request, request.extra, skills_path
-    )
-    label_studio_tool, label_studio_secrets = _build_label_studio_tool(
-        http_request, request.extra
-    )
-
-    # 4. Build LLM config
-    llm = LLM(
-        usage_id="pyromind-agent",
-        model=request.llm.model,
-        api_key=request.llm.api_key,
-        base_url=request.llm.base_url,
-        stream=True,
-        timeout=request.llm.timeout or 60,
-        persist_runtime_config=False,
-    )
-
-    # 5. Build the codex-style agent with Pyromind tools and blocking subagents.
-    agent = get_codex_agent(
+        request=request,
+        profile=PYROMIND_PROFILE,
+        instructions_prefix=None,
         llm=llm,
-        cli_mode=True,
-        agent_context=agent_context,
-        custom_instructions=custom_instructions,
-        terminal_params=dict(PYROMIND_TERMINAL_PARAMS),
-        extra_tools=[
-            *(
-                [
-                    Tool(name=SkillsListTool.__name__),
-                    Tool(name=SkillsReadTool.__name__),
-                ]
-                if skills
-                else []
-            ),
-            Tool(name="grep"),
-            Tool(name="file_editor"),
-            Tool(name=PyromindSubAgentTool.name),
-            Tool(name=WorkflowDebugTool.name, params=debug_tool.params),
-            Tool(name=SubmitWorkflowTool.name),
-            *sandbox_tools,
-            *storage_tools,
-            validation_tool,
-            analysis_tool,
-            training_tool,
-            *([label_studio_tool] if label_studio_tool is not None else []),
-        ],
+        conversation_dir=conversation_dir,
+        knowledge_base_path=knowledge_base_path,
     )
 
-    # 6. Build a conversation-private workspace. The knowledge base is accessed
+    # 3. Build a conversation-private workspace. The knowledge base is accessed
     #    separately via its absolute path in the prompt.
     workspace = LocalWorkspace(working_dir=str(conversation_dir))
 
@@ -1447,32 +1423,16 @@ async def create_pyromind_conversation(
         workflow_file.parent.mkdir(parents=True, exist_ok=True)
         workflow_file.write_text(workflow_dsl, encoding="utf-8")
 
-    from openhands.tools.data_preparation.runner import terminal_model_environment
-
-    terminal_secrets = {
-        name: StaticSecret(value=SecretStr(value))
-        for name, value in terminal_model_environment(llm).items()
-    }
-
-    # 7. Assemble StartConversationRequest. Pyromind sends the initial message
+    # 4. Assemble StartConversationRequest. Pyromind sends the initial message
     # after startup through EventService so the workflow snapshot hook can bind
     # the input snapshot to the generated user MessageEvent.id.
     user_id = get_current_user_id(http_request)
-    start_request = StartConversationRequest(
+    start_request = _build_agent_start_request(
         agent=agent,
         workspace=workspace,
         conversation_id=conversation_id,
-        initial_message=None,
         secrets={
-            **terminal_secrets,
-            **validation_secrets,
-            **analysis_secrets,
-            **training_secrets,
-            **run_secrets,
-            **debug_secrets,
-            **sandbox_secrets,
-            **storage_secrets,
-            **label_studio_secrets,
+            **agent_secrets,
             **(
                 {
                     PYROMIND_PRODUCT_USER_ID_SECRET: StaticSecret(
@@ -1483,15 +1443,14 @@ async def create_pyromind_conversation(
                 else {}
             ),
         },
-        tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
+        tags={
+            PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE,
+            PYROMIND_AGENT_PROFILE_TAG_KEY: PYROMIND_PROFILE.tag_value,
+        },
         user_id=user_id,
-        # Pyromind exposes terminal, patch, and workflow execution tools. Treat
-        # unknown-risk actions as requiring user confirmation by default.
-        confirmation_policy=ConfirmRisky(),
-        security_analyzer=PatternSecurityAnalyzer(),
     )
 
-    # 8. Delegate to conversation service
+    # 5. Delegate to conversation service
     try:
         info, is_new = await conversation_service.start_conversation(start_request)
     except PermissionError as e:
@@ -1548,6 +1507,7 @@ async def send_pyromind_message(
     (not into the user's visible message) so the agent knows to treat the
     current file as authoritative.
     """
+    _require_pyromind_tags(event_service.stored.tags)
     current_user = getattr(http_request.state, "current_user", None)
     if isinstance(current_user, CurrentLoginUser):
         await apply_pyromind_validation_context(event_service, current_user)
@@ -1581,6 +1541,7 @@ async def rollback_pyromind_workflow_at_event(
     event_service: EventService = Depends(get_event_service),
 ) -> PyromindWorkflowRollbackResponse:
     """Restore a workflow snapshot when the event has one."""
+    _require_pyromind_tags(event_service.stored.tags)
     current_user = getattr(http_request.state, "current_user", None)
     if isinstance(current_user, CurrentLoginUser):
         await apply_pyromind_validation_context(event_service, current_user)
@@ -1644,6 +1605,17 @@ async def fork_pyromind_conversation_at_event(
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> PyromindForkAtEventResponse:
     """Create a new Pyromind conversation branch at a workflow checkpoint."""
+    user_id = get_current_user_id(http_request)
+    source_event_service = await conversation_service.get_event_service(
+        conversation_id,
+        user_id=user_id,
+    )
+    if source_event_service is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail="Pyromind Agent conversation not found.",
+        )
+    _require_pyromind_tags(source_event_service.stored.tags)
     try:
         (
             conversation,
@@ -1653,7 +1625,7 @@ async def fork_pyromind_conversation_at_event(
             event_id=request.event_id,
             title=request.title,
             tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
-            user_id=get_current_user_id(http_request),
+            user_id=user_id,
         )
     except ConversationForkAtEventSourceNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
