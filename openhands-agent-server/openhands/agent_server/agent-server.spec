@@ -139,6 +139,7 @@ a = Analysis(
         # Pi skill roots required by PiAdapter startup validation
         *get_pi_skill_datas(),
         # Third-party packages that ship data
+        *collect_data_files("pyromind_agent_server", includes=["plan_migrations/**/*.py"]),
         *collect_data_files("tiktoken"),
         *collect_data_files("tiktoken_ext"),
         *collect_data_files("litellm"),
@@ -201,6 +202,8 @@ a = Analysis(
         *collect_submodules("pyromind_agent_server"),
 
         # Third-party dynamic imports
+        "sqlalchemy.dialects.mysql.pymysql",
+        "pymysql",
         *collect_submodules("tiktoken"),
         *collect_submodules("tiktoken_ext"),
         *collect_submodules("litellm"),

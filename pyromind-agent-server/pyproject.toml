@@ -7,7 +7,10 @@ dependencies = [
     "fastapi>=0.104",
     "harness-adapter[openhands]",
     "openhands-agent-server",
-    "pyromind-runtime",
+    "pyromind-runtime[database]",
+    "sqlalchemy>=2,<3",
+    "pymysql>=1.1,<2",
+    "alembic>=1.13,<2",
 ]
 
 [project.scripts]

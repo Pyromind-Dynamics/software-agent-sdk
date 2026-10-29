@@ -18,6 +18,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 
+# EchoMind experiment plans. Explicit deployment environment takes precedence.
+EXPERIMENT_PLAN_ENV_FILE="${EXPERIMENT_PLAN_ENV_FILE:-${SCRIPT_DIR}/.env.experiment-plans.local}"
+if [[ -z "${EXPERIMENT_PLAN_DATABASE_URL:-}" && -f "${EXPERIMENT_PLAN_ENV_FILE}" ]]; then
+  source "${EXPERIMENT_PLAN_ENV_FILE}"
+fi
+export EXPERIMENT_PLAN_DATABASE_URL="${EXPERIMENT_PLAN_DATABASE_URL:-}"
+
 export PYROMIND_HARNESS_BACKEND="pi"
 export APP_ENV="${APP_ENV:-dev}"
 export PYROMIND_PI_TERMINAL_BACKEND="${PYROMIND_PI_TERMINAL_BACKEND:-sandbox}"
@@ -253,6 +260,11 @@ for (const name of ["@earendil-works/pi-coding-agent", "pi-subagents", "@agentge
 }
 JS
 
+# Apply additive plan migrations before serving requests.
+if [[ -n "${EXPERIMENT_PLAN_DATABASE_URL:-}" ]]; then
+  uv run --project "${SOFTWARE_AGENT_SDK_DIR}" python -m pyromind_agent_server.plan_migrations
+fi
+
 # ----------------------------------------------------------
 # Start Agent Server
 # ----------------------------------------------------------
@@ -272,6 +284,7 @@ echo " Conversations:     ${OH_CONVERSATIONS_PATH}"
 echo " Project workspace: ${OH_WORKSPACE_PATH}"
 echo " Bash events:       ${OH_BASH_EVENTS_DIR}"
 echo " Config path:       ${OPENHANDS_AGENT_SERVER_CONFIG_PATH}"
+echo " Plan database:     $([[ -n "${EXPERIMENT_PLAN_DATABASE_URL:-}" ]] && echo configured || echo disabled)"
 echo " Pyromind JWT auth: ${OH_ENABLE_PYROMIND_JWT_AUTH}"
 echo " Server env:        ${APP_ENV:-dev}"
 echo " Kafka env:         ${KAFKA_ENV}"

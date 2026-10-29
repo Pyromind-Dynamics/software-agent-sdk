@@ -5,6 +5,9 @@ description = "Harness-neutral runtime contracts and product event projection fo
 requires-python = ">=3.12"
 dependencies = ["pydantic>=2.12.5"]
 
+[project.optional-dependencies]
+database = ["sqlalchemy>=2,<3"]
+
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"

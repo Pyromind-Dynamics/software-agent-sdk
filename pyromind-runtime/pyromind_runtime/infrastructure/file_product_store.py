@@ -56,6 +56,9 @@ class _Metadata(ContractModel):
     user_id: str
     x_cluster: str | None = None
     harness_id: str = Field(default="openhands", min_length=1)
+    profile_id: str | None = None
+    tool_allowlist: tuple[str, ...] | None = None
+    command_allowlist: tuple[str, ...] | None = None
     capabilities: HarnessCapabilities
     last_sequence: int = Field(default=0, ge=0)
 
@@ -106,6 +109,9 @@ class FileProductStore:
         *,
         user_id: str,
         harness_id: str = "openhands",
+        profile_id: str | None = None,
+        tool_allowlist: tuple[str, ...] | None = None,
+        command_allowlist: tuple[str, ...] | None = None,
     ) -> None:
         if not self.conversation_dir.is_dir():
             raise ProductStoreError("conversation directory does not exist")
@@ -117,13 +123,16 @@ class FileProductStore:
                 raise ProductStoreCorruptionError(
                     "product store belongs to another conversation"
                 )
-            if metadata.user_id != user_id:
+            if metadata.user_id != user_id or metadata.profile_id != profile_id:
                 raise PermissionError("conversation does not belong to current user")
             return
         metadata = _Metadata(
             conversation_id=snapshot.conversation_id,
             user_id=user_id,
             harness_id=harness_id,
+            profile_id=profile_id,
+            tool_allowlist=tool_allowlist,
+            command_allowlist=command_allowlist,
             capabilities=snapshot.capabilities,
         )
         try:
@@ -143,10 +152,27 @@ class FileProductStore:
             self.directory.rmdir()
             raise
 
-    def authorize(self, user_id: str) -> None:
+    def authorize(self, user_id: str, profile_id: str | None = None) -> None:
         metadata = self._load_metadata()
-        if metadata.user_id != user_id:
+        if metadata.user_id != user_id or metadata.profile_id != profile_id:
             raise PermissionError("conversation does not belong to current user")
+
+    def permits_tool(self, name: str) -> bool:
+        allowed = self._load_metadata().tool_allowlist
+        return allowed is not None and name in allowed
+
+    def access_policy(self) -> dict:
+        metadata = self._load_metadata()
+        return {
+            "profile_id": metadata.profile_id,
+            "tool_allowlist": metadata.tool_allowlist,
+            "command_allowlist": metadata.command_allowlist,
+        }
+
+    def require_command(self, command_type: str) -> None:
+        allowed = self._load_metadata().command_allowlist
+        if allowed is not None and command_type not in allowed:
+            raise PermissionError("command is not enabled for this conversation")
 
     def load_x_cluster(self) -> str | None:
         return self._load_metadata().x_cluster

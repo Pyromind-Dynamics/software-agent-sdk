@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+from dataclasses import replace
 from typing import Annotated
 from uuid import uuid4
 
@@ -27,6 +28,7 @@ from pyromind_agent_server.api.schemas import (
 )
 from pyromind_agent_server.auth_context import request_context
 from pyromind_agent_server.bootstrap import ensure_product_runtime
+from pyromind_agent_server.profiles import DEFAULT_PRODUCT_PROFILE, ConversationProfile
 
 
 _SSE_HEARTBEAT_SECONDS = 15.0
@@ -57,10 +59,15 @@ def get_conversation_service(request: Request) -> ConversationService:
     return service
 
 
-def create_product_router() -> APIRouter:
+def create_product_router(
+    profile: ConversationProfile = DEFAULT_PRODUCT_PROFILE,
+) -> APIRouter:
+    def context_for(request: Request):
+        return replace(request_context(request), profile_id=profile.profile_id)
+
     router = APIRouter(
-        prefix="/api/v2/pyromind/conversations",
-        tags=["Pyromind Product API"],
+        prefix=profile.route_prefix,
+        tags=["Product API"],
         dependencies=[Depends(check_session_api_key)],
     )
 
@@ -74,7 +81,7 @@ def create_product_router() -> APIRouter:
             return await get_product_runtime(request).prepare_workflow_execution(
                 conversation_id,
                 body.workflow_path,
-                request_context(request),
+                context_for(request),
                 request_id=body.request_id,
             )
         except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
@@ -89,7 +96,13 @@ def create_product_router() -> APIRouter:
         body: CreateConversationRequest,
         request: Request,
     ) -> ConversationSnapshot:
-        context = request_context(request)
+        context = context_for(request)
+        runtime = get_product_runtime(request)
+        if profile.tool_allowlist and "get_experiment_plan" in profile.tool_allowlist:
+            if not runtime.experiment_plans_available:
+                raise HTTPException(503, detail="Plan database is not configured")
+            if body.workflow_xyflow is not None:
+                raise HTTPException(422, detail="Workflow execution is not enabled")
         conversation_id = uuid4().hex
         conversations_dir = get_conversation_service(request).conversations_dir
         spec = SessionSpec(
@@ -101,6 +114,12 @@ def create_product_router() -> APIRouter:
             model_configuration=body.llm.model_dump(mode="json"),
             user_input_enabled=body.user_input_enabled,
             extra=body.extra,
+            profile_id=profile.profile_id,
+            harness_id=profile.harness_id,
+            product_instructions=profile.instructions,
+            tool_allowlist=profile.tool_allowlist,
+            skill_allowlist=profile.skill_allowlist,
+            command_allowlist=profile.command_allowlist,
         )
         try:
             return await get_product_runtime(request).create_conversation(spec, context)
@@ -109,9 +128,7 @@ def create_product_router() -> APIRouter:
 
     @router.get("", response_model=tuple[ConversationSnapshot, ...])
     async def list_conversations(request: Request) -> tuple[ConversationSnapshot, ...]:
-        return await get_product_runtime(request).list_snapshots(
-            request_context(request)
-        )
+        return await get_product_runtime(request).list_snapshots(context_for(request))
 
     @router.get("/{conversation_id}/snapshot", response_model=ConversationSnapshot)
     async def get_snapshot(
@@ -120,8 +137,10 @@ def create_product_router() -> APIRouter:
     ) -> ConversationSnapshot:
         try:
             return await get_product_runtime(request).get_snapshot(
-                conversation_id, request_context(request)
+                conversation_id, context_for(request)
             )
+        except ProductRuntimeError as exc:
+            raise _product_error(exc) from exc
         except (
             FileNotFoundError,
             PermissionError,
@@ -142,7 +161,7 @@ def create_product_router() -> APIRouter:
     ) -> CommandReceipt:
         try:
             return await get_product_runtime(request).submit_command(
-                conversation_id, command, request_context(request)
+                conversation_id, command, context_for(request)
             )
         except CommandConflictError as exc:
             raise HTTPException(
@@ -174,10 +193,12 @@ def create_product_router() -> APIRouter:
         last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
     ) -> StreamingResponse:
         cursor = _resolve_cursor(after_seq, last_event_id)
-        context = request_context(request)
+        context = context_for(request)
         runtime = get_product_runtime(request)
         try:
             await runtime.get_snapshot(conversation_id, context)
+        except ProductRuntimeError as exc:
+            raise _product_error(exc) from exc
         except (
             FileNotFoundError,
             PermissionError,
@@ -195,6 +216,23 @@ def create_product_router() -> APIRouter:
             },
         )
 
+    @router.get("/{conversation_id}/experiment-plans")
+    async def get_experiment_plan(
+        conversation_id: str,
+        request: Request,
+        revision: Annotated[int | None, Query(ge=1)] = None,
+    ):
+        try:
+            return await get_product_runtime(request).get_experiment_plan(
+                conversation_id, context_for(request), revision
+            )
+        except ProductRuntimeError as exc:
+            raise _product_error(exc) from exc
+        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
+            raise _not_found(conversation_id) from exc
+        except ValueError as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
+
     @router.post(
         "/{conversation_id}/forks",
         response_model=ConversationSnapshot,
@@ -205,7 +243,7 @@ def create_product_router() -> APIRouter:
         body: ForkConversationRequest,
         request: Request,
     ) -> ConversationSnapshot:
-        context = request_context(request)
+        context = context_for(request)
         try:
             return await get_product_runtime(request).fork_conversation(
                 conversation_id,
@@ -234,6 +272,7 @@ def _not_found(conversation_id: str) -> HTTPException:
 
 def _product_error(error: ProductRuntimeError) -> HTTPException:
     status_code = {
+        "plan_store_unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
         "conversation_not_found": status.HTTP_404_NOT_FOUND,
         "checkpoint_not_found": status.HTTP_404_NOT_FOUND,
         "capacity_exceeded": status.HTTP_429_TOO_MANY_REQUESTS,

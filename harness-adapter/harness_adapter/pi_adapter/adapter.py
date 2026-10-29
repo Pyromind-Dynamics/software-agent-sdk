@@ -139,24 +139,7 @@ directories outside the workspace; terminal commands use their absolute paths.
 Use update_plan for complex, multi-step work. Each call must contain the complete
 plan snapshot; keep at most one step in_progress, mark completed steps promptly,
 and do not use it for simple tasks.
-For Pyromind workflow requests, read the matching
-skill before editing exactly
-public_data/workflow_canvas/workflow.py, then call validate_workflow_dsl without
-dsl_path; pass it only when validating another workspace file. Do not inspect
-credentials or work around failed validation authentication.
-
-For model evaluation, baseline benchmarks, post-training evaluation,
-ground-truth comparisons or evaluation reports, read the inference-evaluation
-skill and follow its instructions.
-
-Route other dataset work before acting. Use the data-processing skill for any
-dataset request; its SKILL.md routing table selects the paradigm:
-format-conversion for deterministic field, format, structure, regex, keyword,
-and length transformations; llm-pipeline for content assessment, DataFlow
-operators, LLM processing, images, and multimodal work; environment-processing
-for tasks that require a specific sandbox runtime, including embodied robot
-data cleaning. If the intent is ambiguous, ask the user first.
-Never start both full-run paths for one request."""
+"""
 
 # Appended only when the execution plane is the platform Sandbox, where the
 # user's Storage is mounted and reading data is a local operation.
@@ -267,6 +250,7 @@ class PiAdapter:
         else:
             repository = Path(__file__).parents[3]
         self._workflow_call = workflow_call
+        self._plan_call: Any = None
         self._execution_outputs: dict[str, tuple[str, WorkflowEventSink]] = {}
         self._terminal_backend = validate_pi_terminal_backend(terminal_backend)
         self._conversation_root = Path(conversation_root).resolve()
@@ -353,6 +337,45 @@ class PiAdapter:
     ) -> None:
         self._business_tools.version_call = callback
         self._business_tools.execution_call = execution
+
+    def set_plan_handler(self, callback: Any) -> None:
+        self._plan_call = callback
+
+    def _tool_allowed(self, session: _PiSession, name: str) -> bool:
+        allowed = session.config.get("tool_allowlist")
+        return allowed is None or name in allowed
+
+    def _tool_specs(self, session: _PiSession) -> list[dict[str, Any]]:
+        from pyromind_runtime.domain.experiment_plans import PLAN_TOOLS
+
+        specs = self._business_tools.specs(sandbox=self._terminal_backend == "sandbox")
+        if self._plan_call is not None:
+            descriptions = {
+                "create_experiment_plan": (
+                    "Create a reviewable experiment plan proposal. "
+                    "Does not create a project or authorize execution."
+                ),
+                "revise_experiment_plan": (
+                    "Propose a complete replacement plan based on expected_revision. "
+                    "Include source_proposal_id when editing a pending draft. "
+                    "Preserve unchanged stage/task IDs. Requires user confirmation."
+                ),
+                "get_experiment_plan": (
+                    "Read the authoritative current plan and pending proposal, "
+                    "or a specified historical revision."
+                ),
+            }
+            specs += [
+                {
+                    "name": name,
+                    "description": descriptions[name],
+                    "input_schema": model.model_json_schema(),
+                }
+                for name, model in PLAN_TOOLS.items()
+                if session.config.get("tool_allowlist") is not None
+                and self._tool_allowed(session, name)
+            ]
+        return [spec for spec in specs if self._tool_allowed(session, spec["name"])]
 
     def set_workflow_preparer(self, callback: Any) -> None:
         self._business_tools.set_workflow_preparer(callback)
@@ -1230,9 +1253,9 @@ class PiAdapter:
                 ),
                 "system_prompt": system_prompt,
                 "model": {**session.config["model"], "api_key": api_key},
-                "tools": self._business_tools.specs(
-                    sandbox=self._terminal_backend == "sandbox"
-                ),
+                "tools": self._tool_specs(session),
+                "tool_allowlist": session.config.get("tool_allowlist"),
+                "skill_allowlist": session.config.get("skill_allowlist"),
                 "terminal_environment": (
                     self._business_tools.terminal_environment(
                         replace(
@@ -1278,6 +1301,10 @@ class PiAdapter:
         self, session: _PiSession, method: str, params: dict[str, Any]
     ) -> Any:
         if method == "workflow.invoke":
+            if not self._tool_allowed(
+                session, "genome_" + str(params.get("action", ""))
+            ):
+                raise PermissionError("workflow tool is not enabled")
             if self._workflow_call is None:
                 raise ValueError("workflows are not configured")
             action, arguments, request_id = (
@@ -1320,9 +1347,26 @@ class PiAdapter:
             tool_name = params.get("tool_name")
             if not isinstance(tool_name, str):
                 raise ValueError("tool_name must be a string")
+            if not self._tool_allowed(session, tool_name):
+                raise PermissionError("tool is not enabled for this conversation")
             arguments = params.get("arguments")
             if not isinstance(arguments, dict):
                 raise ValueError("tool arguments must be an object")
+            from pyromind_runtime.domain.experiment_plans import PLAN_TOOLS
+
+            if tool_name in PLAN_TOOLS:
+                if self._plan_call is None:
+                    raise ValueError("plan tools are not configured")
+                result = await self._plan_call(
+                    session.session_id, tool_name, arguments, session.context
+                )
+                return {
+                    "content": [
+                        {"type": "text", "text": json.dumps(result, ensure_ascii=False)}
+                    ],
+                    "details": result,
+                    "is_error": False,
+                }
             result = await self._business_tools.execute(
                 tool_name,
                 arguments,
@@ -1368,6 +1412,8 @@ class PiAdapter:
                 pending.future.set_result((False, "Subagent request cancelled"))
             return {"cancelled": True}
         if method == "permission.check":
+            if not self._tool_allowed(session, "terminal"):
+                raise PermissionError("terminal execution is not enabled")
             arguments = params.get("arguments")
             tool_call_id = params.get("tool_call_id")
             if not isinstance(arguments, dict) or not isinstance(tool_call_id, str):
@@ -1896,6 +1942,9 @@ def _session_config(spec: SessionSpec) -> dict[str, Any]:
     return {
         "session_id": spec.conversation_id,
         "product_instructions": spec.product_instructions,
+        "profile_id": spec.profile_id,
+        "tool_allowlist": spec.tool_allowlist,
+        "skill_allowlist": spec.skill_allowlist,
         "protocol_version": PROTOCOL_VERSION,
         "model": {
             "provider": provider,

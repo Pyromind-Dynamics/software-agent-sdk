@@ -184,6 +184,7 @@ repomix-output.txt
 # misc
 .DS_Store
 .env.local
+.env.experiment-plans.local
 .env.development.local
 .env.test.local
 .env.production.local

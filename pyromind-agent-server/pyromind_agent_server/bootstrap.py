@@ -29,6 +29,8 @@ from openhands.agent_server.run_workflow_callback import set_workflow_status_dis
 from openhands.agent_server.storage_quota import ensure_conversation_quota
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
+from pyromind_agent_server.plan_database import build_experiment_plan_store
+from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 
 
@@ -161,35 +163,32 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             scope, action, arguments, request_id, context, origin_run_id
         )
 
-    if backend == "pi":
-        terminal_backend = resolve_pi_terminal_backend()
-        pi_adapter = PiAdapter(
-            service.conversations_dir,
-            terminal_backend=terminal_backend,
-            apply_workspace_quota=ensure_conversation_quota,
-            pipeline_runs=pipeline_runs,
-            workflow_call=workflow_call if workflow_enabled else None,
-        )
-        pi_adapter.set_version_handler(version_call, execution_call)
-        adapters["pi"] = pi_adapter
-        if workflow_enabled:
+    terminal_backend = resolve_pi_terminal_backend()
+    pi_adapter = PiAdapter(
+        service.conversations_dir,
+        terminal_backend=terminal_backend,
+        apply_workspace_quota=ensure_conversation_quota,
+        pipeline_runs=pipeline_runs,
+        workflow_call=workflow_call if workflow_enabled else None,
+    )
+    pi_adapter.set_version_handler(version_call, execution_call)
+    adapters["pi"] = pi_adapter
+    if workflow_enabled and backend == "pi":
 
-            def execution_host(scope: str) -> ExecutionHost:
-                def subscribe(
-                    execution_id: str, sink: WorkflowEventSink | None
-                ) -> None:
-                    pi_adapter.execution_subscribe(scope, execution_id, sink)
+        def execution_host(scope: str) -> ExecutionHost:
+            def subscribe(execution_id: str, sink: WorkflowEventSink | None) -> None:
+                pi_adapter.execution_subscribe(scope, execution_id, sink)
 
-                return ExecutionHost(
-                    pi_adapter.execution_request(scope),
-                    subscribe,
-                    service.conversations_dir / scope,
-                )
-
-            workflows = AgentGenomeBackend(
-                agentgenome_home(service.conversations_dir),
-                execution_host,
+            return ExecutionHost(
+                pi_adapter.execution_request(scope),
+                subscribe,
+                service.conversations_dir / scope,
             )
+
+        workflows = AgentGenomeBackend(
+            agentgenome_home(service.conversations_dir),
+            execution_host,
+        )
     idle_eviction_seconds = int(
         os.getenv("PYROMIND_IDLE_CONVERSATION_EVICTION_SECONDS", "300")
     )
@@ -221,6 +220,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         service.conversations_dir,
         adapters,
         default_harness_id=backend,
+        experiment_plan_store=build_experiment_plan_store(),
         external_tasks=external_tasks,
         idle_eviction_seconds=idle_eviction_seconds,
         release_grace_seconds=release_grace_seconds,
@@ -232,10 +232,8 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         versions=versions,
         evaluation_storage_factory=build_evaluation_storage,
     )
-    if backend == "pi":
-        adapter = adapters["pi"]
-        assert isinstance(adapter, PiAdapter)
-        adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
+    pi_adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
+    pi_adapter.set_plan_handler(runtime.experiment_plan_call)
     logger.info(
         "Pyromind product runtime ready: default_harness=%s "
         "PYROMIND_HARNESS_BACKEND=%s registered_harnesses=%s "
@@ -310,5 +308,6 @@ def install_product_api(app: FastAPI) -> FastAPI:
 
     app.router.lifespan_context = product_lifespan
     app.include_router(create_product_router())
+    app.include_router(create_product_router(ECHOMIND_PRODUCT_PROFILE))
     app.include_router(create_evaluation_runs_router())
     return app

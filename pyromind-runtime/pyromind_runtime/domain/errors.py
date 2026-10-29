@@ -4,6 +4,7 @@ from typing import Literal
 
 
 type ProductErrorCode = Literal[
+    "plan_store_unavailable",
     "conversation_not_found",
     "checkpoint_not_found",
     "conversation_busy",

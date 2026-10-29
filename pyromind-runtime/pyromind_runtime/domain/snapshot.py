@@ -7,6 +7,7 @@ from pydantic import Field, JsonValue, field_validator, model_serializer
 from pyromind_runtime.domain.base import AwareDatetime, ContractModel
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.content import ContentBlock, JsonObject
+from pyromind_runtime.domain.experiment_plans import ExperimentPlanView
 from pyromind_runtime.domain.user_input import PendingUserInput
 
 
@@ -172,6 +173,7 @@ class ConversationSnapshot(ContractModel):
     timeline: tuple[TimelineItem, ...] = ()
     current_workflow: WorkflowState | None = None
     plan: PlanState | None = None
+    experiment_plan: ExperimentPlanView | None = None
     pending_permissions: tuple[PendingPermission, ...] = ()
     pending_inputs: tuple[PendingUserInput, ...] = ()
     # Automatic-turn suspension is separate from display status and is released by
@@ -188,6 +190,8 @@ class ConversationSnapshot(ContractModel):
         # Omit empty input state and default policy for disabled sessions so strict
         # older clients remain compatible; old serialized snapshots use the defaults.
         data = handler(self)
+        if self.experiment_plan is None:
+            data.pop("experiment_plan", None)
         if not self.pending_inputs:
             data.pop("pending_inputs", None)
         if not self.automatic_turns_suspended:

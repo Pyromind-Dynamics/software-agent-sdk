@@ -1462,11 +1462,7 @@ async def test_history_result_recovers_once_without_reexecuting(
 
 
 @pytest.mark.parametrize("harness", ["pi", "openhands"])
-async def test_runtime_supplies_same_shared_flywheel_instructions(tmp_path, harness):
-    from pyromind_runtime.application.product_instructions import (
-        DATA_FLYWHEEL_INSTRUCTIONS,
-    )
-
+async def test_runtime_preserves_profile_supplied_instructions(tmp_path, harness):
     adapter = FakeAdapter(harness)
     runtime = ConversationRuntime(tmp_path, adapter, default_harness_id=harness)
     await runtime.create_conversation(
@@ -1478,7 +1474,7 @@ async def test_runtime_supplies_same_shared_flywheel_instructions(tmp_path, harn
         ),
         RequestContext(user_id="u"),
     )
-    assert adapter.created_specs[0].product_instructions == (
-        DATA_FLYWHEEL_INSTRUCTIONS + "\nAdditional business context."
+    assert (
+        adapter.created_specs[0].product_instructions == "Additional business context."
     )
     await runtime.close()

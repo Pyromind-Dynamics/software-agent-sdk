@@ -1,3 +1,4 @@
+import { capabilityCeiling, restrictSkillReads } from "./session-policy.js";
 import { fileURLToPath } from "node:url";
 import { SubagentHost } from "./subagent-host.js";
 import { ToolCoordinator } from "./tool-coordinator.js";
@@ -57,6 +58,8 @@ interface PiSessionConfig extends PiModelConfig {
   knowledgeRoot?: string;
   resourceLimits?: ResourceLimitsConfig;
   tools: BusinessToolConfig[];
+  toolAllowlist?: string[];
+  skillAllowlist?: string[];
 }
 
 export interface ParsedPrompt {
@@ -174,7 +177,15 @@ export async function createPiSession(
   if (sessionOptions.askUserTool) rawTools.push(sessionOptions.askUserTool);
   if (!executionAccess) throw new Error("execution environment was not initialized");
   const coordinator = new ToolCoordinator();
-  const tools = rawTools.map((tool) => coordinator.wrap(tool, peer));
+  const allowedSkillRoots = config.skillAllowlist?.map(name => {
+    const root = config.skillsDirectory ? join(config.skillsDirectory, name) : config.skillRoots.find(root => root.name === name)?.path;
+    if (!root) throw new Error(`Unknown allowed skill: ${name}`);
+    const canonical = realpathSync(root);
+    if (!skillPaths.some(parent => inside(canonical, parent))) throw new Error("Allowed skill escapes resource roots");
+    return canonical;
+  });
+  const tools = rawTools.map((tool) => coordinator.wrap(
+    restrictSkillReads(tool, config.workspaceRoot, skillPaths, allowedSkillRoots, config.skillsDirectory), peer));
   const childTools = tools.filter((tool) => ["read", "write", "edit", "terminal"].includes(tool.name)).map((tool) => {
     if (tool.name !== "read" || config.terminalBackend !== "sandbox") return tool;
     return { ...tool, execute: (id: string, args: any, signal?: AbortSignal, update?: any) => coordinator.run(signal, async () => {
@@ -210,6 +221,7 @@ export async function createPiSession(
       createToolResultExtension(),
       createNoProgressGuardExtension(),
       { name: "no-spin", factory: createNoSpinExtension(sessionOptions.onRepetitionDetected) },
+      capabilityCeiling(config.toolAllowlist),
       (pi) => {
         if (config.terminalBackend !== "sandbox") return;
         pi.on("before_agent_start", (event) => {
@@ -251,7 +263,7 @@ export async function createPiSession(
       skills: skills.filter((skill) => {
         try {
           const path = realpathSync(skill.filePath);
-          return skillPaths.some((root) => inside(path, root));
+          return (allowedSkillRoots ?? skillPaths).some((root) => inside(path, root));
         } catch {
           return false;
         }
@@ -342,6 +354,8 @@ function parseConfig(value: JsonObject): PiSessionConfig {
     knowledgeRoot: optionalString(value, "knowledge_root"),
     resourceLimits: parseResourceLimits(value.resource_limits),
     tools: parseTools(value.tools),
+    toolAllowlist: parseAllowlist(value.tool_allowlist),
+    skillAllowlist: parseAllowlist(value.skill_allowlist),
   };
 }
 
@@ -417,6 +431,12 @@ function parseSkillRoots(value: JsonObject): SkillRootConfig[] {
   }
   if (value.skill_root === undefined && optionalString(value, "skills_directory")) return [];
   return [{ name: "skill", path: requiredString(value, "skill_root") }];
+}
+
+function parseAllowlist(value: JsonValue | undefined): string[] | undefined {
+  if (value == null) return undefined;
+  if (!Array.isArray(value) || value.some(item => typeof item !== "string" || !item || item.includes("/") || item.includes("\\") || item === "..")) throw new Error("invalid capability allowlist");
+  return value as string[];
 }
 
 function parseTools(value: JsonValue | undefined): BusinessToolConfig[] {

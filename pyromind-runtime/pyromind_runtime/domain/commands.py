@@ -66,12 +66,27 @@ class InputResponseCommand(ContractModel):
         return self
 
 
+class ConfirmExperimentPlanCommand(ContractModel):
+    command_id: str = Field(min_length=1, max_length=128)
+    type: Literal["confirm_experiment_plan"] = "confirm_experiment_plan"
+    proposal_id: str = Field(min_length=1)
+    expected_revision: int = Field(ge=0)
+
+
+class RejectExperimentPlanCommand(ContractModel):
+    command_id: str = Field(min_length=1, max_length=128)
+    type: Literal["reject_experiment_plan"] = "reject_experiment_plan"
+    proposal_id: str = Field(min_length=1)
+
+
 type ProductCommand = Annotated[
     UserMessageCommand
     | CancelCommand
     | PermissionResponseCommand
     | RollbackWorkflowCommand
-    | InputResponseCommand,
+    | InputResponseCommand
+    | ConfirmExperimentPlanCommand
+    | RejectExperimentPlanCommand,
     Field(discriminator="type"),
 ]
 

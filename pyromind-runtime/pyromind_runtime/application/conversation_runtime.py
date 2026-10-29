@@ -26,7 +26,7 @@ from pyromind_runtime.application.evaluation_cases import (
     EvaluationMedia,
 )
 from pyromind_runtime.application.event_projection import ProductEventProjector
-from pyromind_runtime.application.product_instructions import DATA_FLYWHEEL_INSTRUCTIONS
+from pyromind_runtime.application.experiment_plans import ExperimentPlans
 from pyromind_runtime.application.reusable_workflows import (
     ReusableWorkflows,
     started_run,
@@ -38,9 +38,11 @@ from pyromind_runtime.domain.capabilities import ResourceLimits
 from pyromind_runtime.domain.commands import (
     CancelCommand,
     CommandReceipt,
+    ConfirmExperimentPlanCommand,
     InputResponseCommand,
     PermissionResponseCommand,
     ProductCommand,
+    RejectExperimentPlanCommand,
     RollbackWorkflowCommand,
     UserMessageCommand,
 )
@@ -58,6 +60,15 @@ from pyromind_runtime.domain.evaluation import (
     AnnotationSummaryResult,
 )
 from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.experiment_plans import (
+    PLAN_TOOLS,
+    CreateExperimentPlan,
+    ExperimentPlanView,
+    GetExperimentPlan,
+    PlanOwner,
+    PlanRevision,
+    ReviseExperimentPlan,
+)
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
@@ -77,6 +88,7 @@ from pyromind_runtime.infrastructure.file_product_store import (
     FileProductStore,
     ProductStoreError,
 )
+from pyromind_runtime.ports.experiment_plans import ExperimentPlanStore
 from pyromind_runtime.ports.external_tasks import ExternalTaskRegistry
 from pyromind_runtime.ports.harness import (
     ExternalTaskNotification,
@@ -153,6 +165,7 @@ class ConversationRuntime:
         adapters: HarnessAdapter | Mapping[str, HarnessAdapter],
         *,
         default_harness_id: str = "openhands",
+        experiment_plan_store: ExperimentPlanStore | None = None,
         external_tasks: ExternalTaskRegistry | None = None,
         idle_eviction_seconds: int = 300,
         release_grace_seconds: int = 300,
@@ -174,6 +187,9 @@ class ConversationRuntime:
         if default_harness_id not in self.adapters:
             raise ValueError(f"default harness is not registered: {default_harness_id}")
         self.default_harness_id = default_harness_id
+        self._experiment_plans = (
+            ExperimentPlans(experiment_plan_store) if experiment_plan_store else None
+        )
         self._resource_limits = resource_limits
         self._external_tasks = external_tasks
         self._workflow_submission = workflow_submission
@@ -217,6 +233,123 @@ class ConversationRuntime:
         self._evaluation_annotation_cache_lock = threading.Lock()
         self._pending_task_registrations: dict[str, asyncio.Event] = {}
 
+    @property
+    def experiment_plans_available(self) -> bool:
+        return self._experiment_plans is not None
+
+    def _plan_service(
+        self, conversation_id: str, context: RequestContext, tool_name: str
+    ) -> tuple[ExperimentPlans, PlanOwner]:
+        store = self._store(conversation_id)
+        store.authorize(context.user_id, context.profile_id)
+        if not store.permits_tool(tool_name):
+            raise PermissionError("plan capability is not enabled")
+        if self._experiment_plans is None:
+            raise ProductRuntimeError(
+                "plan_store_unavailable", "Plan database is not configured."
+            )
+        return self._experiment_plans, PlanOwner(
+            user_id=context.user_id,
+            conversation_id=conversation_id,
+            profile_id=context.profile_id,
+        )
+
+    @staticmethod
+    async def _plan_io[T](call: Callable[..., T], *args: Any) -> T:
+        try:
+            return await asyncio.to_thread(call, *args)
+        except (ValueError, PermissionError):
+            raise
+        except Exception as exc:
+            raise ProductRuntimeError(
+                "plan_store_unavailable", "Plan database is unavailable; retry shortly."
+            ) from exc
+
+    async def get_experiment_plan(
+        self, conversation_id: str, context: RequestContext, revision: int | None = None
+    ) -> ExperimentPlanView | PlanRevision:
+        service, owner = self._plan_service(
+            conversation_id, context, "get_experiment_plan"
+        )
+        if revision is not None:
+            return await self._plan_io(service.store.revision, owner, revision)
+        return await self._plan_io(service.store.view, owner)
+
+    async def experiment_plan_call(
+        self,
+        conversation_id: str,
+        tool_name: str,
+        arguments: JsonObject,
+        context: RequestContext,
+    ) -> JsonObject:
+        if tool_name not in PLAN_TOOLS:
+            raise PermissionError("unknown plan tool")
+        service, owner = self._plan_service(conversation_id, context, tool_name)
+        request = PLAN_TOOLS[tool_name].model_validate(arguments)
+        if isinstance(request, GetExperimentPlan):
+            result = await self.get_experiment_plan(
+                conversation_id, context, request.revision
+            )
+        else:
+            assert isinstance(request, (CreateExperimentPlan, ReviseExperimentPlan))
+            result = await self._plan_io(service.propose, owner, request)
+            self._notify_plan_changed(conversation_id, result.proposal_id)
+        return result.model_dump(mode="json")
+
+    def _notify_plan_changed(self, conversation_id: str, change_id: str) -> None:
+        # SQL is authoritative. A lost refresh hint never changes a committed result.
+        try:
+            event, _ = self._store(conversation_id).append(
+                ProductEvent(
+                    event_id=f"plan:{change_id}",
+                    conversation_id=conversation_id,
+                    type="experiment_plan.changed",
+                    payload={},
+                )
+            )
+            self._publish(event)
+        except Exception:
+            logger.warning(
+                "Plan saved; refresh notification failed for %s", conversation_id
+            )
+
+    async def _submit_plan_decision(
+        self,
+        conversation_id: str,
+        command: ConfirmExperimentPlanCommand | RejectExperimentPlanCommand,
+        context: RequestContext,
+    ) -> CommandReceipt:
+        service, owner = self._plan_service(
+            conversation_id, context, "get_experiment_plan"
+        )
+        store = self._store(conversation_id)
+        receipt, claimed = store.claim_command(command)
+        if not claimed and receipt.status == "completed":
+            return receipt
+        if isinstance(command, ConfirmExperimentPlanCommand):
+            revision = await self._plan_io(
+                service.store.confirm,
+                owner,
+                command.proposal_id,
+                command.expected_revision,
+                command.command_id,
+            )
+            response = revision.model_dump(mode="json")
+        else:
+            await self._plan_io(service.store.reject, owner, command.proposal_id)
+            response = {"rejected": True, "proposal_id": command.proposal_id}
+        completed = receipt.model_copy(
+            update={"status": "completed", "response": response}
+        )
+        self._notify_plan_changed(conversation_id, command.command_id)
+        try:
+            store.complete_command(completed)
+        except Exception:
+            logger.warning(
+                "Plan saved; command receipt write failed for %s", conversation_id
+            )
+        return completed
+
     async def version_call(
         self,
         conversation_id: str,
@@ -224,7 +357,7 @@ class ConversationRuntime:
         command_id: str,
         context: RequestContext,
     ) -> dict[str, Any]:
-        self._store(conversation_id).authorize(context.user_id)
+        self._store(conversation_id).authorize(context.user_id, context.profile_id)
         if self.versions is None:
             raise ValueError("version management is unavailable")
         return await asyncio.to_thread(
@@ -242,7 +375,7 @@ class ConversationRuntime:
     ) -> dict[str, Any]:
         """Submit an already-authorized tool action through the durable product path."""
         store = self._store(conversation_id)
-        store.authorize(context.user_id)
+        store.authorize(context.user_id, context.profile_id)
         if self.versions is None or self._workflow_submission is None:
             raise ValueError("versioned submission is unavailable")
         identity = "tool:" + request_id
@@ -342,7 +475,7 @@ class ConversationRuntime:
         if context is None or self._evaluation_storage_factory is None:
             return
         store = self._store(conversation_id)
-        store.authorize(context.user_id)
+        store.authorize(context.user_id, context.profile_id)
         completed = {
             task.task_id
             for task in store.load_snapshot().external_tasks
@@ -379,7 +512,7 @@ class ConversationRuntime:
         )
 
         store = self._store(conversation_id)
-        store.authorize(context.user_id)
+        store.authorize(context.user_id, context.profile_id)
         with self._evaluation_annotation_cache_lock:
             return TrainingEvaluations(store, storage).finalize(run_id)
 
@@ -429,7 +562,7 @@ class ConversationRuntime:
             return
         store = self._store(conversation_id)
         if context is not None:
-            store.authorize(context.user_id)
+            store.authorize(context.user_id, context.profile_id)
         versions = self.versions
 
         def reconcile() -> None:
@@ -1079,21 +1212,15 @@ class ConversationRuntime:
         context: RequestContext,
     ) -> ConversationSnapshot:
         total_started_at = time.perf_counter()
-        adapter = self._adapter(self.default_harness_id)
+        if spec.user_id != context.user_id or spec.profile_id != context.profile_id:
+            raise PermissionError("session identity does not match request")
+        harness_id = spec.harness_id or self.default_harness_id
+        adapter = self._adapter(harness_id)
         adapter_started_at = time.perf_counter()
         self._cancel_retention(spec.conversation_id)
         await self._make_room()
         if self._resource_limits is not None:
             spec = spec.model_copy(update={"resource_limits": self._resource_limits})
-        spec = spec.model_copy(
-            update={
-                "product_instructions": "\n".join(
-                    part
-                    for part in (DATA_FLYWHEEL_INSTRUCTIONS, spec.product_instructions)
-                    if part
-                )
-            }
-        )
         handle = await adapter.create_session(spec, context)
         self._log_timing(
             "adapter.create_session_ms",
@@ -1101,7 +1228,7 @@ class ConversationRuntime:
             conversation_id=handle.session_id,
             harness_id=handle.harness_id,
         )
-        if handle.harness_id != self.default_harness_id:
+        if handle.harness_id != harness_id:
             await adapter.close(handle)
             raise ValueError(
                 "adapter returned a handle for a different harness: "
@@ -1122,6 +1249,9 @@ class ConversationRuntime:
                 ),
                 user_id=context.user_id,
                 harness_id=handle.harness_id,
+                profile_id=spec.profile_id,
+                tool_allowlist=spec.tool_allowlist,
+                command_allowlist=spec.command_allowlist,
             )
             store.save_x_cluster(context.x_cluster)
             store.append(
@@ -1165,7 +1295,11 @@ class ConversationRuntime:
         context: RequestContext,
     ) -> ConversationSnapshot:
         store = await self._read_store(conversation_id, context)
-        return store.load_snapshot()
+        snapshot = store.load_snapshot()
+        if store.permits_tool("get_experiment_plan"):
+            view = await self.get_experiment_plan(conversation_id, context)
+            snapshot = snapshot.model_copy(update={"experiment_plan": view})
+        return snapshot
 
     async def submit_command(
         self,
@@ -1173,8 +1307,13 @@ class ConversationRuntime:
         command: ProductCommand,
         context: RequestContext,
     ) -> CommandReceipt:
+        store = await self._read_store(conversation_id, context)
+        store.require_command(command.type)
+        if isinstance(
+            command, (ConfirmExperimentPlanCommand, RejectExperimentPlanCommand)
+        ):
+            return await self._submit_plan_decision(conversation_id, command, context)
         store = await self._ensure_active(conversation_id, context)
-        store.authorize(context.user_id)
         store.save_x_cluster(context.x_cluster)
         receipt, claimed = store.claim_command(command)
         if not claimed:
@@ -1436,7 +1575,8 @@ class ConversationRuntime:
         if self._workflow_submission is None:
             raise ValueError("workflow submission is unavailable")
         store = self._store(conversation_id)
-        store.authorize(context.user_id)
+        store.authorize(context.user_id, context.profile_id)
+        store.require_command("workflow_execution")
         identity = request_id or uuid4().hex
         previous = store.load_workflow_execution_requests().get(identity)
         if previous is not None:
@@ -1678,7 +1818,8 @@ class ConversationRuntime:
         context: RequestContext,
     ) -> ConversationSnapshot:
         source_store = await self._ensure_active(conversation_id, context)
-        source_store.authorize(context.user_id)
+        source_store.authorize(context.user_id, context.profile_id)
+        source_store.require_command("fork")
         source_snapshot = source_store.load_snapshot()
         if not source_snapshot.capabilities.fork:
             raise ProductRuntimeError(
@@ -1716,6 +1857,7 @@ class ConversationRuntime:
                 ),
                 user_id=context.user_id,
                 harness_id=target_handle.harness_id,
+                **source_store.access_policy(),
             )
             target_store.append(
                 ProductEvent(
@@ -2033,6 +2175,8 @@ class ConversationRuntime:
             *(conversation.task for conversation in active),
             return_exceptions=True,
         )
+        if self._experiment_plans is not None:
+            await asyncio.to_thread(self._experiment_plans.store.close)
 
     async def list_snapshots(
         self, context: RequestContext
@@ -2049,7 +2193,7 @@ class ConversationRuntime:
             try:
                 # Authorize before coordinating writes so another user's conversation
                 # is neither listed nor modified.
-                store.authorize(context.user_id)
+                store.authorize(context.user_id, context.profile_id)
             except (PermissionError, OSError, ProductStoreError):
                 continue
             try:
@@ -2091,7 +2235,7 @@ class ConversationRuntime:
         poll snapshots and re-open event streams while a conversation sits idle.
         """
         store = self._store(conversation_id)
-        store.authorize(context.user_id)
+        store.authorize(context.user_id, context.profile_id)
         if conversation_id in self._active or self._has_pending_external_work(store):
             store = await self._ensure_active(conversation_id, context)
         else:
@@ -2122,7 +2266,7 @@ class ConversationRuntime:
     ) -> FileProductStore:
         store = self._store(conversation_id)
         if store.metadata_path.is_file():
-            store.authorize(context.user_id)
+            store.authorize(context.user_id, context.profile_id)
         while True:
             active = self._active.get(conversation_id)
             if active is not None and active.stopping is not None:
@@ -2145,7 +2289,7 @@ class ConversationRuntime:
     ) -> FileProductStore:
         store = self._store(conversation_id)
         if store.metadata_path.is_file():
-            store.authorize(context.user_id)
+            store.authorize(context.user_id, context.profile_id)
         self._ensure_evictor()
         self._cancel_retention(conversation_id)
         existing = self._active.get(conversation_id)
@@ -2171,7 +2315,7 @@ class ConversationRuntime:
                 return self._store(conversation_id)
             store = self._store(conversation_id)
             if store.metadata_path.is_file():
-                store.authorize(context.user_id)
+                store.authorize(context.user_id, context.profile_id)
             # Coordinate leftover inputs only after the old run is gone so attach
             # receives the current policy.
             await self._user_input.coordinate_recovery(store, conversation_id)
@@ -2195,14 +2339,19 @@ class ConversationRuntime:
                     "adapter returned a handle for a different harness: "
                     f"{handle.harness_id}"
                 )
-            store.create(
-                ConversationSnapshot(
-                    conversation_id=conversation_id,
-                    capabilities=handle.capabilities,
-                ),
-                user_id=context.user_id,
-                harness_id=harness_id,
-            )
+            try:
+                store.create(
+                    ConversationSnapshot(
+                        conversation_id=conversation_id,
+                        capabilities=handle.capabilities,
+                    ),
+                    user_id=context.user_id,
+                    harness_id=harness_id,
+                    profile_id=context.profile_id,
+                )
+            except Exception:
+                await adapter.close(handle)
+                raise
             active = self._start_pump(handle, adapter, store, context)
             self._active[conversation_id] = active
             await active.ready.wait()

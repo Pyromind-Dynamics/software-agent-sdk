@@ -12,3 +12,4 @@ class RequestContext:
     authorization: str | None = None
     x_cluster: str | None = None
     accept_language: str | None = None
+    profile_id: str | None = None

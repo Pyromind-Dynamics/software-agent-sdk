@@ -26,6 +26,11 @@ class SessionSpec(ContractModel):
     user_input_enabled: bool = False
     extra: JsonObject = Field(default_factory=dict)
     product_instructions: str = ""
+    profile_id: str | None = None
+    harness_id: str | None = None
+    tool_allowlist: tuple[str, ...] | None = None
+    skill_allowlist: tuple[str, ...] | None = None
+    command_allowlist: tuple[str, ...] | None = None
 
 
 class SessionHandle(ContractModel):
