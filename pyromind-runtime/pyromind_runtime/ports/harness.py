@@ -11,6 +11,7 @@ from pyromind_runtime.domain.commands import ProductCommand
 from pyromind_runtime.domain.content import ContentBlock, JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
+from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import WorkflowState
 
 
@@ -38,6 +39,8 @@ class SessionSpec(ContractModel):
     harness_id: str | None = None
     tool_allowlist: tuple[str, ...] | None = None
     skill_allowlist: tuple[str, ...] | None = None
+    development_tool_allowlist: tuple[str, ...] | None = None
+    development_skill_allowlist: tuple[str, ...] | None = None
     command_allowlist: tuple[str, ...] | None = None
     delegated_roles: tuple[DelegatedRole, ...] | None = None
     managed_delegation: bool = False
@@ -135,12 +138,30 @@ class HarnessAdapter(Protocol):
         recovery: AttachRecovery | None = None,
     ) -> SessionHandle: ...
 
+    async def update_session_policy(
+        self,
+        handle: SessionHandle,
+        policy: SessionPolicy,
+        context: RequestContext,
+    ) -> None: ...
+
     async def send(
         self,
         handle: SessionHandle,
         command: ProductCommand,
         context: RequestContext,
     ) -> JsonObject: ...
+
+    async def read_workspace_text(
+        self,
+        handle: SessionHandle,
+        path: str,
+        context: RequestContext,
+        *,
+        max_bytes: int | None = None,
+    ) -> str | None:
+        """Read a workspace-relative UTF-8 file, or return None if absent."""
+        ...
 
     async def fork(
         self,

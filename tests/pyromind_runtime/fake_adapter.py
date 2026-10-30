@@ -9,6 +9,7 @@ from pyromind_runtime.domain.commands import InputResponseCommand, ProductComman
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent, HarnessEventType
+from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import WorkflowState
 from pyromind_runtime.ports.harness import (
     AttachRecovery,
@@ -19,6 +20,12 @@ from pyromind_runtime.ports.harness import (
     RestoreWorkflowSpec,
     SessionHandle,
     SessionSpec,
+)
+
+from openhands.sdk.workspace.local import LocalWorkspace
+from openhands.tools.utils.workspace_files import (
+    WorkspaceFileNotFoundError,
+    read_workspace_text,
 )
 
 
@@ -46,6 +53,7 @@ class FakeAdapter:
         ] = []
         self.forks: list[tuple[ForkSpec, ProductCheckpoint]] = []
         self.restores: list[RestoreWorkflowSpec] = []
+        self.session_policies: list[tuple[str, SessionPolicy]] = []
         # Test seams for the user-input flow.
         self.input_responses: list[tuple[str, InputResponseCommand]] = []
         self.fail_input_delivery = False
@@ -128,6 +136,44 @@ class FakeAdapter:
                 raise RuntimeError("input delivery failed")
             return {"resolved": True}
         return {"accepted": True}
+
+    async def update_session_policy(
+        self,
+        handle: SessionHandle,
+        policy: SessionPolicy,
+        context: RequestContext,
+    ) -> None:
+        del context
+        self.session_policies.append((handle.session_id, policy))
+
+    async def read_workspace_text(
+        self,
+        handle: SessionHandle,
+        path: str,
+        context: RequestContext,
+        *,
+        max_bytes: int | None = None,
+    ) -> str | None:
+        del context
+        spec = next(
+            spec
+            for spec in self.created_specs
+            if spec.conversation_id == handle.session_id
+        )
+        workspace_root = Path(spec.workspace_root)
+        if workspace_root.name != handle.session_id:
+            workspace_root /= handle.session_id
+        try:
+            return await asyncio.to_thread(
+                read_workspace_text,
+                LocalWorkspace(working_dir=str(workspace_root)),
+                path,
+                max_bytes=max_bytes,
+            )
+        except WorkspaceFileNotFoundError:
+            return None
+        except ValueError as exc:
+            raise OSError(str(exc)) from exc
 
     async def fork(
         self,

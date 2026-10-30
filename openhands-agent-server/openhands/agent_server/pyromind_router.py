@@ -407,9 +407,7 @@ def _build_agent_with_profile(
         **storage_secrets,
         **label_studio_secrets,
     }
-    allowed_tools = set(profile.tool_allowlist)
-    tools = [tool for tool in agent.tools if tool.name in allowed_tools]
-    return agent.model_copy(update={"tools": tools}), secrets
+    return agent, secrets
 
 
 def _build_agent_start_request(

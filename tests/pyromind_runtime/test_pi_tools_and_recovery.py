@@ -2181,6 +2181,93 @@ async def test_sandbox_reads_staged_workflow_before_container_exists(tmp_path) -
     assert await adapter._read_workflow(session) == "workflow = InputNode()"
 
 
+async def test_sandbox_reads_project_request_through_workspace_port(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="sandbox")
+    root = conversations / "conversation-1"
+    request_path = root / "public_data" / "project_request.json"
+    request_path.parent.mkdir(parents=True)
+    request_path.write_text('{"name":"AVI"}', encoding="utf-8")
+    files = PiSessionFiles(root)
+    files.initialize({"session_id": "conversation-1"})
+    files.save_sandbox(
+        {
+            "sandbox_id": "sbx-1",
+            "workspace_path": "/target-workspace/.pyromind-agent/conversation-1",
+            "mount_path": "/target-workspace",
+        }
+    )
+    session = pi_adapter_module._PiSession(
+        "conversation-1",
+        root,
+        files,
+        {},
+        RequestContext(user_id="42"),
+        workspace=LocalWorkspace(working_dir=str(root)),
+    )
+    await adapter._register(session)
+
+    assert (
+        await adapter.read_workspace_text(
+            adapter._handle(session),
+            "public_data/project_request.json",
+            RequestContext(user_id="42"),
+        )
+        == '{"name":"AVI"}'
+    )
+    assert (
+        await adapter.read_workspace_text(
+            adapter._handle(session),
+            "public_data/missing.json",
+            RequestContext(user_id="42"),
+        )
+        is None
+    )
+
+
+async def test_sandbox_project_request_read_does_not_start_an_idle_runner(
+    tmp_path, monkeypatch
+) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="sandbox")
+    root = conversations / "conversation-1"
+    request_path = root / "public_data" / "project_request.json"
+    request_path.parent.mkdir(parents=True)
+    request_path.write_text('{"name":"AVI"}', encoding="utf-8")
+    files = PiSessionFiles(root)
+    files.initialize({"session_id": "conversation-1", "model": {"id": "test"}})
+    files.save_sandbox(
+        {
+            "sandbox_id": "sbx-1",
+            "workspace_path": "/target-workspace/.pyromind-agent/conversation-1",
+            "mount_path": "/target-workspace",
+        }
+    )
+
+    async def local_workspace(_session):
+        return LocalWorkspace(working_dir=str(root))
+
+    monkeypatch.setattr(adapter, "_workspace", local_workspace)
+    handle = SessionHandle(
+        session_id="conversation-1",
+        adapter_session_ref="conversation-1",
+        harness_id="pi",
+        capabilities=pi_adapter_module.PI_CAPABILITIES,
+    )
+
+    assert (
+        await adapter.read_workspace_text(
+            handle,
+            "public_data/project_request.json",
+            RequestContext(user_id="42"),
+        )
+        == '{"name":"AVI"}'
+    )
+    assert "conversation-1" not in adapter._sessions
+
+
 async def test_sandbox_close_pauses_instead_of_deleting_the_container(
     tmp_path, monkeypatch
 ) -> None:

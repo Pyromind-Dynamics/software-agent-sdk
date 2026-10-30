@@ -7,6 +7,8 @@ from pyromind_runtime.ports.harness import DelegatedRole
 
 from openhands.agent_server.agent_profiles.echomind_eval import ECHOMIND_EVAL_ROLE
 from openhands.agent_server.agent_profiles.echomind_manager import (
+    ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
+    ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
     ECHOMIND_MANAGER_PROFILE,
 )
 
@@ -19,9 +21,12 @@ class ConversationProfile:
     instructions: str = ""
     tool_allowlist: tuple[str, ...] | None = None
     skill_allowlist: tuple[str, ...] | None = None
+    development_tool_allowlist: tuple[str, ...] | None = None
+    development_skill_allowlist: tuple[str, ...] | None = None
     command_allowlist: tuple[str, ...] | None = None
     delegated_roles: tuple[DelegatedRole, ...] | None = None
     managed_delegation: bool = False
+    conversation_marker: str | None = None
 
 
 _PRODUCT_ROUTING_INSTRUCTIONS = """For Pyromind workflow requests, read the matching
@@ -57,10 +62,13 @@ ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
     skill_allowlist=ECHOMIND_MANAGER_PROFILE.skill_allowlist,
     delegated_roles=(ECHOMIND_EVAL_ROLE,),
     managed_delegation=True,
+    development_tool_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
+    development_skill_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
     command_allowlist=(
         "user_message",
         "cancel",
         "confirm_experiment_plan",
         "reject_experiment_plan",
     ),
+    conversation_marker=ECHOMIND_MANAGER_PROFILE.tag_value,
 )

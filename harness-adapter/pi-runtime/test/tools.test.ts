@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { normalizeBusinessToolContent, safePath } from "../src/tools.js";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
+import type { JsonlRpcPeer } from "../src/rpc-peer.js";
+import { restrictSkillReads } from "../src/session-policy.js";
+import { createTools, normalizeBusinessToolContent, safePath } from "../src/tools.js";
 import { WorkspaceAccessPolicy } from "../src/workspace-policy.js";
 
 test("business tool content converts OpenHands inline image URLs for Pi", () => {
@@ -46,6 +51,60 @@ test("business tool content makes unsupported image URLs visible", () => {
     { type: "text", text: "[Image omitted: Pi only accepts inline base64 image data.]" },
     { type: "text", text: "[Image omitted: Pi only accepts inline base64 image data.]" },
   ]);
+});
+
+test("sandbox read resolves the remote endpoint for Storage paths", async (context) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "pi-tools-sandbox-read-")));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const requested: string[] = [];
+  const fileApi = createServer((request, response) => {
+    const url = new URL(request.url ?? "/", "http://localhost");
+    requested.push(url.searchParams.get("path") ?? "");
+    response.end("sample");
+  });
+  await new Promise<void>((resolve) => fileApi.listen(0, "127.0.0.1", resolve));
+  context.after(() => fileApi.close());
+  const endpointUrl = `http://127.0.0.1:${(fileApi.address() as { port: number }).port}`;
+  let ensures = 0;
+  const tools = await createTools(
+    {} as JsonlRpcPeer,
+    new NodeExecutionEnv({ cwd: root }),
+    root,
+    "sandbox",
+    [],
+    undefined,
+    undefined,
+    [],
+    {
+      sandbox: async () => {
+        ensures++;
+        return {
+          baseUrl: endpointUrl,
+          wsBaseUrl: endpointUrl,
+          sandboxId: "sandbox-1",
+          apiKey: "key",
+          workspacePath: "/target-workspace/.pyromind-agent/conv-1",
+          storagePath: "/target-workspace",
+        };
+      },
+    },
+  );
+  const read = tools.find((tool) => tool.name === "read")!;
+  const restricted = restrictSkillReads(
+    read,
+    root,
+    [],
+    [],
+    undefined,
+    { canonicalizeWorkspacePaths: false },
+  );
+
+  await restricted.execute("remote-read", {
+    path: "/target-workspace/datasets/demo/avi/train.jsonl",
+  });
+
+  assert.equal(ensures, 1);
+  assert.deepEqual(requested, ["/target-workspace/datasets/demo/avi/train.jsonl"]);
 });
 
 async function workspaceLayout(prefix = "pi-tools-") {

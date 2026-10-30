@@ -22,6 +22,35 @@ from pyromind_runtime.ports.harness import SessionSpec
 from .fake_adapter import FakeAdapter
 
 
+async def test_workspace_read_does_not_attach_an_idle_conversation(tmp_path) -> None:
+    class ReadAdapter(FakeAdapter):
+        async def read_workspace_text(self, handle, path, context, *, max_bytes=None):
+            del context, max_bytes
+            return f"{handle.session_id}/{path}"
+
+    directory = tmp_path / "readable"
+    directory.mkdir()
+    FileProductStore(directory).create(
+        ConversationSnapshot(
+            conversation_id="readable",
+            capabilities=HarnessCapabilities(),
+        ),
+        user_id="42",
+    )
+    adapter = ReadAdapter()
+    runtime = ConversationRuntime(tmp_path, adapter)
+
+    assert (
+        await runtime.read_workspace_text(
+            "readable",
+            "public_data/project_request.json",
+            RequestContext(user_id="42"),
+        )
+        == "readable/public_data/project_request.json"
+    )
+    assert adapter.attached == []
+
+
 async def test_list_orders_by_activity_and_recovers_legacy_timestamps(
     tmp_path,
 ) -> None:

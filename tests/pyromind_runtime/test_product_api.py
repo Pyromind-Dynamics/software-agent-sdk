@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import harness_adapter.pi_adapter.adapter as pi_adapter_module
@@ -10,6 +11,9 @@ from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.api.router import _resolve_cursor, _sse_stream
 from pyromind_agent_server.app import create_app
 from pyromind_agent_server.bootstrap import install_product_api
+from pyromind_agent_server.profiles import (
+    ConversationProfile,
+)
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
@@ -60,6 +64,24 @@ async def test_composed_app_mounts_product_router(tmp_path) -> None:
     assert response.status_code == 503
 
 
+def test_composed_app_mounts_echomind_project_routes(tmp_path) -> None:
+    app = create_app(
+        Config(
+            conversations_path=tmp_path / "conversations",
+            workspace_path=tmp_path / "workspace",
+            enable_session_api_key_auth=False,
+            enable_pyromind_jwt_auth=False,
+        )
+    )
+    paths = set(app.openapi()["paths"])
+
+    assert "/api/v2/echomind/conversations" in paths
+    assert "/api/echomind/projects/{project_id}" in paths
+    assert "/api/echomind/conversations" not in paths
+    assert "/api/echomind/projects" not in paths
+    assert not any("project-request" in path for path in paths)
+
+
 async def test_http_create_list_snapshot_and_command(tmp_path) -> None:
     conversations = tmp_path / "conversations"
     conversations.mkdir()
@@ -104,6 +126,67 @@ async def test_http_create_list_snapshot_and_command(tmp_path) -> None:
     assert adapter.created_specs[0].workspace_root == str(
         conversations / conversation_id
     )
+    await runtime.close()
+
+
+async def test_product_profiles_isolate_conversations_with_the_same_profile_id(
+    tmp_path,
+) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    runtime = ConversationRuntime(conversations, FakeAdapter())
+    first_profile = ConversationProfile(
+        route_prefix="/api/first/conversations",
+        profile_id="shared-profile",
+        conversation_marker="first",
+    )
+    second_profile = ConversationProfile(
+        route_prefix="/api/second/conversations",
+        profile_id="shared-profile",
+        conversation_marker="second",
+    )
+    app = _app(tmp_path, runtime)
+    from pyromind_agent_server.api.router import create_product_router
+
+    app.include_router(create_product_router(first_profile))
+    app.include_router(create_product_router(second_profile))
+    transport = httpx.ASGITransport(app=app)
+    headers = {"x-pyromind-debug-user-id": "42"}
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers=headers
+    ) as client:
+        first = await client.post(
+            "/api/first/conversations",
+            json={"llm": {"model": "test-model"}},
+        )
+        second = await client.post(
+            "/api/second/conversations",
+            json={"llm": {"model": "test-model"}},
+        )
+        first_id = first.json()["conversation_id"]
+        second_id = second.json()["conversation_id"]
+        for conversation_id in (first_id, second_id):
+            metadata_path = conversations / conversation_id / "product" / "meta.json"
+            metadata = json.loads(metadata_path.read_text())
+            metadata["profile_id"] = None
+            metadata_path.write_text(json.dumps(metadata))
+
+        assert [
+            item["conversation_id"]
+            for item in (await client.get("/api/first/conversations")).json()
+        ] == [first_id]
+        assert [
+            item["conversation_id"]
+            for item in (await client.get("/api/second/conversations")).json()
+        ] == [second_id]
+        assert (await client.get("/api/v2/pyromind/conversations")).json() == []
+        assert (
+            await client.get(f"/api/first/conversations/{second_id}/snapshot")
+        ).status_code == 404
+        assert (
+            await client.get(f"/api/second/conversations/{first_id}/snapshot")
+        ).status_code == 404
+
     await runtime.close()
 
 

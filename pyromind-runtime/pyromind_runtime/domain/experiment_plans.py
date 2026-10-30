@@ -116,6 +116,15 @@ def _acyclic(ids: set[str], edges: list[tuple[str, str]]) -> None:
 
 class WorkflowPlan(ContractModel):
     schema_version: Literal[1] = 1
+    skill: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description=(
+            "Scenario Skill that determines the Project Graph template. "
+            "Use null for a generic plan."
+        ),
+    )
     name: str = Field(min_length=1, max_length=255)
     goal: str = Field(min_length=1)
     resources: tuple[PlanResource, ...] = ()

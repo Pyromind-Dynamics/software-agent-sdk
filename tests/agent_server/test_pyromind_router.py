@@ -465,7 +465,6 @@ async def test_pyromind_conversation_uses_conversation_workspace(tmp_path):
     assert RunWorkflowTool.name not in tool_names
     assert ValidateWorkflowDslTool.name in tool_names
     assert TrainingAnalysisTool.name in tool_names
-    assert tool_names <= set(PYROMIND_PROFILE.tool_allowlist)
     assert "preview_dataset" not in tool_names
     assert "dataset_download" not in tool_names
     assert "df_convert" not in tool_names

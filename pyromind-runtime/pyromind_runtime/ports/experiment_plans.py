@@ -10,6 +10,10 @@ from pyromind_runtime.domain.experiment_plans import (
 )
 
 
+class ExperimentPlanProjectBinder(Protocol):
+    def bind(self, revision: PlanRevision, owner: PlanOwner) -> None: ...
+
+
 class ExperimentPlanStore(Protocol):
     def close(self) -> None: ...
 

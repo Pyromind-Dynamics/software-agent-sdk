@@ -1,11 +1,12 @@
 ---
 name: avi-baseline-evaluation
-description: AVI 图片质检实验的 Init 基模评测口径与证据要求。
+description: AVI 图片质检实验的基模评测口径与证据要求。
 ---
 
 # AVI 基线评测
 
-Init 是实验图的第一阶段，后续连接 Data。Eval 执行 Init 的基模 bench，阶段不等于 Agent。
+Eval 为已确认计划中的目标任务准备基模 bench；AVI 计划使用 Inference 和 Evaluator
+阶段表达推理与评分工作，阶段不等于 Agent。
 固定评测集、GT、媒体、预处理、模型版本、生成参数和评分规则，供后续同口径比较。
 
 根据实际标签定义检查分类正确性、各类 Precision/Recall/F1、混淆矩阵、漏检和误放行；

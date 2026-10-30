@@ -101,7 +101,10 @@ from pyromind_runtime.infrastructure.file_product_store import (
     ProductStoreError,
 )
 from pyromind_runtime.ports.experiment_execution import DelegatedExecutionStore
-from pyromind_runtime.ports.experiment_plans import ExperimentPlanStore
+from pyromind_runtime.ports.experiment_plans import (
+    ExperimentPlanProjectBinder,
+    ExperimentPlanStore,
+)
 from pyromind_runtime.ports.external_tasks import ExternalTaskRegistry
 from pyromind_runtime.ports.harness import (
     DelegationAdapter,
@@ -183,6 +186,7 @@ class ConversationRuntime:
         experiment_execution_store: DelegatedExecutionStore | None = None,
         execution_roles: tuple[str, ...] = (),
         evaluation_config_validator: Callable[[JsonObject], JsonObject] | None = None,
+        experiment_plan_project_binder: ExperimentPlanProjectBinder | None = None,
         external_tasks: ExternalTaskRegistry | None = None,
         idle_eviction_seconds: int = 300,
         release_grace_seconds: int = 300,
@@ -228,6 +232,7 @@ class ConversationRuntime:
                 delegated.reconcile,
             )
         self._execution_event_task: asyncio.Task[None] | None = None
+        self._experiment_plan_project_binder = experiment_plan_project_binder
         self._resource_limits = resource_limits
         self._external_tasks = external_tasks
         self._workflow_submission = workflow_submission
@@ -643,6 +648,13 @@ class ConversationRuntime:
                 command.expected_revision,
                 command.command_id,
             )
+            if self._experiment_plan_project_binder is not None:
+                await self._plan_io(
+                    self._experiment_plan_project_binder.bind,
+                    revision,
+                    owner,
+                )
+            await self._activate_development_policy(conversation_id, store, context)
             response = revision.model_dump(mode="json")
         else:
             await self._plan_io(service.store.reject, owner, command.proposal_id)
@@ -658,6 +670,25 @@ class ConversationRuntime:
                 "Plan saved; command receipt write failed for %s", conversation_id
             )
         return completed
+
+    async def _activate_development_policy(
+        self,
+        conversation_id: str,
+        store: FileProductStore,
+        context: RequestContext,
+    ) -> None:
+        policy = store.activate_development_policy()
+        if policy.tool_allowlist is None and policy.skill_allowlist is None:
+            return
+        snapshot = store.load_snapshot()
+        harness_id = store.harness_id()
+        handle = SessionHandle(
+            session_id=conversation_id,
+            adapter_session_ref=conversation_id,
+            harness_id=harness_id,
+            capabilities=snapshot.capabilities,
+        )
+        await self._adapter(harness_id).update_session_policy(handle, policy, context)
 
     async def version_call(
         self,
@@ -1560,6 +1591,9 @@ class ConversationRuntime:
                 harness_id=handle.harness_id,
                 profile_id=spec.profile_id,
                 tool_allowlist=spec.tool_allowlist,
+                skill_allowlist=spec.skill_allowlist,
+                development_tool_allowlist=spec.development_tool_allowlist,
+                development_skill_allowlist=spec.development_skill_allowlist,
                 command_allowlist=spec.command_allowlist,
             )
             store.save_x_cluster(context.x_cluster)
@@ -1616,6 +1650,42 @@ class ConversationRuntime:
                     update={"experiment_executions": executions}
                 )
         return snapshot
+
+    async def read_workspace_text(
+        self,
+        conversation_id: str,
+        path: str,
+        context: RequestContext,
+        *,
+        max_bytes: int | None = None,
+    ) -> str | None:
+        store = await self._read_store(conversation_id, context)
+        active = self._active.get(conversation_id)
+        if active is not None:
+            try:
+                async with self._use(conversation_id) as current:
+                    return await current.adapter.read_workspace_text(
+                        current.handle,
+                        path,
+                        context,
+                        max_bytes=max_bytes,
+                    )
+            finally:
+                self._schedule_release(conversation_id)
+
+        snapshot = store.load_snapshot()
+        handle = SessionHandle(
+            session_id=conversation_id,
+            adapter_session_ref=conversation_id,
+            harness_id=store.harness_id(),
+            capabilities=snapshot.capabilities,
+        )
+        return await self._adapter(handle.harness_id).read_workspace_text(
+            handle,
+            path,
+            context,
+            max_bytes=max_bytes,
+        )
 
     async def submit_command(
         self,

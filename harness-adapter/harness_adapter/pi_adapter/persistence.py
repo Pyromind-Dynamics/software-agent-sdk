@@ -59,6 +59,9 @@ class PiSessionFiles:
     def load_session(self) -> dict[str, Any]:
         return _load_object(self.session_path)
 
+    def save_session(self, session: dict[str, Any]) -> None:
+        _atomic_json(self.session_path, session)
+
     def load_inflight(self) -> dict[str, Any] | None:
         if not self.inflight_path.is_file():
             return None
