@@ -21,10 +21,10 @@ from openhands.agent_server.agent_profiles.pyromind import PYROMIND_PROFILE
 from openhands.agent_server.echomind_projects import ProjectStore
 
 
-def _avi_plan(*, name: str = "AVI experiment") -> WorkflowPlan:
+def _experiment_plan(*, name: str = "AVI experiment") -> WorkflowPlan:
     return WorkflowPlan.model_validate(
         {
-            "skill": "avi-single-turn",
+            "skill": "experiment-planning",
             "name": name,
             "goal": "Build a Dataset -> Inference -> Evaluator -> Train loop.",
             "resources": [
@@ -52,6 +52,13 @@ def _avi_plan(*, name: str = "AVI experiment") -> WorkflowPlan:
 def test_echomind_manager_planning_and_development_capabilities_are_explicit():
     assert ECHOMIND_PRODUCT_PROFILE.profile_id == "echomind"
     assert ECHOMIND_PRODUCT_PROFILE.tool_allowlist == ECHOMIND_MANAGER_PLANNING_TOOLS
+    assert set(ECHOMIND_MANAGER_PLANNING_TOOLS) == {
+        "read",
+        "terminal",
+        "create_experiment_plan",
+        "revise_experiment_plan",
+        "get_experiment_plan",
+    }
     assert ECHOMIND_PRODUCT_PROFILE.skill_allowlist == ECHOMIND_MANAGER_PLANNING_SKILLS
     assert ECHOMIND_MANAGER_PROFILE.usage_id == "echomind-manager"
 
@@ -63,7 +70,7 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
     }
     assert set(ECHOMIND_MANAGER_DEVELOPMENT_SKILLS) == {
         *PYROMIND_PROFILE.skill_allowlist,
-        "avi-single-turn",
+        "experiment-planning",
     }
     assert ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist == (
         ECHOMIND_MANAGER_DEVELOPMENT_TOOLS
@@ -85,7 +92,7 @@ def test_plan_binding_creates_and_updates_one_project_with_revision_id(tmp_path)
         PlanRevision(
             project_id=project_id,
             revision=1,
-            plan=_avi_plan(),
+            plan=_experiment_plan(),
             confirmed_by="42",
         ),
         echomind_conversation_id=owner.conversation_id,
@@ -94,7 +101,7 @@ def test_plan_binding_creates_and_updates_one_project_with_revision_id(tmp_path)
 
     assert first.project.project_id == project_id
     assert first.graph.project_id == project_id
-    assert first.graph.template == "avi-single-turn/v1"
+    assert first.graph.template == "experiment-planning/v1"
     assert [node.id for node in first.graph.nodes] == [
         "dataset",
         "inference",
@@ -108,7 +115,7 @@ def test_plan_binding_creates_and_updates_one_project_with_revision_id(tmp_path)
         PlanRevision(
             project_id=project_id,
             revision=2,
-            plan=_avi_plan(name="Revised AVI experiment"),
+            plan=_experiment_plan(name="Revised AVI experiment"),
             confirmed_by="42",
         ),
         echomind_conversation_id=owner.conversation_id,
@@ -120,6 +127,37 @@ def test_plan_binding_creates_and_updates_one_project_with_revision_id(tmp_path)
     assert len(list((tmp_path / "projects").iterdir())) == 1
 
 
+def test_project_graph_follows_plan_topology_instead_of_skill_name(tmp_path):
+    plan = WorkflowPlan.model_validate(
+        {
+            "skill": "experiment-planning",
+            "name": "Custom topology",
+            "goal": "Validate generic graph generation.",
+            "stages": [
+                {"id": "prepare", "name": "Dataset"},
+                {"id": "score", "name": "Evaluator"},
+            ],
+            "edges": [{"source": "prepare", "target": "score"}],
+        }
+    )
+    project_id = uuid4().hex
+    project = ProjectStore.for_conversations_dir(tmp_path / "conversations").bind_plan(
+        PlanRevision(
+            project_id=project_id,
+            revision=1,
+            plan=plan,
+            confirmed_by="42",
+        ),
+        echomind_conversation_id="conversation-1",
+        owner_user_id="42",
+    )
+
+    assert [node.id for node in project.graph.nodes] == ["prepare", "score"]
+    assert project.graph.edges[0].source == "prepare"
+    assert project.graph.edges[0].target == "score"
+    assert project.graph.nodes[1].config["artifact_format"] == "atif"
+
+
 def test_binder_uses_plan_owner_for_project_identity(tmp_path):
     owner = PlanOwner(
         user_id="42",
@@ -129,7 +167,7 @@ def test_binder_uses_plan_owner_for_project_identity(tmp_path):
     revision = PlanRevision(
         project_id=uuid4().hex,
         revision=1,
-        plan=_avi_plan(),
+        plan=_experiment_plan(),
         confirmed_by=owner.user_id,
     )
 

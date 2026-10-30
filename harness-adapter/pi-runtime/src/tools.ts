@@ -119,8 +119,10 @@ export async function createTools(
     policy,
     { resourceLimits },
   );
+  const allowedReadRoots = [policy.publicDataRoot, ...policy.readOnlyRoots];
   options.onExecutionReady?.({ operations: terminalOperations, cwd: workspaceRoot,
     env: { ...safeShellEnvironment(), ...options.terminalEnvironment }, confirmsAbort: true,
+    allowedReadRoots,
     protectedRoot: verificationRoot,
     readFile: async (path, limit) => {
       const file = await open(path, "r");
@@ -214,6 +216,7 @@ async function createSandboxTools(
     new SandboxTerminalFileClient(terminalOperations, { chunkChars: scriptChunkChars }),
   );
   const fileOperations = createSandboxFileOperations(fileClient, options.readMirror);
+  const allowedReadRoots: string[] = [];
   let policy: SandboxPathPolicy | undefined;
   const resolvePolicy = async (): Promise<SandboxPathPolicy> => {
     if (policy) return policy;
@@ -227,6 +230,11 @@ async function createSandboxTools(
       knowledgeRoot,
       storageRoot: resolved.storagePath,
     });
+    allowedReadRoots.push(
+      resolved.storagePath,
+      policy.publicDataPath,
+      ...policy.readOnlyRoots,
+    );
     return policy;
   };
 
@@ -253,6 +261,7 @@ async function createSandboxTools(
   });
   options.onExecutionReady?.({ operations: executionOperations, cwd: sandboxCwd,
     env: options.terminalEnvironment,
+    allowedReadRoots,
     writeFile: (path, content) => fileClient.write(path, content),
     readFile: (path, limit) => fileClient.read(path, limit),
     resolvePath: async (path, operation) => (await resolvePolicy()).resolvePath(path, operation) });

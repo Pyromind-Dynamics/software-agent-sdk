@@ -5,71 +5,14 @@ from typing import Any, Literal
 from pyromind_runtime.domain.experiment_plans import ExperimentStage, WorkflowPlan
 
 
-AVI_SINGLE_TURN_SKILL = "avi-single-turn"
-AVI_STAGE_IDS = ("dataset", "inference", "evaluator", "train")
+EXPERIMENT_PLANNING_SKILL = "experiment-planning"
+EXPERIMENT_GRAPH_TEMPLATE = "experiment-planning/v1"
 
 ProjectNodeType = Literal["dataset", "inference", "evaluator", "train"]
 
 
 def build_graph_payload(
     *,
-    skill: str | None,
-    plan: WorkflowPlan,
-) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    if skill == AVI_SINGLE_TURN_SKILL:
-        return _build_avi_graph(plan)
-    return _build_generic_graph(plan)
-
-
-def _build_avi_graph(
-    plan: WorkflowPlan,
-) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    stages = {stage.id: stage for stage in plan.stages if stage.enabled}
-    missing = [stage_id for stage_id in AVI_STAGE_IDS if stage_id not in stages]
-    if missing:
-        raise ValueError(
-            "AVI plan must enable Dataset, Inference, Evaluator, and Train stages: "
-            + ", ".join(missing)
-        )
-
-    resources = _resources_payload(plan)
-    tasks_by_stage = _tasks_by_stage(plan)
-    nodes = []
-    for stage_id in AVI_STAGE_IDS:
-        stage = stages[stage_id]
-        config: dict[str, Any] = {
-            "resources": resources,
-            "tasks": tasks_by_stage.get(stage_id, []),
-        }
-        if stage_id == "dataset":
-            config.update(
-                {
-                    "capability": "data-processing",
-                    "platform_task_kind": "data_preparation",
-                }
-            )
-        elif stage_id == "evaluator":
-            config["artifact_format"] = "atif"
-        nodes.append(
-            _node(
-                node_id=stage.id,
-                node_type=stage_id,
-                title=stage.name,
-                launch_mode="agent" if stage_id == "dataset" else "executor",
-                config=config,
-            )
-        )
-
-    valid_ids = set(AVI_STAGE_IDS)
-    edges = [
-        {"source": edge.source, "target": edge.target}
-        for edge in plan.edges
-        if edge.source in valid_ids and edge.target in valid_ids
-    ]
-    return nodes, edges
-
-
-def _build_generic_graph(
     plan: WorkflowPlan,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     resources = _resources_payload(plan)
@@ -83,24 +26,26 @@ def _build_generic_graph(
         if node_type is None:
             continue
         node_types[stage.id] = node_type
+        config: dict[str, Any] = {
+            "resources": resources,
+            "tasks": tasks_by_stage.get(stage.id, []),
+        }
+        if node_type == "dataset":
+            config.update(
+                {
+                    "capability": "data-processing",
+                    "platform_task_kind": "data_preparation",
+                }
+            )
+        elif node_type == "evaluator":
+            config["artifact_format"] = "atif"
         nodes.append(
             _node(
                 node_id=stage.id,
                 node_type=node_type,
                 title=stage.name,
                 launch_mode="agent" if node_type == "dataset" else "executor",
-                config={
-                    "resources": resources,
-                    "tasks": tasks_by_stage.get(stage.id, []),
-                    **(
-                        {
-                            "capability": "data-processing",
-                            "platform_task_kind": "data_preparation",
-                        }
-                        if node_type == "dataset"
-                        else {}
-                    ),
-                },
+                config=config,
             )
         )
     edges = [

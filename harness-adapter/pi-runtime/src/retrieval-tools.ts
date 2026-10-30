@@ -65,7 +65,7 @@ print(json.dumps({'lines':out,'truncated':truncated}))
 export function createRetrievalTools(access: ExecutionAccess, mirror?: SandboxReadMirror): AgentTool[] {
   return ["grep", "find", "ls"].map((kind): AgentTool => ({
     name: kind, label: kind,
-    description: `${kind === "grep" ? "Search text with line numbers" : kind === "find" ? "Find file paths" : "List directory entries"} in an authorized knowledge/ or public_data/ path. Results are bounded; narrow the path when truncated.`,
+    description: `${kind === "grep" ? "Search text with line numbers" : kind === "find" ? "Find file paths" : "List directory entries"} in an authorized Storage, knowledge/, .agents/skills/, or conversation path. Results are bounded; narrow the path when truncated.`,
     parameters: { type: "object", properties: {
       path: { type: "string", description: "Logical resource or workspace path; defaults to public_data/." },
       ...(kind === "grep" ? { pattern: { type: "string" }, literal: { type: "boolean" }, ignoreCase: { type: "boolean" } } : {}),
@@ -97,9 +97,11 @@ async function runRetrieval(access: ExecutionAccess, mirror: SandboxReadMirror |
   // read-only resource roots. The removed `storage/` alias is not a scope.
   const scopes = ["public_data", "knowledge", ".agents/skills", storageMount(access.cwd)]
     .filter((path): path is string => typeof path === "string");
-  const allowedRoots = host ? [root] : (await Promise.all(scopes.map(async (path) => {
-    try { return await access.resolvePath(path, "read"); } catch { return undefined; }
-  }))).filter((path): path is string => path !== undefined);
+  const allowedRoots = host ? [root] : access.allowedReadRoots ?? (
+    await Promise.all(scopes.map(async (path) => {
+      try { return await access.resolvePath(path, "read"); } catch { return undefined; }
+    }))
+  ).filter((path): path is string => path !== undefined);
   const query = JSON.stringify({ ...args, kind, label, root, allowedRoots, limit: Math.min(200, Math.max(1, Number(args.limit ?? 100))) });
   let stdout: string;
   if (host) {

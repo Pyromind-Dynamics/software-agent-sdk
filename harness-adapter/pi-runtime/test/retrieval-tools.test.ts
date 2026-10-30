@@ -49,3 +49,29 @@ test("knowledge mirror searches never create a sandbox and reject external symli
   assert.match(JSON.stringify(result.content), /knowledge\/index.md:1:platform fact/);
   await assert.rejects(grep.execute("g", { path: "knowledge/escape", pattern: "read" }, new AbortController().signal), /symlink/);
 });
+
+test("ls accepts a Storage mount root already authorized by the path policy", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-search-storage-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, "datasets"));
+  const access = {
+    cwd: ".",
+    allowedReadRoots: [root],
+    resolvePath: async (path: string) => {
+      if (path === root) return root;
+      if (path === "public_data") return join(root, "public_data");
+      throw new Error("unauthorized root");
+    },
+    operations: {
+      exec: async (command: string, cwd: string, options: any) => {
+        const { stdout } = await promisify(execFile)("/bin/sh", ["-c", command], { cwd });
+        options.onData(Buffer.from(stdout));
+        return { exitCode: 0 };
+      },
+    },
+  } as unknown as ExecutionAccess;
+  const ls = createRetrievalTools(access).find((tool) => tool.name === "ls");
+  assert.ok(ls);
+  const result = await ls.execute("ls", { path: root }, new AbortController().signal);
+  assert.match(JSON.stringify(result.content), /datasets\//);
+});

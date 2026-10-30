@@ -89,6 +89,14 @@ test("sandbox paths keep conversation state out of reach under the mount", () =>
   }
 });
 
+test("sandbox paths allow inspecting configured read roots themselves", () => {
+  const configured = policy();
+  for (const root of [`${WORKSPACE}/public_data`, SKILLS, KNOWLEDGE]) {
+    assert.equal(configured.resolvePath(root, "read"), root);
+  }
+  assert.equal(configured.resolvePath("public_data", "read"), `${WORKSPACE}/public_data`);
+});
+
 test("this conversation's own tool staging stays readable under the mount", () => {
   // `df_run_pipeline` writes its runs here, outside public_data/.
   const run = `${WORKSPACE}/data_preparation/d495ecbf/processed.jsonl`;

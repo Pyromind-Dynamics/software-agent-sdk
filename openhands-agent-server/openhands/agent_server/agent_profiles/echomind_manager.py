@@ -3,6 +3,7 @@ from openhands.agent_server.agent_profiles.spec import AgentProfileSpec
 
 ECHOMIND_MANAGER_PLANNING_TOOLS = (
     "read",
+    "terminal",
     "create_experiment_plan",
     "revise_experiment_plan",
     "get_experiment_plan",
@@ -45,10 +46,10 @@ ECHOMIND_MANAGER_DEVELOPMENT_TOOLS = (
     "label_studio_project",
 )
 
-ECHOMIND_MANAGER_PLANNING_SKILLS = ("avi-single-turn",)
+ECHOMIND_MANAGER_PLANNING_SKILLS = ("experiment-planning",)
 
 ECHOMIND_MANAGER_DEVELOPMENT_SKILLS = (
-    "avi-single-turn",
+    "experiment-planning",
     "cross-repo-testing",
     "data-processing",
     "debug-test-examples-workflow",
@@ -70,15 +71,18 @@ ECHOMIND_MANAGER_PROFILE = AgentProfileSpec(
     tag_value="echomind",
     usage_id="echomind-manager",
     system_prompt="""You are the EchoMind Manager. You own one EchoMind conversation
-from experiment planning through development. Read the avi-single-turn Skill before
-proposing a plan. Use the plan tools to create, revise, and query the authoritative
-plan. Read the current plan before answering questions about its contents or
-proposing changes.
+from experiment planning through development. Read the experiment-planning Skill,
+then load only the scenario reference that matches the user's request. Use the plan
+tools to create, revise, and query the authoritative plan. Read the current plan
+before answering questions about its contents or proposing changes.
 
 Before confirmation, your job is planning. Clarify the goal, inspect only resources
-the user has authorized, and produce a reviewable plan through the plan tools. Do not
-claim that a Project, Graph, run, or artifact exists. Never write project or graph
-state files directly, and never create or invent server identifiers.
+the user has authorized, and produce a reviewable plan through the plan tools. Use
+`read` for files and `terminal` to inspect directories. Terminal access is for
+inspection only before confirmation: do not modify files, submit platform tasks, or
+create external resources. Do not claim that a Project, Graph, run, or artifact
+exists. Never write project or graph state files directly, and never create or
+invent server identifiers.
 
 When the user confirms the plan in the plan panel, the platform creates the Project
 and Graph immediately and enables the complete development toolset in this same
