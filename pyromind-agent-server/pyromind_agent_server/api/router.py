@@ -120,6 +120,8 @@ def create_product_router(
             tool_allowlist=profile.tool_allowlist,
             skill_allowlist=profile.skill_allowlist,
             command_allowlist=profile.command_allowlist,
+            delegated_roles=profile.delegated_roles,
+            managed_delegation=profile.managed_delegation,
         )
         try:
             return await get_product_runtime(request).create_conversation(spec, context)
@@ -215,6 +217,17 @@ def create_product_router(
                 "X-Accel-Buffering": "no",
             },
         )
+
+    @router.get("/{conversation_id}/experiment-executions")
+    async def list_experiment_executions(conversation_id: str, request: Request):
+        try:
+            return await get_product_runtime(request).get_experiment_executions(
+                conversation_id, context_for(request)
+            )
+        except ProductRuntimeError as exc:
+            raise _product_error(exc) from exc
+        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
+            raise _not_found(conversation_id) from exc
 
     @router.get("/{conversation_id}/experiment-plans")
     async def get_experiment_plan(

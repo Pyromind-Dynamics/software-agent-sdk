@@ -39,6 +39,7 @@ type HarnessEventType = Literal[
 
 type ProductEventType = Literal[
     "experiment_plan.changed",
+    "experiment_execution.changed",
     "conversation.created",
     "status.changed",
     "message.started",

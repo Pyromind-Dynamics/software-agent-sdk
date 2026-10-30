@@ -71,6 +71,11 @@ export class PiAgentRuntime {
       if (!this.execution) throw new Error("execution host not ready");
       return this.execution.handle(method, params);
     }
+    if (method === "delegation.control") {
+      this.requireSession();
+      if (!this.subagents) throw new Error("Delegation host is unavailable");
+      return await this.subagents.control(params);
+    }
     if (method === "stage.execute") return this.executeStage(params);
     if (method === "stage.cancel") return this.cancelStage(requiredString(params, "request_id"));
     if (method === "start") return this.start(params);

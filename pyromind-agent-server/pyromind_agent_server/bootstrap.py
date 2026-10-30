@@ -20,6 +20,9 @@ from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.versions import VersionToolRequest
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
+from pyromind_runtime.infrastructure.sql_experiment_execution import (
+    SQLExperimentExecutionStore,
+)
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import HarnessAdapter
 from pyromind_runtime.ports.workflows import WorkflowEventSink
@@ -27,6 +30,9 @@ from pyromind_runtime.ports.workflows import WorkflowEventSink
 from openhands.agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
 from openhands.agent_server.run_workflow_callback import set_workflow_status_dispatcher
 from openhands.agent_server.storage_quota import ensure_conversation_quota
+from pyromind_agent_server.evaluation_configuration import (
+    validate_evaluation_configuration,
+)
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.plan_database import build_experiment_plan_store
@@ -216,11 +222,18 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             harness_eviction_seconds,
             idle_eviction_seconds,
         )
+    plan_store = build_experiment_plan_store()
     runtime = ConversationRuntime(
         service.conversations_dir,
         adapters,
         default_harness_id=backend,
-        experiment_plan_store=build_experiment_plan_store(),
+        experiment_plan_store=plan_store,
+        experiment_execution_store=SQLExperimentExecutionStore(plan_store.engine)
+        if plan_store
+        else None,
+        execution_roles=tuple(
+            role.name for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()
+        ),
         external_tasks=external_tasks,
         idle_eviction_seconds=idle_eviction_seconds,
         release_grace_seconds=release_grace_seconds,
@@ -231,9 +244,11 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         workflow_submission=PlatformWorkflowSubmission(),
         versions=versions,
         evaluation_storage_factory=build_evaluation_storage,
+        evaluation_config_validator=validate_evaluation_configuration,
     )
     pi_adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
     pi_adapter.set_plan_handler(runtime.experiment_plan_call)
+    pi_adapter.set_role_handler(runtime.execution_role_call)
     logger.info(
         "Pyromind product runtime ready: default_harness=%s "
         "PYROMIND_HARNESS_BACKEND=%s registered_harnesses=%s "
@@ -297,6 +312,7 @@ def install_product_api(app: FastAPI) -> FastAPI:
             runtime = ensure_product_runtime(current_app)
             if runtime is not None:
                 await runtime.recover_version_metadata()
+                await runtime.start_execution_events()
             try:
                 yield
             finally:

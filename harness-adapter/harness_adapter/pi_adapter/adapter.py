@@ -251,6 +251,8 @@ class PiAdapter:
             repository = Path(__file__).parents[3]
         self._workflow_call = workflow_call
         self._plan_call: Any = None
+        self._role_call: Any = None
+        self._role_scopes: dict[tuple[str, str], dict[str, Any]] = {}
         self._execution_outputs: dict[str, tuple[str, WorkflowEventSink]] = {}
         self._terminal_backend = validate_pi_terminal_backend(terminal_backend)
         self._conversation_root = Path(conversation_root).resolve()
@@ -341,12 +343,82 @@ class PiAdapter:
     def set_plan_handler(self, callback: Any) -> None:
         self._plan_call = callback
 
+    def set_role_handler(self, callback: Any) -> None:
+        self._role_call = callback
+
+    async def control_delegation(
+        self, handle: SessionHandle, request: JsonObject, context: RequestContext
+    ) -> JsonObject:
+        session = self._session(handle.session_id)
+        session.context = context
+        roles = {
+            role["name"]: role for role in session.config.get("delegated_roles") or []
+        }
+        role = str(request.get("role", ""))
+        if role not in roles or not session.config.get("managed_delegation"):
+            raise PermissionError("delegated role is not enabled")
+        scope = request.get("scope")
+        if not isinstance(scope, dict):
+            raise ValueError("delegation requires a trusted work scope")
+        self._role_scopes[(session.session_id, role)] = dict(scope)
+        await self._ensure_runner(session)
+        assert session.runner is not None
+        native_request = dict(request)
+        if request.get("launch_request_id") and not request.get("execution_ref"):
+            native_request["execution_ref"] = "rpc-spawn-" + str(
+                request["launch_request_id"]
+            )
+        raw = await session.runner.request("delegation.control", native_request)
+        if not isinstance(raw, dict):
+            raise ValueError("invalid delegation response")
+        return {
+            "execution_ref": raw.get("execution_ref"),
+            "status": {
+                "complete": "succeeded",
+                "completed": "succeeded",
+                "running": "running",
+                "queued": "queued",
+                "pending": "queued",
+                "failed": "failed",
+                "stopped": "stopped",
+                "paused": "paused",
+                "stopping": "stopping",
+            }.get(str(raw.get("status")), "unknown"),
+            "result_text": str(raw.get("result_text", "")),
+        }
+
+    def _delegated_tool_specs(self, session: _PiSession) -> dict[str, Any]:
+        from pyromind_runtime.domain.experiment_execution import ROLE_TOOLS
+
+        return {
+            role["name"]: [
+                {
+                    "name": name,
+                    "description": description,
+                    "input_schema": model.model_json_schema(),
+                }
+                for name, (model, description) in ROLE_TOOLS.items()
+                if name in role["tools"]
+            ]
+            for role in session.config.get("delegated_roles") or []
+        }
+
     def _tool_allowed(self, session: _PiSession, name: str) -> bool:
         allowed = session.config.get("tool_allowlist")
         return allowed is None or name in allowed
 
     def _tool_specs(self, session: _PiSession) -> list[dict[str, Any]]:
+        from pyromind_runtime.domain.experiment_execution import (
+            GetExperimentExecution,
+            RequestExperimentTask,
+        )
         from pyromind_runtime.domain.experiment_plans import PLAN_TOOLS
+
+        tools = {
+            **PLAN_TOOLS,
+            "request_experiment_task": RequestExperimentTask,
+            "get_experiment_execution": GetExperimentExecution,
+        }
 
         specs = self._business_tools.specs(sandbox=self._terminal_backend == "sandbox")
         if self._plan_call is not None:
@@ -368,10 +440,14 @@ class PiAdapter:
             specs += [
                 {
                     "name": name,
-                    "description": descriptions[name],
+                    "description": descriptions.get(
+                        name,
+                        "Request or query a scoped experiment execution. "
+                        "Execution requires separate user approval.",
+                    ),
                     "input_schema": model.model_json_schema(),
                 }
-                for name, model in PLAN_TOOLS.items()
+                for name, model in tools.items()
                 if session.config.get("tool_allowlist") is not None
                 and self._tool_allowed(session, name)
             ]
@@ -1031,6 +1107,9 @@ class PiAdapter:
         session = await self._remove(handle.session_id)
         if session is None:
             return
+        for key in tuple(self._role_scopes):
+            if key[0] == handle.session_id:
+                self._role_scopes.pop(key, None)
         try:
             if (
                 session.pending_permission is not None
@@ -1256,6 +1335,9 @@ class PiAdapter:
                 "tools": self._tool_specs(session),
                 "tool_allowlist": session.config.get("tool_allowlist"),
                 "skill_allowlist": session.config.get("skill_allowlist"),
+                "delegated_roles": session.config.get("delegated_roles"),
+                "delegated_tool_specs": self._delegated_tool_specs(session),
+                "managed_delegation": session.config.get("managed_delegation", False),
                 "terminal_environment": (
                     self._business_tools.terminal_environment(
                         replace(
@@ -1300,6 +1382,37 @@ class PiAdapter:
     async def _runner_request(
         self, session: _PiSession, method: str, params: dict[str, Any]
     ) -> Any:
+        if method == "role.tool.execute":
+            role, name = params.get("role"), params.get("tool_name")
+            configured = next(
+                (
+                    item
+                    for item in session.config.get("delegated_roles") or []
+                    if item["name"] == role
+                ),
+                None,
+            )
+            scope = self._role_scopes.get((session.session_id, str(role)))
+            if (
+                not configured
+                or name not in configured["tools"]
+                or scope is None
+                or self._role_call is None
+            ):
+                raise PermissionError("role tool is not authorized")
+            arguments = params.get("arguments")
+            if not isinstance(arguments, dict):
+                raise ValueError("role tool arguments must be an object")
+            result = await self._role_call(
+                session.session_id, role, name, arguments, scope, session.context
+            )
+            return {
+                "content": [
+                    {"type": "text", "text": json.dumps(result, ensure_ascii=False)}
+                ],
+                "details": result,
+                "is_error": False,
+            }
         if method == "workflow.invoke":
             if not self._tool_allowed(
                 session, "genome_" + str(params.get("action", ""))
@@ -1354,7 +1467,10 @@ class PiAdapter:
                 raise ValueError("tool arguments must be an object")
             from pyromind_runtime.domain.experiment_plans import PLAN_TOOLS
 
-            if tool_name in PLAN_TOOLS:
+            if tool_name in PLAN_TOOLS or tool_name in {
+                "request_experiment_task",
+                "get_experiment_execution",
+            }:
                 if self._plan_call is None:
                     raise ValueError("plan tools are not configured")
                 result = await self._plan_call(
@@ -1943,8 +2059,14 @@ def _session_config(spec: SessionSpec) -> dict[str, Any]:
         "session_id": spec.conversation_id,
         "product_instructions": spec.product_instructions,
         "profile_id": spec.profile_id,
+        "managed_delegation": spec.managed_delegation,
         "tool_allowlist": spec.tool_allowlist,
         "skill_allowlist": spec.skill_allowlist,
+        "delegated_roles": [
+            role.model_dump(mode="json") for role in spec.delegated_roles
+        ]
+        if spec.delegated_roles is not None
+        else None,
         "protocol_version": PROTOCOL_VERSION,
         "model": {
             "provider": provider,

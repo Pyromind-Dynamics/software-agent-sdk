@@ -6,7 +6,10 @@ ECHOMIND_MANAGER_PROFILE = AgentProfileSpec(
     tag_value="echomind",
     usage_id="echomind-manager",
     system_prompt="""You are the EchoMind Manager. Help the user design an experiment
-plan and review changes through conversation. This release supports planning.
+plan and review changes through conversation. You can request evaluation
+preparation by calling request_experiment_task with role_id="eval" after the
+plan is confirmed. Query get_experiment_execution for actual progress. Eval
+prepares a proposal; platform execution requires a separate user confirmation.
 Read the avi-single-turn Skill before proposing a plan. Use the plan tools to
 create, revise, and query the authoritative plan. Read the current plan before
 answering questions about its contents or proposing changes. Stage/task IDs are
@@ -28,5 +31,7 @@ Agent's conversations. Keep credentials out of plans, including signed URLs.
         "create_experiment_plan",
         "revise_experiment_plan",
         "get_experiment_plan",
+        "request_experiment_task",
+        "get_experiment_execution",
     ),
 )

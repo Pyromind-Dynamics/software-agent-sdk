@@ -11,9 +11,10 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
+from pyromind_runtime.application.delegated_execution import DelegatedExecution
 from pyromind_runtime.application.evaluation_annotations import (
     EvaluationAnnotationService,
     EvaluationLockRegistry,
@@ -26,6 +27,7 @@ from pyromind_runtime.application.evaluation_cases import (
     EvaluationMedia,
 )
 from pyromind_runtime.application.event_projection import ProductEventProjector
+from pyromind_runtime.application.experiment_execution import ExperimentExecutions
 from pyromind_runtime.application.experiment_plans import ExperimentPlans
 from pyromind_runtime.application.reusable_workflows import (
     ReusableWorkflows,
@@ -33,15 +35,18 @@ from pyromind_runtime.application.reusable_workflows import (
 )
 from pyromind_runtime.application.user_input_coordinator import UserInputCoordinator
 from pyromind_runtime.application.versions import Versions
+from pyromind_runtime.application.work_queue import DurableWorker
 from pyromind_runtime.application.workflow_completion import WorkflowCompletionHook
 from pyromind_runtime.domain.capabilities import ResourceLimits
 from pyromind_runtime.domain.commands import (
     CancelCommand,
     CommandReceipt,
+    ConfirmExperimentExecutionCommand,
     ConfirmExperimentPlanCommand,
     InputResponseCommand,
     PermissionResponseCommand,
     ProductCommand,
+    RejectExperimentExecutionCommand,
     RejectExperimentPlanCommand,
     RollbackWorkflowCommand,
     UserMessageCommand,
@@ -60,6 +65,13 @@ from pyromind_runtime.domain.evaluation import (
     AnnotationSummaryResult,
 )
 from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.experiment_execution import (
+    ROLE_TOOLS,
+    EvaluationProposal,
+    ExperimentExecutionView,
+    ReadExperimentResource,
+    RequestExperimentTask,
+)
 from pyromind_runtime.domain.experiment_plans import (
     PLAN_TOOLS,
     CreateExperimentPlan,
@@ -88,9 +100,11 @@ from pyromind_runtime.infrastructure.file_product_store import (
     FileProductStore,
     ProductStoreError,
 )
+from pyromind_runtime.ports.experiment_execution import DelegatedExecutionStore
 from pyromind_runtime.ports.experiment_plans import ExperimentPlanStore
 from pyromind_runtime.ports.external_tasks import ExternalTaskRegistry
 from pyromind_runtime.ports.harness import (
+    DelegationAdapter,
     ExternalTaskNotification,
     ForkSpec,
     HarnessAdapter,
@@ -166,6 +180,9 @@ class ConversationRuntime:
         *,
         default_harness_id: str = "openhands",
         experiment_plan_store: ExperimentPlanStore | None = None,
+        experiment_execution_store: DelegatedExecutionStore | None = None,
+        execution_roles: tuple[str, ...] = (),
+        evaluation_config_validator: Callable[[JsonObject], JsonObject] | None = None,
         external_tasks: ExternalTaskRegistry | None = None,
         idle_eviction_seconds: int = 300,
         release_grace_seconds: int = 300,
@@ -190,6 +207,27 @@ class ConversationRuntime:
         self._experiment_plans = (
             ExperimentPlans(experiment_plan_store) if experiment_plan_store else None
         )
+        self._experiment_executions = (
+            ExperimentExecutions(experiment_plan_store, experiment_execution_store)
+            if experiment_plan_store and experiment_execution_store
+            else None
+        )
+        self._execution_worker: DurableWorker | None = None
+        self._delegated_store = experiment_execution_store
+        self._execution_roles = execution_roles
+        self._evaluation_config_validator = evaluation_config_validator
+        if experiment_plan_store and experiment_execution_store and execution_roles:
+            delegated = DelegatedExecution(
+                experiment_plan_store,
+                experiment_execution_store,
+                self._control_delegation,
+            )
+            self._execution_worker = DurableWorker(
+                experiment_execution_store.queue,
+                {"prepare_execution": delegated.prepare},
+                delegated.reconcile,
+            )
+        self._execution_event_task: asyncio.Task[None] | None = None
         self._resource_limits = resource_limits
         self._external_tasks = external_tasks
         self._workflow_submission = workflow_submission
@@ -232,6 +270,267 @@ class ConversationRuntime:
         ] = {}
         self._evaluation_annotation_cache_lock = threading.Lock()
         self._pending_task_registrations: dict[str, asyncio.Event] = {}
+
+    def _execution_service(
+        self, conversation_id: str, context: RequestContext, tool_name: str
+    ) -> tuple[ExperimentExecutions, PlanOwner]:
+        store = self._store(conversation_id)
+        store.authorize(context.user_id, context.profile_id)
+        readable = tool_name == "get_experiment_execution" and store.permits_tool(
+            "get_experiment_plan"
+        )
+        if not store.permits_tool(tool_name) and not readable:
+            raise PermissionError("experiment execution capability is not enabled")
+        if self._experiment_executions is None:
+            raise ProductRuntimeError(
+                "plan_store_unavailable", "Execution worker is not configured."
+            )
+        return self._experiment_executions, PlanOwner(
+            user_id=context.user_id,
+            conversation_id=conversation_id,
+            profile_id=context.profile_id,
+        )
+
+    async def get_experiment_executions(
+        self, conversation_id: str, context: RequestContext
+    ) -> tuple[ExperimentExecutionView, ...]:
+        service, owner = self._execution_service(
+            conversation_id, context, "get_experiment_execution"
+        )
+        return await self._plan_io(service.list, owner)
+
+    async def request_experiment_task(
+        self,
+        conversation_id: str,
+        request: RequestExperimentTask,
+        context: RequestContext,
+    ) -> dict:
+        service, owner = self._execution_service(
+            conversation_id, context, "request_experiment_task"
+        )
+        return await self._plan_io(
+            service.request, owner, request, self._execution_roles
+        )
+
+    async def _submit_execution_decision(
+        self,
+        conversation_id: str,
+        command: ConfirmExperimentExecutionCommand | RejectExperimentExecutionCommand,
+        context: RequestContext,
+    ) -> CommandReceipt:
+        service, owner = self._execution_service(
+            conversation_id, context, "get_experiment_execution"
+        )
+        store = self._store(conversation_id)
+        receipt, claimed = store.claim_command(command)
+        if not claimed and receipt.status == "completed":
+            return receipt
+        response = await self._plan_io(
+            service.decide,
+            owner,
+            command.run_id,
+            command.command_id,
+            command.expected_revision,
+            command.fingerprint,
+            "allow"
+            if isinstance(command, ConfirmExperimentExecutionCommand)
+            else "deny",
+        )
+        completed = receipt.model_copy(
+            update={
+                "status": "completed",
+                "response": {
+                    "run_id": response["id"],
+                    "state": response["state"],
+                    "fingerprint": response["fingerprint"],
+                },
+            }
+        )
+        try:
+            store.complete_command(completed)
+        except OSError:
+            logger.warning(
+                "Execution committed; command receipt write failed: %s",
+                command.command_id,
+            )
+        return completed
+
+    async def flush_execution_events(self) -> None:
+        if self._experiment_executions is None:
+            return
+        port = self._experiment_executions.store
+        for notification in await self._plan_io(port.pending_deliveries):
+            conversation_id = notification["conversation_id"]
+            event, _ = self._store(conversation_id).append(
+                ProductEvent(
+                    event_id="execution:" + notification["id"],
+                    conversation_id=conversation_id,
+                    type="experiment_execution.changed",
+                    payload=notification["payload"],
+                )
+            )
+            self._publish(event)
+            await self._plan_io(port.acknowledge_delivery, notification["id"])
+
+    async def start_execution_events(self) -> None:
+        if (
+            self._execution_event_task is not None
+            or self._experiment_executions is None
+        ):
+            return
+
+        async def publish_loop() -> None:
+            while not self._closing:
+                try:
+                    await self.flush_execution_events()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "Execution refresh delivery failed; retrying", exc_info=True
+                    )
+                await asyncio.sleep(1)
+
+        self._execution_event_task = asyncio.create_task(publish_loop())
+        if self._execution_worker:
+            await self._execution_worker.start()
+
+    async def _control_delegation(
+        self, owner: PlanOwner, role: str, request: dict
+    ) -> dict:
+        if self._delegated_store is None:
+            raise PermissionError("delegated execution is unavailable")
+        scope = request.get("scope")
+        if not isinstance(scope, dict):
+            raise PermissionError("missing delegated work scope")
+        await self._plan_io(
+            self._delegated_store.role_scope, owner, str(scope["run_id"]), role, scope
+        )
+        active = self._active.get(owner.conversation_id)
+        if active is None:
+            raise PermissionError("session requires renewed authorization")
+        context = active.context
+        self._store(owner.conversation_id).authorize(
+            context.user_id, context.profile_id
+        )
+        if context.user_id != owner.user_id or context.profile_id != owner.profile_id:
+            raise PermissionError("delegated work owner mismatch")
+        if request.get("action") == "authorize":
+            return {"status": "authorized"}
+        async with self._use(owner.conversation_id):
+            port = cast(DelegationAdapter, active.adapter)
+            return await port.control_delegation(
+                active.handle, {**request, "role": role}, context
+            )
+
+    async def execution_role_call(
+        self,
+        conversation_id: str,
+        role: str,
+        tool: str,
+        arguments: dict,
+        scope: dict,
+        context: RequestContext,
+    ) -> dict:
+        if (
+            self._delegated_store is None
+            or role not in self._execution_roles
+            or tool not in ROLE_TOOLS
+        ):
+            raise PermissionError("execution role capability is unavailable")
+        owner = PlanOwner(
+            user_id=context.user_id,
+            conversation_id=conversation_id,
+            profile_id=context.profile_id,
+        )
+        self._store(conversation_id).authorize(context.user_id, context.profile_id)
+        run_id = str(scope["run_id"])
+        row = await self._plan_io(
+            self._delegated_store.role_scope, owner, run_id, role, scope
+        )
+        model = ROLE_TOOLS[tool][0].model_validate(arguments)
+        if getattr(model, "run_id", None) not in {None, run_id}:
+            raise PermissionError("tool requested another execution")
+        if isinstance(model, EvaluationProposal):
+            if (
+                self._evaluation_config_validator is None
+                or self._experiment_plans is None
+            ):
+                raise ValueError("evaluation configuration validation is unavailable")
+            configuration = self._evaluation_config_validator(model.configuration)
+            revision = await self._plan_io(
+                self._experiment_plans.store.revision, owner, row["revision"]
+            )
+            task = next(t for t in revision.plan.tasks if t.id == row["task_id"])
+            required = {entry.resource_id for entry in task.inputs if entry.resource_id}
+            if set(model.input_fingerprints) != required:
+                raise ValueError("all declared input fingerprints must be verified")
+            for resource_id, checksum in model.input_fingerprints.items():
+                actual = await self.execution_role_call(
+                    conversation_id,
+                    role,
+                    "read_experiment_resource",
+                    {"run_id": run_id, "resource_id": resource_id},
+                    scope,
+                    context,
+                )
+                if checksum != actual["sha256"]:
+                    raise ValueError("input changed during evaluation preparation")
+            model = model.model_copy(update={"configuration": configuration})
+            result = await self._plan_io(
+                self._delegated_store.propose_from_role,
+                owner,
+                run_id,
+                role,
+                scope,
+                model.model_dump(mode="json"),
+            )
+            return {
+                "run_id": run_id,
+                "state": result["state"],
+                "fingerprint": result["fingerprint"],
+            }
+        if isinstance(model, ReadExperimentResource):
+            if (
+                self._experiment_plans is None
+                or self._evaluation_storage_factory is None
+            ):
+                raise ValueError("input storage is unavailable")
+            revision = await self._plan_io(
+                self._experiment_plans.store.revision, owner, row["revision"]
+            )
+            task = next(t for t in revision.plan.tasks if t.id == row["task_id"])
+            permitted = {
+                entry.resource_id for entry in task.inputs if entry.resource_id
+            }
+            if model.resource_id not in permitted:
+                raise PermissionError("resource is not declared as this task's input")
+            resource = next(
+                r for r in revision.plan.resources if r.id == model.resource_id
+            )
+            path = resource.uri or ""
+            if not path.startswith("/") or ".." in path.split("/"):
+                raise ValueError("resource needs an absolute Storage file path")
+            storage = self._evaluation_storage_factory(context)
+            content = await asyncio.to_thread(storage.read, path)
+            import hashlib
+
+            checksum = await asyncio.to_thread(
+                lambda: hashlib.sha256(content).hexdigest()
+            )
+            return {
+                "resource_id": resource.id,
+                "sha256": checksum,
+                "size": len(content),
+                "preview": content[: model.max_bytes].decode("utf-8", errors="replace"),
+                "truncated": len(content) > model.max_bytes,
+            }
+        if tool == "get_experiment_execution":
+            views = await self.get_experiment_executions(conversation_id, context)
+            return next(
+                view.model_dump(mode="json") for view in views if view.run_id == run_id
+            )
+        raise ValueError("unsupported role tool")
 
     @property
     def experiment_plans_available(self) -> bool:
@@ -282,6 +581,16 @@ class ConversationRuntime:
         arguments: JsonObject,
         context: RequestContext,
     ) -> JsonObject:
+        if tool_name == "request_experiment_task":
+            row = await self.request_experiment_task(
+                conversation_id,
+                RequestExperimentTask.model_validate(arguments),
+                context,
+            )
+            return {"run_id": row["id"], "state": row["state"]}
+        if tool_name == "get_experiment_execution":
+            views = await self.get_experiment_executions(conversation_id, context)
+            return {"executions": [view.model_dump(mode="json") for view in views]}
         if tool_name not in PLAN_TOOLS:
             raise PermissionError("unknown plan tool")
         service, owner = self._plan_service(conversation_id, context, tool_name)
@@ -1299,6 +1608,13 @@ class ConversationRuntime:
         if store.permits_tool("get_experiment_plan"):
             view = await self.get_experiment_plan(conversation_id, context)
             snapshot = snapshot.model_copy(update={"experiment_plan": view})
+            if self._experiment_executions is not None:
+                executions = await self.get_experiment_executions(
+                    conversation_id, context
+                )
+                snapshot = snapshot.model_copy(
+                    update={"experiment_executions": executions}
+                )
         return snapshot
 
     async def submit_command(
@@ -1313,7 +1629,23 @@ class ConversationRuntime:
             command, (ConfirmExperimentPlanCommand, RejectExperimentPlanCommand)
         ):
             return await self._submit_plan_decision(conversation_id, command, context)
+        if isinstance(
+            command,
+            (ConfirmExperimentExecutionCommand, RejectExperimentExecutionCommand),
+        ):
+            return await self._submit_execution_decision(
+                conversation_id, command, context
+            )
         store = await self._ensure_active(conversation_id, context)
+        if self._delegated_store is not None:
+            await self._plan_io(
+                self._delegated_store.resume_authorized,
+                PlanOwner(
+                    user_id=context.user_id,
+                    conversation_id=conversation_id,
+                    profile_id=context.profile_id,
+                ),
+            )
         store.save_x_cluster(context.x_cluster)
         receipt, claimed = store.claim_command(command)
         if not claimed:
@@ -2150,6 +2482,12 @@ class ConversationRuntime:
         # Release admission waiters first so shutdown can fail them immediately
         # instead of blocking on a suspended graph.
         self._closing = True
+        if self._execution_worker:
+            await self._execution_worker.close()
+        if self._execution_event_task is not None:
+            self._execution_event_task.cancel()
+            await asyncio.gather(self._execution_event_task, return_exceptions=True)
+            self._execution_event_task = None
         for wakeup in self._auto_execution_wakeups.values():
             wakeup.set()
         await asyncio.gather(*tuple(self._input_response_tasks), return_exceptions=True)

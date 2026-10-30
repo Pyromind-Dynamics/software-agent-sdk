@@ -10,7 +10,7 @@ export default async function (pi: ExtensionAPI) {
   pi.on("session_start", async () => {
     const socket = process.env.PYROMIND_SUBAGENT_SOCKET;
     if (!socket) throw new Error("Missing subagent execution host");
-    await callSubagentHost(socket, { method: "config", role: "search" });
+    await callSubagentHost(socket, { method: "probe" });
     const active = new Set(pi.getActiveTools());
     for (const tool of pi.getAllTools()) {
       if (active.has(tool.name) && !tool.description.startsWith("[Conversation host]")) {

@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { callSubagentHost } from "./subagent-ipc.js";
 
 /** Loaded by pi-subagents in both its foreground and detached child sessions. */
-export async function installChildHost(pi: ExtensionAPI, role: "search" | "general_purpose") {
+export async function installChildHost(pi: ExtensionAPI, role: string) {
   const socket = process.env.PYROMIND_SUBAGENT_SOCKET;
   if (!socket) throw new Error("Missing conversation subagent host");
   const config = await callSubagentHost(socket, { method: "config", role });
@@ -37,5 +37,16 @@ export async function installChildHost(pi: ExtensionAPI, role: "search" | "gener
     const allowed = new Set(config.tools.map((tool: any) => tool.name));
     if (pi.getActiveTools().some((name) => !allowed.has(name))) throw new Error("Unexpected tool in subagent session");
   });
-  pi.on("before_agent_start", (event) => ({ systemPrompt: event.systemPrompt + "\n" + config.instructions }));
+  pi.on("before_agent_start", (event) => {
+    let prompt = event.systemPrompt;
+    for (const mapping of config.skillPathAliases ?? []) {
+      prompt = prompt.replaceAll(mapping.host, mapping.alias);
+      const options = event.systemPromptOptions;
+      options.skills = options.skills.map(skill => ({ ...skill,
+        filePath: skill.filePath.replace(mapping.host, mapping.alias),
+        baseDir: skill.baseDir.replace(mapping.host, mapping.alias),
+      }));
+    }
+    return { systemPrompt: prompt + "\n" + config.instructions };
+  });
 }

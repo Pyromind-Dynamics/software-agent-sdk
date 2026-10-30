@@ -401,7 +401,16 @@ def test_plan_migration_matches_storage_schema(tmp_path):
         context = MigrationContext.configure(
             connection, opts={"version_table": "experiment_plan_schema_version"}
         )
-        assert compare_metadata(context, metadata) == []
+        from pyromind_runtime.infrastructure.sql_experiment_execution import (
+            metadata as execution_metadata,
+        )
+        from sqlalchemy import MetaData
+
+        combined = MetaData()
+        for source in (metadata, execution_metadata):
+            for table in source.tables.values():
+                table.to_metadata(combined)
+        assert compare_metadata(context, combined) == []
     engine.dispose()
 
 
@@ -640,6 +649,8 @@ async def test_plan_tools_through_real_pi_and_restored_session(
             "create_experiment_plan",
             "revise_experiment_plan",
             "get_experiment_plan",
+            "request_experiment_task",
+            "get_experiment_execution",
         }
         prompt = json.dumps(requests[0]["messages"], ensure_ascii=False)
         assert "avi-single-turn" in prompt and "generate-workflow-dsl" not in prompt

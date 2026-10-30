@@ -319,7 +319,7 @@ function bindPathTool(
   };
 }
 
-function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig): AgentTool<TSchema, unknown> {
+export function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig, role?: string): AgentTool<TSchema, unknown> {
   return {
     name: config.name,
     label: config.name,
@@ -327,7 +327,8 @@ function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig): AgentTool
     parameters: config.inputSchema as TSchema,
     async execute(callId, params, signal) {
       if (!isRecord(params)) throw new Error("tool arguments must be an object");
-      const response = await peer.request("tool.execute", {
+      const response = await peer.request(role ? "role.tool.execute" : "tool.execute", {
+        ...(role ? { role } : {}),
         tool_call_id: callId,
         tool_name: config.name,
         arguments: JSON.parse(JSON.stringify(params)) as JsonObject,

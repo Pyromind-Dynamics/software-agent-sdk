@@ -5,7 +5,6 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { isRecord } from "./protocol.js";
 
 const RUN_ID = "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
-const REPORT_NAME = new RegExp(`^(${RUN_ID})_(search|general_purpose)(?:_0)?_output\\.md$`);
 const TARGET = new RegExp(`public_data/subagents/(${RUN_ID})/report\\.md`, "g");
 const MAX_REPORT_BYTES = 16 * 1024 * 1024;
 const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -29,9 +28,11 @@ export class SubagentReports {
   private readonly pending = new Map<string, Promise<void>>();
   private readonly failures = new Map<string, string>();
   private readonly root: string;
+  private readonly reportName: RegExp;
 
-  constructor(workspace: string, private readonly parentId: () => string, private readonly writer: AgentTool) {
+  constructor(workspace: string, private readonly parentId: () => string, private readonly writer: AgentTool, private readonly allowedRoles: string[] = ["search", "general_purpose"]) {
     this.root = join(workspace, "pi", "subagent-artifacts");
+    this.reportName = new RegExp(`^(${RUN_ID})_(${allowedRoles.map(escapeRegex).join("|")})(?:_0)?_output\\.md$`);
   }
 
   beginTurn() { this.failures.clear(); }
@@ -40,7 +41,7 @@ export class SubagentReports {
     const original = content;
     const text = strings([content, details]).join("\n");
     const sources = new Set<string>();
-    const pattern = new RegExp(`${escapeRegex(this.root)}/(${RUN_ID})_(?:search|general_purpose)(?:_0)?_output\\.md`, "g");
+    const pattern = new RegExp(`${escapeRegex(this.root)}/(${RUN_ID})_(?:${this.allowedRoles.map(escapeRegex).join("|")})(?:_0)?_output\\.md`, "g");
     for (const match of text.matchAll(pattern)) sources.add(match[0]);
     // Successful tool results are persisted with workspace references. Reconstruct from
     // native metadata after restart, without a second durable report registry.
@@ -49,13 +50,13 @@ export class SubagentReports {
       for (const run of details.runs) if (isRecord(run) && typeof run.runId === "string" && new RegExp(`^${RUN_ID}$`).test(run.runId)) ids.add(run.runId);
     }
     for (const id of ids) {
-      for (const agent of ["search", "general_purpose"]) for (const suffix of ["_0", ""]) {
+      for (const agent of this.allowedRoles) for (const suffix of ["_0", ""]) {
         const path = join(this.root, `${id}_${agent}${suffix}_output.md`);
         try { await this.metadata(path); sources.add(path); } catch { /* Other native filename variants need not exist. */ }
       }
     }
     for (const source of sources) {
-      const id = REPORT_NAME.exec(basename(source))![1];
+      const id = this.reportName.exec(basename(source))![1];
       const target = `public_data/subagents/${id}/report.md`;
       if (!strings(content).some(value => value.includes(source) || value.includes(target) || value.includes(`run ID: ${id}`) || /preview truncated/.test(value))) continue;
       try {
@@ -106,10 +107,10 @@ export class SubagentReports {
   }
 
   private async metadata(source: string) {
-    const match = REPORT_NAME.exec(basename(source));
+    const match = this.reportName.exec(basename(source));
     if (!match || join(this.root, basename(source)) !== source) throw new Error("报告路径校验失败");
     const meta = JSON.parse(await this.readFile(source.replace(/_output\.md$/, "_meta.json"), 1024 * 1024));
-    if (!isRecord(meta) || meta.runId !== match[1] || meta.agent !== match[2] || meta.parentSessionId !== this.parentId()) throw new Error("报告不属于当前会话的原生运行记录");
+    if (!isRecord(meta) || meta.runId !== match[1] || typeof meta.agent !== "string" || !this.allowedRoles.includes(meta.agent) || meta.agent !== match[2] || meta.parentSessionId !== this.parentId()) throw new Error("报告不属于当前会话的原生运行记录");
     return meta;
   }
 

@@ -1,3 +1,4 @@
+import { parseSubagentRoles, type SubagentRoleDefinition } from "./subagent-roles.js";
 import { capabilityCeiling, restrictSkillReads } from "./session-policy.js";
 import { fileURLToPath } from "node:url";
 import { SubagentHost } from "./subagent-host.js";
@@ -37,6 +38,7 @@ import {
 import { inside } from "./workspace-policy.js";
 import {
   createTools,
+  businessTool,
   type BusinessToolConfig,
   type CreateToolsOptions,
   type SkillRootConfig,
@@ -60,6 +62,7 @@ interface PiSessionConfig extends PiModelConfig {
   tools: BusinessToolConfig[];
   toolAllowlist?: string[];
   skillAllowlist?: string[];
+  delegatedRoles?: SubagentRoleDefinition[];
 }
 
 export interface ParsedPrompt {
@@ -198,7 +201,30 @@ export async function createPiSession(
   })));
   const childInstructions = "Use read-only knowledge/ and .agents/skills/ resources and public_data/ conversation files. The user Storage mount is addressed by its absolute path. Write only public_data/. " +
     "Tool paths refer to the conversation execution environment, never the host's directories. Available skills:\n" + skillPaths.map((path) => applySandboxPathAliases(path, sandboxPathAliases)).join("\n");
-  const subagents = new SubagentHost(config.workspaceRoot, config.sessionId, peer, childTools, modelRuntime, model, childInstructions);
+  const roleToolSets = config.delegatedRoles ? Object.fromEntries(config.delegatedRoles.map(role => {
+    const roots = (role.skills ?? []).map(name => {
+      const root = config.skillsDirectory ? join(config.skillsDirectory, name) : config.skillRoots.find(root => root.name === name)?.path;
+      if (!root) throw new Error(`Unknown delegated skill: ${name}`);
+      const canonical = realpathSync(root);
+      if (!skillPaths.some(parent => inside(canonical, parent))) throw new Error("Delegated skill escapes resource roots");
+      return canonical;
+    });
+    role.skillPaths = roots;
+    const roleSpecs = isRecord(params.delegated_tool_specs) && Array.isArray(params.delegated_tool_specs[role.name])
+      ? parseTools(params.delegated_tool_specs[role.name]) : [];
+    const business = roleSpecs.map(spec => businessTool(peer, spec, role.name));
+    const scoped = childTools.filter(tool => role.tools.includes(tool.name)).map(tool => {
+      const raw = rawTools.find(candidate => candidate.name === tool.name) ?? tool;
+      const guarded = coordinator.wrap(restrictSkillReads(raw, config.workspaceRoot, skillPaths, roots, config.skillsDirectory), peer);
+      if (tool.name !== "read" || config.terminalBackend !== "sandbox") return guarded;
+      return { ...guarded, execute: (id: string, args: any, signal?: AbortSignal, update?: any) => coordinator.run(signal, async () => {
+        await verifyReadScope(executionAccess!, options.readMirror, args.path, signal);
+        return guarded.execute(id, args, signal, update);
+      }) };
+    });
+    return [role.name, [...scoped, ...business]];
+  })) : undefined;
+  const subagents = new SubagentHost(config.workspaceRoot, config.sessionId, peer, childTools, modelRuntime, model, childInstructions, config.delegatedRoles, roleToolSets, sandboxPathAliases);
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 20_000 },
     retry: modelRetrySettings(),
@@ -214,7 +240,14 @@ export async function createPiSession(
     appendSystemPrompt: params.workflows_enabled === true
       ? ["历史经验的路径参数使用当前会话执行环境的路径：Storage 文件用挂载点绝对路径（如 /target-workspace/agentTest/input.csv），会话文件使用 public_data/...。与 read/terminal 验证成功的路径保持一致；不要改成服务端路径或平台 /workspace 路径。"]
       : [],
-    eventBus: experienceHost.eventBus,
+    eventBus: params.managed_delegation === true ? {
+      ...experienceHost.eventBus,
+      emit(channel, data) {
+        if (["subagent:async-complete", "subagent:foreground-complete"].includes(channel) && isRecord(data))
+          return experienceHost.eventBus.emit(channel, { ...data, triggerTurn: false });
+        return experienceHost.eventBus.emit(channel, data);
+      },
+    } : experienceHost.eventBus,
     additionalExtensionPaths: [...experienceHost.additionalExtensionPaths, fileURLToPath(import.meta.resolve("pi-subagents"))],
     extensionFactories: [
       subagents.extension,
@@ -356,6 +389,7 @@ function parseConfig(value: JsonObject): PiSessionConfig {
     tools: parseTools(value.tools),
     toolAllowlist: parseAllowlist(value.tool_allowlist),
     skillAllowlist: parseAllowlist(value.skill_allowlist),
+    delegatedRoles: parseSubagentRoles(value.delegated_roles),
   };
 }
 

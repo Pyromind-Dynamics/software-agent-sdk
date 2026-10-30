@@ -1,3 +1,4 @@
+import { writeSubagentRoles, type SubagentRoleDefinition } from "./subagent-roles.js";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -19,7 +20,7 @@ export function subagentModule(name: string): string {
   return existsSync(js) ? js : js.replace(/\.js$/, ".ts");
 }
 
-export function prepareSubagentEnvironment(workspace: string) {
+export function prepareSubagentEnvironment(workspace: string, definitions?: SubagentRoleDefinition[]) {
   const agentDir = join(workspace, "pi", "agent");
   const stateRoot = join(workspace, "pi", "subagents");
   for (const path of [agentDir, stateRoot, join(agentDir, "agents"), join(agentDir, "extensions", "subagent")]) mkdirSync(path, { recursive: true, mode: 0o700 });
@@ -31,6 +32,7 @@ export function prepareSubagentEnvironment(workspace: string) {
     const extension = subagentModule(role === "search" ? "subagent-search-extension" : "subagent-general-extension");
     writeFileSync(join(agentDir, "agents", `${role}.md`), readFileSync(join(roleRoot, `${role}.md`), "utf8").replace("{{extension}}", extension), { mode: 0o600 });
   }
+  if (definitions) writeSubagentRoles(agentDir, definitions, subagentModule("subagent-child-extension"));
   writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ subagents: {
     disableBuiltins: true, agentExcludeDirs: [join(workspace, ".agents"), join(workspace, ".pi")],
     modelScope: { allow: ["inherit"] },
@@ -45,6 +47,8 @@ Inspect: {action:"status",id:"<run-id>"}. Continue: {action:"resume",id:"<run-id
 Resume restores the child session and returns a new run ID; use the latest returned ID. Native completion notifications deliver background results.
 When a result points to Full output in public_data/subagents/, use read with that exact path and paginate as needed. Do not rerun the child to retrieve a truncated report.
 Only these two exact role names and these calls are supported. Do not pass options, model, tools, cwd, workflow, tasks or chain overrides.\n`, { mode: 0o600 });
+  if (definitions) writeFileSync(join(agentDir, "subagent-tool-description.md"),
+    `Delegate a bounded task to an enabled role: ${definitions.map(role => role.name).join(", ")}. Use status/resume/stop for lifecycle control; role tools and context are host-controlled.`, { mode: 0o600 });
   writeFileSync(join(agentDir, "extensions", "subagent", "config.json"), JSON.stringify({
     toolActivation: "eager", toolDescriptionMode: "custom", asyncByDefault: true,
     defaultSubagentContext: "fresh", intercomBridge: { mode: "off" }, maxActiveAsyncRunsPerSession: 4, globalConcurrencyLimit: 4,
@@ -57,6 +61,7 @@ Only these two exact role names and these calls are supported. Do not pass optio
 
 /** Bridges capabilities and product observations; all execution lifecycle belongs to pi-subagents. */
 export class SubagentHost {
+  private readonly roleTools: Record<string, string[]>;
   private session?: AgentSession;
   private pi?: ExtensionAPI;
   private closeIpc?: () => Promise<void>;
@@ -81,24 +86,30 @@ export class SubagentHost {
   readonly paths: ReturnType<typeof prepareSubagentEnvironment>;
 
   constructor(workspace: string, private sessionId: string, private peer: JsonlRpcPeer,
-    private tools: AgentTool[], private modelRuntime: ModelRuntime, private model: Model<Api>, private instructions: string) {
-    this.paths = prepareSubagentEnvironment(workspace);
+    private tools: AgentTool[], private modelRuntime: ModelRuntime, private model: Model<Api>, private instructions: string, private definitions?: SubagentRoleDefinition[], private roleToolSets?: Record<string, AgentTool[]>, private skillPathAliases: Array<{ host: string; alias: string }> = []) {
+    this.roleTools = definitions ? Object.fromEntries(definitions.map(role => [role.name, role.tools])) : ROLE_TOOLS;
+    const toolNames = new Set([...tools, ...Object.values(roleToolSets ?? {}).flat()].map(tool => tool.name));
+    if (definitions?.some(role => role.tools.some(name => !toolNames.has(name)))) throw new Error("Delegated role requests an unavailable host tool");
+    this.paths = prepareSubagentEnvironment(workspace, definitions);
     const writer = tools.find(tool => tool.name === "write");
     if (!writer) throw new Error("Subagent report delivery requires the conversation write tool");
-    this.reports = new SubagentReports(workspace, () => this.session!.sessionId, writer);
+    this.reports = new SubagentReports(workspace, () => this.session!.sessionId, writer, Object.keys(this.roleTools));
   }
 
   async start() {
     this.closeIpc = await serveSubagentIpc(this.paths.socket, async (request, signal, update) => {
-      if (!isRecord(request) || !(request.role === "search" || request.role === "general_purpose")) throw new Error("Unknown child role");
-      const allowed = ROLE_TOOLS[request.role];
+      if (isRecord(request) && request.method === "probe") return { ready: true };
+      if (!isRecord(request) || typeof request.role !== "string" || !Object.hasOwn(this.roleTools, request.role)) throw new Error("Unknown child role");
+      const allowed = this.roleTools[request.role];
+      const roleTools = this.roleToolSets?.[request.role] ?? this.tools;
       if (request.method === "config") return {
         model: publicModel(this.session?.model ?? this.model), instructions: this.instructions,
-        tools: this.tools.filter((tool) => allowed.includes(tool.name)).map(({ name, label, description, parameters }) => ({ name, label, description: `[Conversation host] ${description}`, parameters })),
+        skillPathAliases: this.skillPathAliases,
+        tools: roleTools.filter((tool) => allowed.includes(tool.name)).map(({ name, label, description, parameters }) => ({ name, label, description: `[Conversation host] ${description}`, parameters })),
       };
       if (request.method === "tool") {
         if (typeof request.name !== "string" || !allowed.includes(request.name)) throw new Error("Child tool is not allowed");
-        const tool = this.tools.find((tool) => tool.name === request.name);
+        const tool = roleTools.find((tool) => tool.name === request.name);
         if (!tool) throw new Error("Child tool is unavailable");
         const id = `subagent:${request.session}:${request.id}`;
         try { return await tool.execute(id, request.args, signal, update); }
@@ -138,13 +149,13 @@ export class SubagentHost {
     pi.on("session_start", (_event, ctx) => {
       for (const registration of this.registrations) registration.dispose();
       this.registrations = [
-        registerSubagentCapabilityCeiling({ sessionId: ctx.sessionManager.getSessionId(), source: "conversation", ceiling: { allowedAgents: Object.keys(ROLE_TOOLS), allowedTools: ROLE_TOOLS.general_purpose } }),
+        registerSubagentCapabilityCeiling({ sessionId: ctx.sessionManager.getSessionId(), source: "conversation", ceiling: { allowedAgents: Object.keys(this.roleTools), allowedTools: [...new Set(Object.values(this.roleTools).flat())] } }),
         registerRequiredChildExtensions({ sessionId: ctx.sessionManager.getSessionId(), extensions: [{ id: "conversation-host", path: subagentModule("subagent-required-extension") }] }),
       ];
     });
     pi.on("tool_call", (event) => {
       if (event.toolName !== "subagent") return;
-      const error = validateSubagentCall(event.input);
+      const error = validateSubagentCall(event.input, this.roleTools);
       if (error) return { block: true, reason: error };
     });
     for (const event of ["subagent:async-started", "subagent:async-complete", "subagent:foreground-complete", "subagent:process-terminal", "subagent:child-status"]) {
@@ -166,9 +177,8 @@ export class SubagentHost {
     this.monitor.unref();
   }
 
-  async rpc(method: string, params: Record<string, unknown> = {}): Promise<any> {
+  async rpc(method: string, params: Record<string, unknown> = {}, requestId: string = randomUUID()): Promise<any> {
     if (!this.pi) throw new Error("Subagent plugin not loaded");
-    const requestId = randomUUID();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { off(); reject(new Error(`Subagent ${method} timed out`)); }, 15_000);
       const off = this.pi!.events.on(`subagents:rpc:v1:reply:${requestId}`, (reply: any) => {
@@ -177,6 +187,32 @@ export class SubagentHost {
       });
       this.pi!.events.emit("subagents:rpc:v1:request", { version: 1, requestId, method, params });
     });
+  }
+
+  async control(input: JsonObject): Promise<any> {
+    const action = input.action;
+    let result: any;
+    if (action === "spawn") {
+      if (typeof input.role !== "string" || !Object.hasOwn(this.roleTools, input.role)
+        || typeof input.task !== "string" || typeof input.request_id !== "string") throw new Error("Invalid delegated launch");
+      result = await this.rpc("spawn", { agent: input.role, task: input.task, context: "fresh" }, input.request_id);
+    } else {
+      if (!["status", "resume", "stop"].includes(String(action)) || typeof input.execution_ref !== "string") throw new Error("Invalid delegated control");
+      result = await this.rpc(String(action), { id: input.execution_ref,
+        ...(action === "resume" ? { message: String(input.task ?? "") } : {}),
+      }, typeof input.request_id === "string" ? input.request_id : randomUUID());
+    }
+    const id = result?.details?.runId ?? result?.runId ?? input.execution_ref;
+    let state = result?.details?.state ?? result?.state ?? "unknown";
+    if (typeof id === "string" && /^[a-zA-Z0-9-]+$/.test(id)) {
+      const path = join(this.paths.stateRoot, "async-subagent-runs", id, "status.json");
+      if (existsSync(path)) {
+        const status = JSON.parse(readFileSync(path, "utf8"));
+        if (status.runId !== id || ![this.session!.sessionManager.getSessionFile(), this.session!.sessionId].includes(status.sessionId)) throw new Error("Delegated run ownership mismatch");
+        state = status.state;
+      }
+    }
+    return { execution_ref: typeof id === "string" ? id : null, status: state, result_text: displayText(result) };
   }
 
   observeCall(id: string, input: unknown) {
@@ -300,7 +336,7 @@ export class SubagentHost {
       if (["running", "queued"].includes(state) && !this.display.value(id, "started_at")) this.display.update(id, { started_at: new Date().toISOString() });
       this.emit(id, "subagent.started", { label, details: this.display.details(id) });
     }
-    this.display.update(id, { status: state, ...(["search", "general_purpose"].includes(label) ? { role: label } : {}) });
+    this.display.update(id, { status: state, ...(Object.hasOwn(this.roleTools, label) ? { role: label } : {}) });
     if (previous === state) {
       if (outputChanged && !this.finalizing.has(id)) this.emit(id, "subagent.progress", { details: this.display.details(id), result: this.handoffs.get(id)! });
       return;
@@ -371,11 +407,11 @@ export class SubagentHost {
   }
 }
 
-export function validateSubagentCall(input: Record<string, unknown>): string | undefined {
+export function validateSubagentCall(input: Record<string, unknown>, roles: Record<string, string[]> = ROLE_TOOLS): string | undefined {
   const fields = input.action ? ["action", "id", "message", "options"] : ["agent", "task", "async", "context"];
   if (Object.keys(input).some((key) => !fields.includes(key))) return 'Supported launch: {agent:"search"|"general_purpose",task:"...",async:true|false}. Management: {action:"status"|"resume"|"stop"|"list",id?,message?}. Other fields, including options, are host-controlled.';
   if (input.action && !["status", "resume", "stop", "list"].includes(String(input.action))) return "Unsupported subagent action; supported actions: status, resume, stop, list. Available agents: search, general_purpose.";
-  if (input.agent && !Object.hasOwn(ROLE_TOOLS, String(input.agent))) return "Unknown subagent role; available agents: search, general_purpose (use the exact name).";
+  if (input.agent && !Object.hasOwn(roles, String(input.agent))) return `Unknown subagent role; available agents: ${Object.keys(roles).join(", ")} (use the exact name).`;
   if (input.context !== undefined && input.context !== "fresh") return "Subagents use an independent fresh context";
   if (input.options !== undefined) return "Subagent options are host-controlled";
   return undefined;

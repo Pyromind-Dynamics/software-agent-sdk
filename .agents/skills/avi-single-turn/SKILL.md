@@ -5,7 +5,7 @@ description: 为 AVI 图片质检设计实验计划，覆盖基模评测、数�
 
 # AVI 实验计划
 
-本步只提供计划管理。计划、待确认提案和历史版本通过实验计划工具读取；持久化由 Runtime 负责。
+计划、待确认提案和历史版本通过实验计划工具读取；持久化由 Runtime 负责。已确认计划可委派 Eval 准备真实评测提案，平台执行另需用户确认。
 
 ## 参考流程
 
@@ -18,7 +18,7 @@ description: 为 AVI 图片质检设计实验计划，覆盖基模评测、数�
 | Train | 配置并训练模型 | 数据版本、基模 → checkpoint 与训练报告 |
 | Eval | 按相同口径评测训练结果并与 baseline 比较 | checkpoint、固定评测集、baseline → 比较结论与改进建议 |
 
-Init 是图中第一个独立阶段，后续连接 Data；后续实现中可复用 Eval 子 Agent 的评测能力。阶段表示业务工作，任务表示阶段内的一项活，阶段不等于 Agent。
+Init 是实验图中的第一个阶段，后续连接 Data；由 Eval 子 Agent 准备评测方案并复用通用评测能力。阶段表示业务工作，任务表示阶段内的一项活，阶段不等于 Agent。
 
 用户可以只做评测或启用其他阶段组合。以用户目标调整阶段启用情况和连线，无需收集未启用阶段的训练参数。Inference、Tracer 当前仍保持占位。运行中的跳过、重试、回退和输入失效处理属于后续能力。
 
@@ -36,3 +36,12 @@ Init 是图中第一个独立阶段，后续连接 Data；后续实现中可复�
 首次用 `create_experiment_plan` 生成完整草稿。修改前用 `get_experiment_plan` 获取最新版本；用 `revise_experiment_plan` 提交完整新计划、`expected_revision` 和修改摘要。存在待确认草稿时同时提交它的 `source_proposal_id`。未改动的阶段、任务 ID 保持稳定。
 
 前端确认后才创建项目或新版本。草稿可展示图，不能宣称已经执行任何阶段，也不能把用户在聊天中说“确认”当作数据库提交成功。
+
+
+## 委派评测准备
+
+用户要求跑 baseline 时，先读取已确认版本；用 request_experiment_task 指定目标 task_id、expected_revision、role_id: eval 和稳定 request_id。
+同一次请求重试复用 request_id，避免重复准备任务。不要直接启动原生 subagent 或平台任务。
+用 get_experiment_execution 查询真实状态、提案和缺失信息；排队不代表已完成评测。
+Eval 的提案通过独立执行确认后才能运行，计划确认不替代执行确认。
+当前 Dataset、Train、训练后批量评测仍只支持规划；不要自动推进。

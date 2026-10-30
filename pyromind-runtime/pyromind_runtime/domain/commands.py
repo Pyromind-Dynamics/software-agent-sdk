@@ -79,6 +79,22 @@ class RejectExperimentPlanCommand(ContractModel):
     proposal_id: str = Field(min_length=1)
 
 
+class ConfirmExperimentExecutionCommand(ContractModel):
+    command_id: str = Field(min_length=1, max_length=128)
+    type: Literal["confirm_experiment_execution"] = "confirm_experiment_execution"
+    run_id: str = Field(min_length=1)
+    expected_revision: int = Field(ge=1)
+    fingerprint: str = Field(min_length=64, max_length=64)
+
+
+class RejectExperimentExecutionCommand(ContractModel):
+    command_id: str = Field(min_length=1, max_length=128)
+    type: Literal["reject_experiment_execution"] = "reject_experiment_execution"
+    run_id: str = Field(min_length=1)
+    expected_revision: int = Field(ge=1)
+    fingerprint: str = Field(min_length=64, max_length=64)
+
+
 type ProductCommand = Annotated[
     UserMessageCommand
     | CancelCommand
@@ -86,7 +102,9 @@ type ProductCommand = Annotated[
     | RollbackWorkflowCommand
     | InputResponseCommand
     | ConfirmExperimentPlanCommand
-    | RejectExperimentPlanCommand,
+    | RejectExperimentPlanCommand
+    | ConfirmExperimentExecutionCommand
+    | RejectExperimentExecutionCommand,
     Field(discriminator="type"),
 ]
 

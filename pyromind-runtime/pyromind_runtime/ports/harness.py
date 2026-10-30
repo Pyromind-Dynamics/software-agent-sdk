@@ -14,6 +14,14 @@ from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.snapshot import WorkflowState
 
 
+class DelegatedRole(ContractModel):
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    description: str = Field(min_length=1, pattern=r"^[^\r\n]+$")
+    prompt: str = Field(min_length=1)
+    tools: tuple[str, ...] = ()
+    skills: tuple[str, ...] = ()
+
+
 class SessionSpec(ContractModel):
     conversation_id: str = Field(min_length=1)
     user_id: str = Field(min_length=1)
@@ -31,6 +39,8 @@ class SessionSpec(ContractModel):
     tool_allowlist: tuple[str, ...] | None = None
     skill_allowlist: tuple[str, ...] | None = None
     command_allowlist: tuple[str, ...] | None = None
+    delegated_roles: tuple[DelegatedRole, ...] | None = None
+    managed_delegation: bool = False
 
 
 class SessionHandle(ContractModel):
@@ -168,3 +178,9 @@ class HarnessAdapter(Protocol):
         survive for the next attach implement this as a no-op.
         """
         ...
+
+
+class DelegationAdapter(Protocol):
+    async def control_delegation(
+        self, handle: SessionHandle, request: JsonObject, context: RequestContext
+    ) -> JsonObject: ...
