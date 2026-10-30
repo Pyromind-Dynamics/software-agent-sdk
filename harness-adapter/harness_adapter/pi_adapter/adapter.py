@@ -33,6 +33,7 @@ from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import HarnessEvent
+from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import ConversationSnapshot, WorkflowState
 from pyromind_runtime.domain.user_input import UserInputRequest
 from pyromind_runtime.ports.harness import (
@@ -214,6 +215,7 @@ class _PiSession:
     queue: asyncio.Queue[HarnessEvent | None] = field(default_factory=asyncio.Queue)
     runner: PiRunnerProcess | None = None
     running: bool = False
+    runner_restart_pending: bool = False
     pending_permission: _PendingPermission | None = None
     finished_runs: set[str] = field(default_factory=set)
     active_external_tasks: dict[str, str] = field(default_factory=dict)
@@ -631,6 +633,33 @@ class PiAdapter:
             finally:
                 await self._discard_sandbox(session)
             raise
+
+    async def update_session_policy(
+        self,
+        handle: SessionHandle,
+        policy: SessionPolicy,
+        context: RequestContext,
+    ) -> None:
+        conversation_id = handle.session_id
+        session = self._sessions.get(conversation_id)
+        if session is None:
+            root = self._safe_conversation_dir(conversation_id)
+            files = PiSessionFiles(root)
+            config = files.load_session()
+        else:
+            if session.context.user_id != context.user_id:
+                raise PermissionError("conversation does not belong to current user")
+            files = session.files
+            config = dict(session.config)
+        updated = {
+            **config,
+            "tool_allowlist": policy.tool_allowlist,
+            "skill_allowlist": policy.skill_allowlist,
+        }
+        files.save_session(updated)
+        if session is not None:
+            session.config = updated
+            session.runner_restart_pending = session.runner is not None
 
     def _restored_session(
         self,
@@ -1334,8 +1363,17 @@ class PiAdapter:
         )
 
     async def _ensure_runner(self, session: _PiSession) -> None:
-        if session.runner is not None and session.runner.running:
+        if (
+            session.runner is not None
+            and session.runner.running
+            and not session.runner_restart_pending
+        ):
             return
+        if session.runner is not None:
+            runner = session.runner
+            session.runner = None
+            await runner.close()
+        session.runner_restart_pending = False
         await self._start_runner(session, _api_key(session.model_configuration))
 
     async def _prompt(

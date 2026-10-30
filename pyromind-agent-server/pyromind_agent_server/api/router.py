@@ -129,6 +129,8 @@ def create_product_router(
             product_instructions=profile.instructions,
             tool_allowlist=profile.tool_allowlist,
             skill_allowlist=profile.skill_allowlist,
+            development_tool_allowlist=profile.development_tool_allowlist,
+            development_skill_allowlist=profile.development_skill_allowlist,
             command_allowlist=profile.command_allowlist,
         )
         try:

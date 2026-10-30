@@ -13,6 +13,9 @@ from alembic import command
 from alembic.config import Config as AlembicConfig
 from pydantic import ValidationError
 from pyromind_agent_server.api.router import create_product_router
+from pyromind_agent_server.experiment_plan_projects import (
+    EchoMindExperimentPlanProjectBinder,
+)
 from pyromind_agent_server.profiles import (
     DEFAULT_PRODUCT_PROFILE,
     ECHOMIND_PRODUCT_PROFILE,
@@ -39,6 +42,8 @@ from pyromind_runtime.infrastructure.sql_experiment_plan_store import (
 )
 from pyromind_runtime.ports.harness import SessionSpec
 from sqlalchemy import create_engine, delete, event, func, select
+
+from openhands.agent_server.echomind_projects import ProjectStore
 
 from .fake_adapter import FakeAdapter
 from .test_product_api import _app
@@ -617,6 +622,8 @@ async def test_plan_tools_through_real_pi_and_restored_session(
                 product_instructions=profile.instructions,
                 tool_allowlist=profile.tool_allowlist,
                 skill_allowlist=profile.skill_allowlist,
+                development_tool_allowlist=profile.development_tool_allowlist,
+                development_skill_allowlist=profile.development_skill_allowlist,
                 command_allowlist=profile.command_allowlist,
                 model_configuration={
                     "model": "local-plan-model",
@@ -653,8 +660,7 @@ async def test_plan_tools_through_real_pi_and_restored_session(
             ),
             context,
         )
-        await runtime.close()
-        runtime, adapter = build_runtime()
+        request_count = len(requests)
         await runtime.submit_command(
             "manager",
             UserMessageCommand(
@@ -665,9 +671,31 @@ async def test_plan_tools_through_real_pi_and_restored_session(
         )
         proposal = await wait_draft(runtime, 1)
         assert proposal.plan.goal == "只做评测"
+        updated_tools = {
+            tool["function"]["name"] for tool in requests[request_count]["tools"]
+        }
+        assert {
+            "read",
+            "write",
+            "edit",
+            "terminal",
+            "validate_workflow_dsl",
+            "df_submit_pipeline",
+            "sandbox_create",
+            "sandbox_terminal",
+        }.issubset(updated_tools)
+        assert updated_tools.issubset(set(profile.development_tool_allowlist or ()))
+        await runtime.close()
+        runtime, _ = build_runtime()
         assert profile.tool_allowlist is not None
-        assert adapter._sessions["manager"].config["tool_allowlist"] == list(
-            profile.tool_allowlist
+        persisted_config = json.loads(
+            (root / "manager" / "pi" / "session.json").read_text(encoding="utf-8")
+        )
+        assert persisted_config["tool_allowlist"] == list(
+            profile.development_tool_allowlist or ()
+        )
+        assert persisted_config["skill_allowlist"] == list(
+            profile.development_skill_allowlist or ()
         )
         snapshot = await runtime.get_snapshot("manager", context)
         assert snapshot.experiment_plan is not None
@@ -675,3 +703,88 @@ async def test_plan_tools_through_real_pi_and_restored_session(
     finally:
         await runtime.close()
         await runner.cleanup()
+
+
+async def test_plan_confirmation_binds_project_and_activates_development_policy(
+    tmp_path, plan_store
+):
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter("pi")
+    binder = EchoMindExperimentPlanProjectBinder(conversations)
+    runtime = ConversationRuntime(
+        conversations,
+        {"pi": adapter},
+        default_harness_id="pi",
+        experiment_plan_store=plan_store,
+        experiment_plan_project_binder=binder,
+    )
+    profile = ECHOMIND_PRODUCT_PROFILE
+    context = RequestContext(user_id="42", profile_id=profile.profile_id)
+    plan = {
+        "skill": "avi-single-turn",
+        "name": "AVI project",
+        "goal": "Build the four-stage graph",
+        "stages": [
+            {"id": "dataset", "name": "Dataset"},
+            {"id": "inference", "name": "Inference"},
+            {"id": "evaluator", "name": "Evaluator"},
+            {"id": "train", "name": "Train"},
+        ],
+        "edges": [
+            {"source": "dataset", "target": "inference"},
+            {"source": "inference", "target": "evaluator"},
+            {"source": "evaluator", "target": "train"},
+        ],
+    }
+    try:
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id="manager-project",
+                user_id="42",
+                profile_id=profile.profile_id,
+                workspace_root=str(conversations / "manager-project"),
+                product_instructions=profile.instructions,
+                tool_allowlist=profile.tool_allowlist,
+                skill_allowlist=profile.skill_allowlist,
+                development_tool_allowlist=profile.development_tool_allowlist,
+                development_skill_allowlist=profile.development_skill_allowlist,
+                command_allowlist=profile.command_allowlist,
+            ),
+            context,
+        )
+        draft = await runtime.experiment_plan_call(
+            "manager-project",
+            "create_experiment_plan",
+            {"plan": plan},
+            context,
+        )
+        command = ConfirmExperimentPlanCommand(
+            command_id="confirm-project",
+            proposal_id=str(draft["proposal_id"]),
+            expected_revision=0,
+        )
+        receipt = await runtime.submit_command("manager-project", command, context)
+        revision = await runtime.get_experiment_plan("manager-project", context)
+        assert receipt.status == "completed"
+        assert revision.project_id is not None
+        project = ProjectStore.for_conversations_dir(conversations).load(
+            revision.project_id, owner_user_id="42"
+        )
+        assert project.graph.template == "avi-single-turn/v1"
+        assert [node.id for node in project.graph.nodes] == [
+            "dataset",
+            "inference",
+            "evaluator",
+            "train",
+        ]
+        activated = adapter.session_policies[-1][1]
+        assert activated.tool_allowlist == profile.development_tool_allowlist
+        assert activated.skill_allowlist == profile.development_skill_allowlist
+
+        assert (
+            await runtime.submit_command("manager-project", command, context) == receipt
+        )
+        assert len(list((tmp_path / "projects").iterdir())) == 1
+    finally:
+        await runtime.close()

@@ -9,6 +9,7 @@ from pyromind_runtime.domain.commands import InputResponseCommand, ProductComman
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent, HarnessEventType
+from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import WorkflowState
 from pyromind_runtime.ports.harness import (
     AttachRecovery,
@@ -52,6 +53,7 @@ class FakeAdapter:
         ] = []
         self.forks: list[tuple[ForkSpec, ProductCheckpoint]] = []
         self.restores: list[RestoreWorkflowSpec] = []
+        self.session_policies: list[tuple[str, SessionPolicy]] = []
         # Test seams for the user-input flow.
         self.input_responses: list[tuple[str, InputResponseCommand]] = []
         self.fail_input_delivery = False
@@ -134,6 +136,15 @@ class FakeAdapter:
                 raise RuntimeError("input delivery failed")
             return {"resolved": True}
         return {"accepted": True}
+
+    async def update_session_policy(
+        self,
+        handle: SessionHandle,
+        policy: SessionPolicy,
+        context: RequestContext,
+    ) -> None:
+        del context
+        self.session_policies.append((handle.session_id, policy))
 
     async def read_workspace_text(
         self,

@@ -1,132 +1,97 @@
 ---
 name: avi-single-turn
 description: >-
-  PCB AVI 图片质检单轮 SFT/DPO 场景入口。用于设计实验计划，或澄清数据、
-  推理、评估与训练需求后生成可确认的 Project 创建请求，并套用
-  Dataset -> Inference -> Evaluator -> Train 四阶段 Graph 模板。
+  PCB AVI 图片质检单轮 SFT/DPO 场景入口。用于澄清数据、推理、评估与训练目标，
+  生成可确认的实验计划，并在确认后创建 Dataset -> Inference -> Evaluator ->
+  Train 四阶段 Project Graph。
 ---
 
 # PCB AVI 单轮训练
 
-这个 Skill 同时覆盖两类开发态工作：
+EchoMind Manager 用本 Skill 完成 AVI 单轮训练的需求澄清和实验计划。计划确认后，
+平台立即用同一个 Project ID 创建 Project 和 Graph；当前会话随后进入开发态，
+取得完整平台开发能力。不要直接写 Project 或 Graph 状态文件。
 
-- **计划模式**：使用实验计划工具生成可确认的阶段/任务草案。
-- **Project 模式**：补齐需求清单，生成 `project_request.json`，等用户显式确认后由平台创建 Project 和 Graph。
+## 计划契约
 
-两种模式共享 AVI 业务知识，不代表两个 Agent，也不共享会话上下文。以当前会话实际提供的工具为准，不要在一个模式下伪造另一个模式的结果。
+创建计划时：
 
-## 计划模式
-
-计划、待确认提案和历史版本通过实验计划工具读取；持久化由 Runtime 负责。
-
-默认阶段图：`Init → Data → Train → Eval`。另保留 Inference、Tracer 两个未启用的占位阶段（`placeholder: true, enabled: false`）。
-
-| 阶段 | 计划中的职责 | 典型输入与预期产物 |
-|---|---|---|
-| Init | 使用基模跑 bench，建立比较基线 | 基模、固定评测集 → baseline 指标与报告 |
-| Data | 检查数据，设计清洗或预打标方案 | 原始数据 → 供训练使用的数据版本 |
-| Train | 配置并训练模型 | 数据版本、基模 → checkpoint 与训练报告 |
-| Eval | 按相同口径评测训练结果并与 baseline 比较 | checkpoint、固定评测集、baseline → 比较结论与改进建议 |
-
-Init 是图中第一个独立阶段，后续连接 Data；后续实现中可复用 Eval 子 Agent 的评测能力。阶段表示业务工作，任务表示阶段内的一项活，阶段不等于 Agent。
-
-用户可以只做评测或启用其他阶段组合。以用户目标调整阶段启用情况和连线，无需收集未启用阶段的训练参数。Inference、Tracer 当前仍保持占位。运行中的跳过、重试、回退和输入失效处理属于后续能力。
-
-## 计划内容
-
-明确实验目标、已有模型和数据、评价口径、预期结果与约束。未知的资源或执行参数写入 `unresolved`，不编造 URI，也不因为暂缺训练参数而阻止保存评测计划。
-
-- `resources` 登记所需外部资源：`id, name, uri, description`；尚未确定的资源也登记占位项，`uri: null`，缺失信息记入 `unresolved`，任务输入仍通过 `resource_id` 引用，不能只填名称。固定评测集用于后续 baseline 与训练后评测的同口径比较。
-- `stages` 使用稳定的局部 ID，填写 `name, description, enabled, placeholder`。
-- `tasks` 填写稳定局部 ID、`stage_id`、自由名称、说明、输入、预期输出和完成条件声明。推荐任务名如“基模评测”“检查标注完整性”“小样训练验证”，无固定业务 task_type。
-- 外部输入写作 `{name, resource_id}`；上游预期产物写作 `{name, task_id, output_name}`，对应上游 `outputs` 中的名称。产物尚未生成也可用于规划。
-- `outputs` 使用 `{name, description}`；`completion_conditions` 使用 `{kind, description}` 描述完成依据，如报告产出、外部任务终态。本步只保存声明，不判断完成。
-- `edges` 使用阶段 ID 的 `{source, target}`，表示阶段先后引导。任务输入声明表达具体参数来源；图和输入依赖都不能形成环。
-
-首次用 `create_experiment_plan` 生成完整草稿。修改前用 `get_experiment_plan` 获取最新版本；用 `revise_experiment_plan` 提交完整新计划、`expected_revision` 和修改摘要。存在待确认草稿时同时提交它的 `source_proposal_id`。未改动的阶段、任务 ID 保持稳定。
-
-前端确认后才创建项目或新版本。草稿可展示图，不能宣称已经执行任何阶段，也不能把用户在聊天中说“确认”当作数据库提交成功。
-
-## Project 模式
-
-先读取 [需求清单](references/requirements.md)，逐项判断是否已明确。只询问缺失项，
-把相关问题合并成一次简洁提问；不得根据常见默认值替用户确认。
-
-以下 requirement key 必须全部存在、`status=confirmed` 且 `value` 非空：
-
-```text
-dataset_uri
-dataset_format
-image_roles
-label_schema
-split_policy
-inference_model
-train_mode
-evaluation_rule
-artifact_goal
-```
-
-`train_mode` 只允许 `sft` 或 `dpo`。只有用户明确接受 DPO 的 chosen/rejected
-构造方式时才选择 `dpo`；否则先确认是否能做 SFT。
-
-数据字段、图片角色和标签语义读取
-[AVI 数据契约](references/data-contract.md)。评测输出和主指标读取
-[评测口径](references/evaluation.md)。不要在这个阶段清洗数据、运行模型或提交训练。
-
-需求齐备后，把请求写到当前会话的：
-
-```text
-public_data/project_request.json
-```
-
-文件必须符合：
-
-```json
-{
-  "schema_version": 1,
-  "name": "PCB AVI 单轮 SFT",
-  "description": "基于缺陷图、差分图和 GT 图训练 AVI 质检模型",
-  "skill": "avi-single-turn",
-  "requirements": [
-    {
-      "key": "dataset_uri",
-      "label": "数据集位置",
-      "value": "datasets/avi/train.jsonl",
-      "status": "confirmed"
-    }
-  ]
-}
-```
-
-`requirements` 必须包含上面的全部 key。文件只描述需求，不包含 Graph、节点、
-`project_id`、`graph_id`、Run ID、本机路径、凭据或签名 URL。
-
-写完后向用户汇总数据、模型、训练方式和评估门禁，并请用户明确确认创建 Project。
-用户确认前不得声称 Project 或 Graph 已存在。
-
-## Graph 模板
-
-Project 创建成功后，平台读取
-[Graph 模板](references/graph-template.md)，生成固定四节点：
+- `skill` 固定为 `avi-single-turn`。
+- `name` 是简短项目名，`goal` 说明要解决的问题和验收目标。
+- 阶段 ID 固定为 `dataset`、`inference`、`evaluator`、`train`，且全部启用。
+- 阶段关系固定为：
 
 ```text
 dataset -> inference -> evaluator -> train
 ```
 
-当前节点只注册 `contract_probe` 执行器。它可以生成一条 Run 和验证执行契约的
-`stage_contract_probe` Artifact，但不执行真实数据、推理、评估或训练。可以说明执行
-链路已打通，但不得声称某个阶段已经产出业务结果。具体阶段执行器接入后，再由平台状态
-接口报告 `running`、`succeeded` 或 `failed`。
+- 数据位置、模型、训练方式和评测口径等已知信息写入 `resources` 或任务描述。
+- 尚未确认的信息写入 `unresolved`；不要编造 URI、模型、指标或运行结果。
+- 不要在计划中填写 `project_id`、`graph_id`、Run ID、Task ID、凭据或签名 URL。
 
-Dataset 阶段通过服务端提供的 Project/Stage 上下文启动后，必须读取并遵循通用的
-`data-processing` Skill：检查真实 Storage 数据、选择数据处理范式、编写 Pipeline、
-先跑小样并等待用户确认，再提交全量验证任务。Graph 只保存阶段、依赖和候选执行规格，
-不在本 Skill 中复制通用数据处理 SOP。
+推荐阶段职责：
 
-## 交付边界
+| 阶段 | 职责 | 典型产物 |
+|---|---|---|
+| Dataset | 用通用 data-processing 能力探查、清洗、转换并验证真实 Storage 数据 | 可复现的数据处理 Pipeline 与验证产物 |
+| Inference | 用选定模型对固定评测集推理 | 预测结果与推理记录 |
+| Evaluator | 按统一口径计算指标并生成报告 | ATIF/标准评估产物 |
+| Train | 基于已验证的数据和评测门禁执行 SFT 或 DPO | checkpoint 与训练报告 |
 
-- 不复用或修改 Pyromind Agent 的对话上下文。
-- 不在通用 data-processing、sandbox 或 workflow Skill 中加入 AVI 分支。
-- 不把 demo 的在线 feeder、Kafka、推理热切换或轮询逻辑塞进本阶段。
-- 用户未确认 Project 时，停留在需求和方案讨论。
-- Graph、Project 和后续 Stage Run 的 ID 只能由服务端生成。
+Dataset 阶段只声明平台能力，不复制 `data-processing` Skill 的 SOP，也不把
+AVI 字段规则写进通用数据处理实现。开发态由当前 EchoMind Manager 使用
+`data-processing` Skill 完成小样、确认和全量验证；Graph 固化后则由执行器按冻结规格运行。
+
+## 需求澄清
+
+先读取 [需求清单](references/requirements.md)，再结合
+[AVI 数据契约](references/data-contract.md) 和
+[评测口径](references/evaluation.md) 判断信息是否足够。
+
+至少确认：
+
+- 数据位于哪个 Storage 路径，真实数据形态是否可检查；
+- 缺陷图、差分图、GT 图等图片角色和标签语义；
+- 推理基模、训练方式（SFT 或 DPO）和可用算力约束；
+- 固定评测集、主指标、门禁和预期产物；
+- 数据划分、批次隔离以及是否存在泄漏风险。
+
+只询问缺失且会影响本阶段的项，合并成一次简洁提问。用户未明确接受 DPO 的
+chosen/rejected 构造方式时，不要自行选择 DPO。需求未齐时可以保存带 `unresolved`
+的计划草案，但必须明确告诉用户哪些信息仍待补充。
+
+## 计划工具
+
+1. 首次用 `create_experiment_plan` 提交完整计划。
+2. 修改前先用 `get_experiment_plan` 读取当前版本和待确认提案。
+3. 用 `revise_experiment_plan` 提交完整新计划、`expected_revision` 和修改摘要。
+4. 修改待确认草案时同时提交它的 `source_proposal_id`；未变化的阶段和任务 ID 保持不变。
+5. 只有用户在计划面板明确确认后，平台才创建或更新 Project/Graph。聊天中的“确认”
+   不替代面板确认动作。
+
+确认第一版时，Project ID 来自服务端计划 Revision。确认后续版本时，同一个 Project ID
+保留，Graph 按新 Revision 更新。不要自行创建第二个 Project。
+
+## Graph 生成边界
+
+平台从已确认 `WorkflowPlan` 生成 Graph：
+
+- 节点顺序和 ID 来自四个已启用阶段；
+- 节点配置来自阶段的 `resources` 和 `tasks`，不读取另一份 requirements 文件；
+- `dataset` 节点绑定 `data-processing` 能力并采用 Agent 开发模式；
+- 其余阶段首期使用确定性执行器契约壳，不代表业务执行已经实现；
+- 阶段可独立启动和验证，但未接入的执行器必须明确显示为壳或尚未执行。
+
+不要直接写 `project.json`、`graph.json`、节点或边，也不要猜测服务端生成的 Graph ID。
+
+## 开发态边界
+
+计划确认后，同一个 EchoMind Manager 会话获得完整平台工具和通用 Skill。此时可以：
+
+- 使用远端 Sandbox 探查真实 Storage 数据；
+- 使用 `data-processing` 设计 Pipeline、跑小样并提交平台任务；
+- 修改计划和 Graph 草案，并再次通过计划面板确认 Revision；
+- 记录错误、产物和验证结果，供后续阶段复用。
+
+不要修改 Pyromind Agent 的会话或工作流，不要成为生产调度器，也不要在通用 Skill/Tool
+中加入 EchoMind 或 AVI 专属分支。发布态执行由平台执行引擎负责。

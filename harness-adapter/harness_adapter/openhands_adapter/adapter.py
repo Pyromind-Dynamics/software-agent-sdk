@@ -21,6 +21,7 @@ from pyromind_runtime.domain.commands import (
 from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
+from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import WorkflowState
 from pyromind_runtime.ports.harness import (
     AttachRecovery,
@@ -254,6 +255,17 @@ class OpenHandsAdapter:
             )
         self._install_version_tool(conversation_id, event_service, context)
         return await self._attach(conversation_id, event_service)
+
+    async def update_session_policy(
+        self,
+        handle: SessionHandle,
+        policy: SessionPolicy,
+        context: RequestContext,
+    ) -> None:
+        del handle, policy, context
+        raise NotImplementedError(
+            "OpenHands sessions do not support runtime policy changes"
+        )
 
     async def _reactivate(
         self,

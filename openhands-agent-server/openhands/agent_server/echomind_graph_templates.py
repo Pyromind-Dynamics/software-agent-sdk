@@ -1,95 +1,152 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any, Literal
+
+from pyromind_runtime.domain.experiment_plans import ExperimentStage, WorkflowPlan
 
 
 AVI_SINGLE_TURN_SKILL = "avi-single-turn"
+AVI_STAGE_IDS = ("dataset", "inference", "evaluator", "train")
 
-AVI_REQUIRED_REQUIREMENT_KEYS = (
-    "dataset_uri",
-    "dataset_format",
-    "image_roles",
-    "label_schema",
-    "split_policy",
-    "inference_model",
-    "train_mode",
-    "evaluation_rule",
-    "artifact_goal",
-)
+ProjectNodeType = Literal["dataset", "inference", "evaluator", "train"]
 
 
 def build_graph_payload(
     *,
-    skill: str,
-    requirements: Mapping[str, str],
+    skill: str | None,
+    plan: WorkflowPlan,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    if skill != AVI_SINGLE_TURN_SKILL:
-        return [], []
+    if skill == AVI_SINGLE_TURN_SKILL:
+        return _build_avi_graph(plan)
+    return _build_generic_graph(plan)
 
-    train_mode = (
-        "dpo" if requirements.get("train_mode", "").strip().lower() == "dpo" else "sft"
-    )
-    nodes = [
-        _node(
-            node_id="dataset",
-            node_type="dataset",
-            title="Dataset",
-            launch_mode="agent",
-            config={
-                "capability": "data-processing",
-                "platform_task_kind": "data_preparation",
-                "input_hint": requirements["dataset_uri"],
-                "validation": {
-                    "status": "draft",
-                    "validation_run_id": None,
-                    "candidate_execution_spec": None,
-                },
-            },
-        ),
-        _node(
-            node_id="inference",
-            node_type="inference",
-            title="Inference",
-            config={
-                "model": requirements["inference_model"],
-                "dataset_ref": "dataset.dataset",
-            },
-        ),
-        _node(
-            node_id="evaluator",
-            node_type="evaluator",
-            title="Evaluator",
-            config={
-                "predictions_ref": "inference.predictions",
-                "rule": requirements["evaluation_rule"],
-                "artifact_format": "atif",
-            },
-        ),
-        _node(
-            node_id="train",
-            node_type="train",
-            title=f"Train ({train_mode.upper()})",
-            config={
-                "method": train_mode,
-                "dataset_ref": "dataset.dataset",
-                "evaluation_ref": "evaluator.report",
-                "artifact_goal": requirements["artifact_goal"],
-            },
-        ),
-    ]
+
+def _build_avi_graph(
+    plan: WorkflowPlan,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    stages = {stage.id: stage for stage in plan.stages if stage.enabled}
+    missing = [stage_id for stage_id in AVI_STAGE_IDS if stage_id not in stages]
+    if missing:
+        raise ValueError(
+            "AVI plan must enable Dataset, Inference, Evaluator, and Train stages: "
+            + ", ".join(missing)
+        )
+
+    resources = _resources_payload(plan)
+    tasks_by_stage = _tasks_by_stage(plan)
+    nodes = []
+    for stage_id in AVI_STAGE_IDS:
+        stage = stages[stage_id]
+        config: dict[str, Any] = {
+            "resources": resources,
+            "tasks": tasks_by_stage.get(stage_id, []),
+        }
+        if stage_id == "dataset":
+            config.update(
+                {
+                    "capability": "data-processing",
+                    "platform_task_kind": "data_preparation",
+                }
+            )
+        elif stage_id == "evaluator":
+            config["artifact_format"] = "atif"
+        nodes.append(
+            _node(
+                node_id=stage.id,
+                node_type=stage_id,
+                title=stage.name,
+                launch_mode="agent" if stage_id == "dataset" else "executor",
+                config=config,
+            )
+        )
+
+    valid_ids = set(AVI_STAGE_IDS)
     edges = [
-        {"source": "dataset", "target": "inference"},
-        {"source": "inference", "target": "evaluator"},
-        {"source": "evaluator", "target": "train"},
+        {"source": edge.source, "target": edge.target}
+        for edge in plan.edges
+        if edge.source in valid_ids and edge.target in valid_ids
     ]
     return nodes, edges
+
+
+def _build_generic_graph(
+    plan: WorkflowPlan,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    resources = _resources_payload(plan)
+    tasks_by_stage = _tasks_by_stage(plan)
+    nodes = []
+    node_types: dict[str, ProjectNodeType] = {}
+    for stage in plan.stages:
+        if not stage.enabled:
+            continue
+        node_type = _stage_node_type(stage)
+        if node_type is None:
+            continue
+        node_types[stage.id] = node_type
+        nodes.append(
+            _node(
+                node_id=stage.id,
+                node_type=node_type,
+                title=stage.name,
+                launch_mode="agent" if node_type == "dataset" else "executor",
+                config={
+                    "resources": resources,
+                    "tasks": tasks_by_stage.get(stage.id, []),
+                    **(
+                        {
+                            "capability": "data-processing",
+                            "platform_task_kind": "data_preparation",
+                        }
+                        if node_type == "dataset"
+                        else {}
+                    ),
+                },
+            )
+        )
+    edges = [
+        {"source": edge.source, "target": edge.target}
+        for edge in plan.edges
+        if edge.source in node_types and edge.target in node_types
+    ]
+    return nodes, edges
+
+
+def _stage_node_type(stage: ExperimentStage) -> ProjectNodeType | None:
+    value = f"{stage.id} {stage.name}".lower()
+    if "dataset" in value or value.startswith("data"):
+        return "dataset"
+    if "inference" in value:
+        return "inference"
+    if "evaluator" in value or "evaluation" in value or "eval" in value:
+        return "evaluator"
+    if "train" in value:
+        return "train"
+    return None
+
+
+def _resources_payload(plan: WorkflowPlan) -> list[dict[str, str | None]]:
+    return [
+        {
+            "id": resource.id,
+            "name": resource.name,
+            "uri": resource.uri,
+            "description": resource.description,
+        }
+        for resource in plan.resources
+    ]
+
+
+def _tasks_by_stage(plan: WorkflowPlan) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for task in plan.tasks:
+        grouped.setdefault(task.stage_id, []).append(task.model_dump(mode="json"))
+    return grouped
 
 
 def _node(
     *,
     node_id: str,
-    node_type: Literal["dataset", "inference", "evaluator", "train"],
+    node_type: ProjectNodeType,
     title: str,
     launch_mode: Literal["agent", "executor"] = "executor",
     config: dict[str, Any],

@@ -41,4 +41,54 @@ test("skill capability ceiling enforces reads through aliases, absolute paths an
     await assert.rejects(() => restricted.execute("denied", { path }), /not enabled/);
   }
   assert.equal(calls, 1);
+
+  const sandboxRestricted = restrictSkillReads(
+    tool,
+    root,
+    [skills],
+    [allowed],
+    skills,
+    { canonicalizeWorkspacePaths: false },
+  );
+  await assert.rejects(
+    () => sandboxRestricted.execute("remote-denied", {
+      path: "/target-workspace/.pyromind-agent/conv-1/.agents/skills/other/SKILL.md",
+    }),
+    /not enabled/,
+  );
+  await sandboxRestricted.execute("remote-allowed", {
+    path: "/target-workspace/.pyromind-agent/conv-1/.agents/skills/selected/SKILL.md",
+  });
+  assert.equal(calls, 2);
+});
+
+test("sandbox reads leave remote and workspace paths to the execution plane", async () => {
+  let calls = 0;
+  const seen: string[] = [];
+  const tool = { name: "read", execute: async (_id: string, args: { path: string }) => {
+    calls++;
+    seen.push(args.path);
+    return { content: [{ type: "text", text: "remote" }], details: {} };
+  } } as unknown as AgentTool;
+  const restricted = restrictSkillReads(
+    tool,
+    "/tmp/pi-skill-policy-conversation",
+    ["/tmp/pi-skill-policy-resources"],
+    ["/tmp/pi-skill-policy-resources/allowed"],
+    "/tmp/pi-skill-policy-resources",
+    { canonicalizeWorkspacePaths: false },
+  );
+
+  for (const path of [
+    "/target-workspace/datasets/demo/avi/train.jsonl",
+    "public_data/generated/output.jsonl",
+  ]) {
+    await restricted.execute("remote", { path });
+  }
+
+  assert.equal(calls, 2);
+  assert.deepEqual(seen, [
+    "/target-workspace/datasets/demo/avi/train.jsonl",
+    "public_data/generated/output.jsonl",
+  ]);
 });

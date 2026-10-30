@@ -144,8 +144,7 @@ class ProjectRunStore:
         return failed
 
     def list(self, project_id: str) -> list[StageRun]:
-        canonical_project_id = _canonical_id(project_id, kind="project")
-        runs_dir = self.projects_root / canonical_project_id / "runs"
+        runs_dir = self._project_dir(project_id) / "runs"
         if not runs_dir.is_dir():
             return []
         runs = [
@@ -164,11 +163,9 @@ class ProjectRunStore:
         project_id: str,
         artifact_id: str,
     ) -> ProjectArtifactDocument:
-        canonical_project_id = _canonical_id(project_id, kind="project")
         canonical_artifact_id = _canonical_id(artifact_id, kind="artifact")
         path = (
-            self.projects_root
-            / canonical_project_id
+            self._project_dir(project_id)
             / "artifacts"
             / f"{canonical_artifact_id}.json"
         )
@@ -178,7 +175,8 @@ class ProjectRunStore:
             path.read_text(encoding="utf-8")
         )
         if (
-            document.artifact.project_id != canonical_project_id
+            _canonical_id(document.artifact.project_id, kind="project")
+            != _canonical_id(project_id, kind="project")
             or document.artifact.artifact_id != canonical_artifact_id
         ):
             raise ValueError("artifact metadata does not match its storage path")
@@ -207,7 +205,7 @@ class ProjectRunStore:
             content_sha256=sha256(content_bytes).hexdigest(),
             size_bytes=len(content_bytes),
         )
-        path = self.projects_root / run.project_id / "artifacts" / f"{artifact_id}.json"
+        path = self._project_dir(run.project_id) / "artifacts" / f"{artifact_id}.json"
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         _write_json(
             path,
@@ -219,9 +217,13 @@ class ProjectRunStore:
         return artifact, path
 
     def _write_run(self, run: StageRun) -> None:
-        run_dir = self.projects_root / run.project_id / "runs"
+        run_dir = self._project_dir(run.project_id) / "runs"
         run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         _write_json(run_dir / f"{run.run_id}.json", run.model_dump(mode="json"))
+
+    def _project_dir(self, project_id: str) -> Path:
+        canonical_project_id = _canonical_id(project_id, kind="project")
+        return self.projects_root / canonical_project_id
 
 
 def run_project_node(

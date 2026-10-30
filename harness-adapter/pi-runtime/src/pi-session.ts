@@ -185,7 +185,14 @@ export async function createPiSession(
     return canonical;
   });
   const tools = rawTools.map((tool) => coordinator.wrap(
-    restrictSkillReads(tool, config.workspaceRoot, skillPaths, allowedSkillRoots, config.skillsDirectory), peer));
+    restrictSkillReads(
+      tool,
+      config.workspaceRoot,
+      skillPaths,
+      allowedSkillRoots,
+      config.skillsDirectory,
+      { canonicalizeWorkspacePaths: config.terminalBackend !== "sandbox" },
+    ), peer));
   const childTools = tools.filter((tool) => ["read", "write", "edit", "terminal"].includes(tool.name)).map((tool) => {
     if (tool.name !== "read" || config.terminalBackend !== "sandbox") return tool;
     return { ...tool, execute: (id: string, args: any, signal?: AbortSignal, update?: any) => coordinator.run(signal, async () => {

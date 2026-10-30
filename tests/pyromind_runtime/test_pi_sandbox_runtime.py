@@ -22,6 +22,7 @@ from harness_adapter.pi_adapter.sandbox_runtime import (
     STORAGE_HOST_PATH,
     SandboxExecutionManager,
     SandboxSettings,
+    _sandbox_client,
 )
 from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
 from pyromind_runtime.domain.context import RequestContext
@@ -147,6 +148,11 @@ def _context(
         model_configuration={},
         extra=extra or {},
     )
+
+
+def test_default_sandbox_client_requires_platform_credentials(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="auth_token cookie or Bearer"):
+        _sandbox_client(_context(tmp_path))
 
 
 def _uploaded_scripts(client: _FakeSandboxClient) -> list[str]:

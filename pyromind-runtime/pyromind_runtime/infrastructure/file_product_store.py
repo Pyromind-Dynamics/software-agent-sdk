@@ -21,6 +21,7 @@ from pyromind_runtime.domain.commands import (
 from pyromind_runtime.domain.evaluation import EvaluationCommitState
 from pyromind_runtime.domain.events import ProductEvent, WorkflowRunState
 from pyromind_runtime.domain.pipeline import PipelineRun
+from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 from pyromind_runtime.domain.user_input import UserInputResolution
 from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
@@ -58,6 +59,9 @@ class _Metadata(ContractModel):
     harness_id: str = Field(default="openhands", min_length=1)
     profile_id: str | None = None
     tool_allowlist: tuple[str, ...] | None = None
+    skill_allowlist: tuple[str, ...] | None = None
+    development_tool_allowlist: tuple[str, ...] | None = None
+    development_skill_allowlist: tuple[str, ...] | None = None
     command_allowlist: tuple[str, ...] | None = None
     capabilities: HarnessCapabilities
     last_sequence: int = Field(default=0, ge=0)
@@ -111,6 +115,9 @@ class FileProductStore:
         harness_id: str = "openhands",
         profile_id: str | None = None,
         tool_allowlist: tuple[str, ...] | None = None,
+        skill_allowlist: tuple[str, ...] | None = None,
+        development_tool_allowlist: tuple[str, ...] | None = None,
+        development_skill_allowlist: tuple[str, ...] | None = None,
         command_allowlist: tuple[str, ...] | None = None,
     ) -> None:
         if not self.conversation_dir.is_dir():
@@ -132,6 +139,9 @@ class FileProductStore:
             harness_id=harness_id,
             profile_id=profile_id,
             tool_allowlist=tool_allowlist,
+            skill_allowlist=skill_allowlist,
+            development_tool_allowlist=development_tool_allowlist,
+            development_skill_allowlist=development_skill_allowlist,
             command_allowlist=command_allowlist,
             capabilities=snapshot.capabilities,
         )
@@ -161,11 +171,41 @@ class FileProductStore:
         allowed = self._load_metadata().tool_allowlist
         return allowed is not None and name in allowed
 
+    def activate_development_policy(self) -> SessionPolicy:
+        with self._lock():
+            metadata = self._load_metadata()
+            tool_allowlist = (
+                metadata.development_tool_allowlist
+                if metadata.development_tool_allowlist is not None
+                else metadata.tool_allowlist
+            )
+            skill_allowlist = (
+                metadata.development_skill_allowlist
+                if metadata.development_skill_allowlist is not None
+                else metadata.skill_allowlist
+            )
+            if (
+                metadata.tool_allowlist != tool_allowlist
+                or metadata.skill_allowlist != skill_allowlist
+            ):
+                metadata = metadata.model_copy(
+                    update={
+                        "tool_allowlist": tool_allowlist,
+                        "skill_allowlist": skill_allowlist,
+                    }
+                )
+                self._atomic_write(self.metadata_path, metadata.model_dump_json())
+            return SessionPolicy(
+                tool_allowlist=tool_allowlist,
+                skill_allowlist=skill_allowlist,
+            )
+
     def access_policy(self) -> dict:
         metadata = self._load_metadata()
         return {
             "profile_id": metadata.profile_id,
             "tool_allowlist": metadata.tool_allowlist,
+            "skill_allowlist": metadata.skill_allowlist,
             "command_allowlist": metadata.command_allowlist,
         }
 

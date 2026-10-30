@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Literal
 from uuid import uuid4
 
@@ -8,18 +9,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from pyromind_runtime.domain.commands import UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
-from pyromind_runtime.domain.errors import ProductRuntimeError
 
 from openhands.agent_server.dependencies import check_session_api_key
 from openhands.agent_server.echomind_projects import (
-    PROJECT_REQUEST_RELATIVE_PATH,
     ProjectInfo,
     ProjectNotFoundError,
-    ProjectRequest,
-    ProjectRequestInvalidError,
-    ProjectRequestNotFoundError,
     ProjectStore,
-    read_project_request_text,
 )
 from openhands.agent_server.echomind_stage_executors import (
     get_project_node_executor,
@@ -30,14 +25,16 @@ from openhands.agent_server.echomind_stage_runs import (
     StageRun,
     run_project_node,
 )
+from openhands.agent_server.pyromind_auth import (
+    parse_auth_token_from_cookie_header,
+)
 from pyromind_agent_server.api.router import (
-    _product_error,
     _profile_matches,
     context_for_profile,
     get_conversation_service,
     get_product_runtime,
 )
-from pyromind_agent_server.profiles import ECHOMIND_CHAT_PROFILE
+from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 
 
 router = APIRouter(
@@ -45,13 +42,6 @@ router = APIRouter(
     tags=["EchoMind Projects"],
     dependencies=[Depends(check_session_api_key)],
 )
-
-
-class CreateEchoMindProjectRequest(BaseModel):
-    conversation_id: str
-    confirmed: Literal[True]
-
-    model_config = {"extra": "forbid"}
 
 
 class StartEchoMindProjectNodeResponse(BaseModel):
@@ -112,7 +102,7 @@ def _require_echomind_conversation(request: Request, conversation_id: str) -> No
     if not _profile_matches(
         get_conversation_service(request),
         conversation_id,
-        ECHOMIND_CHAT_PROFILE,
+        ECHOMIND_PRODUCT_PROFILE,
     ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -120,82 +110,24 @@ def _require_echomind_conversation(request: Request, conversation_id: str) -> No
         )
 
 
-async def _read_agent_project_request(
-    request: Request,
-    conversation_id: str,
-) -> ProjectRequest:
-    try:
-        content = await get_product_runtime(request).read_workspace_text(
-            conversation_id,
-            PROJECT_REQUEST_RELATIVE_PATH.as_posix(),
-            context_for_profile(request, ECHOMIND_CHAT_PROFILE),
-        )
-    except ProductRuntimeError as exc:
-        raise _product_error(exc) from exc
-    except OSError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="EchoMind workspace file could not be read.",
-        ) from exc
-    if content is None:
-        raise ProjectRequestNotFoundError(PROJECT_REQUEST_RELATIVE_PATH.as_posix())
-    return read_project_request_text(content)
+def _require_sandbox_credentials(request: Request) -> None:
+    if os.getenv("PYROMIND_HARNESS_BACKEND", "").strip().lower() != "pi":
+        return
+    if os.getenv("PYROMIND_PI_TERMINAL_BACKEND", "").strip().lower() != "sandbox":
+        return
 
-
-@router.get(
-    "/conversations/{conversation_id}/project-request",
-    responses={404: {"description": "EchoMind project request not found"}},
-)
-async def get_echomind_project_request(
-    conversation_id: str,
-    request: Request,
-) -> ProjectRequest:
-    _require_echomind_conversation(request, conversation_id)
-    try:
-        return await _read_agent_project_request(request, conversation_id)
-    except ProjectRequestNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="EchoMind project request does not exist yet.",
-        ) from exc
-    except ProjectRequestInvalidError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=f"EchoMind project request is invalid: {exc}",
-        ) from exc
-
-
-@router.post(
-    "/projects",
-    response_model=ProjectInfo,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_echomind_project(
-    request: Request,
-    body: CreateEchoMindProjectRequest,
-) -> ProjectInfo:
-    _require_echomind_conversation(request, body.conversation_id)
-    context = context_for_profile(request, ECHOMIND_CHAT_PROFILE)
-    service = get_conversation_service(request)
-    try:
-        project_request = await _read_agent_project_request(
-            request, body.conversation_id
-        )
-    except ProjectRequestNotFoundError as exc:
+    auth_token = parse_auth_token_from_cookie_header(request.headers.get("cookie"))
+    authorization = request.headers.get("authorization", "")
+    scheme, _, value = authorization.partition(" ")
+    if not auth_token and not (scheme.lower() == "bearer" and value.strip()):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="EchoMind Agent has not produced a project request yet.",
-        ) from exc
-    except ProjectRequestInvalidError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=f"EchoMind project request is invalid: {exc}",
-        ) from exc
-    return ProjectStore.for_conversations_dir(service.conversations_dir).create(
-        project_request,
-        echomind_conversation_id=body.conversation_id,
-        owner_user_id=context.user_id,
-    )
+            detail=(
+                "Dataset development runs in the conversation sandbox. "
+                "Enter a Cookie containing auth_token=... or a Bearer "
+                "Authorization, and set x-cluster, then click Apply."
+            ),
+        )
 
 
 @router.get(
@@ -205,7 +137,7 @@ async def create_echomind_project(
 )
 async def get_echomind_project(project_id: str, request: Request) -> ProjectInfo:
     service = get_conversation_service(request)
-    context = context_for_profile(request, ECHOMIND_CHAT_PROFILE)
+    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
     try:
         return ProjectStore.for_conversations_dir(service.conversations_dir).load(
             project_id,
@@ -229,7 +161,8 @@ async def start_echomind_project_node(
     node_id: str,
     request: Request,
 ) -> StartEchoMindProjectNodeResponse:
-    context = context_for_profile(request, ECHOMIND_CHAT_PROFILE)
+    _require_sandbox_credentials(request)
+    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
     service = get_conversation_service(request)
     store = ProjectStore.for_conversations_dir(service.conversations_dir)
     try:
@@ -298,7 +231,7 @@ async def run_echomind_project_node(
     node_id: str,
     request: Request,
 ) -> StageRun:
-    context = context_for_profile(request, ECHOMIND_CHAT_PROFILE)
+    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
     service = get_conversation_service(request)
     store = ProjectStore.for_conversations_dir(service.conversations_dir)
     try:
@@ -345,7 +278,7 @@ async def list_echomind_project_runs(
     project_id: str,
     request: Request,
 ) -> list[StageRun]:
-    context = context_for_profile(request, ECHOMIND_CHAT_PROFILE)
+    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
     service = get_conversation_service(request)
     store = ProjectStore.for_conversations_dir(service.conversations_dir)
     try:
@@ -371,7 +304,7 @@ async def get_echomind_project_artifact(
     artifact_id: str,
     request: Request,
 ) -> ProjectArtifactDocument:
-    context = context_for_profile(request, ECHOMIND_CHAT_PROFILE)
+    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
     service = get_conversation_service(request)
     store = ProjectStore.for_conversations_dir(service.conversations_dir)
     try:

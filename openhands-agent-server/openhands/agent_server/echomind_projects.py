@@ -2,23 +2,19 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pyromind_runtime.domain.experiment_plans import PlanRevision, WorkflowPlan
 
 from openhands.agent_server.echomind_graph_templates import (
-    AVI_REQUIRED_REQUIREMENT_KEYS,
     AVI_SINGLE_TURN_SKILL,
     build_graph_payload,
 )
 
-
-PROJECT_REQUEST_RELATIVE_PATH = Path("public_data/project_request.json")
-_MAX_PROJECT_REQUEST_BYTES = 1024 * 1024
 
 ProjectNodeType = Literal["dataset", "inference", "evaluator", "train"]
 ProjectLifecycle = Literal["development", "frozen"]
@@ -66,52 +62,6 @@ class ProjectEdge(BaseModel):
     target: str = Field(min_length=1, max_length=128)
 
 
-class ProjectRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    schema_version: Literal[1] = 1
-    name: str = Field(min_length=1, max_length=256)
-    description: str = Field(min_length=1, max_length=8000)
-    skill: str = Field(min_length=1, max_length=128)
-    requirements: list[ProjectRequirement] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def require_complete_requirements(self) -> ProjectRequest:
-        keys = [requirement.key for requirement in self.requirements]
-        duplicate_keys = sorted({key for key in keys if keys.count(key) > 1})
-        if duplicate_keys:
-            raise ValueError(
-                "project request has duplicate requirements: "
-                + ", ".join(duplicate_keys)
-            )
-
-        missing = [
-            requirement.key
-            for requirement in self.requirements
-            if requirement.status == "missing"
-        ]
-        if missing:
-            raise ValueError(
-                "project request has unresolved requirements: " + ", ".join(missing)
-            )
-
-        required_keys = (
-            AVI_REQUIRED_REQUIREMENT_KEYS if self.skill == AVI_SINGLE_TURN_SKILL else ()
-        )
-        confirmed_keys = {
-            requirement.key
-            for requirement in self.requirements
-            if requirement.status == "confirmed" and requirement.value.strip()
-        }
-        missing_required = sorted(set(required_keys) - confirmed_keys)
-        if missing_required:
-            raise ValueError(
-                "project request is missing required requirements: "
-                + ", ".join(missing_required)
-            )
-        return self
-
-
 class ProjectRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -120,7 +70,7 @@ class ProjectRecord(BaseModel):
     name: str
     description: str
     skill: str
-    requirements: list[ProjectRequirement]
+    requirements: list[ProjectRequirement] = Field(default_factory=list)
     owner_user_id: str | None = None
     echomind_conversation_id: str
     lifecycle: ProjectLifecycle = "development"
@@ -187,38 +137,12 @@ class ProjectInfo(BaseModel):
         return self
 
 
-class ProjectRequestNotFoundError(FileNotFoundError):
-    pass
-
-
-class ProjectRequestInvalidError(ValueError):
-    pass
-
-
 class ProjectNotFoundError(FileNotFoundError):
     pass
 
 
-def read_project_request(conversation_working_dir: Path | str) -> ProjectRequest:
-    path = Path(conversation_working_dir) / PROJECT_REQUEST_RELATIVE_PATH
-    if not path.is_file():
-        raise ProjectRequestNotFoundError(str(PROJECT_REQUEST_RELATIVE_PATH))
-    if path.stat().st_size > _MAX_PROJECT_REQUEST_BYTES:
-        raise ProjectRequestInvalidError("project request is too large")
-    return read_project_request_text(path.read_text(encoding="utf-8"))
-
-
-def read_project_request_text(content: str) -> ProjectRequest:
-    if len(content.encode("utf-8")) > _MAX_PROJECT_REQUEST_BYTES:
-        raise ProjectRequestInvalidError("project request is too large")
-    try:
-        return ProjectRequest.model_validate_json(content)
-    except ValueError as exc:
-        raise ProjectRequestInvalidError(str(exc)) from exc
-
-
 class ProjectStore:
-    """File-backed Project store with a Project-owned Graph."""
+    """File-backed Project store whose identity comes from an ExperimentPlan."""
 
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
@@ -227,38 +151,51 @@ class ProjectStore:
     def for_conversations_dir(cls, conversations_dir: Path | str) -> ProjectStore:
         return cls(Path(conversations_dir).parent / "projects")
 
-    def create(
+    def bind_plan(
         self,
-        request: ProjectRequest,
+        revision: PlanRevision,
         *,
         echomind_conversation_id: str,
         owner_user_id: str | None,
     ) -> ProjectInfo:
-        project_id = str(uuid4())
-        graph_id = str(uuid4())
+        plan = revision.plan
+        project_id = revision.project_id
+        try:
+            canonical_project_id = str(UUID(project_id))
+        except ValueError as exc:
+            raise ValueError("plan revision has an invalid project_id") from exc
+
+        final_dir = self.root / canonical_project_id
+        existing = self._load_optional(canonical_project_id)
+        if existing is not None:
+            if (
+                existing.project.owner_user_id not in {None, owner_user_id}
+                or existing.project.echomind_conversation_id != echomind_conversation_id
+            ):
+                raise PermissionError("Project belongs to another conversation")
+            graph_id = existing.graph.graph_id
+            created_at = existing.project.created_at
+        else:
+            graph_id = str(uuid4())
+            created_at = _utc_now()
+
+        skill = plan.skill or "custom"
+        node_payloads, edge_payloads = build_graph_payload(skill=skill, plan=plan)
         project = ProjectRecord(
             project_id=project_id,
-            name=request.name,
-            description=request.description,
-            skill=request.skill,
-            requirements=request.requirements,
+            name=plan.name,
+            description=plan.goal,
+            skill=skill,
+            requirements=_requirements_from_plan(plan),
             owner_user_id=owner_user_id,
             echomind_conversation_id=echomind_conversation_id,
             lifecycle="development",
-        )
-        requirement_values = {
-            requirement.key: requirement.value for requirement in request.requirements
-        }
-        node_payloads, edge_payloads = build_graph_payload(
-            skill=request.skill,
-            requirements=requirement_values,
+            created_at=created_at,
         )
         graph = ProjectGraph(
             graph_id=graph_id,
             project_id=project_id,
-            template=(
-                "avi-single-turn/v1" if request.skill == AVI_SINGLE_TURN_SKILL else None
-            ),
+            template=("avi-single-turn/v1" if skill == AVI_SINGLE_TURN_SKILL else None),
             lifecycle="development",
             nodes=[
                 ProjectNode.model_validate(node_payload)
@@ -271,16 +208,9 @@ class ProjectStore:
         )
 
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        final_dir = self.root / project_id
-        temporary_dir = self.root / f".{project_id}.{uuid4().hex}.tmp"
-        temporary_dir.mkdir(mode=0o700)
-        try:
-            _write_json(temporary_dir / "project.json", project.model_dump(mode="json"))
-            _write_json(temporary_dir / "graph.json", graph.model_dump(mode="json"))
-            os.replace(temporary_dir, final_dir)
-        finally:
-            if temporary_dir.exists():
-                shutil.rmtree(temporary_dir, ignore_errors=True)
+        final_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _write_json(final_dir / "project.json", project.model_dump(mode="json"))
+        _write_json(final_dir / "graph.json", graph.model_dump(mode="json"))
         return ProjectInfo(project=project, graph=graph)
 
     def load(
@@ -293,25 +223,42 @@ class ProjectStore:
             canonical_project_id = str(UUID(project_id))
         except ValueError as exc:
             raise ProjectNotFoundError(project_id) from exc
+        project = self._load_optional(canonical_project_id)
+        if project is None:
+            raise ProjectNotFoundError(project_id)
+        if (
+            owner_user_id is not None
+            and project.project.owner_user_id is not None
+            and project.project.owner_user_id != owner_user_id
+        ):
+            raise ProjectNotFoundError(project_id)
+        return project
+
+    def _load_optional(self, canonical_project_id: str) -> ProjectInfo | None:
         project_dir = self.root / canonical_project_id
         project_path = project_dir / "project.json"
         graph_path = project_dir / "graph.json"
         if not project_path.is_file() or not graph_path.is_file():
-            raise ProjectNotFoundError(project_id)
-
+            return None
         project = ProjectRecord.model_validate_json(
             project_path.read_text(encoding="utf-8")
         )
         graph = ProjectGraph.model_validate_json(graph_path.read_text(encoding="utf-8"))
-        if (
-            owner_user_id is not None
-            and project.owner_user_id is not None
-            and project.owner_user_id != owner_user_id
-        ):
-            raise ProjectNotFoundError(project_id)
         if graph.project_id != project.project_id:
             raise ValueError("project graph belongs to another project")
         return ProjectInfo(project=project, graph=graph)
+
+
+def _requirements_from_plan(plan: WorkflowPlan) -> list[ProjectRequirement]:
+    return [
+        ProjectRequirement(
+            key=resource.id,
+            label=resource.name,
+            value=resource.uri or "",
+            status="confirmed" if resource.uri else "missing",
+        )
+        for resource in plan.resources
+    ]
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:

@@ -12,7 +12,6 @@ from pyromind_agent_server.api.router import _resolve_cursor, _sse_stream
 from pyromind_agent_server.app import create_app
 from pyromind_agent_server.bootstrap import install_product_api
 from pyromind_agent_server.profiles import (
-    ECHOMIND_CHAT_PROFILE,
     ConversationProfile,
 )
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
@@ -76,94 +75,11 @@ def test_composed_app_mounts_echomind_project_routes(tmp_path) -> None:
     )
     paths = set(app.openapi()["paths"])
 
-    assert "/api/echomind/projects" in paths
-    assert "/api/echomind/conversations/{conversation_id}/project-request" in paths
-
-
-async def test_echomind_project_request_reads_adapter_workspace(tmp_path) -> None:
-    conversations = tmp_path / "conversations"
-    conversations.mkdir()
-    runtime = ConversationRuntime(
-        conversations,
-        {"pi": FakeAdapter("pi")},
-        default_harness_id="pi",
-    )
-    app = FastAPI()
-    app.state.config = Config(
-        conversations_path=conversations,
-        workspace_path=tmp_path / "workspace",
-        enable_session_api_key_auth=False,
-        enable_pyromind_jwt_auth=False,
-    )
-    app.state.conversation_service = ConversationService(
-        conversations_dir=conversations
-    )
-    app.state.product_runtime = runtime
-    from pyromind_agent_server.api.echomind_projects import router as projects_router
-    from pyromind_agent_server.api.router import create_product_router
-
-    app.include_router(create_product_router(ECHOMIND_CHAT_PROFILE))
-    app.include_router(projects_router)
-    headers = {"x-pyromind-debug-user-id": "42"}
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
-        base_url="http://test",
-        headers=headers,
-    ) as client:
-        created = await client.post(
-            "/api/echomind/conversations",
-            json={"llm": {"model": "test-model"}},
-        )
-        assert created.status_code == 201
-        conversation_id = created.json()["conversation_id"]
-        request_path = (
-            conversations / conversation_id / "public_data" / "project_request.json"
-        )
-        requirement_keys = (
-            "dataset_uri",
-            "dataset_format",
-            "image_roles",
-            "label_schema",
-            "split_policy",
-            "inference_model",
-            "train_mode",
-            "evaluation_rule",
-            "artifact_goal",
-        )
-        request_path.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "name": "AVI demo",
-                    "description": "demo",
-                    "skill": "avi-single-turn",
-                    "requirements": [
-                        {
-                            "key": key,
-                            "label": key,
-                            "value": "confirmed",
-                            "status": "confirmed",
-                        }
-                        for key in requirement_keys
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        response = await client.get(
-            f"/api/echomind/conversations/{conversation_id}/project-request"
-        )
-        project = await client.post(
-            "/api/echomind/projects",
-            json={"conversation_id": conversation_id, "confirmed": True},
-        )
-
-    assert response.status_code == 200
-    assert response.json()["name"] == "AVI demo"
-    assert project.status_code == 201
-    assert project.json()["graph"]["template"] == "avi-single-turn/v1"
-    await runtime.close()
+    assert "/api/v2/echomind/conversations" in paths
+    assert "/api/echomind/projects/{project_id}" in paths
+    assert "/api/echomind/conversations" not in paths
+    assert "/api/echomind/projects" not in paths
+    assert not any("project-request" in path for path in paths)
 
 
 async def test_http_create_list_snapshot_and_command(tmp_path) -> None:

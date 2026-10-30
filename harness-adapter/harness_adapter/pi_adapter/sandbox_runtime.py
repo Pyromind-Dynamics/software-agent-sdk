@@ -1194,10 +1194,16 @@ class SandboxExecutionManager:
 
 def _sandbox_client(context: ToolExecutionContext) -> SandboxClientLike:
     env, cluster = _execution_target(context)
+    auth_token = _auth_token(context.request_context)
+    if not auth_token:
+        raise ValueError(
+            "Sandbox execution requires a Pyromind auth_token cookie or "
+            "Bearer authorization."
+        )
     api = create_sandbox_api_client(
         env=env,
         cluster=cluster,
-        auth_token=_auth_token(context.request_context),
+        auth_token=auth_token,
         headers=_forward_headers(context.request_context, include_cookie=False),
     )
     return api.sandboxes

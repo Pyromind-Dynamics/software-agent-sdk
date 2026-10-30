@@ -1,6 +1,6 @@
 # AVI 单轮 Graph 模板
 
-Project 创建时，平台按 `avi-single-turn/v1` 模板写入本地 Graph。
+用户确认计划 Revision 时，平台按 `avi-single-turn/v1` 模板写入本地 Graph。
 
 ## 拓扑
 
@@ -8,40 +8,23 @@ Project 创建时，平台按 `avi-single-turn/v1` 模板写入本地 Graph。
 dataset -> inference -> evaluator -> train
 ```
 
-四个节点都属于同一个 Project。节点 ID 和 Graph ID 由服务端生成；客户端和 Agent
-不能提交自造 ID。
+四个阶段 ID 与计划一致，四个节点都属于同一个 Project。Project ID 来自计划 Revision；
+Graph ID 由服务端生成。客户端和 Agent 不能提交自造服务端 ID。
 
 ## 节点配置
 
-### dataset
+每个节点的 `config` 从对应阶段的 `resources` 和 `tasks` 生成。`resources` 保存已确认的
+外部输入及其 URI，`unresolved` 保存仍待补充的信息；平台不读取第二份 requirements
+文件，也不维护重复的 AVI 配置事实源。
 
-从 Project requirements 读取：
+- `dataset` 绑定 `data-processing` 能力，采用 Agent 开发模式。真实 Schema、图片角色、
+  标签语义和划分必须由开发态检查 Storage 数据后确认。
+- `inference` 声明模型和阶段任务，输入来自 Dataset 阶段产物。
+- `evaluator` 声明评测任务，标准产物格式为 `atif`。
+- `train` 声明 SFT/DPO 训练任务和预期产物。
 
-- `dataset_uri`
-- `dataset_format`
-- `image_roles`
-- `label_schema`
-- `split_policy`
-
-### inference
-
-- `model` 来自 `inference_model`
-- 输入引用 `dataset.dataset`
-- 输出引用 `inference.predictions`
-
-### evaluator
-
-- 输入引用 `inference.predictions`
-- `rule` 来自 `evaluation_rule`
-- `artifact_format=atif`
-- 输出引用 `evaluator.report`
-
-### train
-
-- `method` 为 `sft` 或 `dpo`
-- 输入引用 `dataset.dataset` 和 `evaluator.report`
-- `artifact_goal` 来自同名 requirement
-- DPO 时数据契约还必须提供 rejected answer
+后续计划 Revision 确认时，平台更新同一个 Project 的 Graph。Project ID 和 Graph ID
+保持稳定，不创建第二个 Project。
 
 ## Contract Probe
 
