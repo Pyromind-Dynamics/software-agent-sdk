@@ -121,8 +121,8 @@ class WorkflowPlan(ContractModel):
         min_length=1,
         max_length=128,
         description=(
-            "Scenario Skill that determines the Project Graph template. "
-            "Use null for a generic plan."
+            "Planning Skill that produced this plan. Scenario topology comes from "
+            "stages, tasks, and edges rather than the Skill name."
         ),
     )
     name: str = Field(min_length=1, max_length=255)

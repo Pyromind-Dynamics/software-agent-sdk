@@ -9,7 +9,7 @@ from openhands.agent_server.echomind_stage_runs import ProjectRunStore, run_proj
 def _plan() -> WorkflowPlan:
     return WorkflowPlan.model_validate(
         {
-            "skill": "avi-single-turn",
+            "skill": "experiment-planning",
             "name": "AVI experiment",
             "goal": "Validate a Dataset -> Inference -> Evaluator -> Train graph.",
             "resources": [],

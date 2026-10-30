@@ -52,6 +52,7 @@ EchoMind Manager 只加载：
 
 ```text
 read
+terminal
 create_experiment_plan
 revise_experiment_plan
 get_experiment_plan
@@ -60,7 +61,7 @@ get_experiment_plan
 Skill：
 
 ```text
-avi-single-turn
+experiment-planning
 ```
 
 这个白名单同时约束模型可见工具、实际工具调用、Skill 可见范围和工作区读取。
@@ -77,7 +78,7 @@ avi-single-turn
 5. 在下一个 prompt 前重启 Pi runner，使新工具和 Skill 生效。
 
 开发工具集等于 Pyromind Agent 的完整开发工具集，再加三个计划工具。开发 Skill
-集等于 Pyromind Agent 的完整 Skill 集，再加 `avi-single-turn`。
+集等于 Pyromind Agent 的完整 Skill 集，再加 `experiment-planning`。
 
 确认命令使用 `command_id` 保证幂等。若确认在 SQL 提交后、文件绑定或策略切换时
 中断，同一条命令重试会继续完成剩余步骤，不会创建第二个 Project。
@@ -130,9 +131,9 @@ Pyromind 使用同一个 Sandbox 实现和同一套 Storage 挂载语义。
   AVI 或 EchoMind 分支；
 - 两条链路的测试分别维护，公共能力只通过独立测试验证。
 
-## 6. AVI Graph
+## 6. 实验 Graph
 
-AVI 固定四阶段：
+通用 Skill 先识别场景，再按需读取 reference。AVI reference 首期使用四阶段：
 
 ```text
 dataset -> inference -> evaluator -> train
@@ -140,7 +141,8 @@ dataset -> inference -> evaluator -> train
 
 Graph 生成规则：
 
-- `skill=avi-single-turn` 时必须启用四个固定阶段 ID；
+- `skill=experiment-planning` 只记录规划入口，不用于选择后端模板；
+- 后端统一从计划中的 stages 和 edges 生成节点与边；
 - 节点 title 来自计划；
 - 节点 `config.resources` 和 `config.tasks` 来自计划；
 - Dataset 节点使用 `launch_mode=agent`，绑定 `data-processing` 能力；
@@ -179,7 +181,8 @@ EchoMind 页面只有一个正式入口：`?chat=echomind`。
 | Graph 生成 | `openhands-agent-server/openhands/agent_server/echomind_graph_templates.py` |
 | Project/Graph 持久化 | `openhands-agent-server/openhands/agent_server/echomind_projects.py` |
 | Project/Stage API | `pyromind-agent-server/pyromind_agent_server/api/echomind_projects.py` |
-| AVI 场景 Skill | `.agents/skills/avi-single-turn/` |
+| 通用实验规划 Skill | `.agents/skills/experiment-planning/` |
+| AVI 场景 reference | `.agents/skills/experiment-planning/references/avi-single-turn.md` |
 
 ## 9. 验证
 

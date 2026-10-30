@@ -203,6 +203,9 @@ export class SandboxPathPolicy {
     if (insideSandboxPath(target, posix.join(this.workspacePath, RUNNER_STATE_DIRNAME))) {
       return `the runner's session state (${RUNNER_STATE_DIRNAME}/)`;
     }
+    if (target === this.publicDataPath || this.readOnlyRoots.includes(target)) {
+      return undefined;
+    }
     const relative = posix.relative(this.workspacePath, target);
     if (!relative.includes("/")) return "conversation metadata";
     return undefined;

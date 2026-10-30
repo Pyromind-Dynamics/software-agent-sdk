@@ -653,6 +653,7 @@ async def test_plan_tools_through_real_pi_and_restored_session(
         tools = {tool["function"]["name"] for tool in requests[0]["tools"]}
         assert tools == {
             "read",
+            "terminal",
             "create_experiment_plan",
             "revise_experiment_plan",
             "get_experiment_plan",
@@ -660,7 +661,7 @@ async def test_plan_tools_through_real_pi_and_restored_session(
             "get_experiment_execution",
         }
         prompt = json.dumps(requests[0]["messages"], ensure_ascii=False)
-        assert "avi-single-turn" in prompt and "generate-workflow-dsl" not in prompt
+        assert "experiment-planning" in prompt and "generate-workflow-dsl" not in prompt
         assert "For Pyromind workflow requests" not in prompt
         await runtime.submit_command(
             "manager",
@@ -733,7 +734,7 @@ async def test_plan_confirmation_binds_project_and_activates_development_policy(
     profile = ECHOMIND_PRODUCT_PROFILE
     context = RequestContext(user_id="42", profile_id=profile.profile_id)
     plan = {
-        "skill": "avi-single-turn",
+        "skill": "experiment-planning",
         "name": "AVI project",
         "goal": "Build the four-stage graph",
         "stages": [
@@ -782,7 +783,7 @@ async def test_plan_confirmation_binds_project_and_activates_development_policy(
         project = ProjectStore.for_conversations_dir(conversations).load(
             revision.project_id, owner_user_id="42"
         )
-        assert project.graph.template == "avi-single-turn/v1"
+        assert project.graph.template == "experiment-planning/v1"
         assert [node.id for node in project.graph.nodes] == [
             "dataset",
             "inference",

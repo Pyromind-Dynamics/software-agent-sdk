@@ -9,7 +9,8 @@
 
 ```text
 对话说明目标
-  -> EchoMind Manager 读取 avi-single-turn Skill
+  -> EchoMind Manager 读取 experiment-planning Skill
+  -> 按需加载 AVI 场景 reference
   -> 生成可确认的 WorkflowPlan
   -> 用户确认
   -> 创建 Project/Graph
@@ -70,7 +71,7 @@
 
 - 增加 `create_experiment_plan`、`revise_experiment_plan`、
   `get_experiment_plan`；
-- 规划阶段只开放 `read` 和三个计划工具；
+- 规划阶段开放 `read`、`terminal` 和三个计划工具；
 - 前端显示计划、待确认提案、更改点、历史和确认按钮；
 - 确认时提交 SQL Revision；
 - 从 Revision 生成 Project/Graph。
@@ -172,15 +173,19 @@
 - 失败事件可重新唤起独立 Agent 任务；
 - Agent 不成为生产环境唯一调度器。
 
-## 4. AVI 计划契约
+## 4. AVI 场景计划契约
 
-AVI 的 `WorkflowPlan`：
+通用 `experiment-planning` Skill 读取 AVI reference 后生成 `WorkflowPlan`：
 
 ```text
-skill = avi-single-turn
+skill = experiment-planning
 stages = dataset, inference, evaluator, train
 edges = dataset -> inference -> evaluator -> train
 ```
+
+场景 reference 位于 `.agents/skills/experiment-planning/references/avi-single-turn.md`。
+Skill 名只记录规划入口，不决定后端 Graph 模板；后端统一从计划中的 stages、
+resources、tasks 和 edges 生成 Graph。
 
 节点配置来自计划：
 

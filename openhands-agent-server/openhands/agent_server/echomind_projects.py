@@ -11,7 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pyromind_runtime.domain.experiment_plans import PlanRevision, WorkflowPlan
 
 from openhands.agent_server.echomind_graph_templates import (
-    AVI_SINGLE_TURN_SKILL,
+    EXPERIMENT_GRAPH_TEMPLATE,
+    EXPERIMENT_PLANNING_SKILL,
     build_graph_payload,
 )
 
@@ -179,8 +180,8 @@ class ProjectStore:
             graph_id = str(uuid4())
             created_at = _utc_now()
 
-        skill = plan.skill or "custom"
-        node_payloads, edge_payloads = build_graph_payload(skill=skill, plan=plan)
+        skill = plan.skill or EXPERIMENT_PLANNING_SKILL
+        node_payloads, edge_payloads = build_graph_payload(plan=plan)
         project = ProjectRecord(
             project_id=project_id,
             name=plan.name,
@@ -195,7 +196,7 @@ class ProjectStore:
         graph = ProjectGraph(
             graph_id=graph_id,
             project_id=project_id,
-            template=("avi-single-turn/v1" if skill == AVI_SINGLE_TURN_SKILL else None),
+            template=EXPERIMENT_GRAPH_TEMPLATE,
             lifecycle="development",
             nodes=[
                 ProjectNode.model_validate(node_payload)

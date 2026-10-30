@@ -2,10 +2,10 @@
 
 ## 目标
 
-用户只通过 EchoMind Manager 对话描述目标。Manager 先读取
-`avi-single-turn` Skill，通过计划工具形成可审阅的 `WorkflowPlan`。用户在前端
-计划面板确认后，平台立即创建或更新 Project/Graph，并在同一个 EchoMind 会话
-中开放完整开发能力。
+用户只通过 EchoMind Manager 对话描述目标。Manager 先读取通用的
+`experiment-planning` Skill，再按需加载匹配的场景 reference，通过计划工具形成
+可审阅的 `WorkflowPlan`。用户在前端计划面板确认后，平台立即创建或更新
+Project/Graph，并在同一个 EchoMind 会话中开放完整开发能力。
 
 ## 唯一入口
 
@@ -27,6 +27,7 @@ Tool：
 
 ```text
 read
+terminal
 create_experiment_plan
 revise_experiment_plan
 get_experiment_plan
@@ -35,7 +36,7 @@ get_experiment_plan
 Skill：
 
 ```text
-avi-single-turn
+experiment-planning
 ```
 
 Plan Proposal 是草稿，不是 Project。规划阶段的 Agent 不能：
@@ -73,13 +74,14 @@ Project/Graph。
 
 ## Graph
 
-AVI 首期固定：
+AVI reference 首期固定：
 
 ```text
 dataset -> inference -> evaluator -> train
 ```
 
-Graph 从已确认 `WorkflowPlan` 的 stages、tasks、resources 和 edges 生成。
+Graph 从已确认 `WorkflowPlan` 的 stages、tasks、resources 和 edges 生成。后端不按
+Skill 名选择场景模板，也不维护 AVI 专属路由。
 Project/Graph 不再读取 requirements 文件。
 
 Dataset 节点绑定 Agent 开发模式，其余节点首期使用 Contract Probe 壳，确保

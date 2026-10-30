@@ -16,6 +16,8 @@ export const READ_BATCH_BUDGET_BYTES = 768 * 1024;
 export interface ExecutionAccess {
   operations: BashOperations;
   readFile?(path: string, limit: number): Promise<Buffer>;
+  /** Roots the path policy authorizes for read-only search tools. */
+  allowedReadRoots?: readonly string[];
   protectedRoot?: string;
   writeFile(path: string, content: Buffer): Promise<void>;
   resolvePath(path: string, operation: "read" | "write"): Promise<string>;
