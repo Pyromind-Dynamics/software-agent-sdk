@@ -262,9 +262,12 @@ class _ToolConversationFacade:
             secret_registry=registry,
         )
         self.signals: list[dict[str, Any]] = []
+        self._task_run_id = context.extra.get("managed_task_run_id")
 
     def register_active_long_task(self, task: Any) -> None:
         value = task.model_dump(mode="json") if hasattr(task, "model_dump") else {}
+        if self._task_run_id:
+            value["managed_task_run_id"] = self._task_run_id
         self.signals.append({"type": "external_task.submitted", "task": value})
 
     def send_agent_message(self, message: Any) -> None:
@@ -915,17 +918,24 @@ class PyromindBusinessToolHost:
     def _evaluation_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         params = self._execution_params(context)
         if self._pipeline_runs is not None and self._inference_runtime is not None:
+            runs = self._pipeline_runs(context.conversation_id).with_context(
+                context.request_context
+            )
+            if context.extra.get("managed_operation_id"):
+                runs = runs.with_operation(
+                    context.extra["managed_operation_id"],
+                    context.extra.get("managed_task_run_id"),
+                )
             params["inference_handler"] = InferencePipelineHandler(
                 self._inference_runtime,
-                self._pipeline_runs(context.conversation_id).with_context(
-                    context.request_context
-                ),
+                runs,
                 ValidateWorkflowDslExecutor(
                     env=params["env"],
                     secret_headers={"authorization": _VALIDATE_AUTHORIZATION_SECRET}
                     if context.request_context.authorization
                     else None,
                 ),
+                submission_guard=context.extra.get("managed_submission_guard"),
             )
         return params
 

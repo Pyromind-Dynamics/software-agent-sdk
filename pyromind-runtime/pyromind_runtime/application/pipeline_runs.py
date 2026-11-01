@@ -4,7 +4,7 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pyromind_runtime.application.versions import Versions, snapshot_result
 from pyromind_runtime.domain.content import JsonObject
@@ -30,16 +30,38 @@ class PipelineRuns:
         registry: ExternalTaskRegistry,
         versions: Versions | None = None,
         context: RequestContext | None = None,
+        operation_id: str | None = None,
+        task_run_id: str | None = None,
     ) -> None:
         self.conversation_id = conversation_id
         self._store = store
         self._registry = registry
         self._versions = versions
         self._context = context
+        self._operation_id, self._task_run_id = operation_id, task_run_id
 
     def with_context(self, context: RequestContext) -> PipelineRuns:
         return PipelineRuns(
-            self.conversation_id, self._store, self._registry, self._versions, context
+            self.conversation_id,
+            self._store,
+            self._registry,
+            self._versions,
+            context,
+            self._operation_id,
+            self._task_run_id,
+        )
+
+    def with_operation(
+        self, operation_id: str | None, task_run_id: str | None
+    ) -> PipelineRuns:
+        return PipelineRuns(
+            self.conversation_id,
+            self._store,
+            self._registry,
+            self._versions,
+            self._context,
+            operation_id,
+            task_run_id,
         )
 
     def prepare_execution(
@@ -376,8 +398,17 @@ class PipelineRuns:
                 }
             )
         else:
-            run_id = uuid4()
+            run_id = (
+                uuid5(NAMESPACE_URL, f"{self.conversation_id}:{self._operation_id}")
+                if self._operation_id
+                else uuid4()
+            )
+            if self._operation_id and self.resolve(str(run_id)) is not None:
+                raise ValueError(
+                    "managed operation already reserved; reconcile its original run"
+                )
             run = PipelineRun(
+                task_run_id=self._task_run_id,
                 run_id=run_id,
                 conversation_id=self.conversation_id,
                 definition=definition,
@@ -421,6 +452,7 @@ class PipelineRuns:
                 "submitted_at": now,
                 "updated_at": now,
                 "resume_pending": False,
+                **({"managed_task_run_id": run.task_run_id} if run.task_run_id else {}),
             }
             self._registry.register(self.conversation_id, payload)
             if self._versions is not None:

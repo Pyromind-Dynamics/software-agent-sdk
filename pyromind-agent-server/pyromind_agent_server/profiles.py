@@ -16,6 +16,7 @@ from openhands.agent_server.agent_profiles.echomind_manager import (
 @dataclass(frozen=True, slots=True)
 class ConversationProfile:
     route_prefix: str
+    configuration_version: int = 0
     profile_id: str | None = None
     harness_id: str | None = None
     instructions: str = ""
@@ -54,6 +55,7 @@ DEFAULT_PRODUCT_PROFILE = ConversationProfile(
 )
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
+    configuration_version=3,
     route_prefix="/api/v2/echomind/conversations",
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
     harness_id="pi",
@@ -69,6 +71,8 @@ ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
         "cancel",
         "confirm_experiment_plan",
         "reject_experiment_plan",
+        "control_experiment_task",
+        "resolve_experiment_submission",
     ),
     conversation_marker=ECHOMIND_MANAGER_PROFILE.tag_value,
 )

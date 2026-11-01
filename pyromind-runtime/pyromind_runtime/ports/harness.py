@@ -107,6 +107,7 @@ class ExternalTaskNotification(ContractModel):
     hidden_text: str
     trigger_turn: bool = True
     reset_attempt_budget: bool = False
+    resume_interrupted: bool = False
 
 
 class HarnessAdapter(Protocol):
@@ -202,6 +203,16 @@ class HarnessAdapter(Protocol):
 
 
 class DelegationAdapter(Protocol):
+    async def execute_delegated_tool(
+        self,
+        handle: SessionHandle,
+        role: str,
+        scope: JsonObject,
+        tool: str,
+        arguments: JsonObject,
+        context: RequestContext,
+    ) -> JsonObject: ...
+
     async def control_delegation(
         self, handle: SessionHandle, request: JsonObject, context: RequestContext
     ) -> JsonObject: ...

@@ -2,17 +2,50 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from pyromind_runtime.domain.base import ContractModel
 from pyromind_runtime.domain.content import JsonObject
 
 
+class DelegatedTask(ContractModel):
+    name: str = Field(min_length=1, max_length=255)
+    instruction: str = Field(min_length=1, max_length=32000)
+    inputs: JsonObject = Field(default_factory=dict)
+    constraints: tuple[str, ...] = ()
+    expected_outputs: tuple[str, ...] = ()
+
+
 class RequestExperimentTask(ContractModel):
-    task_id: str = Field(min_length=1)
-    expected_revision: int = Field(ge=1)
+    task_id: str | None = Field(default=None, min_length=1)
+    expected_revision: int | None = Field(default=None, ge=1)
     role_id: str = Field(min_length=1)
     request_id: str = Field(min_length=1, max_length=128)
+    task: DelegatedTask | None = None
+    intent: Literal["execute", "prepare"] = "execute"
+    stage_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_contract(self):
+        if self.task is None and (
+            self.task_id is None or self.expected_revision is None
+        ):
+            raise ValueError("provide a task, or legacy task_id and expected_revision")
+        if self.task is not None and (
+            self.task_id is not None or self.expected_revision is not None
+        ):
+            raise ValueError("standalone tasks must not depend on a plan revision")
+        return self
+
+
+class DelegateExperimentTask(ContractModel):
+    """Current model-facing contract; legacy requests remain API-compatible."""
+
+    role_id: str = Field(min_length=1)
+    request_id: str = Field(min_length=1, max_length=128)
+    task: DelegatedTask
+    intent: Literal["execute", "prepare"] = "execute"
+    stage_id: str | None = None
 
 
 class GetExperimentExecution(ContractModel):
@@ -41,9 +74,9 @@ EXECUTION_TOOLS = {
 class ExperimentExecutionView(ContractModel):
     run_id: str
     project_id: str
-    plan_revision: int
+    plan_revision: int | None = None
     task_id: str
-    stage_id: str
+    stage_id: str | None = None
     task_name: str
     role_id: str
     state: str
@@ -53,6 +86,25 @@ class ExperimentExecutionView(ContractModel):
     metrics: JsonObject | None = None
     platform_task_id: str | None = None
     artifacts: tuple[JsonObject, ...] = ()
+    intent: str = "prepare"
+    summary: str | None = None
+    report_uri: str | None = None
+    blockers: tuple[str, ...] = ()
+    waiting_reason: str | None = None
+
+
+class RecordExperimentResult(ContractModel):
+    run_id: str
+    summary: str = Field(min_length=1, max_length=16000)
+    report_uri: str | None = None
+    blockers: tuple[str, ...] = ()
+
+
+class ControlExperimentTask(ContractModel):
+    run_id: str
+    action: Literal["continue", "cancel", "retry_report"]
+    command_id: str = Field(min_length=1, max_length=128)
+    message: str = ""
 
 
 class ReadExperimentResource(ContractModel):
@@ -62,6 +114,10 @@ class ReadExperimentResource(ContractModel):
 
 
 ROLE_TOOLS = {
+    "record_experiment_result": (
+        RecordExperimentResult,
+        "Register a report or essential missing inputs; Runtime verifies result evidence.",
+    ),
     "read_experiment_resource": (
         ReadExperimentResource,
         "Read a declared input; return a bounded preview and content digest.",

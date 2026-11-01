@@ -11,7 +11,7 @@ from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.evaluation_configuration import (
     validate_evaluation_configuration,
 )
-from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
+from tests.pyromind_runtime.legacy_experiment_profile import LEGACY_EXPERIMENT_PROFILE as ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.experiment_plans import ExperimentPlans
 from pyromind_runtime.domain.context import RequestContext
@@ -33,7 +33,7 @@ from pyromind_runtime.ports.harness import SessionSpec
 from sqlalchemy import create_engine
 
 
-async def test_eval_native_child_prepares_proposal_through_scoped_tools(
+async def test_legacy_eval_native_child_prepares_proposal_through_scoped_tools(
     tmp_path, monkeypatch
 ):
     requests = []

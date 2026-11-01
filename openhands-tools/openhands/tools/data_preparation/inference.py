@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, cast
 
@@ -417,10 +418,12 @@ class InferencePipelineHandler:
         runtime_dir: Path,
         runs: PipelineRunBackend,
         validator: ValidateWorkflowDslExecutor,
+        submission_guard: Callable[[], None] | None = None,
     ) -> None:
         self.runtime_dir = runtime_dir
         self.runs = runs
         self.validator = validator
+        self._submission_guard = submission_guard
 
     def _validate(
         self,
@@ -744,6 +747,8 @@ class InferencePipelineHandler:
                     conversation,
                     frozen_script_name=filename,
                 )
+            if self._submission_guard:
+                self._submission_guard()
             submitting = True
             response = submit_workflow_task(
                 client=client,

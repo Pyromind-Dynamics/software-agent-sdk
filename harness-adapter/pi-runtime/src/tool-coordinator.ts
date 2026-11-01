@@ -25,9 +25,13 @@ export class ToolCoordinator {
     } finally { if (onAbort) signal?.removeEventListener("abort", onAbort); }
   }
 
-  wrap(tool: AgentTool, peer: JsonlRpcPeer): AgentTool {
+  wrap(tool: AgentTool, peer: JsonlRpcPeer, role?: string): AgentTool {
     if (!["terminal", "write", "edit"].includes(tool.name)) return tool;
-    return { ...tool, execute: (id, args, signal, update) => this.run(signal, async () => {
+    const execute = (id: string, args: any, signal?: AbortSignal, update?: any, scope?: JsonObject) => this.run(signal, async () => {
+      if (role) {
+        if (!scope) throw new Error("Delegated tool requires a work scope");
+        await peer.request("delegation.authorize_tool", { role, scope, tool_name: tool.name });
+      }
       if (tool.name === "terminal") {
         const cancelPermission = () => { void peer.request("permission.cancel", { tool_call_id: id }).catch(() => {}); };
         signal?.addEventListener("abort", cancelPermission, { once: true });
@@ -35,6 +39,7 @@ export class ToolCoordinator {
         try {
           decision = await peer.request("permission.check", {
             tool_call_id: id, tool_name: "terminal", arguments: JSON.parse(JSON.stringify(args)) as JsonObject,
+            ...(role ? {delegated_role: role, delegated_scope: scope!} : {}),
           });
         } finally { signal?.removeEventListener("abort", cancelPermission); }
         signal?.throwIfAborted();
@@ -42,6 +47,8 @@ export class ToolCoordinator {
         if (!decision.allow) throw new Error(typeof decision.reason === "string" ? decision.reason : "User denied terminal command");
       }
       return tool.execute(id, args, signal, update);
-    }) };
+    });
+    return { ...tool, execute: (id, args, signal, update) => execute(id, args, signal, update),
+      ...(role ? {executeScoped: (id: string, args: any, signal: AbortSignal | undefined, scope: JsonObject) => execute(id, args, signal, undefined, scope)} : {}) };
   }
 }

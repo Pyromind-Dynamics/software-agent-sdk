@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka.structs import TopicPartition
 
 from openhands.agent_server.kafka_bus.kafka_handler import MessageHandler
 from openhands.agent_server.kafka_bus.kafka_topic import KafkaTopic
@@ -41,7 +42,8 @@ class KafkaMessageBus:
     支持 cluster_scoped 和全局两种消费模式。
     """
 
-    def __init__(self):
+    def __init__(self, *, acknowledge_after_handle: bool = False):
+        self._acknowledge_after_handle = acknowledge_after_handle
         self._producer: AIOKafkaProducer | None = None
         self._consumers: list[AIOKafkaConsumer] = []
         self._consumer_tasks: list[asyncio.Task] = []
@@ -134,8 +136,9 @@ class KafkaMessageBus:
             logger.warning("[MessageBus] 开发环境，不启动 Consumer")
             return
 
-        for h in ALL_HANDLERS:
-            self.register_handler(h)
+        if not self._acknowledge_after_handle:
+            for h in ALL_HANDLERS:
+                self.register_handler(h)
 
         brokers = env_util.get_kafka_brokers()
         if not brokers:
@@ -201,7 +204,7 @@ class KafkaMessageBus:
             bootstrap_servers=brokers,
             group_id=group_id,
             auto_offset_reset="latest",
-            enable_auto_commit=True,
+            enable_auto_commit=not self._acknowledge_after_handle,
             auto_commit_interval_ms=5000,
             request_timeout_ms=40000,
             max_poll_interval_ms=900000,
@@ -253,17 +256,25 @@ class KafkaMessageBus:
                     payload = json.loads(msg.value.decode("utf-8"))
                     event = MessageEvent.from_dict(payload)
                     event.topic = msg.topic
+                    if not event.message_id:
+                        event.message_id = f"{msg.topic}:{msg.partition}:{msg.offset}"
                 except Exception:
-                    raw = msg.value[:200] if msg.value is not None else None
                     logger.error(
                         f"[MessageBus] 消息反序列化失败，跳过: "
                         f"topic={getattr(msg, 'topic', topic)}, "
-                        f"offset={getattr(msg, 'offset', None)}, value={raw!r}",
-                        exc_info=True,
+                        f"offset={getattr(msg, 'offset', None)}",
                     )
+                    if self._acknowledge_after_handle:
+                        await consumer.commit({TopicPartition(msg.topic, msg.partition): msg.offset + 1})
                     continue
 
-                await self._handle_one(event)
+                if self._acknowledge_after_handle:
+                    # A DB/commit failure leaves this partition unacknowledged.
+                    # The existing restart path replays it before later offsets.
+                    await self._handlers[topic].handle(event)
+                    await consumer.commit({TopicPartition(msg.topic, msg.partition): msg.offset + 1})
+                else:
+                    await self._handle_one(event)
         except Exception as e:
             logger.error(
                 f"[MessageBus] 消费循环异常退出: topic={topic}, error={e}",

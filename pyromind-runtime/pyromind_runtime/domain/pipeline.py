@@ -10,6 +10,9 @@ from pyromind_runtime.domain.content import JsonObject
 
 
 class PipelineRun(ContractModel):
+    task_run_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     schema_version: Literal[1] = 1
     run_id: UUID
     conversation_id: str

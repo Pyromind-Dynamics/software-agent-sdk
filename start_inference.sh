@@ -18,12 +18,25 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 
-# EchoMind experiment plans. Explicit deployment environment takes precedence.
-EXPERIMENT_PLAN_ENV_FILE="${EXPERIMENT_PLAN_ENV_FILE:-${SCRIPT_DIR}/.env.experiment-plans.local}"
-if [[ -z "${EXPERIMENT_PLAN_DATABASE_URL:-}" && -f "${EXPERIMENT_PLAN_ENV_FILE}" ]]; then
-  source "${EXPERIMENT_PLAN_ENV_FILE}"
-fi
-export EXPERIMENT_PLAN_DATABASE_URL="${EXPERIMENT_PLAN_DATABASE_URL:-}"
+# Local development uses SQLite; change only this field for MariaDB.
+export EXPERIMENT_DB_BACKEND="${EXPERIMENT_DB_BACKEND:-sqlite}"
+case "${EXPERIMENT_DB_BACKEND}" in
+  sqlite)
+    export EXPERIMENT_SQLITE_PATH="${EXPERIMENT_SQLITE_PATH:-${SCRIPT_DIR}/workspace/experiments/experiments.sqlite3}"
+    ;;
+  mariadb)
+    EXPERIMENT_PLAN_ENV_FILE="${EXPERIMENT_PLAN_ENV_FILE:-${SCRIPT_DIR}/.env.experiment-plans.local}"
+    if [[ -z "${EXPERIMENT_PLAN_DATABASE_URL:-}" && -f "${EXPERIMENT_PLAN_ENV_FILE}" ]]; then
+      source "${EXPERIMENT_PLAN_ENV_FILE}"
+    fi
+    if [[ -z "${EXPERIMENT_PLAN_DATABASE_URL:-}" ]]; then
+      echo "ERROR: MariaDB requires EXPERIMENT_PLAN_DATABASE_URL" >&2
+      exit 1
+    fi
+    export EXPERIMENT_PLAN_DATABASE_URL
+    ;;
+  *) echo "ERROR: EXPERIMENT_DB_BACKEND must be sqlite or mariadb" >&2; exit 1 ;;
+esac
 
 export PYROMIND_HARNESS_BACKEND="pi"
 export APP_ENV="${APP_ENV:-dev}"
@@ -261,7 +274,7 @@ for (const name of ["@earendil-works/pi-coding-agent", "pi-subagents", "@agentge
 JS
 
 # Apply additive plan migrations before serving requests.
-if [[ -n "${EXPERIMENT_PLAN_DATABASE_URL:-}" ]]; then
+if [[ -n "${EXPERIMENT_DB_BACKEND:-}" ]]; then
   uv run --project "${SOFTWARE_AGENT_SDK_DIR}" python -m pyromind_agent_server.plan_migrations
 fi
 
@@ -284,7 +297,7 @@ echo " Conversations:     ${OH_CONVERSATIONS_PATH}"
 echo " Project workspace: ${OH_WORKSPACE_PATH}"
 echo " Bash events:       ${OH_BASH_EVENTS_DIR}"
 echo " Config path:       ${OPENHANDS_AGENT_SERVER_CONFIG_PATH}"
-echo " Plan database:     $([[ -n "${EXPERIMENT_PLAN_DATABASE_URL:-}" ]] && echo configured || echo disabled)"
+echo " Plan database:     ${EXPERIMENT_DB_BACKEND}"
 echo " Pyromind JWT auth: ${OH_ENABLE_PYROMIND_JWT_AUTH}"
 echo " Server env:        ${APP_ENV:-dev}"
 echo " Kafka env:         ${KAFKA_ENV}"

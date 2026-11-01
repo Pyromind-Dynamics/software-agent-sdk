@@ -43,11 +43,13 @@ from pyromind_runtime.domain.commands import (
     CommandReceipt,
     ConfirmExperimentExecutionCommand,
     ConfirmExperimentPlanCommand,
+    ControlExperimentTaskCommand,
     InputResponseCommand,
     PermissionResponseCommand,
     ProductCommand,
     RejectExperimentExecutionCommand,
     RejectExperimentPlanCommand,
+    ResolveExperimentSubmissionCommand,
     RollbackWorkflowCommand,
     UserMessageCommand,
 )
@@ -67,12 +69,14 @@ from pyromind_runtime.domain.evaluation import (
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.experiment_execution import (
     ROLE_TOOLS,
+    ControlExperimentTask,
     EvaluationProposal,
     ExperimentExecutionView,
     ReadExperimentResource,
     RequestExperimentTask,
 )
 from pyromind_runtime.domain.experiment_plans import (
+    CONTEXT_TOOLS,
     PLAN_TOOLS,
     CreateExperimentPlan,
     ExperimentPlanView,
@@ -80,8 +84,10 @@ from pyromind_runtime.domain.experiment_plans import (
     PlanOwner,
     PlanRevision,
     ReviseExperimentPlan,
+    UpdateExperimentContext,
 )
 from pyromind_runtime.domain.pipeline import PipelineRun
+from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
     ExternalTaskState,
@@ -120,7 +126,10 @@ from pyromind_runtime.ports.storage import (
     EvaluationStorage,
     EvaluationStorageMissingError,
 )
-from pyromind_runtime.ports.workflow_submission import WorkflowSubmissionPort
+from pyromind_runtime.ports.workflow_submission import (
+    ExternalTaskQueryPort,
+    WorkflowSubmissionPort,
+)
 from pyromind_runtime.ports.workflows import WorkflowBackend
 
 
@@ -183,6 +192,7 @@ class ConversationRuntime:
         *,
         default_harness_id: str = "openhands",
         experiment_plan_store: ExperimentPlanStore | None = None,
+        external_task_query: ExternalTaskQueryPort | None = None,
         experiment_execution_store: DelegatedExecutionStore | None = None,
         execution_roles: tuple[str, ...] = (),
         evaluation_config_validator: Callable[[JsonObject], JsonObject] | None = None,
@@ -219,6 +229,7 @@ class ConversationRuntime:
         self._execution_worker: DurableWorker | None = None
         self._delegated_store = experiment_execution_store
         self._execution_roles = execution_roles
+        self._external_task_query = external_task_query
         self._evaluation_config_validator = evaluation_config_validator
         if experiment_plan_store and experiment_execution_store and execution_roles:
             delegated = DelegatedExecution(
@@ -228,8 +239,18 @@ class ConversationRuntime:
             )
             self._execution_worker = DurableWorker(
                 experiment_execution_store.queue,
-                {"prepare_execution": delegated.prepare},
-                delegated.reconcile,
+                {
+                    "prepare_execution": lambda item: self._delegated_work(
+                        delegated, item
+                    ),
+                    "execute_task": lambda item: self._delegated_work(delegated, item),
+                    "generate_report": lambda item: self._delegated_work(
+                        delegated, item
+                    ),
+                    "manager_turn": self._manager_turn,
+                    "cancel_execution": self._cancel_experiment_work,
+                },
+                lambda item: self._reconcile_execution_work(delegated, item),
             )
         self._execution_event_task: asyncio.Task[None] | None = None
         self._experiment_plan_project_binder = experiment_plan_project_binder
@@ -276,6 +297,372 @@ class ConversationRuntime:
         self._evaluation_annotation_cache_lock = threading.Lock()
         self._pending_task_registrations: dict[str, asyncio.Event] = {}
 
+    async def _execution_active(self, owner: PlanOwner) -> _ActiveConversation:
+        active = self._active.get(owner.conversation_id)
+        if active is None:
+            retained = self._retained.get(owner.conversation_id)
+            if (
+                retained
+                and retained.context.user_id == owner.user_id
+                and retained.context.profile_id == owner.profile_id
+            ):
+                await self._ensure_active(owner.conversation_id, retained.context)
+                active = self._active.get(owner.conversation_id)
+        if active is None:
+            raise PermissionError("session requires renewed authorization")
+        self._store(owner.conversation_id).authorize(owner.user_id, owner.profile_id)
+        if (
+            active.context.user_id != owner.user_id
+            or active.context.profile_id != owner.profile_id
+        ):
+            raise PermissionError("delegated work owner mismatch")
+        return active
+
+    async def _delegated_work(self, delegated: DelegatedExecution, item: dict) -> dict:
+        owner = PlanOwner.model_validate(item["payload"]["owner"])
+        await self._execution_active(owner)
+        async with self._use(owner.conversation_id):
+            return await delegated.prepare(item)
+
+    async def _reconcile_execution_work(
+        self, delegated: DelegatedExecution, item: dict
+    ) -> bool:
+        if item["kind"] in {"manager_turn", "cancel_execution"}:
+            # These handlers use durable command/notification receipts or query
+            # existing tasks. Neither can create an untracked platform task.
+            return True
+        return await delegated.reconcile(item)
+
+    async def _execute_role_tool(
+        self, owner: PlanOwner, role: str, scope: dict, tool: str, arguments: dict
+    ) -> dict:
+        active = await self._execution_active(owner)
+        self._store(owner.conversation_id).authorize(owner.user_id, owner.profile_id)
+        if (
+            active.context.user_id != owner.user_id
+            or active.context.profile_id != owner.profile_id
+        ):
+            raise PermissionError("delegated work owner mismatch")
+        async with self._use(owner.conversation_id):
+            return dict(
+                await cast(DelegationAdapter, active.adapter).execute_delegated_tool(
+                    active.handle, role, scope, tool, arguments, active.context
+                )
+            )
+
+    async def _read_execution_file(self, owner: PlanOwner, path: str) -> bytes:
+        active = await self._execution_active(owner)
+        self._store(owner.conversation_id).authorize(owner.user_id, owner.profile_id)
+        if path.startswith("public_data/"):
+            value = await active.adapter.read_workspace_text(
+                active.handle, path, active.context, max_bytes=2 * 1024 * 1024
+            )
+            if value is None:
+                raise ValueError("report is not readable")
+            return value.encode()
+        if self._evaluation_storage_factory is None:
+            raise ValueError("artifact storage is unavailable")
+        return await asyncio.to_thread(
+            self._evaluation_storage_factory(active.context).read, path
+        )
+
+    async def _query_execution_task(self, owner: PlanOwner, task_id: str) -> dict:
+        active = await self._execution_active(owner)
+        self._store(owner.conversation_id).authorize(owner.user_id, owner.profile_id)
+        if self._external_task_query is None:
+            raise ValueError("platform query is unavailable")
+        return dict(await self._external_task_query.query(task_id, active.context))
+
+    async def _manager_turn(self, item: dict) -> dict:
+        owner = PlanOwner.model_validate(item["payload"]["owner"])
+        await self._execution_active(owner)
+        async with self._use(owner.conversation_id):
+            return await self._manager_turn_active(item)
+
+    async def _manager_turn_active(self, item: dict) -> dict:
+        """SQL admits durable inputs; the existing harness owns the model turn."""
+        owner = PlanOwner.model_validate(item["payload"]["owner"])
+        active = self._active.get(owner.conversation_id)
+        if active is None:
+            raise PermissionError("session requires renewed authorization")
+        store = self._store(owner.conversation_id)
+        store.authorize(owner.user_id, owner.profile_id)
+        updates: asyncio.Queue[ProductEvent] = asyncio.Queue()
+        self._subscribers.setdefault(owner.conversation_id, set()).add(updates)
+        try:
+
+            def completed(identity: str) -> bool:
+                return any(
+                    event.type == "status.changed"
+                    and event.payload.get("status") != "running"
+                    and (
+                        event.run_id == identity
+                        or (event.run_id or "").startswith(identity + ":")
+                    )
+                    for event in store.replay()
+                )
+
+            recovering = item["attempts"] > 1
+            response = None
+            while not recovering and store.load_snapshot().status == "running":
+                await updates.get()
+            if "command" in item["payload"]:
+                command = UserMessageCommand.model_validate(item["payload"]["command"])
+                receipt, _ = store.claim_command(command)
+                if receipt.status == "completed":
+                    if completed(command.command_id):
+                        return {"delivered": True}
+                    if store.load_snapshot().automatic_turns_suspended:
+                        raise PermissionError("automatic turns are suspended")
+                    notice_id = "accepted-message:" + command.command_id
+                    expected = f"callback:{notice_id}:succeeded"
+                    if completed(expected):
+                        return {"delivered": True}
+                    response = await active.adapter.notify_external_task(
+                        active.handle,
+                        ExternalTaskNotification(
+                            task_id=notice_id,
+                            kind="accepted_message",
+                            status="succeeded",
+                            resume_interrupted=True,
+                            hidden_text=(
+                                "Resume the already accepted user message after "
+                                "interruption. Read the experiment context and "
+                                "existing executions first; continue existing work "
+                                "without launching a duplicate evaluation. "
+                                "Do not append the original user message again."
+                            ),
+                        ),
+                        active.context,
+                    )
+                else:
+                    expected = command.command_id
+                    await self._send_claimed(
+                        owner.conversation_id, command, receipt, active.context
+                    )
+            else:
+                if store.load_snapshot().automatic_turns_suspended:
+                    raise PermissionError("automatic turns are suspended")
+                notice_id = item["payload"]["notice_id"]
+                expected = f"callback:{notice_id}:succeeded"
+                if completed(expected):
+                    return {"delivered": True}
+                response = await active.adapter.notify_external_task(
+                    active.handle,
+                    ExternalTaskNotification(
+                        task_id=notice_id,
+                        kind="experiment_task",
+                        status="succeeded",
+                        resume_interrupted=True,
+                        hidden_text="Delegated task update. Use these verified facts "
+                        "and decide within the user's goal.\n"
+                        + json.dumps(item["payload"]["result"], ensure_ascii=False),
+                    ),
+                    active.context,
+                )
+                if response.get("duplicate") and completed(expected):
+                    return {"delivered": True}
+            if response and response.get("completed"):
+                event, _ = store.append(
+                    ProductEvent(
+                        event_id="recovered-turn:" + expected,
+                        conversation_id=owner.conversation_id,
+                        run_id=expected,
+                        type="status.changed",
+                        payload={
+                            "status": "finished"
+                            if response.get("settled_status") != "failed"
+                            else "error"
+                        },
+                    )
+                )
+                self._publish(event)
+                return {"delivered": True}
+            while True:
+                event = await updates.get()
+                if (
+                    (
+                        event.run_id == expected
+                        or (event.run_id or "").startswith(expected + ":")
+                    )
+                    and event.type == "status.changed"
+                    and event.payload.get("status") != "running"
+                ):
+                    break
+            return {"delivered": True}
+        finally:
+            self._subscribers.get(owner.conversation_id, set()).discard(updates)
+
+    async def _control_experiment_task(
+        self, owner: PlanOwner, command: ControlExperimentTask
+    ) -> dict:
+        if self._delegated_store is None:
+            raise ValueError("execution store unavailable")
+        rows = await self._plan_io(self._delegated_store.list, owner)
+        row = next((row for row in rows if row["id"] == command.run_id), None)
+        if row is None:
+            raise PermissionError("execution not found")
+        if not row.get("task_spec"):
+            raise ValueError(
+                "legacy preparation is historical; delegate a standalone task"
+            )
+        if command.action == "cancel":
+            result = await self._plan_io(self._delegated_store.cancel, owner, row["id"])
+            return {"run_id": row["id"], "state": result["state"]}
+        if command.action == "retry_report":
+            if row["report_state"] != "failed":
+                raise ValueError("only a failed report can be retried")
+            work_id = await self._plan_io(
+                self._delegated_store.enqueue_report,
+                owner,
+                row["id"],
+                command.message,
+                command.command_id,
+            )
+        else:
+            work_id = await self._plan_io(
+                self._delegated_store.continue_task,
+                owner,
+                row["id"],
+                command.command_id,
+                command.message,
+            )
+        return {"run_id": row["id"], "work_id": work_id}
+
+    async def _cancel_experiment_work(self, item: dict) -> dict:
+        while True:
+            result = await self._cancel_experiment_attempt(item)
+            if result["state"] != "cancel_requested":
+                return result
+            await asyncio.sleep(2)
+
+    async def _cancel_experiment_attempt(self, item: dict) -> dict:
+        assert self._delegated_store is not None
+        owner = PlanOwner.model_validate(item["payload"]["owner"])
+        row = next(
+            row
+            for row in await self._plan_io(self._delegated_store.list, owner)
+            if row["id"] == item["payload"]["run_id"]
+        )
+        scope = {
+            "run_id": row["id"],
+            "work_id": item["id"],
+            "generation": item["generation"],
+            "control": True,
+        }
+        native = await self._plan_io(
+            self._delegated_store.native_reference, owner, row["id"]
+        )
+        stopped = not native
+        if native:
+            status = await self._control_delegation(
+                owner,
+                row["role_id"],
+                {"action": "status", "execution_ref": native, "scope": scope},
+            )
+            if status["status"] == "unknown":
+                raise ValueError("native cancellation requires reconciliation")
+            if status["status"] not in {"succeeded", "failed", "stopped", "paused"}:
+                await self._control_delegation(
+                    owner,
+                    row["role_id"],
+                    {"action": "stop", "execution_ref": native, "scope": scope},
+                )
+                status = await self._control_delegation(
+                    owner,
+                    row["role_id"],
+                    {"action": "status", "execution_ref": native, "scope": scope},
+                )
+            stopped = status["status"] in {"succeeded", "failed", "stopped", "paused"}
+        platform_stopped = True
+        for sub in row.get("submissions", []):
+            if sub["state"] in {"submitting", "submission_uncertain"}:
+                platform_stopped = False
+            elif sub.get("task_id"):
+                status = str(
+                    (await self._query_execution_task(owner, sub["task_id"]))["status"]
+                ).lower()
+                await self._plan_io(
+                    self._delegated_store.ingest,
+                    f"cancel:{sub['task_id']}:{time.time_ns()}",
+                    sub["task_id"],
+                    "query",
+                    {"status": status},
+                )
+                await self._plan_io(self._delegated_store.apply_observations)
+                if status not in {
+                    "succeeded",
+                    "success",
+                    "failed",
+                    "error",
+                    "terminated",
+                    "stopped",
+                }:
+                    await self._execute_role_tool(
+                        owner,
+                        row["role_id"],
+                        scope,
+                        "df_stop_task",
+                        {"task_id": sub["task_id"]},
+                    )
+                    platform_stopped = False
+        result = await self._plan_io(
+            self._delegated_store.cancellation_result,
+            owner,
+            row["id"],
+            scope,
+            stopped,
+            platform_stopped,
+        )
+        return {"state": result["state"]}
+
+    async def apply_session_configuration(
+        self, conversation_id: str, policy: SessionPolicy, context: RequestContext
+    ) -> bool:
+        """Apply trusted router configuration only at an idle boundary."""
+        store = await self._read_store(conversation_id, context)
+        if policy.configuration_version <= store.configuration_version():
+            return True
+        async with self._activation_locks.setdefault(conversation_id, asyncio.Lock()):
+            if store.load_snapshot().status == "running":
+                return False
+            owner = PlanOwner(
+                user_id=context.user_id,
+                conversation_id=conversation_id,
+                profile_id=context.profile_id,
+            )
+            if self._delegated_store:
+                if not await self._plan_io(
+                    self._delegated_store.retire_legacy_work, owner
+                ):
+                    return False
+            snapshot = store.load_snapshot()
+            handle = SessionHandle(
+                session_id=conversation_id,
+                adapter_session_ref=conversation_id,
+                harness_id=store.harness_id(),
+                capabilities=snapshot.capabilities,
+            )
+            changed = store.access_policy()["tool_allowlist"] != policy.tool_allowlist
+            await self._adapter(handle.harness_id).update_session_policy(
+                handle, policy, context
+            )
+            await asyncio.to_thread(store.apply_configuration, policy)
+            if changed:
+                event, _ = store.append(
+                    ProductEvent(
+                        conversation_id=conversation_id,
+                        type="notice.raised",
+                        payload={
+                            "code": "session_configuration_updated",
+                            "severity": "info",
+                            "message": "实验会话已更新；历史提案不会自动提交。",
+                        },
+                    )
+                )
+                self._publish(event)
+        return True
+
     def _execution_service(
         self, conversation_id: str, context: RequestContext, tool_name: str
     ) -> tuple[ExperimentExecutions, PlanOwner]:
@@ -316,6 +703,43 @@ class ConversationRuntime:
         return await self._plan_io(
             service.request, owner, request, self._execution_roles
         )
+
+    async def read_experiment_artifact(
+        self, conversation_id: str, run_id: str, name: str, context: RequestContext
+    ) -> dict:
+        """Read a registered artifact, never a caller-supplied resource URI."""
+        import hashlib
+
+        service, owner = self._execution_service(
+            conversation_id, context, "get_experiment_execution"
+        )
+        rows = await self._plan_io(service.store.list, owner)
+        row = next((row for row in rows if row["id"] == run_id), None)
+        artifact = next(
+            (item for item in (row or {}).get("artifacts", []) if item["name"] == name),
+            None,
+        )
+        if artifact is None:
+            raise FileNotFoundError("registered artifact not found")
+        uri = artifact["uri"]
+        if uri.startswith("public_data/experiment-runs/"):
+            value = await self.read_workspace_text(
+                conversation_id, uri, context, max_bytes=2 * 1024 * 1024
+            )
+            if value is None:
+                raise FileNotFoundError("registered report is unavailable")
+            body = value.encode()
+        else:
+            if self._evaluation_storage_factory is None:
+                raise ValueError("artifact storage is unavailable")
+            body = await asyncio.to_thread(
+                self._evaluation_storage_factory(context).read, uri
+            )
+        if len(body) > 2 * 1024 * 1024:
+            raise ValueError("artifact exceeds inline preview limit")
+        if hashlib.sha256(body).hexdigest() != artifact["sha256"]:
+            raise ValueError("registered artifact changed")
+        return {"name": name, "content": body.decode("utf-8")}
 
     async def _submit_execution_decision(
         self,
@@ -375,7 +799,90 @@ class ConversationRuntime:
                 )
             )
             self._publish(event)
+            owner_payload = notification["payload"].get("owner")
+            if owner_payload and self._delegated_store:
+                owner = PlanOwner.model_validate(owner_payload)
+                row = next(
+                    (
+                        row
+                        for row in await self._plan_io(port.list, owner)
+                        if row["id"] == notification["payload"]["run_id"]
+                    ),
+                    None,
+                )
+                if row:
+                    self._project_managed_tasks(conversation_id, row)
+                if (
+                    row
+                    and row.get("task_spec")
+                    and row["report_state"] in {"ready", "failed"}
+                ):
+                    result = {
+                        "run_id": row["id"],
+                        "state": row["state"],
+                        "report_state": row["report_state"],
+                        "metrics": row.get("metrics"),
+                        **(row.get("result") or {}),
+                    }
+                    import hashlib
+
+                    notice_id = (
+                        row["id"]
+                        + ":"
+                        + hashlib.sha256(
+                            json.dumps(
+                                result, sort_keys=True, ensure_ascii=False
+                            ).encode()
+                        ).hexdigest()
+                    )
+                    await self._plan_io(
+                        self._delegated_store.enqueue_manager,
+                        owner,
+                        "notice:" + notice_id,
+                        {"notice_id": notice_id, "result": result},
+                    )
             await self._plan_io(port.acknowledge_delivery, notification["id"])
+
+    def _project_managed_tasks(self, conversation_id: str, row: dict) -> None:
+        """Refresh the shared task view without delivering raw callbacks to Manager."""
+        store = self._store(conversation_id)
+        tasks = {task.task_id: task for task in store.load_snapshot().external_tasks}
+        for sub in row.get("submissions", []):
+            task = tasks.get(sub.get("task_id"))
+            status = sub["state"]
+            if (
+                task is None
+                or task.managed_task_run_id != row["id"]
+                or status
+                not in {
+                    "pending",
+                    "running",
+                    "succeeded",
+                    "failed",
+                    "stopped",
+                    "terminated",
+                }
+                or task.status == status
+                and not task.resume_pending
+            ):
+                continue
+            event, _ = store.append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    type="external_task.updated",
+                    payload={
+                        **task.model_dump(mode="json"),
+                        "status": status,
+                        "resume_pending": False,
+                        "updated_at": datetime.now().astimezone().isoformat(),
+                    },
+                )
+            )
+            self._publish(event)
+            if self._external_tasks:
+                self._external_tasks.update_status(
+                    conversation_id, task.task_id, status
+                )
 
     async def start_execution_events(self) -> None:
         if (
@@ -383,11 +890,18 @@ class ConversationRuntime:
             or self._experiment_executions is None
         ):
             return
+        if self._delegated_store:
+            await self._plan_io(self._delegated_store.recover_submissions)
 
         async def publish_loop() -> None:
             while not self._closing:
                 try:
                     await self.flush_execution_events()
+                    if self._experiment_executions and self._external_task_query:
+                        await self._recover_execution_receipts()
+                        await self._experiment_executions.poll(
+                            self._query_execution_task, self._read_execution_file
+                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -400,6 +914,38 @@ class ConversationRuntime:
         if self._execution_worker:
             await self._execution_worker.start()
 
+    async def _recover_execution_receipts(self) -> None:
+        if self._delegated_store is None:
+            return
+        for pending in await self._plan_io(self._delegated_store.pending_runs):
+            if pending["state"] != "submission_uncertain":
+                continue
+            owner = PlanOwner(
+                user_id=pending["user_id"],
+                conversation_id=pending["conversation_id"],
+                profile_id=pending["profile_id"],
+            )
+            product = self._store(owner.conversation_id)
+            product.authorize(owner.user_id, owner.profile_id)
+            pipelines = await asyncio.to_thread(product.load_pipeline_runs)
+            rows = await self._plan_io(self._delegated_store.list, owner)
+            row = next(row for row in rows if row["id"] == pending["id"])
+            for sub in row.get("submissions", []):
+                pipeline = pipelines.get(sub["evidence"].get("pipeline_run_id"))
+                if pipeline and pipeline.task_run_id == row["id"] and pipeline.task_id:
+                    await self._plan_io(
+                        self._delegated_store.recover_managed_receipt,
+                        owner,
+                        row["id"],
+                        sub["id"],
+                        {
+                            "run_id": str(pipeline.run_id),
+                            "task_id": pipeline.task_id,
+                            "output_dir": pipeline.output_dir,
+                            "is_error": False,
+                        },
+                    )
+
     async def _control_delegation(
         self, owner: PlanOwner, role: str, request: dict
     ) -> dict:
@@ -411,9 +957,7 @@ class ConversationRuntime:
         await self._plan_io(
             self._delegated_store.role_scope, owner, str(scope["run_id"]), role, scope
         )
-        active = self._active.get(owner.conversation_id)
-        if active is None:
-            raise PermissionError("session requires renewed authorization")
+        active = await self._execution_active(owner)
         context = active.context
         self._store(owner.conversation_id).authorize(
             context.user_id, context.profile_id
@@ -437,11 +981,7 @@ class ConversationRuntime:
         scope: dict,
         context: RequestContext,
     ) -> dict:
-        if (
-            self._delegated_store is None
-            or role not in self._execution_roles
-            or tool not in ROLE_TOOLS
-        ):
+        if self._delegated_store is None or role not in self._execution_roles:
             raise PermissionError("execution role capability is unavailable")
         owner = PlanOwner(
             user_id=context.user_id,
@@ -453,6 +993,29 @@ class ConversationRuntime:
         row = await self._plan_io(
             self._delegated_store.role_scope, owner, run_id, role, scope
         )
+        if tool == "authorize_experiment_tool":
+            return {"authorized": True}
+        if tool == "authorize_experiment_submission":
+            if (
+                not row.get("task_spec")
+                or row["task_spec"]["intent"] != "execute"
+                or row["state"] != "submitting"
+            ):
+                raise PermissionError("execution no longer authorizes submission")
+            return {"authorized": True}
+        if row.get("task_spec"):
+            assert self._experiment_executions is not None
+            return await self._experiment_executions.role_call(
+                owner,
+                role,
+                tool,
+                arguments,
+                scope,
+                self._execute_role_tool,
+                self._read_execution_file,
+            )
+        if tool not in ROLE_TOOLS:
+            raise PermissionError("role tool is not authorized")
         model = ROLE_TOOLS[tool][0].model_validate(arguments)
         if getattr(model, "run_id", None) not in {None, run_id}:
             raise PermissionError("tool requested another execution")
@@ -546,8 +1109,15 @@ class ConversationRuntime:
     ) -> tuple[ExperimentPlans, PlanOwner]:
         store = self._store(conversation_id)
         store.authorize(context.user_id, context.profile_id)
-        if not store.permits_tool(tool_name):
+        readable = tool_name == "get_experiment_plan" and "get_experiment_context" in (
+            store.access_policy()["tool_allowlist"] or ()
+        )
+        if not store.permits_tool(tool_name) and not readable:
             raise PermissionError("plan capability is not enabled")
+        if tool_name in CONTEXT_TOOLS and tool_name not in (
+            store.access_policy()["tool_allowlist"] or ()
+        ):
+            raise PermissionError("experiment context capability is not enabled")
         if self._experiment_plans is None:
             raise ProductRuntimeError(
                 "plan_store_unavailable", "Plan database is not configured."
@@ -586,6 +1156,31 @@ class ConversationRuntime:
         arguments: JsonObject,
         context: RequestContext,
     ) -> JsonObject:
+        if tool_name in CONTEXT_TOOLS:
+            service, owner = self._plan_service(conversation_id, context, tool_name)
+            if tool_name == "get_experiment_context":
+                return (await self._plan_io(service.store.context, owner)).model_dump(
+                    mode="json"
+                )
+            view = await self._plan_io(
+                service.store.update_context,
+                owner,
+                UpdateExperimentContext.model_validate(arguments),
+            )
+            event, _ = self._store(conversation_id).append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    type="experiment_context.changed",
+                    payload={"sequence": view.sequence},
+                )
+            )
+            self._publish(event)
+            return view.model_dump(mode="json")
+        if tool_name == "control_experiment_task":
+            _, owner = self._execution_service(conversation_id, context, tool_name)
+            return await self._control_experiment_task(
+                owner, ControlExperimentTask.model_validate(arguments)
+            )
         if tool_name == "request_experiment_task":
             row = await self.request_experiment_task(
                 conversation_id,
@@ -1649,6 +2244,51 @@ class ConversationRuntime:
                 snapshot = snapshot.model_copy(
                     update={"experiment_executions": executions}
                 )
+        if (
+            "get_experiment_context" in (store.access_policy()["tool_allowlist"] or ())
+            and self._experiment_plans
+        ):
+            owner = PlanOwner(
+                user_id=context.user_id,
+                conversation_id=conversation_id,
+                profile_id=context.profile_id,
+            )
+            view = await self._plan_io(self._experiment_plans.store.context, owner)
+            executions = (
+                await self.get_experiment_executions(conversation_id, context)
+                if self._experiment_executions
+                else ()
+            )
+            queue = (
+                await self._plan_io(self._delegated_store.work_items, owner)
+                if self._delegated_store
+                else ()
+            )
+            if self._delegated_store and (
+                any(
+                    item["state"] in {"queued", "running", "waiting_authorization"}
+                    for item in queue
+                )
+                or any(
+                    execution.state
+                    in {
+                        "waiting_platform",
+                        "waiting_artifacts",
+                        "cancel_requested",
+                    }
+                    or execution.report_state == "queued"
+                    for execution in executions
+                )
+            ):
+                await self._ensure_active(conversation_id, context)
+                await self._plan_io(self._delegated_store.resume_authorized, owner)
+            snapshot = snapshot.model_copy(
+                update={
+                    "experiment_context": view,
+                    "experiment_executions": executions,
+                    "experiment_queue": queue,
+                }
+            )
         return snapshot
 
     async def read_workspace_text(
@@ -1695,6 +2335,76 @@ class ConversationRuntime:
     ) -> CommandReceipt:
         store = await self._read_store(conversation_id, context)
         store.require_command(command.type)
+        if isinstance(command, ResolveExperimentSubmissionCommand):
+            _, owner = self._execution_service(
+                conversation_id, context, "control_experiment_task"
+            )
+            assert self._delegated_store is not None
+            receipt, _ = store.claim_command(command)
+            if receipt.status == "completed":
+                return receipt
+            if command.action == "abandon":
+                result = await self._plan_io(
+                    self._delegated_store.abandon,
+                    owner,
+                    command.run_id,
+                    command.command_id,
+                )
+            else:
+                rows = await self._plan_io(self._delegated_store.list, owner)
+                row = next((row for row in rows if row["id"] == command.run_id), None)
+                if row is None:
+                    raise PermissionError("execution not found")
+                pipelines = await asyncio.to_thread(store.load_pipeline_runs)
+                match = next(
+                    (
+                        pipeline
+                        for sub in row.get("submissions", [])
+                        if (
+                            pipeline := pipelines.get(
+                                sub["evidence"].get("pipeline_run_id")
+                            )
+                        )
+                        and pipeline.task_run_id == row["id"]
+                        and pipeline.task_id == command.task_id
+                    ),
+                    None,
+                )
+                if match is None:
+                    raise ValueError(
+                        "无法核实此任务与原提交配置的关联；保留待核对状态。"
+                    )
+                await self._query_execution_task(owner, command.task_id)
+                result = await self._plan_io(
+                    self._delegated_store.resolve,
+                    owner,
+                    row["id"],
+                    command.task_id,
+                    command.command_id,
+                    {
+                        "pipeline_run_id": str(match.run_id),
+                        "fingerprint": match.fingerprint,
+                    },
+                )
+            return store.complete_command(
+                receipt.model_copy(
+                    update={
+                        "status": "completed",
+                        "response": {"run_id": result["id"], "state": result["state"]},
+                    }
+                )
+            )
+        if isinstance(command, ControlExperimentTaskCommand):
+            receipt, claimed = store.claim_command(command)
+            if not claimed:
+                return receipt
+            _, owner = self._execution_service(
+                conversation_id, context, "control_experiment_task"
+            )
+            result = await self._control_experiment_task(owner, command)
+            return store.complete_command(
+                receipt.model_copy(update={"status": "completed", "response": result})
+            )
         if isinstance(
             command, (ConfirmExperimentPlanCommand, RejectExperimentPlanCommand)
         ):
@@ -1719,6 +2429,25 @@ class ConversationRuntime:
         store.save_x_cluster(context.x_cluster)
         receipt, claimed = store.claim_command(command)
         if not claimed:
+            return receipt
+        if (
+            isinstance(command, UserMessageCommand)
+            and self._delegated_store
+            and "get_experiment_context"
+            in (store.access_policy()["tool_allowlist"] or ())
+        ):
+            owner = PlanOwner(
+                user_id=context.user_id,
+                conversation_id=conversation_id,
+                profile_id=context.profile_id,
+            )
+            await self._plan_io(
+                self._delegated_store.enqueue_manager,
+                owner,
+                "user:" + command.command_id,
+                {"command": command.model_dump(mode="json")},
+                10,
+            )
             return receipt
         if isinstance(command, InputResponseCommand):
             # HTTP cancellation must not interrupt a claimed answer between
@@ -2320,6 +3049,46 @@ class ConversationRuntime:
         completion_result: JsonObject | None = None,
     ) -> ProductEvent:
         """Persist one callback and notify its owning harness at most once."""
+        if self._delegated_store:
+            early = (
+                self._external_tasks.resolve(conversation_id, task_id)
+                if self._external_tasks
+                else None
+            )
+            # A known unowned legacy task does not depend on the optional SQL
+            # execution ledger, including during a database outage.
+            managed = (
+                await self._plan_io(self._delegated_store.platform_run, task_id)
+                if not early or early.get("managed_task_run_id")
+                else None
+            )
+            if managed or early and early.get("managed_task_run_id"):
+                if managed and managed["conversation_id"] != conversation_id:
+                    raise PermissionError(
+                        "platform task belongs to another conversation"
+                    )
+                normalized = {
+                    "success": "succeeded",
+                    "error": "failed",
+                    "terminated": "stopped",
+                }.get(status.lower(), status.lower())
+                await self._plan_io(
+                    self._delegated_store.ingest,
+                    f"callback:{task_id}:{normalized}",
+                    task_id,
+                    "callback",
+                    {"status": normalized},
+                )
+                await self._plan_io(self._delegated_store.apply_observations)
+                event, _ = self._store(conversation_id).append(
+                    ProductEvent(
+                        conversation_id=conversation_id,
+                        type="experiment_execution.changed",
+                        payload={"platform_task_id": task_id},
+                    )
+                )
+                self._publish(event)
+                return event
         store = self._store(conversation_id)
         snapshot = store.load_snapshot()
         task = next(
@@ -2661,7 +3430,7 @@ class ConversationRuntime:
         return any(
             task.resume_pending
             or (
-                task.kind == "historical_experience"
+                (task.kind == "historical_experience" or task.managed_task_run_id)
                 and task.status in {"pending", "running"}
             )
             for task in snapshot.external_tasks
@@ -2780,6 +3549,7 @@ class ConversationRuntime:
         otherwise be replayed into a dead service and fail terminally.
         """
         handle = await active.adapter.attach_session(active.handle.session_id, context)
+        active.context = context
         if handle != active.handle:
             logger.warning(
                 "Harness returned a different handle for conversation %s; "
@@ -2940,7 +3710,7 @@ class ConversationRuntime:
                         )
                     await self._complete_history(active.handle.session_id, result)
         for task in store.load_snapshot().external_tasks:
-            if not task.resume_pending:
+            if not task.resume_pending or task.managed_task_run_id:
                 continue
             if task.graph_run_id:
                 # The callback arrived while this conversation was released, so

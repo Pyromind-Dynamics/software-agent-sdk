@@ -7,10 +7,29 @@ from pydantic import Field, model_validator
 
 from pyromind_runtime.domain.base import ContractModel, utc_now
 from pyromind_runtime.domain.content import ContentBlock, JsonObject
+from pyromind_runtime.domain.experiment_execution import ControlExperimentTask
 from pyromind_runtime.domain.user_input import (
     MAX_USER_INPUT_BYTES,
     UserInputAnswer,
 )
+
+
+class ControlExperimentTaskCommand(ControlExperimentTask):
+    type: Literal["control_experiment_task"] = "control_experiment_task"
+
+
+class ResolveExperimentSubmissionCommand(ContractModel):
+    type: Literal["resolve_experiment_submission"] = "resolve_experiment_submission"
+    command_id: str = Field(min_length=1, max_length=128)
+    run_id: str = Field(min_length=1)
+    action: Literal["bind", "abandon"]
+    task_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_target(self):
+        if (self.action == "bind") != (self.task_id is not None):
+            raise ValueError("only binding requires a platform task ID")
+        return self
 
 
 class UserMessageCommand(ContractModel):
@@ -104,7 +123,9 @@ type ProductCommand = Annotated[
     | ConfirmExperimentPlanCommand
     | RejectExperimentPlanCommand
     | ConfirmExperimentExecutionCommand
-    | RejectExperimentExecutionCommand,
+    | RejectExperimentExecutionCommand
+    | ControlExperimentTaskCommand
+    | ResolveExperimentSubmissionCommand,
     Field(discriminator="type"),
 ]
 

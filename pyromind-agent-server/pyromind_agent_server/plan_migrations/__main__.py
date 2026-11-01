@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy.engine import make_url
+
+from pyromind_agent_server.plan_database import resolve_database_url
 
 
 def main() -> None:
-    url = make_url(os.environ["EXPERIMENT_PLAN_DATABASE_URL"])
-    if url.drivername != "mysql+pymysql":
-        raise ValueError("Plan migrations require mysql+pymysql")
+    url = resolve_database_url()
+    if url is None:
+        raise ValueError("Experiment database is not configured")
     config = Config()
     config.set_main_option("script_location", str(Path(__file__).parent))
     config.attributes["database_url"] = url

@@ -3,10 +3,12 @@ from __future__ import annotations
 from typing import Protocol
 
 from pyromind_runtime.domain.experiment_plans import (
+    ExperimentContextView,
     ExperimentPlanView,
     PlanOwner,
     PlanProposal,
     PlanRevision,
+    UpdateExperimentContext,
 )
 
 
@@ -15,6 +17,13 @@ class ExperimentPlanProjectBinder(Protocol):
 
 
 class ExperimentPlanStore(Protocol):
+    def context(
+        self, owner: PlanOwner, *, create: bool = False
+    ) -> ExperimentContextView: ...
+
+    def update_context(
+        self, owner: PlanOwner, request: UpdateExperimentContext
+    ) -> ExperimentContextView: ...
     def close(self) -> None: ...
 
     def view(self, owner: PlanOwner) -> ExperimentPlanView: ...

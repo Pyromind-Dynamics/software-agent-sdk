@@ -34,9 +34,6 @@ from pyromind_agent_server.evaluation_configuration import (
     validate_evaluation_configuration,
 )
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
-from pyromind_agent_server.experiment_plan_projects import (
-    EchoMindExperimentPlanProjectBinder,
-)
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.plan_database import build_experiment_plan_store
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
@@ -226,20 +223,17 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             idle_eviction_seconds,
         )
     plan_store = build_experiment_plan_store()
+    execution_store = SQLExperimentExecutionStore(plan_store.engine) if plan_store else None
     runtime = ConversationRuntime(
         service.conversations_dir,
         adapters,
         default_harness_id=backend,
         experiment_plan_store=plan_store,
-        experiment_execution_store=SQLExperimentExecutionStore(plan_store.engine)
-        if plan_store
-        else None,
+        experiment_execution_store=execution_store,
         execution_roles=tuple(
             role.name for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()
         ),
-        experiment_plan_project_binder=EchoMindExperimentPlanProjectBinder(
-            service.conversations_dir
-        ),
+        external_task_query=PlatformWorkflowSubmission(),
         external_tasks=external_tasks,
         idle_eviction_seconds=idle_eviction_seconds,
         release_grace_seconds=release_grace_seconds,
@@ -273,6 +267,13 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     )
     set_workflow_status_dispatcher(WorkflowStatusDispatcher(runtime).dispatch)
     app.state.product_runtime = runtime
+    if execution_store:
+        from openhands.agent_server.kafka_bus.kafka_bus import KafkaMessageBus
+        from pyromind_agent_server.execution_observations import ExecutionObservationHandler
+
+        bus = KafkaMessageBus(acknowledge_after_handle=True)
+        bus.register_handler(ExecutionObservationHandler(execution_store))
+        app.state.execution_observation_bus = bus
     return runtime
 
 
@@ -322,9 +323,15 @@ def install_product_api(app: FastAPI) -> FastAPI:
             if runtime is not None:
                 await runtime.recover_version_metadata()
                 await runtime.start_execution_events()
+                bus = getattr(current_app.state, "execution_observation_bus", None)
+                if bus:
+                    await bus.start_consumer()
             try:
                 yield
             finally:
+                bus = getattr(current_app.state, "execution_observation_bus", None)
+                if bus:
+                    await bus.stop()
                 runtime = getattr(current_app.state, "product_runtime", None)
                 if isinstance(runtime, ConversationRuntime):
                     await runtime.close()

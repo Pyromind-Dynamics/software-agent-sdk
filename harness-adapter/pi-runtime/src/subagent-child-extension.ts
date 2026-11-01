@@ -30,7 +30,7 @@ export async function installChildHost(pi: ExtensionAPI, role: string) {
   });
   for (const tool of config.tools) {
     pi.registerTool({ ...tool, execute: (id: string, args: unknown, signal: AbortSignal | undefined, update: any, ctx: any) =>
-      callSubagentHost(socket, { method: "tool", role, name: tool.name, id: `${ctx.sessionManager.getLeafId()}:${id}`, args, session: ctx.sessionManager.getSessionId() }, signal, update) });
+      callSubagentHost(socket, { method: "tool", role, scope: config.scope, name: tool.name, id: `${ctx.sessionManager.getLeafId()}:${id}`, args, session: ctx.sessionManager.getSessionId() }, signal, update) });
   }
   pi.on("session_start", async (_event, ctx) => {
     await callSubagentHost(socket, { method: "config", role });
@@ -39,6 +39,10 @@ export async function installChildHost(pi: ExtensionAPI, role: string) {
   });
   pi.on("before_agent_start", (event) => {
     let prompt = event.systemPrompt;
+    if (config.workspacePathAlias) {
+      event.systemPromptOptions.cwd = config.workspacePathAlias.alias;
+      prompt = prompt.replaceAll(config.workspacePathAlias.host, config.workspacePathAlias.alias);
+    }
     for (const mapping of config.skillPathAliases ?? []) {
       prompt = prompt.replaceAll(mapping.host, mapping.alias);
       const options = event.systemPromptOptions;

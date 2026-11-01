@@ -169,6 +169,20 @@ def configure_model_source(inference_submission):
     return configure
 
 
+def test_expired_delegation_is_rejected_immediately_before_platform_create(inference_submission):
+    ctx = inference_submission
+
+    def expired():
+        raise PermissionError("delegation lease expired")
+
+    ctx.handler._submission_guard = expired
+    result = ctx.executor(ctx.action, ctx.conversation)
+    assert result.is_error
+    ctx.submit.assert_not_called()
+    run = next(iter(ctx.store.load_pipeline_runs().values()))
+    assert run.submission_status == "failed" and run.task_id is None
+
+
 @pytest.mark.parametrize("operation", ["profile", "review", "report"])
 def test_products_submit_cpu_only_without_model_or_scoring(
     operation, inference_submission

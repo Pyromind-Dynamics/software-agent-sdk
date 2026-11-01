@@ -218,6 +218,47 @@ class GetExperimentPlan(ContractModel):
     revision: int | None = Field(default=None, ge=1)
 
 
+class ExperimentContext(ContractModel):
+    """Optional advice, not an executable plan or an authorization boundary."""
+
+    goal: str = ""
+    constraints: tuple[str, ...] = ()
+    resources: tuple[PlanResource, ...] = ()
+    stages: tuple[ExperimentStage, ...] = ()
+    edges: tuple[PlanEdge, ...] = ()
+    conclusions: tuple[str, ...] = ()
+    next_steps: tuple[str, ...] = ()
+    blockers: tuple[str, ...] = ()
+    status: Literal["active", "completed"] = "active"
+
+    @model_validator(mode="after")
+    def validate_references(self):
+        ids = [stage.id for stage in self.stages]
+        _unique(ids, "stage id")
+        _unique([resource.id for resource in self.resources], "resource id")
+        if any(e.source not in ids or e.target not in ids for e in self.edges):
+            raise ValueError("guide edge references an unknown stage")
+        # Advice may return to a previous stage. It is not a scheduling DAG.
+        return self
+
+
+class ExperimentContextView(ContractModel):
+    project_id: str | None = None
+    sequence: int = 0
+    context: ExperimentContext = Field(default_factory=ExperimentContext)
+
+
+class UpdateExperimentContext(ContractModel):
+    context: ExperimentContext
+    expected_sequence: int = Field(default=0, ge=0)
+
+
+CONTEXT_TOOLS = {
+    "get_experiment_context": ContractModel,
+    "update_experiment_context": UpdateExperimentContext,
+}
+
+
 PLAN_TOOLS = {
     "create_experiment_plan": CreateExperimentPlan,
     "revise_experiment_plan": ReviseExperimentPlan,

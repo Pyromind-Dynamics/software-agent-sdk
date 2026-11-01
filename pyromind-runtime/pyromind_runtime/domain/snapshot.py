@@ -8,7 +8,10 @@ from pyromind_runtime.domain.base import AwareDatetime, ContractModel
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.content import ContentBlock, JsonObject
 from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
-from pyromind_runtime.domain.experiment_plans import ExperimentPlanView
+from pyromind_runtime.domain.experiment_plans import (
+    ExperimentContextView,
+    ExperimentPlanView,
+)
 from pyromind_runtime.domain.user_input import PendingUserInput
 
 
@@ -124,6 +127,9 @@ class UsageState(ContractModel):
 
 
 class ExternalTaskState(ContractModel):
+    managed_task_run_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     task_id: str = Field(min_length=1)
     kind: Literal[
         "historical_experience",
@@ -175,7 +181,9 @@ class ConversationSnapshot(ContractModel):
     current_workflow: WorkflowState | None = None
     plan: PlanState | None = None
     experiment_plan: ExperimentPlanView | None = None
+    experiment_context: ExperimentContextView | None = None
     experiment_executions: tuple[ExperimentExecutionView, ...] | None = None
+    experiment_queue: tuple[JsonObject, ...] | None = None
     pending_permissions: tuple[PendingPermission, ...] = ()
     pending_inputs: tuple[PendingUserInput, ...] = ()
     # Automatic-turn suspension is separate from display status and is released by
@@ -194,8 +202,12 @@ class ConversationSnapshot(ContractModel):
         data = handler(self)
         if self.experiment_executions is None:
             data.pop("experiment_executions", None)
+        if self.experiment_queue is None:
+            data.pop("experiment_queue", None)
         if self.experiment_plan is None:
             data.pop("experiment_plan", None)
+        if self.experiment_context is None:
+            data.pop("experiment_context", None)
         if not self.pending_inputs:
             data.pop("pending_inputs", None)
         if not self.automatic_turns_suspended:

@@ -40,6 +40,7 @@ export class PiAgentRuntime {
   private sessionId: string | undefined;
   private workspaceRoot: string | undefined;
   private terminalBackend: string | undefined;
+  private managedDelegation = false;
   private normalizer: PiEventNormalizer | undefined;
   /** Blocks automatic scheduling (notifications, stages) until a user prompt. */
   private executionSuspended = false;
@@ -148,6 +149,7 @@ export class PiAgentRuntime {
     this.sessionId = sessionId;
     this.workspaceRoot = requiredString(params, "workspace_root");
     this.terminalBackend = requiredString(params, "terminal_backend");
+    this.managedDelegation = params.managed_delegation === true;
     for (const entry of session.sessionManager.getBranch()) {
       if (entry.type !== "custom" || entry.customType !== "pyromind.notification" || !isObject(entry.data)) continue;
       const { runId, message } = entry.data;
@@ -159,6 +161,9 @@ export class PiAgentRuntime {
         customType: "pyromind.external_task", content: message.content, display: false,
         details: isObject(message.details) ? message.details : {},
       } });
+      else if (isObject(message.details) && message.details.resume_interrupted === true && !notificationSettled(session.sessionManager.getBranch(), runId)) {
+        this.pendingNotifications.push({ runId, message: recoveryMessage(runId) });
+      }
     }
     try { await subagents.attach(session); }
     catch (error) {
@@ -406,7 +411,14 @@ export class PiAgentRuntime {
     const session = this.requireSession();
     const runId = requiredString(params, "run_id");
     const content = requiredString(params, "content");
-    if (this.notificationIds.has(runId)) return { accepted: true, duplicate: true };
+    if (this.notificationIds.has(runId)) {
+      if (params.resume_interrupted !== true) return { accepted: true, duplicate: true };
+      const settled = notificationSettled(session.sessionManager.getBranch(), runId);
+      if (settled) return { accepted: true, duplicate: true, completed: true, settled_status: settled };
+      if (this.executionSuspended || session.isStreaming || this.normalizer || this.pendingNotifications.some(item => item.runId === runId)) return {accepted: true, duplicate: true, queued: true};
+      this.startNotification(runId, recoveryMessage(runId));
+      return {accepted: true, resumed: true};
+    }
     const details = { ...(isObject(params.details) ? params.details : {}), notification_run_id: runId };
     const message = {
       customType: "pyromind.external_task",
@@ -479,12 +491,14 @@ export class PiAgentRuntime {
       this.normalizer = undefined;
       return;
     }
+    let outcome: RunOutcome = {status: "failed", error_code: "interrupted"};
     try {
       const session = this.requireSession();
       await session.sendCustomMessage(message, {
         triggerTurn: true,
       });
-      this.finishRun(runId, this.outcome.normalize(session.messages));
+      outcome = this.outcome.normalize(session.messages);
+      this.finishRun(runId, outcome);
     } catch (error) {
       this.finishRun(runId, {
         status: "failed",
@@ -492,7 +506,7 @@ export class PiAgentRuntime {
         message: error instanceof Error ? error.message : "Pi notification failed",
       });
     } finally {
-      this.requireSession().sessionManager.appendCustomEntry("pyromind.notification.finished", { runId: notificationId, execution_run_id: runId });
+      this.requireSession().sessionManager.appendCustomEntry("pyromind.notification.finished", { runId: notificationId, execution_run_id: runId, status: outcome.status });
       this.normalizer = undefined;
       this.drainNotifications();
     }
@@ -576,7 +590,7 @@ export class PiAgentRuntime {
     const session = this.requireSession();
     await session.abort();
     await session.waitForIdle();
-    await this.subagents?.stopAll();
+    await this.subagents?.stopAll(this.managedDelegation ? "interrupt" : "stop");
     await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     session.dispose();
     await this.subagents?.close();
@@ -608,4 +622,15 @@ export function notificationWasDelivered(entries: SessionEntry[], runId: string)
         `callback:${item.details.task_id}:${item.details.status}` === runId)) ||
     (item.type === "custom" && item.customType === "pyromind.notification.finished" &&
       isObject(item.data) && item.data.runId === runId));
+}
+
+export function notificationSettled(entries: SessionEntry[], runId: string): string | undefined {
+  const receipt = [...entries].reverse().find(item => item.type === "custom" && item.customType === "pyromind.notification.finished" && isObject(item.data) && item.data.runId === runId);
+  if (!receipt || receipt.type !== "custom" || !isObject(receipt.data)) return undefined;
+  const status = receipt.data.status;
+  return status === undefined ? "completed" : status === "completed" || status === "failed" ? status : undefined;
+}
+
+function recoveryMessage(runId: string) {
+  return {customType: "pyromind.recovery", content: "Continue handling the interrupted notification already in this conversation. Read current task facts first; reuse existing executions and do not repeat platform submission.", display: false, details: {notification_run_id: runId}};
 }

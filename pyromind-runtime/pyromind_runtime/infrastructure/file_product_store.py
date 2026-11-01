@@ -53,6 +53,7 @@ class CommandConflictError(ProductStoreError):
 
 
 class _Metadata(ContractModel):
+    configuration_version: int = 0
     conversation_id: str
     user_id: str
     x_cluster: str | None = None
@@ -208,6 +209,24 @@ class FileProductStore:
             "skill_allowlist": metadata.skill_allowlist,
             "command_allowlist": metadata.command_allowlist,
         }
+
+    def configuration_version(self) -> int:
+        return self._load_metadata().configuration_version
+
+    def apply_configuration(self, policy: SessionPolicy) -> None:
+        with self._lock():
+            metadata = self._load_metadata()
+            updated = metadata.model_copy(
+                update={
+                    "configuration_version": policy.configuration_version,
+                    "tool_allowlist": policy.tool_allowlist,
+                    "skill_allowlist": policy.skill_allowlist,
+                    "command_allowlist": policy.command_allowlist,
+                    "development_tool_allowlist": None,
+                    "development_skill_allowlist": None,
+                }
+            )
+            self._atomic_write(self.metadata_path, updated.model_dump_json())
 
     def require_command(self, command_type: str) -> None:
         allowed = self._load_metadata().command_allowlist

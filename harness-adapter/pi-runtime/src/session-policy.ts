@@ -21,7 +21,7 @@ export function restrictSkillReads(
   tool: AgentTool, workspace: string, resourceRoots: string[], allowedRoots: string[] | undefined,
   skillsDirectory?: string, options: { canonicalizeWorkspacePaths?: boolean } = {},
 ): AgentTool {
-  if (!allowedRoots || !["read", "grep", "find", "ls"].includes(tool.name)) return tool;
+  if (!allowedRoots || !["read", "read_skill", "grep", "find", "ls"].includes(tool.name)) return tool;
   return { ...tool, execute: async (id, args: any, signal, update) => {
     if (typeof args.path === "string") {
       const path = args.path.replaceAll("\\", "/");

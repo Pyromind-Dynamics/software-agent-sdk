@@ -4,9 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { parseSubagentRoles, writeSubagentRoles } from "../src/subagent-roles.js";
-import { validateSubagentCall } from "../src/subagent-host.js";
+import { SubagentHost, validateSubagentCall } from "../src/subagent-host.js";
 
 const role = { name: "evaluator", description: "Evaluate frozen inputs", prompt: "Return evidence", tools: ["read"], skills: ["evaluation"] };
+
+test("missing tools identify the role and cannot be supplied by another role", () => {
+  assert.throws(() => new SubagentHost("/unused", "test", {} as any,
+    [{name: "read"}] as any, {} as any, {} as any, "", [role],
+    {evaluator: []}), /evaluator.*read/);
+});
 
 test("trusted roles validate names and reject duplicate roles or injected frontmatter", () => {
   assert.deepEqual(parseSubagentRoles([role]), [role]);

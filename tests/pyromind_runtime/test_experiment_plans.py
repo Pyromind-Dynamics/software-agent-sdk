@@ -18,7 +18,6 @@ from pyromind_agent_server.experiment_plan_projects import (
 )
 from pyromind_agent_server.profiles import (
     DEFAULT_PRODUCT_PROFILE,
-    ECHOMIND_PRODUCT_PROFILE,
 )
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.experiment_plans import ExperimentPlans
@@ -35,9 +34,9 @@ from pyromind_runtime.domain.experiment_plans import (
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.infrastructure.sql_experiment_plan_store import (
     SQLExperimentPlanStore,
+    documents,
     metadata,
     projects,
-    proposals,
     revisions,
 )
 from pyromind_runtime.ports.harness import SessionSpec
@@ -46,6 +45,9 @@ from sqlalchemy import create_engine, delete, event, func, select
 from openhands.agent_server.echomind_projects import ProjectStore
 
 from .fake_adapter import FakeAdapter
+from .legacy_experiment_profile import (
+    LEGACY_EXPERIMENT_PROFILE as ECHOMIND_PRODUCT_PROFILE,
+)
 from .test_product_api import _app
 
 
@@ -216,7 +218,10 @@ def test_sql_failure_rolls_back_first_confirmation(plan_store, owner, plan_paylo
     )
 
     def fail_revision(connection, cursor, statement, parameters, context, executemany):
-        if statement.startswith("INSERT INTO experiment_plan_revisions"):
+        if (
+            statement.startswith("INSERT INTO experiment_plan_documents")
+            and context.compiled_parameters[0].get("kind") == "revision"
+        ):
             raise RuntimeError("database failure")
 
     event.listen(plan_store.engine, "before_cursor_execute", fail_revision)
@@ -466,7 +471,10 @@ def test_mariadb_concurrent_first_confirmation_and_recovery(plan_payload):
             stores[1].confirm(owner, next_draft.proposal_id, 0, "stale")
 
         def fail_revision(connection, cursor, statement, parameters, context, many):
-            if statement.startswith("INSERT INTO experiment_plan_revisions"):
+            if (
+                statement.startswith("INSERT INTO experiment_plan_documents")
+                and context.compiled_parameters[0].get("kind") == "revision"
+            ):
                 raise RuntimeError("injected database failure")
 
         event.listen(engines[0], "before_cursor_execute", fail_revision)
@@ -491,7 +499,10 @@ def test_mariadb_concurrent_first_confirmation_and_recovery(plan_payload):
             )
             if project_id:
                 connection.execute(
-                    delete(revisions).where(revisions.c.project_id == project_id)
+                    delete(documents).where(
+                        documents.c.kind == "revision",
+                        documents.c.project_id == project_id,
+                    )
                 )
                 connection.execute(
                     delete(projects).where(projects.c.project_id == project_id)
@@ -501,7 +512,10 @@ def test_mariadb_concurrent_first_confirmation_and_recovery(plan_payload):
             )
 
             connection.execute(
-                delete(proposals).where(proposals.c.owner_key == _owner_key(owner))
+                delete(documents).where(
+                    documents.c.kind == "proposal",
+                    documents.c.owner_key == _owner_key(owner),
+                )
             )
         for engine in engines:
             engine.dispose()
@@ -717,7 +731,7 @@ async def test_plan_tools_through_real_pi_and_restored_session(
         await runner.cleanup()
 
 
-async def test_plan_confirmation_binds_project_and_activates_development_policy(
+async def test_legacy_optional_plan_binder_activates_legacy_policy(
     tmp_path, plan_store
 ):
     conversations = tmp_path / "conversations"

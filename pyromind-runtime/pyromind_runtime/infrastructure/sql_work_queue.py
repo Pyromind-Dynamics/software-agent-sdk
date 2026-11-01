@@ -10,6 +10,11 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Connection, Engine
 
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
+from pyromind_runtime.infrastructure.sql_database import (
+    configure_engine,
+    insert_if_absent,
+    write_transaction,
+)
 
 
 metadata = sa.MetaData()
@@ -64,7 +69,7 @@ class StaleLeaseError(ValueError):
 
 class SQLWorkQueue:
     def __init__(self, engine: Engine):
-        self.engine = engine
+        self.engine = configure_engine(engine)
 
     def enqueue(
         self,
@@ -75,7 +80,7 @@ class SQLWorkQueue:
         payload: dict,
         priority: int = 100,
     ) -> str:
-        with self.engine.begin() as conn:
+        with write_transaction(self.engine) as conn:
             return self.put(conn, owner, lane, key, kind, payload, priority)
 
     def put(
@@ -96,17 +101,7 @@ class SQLWorkQueue:
         # Ensure and lock the lane before checking admission. Concurrent writers
         # use database-native insert conflict handling rather than a read/insert race.
         values = {"lane": lane, "owner": owner, "generation": 0}
-        if conn.dialect.name in {"mysql", "mariadb"}:
-            from sqlalchemy.dialects.mysql import insert
-
-            statement = insert(roles).values(**values)
-            conn.execute(statement.on_duplicate_key_update(lane=lane))
-        elif conn.dialect.name == "sqlite":
-            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-
-            conn.execute(sqlite_insert(roles).values(**values).on_conflict_do_nothing())
-        else:
-            raise ValueError("unsupported queue database")
+        insert_if_absent(conn, roles, values, "lane")
         conn.execute(
             sa.select(roles.c.lane).where(roles.c.lane == lane).with_for_update()
         ).one()
@@ -145,7 +140,7 @@ class SQLWorkQueue:
     def claim(
         self, lease_seconds: int = 90, kinds: tuple[str, ...] | None = None
     ) -> dict | None:
-        with self.engine.begin() as conn:
+        with write_transaction(self.engine) as conn:
             candidates = conn.execute(
                 sa.select(work)
                 .where(
@@ -171,18 +166,27 @@ class SQLWorkQueue:
                     continue
                 generation = lane["generation"] + 1
                 lease = now() + timedelta(seconds=lease_seconds)
-                conn.execute(
+                claimed = conn.execute(
                     roles.update()
-                    .where(roles.c.lane == lane["lane"])
+                    .where(
+                        roles.c.lane == lane["lane"],
+                        roles.c.generation == lane["generation"],
+                        sa.or_(
+                            roles.c.active_id.is_(None),
+                            roles.c.active_id == candidate["id"],
+                        ),
+                    )
                     .values(
                         active_id=candidate["id"],
                         generation=generation,
                         lease_until=lease,
                     )
                 )
-                conn.execute(
+                if claimed.rowcount != 1:
+                    continue
+                admitted = conn.execute(
                     work.update()
-                    .where(work.c.id == candidate["id"])
+                    .where(work.c.id == candidate["id"], work.c.state == "queued")
                     .values(
                         state="running",
                         generation=generation,
@@ -190,6 +194,8 @@ class SQLWorkQueue:
                         attempts=candidate["attempts"] + 1,
                     )
                 )
+                if admitted.rowcount != 1:
+                    return None
                 return {**candidate, "generation": generation, "state": "running"}
         return None
 
@@ -208,7 +214,7 @@ class SQLWorkQueue:
         return dict(row)
 
     def heartbeat(self, identity: str, generation: int, seconds: int = 90) -> None:
-        with self.engine.begin() as conn:
+        with write_transaction(self.engine) as conn:
             row = self.fenced(conn, identity, generation)
             lease = now() + timedelta(seconds=seconds)
             conn.execute(
@@ -231,7 +237,7 @@ class SQLWorkQueue:
             "reconciliation_required",
         }:
             raise ValueError("invalid completion state")
-        with self.engine.begin() as conn:
+        with write_transaction(self.engine) as conn:
             row = self.fenced(conn, identity, generation)
             conn.execute(
                 work.update()
@@ -263,7 +269,7 @@ class SQLWorkQueue:
             ]
 
     def reconcile_expired(self, identity: str, safe_to_retry: bool) -> None:
-        with self.engine.begin() as conn:
+        with write_transaction(self.engine) as conn:
             row = (
                 conn.execute(
                     sa.select(work).where(work.c.id == identity).with_for_update()
@@ -304,7 +310,7 @@ class SQLWorkQueue:
     ) -> None:
         if not previous_execution_stopped:
             raise ValueError("previous execution must be proved stopped before retry")
-        with self.engine.begin() as conn:
+        with write_transaction(self.engine) as conn:
             row = (
                 conn.execute(
                     sa.select(work)

@@ -1,6 +1,5 @@
 import { parseSubagentRoles, type SubagentRoleDefinition } from "./subagent-roles.js";
 import { capabilityCeiling, restrictSkillReads } from "./session-policy.js";
-import { fileURLToPath } from "node:url";
 import { SubagentHost } from "./subagent-host.js";
 import { ToolCoordinator } from "./tool-coordinator.js";
 import { createRetrievalTools, verifyReadScope } from "./retrieval-tools.js";
@@ -18,6 +17,7 @@ import {
   SettingsManager,
   type RetrySettings,
   type ToolDefinition,
+  type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { createPiModelRuntime, type PiModelConfig } from "./pi-model.js";
 import { createNoProgressGuardExtension } from "./no-progress-guard.js";
@@ -178,6 +178,15 @@ export async function createPiSession(
     options,
   );
   if (sessionOptions.askUserTool) rawTools.push(sessionOptions.askUserTool);
+  const read = rawTools.find(tool => tool.name === "read");
+  if (read) rawTools.push({ ...read, name: "read_skill", description: "Read an enabled Skill or reference; does not read task data.",
+    execute: (id: string, args: any, signal?: AbortSignal, update?: any) => {
+      const path = String(args.path ?? "");
+      const candidate = path.startsWith(".agents/skills/") && config.skillsDirectory ? join(config.skillsDirectory, path.slice(".agents/skills/".length)) : path;
+      if (!skillPaths.some(root => inside(realpathSync(candidate), root))) throw new Error("read_skill only reads Skill resources");
+      return read.execute(id, args, signal, update);
+    },
+  });
   if (!executionAccess) throw new Error("execution environment was not initialized");
   const coordinator = new ToolCoordinator();
   const allowedSkillRoots = config.skillAllowlist?.map(name => {
@@ -222,7 +231,7 @@ export async function createPiSession(
     const business = roleSpecs.map(spec => businessTool(peer, spec, role.name));
     const scoped = childTools.filter(tool => role.tools.includes(tool.name)).map(tool => {
       const raw = rawTools.find(candidate => candidate.name === tool.name) ?? tool;
-      const guarded = coordinator.wrap(restrictSkillReads(raw, config.workspaceRoot, skillPaths, roots, config.skillsDirectory), peer);
+      const guarded = coordinator.wrap(restrictSkillReads(raw, config.workspaceRoot, skillPaths, roots, config.skillsDirectory), peer, role.name);
       if (tool.name !== "read" || config.terminalBackend !== "sandbox") return guarded;
       return { ...guarded, execute: (id: string, args: any, signal?: AbortSignal, update?: any) => coordinator.run(signal, async () => {
         await verifyReadScope(executionAccess!, options.readMirror, args.path, signal);
@@ -232,6 +241,7 @@ export async function createPiSession(
     return [role.name, [...scoped, ...business]];
   })) : undefined;
   const subagents = new SubagentHost(config.workspaceRoot, config.sessionId, peer, childTools, modelRuntime, model, childInstructions, config.delegatedRoles, roleToolSets, sandboxPathAliases);
+  const { default: subagentExtension } = await import("pi-subagents");
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 20_000 },
     retry: modelRetrySettings(),
@@ -247,17 +257,11 @@ export async function createPiSession(
     appendSystemPrompt: params.workflows_enabled === true
       ? ["历史经验的路径参数使用当前会话执行环境的路径：Storage 文件用挂载点绝对路径（如 /target-workspace/agentTest/input.csv），会话文件使用 public_data/...。与 read/terminal 验证成功的路径保持一致；不要改成服务端路径或平台 /workspace 路径。"]
       : [],
-    eventBus: params.managed_delegation === true ? {
-      ...experienceHost.eventBus,
-      emit(channel, data) {
-        if (["subagent:async-complete", "subagent:foreground-complete"].includes(channel) && isRecord(data))
-          return experienceHost.eventBus.emit(channel, { ...data, triggerTurn: false });
-        return experienceHost.eventBus.emit(channel, data);
-      },
-    } : experienceHost.eventBus,
-    additionalExtensionPaths: [...experienceHost.additionalExtensionPaths, fileURLToPath(import.meta.resolve("pi-subagents"))],
+    eventBus: experienceHost.eventBus,
+    additionalExtensionPaths: experienceHost.additionalExtensionPaths,
     extensionFactories: [
       subagents.extension,
+      (pi: ExtensionAPI) => subagentExtension(params.managed_delegation === true ? managedSubagentApi(pi) : pi),
       createToolResultExtension(),
       createNoProgressGuardExtension(),
       { name: "no-spin", factory: createNoSpinExtension(sessionOptions.onRepetitionDetected) },
@@ -531,4 +535,21 @@ function toolDefinition(tool: AgentTool): ToolDefinition {
 function safeShellEnvironment(): Record<string, string> {
   const names = ["PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"];
   return Object.fromEntries(names.flatMap((name) => process.env[name] ? [[name, process.env[name]!]] : []));
+}
+
+/** The product queue owns parent turns; the plugin still owns child lifecycle. */
+export function managedSubagentApi(pi: ExtensionAPI): ExtensionAPI {
+  return {
+    ...pi,
+    sendMessage(message, options) {
+      // Native completion previews belong in the task UI, not the Manager's
+      // context. SubagentHost already observes the plugin's lifecycle/results.
+      if (message.customType === "subagent-notify") return;
+      pi.sendMessage(message, {...options, triggerTurn: false});
+    },
+    sendUserMessage() {
+      // pi-subagents uses a user-message wake when an idle parent should run.
+      // Managed work delivers one durable summary through Runtime instead.
+    },
+  };
 }

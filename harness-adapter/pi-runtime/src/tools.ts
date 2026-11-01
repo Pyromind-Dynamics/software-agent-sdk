@@ -328,16 +328,11 @@ function bindPathTool(
   };
 }
 
-export function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig, role?: string): AgentTool<TSchema, unknown> {
-  return {
-    name: config.name,
-    label: config.name,
-    description: config.description,
-    parameters: config.inputSchema as TSchema,
-    async execute(callId, params, signal) {
+export function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig, role?: string): AgentTool<TSchema, unknown> & { executeScoped: (id: string, args: unknown, signal?: AbortSignal, scope?: JsonObject) => Promise<any> } {
+  const executeScoped = async (callId: string, params: unknown, signal?: AbortSignal, scope?: JsonObject) => {
       if (!isRecord(params)) throw new Error("tool arguments must be an object");
       const response = await peer.request(role ? "role.tool.execute" : "tool.execute", {
-        ...(role ? { role } : {}),
+        ...(role ? { role, scope } : {}),
         tool_call_id: callId,
         tool_name: config.name,
         arguments: JSON.parse(JSON.stringify(params)) as JsonObject,
@@ -353,7 +348,10 @@ export function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig, rol
           resultCategory: response.is_error ? "failure" : "success",
         },
       };
-    },
+  };
+  return { name: config.name, label: config.name, description: config.description,
+    parameters: config.inputSchema as TSchema, executeScoped,
+    execute: (id, args, signal) => executeScoped(id, args, signal),
   };
 }
 

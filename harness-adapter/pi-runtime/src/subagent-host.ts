@@ -78,6 +78,7 @@ export class SubagentHost {
   private readonly backgroundIds = new Set<string>();
   private lastUsage = "";
   private usagePending = false;
+  private readonly workScopes = new Map<string, JsonObject>();
   private readonly mutatedSessions = new Set<string>();
   private disposed = false;
   private monitor?: NodeJS.Timeout;
@@ -85,11 +86,14 @@ export class SubagentHost {
   private readonly reports: SubagentReports;
   readonly paths: ReturnType<typeof prepareSubagentEnvironment>;
 
-  constructor(workspace: string, private sessionId: string, private peer: JsonlRpcPeer,
+  constructor(private workspace: string, private sessionId: string, private peer: JsonlRpcPeer,
     private tools: AgentTool[], private modelRuntime: ModelRuntime, private model: Model<Api>, private instructions: string, private definitions?: SubagentRoleDefinition[], private roleToolSets?: Record<string, AgentTool[]>, private skillPathAliases: Array<{ host: string; alias: string }> = []) {
     this.roleTools = definitions ? Object.fromEntries(definitions.map(role => [role.name, role.tools])) : ROLE_TOOLS;
-    const toolNames = new Set([...tools, ...Object.values(roleToolSets ?? {}).flat()].map(tool => tool.name));
-    if (definitions?.some(role => role.tools.some(name => !toolNames.has(name)))) throw new Error("Delegated role requests an unavailable host tool");
+    for (const role of definitions ?? []) {
+      const available = new Set((roleToolSets?.[role.name] ?? tools).map(tool => tool.name));
+      const missing = role.tools.filter(name => !available.has(name));
+      if (missing.length) throw new Error(`Delegated role ${role.name} requests unavailable host tools: ${missing.join(", ")}`);
+    }
     this.paths = prepareSubagentEnvironment(workspace, definitions);
     const writer = tools.find(tool => tool.name === "write");
     if (!writer) throw new Error("Subagent report delivery requires the conversation write tool");
@@ -104,15 +108,26 @@ export class SubagentHost {
       const roleTools = this.roleToolSets?.[request.role] ?? this.tools;
       if (request.method === "config") return {
         model: publicModel(this.session?.model ?? this.model), instructions: this.instructions,
-        skillPathAliases: this.skillPathAliases,
+        skillPathAliases: this.skillPathAliases, scope: this.workScopes.get(request.role),
+        workspacePathAlias: this.skillPathAliases.length ? {host: this.workspace, alias: "."} : undefined,
         tools: roleTools.filter((tool) => allowed.includes(tool.name)).map(({ name, label, description, parameters }) => ({ name, label, description: `[Conversation host] ${description}`, parameters })),
       };
       if (request.method === "tool") {
         if (typeof request.name !== "string" || !allowed.includes(request.name)) throw new Error("Child tool is not allowed");
         const tool = roleTools.find((tool) => tool.name === request.name);
         if (!tool) throw new Error("Child tool is unavailable");
+        const expected = this.workScopes.get(request.role), supplied = request.scope;
+        if (expected && (!isRecord(supplied) || ["run_id", "work_id", "generation"].some(key => supplied[key] !== expected[key]))) throw new Error("Stale delegated work scope");
+        if (expected && ["write", "edit"].includes(request.name)) {
+          const args = isRecord(request.args) ? request.args : {};
+          const path = String(args.path ?? "");
+          if (!path.startsWith(`public_data/experiment-runs/${expected.run_id}/`) || path.split("/").includes("..")) throw new Error("Write only this task's workspace");
+        }
         const id = `subagent:${request.session}:${request.id}`;
-        try { return await tool.execute(id, request.args, signal, update); }
+        try {
+          if ("executeScoped" in tool && typeof tool.executeScoped === "function") return await tool.executeScoped(id, request.args, signal, supplied);
+          return await tool.execute(id, request.args, signal, update);
+        }
         finally { if (["write", "edit", "terminal"].includes(request.name)) {
           this.mutatedSessions.add(String(request.session));
           this.emit(`mutation:${randomUUID()}`, "subagent.workflow_modified", {});
@@ -191,14 +206,15 @@ export class SubagentHost {
 
   async control(input: JsonObject): Promise<any> {
     const action = input.action;
+    if (typeof input.role === "string" && isRecord(input.scope) && input.scope.control !== true) this.workScopes.set(input.role, input.scope);
     let result: any;
     if (action === "spawn") {
       if (typeof input.role !== "string" || !Object.hasOwn(this.roleTools, input.role)
         || typeof input.task !== "string" || typeof input.request_id !== "string") throw new Error("Invalid delegated launch");
       result = await this.rpc("spawn", { agent: input.role, task: input.task, context: "fresh" }, input.request_id);
     } else {
-      if (!["status", "resume", "stop"].includes(String(action)) || typeof input.execution_ref !== "string") throw new Error("Invalid delegated control");
-      result = await this.rpc(String(action), { id: input.execution_ref,
+      if (!["status", "resume", "stop", "pause"].includes(String(action)) || typeof input.execution_ref !== "string") throw new Error("Invalid delegated control");
+      result = await this.rpc(action === "pause" ? "interrupt" : String(action), { id: input.execution_ref,
         ...(action === "resume" ? { message: String(input.task ?? "") } : {}),
       }, typeof input.request_id === "string" ? input.request_id : randomUUID());
     }
@@ -376,11 +392,11 @@ export class SubagentHost {
     this.peer.emit({ protocolVersion: PROTOCOL_VERSION, type: "pi.event", eventId: kind === "subagent.progress" ? `${id}:${kind}:${randomUUID()}` : `${id}:${kind}:${payload.status ?? ""}`, sessionId: this.sessionId, runId: id, occurredAt: new Date().toISOString(), kind, payload });
   }
 
-  async stopAll() {
+  async stopAll(action: "stop" | "interrupt" = "stop") {
     await this.refresh();
     for (const id of this.backgroundIds) {
       if (["running", "queued"].includes(this.states.get(id) ?? "")) {
-        try { await this.rpc("stop", { id }); }
+        try { await this.rpc(action, { id }); }
         catch (error) {
           await this.refresh(false);
           if (["running", "queued"].includes(this.states.get(id) ?? "")) throw error;

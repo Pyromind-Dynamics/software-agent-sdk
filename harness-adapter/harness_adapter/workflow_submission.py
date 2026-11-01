@@ -58,6 +58,37 @@ def _storage_path(workflow_path: str) -> str:
 
 
 class PlatformWorkflowSubmission:
+    async def query(self, task_id: str, context: RequestContext) -> JsonObject:
+        def fetch():
+            if not context.cookie and not context.authorization:
+                raise PermissionError("platform credentials need renewal")
+            route = context.x_cluster or ""
+            cluster, separator, env = route.partition("#")
+            client = create_workflow_api_client(
+                env=env if separator else os.getenv("APP_ENV", "prod"),
+                cluster=cluster or os.getenv("PYROMIND_CLUSTER", "default"),
+                auth_token=parse_auth_token_from_cookie_header(context.cookie),
+                headers={
+                    key: value
+                    for key, value in {
+                        "authorization": context.authorization,
+                        "x-cluster": route,
+                    }.items()
+                    if value
+                },
+            )
+            try:
+                task = client.studio.get_task(task_id)
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                if getattr(exc, "status_code", getattr(response, "status_code", None)) in {401, 403}:
+                    raise PermissionError("platform credentials need renewal") from exc
+                raise
+            status = getattr(task, "status", "")
+            return {"task_id": task_id, "status": str(getattr(status, "value", status))}
+
+        return await asyncio.to_thread(fetch)
+
     async def prepare(self, workflow_path: str, context: RequestContext) -> JsonObject:
         return await asyncio.to_thread(self._prepare, workflow_path, context)
 

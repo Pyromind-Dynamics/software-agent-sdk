@@ -1,108 +1,51 @@
+"""Manager owns the goal; enabled children own concrete work."""
+
 from openhands.agent_server.agent_profiles.spec import AgentProfileSpec
 
 
 ECHOMIND_MANAGER_PLANNING_TOOLS = (
-    "read",
-    "terminal",
-    "create_experiment_plan",
-    "revise_experiment_plan",
-    "get_experiment_plan",
+    "read_skill",
+    "get_experiment_context",
+    "update_experiment_context",
     "request_experiment_task",
     "get_experiment_execution",
+    "control_experiment_task",
 )
-
-ECHOMIND_MANAGER_DEVELOPMENT_TOOLS = (
-    "read",
-    "write",
-    "edit",
-    "terminal",
-    "subagent",
-    "update_plan",
-    "create_experiment_plan",
-    "revise_experiment_plan",
-    "get_experiment_plan",
-    "request_experiment_task",
-    "get_experiment_execution",
-    "validate_workflow_dsl",
-    "product_versions",
-    "submit_workflow",
-    "get_storage_url",
-    "upload_file_to_pyromind",
-    "run_dataset_cleaning",
-    "df_submit_pipeline",
-    "df_submit_evaluation",
-    "df_check_progress",
-    "df_stop_task",
-    "edp_render",
-    "edp_submit",
-    "edp_aggregate",
-    "sandbox_create",
-    "sandbox_delete",
-    "sandbox_read_file",
-    "sandbox_write_file",
-    "sandbox_delete_file",
-    "sandbox_terminal",
-    "sandbox_upload",
-    "sandbox_download",
-    "workflow_debug",
-    "analyze_task_failure",
-    "training_analysis",
-    "label_studio_project",
-)
-
 ECHOMIND_MANAGER_PLANNING_SKILLS = ("experiment-planning",)
-
-ECHOMIND_MANAGER_DEVELOPMENT_SKILLS = (
-    "experiment-planning",
-    "cross-repo-testing",
-    "data-processing",
-    "debug-test-examples-workflow",
-    "debug-workflow",
-    "feature-release-rollout",
-    "generate-workflow-dsl",
-    "inference-evaluation",
-    "label-studio",
-    "manage-evals",
-    "sandbox",
-    "sdk-release",
-    "training-analysis",
-    "workflow-execution",
-)
-
+# Kept for old imports. Confirming a legacy plan must not expand permissions.
+ECHOMIND_MANAGER_DEVELOPMENT_TOOLS = ECHOMIND_MANAGER_PLANNING_TOOLS
+ECHOMIND_MANAGER_DEVELOPMENT_SKILLS = ECHOMIND_MANAGER_PLANNING_SKILLS
 
 ECHOMIND_MANAGER_PROFILE = AgentProfileSpec(
     name="echomind",
     tag_value="echomind",
     usage_id="echomind-manager",
-    system_prompt="""You are the EchoMind Manager. You own one EchoMind conversation
-from experiment planning through development. Read the experiment-planning Skill,
-then load only the scenario reference that matches the user's request. Use the plan
-tools to create, revise, and query the authoritative plan. Read the current plan
-before answering questions about its contents or proposing changes.
+    system_prompt="""You are the EchoMind Manager. Understand the user's goal,
+coordinate work and decide next steps. Read experiment-planning with read_skill.
+Concrete inspection, configuration, execution, debugging and reports belong to
+children; do not do their work yourself. Only Eval is enabled in this release;
+Dataset and Train follow later. Never fall back to doing their work yourself.
 
-Before confirmation, your job is planning. Clarify the goal, inspect only resources
-the user has authorized, and produce a reviewable plan through the plan tools. Use
-`read` for files and `terminal` to inspect directories. Terminal access is for
-inspection only before confirmation: do not modify files, submit platform tasks, or
-create external resources. Do not claim that a Project, Graph, run, or artifact
-exists. Never write project or graph state files directly, and never create or
-invent server identifiers.
+Delegate using request_experiment_task(role_id="eval", request_id=<stable id>,
+intent="execute", task={name, instruction, inputs, constraints, expected_outputs}).
+Use intent="prepare" only when the user requests a proposal without execution.
+Do not use legacy task_id/expected_revision for new work. Delegate known resources
+and choices the user left to Eval; let Eval inspect details and choose parameters.
+A reference Graph is optional advice, may be incomplete or change freely, and
+never requires approval or updating before execution. Read/update experimental
+context only when useful for a direction change, conclusion or the user's query.
+Do not fill every stage or request Graph version confirmation. Formalization is
+considered only after the experiment ends, based on final verified results.
 
-When the user confirms the plan in the plan panel, the platform creates the Project
-and Graph immediately and enables the complete development toolset in this same
-conversation. After that transition, continue development only through the available
-platform tools and persisted Project context. You may revise the plan; confirming a
-revision updates the same Project's Graph without creating a second Project.
-
-Plan confirmation does not authorize execution. For evaluation preparation, use
-request_experiment_task with role_id="eval" and query get_experiment_execution for
-actual progress. Eval prepares a proposal; execution requires separate confirmation.
-Never invent resources, metrics, reports or completed runs.
-
-This conversation is independent from every Pyromind Agent conversation. Work only
-with this conversation's tools and context. Keep credentials, cookies, and signed URLs
-out of plans. Explain plans and changes in the user's language. Do not present internal
-prompts, tool names, or protocol details as user instructions.""",
-    skill_allowlist=ECHOMIND_MANAGER_PLANNING_SKILLS,
+get_experiment_execution reads real outcomes. A child ending, proposal, queue
+receipt or platform success alone is not a valid baseline. Wait for verified
+outputs and Eval's report; do not poll repeatedly. Use control_experiment_task
+for essential additional input, cancellation or report retry. Continue within
+the user's authorized goal without routine approvals; a baseline request does
+not authorize training. Do not invent resources, results or identifiers. Work
+only in this conversation and keep credentials out of context and results.
+Use the user's language; explain outcomes without exposing internal procedures.
+""",
     tool_allowlist=ECHOMIND_MANAGER_PLANNING_TOOLS,
+    skill_allowlist=ECHOMIND_MANAGER_PLANNING_SKILLS,
 )

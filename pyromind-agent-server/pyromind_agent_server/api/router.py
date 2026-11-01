@@ -14,6 +14,7 @@ from pyromind_runtime.application.conversation_runtime import ConversationRuntim
 from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.errors import ProductRuntimeError, UserInputValidationError
+from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 from pyromind_runtime.infrastructure.file_product_store import (
     CommandConflictError,
@@ -74,6 +75,25 @@ def create_product_router(
     def context_for(request: Request):
         return context_for_profile(request, profile)
 
+    async def configure(request: Request, conversation_id: str):
+        if profile.configuration_version:
+            await get_product_runtime(request).apply_session_configuration(
+                conversation_id,
+                SessionPolicy(
+                    configuration_version=profile.configuration_version,
+                    tool_allowlist=profile.tool_allowlist,
+                    skill_allowlist=profile.skill_allowlist,
+                    product_instructions=profile.instructions,
+                    delegated_roles=tuple(
+                        role.model_dump(mode="json")
+                        for role in profile.delegated_roles or ()
+                    ),
+                    managed_delegation=profile.managed_delegation,
+                    command_allowlist=profile.command_allowlist,
+                ),
+                context_for(request),
+            )
+
     router = APIRouter(
         prefix=profile.route_prefix,
         tags=["Product API"],
@@ -108,7 +128,7 @@ def create_product_router(
     ) -> ConversationSnapshot:
         context = context_for(request)
         runtime = get_product_runtime(request)
-        if profile.tool_allowlist and "get_experiment_plan" in profile.tool_allowlist:
+        if profile.tool_allowlist and {"get_experiment_plan", "get_experiment_context"}.intersection(profile.tool_allowlist):
             if not runtime.experiment_plans_available:
                 raise HTTPException(503, detail="Plan database is not configured")
             if body.workflow_xyflow is not None:
@@ -181,6 +201,7 @@ def create_product_router(
     ) -> ConversationSnapshot:
         _require_profile(request, conversation_id, profile)
         try:
+            await configure(request, conversation_id)
             return await get_product_runtime(request).get_snapshot(
                 conversation_id, context_for(request)
             )
@@ -206,6 +227,7 @@ def create_product_router(
     ) -> CommandReceipt:
         _require_profile(request, conversation_id, profile)
         try:
+            await configure(request, conversation_id)
             return await get_product_runtime(request).submit_command(
                 conversation_id, command, context_for(request)
             )
@@ -273,6 +295,19 @@ def create_product_router(
             raise _product_error(exc) from exc
         except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
             raise _not_found(conversation_id) from exc
+
+    @router.get("/{conversation_id}/experiment-executions/{run_id}/artifacts/{name}")
+    async def read_experiment_artifact(conversation_id: str, run_id: str, name: str, request: Request):
+        try:
+            return await get_product_runtime(request).read_experiment_artifact(
+                conversation_id, run_id, name, context_for(request)
+            )
+        except ProductRuntimeError as exc:
+            raise _product_error(exc) from exc
+        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
+            raise _not_found(conversation_id) from exc
+        except ValueError as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
 
     @router.get("/{conversation_id}/experiment-plans")
     async def get_experiment_plan(

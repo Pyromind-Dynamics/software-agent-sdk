@@ -24,12 +24,19 @@ from sqlalchemy import (
 from sqlalchemy.engine import Connection, Engine, RowMapping
 
 from pyromind_runtime.domain.experiment_plans import (
+    ExperimentContext,
+    ExperimentContextView,
     ExperimentPlanView,
     PlanConflictError,
     PlanOwner,
     PlanProposal,
     PlanRevision,
     PlanRevisionSummary,
+    UpdateExperimentContext,
+)
+from pyromind_runtime.infrastructure.sql_database import (
+    configure_engine,
+    connection_transaction,
 )
 
 
@@ -43,27 +50,49 @@ projects = Table(
     Column("conversation_id", String(128), nullable=False),
     Column("profile_id", String(128)),
     Column("current_revision", Integer, nullable=False),
+    Column("context", JSON),
+    Column("context_sequence", Integer, nullable=False, server_default="0"),
 )
-proposals = Table(
-    "experiment_plan_proposals",
+documents = Table(
+    "experiment_plan_documents",
     metadata,
-    Column("proposal_id", String(64), primary_key=True),
+    Column("kind", String(16), primary_key=True),
+    Column("document_id", String(64), primary_key=True),
     Column("owner_key", String(64), nullable=False, index=True),
-    Column("status", String(16), nullable=False),
-    Column("base_revision", Integer, nullable=False),
-    Column("payload", JSON, nullable=False),
+    Column("project_id", String(64), ForeignKey(projects.c.project_id)),
+    Column("revision", Integer),
+    Column("status", String(16)),
+    Column("base_revision", Integer),
+    Column("attributes", JSON, nullable=False),
     Column("confirmation_command_id", String(128)),
     Column("confirmed_revision", Integer),
-    UniqueConstraint("owner_key", "confirmation_command_id"),
-)
-revisions = Table(
-    "experiment_plan_revisions",
-    metadata,
-    Column(
-        "project_id", String(64), ForeignKey(projects.c.project_id), primary_key=True
+    UniqueConstraint(
+        "owner_key", "confirmation_command_id", name="uq_plan_document_confirmation"
     ),
-    Column("revision", Integer, primary_key=True),
-    Column("payload", JSON, nullable=False),
+    UniqueConstraint("project_id", "revision", name="uq_plan_document_revision"),
+)
+# Read projections retain the existing domain mapping, not physical legacy tables.
+proposals = (
+    select(
+        documents.c.document_id.label("proposal_id"),
+        documents.c.owner_key,
+        documents.c.status,
+        documents.c.base_revision,
+        documents.c.attributes.label("payload"),
+        documents.c.confirmation_command_id,
+        documents.c.confirmed_revision,
+    )
+    .where(documents.c.kind == "proposal")
+    .subquery("plan_proposals")
+)
+revisions = (
+    select(
+        documents.c.project_id,
+        documents.c.revision,
+        documents.c.attributes.label("payload"),
+    )
+    .where(documents.c.kind == "revision")
+    .subquery("plan_revisions")
 )
 
 
@@ -72,18 +101,86 @@ def _owner_key(owner: PlanOwner) -> str:
 
 
 class SQLExperimentPlanStore:
-    """Transactional plan storage; MariaDB in production, SQLite in unit tests.
+    """Transactional plan storage shared by MariaDB and local SQLite.
 
     A connection-scoped advisory lock also serializes the first proposal and
     first confirmation, before any project row exists to SELECT FOR UPDATE.
     """
 
     def __init__(self, engine: Engine) -> None:
-        self.engine = engine
+        self.engine = configure_engine(engine)
         self._local_lock = threading.RLock()
 
     def close(self) -> None:
         self.engine.dispose()
+
+    def context(
+        self, owner: PlanOwner, *, create: bool = False
+    ) -> ExperimentContextView:
+        with self._transaction(owner) as connection:
+            key = _owner_key(owner)
+            row = self._project(connection, key)
+            if row is None:
+                if not create:
+                    return ExperimentContextView()
+                identity = uuid4().hex
+                connection.execute(
+                    projects.insert().values(
+                        project_id=identity,
+                        owner_key=key,
+                        user_id=owner.user_id,
+                        conversation_id=owner.conversation_id,
+                        profile_id=owner.profile_id,
+                        current_revision=0,
+                        context_sequence=0,
+                        context={},
+                    )
+                )
+                return ExperimentContextView(project_id=identity)
+            body = row["context"]
+            if body is None and row["current_revision"]:
+                saved = connection.scalar(
+                    select(revisions.c.payload).where(
+                        revisions.c.project_id == row["project_id"],
+                        revisions.c.revision == row["current_revision"],
+                    )
+                )["plan"]
+                body = {
+                    key: saved[key]
+                    for key in ("goal", "resources", "stages", "edges")
+                    if key in saved
+                }
+            return ExperimentContextView(
+                project_id=row["project_id"],
+                sequence=row["context_sequence"],
+                context=ExperimentContext.model_validate(body or {}),
+            )
+
+    def update_context(
+        self, owner: PlanOwner, request: UpdateExperimentContext
+    ) -> ExperimentContextView:
+        import json
+
+        from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
+
+        payload = request.context.model_dump(mode="json")
+        validate_persisted_payload(payload)
+        if len(json.dumps(payload).encode()) > 262144:
+            raise ValueError("experiment context exceeds 256 KiB")
+        current = self.context(owner, create=True)
+        with self._transaction(owner) as connection:
+            result = connection.execute(
+                update(projects)
+                .where(
+                    projects.c.project_id == current.project_id,
+                    projects.c.owner_key == _owner_key(owner),
+                    projects.c.context_sequence == request.expected_sequence,
+                )
+                .values(context=payload, context_sequence=request.expected_sequence + 1)
+            )
+            if result.rowcount != 1:
+                raise PlanConflictError("context changed; reread and merge")
+        return self.context(owner)
 
     @contextmanager
     def _transaction(self, owner: PlanOwner) -> Iterator[Connection]:
@@ -98,7 +195,7 @@ class SQLExperimentPlanStore:
                 if acquired != 1:
                     raise PlanConflictError("plan is busy; retry shortly")
             try:
-                with connection.begin():
+                with connection_transaction(connection):
                     yield connection
             finally:
                 if named_lock:
@@ -208,17 +305,19 @@ class SQLExperimentPlanStore:
                     "include source_proposal_id to revise the draft"
                 )
             connection.execute(
-                update(proposals)
-                .where(proposals.c.owner_key == key, proposals.c.status == "pending")
+                update(documents)
+                .where(documents.c.kind == "proposal")
+                .where(documents.c.owner_key == key, documents.c.status == "pending")
                 .values(status="superseded")
             )
             connection.execute(
-                insert(proposals).values(
-                    proposal_id=proposal.proposal_id,
+                insert(documents).values(
+                    kind="proposal",
+                    document_id=proposal.proposal_id,
                     owner_key=key,
                     status="pending",
                     base_revision=current,
-                    payload=proposal.model_dump(mode="json"),
+                    attributes=proposal.model_dump(mode="json"),
                 )
             )
         return proposal
@@ -293,15 +392,21 @@ class SQLExperimentPlanStore:
                     .values(current_revision=revision.revision)
                 )
             connection.execute(
-                insert(revisions).values(
+                insert(documents).values(
+                    kind="revision",
+                    document_id=hashlib.sha256(
+                        f"{project_id}:{revision.revision}".encode()
+                    ).hexdigest(),
+                    owner_key=key,
                     project_id=project_id,
                     revision=revision.revision,
-                    payload=revision.model_dump(mode="json"),
+                    attributes=revision.model_dump(mode="json"),
                 )
             )
             connection.execute(
-                update(proposals)
-                .where(proposals.c.proposal_id == proposal_id)
+                update(documents)
+                .where(documents.c.kind == "proposal")
+                .where(documents.c.document_id == proposal_id)
                 .values(
                     status="confirmed",
                     confirmation_command_id=command_id,
@@ -321,11 +426,12 @@ class SQLExperimentPlanStore:
             if row is None or row[0] not in {"pending", "rejected"}:
                 raise PlanConflictError("proposal is no longer pending")
             connection.execute(
-                update(proposals)
+                update(documents)
+                .where(documents.c.kind == "proposal")
                 .where(
                     and_(
-                        proposals.c.owner_key == _owner_key(owner),
-                        proposals.c.proposal_id == proposal_id,
+                        documents.c.owner_key == _owner_key(owner),
+                        documents.c.document_id == proposal_id,
                     )
                 )
                 .values(status="rejected")

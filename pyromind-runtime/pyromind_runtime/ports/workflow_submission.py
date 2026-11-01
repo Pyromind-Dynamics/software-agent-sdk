@@ -14,3 +14,7 @@ class WorkflowSubmissionPort(Protocol):
     async def submit(
         self, workflow: JsonObject, conversation_id: str, context: RequestContext
     ) -> str: ...
+
+
+class ExternalTaskQueryPort(Protocol):
+    async def query(self, task_id: str, context: RequestContext) -> JsonObject: ...
