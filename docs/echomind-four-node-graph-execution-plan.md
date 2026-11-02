@@ -1123,71 +1123,76 @@ Agent：
 
 ### 15.2 实现内容
 
+S2 采用轻量实现，先复用现有 `StageRun` 持久化壳，不提前引入
+`GraphRun`、`runtime_work_items` 或新的节点执行数据库。
+
 后端：
 
-- 新增最小 `graph_runs`；
-- 扩展 `experiment_task_runs` 的 graph/node 字段；
-- 新增 node validation API；
-- `GraphRun.mode=node_validation`；
-- 使用 `runtime_work_items` 调度；
-- 增加 `development_stub` Node executor；
+- 复用 `projects/<project_id>/runs/*.json` 保存节点验证 Run；
+- 扩展 `StageRun`：
+  - `mode=node_validation`；
+  - `request_id` 幂等键；
+  - `node_config_digest` 配置指纹；
+- 四个节点都可通过现有 `/run` 入口启动验证壳，不再为 Agent 节点单独拒绝；
+- Dataset 的 Agent 开发入口继续由 `/start` 投递会话，和验证壳保持两个动作；
+- 使用现有 `contract_probe` executor；
 - 生成 `node_validation_report` Artifact；
-- 支持成功、失败、取消和重启恢复；
-- 记录 `node_config_digest`。
+- executor 失败会落成 `failed` StageRun；
+- 相同 `request_id` 返回原 Run，不重复执行；同 ID 换节点或换配置返回冲突。
 
 Agent：
 
-- Manager 增加 `start_node_validation` 和 `get_project_run`；
-- 节点 role 暂时使用 development stub；
-- 不修改领域 Skill。
+- S2 不新增 Manager 工具或领域 Skill；
+- 节点验证由前端直接调用 Project API；
+- 真实节点执行和 Manager 参与留到后续阶段。
 
 前端：
 
 - 每个节点显示“验证”按钮；
 - 展示最近一次验证状态；
-- 展示 NodeRun 列表、时间、错误、Artifact；
+- 展示验证历史、时间、错误和 `node_validation_report`；
 - 配置修改后显示“验证已过期”；
-- 页面刷新后从 NodeRun 恢复。
+- 页面刷新后从 `/runs` 恢复状态。
 
 ### 15.3 验证内容
 
 自动化：
 
-- 新增 `tests/pyromind_runtime/test_node_validation.py`；
-- 四个节点都能创建 NodeRun；
+- 扩展 `tests/agent_server/test_echomind_stage_runs.py`；
+- 四个节点都能创建验证 Run；
 - 相同 request ID 不创建重复 Run；
-- 失败状态不遗留永久 running；
-- Runtime 重启后状态可恢复；
-- Artifact 数量、SHA-256 和读取接口正确；
-- 旧 standalone ExperimentExecution 不受影响。
+- executor 失败状态可持久化；
+- 配置指纹前后端一致；
+- Artifact 内容、SHA-256 和读取接口正确；
+- 旧 StageRun 字段仍可读取。
 
 手工：
 
 1. 打开已有 Project；
 2. 对 Dataset 节点点击“验证”；
-3. 观察状态从 queued/running 到 succeeded；
+3. 观察状态从 running 到 succeeded；
 4. 打开生成的 `node_validation_report`；
 5. 对剩余三个节点重复；
 6. 修改 Train 节点配置；
 7. 检查 Train 显示“验证已过期”，其他节点不受影响；
 8. 重新验证 Train；
-9. 刷新页面并重启后端；
-10. 检查两次 Train NodeRun 历史仍然存在。
+9. 刷新页面，检查验证状态和历史仍然存在。
 
 通过标准：
 
 - 四节点都能独立启动；
-- 每个节点都有可查询的输入、状态、时间和 Artifact；
-- 修改一个节点不影响其他节点的成功记录；
-- 重启后不存在丢状态或重复执行；
+- 每个节点都有可查询的配置指纹、状态、时间和 Artifact；
+- 修改一个节点只让该节点的旧验证过期；
+- 刷新后状态不丢失，相同 request ID 不重复执行；
 - 此阶段结果只用于验证执行壳。
 
 ### 15.4 回归影响
 
 - 旧 StageRun 仍可读取；
-- `contract_probe` 不再作为新流程的主路径；
-- 现有 WorkQueue 和 ExperimentExecution 测试继续通过；
+- `contract_probe` 是 S2 的唯一节点执行器；
+- 现有 WorkQueue 和 ExperimentExecution 保持独立，不做改造；
 - 没有新增 GraphRevision 或版本确认。
+- `GraphRun`、取消、进程中断恢复和真实节点执行在后续阶段补充。
 
 ## 16. S3：Dataset 真实执行
 

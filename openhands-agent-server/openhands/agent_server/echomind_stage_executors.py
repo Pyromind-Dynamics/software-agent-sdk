@@ -22,6 +22,7 @@ class StageExecutionResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     message: str
+    input_refs: list[str] = Field(default_factory=list)
     artifacts: list[StageArtifactPayload] = Field(default_factory=list)
 
 
@@ -41,21 +42,31 @@ class ContractProbeExecutor:
         project: ProjectInfo,
         node: ProjectNode,
     ) -> StageExecutionResult:
+        input_refs = [
+            resource["uri"]
+            for resource in node.config.get("resources", [])
+            if isinstance(resource, dict)
+            and isinstance(resource.get("uri"), str)
+            and resource["uri"]
+        ]
         return StageExecutionResult(
             message=(
-                f"{node.title} contract probe completed. "
+                f"{node.title} node validation completed. "
                 "No business stage was executed."
             ),
+            input_refs=input_refs,
             artifacts=[
                 StageArtifactPayload(
-                    kind="stage_contract_probe",
+                    kind="node_validation_report",
                     content={
-                        "probe_version": 1,
+                        "schema_version": 1,
+                        "validation_mode": "contract_probe",
                         "project_id": project.project.project_id,
                         "graph_id": project.graph.graph_id,
                         "node_id": node.id,
                         "node_type": node.type,
                         "executor": node.executor,
+                        "input_refs": input_refs,
                     },
                 )
             ],
