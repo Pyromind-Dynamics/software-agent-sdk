@@ -11,6 +11,8 @@ from aiohttp import web
 from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.domain.commands import UserMessageCommand
+from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.experiment_execution import RequestExperimentTask
 from pyromind_runtime.domain.experiment_plans import PlanOwner
@@ -25,6 +27,12 @@ from pyromind_runtime.infrastructure.sql_experiment_plan_store import (
 from pyromind_runtime.infrastructure.sql_work_queue import work
 from pyromind_runtime.ports.harness import SessionSpec
 from sqlalchemy import create_engine
+
+from . import test_standalone_experiments as execution_fixtures
+from .test_evaluation_cases import FakeStorage
+
+
+experiment = execution_fixtures.experiment
 
 
 def stream(name=None, arguments=None, text="Done"):
@@ -90,9 +98,19 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         payload = await request.json()
         captured.append(payload)
         names = {item["function"]["name"] for item in payload.get("tools", [])}
-        if "df_submit_evaluation" not in names:
+        if "record_experiment_result" not in names:
             manager_requests.append(payload)
-            return stream(text="Baseline completed. Only Eval has executed the work.")
+            if not any(
+                message.get("role") == "tool" for message in payload["messages"]
+            ):
+                return stream(
+                    "read_experiment_artifact",
+                    {
+                        "run_id": current["id"],
+                        "name": "agent_report",
+                    },
+                )
+            return stream(text="Baseline completed. Report verified.")
         if restart == "preparation" and not current.get("restarted"):
             preparation.set()
             await resume_preparation.wait()
@@ -156,7 +174,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
-    port = site._server.sockets[0].getsockname()[1]
+    port = runner.addresses[0][1]
     monkeypatch.setenv("OPENAI_API_KEY", "local-test-key")
     monkeypatch.setenv(
         "PYROMIND_PI_RUNTIME",
@@ -179,16 +197,16 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         "metrics": metrics,
     }
 
-    class Storage:
-        def read(self, path):
-            return {
-                "metrics.json": json.dumps(metrics).encode(),
-                "report.json": json.dumps(report).encode(),
-                "predictions.jsonl": b'{"id":"one","prediction":"ok"}\n',
-            }[path.rsplit("/", 1)[-1]]
+    storage = FakeStorage(
+        {
+            "/evaluation/output/metrics.json": json.dumps(metrics).encode(),
+            "/evaluation/output/report.json": json.dumps(report).encode(),
+            "/evaluation/output/predictions.jsonl": b'{"id":"one","prediction":"ok"}\n',
+        }
+    )
 
     class Query:
-        async def query(self, task_id, context):
+        async def query(self, task_id: str, context: RequestContext) -> JsonObject:
             assert task_id == "platform-local-test" and context.user_id == "42"
             return {
                 "status": "Running"
@@ -204,7 +222,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         experiment_execution_store=store,
         execution_roles=("eval",),
         external_task_query=Query(),
-        evaluation_storage_factory=lambda _: Storage(),
+        evaluation_storage_factory=lambda _: storage,
     )
     adapter.set_plan_handler(runtime.experiment_plan_call)
     adapter.set_role_handler(runtime.execution_role_call)
@@ -326,7 +344,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
                 experiment_execution_store=store,
                 execution_roles=("eval",),
                 external_task_query=Query(),
-                evaluation_storage_factory=lambda _: Storage(),
+                evaluation_storage_factory=lambda _: storage,
             )
             adapter.set_plan_handler(runtime.experiment_plan_call)
             adapter.set_role_handler(runtime.execution_role_call)
@@ -359,7 +377,10 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
             and view.report_uri == current["report"]
         )
         assert plans.view(owner).current is None
-        assert len(manager_requests) == 1
+        assert len(manager_requests) == 2
+        assert "One actual sample was scored" in json.dumps(
+            manager_requests[-1]["messages"]
+        )
         if not restart:
             projected = (await runtime.get_snapshot("manager", context)).external_tasks
             assert len(projected) == 1
@@ -372,14 +393,18 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
             if payload not in manager_requests
             for tool in payload["tools"]
         }
+        assert profile.delegated_roles is not None
         assert set(profile.delegated_roles[0].tools) <= child_tools
         manager_tools = {
             tool["function"]["name"] for tool in manager_requests[0]["tools"]
         }
         assert (
-            "df_submit_evaluation" not in manager_tools
-            and "terminal" not in manager_tools
+            "df_submit_evaluation" in manager_tools
+            and "terminal" in manager_tools
+            and "read" in manager_tools
             and "subagent" not in manager_tools
+            and "record_experiment_result" not in manager_tools
+            and "read_skill" not in manager_tools
         )
         assert "/dataset.jsonl" not in json.dumps(manager_requests[0]["messages"])
         role_file = (root / "manager/pi/agent/agents/eval.md").read_text()
@@ -403,3 +428,148 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         await runtime.close()
         await runner.cleanup()
         engine.dispose()
+
+
+async def test_manager_inspects_and_plans_without_delegating_or_submitting(
+    tmp_path, monkeypatch, experiment
+):
+    service, _, _ = experiment
+    profile = ECHOMIND_PRODUCT_PROFILE
+    captured = []
+    reference = {
+        "goal": "Create a baseline plan without platform submission",
+        "resources": [
+            {"id": "bench", "name": "Evaluation data", "uri": "public_data/val.jsonl"}
+        ],
+        "stages": [
+            {"id": "init", "name": "Init"},
+            {
+                "id": "inference",
+                "name": "Inference",
+                "placeholder": True,
+                "enabled": False,
+            },
+        ],
+        "tasks": [
+            {
+                "id": "baseline",
+                "stage_id": "init",
+                "name": "Baseline",
+                "inputs": [{"name": "dataset", "resource_id": "bench"}],
+            }
+        ],
+    }
+    script = [
+        ("read", {"path": ".agents/skills/experiment-planning/SKILL.md"}),
+        ("terminal", {"command": "wc -l public_data/val.jsonl"}),
+        ("read", {"path": "public_data/val.jsonl"}),
+        ("update_experiment_context", {"context": reference, "expected_sequence": 0}),
+    ]
+
+    async def respond(request):
+        payload = await request.json()
+        captured.append(payload)
+        if len(captured) <= len(script):
+            name, arguments = script[len(captured) - 1]
+            return stream(name, arguments)
+        return stream(
+            text="Data inspected and reference plan saved without submission."
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", respond)
+    server = web.AppRunner(app)
+    await server.setup()
+    site = web.TCPSite(server, "127.0.0.1", 0)
+    await site.start()
+    port = server.addresses[0][1]
+    root = tmp_path / "conversations"
+    data = root / "manager/public_data/val.jsonl"
+    monkeypatch.setenv("OPENAI_API_KEY", "local-test-key")
+    adapter = PiAdapter(root, terminal_backend="os-sandbox")
+    runtime = ConversationRuntime(
+        root,
+        {"pi": adapter},
+        default_harness_id="pi",
+        experiment_plan_store=service.plans,
+        experiment_execution_store=service.store,
+        execution_roles=("eval",),
+    )
+    adapter.set_plan_handler(runtime.experiment_plan_call)
+    context = RequestContext(user_id="42", profile_id=profile.profile_id)
+    owner = PlanOwner(
+        user_id="42", conversation_id="manager", profile_id=profile.profile_id
+    )
+    try:
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id="manager",
+                user_id="42",
+                profile_id=profile.profile_id,
+                workspace_root=str(root / "manager"),
+                product_instructions=profile.instructions,
+                tool_allowlist=profile.tool_allowlist,
+                skill_allowlist=profile.skill_allowlist,
+                delegated_roles=profile.delegated_roles,
+                managed_delegation=True,
+                model_configuration={
+                    "model": "eval-test-model",
+                    "base_url": f"http://127.0.0.1:{port}/v1",
+                    "api_key": "local-test-key",
+                },
+            ),
+            context,
+        )
+        data.parent.mkdir(parents=True, exist_ok=True)
+        data.write_text('{"id":"sample","label":"pass"}\n')
+        await runtime.start_execution_events()
+        await runtime.submit_command(
+            "manager",
+            UserMessageCommand(
+                command_id="plan-only",
+                content=(
+                    TextContent(
+                        text=(
+                            "Inspect data and create a reference plan. "
+                            "Do not submit platform tasks."
+                        )
+                    ),
+                ),
+            ),
+            context,
+        )
+        async with asyncio.timeout(30):
+            while True:
+                snapshot = await runtime.get_snapshot("manager", context)
+                if snapshot.status == "error":
+                    pytest.fail(str(snapshot.timeline))
+                if len(captured) == 5 and snapshot.status == "idle":
+                    break
+                await asyncio.sleep(0.05)
+        saved = service.plans.context(owner)
+        assert saved.context.tasks[0].inputs[0].resource_id == "bench"
+        assert service.store.list(owner) == []
+        assert service.plans.view(owner).current is None
+        results = [
+            message
+            for message in captured[-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert len(results) == 4
+        assert "sample" in str(results[2]["content"])
+        assert '"sequence": 1' in str(results[3]["content"])
+        assert all("request_failed" not in str(result) for result in results)
+        names = {tool["function"]["name"] for tool in captured[0]["tools"]}
+        assert {
+            "read",
+            "terminal",
+            "write",
+            "df_submit_evaluation",
+            "read_experiment_artifact",
+        } <= names
+        assert not {"read_skill", "subagent", "record_experiment_result"} & names
+        prompt = json.dumps(captured[0]["messages"])
+        assert "inference-evaluation" in prompt and "data-processing" in prompt
+    finally:
+        await runtime.close()
+        await server.cleanup()

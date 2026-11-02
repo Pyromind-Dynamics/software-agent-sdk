@@ -52,6 +52,11 @@ class GetExperimentExecution(ContractModel):
     run_id: str | None = None
 
 
+class ReadExperimentArtifact(ContractModel):
+    run_id: str = Field(min_length=1)
+    name: str = Field(min_length=1, description="Name from the execution's artifacts.")
+
+
 class ExecutionCondition(ContractModel):
     kind: Literal["external_task_succeeded", "artifacts_verified", "agent_result_valid"]
 
@@ -116,7 +121,8 @@ class ReadExperimentResource(ContractModel):
 ROLE_TOOLS = {
     "record_experiment_result": (
         RecordExperimentResult,
-        "Register a report or essential missing inputs; Runtime verifies result evidence.",
+        "Register a report or essential missing inputs; "
+        "Runtime verifies result evidence.",
     ),
     "read_experiment_resource": (
         ReadExperimentResource,

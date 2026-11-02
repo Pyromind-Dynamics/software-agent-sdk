@@ -21,8 +21,12 @@ class ExperimentStage(ContractModel):
     id: str = Field(min_length=1, max_length=128)
     name: str = Field(min_length=1)
     description: str = ""
-    enabled: bool = True
-    placeholder: bool = False
+    enabled: bool = Field(
+        default=True, description="Must be false when placeholder is true."
+    )
+    placeholder: bool = Field(
+        default=False, description="An unimplemented stage; also set enabled=false."
+    )
 
     @model_validator(mode="after")
     def validate_placeholder(self) -> ExperimentStage:
@@ -114,6 +118,36 @@ def _acyclic(ids: set[str], edges: list[tuple[str, str]]) -> None:
         raise ValueError("plan contains a cycle")
 
 
+def _validate_task_references(
+    stages: tuple[ExperimentStage, ...],
+    tasks: tuple[ExperimentTask, ...],
+    resources: tuple[PlanResource, ...],
+) -> list[tuple[str, str]]:
+    _unique([stage.id for stage in stages], "stage id")
+    _unique([task.id for task in tasks], "task id")
+    _unique([resource.id for resource in resources], "resource id")
+    stage_ids = {stage.id for stage in stages}
+    resource_ids = {resource.id for resource in resources}
+    by_id = {task.id: task for task in tasks}
+    dependencies: list[tuple[str, str]] = []
+    for task in tasks:
+        if task.stage_id not in stage_ids:
+            raise ValueError("task references an unknown stage")
+        _unique([item.name for item in task.inputs], "input name")
+        _unique([item.name for item in task.outputs], "output name")
+        for item in task.inputs:
+            if item.resource_id and item.resource_id not in resource_ids:
+                raise ValueError("input references an unknown resource")
+            if item.task_id:
+                upstream = by_id.get(item.task_id)
+                if upstream is None or item.output_name not in {
+                    output.name for output in upstream.outputs
+                }:
+                    raise ValueError("input references an unknown task output")
+                dependencies.append((item.task_id, task.id))
+    return dependencies
+
+
 class WorkflowPlan(ContractModel):
     schema_version: Literal[1] = 1
     skill: str | None = Field(
@@ -135,32 +169,18 @@ class WorkflowPlan(ContractModel):
 
     @model_validator(mode="after")
     def validate_graph(self) -> WorkflowPlan:
-        _unique([stage.id for stage in self.stages], "stage id")
-        _unique([task.id for task in self.tasks], "task id")
-        _unique([resource.id for resource in self.resources], "resource id")
+        dependencies = _validate_task_references(
+            self.stages, self.tasks, self.resources
+        )
         stage_ids = {stage.id for stage in self.stages}
-        resources = {resource.id for resource in self.resources}
-        tasks = {task.id: task for task in self.tasks}
-        dependencies: list[tuple[str, str]] = []
         stage_edges = [(edge.source, edge.target) for edge in self.edges]
         _unique([f"{a}\0{b}" for a, b in stage_edges], "edge")
-        for task in self.tasks:
-            if task.stage_id not in stage_ids:
-                raise ValueError("task references an unknown stage")
-            _unique([item.name for item in task.inputs], "input name")
-            _unique([item.name for item in task.outputs], "output name")
-            for item in task.inputs:
-                if item.resource_id and item.resource_id not in resources:
-                    raise ValueError("input references an unknown resource")
-                if item.task_id:
-                    upstream = tasks.get(item.task_id)
-                    if upstream is None or item.output_name not in {
-                        output.name for output in upstream.outputs
-                    }:
-                        raise ValueError("input references an unknown task output")
-                    dependencies.append((item.task_id, task.id))
-                    if upstream.stage_id != task.stage_id:
-                        stage_edges.append((upstream.stage_id, task.stage_id))
+        tasks = {task.id: task for task in self.tasks}
+        stage_edges.extend(
+            (tasks[source].stage_id, tasks[target].stage_id)
+            for source, target in dependencies
+            if tasks[source].stage_id != tasks[target].stage_id
+        )
         _acyclic(stage_ids, stage_edges)
         _acyclic(set(tasks), dependencies)
         return self
@@ -225,6 +245,7 @@ class ExperimentContext(ContractModel):
     constraints: tuple[str, ...] = ()
     resources: tuple[PlanResource, ...] = ()
     stages: tuple[ExperimentStage, ...] = ()
+    tasks: tuple[ExperimentTask, ...] = ()
     edges: tuple[PlanEdge, ...] = ()
     conclusions: tuple[str, ...] = ()
     next_steps: tuple[str, ...] = ()
@@ -234,8 +255,7 @@ class ExperimentContext(ContractModel):
     @model_validator(mode="after")
     def validate_references(self):
         ids = [stage.id for stage in self.stages]
-        _unique(ids, "stage id")
-        _unique([resource.id for resource in self.resources], "resource id")
+        _validate_task_references(self.stages, self.tasks, self.resources)
         if any(e.source not in ids or e.target not in ids for e in self.edges):
             raise ValueError("guide edge references an unknown stage")
         # Advice may return to a previous stage. It is not a scheduling DAG.
@@ -249,7 +269,13 @@ class ExperimentContextView(ContractModel):
 
 
 class UpdateExperimentContext(ContractModel):
-    context: ExperimentContext
+    context: ExperimentContext = Field(
+        description=(
+            "Complete replacement context, not a patch. Include all resources, "
+            "stages, tasks and edges to keep; omitted arrays become empty. "
+            "Task inputs reference resources or upstream task outputs."
+        )
+    )
     expected_sequence: int = Field(default=0, ge=0)
 
 

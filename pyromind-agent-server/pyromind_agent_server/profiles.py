@@ -55,7 +55,7 @@ DEFAULT_PRODUCT_PROFILE = ConversationProfile(
 )
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=3,
+    configuration_version=4,
     route_prefix="/api/v2/echomind/conversations",
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
     harness_id="pi",

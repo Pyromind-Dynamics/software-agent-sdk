@@ -57,6 +57,17 @@ class StorageFileNotFoundError(ValueError):
     """
 
 
+class StorageReadError(ValueError):
+    """Sanitized read failure with a bounded retry decision."""
+
+    def __init__(self, reason: str, *, status_code: int | None = None):
+        self.reason = reason
+        self.status_code = status_code
+        self.retryable = reason == "timeout" or status_code in {502, 503, 504}
+        suffix = f" (HTTP {status_code})" if status_code is not None else ""
+        super().__init__(f"Storage read failed: {reason}{suffix}")
+
+
 class _TransientStorageError(ValueError):
     """Internal marker for a Storage failure that is worth retrying."""
 
@@ -467,10 +478,14 @@ def request_storage_url(
             json=body,
             timeout=timeout,
         )
+    except httpx.TimeoutException as exc:
+        raise StorageReadError("timeout") from exc
     except httpx.RequestError as exc:
-        raise ValueError(
-            f"Failed to request Pyromind storage download URL: {exc}"
-        ) from exc
+        raise StorageReadError("transport") from exc
+    if response.status_code == 404:
+        raise StorageFileNotFoundError("Storage object not found")
+    if response.status_code >= 400:
+        raise StorageReadError("get_url", status_code=response.status_code)
     payload = _decode_json_response(response, "Pyromind storage get_url API")
     if isinstance(payload, str):
         raise ValueError(payload)
@@ -484,6 +499,31 @@ def request_storage_url(
 
 
 def download_file_from_pyromind(
+    *,
+    storage_path: str,
+    storage_base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+    max_bytes: int,
+) -> bytes:
+    """Download a bounded file, retrying only temporary read failures."""
+    for attempt in range(3):
+        try:
+            return _download_file_once(
+                storage_path=storage_path,
+                storage_base_url=storage_base_url,
+                headers=headers,
+                timeout=timeout,
+                max_bytes=max_bytes,
+            )
+        except StorageReadError as exc:
+            if not exc.retryable or attempt == 2:
+                raise
+            time.sleep(0.5 * 2**attempt)
+    raise AssertionError("unreachable")
+
+
+def _download_file_once(
     *,
     storage_path: str,
     storage_base_url: str,
@@ -513,23 +553,19 @@ def download_file_from_pyromind(
             follow_redirects=True,
         ) as download:
             if download.status_code == 404:
-                raise StorageFileNotFoundError(
-                    f"Pyromind storage object not found: {storage_path}"
-                )
+                raise StorageFileNotFoundError("Storage object not found")
             if download.status_code >= 400:
-                body = download.read().decode("utf-8", errors="replace")
-                raise ValueError(
-                    "Pyromind storage download URL returned HTTP "
-                    f"{download.status_code}: {_truncate_text(body)}"
-                )
+                raise StorageReadError("download", status_code=download.status_code)
             for chunk in download.iter_bytes():
                 if len(content) + len(chunk) > max_bytes:
                     raise ValueError(
                         f"Storage file exceeds the {max_bytes}-byte preflight limit."
                     )
                 content.extend(chunk)
+    except httpx.TimeoutException as exc:
+        raise StorageReadError("timeout") from exc
     except httpx.RequestError as exc:
-        raise ValueError(f"Failed to download Pyromind storage file: {exc}") from exc
+        raise StorageReadError("transport") from exc
     return bytes(content)
 
 

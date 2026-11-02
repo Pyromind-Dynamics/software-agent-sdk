@@ -4,7 +4,7 @@
 
 ## 执行链路
 
-用户描述目标 → Manager 委派 Eval → Eval 探查、写配置、调用原评测工具 → Runtime 等待平台并验证产物 → 恢复 Eval 分析并登记报告 → Manager 收到一次持久通知。
+用户描述目标 → Manager 直接探查、分析和执行，或按需委派 Eval。委派时沿用原链路：Eval 探查、写配置、调用原评测工具 → Runtime 等待平台并验证产物 → 恢复 Eval 分析并登记报告 → Manager 收到一次持久通知。
 
 参考 Graph 是可选、可变的方向信息。任务独立于 Graph 和计划版本；Graph 变化不重跑任务。`intent=execute` 按用户授权执行，`intent=prepare` 禁止平台提交。仅启用 Eval，Dataset、Train 尚未开放。
 
@@ -16,7 +16,13 @@
 - Eval 复用 `inference-evaluation` Skill、`df_submit_evaluation`、`df_check_progress` 和既有 PipelineRuns、DSL、评分、报告实现。没有新增一套评分执行器。
 - Runtime 只处理归属、委派、状态、幂等、结果证据和持久队列。Harness 差异均在 Adapter 内。场景规则、Prompt、白名单放 Profile 与 Skill。
 
-Manager 仅有 `read_skill`、实验上下文读取/更新、任务委派/查询/控制工具。模型可见的委派 schema 必须包含任务正文；旧 `task_id/expected_revision` 请求仍由兼容 API 接受。Eval 有角色独立的读写、终端、Storage 和原评测工具；无法修改全局方向或启动其他角色。
+Manager 的平台工具和 Skill 白名单以 `a2c02d30` 父提交的完整开发能力为基准恢复，从会话开始即可使用，不依赖计划确认。删除 `read_skill`，统一使用 `read` 读取 Skill 和业务文件；EchoMind 不开放通用 `subagent`，仅保留可选的 Eval 委派。Pyromind 的 `search`、`general_purpose` 和原链路不变。模型可见的委派 schema 必须包含任务正文；旧 `task_id/expected_revision` 请求仍由兼容 API 接受。Eval 保持角色独立的工具白名单，无法修改全局方向或启动其他角色。
+
+参考计划通过既有 `ExperimentContext` 增加可选 `tasks`，复用原 `ExperimentTask` 及输入输出引用校验。`update_experiment_context` 是完整替换，使用 sequence 做并发控制；阶段参考图仍允许回环，不参与执行调度。旧 context 缺少 tasks 时按空数组读取，SQL 表结构不变。
+
+Manager 的 `read_experiment_artifact(run_id, name)` 复用既有 Runtime/HTTP 产物读取逻辑，验证会话归属、登记产物和 SHA-256。报告登记规范化任务内的相对路径；Storage 超时或 502/503/504 最多读取三次，退避 0.5、1 秒，认证和路径错误不重试。故障不会触发新的 GPU 任务。
+
+EchoMind 配置版本升为 4，已有会话在空闲且无执行中的受管工作时通过原配置机制更新 Prompt、工具和 Skill；不重写历史计划、不自动启动任务。改动分别位于 Profile/场景 Skill、通用 Domain/Application 和 Adapter；依赖方向不变。公开协议仅增量扩展 tasks 和模型报告读取工具，旧正式计划 API 与历史数据保持兼容。
 
 所有角色工具校验白名单和执行作用域。原生写入、编辑和终端在执行前校验 SQL 工作项及租约代次；终端沿用既有权限检查，不能因为 Manager 没有终端而错误拒绝 Eval。
 

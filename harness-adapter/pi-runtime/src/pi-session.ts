@@ -178,15 +178,6 @@ export async function createPiSession(
     options,
   );
   if (sessionOptions.askUserTool) rawTools.push(sessionOptions.askUserTool);
-  const read = rawTools.find(tool => tool.name === "read");
-  if (read) rawTools.push({ ...read, name: "read_skill", description: "Read an enabled Skill or reference; does not read task data.",
-    execute: (id: string, args: any, signal?: AbortSignal, update?: any) => {
-      const path = String(args.path ?? "");
-      const candidate = path.startsWith(".agents/skills/") && config.skillsDirectory ? join(config.skillsDirectory, path.slice(".agents/skills/".length)) : path;
-      if (!skillPaths.some(root => inside(realpathSync(candidate), root))) throw new Error("read_skill only reads Skill resources");
-      return read.execute(id, args, signal, update);
-    },
-  });
   if (!executionAccess) throw new Error("execution environment was not initialized");
   const coordinator = new ToolCoordinator();
   const allowedSkillRoots = config.skillAllowlist?.map(name => {

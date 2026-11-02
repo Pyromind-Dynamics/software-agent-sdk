@@ -81,6 +81,7 @@ from openhands.sdk.workspace.base import BaseWorkspace
 from openhands.sdk.workspace.local import LocalWorkspace
 from openhands.tools.pyromind_dataset.definition import (
     StorageFileNotFoundError,
+    StorageReadError,
     _default_storage_base_url,
     download_file_from_pyromind,
 )
@@ -531,6 +532,7 @@ class PiAdapter:
             ControlExperimentTask,
             DelegateExperimentTask,
             GetExperimentExecution,
+            ReadExperimentArtifact,
         )
         from pyromind_runtime.domain.experiment_plans import CONTEXT_TOOLS, PLAN_TOOLS
 
@@ -540,6 +542,7 @@ class PiAdapter:
             "control_experiment_task": ControlExperimentTask,
             "request_experiment_task": DelegateExperimentTask,
             "get_experiment_execution": GetExperimentExecution,
+            "read_experiment_artifact": ReadExperimentArtifact,
         }
 
         specs = self._business_tools.specs(sandbox=self._terminal_backend == "sandbox")
@@ -557,6 +560,21 @@ class PiAdapter:
                 "get_experiment_plan": (
                     "Read the authoritative current plan and pending proposal, "
                     "or a specified historical revision."
+                ),
+                "get_experiment_context": (
+                    "Read the current reference plan and its sequence. "
+                    "Reference plans do not authorize or gate execution."
+                ),
+                "update_experiment_context": (
+                    "Replace the complete reference plan using expected_sequence. "
+                    "Include resources, stages, tasks and edges to retain. "
+                    "Task inputs reference resource_id or task_id/output_name. "
+                    "Placeholder stages require enabled=false."
+                ),
+                "read_experiment_artifact": (
+                    "Read a registered report by run_id and artifact name from "
+                    "get_experiment_execution. Verifies ownership and content digest. "
+                    "Do not supply a file path or Storage URL."
                 ),
                 "request_experiment_task": (
                     "Delegate a complete task to an enabled role. A successful "
@@ -749,6 +767,11 @@ class PiAdapter:
             return body.decode("utf-8")
         except StorageFileNotFoundError:
             return None
+        except StorageReadError as exc:
+            raise ProductRuntimeError(
+                "harness_operation_failed",
+                f"Stored workspace file is unavailable: {exc}; check access and retry.",
+            ) from exc
         except Exception as exc:
             raise ProductRuntimeError(
                 "harness_operation_failed",
@@ -1747,6 +1770,7 @@ class PiAdapter:
                     "control_experiment_task",
                     "request_experiment_task",
                     "get_experiment_execution",
+                    "read_experiment_artifact",
                 }
             ):
                 if self._plan_call is None:

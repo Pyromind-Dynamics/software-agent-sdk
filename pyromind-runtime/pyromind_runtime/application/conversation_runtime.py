@@ -72,6 +72,8 @@ from pyromind_runtime.domain.experiment_execution import (
     ControlExperimentTask,
     EvaluationProposal,
     ExperimentExecutionView,
+    GetExperimentExecution,
+    ReadExperimentArtifact,
     ReadExperimentResource,
     RequestExperimentTask,
 )
@@ -1188,8 +1190,18 @@ class ConversationRuntime:
                 context,
             )
             return {"run_id": row["id"], "state": row["state"]}
+        if tool_name == "read_experiment_artifact":
+            if not self._store(conversation_id).permits_tool(tool_name):
+                raise PermissionError("artifact reading capability is not enabled")
+            request = ReadExperimentArtifact.model_validate(arguments)
+            return await self.read_experiment_artifact(
+                conversation_id, request.run_id, request.name, context
+            )
         if tool_name == "get_experiment_execution":
+            query = GetExperimentExecution.model_validate(arguments)
             views = await self.get_experiment_executions(conversation_id, context)
+            if query.run_id is not None:
+                views = tuple(view for view in views if view.run_id == query.run_id)
             return {"executions": [view.model_dump(mode="json") for view in views]}
         if tool_name not in PLAN_TOOLS:
             raise PermissionError("unknown plan tool")
@@ -2374,6 +2386,7 @@ class ConversationRuntime:
                     raise ValueError(
                         "无法核实此任务与原提交配置的关联；保留待核对状态。"
                     )
+                assert command.task_id is not None
                 await self._query_execution_task(owner, command.task_id)
                 result = await self._plan_io(
                     self._delegated_store.resolve,

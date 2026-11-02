@@ -7,6 +7,7 @@ import hashlib
 import json
 import time
 from collections.abc import Awaitable, Callable
+from pathlib import PurePosixPath
 from typing import cast
 
 from pyromind_runtime.domain.experiment_execution import (
@@ -60,6 +61,7 @@ class ExperimentExecutions:
         if not stage.enabled or stage.placeholder:
             raise ValueError("task stage is disabled")
         assert view.project_id is not None
+        assert request.task_id is not None
         return self.store.request(
             owner,
             view.project_id,
@@ -175,12 +177,18 @@ class ExperimentExecutions:
                 raise PermissionError("result belongs to another task")
             artifact = None
             if result.report_uri:
-                root = f"public_data/experiment-runs/{row['id']}/"
-                if not result.report_uri.startswith(
-                    root
-                ) or ".." in result.report_uri.split("/"):
+                path = PurePosixPath(result.report_uri)
+                root = PurePosixPath("public_data/experiment-runs") / row["id"]
+                if (
+                    path.is_absolute()
+                    or ".." in path.parts
+                    or "\\" in result.report_uri
+                    or path == root
+                    or not path.is_relative_to(root)
+                ):
                     raise PermissionError("report must be in this task's workspace")
-                body = await read(owner, result.report_uri)
+                result = result.model_copy(update={"report_uri": path.as_posix()})
+                body = await read(owner, path.as_posix())
                 artifact = {
                     "uri": result.report_uri,
                     "sha256": hashlib.sha256(body).hexdigest(),
@@ -353,7 +361,8 @@ class ExperimentExecutions:
                         store.enqueue_report,
                         owner,
                         run_id,
-                        "Explain the platform failure without submitting another GPU task.",
+                        "Explain the platform failure without submitting "
+                        "another GPU task.",
                     )
                 self._checks[run_id] = (time.monotonic() + 30, 0)
             except PermissionError:
@@ -378,7 +387,8 @@ class ExperimentExecutions:
                     run_id,
                     "平台结果尚不能验证，正在重试读取产物或查询任务。"
                     if not unavailable
-                    else "平台成功但产物未通过覆盖范围或格式校验；不能宣告 baseline 有效。",
+                    else "平台成功但产物未通过覆盖范围或格式校验；"
+                    "不能宣告 baseline 有效。",
                     artifact_failure=unavailable,
                 )
                 if unavailable:
@@ -386,5 +396,6 @@ class ExperimentExecutions:
                         store.enqueue_report,
                         owner,
                         run_id,
-                        "Explain missing or invalid artifacts; do not rerun GPU inference.",
+                        "Explain missing or invalid artifacts; "
+                        "do not rerun GPU inference.",
                     )
