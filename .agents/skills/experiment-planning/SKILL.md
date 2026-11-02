@@ -21,6 +21,8 @@ get_experiment_context 读取全局事实。update_experiment_context 完整替�
 占位阶段同时设置 placeholder=true、enabled=false。未知资源 URI 留空并说明缺口。
 参考图可以不完整、跳过、加阶段或返回，不承担执行调度和审批。
 只补充当前目标需要的细节，不要求先确认 Graph 或补齐全部阶段。
+展示阶段结果时，可用 stage_executions 将阶段 ID 关联到已有 TaskRun ID；
+事后整理参考图也可关联，不改写执行快照，不按阶段名或角色名猜测执行状态。
 
 按需委派使用 request_experiment_task：role_id 选当前启用的角色、稳定 request_id，task 传
 name、instruction、已知 inputs、constraints、expected_outputs。

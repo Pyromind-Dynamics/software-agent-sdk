@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
 
@@ -245,6 +245,14 @@ class ExperimentContext(ContractModel):
     constraints: tuple[str, ...] = ()
     resources: tuple[PlanResource, ...] = ()
     stages: tuple[ExperimentStage, ...] = ()
+    stage_executions: dict[
+        str, tuple[Annotated[str, Field(min_length=1, max_length=128)], ...]
+    ] = Field(
+        default_factory=dict,
+        exclude_if=lambda value: not value,
+        description="Optional display associations: stage ID to existing TaskRun IDs. "
+        "Does not schedule execution or change a task's frozen specification.",
+    )
     tasks: tuple[ExperimentTask, ...] = ()
     edges: tuple[PlanEdge, ...] = ()
     conclusions: tuple[str, ...] = ()
@@ -255,6 +263,10 @@ class ExperimentContext(ContractModel):
     @model_validator(mode="after")
     def validate_references(self):
         ids = [stage.id for stage in self.stages]
+        if any(stage_id not in ids for stage_id in self.stage_executions):
+            raise ValueError("execution association references an unknown stage")
+        for run_ids in self.stage_executions.values():
+            _unique(list(run_ids), "execution association")
         _validate_task_references(self.stages, self.tasks, self.resources)
         if any(e.source not in ids or e.target not in ids for e in self.edges):
             raise ValueError("guide edge references an unknown stage")
