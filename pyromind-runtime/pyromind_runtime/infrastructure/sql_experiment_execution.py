@@ -1194,17 +1194,20 @@ class SQLExperimentExecutionStore:
                 "abandoned",
             }:
                 return row
-            sub = (
+            submitted = list(
                 conn.execute(
                     sa.select(submissions)
                     .where(submissions.c.run_id == run_id)
                     .with_for_update()
                 )
                 .mappings()
-                .first()
+                .all()
             )
             # Unknown remote acceptance is never proof of termination.
-            if sub and sub["state"] in {"submitting", "submission_uncertain"}:
+            if any(
+                sub["state"] in {"submitting", "submission_uncertain"}
+                for sub in submitted
+            ):
                 raise ValueError(
                     "submission acceptance is uncertain; reconcile or abandon it"
                 )
@@ -1224,7 +1227,7 @@ class SQLExperimentExecutionStore:
                     work.c.state == "running",
                 )
             ).first()
-            remote = sub and sub["task_id"]
+            remote = any(sub["task_id"] for sub in submitted)
             state = "cancel_requested" if remote or active_work else "cancelled"
             conn.execute(
                 runs.update()
@@ -1249,6 +1252,29 @@ class SQLExperimentExecutionStore:
             self.changed(conn, owner, run_id, state)
             return self._run(conn, owner, run_id)
 
+    @staticmethod
+    def _resolution_submission(conn, run_id: str, command_id: str) -> dict:
+        candidates = list(
+            conn.execute(
+                sa.select(submissions)
+                .where(submissions.c.run_id == run_id)
+                .with_for_update()
+            ).mappings()
+        )
+        repeated = [
+            sub
+            for sub in candidates
+            if sub["evidence"].get("resolution", {}).get("command_id") == command_id
+        ]
+        unresolved = repeated or [
+            sub
+            for sub in candidates
+            if sub["state"] in {"submitting", "submission_uncertain"}
+        ]
+        if len(unresolved) != 1:
+            raise ValueError("exactly one uncertain submission must be reconciled")
+        return dict(unresolved[0])
+
     def abandon(self, owner: PlanOwner, run_id: str, command_id: str) -> dict:
         with write_transaction(self.engine) as conn:
             row = self._run(conn, owner, run_id)
@@ -1256,15 +1282,7 @@ class SQLExperimentExecutionStore:
                 return row
             if row["state"] != "submission_uncertain":
                 raise ValueError("only uncertain submissions can be abandoned")
-            sub = (
-                conn.execute(
-                    sa.select(submissions)
-                    .where(submissions.c.run_id == run_id)
-                    .with_for_update()
-                )
-                .mappings()
-                .one()
-            )
+            sub = self._resolution_submission(conn, run_id, command_id)
             evidence = {
                 **sub["evidence"],
                 "resolution": {
@@ -1299,15 +1317,7 @@ class SQLExperimentExecutionStore:
         validate_persisted_payload(verified_evidence)
         with write_transaction(self.engine) as conn:
             row = self._run(conn, owner, run_id)
-            sub = (
-                conn.execute(
-                    sa.select(submissions)
-                    .where(submissions.c.run_id == run_id)
-                    .with_for_update()
-                )
-                .mappings()
-                .one()
-            )
+            sub = self._resolution_submission(conn, run_id, command_id)
             resolution = sub["evidence"].get("resolution", {})
             if resolution.get("command_id") == command_id:
                 if sub["task_id"] != task_id:

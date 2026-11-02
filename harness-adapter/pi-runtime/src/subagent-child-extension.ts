@@ -37,7 +37,12 @@ export async function installChildHost(pi: ExtensionAPI, role: string) {
     const allowed = new Set(config.tools.map((tool: any) => tool.name));
     if (pi.getActiveTools().some((name) => !allowed.has(name))) throw new Error("Unexpected tool in subagent session");
   });
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", async (event) => {
+    // Native resume can retain the child session and its tool closures. Bind
+    // the new turn to the newly admitted work lease, while an interrupted
+    // turn keeps its old scope and cannot write through an expired lease.
+    const admission = await callSubagentHost(socket, {method: "config", role});
+    config.scope = admission.scope;
     let prompt = event.systemPrompt;
     if (config.workspacePathAlias) {
       event.systemPromptOptions.cwd = config.workspacePathAlias.alias;

@@ -364,3 +364,42 @@ def test_completed_platform_result_wins_cancel_race(experiment):
     service.store.apply_observations()
     assert service.store.cancellation_result(owner, run["id"], scope, True, True)["state"] == "waiting_artifacts"
     assert service.list(owner)[0].metrics is None
+
+@pytest.mark.parametrize("action", ["bind", "abandon"])
+def test_reconcile_targets_uncertain_operation_and_preserves_previous_task(
+    experiment, action
+):
+    service, owner, _ = experiment
+    run = service.request(owner, request(), ("eval",))
+    scope = claim(service, owner, run)
+    store = service.store
+    store.managed_submission(owner, run["id"], scope, {"operation": "inference"})
+    store.managed_receipt(
+        owner,
+        run["id"],
+        scope,
+        "inference",
+        {"task_id": "gpu-original", "output_dir": "/original"},
+    )
+    store.managed_submission(owner, run["id"], scope, {"operation": "report"})
+    store.managed_receipt(owner, run["id"], scope, "report", {"uncertain": True})
+    with pytest.raises(ValueError, match="acceptance is uncertain"):
+        store.cancel(owner, run["id"])
+    if action == "bind":
+        result = store.resolve(
+            owner, run["id"], "cpu-report", "resolve", {"verified": True}
+        )
+        assert result["state"] == "waiting_platform"
+        assert (
+            store.resolve(owner, run["id"], "cpu-report", "resolve", {})["id"]
+            == run["id"]
+        )
+        assert store.cancel(owner, run["id"])["state"] == "cancel_requested"
+    else:
+        assert store.abandon(owner, run["id"], "abandon")["state"] == "abandoned"
+    entries = {
+        entry["operation_key"]: entry for entry in store.list(owner)[0]["submissions"]
+    }
+    assert entries["inference"]["task_id"] == "gpu-original"
+    assert "resolution" not in entries["inference"]["evidence"]
+    assert entries["report"]["evidence"]["resolution"]["action"] == action

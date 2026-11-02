@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,6 +22,7 @@ from pyromind_runtime.infrastructure.sql_experiment_plan_store import (
     SQLExperimentPlanStore,
     metadata as plan_metadata,
 )
+from pyromind_runtime.infrastructure.sql_work_queue import work
 from pyromind_runtime.ports.harness import SessionSpec
 from sqlalchemy import create_engine
 
@@ -76,12 +77,14 @@ def stream(name=None, arguments=None, text="Done"):
     )
 
 
-@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("restart", [False, "platform", "preparation"])
 async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
     tmp_path, monkeypatch, restart
 ):
     captured, submitted, manager_requests = [], [], []
     current = {}
+    preparation = asyncio.Event()
+    resume_preparation = asyncio.Event()
 
     async def respond(request):
         payload = await request.json()
@@ -90,6 +93,9 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         if "df_submit_evaluation" not in names:
             manager_requests.append(payload)
             return stream(text="Baseline completed. Only Eval has executed the work.")
+        if restart == "preparation" and not current.get("restarted"):
+            preparation.set()
+            await resume_preparation.wait()
         messages = json.dumps(payload["messages"], ensure_ascii=False)
         used = [
             call["function"]["name"]
@@ -288,14 +294,30 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         )
         await runtime.start_execution_events()
         if restart:
-            async with asyncio.timeout(30):
-                while not any(
-                    item["kind"] == "execute_task" and item["state"] == "completed"
-                    for item in store.work_items(owner)
-                ):
-                    await asyncio.sleep(0.1)
+            if restart == "preparation":
+                await asyncio.wait_for(preparation.wait(), 30)
+            else:
+                async with asyncio.timeout(30):
+                    while not any(
+                        item["kind"] == "execute_task" and item["state"] == "completed"
+                        for item in store.work_items(owner)
+                    ):
+                        await asyncio.sleep(0.1)
             await runtime.close()
+            if restart == "preparation":
+                # Advance the expired lease boundary without a 90-second wait.
+                with engine.begin() as connection:
+                    connection.execute(
+                        work.update()
+                        .where(work.c.state == "running")
+                        .values(
+                            lease_until=datetime.now(UTC).replace(tzinfo=None)
+                            - timedelta(seconds=1)
+                        )
+                    )
             adapter = PiAdapter(root, terminal_backend="os-sandbox")
+            original_execute = adapter._business_tools.execute
+            monkeypatch.setattr(adapter._business_tools, "execute", execute)
             runtime = ConversationRuntime(
                 root,
                 {"pi": adapter},
@@ -309,6 +331,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
             adapter.set_plan_handler(runtime.experiment_plan_call)
             adapter.set_role_handler(runtime.execution_role_call)
             current["restarted"] = True
+            resume_preparation.set()
             # A fresh authenticated read restores credentials in memory; no
             # request credentials are saved in the queue or native transcript.
             await runtime.get_snapshot("manager", context)

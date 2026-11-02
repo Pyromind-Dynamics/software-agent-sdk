@@ -52,6 +52,7 @@ from pyromind_runtime.ports.workflows import WorkflowCall, WorkflowEventSink
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,
+    _forward_headers,
 )
 from harness_adapter.pi_adapter.event_translator import translate_runner_event
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
@@ -78,6 +79,11 @@ from openhands.agent_server.workflow_canvas_models import (
 from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
 from openhands.sdk.workspace.base import BaseWorkspace
 from openhands.sdk.workspace.local import LocalWorkspace
+from openhands.tools.pyromind_dataset.definition import (
+    StorageFileNotFoundError,
+    _default_storage_base_url,
+    download_file_from_pyromind,
+)
 from openhands.tools.utils.workspace_files import (
     WorkspaceFileNotFoundError,
     read_workspace_text as read_workspace_text_file,
@@ -697,7 +703,7 @@ class PiAdapter:
         if self._terminal_backend == "sandbox" and not self._has_execution_workspace(
             session
         ):
-            return None
+            return await self._read_stored_workspace_text(session, path, max_bytes)
         workspace = await self._workspace(session)
         try:
             return await asyncio.to_thread(
@@ -707,9 +713,47 @@ class PiAdapter:
                 max_bytes=max_bytes,
             )
         except WorkspaceFileNotFoundError:
+            if self._terminal_backend == "sandbox":
+                return await self._read_stored_workspace_text(session, path, max_bytes)
             return None
         except ValueError as exc:
             raise OSError(str(exc)) from exc
+
+    async def _read_stored_workspace_text(
+        self,
+        session: _PiSession,
+        path: str,
+        max_bytes: int | None,
+    ) -> str | None:
+        """Mounted workspace files survive the container's lifecycle in Storage."""
+        relative = PurePosixPath(path)
+        if relative.is_absolute() or ".." in relative.parts or "\\" in path:
+            raise ValueError("Path must stay inside the conversation workspace")
+        context = session.context
+        if not context.cookie and not context.authorization:
+            return None
+        base_url = (
+            session.extra.get("storage_base_url")
+            or session.extra.get("storage_api_base_url")
+            or _default_storage_base_url()
+        )
+        try:
+            body = await asyncio.to_thread(
+                download_file_from_pyromind,
+                storage_path=f"{PYROMIND_AGENT_STORAGE_ROOT}/{session.session_id}/{relative.as_posix()}",
+                storage_base_url=base_url,
+                headers=_forward_headers(context, include_cookie=True),
+                timeout=30,
+                max_bytes=max_bytes if max_bytes is not None else 2 * 1024 * 1024,
+            )
+            return body.decode("utf-8")
+        except StorageFileNotFoundError:
+            return None
+        except Exception as exc:
+            raise ProductRuntimeError(
+                "harness_operation_failed",
+                "Stored workspace file is unavailable; check access and retry.",
+            ) from exc
 
     async def _write_workflow(self, session: _PiSession, dsl: str) -> None:
         if self._stage_pending_workflow(session, dsl):

@@ -63,3 +63,22 @@ cd harness-adapter/pi-runtime && npm test
 ```
 
 真实 Pi 集成测试覆盖独立角色、真实工具 schema、原生继续、完整 Runtime 重建后等待平台恢复、报告登记与 Manager 单次通知；平台调用使用测试替身，因此不能替代真实 GPU 验收。Kafka 故障注入覆盖落库失败不确认、offset 提交失败重放；真实 broker 和 MariaDB 网络验收需可连接的部署环境。
+
+### 真实小样验收记录
+
+2026-11-02 重新打开并核验了此前完成的实验：
+
+- 会话：`d95eb2fa655b40038134b08b84a625cc`。
+- TaskRun：`e10857aacca0413e805d26b488c396e7`；平台任务：`9650`。
+- 基模：`/models/Qwen/Qwen3-VL-4B-Instruct`；验证集：`pcb_avi_recheck_0823_0828/val.jsonl`。
+- 实际请求及评测均为 4 条，无 API/评分执行异常；执行成功、报告就绪，四个工作项均完成。分类准确率为 0；这只证明四条小样的结果，不代表完整验证集效果。
+- 预测、指标、评分报告及 Eval 解释报告已登记；Manager 已根据结果完成总结。本次重开没有再次提交评测。
+- Sandbox 空闲回收后，报告通过当前请求凭据直接从持久 Storage 读取，无须启动 Agent、重新创建容器或提供模型密钥。报告 SHA-256 与首次登记一致。
+
+本地核验副本在 `workspace/acceptance/step2-baseline/`：`report.md`、`metrics.json` 和 `verification.json`，不包含请求凭据。原始 SQL 元数据与 Storage 文件仍是事实源。
+
+本轮修复涉及 Adapter 文件读取、子角色恢复时绑定新的受信工作租约，以及 SQL Store 对多次提交的核对/取消选择；公开 API 和数据库结构不变。跨用户、跨 Profile 的校验仍先于产物读取，旧执行者的过期租约仍被拒绝。
+
+真实 Pi 恢复测试包含准备过程中关闭服务和等待平台时关闭服务两种情况，均保持单次评测提交、恢复后生成报告与 Manager 单次通知。真实 MariaDB 已在独立临时库通过 48 项事务、并发及迁移测试，临时库已清理，现有实验数据库未修改。Kafka 当前只能建立 TCP 连接，Consumer 仍无法完成协议连接；本次真实 baseline 使用平台查询完成对账，真实 Kafka 端到端验收尚待 broker 配置或连接恢复。
+
+最终本地回归：Runtime 与原评测提交工具共 736 项通过、8 项环境条件跳过；Pi Adapter 218 项通过；前端 41 项通过并成功构建。MariaDB 上述 48 项为单独配置临时数据库运行的专项结果。
