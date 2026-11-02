@@ -1,66 +1,38 @@
+from openhands.agent_server.agent_profiles.pyromind import PYROMIND_PROFILE
 from openhands.agent_server.agent_profiles.spec import AgentProfileSpec
 
 
 ECHOMIND_MANAGER_DEVELOPMENT_TOOLS = (
-    "read",
-    "write",
-    "edit",
-    "terminal",
-    "update_plan",
+    *PYROMIND_PROFILE.tool_allowlist,
+    "create_experiment_plan",
+    "revise_experiment_plan",
     "get_experiment_plan",
-    "request_experiment_task",
-    "get_experiment_execution",
-    "validate_workflow_dsl",
-    "product_versions",
-    "submit_workflow",
-    "get_storage_url",
-    "upload_file_to_pyromind",
-    "run_dataset_cleaning",
-    "df_submit_pipeline",
-    "df_submit_evaluation",
-    "df_check_progress",
-    "df_stop_task",
-    "edp_render",
-    "edp_submit",
-    "edp_aggregate",
-    "sandbox_create",
-    "sandbox_delete",
-    "sandbox_read_file",
-    "sandbox_write_file",
-    "sandbox_delete_file",
-    "sandbox_terminal",
-    "sandbox_upload",
-    "sandbox_download",
-    "workflow_debug",
-    "analyze_task_failure",
-    "training_analysis",
-    "label_studio_project",
     "get_experiment_context",
     "update_experiment_context",
+    "request_experiment_task",
     "control_experiment_task",
+    "get_experiment_execution",
     "read_experiment_artifact",
+    "get_project_graph",
+    "apply_graph_patch",
 )
 
 ECHOMIND_MANAGER_DEVELOPMENT_SKILLS = (
+    *PYROMIND_PROFILE.skill_allowlist,
     "experiment-planning",
-    "cross-repo-testing",
-    "data-processing",
-    "debug-test-examples-workflow",
-    "debug-workflow",
-    "feature-release-rollout",
-    "generate-workflow-dsl",
-    "inference-evaluation",
-    "label-studio",
-    "manage-evals",
-    "sandbox",
-    "sdk-release",
-    "training-analysis",
-    "workflow-execution",
+    "experiment-graph-development",
     "avi-baseline-evaluation",
 )
 
-ECHOMIND_MANAGER_PLANNING_TOOLS = ECHOMIND_MANAGER_DEVELOPMENT_TOOLS
-ECHOMIND_MANAGER_PLANNING_SKILLS = ECHOMIND_MANAGER_DEVELOPMENT_SKILLS
+ECHOMIND_MANAGER_PLANNING_TOOLS = (
+    "read",
+    "terminal",
+    "create_experiment_plan",
+    "revise_experiment_plan",
+    "get_experiment_plan",
+)
+
+ECHOMIND_MANAGER_PLANNING_SKILLS = ("experiment-planning",)
 
 ECHOMIND_MANAGER_PROFILE = AgentProfileSpec(
     name="echomind",
@@ -84,6 +56,11 @@ Reference plans include resources, stages and tasks with explicit input/output
 references. Update the complete context using its current sequence.
 Do not fill every stage or request Graph version confirmation. Formalization is
 considered only after the experiment ends, based on final verified results.
+After a Project exists, read experiment-graph-development and use
+get_project_graph before changing the mutable Working Graph. Use apply_graph_patch
+for node, edge and requirement changes. Do not claim a Graph change until the
+tool returns the updated Graph. Do not introduce GraphRevision or version
+confirmation during development.
 
 get_experiment_execution reads real outcomes. A child ending, proposal, queue
 receipt or platform success alone is not a valid baseline. Wait for verified
@@ -96,6 +73,6 @@ not authorize training. Do not invent resources, results or identifiers. Work
 only in this conversation and keep credentials out of context and results.
 Use the user's language; explain outcomes without exposing internal procedures.
 """,
-    tool_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
-    skill_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
+    tool_allowlist=ECHOMIND_MANAGER_PLANNING_TOOLS,
+    skill_allowlist=ECHOMIND_MANAGER_PLANNING_SKILLS,
 )

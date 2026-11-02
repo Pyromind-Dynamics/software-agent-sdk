@@ -23,6 +23,18 @@ def test_legacy_dataset_task_kinds_normalize_to_data_preparation() -> None:
         assert state.kind == "data_preparation"
 
 
+def test_legacy_external_task_wait_status_loads_as_idle() -> None:
+    snapshot = ConversationSnapshot.model_validate(
+        {
+            "conversation_id": "conversation-1",
+            "status": "waiting_for_external_task",
+            "capabilities": {},
+        }
+    )
+
+    assert snapshot.status == "idle"
+
+
 def _snapshot() -> ConversationSnapshot:
     return ConversationSnapshot(
         conversation_id="conversation-1",
@@ -149,7 +161,7 @@ def test_projector_tracks_external_task_lifecycle() -> None:
     snapshot = projector.reduce(
         _snapshot(), _event(1, "external_task.submitted", submitted)
     )
-    assert snapshot.status == "waiting_for_external_task"
+    assert snapshot.status == "idle"
     snapshot = projector.reduce(
         snapshot,
         _event(
@@ -212,7 +224,7 @@ def test_projector_accepts_environment_processing_kinds() -> None:
         snapshot = projector.reduce(
             _snapshot(), _event(1, "external_task.submitted", submitted)
         )
-        assert snapshot.status == "waiting_for_external_task"
+        assert snapshot.status == "idle"
         assert snapshot.external_tasks[0].kind == kind
         completed = projector.reduce(
             snapshot,

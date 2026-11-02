@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from pyromind_runtime.domain.commands import UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
+from pyromind_runtime.domain.project_graphs import GraphPatch, ProjectGraphView
 
 from openhands.agent_server.dependencies import check_session_api_key
 from openhands.agent_server.echomind_projects import (
@@ -147,6 +148,71 @@ async def get_echomind_project(project_id: str, request: Request) -> ProjectInfo
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Project not found: {project_id}",
+        ) from exc
+
+
+@router.get(
+    "/projects/{project_id}/graph",
+    response_model=ProjectGraphView,
+    responses={404: {"description": "Project not found"}},
+)
+async def get_echomind_project_graph(
+    project_id: str,
+    request: Request,
+) -> ProjectGraphView:
+    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
+    service = get_conversation_service(request)
+    try:
+        return ProjectStore.for_conversations_dir(service.conversations_dir).get_graph(
+            project_id,
+            owner_user_id=context.user_id,
+        )
+    except ProjectNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {project_id}",
+        ) from exc
+
+
+@router.patch(
+    "/projects/{project_id}/graph",
+    response_model=ProjectGraphView,
+    responses={404: {"description": "Project not found"}},
+)
+async def patch_echomind_project_graph(
+    project_id: str,
+    patch: GraphPatch,
+    request: Request,
+) -> ProjectGraphView:
+    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
+    service = get_conversation_service(request)
+    try:
+        project = ProjectStore.for_conversations_dir(service.conversations_dir).load(
+            project_id,
+            owner_user_id=context.user_id,
+        )
+    except ProjectNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {project_id}",
+        ) from exc
+    _require_echomind_conversation(request, project.project.echomind_conversation_id)
+    try:
+        return await get_product_runtime(request).apply_project_graph_patch(
+            project.project.echomind_conversation_id,
+            context,
+            project_id,
+            patch,
+        )
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
         ) from exc
 
 

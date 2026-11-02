@@ -67,8 +67,14 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
         "create_experiment_plan",
         "revise_experiment_plan",
         "get_experiment_plan",
+        "get_project_graph",
+        "apply_graph_patch",
+        "get_experiment_context",
+        "update_experiment_context",
         "request_experiment_task",
         "get_experiment_execution",
+        "control_experiment_task",
+        "read_experiment_artifact",
     }
     assert not {"request_experiment_task", "get_experiment_execution"}.intersection(
         PYROMIND_PROFILE.tool_allowlist
@@ -76,6 +82,8 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
     assert set(ECHOMIND_MANAGER_DEVELOPMENT_SKILLS) == {
         *PYROMIND_PROFILE.skill_allowlist,
         "experiment-planning",
+        "experiment-graph-development",
+        "avi-baseline-evaluation",
     }
     assert ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist == (
         ECHOMIND_MANAGER_DEVELOPMENT_TOOLS

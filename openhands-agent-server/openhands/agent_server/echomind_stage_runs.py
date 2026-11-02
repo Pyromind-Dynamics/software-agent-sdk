@@ -9,12 +9,9 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
+from pyromind_runtime.domain.project_graphs import ProjectNodeType
 
-from openhands.agent_server.echomind_projects import (
-    ProjectInfo,
-    ProjectNode,
-    ProjectNodeType,
-)
+from openhands.agent_server.echomind_projects import ProjectInfo, ProjectNode
 from openhands.agent_server.echomind_stage_executors import (
     StageArtifactPayload,
     StageExecutionResult,

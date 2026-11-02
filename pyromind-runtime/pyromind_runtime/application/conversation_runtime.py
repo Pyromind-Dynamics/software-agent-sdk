@@ -89,6 +89,13 @@ from pyromind_runtime.domain.experiment_plans import (
     UpdateExperimentContext,
 )
 from pyromind_runtime.domain.pipeline import PipelineRun
+from pyromind_runtime.domain.project_graphs import (
+    PROJECT_GRAPH_TOOLS,
+    ApplyProjectGraphPatch,
+    GetProjectGraph,
+    GraphPatch,
+    ProjectGraphView,
+)
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
@@ -124,6 +131,7 @@ from pyromind_runtime.ports.harness import (
     SessionHandle,
     SessionSpec,
 )
+from pyromind_runtime.ports.project_graphs import ProjectGraphStore
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
     EvaluationStorageMissingError,
@@ -199,6 +207,7 @@ class ConversationRuntime:
         execution_roles: tuple[str, ...] = (),
         evaluation_config_validator: Callable[[JsonObject], JsonObject] | None = None,
         experiment_plan_project_binder: ExperimentPlanProjectBinder | None = None,
+        project_graph_store: ProjectGraphStore | None = None,
         external_tasks: ExternalTaskRegistry | None = None,
         idle_eviction_seconds: int = 300,
         release_grace_seconds: int = 300,
@@ -256,6 +265,7 @@ class ConversationRuntime:
             )
         self._execution_event_task: asyncio.Task[None] | None = None
         self._experiment_plan_project_binder = experiment_plan_project_binder
+        self._project_graph_store = project_graph_store
         self._resource_limits = resource_limits
         self._external_tasks = external_tasks
         self._workflow_submission = workflow_submission
@@ -1151,6 +1161,76 @@ class ConversationRuntime:
             return await self._plan_io(service.store.revision, owner, revision)
         return await self._plan_io(service.store.view, owner)
 
+    def _project_graph_owner(
+        self,
+        conversation_id: str,
+        context: RequestContext,
+        tool_name: str,
+    ) -> PlanOwner:
+        store = self._store(conversation_id)
+        store.authorize(context.user_id, context.profile_id)
+        if not store.permits_tool(tool_name):
+            raise PermissionError("project graph capability is not enabled")
+        if self._project_graph_store is None:
+            raise ProductRuntimeError(
+                "project_graph_store_unavailable",
+                "Project graph storage is not configured.",
+            )
+        return PlanOwner(
+            user_id=context.user_id,
+            conversation_id=conversation_id,
+            profile_id=context.profile_id,
+        )
+
+    async def get_project_graph(
+        self,
+        conversation_id: str,
+        context: RequestContext,
+        project_id: str,
+    ) -> ProjectGraphView:
+        owner = self._project_graph_owner(
+            conversation_id,
+            context,
+            "get_project_graph",
+        )
+        assert self._project_graph_store is not None
+        return await self._plan_io(self._project_graph_store.get, owner, project_id)
+
+    async def apply_project_graph_patch(
+        self,
+        conversation_id: str,
+        context: RequestContext,
+        project_id: str,
+        patch: GraphPatch,
+    ) -> ProjectGraphView:
+        owner = self._project_graph_owner(
+            conversation_id,
+            context,
+            "apply_graph_patch",
+        )
+        assert self._project_graph_store is not None
+        result = await self._plan_io(
+            self._project_graph_store.apply,
+            owner,
+            project_id,
+            patch,
+        )
+        event, _ = self._store(conversation_id).append(
+            ProductEvent(
+                event_id=f"project-graph:{patch.request_id}",
+                conversation_id=conversation_id,
+                type="project_graph.changed",
+                payload={
+                    "project_id": project_id,
+                    "graph_id": result.graph_id,
+                    "request_id": patch.request_id,
+                    "operation_count": len(patch.operations),
+                },
+            )
+        )
+        self._publish(event)
+        return result
+
     async def experiment_plan_call(
         self,
         conversation_id: str,
@@ -1158,6 +1238,26 @@ class ConversationRuntime:
         arguments: JsonObject,
         context: RequestContext,
     ) -> JsonObject:
+        if tool_name in PROJECT_GRAPH_TOOLS:
+            if tool_name == "get_project_graph":
+                request = GetProjectGraph.model_validate(arguments)
+                result = await self.get_project_graph(
+                    conversation_id,
+                    context,
+                    request.project_id,
+                )
+            else:
+                request = ApplyProjectGraphPatch.model_validate(arguments)
+                result = await self.apply_project_graph_patch(
+                    conversation_id,
+                    context,
+                    request.project_id,
+                    GraphPatch(
+                        request_id=request.request_id,
+                        operations=request.operations,
+                    ),
+                )
+            return result.model_dump(mode="json")
         if tool_name in CONTEXT_TOOLS:
             service, owner = self._plan_service(conversation_id, context, tool_name)
             if tool_name == "get_experiment_context":

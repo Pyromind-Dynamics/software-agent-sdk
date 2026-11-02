@@ -1,6 +1,9 @@
 # EchoMind 双 Agent 改动设计
 
-> 状态：P1.5 已实现
+> 状态：P1/P1.5 已实现，P2 Graph 与阶段执行壳已落地。
+> 当前功能状态和后续路线以 `docs/echomind-avi-single-turn-plan.md` 为准。
+> 目标 Graph 和主/子 Agent 交互契约见
+> `docs/echomind-graph-agent-contract.md`。
 > 范围：Pyromind Workbench 与 EchoMind Manager 的入口、Profile、会话策略、
 > Project/Graph 生命周期和前端边界
 
@@ -150,8 +153,11 @@ Graph 生成规则：
 - Evaluator 标准产物格式为 `atif`；
 - 节点和边不另读 Project Request 或 AVI requirements 文件。
 
-首期 Stage Run 仍以 `contract_probe` 验证状态、Run、Artifact 和前端交互。
-这不代表真实数据处理、推理、评估或训练执行器已经完成。
+当前 Dataset 节点可以把开发任务投递到 EchoMind 会话，但 `/start` 尚未创建
+StageRun，也尚未把 `data-processing` 的小样、确认和全量任务绑定到阶段记录。
+
+Inference、Evaluator、Train 的 `/run` 仍以 `contract_probe` 验证状态、Run、
+Artifact 和前端交互。这不代表真实推理、评估或训练执行器已经完成。
 
 ## 7. 前端
 
