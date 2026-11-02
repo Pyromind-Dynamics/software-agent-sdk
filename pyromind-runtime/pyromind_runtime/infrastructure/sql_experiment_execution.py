@@ -1365,6 +1365,14 @@ class SQLExperimentExecutionStore:
                 or item["payload"].get("run_id") != run_id
             ):
                 raise PermissionError("role work belongs to a different execution")
+            row["submissions"] = [
+                dict(sub)
+                for sub in conn.execute(
+                    sa.select(submissions)
+                    .where(submissions.c.run_id == run_id)
+                    .order_by(submissions.c.updated_at.desc())
+                ).mappings()
+            ]
             if row["state"] == "queued" and item["kind"] in {
                 "execute_task",
                 "prepare_execution",

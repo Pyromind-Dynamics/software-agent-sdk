@@ -1,6 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { SubagentDisplay, transcriptWindow, displayText } from "../src/subagent-display.js";
+
+test("managed presentation survives restart without persisting prompts, traces or lifecycle state", () => {
+  const root = mkdtempSync(join(tmpdir(), "subagent-display-"));
+  try {
+    const path = join(root, "presentation.json");
+    const display = new SubagentDisplay(async () => ({}), () => {}, path);
+    display.update("second", { status: "running", trace: { text: "private activity" } });
+    display.remember("second", { task: "Inspect data", phase: "report", previous_run_id: "first",
+      prompt: "private prompt", authorization: "private credential" });
+    const saved = readFileSync(path, "utf8");
+    assert.doesNotMatch(saved, /private|status|trace|prompt|authorization/);
+    const restored = new SubagentDisplay(async () => ({}), () => {}, path);
+    assert.deepEqual(restored.details("second"), { subagent: { version: 1, run_id: "second",
+      task: "Inspect data", phase: "report", previous_run_id: "first" } });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test("native transcript windows remove metadata and bound UTF-8 without losing truncation notice", () => {
   const window = transcriptWindow('Run: abc\nSession: /private/session\nArtifacts:\n  Events: /private/events\nTranscript tail from /private/log (tail truncated):\nTool: read\n证据');

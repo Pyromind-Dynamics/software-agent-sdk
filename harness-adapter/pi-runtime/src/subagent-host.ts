@@ -71,9 +71,7 @@ export class SubagentHost {
   private readonly finalizing = new Map<string, Promise<void>>();
   private readonly handoffs = new Map<string, string>();
   private readonly launchInputs = new Map<string, Record<string, unknown>>();
-  private readonly display = new SubagentDisplay((method, params) => this.rpc(method, params), id => {
-    this.emit(id, "subagent.progress", { details: this.display.details(id) });
-  });
+  private readonly display: SubagentDisplay;
   private readonly launches = new Map<string, string | undefined>();
   private readonly backgroundIds = new Set<string>();
   private lastUsage = "";
@@ -95,6 +93,9 @@ export class SubagentHost {
       if (missing.length) throw new Error(`Delegated role ${role.name} requests unavailable host tools: ${missing.join(", ")}`);
     }
     this.paths = prepareSubagentEnvironment(workspace, definitions);
+    this.display = new SubagentDisplay((method, params) => this.rpc(method, params), id => {
+      this.emit(id, "subagent.progress", { details: this.display.details(id) });
+    }, join(workspace, "pi", "subagent-display.json"));
     const writer = tools.find(tool => tool.name === "write");
     if (!writer) throw new Error("Subagent report delivery requires the conversation write tool");
     this.reports = new SubagentReports(workspace, () => this.session!.sessionId, writer, Object.keys(this.roleTools));
@@ -226,6 +227,14 @@ export class SubagentHost {
         const status = JSON.parse(readFileSync(path, "utf8"));
         if (status.runId !== id || ![this.session!.sessionManager.getSessionFile(), this.session!.sessionId].includes(status.sessionId)) throw new Error("Delegated run ownership mismatch");
         state = status.state;
+      }
+      if (action === "spawn" || action === "resume") {
+        const changed = this.display.remember(id, {
+          ...(isRecord(input.display) ? input.display : {}),
+          ...(action === "resume" && typeof input.execution_ref === "string"
+            ? { previous_run_id: input.execution_ref } : {}),
+        });
+        if (changed && this.states.has(id)) this.emit(id, "subagent.progress", { details: this.display.details(id) });
       }
     }
     return { execution_ref: typeof id === "string" ? id : null, status: state, result_text: displayText(result) };

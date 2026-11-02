@@ -62,6 +62,62 @@ def claim(service, owner, run):
     }
 
 
+@pytest.mark.parametrize(
+    "case",
+    ["allowed", "other_directory", "other_conversation", "other_profile", "stale"],
+)
+async def test_progress_checks_submission_ownership_and_live_lease(experiment, case):
+    service, owner, engine = experiment
+    run = service.request(owner, request(), ("eval",))
+    scope = claim(service, owner, run)
+    service.store.managed_submission(
+        owner, run["id"], scope, {"operation": "inference"}
+    )
+    service.store.managed_receipt(
+        owner,
+        run["id"],
+        scope,
+        "inference",
+        {"task_id": "platform-1", "output_dir": "/outputs/one"},
+    )
+    calls = []
+
+    async def execute(*args):
+        calls.append(args)
+        return {"details": {"status": "succeeded"}}
+
+    async def read(*_):
+        raise AssertionError("progress uses the existing tool")
+
+    output_dir = "/outputs/other" if case == "other_directory" else "/outputs/one"
+    if case in {"other_conversation", "other_profile"}:
+        field = "conversation_id" if case == "other_conversation" else "profile_id"
+        owner = owner.model_copy(update={field: "other"})
+    if case == "stale":
+        with engine.begin() as conn:
+            conn.execute(
+                work.update()
+                .where(work.c.id == scope["work_id"])
+                .values(lease_until=now() - timedelta(seconds=1))
+            )
+    call = service.role_call(
+        owner,
+        "eval",
+        "df_check_progress",
+        {"output_dir": output_dir},
+        scope,
+        execute,
+        read,
+    )
+    if case == "allowed":
+        assert await call == {"details": {"status": "succeeded"}}
+        assert len(calls) == 1
+    else:
+        with pytest.raises((PermissionError, StaleLeaseError)):
+            await call
+        assert calls == []
+
+
 def test_task_does_not_require_graph_or_plan_and_is_idempotent(experiment):
     service, owner, _ = experiment
     run = service.request(owner, request(), ("eval",))
@@ -309,18 +365,33 @@ def test_other_owners_and_expired_leases_cannot_submit(experiment):
         )
 
 
-def test_native_end_with_missing_submit_receipt_is_uncertain_and_cannot_repeat(experiment):
+def test_native_end_with_missing_submit_receipt_is_uncertain_and_cannot_repeat(
+    experiment,
+):
     service, owner, _ = experiment
     run = service.request(owner, request(), ("eval",))
     scope = claim(service, owner, run)
-    service.store.managed_submission(owner, run["id"], scope, {"operation": "inference"})
+    service.store.managed_submission(
+        owner, run["id"], scope, {"operation": "inference"}
+    )
     service.store.complete_agent_turn(owner, run["id"], scope, "Native process exited")
     assert service.list(owner)[0].state == "submission_uncertain"
     with pytest.raises(ValueError, match="cannot submit"):
-        service.store.managed_submission(owner, run["id"], scope, {"operation": "inference"})
+        service.store.managed_submission(
+            owner, run["id"], scope, {"operation": "inference"}
+        )
     service.store.queue.finish(scope["work_id"], scope["generation"], {})
     sub = service.store.list(owner)[0]["submission"]
-    service.store.recover_managed_receipt(owner, run["id"], sub["id"], {"task_id": "original", "run_id": sub["evidence"]["pipeline_run_id"], "output_dir": "/output"})
+    service.store.recover_managed_receipt(
+        owner,
+        run["id"],
+        sub["id"],
+        {
+            "task_id": "original",
+            "run_id": sub["evidence"]["pipeline_run_id"],
+            "output_dir": "/output",
+        },
+    )
     assert service.list(owner)[0].platform_task_id == "original"
     assert service.list(owner)[0].state == "waiting_platform"
 
@@ -329,8 +400,16 @@ async def test_conflicting_terminal_notification_uses_authoritative_query(experi
     service, owner, _ = experiment
     run = service.request(owner, request(), ("eval",))
     scope = claim(service, owner, run)
-    service.store.managed_submission(owner, run["id"], scope, {"operation": "inference"})
-    service.store.managed_receipt(owner, run["id"], scope, "inference", {"task_id": "task", "output_dir": "/output"})
+    service.store.managed_submission(
+        owner, run["id"], scope, {"operation": "inference"}
+    )
+    service.store.managed_receipt(
+        owner,
+        run["id"],
+        scope,
+        "inference",
+        {"task_id": "task", "output_dir": "/output"},
+    )
     service.store.ingest("success", "task", "kafka", {"status": "succeeded"})
     service.store.apply_observations()
     service.store.ingest("failure", "task", "kafka", {"status": "failed"})
@@ -354,16 +433,28 @@ def test_completed_platform_result_wins_cancel_race(experiment):
     service, owner, _ = experiment
     run = service.request(owner, request(), ("eval",))
     scope = claim(service, owner, run)
-    service.store.managed_submission(owner, run["id"], scope, {"operation": "inference"})
-    service.store.managed_receipt(owner, run["id"], scope, "inference", {"task_id": "task", "output_dir": "/output"})
+    service.store.managed_submission(
+        owner, run["id"], scope, {"operation": "inference"}
+    )
+    service.store.managed_receipt(
+        owner,
+        run["id"],
+        scope,
+        "inference",
+        {"task_id": "task", "output_dir": "/output"},
+    )
     service.store.queue.finish(scope["work_id"], scope["generation"], {})
     assert service.store.cancel(owner, run["id"])["state"] == "cancel_requested"
     control = service.store.queue.claim(kinds=("cancel_execution",))
     scope = {"work_id": control["id"], "generation": control["generation"]}
     service.store.ingest("won-race", "task", "query", {"status": "succeeded"})
     service.store.apply_observations()
-    assert service.store.cancellation_result(owner, run["id"], scope, True, True)["state"] == "waiting_artifacts"
+    assert (
+        service.store.cancellation_result(owner, run["id"], scope, True, True)["state"]
+        == "waiting_artifacts"
+    )
     assert service.list(owner)[0].metrics is None
+
 
 @pytest.mark.parametrize("action", ["bind", "abandon"])
 def test_reconcile_targets_uncertain_operation_and_preserves_previous_task(

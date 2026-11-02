@@ -40,6 +40,7 @@ class DelegatedExecution:
         specification = row.get("task_spec")
         report = item["kind"] == "generate_report"
         if specification:
+            task_name = specification["task"]["name"]
             task_body = {
                 "run_id": run_id,
                 **specification,
@@ -65,6 +66,7 @@ class DelegatedExecution:
                 self.plans.revision, owner, row["revision"]
             )
             task = next(t for t in revision.plan.tasks if t.id == row["task_id"])
+            task_name = task.name
             task_body = (
                 {}
                 if item["checkpoint"]
@@ -79,6 +81,7 @@ class DelegatedExecution:
                     "a proposal. Do not start tasks.",
                 }
             )
+        display = {"task": task_name, "phase": "report" if report else "execute"}
         await self.control(owner, role, {"action": "authorize", "scope": scope})
         checkpoint = item["checkpoint"]
         if checkpoint.get("launch_pending"):
@@ -162,6 +165,7 @@ class DelegatedExecution:
                                 else {"execution_ref": checkpoint["execution_ref"]}
                             ),
                             "task": json.dumps(task_body, ensure_ascii=False),
+                            "display": display,
                             "request_id": request_id,
                             "scope": scope,
                         },
@@ -189,6 +193,7 @@ class DelegatedExecution:
                     **({"execution_ref": prior} if prior else {}),
                     "role": role,
                     "task": prompt,
+                    "display": display,
                     "request_id": item["id"],
                     "scope": scope,
                 },
