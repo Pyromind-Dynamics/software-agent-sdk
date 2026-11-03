@@ -33,7 +33,6 @@ _STATUSES = frozenset(
         "paused",
         "waiting_for_confirmation",
         "waiting_for_input",
-        "waiting_for_external_task",
         "finished",
         "error",
         "stuck",
@@ -41,9 +40,6 @@ _STATUSES = frozenset(
         "closed",
     }
 )
-# Background task completion events must not overwrite terminal states with idle or
-# running.
-_SETTLED_STATUSES = frozenset({"paused", "error", "stuck", "deleting", "closed"})
 _MessageRole = Literal["user", "assistant", "system"]
 _OperationCategory = Literal["tool", "subagent", "observation"]
 _CompactionStatus = Literal["started", "completed", "skipped", "failed"]
@@ -553,14 +549,7 @@ class SnapshotProjector:
             for existing in snapshot.external_tasks
             if existing.task_id != task.task_id
         )
-        status = snapshot.status
-        if not self._background_status_locked(snapshot) and (
-            task.kind != "historical_experience"
-        ):
-            status = "waiting_for_external_task"
-        return snapshot.model_copy(
-            update={"external_tasks": (*tasks, task), "status": status}
-        )
+        return snapshot.model_copy(update={"external_tasks": (*tasks, task)})
 
     def _on_external_task_updated(
         self, snapshot: ConversationSnapshot, event: ProductEvent
@@ -591,26 +580,7 @@ class SnapshotProjector:
     def _on_external_task_completed(
         self, snapshot: ConversationSnapshot, event: ProductEvent
     ) -> ConversationSnapshot:
-        updated = self._update_external_task(snapshot, event)
-        if event.payload.get("kind") == "historical_experience":
-            return updated
-        if self._background_status_locked(updated):
-            return updated
-        running = any(
-            task.status in {"pending", "running"} for task in updated.external_tasks
-        )
-        return updated.model_copy(
-            update={"status": "waiting_for_external_task" if running else "idle"}
-        )
-
-    @staticmethod
-    def _background_status_locked(snapshot: ConversationSnapshot) -> bool:
-        """Keep paused, settled, and input-waiting states during background updates."""
-        return (
-            snapshot.status in _SETTLED_STATUSES
-            or snapshot.status == "waiting_for_input"
-            or bool(snapshot.pending_inputs)
-        )
+        return self._update_external_task(snapshot, event)
 
     def _update_external_task(
         self, snapshot: ConversationSnapshot, event: ProductEvent

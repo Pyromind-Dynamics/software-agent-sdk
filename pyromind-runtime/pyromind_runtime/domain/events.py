@@ -41,6 +41,7 @@ type ProductEventType = Literal[
     "experiment_context.changed",
     "experiment_plan.changed",
     "experiment_execution.changed",
+    "project_graph.changed",
     "conversation.created",
     "status.changed",
     "message.started",

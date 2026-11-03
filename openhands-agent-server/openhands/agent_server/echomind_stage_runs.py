@@ -8,13 +8,11 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
+from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, Field
+from pyromind_runtime.domain.project_graphs import ProjectNodeType
 
-from openhands.agent_server.echomind_projects import (
-    ProjectInfo,
-    ProjectNode,
-    ProjectNodeType,
-)
+from openhands.agent_server.echomind_projects import ProjectInfo, ProjectNode
 from openhands.agent_server.echomind_stage_executors import (
     StageArtifactPayload,
     StageExecutionResult,
@@ -23,6 +21,7 @@ from openhands.agent_server.echomind_stage_executors import (
 
 
 StageRunStatus = Literal["running", "succeeded", "failed"]
+StageRunMode = Literal["node_validation"]
 
 
 def _utc_now() -> datetime:
@@ -56,11 +55,14 @@ class StageRun(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     schema_version: Literal[1] = 1
+    mode: StageRunMode = "node_validation"
+    request_id: str | None = None
     run_id: str
     project_id: str
     node_id: str
     node_type: ProjectNodeType
     executor: str
+    node_config_digest: str = ""
     status: StageRunStatus
     message: str
     input_refs: list[str] = Field(default_factory=list)
@@ -88,21 +90,41 @@ class ProjectRunStore:
         *,
         project: ProjectInfo,
         node: ProjectNode,
-    ) -> StageRun:
-        now = _utc_now()
-        run = StageRun(
-            run_id=str(uuid4()),
-            project_id=project.project.project_id,
-            node_id=node.id,
-            node_type=node.type,
-            executor=node.executor,
-            status="running",
-            message=f"Starting {node.title}.",
-            created_at=now,
-            started_at=now,
-        )
-        self._write_run(run)
-        return run
+        request_id: str | None,
+    ) -> tuple[StageRun, bool]:
+        config_digest = project_node_config_digest(node)
+        project_dir = self._project_dir(project.project.project_id)
+        project_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock = FileLock(str(project_dir / ".run-mutation.lock"))
+        with lock:
+            existing = self._find_by_request_id(project.project.project_id, request_id)
+            if existing is not None:
+                if (
+                    existing.node_id != node.id
+                    or existing.node_config_digest != config_digest
+                ):
+                    raise ValueError(
+                        "request_id was already used for another node validation"
+                    )
+                return existing, False
+
+            now = _utc_now()
+            run = StageRun(
+                mode="node_validation",
+                request_id=request_id,
+                run_id=str(uuid4()),
+                project_id=project.project.project_id,
+                node_id=node.id,
+                node_type=node.type,
+                executor=node.executor,
+                node_config_digest=config_digest,
+                status="running",
+                message=f"Starting node validation for {node.title}.",
+                created_at=now,
+                started_at=now,
+            )
+            self._write_run(run)
+            return run, True
 
     def succeed(
         self,
@@ -120,6 +142,7 @@ class ProjectRunStore:
                 update={
                     "status": "succeeded",
                     "message": result.message,
+                    "input_refs": result.input_refs,
                     "artifacts": artifacts,
                     "finished_at": _utc_now(),
                 }
@@ -155,6 +178,18 @@ class ProjectRunStore:
             runs,
             key=lambda run: (run.created_at, run.run_id),
             reverse=True,
+        )
+
+    def _find_by_request_id(
+        self,
+        project_id: str,
+        request_id: str | None,
+    ) -> StageRun | None:
+        if request_id is None:
+            return None
+        return next(
+            (run for run in self.list(project_id) if run.request_id == request_id),
+            None,
         )
 
     def load_artifact(
@@ -231,14 +266,35 @@ def run_project_node(
     project: ProjectInfo,
     node: ProjectNode,
     run_store: ProjectRunStore,
+    request_id: str | None = None,
 ) -> StageRun:
-    executor = get_project_node_executor(node.executor)
-    run = run_store.start(project=project, node=node)
+    run, created = run_store.start(
+        project=project,
+        node=node,
+        request_id=request_id,
+    )
+    if not created:
+        return run
     try:
+        executor = get_project_node_executor(node.executor)
         result = executor.run(project=project, node=node)
         return run_store.succeed(run, result)
     except Exception as exc:
         return run_store.fail(run, exc)
+
+
+def project_node_config_digest(node: ProjectNode) -> str:
+    payload = json.dumps(
+        {
+            "type": node.type,
+            "executor": node.executor,
+            "config": node.config,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"sha256:{sha256(payload.encode('utf-8')).hexdigest()}"
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:

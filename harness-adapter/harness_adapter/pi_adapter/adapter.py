@@ -535,10 +535,12 @@ class PiAdapter:
             ReadExperimentArtifact,
         )
         from pyromind_runtime.domain.experiment_plans import CONTEXT_TOOLS, PLAN_TOOLS
+        from pyromind_runtime.domain.project_graphs import PROJECT_GRAPH_TOOLS
 
         tools = {
             **PLAN_TOOLS,
             **CONTEXT_TOOLS,
+            **PROJECT_GRAPH_TOOLS,
             "control_experiment_task": ControlExperimentTask,
             "request_experiment_task": DelegateExperimentTask,
             "get_experiment_execution": GetExperimentExecution,
@@ -575,6 +577,15 @@ class PiAdapter:
                     "Read a registered report by run_id and artifact name from "
                     "get_experiment_execution. Verifies ownership and content digest. "
                     "Do not supply a file path or Storage URL."
+                ),
+                "get_project_graph": (
+                    "Read the current mutable Project Graph during development. "
+                    "Use the project_id returned by the confirmed experiment plan."
+                ),
+                "apply_graph_patch": (
+                    "Apply one atomic development-time Graph patch. Supports adding, "
+                    "updating and removing nodes or edges and replacing the "
+                    "requirements list. Use a stable request_id for retries."
                 ),
                 "request_experiment_task": (
                     "Delegate a complete task to an enabled role. A successful "
@@ -1761,10 +1772,12 @@ class PiAdapter:
                 CONTEXT_TOOLS,
                 PLAN_TOOLS,
             )
+            from pyromind_runtime.domain.project_graphs import PROJECT_GRAPH_TOOLS
 
             if (
                 tool_name in PLAN_TOOLS
                 or tool_name in CONTEXT_TOOLS
+                or tool_name in PROJECT_GRAPH_TOOLS
                 or tool_name
                 in {
                     "control_experiment_task",

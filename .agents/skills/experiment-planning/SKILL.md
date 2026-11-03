@@ -18,6 +18,7 @@ get_experiment_context 读取全局事实。update_experiment_context 完整替�
 保留稳定 ID，传入当前 expected_sequence；冲突后重读合并。
 资源放 resources，阶段放 stages，任务放 tasks；任务的 stage_id 指向阶段，
 外部输入通过 resource_id 引用资源，上游产物通过 task_id + output_name 引用。
+edges 只连接 stage.id；task 间依赖由 task.inputs 表达，不要把 task.id 写进 edges。
 占位阶段同时设置 placeholder=true、enabled=false。未知资源 URI 留空并说明缺口。
 参考图可以不完整、跳过、加阶段或返回，不承担执行调度和审批。
 只补充当前目标需要的细节，不要求先确认 Graph 或补齐全部阶段。

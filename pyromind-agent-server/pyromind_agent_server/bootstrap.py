@@ -30,10 +30,14 @@ from pyromind_runtime.ports.workflows import WorkflowEventSink
 from openhands.agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
 from openhands.agent_server.run_workflow_callback import set_workflow_status_dispatcher
 from openhands.agent_server.storage_quota import ensure_conversation_quota
+from pyromind_agent_server.echomind_project_graphs import EchoMindProjectGraphStore
 from pyromind_agent_server.evaluation_configuration import (
     validate_evaluation_configuration,
 )
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
+from pyromind_agent_server.experiment_plan_projects import (
+    EchoMindExperimentPlanProjectBinder,
+)
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.plan_database import build_experiment_plan_store
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
@@ -223,13 +227,19 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             idle_eviction_seconds,
         )
     plan_store = build_experiment_plan_store()
-    execution_store = SQLExperimentExecutionStore(plan_store.engine) if plan_store else None
+    execution_store = (
+        SQLExperimentExecutionStore(plan_store.engine) if plan_store else None
+    )
+    project_binder = EchoMindExperimentPlanProjectBinder(service.conversations_dir)
+    project_graph_store = EchoMindProjectGraphStore(service.conversations_dir)
     runtime = ConversationRuntime(
         service.conversations_dir,
         adapters,
         default_harness_id=backend,
         experiment_plan_store=plan_store,
         experiment_execution_store=execution_store,
+        experiment_plan_project_binder=project_binder,
+        project_graph_store=project_graph_store,
         execution_roles=tuple(
             role.name for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()
         ),
@@ -269,7 +279,9 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     app.state.product_runtime = runtime
     if execution_store:
         from openhands.agent_server.kafka_bus.kafka_bus import KafkaMessageBus
-        from pyromind_agent_server.execution_observations import ExecutionObservationHandler
+        from pyromind_agent_server.execution_observations import (
+            ExecutionObservationHandler,
+        )
 
         bus = KafkaMessageBus(acknowledge_after_handle=True)
         bus.register_handler(ExecutionObservationHandler(execution_store))

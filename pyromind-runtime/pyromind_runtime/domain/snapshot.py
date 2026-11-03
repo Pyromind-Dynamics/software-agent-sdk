@@ -21,7 +21,6 @@ type ConversationStatus = Literal[
     "paused",
     "waiting_for_confirmation",
     "waiting_for_input",
-    "waiting_for_external_task",
     "finished",
     "error",
     "stuck",
@@ -194,6 +193,13 @@ class ConversationSnapshot(ContractModel):
     )
     usage: UsageState = Field(default_factory=UsageState)
     external_tasks: tuple[ExternalTaskState, ...] = ()
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def normalize_legacy_external_task_status(cls, value: object) -> object:
+        if value == "waiting_for_external_task":
+            return "idle"
+        return value
 
     @model_serializer(mode="wrap")
     def _omit_default_input_state(self, handler):

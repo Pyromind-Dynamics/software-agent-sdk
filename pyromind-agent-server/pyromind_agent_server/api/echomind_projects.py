@@ -6,18 +6,16 @@ from typing import Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pyromind_runtime.domain.commands import UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
+from pyromind_runtime.domain.project_graphs import GraphPatch, ProjectGraphView
 
 from openhands.agent_server.dependencies import check_session_api_key
 from openhands.agent_server.echomind_projects import (
     ProjectInfo,
     ProjectNotFoundError,
     ProjectStore,
-)
-from openhands.agent_server.echomind_stage_executors import (
-    get_project_node_executor,
 )
 from openhands.agent_server.echomind_stage_runs import (
     ProjectArtifactDocument,
@@ -52,6 +50,10 @@ class StartEchoMindProjectNodeResponse(BaseModel):
     conversation_id: str
     event_id: str
     status: Literal["started"] = "started"
+
+
+class RunEchoMindProjectNodeRequest(BaseModel):
+    request_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 def _build_dataset_start_context(project: ProjectInfo, node_id: str) -> str:
@@ -150,6 +152,71 @@ async def get_echomind_project(project_id: str, request: Request) -> ProjectInfo
         ) from exc
 
 
+@router.get(
+    "/projects/{project_id}/graph",
+    response_model=ProjectGraphView,
+    responses={404: {"description": "Project not found"}},
+)
+async def get_echomind_project_graph(
+    project_id: str,
+    request: Request,
+) -> ProjectGraphView:
+    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
+    service = get_conversation_service(request)
+    try:
+        return ProjectStore.for_conversations_dir(service.conversations_dir).get_graph(
+            project_id,
+            owner_user_id=context.user_id,
+        )
+    except ProjectNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {project_id}",
+        ) from exc
+
+
+@router.patch(
+    "/projects/{project_id}/graph",
+    response_model=ProjectGraphView,
+    responses={404: {"description": "Project not found"}},
+)
+async def patch_echomind_project_graph(
+    project_id: str,
+    patch: GraphPatch,
+    request: Request,
+) -> ProjectGraphView:
+    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
+    service = get_conversation_service(request)
+    try:
+        project = ProjectStore.for_conversations_dir(service.conversations_dir).load(
+            project_id,
+            owner_user_id=context.user_id,
+        )
+    except ProjectNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {project_id}",
+        ) from exc
+    _require_echomind_conversation(request, project.project.echomind_conversation_id)
+    try:
+        return await get_product_runtime(request).apply_project_graph_patch(
+            project.project.echomind_conversation_id,
+            context,
+            project_id,
+            patch,
+        )
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+
 @router.post(
     "/projects/{project_id}/nodes/{node_id}/start",
     response_model=StartEchoMindProjectNodeResponse,
@@ -230,6 +297,7 @@ async def run_echomind_project_node(
     project_id: str,
     node_id: str,
     request: Request,
+    payload: RunEchoMindProjectNodeRequest | None = None,
 ) -> StageRun:
     context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
     service = get_conversation_service(request)
@@ -250,23 +318,23 @@ async def run_echomind_project_node(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Project node not found: {node_id}",
         )
-    if node.launch_mode == "agent":
+    if project.graph.lifecycle != "development":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Agent-led Project nodes must use the start endpoint.",
+            detail="Frozen Projects cannot run node validation.",
         )
     try:
-        get_project_node_executor(node.executor)
+        return run_project_node(
+            project=project,
+            node=node,
+            run_store=ProjectRunStore(store.root),
+            request_id=payload.request_id if payload else None,
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
         ) from exc
-    return run_project_node(
-        project=project,
-        node=node,
-        run_store=ProjectRunStore(store.root),
-    )
 
 
 @router.get(

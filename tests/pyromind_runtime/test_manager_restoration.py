@@ -111,6 +111,8 @@ async def test_idle_upgrade_restores_manager_capabilities_without_executing(
                 workspace_root=str(root / "old-manager"),
                 tool_allowlist=("read_skill", "get_experiment_context"),
                 skill_allowlist=("experiment-planning",),
+                development_tool_allowlist=("read_skill", "get_project_graph"),
+                development_skill_allowlist=("experiment-planning",),
             ),
             context,
         )
@@ -131,6 +133,9 @@ async def test_idle_upgrade_restores_manager_capabilities_without_executing(
         assert store.configuration_version() == 4
         assert store.access_policy()["tool_allowlist"] == profile.tool_allowlist
         assert store.access_policy()["skill_allowlist"] == profile.skill_allowlist
+        activated = store.activate_development_policy()
+        assert activated.tool_allowlist == ("read_skill", "get_project_graph")
+        assert activated.skill_allowlist == ("experiment-planning",)
         assert len(adapter.session_policies) == 1
         assert await runtime.apply_session_configuration("old-manager", policy, context)
         assert len(adapter.session_policies) == 1

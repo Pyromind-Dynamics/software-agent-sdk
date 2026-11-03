@@ -1,5 +1,8 @@
 # EchoMind 步骤 1：Manager 规划与 Graph 创建
 
+> 历史步骤记录：本文覆盖 P1/P1.5 和 P2.0 基础能力。
+> 当前完整功能状态与后续路线见 `docs/echomind-avi-single-turn-plan.md`。
+
 ## 目标
 
 用户只通过 EchoMind Manager 对话描述目标。Manager 先读取通用的
@@ -84,8 +87,9 @@ Graph 从已确认 `WorkflowPlan` 的 stages、tasks、resources 和 edges 生�
 Skill 名选择场景模板，也不维护 AVI 专属路由。
 Project/Graph 不再读取 requirements 文件。
 
-Dataset 节点绑定 Agent 开发模式，其余节点首期使用 Contract Probe 壳，确保
-Stage Run、状态、错误和 Artifact 接口先跑通。
+Dataset 节点绑定 Agent 开发模式，但当前 `/start` 只投递会话任务，不创建
+StageRun。其余节点首期使用 Contract Probe 壳，只验证 Run、状态、错误和 Artifact
+接口，不代表真实业务执行完成。
 
 ## 前端
 

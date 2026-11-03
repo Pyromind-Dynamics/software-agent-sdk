@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import UTC, datetime
@@ -7,8 +8,24 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
+from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pyromind_runtime.domain.experiment_plans import PlanRevision, WorkflowPlan
+from pyromind_runtime.domain.project_graphs import (
+    AddProjectEdge,
+    AddProjectNode,
+    GraphPatch,
+    ProjectEdge,
+    ProjectGraph,
+    ProjectGraphView,
+    ProjectLifecycle,
+    ProjectNode,
+    ProjectRequirement,
+    RemoveProjectEdge,
+    RemoveProjectNode,
+    UpdateProjectNode,
+    UpdateProjectRequirements,
+)
 
 from openhands.agent_server.echomind_graph_templates import (
     EXPERIMENT_GRAPH_TEMPLATE,
@@ -17,50 +34,8 @@ from openhands.agent_server.echomind_graph_templates import (
 )
 
 
-ProjectNodeType = Literal["dataset", "inference", "evaluator", "train"]
-ProjectLifecycle = Literal["development", "frozen"]
-ProjectNodeLaunchMode = Literal["agent", "executor"]
-RequirementStatus = Literal["confirmed", "missing"]
-ProjectNodeStatus = Literal[
-    "idle",
-    "running",
-    "succeeded",
-    "failed",
-    "skipped",
-    "not_implemented",
-]
-
-
 def _utc_now() -> datetime:
     return datetime.now(UTC)
-
-
-class ProjectRequirement(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    key: str = Field(min_length=1, max_length=128)
-    label: str = Field(min_length=1, max_length=256)
-    value: str = Field(max_length=4000)
-    status: RequirementStatus
-
-
-class ProjectNode(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    id: str = Field(min_length=1, max_length=128)
-    type: ProjectNodeType
-    title: str = Field(min_length=1, max_length=256)
-    status: ProjectNodeStatus = "idle"
-    launch_mode: ProjectNodeLaunchMode = "executor"
-    executor: str = Field(default="contract_probe", min_length=1, max_length=128)
-    config: dict[str, Any] = Field(default_factory=dict)
-
-
-class ProjectEdge(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    source: str = Field(min_length=1, max_length=128)
-    target: str = Field(min_length=1, max_length=128)
 
 
 class ProjectRecord(BaseModel):
@@ -77,50 +52,6 @@ class ProjectRecord(BaseModel):
     lifecycle: ProjectLifecycle = "development"
     frozen_at: datetime | None = None
     created_at: datetime = Field(default_factory=_utc_now)
-
-
-class ProjectGraph(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    schema_version: Literal[1] = 1
-    graph_id: str
-    project_id: str
-    template: str | None = None
-    lifecycle: ProjectLifecycle = "development"
-    nodes: list[ProjectNode] = Field(default_factory=list)
-    edges: list[ProjectEdge] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def validate_topology(self) -> ProjectGraph:
-        node_ids = {node.id for node in self.nodes}
-        if len(node_ids) != len(self.nodes):
-            raise ValueError("graph node IDs must be unique")
-
-        adjacency: dict[str, list[str]] = {node_id: [] for node_id in node_ids}
-        for edge in self.edges:
-            if edge.source == edge.target:
-                raise ValueError("graph must not contain self edges")
-            if edge.source not in node_ids or edge.target not in node_ids:
-                raise ValueError("graph edge references an unknown node")
-            adjacency[edge.source].append(edge.target)
-
-        visiting: set[str] = set()
-        visited: set[str] = set()
-
-        def visit(node_id: str) -> None:
-            if node_id in visiting:
-                raise ValueError("graph must not contain cycles")
-            if node_id in visited:
-                return
-            visiting.add(node_id)
-            for target in adjacency[node_id]:
-                visit(target)
-            visiting.remove(node_id)
-            visited.add(node_id)
-
-        for node_id in node_ids:
-            visit(node_id)
-        return self
 
 
 class ProjectInfo(BaseModel):
@@ -235,6 +166,80 @@ class ProjectStore:
             raise ProjectNotFoundError(project_id)
         return project
 
+    def get_graph(
+        self,
+        project_id: str,
+        *,
+        owner_user_id: str | None,
+    ) -> ProjectGraphView:
+        return _graph_view(self.load(project_id, owner_user_id=owner_user_id))
+
+    def apply_graph_patch(
+        self,
+        project_id: str,
+        *,
+        owner_user_id: str | None,
+        patch: GraphPatch,
+    ) -> ProjectGraphView:
+        try:
+            canonical_project_id = str(UUID(project_id))
+        except ValueError as exc:
+            raise ProjectNotFoundError(project_id) from exc
+        project_dir = self.root / canonical_project_id
+        if not project_dir.is_dir():
+            raise ProjectNotFoundError(project_id)
+        lock = FileLock(str(project_dir / ".graph-mutation.lock"))
+        with lock:
+            current = self.load(
+                canonical_project_id,
+                owner_user_id=owner_user_id,
+            )
+            if current.project.lifecycle != "development":
+                raise ValueError("frozen Projects cannot be modified")
+
+            ledger_path = project_dir / "graph-mutations.json"
+            ledger = _read_json_object(ledger_path)
+            request_digest = _graph_patch_digest(patch)
+            previous_digest = ledger.get(patch.request_id)
+            if previous_digest is not None:
+                if previous_digest != request_digest:
+                    raise ValueError(
+                        "request_id was already used for another graph patch"
+                    )
+                return _graph_view(current)
+
+            nodes = list(current.graph.nodes)
+            edges = list(current.graph.edges)
+            requirements = list(current.project.requirements)
+            for operation in patch.operations:
+                nodes, edges, requirements = _apply_operation(
+                    operation,
+                    nodes=nodes,
+                    edges=edges,
+                    requirements=requirements,
+                )
+
+            graph = ProjectGraph.model_validate(
+                {
+                    **current.graph.model_dump(mode="python"),
+                    "nodes": nodes,
+                    "edges": edges,
+                }
+            )
+            project = current.project.model_copy(update={"requirements": requirements})
+            updated = ProjectInfo(project=project, graph=graph)
+
+            if graph != current.graph:
+                _write_json(project_dir / "graph.json", graph.model_dump(mode="json"))
+            if project != current.project:
+                _write_json(
+                    project_dir / "project.json",
+                    project.model_dump(mode="json"),
+                )
+            ledger[patch.request_id] = request_digest
+            _write_json(ledger_path, ledger)
+            return _graph_view(updated)
+
     def _load_optional(self, canonical_project_id: str) -> ProjectInfo | None:
         project_dir = self.root / canonical_project_id
         project_path = project_dir / "project.json"
@@ -272,3 +277,89 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
         os.replace(temporary_path, path)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def _graph_view(info: ProjectInfo) -> ProjectGraphView:
+    return ProjectGraphView(
+        project_id=info.project.project_id,
+        graph_id=info.graph.graph_id,
+        name=info.project.name,
+        description=info.project.description,
+        lifecycle=info.graph.lifecycle,
+        template=info.graph.template,
+        requirements=list(info.project.requirements),
+        nodes=list(info.graph.nodes),
+        edges=list(info.graph.edges),
+    )
+
+
+def _apply_operation(
+    operation: Any,
+    *,
+    nodes: list[ProjectNode],
+    edges: list[ProjectEdge],
+    requirements: list[ProjectRequirement],
+) -> tuple[list[ProjectNode], list[ProjectEdge], list[ProjectRequirement]]:
+    nodes = list(nodes)
+    edges = list(edges)
+    requirements = list(requirements)
+
+    if isinstance(operation, AddProjectNode):
+        nodes.append(operation.node)
+    elif isinstance(operation, UpdateProjectNode):
+        index = _node_index(nodes, operation.node_id)
+        changes = operation.model_dump(exclude_unset=True, exclude={"op", "node_id"})
+        payload = {
+            **nodes[index].model_dump(mode="python"),
+            **changes,
+            "status": "idle",
+        }
+        nodes[index] = ProjectNode.model_validate(payload)
+    elif isinstance(operation, RemoveProjectNode):
+        _node_index(nodes, operation.node_id)
+        nodes = [node for node in nodes if node.id != operation.node_id]
+        edges = [
+            edge
+            for edge in edges
+            if edge.source != operation.node_id and edge.target != operation.node_id
+        ]
+    elif isinstance(operation, AddProjectEdge):
+        edges.append(operation.edge)
+    elif isinstance(operation, RemoveProjectEdge):
+        if operation.edge not in edges:
+            raise ValueError("graph edge does not exist")
+        edges.remove(operation.edge)
+    elif isinstance(operation, UpdateProjectRequirements):
+        requirements = list(operation.requirements)
+    else:
+        raise ValueError("unsupported graph patch operation")
+    return nodes, edges, requirements
+
+
+def _node_index(nodes: list[ProjectNode], node_id: str) -> int:
+    for index, node in enumerate(nodes):
+        if node.id == node_id:
+            return index
+    raise ValueError(f"graph node does not exist: {node_id}")
+
+
+def _graph_patch_digest(patch: GraphPatch) -> str:
+    payload = json.dumps(
+        patch.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _read_json_object(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in payload.items()
+    ):
+        raise ValueError(f"invalid graph mutation ledger: {path}")
+    return payload
