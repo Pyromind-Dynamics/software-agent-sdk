@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import shlex
 import subprocess
 import threading
 from pathlib import Path
@@ -10,30 +11,46 @@ from typing import Any
 
 import pytest
 from harness_adapter.agentgenome_bridge import (
+    BridgeAwait,
     BridgeTool,
     ExecutionHost,
+    ProbeRead,
     _storage_alias,
     _tool_path,
 )
 
 
-def test_platform_storage_spelling_gains_the_sandbox_alias() -> None:
+MOUNT = "/target-workspace"
+
+
+def test_platform_storage_spelling_gains_the_sandbox_mount() -> None:
     assert (
-        _storage_alias("/datasets/test_100/images")
-        == "storage/datasets/test_100/images"
+        _storage_alias("/datasets/test_100/images", MOUNT)
+        == "/target-workspace/datasets/test_100/images"
     )
     assert (
-        _storage_alias("datasets/test_100/prelabel_manifest.jsonl")
-        == "storage/datasets/test_100/prelabel_manifest.jsonl"
+        _storage_alias("datasets/test_100/prelabel_manifest.jsonl", MOUNT)
+        == "/target-workspace/datasets/test_100/prelabel_manifest.jsonl"
     )
 
 
 def test_sandbox_aliases_are_already_resolvable() -> None:
-    assert _storage_alias("storage/datasets/x.jsonl") is None
-    assert _storage_alias("public_data/label-studio/field_map.json") is None
-    assert _storage_alias(".agents/skills/data-processing/SKILL.md") is None
-    assert _storage_alias("knowledge/nodes/x.md") is None
-    assert _storage_alias("") is None
+    assert _storage_alias("public_data/label-studio/field_map.json", MOUNT) is None
+    assert _storage_alias(".agents/skills/data-processing/SKILL.md", MOUNT) is None
+    assert _storage_alias("knowledge/nodes/x.md", MOUNT) is None
+    assert _storage_alias("", MOUNT) is None
+    # No mount in the local execution plane, so there is nothing to add.
+    assert _storage_alias("/datasets/x.jsonl", None) is None
+
+
+def test_the_removed_storage_prefix_is_not_remapped() -> None:
+    """The alias is gone, so the policy's own removal error must surface.
+
+    Remapping it to the mount here would turn a clear "alias was removed" into a
+    "file not found" somewhere further along.
+    """
+
+    assert _storage_alias("storage/datasets/x.jsonl", MOUNT) is None
 
 
 def test_a_tool_reads_back_the_path_the_graph_declared() -> None:
@@ -65,31 +82,26 @@ def test_run_directory_paths_become_workspace_relative() -> None:
     assert _tool_path("vision", {}, workspace, package) == "vision"
 
 
-def test_a_storage_alias_path_loses_the_alias_for_a_tool() -> None:
-    """`/storage/...` 不是平台对象路径，工具按对象路径查会 not found。
+def test_a_removed_alias_path_is_not_rewritten_for_a_tool() -> None:
+    """The alias is gone, so the bridge must not invent a platform path from it.
 
-    回放把参数解析成 `/storage/datasets/...` 交给 Label Studio，平台报
-    `storage object not found`；去掉别名才是 `/datasets/...`。裸 `storage/...`
-    保持原样，业务工具自己会解析这种拼写。
+    Rewriting `storage/...` here would hide the removal behind a lookup that
+    fails later; leaving it alone lets the tool report the removal itself.
     """
     workspace = "/target-workspace/.pyromind-agent/abc"
     package = "public_data/workflow-runs/run/package"
 
     assert (
-        _tool_path("/storage/datasets/test_100/review.jsonl", {}, workspace, package)
-        == "/datasets/test_100/review.jsonl"
-    )
-    assert (
         _tool_path("storage/datasets/test_100/review.jsonl", {}, workspace, package)
         == "storage/datasets/test_100/review.jsonl"
     )
-    # 已声明的拼写仍然优先。
+    # A path the graph already declared keeps that spelling.
     declared = {
-        "/storage/datasets/test_100/review.jsonl": "datasets/test_100/review.jsonl"
+        "storage/datasets/test_100/review.jsonl": "datasets/test_100/review.jsonl"
     }
     assert (
         _tool_path(
-            "/storage/datasets/test_100/review.jsonl",
+            "storage/datasets/test_100/review.jsonl",
             declared,
             workspace,
             package,
@@ -137,6 +149,7 @@ def test_dataflow_receives_the_conversation_scoped_storage_path() -> None:
         host.workspace = workspace
         host.root = f"{workspace}/public_data/workflow-runs/run"
         host.package = "public_data/workflow-runs/run/package"
+        host.graph_run_id = "graph-run-1"
         await asyncio.to_thread(
             BridgeTool(host).call,
             "df_submit_pipeline",
@@ -150,6 +163,7 @@ def test_dataflow_receives_the_conversation_scoped_storage_path() -> None:
         "script_path": "public_data/workflow-runs/run/package/scripts/pipeline.py",
     }
     assert calls[0]["tool_call_id"] == "node-clean:1:call-1"
+    assert calls[0]["origin_run_id"] == "graph-run-1"
     # DataFlow's pod path adds the mount back; it must find the *same* file.
     assert "/target-workspace" + calls[0]["arguments"]["input_path"] == artifact
 
@@ -178,6 +192,49 @@ def test_tool_cancellation_forwards_only_the_exact_execution_id() -> None:
             "tool_call_id": "node-clean:1:call-1",
         }
     ]
+
+
+@pytest.mark.parametrize("model_path", ["/models/checkpoint-100", "Qwen/Qwen3-32B"])
+def test_evaluation_maps_configs_but_keeps_the_model_reference(model_path):
+    workspace = "/target-workspace/.pyromind-agent/conversation"
+    package = "public_data/workflow-runs/run/package"
+    calls = []
+
+    async def request(method, payload):
+        assert method == "execution.tool"
+        calls.append(payload)
+        return {"is_error": False, "content": [], "details": {}}
+
+    async def invoke():
+        host = ExecutionHost(request, lambda *_: None)
+        host.workspace = workspace
+        host.root = f"{workspace}/public_data/workflow-runs/run"
+        host.package = package
+        await asyncio.to_thread(
+            BridgeTool(host).call,
+            "df_submit_evaluation",
+            {
+                "operation": "inference",
+                "input_path": "/target-workspace/datasets/test.jsonl",
+                "model_path": model_path,
+                "dataset_config_path": "configs/dataset.json",
+                "evaluation_config_path": "configs/evaluation.json",
+                "report_spec_path": "configs/report.json",
+                "served_model_name": "default",
+            },
+            execution_id="evaluate:1",
+        )
+
+    asyncio.run(invoke())
+    assert calls[0]["arguments"] == {
+        "operation": "inference",
+        "input_path": "/datasets/test.jsonl",
+        "model_path": model_path,
+        "dataset_config_path": f"{package}/configs/dataset.json",
+        "evaluation_config_path": f"{package}/configs/evaluation.json",
+        "report_spec_path": f"{package}/configs/report.json",
+        "served_model_name": "default",
+    }
 
 
 def test_tool_bridge_rejects_an_empty_execution_id() -> None:
@@ -229,11 +286,13 @@ class FakePlane:
             if self.scope_error_for and path.startswith(self.scope_error_for):
                 raise RuntimeError(
                     "request_failed: PATH_SCOPE_ERROR: read paths must stay within "
-                    "public_data/, storage/, configured skill directories, "
-                    "or knowledge/"
+                    "public_data/, the user Storage mount, configured skill "
+                    "directories, or knowledge/"
                 )
             self.resolved.append(path)
-            return {"path": f"/target-workspace/{path}"}
+            return {
+                "path": path if path.startswith("/") else f"/target-workspace/{path}"
+            }
         if method == "execution.run":
             self.commands.append(str(payload["command"]))
             self.runs.append(dict(payload))
@@ -246,6 +305,7 @@ def sample(plane: FakePlane, path: str) -> bytes:
 
     async def call() -> bytes:
         host = ExecutionHost(plane.request, lambda *_: None)
+        host.workspace = "/target-workspace/.pyromind-agent/conv"
         return await asyncio.to_thread(host.head, path, 64)
 
     return asyncio.run(call())
@@ -257,11 +317,8 @@ def test_head_retries_the_storage_spelling_a_tool_declared() -> None:
     )
 
     assert sample(plane, "datasets/test_100/manifest.jsonl") == b"{}"
-    assert plane.resolved == ["storage/datasets/test_100/manifest.jsonl"]
-    assert (
-        "/target-workspace/storage/datasets/test_100/manifest.jsonl"
-        in plane.commands[0]
-    )
+    assert plane.resolved == ["/target-workspace/datasets/test_100/manifest.jsonl"]
+    assert "/target-workspace/datasets/test_100/manifest.jsonl" in plane.commands[0]
 
 
 def test_head_reports_a_directory_instead_of_reading_it() -> None:
@@ -303,6 +360,8 @@ class RecordingPlane:
         path = str(payload["path"])
         self.calls.append((method, path))
         if method == "execution.resolve":
+            if path.startswith("/"):
+                return {"path": path}
             if path.startswith("storage/"):
                 return {"path": f"/target-workspace/{path.removeprefix('storage/')}"}
             return {"path": f"/target-workspace/.pyromind-agent/conv/{path}"}
@@ -328,6 +387,8 @@ class SandboxShapePlane:
         if method == "execution.resolve":
             path = str(payload["path"])
             self.resolved.append(path)
+            if path.startswith("/"):
+                return {"path": path}
             if path.startswith("storage/"):
                 return {"path": f"{self.mount}/{path.removeprefix('storage/')}"}
             return {"path": f"{self.workspace}/{path}"}
@@ -391,8 +452,8 @@ def test_metadata_reports_a_failed_probe_instead_of_claiming_the_file_is_missing
         asyncio.run(call())
 
 
-def test_an_artifact_pinned_beside_a_storage_input_travels_under_the_alias() -> None:
-    """The path policy admits Storage as `storage/...`, never as a mount path."""
+def test_an_artifact_pinned_beside_a_storage_input_travels_under_the_mount() -> None:
+    """The path policy admits Storage by its mount path, as the file already is."""
     plane = RecordingPlane()
     pinned = "/target-workspace/datasets/m/manifest_10.jsonl"
 
@@ -407,12 +468,12 @@ def test_an_artifact_pinned_beside_a_storage_input_travels_under_the_alias() -> 
 
     path, text = asyncio.run(call())
     assert path == pinned
-    assert ("execution.write", "storage/datasets/m/manifest_10.jsonl") in plane.calls
-    assert ("execution.read", "storage/datasets/m/manifest_10.jsonl") in plane.calls
+    assert ("execution.write", pinned) in plane.calls
+    assert ("execution.read", pinned) in plane.calls
     assert text == "row\n"
 
 
-def test_a_pinned_artifact_is_sampled_under_the_storage_alias() -> None:
+def test_a_pinned_artifact_is_sampled_under_the_mount() -> None:
     """Sampling and preflights resolve the mount path the same way reads do."""
     plane = RecordingPlane()
     pinned = "/target-workspace/datasets/m/manifest_10.jsonl"
@@ -424,10 +485,7 @@ def test_a_pinned_artifact_is_sampled_under_the_storage_alias() -> None:
         return await asyncio.to_thread(host.head, pinned, 64)
 
     assert asyncio.run(call()) == b"row\n"
-    assert plane.calls[0] == (
-        "execution.resolve",
-        "storage/datasets/m/manifest_10.jsonl",
-    )
+    assert plane.calls[0] == ("execution.resolve", pinned)
     assert pinned in plane.commands[0]
 
 
@@ -824,20 +882,329 @@ def test_metadata_many_falls_back_to_the_plane_when_the_host_has_no_file(
     "missing" without asking the plane — which turned every Storage input into a
     blocking "输入不存在" during a plan review.
     """
-    plane = LocalPlane(tmp_path / "plane")
-    data = plane.root / "datasets/data.csv"
+    mount = tmp_path / "mount"
+    plane = LocalPlane(mount)
+    data = mount / "datasets/data.csv"
     data.parent.mkdir(parents=True)
     data.write_text("question\nhello\n")
-    conversation = tmp_path / "conversation"
-    conversation.mkdir()
+    conversation = mount / ".pyromind-agent" / "conversation"
+    conversation.mkdir(parents=True)
 
     async def call() -> dict[str, Any]:
         host = ExecutionHost(plane.request, lambda *_: None, conversation)
+        # The third argument is the host-local root; the workspace is what tells
+        # the bridge where Storage is mounted.
+        host.workspace = str(conversation)
         return await asyncio.to_thread(
             host.metadata_many,
-            ["datasets/data.csv", "storage/datasets/data.csv"],
+            # The platform spelling of the file, and one that really is missing.
+            ["/datasets/data.csv", "/datasets/missing.csv"],
         )
 
     answers = asyncio.run(call())
-    assert answers["datasets/data.csv"]["exists"] is True
-    assert answers["storage/datasets/data.csv"]["exists"] is True
+    assert answers["/datasets/data.csv"]["exists"] is True
+    assert answers["/datasets/missing.csv"]["exists"] is False
+
+
+def test_metadata_many_maps_object_paths_before_any_workflow_has_run() -> None:
+    """A distill probes its inputs before `workspace` is set by a run.
+
+    The mount has to come from the execution plane; without it every Storage
+    object path is probed literally, reads as missing, and the plan can never
+    pass its review.
+    """
+    resolved: list[str] = []
+    spellings: list[list[str]] = []
+
+    async def request(method: str, payload: dict[str, Any]) -> Any:
+        if method == "execution.resolve":
+            path = str(payload["path"])
+            resolved.append(path)
+            return {"path": f"/target-workspace/.pyromind-agent/conv/{path}"}
+        if method == "execution.run":
+            probed = json.loads(shlex.split(str(payload["command"]))[-1])
+            spellings.append(probed)
+            answers = {
+                spelling: {"exists": spelling.startswith("/target-workspace/")}
+                for spelling in probed
+            }
+            return {"rc": 0, "stdout": json.dumps(answers), "truncated": False}
+        raise AssertionError(f"unexpected bridge call: {method}")
+
+    async def run() -> tuple[dict[str, Any], str]:
+        host = ExecutionHost(request, lambda *_: None)
+        assert host.workspace == ""
+        answers = await asyncio.to_thread(host.metadata_many, ["/datasets/a.jsonl"])
+        # One round trip for the whole session, not one per probe.
+        assert host._probe_mount() == "/target-workspace"
+        return answers, host.workspace
+
+    answers, workspace = asyncio.run(run())
+
+    assert answers["/datasets/a.jsonl"]["exists"] is True
+    assert "/target-workspace/datasets/a.jsonl" in spellings[0]
+    assert workspace == "/target-workspace/.pyromind-agent/conv"
+    # The workspace root itself is refused as conversation metadata, so the probe
+    # resolves a child of public_data and strips it back off.
+    assert resolved == ["public_data/.agentgenome-mount-probe"]
+
+
+def test_storage_mount_stays_unset_on_a_plane_without_one() -> None:
+    """The local execution plane has no mount; nothing may be invented."""
+
+    async def request(method: str, payload: dict[str, Any]) -> Any:
+        assert method == "execution.resolve"
+        return {"path": f"/Users/someone/conversations/conv/{payload['path']}"}
+
+    async def run() -> tuple[str | None, str]:
+        host = ExecutionHost(request, lambda *_: None)
+        return await asyncio.to_thread(host._probe_mount), host.workspace
+
+    mount, workspace = asyncio.run(run())
+
+    assert mount is None
+    assert workspace == ""
+
+
+def test_a_failed_mount_probe_is_retried_instead_of_sticking() -> None:
+    """A transient resolve failure must not blind the rest of the session."""
+    attempts: list[str] = []
+
+    async def request(method: str, payload: dict[str, Any]) -> Any:
+        assert method == "execution.resolve"
+        attempts.append(str(payload["path"]))
+        if len(attempts) == 1:
+            raise RuntimeError("request_failed: sandbox is starting")
+        return {"path": f"/target-workspace/.pyromind-agent/conv/{payload['path']}"}
+
+    async def run() -> tuple[str | None, str | None]:
+        host = ExecutionHost(request, lambda *_: None)
+        first = await asyncio.to_thread(host._probe_mount)
+        second = await asyncio.to_thread(host._probe_mount)
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert first is None
+    assert second == "/target-workspace"
+    assert len(attempts) == 2
+
+
+class _AwaitHost:
+    """Just enough host for the await probe: a file map and a workspace root."""
+
+    def __init__(
+        self,
+        files: dict[str, bytes],
+        workspace: str = f"{MOUNT}/.pyromind-agent/conv",
+        errors: dict[str, str] | None = None,
+    ):
+        self.files = files
+        self.workspace = workspace
+        self.errors = errors or {}
+        self.read_limits: list[int] = []
+        self.read_paths: list[str] = []
+        self.metadata_calls: list[str] = []
+
+    def read_probe(self, path: str, limit: int) -> ProbeRead:
+        self.read_paths.append(path)
+        self.read_limits.append(limit)
+        if path in self.errors:
+            return ProbeRead(None, self.errors[path])
+        raw = self.files.get(path)
+        if raw is None:
+            return ProbeRead(None)
+        if len(raw) > limit:
+            # Match the sandbox file API: it streams the whole object and then
+            # rejects it. `limit` is not a ranged-read offset.
+            return ProbeRead(
+                None,
+                "PiRunnerError: request_failed: file exceeds size limit",
+            )
+        return ProbeRead(raw, None)
+
+    def metadata(self, path: str) -> dict[str, Any]:
+        self.metadata_calls.append(path)
+        if path in self.errors:
+            raise RuntimeError(self.errors[path])
+        raw = self.files.get(path)
+        if raw is None:
+            return {"exists": False}
+        return {
+            "exists": True,
+            "is_file": True,
+            "is_dir": False,
+            "size": len(raw),
+        }
+
+    def _resolve(self, path: str, write: bool) -> str:
+        del write
+        return path
+
+    def exists(self, path: str) -> bool:
+        return bool(self.metadata(path)["exists"])
+
+
+def _receipt(output_dir: str) -> bytes:
+    return json.dumps(
+        {
+            "status": "Pending",
+            "task_id": "9391",
+            "output_dir": output_dir,
+        }
+    ).encode()
+
+
+DIR = "/.pyromind-agent/conv/data_preparation/run-1"
+SANDBOX_DIR = f"{MOUNT}{DIR}"
+
+
+def test_a_finished_platform_run_completes_the_await() -> None:
+    """平台用 FINISHED 而不是 succeeded 时，await 也必须认。"""
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.json": json.dumps({"status": "FINISHED"}).encode(),
+            f"{SANDBOX_DIR}/processed.jsonl": b"{}\n",
+        }
+    )
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+    assert result.status == "completed"
+    assert result.product == f"{SANDBOX_DIR}/processed.jsonl"
+    assert max(host.read_limits) == 512 * 1024
+    assert f"{SANDBOX_DIR}/processed.jsonl" in host.metadata_calls
+    assert f"{SANDBOX_DIR}/processed.jsonl" not in host.read_paths
+
+
+def test_a_status_envelope_avoids_reading_an_oversized_report() -> None:
+    """A compact terminal status stays readable when the detailed report is large."""
+    report = json.dumps({"status": "succeeded", "rows": ["x" * 200] * 4000}).encode()
+    assert len(report) > 512 * 1024
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.status.json": json.dumps(
+                {"status": "succeeded", "product": "processed.jsonl"}
+            ).encode(),
+            f"{SANDBOX_DIR}/report.json": report,
+            f"{SANDBOX_DIR}/processed.jsonl": b"{}\n",
+        }
+    )
+
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+
+    assert result.status == "completed"
+    assert result.detail["status_source"] == "status"
+    assert f"{SANDBOX_DIR}/report.status.json" in host.read_paths
+    assert f"{SANDBOX_DIR}/report.json" not in host.read_paths
+
+
+def test_an_oversized_legacy_report_requires_a_status_envelope() -> None:
+    report = json.dumps({"status": "succeeded", "rows": ["x" * 200] * 4000}).encode()
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.json": report,
+        }
+    )
+
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+
+    assert result.status == "failed"
+    assert "report.status.json" in str(result.error)
+    assert not host.metadata_calls
+
+
+def test_the_receipt_status_is_not_the_verdict() -> None:
+    """受理单里的 Pending 只是提交快照；判定看 report.json。"""
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.json": json.dumps({"status": "succeeded"}).encode(),
+            f"{SANDBOX_DIR}/processed.jsonl": b"{}\n",
+        }
+    )
+    assert BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json").status == "completed"
+
+
+def test_an_oversized_report_is_still_read() -> None:
+    """报告超过旧的 64KB 上限时不能永远 pending。"""
+    report = json.dumps({"status": "succeeded", "rows": ["x" * 200] * 800}).encode()
+    assert len(report) > 65536
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.json": report,
+            f"{SANDBOX_DIR}/processed.jsonl": b"{}\n",
+        }
+    )
+    assert BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json").status == "completed"
+
+
+def test_the_product_path_comes_from_the_report_when_it_names_one() -> None:
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.json": json.dumps(
+                {"status": "succeeded", "product": "out/result.jsonl"}
+            ).encode(),
+            f"{SANDBOX_DIR}/out/result.jsonl": b"{}\n",
+        }
+    )
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+    assert result.status == "completed"
+    assert result.product == f"{SANDBOX_DIR}/out/result.jsonl"
+
+
+def test_an_already_sandbox_absolute_output_dir_is_not_prefixed_twice() -> None:
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(SANDBOX_DIR),
+            f"{SANDBOX_DIR}/report.json": json.dumps({"status": "succeeded"}).encode(),
+            f"{SANDBOX_DIR}/processed.jsonl": b"{}\n",
+        }
+    )
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+    assert result.status == "completed"
+    assert result.product == f"{SANDBOX_DIR}/processed.jsonl"
+
+
+def test_an_unreadable_report_says_so_instead_of_silently_pending() -> None:
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.json": b'{"status": "succeeded"',
+        }
+    )
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+    assert result.status == "failed"
+    assert "无法解析" in str(result.error)
+
+
+@pytest.mark.parametrize("placeholder", [[], None, "running", 0])
+def test_a_non_object_report_is_pending_until_the_final_report(
+    placeholder: object,
+) -> None:
+    """平台运行期可能先写合法 JSON 占位，不能被当成终态失败。"""
+    host = _AwaitHost(
+        {
+            f"{MOUNT}/run/receipt.json": _receipt(DIR),
+            f"{SANDBOX_DIR}/report.json": json.dumps(placeholder).encode(),
+        }
+    )
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+    assert result.status == "pending"
+    assert result.detail["task_id"] == "9391"
+    assert result.detail["output_dir"] == SANDBOX_DIR
+
+
+def test_a_report_read_error_is_not_reported_as_pending() -> None:
+    host = _AwaitHost(
+        {f"{MOUNT}/run/receipt.json": _receipt(DIR)},
+        errors={
+            f"{SANDBOX_DIR}/report.json": "TimeoutError: execution plane unavailable"
+        },
+    )
+    result = BridgeAwait(host).probe(f"{MOUNT}/run/receipt.json")
+    assert result.status == "failed"
+    assert "unreadable" in str(result.error)

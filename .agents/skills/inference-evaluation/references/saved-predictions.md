@@ -6,19 +6,18 @@
 ## 提交
 
 ```python
-df_submit_pipeline(
+df_submit_evaluation(
+    operation="score",
     input_path="/models/training-output",
-    evaluation={
-        "source_manifest_path": "public_data/source_manifest.json",
-        "scoring_spec_path": "public_data/scoring_spec.json",
-        "scoring_script_path": "public_data/score_eval.py",
-    },
+    source_manifest_path="public_data/source_manifest.json",
+    scoring_spec_path="public_data/scoring_spec.json",
+    scoring_script_path="public_data/score_eval.py",
 )
 ```
 
-与 `inference`、`products`、清洗脚本参数互斥。工具冻结脚本、说明、清单和运行时，生成
+此操作不接受推理、产物或清洗脚本参数。工具冻结脚本、说明、清单和运行时，生成
 CustomCommandCPUNode 工作流；全量处理，无 GPU、无模型调用。
-恢复使用 `mode="resume"` 和原 `resume_run_id`，可以省略 evaluation；同一冻结
+恢复使用 `operation="resume"`、原 `resume_run_id` 和不变的 input_path，不传评分配置；同一冻结
 输入恢复，不修改旧评分口径。脚本、源文件或配置变化需要新建 full run。
 
 ## 来源清单
@@ -104,7 +103,7 @@ LoRA 模型引用包含 adapter 与基模，后续推理合并该 step，不使�
 
 ## 所选 checkpoint 需要后续推理时
 
-使用现有 inference 入口，`inference.model_path` 填所选 checkpoint-n 的准确 Storage 路径，
+使用 `df_submit_evaluation(operation="inference", ...)` 入口，`model_path` 填所选 checkpoint-n 的准确 Storage 路径，
 其评测配置的 `model_source` 写 `{"type":"checkpoint","kind":"full"}`。
 LoRA 写 `{"type":"checkpoint","kind":"lora","base_model":"/models/实际基模"}`；
 基模必须已准备到 Storage，远端模型标识先通过已有 clone/download 能力解析到实际文件。
@@ -113,7 +112,7 @@ LoRA 写 `{"type":"checkpoint","kind":"lora","base_model":"/models/实际基模"
 这一步只用于缺少目标预测、独立测试集或生成配置变化的评测，不为全 step 评分触发。
 
 仅 train + val 时，不额外推理；rubric 变化只重新 CPU 评分。存在独立 test 时，先完成
-验证集选模，再在 inference 中传 selection_run_id=选模批次 run_id，input_path 使用该批次
+验证集选模，再在工具顶层传 selection_run_id=选模批次 run_id，input_path 使用该批次
 清单 datasets.test.path，model_path 与 model_source 精确对应选中 checkpoint。
 测试集文件必须与 train/validation 不同且指纹不同；应由数据来源确认独立划分，路径和指纹
 检查不能证明无近重复或业务泄漏。test 不参与选模，不把 test 的表现用于重新挑选 checkpoint。

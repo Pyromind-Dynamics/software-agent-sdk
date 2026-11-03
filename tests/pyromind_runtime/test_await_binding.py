@@ -57,10 +57,43 @@ def test_an_unbound_task_keeps_its_normal_instruction() -> None:
     assert notification.trigger_turn is True
 
 
+def test_an_external_history_wait_does_not_trigger_an_agent_turn() -> None:
+    notification = _build_external_task_notification(
+        _task(
+            kind="historical_experience",
+            graph_run_id=None,
+            completion_result={
+                "status": "waiting",
+                "waiting": {
+                    "kind": "external",
+                    "node": "chain.wait",
+                    "task_id": "platform-1",
+                },
+            },
+        ),
+        status="waiting",
+        error_summary=None,
+        auto_run=True,
+    )
+    assert notification.trigger_turn is False
+    assert "外部任务" in notification.hidden_text
+
+
 def test_parking_on_an_external_task_binds_the_platform_task_to_the_run(
     tmp_path,
 ) -> None:
     runtime = _runtime(tmp_path)
+    runtime.register_external_task(
+        "conv-1",
+        {
+            "task_id": "9184",
+            "kind": "workflow_run",
+            "run_id": "submission-1",
+            "status": "pending",
+            "submitted_at": "2026-10-22T06:00:00+00:00",
+            "updated_at": "2026-10-22T06:00:00+00:00",
+        },
+    )
     runtime._bind_parked_await(
         "conv-1",
         {
@@ -80,6 +113,35 @@ def test_parking_on_an_external_task_binds_the_platform_task_to_the_run(
     assert bound.graph_run_id == "run-1"
     assert bound.run_id == "run-1"
     assert bound.kind == "graph_await"
+
+
+def test_a_terminal_task_accepts_a_late_graph_binding_without_status_regression(
+    tmp_path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.register_external_task(
+        "conv-1",
+        {
+            "task_id": "9184",
+            "kind": "workflow_run",
+            "run_id": "submission-1",
+            "status": "succeeded",
+            "submitted_at": "2026-10-22T06:00:00+00:00",
+            "updated_at": "2026-10-22T06:30:00+00:00",
+        },
+    )
+
+    bound = runtime.bind_external_task_to_graph(
+        "conv-1",
+        task_id="9184",
+        graph_run_id="run-1",
+        output_dir="/.pyromind-agent/conv-1/data_preparation/x",
+    )
+
+    assert bound is not None
+    assert bound.graph_run_id == "run-1"
+    assert bound.kind == "graph_await"
+    assert bound.status == "succeeded"
 
 
 def test_a_human_gate_is_not_bound_to_an_external_task(tmp_path) -> None:

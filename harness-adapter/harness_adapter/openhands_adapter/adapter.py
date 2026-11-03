@@ -23,6 +23,7 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.snapshot import WorkflowState
 from pyromind_runtime.ports.harness import (
+    AttachRecovery,
     ExternalTaskNotification,
     ForkSpec,
     ProductCheckpoint,
@@ -128,11 +129,11 @@ class OpenHandsAdapter:
             return
         conversation = service.get_conversation()
         if self._pipeline_runs is not None:
+            from openhands.tools.data_preparation.evaluation_submit import (
+                DfSubmitEvaluationExecutor,
+            )
             from openhands.tools.data_preparation.inference import (
                 InferencePipelineHandler,
-            )
-            from openhands.tools.data_preparation.platform_submit import (
-                DfSubmitPipelineExecutor,
             )
             from openhands.tools.training_analysis import TrainingAnalysisExecutor
             from openhands.tools.workflow.validate_workflow_dsl import (
@@ -160,8 +161,8 @@ class OpenHandsAdapter:
             )
             if training is not None and validator is not None:
                 for executor in executors:
-                    if isinstance(executor, DfSubmitPipelineExecutor):
-                        executor._inference_handler = InferencePipelineHandler(
+                    if isinstance(executor, DfSubmitEvaluationExecutor):
+                        executor.inference_handler = InferencePipelineHandler(
                             Path(training.runtime_dir).parent.parent
                             / "inference-evaluation/scripts",
                             self._pipeline_runs(scope).with_context(context),
@@ -225,7 +226,10 @@ class OpenHandsAdapter:
         self,
         conversation_id: str,
         context: RequestContext,
+        recovery: AttachRecovery | None = None,
     ) -> SessionHandle:
+        # OpenHands does not support user input yet; accept the shared parameter.
+        del recovery
         existing = self._sessions.get(conversation_id)
         if existing is not None:
             if existing.event_service.is_open():

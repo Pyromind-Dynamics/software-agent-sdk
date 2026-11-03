@@ -19,10 +19,17 @@ class PredictionEvaluationOptions(BaseModel):
     scoring_script_path: str = Field(min_length=1)
 
 
-def prepare_definition(action: Any, files: Any, runtime_hash: str) -> dict[str, Any]:
+def prepare_definition(
+    options: PredictionEvaluationOptions,
+    files: Any,
+    runtime_hash: str,
+    *,
+    input_path: str,
+    cpu: int,
+    memory: int,
+) -> dict[str, Any]:
     from openhands.tools.data_preparation.inference import storage_path
 
-    options = action.evaluation
     manifest = json.loads(files.read_text(options.source_manifest_path))
     spec = json.loads(files.read_text(options.scoring_spec_path))
     script = files.read_text(options.scoring_script_path)
@@ -88,11 +95,11 @@ def prepare_definition(action: Any, files: Any, runtime_hash: str) -> dict[str, 
         "source_manifest": manifest,
         "scoring_spec": spec,
         "scoring_script": script,
-        "input_path": storage_path(action.input_path),
+        "input_path": storage_path(input_path),
         "dataset_config": {},
         "evaluation_config": {},
-        "cpu": action.cpu,
-        "memory": action.memory,
+        "cpu": cpu,
+        "memory": memory,
         "runtime_sha256": runtime_hash,
     }
 

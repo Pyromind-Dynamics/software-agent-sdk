@@ -54,6 +54,7 @@ def conversation(tmp_path: Path, workspace_xml: Path) -> MagicMock:
     conv = MagicMock()
     conv.id = "test-conversation-id"
     conv.workspace.working_dir = str(tmp_path)
+    conv.workspace.storage_path = "/target-workspace"
     conv.state.secret_registry.get_secret_value.return_value = "test-token"
     return conv
 
@@ -215,7 +216,9 @@ def test_read_workspace_file_stages_remote_workspace_file(
     assert executor._read_workspace_file("missing.xml", conversation) is None
 
 
-@pytest.mark.parametrize("path", ["storage/review/config.xml", "/review/config.xml"])
+@pytest.mark.parametrize(
+    "path", ["/target-workspace/review/config.xml", "/review/config.xml"]
+)
 def test_storage_config_access_error_keeps_path_diagnostics(
     executor, conversation, monkeypatch, path
 ):

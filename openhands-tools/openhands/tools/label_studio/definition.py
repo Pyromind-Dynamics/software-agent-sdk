@@ -34,8 +34,9 @@ class LabelStudioProjectAction(Action):
     dataset_path: str | None = Field(
         default=None,
         description=(
-            "Storage object path, storage/... alias, or absolute Storage mount "
-            "path. Required for operation='create'. A directory of "
+            "Storage object path (/datasets/...), absolute Storage mount path "
+            "(/target-workspace/...), or a workspace-relative path. Required for "
+            "operation='create'. A directory of "
             "sample directories for the directory adapters, or one JSON Lines "
             "object for adapter='jsonl' -- a pipeline's own output file is "
             "imported as written, without being reshaped first. A Genome run's "
@@ -46,8 +47,8 @@ class LabelStudioProjectAction(Action):
     label_config_path: str | None = Field(
         default=None,
         description=(
-            "label_config.xml in the workspace or Storage (object path, "
-            "storage/... alias, or absolute mount path). Required for "
+            "label_config.xml in the workspace or Storage (object path or "
+            "absolute mount path). Required for "
             "operation='create' and 'update_config'."
         ),
     )

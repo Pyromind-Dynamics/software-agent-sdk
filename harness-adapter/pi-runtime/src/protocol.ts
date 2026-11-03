@@ -8,6 +8,7 @@ export type JsonObject = { [key: string]: JsonValue };
 export type RunnerEventKind =
   | "agent.started"
   | "run.finished"
+  | "execution.policy.updated"
   | "message.started"
   | "message.delta"
   | "message.completed"

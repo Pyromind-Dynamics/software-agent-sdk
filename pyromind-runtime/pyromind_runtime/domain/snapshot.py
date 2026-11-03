@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import Field, JsonValue, field_validator
+from pydantic import Field, JsonValue, field_validator, model_serializer
 
 from pyromind_runtime.domain.base import AwareDatetime, ContractModel
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.content import ContentBlock, JsonObject
+from pyromind_runtime.domain.user_input import PendingUserInput
 
 
 type ConversationStatus = Literal[
@@ -14,6 +15,7 @@ type ConversationStatus = Literal[
     "running",
     "paused",
     "waiting_for_confirmation",
+    "waiting_for_input",
     "waiting_for_external_task",
     "finished",
     "error",
@@ -171,11 +173,26 @@ class ConversationSnapshot(ContractModel):
     current_workflow: WorkflowState | None = None
     plan: PlanState | None = None
     pending_permissions: tuple[PendingPermission, ...] = ()
+    pending_inputs: tuple[PendingUserInput, ...] = ()
+    # Automatic-turn suspension is separate from display status and is released by
+    # the next successfully accepted user message.
+    automatic_turns_suspended: bool = False
     compaction_status: Literal["started", "completed", "skipped", "failed"] | None = (
         None
     )
     usage: UsageState = Field(default_factory=UsageState)
     external_tasks: tuple[ExternalTaskState, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def _omit_default_input_state(self, handler):
+        # Omit empty input state and default policy for disabled sessions so strict
+        # older clients remain compatible; old serialized snapshots use the defaults.
+        data = handler(self)
+        if not self.pending_inputs:
+            data.pop("pending_inputs", None)
+        if not self.automatic_turns_suspended:
+            data.pop("automatic_turns_suspended", None)
+        return data
 
 
 class ConversationSummary(ContractModel):

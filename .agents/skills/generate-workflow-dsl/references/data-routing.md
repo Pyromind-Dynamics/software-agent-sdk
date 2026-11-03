@@ -20,9 +20,9 @@
 
 | 使用位置 | 路径示例 |
 |---|---|
-| Agent 的 `read` / `terminal` / `write` | `storage/datasets/my_data/train.jsonl` |
+| Agent 的 `read` / `terminal` / `write` | `/target-workspace/datasets/my_data/train.jsonl` |
 | 训练节点访问挂载数据 | `/workspace/datasets/my_data/train.jsonl` |
-| `submit_workflow.workflow_path` | `storage/.../workflow.py` |
+| `submit_workflow.workflow_path` | `/target-workspace/.../workflow.py` |
 
 `public_data/...` 是会话文件路径；正式提交按 `workflow-execution` 上传实际生成的
 `workflow.py`，再使用返回位置。上传返回的 Storage 路径按目标工具或节点契约使用，
@@ -49,7 +49,7 @@ dataset_config = DatasetConfigBuilderNode(
 ```
 
 `LoadDataset.source_dir` 只接目录，具体文件从其 `dataset_path` 拼接。PathJoin 的 `subpath`
-使用 Storage 相对目录或文件名，去掉 `storage/` 或已知挂载根，避免绝对路径覆盖基础目录或重复拼接。
+使用 Storage 相对目录或文件名，去掉已知挂载根，避免绝对路径覆盖基础目录或重复拼接。
 train、val 共用数据根时可复用该根。
 
 Clone/Download 输出 `dataset_path`，可直接传给 `DatasetConfigBuilderNode`；需要目录内具体文件时

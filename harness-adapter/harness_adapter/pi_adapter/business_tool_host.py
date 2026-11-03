@@ -46,6 +46,7 @@ from openhands.sdk.workspace.local import LocalWorkspace
 from openhands.tools.data_preparation import (
     DfCheckProgressTool,
     DfStopTaskTool,
+    DfSubmitEvaluationTool,
     DfSubmitPipelineTool,
 )
 from openhands.tools.data_preparation.inference import InferencePipelineHandler
@@ -333,6 +334,9 @@ class PyromindBusinessToolHost:
             DfSubmitPipelineTool.name: lambda context: DfSubmitPipelineTool.create(
                 **self._preparation_params(context)
             )[0],
+            DfSubmitEvaluationTool.name: lambda context: DfSubmitEvaluationTool.create(
+                **self._evaluation_params(context)
+            )[0],
             DfCheckProgressTool.name: lambda context: DfCheckProgressTool.create(
                 **self._storage_params(context)
             )[0],
@@ -408,7 +412,7 @@ class PyromindBusinessToolHost:
         """Tool specs this session exposes.
 
         ``sandbox`` sessions mount the user's Storage, so they publish
-        workspace files by writing to ``storage/...`` and have no use for the
+        workspace files by writing under the mount and have no use for the
         host-side presigned upload tool.
         """
         specs = [validation_tool_spec()]
@@ -435,7 +439,7 @@ class PyromindBusinessToolHost:
                                 "type": "string",
                                 "description": (
                                     "Existing Storage Python DSL path, such as "
-                                    "storage/project/workflow.py"
+                                    "/project/workflow.py"
                                 ),
                             }
                         },
@@ -452,6 +456,7 @@ class PyromindBusinessToolHost:
             GetStorageUrlTool,
             RunDatasetCleaningTool,
             DfSubmitPipelineTool,
+            DfSubmitEvaluationTool,
             DfCheckProgressTool,
             DfStopTaskTool,
             EdpRenderTool,
@@ -494,6 +499,7 @@ class PyromindBusinessToolHost:
         arguments: dict[str, Any],
         context: ToolExecutionContext,
         tool_call_id: str | None = None,
+        origin_run_id: str | None = None,
     ) -> dict[str, Any]:
         started_at = time.perf_counter()
         if name == ProductVersionsTool.name:
@@ -595,6 +601,7 @@ class PyromindBusinessToolHost:
                     lambda: identity,
                     context.request_context,
                     asyncio.get_running_loop(),
+                    graph_run_id=origin_run_id,
                 ),
             )
 
@@ -903,6 +910,10 @@ class PyromindBusinessToolHost:
     def _preparation_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         params = self._execution_params(context)
         params["runtime_dir"] = str(self._preparation_runtime)
+        return params
+
+    def _evaluation_params(self, context: ToolExecutionContext) -> dict[str, Any]:
+        params = self._execution_params(context)
         if self._pipeline_runs is not None and self._inference_runtime is not None:
             params["inference_handler"] = InferencePipelineHandler(
                 self._inference_runtime,

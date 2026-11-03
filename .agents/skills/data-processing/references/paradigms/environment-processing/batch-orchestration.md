@@ -17,7 +17,7 @@
 
 清单本身由 `edp_render` 在平台节点分片写入 storage
 (`<root>/batch-XXX/manifest.jsonl` + `shards.json` 索引),agent 不在本地构造;
-直接读 `storage/<root>/batch-XXX/...`(或需要时用 `sandbox_download`
+直接读 `/target-workspace/<root>/batch-XXX/...`(或需要时用 `sandbox_download`
 拉进沙箱工作目录)。
 
 ## verdict 结构(输出)

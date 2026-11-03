@@ -83,6 +83,29 @@ async def test_direct_tool_submission_is_durable_and_idempotent(version_runtime)
         )
 
 
+async def test_graph_submission_registers_the_await_owner_immediately(
+    version_runtime,
+):
+    runtime, submission, context = version_runtime
+    await runtime.submit_versioned_workflow(
+        "c",
+        "graph-call",
+        submission.workflow,
+        None,
+        context,
+        "graph-run-1",
+    )
+
+    task = next(
+        task
+        for task in runtime._store("c").load_snapshot().external_tasks
+        if task.task_id == "task-123"
+    )
+    assert task.kind == "graph_await"
+    assert task.graph_run_id == "graph-run-1"
+    assert task.run_id == "graph-run-1"
+
+
 async def test_uncertain_submission_never_auto_retries(version_runtime, monkeypatch):
     runtime, _, context = version_runtime
     calls = []

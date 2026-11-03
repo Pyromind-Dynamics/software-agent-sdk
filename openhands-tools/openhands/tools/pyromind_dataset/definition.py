@@ -664,9 +664,9 @@ _GET_STORAGE_URL_DESCRIPTION = (
     "URLs in your reply as Markdown (`![description](url)` for images, "
     "`[label](url)` for other files). Showing a file to the user never depends "
     "on image support in your own model.\n\n"
-    "Paths may be workspace paths (`public_data/report.html`), the Storage "
-    "alias (`storage/datasets/img.png`), absolute sandbox paths, or Storage "
-    "paths (`/datasets/img.png`). The file must live under the mounted "
+    "Paths may be workspace paths (`public_data/report.html`), the Storage mount "
+    "path (`/target-workspace/datasets/img.png`), absolute sandbox paths, or "
+    "Storage paths (`/datasets/img.png`). The file must live under the mounted "
     "Storage; sandbox paths outside the mount, such as `/tmp`, have no URL, so "
     "copy those into the workspace first (for example under `public_data/`) "
     "and call this tool again. "
@@ -686,7 +686,7 @@ def _storage_path_for(
     """Map a model-facing path to the path the Storage API expects.
 
     Workspace paths resolve under the conversation directory inside Storage,
-    while the ``storage/`` alias, absolute mount paths and Storage paths
+    while the Storage mount path, absolute sandbox paths and Storage paths
     resolve against the Storage root.
     """
     try:
@@ -721,8 +721,8 @@ class GetStorageUrlAction(Action):
     paths: list[str] = Field(
         description=(
             "Files to resolve, addressed as workspace paths "
-            "('public_data/report.html'), the Storage alias "
-            "('storage/datasets/img.png'), or Storage paths "
+            "('public_data/report.html'), the Storage mount path "
+            "('/target-workspace/datasets/img.png'), or Storage paths "
             "('/datasets/img.png')."
         ),
     )

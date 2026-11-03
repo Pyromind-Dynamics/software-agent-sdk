@@ -20,7 +20,7 @@ export interface SandboxEndpoint {
   /** Sandbox-side conversation root. */
   workspacePath: string;
   /**
-   * Sandbox-side Storage mount root, addressed by the model as `storage/`.
+   * Sandbox-side Storage mount root, addressed by its absolute path.
    * The workspace holds a symlink with that name, so shell and script
    * relative paths resolve to the same place as the file tools.
    */

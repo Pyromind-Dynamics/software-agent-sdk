@@ -9,7 +9,8 @@ Usage (called automatically by the platform command after pipeline completes):
 
     python generate_report.py --log-dir /path/to/run_dir
 
-The report is written to ``<log_dir>/report.json``.
+The report is written to ``<log_dir>/report.json``. A compact
+``<log_dir>/report.status.json`` is written beside it for bounded status probes.
 """
 
 from __future__ import annotations  # noqa: I001
@@ -31,6 +32,7 @@ except ImportError:
 
 MAX_ERROR_SAMPLES = 20
 INPUT_PREVIEW_CHARS = 200
+STATUS_REPORT_FILENAME = "report.status.json"
 
 
 def _count_jsonl_lines(path: Path) -> int:
@@ -321,6 +323,33 @@ def generate_report(
     return report
 
 
+def write_status_report(
+    log_dir: str | Path,
+    report: dict,
+    product_file: str | Path | None = None,
+) -> Path:
+    """Write the bounded status envelope consumed by AgentGenome await nodes."""
+    directory = Path(log_dir)
+    product = Path(product_file) if product_file else directory / "processed.jsonl"
+    try:
+        product_ref = product.resolve().relative_to(directory.resolve()).as_posix()
+    except ValueError:
+        product_ref = str(product)
+    payload = {
+        "schema_version": 1,
+        "status": report.get("status"),
+        "product": product_ref,
+    }
+    if isinstance(report.get("report_status"), str):
+        payload["report_status"] = report["report_status"]
+    path = directory / STATUS_REPORT_FILENAME
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
+    temporary.replace(path)
+    return path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate report.json from LLM call logs."
@@ -363,9 +392,17 @@ def main() -> None:
         runtime_dir_name=args.runtime_dir_name,
         image_utils_api_version=args.image_utils_api_version,
     )
+    product_file = args.output_file if args.output_file else log_dir / "processed.jsonl"
+    write_status_report(log_dir, {"status": "running"}, product_file)
     report_path = log_dir / "report.json"
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
+    terminal = "failed" if report["status"] == "failed" else "succeeded"
+    write_status_report(
+        log_dir,
+        {"status": terminal, "report_status": report["status"]},
+        product_file,
+    )
     print(f"Report written to {report_path}")
     print(
         f"  status={report['status']} "

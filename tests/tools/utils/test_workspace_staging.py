@@ -33,16 +33,20 @@ def test_resolve_workspace_path_keeps_relative_paths_workspace_scoped() -> None:
     assert from_storage is False
 
 
-def test_resolve_workspace_path_maps_storage_alias_and_absolute_mount() -> None:
-    alias, alias_storage = resolve_workspace_path(
-        _workspace(), "storage/datasets/a.jsonl"
-    )
-    absolute, absolute_storage = resolve_workspace_path(
+def test_resolve_workspace_path_maps_the_absolute_mount() -> None:
+    relative, from_storage = resolve_workspace_path(
         _workspace(), "/target-workspace/datasets/a.jsonl"
     )
 
-    assert (alias, alias_storage) == (PurePosixPath("datasets/a.jsonl"), True)
-    assert (absolute, absolute_storage) == (PurePosixPath("datasets/a.jsonl"), True)
+    assert (relative, from_storage) == (PurePosixPath("datasets/a.jsonl"), True)
+
+
+def test_resolve_workspace_path_rejects_the_removed_storage_alias() -> None:
+    """The alias used to be a symlink in the workspace; it is gone, so a path
+    starting with it must not be read as a workspace directory of that name."""
+
+    with pytest.raises(WorkspaceStagingError, match="removed 'storage/' alias"):
+        resolve_workspace_path(_workspace(), "storage/datasets/a.jsonl")
 
 
 def test_resolve_workspace_path_maps_absolute_workspace_path() -> None:
@@ -54,13 +58,11 @@ def test_resolve_workspace_path_maps_absolute_workspace_path() -> None:
     assert from_storage is False
 
 
-def test_resolve_workspace_path_keeps_storage_plain_without_mount() -> None:
-    relative, from_storage = resolve_workspace_path(
-        _workspace(storage_path=None), "storage/datasets/a.jsonl"
-    )
-
-    assert relative == PurePosixPath("storage/datasets/a.jsonl")
-    assert from_storage is False
+def test_resolve_workspace_path_rejects_the_alias_without_a_mount_too() -> None:
+    with pytest.raises(WorkspaceStagingError, match="removed 'storage/' alias"):
+        resolve_workspace_path(
+            _workspace(storage_path=None), "storage/datasets/a.jsonl"
+        )
 
 
 @pytest.mark.parametrize(
@@ -231,7 +233,7 @@ def test_stage_workspace_members_mirrors_the_storage_layout(
 
     stage_workspace_members(
         sandbox_workspace,
-        "storage/datasets/prelabel_in",
+        str(sandbox_workspace.storage_dir / "datasets" / "prelabel_in"),
         ["images/b0.bmp"],
         destination=stage,
     )
@@ -281,7 +283,7 @@ def test_stage_workspace_members_splits_transfers_that_arrive_truncated(
 
     stage_workspace_members(
         workspace,
-        "storage/datasets/prelabel_in",
+        str(sandbox_workspace.storage_dir / "datasets" / "prelabel_in"),
         members,
         destination=stage,
     )
@@ -305,7 +307,7 @@ def test_stage_workspace_members_reports_a_truncated_single_member(
     with pytest.raises(WorkspaceArchiveTruncatedError, match=r"4096 of \d+ bytes"):
         stage_workspace_members(
             workspace,
-            "storage/datasets/prelabel_in",
+            str(sandbox_workspace.storage_dir / "datasets" / "prelabel_in"),
             ["big.bmp"],
             destination=tmp_path / "stage",
         )
@@ -324,7 +326,7 @@ def test_stage_workspace_members_reports_an_unreadable_archive(
     with pytest.raises(WorkspaceArchiveTruncatedError):
         stage_workspace_members(
             workspace,
-            "storage/datasets/prelabel_in",
+            str(sandbox_workspace.storage_dir / "datasets" / "prelabel_in"),
             ["b0.bmp"],
             destination=tmp_path / "stage",
         )
@@ -342,7 +344,7 @@ def test_stage_workspace_members_survives_an_unavailable_size_probe(
 
     stage_workspace_members(
         workspace,
-        "storage/datasets/prelabel_in",
+        str(sandbox_workspace.storage_dir / "datasets" / "prelabel_in"),
         ["b0.bmp"],
         destination=tmp_path / "stage",
     )

@@ -27,7 +27,6 @@ from typing import Any, Protocol, runtime_checkable
 
 from openhands.sdk.workspace.models import CommandResult, FileOperationResult
 from openhands.tools.utils.workspace_staging import (
-    STORAGE_ALIAS,
     WorkspaceStagingError,
     is_remote_workspace,
     resolve_workspace_path,
@@ -83,10 +82,9 @@ class SandboxCommandWorkspace(Protocol):
 def supports_sandbox_execution(workspace: Any) -> bool:
     """True when a remote workspace can host the run instead of the agent host.
 
-    Platform sandbox workspaces expose both a command port and the Storage mount
-    the conversation addresses as ``storage/``. A remote workspace without the
-    mount keeps the staging path, because a run there could not reach user
-    Storage.
+    Platform sandbox workspaces expose both a command port and the Storage mount.
+    A remote workspace without the mount keeps the staging path, because a run
+    there could not reach user Storage.
     """
 
     if not is_remote_workspace(workspace):
@@ -109,7 +107,7 @@ class SandboxTarget:
 def sandbox_target(workspace: Any, path: str) -> SandboxTarget:
     """Resolve a workspace path for execution inside the sandbox.
 
-    ``storage/...`` addresses the Storage mount, everything else the
+    A path under the Storage mount addresses Storage, everything else the
     conversation workspace, mirroring the layout the sandbox shell sees.
     """
 
@@ -123,11 +121,7 @@ def sandbox_target(workspace: Any, path: str) -> SandboxTarget:
         if from_storage
         else PurePosixPath(str(workspace.working_dir))
     )
-    display = (
-        PurePosixPath(STORAGE_ALIAS, *relative.parts).as_posix()
-        if from_storage
-        else relative.as_posix()
-    )
+    display = (root / relative).as_posix() if from_storage else relative.as_posix()
     return SandboxTarget(
         absolute=root / relative,
         relative=relative,

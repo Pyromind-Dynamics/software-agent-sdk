@@ -16,9 +16,9 @@ from harness_adapter.pi_adapter.sandbox_runtime import (
     DEFAULT_CPU,
     DEFAULT_MEMORY,
     DEFAULT_MOUNT_PATH,
+    LEGACY_STORAGE_ALIAS,
     PYROMIND_AGENT_RESOURCES_ROOT,
     PYROMIND_AGENT_STORAGE_ROOT,
-    STORAGE_ALIAS,
     STORAGE_HOST_PATH,
     SandboxExecutionManager,
     SandboxSettings,
@@ -339,9 +339,10 @@ def test_ensure_creates_and_prepares_a_sandbox(
     script = _uploaded_script(client)
     assert f"mkdir -p {endpoint['workspace_path']}" in script
     assert f"mkdir -p {endpoint['workspace_path']}/public_data" in script
-    assert (
-        f"ln -s {DEFAULT_MOUNT_PATH} {endpoint['workspace_path']}/{STORAGE_ALIAS}"
-    ) in script
+    # Storage is addressed by its mount path, so the old symlink must be gone:
+    # the script only clears one an older runtime left behind.
+    assert "ln -s" not in script
+    assert (f"if [ -L {endpoint['workspace_path']}/{LEGACY_STORAGE_ALIAS} ]") in script
     record = files.load_sandbox()
     assert record is not None
     assert "api_key" not in json.dumps(record)
@@ -383,23 +384,78 @@ def test_ensure_reuses_a_running_sandbox_without_repairing(
         }
     )
     client = _FakeSandboxClient(status="running")
+    probes: list[dict[str, object]] = []
+
+    def terminal(**kwargs: object) -> tuple[str, int, bool]:
+        probes.append(kwargs)
+        return "", 0, False
+
     monkeypatch.setattr(
-        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
-        lambda **kwargs: pytest.fail("a reused sandbox must not be re-probed"),
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command", terminal
     )
     manager = SandboxExecutionManager(client_factory=lambda context: client)
 
     endpoint = asyncio.run(manager.ensure(_context(tmp_path), files))
 
     assert client.calls == ["get:sbx-1"]
+    assert [probe["command"] for probe in probes] == ["true"]
     assert endpoint["sandbox_id"] == "sbx-1"
     record = files.load_sandbox()
     assert record is not None
     assert record["created_at"] == "2026-01-01T00:00:00+00:00"
 
 
+def test_ensure_rebuilds_a_running_sandbox_whose_terminal_is_dead(
+    tmp_path: Path, files: PiSessionFiles, monkeypatch
+) -> None:
+    """The control plane can report "running" for a container whose data plane
+    stopped answering; reusing it turns every later call into a hung connect."""
+    files.save_sandbox(
+        {
+            "sandbox_id": "sbx-1",
+            "workspace_path": f"{DEFAULT_MOUNT_PATH}/.pyromind-agent/conv-1",
+            "mount_path": DEFAULT_MOUNT_PATH,
+            "storage_host_path": STORAGE_HOST_PATH,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "workspace_version": _WORKSPACE_LAYOUT_VERSION,
+        }
+    )
+    client = _FakeSandboxClient(status="running")
+
+    def terminal(**kwargs: object) -> tuple[str, int, bool]:
+        # The probe never reaches the container; the prepare script does.
+        if kwargs["command"] == "true":
+            raise TimeoutError("connect timed out")
+        return "", 0, False
+
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command", terminal
+    )
+    manager = SandboxExecutionManager(client_factory=lambda context: client)
+
+    asyncio.run(manager.ensure(_context(tmp_path), files))
+
+    assert "delete:sbx-1" in client.calls
+    assert "create:running" in client.calls
+
+
+def test_prewarm_logs_why_the_sandbox_could_not_be_prepared(
+    tmp_path: Path, files: PiSessionFiles, caplog
+) -> None:
+    """The warning used to name only the exception type, which hid the reason."""
+    client = _FakeSandboxClient(
+        create_error=RuntimeError("quota exceeded for us-west-1")
+    )
+    manager = SandboxExecutionManager(client_factory=lambda context: client)
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(manager._prewarm(_context(tmp_path), files))
+
+    assert "quota exceeded for us-west-1" in caplog.text
+
+
 def test_ensure_refreshes_a_cached_endpoint_bundle_on_request(
-    tmp_path: Path, files: PiSessionFiles
+    tmp_path: Path, files: PiSessionFiles, monkeypatch
 ) -> None:
     files.save_sandbox(
         {
@@ -418,6 +474,10 @@ def test_ensure_refreshes_a_cached_endpoint_bundle_on_request(
         clients.append(client)
         return client
 
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
+        lambda **kwargs: ("", 0, False),
+    )
     manager = SandboxExecutionManager(client_factory=factory)
     context = _context(tmp_path)
 
@@ -434,7 +494,7 @@ def test_ensure_refreshes_a_cached_endpoint_bundle_on_request(
     assert refreshed["sandbox_id"] == first["sandbox_id"] == "sbx-1"
 
 
-def test_ensure_upgrades_a_running_sandbox_to_the_storage_alias_layout(
+def test_ensure_clears_the_legacy_storage_alias_from_a_running_sandbox(
     tmp_path: Path, files: PiSessionFiles, monkeypatch
 ) -> None:
     files.save_sandbox(
@@ -457,7 +517,9 @@ def test_ensure_upgrades_a_running_sandbox_to_the_storage_alias_layout(
 
     assert endpoint["storage_path"] == DEFAULT_MOUNT_PATH
     assert len(commands) == 1
-    assert "ln -s" in _uploaded_script(client)
+    script = _uploaded_script(client)
+    assert "ln -s" not in script
+    assert (f"if [ -L {endpoint['workspace_path']}/{LEGACY_STORAGE_ALIAS} ]") in script
     record = files.load_sandbox()
     assert record is not None
     assert record["workspace_version"] == _WORKSPACE_LAYOUT_VERSION
@@ -939,7 +1001,7 @@ def test_ensure_applies_pending_fork_from_materialized_source(
 
     scripts = _uploaded_scripts(client)
     assert any("cp -a" in script for script in scripts)
-    assert "ln -s" in scripts[-1]
+    assert "ln -s" not in scripts[-1]
     assert (
         client.files[
             f"{DEFAULT_MOUNT_PATH}{PYROMIND_AGENT_STORAGE_ROOT}/conv-1"
@@ -984,7 +1046,7 @@ def test_ensure_skips_copy_when_fork_source_never_materialized(
 
 
 def test_ensure_flushes_staged_workflow_into_a_running_sandbox(
-    tmp_path: Path, files: PiSessionFiles
+    tmp_path: Path, files: PiSessionFiles, monkeypatch
 ) -> None:
     client = _FakeSandboxClient()
     files.save_sandbox(
@@ -1000,6 +1062,10 @@ def test_ensure_flushes_staged_workflow_into_a_running_sandbox(
     )
     files.save_pending_sandbox_staging(
         source_conversation_id=None, workflow_dsl="nodes: []\n"
+    )
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
+        lambda **kwargs: ("", 0, False),
     )
     manager = SandboxExecutionManager(client_factory=lambda context: client)
 

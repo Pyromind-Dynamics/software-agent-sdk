@@ -22,6 +22,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { createPiModelRuntime, type PiModelConfig } from "./pi-model.js";
 import { createNoProgressGuardExtension } from "./no-progress-guard.js";
+import { createNoSpinExtension } from "./no-spin-extension.js";
 import { createToolResultExtension } from "./tool-results.js";
 import { isRecord, type JsonObject, type JsonValue } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
@@ -67,8 +68,11 @@ export interface ParsedPrompt {
 }
 
 export interface PiSessionOptions {
+  onRepetitionDetected?: () => void;
   /** Test seam: the terminal socket used by a sandbox session. */
   terminalConnect?: SandboxTerminalConnector;
+  /** The runner-local ask_user tool, present only for input-enabled sessions. */
+  askUserTool?: AgentTool;
 }
 
 const DEFAULT_MODEL_MAX_RETRIES = 2;
@@ -275,6 +279,7 @@ export async function createPiSession(
     config.tools,
     options,
   );
+  if (sessionOptions.askUserTool) rawTools.push(sessionOptions.askUserTool);
   if (!executionAccess) throw new Error("execution environment was not initialized");
   const coordinator = new ToolCoordinator();
   const tools = rawTools.map((tool) => coordinator.wrap({
@@ -297,7 +302,7 @@ export async function createPiSession(
   childTools.push(...createRetrievalTools(executionAccess, options.readMirror).map((tool) => ({
     ...tool, execute: (id: string, args: any, signal?: AbortSignal, update?: any) => coordinator.run(signal, () => tool.execute(id, args, signal, update)),
   })));
-  const childInstructions = "Use read-only knowledge/ and .agents/skills/ resources and public_data/ conversation files. Storage paths keep their storage/ prefix. Write only public_data/. " +
+  const childInstructions = "Use read-only knowledge/ and .agents/skills/ resources and public_data/ conversation files. The user Storage mount is addressed by its absolute path. Write only public_data/. " +
     "Tool paths refer to the conversation execution environment, never the host's directories. Available skills:\n" + skillPaths.map((path) => applySandboxPathAliases(path, sandboxPathAliases)).join("\n");
   const subagents = new SubagentHost(config.workspaceRoot, config.sessionId, peer, childTools, modelRuntime, model, childInstructions);
   const settingsManager = SettingsManager.inMemory({
@@ -313,7 +318,7 @@ export async function createPiSession(
     settingsManager,
     systemPrompt: config.systemPrompt,
     appendSystemPrompt: params.workflows_enabled === true
-      ? ["历史经验的路径参数使用当前会话执行环境的路径：Storage 文件保留 storage/ 前缀（如 storage/agentTest/input.csv），会话文件使用 public_data/...。与 read/terminal 验证成功的路径保持一致；不要改成服务端路径、平台 /workspace 路径或省略 storage/。"]
+      ? ["历史经验的路径参数使用当前会话执行环境的路径：Storage 文件用挂载点绝对路径（如 /target-workspace/agentTest/input.csv），会话文件使用 public_data/...。与 read/terminal 验证成功的路径保持一致；不要改成服务端路径或平台 /workspace 路径。"]
       : [],
     eventBus: experienceHost.eventBus,
     additionalExtensionPaths: [
@@ -325,6 +330,7 @@ export async function createPiSession(
       subagents.extension,
       createToolResultExtension(recorder),
       createNoProgressGuardExtension(recorder),
+      { name: "no-spin", factory: createNoSpinExtension(sessionOptions.onRepetitionDetected) },
       (pi) => {
         if (config.terminalBackend !== "sandbox") return;
         pi.on("before_agent_start", (event) => {
@@ -380,6 +386,10 @@ export async function createPiSession(
   });
   await resourceLoader.reload();
   experienceHost.assertLoaded(resourceLoader);
+  const extensions = resourceLoader.getExtensions();
+  if (!extensions.extensions.some((extension) => extension.path === "<inline:no-spin>")) {
+    throw new Error(`Repetition protection failed to load: ${JSON.stringify(extensions.errors)}`);
+  }
   const sessionManager = SessionManager.open(
     config.sessionPath,
     join(config.workspaceRoot, "pi"),

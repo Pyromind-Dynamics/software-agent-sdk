@@ -293,6 +293,28 @@ def test_report_all_success(generate_report_mod: Any, tmp_path: Path) -> None:
     assert report["duration_seconds"] == 5.0
 
 
+def test_generate_report_main_writes_a_compact_status_envelope(
+    generate_report_mod: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["generate_report.py", "--log-dir", str(tmp_path)],
+    )
+
+    generate_report_mod.main()
+
+    status = json.loads((tmp_path / "report.status.json").read_text(encoding="utf-8"))
+    assert status == {
+        "schema_version": 1,
+        "status": "succeeded",
+        "report_status": "no_llm_calls",
+        "product": "processed.jsonl",
+    }
+
+
 def test_report_writes_deduplicated_label_corrections(
     generate_report_mod: Any,
     tmp_path: Path,

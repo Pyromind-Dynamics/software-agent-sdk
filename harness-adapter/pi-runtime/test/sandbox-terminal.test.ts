@@ -14,6 +14,7 @@ import {
   buildStageBatches,
   ENVIRONMENT_RUNNER,
   SandboxTerminalExecutionError,
+  isUnstartedTerminalFailure,
   buildStartLine,
   buildWatchScript,
   SandboxTerminalOperations,
@@ -55,7 +56,10 @@ test("operator timeouts come from the environment when configured", () => {
   assert.deepEqual(sandboxTerminalTimeouts({
     PYROMIND_PI_TERMINAL_RESOLVE_TIMEOUT_MS: "60000",
     PYROMIND_PI_TERMINAL_STARTUP_TIMEOUT_MS: " 90000 ",
-  }), { resolveTimeoutMs: 60_000, startupTimeoutMs: 90_000 });
+  }), {
+    resolveTimeoutMs: 60_000, startupTimeoutMs: 90_000,
+    queueTimeoutMs: undefined,
+  });
   assert.throws(() => sandboxTerminalTimeouts({ PYROMIND_PI_TERMINAL_STARTUP_TIMEOUT_MS: "soon" }),
     /must be a positive number of milliseconds/);
 });
@@ -124,6 +128,26 @@ test("a rejected endpoint resolution is retried on the same budget", async () =>
   assert.equal(attempts, 2);
   assert.deepEqual(requests, [{ refresh: false }, { refresh: true }]);
   assert.equal(sockets.length, 1);
+});
+
+test("a call which never started drops the endpoint bundle", () => {
+  // A pod the control plane rescheduled leaves the bundle pointing at an address
+  // nothing answers: the connect only times out, so there is no execution record
+  // to classify it by. Nothing ran, so the bundle is the only thing to drop.
+  const unstarted = new SandboxTerminalExecutionError("timeout:300", {
+    started: false,
+    stopped: true,
+  } as never);
+  const started = new SandboxTerminalExecutionError("timeout:300", {
+    started: true,
+    stopped: true,
+  } as never);
+
+  assert.equal(isUnstartedTerminalFailure(unstarted), true);
+  assert.equal(isUnstartedTerminalFailure(started), false);
+  assert.equal(isUnstartedTerminalFailure(new Error("timeout")), true);
+  assert.equal(isUnstartedTerminalFailure(new Error("closed")), true);
+  assert.equal(isUnstartedTerminalFailure(new Error("boom")), false);
 });
 
 test("a persistent endpoint resolution failure reports the control-plane error", async () => {

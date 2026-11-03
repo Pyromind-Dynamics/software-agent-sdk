@@ -104,7 +104,7 @@ export class WorkflowExecution {
     if (method === "execution.tool") {
       // A graph's fixed tool call is the same business tool the agent calls, so it
       // goes back through the adapter's tool port instead of a second implementation.
-      const { name, arguments: toolArguments, tool_call_id } = params;
+      const { name, arguments: toolArguments, tool_call_id, origin_run_id } = params;
       if (typeof name !== "string" || !toolArguments || typeof toolArguments !== "object"
           || Array.isArray(toolArguments)) {
         throw new Error("tool name and arguments are required");
@@ -113,6 +113,7 @@ export class WorkflowExecution {
         tool_name: name,
         arguments: toolArguments as JsonObject,
         ...(typeof tool_call_id === "string" ? { tool_call_id } : {}),
+        ...(typeof origin_run_id === "string" && origin_run_id ? { origin_run_id } : {}),
       });
       if (!response || typeof response !== "object" || Array.isArray(response)) {
         throw new Error("invalid Python tool response");

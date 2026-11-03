@@ -47,6 +47,7 @@ from openhands.tools.pyromind_dataset.definition import (
     download_tail_from_pyromind,
     upload_local_file_to_pyromind,
 )
+from openhands.tools.utils.storage_paths import to_tool_storage_path
 from openhands.tools.utils.workspace_staging import (
     WorkspaceStagingError,
     is_remote_workspace,
@@ -330,9 +331,9 @@ def build_render_command(
     limit: int | None,
 ) -> str:
     """Assemble the render command: install minimal deps, run render_manifest."""
-    pod_output = _pod_path(str(PurePosixPath("/" + output_dir.lstrip("/"))))
+    pod_output = _pod_path(to_tool_storage_path(output_dir, field="output_dir"))
     venv = "/tmp/edp-venv"
-    data_pod = _pod_path(str(PurePosixPath("/" + data_source.lstrip("/"))))
+    data_pod = _pod_path(to_tool_storage_path(data_source, field="data_source"))
     out_pod = pod_output
 
     steps = [
@@ -557,7 +558,9 @@ class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
 
             command = build_render_command(
                 output_dir=output_dir,
-                data_source=str(PurePosixPath("/" + action.data_source.lstrip("/"))),
+                data_source=to_tool_storage_path(
+                    action.data_source, field="data_source"
+                ),
                 shard_size=action.shard_size,
                 limit=action.limit,
             )

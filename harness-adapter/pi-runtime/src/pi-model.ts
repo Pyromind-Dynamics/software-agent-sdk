@@ -1,6 +1,7 @@
 import { type Api, clampThinkingLevel, InMemoryCredentialStore, type Model, type Models } from "@earendil-works/pi-ai";
 import { stream as streamModel, streamSimple as streamModelSimple } from "@earendil-works/pi-ai/compat";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { modelIdleTimeoutMs, modelStreamWithIdleTimeout } from "./model-stream.js";
 
 export interface PiModelConfig {
   provider: string;
@@ -21,23 +22,25 @@ export async function createPiModelRuntime(config: PiModelConfig): Promise<{
   let model = resolveModel(modelRuntime, config);
 
   if (config.baseUrl && !isOfficialOpenAIBaseUrl(config.baseUrl)) {
+    const idleTimeoutMs = modelIdleTimeoutMs();
     modelRuntime.registerProvider(config.provider, {
       name: config.provider,
       baseUrl: model.baseUrl,
       api: model.api,
-      streamSimple: (requestModel, context, options) => {
-        if (requestModel.api !== "openai-completions") {
-          return streamModelSimple(requestModel, context, options);
-        }
-        const reasoning = options?.reasoning
-          ? clampThinkingLevel(requestModel, options.reasoning)
-          : undefined;
-        // Keep explicit output limits without deriving max_tokens from context usage.
-        return streamModel(requestModel, context, {
-          ...options,
-          reasoningEffort: reasoning === "off" ? undefined : reasoning,
-        });
-      },
+      streamSimple: (requestModel, context, options) =>
+        modelStreamWithIdleTimeout(requestModel, options, (guardedOptions) => {
+          if (requestModel.api !== "openai-completions") {
+            return streamModelSimple(requestModel, context, guardedOptions);
+          }
+          const reasoning = guardedOptions.reasoning
+            ? clampThinkingLevel(requestModel, guardedOptions.reasoning)
+            : undefined;
+          // Keep explicit output limits without deriving max_tokens from context usage.
+          return streamModel(requestModel, context, {
+            ...guardedOptions,
+            reasoningEffort: reasoning === "off" ? undefined : reasoning,
+          });
+        }, idleTimeoutMs),
       models: [{
         ...model,
         input: [...model.input],

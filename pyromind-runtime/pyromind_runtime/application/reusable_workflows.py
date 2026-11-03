@@ -13,6 +13,7 @@ from pyromind_runtime.ports.workflows import WorkflowBackend
 
 
 type Publish = Callable[[str, str, str, JsonObject], Coroutine[Any, Any, None]]
+type Admission = Callable[[str], Coroutine[Any, Any, None]]
 
 
 def started_run(action: str, result: JsonObject) -> str | None:
@@ -59,13 +60,15 @@ class ReusableWorkflows:
         complete: Callable[[str, JsonObject], Coroutine[Any, Any, None]] | None = None,
         agent_task: Callable[[str, JsonObject], Coroutine[Any, Any, JsonObject]]
         | None = None,
+        admission: Admission | None = None,
     ) -> None:
+        self.admission = admission
         self.agent_task = agent_task
         self.complete = complete
         self.backend = backend
         self.publish = publish
         self.active: dict[str, _Run] = {}
-        self.deferred: set[asyncio.Task[None]] = set()
+        self.deferred: set[asyncio.Task[object]] = set()
 
     def busy(self, scope: str) -> bool:
         return scope in self.active
@@ -107,7 +110,7 @@ class ReusableWorkflows:
         while run := self.active.get(scope):
             await run.done.wait()
 
-    def defer(self, work: Coroutine[Any, Any, None]) -> None:
+    def defer(self, work: Coroutine[Any, Any, object]) -> None:
         task = asyncio.create_task(work)
         self.deferred.add(task)
         task.add_done_callback(self.deferred.discard)
@@ -220,6 +223,8 @@ class ReusableWorkflows:
                     "arguments": {"workflow_run_id": run.run_id},
                 },
             )
+            if self.admission is not None:
+                await self.admission(scope)
             result = await self.backend.execute(scope, run.run_id, emit)
             # A parked run is a pause, not a verdict: the chain keeps its checkpoint
             # and the operation stays open until the human gate is answered and the

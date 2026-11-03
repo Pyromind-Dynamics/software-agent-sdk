@@ -7,7 +7,7 @@
 
 DataFlow 不在 `dataflow.operators` 顶层导出算子，`getattr(operators, "PromptedFilter")`
 一定失败；`dataflow.operators.core_text.filter` 也不是可导入的包（`filter/` 没有
-`__init__.py`）。下表是 open-dataflow 1.0.10 实测可用的导入路径，直接照抄，不要在
+`__init__.py`）。下表是 open-dataflow 1.0.13 实测可用的导入路径，直接照抄，不要在
 沙箱里翻 site-packages 反查：
 
 ```python
@@ -355,7 +355,7 @@ pipeline 必须把无响应/解析失败的记录写入 `failures.jsonl`（`reas
 
 ### 资源与版本
 
-- 沙箱小样和 Pyromind 都使用 `open-dataflow==1.0.11`。
+- 沙箱小样和 Pyromind 都使用 `open-dataflow==1.0.13`。
 - Text2SQL 算子在 Python 3.13 存在上游 `re.template` 兼容问题，这类 Pipeline 需要
   用 `PYROMIND_SANDBOX_DATAFLOW_PYTHON` 指向沙箱内 Python 3.10 的解释器。
 - 只使用 API Chat/Vision 和 CPU 算子；需要 Embedding、CUDA、外部服务或模型下载的

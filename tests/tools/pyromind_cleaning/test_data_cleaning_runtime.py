@@ -589,15 +589,15 @@ def test_skill_guides_sandbox_default_and_platform_fallback():
     assert "等待用户明确确认" in skill
     assert "确定性格式转换默认在会话沙箱内完成" in skill
     assert "不需要下载数据到沙箱之外" in skill
-    assert "用户 Storage 已挂载为 `storage/`" in skill
-    assert "直接读 `storage/<path>`" in skill
+    assert "用户 Storage 已挂载为 `/target-workspace`" in skill
+    assert "直接读 `/target-workspace/<path>`" in skill
     assert "用 `write` 写转换脚本，用 `terminal` 执行" in skill
     assert "都是 Storage 根路径（以 `/` 开头）" in skill
     assert "不要原样重试" in skill
     assert "不要查看、搜索或反复读取 `cleaning_utils.py`" in skill
     assert "prompt/chosen/rejected 自动按 DPO 清洗" in skill
     assert "不透明 `error_log`" in skill
-    assert "`storage/<output_dir>/report.json`" in skill
+    assert "`/target-workspace` + `output_dir`" in skill
     assert "`output.jsonl`" in skill
     assert "只生成两个数据产物" in skill
     assert "`read_file`" not in skill

@@ -17,6 +17,7 @@ class CreateConversationRequest(BaseModel):
         default=None,
         validation_alias=AliasChoices("workflow_xyflow", "workflowXyflow"),
     )
+    user_input_enabled: bool = False
     extra: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"populate_by_name": True, "extra": "forbid"}

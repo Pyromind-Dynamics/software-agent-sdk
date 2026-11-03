@@ -16,6 +16,7 @@ from openhands.tools.pyromind_dataset.definition import (
     _default_storage_base_url,
     download_file_from_pyromind,
 )
+from openhands.tools.utils.storage_paths import REMOVED_ALIAS
 from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
 from openhands.tools.workflow.task_submission import (
     create_workflow_api_client,
@@ -27,6 +28,35 @@ from openhands.tools.workflow.validate_workflow_dsl import (
 )
 
 
+# The sandbox mount point the file is visible under. It names the Storage root,
+# so a workflow path carrying it is restated without it.
+def _mount_prefix() -> str:
+    mount = os.getenv("PYROMIND_SANDBOX_MOUNT_PATH", "/target-workspace")
+    return mount.strip("/").split("/")[0]
+
+
+def _storage_path(workflow_path: str) -> str:
+    """Restate the spelling the model used as the Storage path the platform reads."""
+    path = PurePosixPath(workflow_path)
+    if path.suffix != ".py" or ".." in path.parts:
+        raise ValueError("workflow_path must be a workflow .py file inside Storage")
+    parts = [part for part in path.parts if part not in {"", "/", "."}]
+    if parts and parts[0] == REMOVED_ALIAS:
+        raise ValueError(
+            "workflow_path uses the removed 'storage/' alias; pass the mount path "
+            f"('/{_mount_prefix()}/<dir>/workflow.py') or the Storage path "
+            "('/<dir>/workflow.py')"
+        )
+    if parts and parts[0] == _mount_prefix():
+        parts = parts[1:]
+    if len(parts) < 2:
+        raise ValueError(
+            "workflow_path must be a workflow .py file inside Storage, "
+            "such as /<dir>/workflow.py"
+        )
+    return "/" + "/".join(parts)
+
+
 class PlatformWorkflowSubmission:
     async def prepare(self, workflow_path: str, context: RequestContext) -> JsonObject:
         return await asyncio.to_thread(self._prepare, workflow_path, context)
@@ -34,14 +64,7 @@ class PlatformWorkflowSubmission:
     @staticmethod
     def _prepare(workflow_path: str, context: RequestContext) -> JsonObject:
         path = PurePosixPath(workflow_path)
-        if (
-            not workflow_path.startswith("storage/")
-            or path.suffix != ".py"
-            or ".." in path.parts
-            or len(path.parts) < 3
-        ):
-            raise ValueError("workflow_path must be a workflow.py under storage/")
-        storage_path = "/" + str(PurePosixPath(*path.parts[1:]))
+        storage_path = _storage_path(workflow_path)
         headers = {
             name: value
             for name, value in (

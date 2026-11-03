@@ -5,12 +5,13 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
-from pyromind_runtime.domain.commands import ProductCommand
+from pyromind_runtime.domain.commands import InputResponseCommand, ProductCommand
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent, HarnessEventType
 from pyromind_runtime.domain.snapshot import WorkflowState
 from pyromind_runtime.ports.harness import (
+    AttachRecovery,
     ExternalTaskNotification,
     ForkSpec,
     ProductCheckpoint,
@@ -45,6 +46,9 @@ class FakeAdapter:
         ] = []
         self.forks: list[tuple[ForkSpec, ProductCheckpoint]] = []
         self.restores: list[RestoreWorkflowSpec] = []
+        # Test seams for the user-input flow.
+        self.input_responses: list[tuple[str, InputResponseCommand]] = []
+        self.fail_input_delivery = False
 
     async def describe(self):
         return "fake", self.capabilities
@@ -101,7 +105,10 @@ class FakeAdapter:
         return handle
 
     async def attach_session(
-        self, conversation_id: str, context: RequestContext
+        self,
+        conversation_id: str,
+        context: RequestContext,
+        recovery: AttachRecovery | None = None,
     ) -> SessionHandle:
         self.attached.append(conversation_id)
         handle = self._open(conversation_id)
@@ -115,6 +122,11 @@ class FakeAdapter:
         context: RequestContext,
     ) -> JsonObject:
         self.sent.append((handle.session_id, command, context))
+        if isinstance(command, InputResponseCommand):
+            self.input_responses.append((handle.session_id, command))
+            if self.fail_input_delivery:
+                raise RuntimeError("input delivery failed")
+            return {"resolved": True}
         return {"accepted": True}
 
     async def fork(

@@ -10,7 +10,7 @@ AgentGenome 在原生 Pi 与 SDK 中使用同一个默认插件入口。SDK 通�
 
 面向 Agent 和用户，AgentGenome graph 统一称为“历史经验”；“工作流”指 Pyromind 平台 DSL。历史经验（graph + scripts）和 Skill 都可复用：执行任务先查 `genome_list`，用 `genome_get` 确认适用性，合适则复用，否则再选 Skill。闲聊无需查询。工具名 `genome_*` 和内部工作流接口保持兼容。
 
-Storage 输入须保留 `storage/` 前缀，例如 `storage/agentTest/input.csv`。`agentTest/input.csv` 指当前会话下的相对路径，并非同一文件；平台的 `/workspace/...` 也不能直接当作当前沙箱路径。使用 `read`/`terminal` 已验证成功的原路径。
+Storage 输入用挂载点绝对路径，例如 `/target-workspace/agentTest/input.csv`。`agentTest/input.csv` 指当前会话下的相对路径，并非同一文件；平台的 `/workspace/...` 也不能直接当作当前沙箱路径。旧写法 `storage/...` 已移除（会被读成挂载点，但不要再使用）。使用 `read`/`terminal` 已验证成功的原路径。
 
 ## 快速测试与启动
 

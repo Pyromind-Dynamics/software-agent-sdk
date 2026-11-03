@@ -60,10 +60,14 @@ PYROMIND_AGENT_STORAGE_ROOT = "/.pyromind-agent"
 # of one deployment, so a conversation which finds its digest already there
 # unpacks it from the mount instead of uploading it again.
 PYROMIND_AGENT_RESOURCES_ROOT = "/.pyromind-agent-resources"
-# Workspace-relative alias for the mounted Storage root. The model reads data
-# through normal file/terminal tools instead of the Storage HTTP API.
-STORAGE_ALIAS = "storage"
-_WORKSPACE_LAYOUT_VERSION = 3
+# The workspace symlink that used to expose the Storage mount under a short
+# relative name. Storage is addressed by its mount path now, so the link is only
+# remembered here to clear it out of workspaces laid out by an older runtime.
+LEGACY_STORAGE_ALIAS = "storage"
+# Bumped when the workspace layout changes, so an existing sandbox re-runs the
+# prepare script. 4: the Storage symlink is no longer created, and workspaces
+# laid out by version 3 still carry it until they are prepared again.
+_WORKSPACE_LAYOUT_VERSION = 4
 # The platform rejects a create request without memory; mirror the sandbox
 # tool's own fallback (platform minimum 4 vCPU, 1:2 vCPU:memory ratio).
 DEFAULT_CPU = "4"
@@ -81,6 +85,10 @@ _MOUNT_MISSING_EXIT_CODE = 3
 _FORK_MISSING_EXIT_CODE = 42
 _CREATE_TIMEOUT_SECONDS = 600
 _PREPARE_TIMEOUT_SECONDS = 120
+# A recorded sandbox can outlive its data-plane endpoint: the control plane still
+# reports it running while connections to the terminal port never complete. One
+# short command tells the two apart before the session depends on it.
+_PROBE_TIMEOUT_SECONDS = 15
 # A fork copies an existing conversation inside the mount, so it scales with
 # the amount of data the source conversation wrote to Storage.
 _FORK_TIMEOUT_SECONDS = 600
@@ -444,6 +452,11 @@ class SandboxExecutionManager:
         settings = SandboxSettings.from_extra(context.extra)
         record = files.load_sandbox() or {}
         client = await asyncio.to_thread(self._client_factory, context)
+        ws_base_url = terminal_base_url(
+            cluster=client.cluster,
+            env=_execution_target(context)[0],
+            fallback=client.base_url,
+        )
         mount_path = settings.mount_path
         workspace_path = (
             f"{mount_path}{PYROMIND_AGENT_STORAGE_ROOT}/{context.conversation_id}"
@@ -497,6 +510,25 @@ class SandboxExecutionManager:
             sandbox = await self._create(client, settings, context.conversation_id)
             prepare = True
 
+        if (
+            not prepare
+            and not record_needs_prepare
+            and not await self._reachable(client, sandbox.id, ws_base_url)
+        ):
+            # The control plane reports the container running even after its
+            # terminal port stops answering, so a reuse that is never checked
+            # turns every later call into a wait for a connection that will not
+            # open. Rebuild it here instead.
+            logger.warning(
+                "Recreating Pi sandbox whose terminal stopped answering "
+                "conversation_id=%s sandbox_id=%s",
+                context.conversation_id,
+                sandbox.id,
+            )
+            await asyncio.to_thread(client.delete, sandbox.id)
+            sandbox = await self._create(client, settings, context.conversation_id)
+            prepare = True
+
         if prepare:
             # The sandbox name is derived from the conversation, so record the
             # container before its workspace is ready: a retry has to repair
@@ -511,11 +543,6 @@ class SandboxExecutionManager:
                 }
             )
 
-        ws_base_url = terminal_base_url(
-            cluster=client.cluster,
-            env=_execution_target(context)[0],
-            fallback=client.base_url,
-        )
         if pending_staging is not None:
             await self._apply_pending_staging(
                 client,
@@ -582,11 +609,53 @@ class SandboxExecutionManager:
             return await asyncio.to_thread(client.get_sandbox, sandbox_id)
         except Exception as exc:  # noqa: BLE001
             logger.info(
-                "Pi sandbox lookup failed; recreating sandbox_id=%s error=%s",
+                "Pi sandbox lookup failed; recreating sandbox_id=%s error=%s: %s",
                 sandbox_id,
                 type(exc).__name__,
+                exc,
             )
             return None
+
+    async def _reachable(
+        self, client: SandboxClientLike, sandbox_id: str, ws_base_url: str
+    ) -> bool:
+        """Whether the sandbox's terminal answers right now.
+
+        The control plane keeps reporting a container as running after its data
+        plane stops accepting connections, so a recorded sandbox has to be
+        asked, not assumed. Anything but a clean exit means "not usable" and the
+        caller rebuilds it.
+        """
+        try:
+            _, exit_code, timed_out = await asyncio.wait_for(
+                asyncio.to_thread(
+                    run_terminal_command,
+                    base_url=ws_base_url,
+                    api_key=client.api_key,
+                    sandbox_id=sandbox_id,
+                    command="true",
+                    timeout_seconds=_PROBE_TIMEOUT_SECONDS,
+                ),
+                _PROBE_TIMEOUT_SECONDS + 5,
+            )
+        except Exception as error:  # noqa: BLE001 - any failure means "rebuild it"
+            logger.info(
+                "Pi sandbox probe failed sandbox_id=%s error=%s: %s",
+                sandbox_id,
+                type(error).__name__,
+                error,
+            )
+            return False
+        if timed_out or exit_code != 0:
+            logger.info(
+                "Pi sandbox probe answered badly sandbox_id=%s exit_code=%s "
+                "timed_out=%s",
+                sandbox_id,
+                exit_code,
+                timed_out,
+            )
+            return False
+        return True
 
     async def _create(
         self, client: SandboxClientLike, settings: SandboxSettings, conversation_id: str
@@ -686,15 +755,17 @@ class SandboxExecutionManager:
         mount_path: str,
         workspace_path: str,
     ) -> None:
-        storage_link = f"{workspace_path}/{STORAGE_ALIAS}"
+        legacy_link = f"{workspace_path}/{LEGACY_STORAGE_ALIAS}"
         public_data = f"{workspace_path}/public_data"
         script = (
             f"if [ ! -d {shlex.quote(mount_path)} ]; then "
             f"exit {_MOUNT_MISSING_EXIT_CODE}; fi\n"
             f"mkdir -p {shlex.quote(workspace_path)} && "
             f"mkdir -p {shlex.quote(public_data)} && "
-            f"rm -rf {shlex.quote(storage_link)} && "
-            f"ln -s {shlex.quote(mount_path)} {shlex.quote(storage_link)}\n"
+            # Drop the alias an older runtime left behind. Only a symlink is
+            # removed, so a real directory of that name is never touched.
+            f"if [ -L {shlex.quote(legacy_link)} ]; then "
+            f"rm -f {shlex.quote(legacy_link)}; fi\n"
         )
         output, exit_code, timed_out = await self._run_script(
             client, sandbox_id, ws_base_url, script
@@ -1080,9 +1151,10 @@ class SandboxExecutionManager:
             raise
         except Exception as error:  # noqa: BLE001 - the first touch retries
             logger.warning(
-                "Pi sandbox pre-warm failed conversation_id=%s error=%s",
+                "Pi sandbox pre-warm failed conversation_id=%s error=%s: %s",
                 context.conversation_id,
                 type(error).__name__,
+                error,
             )
 
     def _cancel_prewarm(self, conversation_id: str) -> None:

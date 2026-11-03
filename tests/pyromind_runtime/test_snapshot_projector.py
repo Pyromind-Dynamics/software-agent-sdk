@@ -1,3 +1,4 @@
+import pytest
 from pyromind_runtime.application import SnapshotProjector
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.events import ProductEvent
@@ -163,16 +164,34 @@ def test_projector_tracks_external_task_lifecycle() -> None:
 
     snapshot = projector.reduce(
         snapshot,
-        _event(3, "external_task.submitted", submitted),
+        _event(
+            3,
+            "external_task.bound",
+            {
+                "task_id": "task-1",
+                "graph_run_id": "graph-1",
+                "output_dir": "/agent/conv/data_cleaning/graph-1",
+            },
+        ),
+    )
+    assert snapshot.external_tasks[0].kind == "graph_await"
+    assert snapshot.external_tasks[0].graph_run_id == "graph-1"
+    assert snapshot.external_tasks[0].status == "succeeded"
+    assert snapshot.external_tasks[0].resume_pending is True
+
+    snapshot = projector.reduce(
+        snapshot,
+        _event(4, "external_task.submitted", submitted),
     )
     snapshot = projector.reduce(
         snapshot,
-        _event(4, "external_task.updated", {**submitted, "status": "running"}),
+        _event(5, "external_task.updated", {**submitted, "status": "running"}),
     )
 
     assert snapshot.status == "idle"
     assert snapshot.external_tasks[0].status == "succeeded"
     assert snapshot.external_tasks[0].resume_pending is True
+    assert snapshot.external_tasks[0].graph_run_id == "graph-1"
 
 
 def test_projector_accepts_environment_processing_kinds() -> None:
@@ -243,3 +262,51 @@ def test_late_completion_preserves_new_run_and_message_command_id():
     )
     assert snapshot.status == "idle"
     assert snapshot.active_run_id is None
+
+
+@pytest.mark.parametrize("outcome", ["cancelled", "interrupted"])
+@pytest.mark.parametrize("failure_first", [False, True])
+def test_input_resolution_preserves_history_outcome(outcome, failure_first):
+    projector = SnapshotProjector()
+    snapshot = projector.reduce(
+        _snapshot(),
+        _event(1, "operation.started", {"operation_id": "ask-1", "name": "ask_user"}),
+    )
+    snapshot = projector.reduce(
+        snapshot,
+        _event(
+            2,
+            "input.requested",
+            {
+                "request_id": "input-1",
+                "operation_id": "ask-1",
+                "questions": [{"id": "format", "prompt": "Format?"}],
+            },
+        ),
+    )
+    resolution = (
+        "input.resolved",
+        {"request_id": "input-1", "outcome": outcome},
+    )
+    failure = (
+        "operation.failed",
+        {
+            "operation_id": "ask-1",
+            "output": [{"type": "text", "text": "This operation was aborted"}],
+            "details": {"trace": "native-result"},
+            "error_code": "tool_execution_failed",
+        },
+    )
+    ordered = [failure, resolution] if failure_first else [resolution, failure]
+    for seq, (event_type, payload) in enumerate(ordered, start=3):
+        snapshot = projector.reduce(snapshot, _event(seq, event_type, payload))
+    restored = ConversationSnapshot.model_validate_json(snapshot.model_dump_json())
+    operation = restored.timeline[0]
+    assert isinstance(operation, TimelineOperation)
+    assert operation.details == {
+        "trace": "native-result",
+        "user_input": {"request_id": "input-1", "status": outcome},
+    }
+    assert operation.error_code == "tool_execution_failed"
+    assert restored.status == "paused"
+    assert not restored.pending_inputs

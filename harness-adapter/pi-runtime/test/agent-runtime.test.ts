@@ -132,6 +132,14 @@ test("final Pi stop reasons normalize without treating length as success", () =>
   );
 });
 
+test("thinking-only and blank final responses fail without hiding genuine cancellations", () => {
+  for (const content of [[], [{ type: "thinking", thinking: "Internal analysis only." }], [{ type: "text", text: "  " }]]) {
+    const message = { ...assistant("stop"), content } as AssistantMessage;
+    assert.equal(normalizePiOutcome([message]).error_code, "model_empty_response");
+    assert.equal(normalizePiOutcome([{ ...message, stopReason: "aborted" }]).status, "cancelled");
+  }
+});
+
 test("idle external notification triggers an independent hidden Pi turn", async () => {
   const events: RunnerEvent[] = [];
   const peer = {
@@ -175,7 +183,7 @@ test("idle external notification triggers an independent hidden Pi turn", async 
 function assistant(stopReason: AssistantMessage["stopReason"]): AgentMessage {
   return {
     role: "assistant",
-    content: [],
+    content: [{ type: "text", text: "A completed response." }],
     api: "openai-completions",
     provider: "openai",
     model: "test-model",

@@ -69,9 +69,9 @@ class SandboxWorkspace(BaseWorkspace):
     ) -> None:
         """Bind the SDK workspace port to one platform sandbox.
 
-        ``storage_path`` is the sandbox-side mount of the user Storage that the
-        conversation addresses as ``storage/``; tools that stage data into a
-        local staging directory resolve the alias against it.
+        ``storage_path`` is the sandbox-side mount of the user Storage; tools
+        that stage data into a local staging directory resolve Storage paths
+        against it.
         """
         super().__init__(working_dir=str(working_dir), **kwargs)
         self._storage_path = str(storage_path)
@@ -81,7 +81,7 @@ class SandboxWorkspace(BaseWorkspace):
 
     @property
     def storage_path(self) -> str:
-        """Sandbox-side Storage mount root addressed as ``storage/``."""
+        """Sandbox-side Storage mount root, addressed by its absolute path."""
         return self._storage_path
 
     def execute_command(

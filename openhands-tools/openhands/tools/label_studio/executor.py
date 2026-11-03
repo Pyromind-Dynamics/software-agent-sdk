@@ -1005,7 +1005,7 @@ class LabelStudioProjectExecutor(
             relative, from_storage = resolve_workspace_path(workspace, relative_path)
         except WorkspaceStagingError:
             relative, from_storage = PurePosixPath(), True
-        if from_storage or relative_path.startswith("storage/"):
+        if from_storage:
             try:
                 return self._download_from_storage(
                     resolved.resolved,

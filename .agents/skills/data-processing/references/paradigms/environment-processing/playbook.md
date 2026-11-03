@@ -64,7 +64,7 @@ manifest 的构造、逐条验证、最终聚合**全部在平台节点执行**,
 不出现本地 manifest.jsonl / verdicts.jsonl / 训练文件:
 
 ```text
-看字段(直读 storage/) → 写/确认 render 模板 JSON(几 KB)
+看字段(直读 /target-workspace/) → 写/确认 render 模板 JSON(几 KB)
   ① edp_render    → 平台节点:读 parquet → 分片写 batch-XXX/manifest.jsonl + shards.json
   ② edp_submit    → 平台节点:逐条起镜像验证 → verdicts.jsonl + traces/
   ③ edp_aggregate → 平台节点:跨片合并去重 + 转 slime/SFT → 训练文件落 storage
@@ -85,12 +85,12 @@ agent 不需要做任何事。
 ### 1. 渲染分片(manifest 由平台节点构造)
 
 **数据源定位(先做这一步)**:用户给出的数据路径(如 `/workspace/datasets/...`)
-一律是 storage 路径,**第一步先探索目录结构**。Storage 已挂载为 `storage/`,
-直接用 `read`/`terminal` 查看(`storage/` 相对路径)。数据源的目录结构与字段映射
+一律是 storage 路径,**第一步先探索目录结构**。Storage 已挂载为 `/target-workspace`,
+直接用 `read`/`terminal` 查看(`/target-workspace` 绝对路径)。数据源的目录结构与字段映射
 见对应 case 文档(如 [tmax](cases/tmax.md))。
 
 **调研纪律(硬约束)**:写模板前的调研只允许两类动作——查看数据(用
-`read`/`terminal` 直读 `storage/...`)与读本 skill 文档/源码。单文件超限时
+`read`/`terminal` 直读 `/target-workspace/...`)与读本 skill 文档/源码。单文件超限时
 **不要**把全量数据拷进会话工作区查 schema——那会把全量数据拉回 agent 侧,
 违背三段平台化的控制面原则;正确动作是先向用户提问,说明缺口
 与候选方案,由用户决策。字段来源表达不了时先查下方 spec 能力表
@@ -189,7 +189,7 @@ edp_submit(manifest=<render 输出的 batch-001/manifest.jsonl>, limit=3)
 - Kafka 终态回调自动唤醒会话(Succeeded/Failed),随后查看
   `<output_dir>/run/verdicts.jsonl`(task_id / verdict / exit_code /
   error_category / reward / note)与 `<output_dir>/run/traces/`(解题轨迹):
-  用 `read`/`terminal` 读 `storage/<output_dir>/run/...`
+  用 `read`/`terminal` 读 `/target-workspace/<output_dir>/run/...`
 - 运行中可 `df_check_progress(output_dir=<run 目录>, tail_filename="verdicts.jsonl")`
   看实时进度(total/processed/ETA + 最近若干条 verdict);节点日志逐条一行
   (`[i/N] task_id=... verdict=... reward=...`)
