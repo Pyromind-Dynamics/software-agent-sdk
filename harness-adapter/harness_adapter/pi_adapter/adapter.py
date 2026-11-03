@@ -35,6 +35,7 @@ from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import ConversationSnapshot, WorkflowState
+from pyromind_runtime.domain.task_correlation import TaskOrigin
 from pyromind_runtime.domain.user_input import UserInputRequest
 from pyromind_runtime.ports.harness import (
     AttachRecovery,
@@ -446,6 +447,13 @@ class PiAdapter:
         ):
             raise PermissionError("role tool is not authorized")
         tool_context = await self._tool_context(session)
+        if scope.get("task_origin") is not None:
+            tool_context = replace(
+                tool_context,
+                request_context=replace(
+                    context, task_origin=TaskOrigin.model_validate(scope["task_origin"])
+                ),
+            )
         workspace = tool_context.workspace
         root = "public_data/experiment-runs/" + str(scope["run_id"])
         if workspace is not None:
@@ -1350,7 +1358,12 @@ class PiAdapter:
         if notification.reset_attempt_budget:
             self._business_tools.reset_attempt_budget(session.workspace_root)
         result = await session.runner.request(
-            "notify" if notification.trigger_turn else "context.append",
+            "recipient.notify"
+            if notification.correlation is not None
+            and notification.correlation.type == "subagent"
+            else "notify"
+            if notification.trigger_turn
+            else "context.append",
             {
                 "run_id": f"callback:{task_id}:{status}",
                 "content": notification.hidden_text,
@@ -1693,6 +1706,11 @@ class PiAdapter:
             arguments = params.get("arguments")
             if not isinstance(arguments, dict):
                 raise ValueError("role tool arguments must be an object")
+            if params.get("origin") is not None:
+                origin = TaskOrigin.model_validate(params["origin"])
+                if origin.type != "subagent":
+                    raise PermissionError("delegated call requires a child origin")
+                scope = {**scope, "task_origin": origin.model_dump(mode="json")}
             result = await self._role_call(
                 session.session_id, role, name, arguments, scope, session.context
             )
@@ -1785,10 +1803,19 @@ class PiAdapter:
                     "details": result,
                     "is_error": False,
                 }
+            tool_context = await self._tool_context(session)
+            if params.get("origin") is not None:
+                origin = TaskOrigin.model_validate(params["origin"])
+                if origin.type != "subagent":
+                    raise PermissionError("only child calls can carry an origin")
+                tool_context = replace(
+                    tool_context,
+                    request_context=replace(session.context, task_origin=origin),
+                )
             result = await self._business_tools.execute(
                 tool_name,
                 arguments,
-                await self._tool_context(session),
+                tool_context,
                 tool_call_id=(
                     params.get("tool_call_id")
                     if isinstance(params.get("tool_call_id"), str)
@@ -1933,6 +1960,7 @@ class PiAdapter:
                         type="external_task.submitted",
                         payload={
                             "task_id": task_id,
+                            "correlation": task.get("correlation"),
                             "kind": kind,
                             "run_id": run_id if isinstance(run_id, str) else task_id,
                             "status": _external_task_status(

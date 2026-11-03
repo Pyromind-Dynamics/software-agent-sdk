@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import UUID
 
 from pyromind_runtime.domain.content import JsonObject
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
 from openhands.tools.data_preparation.platform_submit import (
     TASK_ASSOCIATION_DIRNAME as PREPARATION_TASK_DIR,
@@ -81,6 +82,20 @@ class WorkflowExternalTaskRegistry:
         task_id = payload.get("task_id")
         if not isinstance(task_id, str) or not task_id:
             raise ValueError("external task_id is required")
+        canonical_id = _canonical_conversation_id(conversation_id)
+        owner = self.owner(task_id)
+        if owner is not None and owner != canonical_id:
+            raise PermissionError("external task belongs to another conversation")
+        existing = self._load_product(task_id)
+        if existing is not None:
+            previous = existing["payload"].get("correlation")
+            if previous is not None:
+                supplied = payload.get("correlation")
+                if supplied is not None and TaskCorrelation.model_validate(
+                    previous
+                ) != TaskCorrelation.model_validate(supplied):
+                    raise PermissionError("external task origin cannot change")
+                payload = {**payload, "correlation": previous}
         self._product_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         value = {
             "conversation_id": _canonical_conversation_id(conversation_id),

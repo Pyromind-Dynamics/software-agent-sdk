@@ -96,6 +96,7 @@ from pyromind_runtime.domain.snapshot import (
     TimelineOperation,
     WorkflowState,
 )
+from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
 from pyromind_runtime.domain.versions import (
     RunSource,
     SaveVersion,
@@ -298,6 +299,8 @@ class ConversationRuntime:
         ] = {}
         self._evaluation_annotation_cache_lock = threading.Lock()
         self._pending_task_registrations: dict[str, asyncio.Event] = {}
+        self._observation_replays: set[asyncio.Task[None]] = set()
+        self._notification_retries: dict[str, asyncio.Task[None]] = {}
 
     async def _execution_active(self, owner: PlanOwner) -> _ActiveConversation:
         active = self._active.get(owner.conversation_id)
@@ -1335,16 +1338,32 @@ class ConversationRuntime:
         code: str | None,
         context: RequestContext,
         graph_run_id: str | None = None,
+        correlation: TaskCorrelation | None = None,
     ) -> dict[str, Any]:
         """Submit an already-authorized tool action through the durable product path."""
         store = self._store(conversation_id)
         store.authorize(context.user_id, context.profile_id)
         if self.versions is None or self._workflow_submission is None:
             raise ValueError("versioned submission is unavailable")
+        correlation = correlation or TaskCorrelation(
+            conversation_id=conversation_id,
+            task_kind="workflow_run",
+            **(context.task_origin or TaskOrigin()).model_dump(),
+        )
+        if (
+            correlation.conversation_id
+            != TaskCorrelation(
+                conversation_id=conversation_id, task_kind=correlation.task_kind
+            ).conversation_id
+        ):
+            raise PermissionError("submission belongs to another conversation")
+        context = replace(context, task_origin=correlation.origin)
         identity = "tool:" + request_id
         digest = fingerprint({"workflow": workflow, "code": code})
         previous = store.load_workflow_execution_requests().get(identity)
         if previous is not None:
+            if previous.correlation is not None and previous.correlation != correlation:
+                raise PermissionError("request belongs to another task origin")
             if previous.fingerprint != digest:
                 raise ValueError("request id already used with different execution")
             if previous.task_id:
@@ -1374,6 +1393,7 @@ class ConversationRuntime:
             conversation_id=conversation_id,
             permission_id=identity,
             workflow_path="version://" + record.id,
+            correlation=correlation,
             fingerprint=digest,
             workflow=effective,
             summary={"name": str(workflow.get("name", "workflow"))},
@@ -1382,7 +1402,7 @@ class ConversationRuntime:
         store.save_workflow_execution_request(request, expected_revision=None)
         try:
             task_id = await self._workflow_submission.submit(
-                effective, conversation_id, context
+                effective, conversation_id, context, correlation=correlation
             )
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
@@ -1403,7 +1423,8 @@ class ConversationRuntime:
             conversation_id,
             {
                 "task_id": task_id,
-                "kind": "graph_await" if graph_run_id else "workflow_run",
+                "kind": "graph_await" if graph_run_id else correlation.task_kind,
+                "correlation": correlation.model_dump(mode="json", exclude_none=True),
                 "run_id": graph_run_id or identity,
                 "graph_run_id": graph_run_id,
                 "status": "pending",
@@ -2731,15 +2752,23 @@ class ConversationRuntime:
         context: RequestContext,
         *,
         request_id: str | None = None,
+        origin: TaskOrigin | None = None,
     ) -> dict[str, Any]:
         if self._workflow_submission is None:
             raise ValueError("workflow submission is unavailable")
         store = self._store(conversation_id)
         store.authorize(context.user_id, context.profile_id)
         store.require_command("workflow_execution")
+        correlation = TaskCorrelation(
+            conversation_id=conversation_id,
+            task_kind="workflow_run",
+            **(origin or context.task_origin or TaskOrigin()).model_dump(),
+        )
         identity = request_id or uuid4().hex
         previous = store.load_workflow_execution_requests().get(identity)
         if previous is not None:
+            if previous.correlation is not None and previous.correlation != correlation:
+                raise PermissionError("request belongs to another task origin")
             if previous.workflow_path != workflow_path:
                 raise ValueError("request id already belongs to another workflow")
             return {
@@ -2775,6 +2804,7 @@ class ConversationRuntime:
             request_id=identity,
             conversation_id=conversation_id,
             permission_id=f"workflow-run:{identity}",
+            correlation=correlation,
             workflow_path=workflow_path,
             fingerprint=fingerprint,
             workflow=workflow,
@@ -2879,7 +2909,12 @@ class ConversationRuntime:
         assert self._workflow_submission is not None
         try:
             task_id = await self._workflow_submission.submit(
-                request.workflow, request.conversation_id, context
+                request.workflow,
+                request.conversation_id,
+                replace(context, task_origin=request.correlation.origin)
+                if request.correlation
+                else context,
+                correlation=request.correlation,
             )
         except Exception as exc:
             logger.warning(
@@ -2919,6 +2954,11 @@ class ConversationRuntime:
             "task_id": task_id,
             "kind": "workflow_run",
             "run_id": request.request_id,
+            "correlation": request.correlation.model_dump(
+                mode="json", exclude_none=True
+            )
+            if request.correlation
+            else None,
             "status": "pending",
             "submitted_at": now,
             "updated_at": now,
@@ -3076,8 +3116,57 @@ class ConversationRuntime:
         error_summary: str | None = None,
         auto_run: bool = True,
         completion_result: JsonObject | None = None,
+        correlation: TaskCorrelation | None = None,
     ) -> ProductEvent:
         """Persist one callback and notify its owning harness at most once."""
+        if correlation is not None:
+            store = self._store(conversation_id)
+            if (
+                correlation.conversation_id
+                != TaskCorrelation(
+                    conversation_id=conversation_id, task_kind=correlation.task_kind
+                ).conversation_id
+            ):
+                raise PermissionError("callback belongs to another conversation")
+            owner = self.resolve_external_task_owner(task_id)
+            if owner is not None and owner != correlation.conversation_id:
+                raise PermissionError("platform task belongs to another conversation")
+            known = next(
+                (
+                    item
+                    for item in store.load_snapshot().external_tasks
+                    if item.task_id == task_id
+                ),
+                None,
+            )
+            saved = known.correlation if known else None
+            if saved is None and self._external_tasks:
+                registered = self._external_tasks.resolve(conversation_id, task_id)
+                if registered and registered.get("correlation"):
+                    saved = TaskCorrelation.model_validate(registered["correlation"])
+            if saved is None:
+                observed, _ = store.append(
+                    ProductEvent(
+                        event_id=f"external-task:{task_id}:{status}:observed:{correlation.to_out_id()}",
+                        conversation_id=conversation_id,
+                        type="external_task.observed",
+                        payload={
+                            "task_id": task_id,
+                            "status": status,
+                            "correlation": correlation.model_dump(
+                                mode="json", exclude_none=True
+                            ),
+                            "error_summary": _controlled_error(error_summary),
+                            "auto_run": auto_run,
+                        },
+                    )
+                )
+                self._publish(observed)
+                return observed
+            if saved != correlation:
+                raise PermissionError(
+                    "callback task origin does not match its registration"
+                )
         if self._delegated_store:
             early = (
                 self._external_tasks.resolve(conversation_id, task_id)
@@ -3238,17 +3327,28 @@ class ConversationRuntime:
         if active is not None and notify:
             async with self._use(conversation_id):
                 try:
-                    await active.adapter.notify_external_task(
-                        active.handle,
-                        _build_external_task_notification(
-                            task.model_copy(update=notification_payload),
-                            status=normalized,
-                            error_summary=_controlled_error(error_summary),
-                            auto_run=auto_run,
-                            has_training_node=_workflow_has_training_node(store, task),
-                        ),
-                        active.context,
-                    )
+                    response: JsonObject = {"accepted": True}
+                    if not (task.graph_run_id and self._workflows is not None):
+                        response = await active.adapter.notify_external_task(
+                            active.handle,
+                            _build_external_task_notification(
+                                ExternalTaskState.model_validate(
+                                    {
+                                        **task.model_dump(mode="json"),
+                                        **notification_payload,
+                                    }
+                                ),
+                                status=normalized,
+                                error_summary=_controlled_error(error_summary),
+                                auto_run=auto_run,
+                                has_training_node=_workflow_has_training_node(
+                                    store, task
+                                ),
+                            ),
+                            active.context,
+                        )
+                    if response.get("accepted") is False:
+                        raise RuntimeError("external task recipient is not available")
                     acknowledged, _ = store.append(
                         ProductEvent(
                             event_id=f"external-task:{task_id}:{normalized}:resumed",
@@ -3274,7 +3374,83 @@ class ConversationRuntime:
                         )
                     )
                     self._publish(persisted)
+                    self._schedule_notification_retry(conversation_id)
         return persisted
+
+    def _schedule_notification_retry(self, conversation_id: str) -> None:
+        if conversation_id in self._notification_retries or self._closing:
+            return
+
+        async def retry() -> None:
+            try:
+                while not self._closing:
+                    await asyncio.sleep(2)
+                    active = self._active.get(conversation_id)
+                    store = self._store(conversation_id)
+                    snapshot = store.load_snapshot()
+                    if active is None or snapshot.automatic_turns_suspended:
+                        return
+                    if not any(
+                        task.resume_pending and not task.managed_task_run_id
+                        for task in snapshot.external_tasks
+                    ):
+                        return
+                    async with self._notification_resume_lock:
+                        try:
+                            await self._resume_notifications(active, store)
+                        except Exception:
+                            logger.exception(
+                                "External task recipient remains unavailable for %s",
+                                conversation_id,
+                            )
+            finally:
+                self._notification_retries.pop(conversation_id, None)
+
+        self._notification_retries[conversation_id] = asyncio.create_task(retry())
+
+    def _schedule_observation_replay(self, conversation_id: str, task_id: str) -> None:
+        if not any(
+            event.type == "external_task.observed"
+            and event.payload.get("task_id") == task_id
+            for event in self._store(conversation_id).replay()
+        ):
+            return
+        task = asyncio.create_task(
+            self._replay_external_observations(conversation_id, task_id)
+        )
+        self._observation_replays.add(task)
+        task.add_done_callback(self._observation_replays.discard)
+
+    async def _replay_external_observations(
+        self, conversation_id: str, task_id: str | None = None
+    ) -> None:
+        store = self._store(conversation_id)
+        known = {task.task_id: task for task in store.load_snapshot().external_tasks}
+        for event in store.replay():
+            if event.type != "external_task.observed":
+                continue
+            identity = str(event.payload["task_id"])
+            if identity not in known or task_id is not None and identity != task_id:
+                continue
+            if known[identity].correlation is None:
+                continue
+            try:
+                await self.deliver_external_task_status(
+                    conversation_id,
+                    task_id=identity,
+                    status=str(event.payload["status"]),
+                    error_summary=cast(str | None, event.payload.get("error_summary")),
+                    auto_run=event.payload.get("auto_run") is not False,
+                    correlation=TaskCorrelation.model_validate(
+                        event.payload["correlation"]
+                    ),
+                )
+            except PermissionError:
+                logger.warning("Rejected external task observation for %s", identity)
+            except Exception:
+                logger.exception(
+                    "Could not replay external task observation for %s", identity
+                )
 
     def resolve_external_task_owner(self, task_id: str) -> str | None:
         if self._external_tasks is None:
@@ -3289,6 +3465,28 @@ class ConversationRuntime:
         task_id = str(payload.get("task_id") or "")
         if not task_id:
             raise ValueError("external task_id is required")
+        owner = self.resolve_external_task_owner(task_id)
+        canonical_id = TaskCorrelation(
+            conversation_id=conversation_id, task_kind="workflow_run"
+        ).conversation_id
+        if owner is not None and owner != canonical_id:
+            raise PermissionError("external task belongs to another conversation")
+        existing = next(
+            (item for item in snapshot.external_tasks if item.task_id == task_id), None
+        )
+        if (
+            existing
+            and existing.correlation
+            and payload.get("correlation") is not None
+            and existing.correlation
+            != TaskCorrelation.model_validate(payload["correlation"])
+        ):
+            raise PermissionError("external task origin cannot change")
+        if existing and existing.correlation and payload.get("correlation") is None:
+            payload = {
+                **payload,
+                "correlation": existing.correlation.model_dump(mode="json"),
+            }
         event = ProductEvent(
             event_id=f"external-task:{task_id}:submitted",
             conversation_id=conversation_id,
@@ -3314,6 +3512,7 @@ class ConversationRuntime:
                 logger.exception("Could not register external task %s", task_id)
         if updated.through_seq != snapshot.through_seq:
             self._publish(persisted)
+        self._schedule_observation_replay(conversation_id, task_id)
         registration = self._pending_task_registrations.get(task_id)
         if registration is not None:
             registration.set()
@@ -3359,6 +3558,11 @@ class ConversationRuntime:
         for wakeup in self._auto_execution_wakeups.values():
             wakeup.set()
         await asyncio.gather(*tuple(self._input_response_tasks), return_exceptions=True)
+        await asyncio.gather(*tuple(self._observation_replays), return_exceptions=True)
+        retries = tuple(self._notification_retries.values())
+        for retry in retries:
+            retry.cancel()
+        await asyncio.gather(*retries, return_exceptions=True)
         if self._workflows:
             await self._workflows.close()
         if self._evictor is not None:
@@ -3613,6 +3817,8 @@ class ConversationRuntime:
     async def _resume_pending_external_tasks(
         self, active: _ActiveConversation, store: FileProductStore
     ) -> None:
+        self._schedule_notification_retry(active.handle.session_id)
+        await self._replay_external_observations(active.handle.session_id)
         await self.reconcile_versions(active.handle.session_id, active.context)
         async with self._notification_resume_lock:
             await self._repair_parked_await_bindings(active.handle.session_id)
@@ -3670,6 +3876,7 @@ class ConversationRuntime:
                     ExternalTaskNotification(
                         task_id=request.task_id,
                         kind="workflow_run",
+                        correlation=request.correlation,
                         run_id=request.request_id,
                         status=reference["status"],
                         hidden_text=(
@@ -3749,17 +3956,28 @@ class ConversationRuntime:
                 ):
                     continue
             else:
-                await active.adapter.notify_external_task(
-                    active.handle,
-                    _build_external_task_notification(
-                        task,
-                        status=task.status,
-                        error_summary=task.error_summary,
-                        auto_run=task.resume_auto_run,
-                        has_training_node=_workflow_has_training_node(store, task),
-                    ),
-                    active.context,
-                )
+                try:
+                    response = await active.adapter.notify_external_task(
+                        active.handle,
+                        _build_external_task_notification(
+                            task,
+                            status=task.status,
+                            error_summary=task.error_summary,
+                            auto_run=task.resume_auto_run,
+                            has_training_node=_workflow_has_training_node(store, task),
+                        ),
+                        active.context,
+                    )
+                except Exception:
+                    if task.correlation is None or task.correlation.type == "main":
+                        raise
+                    logger.exception(
+                        "External task recipient unavailable for %s", task.task_id
+                    )
+                    self._schedule_notification_retry(active.handle.session_id)
+                    continue
+                if response.get("accepted") is False:
+                    continue
             notification = task.model_dump(mode="json")
             notification["resume_pending"] = False
             persisted, _ = await asyncio.to_thread(
@@ -3867,6 +4085,10 @@ class ConversationRuntime:
                             handle.session_id,
                         )
                 self._publish(persisted)
+                if product_event.type == "external_task.submitted":
+                    self._schedule_observation_replay(
+                        handle.session_id, str(product_event.payload["task_id"])
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -4347,6 +4569,7 @@ def _build_external_task_notification(
         return ExternalTaskNotification(
             task_id=task.task_id,
             kind=task.kind,
+            correlation=task.correlation,
             run_id=task.run_id,
             status=status,
             output_dir=task.output_dir,
@@ -4502,6 +4725,7 @@ def _build_external_task_notification(
     return ExternalTaskNotification(
         task_id=task.task_id,
         kind=task.kind,
+        correlation=task.correlation,
         run_id=task.run_id,
         status=status,
         output_dir=task.output_dir,

@@ -10,6 +10,7 @@ import { registerSubagentCapabilityCeiling } from "pi-subagents/capability-ceili
 import { registerRequiredChildExtensions } from "pi-subagents/required-child-extensions";
 import { serveSubagentIpc } from "./subagent-ipc.js";
 import { SubagentDisplay, displayText, transcriptWindow } from "./subagent-display.js";
+import { SubagentRecipients } from "./subagent-recipients.js";
 import { SubagentReports } from "./subagent-reports.js";
 import { isRecord, type JsonObject, type RunnerEvent, PROTOCOL_VERSION } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
@@ -82,6 +83,7 @@ export class SubagentHost {
   private monitor?: NodeJS.Timeout;
   private refreshPending?: Promise<void>;
   private readonly reports: SubagentReports;
+  private recipients?: SubagentRecipients;
   readonly paths: ReturnType<typeof prepareSubagentEnvironment>;
 
   constructor(private workspace: string, private sessionId: string, private peer: JsonlRpcPeer,
@@ -126,7 +128,7 @@ export class SubagentHost {
         }
         const id = `subagent:${request.session}:${request.id}`;
         try {
-          if ("executeScoped" in tool && typeof tool.executeScoped === "function") return await tool.executeScoped(id, request.args, signal, supplied);
+          if ("executeScoped" in tool && typeof tool.executeScoped === "function") return await tool.executeScoped(id, request.args, signal, supplied, this.recipients!.origin(request.session, request.session_file));
           return await tool.execute(id, request.args, signal, update);
         }
         finally { if (["write", "edit", "terminal"].includes(request.name)) {
@@ -186,11 +188,17 @@ export class SubagentHost {
 
   async attach(session: AgentSession) {
     this.session = session;
+    this.recipients = new SubagentRecipients(this.paths.stateRoot, session, (method, params, id) => this.rpc(method, params, id), this.sessionId);
     if (!session.getToolDefinition("subagent")) throw new Error("pi-subagents did not register its native tool");
     await session.bindExtensions({ mode: "print", onError: (error) => process.stderr.write(`Pi extension ${error.extensionPath}: ${error.error}\n`) });
     await this.refresh();
     this.monitor = setInterval(() => void this.refresh(false).catch((error) => process.stderr.write(`Subagent reconciliation: ${error.message}\n`)), 1000);
     this.monitor.unref();
+  }
+
+  async notifyRecipient(params: JsonObject): Promise<JsonObject> {
+    if (!this.recipients) return { accepted: false, reason: "subagents_not_ready" };
+    return this.recipients.notify(params);
   }
 
   async rpc(method: string, params: Record<string, unknown> = {}, requestId: string = randomUUID()): Promise<any> {

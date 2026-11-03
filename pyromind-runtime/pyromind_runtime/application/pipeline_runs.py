@@ -10,6 +10,7 @@ from pyromind_runtime.application.versions import Versions, snapshot_result
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.pipeline import PipelineRun
+from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
 from pyromind_runtime.domain.versions import (
     RunSource,
     SaveVersion,
@@ -447,6 +448,14 @@ class PipelineRuns:
                 "task_id": task_id,
                 "run_id": run_id,
                 "kind": "data_preparation",
+                "correlation": TaskCorrelation(
+                    conversation_id=self.conversation_id,
+                    task_kind="data_preparation",
+                    **(
+                        (self._context.task_origin if self._context else None)
+                        or TaskOrigin()
+                    ).model_dump(),
+                ).model_dump(mode="json", exclude_none=True),
                 "status": "pending",
                 "output_dir": run.output_dir,
                 "submitted_at": now,

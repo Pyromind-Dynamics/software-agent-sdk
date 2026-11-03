@@ -625,7 +625,9 @@ class SnapshotProjector:
                     and incoming_status != existing.status
                 ):
                     return snapshot
-                tasks[index] = existing.model_copy(update=dict(event.payload))
+                tasks[index] = ExternalTaskState.model_validate(
+                    {**existing.model_dump(mode="json"), **event.payload}
+                )
                 return snapshot.model_copy(update={"external_tasks": tuple(tasks)})
         return snapshot
 

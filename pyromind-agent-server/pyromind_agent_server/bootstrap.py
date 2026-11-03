@@ -18,6 +18,7 @@ from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.capabilities import ResourceLimits
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.versions import VersionToolRequest
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.infrastructure.sql_experiment_execution import (
@@ -128,6 +129,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         code: str | None,
         context: RequestContext,
         graph_run_id: str | None,
+        correlation: TaskCorrelation | None = None,
     ):
         assert isinstance(runtime, ConversationRuntime)
         return await runtime.submit_versioned_workflow(
@@ -137,6 +139,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             code,
             context,
             graph_run_id=graph_run_id,
+            correlation=correlation,
         )
 
     openhands_adapter.set_version_handler(version_call, execution_call)
@@ -223,7 +226,9 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             idle_eviction_seconds,
         )
     plan_store = build_experiment_plan_store()
-    execution_store = SQLExperimentExecutionStore(plan_store.engine) if plan_store else None
+    execution_store = (
+        SQLExperimentExecutionStore(plan_store.engine) if plan_store else None
+    )
     runtime = ConversationRuntime(
         service.conversations_dir,
         adapters,
@@ -269,7 +274,9 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     app.state.product_runtime = runtime
     if execution_store:
         from openhands.agent_server.kafka_bus.kafka_bus import KafkaMessageBus
-        from pyromind_agent_server.execution_observations import ExecutionObservationHandler
+        from pyromind_agent_server.execution_observations import (
+            ExecutionObservationHandler,
+        )
 
         bus = KafkaMessageBus(acknowledge_after_handle=True)
         bus.register_handler(ExecutionObservationHandler(execution_store))

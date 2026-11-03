@@ -755,6 +755,7 @@ class InferencePipelineHandler:
                 workflow=workflow,
                 name=str(workflow["name"]),
                 conversation_id=str(conversation.id),
+                task_kind="data_preparation",
                 retry_create=False,
             )
             task_id = response.task_id

@@ -12,6 +12,7 @@ from pyromind_runtime.domain.experiment_plans import (
     ExperimentContextView,
     ExperimentPlanView,
 )
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.user_input import PendingUserInput
 
 
@@ -127,6 +128,9 @@ class UsageState(ContractModel):
 
 
 class ExternalTaskState(ContractModel):
+    correlation: TaskCorrelation | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     managed_task_run_id: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -141,6 +145,7 @@ class ExternalTaskState(ContractModel):
         "environment_processing_aggregate",
         "workflow_run",
         "graph_await",
+        "archive_extraction",
     ]
     run_id: str | None = None
     # The graph run parked on this task. A terminal callback resumes that run

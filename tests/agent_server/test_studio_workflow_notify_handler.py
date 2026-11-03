@@ -4,6 +4,7 @@ import zlib
 from typing import Any
 
 import pytest
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
 from openhands.agent_server.kafka_bus.handlers import (
     studio_workflow_notify_handler as handler_module,
@@ -45,7 +46,10 @@ async def test_terminal_notification_uses_generic_workflow_callback(
                 "task_id": "clean-task-1",
                 "status": "Succeeded",
                 "error_msg": None,
-                "out_id": "agent1#550e8400-e29b-41d4-a716-446655440000",
+                "out_id": TaskCorrelation(
+                    conversation_id="550e8400-e29b-41d4-a716-446655440000",
+                    task_kind="workflow_run",
+                ).to_out_id(),
             },
         )
     )
@@ -54,9 +58,12 @@ async def test_terminal_notification_uses_generic_workflow_callback(
         "task_id": "clean-task-1",
         "status": "Succeeded",
         "error_log": None,
-        "conversation_id": "550e8400-e29b-41d4-a716-446655440000",
+        "conversation_id": "550e8400e29b41d4a716446655440000",
         "auto_run": True,
         "from_workflow_debug": False,
+        "correlation": TaskCorrelation(
+            conversation_id="550e8400e29b41d4a716446655440000", task_kind="workflow_run"
+        ),
     }
 
 
@@ -89,7 +96,10 @@ async def test_debug_out_id_passes_from_workflow_debug(
                 "task_id": "debug-task-1",
                 "status": "Failed",
                 "error_msg": "node boom",
-                "out_id": "agent1#debug#550e8400-e29b-41d4-a716-446655440000",
+                "out_id": TaskCorrelation(
+                    conversation_id="550e8400-e29b-41d4-a716-446655440000",
+                    task_kind="workflow_debug",
+                ).to_out_id(),
             },
         )
     )
@@ -98,9 +108,13 @@ async def test_debug_out_id_passes_from_workflow_debug(
         "task_id": "debug-task-1",
         "status": "Failed",
         "error_log": "node boom",
-        "conversation_id": "550e8400-e29b-41d4-a716-446655440000",
+        "conversation_id": "550e8400e29b41d4a716446655440000",
         "auto_run": True,
         "from_workflow_debug": True,
+        "correlation": TaskCorrelation(
+            conversation_id="550e8400e29b41d4a716446655440000",
+            task_kind="workflow_debug",
+        ),
     }
 
 
@@ -122,7 +136,17 @@ async def test_missing_or_foreign_out_id_is_discarded(
     )
 
     handler = StudioWorkflowNotifyHandler()
-    for out_id in (None, "", "other#cid", "bare-uuid"):
+    for out_id in (
+        None,
+        "",
+        "other#cid",
+        "bare-uuid",
+        "agent1#cid",
+        "agent1#debug#cid",
+        "{}",
+        "[]",
+        "null",
+    ):
         await handler.handle(
             MessageEvent(
                 event_type=TrainingTaskEventType.TRAINING_TASK_STATUS_CHANGED,
@@ -173,7 +197,10 @@ async def test_compressed_error_msg_is_decoded(
                 "task_id": "compressed-task-1",
                 "status": "Failed",
                 "error_msg": compressed,
-                "out_id": "agent1#550e8400-e29b-41d4-a716-446655440000",
+                "out_id": TaskCorrelation(
+                    conversation_id="550e8400-e29b-41d4-a716-446655440000",
+                    task_kind="workflow_run",
+                ).to_out_id(),
             },
         )
     )

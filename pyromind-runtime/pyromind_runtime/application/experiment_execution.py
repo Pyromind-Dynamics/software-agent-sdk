@@ -235,6 +235,7 @@ class ExperimentExecutions:
                     "output_dir",
                     "status",
                     "execution_revision",
+                    "correlation",
                 )
                 if details.get(key) is not None
             }

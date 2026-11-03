@@ -419,3 +419,25 @@ def test_generated_business_scoring_only_executes_in_cpu_worker():
         "scoring_script_path",
         "manifest_path",
     } <= DfSubmitEvaluationAction.model_fields.keys()
+
+
+def test_return_addresses_stay_in_the_product_contract_and_out_of_model_arguments():
+    from pyromind_runtime.domain.task_correlation import TaskCorrelation
+    from pyromind_runtime.ports.harness import ExternalTaskNotification
+
+    from openhands.tools.workflow import RunWorkflowAction
+    from openhands.tools.workflow_debug.definition import WorkflowDebugAction
+
+    assert "correlation" in ExternalTaskNotification.model_fields
+    assert set(TaskCorrelation.model_fields) == {
+        "version",
+        "source",
+        "conversation_id",
+        "type",
+        "subagent_id",
+        "task_kind",
+    }
+    for action in (RunWorkflowAction, WorkflowDebugAction, DfSubmitPipelineAction):
+        assert not {"correlation", "origin", "subagent_id"}.intersection(
+            action.model_fields
+        )

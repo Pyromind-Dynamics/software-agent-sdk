@@ -79,7 +79,7 @@ def test_expired_work_requires_explicit_reconciliation(ledger):
     with pytest.raises(StaleLeaseError):
         q.finish(identity, claimed["generation"], {})
     assert q.expired()[0]["id"] == identity
-    q.reconcile_expired(identity, safe_to_retry=False)
+    q.reconcile_expired(identity, safe_to_retry=False, generation=claimed["generation"])
     assert q.claim() is None
     assert q.list("owner")[0]["state"] == "reconciliation_required"
 
@@ -350,7 +350,7 @@ def test_recovery_retains_role_ownership_until_original_work_is_reclaimed(ledger
             .where(work.c.id == original)
             .values(lease_until=now() - timedelta(seconds=1))
         )
-    q.reconcile_expired(original, safe_to_retry=True)
+    q.reconcile_expired(original, safe_to_retry=True, generation=item["generation"])
     resumed = q.claim()
     assert resumed["id"] == original
     assert resumed["generation"] > item["generation"]
@@ -407,7 +407,7 @@ async def test_pending_launch_recovery_queries_correlation_without_respawning(
             .where(work.c.id == item["id"])
             .values(lease_until=now() - timedelta(seconds=1))
         )
-    ledger.queue.reconcile_expired(item["id"], True)
+    ledger.queue.reconcile_expired(item["id"], True, generation=item["generation"])
     recovered = ledger.queue.claim()
     task = SimpleNamespace(id="task", name="Task")
     plans = cast(

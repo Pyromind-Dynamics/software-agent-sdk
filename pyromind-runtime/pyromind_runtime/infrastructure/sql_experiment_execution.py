@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 from pyromind_runtime.domain.experiment_plans import PlanOwner
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.infrastructure.sql_database import (
     configure_engine,
     insert_if_absent,
@@ -997,6 +998,33 @@ class SQLExperimentExecutionStore:
                 )
                 if not sub:
                     continue
+                supplied = event["attributes"].get("correlation")
+                if supplied is not None:
+                    correlation = TaskCorrelation.model_validate(supplied)
+                    conversation = conn.execute(
+                        sa.select(projects.c.conversation_id)
+                        .join(runs, runs.c.project_id == projects.c.project_id)
+                        .where(runs.c.id == sub["run_id"])
+                    ).scalar_one()
+                    expected_conversation = TaskCorrelation(
+                        conversation_id=conversation, task_kind=correlation.task_kind
+                    ).conversation_id
+                    receipt = (sub["evidence"] or {}).get("receipt", {})
+                    expected = receipt.get("correlation")
+                    if (
+                        correlation.conversation_id != expected_conversation
+                        or expected is not None
+                        and TaskCorrelation.model_validate(expected) != correlation
+                    ):
+                        conn.execute(
+                            messages.update()
+                            .where(
+                                messages.c.direction == "in",
+                                messages.c.id == event["id"],
+                            )
+                            .values(state="invalid")
+                        )
+                        continue
                 status = str(event["attributes"].get("status", "")).lower()
                 if status not in terminal | {"running", "pending"}:
                     conn.execute(

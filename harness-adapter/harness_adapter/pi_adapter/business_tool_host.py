@@ -14,6 +14,7 @@ from typing import Any, cast
 from pydantic import SecretStr
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.task_correlation import TaskOrigin
 from pyromind_runtime.domain.versions import VersionToolRequest
 
 from harness_adapter.openhands_adapter.session_factory import current_user_from_context
@@ -84,6 +85,7 @@ from openhands.tools.workflow.analyze_task_failure import AnalyzeTaskFailureTool
 from openhands.tools.workflow.run_workflow import WORKFLOW_ATTEMPT_STATE_KEY
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
+    workflow_submission_scope,
 )
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
@@ -505,6 +507,7 @@ class PyromindBusinessToolHost:
         origin_run_id: str | None = None,
     ) -> dict[str, Any]:
         started_at = time.perf_counter()
+        origin = context.request_context.task_origin or TaskOrigin()
         if name == ProductVersionsTool.name:
             if self.version_call is None:
                 raise ValueError("version management is unavailable")
@@ -543,6 +546,7 @@ class PyromindBusinessToolHost:
                     workflow_path,
                     context.request_context,
                     request_id=tool_call_id,
+                    **({"origin": origin} if origin.type == "subagent" else {}),
                 )
                 return BusinessToolResult(
                     is_error=False,
@@ -623,7 +627,10 @@ class PyromindBusinessToolHost:
             if tool.executor is not None:
                 self._active_executors[key] = tool.executor
             try:
-                observation = await asyncio.to_thread(tool, action, cast(Any, facade))
+                with workflow_submission_scope(origin) as submissions:
+                    observation = await asyncio.to_thread(
+                        tool, action, cast(Any, facade)
+                    )
             finally:
                 self._active_executors.pop(key, None)
             if name == WorkflowDebugTool.name:
@@ -644,6 +651,35 @@ class PyromindBusinessToolHost:
                             },
                         }
                     )
+            observation_data = observation.model_dump(mode="json")
+            recorded = {
+                str(signal.get("task", {}).get("task_id"))
+                for signal in facade.signals
+                if signal.get("type") == "external_task.submitted"
+            }
+            for task_id in submissions.direct_tasks - recorded:
+                facade.signals.append(
+                    {
+                        "type": "external_task.submitted",
+                        "task": {
+                            "task_id": task_id,
+                            "kind": submissions.submissions[task_id].task_kind,
+                            "status": "pending",
+                        },
+                    }
+                )
+            for signal in facade.signals:
+                task = signal.get("task")
+                if signal.get("type") == "external_task.submitted" and isinstance(
+                    task, dict
+                ):
+                    correlation = submissions.submissions.get(
+                        str(task.get("task_id") or observation_data.get("task_id", ""))
+                    )
+                    if correlation is not None:
+                        task["correlation"] = correlation.model_dump(
+                            mode="json", exclude_none=True
+                        )
             attempts = facade.state.agent_state.get(WORKFLOW_ATTEMPT_STATE_KEY)
             files.save_business_state(
                 {
@@ -658,6 +694,10 @@ class PyromindBusinessToolHost:
             details = observation.model_dump(
                 mode="json", exclude={"content", "is_error"}
             )
+            if len(submissions.submissions) == 1:
+                details["correlation"] = next(
+                    iter(submissions.submissions.values())
+                ).model_dump(mode="json", exclude_none=True)
             return BusinessToolResult(
                 is_error=bool(observation.is_error),
                 content=content,

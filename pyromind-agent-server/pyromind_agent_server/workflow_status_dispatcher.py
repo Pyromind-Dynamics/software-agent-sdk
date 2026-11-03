@@ -3,6 +3,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 
 from openhands.agent_server.run_workflow_callback import (
@@ -27,7 +28,16 @@ class WorkflowStatusDispatcher:
         conversation_id: str | None = None,
         auto_run: bool = True,
         from_workflow_debug: bool = False,
+        correlation: TaskCorrelation | None = None,
     ) -> RunWorkflowCallbackResult:
+        if correlation is not None:
+            if (
+                conversation_id is not None
+                and _canonical_conversation_id(conversation_id)
+                != correlation.conversation_id
+            ):
+                raise PermissionError("callback conversation does not match out_id")
+            conversation_id = correlation.conversation_id
         normalized = normalize_platform_status(status)
         owner = self._runtime.resolve_external_task_owner(task_id)
         supplied_conversation_id = (
@@ -59,6 +69,13 @@ class WorkflowStatusDispatcher:
         store = FileProductStore(
             self._runtime.conversation_root / resolved_conversation_id
         )
+        if correlation is not None and not store.metadata_path.is_file():
+            return RunWorkflowCallbackResult(
+                outcome="unknown_conversation",
+                task_id=task_id,
+                normalized_status=normalized,
+                conversation_id=resolved_conversation_id,
+            )
         if not store.metadata_path.is_file():
             return await deliver_run_workflow_status(
                 task_id=task_id,
@@ -74,6 +91,7 @@ class WorkflowStatusDispatcher:
             status=status,
             error_summary=error_log,
             auto_run=auto_run,
+            correlation=correlation,
         )
         return RunWorkflowCallbackResult(
             outcome="delivered_async",

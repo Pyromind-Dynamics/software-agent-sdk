@@ -1,8 +1,9 @@
 import base64
 import json
 import zlib
-from enum import Enum
+from enum import StrEnum
 
+from pyromind_runtime.domain.task_correlation import parse_task_correlation
 from pyromind_sdk.client.models import StudioTaskStatus
 
 from openhands.agent_server.kafka_bus.kafka_handler import MessageHandler
@@ -17,9 +18,6 @@ from openhands.sdk.utils.env_util import get_pod_name
 
 
 logger = get_logger(__name__)
-
-OUT_ID_PREFIX = "agent1#"
-OUT_ID_DEBUG_MARKER = "debug#"
 
 # Outcomes that mean "this pod should ignore the message" under Kafka broadcast
 # (unique group_id per pod). Do not raise — Kafka must not retry/DLQ these.
@@ -42,7 +40,7 @@ _TERMINAL_STUDIO_STATUSES = frozenset(
 )
 
 
-class TrainingTaskEventType(str, Enum):
+class TrainingTaskEventType(StrEnum):
     """Training task event type enumeration"""
 
     TRAINING_TASK_STATUS_CHANGED = "training_task_status_changed"
@@ -71,13 +69,12 @@ class StudioWorkflowNotifyHandler(MessageHandler):
             {
                 "task_id": ...,
                 "status": ...,
-                "out_id": "agent1#<cid>" or "agent1#debug#<cid>",
+                "out_id": "<JSON-serialized TaskCorrelation>",
                 "error_msg": ...,
                 ...
             }
 
-        Messages without ``out_id``, or with an ``out_id`` that does not start
-        with ``agent1#``, are discarded (other systems' tasks share this topic).
+        Only versioned agent JSON return addresses are accepted.
         """
         if event.event_type != TrainingTaskEventType.TRAINING_TASK_STATUS_CHANGED:
             return
@@ -90,6 +87,8 @@ class StudioWorkflowNotifyHandler(MessageHandler):
             message_data,
         )
 
+        if not isinstance(message_data, dict):
+            return
         status = _get_task_status(message_data.get("status"))
         if status is None or status not in _TERMINAL_STUDIO_STATUSES:
             return
@@ -103,8 +102,8 @@ class StudioWorkflowNotifyHandler(MessageHandler):
             return
         task_id = str(raw_task_id)
 
-        conversation_id, from_workflow_debug = _parse_out_id(message_data.get("out_id"))
-        if not conversation_id:
+        correlation = parse_task_correlation(message_data.get("out_id"))
+        if correlation is None:
             # Empty / foreign out_id: not from this agent — discard.
             logger.info(
                 "Skip workflow notify: missing or non-agent out_id "
@@ -122,9 +121,10 @@ class StudioWorkflowNotifyHandler(MessageHandler):
             task_id=task_id,
             status=status.value,
             error_log=error_log,
-            conversation_id=conversation_id,
+            conversation_id=correlation.conversation_id,
             auto_run=True,
-            from_workflow_debug=from_workflow_debug,
+            from_workflow_debug=correlation.task_kind == "workflow_debug",
+            correlation=correlation,
         )
 
         # Broadcast: other pods normally hit unknown_conversation — that is OK.
@@ -134,7 +134,7 @@ class StudioWorkflowNotifyHandler(MessageHandler):
                 "conversation_id=%s",
                 result.outcome,
                 task_id,
-                conversation_id,
+                correlation.conversation_id,
             )
             return
 
@@ -143,34 +143,15 @@ class StudioWorkflowNotifyHandler(MessageHandler):
                 "Unexpected workflow notify outcome=%s task_id=%s conversation_id=%s",
                 result.outcome,
                 task_id,
-                conversation_id,
+                correlation.conversation_id,
             )
 
 
 def _parse_out_id(out_id: object | None) -> tuple[str | None, bool]:
-    """Parse conversation id and workflow_debug flag from task out_id.
-
-    Only accepts out_ids written by this agent (must start with
-    ``OUT_ID_PREFIX``). Empty or foreign formats return ``(None, False)``
-    so the Kafka handler can discard the message.
-
-    Formats:
-    - ``agent1#<conversation_id>`` → production ``run_workflow``
-    - ``agent1#debug#<conversation_id>`` → ``workflow_debug`` test run
-    """
-    if out_id is None:
+    correlation = parse_task_correlation(out_id)
+    if correlation is None:
         return None, False
-    cleaned = str(out_id).strip()
-    if not cleaned or cleaned == "None":
-        return None, False
-    if not cleaned.startswith(OUT_ID_PREFIX):
-        return None, False
-    cleaned = cleaned.removeprefix(OUT_ID_PREFIX).strip()
-    from_workflow_debug = False
-    if cleaned.startswith(OUT_ID_DEBUG_MARKER):
-        from_workflow_debug = True
-        cleaned = cleaned.removeprefix(OUT_ID_DEBUG_MARKER).strip()
-    return (cleaned or None), from_workflow_debug
+    return correlation.conversation_id, correlation.task_kind == "workflow_debug"
 
 
 def _parse_conversation_id_from_out_id(out_id: object | None) -> str | None:

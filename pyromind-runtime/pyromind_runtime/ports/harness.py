@@ -13,6 +13,7 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import WorkflowState
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
 
 class DelegatedRole(ContractModel):
@@ -97,6 +98,7 @@ class RestoreWorkflowResult(ContractModel):
 
 
 class ExternalTaskNotification(ContractModel):
+    correlation: TaskCorrelation | None = None
     task_id: str = Field(min_length=1)
     kind: str = Field(min_length=1)
     run_id: str | None = None

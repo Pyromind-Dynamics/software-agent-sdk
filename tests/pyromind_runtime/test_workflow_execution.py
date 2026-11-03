@@ -16,6 +16,7 @@ from pyromind_runtime.domain.commands import (
 )
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.harness import SessionSpec
 
@@ -27,6 +28,7 @@ class FakeSubmission:
         self.training = training
         self.workflow = {"name": "sft", "nodes": [{"data": {"nodeType": "SFTTrain"}}]}
         self.submissions: list[tuple[dict, str]] = []
+        self.correlations: list[TaskCorrelation | None] = []
 
     async def prepare(self, workflow_path: str, context: RequestContext) -> dict:
         return {
@@ -40,9 +42,15 @@ class FakeSubmission:
         }
 
     async def submit(
-        self, workflow: dict, conversation_id: str, context: RequestContext
+        self,
+        workflow: dict,
+        conversation_id: str,
+        context: RequestContext,
+        *,
+        correlation: TaskCorrelation | None = None,
     ) -> str:
         self.submissions.append((workflow, conversation_id))
+        self.correlations.append(correlation)
         return "task-123"
 
 
@@ -219,7 +227,11 @@ async def test_workflow_confirmation_cancel_or_failure(tmp_path, decision):
     if decision == "allow_once":
 
         async def failed_submit(
-            workflow: dict, conversation_id: str, context: RequestContext
+            workflow: dict,
+            conversation_id: str,
+            context: RequestContext,
+            *,
+            correlation: TaskCorrelation | None = None,
         ) -> str:
             raise TimeoutError("platform create response lost")
 
@@ -278,7 +290,11 @@ async def test_callback_arriving_during_create_waits_for_task_registration(tmp_p
     callback: asyncio.Task | None = None
 
     async def submit_with_fast_callback(
-        workflow: dict, conversation_id: str, context: RequestContext
+        workflow: dict,
+        conversation_id: str,
+        context: RequestContext,
+        *,
+        correlation: TaskCorrelation | None = None,
     ) -> str:
         nonlocal callback
         callback = asyncio.create_task(

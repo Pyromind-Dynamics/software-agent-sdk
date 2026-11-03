@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Coroutine
-from typing import Any, Literal, Self
+from typing import Any, Literal, Protocol, Self
 
 from pydantic import Field
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.versions import VersionToolRequest
 
 from openhands.sdk.tool import (
@@ -118,10 +119,17 @@ class ProductVersionsTool(
 register_tool(ProductVersionsTool.name, ProductVersionsTool)
 
 
-type ExecutionCall = Callable[
-    [str, str, dict[str, Any], str | None, RequestContext, str | None],
-    Coroutine[Any, Any, dict[str, Any]],
-]
+class ExecutionCall(Protocol):
+    def __call__(
+        self,
+        scope: str,
+        request_id: str,
+        workflow: dict[str, Any],
+        code: str | None,
+        context: RequestContext,
+        graph_run_id: str | None,
+        correlation: TaskCorrelation | None = None,
+    ) -> Coroutine[Any, Any, dict[str, Any]]: ...
 
 
 def submission_bridge(
@@ -134,10 +142,20 @@ def submission_bridge(
 ):
     from pyromind_sdk.client.models import TrainingTaskCreateResponse
 
+    from openhands.tools.workflow.task_submission import current_task_correlation
+
     def submit(workflow: dict, name: str, code: str | None):
         effective = {**workflow, "name": name}
         result = asyncio.run_coroutine_threadsafe(
-            callback(scope, request_id(), effective, code, context, graph_run_id),
+            callback(
+                scope,
+                request_id(),
+                effective,
+                code,
+                context,
+                graph_run_id,
+                current_task_correlation(),
+            ),
             loop,
         ).result()
         return TrainingTaskCreateResponse.model_validate({"name": name, **result})

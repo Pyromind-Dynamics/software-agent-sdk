@@ -101,3 +101,46 @@ def test_submit_workflow_task_retries_ssl_create(
 
     assert result.task_id == "task-1"
     assert client.studio.create.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_submission_scopes_keep_the_origin_and_task_kind():
+    import asyncio
+
+    from pyromind_runtime.domain.task_correlation import (
+        TaskOrigin,
+        parse_task_correlation,
+    )
+
+    from openhands.tools.workflow.task_submission import workflow_submission_scope
+
+    requests = {}
+    client = MagicMock()
+
+    def create(request):
+        requests[request.name] = request
+        return SimpleNamespace(task_id=request.name, status="Pending")
+
+    client.studio.create.side_effect = create
+
+    async def submit(identity):
+        origin = TaskOrigin(type="subagent", subagent_id=identity)
+        with workflow_submission_scope(origin) as scope:
+            await asyncio.to_thread(
+                submit_workflow_task,
+                client=client,
+                workflow={},
+                name=identity,
+                conversation_id="c",
+                task_kind="data_preparation",
+            )
+            assert scope.submissions[identity].origin == origin
+            return parse_task_correlation(requests[identity].out_id)
+
+    first, second = await asyncio.gather(submit("worker-1"), submit("worker-2"))
+    assert first is not None and second is not None
+    assert first.subagent_id == "worker-1" and second.subagent_id == "worker-2"
+    assert first.task_kind == second.task_kind == "data_preparation"
+    submit_workflow_task(client=client, workflow={}, name="main", conversation_id="c")
+    main = parse_task_correlation(requests["main"].out_id)
+    assert main is not None and main.type == "main" and main.subagent_id is None

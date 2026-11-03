@@ -10,6 +10,7 @@ from pathlib import PurePosixPath
 from pydantic import JsonValue
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
 from openhands.agent_server.pyromind_auth import parse_auth_token_from_cookie_header
 from openhands.tools.pyromind_dataset.definition import (
@@ -81,11 +82,17 @@ class PlatformWorkflowSubmission:
                 task = client.studio.get_task(task_id)
             except Exception as exc:
                 response = getattr(exc, "response", None)
-                if getattr(exc, "status_code", getattr(response, "status_code", None)) in {401, 403}:
+                if getattr(
+                    exc, "status_code", getattr(response, "status_code", None)
+                ) in {401, 403}:
                     raise PermissionError("platform credentials need renewal") from exc
                 raise
             status = getattr(task, "status", "")
-            return {"task_id": task_id, "status": str(getattr(status, "value", status))}
+            result: JsonObject = {
+                "task_id": task_id,
+                "status": str(getattr(status, "value", status)),
+            }
+            return result
 
         return await asyncio.to_thread(fetch)
 
@@ -143,13 +150,24 @@ class PlatformWorkflowSubmission:
         }
 
     async def submit(
-        self, workflow: JsonObject, conversation_id: str, context: RequestContext
+        self,
+        workflow: JsonObject,
+        conversation_id: str,
+        context: RequestContext,
+        *,
+        correlation: TaskCorrelation | None = None,
     ) -> str:
-        return await asyncio.to_thread(self._submit, workflow, conversation_id, context)
+        return await asyncio.to_thread(
+            self._submit, workflow, conversation_id, context, correlation=correlation
+        )
 
     @staticmethod
     def _submit(
-        workflow: JsonObject, conversation_id: str, context: RequestContext
+        workflow: JsonObject,
+        conversation_id: str,
+        context: RequestContext,
+        *,
+        correlation: TaskCorrelation | None = None,
     ) -> str:
         route = (context.x_cluster or "").strip()
         cluster, separator, routed_env = route.partition("#")
@@ -172,5 +190,7 @@ class PlatformWorkflowSubmission:
             name=str(workflow.get("name") or "workflow"),
             conversation_id=conversation_id,
             retry_create=False,
+            origin=correlation.origin if correlation else context.task_origin,
+            task_kind=correlation.task_kind if correlation else "workflow_run",
         )
         return str(response.task_id)

@@ -288,3 +288,34 @@ async def test_dispatcher_rejects_callback_for_conflicting_owner(tmp_path) -> No
 
     assert result.outcome == "unknown_task"
     assert store.load_snapshot().external_tasks == ()
+
+
+def test_external_task_registry_cannot_transfer_ownership_or_change_the_recipient(
+    tmp_path,
+):
+    import pytest
+    from pyromind_runtime.domain.task_correlation import TaskCorrelation
+
+    registry = WorkflowExternalTaskRegistry(tmp_path)
+    correlation = TaskCorrelation(
+        conversation_id="c",
+        task_kind="workflow_run",
+        type="subagent",
+        subagent_id="worker",
+    )
+    payload = {"task_id": "task", "correlation": correlation.model_dump(mode="json")}
+    registry.register("c", payload)
+    with pytest.raises(PermissionError, match="conversation"):
+        registry.register("other", payload)
+    with pytest.raises(PermissionError, match="origin"):
+        registry.register(
+            "c",
+            {
+                **payload,
+                "correlation": {**payload["correlation"], "subagent_id": "sibling"},
+            },
+        )
+    registry.register("c", {"task_id": "task", "status": "running"})
+    restored = registry.resolve("c", "task")
+    assert restored is not None
+    assert restored["correlation"] == payload["correlation"]

@@ -341,6 +341,7 @@ class ExtractArchiveExecutor(
                 workflow=workflow,
                 name=str(workflow["name"]),
                 conversation_id=str(conversation.id),
+                task_kind="archive_extraction",
             )
             task_id = response.task_id
         except Exception as exc:

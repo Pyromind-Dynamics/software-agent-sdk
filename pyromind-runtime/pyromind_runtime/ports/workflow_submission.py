@@ -4,6 +4,7 @@ from typing import Protocol
 
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
 
 class WorkflowSubmissionPort(Protocol):
@@ -12,7 +13,12 @@ class WorkflowSubmissionPort(Protocol):
     ) -> JsonObject: ...
 
     async def submit(
-        self, workflow: JsonObject, conversation_id: str, context: RequestContext
+        self,
+        workflow: JsonObject,
+        conversation_id: str,
+        context: RequestContext,
+        *,
+        correlation: TaskCorrelation | None = None,
     ) -> str: ...
 
 

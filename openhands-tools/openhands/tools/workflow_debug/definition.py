@@ -132,8 +132,8 @@ the run and sets `keep_ui_lock=true` so the Web UI stays locked until the
 Kafka/platform callback delivers the terminal status. That callback injects a
 `<system_reminder>` and **auto-continues** this conversation (`auto_run=true`).
 
-Debug submissions use out_id `agent1#debug#<conversation_id>` so Kafka can tell
-them apart from production `run_workflow` tasks (`agent1#<conversation_id>`).
+Debug submissions use a JSON out_id with task_kind="workflow_debug" so Kafka can tell
+them apart from production tasks with task_kind="workflow_run".
 Only debug-tagged terminals get the success/fail guidance below.
 
 How to use the result:
