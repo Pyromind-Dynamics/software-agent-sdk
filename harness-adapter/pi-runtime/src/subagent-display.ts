@@ -1,7 +1,9 @@
 import { isRecord, type JsonObject } from "./protocol.js";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 
 const MAX_BYTES = 32 * 1024;
 const MARKER = "\n[轨迹窗口已截断]";
+const PRESENTATION_KEYS = ["task", "phase", "previous_run_id"];
 export function displayText(value: unknown): string {
   if (!isRecord(value)) return "";
   if (typeof value.text === "string") return value.text;
@@ -38,7 +40,29 @@ export class SubagentDisplay {
   private queried = new Map<string, number>();
   private closed = false;
   constructor(private rpc: (method: string, params: Record<string, unknown>) => Promise<unknown>,
-    private progress: (id: string) => void) {}
+    private progress: (id: string) => void, private path?: string) {
+    if (path && existsSync(path)) {
+      const saved = JSON.parse(readFileSync(path, "utf8"));
+      if (isRecord(saved)) for (const [id, values] of Object.entries(saved)) {
+        if (isRecord(values)) this.update(id, this.presentation(values));
+      }
+    }
+  }
+
+  remember(id: string, values: JsonObject) {
+    const changed = this.update(id, this.presentation(values));
+    if (changed && this.path) {
+      const saved = Object.fromEntries([...this.records].map(([key, value]) => [key, this.presentation(value)]));
+      writeFileSync(this.path + ".tmp", JSON.stringify(saved), { mode: 0o600 });
+      renameSync(this.path + ".tmp", this.path);
+    }
+    return changed;
+  }
+
+  private presentation(values: Record<string, unknown>): JsonObject {
+    return Object.fromEntries(PRESENTATION_KEYS.filter(key => typeof values[key] === "string")
+      .map(key => [key, (values[key] as string).slice(0, 256)]));
+  }
 
   settled(id: string) { return this.settling.get(id); }
   value(id: string, key: string) { return this.records.get(id)?.[key]; }

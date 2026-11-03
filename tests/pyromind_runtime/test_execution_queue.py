@@ -409,7 +409,7 @@ async def test_pending_launch_recovery_queries_correlation_without_respawning(
         )
     ledger.queue.reconcile_expired(item["id"], True)
     recovered = ledger.queue.claim()
-    task = SimpleNamespace(id="task")
+    task = SimpleNamespace(id="task", name="Task")
     plans = cast(
         ExperimentPlanStore,
         SimpleNamespace(

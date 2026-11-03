@@ -74,10 +74,10 @@ fi
 # LLM Configuration
 # ----------------------------------------------------------
 # LiteLLM requires a provider prefix (e.g. openai/) for custom OpenAI-compatible endpoints.
-# export LLM_MODEL="${LLM_MODEL:-openai/deepseek-v4.1-flash}"
-# export LLM_BASE_URL="${LLM_BASE_URL:-https://pre-token-plan-cn-east-1.pyromind.ai/v1}"
-export LLM_MODEL="deepseek/deepseek-v4.1-flash-1017"
-export LLM_BASE_URL="https://openrouter.ai/api/v1"
+export LLM_MODEL="${LLM_MODEL:-deepseek-v4.1-flash-1017}"
+export LLM_BASE_URL="${LLM_BASE_URL:-https://token-plan-cn-east-1.pyromind-asia.cn/v1}"
+# export LLM_MODEL="deepseek/deepseek-v4.1-flash-1017"
+# export LLM_BASE_URL="https://openrouter.ai/api/v1"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
 # For OpenRouter, set LLM_MODEL=deepseek/deepseek-v4.1-flash and
@@ -124,7 +124,7 @@ fi
 export OH_ENABLE_PYROMIND_JWT_AUTH="${OH_ENABLE_PYROMIND_JWT_AUTH:-true}"
 
 # Keep the server in local development mode while consuming pre workflow events.
-export KAFKA_ENV="${KAFKA_ENV:-pre}"
+export KAFKA_ENV="${KAFKA_ENV:-prod}"
 export POD_NAME="${POD_NAME:-local-agent-server-${USER:-unknown}}"
 export KAFKA_URL="${KAFKA_URL:-kafka-portal.pyromind.ai:31011,kafka-portal.pyromind.ai:31012,kafka-portal.pyromind.ai:31013}"
 

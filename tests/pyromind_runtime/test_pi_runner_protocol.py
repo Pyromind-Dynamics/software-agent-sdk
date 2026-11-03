@@ -592,6 +592,9 @@ def test_subagent_display_uses_existing_operation_events():
             "version": 1,
             "run_id": "child-1",
             "tool_call_id": "launch-1",
+            "task": "Inspect the assigned inputs",
+            "phase": "report",
+            "previous_run_id": "child-0",
             "status": "running",
             "trace": {"text": "Tool: read", "availability": "available"},
         }

@@ -424,6 +424,24 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
             phases[0]["checkpoint"]["execution_ref"]
             != phases[1]["checkpoint"]["execution_ref"]
         )
+        snapshot = await runtime.get_snapshot("manager", context)
+        children = {
+            entry.run_id: entry
+            for entry in snapshot.timeline
+            if entry.kind == "operation" and entry.category == "subagent"
+        }
+        first_ref = phases[0]["checkpoint"]["execution_ref"]
+        report_ref = phases[1]["checkpoint"]["execution_ref"]
+        first_details = children[first_ref].details
+        report_details = children[report_ref].details
+        assert isinstance(first_details, dict) and isinstance(report_details, dict)
+        first_display = first_details["subagent"]
+        report_display = report_details["subagent"]
+        assert isinstance(first_display, dict) and isinstance(report_display, dict)
+        assert first_display["task"] == report_display["task"] == "自由命名的基模评测"
+        assert first_display["phase"] == "execute"
+        assert report_display["phase"] == "report"
+        assert report_display["previous_run_id"] == first_ref
     finally:
         await runtime.close()
         await runner.cleanup()

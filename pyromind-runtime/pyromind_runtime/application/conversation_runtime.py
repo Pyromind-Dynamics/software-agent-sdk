@@ -1264,10 +1264,26 @@ class ConversationRuntime:
                 return (await self._plan_io(service.store.context, owner)).model_dump(
                     mode="json"
                 )
+            update = UpdateExperimentContext.model_validate(arguments)
+            related = {
+                run_id
+                for run_ids in update.context.stage_executions.values()
+                for run_id in run_ids
+            }
+            if related:
+                executions = (
+                    await self._plan_io(self._experiment_executions.store.list, owner)
+                    if self._experiment_executions
+                    else ()
+                )
+                if not related <= {run["id"] for run in executions}:
+                    raise ValueError(
+                        "execution association must belong to this conversation"
+                    )
             view = await self._plan_io(
                 service.store.update_context,
                 owner,
-                UpdateExperimentContext.model_validate(arguments),
+                update,
             )
             event, _ = self._store(conversation_id).append(
                 ProductEvent(

@@ -97,6 +97,43 @@ async def test_new_profile_has_no_graph_gate_and_artifacts_remain_isolated(
                 {"run_id": run["id"], "name": "agent_report"},
                 context,
             ) == {"name": "agent_report", "content": body.decode()}
+            association = {
+                "expected_sequence": 0,
+                "context": {
+                    "goal": "Reference created after execution",
+                    "stages": [{"id": "later-stage", "name": "Evaluation"}],
+                    "stage_executions": {"later-stage": [run["id"]]},
+                },
+            }
+            linked = await runtime.experiment_plan_call(
+                identity, "update_experiment_context", association, context
+            )
+            assert linked["context"]["stage_executions"] == {"later-stage": [run["id"]]}
+            assert service.store.list(owner)[0]["task_spec"]["stage_id"] is None
+            foreign_session = await client.post(base, json={"llm": {"model": "test"}})
+            foreign = service.request(
+                owner.model_copy(
+                    update={
+                        "conversation_id": foreign_session.json()["conversation_id"],
+                    }
+                ),
+                request(intent="prepare"),
+                ("eval",),
+            )
+            with pytest.raises(ValueError, match="this conversation"):
+                await runtime.experiment_plan_call(
+                    identity,
+                    "update_experiment_context",
+                    {
+                        **association,
+                        "expected_sequence": 1,
+                        "context": {
+                            **association["context"],
+                            "stage_executions": {"later-stage": [foreign["id"]]},
+                        },
+                    },
+                    context,
+                )
             executions = await runtime.experiment_plan_call(
                 identity, "get_experiment_execution", {"run_id": run["id"]}, context
             )
