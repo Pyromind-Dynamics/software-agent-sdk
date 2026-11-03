@@ -5,9 +5,13 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import os
+import time
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import httpx
+import jwt
 
 
 if TYPE_CHECKING:
@@ -17,8 +21,15 @@ if TYPE_CHECKING:
 _PROD_ENVS = frozenset({"prod", "production", "online"})
 
 _BASE_DOMAIN = "api-portal.pyromind.ai"
-_ACCESS_KEY_URI = "/account/find_access_key"
+_ACCESS_KEY_URI = "/account/agent/find_access_key"
 _API_URI = "/api/v1"
+_AGENT_ACCESS_KEY_AUDIENCE = "pyromind-portal/agent-access-key"
+_AGENT_ACCESS_KEY_CLIENT = "pyromind-agent"
+_AGENT_ACCESS_KEY_EVENT = "agent.find_access_key"
+_AGENT_ACCESS_KEY_TOKEN_TYPE = "agent_access_key_request"
+_AGENT_ACCESS_KEY_TTL_SECONDS = 60
+_AGENT_ACCESS_KEY_SECRET_ENV = "PYROMIND_AGENT_ACCESS_KEY_REQUEST_SECRET"
+_DEV_SECRET_KEY = "Kij823420JITRE21i21248cbsxhuexvS"
 
 
 def _get_domain(env: str | None, api_uri: str) -> str:
@@ -67,18 +78,70 @@ def _extract_cookie_header(
     return remaining, cookies
 
 
+@lru_cache
+def _find_secret_key() -> str:
+    env_secret = os.getenv(_AGENT_ACCESS_KEY_SECRET_ENV, "").strip()
+    if env_secret:
+        return env_secret
+    if os.getenv("APP_ENV", "dev") == "dev":
+        return _DEV_SECRET_KEY
+    secret_path = os.getenv("PYROMIND_SECRET_PATH", "/etc/secrets")
+    try:
+        with open(f"{secret_path}/web_secret_key") as secret_file:
+            return secret_file.read().strip()
+    except FileNotFoundError as exc:
+        raise RuntimeError("Secret file not found: web_secret_key") from exc
+    except PermissionError as exc:
+        raise RuntimeError("Permission denied reading secret: web_secret_key") from exc
+
+
+def _user_id_from_auth_token(auth_token: str) -> int:
+    try:
+        payload = jwt.decode(
+            auth_token,
+            options={"verify_signature": False, "verify_exp": False},
+        )
+    except jwt.InvalidTokenError as exc:
+        raise RuntimeError("Invalid auth token") from exc
+    user_id = payload.get("user_id")
+    if type(user_id) is not int:
+        raise RuntimeError("Auth token is missing user_id")
+    return user_id
+
+
+def _build_agent_access_key_request(
+    auth_token: str,
+    *,
+    now: int | None = None,
+) -> str:
+    issued_at = int(time.time()) if now is None else now
+    return jwt.encode(
+        {
+            "aud": _AGENT_ACCESS_KEY_AUDIENCE,
+            "client": _AGENT_ACCESS_KEY_CLIENT,
+            "event": _AGENT_ACCESS_KEY_EVENT,
+            "exp": issued_at + _AGENT_ACCESS_KEY_TTL_SECONDS,
+            "iat": issued_at,
+            "token_type": _AGENT_ACCESS_KEY_TOKEN_TYPE,
+            "user_id": _user_id_from_auth_token(auth_token),
+        },
+        _find_secret_key(),
+        algorithm="HS256",
+    )
+
+
 def get_api_key(
     env: str | None,
     auth_token: str,
     origin_headers: dict[str, str],
     timeout: int = 30,
 ) -> str:
-    """Exchange an auth token for a Pyromind access key.
+    """Exchange a short-lived agent request for a Pyromind access key.
 
     Parses the platform response shape ``{"success": true, "data": {"accessKey": ...}}``
     and returns the access key. Raises on HTTP errors or unexpected payloads.
 
-    用 auth token 换取 Pyromind access key。解析平台返回的
+    用短期 agent 请求凭证换取 Pyromind access key。解析平台返回的
     ``{"success": true, "data": {"accessKey": ...}}`` 格式并返回 access key。
     HTTP 错误或响应格式异常时抛出异常。
     """
@@ -92,7 +155,7 @@ def get_api_key(
     response = httpx.post(
         endpoint_url,
         headers=headers,
-        json={},
+        json={"request_key": _build_agent_access_key_request(auth_token)},
         timeout=timeout,
     )
 
