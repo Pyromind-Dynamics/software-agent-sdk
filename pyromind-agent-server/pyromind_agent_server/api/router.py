@@ -6,7 +6,7 @@ from typing import Annotated
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
@@ -156,6 +156,22 @@ def create_product_router() -> APIRouter:
             raise _not_found(conversation_id) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    @router.get("/{conversation_id}/execution-evidence/{digest}")
+    async def read_execution_evidence(
+        conversation_id: str, digest: str, request: Request
+    ) -> Response:
+        try:
+            content = await get_product_runtime(request).read_execution_evidence(
+                conversation_id, digest, request_context(request)
+            )
+        except (FileNotFoundError, PermissionError, ProductStoreError, ValueError):
+            raise _not_found(conversation_id) from None
+        return Response(
+            content=content,
+            media_type="application/json",
+            headers={"Cache-Control": "private, no-store"},
+        )
 
     @router.get("/{conversation_id}/events")
     async def stream_events(

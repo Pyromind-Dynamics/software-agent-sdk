@@ -29,6 +29,7 @@ from openhands.agent_server.run_workflow_callback import set_workflow_status_dis
 from openhands.agent_server.storage_quota import ensure_conversation_quota
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
+from pyromind_agent_server.observability import build_execution_observer
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 
 
@@ -215,6 +216,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         service.conversations_dir,
         adapters,
         default_harness_id=backend,
+        observer=build_execution_observer(service.conversations_dir),
         external_tasks=external_tasks,
         idle_eviction_seconds=idle_eviction_seconds,
         release_grace_seconds=release_grace_seconds,

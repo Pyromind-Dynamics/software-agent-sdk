@@ -84,6 +84,7 @@ from pyromind_runtime.ports.harness import (
     SessionHandle,
     SessionSpec,
 )
+from pyromind_runtime.ports.observability import ExecutionObserver
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
     EvaluationStorageMissingError,
@@ -149,6 +150,7 @@ class ConversationRuntime:
         adapters: HarnessAdapter | Mapping[str, HarnessAdapter],
         *,
         default_harness_id: str = "openhands",
+        observer: ExecutionObserver | None = None,
         external_tasks: ExternalTaskRegistry | None = None,
         idle_eviction_seconds: int = 300,
         release_grace_seconds: int = 300,
@@ -170,6 +172,7 @@ class ConversationRuntime:
         if default_harness_id not in self.adapters:
             raise ValueError(f"default harness is not registered: {default_harness_id}")
         self.default_harness_id = default_harness_id
+        self._observer = observer
         self._resource_limits = resource_limits
         self._external_tasks = external_tasks
         self._workflow_submission = workflow_submission
@@ -1062,6 +1065,13 @@ class ConversationRuntime:
         store = await self._read_store(conversation_id, context)
         return store.load_snapshot()
 
+    async def read_execution_evidence(
+        self, conversation_id: str, digest: str, context: RequestContext
+    ) -> bytes:
+        store = self._store(conversation_id)
+        store.authorize(context.user_id)
+        return await asyncio.to_thread(store.read_execution_evidence, digest)
+
     async def submit_command(
         self,
         conversation_id: str,
@@ -1114,9 +1124,16 @@ class ConversationRuntime:
                 self._first_delta_started_at[(conversation_id, command.command_id)] = (
                     command_started_at
                 )
+            if isinstance(command, UserMessageCommand) and self._observer:
+                try:
+                    trace = self._observer.start(conversation_id, command.command_id)
+                    context = replace(context, execution_trace=trace)
+                except Exception:
+                    logger.exception("Execution observation start failed")
             try:
                 response = await active.adapter.send(active.handle, command, context)
             except Exception as exc:
+                self._finish_observation(conversation_id, command.command_id, "error")
                 if isinstance(command, UserMessageCommand):
                     self._first_delta_started_at.pop(
                         (conversation_id, command.command_id), None
@@ -1699,6 +1716,15 @@ class ConversationRuntime:
                 if not subscribers:
                     self._subscribers.pop(conversation_id, None)
 
+    def _finish_observation(
+        self, conversation_id: str, run_id: str | None, status: str
+    ) -> None:
+        if self._observer and run_id:
+            try:
+                self._observer.finish(conversation_id, run_id, status)
+            except Exception:
+                logger.exception("Execution observation finish failed")
+
     async def close(self) -> None:
         if self._workflows:
             await self._workflows.close()
@@ -1722,6 +1748,11 @@ class ConversationRuntime:
             *(conversation.task for conversation in active),
             return_exceptions=True,
         )
+        if self._observer:
+            try:
+                await asyncio.to_thread(self._observer.close)
+            except Exception:
+                logger.exception("Execution observation close failed")
 
     def list_snapshots(
         self, context: RequestContext
@@ -2056,6 +2087,17 @@ class ConversationRuntime:
                     for completed in await workflow_hook.accept(harness_event):
                         self._publish(completed)
                     if harness_event.type == "run.finished":
+                        outcome = harness_event.payload.get(
+                            "outcome", harness_event.payload
+                        )
+                        status = (
+                            outcome.get("status", "unknown")
+                            if isinstance(outcome, dict)
+                            else "unknown"
+                        )
+                        self._finish_observation(
+                            handle.session_id, harness_event.run_id, str(status)
+                        )
                         if self._workflows:
                             self._workflows.release(
                                 handle.session_id, harness_event.run_id

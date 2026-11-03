@@ -64,6 +64,19 @@ class _StoredCommand(ContractModel):
 class FileProductStore:
     """Conversation-owned ProductEvent store under ``<conversation>/product``."""
 
+    def read_execution_evidence(self, digest: str) -> bytes:
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise FileNotFoundError("Invalid evidence digest")
+        directory = self.conversation_dir / ".observability"
+        path = directory / f"{digest}.json"
+        if directory.is_symlink() or path.is_symlink():
+            raise FileNotFoundError("Evidence must not be a symlink")
+        with path.open("rb") as stream:
+            data = stream.read(2 * 1024 * 1024 + 1)
+        if len(data) > 2 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != digest:
+            raise FileNotFoundError("Evidence content does not match digest")
+        return data
+
     def __init__(self, conversation_dir: Path | str) -> None:
         self.conversation_dir = Path(conversation_dir)
         self.directory = self.conversation_dir / "product"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 
 import harness_adapter.pi_adapter.adapter as pi_adapter_module
@@ -364,3 +365,39 @@ async def test_product_api_creates_pi_metadata_and_reports_missing_checkpoint(
     )
     assert (conversations / target_id / "pi" / "session.jsonl").is_file()
     await runtime.close()
+
+
+async def test_evidence_http_checks_owner_and_digest(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    runtime = ConversationRuntime(conversations, FakeAdapter())
+    context = RequestContext(user_id="42")
+    await runtime.create_conversation(
+        SessionSpec(
+            conversation_id="evidence",
+            user_id="42",
+            workspace_root=str(conversations / "evidence"),
+        ),
+        context,
+    )
+    content = b'{"content":"immutable evidence"}'
+    digest = hashlib.sha256(content).hexdigest()
+    directory = conversations / "evidence" / ".observability"
+    directory.mkdir()
+    path = directory / f"{digest}.json"
+    path.write_bytes(content)
+    transport = httpx.ASGITransport(app=_app(tmp_path, runtime))
+    url = f"/api/v2/pyromind/conversations/evidence/execution-evidence/{digest}"
+    try:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            owner = await client.get(url, headers={"x-pyromind-debug-user-id": "42"})
+            stranger = await client.get(url, headers={"x-pyromind-debug-user-id": "99"})
+            assert owner.status_code == 200
+            assert owner.content == content
+            assert stranger.status_code == 404
+            path.write_bytes(b"changed")
+            corrupt = await client.get(url, headers={"x-pyromind-debug-user-id": "42"})
+            assert corrupt.status_code == 404
+    finally:
+        await runtime.close()

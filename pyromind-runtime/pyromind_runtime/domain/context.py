@@ -4,6 +4,12 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionTrace:
+    trace_id: str
+    parent_span_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class RequestContext:
     """Ephemeral request credentials; this object must never be persisted."""
 
@@ -12,3 +18,4 @@ class RequestContext:
     authorization: str | None = None
     x_cluster: str | None = None
     accept_language: str | None = None
+    execution_trace: ExecutionTrace | None = None

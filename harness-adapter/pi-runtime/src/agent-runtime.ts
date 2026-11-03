@@ -1,3 +1,4 @@
+import type { ObservationRecorder } from "./observability/recorder.js";
 import type { SubagentHost } from "./subagent-host.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -25,6 +26,7 @@ import type { JsonlRpcPeer } from "./rpc-peer.js";
 import type { WorkflowExecution } from "./workflow-execution.js";
 
 export class PiAgentRuntime {
+  private recorder?: ObservationRecorder;
   private subagents?: SubagentHost;
   private autonomousRunId?: string;
   private cancelling = false;
@@ -73,11 +75,12 @@ export class PiAgentRuntime {
 
   private async start(params: JsonObject): Promise<JsonValue> {
     if (this.session) throw new Error("Pi session already started");
-    const { session, sessionId, execution, subagents } = await createPiSession(
+    const { session, sessionId, execution, subagents, recorder } = await createPiSession(
       params,
       this.peer,
       this.sessionOptions,
     );
+    this.recorder = recorder;
     this.execution = execution;
     this.subagents = subagents;
     session.subscribe((event) => {
@@ -148,7 +151,7 @@ export class PiAgentRuntime {
     this.normalizer = new PiEventNormalizer(this.sessionId!, runId, this.pendingCommandIds);
     this.outcome.reset();
     this.pendingCommandIds.push(runId);
-    setImmediate(() => void this.runPrompt(runId, prompt));
+    setImmediate(() => void this.runPrompt(runId, prompt, params.trace_context));
     return { accepted: true, steered: false };
   }
 
@@ -157,9 +160,10 @@ export class PiAgentRuntime {
     if (index >= 0) this.pendingCommandIds.splice(index, 1);
   }
 
-  private async runPrompt(runId: string, prompt: ParsedPrompt): Promise<void> {
+  private async runPrompt(runId: string, prompt: ParsedPrompt, trace?: JsonValue): Promise<void> {
     try {
       const session = this.requireSession();
+      this.recorder?.begin(runId, trace);
       await session.prompt(prompt.text, {
         images: prompt.images,
       });

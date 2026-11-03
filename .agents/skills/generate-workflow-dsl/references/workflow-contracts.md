@@ -38,10 +38,11 @@ Merge、推理与评测｜平台边界。
 | DownloadAndCacheModel | modelname, cache_dir, download_source | `model_path` |
 
 `download_source` 只允许 `huggingface`、`modelscope`。
-`Qwen/Qwen3-0.6B`、`Qwen/Qwen3-1.7B`、`Qwen/Qwen3-4B`、
-`Qwen/Qwen3-VL-2B-Instruct`、`Qwen/Qwen3-VL-4B-Instruct` 使用 Clone，
-`target_path="/workspace/models/"`。其他开源模型默认 Download，
+Clone 的模型名必须出现在
+`knowledge/nodes/CloneAndCacheModel/CloneAndCacheModel.md` 的当前环境下拉列表中，
+`target_path="/workspace/models/"`。不在列表中的开源模型默认 Download，
 `cache_dir="/workspace/models/<org>/<model>"`、`download_source="huggingface"`，用户指定来源时遵从。
+`Qwen/Qwen3-VL-2B-Instruct` 不在当前 Clone 列表中，使用 Download。
 `qwen3.5-2b` 对应 `Qwen/Qwen3.5-2B`，缓存目录为 `/workspace/models/Qwen/Qwen3.5-2B`。
 两者都通过输出 `model_path` 连接下游，不重复写死缓存路径。
 

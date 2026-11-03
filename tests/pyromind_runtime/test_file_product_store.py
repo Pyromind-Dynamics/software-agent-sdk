@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -385,3 +386,38 @@ def test_replay_returns_events_when_the_cursor_precedes_the_tail(
         store.append(_status_event(f"event-{index}", "running"))
 
     assert [event.seq for event in store.replay(1)] == [2, 3]
+
+
+def test_read_execution_evidence_returns_exact_digest_content(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    directory = store.conversation_dir / ".observability"
+    directory.mkdir()
+    content = b'{"request":"complete"}'
+    digest = hashlib.sha256(content).hexdigest()
+    (directory / f"{digest}.json").write_bytes(content)
+
+    assert store.read_execution_evidence(digest) == content
+    with pytest.raises(FileNotFoundError):
+        store.read_execution_evidence(digest[:-1])
+    with pytest.raises(FileNotFoundError):
+        store.read_execution_evidence("0" * 64)
+
+    (directory / f"{digest}.json").write_bytes(b"tampered")
+    with pytest.raises(FileNotFoundError):
+        store.read_execution_evidence(digest)
+
+
+def test_read_execution_evidence_rejects_symlinks(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    directory = store.conversation_dir / ".observability"
+    directory.mkdir()
+    target = tmp_path / "outside.json"
+    content = b'{"request":"complete"}'
+    target.write_bytes(content)
+    digest = hashlib.sha256(content).hexdigest()
+    (directory / f"{digest}.json").symlink_to(target)
+
+    with pytest.raises(FileNotFoundError):
+        store.read_execution_evidence(digest)

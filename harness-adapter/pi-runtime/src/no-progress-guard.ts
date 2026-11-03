@@ -1,3 +1,4 @@
+import type { ObservationRecorder } from "./observability/recorder.js";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 
@@ -72,36 +73,84 @@ function digestObservation(blocks: readonly ObservationBlock[]): string {
   return `${length}:${hash.toString(16)}`;
 }
 
-export function createNoProgressGuardExtension(): InlineExtension {
+export function createNoProgressGuardExtension(recorder?: ObservationRecorder): InlineExtension {
   return (pi) => {
     const outcomes = new Map<string, CallOutcome>();
     const blockedCalls = new Set<string>();
 
     pi.on("tool_call", (event) => {
-      if (UNGUARDED_TOOLS.has(event.toolName)) return undefined;
-      const outcome = outcomes.get(callKey(event.toolName, event.input));
-      if (outcome === undefined || outcome.repeats < REPEATED_CALL_BLOCK_AT) {
-        return undefined;
-      }
-      blockedCalls.add(event.toolCallId);
-      return { block: true, reason: BLOCK_REASON };
+      const key = callKey(event.toolName, event.input);
+      const unguarded = UNGUARDED_TOOLS.has(event.toolName);
+      const invoke = () => {
+        if (unguarded) return undefined;
+        const outcome = outcomes.get(key);
+        if (outcome === undefined || outcome.repeats < REPEATED_CALL_BLOCK_AT) {
+          return undefined;
+        }
+        blockedCalls.add(event.toolCallId);
+        return { block: true, reason: BLOCK_REASON };
+      };
+      return recorder
+        ? recorder.hook(
+            "no-progress-guard",
+            "tool_call",
+            {
+              tool_name: event.toolName,
+              tool_call_id: event.toolCallId,
+              unguarded,
+              prior_repeats: outcomes.get(key)?.repeats ?? 0,
+              block_at: REPEATED_CALL_BLOCK_AT,
+            },
+            event.toolCallId,
+            invoke,
+          )
+        : invoke();
     });
 
     pi.on("tool_result", (event) => {
-      if (blockedCalls.delete(event.toolCallId)) return undefined;
-      if (UNGUARDED_TOOLS.has(event.toolName)) return undefined;
       const key = callKey(event.toolName, event.input);
       const digest = digestObservation(event.content);
-      const previous = outcomes.get(key);
-      const repeats = previous?.digest === digest ? previous.repeats + 1 : 1;
-      outcomes.set(key, { digest, repeats });
-      if (repeats !== REPEATED_RESULT_NOTICE_AT) return undefined;
-      return {
-        content: [
-          ...event.content,
-          { type: "text", text: REPEATED_RESULT_NOTICE },
-        ],
+      const priorRepeats = outcomes.get(key)?.digest === digest
+        ? outcomes.get(key)!.repeats
+        : 0;
+      const unguarded = UNGUARDED_TOOLS.has(event.toolName);
+      const invoke = () => {
+        if (blockedCalls.delete(event.toolCallId)) return undefined;
+        if (unguarded) return undefined;
+        const previous = outcomes.get(key);
+        const repeats = previous?.digest === digest ? previous.repeats + 1 : 1;
+        outcomes.set(key, { digest, repeats });
+        if (repeats !== REPEATED_RESULT_NOTICE_AT) return undefined;
+        return {
+          content: [
+            ...event.content,
+            { type: "text" as const, text: REPEATED_RESULT_NOTICE },
+          ],
+        };
       };
+      return recorder
+        ? recorder.hook(
+            "no-progress-guard",
+            "tool_result",
+            {
+              tool_name: event.toolName,
+              tool_call_id: event.toolCallId,
+              unguarded,
+              blocked_before: blockedCalls.has(event.toolCallId),
+              prior_repeats: priorRepeats,
+              content_digest: digest,
+              content_chars: event.content.reduce(
+                (total, block) => total + (block.type === "text" ? block.text.length : block.data.length),
+                0,
+              ),
+              ...(priorRepeats + 1 === REPEATED_RESULT_NOTICE_AT
+                ? { added_text: REPEATED_RESULT_NOTICE }
+                : {}),
+            },
+            event.toolCallId,
+            invoke,
+          )
+        : invoke();
     });
   };
 }

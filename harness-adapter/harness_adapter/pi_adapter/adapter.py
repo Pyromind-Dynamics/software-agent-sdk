@@ -1013,7 +1013,23 @@ class PiAdapter:
         assert session.runner is not None
         method = "steer" if session.running else "prompt"
         result = await session.runner.request(
-            method, {"run_id": run_id, "content": content}
+            method,
+            {
+                "run_id": run_id,
+                "content": content,
+                **(
+                    {
+                        "trace_context": {
+                            "trace_id": session.context.execution_trace.trace_id,
+                            "parent_span_id": (
+                                session.context.execution_trace.parent_span_id
+                            ),
+                        }
+                    }
+                    if session.context.execution_trace
+                    else {}
+                ),
+            },
         )
         return result if isinstance(result, dict) else {"accepted": True}
 

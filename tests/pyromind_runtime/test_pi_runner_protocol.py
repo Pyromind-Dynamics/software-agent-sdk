@@ -84,6 +84,20 @@ def test_runner_environment_forwards_operator_tunables(monkeypatch) -> None:
     assert environment["PYROMIND_PI_MODEL_RETRY_BASE_DELAY_MS"] == "500"
 
 
+def test_runner_environment_forwards_langfuse_config(monkeypatch) -> None:
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+    monkeypatch.setenv("LANGFUSE_HOST", "https://langfuse.example.com")
+    monkeypatch.setenv("PYROMIND_OBSERVABILITY_RUN_KIND", "scripted_test")
+
+    environment = _runner_environment()
+
+    assert environment["LANGFUSE_PUBLIC_KEY"] == "pk-lf-test"
+    assert environment["LANGFUSE_SECRET_KEY"] == "sk-lf-test"
+    assert environment["LANGFUSE_HOST"] == "https://langfuse.example.com"
+    assert environment["PYROMIND_OBSERVABILITY_RUN_KIND"] == "scripted_test"
+
+
 async def test_runner_start_uses_a_new_process_session_on_posix(
     monkeypatch, tmp_path
 ) -> None:

@@ -312,6 +312,19 @@ def _runner_environment() -> dict[str, str]:
         "PYROMIND_PI_TERMINAL_TRACE",
         "PYROMIND_PI_MODEL_MAX_RETRIES",
         "PYROMIND_PI_MODEL_RETRY_BASE_DELAY_MS",
+        "LANGFUSE_PUBLIC_KEY",
+        "LANGFUSE_SECRET_KEY",
+        "LANGFUSE_HOST",
+        "LANGFUSE_BASE_URL",
+        "LANGFUSE_USER_ID",
+        "LANGFUSE_TRACING_ENABLED",
+        "LANGFUSE_TRACING_ENVIRONMENT",
+        "LANGFUSE_RELEASE",
+        "LANGFUSE_MEDIA_UPLOAD_ENABLED",
+        "PI_LANGFUSE_MAX_CHARS",
+        "PI_LANGFUSE_DEBUG",
+        "PYROMIND_OBSERVABILITY_API_BASE",
+        "PYROMIND_OBSERVABILITY_RUN_KIND",
     )
     environment = {name: os.environ[name] for name in allowed if name in os.environ}
     ca_bundle = os.environ.get("NODE_EXTRA_CA_CERTS") or _node_ca_bundle()

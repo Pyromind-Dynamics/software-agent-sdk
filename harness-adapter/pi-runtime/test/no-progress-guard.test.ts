@@ -7,6 +7,7 @@ import type {
   ToolResultEvent,
   ToolResultEventResult,
 } from "@earendil-works/pi-coding-agent";
+import type { ObservationRecorder } from "../src/observability/recorder.js";
 import { createNoProgressGuardExtension } from "../src/no-progress-guard.js";
 
 type CallHandler = (event: ToolCallEvent) => ToolCallEventResult | undefined;
@@ -123,4 +124,65 @@ test("a blocked call does not count as another observation", () => {
   assert.equal(guard.call(callEvent("c4"))?.block, true);
   assert.equal(guard.result(resultEvent("c4", "")), undefined);
   assert.equal(guard.call(callEvent("c5"))?.block, true);
+});
+
+type HookRecord = { name: string; event: string; input: Record<string, unknown> };
+
+function recordingGuardHandlers(): {
+  call: CallHandler;
+  result: ResultHandler;
+  records: HookRecord[];
+} {
+  const records: HookRecord[] = [];
+  const recorder = {
+    hook(
+      name: string,
+      event: string,
+      input: Record<string, unknown>,
+      _callId: string,
+      invoke: () => unknown,
+    ) {
+      records.push({ name, event, input });
+      return invoke();
+    },
+  } as unknown as ObservationRecorder;
+  const handlers: Record<string, unknown> = {};
+  const pi = {
+    on(event: string, handler: unknown) {
+      handlers[event] = handler;
+    },
+  } as unknown as ExtensionAPI;
+  const extension = createNoProgressGuardExtension(recorder);
+  const factory = typeof extension === "function" ? extension : extension.factory;
+  factory(pi);
+  return {
+    call: handlers.tool_call as CallHandler,
+    result: handlers.tool_result as ResultHandler,
+    records,
+  };
+}
+
+test("guard records the decision basis and block without changing it", () => {
+  const guard = recordingGuardHandlers();
+  guard.call(callEvent("c1"));
+  guard.result(resultEvent("c1", ""));
+  guard.call(callEvent("c2"));
+  guard.result(resultEvent("c2", ""));
+  guard.call(callEvent("c3"));
+  guard.result(resultEvent("c3", ""));
+  const blocked = guard.call(callEvent("c4"));
+
+  assert.equal(blocked?.block, true);
+  const blockRecord = guard.records.find(
+    (record) => record.name === "no-progress-guard" &&
+      record.event === "tool_call" &&
+      record.input.tool_call_id === "c4",
+  );
+  assert.equal(blockRecord?.input.prior_repeats, 3);
+  assert.equal(blockRecord?.input.block_at, 3);
+  const noticeRecord = guard.records.find(
+    (record) => record.event === "tool_result" &&
+      record.input.tool_call_id === "c2",
+  );
+  assert.match(String(noticeRecord?.input.added_text), /no new information/);
 });
