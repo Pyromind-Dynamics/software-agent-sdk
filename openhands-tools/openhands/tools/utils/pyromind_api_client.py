@@ -21,14 +21,13 @@ if TYPE_CHECKING:
 _PROD_ENVS = frozenset({"prod", "production", "online"})
 
 _BASE_DOMAIN = "api-portal.pyromind.ai"
-_ACCESS_KEY_URI = "/account/agent/find_access_key"
+_SENSITIVE_DATA_ACCESS_KEY_URI = "/account/sensitive_data/find_access_key"
 _API_URI = "/api/v1"
-_AGENT_ACCESS_KEY_AUDIENCE = "pyromind-portal/agent-access-key"
-_AGENT_ACCESS_KEY_CLIENT = "pyromind-agent"
-_AGENT_ACCESS_KEY_EVENT = "agent.find_access_key"
-_AGENT_ACCESS_KEY_TOKEN_TYPE = "agent_access_key_request"
-_AGENT_ACCESS_KEY_TTL_SECONDS = 60
-_AGENT_ACCESS_KEY_SECRET_ENV = "PYROMIND_AGENT_ACCESS_KEY_REQUEST_SECRET"
+_SENSITIVE_DATA_FIND_ACCESS_KEY_EVENT = "sensitive_data.find_access_key"
+_SENSITIVE_DATA_REQUEST_CLIENT = "pyromind-server"
+_SENSITIVE_DATA_REQUEST_TTL_SECONDS = 60
+_SENSITIVE_DATA_REQUEST_SECRET_ENV = "PYROMIND_SENSITIVE_DATA_REQUEST_SECRET"
+_LEGACY_AGENT_REQUEST_SECRET_ENV = "PYROMIND_AGENT_ACCESS_KEY_REQUEST_SECRET"
 _DEV_SECRET_KEY = "Kij823420JITRE21i21248cbsxhuexvS"
 
 
@@ -43,7 +42,7 @@ def _get_domain(env: str | None, api_uri: str) -> str:
 
 
 def _access_key_url(env: str | None) -> str:
-    return _get_domain(env, _ACCESS_KEY_URI)
+    return _get_domain(env, _SENSITIVE_DATA_ACCESS_KEY_URI)
 
 
 def _api_url(env: str | None) -> str:
@@ -80,7 +79,9 @@ def _extract_cookie_header(
 
 @lru_cache
 def _find_secret_key() -> str:
-    env_secret = os.getenv(_AGENT_ACCESS_KEY_SECRET_ENV, "").strip()
+    env_secret = os.getenv(_SENSITIVE_DATA_REQUEST_SECRET_ENV, "").strip()
+    if not env_secret:
+        env_secret = os.getenv(_LEGACY_AGENT_REQUEST_SECRET_ENV, "").strip()
     if env_secret:
         return env_secret
     if os.getenv("APP_ENV", "dev") == "dev":
@@ -109,24 +110,35 @@ def _user_id_from_auth_token(auth_token: str) -> int:
     return user_id
 
 
-def _build_agent_access_key_request(
+def _build_sensitive_data_request_key(
     auth_token: str,
     *,
+    event: str,
     now: int | None = None,
 ) -> str:
     issued_at = int(time.time()) if now is None else now
     return jwt.encode(
         {
-            "aud": _AGENT_ACCESS_KEY_AUDIENCE,
-            "client": _AGENT_ACCESS_KEY_CLIENT,
-            "event": _AGENT_ACCESS_KEY_EVENT,
-            "exp": issued_at + _AGENT_ACCESS_KEY_TTL_SECONDS,
+            "client": _SENSITIVE_DATA_REQUEST_CLIENT,
+            "event": event,
+            "exp": issued_at + _SENSITIVE_DATA_REQUEST_TTL_SECONDS,
             "iat": issued_at,
-            "token_type": _AGENT_ACCESS_KEY_TOKEN_TYPE,
             "user_id": _user_id_from_auth_token(auth_token),
         },
         _find_secret_key(),
         algorithm="HS256",
+    )
+
+
+def _build_sensitive_access_key_request(
+    auth_token: str,
+    *,
+    now: int | None = None,
+) -> str:
+    return _build_sensitive_data_request_key(
+        auth_token,
+        event=_SENSITIVE_DATA_FIND_ACCESS_KEY_EVENT,
+        now=now,
     )
 
 
@@ -155,7 +167,7 @@ def get_api_key(
     response = httpx.post(
         endpoint_url,
         headers=headers,
-        json={"request_key": _build_agent_access_key_request(auth_token)},
+        json={"request_key": _build_sensitive_access_key_request(auth_token)},
         timeout=timeout,
     )
 

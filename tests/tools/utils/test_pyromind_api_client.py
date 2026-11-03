@@ -6,7 +6,8 @@ import pytest
 from openhands.tools.utils import pyromind_api_client
 from openhands.tools.utils.pyromind_api_client import (
     _build_access_key_request_headers,
-    _build_agent_access_key_request,
+    _build_sensitive_access_key_request,
+    _build_sensitive_data_request_key,
     _parse_cookie_pairs,
     _serialize_cookie_pairs,
 )
@@ -18,6 +19,23 @@ TEST_SECRET = "test-secret-key-with-at-least-32-bytes"
 def test_find_secret_key_prefers_environment_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("PYROMIND_SENSITIVE_DATA_REQUEST_SECRET", TEST_SECRET)
+    monkeypatch.setenv(
+        "PYROMIND_AGENT_ACCESS_KEY_REQUEST_SECRET",
+        "legacy-secret-that-must-not-win",
+    )
+    pyromind_api_client._find_secret_key.cache_clear()
+
+    try:
+        assert pyromind_api_client._find_secret_key() == TEST_SECRET
+    finally:
+        pyromind_api_client._find_secret_key.cache_clear()
+
+
+def test_find_secret_key_supports_legacy_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PYROMIND_SENSITIVE_DATA_REQUEST_SECRET", raising=False)
     monkeypatch.setenv("PYROMIND_AGENT_ACCESS_KEY_REQUEST_SECRET", TEST_SECRET)
     pyromind_api_client._find_secret_key.cache_clear()
 
@@ -70,7 +88,7 @@ def test_build_access_key_request_headers_merges_case_insensitive_cookie() -> No
     )
 
 
-def test_build_agent_access_key_request_contains_expected_claims(
+def test_build_sensitive_access_key_request_contains_expected_claims(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -81,20 +99,47 @@ def test_build_agent_access_key_request_contains_expected_claims(
     auth_token = jwt.encode({"user_id": 42}, TEST_SECRET, algorithm="HS256")
     issued_at = int(time.time())
 
-    request_key = _build_agent_access_key_request(auth_token, now=issued_at)
+    request_key = _build_sensitive_access_key_request(auth_token, now=issued_at)
     payload = jwt.decode(
         request_key,
         TEST_SECRET,
         algorithms=["HS256"],
-        audience="pyromind-portal/agent-access-key",
+        options={"verify_exp": False},
     )
 
-    assert payload["client"] == "openhands-agent"
-    assert payload["event"] == "agent.find_access_key"
-    assert payload["token_type"] == "agent_access_key_request"
-    assert payload["user_id"] == 42
-    assert payload["iat"] == issued_at
-    assert payload["exp"] == issued_at + 60
+    assert payload == {
+        "client": "pyromind-server",
+        "event": "sensitive_data.find_access_key",
+        "exp": issued_at + 60,
+        "iat": issued_at,
+        "user_id": 42,
+    }
+
+
+def test_build_sensitive_data_request_key_uses_requested_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        pyromind_api_client,
+        "_find_secret_key",
+        lambda: TEST_SECRET,
+    )
+    auth_token = jwt.encode({"user_id": 42}, TEST_SECRET, algorithm="HS256")
+
+    request_key = _build_sensitive_data_request_key(
+        auth_token,
+        event="sensitive_data.future_event",
+        now=1_700_000_000,
+    )
+    payload = jwt.decode(
+        request_key,
+        TEST_SECRET,
+        algorithms=["HS256"],
+        options={"verify_exp": False},
+    )
+
+    assert payload["client"] == "pyromind-server"
+    assert payload["event"] == "sensitive_data.future_event"
 
 
 def test_get_api_key_posts_agent_request_key(
@@ -129,7 +174,7 @@ def test_get_api_key_posts_agent_request_key(
 
     assert access_key == "long-lived-access-key"
     assert captured["url"] == (
-        "https://pre-api-portal.pyromind.ai/account/agent/find_access_key"
+        "https://pre-api-portal.pyromind.ai/account/sensitive_data/find_access_key"
     )
     request_body = captured["json"]
     assert isinstance(request_body, dict)
