@@ -12,9 +12,28 @@ import {
   redact,
 } from "../src/observability/recorder.js";
 import { recordFinalProviderPayload } from "../src/pi-session.js";
+import { createSecretRedactor, generationOutput } from "../src/observability/langfuse-plugin.js";
 
 const exporter = new InMemorySpanExporter();
 setLangfuseTracerProvider(new NodeTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] }));
+
+test("generation output preserves reasoning and replayable tool arguments without exposing keys", () => {
+  const content = [
+    { type: "thinking", thinking: "Read the input before computing the result." },
+    { type: "text", text: "Checking the input." },
+    { type: "toolCall", id: "call-read", name: "read", arguments: { path: "public_data/input.txt", api_key: "private-test-credential" } },
+  ];
+  const before = JSON.stringify(content);
+  const output = generationOutput(content);
+  assert.equal(output.reasoning_content, content[0].thinking);
+  assert.equal(output.content, "Checking the input.");
+  assert.deepEqual(output.tool_calls, [{ id: "call-read", type: "function", function: {
+    name: "read", arguments: JSON.stringify(content[2].arguments),
+  } }]);
+  const clean = redact(createSecretRedactor("private-test-credential")(output));
+  assert.ok(!JSON.stringify(clean).includes("private-test-credential"));
+  assert.equal(JSON.stringify(content), before);
+});
 
 test("tracing stays disabled without an explicit endpoint", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-langfuse-config-"));
@@ -107,6 +126,31 @@ test("content storage failure does not fail execution", async () => {
   capture.attach(startObservation("storage-failure"));
   capture.fact("unavailable", { value: "safe" });
   await capture.finish();
+});
+
+test("evidence links require an explicitly configured agent endpoint", async () => {
+  for (const base of ["", "https://agent.example.test/"]) {
+    const directory = await mkdtemp(join(tmpdir(), "pi-evidence-url-"));
+    const capture = new ObservationRecorder({
+      conversationId: "url-test", directory, snapshot: {}, secrets: [],
+      evidenceBaseUrl: base,
+    });
+    const root = startObservation("url-root");
+    capture.begin("run"); capture.attach(root);
+    capture.fact("URL evidence", { value: "saved" });
+    await capture.finish(); root.end();
+    const span = exporter.getFinishedSpans().find(item =>
+      item.name === "URL evidence" && item.spanContext().traceId === root.otelSpan.spanContext().traceId);
+    assert.ok(span);
+    const evidence = JSON.parse(String(span.attributes["langfuse.observation.metadata.evidence"]));
+    assert.equal(evidence.status, "saved");
+    assert.equal(JSON.parse(await readFile(join(directory, `${evidence.sha256}.json`), "utf8")).value, "saved");
+    if (base) {
+      assert.equal(evidence.url, `https://agent.example.test/api/v2/pyromind/conversations/url-test/execution-evidence/${evidence.sha256}`);
+    } else {
+      assert.equal(evidence.url, undefined);
+    }
+  }
 });
 
 test("final request is recorded after later payload transformations", async () => {

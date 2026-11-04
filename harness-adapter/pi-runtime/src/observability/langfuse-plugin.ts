@@ -221,6 +221,31 @@ export function extractToolCalls(content: unknown): Array<{ id: string; name: st
     .map((p) => ({ id: p.id, name: p.name }));
 }
 
+export function generationOutput(content: unknown): Record<string, unknown> {
+  const text = truncateText(extractText(content)).text;
+  const blocks = Array.isArray(content) ? content : [];
+  const thinking = truncateText(blocks
+    .filter((part) => part?.type === "thinking" && typeof part.thinking === "string")
+    .map((part) => part.thinking)
+    .join("")).text;
+  const tools = blocks
+    .filter((part) => part?.type === "toolCall")
+    .map((part) => ({
+      id: part.id,
+      type: "function",
+      function: {
+        name: part.name,
+        arguments: JSON.stringify(part.arguments ?? {}),
+      },
+    }));
+  return {
+    role: "assistant",
+    ...(text ? { content: text } : {}),
+    ...(thinking ? { reasoning_content: thinking } : {}),
+    ...(tools.length ? { tool_calls: tools } : {}),
+  };
+}
+
 export interface PiImagePart {
   type: "image";
   data: string;
@@ -560,6 +585,12 @@ export default function (pi: ExtensionAPI, recorder?: ObservationRecorder) {
         ...(opts.cancelled ? { cancelled: true } : {}),
       },
     });
+    if (!inheritedParent && state.lastAssistantText) {
+      state.root.otelSpan.setAttribute(
+        LangfuseOtelSpanAttributes.TRACE_OUTPUT,
+        JSON.stringify({ role: "assistant", content: text }),
+      );
+    }
     state.root.end();
     withdrawParentContext();
     state = undefined;
@@ -624,6 +655,9 @@ export default function (pi: ExtensionAPI, recorder?: ObservationRecorder) {
     const isSubagent = Boolean(inheritedParent);
     traceAttributes = {
       ...(isSubagent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: TRACE_NAME }),
+      ...(isSubagent ? {} : {
+        [LangfuseOtelSpanAttributes.TRACE_INPUT]: JSON.stringify({ role: "user", content: userText }),
+      }),
       [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: isSubagent
         ? (inheritedParent!.sessionId ?? sessionId)
         : recorder?.parentContext ? recorder.conversationId : sessionId,
@@ -650,7 +684,7 @@ export default function (pi: ExtensionAPI, recorder?: ObservationRecorder) {
             : {}),
         },
       },
-      { asType: "span", ...((recorder?.parentContext ?? inheritedParent?.spanContext) ? { parentSpanContext: recorder?.parentContext ?? inheritedParent?.spanContext } : {}) },
+      { asType: "agent", ...((recorder?.parentContext ?? inheritedParent?.spanContext) ? { parentSpanContext: recorder?.parentContext ?? inheritedParent?.spanContext } : {}) },
     );
 
     recorder?.attach(root);
@@ -704,7 +738,8 @@ export default function (pi: ExtensionAPI, recorder?: ObservationRecorder) {
   pi.on("message_update", (event) => {
     const gen = state?.openGeneration;
     if (!gen || gen.finished || gen.sawFirstToken) return;
-    if (extractText((event.message as { content?: unknown })?.content).length > 0) {
+    const update = event.assistantMessageEvent;
+    if ((update.type === "text_delta" || update.type === "thinking_delta" || update.type === "toolcall_delta") && update.delta) {
       gen.sawFirstToken = true;
       gen.obs.update({ completionStartTime: new Date() });
     }
@@ -730,17 +765,13 @@ export default function (pi: ExtensionAPI, recorder?: ObservationRecorder) {
 
     const text = extractText(message.content);
     const tools = extractToolCalls(message.content);
-    const { text: outText, meta: outMeta } = truncateText(text);
+    const { meta: outMeta } = truncateText(text);
     const isError = message.stopReason === "error" || message.stopReason === "aborted";
     state.lastStopReason = message.stopReason;
     if (message.stopReason === "error") state.sawError = true;
 
     gen.obs.update({
-      output: {
-        role: "assistant",
-        ...(outText ? { content: outText } : {}),
-        ...(tools.length ? { tool_calls: tools } : {}),
-      },
+      output: generationOutput(message.content),
       model: message.responseModel || message.model,
       usageDetails: message.usage ? buildUsageDetails(message.usage) : undefined,
       costDetails: message.usage ? buildCostDetails(message.usage) : undefined,

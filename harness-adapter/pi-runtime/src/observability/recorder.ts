@@ -254,9 +254,11 @@ export class ObservationRecorder {
     this.storeOn(observation, clean, "request_evidence");
   }
 
-  private evidenceUrl(hash: string): string {
-    const base = (this.options.evidenceBaseUrl ?? process.env.PYROMIND_OBSERVABILITY_API_BASE ?? "http://localhost:5173").replace(/\/$/, "");
-    return `${base}/api/v2/pyromind/conversations/${encodeURIComponent(this.options.conversationId)}/execution-evidence/${hash}`;
+  private evidenceUrl(hash: string): string | undefined {
+    const base = (this.options.evidenceBaseUrl ?? process.env.PYROMIND_OBSERVABILITY_API_BASE)?.trim().replace(/\/$/, "");
+    return base
+      ? `${base}/api/v2/pyromind/conversations/${encodeURIComponent(this.options.conversationId)}/execution-evidence/${hash}`
+      : undefined;
   }
 
   fact(name: string, input: unknown, parent = this.root): void {
