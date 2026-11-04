@@ -115,6 +115,9 @@ def get_pi_skill_datas():
     skills_dir = project_root / ".agents" / "skills"
     for skill_name in (
         "inference-evaluation",
+        "model-evaluation-preparation",
+        "experiment-planning",
+        "avi-baseline-evaluation",
         "generate-workflow-dsl",
         "data-processing",
         "debug-workflow",
@@ -124,7 +127,7 @@ def get_pi_skill_datas():
     ):
         for path in sorted((skills_dir / skill_name).rglob("*")):
             if path.is_file() and "__pycache__" not in path.parts:
-                rel = path.relative_to(skills_dir).as_posix()
+                rel = path.parent.relative_to(skills_dir).as_posix()
                 data_files.append((str(path), f".agents/skills/{rel}"))
     return data_files
 

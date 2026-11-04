@@ -21,6 +21,7 @@ from pyromind_runtime.domain.commands import (
 from pyromind_runtime.domain.evaluation import EvaluationCommitState
 from pyromind_runtime.domain.events import ProductEvent, WorkflowRunState
 from pyromind_runtime.domain.pipeline import PipelineRun
+from pyromind_runtime.domain.preparation import PreparationPolicy
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 from pyromind_runtime.domain.user_input import UserInputResolution
@@ -53,6 +54,8 @@ class CommandConflictError(ProductStoreError):
 
 
 class _Metadata(ContractModel):
+    preparation_policy: PreparationPolicy | None = None
+    delegated_roles: tuple[str, ...] | None = None
     configuration_version: int = 0
     conversation_id: str
     user_id: str
@@ -120,6 +123,8 @@ class FileProductStore:
         development_tool_allowlist: tuple[str, ...] | None = None,
         development_skill_allowlist: tuple[str, ...] | None = None,
         command_allowlist: tuple[str, ...] | None = None,
+        preparation_policy: PreparationPolicy | None = None,
+        delegated_roles: tuple[str, ...] | None = None,
     ) -> None:
         if not self.conversation_dir.is_dir():
             raise ProductStoreError("conversation directory does not exist")
@@ -144,6 +149,8 @@ class FileProductStore:
             development_tool_allowlist=development_tool_allowlist,
             development_skill_allowlist=development_skill_allowlist,
             command_allowlist=command_allowlist,
+            preparation_policy=preparation_policy,
+            delegated_roles=delegated_roles,
             capabilities=snapshot.capabilities,
         )
         try:
@@ -171,6 +178,17 @@ class FileProductStore:
     def permits_tool(self, name: str) -> bool:
         allowed = self._load_metadata().tool_allowlist
         return allowed is not None and name in allowed
+
+    def development_policy(self) -> SessionPolicy:
+        metadata = self._load_metadata()
+        return SessionPolicy(
+            tool_allowlist=metadata.development_tool_allowlist
+            if metadata.development_tool_allowlist is not None
+            else metadata.tool_allowlist,
+            skill_allowlist=metadata.development_skill_allowlist
+            if metadata.development_skill_allowlist is not None
+            else metadata.skill_allowlist,
+        )
 
     def activate_development_policy(self) -> SessionPolicy:
         with self._lock():
@@ -204,11 +222,16 @@ class FileProductStore:
     def access_policy(self) -> dict:
         metadata = self._load_metadata()
         return {
+            "preparation_policy": metadata.preparation_policy,
+            "delegated_roles": metadata.delegated_roles,
             "profile_id": metadata.profile_id,
             "tool_allowlist": metadata.tool_allowlist,
             "skill_allowlist": metadata.skill_allowlist,
             "command_allowlist": metadata.command_allowlist,
         }
+
+    def preparation_policy(self) -> PreparationPolicy | None:
+        return self._load_metadata().preparation_policy
 
     def configuration_version(self) -> int:
         return self._load_metadata().configuration_version
@@ -222,8 +245,8 @@ class FileProductStore:
                     "tool_allowlist": policy.tool_allowlist,
                     "skill_allowlist": policy.skill_allowlist,
                     "command_allowlist": policy.command_allowlist,
-                    "development_tool_allowlist": None,
-                    "development_skill_allowlist": None,
+                    "development_tool_allowlist": policy.development_tool_allowlist,
+                    "development_skill_allowlist": policy.development_skill_allowlist,
                 }
             )
             self._atomic_write(self.metadata_path, updated.model_dump_json())

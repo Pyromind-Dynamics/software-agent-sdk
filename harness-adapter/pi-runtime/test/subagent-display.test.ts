@@ -70,3 +70,18 @@ test("query errors preserve content and retry next period", async t => {
   now += 2000; await display.poll('run'); assert.deepEqual(display.details('run'), before);
   now += 2000; await display.poll('run'); assert.equal(calls, 3);
 });
+
+
+test("execution bindings survive display recovery without retaining work leases", () => {
+  const root = mkdtempSync(join(tmpdir(), "display-binding-"));
+  const path = join(root, "display.json");
+  try {
+    const binding = {project_id: "project", task_run_id: "business-run", stage_id: "eval", plan_sequence: 3};
+    const display = new SubagentDisplay(async () => ({}), () => {}, path);
+    display.remember("native", {task: "Evaluate", execution: binding, work_id: "private-lease", generation: 7});
+    const restored = new SubagentDisplay(async () => ({}), () => {}, path);
+    assert.deepEqual((restored.details("native").subagent as any).execution, binding);
+    assert.equal(JSON.stringify(restored.details("native")).includes("private-lease"), false);
+    display.close(); restored.close();
+  } finally {rmSync(root, {recursive: true, force: true});}
+});

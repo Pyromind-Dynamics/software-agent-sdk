@@ -23,14 +23,18 @@ def settings(path):
     for name in ("PYROMIND_TEST_COOKIE", "PYROMIND_TEST_X_CLUSTER"):
         if not values.get(name):
             raise ValueError(f"Fill {name} in the local test environment file")
-    headers = {
-        "cookie": values["PYROMIND_TEST_COOKIE"],
-        "x-cluster": values["PYROMIND_TEST_X_CLUSTER"],
+    headers: dict[str, str] = {
+        key: value
+        for key, value in (
+            ("cookie", values["PYROMIND_TEST_COOKIE"]),
+            ("x-cluster", values["PYROMIND_TEST_X_CLUSTER"]),
+        )
+        if value
     }
     if values.get("PYROMIND_TEST_USER_ID"):
-        headers["x-pyromind-debug-user-id"] = values["PYROMIND_TEST_USER_ID"]
+        headers["x-pyromind-debug-user-id"] = values["PYROMIND_TEST_USER_ID"] or ""
     if values.get("PYROMIND_TEST_SESSION_API_KEY"):
-        headers["x-session-api-key"] = values["PYROMIND_TEST_SESSION_API_KEY"]
+        headers["x-session-api-key"] = values["PYROMIND_TEST_SESSION_API_KEY"] or ""
     return values, headers
 
 
@@ -47,7 +51,11 @@ async def request(client, method, path, **kwargs):
 
 async def run(args):
     values, headers = settings(args.env_file)
-    base = values.get("PYROMIND_TEST_AGENT_URL") or "http://127.0.0.1:8000"
+    base = (
+        args.agent_url
+        or values.get("PYROMIND_TEST_AGENT_URL")
+        or "http://127.0.0.1:8000"
+    )
     async with httpx.AsyncClient(base_url=base, headers=headers, timeout=120) as client:
         if args.action == "probe":
             conversations = await request(client, "GET", API)
@@ -85,13 +93,16 @@ async def run(args):
                 if count < 1 or count > 16:
                     raise ValueError("Local acceptance supports 1–16 samples")
                 prompt = (
-                    "请实际完成一次小样 Init baseline，仅评测、不训练不部署。"
+                    "准备一次通用模型小样评测，仅评测、不训练不部署。"
                     f"基模 Storage 路径：{model}；数据：{dataset}。"
                     f"最多 {count} 个样本，"
                     f"inference_evaluation_config 的 limit={count}。"
-                    "Manager 只委派 Eval；Eval 按 inference-evaluation Skill 自主探查、"
+                    "创建前只读探查，补齐场景 Checklist，再生成计划等待创建按钮。"
+                    "评分采用基于真实数据能确定的 GT 或确定性规则；无需上线阈值。"
+                    "创建后 Manager 只委派 Eval；"
+                    "Eval 按 inference-evaluation Skill 自主探查、"
                     "选评分口径并调用原 df_submit_evaluation。"
-                    "无需确认 Graph 或逐阶段确认。"
+                    "本客户端会在计划就绪后提交创建并启动命令。"
                     "缺少无法探查的关键输入才向我提问。最终登记真实指标、覆盖率和报告。"
                 )
             created = await request(client, "POST", API, json={"llm": llm})
@@ -119,8 +130,73 @@ async def run(args):
                 )
         async with asyncio.timeout(args.timeout):
             previous = None
+            creation_command = uuid4().hex
+            creation_started = False
             while True:
                 snapshot = await request(client, "GET", f"{API}/{identity}/snapshot")
+                preparation = snapshot.get("preparation")
+                if preparation and not snapshot.get("project") and not creation_started:
+                    if snapshot.get("pending_inputs"):
+                        raise ValueError(
+                            "Preparation needs user input; open conversation "
+                            + identity
+                        )
+                    if (
+                        args.action == "run"
+                        and preparation["phase"] == "ready"
+                        and not preparation["review_pending"]
+                        and snapshot["status"] != "running"
+                    ):
+                        print(
+                            json.dumps(
+                                {
+                                    "create_project_command_id": creation_command,
+                                    "preparation_revision": preparation["revision"],
+                                }
+                            ),
+                            flush=True,
+                        )
+                        created_project = await request(
+                            client,
+                            "POST",
+                            f"{API}/{identity}/commands",
+                            json={
+                                "type": "create_project",
+                                "command_id": creation_command,
+                                "expected_preparation_revision": preparation[
+                                    "revision"
+                                ],
+                            },
+                        )
+                        creation_started = True
+                        print(
+                            json.dumps(
+                                {
+                                    "project_created": created_project["response"][
+                                        "project_id"
+                                    ],
+                                    "initial_run_id": created_project["response"][
+                                        "initial_run_id"
+                                    ],
+                                }
+                            ),
+                            flush=True,
+                        )
+                        continue
+                    if preparation["phase"] == "collecting" and snapshot["status"] in {
+                        "idle",
+                        "error",
+                        "stuck",
+                    }:
+                        print(
+                            json.dumps(
+                                {
+                                    "preparation_phase": preparation["phase"],
+                                    "missing": preparation["missing"],
+                                }
+                            ),
+                            flush=True,
+                        )
                 executions = snapshot.get("experiment_executions") or []
                 summary = [
                     {
@@ -209,6 +285,7 @@ def main():
     parser.add_argument("action", choices=("probe", "run", "watch"))
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env.test.local")
     parser.add_argument("--conversation")
+    parser.add_argument("--agent-url", help="Override the local acceptance service URL")
     parser.add_argument("--prompt")
     parser.add_argument("--timeout", type=int, default=3600)
     args = parser.parse_args()

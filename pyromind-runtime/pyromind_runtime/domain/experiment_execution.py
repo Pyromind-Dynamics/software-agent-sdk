@@ -76,10 +76,23 @@ EXECUTION_TOOLS = {
 }
 
 
+class ExecutionBinding(ContractModel):
+    project_id: str
+    task_run_id: str
+    stage_id: str
+    plan_sequence: int
+
+
 class ExperimentExecutionView(ContractModel):
     run_id: str
     project_id: str
     plan_revision: int | None = None
+    plan_sequence: int | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    stage_snapshot: JsonObject | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     task_id: str
     stage_id: str | None = None
     task_name: str

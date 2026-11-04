@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import Field, JsonValue, field_validator, model_serializer
+from pydantic import (
+    Field,
+    JsonValue,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from pyromind_runtime.domain.base import AwareDatetime, ContractModel
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
@@ -12,6 +18,7 @@ from pyromind_runtime.domain.experiment_plans import (
     ExperimentContextView,
     ExperimentPlanView,
 )
+from pyromind_runtime.domain.preparation import PreparationView, ProjectView
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.user_input import PendingUserInput
 
@@ -44,6 +51,12 @@ class TimelineMessage(ContractModel):
 
 
 class TimelineOperation(ContractModel):
+    activity: OperationActivity | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    execution: JsonObject | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     kind: Literal["operation"] = "operation"
     item_id: str = Field(min_length=1)
     started_seq: int = Field(ge=1)
@@ -57,6 +70,26 @@ class TimelineOperation(ContractModel):
     details: JsonValue = None
     error_code: str | None = None
     run_id: str | None = None
+
+
+class OperationActivity(ContractModel):
+    """Bounded child conversation using the same neutral message/tool models."""
+
+    items: tuple[TimelineMessage | TimelineOperation, ...] = Field(
+        default=(), max_length=128
+    )
+    truncated: bool = False
+
+    @model_validator(mode="after")
+    def validate_leaf_items(self):
+        for item in self.items:
+            if isinstance(item, TimelineMessage) and item.role == "system":
+                raise ValueError("system messages are not public operation activity")
+            if isinstance(item, TimelineOperation) and (
+                item.category != "tool" or item.activity is not None or item.execution
+            ):
+                raise ValueError("activity contains only leaf messages and tools")
+        return self
 
 
 class WorkflowState(ContractModel):
@@ -185,6 +218,12 @@ class ConversationSnapshot(ContractModel):
     timeline: tuple[TimelineItem, ...] = ()
     current_workflow: WorkflowState | None = None
     plan: PlanState | None = None
+    preparation: PreparationView | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    project: ProjectView | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     experiment_plan: ExperimentPlanView | None = None
     experiment_context: ExperimentContextView | None = None
     experiment_executions: tuple[ExperimentExecutionView, ...] | None = None

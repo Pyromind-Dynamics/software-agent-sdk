@@ -11,7 +11,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from pyromind_runtime.application.delegated_execution import DelegatedExecution
@@ -29,6 +29,11 @@ from pyromind_runtime.application.evaluation_cases import (
 from pyromind_runtime.application.event_projection import ProductEventProjector
 from pyromind_runtime.application.experiment_execution import ExperimentExecutions
 from pyromind_runtime.application.experiment_plans import ExperimentPlans
+from pyromind_runtime.application.preparation import (
+    Preparations,
+    validate_workflow_catalog,
+    validate_workflow_role,
+)
 from pyromind_runtime.application.reusable_workflows import (
     ReusableWorkflows,
     started_run,
@@ -44,6 +49,7 @@ from pyromind_runtime.domain.commands import (
     ConfirmExperimentExecutionCommand,
     ConfirmExperimentPlanCommand,
     ControlExperimentTaskCommand,
+    CreateProjectCommand,
     InputResponseCommand,
     PermissionResponseCommand,
     ProductCommand,
@@ -89,6 +95,14 @@ from pyromind_runtime.domain.experiment_plans import (
     UpdateExperimentContext,
 )
 from pyromind_runtime.domain.pipeline import PipelineRun
+from pyromind_runtime.domain.preparation import (
+    PREPARATION_TOOLS,
+    InspectResource,
+    PreparationView,
+    ProjectView,
+    SetPreparationPlan,
+    UpdatePreparation,
+)
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
@@ -120,11 +134,13 @@ from pyromind_runtime.ports.harness import (
     ExternalTaskNotification,
     ForkSpec,
     HarnessAdapter,
+    OperationActivityReader,
     ProductCheckpoint,
     RestoreWorkflowSpec,
     SessionHandle,
     SessionSpec,
 )
+from pyromind_runtime.ports.preparation import PreparationStore, ResourceInspector
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
     EvaluationStorageMissingError,
@@ -198,6 +214,8 @@ class ConversationRuntime:
         external_task_query: ExternalTaskQueryPort | None = None,
         experiment_execution_store: DelegatedExecutionStore | None = None,
         execution_roles: tuple[str, ...] = (),
+        preparation_store: PreparationStore | None = None,
+        resource_inspector: ResourceInspector | None = None,
         evaluation_config_validator: Callable[[JsonObject], JsonObject] | None = None,
         experiment_plan_project_binder: ExperimentPlanProjectBinder | None = None,
         external_tasks: ExternalTaskRegistry | None = None,
@@ -221,6 +239,10 @@ class ConversationRuntime:
         if default_harness_id not in self.adapters:
             raise ValueError(f"default harness is not registered: {default_harness_id}")
         self.default_harness_id = default_harness_id
+        self._preparations = (
+            Preparations(preparation_store) if preparation_store else None
+        )
+        self._resource_inspector = resource_inspector
         self._experiment_plans = (
             ExperimentPlans(experiment_plan_store) if experiment_plan_store else None
         )
@@ -290,6 +312,7 @@ class ConversationRuntime:
         self._retained: dict[str, _RetainedConversation] = {}
         self._active: dict[str, _ActiveConversation] = {}
         self._activation_locks: dict[str, asyncio.Lock] = {}
+        self._project_creation_locks: dict[str, asyncio.Lock] = {}
         self._subscribers: dict[str, set[asyncio.Queue[ProductEvent]]] = {}
         self._first_command_pending: set[str] = set()
         self._first_delta_started_at: dict[tuple[str, str], float] = {}
@@ -326,6 +349,15 @@ class ConversationRuntime:
     async def _delegated_work(self, delegated: DelegatedExecution, item: dict) -> dict:
         owner = PlanOwner.model_validate(item["payload"]["owner"])
         await self._execution_active(owner)
+        store = self._store(owner.conversation_id)
+        if store.preparation_policy() is not None and not store.permits_tool(
+            "get_experiment_context"
+        ):
+            await self._activate_development_policy(
+                owner.conversation_id,
+                store,
+                self._active[owner.conversation_id].context,
+            )
         async with self._use(owner.conversation_id):
             return await delegated.prepare(item)
 
@@ -626,17 +658,36 @@ class ConversationRuntime:
     ) -> bool:
         """Apply trusted router configuration only at an idle boundary."""
         store = await self._read_store(conversation_id, context)
+        prepared = store.preparation_policy() is not None
+        if policy.preparation_policy is not None and not prepared:
+            return True
         if policy.configuration_version <= store.configuration_version():
             return True
         async with self._activation_locks.setdefault(conversation_id, asyncio.Lock()):
             if store.load_snapshot().status == "running":
                 return False
+            if prepared:
+                # Refresh capabilities without replacing the saved scenario contract.
+                active = await self.get_project(conversation_id, context) is not None
+                policy = policy.model_copy(
+                    update={
+                        "tool_allowlist": policy.development_tool_allowlist
+                        if active and policy.development_tool_allowlist is not None
+                        else policy.tool_allowlist,
+                        "skill_allowlist": policy.development_skill_allowlist
+                        if active and policy.development_skill_allowlist is not None
+                        else policy.skill_allowlist,
+                        "product_instructions": None,
+                        "delegated_roles": None,
+                        "managed_delegation": None,
+                    }
+                )
             owner = PlanOwner(
                 user_id=context.user_id,
                 conversation_id=conversation_id,
                 profile_id=context.profile_id,
             )
-            if self._delegated_store:
+            if self._delegated_store and not prepared:
                 if not await self._plan_io(
                     self._delegated_store.retire_legacy_work, owner
                 ):
@@ -705,8 +756,26 @@ class ConversationRuntime:
         service, owner = self._execution_service(
             conversation_id, context, "request_experiment_task"
         )
+        store = self._store(conversation_id)
+        allowed_roles = store.access_policy()["delegated_roles"]
+        if allowed_roles is None:
+            allowed_roles = self._execution_roles
+        required = store.preparation_policy() is not None
+        if required and (
+            self._preparations is None
+            or await self._plan_io(self._preparations.store.project, owner) is None
+        ):
+            raise PermissionError("create the Project before delegating work")
+        preparation_policy = store.preparation_policy()
+        if preparation_policy is not None and preparation_policy.workflow_nodes:
+            assert self._preparations is not None
+            project = await self._plan_io(self._preparations.store.project, owner)
+            assert project is not None
+            validate_workflow_role(
+                preparation_policy, project.plan, request.stage_id, request.role_id
+            )
         return await self._plan_io(
-            service.request, owner, request, self._execution_roles
+            service.request, owner, request, allowed_roles, required
         )
 
     async def read_experiment_artifact(
@@ -1161,6 +1230,16 @@ class ConversationRuntime:
         arguments: JsonObject,
         context: RequestContext,
     ) -> JsonObject:
+        tool_store = self._store(conversation_id)
+        tool_store.authorize(context.user_id, context.profile_id)
+        if tool_name != "get_experiment_plan" and not tool_store.permits_tool(
+            tool_name
+        ):
+            raise PermissionError("tool is not enabled for this conversation")
+        if tool_name in PREPARATION_TOOLS:
+            return await self._preparation_call(
+                conversation_id, tool_name, arguments, context
+            )
         if tool_name in CONTEXT_TOOLS:
             service, owner = self._plan_service(conversation_id, context, tool_name)
             if tool_name == "get_experiment_context":
@@ -1168,6 +1247,9 @@ class ConversationRuntime:
                     mode="json"
                 )
             update = UpdateExperimentContext.model_validate(arguments)
+            preparation_policy = tool_store.preparation_policy()
+            if preparation_policy is not None:
+                validate_workflow_catalog(preparation_policy, update.context)
             related = {
                 run_id
                 for run_ids in update.context.stage_executions.values()
@@ -1183,6 +1265,22 @@ class ConversationRuntime:
                     raise ValueError(
                         "execution association must belong to this conversation"
                     )
+            if (
+                self._store(conversation_id).preparation_policy() is not None
+                and self._delegated_store
+            ):
+                rows = await self._plan_io(self._delegated_store.list, owner)
+                retained = {stage.id for stage in update.context.stages}
+                for row in rows:
+                    spec = row.get("task_spec") or {}
+                    if (
+                        row["state"]
+                        not in {"succeeded", "failed", "cancelled", "stopped"}
+                        and spec.get("stage_id") not in retained
+                    ):
+                        raise ValueError(
+                            "cannot remove a stage with an unfinished execution"
+                        )
             view = await self._plan_io(
                 service.store.update_context,
                 owner,
@@ -1303,7 +1401,7 @@ class ConversationRuntime:
         store: FileProductStore,
         context: RequestContext,
     ) -> None:
-        policy = store.activate_development_policy()
+        policy = store.development_policy()
         if policy.tool_allowlist is None and policy.skill_allowlist is None:
             return
         snapshot = store.load_snapshot()
@@ -1315,6 +1413,173 @@ class ConversationRuntime:
             capabilities=snapshot.capabilities,
         )
         await self._adapter(harness_id).update_session_policy(handle, policy, context)
+        store.activate_development_policy()
+
+    def _notify_preparation(
+        self,
+        conversation_id: str,
+        event_type: Literal["preparation.changed", "project.changed"],
+    ) -> None:
+        event, _ = self._store(conversation_id).append(
+            ProductEvent(conversation_id=conversation_id, type=event_type)
+        )
+        self._publish(event)
+
+    def _preparation_owner(
+        self, conversation_id: str, context: RequestContext
+    ) -> PlanOwner:
+        store = self._store(conversation_id)
+        store.authorize(context.user_id, context.profile_id)
+        if store.preparation_policy() is None or self._preparations is None:
+            raise PermissionError("preparation is not enabled")
+        return PlanOwner(
+            user_id=context.user_id,
+            conversation_id=conversation_id,
+            profile_id=context.profile_id,
+        )
+
+    def _preparation_evidence(self, conversation_id: str) -> dict[str, str]:
+        snapshot = self._store(conversation_id).load_snapshot()
+        result = {}
+        for item in snapshot.timeline:
+            if item.kind == "message" and item.role == "user":
+                result["message:" + item.item_id] = "User message"
+            elif (
+                item.kind == "operation"
+                and item.status == "completed"
+                and item.name
+                in {
+                    "read",
+                    "terminal",
+                    "grep",
+                    "find",
+                    "ls",
+                    "search",
+                    "ask_user",
+                    "inspect_resource",
+                }
+            ):
+                result["operation:" + item.item_id] = item.name
+        return result
+
+    async def get_preparation(
+        self, conversation_id: str, context: RequestContext
+    ) -> PreparationView:
+        await self._read_store(conversation_id, context)
+        owner = self._preparation_owner(conversation_id, context)
+        assert self._preparations is not None
+        view = await self._plan_io(self._preparations.store.get, owner)
+        return view.model_copy(
+            update={
+                "evidence": {
+                    **view.evidence,
+                    **self._preparation_evidence(conversation_id),
+                }
+            }
+        )
+
+    async def get_project(
+        self, conversation_id: str, context: RequestContext
+    ) -> ProjectView | None:
+        await self._read_store(conversation_id, context)
+        owner = self._preparation_owner(conversation_id, context)
+        assert self._preparations is not None
+        return await self._plan_io(self._preparations.store.project, owner)
+
+    async def _preparation_call(
+        self,
+        conversation_id: str,
+        tool_name: str,
+        arguments: JsonObject,
+        context: RequestContext,
+    ) -> JsonObject:
+        owner = self._preparation_owner(conversation_id, context)
+        if not self._store(conversation_id).permits_tool(tool_name):
+            raise PermissionError("preparation tool is not enabled")
+        assert self._preparations is not None
+        view = await self.get_preparation(conversation_id, context)
+        if tool_name == "get_preparation":
+            return view.model_dump(mode="json")
+        if tool_name == "update_preparation":
+            updated = await self._plan_io(
+                self._preparations.update,
+                owner,
+                UpdatePreparation.model_validate(arguments),
+                set(view.evidence),
+            )
+            self._notify_preparation(conversation_id, "preparation.changed")
+            return updated.model_dump(mode="json")
+        if tool_name == "set_preparation_plan":
+            updated = await self._plan_io(
+                self._preparations.set_plan,
+                owner,
+                SetPreparationPlan.model_validate(arguments),
+            )
+            self._notify_preparation(conversation_id, "preparation.changed")
+            return updated.model_dump(mode="json")
+        if self._resource_inspector is None:
+            raise ValueError(
+                "Resource inspection is unavailable; "
+                "ask the user for missing information"
+            )
+        request = InspectResource.model_validate(arguments)
+        result = await self._plan_io(self._resource_inspector.inspect, request, context)
+        reference = "resource:" + uuid4().hex
+        await self._plan_io(
+            self._preparations.store.add_evidence,
+            owner,
+            reference,
+            f"{request.kind} {request.path}; {result.get('scope', '')}; "
+            f"truncated={result.get('truncated', False)}",
+        )
+        self._notify_preparation(conversation_id, "preparation.changed")
+        return {**result, "evidence_ref": reference}
+
+    async def _create_project(
+        self,
+        conversation_id: str,
+        command: CreateProjectCommand,
+        context: RequestContext,
+    ) -> CommandReceipt:
+        owner = self._preparation_owner(conversation_id, context)
+        assert self._preparations is not None
+        store = self._store(conversation_id)
+        async with self._project_creation_locks.setdefault(
+            conversation_id, asyncio.Lock()
+        ):
+            project = await self._plan_io(self._preparations.store.project, owner)
+            snapshot = store.load_snapshot()
+            if project is None and (
+                snapshot.status == "running"
+                or snapshot.pending_inputs
+                or snapshot.pending_permissions
+            ):
+                raise ValueError(
+                    "wait for the preparation turn and pending questions to finish"
+                )
+            receipt, _ = store.claim_command(command)
+            if receipt.status == "completed":
+                return receipt
+            project = await self._plan_io(
+                self._preparations.store.activate,
+                owner,
+                command.expected_preparation_revision,
+                command.command_id,
+            )
+            if not store.permits_tool("get_experiment_context"):
+                await self._activate_development_policy(conversation_id, store, context)
+            await self._ensure_active(conversation_id, context)
+            if self._delegated_store:
+                await self._plan_io(self._delegated_store.resume_authorized, owner)
+            self._notify_preparation(conversation_id, "project.changed")
+            return store.complete_command(
+                receipt.model_copy(
+                    update={
+                        "status": "completed",
+                        "response": project.model_dump(mode="json"),
+                    }
+                )
+            )
 
     async def version_call(
         self,
@@ -2205,6 +2470,26 @@ class ConversationRuntime:
         await self._make_room()
         if self._resource_limits is not None:
             spec = spec.model_copy(update={"resource_limits": self._resource_limits})
+        if spec.preparation_policy is not None:
+            enabled_roles = {role.name for role in spec.delegated_roles or ()}
+            if not set(spec.preparation_policy.allowed_roles) <= enabled_roles:
+                raise ProductRuntimeError(
+                    "capability_not_supported",
+                    "Preparation roles must be enabled in the session profile",
+                )
+            if self._preparations is None:
+                raise ProductRuntimeError(
+                    "plan_store_unavailable", "Preparation database is not configured"
+                )
+            await self._plan_io(
+                self._preparations.store.initialize,
+                PlanOwner(
+                    user_id=context.user_id,
+                    conversation_id=spec.conversation_id,
+                    profile_id=context.profile_id,
+                ),
+                spec.preparation_policy,
+            )
         handle = await adapter.create_session(spec, context)
         self._log_timing(
             "adapter.create_session_ms",
@@ -2239,6 +2524,10 @@ class ConversationRuntime:
                 development_tool_allowlist=spec.development_tool_allowlist,
                 development_skill_allowlist=spec.development_skill_allowlist,
                 command_allowlist=spec.command_allowlist,
+                preparation_policy=spec.preparation_policy,
+                delegated_roles=tuple(role.name for role in spec.delegated_roles)
+                if spec.delegated_roles is not None
+                else None,
             )
             store.save_x_cluster(context.x_cluster)
             store.append(
@@ -2274,6 +2563,8 @@ class ConversationRuntime:
             # Nothing will run for a conversation created without a prompt, so no
             # ``run.finished`` would ever schedule its release.
             self._schedule_release(handle.session_id)
+        if spec.preparation_policy is not None:
+            return await self.get_snapshot(handle.session_id, context)
         return snapshot
 
     async def get_snapshot(
@@ -2283,6 +2574,64 @@ class ConversationRuntime:
     ) -> ConversationSnapshot:
         store = await self._read_store(conversation_id, context)
         snapshot = store.load_snapshot()
+        missing_activity = tuple(
+            item.item_id
+            for item in snapshot.timeline
+            if isinstance(item, TimelineOperation)
+            and item.category == "subagent"
+            and item.status != "running"
+            and item.activity is None
+        )[-32:]
+        adapter = self._adapter(store.harness_id())
+        if missing_activity and isinstance(adapter, OperationActivityReader):
+            try:
+                activities = await adapter.read_operation_activities(
+                    SessionHandle(
+                        session_id=conversation_id,
+                        adapter_session_ref=conversation_id,
+                        harness_id=store.harness_id(),
+                        capabilities=snapshot.capabilities,
+                    ),
+                    missing_activity,
+                    context,
+                )
+                for operation_id, activity in activities.items():
+                    if operation_id not in missing_activity:
+                        continue
+                    # Existing operation identity/state remains authoritative.
+                    event, _ = store.append(
+                        ProductEvent(
+                            conversation_id=conversation_id,
+                            event_id="activity:"
+                            + fingerprint(
+                                {
+                                    "operation_id": operation_id,
+                                    "activity": activity.model_dump(mode="json"),
+                                }
+                            ),
+                            type="operation.progress",
+                            payload={
+                                "operation_id": operation_id,
+                                "activity": activity.model_dump(mode="json"),
+                            },
+                        )
+                    )
+                    self._publish(event)
+                snapshot = store.load_snapshot()
+            except Exception:
+                logger.warning(
+                    "Retained activity unavailable for %s",
+                    conversation_id,
+                    exc_info=True,
+                )
+        if store.preparation_policy() is not None:
+            preparation = await self.get_preparation(conversation_id, context)
+            project = await self.get_project(conversation_id, context)
+            if project and not store.permits_tool("get_experiment_context"):
+                await self._activate_development_policy(conversation_id, store, context)
+            snapshot = snapshot.model_copy(
+                update={"preparation": preparation, "project": project}
+            )
         if store.permits_tool("get_experiment_plan"):
             view = await self.get_experiment_plan(conversation_id, context)
             snapshot = snapshot.model_copy(update={"experiment_plan": view})
@@ -2384,6 +2733,8 @@ class ConversationRuntime:
     ) -> CommandReceipt:
         store = await self._read_store(conversation_id, context)
         store.require_command(command.type)
+        if isinstance(command, CreateProjectCommand):
+            return await self._create_project(conversation_id, command, context)
         if isinstance(command, ResolveExperimentSubmissionCommand):
             _, owner = self._execution_service(
                 conversation_id, context, "control_experiment_task"
@@ -2480,6 +2831,22 @@ class ConversationRuntime:
         receipt, claimed = store.claim_command(command)
         if not claimed:
             return receipt
+        if (
+            isinstance(command, (UserMessageCommand, InputResponseCommand))
+            and store.preparation_policy() is not None
+        ):
+            if self._preparations is None:
+                raise ValueError("preparation store is unavailable")
+            await self._plan_io(
+                self._preparations.store.invalidate,
+                PlanOwner(
+                    user_id=context.user_id,
+                    conversation_id=conversation_id,
+                    profile_id=context.profile_id,
+                ),
+                command.command_id,
+            )
+            self._notify_preparation(conversation_id, "preparation.changed")
         if (
             isinstance(command, UserMessageCommand)
             and self._delegated_store
@@ -3019,6 +3386,8 @@ class ConversationRuntime:
     ) -> ConversationSnapshot:
         source_store = await self._ensure_active(conversation_id, context)
         source_store.authorize(context.user_id, context.profile_id)
+        if source_store.preparation_policy() is not None:
+            raise ValueError("Project conversations cannot be forked")
         source_store.require_command("fork")
         source_snapshot = source_store.load_snapshot()
         if not source_snapshot.capabilities.fork:
@@ -3614,7 +3983,26 @@ class ConversationRuntime:
                     await self._user_input.coordinate_recovery(
                         store, conversation_dir.name
                     )
-                snapshots.append(store.load_snapshot())
+                snapshot = store.load_snapshot()
+                if (
+                    store.preparation_policy() is not None
+                    and self._preparations is not None
+                ):
+                    owner = PlanOwner(
+                        user_id=context.user_id,
+                        conversation_id=conversation_dir.name,
+                        profile_id=context.profile_id,
+                    )
+                    preparation = await self._plan_io(
+                        self._preparations.store.get, owner
+                    )
+                    project = await self._plan_io(
+                        self._preparations.store.project, owner
+                    )
+                    snapshot = snapshot.model_copy(
+                        update={"preparation": preparation, "project": project}
+                    )
+                snapshots.append(snapshot)
             except Exception:
                 # A single unreadable conversation must not take down the
                 # whole listing: callers only ever see the healthy subset.

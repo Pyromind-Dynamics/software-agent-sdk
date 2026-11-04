@@ -42,7 +42,9 @@ async def test_missing_resources_do_not_create_an_empty_conversation(
 
     monkeypatch.setattr(client, "request", request)
     with pytest.raises(ValueError, match="model/data"):
-        await client.run(argparse.Namespace(env_file=path, action="run", prompt=None))
+        await client.run(
+            argparse.Namespace(env_file=path, action="run", prompt=None, agent_url=None)
+        )
     assert calls == []
 
 
@@ -64,7 +66,9 @@ async def test_command_body_excludes_credentials_and_identity_survives_response_
     monkeypatch.setattr(client, "request", request)
     with pytest.raises(httpx.ReadTimeout):
         await client.run(
-            argparse.Namespace(env_file=path, action="run", prompt="Run baseline")
+            argparse.Namespace(
+                env_file=path, action="run", prompt="Run baseline", agent_url=None
+            )
         )
     assert (
         json.loads(capsys.readouterr().out)["conversation_id"]

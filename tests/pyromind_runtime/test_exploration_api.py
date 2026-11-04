@@ -4,13 +4,13 @@ import json
 import httpx
 import pytest
 from pyromind_agent_server.api.router import create_product_router
-from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.experiment_plans import PlanOwner
 
 from . import test_standalone_experiments as experiment_fixtures
 from .fake_adapter import FakeAdapter
+from .legacy_experiment_profile import EXPERIMENT_PROFILE_V4 as ECHOMIND_PRODUCT_PROFILE
 from .test_product_api import _app
 
 
@@ -108,6 +108,7 @@ async def test_new_profile_has_no_graph_gate_and_artifacts_remain_isolated(
             linked = await runtime.experiment_plan_call(
                 identity, "update_experiment_context", association, context
             )
+            assert isinstance(linked["context"], dict)
             assert linked["context"]["stage_executions"] == {"later-stage": [run["id"]]}
             assert service.store.list(owner)[0]["task_spec"]["stage_id"] is None
             foreign_session = await client.post(base, json={"llm": {"model": "test"}})

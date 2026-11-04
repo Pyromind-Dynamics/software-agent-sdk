@@ -10,6 +10,7 @@ import { registerSubagentCapabilityCeiling } from "pi-subagents/capability-ceili
 import { registerRequiredChildExtensions } from "pi-subagents/required-child-extensions";
 import { serveSubagentIpc } from "./subagent-ipc.js";
 import { SubagentDisplay, displayText, transcriptWindow } from "./subagent-display.js";
+import { SubagentActivity } from "./subagent-activity.js";
 import { SubagentRecipients } from "./subagent-recipients.js";
 import { SubagentReports } from "./subagent-reports.js";
 import { isRecord, type JsonObject, type RunnerEvent, PROTOCOL_VERSION } from "./protocol.js";
@@ -95,9 +96,11 @@ export class SubagentHost {
       if (missing.length) throw new Error(`Delegated role ${role.name} requests unavailable host tools: ${missing.join(", ")}`);
     }
     this.paths = prepareSubagentEnvironment(workspace, definitions);
+    const activity = new SubagentActivity(this.paths.stateRoot, join(workspace, "pi", "subagent-artifacts"),
+      () => this.session ? [this.session.sessionId, this.session.sessionManager.getSessionFile() ?? ""] : []);
     this.display = new SubagentDisplay((method, params) => this.rpc(method, params), id => {
       this.emit(id, "subagent.progress", { details: this.display.details(id) });
-    }, join(workspace, "pi", "subagent-display.json"));
+    }, join(workspace, "pi", "subagent-display.json"), id => activity.read(id));
     const writer = tools.find(tool => tool.name === "write");
     if (!writer) throw new Error("Subagent report delivery requires the conversation write tool");
     this.reports = new SubagentReports(workspace, () => this.session!.sessionId, writer, Object.keys(this.roleTools));
@@ -236,9 +239,10 @@ export class SubagentHost {
         if (status.runId !== id || ![this.session!.sessionManager.getSessionFile(), this.session!.sessionId].includes(status.sessionId)) throw new Error("Delegated run ownership mismatch");
         state = status.state;
       }
-      if (action === "spawn" || action === "resume") {
+      if (action === "spawn" || action === "resume" || (isRecord(input.scope) && isRecord(input.scope.execution))) {
         const changed = this.display.remember(id, {
           ...(isRecord(input.display) ? input.display : {}),
+          ...(isRecord(input.scope) && isRecord(input.scope.execution) ? {execution: input.scope.execution} : {}),
           ...(action === "resume" && typeof input.execution_ref === "string"
             ? { previous_run_id: input.execution_ref } : {}),
         });
@@ -319,6 +323,7 @@ export class SubagentHost {
       }
       for (const [id, state] of this.states) {
         if (["running", "queued"].includes(state)) void this.display.poll(id);
+        else if (this.display.captureActivity(id)) this.emit(id, "subagent.progress", { details: this.display.details(id) });
       }
       if (!this.usagePending) return;
       this.usagePending = false;
@@ -386,6 +391,7 @@ export class SubagentHost {
 
   private async finishDisplay(id: string, state: string, label: string, extra: JsonObject) {
     await this.display.settled(id);
+    this.display.captureActivity(id);
     let result = this.handoffs.get(id) ?? extra.result;
     if (!result) {
       try {
@@ -406,7 +412,11 @@ export class SubagentHost {
   }
 
   private emit(id: string, kind: RunnerEvent["kind"], payload: JsonObject) {
-    this.peer.emit({ protocolVersion: PROTOCOL_VERSION, type: "pi.event", eventId: kind === "subagent.progress" ? `${id}:${kind}:${randomUUID()}` : `${id}:${kind}:${payload.status ?? ""}`, sessionId: this.sessionId, runId: id, occurredAt: new Date().toISOString(), kind, payload });
+    const details = payload.details;
+    const child = isRecord(details) && isRecord(details.subagent) ? details.subagent : undefined;
+    const activity = child && isRecord(child.activity) ? child.activity : undefined;
+    const safePayload = activity ? {...payload, activity, details: {...details as JsonObject, subagent: Object.fromEntries(Object.entries(child ?? {}).filter(([key]) => key !== "activity"))}} : payload;
+    this.peer.emit({ protocolVersion: PROTOCOL_VERSION, type: "pi.event", eventId: kind === "subagent.progress" ? `${id}:${kind}:${randomUUID()}` : `${id}:${kind}:${payload.status ?? ""}`, sessionId: this.sessionId, runId: id, occurredAt: new Date().toISOString(), kind, payload: safePayload });
   }
 
   async stopAll(action: "stop" | "interrupt" = "stop") {

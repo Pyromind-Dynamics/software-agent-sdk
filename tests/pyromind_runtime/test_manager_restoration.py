@@ -3,7 +3,6 @@ from dataclasses import replace
 import pytest
 from pyromind_agent_server.profiles import (
     DEFAULT_PRODUCT_PROFILE,
-    ECHOMIND_PRODUCT_PROFILE,
 )
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.context import RequestContext
@@ -20,6 +19,7 @@ from . import (
     test_standalone_experiments as execution_fixtures,
 )
 from .fake_adapter import FakeAdapter
+from .legacy_experiment_profile import EXPERIMENT_PROFILE_V4 as ECHOMIND_PRODUCT_PROFILE
 from .test_conversation_runtime import _wait_for_status
 
 

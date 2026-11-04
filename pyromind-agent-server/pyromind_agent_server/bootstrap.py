@@ -24,6 +24,7 @@ from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.infrastructure.sql_experiment_execution import (
     SQLExperimentExecutionStore,
 )
+from pyromind_runtime.infrastructure.sql_preparation import SQLPreparationStore
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import HarnessAdapter
 from pyromind_runtime.ports.workflows import WorkflowEventSink
@@ -38,6 +39,7 @@ from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.plan_database import build_experiment_plan_store
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
+from pyromind_agent_server.resource_inspector import StorageResourceInspector
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 
 
@@ -235,6 +237,10 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         default_harness_id=backend,
         experiment_plan_store=plan_store,
         experiment_execution_store=execution_store,
+        preparation_store=SQLPreparationStore(plan_store.engine)
+        if plan_store
+        else None,
+        resource_inspector=StorageResourceInspector(),
         execution_roles=tuple(
             role.name for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()
         ),

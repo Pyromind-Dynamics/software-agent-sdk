@@ -5,10 +5,25 @@ from dataclasses import replace
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.ports.harness import DelegatedRole
 
+from openhands.agent_server.agent_profiles.echomind_manager import (
+    ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
+    ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
+    ECHOMIND_MANAGER_PROFILE,
+)
+
 
 LEGACY_EXPERIMENT_PROFILE = replace(
     ECHOMIND_PRODUCT_PROFILE,
     configuration_version=0,
+    preparation_policy=None,
+    command_allowlist=(
+        "user_message",
+        "cancel",
+        "confirm_experiment_plan",
+        "reject_experiment_plan",
+        "control_experiment_task",
+        "resolve_experiment_submission",
+    ),
     skill_allowlist=("experiment-planning",),
     tool_allowlist=(
         "read",
@@ -60,4 +75,17 @@ LEGACY_EXPERIMENT_PROFILE = replace(
             skills=("experiment-evaluation", "avi-baseline-evaluation"),
         ),
     ),
+)
+
+
+EXPERIMENT_PROFILE_V4 = replace(
+    ECHOMIND_PRODUCT_PROFILE,
+    configuration_version=4,
+    preparation_policy=None,
+    instructions=ECHOMIND_MANAGER_PROFILE.system_prompt or "",
+    tool_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
+    skill_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
+    development_tool_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
+    development_skill_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
+    command_allowlist=LEGACY_EXPERIMENT_PROFILE.command_allowlist,
 )

@@ -9,13 +9,15 @@ from uuid import uuid4
 import pytest
 from aiohttp import web
 from harness_adapter.pi_adapter import PiAdapter
-from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
+from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE as PREPARED_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
-from pyromind_runtime.domain.commands import UserMessageCommand
+from pyromind_runtime.domain.commands import CreateProjectCommand, UserMessageCommand
 from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.experiment_execution import RequestExperimentTask
 from pyromind_runtime.domain.experiment_plans import PlanOwner
+from pyromind_runtime.domain.preparation import PreparationView, UpdatePreparation
 from pyromind_runtime.infrastructure.sql_experiment_execution import (
     SQLExperimentExecutionStore,
     metadata,
@@ -24,11 +26,13 @@ from pyromind_runtime.infrastructure.sql_experiment_plan_store import (
     SQLExperimentPlanStore,
     metadata as plan_metadata,
 )
+from pyromind_runtime.infrastructure.sql_preparation import SQLPreparationStore
 from pyromind_runtime.infrastructure.sql_work_queue import work
 from pyromind_runtime.ports.harness import SessionSpec
 from sqlalchemy import create_engine
 
 from . import test_standalone_experiments as execution_fixtures
+from .legacy_experiment_profile import EXPERIMENT_PROFILE_V4 as ECHOMIND_PRODUCT_PROFILE
 from .test_evaluation_cases import FakeStorage
 
 
@@ -85,9 +89,19 @@ def stream(name=None, arguments=None, text="Done"):
     )
 
 
-@pytest.mark.parametrize("restart", [False, "platform", "preparation"])
+@pytest.mark.parametrize(
+    "restart,prepared",
+    [
+        (False, False),
+        ("platform", False),
+        ("preparation", False),
+        (False, True),
+        ("platform", True),
+        ("preparation", True),
+    ],
+)
 async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
-    tmp_path, monkeypatch, restart
+    tmp_path, monkeypatch, restart, prepared
 ):
     captured, submitted, manager_requests = [], [], []
     current = {}
@@ -187,6 +201,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
     plan_metadata.create_all(engine)
     metadata.create_all(engine)
     plans, store = SQLExperimentPlanStore(engine), SQLExperimentExecutionStore(engine)
+    preparation_store = SQLPreparationStore(engine)
     root = tmp_path / "conversations"
     root.mkdir()
     adapter = PiAdapter(root, terminal_backend="os-sandbox")
@@ -220,6 +235,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         default_harness_id="pi",
         experiment_plan_store=plans,
         experiment_execution_store=store,
+        preparation_store=preparation_store,
         execution_roles=("eval",),
         external_task_query=Query(),
         evaluation_storage_factory=lambda _: storage,
@@ -262,7 +278,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         }
 
     monkeypatch.setattr(adapter._business_tools, "execute", execute)
-    profile = ECHOMIND_PRODUCT_PROFILE
+    profile = PREPARED_PROFILE if prepared else ECHOMIND_PRODUCT_PROFILE
     context = RequestContext(user_id="42", profile_id=profile.profile_id)
     owner = PlanOwner(
         user_id="42", conversation_id="manager", profile_id=profile.profile_id
@@ -277,6 +293,10 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
                 product_instructions=profile.instructions,
                 tool_allowlist=profile.tool_allowlist,
                 skill_allowlist=profile.skill_allowlist,
+                preparation_policy=profile.preparation_policy,
+                development_tool_allowlist=profile.development_tool_allowlist,
+                development_skill_allowlist=profile.development_skill_allowlist,
+                command_allowlist=profile.command_allowlist,
                 delegated_roles=profile.delegated_roles,
                 managed_delegation=True,
                 model_configuration={
@@ -287,24 +307,122 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
             ),
             context,
         )
-        row = await runtime.request_experiment_task(
-            "manager",
-            RequestExperimentTask.model_validate(
-                {
-                    "role_id": "eval",
-                    "request_id": "baseline",
-                    "task": {
-                        "name": "自由命名的基模评测",
-                        "instruction": "Run one sample baseline",
-                        "inputs": {
-                            "model_path": "/models/base",
-                            "input_path": "/dataset.jsonl",
-                        },
+        if prepared:
+            runtime._store("manager").append(
+                ProductEvent(
+                    conversation_id="manager",
+                    type="message.completed",
+                    payload={
+                        "message_id": "fixture",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Evaluate one sample from /dataset.jsonl "
+                                "with /models/base using exact labels",
+                            }
+                        ],
                     },
+                )
+            )
+            values = {
+                "goal": "Evaluate exact label correctness",
+                "model": {"source": "storage", "reference": "/models/base"},
+                "dataset": {"path": "/dataset.jsonl", "format": "jsonl"},
+                "io_contract": {"input": "prompt", "output": "label"},
+                "scoring": {"basis": "exact label match"},
+                "scope": {"mode": "sample", "limit": 1},
+            }
+            facts = {
+                key: {
+                    "value": value,
+                    "status": "resolved",
+                    "evidence_refs": ["message:fixture"],
                 }
-            ),
-            context,
-        )
+                for key, value in values.items()
+            }
+            await runtime.experiment_plan_call(
+                "manager",
+                "update_preparation",
+                UpdatePreparation.model_validate(
+                    {"expected_revision": 0, "facts": facts}
+                ).model_dump(mode="json"),
+                context,
+            )
+            entry = {
+                "role_id": "eval",
+                "request_id": "baseline",
+                "stage_id": "init",
+                "task": {
+                    "name": "自由命名的基模评测",
+                    "instruction": "Run one sample baseline",
+                    "inputs": {
+                        "model_path": "/models/base",
+                        "input_path": "/dataset.jsonl",
+                    },
+                },
+            }
+            guide = {
+                "goal": "One sample baseline",
+                "stages": [{"id": "init", "kind": "init", "name": "Init"}],
+                "resources": [{"id": "data", "name": "Data", "uri": "/dataset.jsonl"}],
+                "tasks": [
+                    {
+                        "id": "baseline",
+                        "kind": "bench",
+                        "name": "Baseline",
+                        "stage_id": "init",
+                        "inputs": [{"name": "input_path", "resource_id": "data"}],
+                    }
+                ],
+            }
+            ready = await runtime.experiment_plan_call(
+                "manager",
+                "update_preparation",
+                UpdatePreparation.model_validate(
+                    {
+                        "expected_revision": 1,
+                        "facts": facts,
+                        "plan": guide,
+                        "entry_task": entry,
+                    }
+                ).model_dump(mode="json"),
+                context,
+            )
+            receipt = await runtime.submit_command(
+                "manager",
+                CreateProjectCommand(
+                    command_id="create",
+                    expected_preparation_revision=PreparationView.model_validate(
+                        ready
+                    ).revision,
+                ),
+                context,
+            )
+            row = next(
+                item
+                for item in store.list(owner)
+                if item["id"] == receipt.response["initial_run_id"]
+            )
+        else:
+            row = await runtime.request_experiment_task(
+                "manager",
+                RequestExperimentTask.model_validate(
+                    {
+                        "role_id": "eval",
+                        "request_id": "baseline",
+                        "task": {
+                            "name": "自由命名的基模评测",
+                            "instruction": "Run one sample baseline",
+                            "inputs": {
+                                "model_path": "/models/base",
+                                "input_path": "/dataset.jsonl",
+                            },
+                        },
+                    }
+                ),
+                context,
+            )
         current.update(
             id=row["id"],
             root=f"public_data/experiment-runs/{row['id']}",
@@ -342,6 +460,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
                 default_harness_id="pi",
                 experiment_plan_store=plans,
                 experiment_execution_store=store,
+                preparation_store=preparation_store,
                 execution_roles=("eval",),
                 external_task_query=Query(),
                 evaluation_storage_factory=lambda _: storage,
@@ -398,14 +517,22 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         manager_tools = {
             tool["function"]["name"] for tool in manager_requests[0]["tools"]
         }
-        assert (
-            "df_submit_evaluation" in manager_tools
-            and "terminal" in manager_tools
-            and "read" in manager_tools
-            and "subagent" not in manager_tools
-            and "record_experiment_result" not in manager_tools
-            and "read_skill" not in manager_tools
-        )
+        if prepared:
+            assert "request_experiment_task" in manager_tools
+            assert "df_submit_evaluation" not in manager_tools
+            assert {"read", "write", "edit", "terminal", "grep", "find", "ls"} <= (
+                manager_tools
+            )
+        else:
+            assert (
+                "df_submit_evaluation" in manager_tools
+                and "terminal" in manager_tools
+                and "read" in manager_tools
+                and "subagent" not in manager_tools
+                and "record_experiment_result" not in manager_tools
+                and "read_skill" not in manager_tools
+            )
+
         assert "/dataset.jsonl" not in json.dumps(manager_requests[0]["messages"])
         role_file = (root / "manager/pi/agent/agents/eval.md").read_text()
         assert (
@@ -439,6 +566,14 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         report_display = report_details["subagent"]
         assert isinstance(first_display, dict) and isinstance(report_display, dict)
         assert first_display["task"] == report_display["task"] == "自由命名的基模评测"
+        if prepared:
+            binding = first_display["execution"]
+            assert isinstance(binding, dict) and binding["task_run_id"] == row["id"]
+            assert report_display["execution"] == first_display["execution"]
+            assert all(
+                child.execution is not None and child.execution["stage_id"] == "init"
+                for child in children.values()
+            )
         assert first_display["phase"] == "execute"
         assert report_display["phase"] == "report"
         assert report_display["previous_run_id"] == first_ref

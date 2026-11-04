@@ -179,51 +179,117 @@ class SQLExperimentExecutionStore:
     ) -> dict:
         if task_spec:
             validate_persisted_payload(task_spec)
+        with self._admission() as conn:
+            return self.request_in_transaction(
+                conn,
+                owner,
+                project,
+                revision,
+                task,
+                role,
+                request_id,
+                task_spec=task_spec,
+            )
+
+    def request_in_transaction(
+        self,
+        conn,
+        owner: PlanOwner,
+        project: str,
+        revision: int | None,
+        task: str,
+        role: str,
+        request_id: str,
+        *,
+        task_spec: dict | None = None,
+    ) -> dict:
         key = digest(owner_key(owner) + ":" + request_id)
         active = digest(owner_key(owner) + ":" + project + ":" + task)
-        with self._admission() as conn:
-            previous = (
-                conn.execute(sa.select(runs).where(runs.c.request_key == key))
+        previous = (
+            conn.execute(sa.select(runs).where(runs.c.request_key == key))
+            .mappings()
+            .first()
+        )
+        if previous:
+            binding_keys = {"plan_sequence", "stage_snapshot"}
+            saved_spec = previous["task_spec"]
+            if {
+                key: value
+                for key, value in (saved_spec or {}).items()
+                if key not in binding_keys
+            } != {
+                key: value
+                for key, value in (task_spec or {}).items()
+                if key not in binding_keys
+            }:
+                raise ValueError("request ID reused with different task content")
+            if (previous["task_id"], previous["revision"], previous["role_id"]) != (
+                task,
+                revision,
+                role,
+            ):
+                raise ValueError("request ID reused with different execution")
+            return dict(previous)
+        if task_spec and task_spec.get("plan_sequence") is not None:
+            project_row = (
+                conn.execute(
+                    sa.select(projects)
+                    .where(
+                        projects.c.project_id == project,
+                        projects.c.owner_key == owner_key(owner),
+                    )
+                    .with_for_update()
+                )
                 .mappings()
                 .first()
             )
-            if previous:
-                if previous["task_spec"] != task_spec:
-                    raise ValueError("request ID reused with different task content")
-                if (previous["task_id"], previous["revision"], previous["role_id"]) != (
-                    task,
-                    revision,
-                    role,
-                ):
-                    raise ValueError("request ID reused with different execution")
-                return dict(previous)
-            identity = uuid4().hex
-            conn.execute(
-                runs.insert().values(
-                    id=identity,
-                    owner=owner_key(owner),
-                    project_id=project,
-                    revision=revision,
-                    task_id=task,
-                    role_id=role,
-                    active_key=active,
-                    request_key=key,
-                    state="queued",
-                    report_state="not_started",
-                    created_at=now(),
-                    task_spec=task_spec,
-                )
+            if (
+                project_row is None
+                or project_row["context_sequence"] != task_spec["plan_sequence"]
+            ):
+                raise ValueError("workflow plan changed; reread before delegation")
+            stage = next(
+                (
+                    stage
+                    for stage in project_row["context"].get("stages", [])
+                    if stage["id"] == task_spec.get("stage_id")
+                ),
+                None,
             )
-            self.queue.put(
-                conn,
-                owner_key(owner),
-                "role:" + role,
-                "prepare:" + identity,
-                "execute_task" if task_spec else "prepare_execution",
-                {"run_id": identity, "owner": owner.model_dump(mode="json")},
+            if (
+                stage is None
+                or not stage.get("enabled", True)
+                or stage.get("placeholder", False)
+            ):
+                raise ValueError("task requires an enabled Project stage")
+            validate_persisted_payload(task_spec)
+        identity = uuid4().hex
+        conn.execute(
+            runs.insert().values(
+                id=identity,
+                owner=owner_key(owner),
+                project_id=project,
+                revision=revision,
+                task_id=task,
+                role_id=role,
+                active_key=active,
+                request_key=key,
+                state="queued",
+                report_state="not_started",
+                created_at=now(),
+                task_spec=task_spec,
             )
-            self.changed(conn, owner, identity, "created")
-            return self._run(conn, owner, identity)
+        )
+        self.queue.put(
+            conn,
+            owner_key(owner),
+            "role:" + role,
+            "prepare:" + identity,
+            "execute_task" if task_spec else "prepare_execution",
+            {"run_id": identity, "owner": owner.model_dump(mode="json")},
+        )
+        self.changed(conn, owner, identity, "created")
+        return self._run(conn, owner, identity)
 
     def list(self, owner: PlanOwner) -> list[dict]:
         with self.engine.connect() as conn:

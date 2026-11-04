@@ -16,8 +16,11 @@ from sqlalchemy import (
     Table,
     UniqueConstraint,
     and_,
+    column,
     insert,
+    or_,
     select,
+    table,
     text,
     update,
 )
@@ -51,6 +54,7 @@ projects = Table(
     Column("profile_id", String(128)),
     Column("current_revision", Integer, nullable=False),
     Column("context", JSON),
+    Column("creation_metadata", JSON),
     Column("context_sequence", Integer, nullable=False, server_default="0"),
 )
 documents = Table(
@@ -144,7 +148,10 @@ class SQLExperimentPlanStore:
                         revisions.c.project_id == row["project_id"],
                         revisions.c.revision == row["current_revision"],
                     )
-                )["plan"]
+                )
+                if saved is None:
+                    raise ValueError("current plan revision is missing")
+                saved = saved["plan"]
                 body = {
                     key: saved[key]
                     for key in ("goal", "resources", "stages", "edges")
@@ -169,6 +176,42 @@ class SQLExperimentPlanStore:
             raise ValueError("experiment context exceeds 256 KiB")
         current = self.context(owner, create=True)
         with self._transaction(owner) as connection:
+            project = self._project(connection, _owner_key(owner))
+            if project is not None and project["creation_metadata"] is not None:
+                execution_rows = table(
+                    "experiment_task_runs",
+                    column("project_id"),
+                    column("state"),
+                    column("task_spec"),
+                    column("report_state"),
+                )
+                active = connection.execute(
+                    select(execution_rows.c.task_spec).where(
+                        execution_rows.c.project_id == current.project_id,
+                        or_(
+                            execution_rows.c.state.not_in(
+                                (
+                                    "succeeded",
+                                    "failed",
+                                    "cancelled",
+                                    "stopped",
+                                    "abandoned",
+                                    "rejected",
+                                )
+                            ),
+                            execution_rows.c.report_state.in_(("queued", "running")),
+                        ),
+                    )
+                )
+                retained = {stage.id for stage in request.context.stages}
+                for (raw_spec,) in active:
+                    spec = (
+                        json.loads(raw_spec) if isinstance(raw_spec, str) else raw_spec
+                    )
+                    if spec and spec.get("stage_id") not in retained:
+                        raise ValueError(
+                            "cannot remove a stage with an unfinished execution"
+                        )
             result = connection.execute(
                 update(projects)
                 .where(
