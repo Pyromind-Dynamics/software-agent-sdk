@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiokafka import AIOKafkaConsumer
 from fastapi import FastAPI
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
 from openhands.agent_server.api import api_lifespan
 from openhands.agent_server.config import Config
@@ -16,6 +17,7 @@ from openhands.agent_server.kafka_bus.handlers.studio_workflow_notify_handler im
     StudioWorkflowNotifyHandler,
     TrainingTaskEventType,
     _parse_conversation_id_from_out_id,
+    _parse_out_id,
 )
 from openhands.agent_server.kafka_bus.kafka_bus import KafkaMessageBus
 from openhands.agent_server.kafka_bus.kafka_topic import KafkaTopic
@@ -84,35 +86,44 @@ def test_kafka_topic_resolve_prod_and_pre(monkeypatch):
 
 
 def test_parse_conversation_id_from_out_id():
-    assert _parse_conversation_id_from_out_id(None) is None
-    assert _parse_conversation_id_from_out_id("") is None
-    assert _parse_conversation_id_from_out_id("None") is None
-    assert _parse_conversation_id_from_out_id("agent1#abc") == "abc"
-    assert _parse_conversation_id_from_out_id("agent1#debug#abc") == "abc"
-    # Bare / foreign out_ids are not from this agent.
-    assert _parse_conversation_id_from_out_id("abc") is None
-    assert _parse_conversation_id_from_out_id("studio#abc") is None
+    for value in (
+        None,
+        "",
+        "None",
+        "agent1#abc",
+        "agent1#debug#abc",
+        "abc",
+        "studio#abc",
+    ):
+        assert _parse_conversation_id_from_out_id(value) is None
+    assert (
+        _parse_conversation_id_from_out_id(
+            TaskCorrelation(conversation_id="abc", task_kind="workflow_run").to_out_id()
+        )
+        == "abc"
+    )
 
 
 def test_parse_out_id_detects_workflow_debug():
-    from openhands.agent_server.kafka_bus.handlers.studio_workflow_notify_handler import (  # noqa: E501
-        _parse_out_id,
-    )
-
-    assert _parse_out_id("agent1#c1") == ("c1", False)
-    assert _parse_out_id("agent1#debug#c1") == ("c1", True)
-    assert _parse_out_id(None) == (None, False)
-    assert _parse_out_id("") == (None, False)
-    assert _parse_out_id("None") == (None, False)
-    # Marker without conversation id → no routeable id.
-    assert _parse_out_id("agent1#debug#") == (None, True)
-    # "debug" alone (no trailing #) is conversation_id="debug" under agent1#.
-    assert _parse_out_id("agent1#debug") == ("debug", False)
-    assert _parse_out_id("  agent1#debug#  abc  ") == ("abc", True)
-    # Reject bare UUID / other systems (must start with agent1#).
-    assert _parse_out_id("c1") == (None, False)
-    assert _parse_out_id("other#c1") == (None, False)
-    assert _parse_out_id("agent2#c1") == (None, False)
+    normal = TaskCorrelation(conversation_id="c1", task_kind="workflow_run").to_out_id()
+    debug = TaskCorrelation(
+        conversation_id="c1", task_kind="workflow_debug"
+    ).to_out_id()
+    assert _parse_out_id(normal) == ("c1", False)
+    assert _parse_out_id(debug) == ("c1", True)
+    assert _parse_out_id("  " + debug + "  ") == ("c1", True)
+    for value in (
+        None,
+        "",
+        "None",
+        "agent1#debug#",
+        "agent1#debug",
+        "agent1#debug#abc",
+        "c1",
+        "other#c1",
+        "agent2#c1",
+    ):
+        assert _parse_out_id(value) == (None, False)
 
 
 def test_is_dev_delegates_to_env_util(monkeypatch):
@@ -452,7 +463,9 @@ async def test_studio_workflow_handler_delivers_terminal_status():
                 data={
                     "status": "Succeeded",
                     "task_id": "t1",
-                    "out_id": "agent1#c1",
+                    "out_id": TaskCorrelation(
+                        conversation_id="c1", task_kind="workflow_run"
+                    ).to_out_id(),
                     "error_msg": None,
                 },
                 event_type=TrainingTaskEventType.TRAINING_TASK_STATUS_CHANGED.value,
@@ -466,6 +479,7 @@ async def test_studio_workflow_handler_delivers_terminal_status():
         conversation_id="c1",
         auto_run=True,
         from_workflow_debug=False,
+        correlation=TaskCorrelation(conversation_id="c1", task_kind="workflow_run"),
     )
 
 
@@ -491,7 +505,9 @@ async def test_studio_workflow_handler_delivers_debug_terminal_status():
                 data={
                     "status": "Failed",
                     "task_id": "t1",
-                    "out_id": "agent1#debug#c1",
+                    "out_id": TaskCorrelation(
+                        conversation_id="c1", task_kind="workflow_debug"
+                    ).to_out_id(),
                     "error_msg": "boom",
                 },
                 event_type=TrainingTaskEventType.TRAINING_TASK_STATUS_CHANGED.value,
@@ -505,6 +521,7 @@ async def test_studio_workflow_handler_delivers_debug_terminal_status():
         conversation_id="c1",
         auto_run=True,
         from_workflow_debug=True,
+        correlation=TaskCorrelation(conversation_id="c1", task_kind="workflow_debug"),
     )
 
 
@@ -531,7 +548,9 @@ async def test_studio_workflow_handler_skips_when_conversation_not_on_pod():
                 data={
                     "status": "Succeeded",
                     "task_id": "t1",
-                    "out_id": "agent1#c1",
+                    "out_id": TaskCorrelation(
+                        conversation_id="c1", task_kind="workflow_run"
+                    ).to_out_id(),
                 },
                 event_type=TrainingTaskEventType.TRAINING_TASK_STATUS_CHANGED.value,
             )
@@ -575,7 +594,7 @@ async def test_studio_workflow_handler_discards_missing_out_id():
 
 @pytest.mark.asyncio
 async def test_studio_workflow_handler_discards_foreign_out_id():
-    """out_id not prefixed with agent1# → other system; discard."""
+    """Non-agent return addresses are discarded."""
     handler = StudioWorkflowNotifyHandler()
     deliver = AsyncMock()
 

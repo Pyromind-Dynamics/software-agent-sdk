@@ -18,6 +18,11 @@ class PlanResource(ContractModel):
 
 
 class ExperimentStage(ContractModel):
+    kind: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Node type selected from the session preparation policy catalog.",
+    )
     id: str = Field(min_length=1, max_length=128)
     name: str = Field(min_length=1)
     description: str = ""
@@ -78,6 +83,11 @@ class CompletionCondition(ContractModel):
 
 
 class ExperimentTask(ContractModel):
+    kind: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Task type declared by the selected workflow node catalog entry.",
+    )
     id: str = Field(min_length=1, max_length=128)
     stage_id: str = Field(min_length=1)
     name: str = Field(min_length=1)
@@ -88,8 +98,12 @@ class ExperimentTask(ContractModel):
 
 
 class PlanEdge(ContractModel):
-    source: str = Field(min_length=1)
-    target: str = Field(min_length=1)
+    source: str = Field(
+        min_length=1, description="Source stage ID from plan.stages[].id"
+    )
+    target: str = Field(
+        min_length=1, description="Target stage ID from plan.stages[].id"
+    )
 
 
 def _unique(values: list[str], label: str) -> None:
@@ -268,8 +282,13 @@ class ExperimentContext(ContractModel):
         for run_ids in self.stage_executions.values():
             _unique(list(run_ids), "execution association")
         _validate_task_references(self.stages, self.tasks, self.resources)
-        if any(e.source not in ids or e.target not in ids for e in self.edges):
-            raise ValueError("guide edge references an unknown stage")
+        for edge in self.edges:
+            if edge.source not in ids or edge.target not in ids:
+                raise ValueError(
+                    f"guide edge references an unknown stage: {edge.source!r} -> "
+                    f"{edge.target!r}; edges must use plan.stages[].id from {ids!r}. "
+                    "Task dependencies belong in plan.tasks[].inputs."
+                )
         # Advice may return to a previous stage. It is not a scheduling DAG.
         return self
 

@@ -41,7 +41,12 @@ class DurableWorker:
             if item["kind"] not in self.handlers:
                 continue
             safe = await self.reconcile(item)
-            await asyncio.to_thread(self.queue.reconcile_expired, item["id"], safe)
+            await asyncio.to_thread(
+                self.queue.reconcile_expired,
+                item["id"],
+                safe,
+                generation=item["generation"],
+            )
 
     async def run_once(self) -> bool:
         item = await asyncio.to_thread(

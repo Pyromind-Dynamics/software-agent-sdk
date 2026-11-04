@@ -11,7 +11,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from pyromind_runtime.application.delegated_execution import DelegatedExecution
@@ -29,6 +29,11 @@ from pyromind_runtime.application.evaluation_cases import (
 from pyromind_runtime.application.event_projection import ProductEventProjector
 from pyromind_runtime.application.experiment_execution import ExperimentExecutions
 from pyromind_runtime.application.experiment_plans import ExperimentPlans
+from pyromind_runtime.application.preparation import (
+    Preparations,
+    validate_workflow_catalog,
+    validate_workflow_role,
+)
 from pyromind_runtime.application.reusable_workflows import (
     ReusableWorkflows,
     started_run,
@@ -44,6 +49,7 @@ from pyromind_runtime.domain.commands import (
     ConfirmExperimentExecutionCommand,
     ConfirmExperimentPlanCommand,
     ControlExperimentTaskCommand,
+    CreateProjectCommand,
     InputResponseCommand,
     PermissionResponseCommand,
     ProductCommand,
@@ -89,6 +95,14 @@ from pyromind_runtime.domain.experiment_plans import (
     UpdateExperimentContext,
 )
 from pyromind_runtime.domain.pipeline import PipelineRun
+from pyromind_runtime.domain.preparation import (
+    PREPARATION_TOOLS,
+    InspectResource,
+    PreparationView,
+    ProjectView,
+    SetPreparationPlan,
+    UpdatePreparation,
+)
 from pyromind_runtime.domain.project_graphs import (
     PROJECT_GRAPH_TOOLS,
     ApplyProjectGraphPatch,
@@ -103,6 +117,7 @@ from pyromind_runtime.domain.snapshot import (
     TimelineOperation,
     WorkflowState,
 )
+from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
 from pyromind_runtime.domain.versions import (
     RunSource,
     SaveVersion,
@@ -126,11 +141,13 @@ from pyromind_runtime.ports.harness import (
     ExternalTaskNotification,
     ForkSpec,
     HarnessAdapter,
+    OperationActivityReader,
     ProductCheckpoint,
     RestoreWorkflowSpec,
     SessionHandle,
     SessionSpec,
 )
+from pyromind_runtime.ports.preparation import PreparationStore, ResourceInspector
 from pyromind_runtime.ports.project_graphs import ProjectGraphStore
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
@@ -205,6 +222,8 @@ class ConversationRuntime:
         external_task_query: ExternalTaskQueryPort | None = None,
         experiment_execution_store: DelegatedExecutionStore | None = None,
         execution_roles: tuple[str, ...] = (),
+        preparation_store: PreparationStore | None = None,
+        resource_inspector: ResourceInspector | None = None,
         evaluation_config_validator: Callable[[JsonObject], JsonObject] | None = None,
         experiment_plan_project_binder: ExperimentPlanProjectBinder | None = None,
         project_graph_store: ProjectGraphStore | None = None,
@@ -229,6 +248,10 @@ class ConversationRuntime:
         if default_harness_id not in self.adapters:
             raise ValueError(f"default harness is not registered: {default_harness_id}")
         self.default_harness_id = default_harness_id
+        self._preparations = (
+            Preparations(preparation_store) if preparation_store else None
+        )
+        self._resource_inspector = resource_inspector
         self._experiment_plans = (
             ExperimentPlans(experiment_plan_store) if experiment_plan_store else None
         )
@@ -299,6 +322,7 @@ class ConversationRuntime:
         self._retained: dict[str, _RetainedConversation] = {}
         self._active: dict[str, _ActiveConversation] = {}
         self._activation_locks: dict[str, asyncio.Lock] = {}
+        self._project_creation_locks: dict[str, asyncio.Lock] = {}
         self._subscribers: dict[str, set[asyncio.Queue[ProductEvent]]] = {}
         self._first_command_pending: set[str] = set()
         self._first_delta_started_at: dict[tuple[str, str], float] = {}
@@ -308,6 +332,8 @@ class ConversationRuntime:
         ] = {}
         self._evaluation_annotation_cache_lock = threading.Lock()
         self._pending_task_registrations: dict[str, asyncio.Event] = {}
+        self._observation_replays: set[asyncio.Task[None]] = set()
+        self._notification_retries: dict[str, asyncio.Task[None]] = {}
 
     async def _execution_active(self, owner: PlanOwner) -> _ActiveConversation:
         active = self._active.get(owner.conversation_id)
@@ -333,6 +359,15 @@ class ConversationRuntime:
     async def _delegated_work(self, delegated: DelegatedExecution, item: dict) -> dict:
         owner = PlanOwner.model_validate(item["payload"]["owner"])
         await self._execution_active(owner)
+        store = self._store(owner.conversation_id)
+        if store.preparation_policy() is not None and not store.permits_tool(
+            "get_experiment_context"
+        ):
+            await self._activate_development_policy(
+                owner.conversation_id,
+                store,
+                self._active[owner.conversation_id].context,
+            )
         async with self._use(owner.conversation_id):
             return await delegated.prepare(item)
 
@@ -633,17 +668,36 @@ class ConversationRuntime:
     ) -> bool:
         """Apply trusted router configuration only at an idle boundary."""
         store = await self._read_store(conversation_id, context)
+        prepared = store.preparation_policy() is not None
+        if policy.preparation_policy is not None and not prepared:
+            return True
         if policy.configuration_version <= store.configuration_version():
             return True
         async with self._activation_locks.setdefault(conversation_id, asyncio.Lock()):
             if store.load_snapshot().status == "running":
                 return False
+            if prepared:
+                # Refresh capabilities without replacing the saved scenario contract.
+                active = await self.get_project(conversation_id, context) is not None
+                policy = policy.model_copy(
+                    update={
+                        "tool_allowlist": policy.development_tool_allowlist
+                        if active and policy.development_tool_allowlist is not None
+                        else policy.tool_allowlist,
+                        "skill_allowlist": policy.development_skill_allowlist
+                        if active and policy.development_skill_allowlist is not None
+                        else policy.skill_allowlist,
+                        "product_instructions": None,
+                        "delegated_roles": None,
+                        "managed_delegation": None,
+                    }
+                )
             owner = PlanOwner(
                 user_id=context.user_id,
                 conversation_id=conversation_id,
                 profile_id=context.profile_id,
             )
-            if self._delegated_store:
+            if self._delegated_store and not prepared:
                 if not await self._plan_io(
                     self._delegated_store.retire_legacy_work, owner
                 ):
@@ -712,8 +766,26 @@ class ConversationRuntime:
         service, owner = self._execution_service(
             conversation_id, context, "request_experiment_task"
         )
+        store = self._store(conversation_id)
+        allowed_roles = store.access_policy()["delegated_roles"]
+        if allowed_roles is None:
+            allowed_roles = self._execution_roles
+        required = store.preparation_policy() is not None
+        if required and (
+            self._preparations is None
+            or await self._plan_io(self._preparations.store.project, owner) is None
+        ):
+            raise PermissionError("create the Project before delegating work")
+        preparation_policy = store.preparation_policy()
+        if preparation_policy is not None and preparation_policy.workflow_nodes:
+            assert self._preparations is not None
+            project = await self._plan_io(self._preparations.store.project, owner)
+            assert project is not None
+            validate_workflow_role(
+                preparation_policy, project.plan, request.stage_id, request.role_id
+            )
         return await self._plan_io(
-            service.request, owner, request, self._execution_roles
+            service.request, owner, request, allowed_roles, required
         )
 
     async def read_experiment_artifact(
@@ -1238,6 +1310,16 @@ class ConversationRuntime:
         arguments: JsonObject,
         context: RequestContext,
     ) -> JsonObject:
+        tool_store = self._store(conversation_id)
+        tool_store.authorize(context.user_id, context.profile_id)
+        if tool_name != "get_experiment_plan" and not tool_store.permits_tool(
+            tool_name
+        ):
+            raise PermissionError("tool is not enabled for this conversation")
+        if tool_name in PREPARATION_TOOLS:
+            return await self._preparation_call(
+                conversation_id, tool_name, arguments, context
+            )
         if tool_name in PROJECT_GRAPH_TOOLS:
             if tool_name == "get_project_graph":
                 request = GetProjectGraph.model_validate(arguments)
@@ -1265,6 +1347,9 @@ class ConversationRuntime:
                     mode="json"
                 )
             update = UpdateExperimentContext.model_validate(arguments)
+            preparation_policy = tool_store.preparation_policy()
+            if preparation_policy is not None:
+                validate_workflow_catalog(preparation_policy, update.context)
             related = {
                 run_id
                 for run_ids in update.context.stage_executions.values()
@@ -1280,6 +1365,22 @@ class ConversationRuntime:
                     raise ValueError(
                         "execution association must belong to this conversation"
                     )
+            if (
+                self._store(conversation_id).preparation_policy() is not None
+                and self._delegated_store
+            ):
+                rows = await self._plan_io(self._delegated_store.list, owner)
+                retained = {stage.id for stage in update.context.stages}
+                for row in rows:
+                    spec = row.get("task_spec") or {}
+                    if (
+                        row["state"]
+                        not in {"succeeded", "failed", "cancelled", "stopped"}
+                        and spec.get("stage_id") not in retained
+                    ):
+                        raise ValueError(
+                            "cannot remove a stage with an unfinished execution"
+                        )
             view = await self._plan_io(
                 service.store.update_context,
                 owner,
@@ -1400,7 +1501,7 @@ class ConversationRuntime:
         store: FileProductStore,
         context: RequestContext,
     ) -> None:
-        policy = store.activate_development_policy()
+        policy = store.development_policy()
         if policy.tool_allowlist is None and policy.skill_allowlist is None:
             return
         snapshot = store.load_snapshot()
@@ -1412,6 +1513,173 @@ class ConversationRuntime:
             capabilities=snapshot.capabilities,
         )
         await self._adapter(harness_id).update_session_policy(handle, policy, context)
+        store.activate_development_policy()
+
+    def _notify_preparation(
+        self,
+        conversation_id: str,
+        event_type: Literal["preparation.changed", "project.changed"],
+    ) -> None:
+        event, _ = self._store(conversation_id).append(
+            ProductEvent(conversation_id=conversation_id, type=event_type)
+        )
+        self._publish(event)
+
+    def _preparation_owner(
+        self, conversation_id: str, context: RequestContext
+    ) -> PlanOwner:
+        store = self._store(conversation_id)
+        store.authorize(context.user_id, context.profile_id)
+        if store.preparation_policy() is None or self._preparations is None:
+            raise PermissionError("preparation is not enabled")
+        return PlanOwner(
+            user_id=context.user_id,
+            conversation_id=conversation_id,
+            profile_id=context.profile_id,
+        )
+
+    def _preparation_evidence(self, conversation_id: str) -> dict[str, str]:
+        snapshot = self._store(conversation_id).load_snapshot()
+        result = {}
+        for item in snapshot.timeline:
+            if item.kind == "message" and item.role == "user":
+                result["message:" + item.item_id] = "User message"
+            elif (
+                item.kind == "operation"
+                and item.status == "completed"
+                and item.name
+                in {
+                    "read",
+                    "terminal",
+                    "grep",
+                    "find",
+                    "ls",
+                    "search",
+                    "ask_user",
+                    "inspect_resource",
+                }
+            ):
+                result["operation:" + item.item_id] = item.name
+        return result
+
+    async def get_preparation(
+        self, conversation_id: str, context: RequestContext
+    ) -> PreparationView:
+        await self._read_store(conversation_id, context)
+        owner = self._preparation_owner(conversation_id, context)
+        assert self._preparations is not None
+        view = await self._plan_io(self._preparations.store.get, owner)
+        return view.model_copy(
+            update={
+                "evidence": {
+                    **view.evidence,
+                    **self._preparation_evidence(conversation_id),
+                }
+            }
+        )
+
+    async def get_project(
+        self, conversation_id: str, context: RequestContext
+    ) -> ProjectView | None:
+        await self._read_store(conversation_id, context)
+        owner = self._preparation_owner(conversation_id, context)
+        assert self._preparations is not None
+        return await self._plan_io(self._preparations.store.project, owner)
+
+    async def _preparation_call(
+        self,
+        conversation_id: str,
+        tool_name: str,
+        arguments: JsonObject,
+        context: RequestContext,
+    ) -> JsonObject:
+        owner = self._preparation_owner(conversation_id, context)
+        if not self._store(conversation_id).permits_tool(tool_name):
+            raise PermissionError("preparation tool is not enabled")
+        assert self._preparations is not None
+        view = await self.get_preparation(conversation_id, context)
+        if tool_name == "get_preparation":
+            return view.model_dump(mode="json")
+        if tool_name == "update_preparation":
+            updated = await self._plan_io(
+                self._preparations.update,
+                owner,
+                UpdatePreparation.model_validate(arguments),
+                set(view.evidence),
+            )
+            self._notify_preparation(conversation_id, "preparation.changed")
+            return updated.model_dump(mode="json")
+        if tool_name == "set_preparation_plan":
+            updated = await self._plan_io(
+                self._preparations.set_plan,
+                owner,
+                SetPreparationPlan.model_validate(arguments),
+            )
+            self._notify_preparation(conversation_id, "preparation.changed")
+            return updated.model_dump(mode="json")
+        if self._resource_inspector is None:
+            raise ValueError(
+                "Resource inspection is unavailable; "
+                "ask the user for missing information"
+            )
+        request = InspectResource.model_validate(arguments)
+        result = await self._plan_io(self._resource_inspector.inspect, request, context)
+        reference = "resource:" + uuid4().hex
+        await self._plan_io(
+            self._preparations.store.add_evidence,
+            owner,
+            reference,
+            f"{request.kind} {request.path}; {result.get('scope', '')}; "
+            f"truncated={result.get('truncated', False)}",
+        )
+        self._notify_preparation(conversation_id, "preparation.changed")
+        return {**result, "evidence_ref": reference}
+
+    async def _create_project(
+        self,
+        conversation_id: str,
+        command: CreateProjectCommand,
+        context: RequestContext,
+    ) -> CommandReceipt:
+        owner = self._preparation_owner(conversation_id, context)
+        assert self._preparations is not None
+        store = self._store(conversation_id)
+        async with self._project_creation_locks.setdefault(
+            conversation_id, asyncio.Lock()
+        ):
+            project = await self._plan_io(self._preparations.store.project, owner)
+            snapshot = store.load_snapshot()
+            if project is None and (
+                snapshot.status == "running"
+                or snapshot.pending_inputs
+                or snapshot.pending_permissions
+            ):
+                raise ValueError(
+                    "wait for the preparation turn and pending questions to finish"
+                )
+            receipt, _ = store.claim_command(command)
+            if receipt.status == "completed":
+                return receipt
+            project = await self._plan_io(
+                self._preparations.store.activate,
+                owner,
+                command.expected_preparation_revision,
+                command.command_id,
+            )
+            if not store.permits_tool("get_experiment_context"):
+                await self._activate_development_policy(conversation_id, store, context)
+            await self._ensure_active(conversation_id, context)
+            if self._delegated_store:
+                await self._plan_io(self._delegated_store.resume_authorized, owner)
+            self._notify_preparation(conversation_id, "project.changed")
+            return store.complete_command(
+                receipt.model_copy(
+                    update={
+                        "status": "completed",
+                        "response": project.model_dump(mode="json"),
+                    }
+                )
+            )
 
     async def version_call(
         self,
@@ -1435,16 +1703,32 @@ class ConversationRuntime:
         code: str | None,
         context: RequestContext,
         graph_run_id: str | None = None,
+        correlation: TaskCorrelation | None = None,
     ) -> dict[str, Any]:
         """Submit an already-authorized tool action through the durable product path."""
         store = self._store(conversation_id)
         store.authorize(context.user_id, context.profile_id)
         if self.versions is None or self._workflow_submission is None:
             raise ValueError("versioned submission is unavailable")
+        correlation = correlation or TaskCorrelation(
+            conversation_id=conversation_id,
+            task_kind="workflow_run",
+            **(context.task_origin or TaskOrigin()).model_dump(),
+        )
+        if (
+            correlation.conversation_id
+            != TaskCorrelation(
+                conversation_id=conversation_id, task_kind=correlation.task_kind
+            ).conversation_id
+        ):
+            raise PermissionError("submission belongs to another conversation")
+        context = replace(context, task_origin=correlation.origin)
         identity = "tool:" + request_id
         digest = fingerprint({"workflow": workflow, "code": code})
         previous = store.load_workflow_execution_requests().get(identity)
         if previous is not None:
+            if previous.correlation is not None and previous.correlation != correlation:
+                raise PermissionError("request belongs to another task origin")
             if previous.fingerprint != digest:
                 raise ValueError("request id already used with different execution")
             if previous.task_id:
@@ -1474,6 +1758,7 @@ class ConversationRuntime:
             conversation_id=conversation_id,
             permission_id=identity,
             workflow_path="version://" + record.id,
+            correlation=correlation,
             fingerprint=digest,
             workflow=effective,
             summary={"name": str(workflow.get("name", "workflow"))},
@@ -1482,7 +1767,7 @@ class ConversationRuntime:
         store.save_workflow_execution_request(request, expected_revision=None)
         try:
             task_id = await self._workflow_submission.submit(
-                effective, conversation_id, context
+                effective, conversation_id, context, correlation=correlation
             )
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
@@ -1503,7 +1788,8 @@ class ConversationRuntime:
             conversation_id,
             {
                 "task_id": task_id,
-                "kind": "graph_await" if graph_run_id else "workflow_run",
+                "kind": "graph_await" if graph_run_id else correlation.task_kind,
+                "correlation": correlation.model_dump(mode="json", exclude_none=True),
                 "run_id": graph_run_id or identity,
                 "graph_run_id": graph_run_id,
                 "status": "pending",
@@ -2284,6 +2570,26 @@ class ConversationRuntime:
         await self._make_room()
         if self._resource_limits is not None:
             spec = spec.model_copy(update={"resource_limits": self._resource_limits})
+        if spec.preparation_policy is not None:
+            enabled_roles = {role.name for role in spec.delegated_roles or ()}
+            if not set(spec.preparation_policy.allowed_roles) <= enabled_roles:
+                raise ProductRuntimeError(
+                    "capability_not_supported",
+                    "Preparation roles must be enabled in the session profile",
+                )
+            if self._preparations is None:
+                raise ProductRuntimeError(
+                    "plan_store_unavailable", "Preparation database is not configured"
+                )
+            await self._plan_io(
+                self._preparations.store.initialize,
+                PlanOwner(
+                    user_id=context.user_id,
+                    conversation_id=spec.conversation_id,
+                    profile_id=context.profile_id,
+                ),
+                spec.preparation_policy,
+            )
         handle = await adapter.create_session(spec, context)
         self._log_timing(
             "adapter.create_session_ms",
@@ -2318,6 +2624,10 @@ class ConversationRuntime:
                 development_tool_allowlist=spec.development_tool_allowlist,
                 development_skill_allowlist=spec.development_skill_allowlist,
                 command_allowlist=spec.command_allowlist,
+                preparation_policy=spec.preparation_policy,
+                delegated_roles=tuple(role.name for role in spec.delegated_roles)
+                if spec.delegated_roles is not None
+                else None,
             )
             store.save_x_cluster(context.x_cluster)
             store.append(
@@ -2353,6 +2663,8 @@ class ConversationRuntime:
             # Nothing will run for a conversation created without a prompt, so no
             # ``run.finished`` would ever schedule its release.
             self._schedule_release(handle.session_id)
+        if spec.preparation_policy is not None:
+            return await self.get_snapshot(handle.session_id, context)
         return snapshot
 
     async def get_snapshot(
@@ -2362,6 +2674,64 @@ class ConversationRuntime:
     ) -> ConversationSnapshot:
         store = await self._read_store(conversation_id, context)
         snapshot = store.load_snapshot()
+        missing_activity = tuple(
+            item.item_id
+            for item in snapshot.timeline
+            if isinstance(item, TimelineOperation)
+            and item.category == "subagent"
+            and item.status != "running"
+            and item.activity is None
+        )[-32:]
+        adapter = self._adapter(store.harness_id())
+        if missing_activity and isinstance(adapter, OperationActivityReader):
+            try:
+                activities = await adapter.read_operation_activities(
+                    SessionHandle(
+                        session_id=conversation_id,
+                        adapter_session_ref=conversation_id,
+                        harness_id=store.harness_id(),
+                        capabilities=snapshot.capabilities,
+                    ),
+                    missing_activity,
+                    context,
+                )
+                for operation_id, activity in activities.items():
+                    if operation_id not in missing_activity:
+                        continue
+                    # Existing operation identity/state remains authoritative.
+                    event, _ = store.append(
+                        ProductEvent(
+                            conversation_id=conversation_id,
+                            event_id="activity:"
+                            + fingerprint(
+                                {
+                                    "operation_id": operation_id,
+                                    "activity": activity.model_dump(mode="json"),
+                                }
+                            ),
+                            type="operation.progress",
+                            payload={
+                                "operation_id": operation_id,
+                                "activity": activity.model_dump(mode="json"),
+                            },
+                        )
+                    )
+                    self._publish(event)
+                snapshot = store.load_snapshot()
+            except Exception:
+                logger.warning(
+                    "Retained activity unavailable for %s",
+                    conversation_id,
+                    exc_info=True,
+                )
+        if store.preparation_policy() is not None:
+            preparation = await self.get_preparation(conversation_id, context)
+            project = await self.get_project(conversation_id, context)
+            if project and not store.permits_tool("get_experiment_context"):
+                await self._activate_development_policy(conversation_id, store, context)
+            snapshot = snapshot.model_copy(
+                update={"preparation": preparation, "project": project}
+            )
         if store.permits_tool("get_experiment_plan"):
             view = await self.get_experiment_plan(conversation_id, context)
             snapshot = snapshot.model_copy(update={"experiment_plan": view})
@@ -2463,6 +2833,8 @@ class ConversationRuntime:
     ) -> CommandReceipt:
         store = await self._read_store(conversation_id, context)
         store.require_command(command.type)
+        if isinstance(command, CreateProjectCommand):
+            return await self._create_project(conversation_id, command, context)
         if isinstance(command, ResolveExperimentSubmissionCommand):
             _, owner = self._execution_service(
                 conversation_id, context, "control_experiment_task"
@@ -2559,6 +2931,22 @@ class ConversationRuntime:
         receipt, claimed = store.claim_command(command)
         if not claimed:
             return receipt
+        if (
+            isinstance(command, (UserMessageCommand, InputResponseCommand))
+            and store.preparation_policy() is not None
+        ):
+            if self._preparations is None:
+                raise ValueError("preparation store is unavailable")
+            await self._plan_io(
+                self._preparations.store.invalidate,
+                PlanOwner(
+                    user_id=context.user_id,
+                    conversation_id=conversation_id,
+                    profile_id=context.profile_id,
+                ),
+                command.command_id,
+            )
+            self._notify_preparation(conversation_id, "preparation.changed")
         if (
             isinstance(command, UserMessageCommand)
             and self._delegated_store
@@ -2831,15 +3219,23 @@ class ConversationRuntime:
         context: RequestContext,
         *,
         request_id: str | None = None,
+        origin: TaskOrigin | None = None,
     ) -> dict[str, Any]:
         if self._workflow_submission is None:
             raise ValueError("workflow submission is unavailable")
         store = self._store(conversation_id)
         store.authorize(context.user_id, context.profile_id)
         store.require_command("workflow_execution")
+        correlation = TaskCorrelation(
+            conversation_id=conversation_id,
+            task_kind="workflow_run",
+            **(origin or context.task_origin or TaskOrigin()).model_dump(),
+        )
         identity = request_id or uuid4().hex
         previous = store.load_workflow_execution_requests().get(identity)
         if previous is not None:
+            if previous.correlation is not None and previous.correlation != correlation:
+                raise PermissionError("request belongs to another task origin")
             if previous.workflow_path != workflow_path:
                 raise ValueError("request id already belongs to another workflow")
             return {
@@ -2875,6 +3271,7 @@ class ConversationRuntime:
             request_id=identity,
             conversation_id=conversation_id,
             permission_id=f"workflow-run:{identity}",
+            correlation=correlation,
             workflow_path=workflow_path,
             fingerprint=fingerprint,
             workflow=workflow,
@@ -2979,7 +3376,12 @@ class ConversationRuntime:
         assert self._workflow_submission is not None
         try:
             task_id = await self._workflow_submission.submit(
-                request.workflow, request.conversation_id, context
+                request.workflow,
+                request.conversation_id,
+                replace(context, task_origin=request.correlation.origin)
+                if request.correlation
+                else context,
+                correlation=request.correlation,
             )
         except Exception as exc:
             logger.warning(
@@ -3019,6 +3421,11 @@ class ConversationRuntime:
             "task_id": task_id,
             "kind": "workflow_run",
             "run_id": request.request_id,
+            "correlation": request.correlation.model_dump(
+                mode="json", exclude_none=True
+            )
+            if request.correlation
+            else None,
             "status": "pending",
             "submitted_at": now,
             "updated_at": now,
@@ -3079,6 +3486,8 @@ class ConversationRuntime:
     ) -> ConversationSnapshot:
         source_store = await self._ensure_active(conversation_id, context)
         source_store.authorize(context.user_id, context.profile_id)
+        if source_store.preparation_policy() is not None:
+            raise ValueError("Project conversations cannot be forked")
         source_store.require_command("fork")
         source_snapshot = source_store.load_snapshot()
         if not source_snapshot.capabilities.fork:
@@ -3176,8 +3585,57 @@ class ConversationRuntime:
         error_summary: str | None = None,
         auto_run: bool = True,
         completion_result: JsonObject | None = None,
+        correlation: TaskCorrelation | None = None,
     ) -> ProductEvent:
         """Persist one callback and notify its owning harness at most once."""
+        if correlation is not None:
+            store = self._store(conversation_id)
+            if (
+                correlation.conversation_id
+                != TaskCorrelation(
+                    conversation_id=conversation_id, task_kind=correlation.task_kind
+                ).conversation_id
+            ):
+                raise PermissionError("callback belongs to another conversation")
+            owner = self.resolve_external_task_owner(task_id)
+            if owner is not None and owner != correlation.conversation_id:
+                raise PermissionError("platform task belongs to another conversation")
+            known = next(
+                (
+                    item
+                    for item in store.load_snapshot().external_tasks
+                    if item.task_id == task_id
+                ),
+                None,
+            )
+            saved = known.correlation if known else None
+            if saved is None and self._external_tasks:
+                registered = self._external_tasks.resolve(conversation_id, task_id)
+                if registered and registered.get("correlation"):
+                    saved = TaskCorrelation.model_validate(registered["correlation"])
+            if saved is None:
+                observed, _ = store.append(
+                    ProductEvent(
+                        event_id=f"external-task:{task_id}:{status}:observed:{correlation.to_out_id()}",
+                        conversation_id=conversation_id,
+                        type="external_task.observed",
+                        payload={
+                            "task_id": task_id,
+                            "status": status,
+                            "correlation": correlation.model_dump(
+                                mode="json", exclude_none=True
+                            ),
+                            "error_summary": _controlled_error(error_summary),
+                            "auto_run": auto_run,
+                        },
+                    )
+                )
+                self._publish(observed)
+                return observed
+            if saved != correlation:
+                raise PermissionError(
+                    "callback task origin does not match its registration"
+                )
         if self._delegated_store:
             early = (
                 self._external_tasks.resolve(conversation_id, task_id)
@@ -3338,17 +3796,28 @@ class ConversationRuntime:
         if active is not None and notify:
             async with self._use(conversation_id):
                 try:
-                    await active.adapter.notify_external_task(
-                        active.handle,
-                        _build_external_task_notification(
-                            task.model_copy(update=notification_payload),
-                            status=normalized,
-                            error_summary=_controlled_error(error_summary),
-                            auto_run=auto_run,
-                            has_training_node=_workflow_has_training_node(store, task),
-                        ),
-                        active.context,
-                    )
+                    response: JsonObject = {"accepted": True}
+                    if not (task.graph_run_id and self._workflows is not None):
+                        response = await active.adapter.notify_external_task(
+                            active.handle,
+                            _build_external_task_notification(
+                                ExternalTaskState.model_validate(
+                                    {
+                                        **task.model_dump(mode="json"),
+                                        **notification_payload,
+                                    }
+                                ),
+                                status=normalized,
+                                error_summary=_controlled_error(error_summary),
+                                auto_run=auto_run,
+                                has_training_node=_workflow_has_training_node(
+                                    store, task
+                                ),
+                            ),
+                            active.context,
+                        )
+                    if response.get("accepted") is False:
+                        raise RuntimeError("external task recipient is not available")
                     acknowledged, _ = store.append(
                         ProductEvent(
                             event_id=f"external-task:{task_id}:{normalized}:resumed",
@@ -3374,7 +3843,83 @@ class ConversationRuntime:
                         )
                     )
                     self._publish(persisted)
+                    self._schedule_notification_retry(conversation_id)
         return persisted
+
+    def _schedule_notification_retry(self, conversation_id: str) -> None:
+        if conversation_id in self._notification_retries or self._closing:
+            return
+
+        async def retry() -> None:
+            try:
+                while not self._closing:
+                    await asyncio.sleep(2)
+                    active = self._active.get(conversation_id)
+                    store = self._store(conversation_id)
+                    snapshot = store.load_snapshot()
+                    if active is None or snapshot.automatic_turns_suspended:
+                        return
+                    if not any(
+                        task.resume_pending and not task.managed_task_run_id
+                        for task in snapshot.external_tasks
+                    ):
+                        return
+                    async with self._notification_resume_lock:
+                        try:
+                            await self._resume_notifications(active, store)
+                        except Exception:
+                            logger.exception(
+                                "External task recipient remains unavailable for %s",
+                                conversation_id,
+                            )
+            finally:
+                self._notification_retries.pop(conversation_id, None)
+
+        self._notification_retries[conversation_id] = asyncio.create_task(retry())
+
+    def _schedule_observation_replay(self, conversation_id: str, task_id: str) -> None:
+        if not any(
+            event.type == "external_task.observed"
+            and event.payload.get("task_id") == task_id
+            for event in self._store(conversation_id).replay()
+        ):
+            return
+        task = asyncio.create_task(
+            self._replay_external_observations(conversation_id, task_id)
+        )
+        self._observation_replays.add(task)
+        task.add_done_callback(self._observation_replays.discard)
+
+    async def _replay_external_observations(
+        self, conversation_id: str, task_id: str | None = None
+    ) -> None:
+        store = self._store(conversation_id)
+        known = {task.task_id: task for task in store.load_snapshot().external_tasks}
+        for event in store.replay():
+            if event.type != "external_task.observed":
+                continue
+            identity = str(event.payload["task_id"])
+            if identity not in known or task_id is not None and identity != task_id:
+                continue
+            if known[identity].correlation is None:
+                continue
+            try:
+                await self.deliver_external_task_status(
+                    conversation_id,
+                    task_id=identity,
+                    status=str(event.payload["status"]),
+                    error_summary=cast(str | None, event.payload.get("error_summary")),
+                    auto_run=event.payload.get("auto_run") is not False,
+                    correlation=TaskCorrelation.model_validate(
+                        event.payload["correlation"]
+                    ),
+                )
+            except PermissionError:
+                logger.warning("Rejected external task observation for %s", identity)
+            except Exception:
+                logger.exception(
+                    "Could not replay external task observation for %s", identity
+                )
 
     def resolve_external_task_owner(self, task_id: str) -> str | None:
         if self._external_tasks is None:
@@ -3389,6 +3934,28 @@ class ConversationRuntime:
         task_id = str(payload.get("task_id") or "")
         if not task_id:
             raise ValueError("external task_id is required")
+        owner = self.resolve_external_task_owner(task_id)
+        canonical_id = TaskCorrelation(
+            conversation_id=conversation_id, task_kind="workflow_run"
+        ).conversation_id
+        if owner is not None and owner != canonical_id:
+            raise PermissionError("external task belongs to another conversation")
+        existing = next(
+            (item for item in snapshot.external_tasks if item.task_id == task_id), None
+        )
+        if (
+            existing
+            and existing.correlation
+            and payload.get("correlation") is not None
+            and existing.correlation
+            != TaskCorrelation.model_validate(payload["correlation"])
+        ):
+            raise PermissionError("external task origin cannot change")
+        if existing and existing.correlation and payload.get("correlation") is None:
+            payload = {
+                **payload,
+                "correlation": existing.correlation.model_dump(mode="json"),
+            }
         event = ProductEvent(
             event_id=f"external-task:{task_id}:submitted",
             conversation_id=conversation_id,
@@ -3414,6 +3981,7 @@ class ConversationRuntime:
                 logger.exception("Could not register external task %s", task_id)
         if updated.through_seq != snapshot.through_seq:
             self._publish(persisted)
+        self._schedule_observation_replay(conversation_id, task_id)
         registration = self._pending_task_registrations.get(task_id)
         if registration is not None:
             registration.set()
@@ -3459,6 +4027,11 @@ class ConversationRuntime:
         for wakeup in self._auto_execution_wakeups.values():
             wakeup.set()
         await asyncio.gather(*tuple(self._input_response_tasks), return_exceptions=True)
+        await asyncio.gather(*tuple(self._observation_replays), return_exceptions=True)
+        retries = tuple(self._notification_retries.values())
+        for retry in retries:
+            retry.cancel()
+        await asyncio.gather(*retries, return_exceptions=True)
         if self._workflows:
             await self._workflows.close()
         if self._evictor is not None:
@@ -3510,7 +4083,26 @@ class ConversationRuntime:
                     await self._user_input.coordinate_recovery(
                         store, conversation_dir.name
                     )
-                snapshots.append(store.load_snapshot())
+                snapshot = store.load_snapshot()
+                if (
+                    store.preparation_policy() is not None
+                    and self._preparations is not None
+                ):
+                    owner = PlanOwner(
+                        user_id=context.user_id,
+                        conversation_id=conversation_dir.name,
+                        profile_id=context.profile_id,
+                    )
+                    preparation = await self._plan_io(
+                        self._preparations.store.get, owner
+                    )
+                    project = await self._plan_io(
+                        self._preparations.store.project, owner
+                    )
+                    snapshot = snapshot.model_copy(
+                        update={"preparation": preparation, "project": project}
+                    )
+                snapshots.append(snapshot)
             except Exception:
                 # A single unreadable conversation must not take down the
                 # whole listing: callers only ever see the healthy subset.
@@ -3713,6 +4305,8 @@ class ConversationRuntime:
     async def _resume_pending_external_tasks(
         self, active: _ActiveConversation, store: FileProductStore
     ) -> None:
+        self._schedule_notification_retry(active.handle.session_id)
+        await self._replay_external_observations(active.handle.session_id)
         await self.reconcile_versions(active.handle.session_id, active.context)
         async with self._notification_resume_lock:
             await self._repair_parked_await_bindings(active.handle.session_id)
@@ -3770,6 +4364,7 @@ class ConversationRuntime:
                     ExternalTaskNotification(
                         task_id=request.task_id,
                         kind="workflow_run",
+                        correlation=request.correlation,
                         run_id=request.request_id,
                         status=reference["status"],
                         hidden_text=(
@@ -3849,17 +4444,28 @@ class ConversationRuntime:
                 ):
                     continue
             else:
-                await active.adapter.notify_external_task(
-                    active.handle,
-                    _build_external_task_notification(
-                        task,
-                        status=task.status,
-                        error_summary=task.error_summary,
-                        auto_run=task.resume_auto_run,
-                        has_training_node=_workflow_has_training_node(store, task),
-                    ),
-                    active.context,
-                )
+                try:
+                    response = await active.adapter.notify_external_task(
+                        active.handle,
+                        _build_external_task_notification(
+                            task,
+                            status=task.status,
+                            error_summary=task.error_summary,
+                            auto_run=task.resume_auto_run,
+                            has_training_node=_workflow_has_training_node(store, task),
+                        ),
+                        active.context,
+                    )
+                except Exception:
+                    if task.correlation is None or task.correlation.type == "main":
+                        raise
+                    logger.exception(
+                        "External task recipient unavailable for %s", task.task_id
+                    )
+                    self._schedule_notification_retry(active.handle.session_id)
+                    continue
+                if response.get("accepted") is False:
+                    continue
             notification = task.model_dump(mode="json")
             notification["resume_pending"] = False
             persisted, _ = await asyncio.to_thread(
@@ -3967,6 +4573,10 @@ class ConversationRuntime:
                             handle.session_id,
                         )
                 self._publish(persisted)
+                if product_event.type == "external_task.submitted":
+                    self._schedule_observation_replay(
+                        handle.session_id, str(product_event.payload["task_id"])
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -4447,6 +5057,7 @@ def _build_external_task_notification(
         return ExternalTaskNotification(
             task_id=task.task_id,
             kind=task.kind,
+            correlation=task.correlation,
             run_id=task.run_id,
             status=status,
             output_dir=task.output_dir,
@@ -4602,6 +5213,7 @@ def _build_external_task_notification(
     return ExternalTaskNotification(
         task_id=task.task_id,
         kind=task.kind,
+        correlation=task.correlation,
         run_id=task.run_id,
         status=status,
         output_dir=task.output_dir,

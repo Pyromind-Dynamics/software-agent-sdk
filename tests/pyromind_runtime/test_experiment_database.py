@@ -33,6 +33,7 @@ from pyromind_runtime.infrastructure.sql_work_queue import now
 
 
 TABLES = {
+    "experiment_preparations",
     "experiment_projects",
     "experiment_plan_documents",
     "experiment_task_runs",
@@ -53,7 +54,7 @@ def migrate(url, target="head"):
         with engine.connect() as conn:
             assert conn.scalar(
                 sa.text("SELECT version_num FROM experiment_plan_schema_version")
-            ) == ("0004_compact_storage" if target == "head" else target)
+            ) == ("0005_preparation" if target == "head" else target)
     finally:
         engine.dispose()
 
@@ -86,18 +87,20 @@ def test_selector_ignores_remote_url_and_resolves_paths_independent_of_cwd(
         )
         == first
     )
+    assert first is not None
     assert first.database == str(
         PROJECT_ROOT / "workspace/experiments/experiments.sqlite3"
     )
     assert resolve_database_url({}) is None
-    assert resolve_database_url(
+    relative = resolve_database_url(
         {"EXPERIMENT_PLAN_DATABASE_URL": "sqlite:///relative.db"}
-    ).database == str(PROJECT_ROOT / "relative.db")
-    remote = "mysql+pymysql://user@host:13306/database"
-    assert (
-        resolve_database_url({"EXPERIMENT_PLAN_DATABASE_URL": remote}).drivername
-        == "mysql+pymysql"
     )
+    assert relative is not None and relative.database == str(
+        PROJECT_ROOT / "relative.db"
+    )
+    remote = "mysql+pymysql://user@host:13306/database"
+    remote_url = resolve_database_url({"EXPERIMENT_PLAN_DATABASE_URL": remote})
+    assert remote_url is not None and remote_url.drivername == "mysql+pymysql"
     with pytest.raises(ValueError, match="must be"):
         resolve_database_url({"EXPERIMENT_DB_BACKEND": "unsupported"})
     with pytest.raises(ValueError, match="requires"):
@@ -112,8 +115,11 @@ def test_startup_sqlite_does_not_source_credentials(tmp_path):
         .read_text()
         .split("export PYROMIND_HARNESS_BACKEND")[0]
     )
-    environment = {**os.environ, "EXPERIMENT_PLAN_ENV_FILE": str(forbidden)}
-    environment.pop("EXPERIMENT_DB_BACKEND", None)
+    environment = {
+        **os.environ,
+        "EXPERIMENT_PLAN_ENV_FILE": str(forbidden),
+        "EXPERIMENT_DB_BACKEND": "sqlite",
+    }
     result = subprocess.run(
         ["bash", "-c", prefix + '\nprintf "%s" "$EXPERIMENT_DB_BACKEND"'],
         env=environment,
@@ -121,6 +127,29 @@ def test_startup_sqlite_does_not_source_credentials(tmp_path):
         text=True,
     )
     assert result.returncode == 0 and result.stdout == "sqlite"
+
+
+def test_startup_defaults_to_mariadb(tmp_path):
+    config = tmp_path / "database.env"
+    config.write_text(
+        "EXPERIMENT_PLAN_DATABASE_URL='mysql+pymysql://test@localhost/test_database'\n"
+    )
+    prefix = (
+        (PROJECT_ROOT / "start_inference.sh")
+        .read_text()
+        .split("export PYROMIND_HARNESS_BACKEND")[0]
+        .split("export OPENAI_API_KEY")[0]
+    )
+    environment = {**os.environ, "EXPERIMENT_PLAN_ENV_FILE": str(config)}
+    environment.pop("EXPERIMENT_DB_BACKEND", None)
+    environment.pop("EXPERIMENT_PLAN_DATABASE_URL", None)
+    result = subprocess.run(
+        ["bash", "-c", prefix + '\nprintf "%s" "$EXPERIMENT_DB_BACKEND"'],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0 and result.stdout == "mariadb"
 
 
 def test_sqlite_engine_settings_and_persistent_file(tmp_path):

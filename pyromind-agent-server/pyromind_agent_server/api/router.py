@@ -83,6 +83,8 @@ def create_product_router(
                     configuration_version=profile.configuration_version,
                     tool_allowlist=profile.tool_allowlist,
                     skill_allowlist=profile.skill_allowlist,
+                    development_tool_allowlist=profile.development_tool_allowlist,
+                    development_skill_allowlist=profile.development_skill_allowlist,
                     product_instructions=profile.instructions,
                     delegated_roles=tuple(
                         role.model_dump(mode="json")
@@ -90,6 +92,7 @@ def create_product_router(
                     ),
                     managed_delegation=profile.managed_delegation,
                     command_allowlist=profile.command_allowlist,
+                    preparation_policy=profile.preparation_policy,
                 ),
                 context_for(request),
             )
@@ -128,7 +131,12 @@ def create_product_router(
     ) -> ConversationSnapshot:
         context = context_for(request)
         runtime = get_product_runtime(request)
-        if profile.tool_allowlist and {"get_experiment_plan", "get_experiment_context"}.intersection(profile.tool_allowlist):
+        if profile.preparation_policy is not None or (
+            profile.tool_allowlist
+            and {"get_experiment_plan", "get_experiment_context"}.intersection(
+                profile.tool_allowlist
+            )
+        ):
             if not runtime.experiment_plans_available:
                 raise HTTPException(503, detail="Plan database is not configured")
             if body.workflow_xyflow is not None:
@@ -142,7 +150,8 @@ def create_product_router(
             initial_message=((TextContent(text=body.message),) if body.message else ()),
             workflow_xyflow=body.workflow_xyflow,
             model_configuration=body.llm.model_dump(mode="json"),
-            user_input_enabled=body.user_input_enabled,
+            user_input_enabled=body.user_input_enabled
+            or profile.preparation_policy is not None,
             extra=body.extra,
             profile_id=profile.profile_id,
             harness_id=profile.harness_id,
@@ -154,6 +163,7 @@ def create_product_router(
             command_allowlist=profile.command_allowlist,
             delegated_roles=profile.delegated_roles,
             managed_delegation=profile.managed_delegation,
+            preparation_policy=profile.preparation_policy,
         )
         try:
             snapshot = await get_product_runtime(request).create_conversation(
@@ -285,6 +295,26 @@ def create_product_router(
             },
         )
 
+    @router.get("/{conversation_id}/preparation")
+    async def get_preparation(conversation_id: str, request: Request):
+        _require_profile(request, conversation_id, profile)
+        try:
+            return await get_product_runtime(request).get_preparation(
+                conversation_id, context_for(request)
+            )
+        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
+            raise _not_found(conversation_id) from exc
+
+    @router.get("/{conversation_id}/project")
+    async def get_project(conversation_id: str, request: Request):
+        _require_profile(request, conversation_id, profile)
+        try:
+            return await get_product_runtime(request).get_project(
+                conversation_id, context_for(request)
+            )
+        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
+            raise _not_found(conversation_id) from exc
+
     @router.get("/{conversation_id}/experiment-executions")
     async def list_experiment_executions(conversation_id: str, request: Request):
         try:
@@ -297,7 +327,9 @@ def create_product_router(
             raise _not_found(conversation_id) from exc
 
     @router.get("/{conversation_id}/experiment-executions/{run_id}/artifacts/{name}")
-    async def read_experiment_artifact(conversation_id: str, run_id: str, name: str, request: Request):
+    async def read_experiment_artifact(
+        conversation_id: str, run_id: str, name: str, request: Request
+    ):
         try:
             return await get_product_runtime(request).read_experiment_artifact(
                 conversation_id, run_id, name, context_for(request)

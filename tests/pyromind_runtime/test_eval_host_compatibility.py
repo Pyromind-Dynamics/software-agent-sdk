@@ -1,11 +1,14 @@
 """Exercise the default remote execution backend with the real Pi host."""
 
+from unittest.mock import AsyncMock
+
 import httpx
 import pytest
 from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.api.router import create_product_router
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.infrastructure.sql_preparation import SQLPreparationStore
 
 from . import test_standalone_experiments as storage_fixtures
 from .test_product_api import _app
@@ -26,6 +29,7 @@ async def test_actual_manager_and_eval_host_create_through_api(
         {"pi": adapter},
         default_harness_id="pi",
         experiment_plan_store=service.plans,
+        preparation_store=SQLPreparationStore(service.plans.engine),
         experiment_execution_store=service.store,
         execution_roles=("eval",),
     )
@@ -50,6 +54,7 @@ async def test_actual_manager_and_eval_host_create_through_api(
             )
             assert created.status_code == 201, created.text
             assert created.json()["conversation_id"]
+            assert ECHOMIND_PRODUCT_PROFILE.delegated_roles is not None
             role = ECHOMIND_PRODUCT_PROFILE.delegated_roles[0]
             business = {
                 item["name"]
@@ -60,6 +65,28 @@ async def test_actual_manager_and_eval_host_create_through_api(
             assert set(role.tools) <= business | native | runtime_tools
             assert "upload_file_to_pyromind" not in role.tools
             session = adapter._sessions[created.json()["conversation_id"]]
+            assert created.json()["preparation"]["phase"] == "collecting"
+            assert {"read", "write", "edit", "terminal", "grep", "find", "ls"} <= set(
+                session.config["tool_allowlist"]
+            )
+            ensure = AsyncMock(return_value={"sandbox_id": "preparation-sandbox"})
+            monkeypatch.setattr(adapter._sandbox, "ensure", ensure)
+            assert await adapter._runner_request(session, "sandbox.ensure", {}) == {
+                "sandbox_id": "preparation-sandbox"
+            }
+            ensure.assert_awaited_once()
+            assert "request_experiment_task" not in {
+                item["name"] for item in adapter._tool_specs(session)
+            }
+            from pyromind_runtime.domain.context import RequestContext
+
+            await runtime._activate_development_policy(
+                session.session_id,
+                runtime._store(session.session_id),
+                RequestContext(
+                    user_id="42", profile_id=ECHOMIND_PRODUCT_PROFILE.profile_id
+                ),
+            )
             delegate = next(
                 item
                 for item in adapter._tool_specs(session)

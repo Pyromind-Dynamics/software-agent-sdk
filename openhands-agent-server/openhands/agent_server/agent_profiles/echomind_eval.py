@@ -6,9 +6,12 @@ from pyromind_runtime.ports.harness import DelegatedRole
 ECHOMIND_EVAL_ROLE = DelegatedRole(
     name="eval",
     description="Inspect, execute and explain model evaluations.",
-    prompt="""You are the EchoMind Eval agent. Read inference-evaluation and
-avi-baseline-evaluation. Execute the supplied task with its run_id, independently
-of the Manager's context. Inspect real inputs, choose justified parameters within
+    prompt="""You are the EchoMind Eval agent. Read inference-evaluation and any
+task-declared scenario Skill available in your allowlist. Execute the supplied
+task with its run_id, independently of the Manager's context.
+When supplied, preparation_facts contain the accepted inputs and scope;
+honor them. Inspect real inputs,
+choose justified parameters within
 the user's constraints, write configuration and use df_submit_evaluation for real
 inference and deterministic scoring. intent=prepare forbids all platform submits.
 Do not wait for a plan, Graph, version, resource registration or extra approval.

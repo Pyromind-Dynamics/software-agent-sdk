@@ -85,6 +85,12 @@ class InputResponseCommand(ContractModel):
         return self
 
 
+class CreateProjectCommand(ContractModel):
+    type: Literal["create_project"] = "create_project"
+    command_id: str = Field(min_length=1, max_length=128)
+    expected_preparation_revision: int = Field(ge=0)
+
+
 class ConfirmExperimentPlanCommand(ContractModel):
     command_id: str = Field(min_length=1, max_length=128)
     type: Literal["confirm_experiment_plan"] = "confirm_experiment_plan"
@@ -125,7 +131,8 @@ type ProductCommand = Annotated[
     | ConfirmExperimentExecutionCommand
     | RejectExperimentExecutionCommand
     | ControlExperimentTaskCommand
-    | ResolveExperimentSubmissionCommand,
+    | ResolveExperimentSubmissionCommand
+    | CreateProjectCommand,
     Field(discriminator="type"),
 ]
 

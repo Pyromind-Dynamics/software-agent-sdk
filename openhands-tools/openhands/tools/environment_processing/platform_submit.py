@@ -718,6 +718,7 @@ class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
                     workflow=workflow,
                     name=str(workflow["name"]),
                     conversation_id=str(conversation.id),
+                    task_kind="environment_processing",
                 )
             except Exception as exc:  # noqa: BLE001
                 # Stop the batch at the first failing shard: partially

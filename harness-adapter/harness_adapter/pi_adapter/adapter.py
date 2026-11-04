@@ -34,7 +34,12 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.session_policy import SessionPolicy
-from pyromind_runtime.domain.snapshot import ConversationSnapshot, WorkflowState
+from pyromind_runtime.domain.snapshot import (
+    ConversationSnapshot,
+    OperationActivity,
+    WorkflowState,
+)
+from pyromind_runtime.domain.task_correlation import TaskOrigin
 from pyromind_runtime.domain.user_input import UserInputRequest
 from pyromind_runtime.ports.harness import (
     AttachRecovery,
@@ -446,6 +451,13 @@ class PiAdapter:
         ):
             raise PermissionError("role tool is not authorized")
         tool_context = await self._tool_context(session)
+        if scope.get("task_origin") is not None:
+            tool_context = replace(
+                tool_context,
+                request_context=replace(
+                    context, task_origin=TaskOrigin.model_validate(scope["task_origin"])
+                ),
+            )
         workspace = tool_context.workspace
         root = "public_data/experiment-runs/" + str(scope["run_id"])
         if workspace is not None:
@@ -535,9 +547,11 @@ class PiAdapter:
             ReadExperimentArtifact,
         )
         from pyromind_runtime.domain.experiment_plans import CONTEXT_TOOLS, PLAN_TOOLS
+        from pyromind_runtime.domain.preparation import PREPARATION_TOOLS
         from pyromind_runtime.domain.project_graphs import PROJECT_GRAPH_TOOLS
 
         tools = {
+            **PREPARATION_TOOLS,
             **PLAN_TOOLS,
             **CONTEXT_TOOLS,
             **PROJECT_GRAPH_TOOLS,
@@ -550,6 +564,32 @@ class PiAdapter:
         specs = self._business_tools.specs(sandbox=self._terminal_backend == "sandbox")
         if self._plan_call is not None:
             descriptions = {
+                "get_preparation": (
+                    "Read the scenario checklist, collected facts, evidence "
+                    "reference catalog, draft plan and current revision."
+                ),
+                "update_preparation": (
+                    "Replace checklist facts using expected_revision. Resolved facts "
+                    "require evidence_refs from get_preparation or inspect_resource. "
+                    "This only collects information; submit a workflow plan "
+                    "separately with set_preparation_plan."
+                ),
+                "set_preparation_plan": (
+                    "Save a workflow plan after the checklist is complete. Every "
+                    "call, including retries, requires expected_revision, plan, "
+                    "entry_task_id (plan.tasks[].id) and role_id "
+                    "(preparation.policy.allowed_roles). plan.edges connect "
+                    "plan.stages[].id; task dependencies use task.inputs. Runtime "
+                    "reuses saved facts and resolves task.inputs from plan.resources; "
+                    "do not repeat facts or construct a separate delegated task. "
+                    "Does not create a Project or start platform work."
+                ),
+                "inspect_resource": (
+                    "Inspect a Storage file prefix or directory with current "
+                    "request credentials. Read-only and bounded; never starts a "
+                    "sandbox. Returns an evidence_ref. A preview does not "
+                    "validate the full dataset."
+                ),
                 "create_experiment_plan": (
                     "Create a reviewable experiment plan proposal. "
                     "Does not create a project or authorize execution."
@@ -710,6 +750,60 @@ class PiAdapter:
             return None
         except ValueError as exc:
             raise OSError(str(exc)) from exc
+
+    async def read_operation_activities(
+        self,
+        handle: SessionHandle,
+        operation_ids: tuple[str, ...],
+        context: RequestContext,
+    ) -> dict[str, OperationActivity]:
+        root = self._safe_conversation_dir(handle.session_id)
+        files = PiSessionFiles(root)
+        config = files.load_session()
+        if (
+            config.get("profile_id") is not None
+            and config["profile_id"] != context.profile_id
+        ):
+            raise PermissionError("session belongs to another profile")
+        ids = [
+            value.removeprefix("subagent:")
+            for value in operation_ids[:32]
+            if value.startswith("subagent:")
+        ]
+        runtime = Path(
+            os.getenv("PYROMIND_PI_RUNTIME")
+            or Path(__file__).parents[2] / "pi-runtime" / "dist" / "index.js"
+        )
+        reader = runtime.with_name("read-operation-activity.js")
+        if not ids or not reader.is_file():
+            return {}
+        process = await asyncio.create_subprocess_exec(
+            "node",
+            str(reader),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(
+                process.communicate(
+                    json.dumps({"workspace": str(root), "ids": ids}).encode()
+                ),
+                10,
+            )
+        except BaseException:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            raise
+        if process.returncode or len(stdout) > 3 * 1024 * 1024:
+            return {}
+        values = json.loads(stdout)
+        return {
+            "subagent:" + key: OperationActivity.model_validate(value)
+            for key, value in values.items()
+            if key in ids
+        }
 
     async def read_workspace_text(
         self,
@@ -931,10 +1025,16 @@ class PiAdapter:
             "tool_allowlist": policy.tool_allowlist,
             "skill_allowlist": policy.skill_allowlist,
         }
-        for name in ("product_instructions", "delegated_roles", "managed_delegation"):
+        for name in (
+            "product_instructions",
+            "delegated_roles",
+            "managed_delegation",
+        ):
             value = getattr(policy, name)
             if value is not None:
                 updated[name] = value
+        if updated == config:
+            return
         files.save_session(updated)
         if session is not None:
             session.config = updated
@@ -1361,7 +1461,12 @@ class PiAdapter:
         if notification.reset_attempt_budget:
             self._business_tools.reset_attempt_budget(session.workspace_root)
         result = await session.runner.request(
-            "notify" if notification.trigger_turn else "context.append",
+            "recipient.notify"
+            if notification.correlation is not None
+            and notification.correlation.type == "subagent"
+            else "notify"
+            if notification.trigger_turn
+            else "context.append",
             {
                 "run_id": f"callback:{task_id}:{status}",
                 "content": notification.hidden_text,
@@ -1704,6 +1809,11 @@ class PiAdapter:
             arguments = params.get("arguments")
             if not isinstance(arguments, dict):
                 raise ValueError("role tool arguments must be an object")
+            if params.get("origin") is not None:
+                origin = TaskOrigin.model_validate(params["origin"])
+                if origin.type != "subagent":
+                    raise PermissionError("delegated call requires a child origin")
+                scope = {**scope, "task_origin": origin.model_dump(mode="json")}
             result = await self._role_call(
                 session.session_id, role, name, arguments, scope, session.context
             )
@@ -1772,10 +1882,12 @@ class PiAdapter:
                 CONTEXT_TOOLS,
                 PLAN_TOOLS,
             )
+            from pyromind_runtime.domain.preparation import PREPARATION_TOOLS
             from pyromind_runtime.domain.project_graphs import PROJECT_GRAPH_TOOLS
 
             if (
-                tool_name in PLAN_TOOLS
+                tool_name in PREPARATION_TOOLS
+                or tool_name in PLAN_TOOLS
                 or tool_name in CONTEXT_TOOLS
                 or tool_name in PROJECT_GRAPH_TOOLS
                 or tool_name
@@ -1798,10 +1910,19 @@ class PiAdapter:
                     "details": result,
                     "is_error": False,
                 }
+            tool_context = await self._tool_context(session)
+            if params.get("origin") is not None:
+                origin = TaskOrigin.model_validate(params["origin"])
+                if origin.type != "subagent":
+                    raise PermissionError("only child calls can carry an origin")
+                tool_context = replace(
+                    tool_context,
+                    request_context=replace(session.context, task_origin=origin),
+                )
             result = await self._business_tools.execute(
                 tool_name,
                 arguments,
-                await self._tool_context(session),
+                tool_context,
                 tool_call_id=(
                     params.get("tool_call_id")
                     if isinstance(params.get("tool_call_id"), str)
@@ -1946,6 +2067,7 @@ class PiAdapter:
                         type="external_task.submitted",
                         payload={
                             "task_id": task_id,
+                            "correlation": task.get("correlation"),
                             "kind": kind,
                             "run_id": run_id if isinstance(run_id, str) else task_id,
                             "status": _external_task_status(

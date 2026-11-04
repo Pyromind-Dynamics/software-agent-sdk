@@ -268,7 +268,10 @@ class SQLWorkQueue:
                 ).mappings()
             ]
 
-    def reconcile_expired(self, identity: str, safe_to_retry: bool) -> None:
+    def reconcile_expired(
+        self, identity: str, safe_to_retry: bool, *, generation: int
+    ) -> bool:
+        """Apply a verdict only to the expired generation that was inspected."""
         with write_transaction(self.engine) as conn:
             row = (
                 conn.execute(
@@ -277,22 +280,36 @@ class SQLWorkQueue:
                 .mappings()
                 .one()
             )
-            if row["state"] != "running" or row["lease_until"] > now():
-                raise ValueError("work has not expired")
-            conn.execute(
+            checked_at = now()
+            if (
+                row["state"] != "running"
+                or row["generation"] != generation
+                or row["lease_until"] is None
+                or row["lease_until"] >= checked_at
+            ):
+                return False
+            updated = conn.execute(
                 work.update()
-                .where(work.c.id == identity)
+                .where(
+                    work.c.id == identity,
+                    work.c.state == "running",
+                    work.c.generation == generation,
+                    work.c.lease_until < checked_at,
+                )
                 .values(
                     state="queued" if safe_to_retry else "reconciliation_required",
-                    generation=row["generation"] + 1,
+                    generation=generation + 1,
                     lease_until=None,
                 )
             )
+            if updated.rowcount != 1:
+                return False
             conn.execute(
                 roles.update()
                 .where(roles.c.lane == row["lane"])
                 .values(active_id=identity, lease_until=None)
             )
+            return True
 
     def list(self, owner: str) -> list[dict]:
         with self.engine.connect() as conn:

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -189,7 +190,13 @@ def test_run_workflow_submits_task_successfully(
     assert "task-123" in observation.text
     mock_client.studio.create.assert_called_once()
     request = mock_client.studio.create.call_args.args[0]
-    assert request.out_id == f"agent1#{_CONVERSATION_ID}"
+    assert json.loads(request.out_id) == {
+        "version": 1,
+        "source": "agent",
+        "conversation_id": _CONVERSATION_ID.hex,
+        "type": "main",
+        "task_kind": "workflow_run",
+    }
     assert request.workflow == {"name": "demo", "nodes": [], "edges": []}
 
 
@@ -233,7 +240,13 @@ def test_run_workflow_executor_test_mode_uses_debug_out_id(
 
     assert not observation.is_error
     request = mock_client.studio.create.call_args.args[0]
-    assert request.out_id == f"agent1#debug#{_CONVERSATION_ID}"
+    assert json.loads(request.out_id) == {
+        "version": 1,
+        "source": "agent",
+        "conversation_id": _CONVERSATION_ID.hex,
+        "type": "main",
+        "task_kind": "workflow_debug",
+    }
     assert request.workflow["execution_argos"] == [{"execution_mode": "test"}]
 
 

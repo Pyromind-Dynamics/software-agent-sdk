@@ -18,8 +18,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 
-# Local development uses SQLite; change only this field for MariaDB.
-export EXPERIMENT_DB_BACKEND="${EXPERIMENT_DB_BACKEND:-sqlite}"
+# Override EXPERIMENT_DB_BACKEND=sqlite to use a local database.
+export EXPERIMENT_DB_BACKEND="${EXPERIMENT_DB_BACKEND:-mariadb}"
 case "${EXPERIMENT_DB_BACKEND}" in
   sqlite)
     export EXPERIMENT_SQLITE_PATH="${EXPERIMENT_SQLITE_PATH:-${SCRIPT_DIR}/workspace/experiments/experiments.sqlite3}"
@@ -38,11 +38,14 @@ case "${EXPERIMENT_DB_BACKEND}" in
   *) echo "ERROR: EXPERIMENT_DB_BACKEND must be sqlite or mariadb" >&2; exit 1 ;;
 esac
 
+export OPENAI_API_KEY
+export OPENROUTER_API_KEY
 export PYROMIND_HARNESS_BACKEND="pi"
 export APP_ENV="${APP_ENV:-dev}"
 export PYROMIND_PI_TERMINAL_BACKEND="${PYROMIND_PI_TERMINAL_BACKEND:-sandbox}"
 export PYROMIND_AGENTGENOME_ENABLED=1
 export PYROMIND_PUBLIC_API_BASE="${PYROMIND_PUBLIC_API_BASE:-http://localhost:5173}"
+export PYROMIND_AGENT_ACCESS_KEY_REQUEST_SECRET
 
 # Only the os-sandbox backend binds tools to the host OS sandbox helpers;
 # the default platform sandbox runs in a remote container and needs none of

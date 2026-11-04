@@ -180,6 +180,14 @@ export async function createPiSession(
   if (sessionOptions.askUserTool) rawTools.push(sessionOptions.askUserTool);
   if (!executionAccess) throw new Error("execution environment was not initialized");
   const coordinator = new ToolCoordinator();
+  rawTools.push(...createRetrievalTools(executionAccess, options.readMirror).map(
+    (tool): AgentTool => ({
+      ...tool,
+      execute: (id, args, signal, update) => coordinator.run(
+        signal, () => tool.execute(id, args, signal, update),
+      ),
+    }),
+  ));
   const allowedSkillRoots = config.skillAllowlist?.map(name => {
     const root = config.skillsDirectory ? join(config.skillsDirectory, name) : config.skillRoots.find(root => root.name === name)?.path;
     if (!root) throw new Error(`Unknown allowed skill: ${name}`);
@@ -196,16 +204,15 @@ export async function createPiSession(
       config.skillsDirectory,
       { canonicalizeWorkspacePaths: config.terminalBackend !== "sandbox" },
     ), peer));
-  const childTools = tools.filter((tool) => ["read", "write", "edit", "terminal"].includes(tool.name)).map((tool) => {
+  const childTools = tools.filter((tool) => [
+    "read", "write", "edit", "terminal", "grep", "find", "ls",
+  ].includes(tool.name)).map((tool) => {
     if (tool.name !== "read" || config.terminalBackend !== "sandbox") return tool;
     return { ...tool, execute: (id: string, args: any, signal?: AbortSignal, update?: any) => coordinator.run(signal, async () => {
       await verifyReadScope(executionAccess!, options.readMirror, args.path, signal);
       return tool.execute(id, args, signal, update);
     }) };
   });
-  childTools.push(...createRetrievalTools(executionAccess, options.readMirror).map((tool) => ({
-    ...tool, execute: (id: string, args: any, signal?: AbortSignal, update?: any) => coordinator.run(signal, () => tool.execute(id, args, signal, update)),
-  })));
   const childInstructions = "Use read-only knowledge/ and .agents/skills/ resources and public_data/ conversation files. The user Storage mount is addressed by its absolute path. Write only public_data/. " +
     "Tool paths refer to the conversation execution environment, never the host's directories. Available skills:\n" + skillPaths.map((path) => applySandboxPathAliases(path, sandboxPathAliases)).join("\n");
   const roleToolSets = config.delegatedRoles ? Object.fromEntries(config.delegatedRoles.map(role => {

@@ -30,7 +30,7 @@ export async function installChildHost(pi: ExtensionAPI, role: string) {
   });
   for (const tool of config.tools) {
     pi.registerTool({ ...tool, execute: (id: string, args: unknown, signal: AbortSignal | undefined, update: any, ctx: any) =>
-      callSubagentHost(socket, { method: "tool", role, scope: config.scope, name: tool.name, id: `${ctx.sessionManager.getLeafId()}:${id}`, args, session: ctx.sessionManager.getSessionId() }, signal, update) });
+      callSubagentHost(socket, { method: "tool", role, scope: config.scope, name: tool.name, id: `${ctx.sessionManager.getLeafId()}:${id}`, args, session: ctx.sessionManager.getSessionId(), session_file: ctx.sessionManager.getSessionFile() }, signal, update) });
   }
   pi.on("session_start", async (_event, ctx) => {
     await callSubagentHost(socket, { method: "config", role });

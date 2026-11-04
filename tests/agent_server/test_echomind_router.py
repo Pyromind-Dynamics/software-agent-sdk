@@ -13,8 +13,6 @@ from pyromind_runtime.domain.experiment_plans import (
 from openhands.agent_server.agent_profiles.echomind_manager import (
     ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
     ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
-    ECHOMIND_MANAGER_PLANNING_SKILLS,
-    ECHOMIND_MANAGER_PLANNING_TOOLS,
     ECHOMIND_MANAGER_PROFILE,
 )
 from openhands.agent_server.agent_profiles.pyromind import PYROMIND_PROFILE
@@ -51,15 +49,24 @@ def _experiment_plan(*, name: str = "AVI experiment") -> WorkflowPlan:
 
 def test_echomind_manager_planning_and_development_capabilities_are_explicit():
     assert ECHOMIND_PRODUCT_PROFILE.profile_id == "echomind"
-    assert ECHOMIND_PRODUCT_PROFILE.tool_allowlist == ECHOMIND_MANAGER_PLANNING_TOOLS
-    assert set(ECHOMIND_MANAGER_PLANNING_TOOLS) == {
+    assert set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ()) == {
         "read",
+        "write",
+        "edit",
         "terminal",
-        "create_experiment_plan",
-        "revise_experiment_plan",
-        "get_experiment_plan",
+        "grep",
+        "find",
+        "ls",
+        "ask_user",
+        "get_preparation",
+        "update_preparation",
+        "set_preparation_plan",
+        "inspect_resource",
     }
-    assert ECHOMIND_PRODUCT_PROFILE.skill_allowlist == ECHOMIND_MANAGER_PLANNING_SKILLS
+    assert ECHOMIND_PRODUCT_PROFILE.skill_allowlist == (
+        "model-evaluation-preparation",
+        "inference-evaluation",
+    )
     assert ECHOMIND_MANAGER_PROFILE.usage_id == "echomind-manager"
 
     assert set(ECHOMIND_MANAGER_DEVELOPMENT_TOOLS) == {
@@ -76,6 +83,17 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
         "control_experiment_task",
         "read_experiment_artifact",
     }
+    assert set(ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist or ()) == {
+        *ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
+        "ask_user",
+        "get_preparation",
+        "inspect_resource",
+        "ls",
+        "set_preparation_plan",
+        "grep",
+        "find",
+        "update_preparation",
+    }
     assert not {"request_experiment_task", "get_experiment_execution"}.intersection(
         PYROMIND_PROFILE.tool_allowlist
     )
@@ -85,11 +103,18 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
         "experiment-graph-development",
         "avi-baseline-evaluation",
     }
-    assert ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist == (
-        ECHOMIND_MANAGER_DEVELOPMENT_TOOLS
-    )
-    assert ECHOMIND_PRODUCT_PROFILE.development_skill_allowlist == (
-        ECHOMIND_MANAGER_DEVELOPMENT_SKILLS
+    assert set(ECHOMIND_PRODUCT_PROFILE.development_skill_allowlist or ()) == {
+        *ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
+        "model-evaluation-preparation",
+    }
+    assert ECHOMIND_PRODUCT_PROFILE.preparation_policy is not None
+    assert ECHOMIND_PRODUCT_PROFILE.command_allowlist == (
+        "user_message",
+        "input_response",
+        "cancel",
+        "create_project",
+        "control_experiment_task",
+        "resolve_experiment_submission",
     )
 
 

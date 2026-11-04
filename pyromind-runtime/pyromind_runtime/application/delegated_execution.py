@@ -82,6 +82,17 @@ class DelegatedExecution:
                 }
             )
         display = {"task": task_name, "phase": "report" if report else "execute"}
+        if (
+            specification
+            and specification.get("stage_id") is not None
+            and specification.get("plan_sequence") is not None
+        ):
+            scope["execution"] = {
+                "project_id": row["project_id"],
+                "task_run_id": run_id,
+                "stage_id": specification["stage_id"],
+                "plan_sequence": specification["plan_sequence"],
+            }
         await self.control(owner, role, {"action": "authorize", "scope": scope})
         checkpoint = item["checkpoint"]
         if checkpoint.get("launch_pending"):

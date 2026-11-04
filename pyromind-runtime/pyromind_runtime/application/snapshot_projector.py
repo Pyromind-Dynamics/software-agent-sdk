@@ -9,9 +9,11 @@ from pydantic import JsonValue, TypeAdapter, ValidationError
 from pyromind_runtime.domain.base import as_utc
 from pyromind_runtime.domain.content import ContentBlock, JsonObject, TextContent
 from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.experiment_execution import ExecutionBinding
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
     ExternalTaskState,
+    OperationActivity,
     PendingPermission,
     PlanState,
     TimelineCompaction,
@@ -212,12 +214,20 @@ class SnapshotProjector:
         if category not in {"tool", "subagent", "observation"}:
             category = "tool"
         operation = TimelineOperation(
+            activity=OperationActivity.model_validate(event.payload["activity"])
+            if event.payload.get("activity") is not None
+            else None,
             item_id=operation_id,
             started_seq=event.seq,
             name=self._string(event.payload, "name", default="operation"),
             category=cast(_OperationCategory, category),
             thought=self._content(event.payload, key="thought"),
             arguments=event.payload.get("arguments", {}),
+            execution=ExecutionBinding.model_validate(
+                event.payload["execution"]
+            ).model_dump(mode="json")
+            if event.payload.get("execution") is not None
+            else None,
             run_id=event.run_id,
         )
         return self._append(snapshot, operation)
@@ -262,8 +272,16 @@ class SnapshotProjector:
                 event.payload,
                 key="output" if "output" in event.payload else "content",
             )
+        if "activity" in event.payload:
+            update["activity"] = OperationActivity.model_validate(
+                event.payload["activity"]
+            )
         if "details" in event.payload:
             update["details"] = event.payload["details"]
+        if "execution" in event.payload:
+            update["execution"] = ExecutionBinding.model_validate(
+                event.payload["execution"]
+            ).model_dump(mode="json")
         if item.name == "ask_user" and isinstance(item.details, dict):
             user_input = item.details.get("user_input")
             if isinstance(user_input, dict) and user_input.get("status") in {
@@ -595,7 +613,9 @@ class SnapshotProjector:
                     and incoming_status != existing.status
                 ):
                     return snapshot
-                tasks[index] = existing.model_copy(update=dict(event.payload))
+                tasks[index] = ExternalTaskState.model_validate(
+                    {**existing.model_dump(mode="json"), **event.payload}
+                )
                 return snapshot.model_copy(update={"external_tasks": tuple(tasks)})
         return snapshot
 

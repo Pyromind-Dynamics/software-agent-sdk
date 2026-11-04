@@ -76,6 +76,14 @@ test("real plugin bridges tools and model, resumes persisted history, and owns b
   const terminalCheck: any = await execute({agent:"general_purpose",task:"CHECK_FAILED_TERMINAL",async:false});
   assert.ok(!terminalCheck.isError, JSON.stringify(terminalCheck));
   assert.ok(events.some(event=>event.kind==="subagent.workflow_modified"));
+  await eventually(async () => {
+    await subagents.refresh();
+    const windows = events.flatMap(event => (event.payload?.activity as any)?.items ?? []);
+    assert.ok(windows.some((item: any) => item.kind === "message" && item.role === "assistant" && JSON.stringify(item.content).includes("CHILD_EVIDENCE_937")));
+    assert.ok(windows.some((item: any) => item.kind === "operation" && item.name === "read" && item.status === "completed"));
+    assert.ok(windows.some((item: any) => item.kind === "operation" && item.name === "terminal" && item.status === "failed"));
+    assert.equal(windows.some((item: any) => item.role === "system"), false);
+  });
   assert.equal(session.messages.some((m: any)=>m.role==="toolResult"&&m.toolName==="read"),false);
   await subagents.stopAll(); await session.abort(); await session.waitForIdle();
   await session.extensionRunner.emit({type:"session_shutdown",reason:"quit"}); session.dispose(); await subagents.close();

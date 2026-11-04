@@ -34,12 +34,30 @@ class ExperimentExecutions:
         owner: PlanOwner,
         request: RequestExperimentTask,
         allowed_roles: tuple[str, ...],
+        require_stage: bool = False,
     ) -> dict:
         if request.role_id not in allowed_roles:
             raise PermissionError("execution role is not enabled")
         if request.task is not None:
-            context = self.plans.context(owner, create=True)
-            assert context.project_id is not None
+            context = self.plans.context(owner, create=not require_stage)
+            if context.project_id is None:
+                raise PermissionError("Project creation is required")
+            frozen = request.model_dump(mode="json")
+            if require_stage:
+                stage = next(
+                    (
+                        stage
+                        for stage in context.context.stages
+                        if stage.id == request.stage_id
+                    ),
+                    None,
+                )
+                if stage is None or not stage.enabled or stage.placeholder:
+                    raise ValueError("task requires an enabled stage in this Project")
+                frozen.update(
+                    plan_sequence=context.sequence,
+                    stage_snapshot=stage.model_dump(mode="json"),
+                )
             return self.store.request(
                 owner,
                 context.project_id,
@@ -47,7 +65,7 @@ class ExperimentExecutions:
                 request.request_id,
                 request.role_id,
                 request.request_id,
-                task_spec=request.model_dump(mode="json"),
+                task_spec=frozen,
             )
         view = self.plans.view(owner)
         if not view.current or view.current_revision != request.expected_revision:
@@ -100,6 +118,8 @@ class ExperimentExecutions:
                     project_id=row["project_id"],
                     task_id=row["task_id"],
                     stage_id=spec.get("stage_id"),
+                    plan_sequence=spec.get("plan_sequence"),
+                    stage_snapshot=spec.get("stage_snapshot"),
                     task_name=spec["task"]["name"],
                     role_id=row["role_id"],
                     state=row["state"],
@@ -235,6 +255,7 @@ class ExperimentExecutions:
                     "output_dir",
                     "status",
                     "execution_revision",
+                    "correlation",
                 )
                 if details.get(key) is not None
             }

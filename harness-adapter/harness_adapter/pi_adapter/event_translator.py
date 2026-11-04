@@ -8,6 +8,8 @@ from datetime import datetime
 from typing import Any, cast
 
 from pyromind_runtime.domain.events import HarnessEvent, HarnessEventType
+from pyromind_runtime.domain.experiment_execution import ExecutionBinding
+from pyromind_runtime.domain.snapshot import OperationActivity
 
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,17 @@ def translate_runner_event(frame: dict[str, Any]) -> tuple[HarnessEvent, ...]:
             "category": "subagent",
             **({"details": payload["details"]} if "details" in payload else {}),
         }
+        if payload.get("activity") is not None:
+            operation["activity"] = OperationActivity.model_validate(
+                payload["activity"]
+            ).model_dump(mode="json")
+        details = payload.get("details")
+        child = details.get("subagent") if isinstance(details, dict) else None
+        binding = child.get("execution") if isinstance(child, dict) else None
+        if binding is not None:
+            operation["execution"] = ExecutionBinding.model_validate(
+                binding
+            ).model_dump(mode="json")
         if kind == "subagent.started":
             return (
                 HarnessEvent(**common, type="operation.started", payload=operation),

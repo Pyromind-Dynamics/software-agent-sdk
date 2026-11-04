@@ -284,6 +284,7 @@ class RunDatasetCleaningExecutor(
                 workflow=workflow,
                 name=str(workflow["name"]),
                 conversation_id=str(conversation.id),
+                task_kind="data_cleaning",
                 submission_handler=self.submission_handler,
             )
             task_id = response.task_id

@@ -1,5 +1,6 @@
 """Tests for the workflow_debug tool wrapper."""
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -136,7 +137,13 @@ def test_workflow_debug_submits_with_test_mode(
     mock_client.studio.create.assert_called_once()
     request = mock_client.studio.create.call_args.args[0]
     assert request.workflow["execution_argos"] == [{"execution_mode": "test"}]
-    assert request.out_id == f"agent1#debug#{_CONVERSATION_ID}"
+    assert json.loads(request.out_id) == {
+        "version": 1,
+        "source": "agent",
+        "conversation_id": _CONVERSATION_ID.hex,
+        "type": "main",
+        "task_kind": "workflow_debug",
+    }
 
 
 def test_workflow_debug_forces_keep_ui_lock_on_success(

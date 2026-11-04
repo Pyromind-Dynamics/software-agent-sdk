@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from pydantic import Field
 
@@ -11,8 +11,10 @@ from pyromind_runtime.domain.commands import ProductCommand
 from pyromind_runtime.domain.content import ContentBlock, JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
+from pyromind_runtime.domain.preparation import PreparationPolicy
 from pyromind_runtime.domain.session_policy import SessionPolicy
-from pyromind_runtime.domain.snapshot import WorkflowState
+from pyromind_runtime.domain.snapshot import OperationActivity, WorkflowState
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
 
 class DelegatedRole(ContractModel):
@@ -44,6 +46,7 @@ class SessionSpec(ContractModel):
     command_allowlist: tuple[str, ...] | None = None
     delegated_roles: tuple[DelegatedRole, ...] | None = None
     managed_delegation: bool = False
+    preparation_policy: PreparationPolicy | None = None
 
 
 class SessionHandle(ContractModel):
@@ -97,6 +100,7 @@ class RestoreWorkflowResult(ContractModel):
 
 
 class ExternalTaskNotification(ContractModel):
+    correlation: TaskCorrelation | None = None
     task_id: str = Field(min_length=1)
     kind: str = Field(min_length=1)
     run_id: str | None = None
@@ -216,3 +220,15 @@ class DelegationAdapter(Protocol):
     async def control_delegation(
         self, handle: SessionHandle, request: JsonObject, context: RequestContext
     ) -> JsonObject: ...
+
+
+@runtime_checkable
+class OperationActivityReader(Protocol):
+    async def read_operation_activities(
+        self,
+        handle: SessionHandle,
+        operation_ids: tuple[str, ...],
+        context: RequestContext,
+    ) -> dict[str, OperationActivity]:
+        """Read retained activity without creating resources or a model turn."""
+        ...

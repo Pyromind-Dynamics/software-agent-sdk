@@ -110,7 +110,7 @@ async def test_uncertain_submission_never_auto_retries(version_runtime, monkeypa
     runtime, _, context = version_runtime
     calls = []
 
-    async def timeout(*args):
+    async def timeout(*args, **kwargs):
         calls.append(args)
         raise TimeoutError("platform may have accepted it")
 

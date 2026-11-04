@@ -38,6 +38,9 @@ type HarnessEventType = Literal[
 ]
 
 type ProductEventType = Literal[
+    "preparation.changed",
+    "project.changed",
+    "external_task.observed",
     "experiment_context.changed",
     "experiment_plan.changed",
     "experiment_execution.changed",

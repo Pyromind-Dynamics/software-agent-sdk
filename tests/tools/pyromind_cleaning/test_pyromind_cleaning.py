@@ -179,7 +179,13 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
     )
 
     request = mock_client.studio.create.call_args.args[0]
-    assert request.out_id == f"agent1#{_CONVERSATION_ID}"
+    assert json.loads(request.out_id) == {
+        "version": 1,
+        "source": "agent",
+        "conversation_id": _CONVERSATION_ID.hex,
+        "type": "main",
+        "task_kind": "data_cleaning",
+    }
     workflow = request.workflow
     assert workflow["id"] == observation.run_id
     assert workflow["edges"] == []
@@ -266,7 +272,13 @@ def test_run_dataset_cleaning_resume_uses_frozen_script(monkeypatch, tmp_path):
     assert observation.run_id == str(run_id)
     assert observation.resumed is True
     request = mock_client.studio.create.call_args.args[0]
-    assert request.out_id == f"agent1#{_CONVERSATION_ID}"
+    assert json.loads(request.out_id) == {
+        "version": 1,
+        "source": "agent",
+        "conversation_id": _CONVERSATION_ID.hex,
+        "type": "main",
+        "task_kind": "data_cleaning",
+    }
     command = request.workflow["nodes"][0]["data"]["config"]["command"]
     frozen_script = (
         f"/target-workspace/agentTest/data_cleaning/{run_id}/clean_script.py"

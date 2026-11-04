@@ -1,6 +1,7 @@
 import ast
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock
 
 import httpx
@@ -419,3 +420,109 @@ def test_generated_business_scoring_only_executes_in_cpu_worker():
         "scoring_script_path",
         "manifest_path",
     } <= DfSubmitEvaluationAction.model_fields.keys()
+
+
+def test_return_addresses_stay_in_the_product_contract_and_out_of_model_arguments():
+    from pyromind_runtime.domain.task_correlation import TaskCorrelation
+    from pyromind_runtime.ports.harness import ExternalTaskNotification
+
+    from openhands.tools.workflow import RunWorkflowAction
+    from openhands.tools.workflow_debug.definition import WorkflowDebugAction
+
+    assert "correlation" in ExternalTaskNotification.model_fields
+    assert set(TaskCorrelation.model_fields) == {
+        "version",
+        "source",
+        "conversation_id",
+        "type",
+        "subagent_id",
+        "task_kind",
+    }
+    for action in (RunWorkflowAction, WorkflowDebugAction, DfSubmitPipelineAction):
+        assert not {"correlation", "origin", "subagent_id"}.intersection(
+            action.model_fields
+        )
+
+
+def test_preparation_policy_is_trusted_profile_configuration():
+    from pydantic import ValidationError
+    from pyromind_agent_server.api.schemas import CreateConversationRequest
+    from pyromind_agent_server.profiles import (
+        DEFAULT_PRODUCT_PROFILE,
+        ECHOMIND_PRODUCT_PROFILE,
+    )
+
+    assert DEFAULT_PRODUCT_PROFILE.preparation_policy is None
+    policy = ECHOMIND_PRODUCT_PROFILE.preparation_policy
+    assert policy is not None
+    roles = ECHOMIND_PRODUCT_PROFILE.delegated_roles
+    assert roles is not None and set(policy.allowed_roles) <= {
+        role.name for role in roles
+    }
+    tools = set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ())
+    assert {"read", "write", "edit", "terminal", "grep", "find", "ls"} <= tools
+    assert not {
+        "subagent",
+        "sandbox_create",
+        "df_submit_evaluation",
+        "request_experiment_task",
+    }.intersection(tools)
+    with pytest.raises(ValidationError):
+        CreateConversationRequest.model_validate(
+            {
+                "llm": {"model": "test"},
+                "preparation_policy": policy.model_dump(mode="json"),
+            }
+        )
+
+
+@pytest.mark.parametrize("layout", ["source", "bundle", "configured"])
+def test_preparation_checklist_resolves_from_source_bundle_or_configured_root(
+    tmp_path, monkeypatch, layout
+):
+    from pyromind_agent_server import profiles
+
+    package = tmp_path / "bundle" / "pyromind_agent_server" / "profiles.py"
+    if layout == "source":
+        package = (
+            tmp_path
+            / "source"
+            / "pyromind-agent-server"
+            / "pyromind_agent_server"
+            / "profiles.py"
+        )
+        root = package.parents[2] / ".agents/skills"
+    elif layout == "configured":
+        root = tmp_path / "configured-skills"
+    else:
+        root = package.parents[1] / ".agents/skills"
+    monkeypatch.setattr(profiles, "__file__", str(package))
+    monkeypatch.delenv("PYROMIND_SKILLS_PATH", raising=False)
+    if layout == "configured":
+        monkeypatch.setenv("PYROMIND_SKILLS_PATH", str(root))
+    policy = profiles.ECHOMIND_PRODUCT_PROFILE.preparation_policy
+    assert policy is not None
+    target = root / "model-evaluation-preparation/checklist.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(policy.model_dump_json())
+    assert profiles._load_preparation_policy() == policy
+
+
+def test_frozen_bundle_includes_preparation_and_role_skill_assets():
+    spec = ROOT / "openhands-agent-server/openhands/agent_server/agent-server.spec"
+    function = next(
+        node
+        for node in ast.parse(spec.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "get_pi_skill_datas"
+    )
+    namespace: dict[str, Any] = {"project_root": ROOT}
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), str(spec), "exec"),
+        namespace,
+    )
+    targets = {
+        (Path(target) / Path(source).name).as_posix()
+        for source, target in namespace["get_pi_skill_datas"]()
+    }
+    assert ".agents/skills/model-evaluation-preparation/checklist.json" in targets
+    assert ".agents/skills/avi-baseline-evaluation/SKILL.md" in targets

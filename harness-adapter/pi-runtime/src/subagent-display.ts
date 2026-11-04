@@ -40,7 +40,8 @@ export class SubagentDisplay {
   private queried = new Map<string, number>();
   private closed = false;
   constructor(private rpc: (method: string, params: Record<string, unknown>) => Promise<unknown>,
-    private progress: (id: string) => void, private path?: string) {
+    private progress: (id: string) => void, private path?: string,
+    private activity?: (id: string) => JsonObject | undefined) {
     if (path && existsSync(path)) {
       const saved = JSON.parse(readFileSync(path, "utf8"));
       if (isRecord(saved)) for (const [id, values] of Object.entries(saved)) {
@@ -60,10 +61,19 @@ export class SubagentDisplay {
   }
 
   private presentation(values: Record<string, unknown>): JsonObject {
-    return Object.fromEntries(PRESENTATION_KEYS.filter(key => typeof values[key] === "string")
-      .map(key => [key, (values[key] as string).slice(0, 256)]));
+    const execution = values.execution;
+    const binding: JsonObject = {};
+    if (isRecord(execution) && typeof execution.project_id === "string" && typeof execution.task_run_id === "string" && typeof execution.stage_id === "string" && typeof execution.plan_sequence === "number") {
+      binding.execution = { project_id: execution.project_id, task_run_id: execution.task_run_id, stage_id: execution.stage_id, plan_sequence: execution.plan_sequence };
+    }
+    return { ...Object.fromEntries(PRESENTATION_KEYS.filter(key => typeof values[key] === "string")
+      .map(key => [key, (values[key] as string).slice(0, 256)])), ...binding };
   }
 
+  captureActivity(id: string) {
+    const activity = this.activity?.(id);
+    return activity ? this.update(id, { activity }) : false;
+  }
   settled(id: string) { return this.settling.get(id); }
   value(id: string, key: string) { return this.records.get(id)?.[key]; }
   details(id: string): JsonObject { return { subagent: this.records.get(id) ?? { version: 1, run_id: id } }; }
@@ -86,7 +96,8 @@ export class SubagentDisplay {
       if (outputOnly) return; // Native completed foreground status contains output, not activity.
       const previous = this.records.get(id)?.trace;
       const comparable = isRecord(previous) ? { ...previous, updated_at: undefined, line_limit: undefined, byte_limit: undefined } : undefined;
-      if (JSON.stringify(comparable) === JSON.stringify(window)) return;
+      const activityChanged = this.captureActivity(id);
+      if (JSON.stringify(comparable) === JSON.stringify(window) && !activityChanged) return;
       this.update(id, { trace: { ...window, updated_at: new Date().toISOString(), line_limit: 200, byte_limit: MAX_BYTES } });
       this.progress(id);
     } catch { /* Keep the last good window; polling failure is not execution failure. */ }

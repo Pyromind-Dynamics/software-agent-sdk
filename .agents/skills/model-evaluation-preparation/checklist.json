@@ -1,0 +1,146 @@
+{
+  "checklist_id": "model-evaluation",
+  "version": 2,
+  "allowed_roles": [
+    "eval"
+  ],
+  "fields": [
+    {
+      "key": "goal",
+      "label": "评测目标",
+      "description": "任务、期望输出与关注的问题",
+      "value_type": "string"
+    },
+    {
+      "key": "model",
+      "label": "被评模型",
+      "description": "来源、模型引用和已知版本；来源可为 storage、clone、download",
+      "value_type": "object",
+      "required_keys": [
+        "source",
+        "reference"
+      ]
+    },
+    {
+      "key": "dataset",
+      "label": "评测数据",
+      "description": "Storage JSONL 位置与格式；无法读取时向用户确认",
+      "value_type": "object",
+      "required_keys": [
+        "path",
+        "format"
+      ]
+    },
+    {
+      "key": "io_contract",
+      "label": "输入输出约定",
+      "description": "输入字段、提示词、媒体角色与输出含义",
+      "value_type": "object",
+      "required_keys": [
+        "input",
+        "output"
+      ],
+      "depends_on": [
+        "dataset"
+      ]
+    },
+    {
+      "key": "scoring",
+      "label": "评分依据",
+      "description": "GT、参考答案或确定性评分规则；不要求上线阈值",
+      "value_type": "object",
+      "required_keys": [
+        "basis"
+      ],
+      "depends_on": [
+        "dataset",
+        "io_contract"
+      ]
+    },
+    {
+      "key": "scope",
+      "label": "执行范围",
+      "description": "小样或全量、样本限制及用户明确的资源约束",
+      "value_type": "object",
+      "required_keys": [
+        "mode"
+      ]
+    }
+  ],
+  "workflow_nodes": [
+    {
+      "id": "init",
+      "name": "Init",
+      "description": "基模评测与基线解读，同一 Stage 内完成推理、评分、报告及分析；由 Eval 角色执行。",
+      "roles": [
+        "eval"
+      ],
+      "max_instances": 1,
+      "tasks": [
+        {
+          "id": "bench",
+          "description": "使用基模或已有预测生成 baseline 指标、逐样本结果与报告。"
+        },
+        {
+          "id": "analysis",
+          "description": "基于已有评测或导入结果进行统计、badcase 分析与报告。"
+        }
+      ]
+    },
+    {
+      "id": "dataset",
+      "name": "Dataset",
+      "description": "数据清洗、预标注与划分；当前为未实现占位。",
+      "tasks": [
+        {
+          "id": "clean_label",
+          "description": "生成可核验的数据版本与统计。"
+        }
+      ]
+    },
+    {
+      "id": "train",
+      "name": "Train",
+      "description": "模型训练；当前为未实现占位。",
+      "tasks": [
+        {
+          "id": "train_run",
+          "description": "训练并登记模型与 checkpoint 产物。"
+        }
+      ]
+    },
+    {
+      "id": "eval",
+      "name": "Eval",
+      "description": "训练后候选模型评测与对应结果分析。",
+      "roles": [
+        "eval"
+      ],
+      "tasks": [
+        {
+          "id": "checkpoint_eval",
+          "description": "评测冻结的候选 checkpoint 或预测。"
+        },
+        {
+          "id": "analysis",
+          "description": "基于已有评测或导入结果进行统计、badcase 分析与报告。"
+        }
+      ]
+    },
+    {
+      "id": "inference",
+      "name": "Inference",
+      "description": "常驻推理服务；当前为未实现占位。"
+    },
+    {
+      "id": "tracer",
+      "name": "Tracer",
+      "description": "线上采集；当前为未实现占位。"
+    },
+    {
+      "id": "rawdata",
+      "name": "RawData",
+      "description": "原始数据来源，无执行角色；当前不启用单独节点。"
+    }
+  ]
+}

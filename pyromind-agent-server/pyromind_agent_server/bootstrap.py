@@ -18,11 +18,13 @@ from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.capabilities import ResourceLimits
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.versions import VersionToolRequest
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.infrastructure.sql_experiment_execution import (
     SQLExperimentExecutionStore,
 )
+from pyromind_runtime.infrastructure.sql_preparation import SQLPreparationStore
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import HarnessAdapter
 from pyromind_runtime.ports.workflows import WorkflowEventSink
@@ -41,6 +43,7 @@ from pyromind_agent_server.experiment_plan_projects import (
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.plan_database import build_experiment_plan_store
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
+from pyromind_agent_server.resource_inspector import StorageResourceInspector
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 
 
@@ -132,6 +135,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         code: str | None,
         context: RequestContext,
         graph_run_id: str | None,
+        correlation: TaskCorrelation | None = None,
     ):
         assert isinstance(runtime, ConversationRuntime)
         return await runtime.submit_versioned_workflow(
@@ -141,6 +145,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             code,
             context,
             graph_run_id=graph_run_id,
+            correlation=correlation,
         )
 
     openhands_adapter.set_version_handler(version_call, execution_call)
@@ -240,6 +245,10 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         experiment_execution_store=execution_store,
         experiment_plan_project_binder=project_binder,
         project_graph_store=project_graph_store,
+        preparation_store=SQLPreparationStore(plan_store.engine)
+        if plan_store
+        else None,
+        resource_inspector=StorageResourceInspector(),
         execution_roles=tuple(
             role.name for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()
         ),

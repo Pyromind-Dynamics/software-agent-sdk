@@ -494,3 +494,55 @@ def test_reconcile_targets_uncertain_operation_and_preserves_previous_task(
     assert entries["inference"]["task_id"] == "gpu-original"
     assert "resolution" not in entries["inference"]["evidence"]
     assert entries["report"]["evidence"]["resolution"]["action"] == action
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [{"conversation_id": "another-conversation"}, {"subagent_id": "another-instance"}],
+)
+def test_early_observations_validate_the_registered_return_address(experiment, forged):
+    from pyromind_runtime.domain.task_correlation import TaskCorrelation
+
+    service, owner, _ = experiment
+    run = service.request(owner, request(), ("eval",))
+    scope = claim(service, owner, run)
+    service.store.managed_submission(
+        owner, run["id"], scope, {"operation": "inference"}
+    )
+    correlation = TaskCorrelation(
+        conversation_id=owner.conversation_id,
+        task_kind="data_preparation",
+        type="subagent",
+        subagent_id="worker",
+    )
+    incoming = {**correlation.model_dump(mode="json", exclude_none=True), **forged}
+    service.store.ingest(
+        "early-forged",
+        "task",
+        "kafka",
+        {"status": "succeeded", "correlation": incoming},
+    )
+    assert service.store.apply_observations() == 0
+    service.store.managed_receipt(
+        owner,
+        run["id"],
+        scope,
+        "inference",
+        {
+            "task_id": "task",
+            "output_dir": "/output",
+            "correlation": correlation.model_dump(mode="json", exclude_none=True),
+        },
+    )
+    assert service.store.apply_observations() == 0
+    assert service.list(owner)[0].state == "waiting_platform"
+    service.store.ingest(
+        "valid",
+        "task",
+        "kafka",
+        {
+            "status": "succeeded",
+            "correlation": correlation.model_dump(mode="json", exclude_none=True),
+        },
+    )
+    assert service.store.apply_observations() == 1
