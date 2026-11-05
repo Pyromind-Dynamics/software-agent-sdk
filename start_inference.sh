@@ -99,14 +99,12 @@ fi
 # LLM Configuration
 # ----------------------------------------------------------
 # LiteLLM requires a provider prefix (e.g. openai/) for custom OpenAI-compatible endpoints.
-export LLM_MODEL="${LLM_MODEL:-deepseek-v4.1-flash-1017}"
-export LLM_BASE_URL="${LLM_BASE_URL:-https://token-plan-cn-east-1.pyromind-asia.cn/v1}"
-# export LLM_MODEL="deepseek/deepseek-v4.1-flash-1017"
-# export LLM_BASE_URL="https://openrouter.ai/api/v1"
+# export LLM_MODEL="${LLM_MODEL:-deepseek-v4.1-flash-1017}"
+# export LLM_BASE_URL="${LLM_BASE_URL:-https://token-plan-cn-east-1.pyromind-asia.cn/v1}"
+export LLM_MODEL="deepseek/deepseek-v4.1-flash-1017"
+export LLM_BASE_URL="https://openrouter.ai/api/v1"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
-# For OpenRouter, set LLM_MODEL=deepseek/deepseek-v4.1-flash and
-# LLM_BASE_URL=https://openrouter.ai/api/v1 before launching.
 
 export LABEL_STUDIO_BASE_URL=https://pre-label-studio.pyromind.ai
 export LABEL_STUDIO_PORTAL_BASE_URL=https://pre-label-studio.pyromind.ai
@@ -117,8 +115,6 @@ if [[ -z "${OPENAI_API_KEY:-}" ]]; then
   echo "ERROR: OPENAI_API_KEY is required. Export it before running start_inference.sh." >&2
   exit 1
 fi
-export LLM_MODEL="${LLM_MODEL:-openai/deepseek-v4-flash-0731}"
-export OPENAI_API_KEY
 
 
 export DF_API_BASE_URL="https://openrouter.ai/api/v1"
@@ -129,7 +125,6 @@ if [[ -z "${DF_API_KEY:-}" ]]; then
   echo "ERROR: DF_API_KEY is required. Set DF_API_KEY or OPENROUTER_API_KEY." >&2
   exit 1
 fi
-#export DF_API_KEY
 
 
 # ----------------------------------------------------------

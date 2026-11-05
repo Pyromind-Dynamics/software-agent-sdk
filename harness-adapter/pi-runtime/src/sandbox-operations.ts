@@ -7,6 +7,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import type { SandboxReadMirror } from "./sandbox-paths.js";
+import { bounded } from "./terminal-channel.js";
 
 /** Endpoint bundle handed to the runner by the control plane on demand. */
 export interface SandboxEndpoint {
@@ -64,7 +65,8 @@ export class SandboxEndpointSession {
     return this.cached;
   }
 
-  invalidate(): void {
+  invalidate(expected?: Promise<SandboxEndpoint>): void {
+    if (expected && this.cached && this.cached !== expected) return;
     this.cached = undefined;
     this.stale = true;
   }
@@ -113,16 +115,16 @@ export class SandboxFileClient {
     private readonly options: SandboxFileClientOptions = {},
   ) {}
 
-  async read(path: string, limit = SANDBOX_FILE_MAX_BYTES): Promise<Buffer> {
+  async read(path: string, limit = SANDBOX_FILE_MAX_BYTES, signal?: AbortSignal): Promise<Buffer> {
     return this.withEndpoint(async (endpoint) => {
       const url = this.url(endpoint, `/sandboxes/${endpoint.sandboxId}/files/read`);
       url.searchParams.set("path", path);
-      return this.bytes("GET", url, await this.fetch(endpoint, url), limit);
-    });
+      return this.bytes("GET", url, await this.fetch(endpoint, url, { signal }), limit);
+    }, signal);
   }
 
-  async access(path: string): Promise<void> {
-    await this.read(path);
+  async access(path: string, signal?: AbortSignal): Promise<void> {
+    await this.read(path, undefined, signal);
   }
 
   async write(path: string, content: string | Buffer, signal?: AbortSignal): Promise<void> {
@@ -190,7 +192,9 @@ export class SandboxFileClient {
     operation: (endpoint: SandboxEndpoint) => Promise<T>,
     signal?: AbortSignal,
   ): Promise<T> {
-    const endpoint = await this.endpoints.resolve();
+    signal?.throwIfAborted();
+    const request = this.endpoints.resolve();
+    const endpoint = await bounded(request, Infinity, signal);
     try {
       return await operation(endpoint);
     } catch (error) {
@@ -201,9 +205,9 @@ export class SandboxFileClient {
     } catch (error) {
       if (signal?.aborted || !isTransportFailure(error)) throw error;
     }
-    this.endpoints.invalidate();
+    this.endpoints.invalidate(request);
     try {
-      return await operation(await this.endpoints.resolve());
+      return await operation(await bounded(this.endpoints.resolve(), Infinity, signal));
     } catch (error) {
       throw new SandboxFileError(
         `${describeError(error)} (retried with a refreshed sandbox endpoint)`,
@@ -322,24 +326,28 @@ export class FallbackSandboxFileClient implements SandboxFileClientLike {
     this.retryFileApiMs = options.retryFileApiMs ?? FILE_API_RETRY_MS;
   }
 
-  async read(path: string, limit?: number): Promise<Buffer> {
-    if (this.terminalOnly) return this.terminal.read(path, limit);
+  async read(path: string, limit?: number, signal?: AbortSignal): Promise<Buffer> {
+    signal?.throwIfAborted();
+    if (this.terminalOnly) return this.terminal.read(path, limit, signal);
     try {
-      const content = await this.fileApi.read(path, limit);
+      const content = await this.fileApi.read(path, limit, signal);
       this.recovered();
       return content;
     } catch (error) {
-      return this.fallback(error, () => this.terminal.read(path, limit));
+      signal?.throwIfAborted();
+      return this.fallback(error, () => this.terminal.read(path, limit, signal));
     }
   }
 
-  async access(path: string): Promise<void> {
-    if (this.terminalOnly) return this.terminal.access(path);
+  async access(path: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    if (this.terminalOnly) return this.terminal.access(path, signal);
     try {
-      await this.fileApi.access(path);
+      await this.fileApi.access(path, signal);
       this.recovered();
     } catch (error) {
-      return this.fallback(error, () => this.terminal.access(path));
+      signal?.throwIfAborted();
+      return this.fallback(error, () => this.terminal.access(path, signal));
     }
   }
 
@@ -453,8 +461,8 @@ export interface SandboxFileOperations {
  * only need these three calls.
  */
 export interface SandboxFileClientLike {
-  read(path: string, limit?: number): Promise<Buffer>;
-  access(path: string): Promise<void>;
+  read(path: string, limit?: number, signal?: AbortSignal): Promise<Buffer>;
+  access(path: string, signal?: AbortSignal): Promise<void>;
   write(path: string, content: string | Buffer, signal?: AbortSignal): Promise<void>;
 }
 
@@ -468,6 +476,7 @@ export interface SandboxFileClientLike {
 export function createSandboxFileOperations(
   client: SandboxFileClientLike,
   mirror?: SandboxReadMirror,
+  signal?: AbortSignal,
 ): SandboxFileOperations {
   let cached: { path: string; buffer: Buffer } | undefined;
   const readBytes = async (path: string): Promise<Buffer> => {
@@ -483,7 +492,7 @@ export function createSandboxFileOperations(
       // only ask the sandbox to read a path that exists on neither side.
       throw missingResource(mirror?.resolveHostAlias(host) ?? host);
     }
-    return client.read(path);
+    return client.read(path, undefined, signal);
   };
   const read = async (path: string): Promise<Buffer> => {
     if (cached?.path === path) {
@@ -510,14 +519,14 @@ export function createSandboxFileOperations(
       },
     },
     write: {
-      writeFile: (path, content) => client.write(path, content),
+      writeFile: (path, content) => client.write(path, content, signal),
       // Both transports create parent directories for a write, so the explicit
       // mkdir the write tool issues before writing is already covered.
       mkdir: async () => undefined,
     },
     edit: {
       readFile: read,
-      writeFile: (path, content) => client.write(path, content),
+      writeFile: (path, content) => client.write(path, content, signal),
       access: primeRead,
     },
   };

@@ -400,7 +400,12 @@ class ConversationRuntime:
         ):
             raise PermissionError("delegated work owner mismatch")
         if tool == "submit_workflow":
-            identity = "execution-workflow:" + str(scope["run_id"])
+            identity = (
+                "execution-workflow:"
+                + str(scope["run_id"])
+                + ":"
+                + str(scope["work_id"])
+            )
             assert self._delegated_store is not None
             return await self.prepare_workflow_execution(
                 owner.conversation_id,
@@ -5388,8 +5393,8 @@ def _build_external_task_notification(
         if status == "failed":
             instruction = (
                 f"Production workflow task {task.task_id} failed. Call "
-                "analyze_task_failure with this task_id, report the node logs and "
-                "diagnosis, then stop. Do not edit or rerun the workflow."
+                "analyze_task_failure with this task_id and use the diagnosis "
+                "to continue the user's task."
             )
         elif status == "succeeded":
             if has_training_node:

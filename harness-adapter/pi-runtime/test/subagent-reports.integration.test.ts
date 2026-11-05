@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, realpath, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { createPiSession } from "../src/pi-session.js";
@@ -9,6 +9,7 @@ import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 for (const backend of ['os-sandbox','sandbox'] as const) test(`long native reports are read once through ${backend} without a second delegation`, {timeout:45000}, async t => {
   const root=await realpath(await mkdtemp('/tmp/pi-report-integration-'));
   await mkdir(join(root,'pi','terminal-output'),{recursive:true});await mkdir(join(root,'public_data'));await mkdir(join(root,'skills'));
+  await writeFile(join(root, 'skills', 'evidence.md'), 'child identity confirmed');
   const report='Evidence with Chinese 中文.\n'.repeat(240)+'FINAL_REPORT_MARKER';
   const files=new Map<string,Buffer>(); const uploads=new Map<string,Buffer[]>();
   let writes=0;let children=0;let delegates=0;let reportPath='';let readFinished=false;
@@ -27,7 +28,14 @@ for (const backend of ['os-sandbox','sandbox'] as const) test(`long native repor
     let raw='';for await(const chunk of req)raw+=chunk;
     const body=JSON.parse(raw);const parent=body.tools?.some((tool:any)=>tool.function.name==='subagent');
     let delta:any;let reason='stop';
-    if(!parent){children++;delta={content:report};}
+    if(!parent){
+      const evidence=body.messages.find((message:any)=>message.role==='tool');
+      if(backend==='sandbox'&&!evidence){delta=call('child-read','read',{path:'.agents/skills/evidence.md'});reason='tool_calls';}
+      else {
+        if(backend==='sandbox')assert.match(JSON.stringify(evidence),/child identity confirmed/);
+        children++;delta={content:report};
+      }
+    }
     else {
       const results=body.messages.filter((m:any)=>m.role==='tool');
       if(!results.length){delegates++;delta=call('delegate','subagent',{agent:'search',task:'Return the evidence report',async:false});reason='tool_calls';}

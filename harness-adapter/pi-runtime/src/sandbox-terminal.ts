@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { posix } from "node:path";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, posix } from "node:path";
 import { bounded, TerminalChannel } from "./terminal-channel.js";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import { describeErrorChain } from "./sandbox-operations.js";
@@ -153,6 +154,10 @@ export interface SandboxTerminalTimeouts {
 export interface SandboxTerminalOptions extends SandboxTerminalTimeouts {
   /** Directory holding per-call `out.log` / `pid` / `rc`, inside the workspace. */
   runsRoot?: string;
+  /** Runner-assigned lane name. Also keeps the environment in the PTY shell. */
+  owner?: string;
+  /** Host-side launch evidence, containing only the sandbox and execution IDs. */
+  journalPath?: string;
   heartbeatSeconds?: number;
   maxReconnects?: number;
   /**
@@ -736,9 +741,10 @@ export function buildLaunchBatchLine(
   files: Record<string, string>,
   withEnvironment = false,
   chunkChars = TERMINAL_SCRIPT_CHUNK_CHARS,
+  shellEnvironment = false,
 ): string {
   const environment = withEnvironment
-    ? `PYROMIND_TERMINAL_ENV="$(cat ${shellQuote(`${harnessDir}/${SANDBOX_ENVIRONMENT_FILE}`)})" `
+    ? launchEnvironment(harnessDir, shellEnvironment)
     : "";
   return `${stagePayloadLines(runDir, files, false, chunkChars).join("\n")}\n` +
     `pm_dir=${shellQuote(runDir)}; if ${stagedCondition(files)}; then ` +
@@ -764,16 +770,19 @@ export function buildReadyLine(
   token: string,
   harnessFiles: Record<string, string>,
   environmentSignature?: string,
+  shellEnvironment = false,
 ): string {
   // The directory is named once: the harness and environment checks repeat it,
   // and a long workspace path would otherwise push the line past the PTY cap.
-  const harnessChecks = Object.keys(harnessFiles)
-    .map((name) => `[ -s "$pm_dir/${name}" ]`).join(" && ");
-  const environmentChecks = environmentSignature === undefined ? undefined :
-    `[ -s "$pm_dir/${SANDBOX_ENVIRONMENT_FILE}" ] && ` +
+  const harnessChecks = shellEnvironment
+    ? stagedCondition(harnessFiles)
+    : Object.keys(harnessFiles).map((name) => `[ -s "$pm_dir/${name}" ]`).join(" && ");
+  const environmentChecks = shellEnvironment
+    ? '[ "${pm_env_sig-}" = "' + environmentSignature + '" ]'
+    : `[ -s "$pm_dir/${SANDBOX_ENVIRONMENT_FILE}" ] && ` +
     `[ "$(cat "$pm_dir/${SANDBOX_ENVIRONMENT_SIGNATURE_FILE}" 2>/dev/null)" ` +
     `= "${environmentSignature}" ]`;
-  const ready = environmentChecks === undefined
+  const ready = environmentSignature === undefined
     ? acknowledgement(token, "ready")
     : `if ${environmentChecks}; then ${acknowledgement(token, "ready")}; ` +
       `else ${acknowledgement(token, "ready", "env")}; fi`;
@@ -789,12 +798,27 @@ export function buildStartLine(
   runDir: string,
   token: string,
   withEnvironment = false,
+  shellEnvironment = false,
 ): string {
-  const environment = withEnvironment
-    ? `PYROMIND_TERMINAL_ENV="$(cat ${shellQuote(`${harnessDir}/${SANDBOX_ENVIRONMENT_FILE}`)})" `
-    : "";
+  const environment = withEnvironment ? launchEnvironment(harnessDir, shellEnvironment) : "";
   return `${environment}sh ${shellQuote(`${harnessDir}/launch.sh`)} ${shellQuote(runDir)}; ` +
     `${acknowledgement(token, "launch")}\n`;
+}
+
+function launchEnvironment(harnessDir: string, shellEnvironment: boolean): string {
+  return shellEnvironment
+    ? 'PYROMIND_TERMINAL_ENV="$pm_env" '
+    : `PYROMIND_TERMINAL_ENV="$(cat ${shellQuote(`${harnessDir}/${SANDBOX_ENVIRONMENT_FILE}`)})" `;
+}
+
+function buildCheckStoppedLine(runDir: string, token: string): string {
+  const stopped = acknowledgement(token, "recovery", "yes");
+  const unknown = acknowledgement(token, "recovery", "unknown");
+  // After a runner restart a PID may have been reused. Probe its group without
+  // sending a signal. Reserve the launch guard if the old launch never arrived.
+  return `pm_run=${shellQuote(runDir)}; p=$(cat "$pm_run/launch_pid" 2>/dev/null); ` +
+    `case "$p" in ''|*[!0-9]*) if mkdir -p "$pm_run" && mkdir "$pm_run/launched" 2>/dev/null; then ${stopped}; else ${unknown}; fi ;; ` +
+    `*) if kill -0 "$p" 2>/dev/null || kill -0 -"$p" 2>/dev/null; then ${unknown}; else ${stopped}; fi ;; esac\n`;
 }
 
 /** The base64 environment plus the files and signature the session caches it under. */
@@ -833,9 +857,9 @@ export function buildResumeLine(runDir: string, token: string): string {
 
 export function buildCancelLine(runDir: string, token: string): string {
   return `unset PYROMIND_ENV_BUFFER; ` +
-    `p=$(cat ${shellQuote(`${runDir}/launch_pid`)} 2>/dev/null); ` +
+    `pm_run=${shellQuote(runDir)}; p=$(cat "$pm_run/launch_pid" 2>/dev/null); ` +
     `case "$p" in ''|*[!0-9]*) ` +
-    `if mkdir ${shellQuote(`${runDir}/launched`)} 2>/dev/null; then ${acknowledgement(token, "stop", "yes")}; ` +
+    `if mkdir -p "$pm_run" && mkdir "$pm_run/launched" 2>/dev/null; then ${acknowledgement(token, "stop", "yes")}; ` +
     `else ${acknowledgement(token, "stop", "unknown")}; fi ;; *) ` +
     `kill -TERM -"$p" 2>/dev/null; sleep 1; kill -KILL -"$p" 2>/dev/null; ` +
     `i=0; while kill -0 -"$p" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i + 1)); done; ` +
@@ -869,11 +893,12 @@ export class SandboxTerminalOperations implements BashOperations {
   private tail: Promise<unknown> = Promise.resolve();
 
   constructor(
-    private readonly endpoint: SandboxEndpoint,
+    private endpoint: SandboxEndpoint,
     options: SandboxTerminalOptions = {},
   ) {
     this.settings = options;
-    this.runsRoot = options.runsRoot ?? `${endpoint.workspacePath}/${SANDBOX_RUNS_DIRNAME}`;
+    const root = options.runsRoot ?? `${endpoint.workspacePath}/${SANDBOX_RUNS_DIRNAME}`;
+    this.runsRoot = options.owner ? `${root}/v2/${options.owner}` : root;
     this.heartbeatTicks = options.heartbeatSeconds ?? DEFAULT_HEARTBEAT_SECONDS;
     this.maxReconnects = options.maxReconnects ?? DEFAULT_MAX_RECONNECTS;
     this.fastPath = options.fastPath ?? sandboxTerminalFastPath();
@@ -904,11 +929,70 @@ export class SandboxTerminalOperations implements BashOperations {
   }
 
   private quarantined: { runDir: string; token: string; execution: TerminalExecutionEvidence } | undefined;
+  get terminationUnconfirmed(): boolean { return this.quarantined !== undefined; }
+
+  updateEndpoint(endpoint: SandboxEndpoint): boolean {
+    if (this.endpoint.sandboxId !== endpoint.sandboxId ||
+        this.endpoint.workspacePath !== endpoint.workspacePath) return false;
+    if (this.endpoint.wsBaseUrl !== endpoint.wsBaseUrl ||
+        this.endpoint.apiKey !== endpoint.apiKey || this.endpoint.cluster !== endpoint.cluster) {
+      this.dispose();
+    }
+    this.endpoint = endpoint;
+    return true;
+  }
   private readonly settings: SandboxTerminalOptions;
   /** The socket this session keeps for every command; never one per command. */
   private session: TerminalChannel | undefined;
   /** Successful exchanges on the current socket; zero means it is new. */
   private sessionExchanges = 0;
+
+  private recordLaunch(executionId: string): void {
+    const path = this.settings.journalPath;
+    if (!path) return;
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    const staged = path + ".tmp";
+    writeFileSync(staged, JSON.stringify({ sandboxId: this.endpoint.sandboxId, executionId }), { mode: 0o600 });
+    renameSync(staged, path);
+  }
+
+  private clearLaunch(): void {
+    if (!this.settings.journalPath) return;
+    try { rmSync(this.settings.journalPath, { force: true }); }
+    catch { process.stderr.write("Sandbox terminal launch record could not be cleared\n"); }
+  }
+
+  private async confirmPreviousLaunch(signal?: AbortSignal): Promise<boolean> {
+    const path = this.settings.journalPath;
+    if (!path) return true;
+    let record: { sandboxId: string; executionId: string };
+    try { record = JSON.parse(readFileSync(path, "utf8")); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+      throw error;
+    }
+    if (!record || typeof record.sandboxId !== "string" ||
+        typeof record.executionId !== "string" || !/^[a-f0-9]{32}$/.test(record.executionId)) {
+      throw new Error("invalid sandbox terminal launch record");
+    }
+    if (record.sandboxId !== this.endpoint.sandboxId) {
+      this.clearLaunch();
+      return true;
+    }
+    const token = randomBytes(9).toString("hex");
+    const channel = this.channel();
+    try {
+      const result = await channel.acknowledge(buildCheckStoppedLine(`${this.runsRoot}/${record.executionId}`, token),
+        `${ACK_MARKER}${token}:recovery:`, Date.now() + (this.settings.stopTimeoutMs ?? STOP_TIMEOUT_MS), signal);
+      if (result !== "yes") return false;
+      this.clearLaunch();
+      return true;
+    } catch {
+      this.retire(channel);
+      signal?.throwIfAborted();
+      return false;
+    }
+  }
 
   private channel(): TerminalChannel {
     if (this.session !== undefined && !this.session.dead) return this.session;
@@ -968,7 +1052,10 @@ export class SandboxTerminalOperations implements BashOperations {
           `${ACK_MARKER}${token}:stop:`, deadline) === "yes";
         this.retire(current);
         return stopped;
-      } catch { return false; }
+      } catch {
+        if (current !== undefined) this.retire(current);
+        return false;
+      }
     }
   }
 
@@ -1050,7 +1137,7 @@ export class SandboxTerminalOperations implements BashOperations {
   ): "single" | "file" | "batches" | "lines" {
     if (!this.fastPath) return "lines";
     if (Buffer.byteLength(buildLaunchBatchLine(harnessDir, runDir, token, scripts, withEnvironment,
-      this.scriptChunkChars)) <=
+      this.scriptChunkChars, this.settings.owner !== undefined)) <=
         this.batchBudgetBytes) return "single";
     if (this.settings.writeFile !== undefined &&
         buildStageBatches(runDir, token, scripts, this.batchBudgetBytes, false, this.scriptChunkChars)
@@ -1146,6 +1233,30 @@ export class SandboxTerminalOperations implements BashOperations {
     if (staged !== "ok") throw new Error("sandbox terminal script staging failed");
   }
 
+  private async stageShellEnvironment(
+    channel: TerminalChannel,
+    evidence: TerminalExecutionEvidence,
+    token: string,
+    environment: StagedEnvironment,
+    deadline: number,
+    options: TerminalExecOptions,
+  ): Promise<void> {
+    const exchange = (line: string, stage: string) => this.acknowledge(channel, evidence,
+      `${line}; ${acknowledgement(token, stage)}\n`, `${ACK_MARKER}${token}:${stage}:`, deadline, options.signal);
+    await exchange("unset pm_env_sig; pm_env=''", "env-init");
+    for (let offset = 0; offset < environment.encoded.length; offset += this.scriptChunkChars) {
+      const chunk = environment.encoded.slice(offset, offset + this.scriptChunkChars);
+      await exchange(`pm_env="$pm_env"${shellQuote(chunk)}`, `env-${offset}`);
+    }
+    const marker = `${ACK_MARKER}${token}:env-ready:`;
+    const result = await this.acknowledge(channel, evidence,
+      'if [ "${#pm_env}" = "' + environment.encoded.length + '" ]; then pm_env_sig=' +
+      shellQuote(environment.signature) + '; ' + acknowledgement(token, "env-ready") +
+      '; else ' + acknowledgement(token, "env-ready", "missing") + '; fi\n',
+      marker, deadline, options.signal);
+    if (result !== "ok") throw new Error("sandbox terminal environment staging failed");
+  }
+
   private async execute(
     command: string,
     cwd: string,
@@ -1160,19 +1271,23 @@ export class SandboxTerminalOperations implements BashOperations {
     const runDir = `${this.runsRoot}/${callId}`;
     const timeout = options.timeout && options.timeout > 0
       ? options.timeout : DEFAULT_COMMAND_TIMEOUT_SECONDS;
+    let previousStopped: boolean;
     if (this.quarantined) {
       const previous = this.quarantined;
-      if (!await this.stop(previous.runDir, previous.token)) {
-        // The session cannot confirm that the run it still carries has stopped,
-        // so this command never reaches a shell of its own. Reporting it as a
-        // launch which never happened is what lets the caller retire the bundle
-        // and replay the command, instead of refusing every later command on a
-        // bundle whose session may already be gone.
-        throw new SandboxTerminalExecutionError("terminal blocked: previous command termination is unconfirmed",
-          { execution_id: callId, remote_run_dir: runDir, phase: "connecting",
-            started: false, stopped: true, error_code: "termination_unconfirmed" });
+      previousStopped = this.settings.journalPath
+        ? await this.confirmPreviousLaunch(options.signal)
+        : await this.stop(previous.runDir, previous.token);
+      if (previousStopped) {
+        this.clearLaunch();
+        this.quarantined = undefined;
       }
-      this.quarantined = undefined;
+    } else {
+      previousStopped = await this.confirmPreviousLaunch(options.signal);
+    }
+    if (!previousStopped) {
+      throw new SandboxTerminalExecutionError("terminal blocked: previous command termination is unconfirmed",
+        { execution_id: callId, remote_run_dir: runDir, phase: "connecting",
+          started: false, stopped: this.settings.owner === undefined, error_code: "termination_unconfirmed" });
     }
     const evidence: TerminalExecutionEvidence = { execution_id: callId, remote_run_dir: runDir,
       phase: "preparing", started: false, stopped: false };
@@ -1183,6 +1298,10 @@ export class SandboxTerminalOperations implements BashOperations {
     };
     let channel: TerminalChannel | undefined;
     let dispatched = false;
+    const dispatch = () => {
+      if (!dispatched) this.recordLaunch(callId);
+      dispatched = true;
+    };
     try {
       const values: Record<string, string> = {};
       for (const [name, value] of Object.entries(options.env ?? {})) {
@@ -1194,6 +1313,7 @@ export class SandboxTerminalOperations implements BashOperations {
       }
       const withEnvironment = Object.keys(values).length > 0;
       const environment = withEnvironment ? stagedEnvironment(values) : undefined;
+      const shellEnvironment = this.settings.owner !== undefined;
       const harnessDir = `${this.runsRoot}/${SANDBOX_HARNESS_DIRNAME}`;
       const harness: HarnessFiles = {
         "watch.sh": buildWatchScript(this.heartbeatTicks),
@@ -1230,7 +1350,7 @@ export class SandboxTerminalOperations implements BashOperations {
           // disk, so a healthy session pays nothing to restage them.
           let phase = Date.now();
           const ready = await this.acknowledge(channel, evidence,
-            buildReadyLine(harnessDir, token, harness, environment?.signature),
+            buildReadyLine(harnessDir, token, harness, environment?.signature, shellEnvironment),
             `${ACK_MARKER}${token}:ready:`, readyDeadline, options.signal);
           handshakeDone = true;
           mark("ready", phase);
@@ -1246,7 +1366,9 @@ export class SandboxTerminalOperations implements BashOperations {
             if (environment !== undefined) {
               evidence.phase = "environment";
               phase = Date.now();
-              if (!this.fastPath || !await this.stageBursts(channel, evidence, harnessDir, token, environment.files,
+              if (shellEnvironment) {
+                await this.stageShellEnvironment(channel, evidence, token, environment, startupDeadline, options);
+              } else if (!this.fastPath || !await this.stageBursts(channel, evidence, harnessDir, token, environment.files,
                   startupDeadline, options, true)) {
                 await this.stageOverTerminal(channel, evidence, harnessDir, token, environment.files,
                   startupDeadline, options, true);
@@ -1259,10 +1381,10 @@ export class SandboxTerminalOperations implements BashOperations {
           if (transport === "single") {
             // The burst stages the script and launches it, so from here on a
             // lost acknowledgement is observed rather than replayed.
-            dispatched = true;
+            dispatch();
             const launched = await this.acknowledge(channel, evidence,
               buildLaunchBatchLine(harnessDir, runDir, token, scripts, withEnvironment,
-                this.scriptChunkChars),
+                this.scriptChunkChars, shellEnvironment),
               `${ACK_MARKER}${token}:launch:`, startupDeadline, options.signal);
             mark("launch", phase);
             if (launched === "ok") evidence.started = true;
@@ -1295,9 +1417,9 @@ export class SandboxTerminalOperations implements BashOperations {
             mark(transport === "file" ? "upload_script" : "stage_script", phase);
           }
           if (!evidence.started) {
-            dispatched = true; // Once sent (or possibly sent), never launch it again.
+            dispatch();
             phase = Date.now();
-            await this.acknowledge(channel, evidence, buildStartLine(harnessDir, runDir, token, withEnvironment),
+            await this.acknowledge(channel, evidence, buildStartLine(harnessDir, runDir, token, withEnvironment, shellEnvironment),
               `${ACK_MARKER}${token}:launch:`, startupDeadline, options.signal);
             mark("launch", phase);
             // The acknowledgement proves the launch line ran, so the happy path
@@ -1363,6 +1485,7 @@ export class SandboxTerminalOperations implements BashOperations {
           // process group. Normal completion preserves rc as durable evidence.
           evidence.phase = "finished";
           evidence.stopped = true;
+          this.clearLaunch();
           evidence.timings_ms = { ...timings, total: Date.now() - openedAt };
           return { exitCode, execution: { ...evidence } };
         } catch (error) {
@@ -1381,6 +1504,7 @@ export class SandboxTerminalOperations implements BashOperations {
       // stay on disk: the next command reuses them.
       if (dispatched) {
         evidence.stopped = await this.stop(runDir, token, channel);
+        if (evidence.stopped) this.clearLaunch();
       } else {
         evidence.stopped = true;
       }
@@ -1421,6 +1545,8 @@ export class SandboxTerminalOperations implements BashOperations {
 export class LazySandboxTerminalOperations implements BashOperations {
   private operations: SandboxTerminalOperations | undefined;
   private tail: Promise<unknown> = Promise.resolve();
+  private endpointRequest?: Promise<SandboxEndpoint>;
+  private readonly lifetime = new AbortController();
 
   constructor(
     private readonly endpoints: SandboxEndpointSession,
@@ -1432,6 +1558,10 @@ export class LazySandboxTerminalOperations implements BashOperations {
     cwd: string,
     options: TerminalExecOptions,
   ): Promise<TerminalExecResult> {
+    options = {
+      ...options,
+      signal: options.signal ? AbortSignal.any([options.signal, this.lifetime.signal]) : this.lifetime.signal,
+    };
     const run = async (): Promise<TerminalExecResult> => {
       for (let attempt = 0; ; attempt += 1) {
         const operations = await this.resolveOperations(options);
@@ -1446,9 +1576,10 @@ export class LazySandboxTerminalOperations implements BashOperations {
           // which only shows up as a connect that never completes. Dropping the
           // bundle makes the next call ask the control plane again, which
           // rebuilds a sandbox whose pod is gone.
-          this.operations?.dispose();
-          this.operations = undefined;
-          this.endpoints.invalidate();
+          operations.dispose();
+          if (!this.options.owner || !operations.terminationUnconfirmed) this.operations = undefined;
+          this.endpoints.invalidate(this.endpointRequest);
+          this.endpointRequest = undefined;
           if (attempt >= MAX_ENDPOINT_REFRESHES || !isPreLaunchDrop(error)) throw error;
         }
       }
@@ -1463,22 +1594,37 @@ export class LazySandboxTerminalOperations implements BashOperations {
     return queued.result;
   }
 
+  async disconnect(): Promise<void> {
+    await this.tail;
+    this.operations?.dispose();
+  }
+
+  async close(): Promise<void> {
+    this.lifetime.abort();
+    await this.disconnect();
+  }
+
   private async resolveOperations(options: TerminalExecOptions): Promise<SandboxTerminalOperations> {
     const resolveDeadline =
       Date.now() + (this.options.resolveTimeoutMs ?? DEFAULT_RESOLVE_TIMEOUT_MS);
     let lastError: unknown;
     for (let attempt = 0; ; attempt += 1) {
+      const request = this.endpoints.resolve();
       try {
-        return await bounded(this.operationsFor(), resolveDeadline, options.signal);
+        const endpoint = await bounded(request, resolveDeadline, options.signal);
+        this.endpointRequest = request;
+        if (!this.operations?.updateEndpoint(endpoint)) {
+          this.operations?.dispose();
+          this.operations = new SandboxTerminalOperations(endpoint, this.options);
+        }
+        return this.operations;
       } catch (error) {
         if (!isRetryableResolve(error, options.signal)) throw this.resolveFailure(error, lastError);
         lastError = error;
         // The control plane records a sandbox before its preparation finishes,
         // and `sandbox.ensure` is idempotent, so a rejected resolve repairs the
         // recorded sandbox on the next attempt instead of failing the call.
-        this.operations?.dispose();
-        this.operations = undefined;
-        this.endpoints.invalidate();
+        this.endpoints.invalidate(request);
         const delay = resolveRetryDelay(
           attempt,
           this.options.resolveRetryBaseMs ?? DEFAULT_RESOLVE_RETRY_BASE_MS,
@@ -1510,14 +1656,6 @@ export class LazySandboxTerminalOperations implements BashOperations {
       },
       { cause: error },
     );
-  }
-
-  private async operationsFor(): Promise<SandboxTerminalOperations> {
-    if (this.operations === undefined) {
-      const endpoint = await this.endpoints.resolve();
-      this.operations = new SandboxTerminalOperations(endpoint, this.options);
-    }
-    return this.operations;
   }
 
   /**

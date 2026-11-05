@@ -2442,3 +2442,87 @@ async def test_idle_runner_exit_terminates_subagent_operations(tmp_path, monkeyp
     assert session.active_subagents == set()
     assert session.files.load_inflight() is None
     await adapter.close(handle)
+
+
+async def test_terminal_approval_is_single_slot_with_independent_queued_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = PiAdapter(tmp_path, terminal_backend="sandbox")
+    files = PiSessionFiles(tmp_path)
+    files.initialize({})
+    files.save_inflight({"run_id": "parent-before"})
+    session = pi_adapter_module._PiSession(
+        "conversation", tmp_path, files, {}, RequestContext(user_id="42")
+    )
+    monkeypatch.setattr(
+        adapter._permissions,
+        "requires_confirmation",
+        lambda _tool_id, args: args["command"] == "risky",
+    )
+
+    first = asyncio.create_task(
+        adapter._check_permission(session, "child-a", {"command": "risky"})
+    )
+    requested = await asyncio.wait_for(session.queue.get(), 1)
+    assert requested and requested.type == "permission.requested"
+    second = asyncio.create_task(
+        adapter._check_permission(session, "child-b", {"command": "risky"})
+    )
+    third = asyncio.create_task(
+        adapter._check_permission(session, "parent", {"command": "risky"})
+    )
+    await asyncio.sleep(0)
+    assert session.queue.empty()
+    assert await adapter._check_permission(session, "safe", {"command": "pwd"}) == {
+        "allow": True
+    }
+    await adapter._runner_request(
+        session, "permission.cancel", {"tool_call_id": "child-b"}
+    )
+    assert (await asyncio.wait_for(second, 1))["allow"] is False
+    assert not first.done()
+    assert not third.done()
+
+    # Parent progress and permission recovery have separate lifecycles.
+    files.save_inflight({"run_id": "parent-after", "operation_id": "parent-tool"})
+    assert session.pending_permission is not None
+    session.pending_permission.future.set_result((True, None))
+    assert (await asyncio.wait_for(first, 1))["allow"] is True
+    resolved = await asyncio.wait_for(session.queue.get(), 1)
+    requested_next = await asyncio.wait_for(session.queue.get(), 1)
+    assert resolved and resolved.type == "permission.resolved"
+    assert requested_next and requested_next.type == "permission.requested"
+    assert requested_next.payload["operation_ids"] == ["parent"]
+    assert files.load_inflight() == {
+        "run_id": "parent-after",
+        "operation_id": "parent-tool",
+    }
+    await adapter._runner_request(
+        session, "permission.cancel", {"tool_call_id": "parent"}
+    )
+    assert (await asyncio.wait_for(third, 1))["allow"] is False
+    assert files.load_pending_permission() is None
+
+
+async def test_terminal_permission_recovery_survives_missing_parent_run(
+    tmp_path: Path,
+) -> None:
+    adapter = PiAdapter(tmp_path, terminal_backend="sandbox")
+    files = PiSessionFiles(tmp_path)
+    files.initialize({})
+    files.save_pending_permission(
+        {
+            "permission_id": "recover-me",
+            "operation_id": "child-terminal",
+            "run_id": "previous",
+        }
+    )
+    session = pi_adapter_module._PiSession(
+        "conversation", tmp_path, files, {}, RequestContext(user_id="42")
+    )
+    await adapter._recover_inflight(session)
+    event = session.queue.get_nowait()
+    assert event and event.type == "permission.resolved"
+    assert event.run_id == "previous"
+    assert event.payload == {"permission_id": "recover-me", "decision": "deny"}
+    assert files.load_pending_permission() is None

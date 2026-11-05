@@ -45,7 +45,7 @@ export class SandboxTerminalFileClient implements SandboxFileClientLike {
     this.chunkChars = options.chunkChars ?? WRITE_CHUNK_CHARS;
   }
 
-  async read(path: string, limit = Number.MAX_SAFE_INTEGER): Promise<Buffer> {
+  async read(path: string, limit = Number.MAX_SAFE_INTEGER, signal?: AbortSignal): Promise<Buffer> {
     const chunks: Buffer[] = [];
     let total = 0;
     const result = await this.terminal.exec(
@@ -53,6 +53,7 @@ export class SandboxTerminalFileClient implements SandboxFileClientLike {
       `base64 < ${shellQuote(path)} | tr -d '\\n'`,
       ".",
       {
+        signal,
         onData: (data) => {
           total += data.byteLength;
           if (total <= limit) chunks.push(data);
@@ -66,11 +67,11 @@ export class SandboxTerminalFileClient implements SandboxFileClientLike {
     return Buffer.from(Buffer.concat(chunks).toString("ascii").replace(/[\r\n]/g, ""), "base64");
   }
 
-  async access(path: string): Promise<void> {
+  async access(path: string, signal?: AbortSignal): Promise<void> {
     const result = await this.terminal.exec(
       `test -r ${shellQuote(path)}`,
       ".",
-      { onData: () => undefined },
+      { onData: () => undefined, signal },
     );
     if (result.exitCode !== 0) {
       throw new Error(`sandbox terminal access failed (${result.exitCode ?? "signal"}): ${path}`);

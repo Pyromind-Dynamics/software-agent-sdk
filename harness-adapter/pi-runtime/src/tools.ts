@@ -42,6 +42,7 @@ import {
 
 import type { ExecutionAccess } from "./workflow-execution.js";
 import { createTerminalTool } from "./terminal-tool.js";
+import { bounded } from "./terminal-channel.js";
 
 const OMITTED_IMAGE_TEXT = "[Image omitted: Pi only accepts inline base64 image data.]";
 const SANDBOX_READ_PATH_SCOPE =
@@ -68,6 +69,7 @@ export interface CreateToolsOptions {
   /** Test seam: the terminal socket used by a sandbox session. */
   terminalConnect?: SandboxTerminalConnector;
   onExecutionReady?: (access: ExecutionAccess) => void;
+  onSandboxToolsReady?: (tools: SandboxTools) => void;
   skillsDirectory?: string;
   /** Present only when the session runs its execution plane in a sandbox. */
   sandbox?: SandboxEndpointProvider;
@@ -76,6 +78,18 @@ export interface CreateToolsOptions {
    * never has to reach the sandbox. Sandbox sessions only.
    */
   readMirror?: SandboxReadMirror;
+}
+
+export interface SandboxToolLane {
+  tools: AgentTool[];
+  access: ExecutionAccess;
+  terminal: LazySandboxTerminalOperations;
+}
+
+export interface SandboxTools {
+  main: SandboxToolLane;
+  workflow: SandboxToolLane;
+  createLane(owner: string): SandboxToolLane;
 }
 
 export async function createTools(
@@ -90,7 +104,7 @@ export async function createTools(
   options: CreateToolsOptions = {},
 ): Promise<AgentTool[]> {
   if (terminalBackend === "sandbox") {
-    return createSandboxTools(peer, businessTools, options);
+    return createSandboxTools(peer, workspaceRoot, businessTools, options);
   }
   const { skillsDirectory } = options;
   const verificationRoot = join(workspaceRoot, "pi", "genome-verification");
@@ -186,6 +200,7 @@ export async function createTools(
  */
 async function createSandboxTools(
   peer: JsonlRpcPeer,
+  workspaceRoot: string,
   businessTools: BusinessToolConfig[],
   options: CreateToolsOptions,
 ): Promise<AgentTool[]> {
@@ -198,29 +213,14 @@ async function createSandboxTools(
   // The sandbox PTY is the Linux one, so its staging lines may be far longer
   // than the macOS-safe default the transport itself falls back to.
   const scriptChunkChars = options.scriptChunkChars ?? SANDBOX_SCRIPT_CHUNK_CHARS;
-  const terminalOperations = new LazySandboxTerminalOperations(endpoints, {
-    connect: options.terminalConnect,
-    scriptChunkChars,
-    ...options.terminalTimeouts,
-  });
-  // The graph executes in the same sandbox but on its own channel: a long `run`
-  // node (or a workflow shell command) must not queue the terminal the agent is
-  // using, which is exactly how a chat turn used to look frozen.
-  const executionOperations = new LazySandboxTerminalOperations(endpoints, {
-    connect: options.terminalConnect,
-    scriptChunkChars,
-    ...options.terminalTimeouts,
-  });
-  const fileClient = new FallbackSandboxFileClient(
-    new SandboxFileClient(endpoints, { probeTimeoutMs: SANDBOX_FILE_PROBE_TIMEOUT_MS }),
-    new SandboxTerminalFileClient(terminalOperations, { chunkChars: scriptChunkChars }),
-  );
-  const fileOperations = createSandboxFileOperations(fileClient, options.readMirror);
+  const fileApi = new SandboxFileClient(endpoints, { probeTimeoutMs: SANDBOX_FILE_PROBE_TIMEOUT_MS });
   const allowedReadRoots: string[] = [];
   let policy: SandboxPathPolicy | undefined;
-  const resolvePolicy = async (): Promise<SandboxPathPolicy> => {
-    if (policy) return policy;
-    const resolved = await endpoints.resolve();
+  const resolvePolicy = async (signal?: AbortSignal): Promise<SandboxPathPolicy> => {
+    signal?.throwIfAborted();
+    const resolved = await bounded(endpoints.resolve(), Infinity, signal);
+    if (policy?.workspacePath === resolved.workspacePath &&
+        policy.storageRoot === resolved.storagePath) return policy;
     const skillsDirectory = `${resolved.workspacePath}/.agents/skills`;
     const knowledgeRoot = `${resolved.workspacePath}/knowledge`;
     policy = SandboxPathPolicy.create({
@@ -230,7 +230,7 @@ async function createSandboxTools(
       knowledgeRoot,
       storageRoot: resolved.storagePath,
     });
-    allowedReadRoots.push(
+    allowedReadRoots.splice(0, allowedReadRoots.length,
       resolved.storagePath,
       policy.publicDataPath,
       ...policy.readOnlyRoots,
@@ -238,71 +238,89 @@ async function createSandboxTools(
     return policy;
   };
 
-  const read = createCodingReadTool(sandboxCwd, {
-    operations: {
-      readFile: async (path) => fileOperations.read.readFile(path),
-      access: async (path) => fileOperations.read.access(path),
-      detectImageMimeType: async (path) =>
-        fileOperations.read.detectImageMimeType?.(path),
-    },
-  });
-  const write = createCodingWriteTool(sandboxCwd, {
-    operations: {
-      writeFile: async (path, content) => fileOperations.write.writeFile(path, content),
-      mkdir: async (dir) => fileOperations.write.mkdir(dir),
-    },
-  });
-  const edit = createCodingEditTool(sandboxCwd, {
-    operations: {
-      readFile: async (path) => fileOperations.edit.readFile(path),
-      writeFile: async (path, content) => fileOperations.edit.writeFile(path, content),
-      access: async (path) => fileOperations.edit.access(path),
-    },
-  });
-  options.onExecutionReady?.({ operations: executionOperations, cwd: sandboxCwd,
-    env: options.terminalEnvironment,
-    allowedReadRoots,
-    writeFile: (path, content) => fileClient.write(path, content),
-    readFile: (path, limit) => fileClient.read(path, limit),
-    resolvePath: async (path, operation) => (await resolvePolicy()).resolvePath(path, operation) });
+  const createLane = (owner: string): SandboxToolLane => {
+    const terminal = new LazySandboxTerminalOperations(endpoints, {
+      owner,
+      journalPath: join(workspaceRoot, "pi", "terminal-runs", owner + ".json"),
+      connect: options.terminalConnect,
+      scriptChunkChars,
+      ...options.terminalTimeouts,
+    });
+    const fileClient = new FallbackSandboxFileClient(
+      fileApi,
+      new SandboxTerminalFileClient(terminal, { chunkChars: scriptChunkChars }),
+    );
+    const access: ExecutionAccess = {
+      operations: terminal, cwd: sandboxCwd, env: options.terminalEnvironment, allowedReadRoots,
+      writeFile: (path, content) => fileClient.write(path, content),
+      readFile: (path, limit) => fileClient.read(path, limit),
+      resolvePath: async (path, operation, signal) => (await resolvePolicy(signal)).resolvePath(path, operation),
+    };
+    const tools = createSandboxLaneTools(sandboxCwd, access, fileClient, options);
+    return { tools, access, terminal };
+  };
+  const main = createLane("main");
+  const workflow = createLane("workflow");
+  options.onExecutionReady?.(workflow.access);
+  options.onSandboxToolsReady?.({ main, workflow, createLane });
+  return [...main.tools, ...businessTools.map((config) => businessTool(peer, config))];
+}
+
+function createSandboxLaneTools(
+  sandboxCwd: string,
+  access: ExecutionAccess,
+  fileClient: FallbackSandboxFileClient,
+  options: CreateToolsOptions,
+): AgentTool[] {
+  // The Pi file tool keeps a probe cache. Keep it within a single call and
+  // pass the caller's abort signal through both file transports.
+  const fileTool = (create: (fileOperations: ReturnType<typeof createSandboxFileOperations>) => AgentTool): AgentTool => {
+    const operations = (signal?: AbortSignal) => createSandboxFileOperations(fileClient, options.readMirror, signal);
+    return {
+      ...create(operations()),
+      execute: (id, args, signal, update) => create(operations(signal)).execute(id, args, signal, update),
+    };
+  };
+  const read = fileTool((files) => createCodingReadTool(sandboxCwd, { operations: files.read }));
+  const write = fileTool((files) => createCodingWriteTool(sandboxCwd, { operations: files.write }));
+  const edit = fileTool((files) => createCodingEditTool(sandboxCwd, { operations: files.edit }));
   const terminal = createTerminalTool(sandboxCwd, {
-    operations: terminalOperations,
+    operations: access.operations,
     exposeSessionEnvironment: false,
     spawnHook: ({ command }) => ({ command, cwd: sandboxCwd, env: options.terminalEnvironment ?? {} }),
   });
   return [
     bindPathTool(
       read,
-      async (path, operation) => {
+      async (path, operation, signal) => {
         // A mirrored resource read is answered from the host, so it must not
         // resolve the endpoint: that would create a sandbox for a doc read.
         const mirrored = options.readMirror?.resolveAlias(path);
         if (mirrored !== undefined) return mirrored;
-        return (await resolvePolicy()).resolvePath(path, operation);
+        return access.resolvePath(path, operation, signal);
       },
       "read",
       SANDBOX_READ_PATH_SCOPE,
     ),
     bindPathTool(
       write,
-      async (path, operation) => (await resolvePolicy()).resolvePath(path, operation),
+      access.resolvePath,
       "write",
       SANDBOX_WRITE_PATH_SCOPE,
     ),
     bindPathTool(
       edit,
-      async (path, operation) => (await resolvePolicy()).resolvePath(path, operation),
+      access.resolvePath,
       "write",
       SANDBOX_WRITE_PATH_SCOPE,
     ),
     terminal,
-    ...businessTools.map((config) => businessTool(peer, config)),
   ];
 }
 
 function bindPathTool(
   tool: AgentTool<any, any>,
-  resolvePath: (path: string, operation: WorkspacePathOperation) => string | Promise<string>,
+  resolvePath: (path: string, operation: WorkspacePathOperation, signal?: AbortSignal) => string | Promise<string>,
   operation: WorkspacePathOperation,
   pathScopeOverride?: string,
 ): AgentTool<any, any> {
@@ -321,7 +339,7 @@ function bindPathTool(
       if (!isRecord(params) || typeof params.path !== "string") throw new Error("path must be a string");
       const safe = {
         ...params,
-        path: await resolvePath(params.path, operation),
+        path: await resolvePath(params.path, operation, signal),
       };
       return tool.execute(callId, safe, signal, onUpdate);
     },

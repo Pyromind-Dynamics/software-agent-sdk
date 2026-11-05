@@ -49,10 +49,11 @@ export async function serveSubagentIpc(path: string, handle: (request: any, sign
   };
 }
 
-export function callSubagentHost(path: string, request: any, signal?: AbortSignal, update?: (value: any) => void): Promise<any> {
+export function callSubagentHost(path: string, request: any, signal?: AbortSignal, update?: (value: any) => void, unref = false): Promise<any> {
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     const socket = createConnection(path);
+    if (unref) socket.unref();
     let settled = false;
     const finish = (error?: Error, result?: any) => {
       if (settled) return;

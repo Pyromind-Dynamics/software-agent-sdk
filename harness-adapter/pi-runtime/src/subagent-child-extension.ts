@@ -1,5 +1,5 @@
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { callSubagentHost } from "./subagent-ipc.js";
 
 /** Loaded by pi-subagents in both its foreground and detached child sessions. */
@@ -7,6 +7,26 @@ export async function installChildHost(pi: ExtensionAPI, role: string) {
   const socket = process.env.PYROMIND_SUBAGENT_SOCKET;
   if (!socket) throw new Error("Missing conversation subagent host");
   const config = await callSubagentHost(socket, { method: "config", role });
+  const terminalTools = new Set<string>(config.terminalTools);
+  let attachment: {
+    controller: AbortController;
+    ready: Promise<string>;
+    identity: { session: string; session_file: string | undefined };
+  } | undefined;
+  const terminalLease = (ctx: ExtensionContext) => {
+    if (attachment) return attachment.ready;
+    const controller = new AbortController();
+    const { promise: ready, resolve, reject } = Promise.withResolvers<string>();
+    const identity = { session: ctx.sessionManager.getSessionId(), session_file: ctx.sessionManager.getSessionFile() };
+    attachment = { controller, ready, identity };
+    void callSubagentHost(socket, {
+      method: "terminal.attach", role, ...identity,
+    }, controller.signal, (value) => resolve(value.id), true).catch(reject).finally(() => {
+      if (attachment?.controller === controller) attachment = undefined;
+    });
+    return ready;
+  };
+  pi.on("session_shutdown", () => { attachment?.controller.abort(); });
   const model = config.model;
   pi.registerProvider(model.provider, {
     baseUrl: model.baseUrl, api: model.api, apiKey: "host-mediated",
@@ -29,8 +49,11 @@ export async function installChildHost(pi: ExtensionAPI, role: string) {
     },
   });
   for (const tool of config.tools) {
-    pi.registerTool({ ...tool, execute: (id: string, args: unknown, signal: AbortSignal | undefined, update: any, ctx: any) =>
-      callSubagentHost(socket, { method: "tool", role, scope: config.scope, name: tool.name, id: `${ctx.sessionManager.getLeafId()}:${id}`, args, session: ctx.sessionManager.getSessionId(), session_file: ctx.sessionManager.getSessionFile() }, signal, update) });
+    pi.registerTool({ ...tool, execute: async (id: string, args: unknown, signal: AbortSignal | undefined, update: any, ctx: ExtensionContext) => {
+      const scope = config.scope;
+      const terminal_lease = terminalTools.has(tool.name) ? await terminalLease(ctx) : undefined;
+      return callSubagentHost(socket, { method: "tool", role, scope, terminal_lease, name: tool.name, id: `${ctx.sessionManager.getLeafId()}:${id}`, args, session: ctx.sessionManager.getSessionId(), session_file: ctx.sessionManager.getSessionFile() }, signal, update);
+    } });
   }
   pi.on("session_start", async (_event, ctx) => {
     await callSubagentHost(socket, { method: "config", role });
@@ -41,6 +64,15 @@ export async function installChildHost(pi: ExtensionAPI, role: string) {
     // Native resume can retain the child session and its tool closures. Bind
     // the new turn to the newly admitted work lease, while an interrupted
     // turn keeps its old scope and cannot write through an expired lease.
+    const previous = attachment;
+    if (previous) {
+      attachment = undefined;
+      try {
+        await callSubagentHost(socket, {
+          method: "terminal.detach", role, ...previous.identity, terminal_lease: await previous.ready,
+        }, previous.controller.signal);
+      } finally { previous.controller.abort(); }
+    }
     const admission = await callSubagentHost(socket, {method: "config", role});
     config.scope = admission.scope;
     let prompt = event.systemPrompt;

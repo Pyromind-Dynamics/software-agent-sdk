@@ -20,7 +20,7 @@ export interface ExecutionAccess {
   allowedReadRoots?: readonly string[];
   protectedRoot?: string;
   writeFile(path: string, content: Buffer): Promise<void>;
-  resolvePath(path: string, operation: "read" | "write"): Promise<string>;
+  resolvePath(path: string, operation: "read" | "write", signal?: AbortSignal): Promise<string>;
   cwd: string;
   env?: NodeJS.ProcessEnv;
   confirmsAbort?: boolean;

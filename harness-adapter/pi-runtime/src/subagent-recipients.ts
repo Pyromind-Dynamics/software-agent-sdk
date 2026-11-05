@@ -8,18 +8,24 @@ type Rpc = (method: string, params: Record<string, unknown>, requestId?: string)
 type Recipient = { id: string; sessionFile: string; sessionId: string };
 type NativeTarget = { runId: string; index: number; state: string; updatedAt: number; step: any };
 
+export function verifyChildSession(stateRoot: string, sessionId: unknown, sessionFile: unknown): string {
+  if (typeof sessionId !== "string" || typeof sessionFile !== "string") throw new Error("Missing child session identity");
+  const path = realpathSync(sessionFile);
+  const root = realpathSync(join(stateRoot, "sessions"));
+  const local = relative(root, path);
+  if (!local || local === ".." || local.startsWith(".." + sep) || local.startsWith(sep)) throw new Error("Child session belongs to another conversation");
+  const header = JSON.parse(readFileSync(path, "utf8").split("\n", 1)[0]);
+  if (header.type !== "session" || header.id !== sessionId) throw new Error("Child session identity mismatch");
+  return path;
+}
+
 /** Only this adapter maps a product recipient to plugin-owned execution records. */
 export class SubagentRecipients {
   constructor(private stateRoot: string, private session: AgentSession, private rpc: Rpc, private conversationId = session.sessionId) {}
 
   origin(sessionId: unknown, sessionFile: unknown): JsonObject {
-    if (typeof sessionId !== "string" || typeof sessionFile !== "string") throw new Error("Missing child session identity");
-    const path = realpathSync(sessionFile);
-    const root = realpathSync(join(this.stateRoot, "sessions"));
-    const local = relative(root, path);
-    if (!local || local === ".." || local.startsWith(".." + sep) || local.startsWith(sep)) throw new Error("Child session belongs to another conversation");
-    const header = JSON.parse(readFileSync(path, "utf8").split("\n", 1)[0]);
-    if (header.type !== "session" || header.id !== sessionId) throw new Error("Child session identity mismatch");
+    const path = verifyChildSession(this.stateRoot, sessionId, sessionFile);
+    if (typeof sessionId !== "string") throw new Error("Missing child session identity");
     const id = createHash("sha256").update(this.conversationId + ":" + sessionId).digest("hex");
     const existing = this.savedRecipient(id);
     if (!existing) this.session.sessionManager.appendCustomEntry("pyromind.subagent.recipient", { id, sessionId, sessionFile: path });

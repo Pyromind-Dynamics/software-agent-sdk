@@ -107,7 +107,9 @@ export function bounded<T>(promise: Promise<T>, deadline: number, signal?: Abort
       else resolve(value as T);
     };
     const abort = (): void => finish(new Error("aborted"));
-    const timer = setTimeout(() => finish(new Error("timeout")), Math.max(0, deadline - Date.now()));
+    const timer = Number.isFinite(deadline)
+      ? setTimeout(() => finish(new Error("timeout")), Math.max(0, deadline - Date.now()))
+      : undefined;
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
     promise.then((value) => finish(undefined, value), (error) => finish(error));

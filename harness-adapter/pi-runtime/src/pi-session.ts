@@ -2,6 +2,7 @@ import { createDelegatedAskUserTool } from "./user-input.js";
 import { parseSubagentRoles, type SubagentRoleDefinition } from "./subagent-roles.js";
 import { capabilityCeiling, restrictSkillReads } from "./session-policy.js";
 import { SubagentHost } from "./subagent-host.js";
+import { usesAgentTerminal } from "./subagent-terminals.js";
 import { ToolCoordinator } from "./tool-coordinator.js";
 import { createRetrievalTools, verifyReadScope } from "./retrieval-tools.js";
 import { genomeHostAccess } from "./genome-host.js";
@@ -42,6 +43,7 @@ import {
   businessTool,
   type BusinessToolConfig,
   type CreateToolsOptions,
+  type SandboxTools,
   type SkillRootConfig,
 } from "./tools.js";
 import type {
@@ -129,6 +131,7 @@ export async function createPiSession(
   const { modelRuntime, model } = await createPiModelRuntime(config);
   const env = new NodeExecutionEnv({ cwd: config.workspaceRoot, shellEnv: safeShellEnvironment() });
   let executionAccess: ExecutionAccess | undefined;
+  let sandboxTools: SandboxTools | undefined;
   const terminalEnvironment = params.terminal_environment ?? {};
   if (!isRecord(terminalEnvironment) || Object.values(terminalEnvironment).some((v) => typeof v !== "string")) throw new Error("invalid terminal environment");
   const skillPaths = [
@@ -158,6 +161,7 @@ export async function createPiSession(
     terminalTimeouts: sandboxTerminalTimeouts(),
     scriptChunkChars: sandboxTerminalScriptChunkChars(),
     onExecutionReady: (access) => { executionAccess = access; },
+    onSandboxToolsReady: (tools) => { sandboxTools = tools; },
     skillsDirectory: config.skillsDirectory,
     ...(config.terminalBackend === "sandbox"
       ? {
@@ -181,14 +185,14 @@ export async function createPiSession(
   if (sessionOptions.askUserTool) rawTools.push(sessionOptions.askUserTool);
   if (!executionAccess) throw new Error("execution environment was not initialized");
   const coordinator = new ToolCoordinator();
-  rawTools.push(...createRetrievalTools(executionAccess, options.readMirror).map(
-    (tool): AgentTool => ({
+  const mainTerminal = new ToolCoordinator();
+  const retrieval = createRetrievalTools(sandboxTools?.main.access ?? executionAccess, options.readMirror);
+  rawTools.push(...(sandboxTools ? retrieval : retrieval.map((tool): AgentTool => ({
       ...tool,
       execute: (id, args, signal, update) => coordinator.run(
         signal, () => tool.execute(id, args, signal, update),
       ),
-    }),
-  ));
+    }))));
   const allowedSkillRoots = config.skillAllowlist?.map(name => {
     const root = config.skillsDirectory ? join(config.skillsDirectory, name) : config.skillRoots.find(root => root.name === name)?.path;
     if (!root) throw new Error(`Unknown allowed skill: ${name}`);
@@ -196,24 +200,21 @@ export async function createPiSession(
     if (!skillPaths.some(parent => inside(canonical, parent))) throw new Error("Allowed skill escapes resource roots");
     return canonical;
   });
-  const tools = rawTools.map((tool) => coordinator.wrap(
-    restrictSkillReads(
+  const guard = (tool: AgentTool, roots: string[] | undefined, terminal: ToolCoordinator, role?: string) => {
+    const guarded = restrictSkillReads(
       tool,
       config.workspaceRoot,
       skillPaths,
-      allowedSkillRoots,
+      roots,
       config.skillsDirectory,
       { canonicalizeWorkspacePaths: config.terminalBackend !== "sandbox" },
-    ), peer));
-  const childTools = tools.filter((tool) => [
-    "read", "write", "edit", "terminal", "grep", "find", "ls",
-  ].includes(tool.name)).map((tool) => {
-    if (tool.name !== "read" || config.terminalBackend !== "sandbox") return tool;
-    return { ...tool, execute: (id: string, args: any, signal?: AbortSignal, update?: any) => coordinator.run(signal, async () => {
-      await verifyReadScope(executionAccess!, options.readMirror, args.path, signal);
-      return tool.execute(id, args, signal, update);
-    }) };
-  });
+    );
+    return sandboxTools && tool.name === "terminal"
+      ? terminal.wrap(guarded, peer, role, true)
+      : coordinator.wrap(guarded, peer, role);
+  };
+  const tools = rawTools.map((tool) => guard(tool, allowedSkillRoots, mainTerminal));
+  const childTools = tools.filter((tool) => usesAgentTerminal(tool.name));
   const childInstructions = "Use read-only knowledge/ and .agents/skills/ resources and public_data/ conversation files. The user Storage mount is addressed by its absolute path. Write only public_data/. " +
     "Tool paths refer to the conversation execution environment, never the host's directories. Available skills:\n" + skillPaths.map((path) => applySandboxPathAliases(path, sandboxPathAliases)).join("\n");
   const roleToolSets = config.delegatedRoles ? Object.fromEntries(config.delegatedRoles.map(role => {
@@ -230,18 +231,32 @@ export async function createPiSession(
     const business = roleSpecs.map(spec => businessTool(peer, spec, role.name));
     const scoped = childTools.filter(tool => role.tools.includes(tool.name)).map(tool => {
       const raw = rawTools.find(candidate => candidate.name === tool.name) ?? tool;
-      const guarded = coordinator.wrap(restrictSkillReads(raw, config.workspaceRoot, skillPaths, roots, config.skillsDirectory), peer, role.name);
-      if (tool.name !== "read" || config.terminalBackend !== "sandbox") return guarded;
-      return { ...guarded, execute: (id: string, args: any, signal?: AbortSignal, update?: any) => coordinator.run(signal, async () => {
-        await verifyReadScope(executionAccess!, options.readMirror, args.path, signal);
-        return guarded.execute(id, args, signal, update);
-      }) };
+      return guard(raw, roots, mainTerminal, role.name);
     });
     const askUser = sessionOptions.askUserTool && role.tools.includes("ask_user")
       ? [createDelegatedAskUserTool(peer, sessionOptions.askUserTool, role.name)] : [];
     return [role.name, [...scoped, ...business, ...askUser]];
   })) : undefined;
-  const subagents = new SubagentHost(config.workspaceRoot, config.sessionId, peer, childTools, modelRuntime, model, childInstructions, config.delegatedRoles, roleToolSets, sandboxPathAliases);
+  const sandbox = sandboxTools;
+  const subagents = new SubagentHost(config.workspaceRoot, config.sessionId, peer, childTools, modelRuntime, model, childInstructions, config.delegatedRoles, roleToolSets, sandboxPathAliases, sandbox && {
+    createLane: sandbox.createLane,
+    tools(lane, roleName) {
+      const role = config.delegatedRoles?.find((definition) => definition.name === roleName);
+      const terminal = new ToolCoordinator();
+      return [...lane.tools, ...createRetrievalTools(lane.access, options.readMirror)].map((tool) => {
+        const guarded = guard(tool, role ? role.skillPaths : allowedSkillRoots, terminal, role?.name);
+        if (tool.name !== "read") return guarded;
+        return { ...guarded, async execute(id, args, signal, update) {
+          if (!isRecord(args) || typeof args.path !== "string") throw new Error("invalid read path");
+          await verifyReadScope(lane.access, options.readMirror, args.path, signal);
+          return guarded.execute(id, args, signal, update);
+        } };
+      });
+    },
+    async close() {
+      await Promise.all([sandbox.main.terminal.close(), sandbox.workflow.terminal.close()]);
+    },
+  });
   const { default: subagentExtension } = await import("pi-subagents");
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 20_000 },

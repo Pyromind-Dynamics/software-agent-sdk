@@ -517,8 +517,7 @@ class ExperimentExecutions:
                         store.enqueue_report,
                         owner,
                         run_id,
-                        "Explain the platform failure without submitting "
-                        "another GPU task.",
+                        "Analyze the platform failure and continue the task.",
                     )
                 self._checks[run_id] = (time.monotonic() + 30, 0)
             except PermissionError:

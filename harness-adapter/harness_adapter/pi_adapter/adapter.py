@@ -210,8 +210,8 @@ def _sandbox_system_prompt(mount_path: str, conversation_id: str) -> str:
 @dataclass(slots=True)
 class _PendingPermission:
     permission_id: str
-    operation_id: str
     future: asyncio.Future[tuple[bool, str | None]]
+    released: asyncio.Future[None]
 
 
 @dataclass(slots=True)
@@ -229,6 +229,9 @@ class _PiSession:
     running: bool = False
     runner_restart_pending: bool = False
     pending_permission: _PendingPermission | None = None
+    permission_calls: dict[str, asyncio.Future[tuple[bool, str | None]]] = field(
+        default_factory=dict
+    )
     finished_runs: set[str] = field(default_factory=set)
     active_external_tasks: dict[str, str] = field(default_factory=dict)
     active_subagents: set[str] = field(default_factory=set)
@@ -1135,9 +1138,7 @@ class PiAdapter:
             return await self._send_user_message(session, command)
         if isinstance(command, CancelCommand):
             self._business_tools.cancel(session.session_id)
-            pending = session.pending_permission
-            if pending is not None and not pending.future.done():
-                pending.future.set_result((False, "Cancelled by user"))
+            self._cancel_permissions(session, "Cancelled by user")
             runner_cancel_error = None
             if session.runner is not None and session.runner.running:
                 try:
@@ -1586,11 +1587,7 @@ class PiAdapter:
             if key[0] == handle.session_id:
                 self._role_scopes.pop(key, None)
         try:
-            if (
-                session.pending_permission is not None
-                and not session.pending_permission.future.done()
-            ):
-                session.pending_permission.future.set_result((False, "Session closed"))
+            self._cancel_permissions(session, "Session closed")
             if session.runner is not None:
                 await session.runner.close()
             await self._pause_sandbox(session)
@@ -1689,6 +1686,7 @@ class PiAdapter:
             )
             if stale_callback:
                 return
+            self._cancel_permissions(session, "Pi runner exited")
             session.runner = None
             if session.pending_user_inputs:
                 records = tuple(
@@ -2044,29 +2042,30 @@ class PiAdapter:
             self._end_input_wait(session, request_id, cancelled=True)
             return {"cancelled": True}
         if method == "permission.cancel":
-            pending = session.pending_permission
-            if (
-                pending is not None
-                and pending.operation_id == params.get("tool_call_id")
-                and not pending.future.done()
-            ):
-                pending.future.set_result((False, "Subagent request cancelled"))
+            call_id = params.get("tool_call_id")
+            pending = (
+                session.permission_calls.get(call_id)
+                if isinstance(call_id, str)
+                else None
+            )
+            if pending is not None and not pending.done():
+                pending.set_result((False, "Terminal request cancelled"))
             return {"cancelled": True}
         if method == "permission.check":
-            if params.get("delegated_role"):
-                await self._authorize_native_role_tool(
-                    session,
-                    params.get("delegated_role"),
-                    params.get("delegated_scope"),
-                    "terminal",
-                )
-            elif not self._tool_allowed(session, "terminal"):
+            role = params.get("delegated_role")
+            if not role and not self._tool_allowed(session, "terminal"):
                 raise PermissionError("terminal execution is not enabled")
             arguments = params.get("arguments")
             tool_call_id = params.get("tool_call_id")
             if not isinstance(arguments, dict) or not isinstance(tool_call_id, str):
                 raise ValueError("invalid terminal permission request")
-            return await self._check_permission(session, tool_call_id, arguments)
+            return await self._check_permission(
+                session,
+                tool_call_id,
+                arguments,
+                role=role,
+                scope=params.get("delegated_scope"),
+            )
         if method == "delegation.authorize_tool":
             await self._authorize_native_role_tool(
                 session,
@@ -2226,52 +2225,105 @@ class PiAdapter:
             workspace=await self._workspace(session),
         )
 
+    @staticmethod
+    def _cancel_permissions(session: _PiSession, reason: str) -> None:
+        for future in session.permission_calls.values():
+            if not future.done():
+                future.set_result((False, reason))
+
     async def _check_permission(
-        self, session: _PiSession, tool_call_id: str, arguments: dict[str, Any]
+        self,
+        session: _PiSession,
+        tool_call_id: str,
+        arguments: dict[str, Any],
+        *,
+        role: Any = None,
+        scope: Any = None,
     ) -> dict[str, Any]:
-        if not self._permissions.requires_confirmation(tool_call_id, arguments):
-            return {"allow": True}
-        permission_id = uuid4().hex
-        future: asyncio.Future[tuple[bool, str | None]] = (
-            asyncio.get_running_loop().create_future()
-        )
-        session.pending_permission = _PendingPermission(
-            permission_id, tool_call_id, future
-        )
-        inflight = session.files.load_inflight() or {}
-        inflight.update({"permission_id": permission_id, "operation_id": tool_call_id})
-        session.files.save_inflight(inflight)
-        session.queue.put_nowait(
-            HarnessEvent(
-                session_id=session.session_id,
-                type="permission.requested",
-                run_id=str(inflight.get("run_id") or ""),
-                payload={
+        if tool_call_id in session.permission_calls:
+            raise ValueError("terminal permission call is already pending")
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[tuple[bool, str | None]] = loop.create_future()
+        session.permission_calls[tool_call_id] = future
+        try:
+            if role:
+                await self._authorize_native_role_tool(session, role, scope, "terminal")
+            if future.done():
+                allow, reason = future.result()
+                return {"allow": allow, "reason": reason}
+            if not self._permissions.requires_confirmation(tool_call_id, arguments):
+                return {"allow": True}
+            while session.pending_permission is not None:
+                await asyncio.wait(
+                    (session.pending_permission.released, future),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if future.done():
+                    allow, reason = future.result()
+                    return {"allow": allow, "reason": reason}
+
+            permission_id = uuid4().hex
+            pending = _PendingPermission(permission_id, future, loop.create_future())
+            run_id = str((session.files.load_inflight() or {}).get("run_id") or "")
+            session.files.save_pending_permission(
+                {
                     "permission_id": permission_id,
-                    "operation_ids": [tool_call_id],
-                    "description": (
-                        f"Allow risky terminal command: {arguments.get('command')}"
-                    ),
-                    "choices": ["allow_once", "deny"],
-                },
+                    "operation_id": tool_call_id,
+                    "run_id": run_id,
+                }
             )
-        )
-        allow, reason = await future
-        session.pending_permission = None
-        inflight.pop("permission_id", None)
-        session.files.save_inflight(inflight)
+            session.pending_permission = pending
+            allow = False
+            try:
+                session.queue.put_nowait(
+                    HarnessEvent(
+                        session_id=session.session_id,
+                        type="permission.requested",
+                        run_id=run_id,
+                        payload={
+                            "permission_id": permission_id,
+                            "operation_ids": [tool_call_id],
+                            "description": (
+                                "Allow risky terminal command: "
+                                f"{arguments.get('command')}"
+                            ),
+                            "choices": ["allow_once", "deny"],
+                        },
+                    )
+                )
+                allow, reason = await future
+                return {
+                    "allow": allow,
+                    "reason": reason or "User denied terminal command",
+                }
+            finally:
+                try:
+                    self._emit_permission_resolved(
+                        session, permission_id, run_id, allow
+                    )
+                    session.files.clear_pending_permission(permission_id)
+                finally:
+                    session.pending_permission = None
+                    pending.released.set_result(None)
+        finally:
+            session.permission_calls.pop(tool_call_id, None)
+
+    @staticmethod
+    def _emit_permission_resolved(
+        session: _PiSession, permission_id: str, run_id: str, allow: bool
+    ) -> None:
         session.queue.put_nowait(
             HarnessEvent(
                 session_id=session.session_id,
+                event_id=f"{session.session_id}:permission:{permission_id}:resolved",
                 type="permission.resolved",
-                run_id=str(inflight.get("run_id") or ""),
+                run_id=run_id,
                 payload={
                     "permission_id": permission_id,
                     "decision": "allow_once" if allow else "deny",
                 },
             )
         )
-        return {"allow": allow, "reason": reason or "User denied terminal command"}
 
     async def _runner_event(self, session: _PiSession, frame: dict[str, Any]) -> None:
         kind = frame.get("kind")
@@ -2416,6 +2468,13 @@ class PiAdapter:
                     )
                 )
             session.queue.put_nowait(HarnessEvent.model_validate(record["completion"]))
+        permission = session.files.load_pending_permission()
+        if permission and isinstance(permission.get("permission_id"), str):
+            permission_id = permission["permission_id"]
+            self._emit_permission_resolved(
+                session, permission_id, str(permission.get("run_id") or ""), False
+            )
+            session.files.clear_pending_permission(permission_id)
         inflight = session.files.load_inflight()
         if inflight is None:
             return

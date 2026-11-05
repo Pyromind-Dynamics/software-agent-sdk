@@ -30,6 +30,7 @@ class PiSessionFiles:
         self.session_path = self.directory / "session.json"
         self.session_log_path = self.directory / "session.jsonl"
         self.inflight_path = self.directory / "inflight.json"
+        self.permission_path = self.directory / "pending-permission.json"
         self.business_state_path = self.directory / "business-state.json"
         self.checkpoint_index_path = self.directory / "fork-index.json"
         self.completions_path = self.directory / "run-completions.json"
@@ -72,6 +73,19 @@ class PiSessionFiles:
 
     def clear_inflight(self) -> None:
         self.inflight_path.unlink(missing_ok=True)
+
+    def load_pending_permission(self) -> dict[str, Any] | None:
+        if not self.permission_path.is_file():
+            return None
+        return _load_object(self.permission_path)
+
+    def save_pending_permission(self, value: dict[str, Any]) -> None:
+        _atomic_json(self.permission_path, value)
+
+    def clear_pending_permission(self, permission_id: str) -> None:
+        record = self.load_pending_permission()
+        if record and record.get("permission_id") == permission_id:
+            self.permission_path.unlink(missing_ok=True)
 
     def load_pending_completions(self) -> dict[str, Any]:
         if not self.completions_path.is_file():

@@ -9,7 +9,7 @@ When the workflow is in the conversation workspace, upload the actual generated 
 
 After confirmation, the product runtime submits the task and records its `taskId`. On the terminal callback, use that taskId:
 
-- Failed: call `analyze_task_failure(task_id)` and report the error and a concrete fix. Do not rerun automatically.
+- Failed: call `analyze_task_failure(task_id)` and use the diagnosis to continue the task.
 - Succeeded with a training node: hand the taskId to [training-analysis](../training-analysis/SKILL.md) for run diagnostics, then follow [inference-evaluation](../inference-evaluation/SKILL.md) for baseline and final-model comparison on the same held-out data, unless evaluation was explicitly excluded. Reuse a comparable existing baseline. Use actual model artifacts, merging LoRA before evaluation; do not ask the user to try an intermediate model. Report missing validation data or artifacts instead of substituting training loss for quality evidence.
 - Succeeded without training, stopped, or terminated: report the task status.
 

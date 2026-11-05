@@ -91,7 +91,7 @@ function storageMount(cwd: string | undefined): string | undefined {
 async function runRetrieval(access: ExecutionAccess, mirror: SandboxReadMirror | undefined, args: Record<string, unknown>, kind: string, signal?: AbortSignal): Promise<{ lines: string[]; truncated: boolean }> {
   const label = typeof args.path === "string" ? args.path : "public_data";
   const host = mirror?.resolveAlias(label);
-  const root = host ? await realpath(host) : await access.resolvePath(label, "read");
+  const root = host ? await realpath(host) : await access.resolvePath(label, "read", signal);
   if (host && !await mirror!.containsCanonical(root)) throw new Error("search resource symlink escapes its configured root");
   // The conversation workspace and the Storage mount it sits inside, plus the
   // read-only resource roots. The removed `storage/` alias is not a scope.
@@ -99,7 +99,7 @@ async function runRetrieval(access: ExecutionAccess, mirror: SandboxReadMirror |
     .filter((path): path is string => typeof path === "string");
   const allowedRoots = host ? [root] : access.allowedReadRoots ?? (
     await Promise.all(scopes.map(async (path) => {
-      try { return await access.resolvePath(path, "read"); } catch { return undefined; }
+      try { return await access.resolvePath(path, "read", signal); } catch { return undefined; }
     }))
   ).filter((path): path is string => path !== undefined);
   const query = JSON.stringify({ ...args, kind, label, root, allowedRoots, limit: Math.min(200, Math.max(1, Number(args.limit ?? 100))) });

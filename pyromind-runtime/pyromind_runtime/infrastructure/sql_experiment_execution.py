@@ -323,17 +323,17 @@ class SQLExperimentExecutionStore:
                         .order_by(submissions.c.updated_at.desc())
                     ).mappings()
                 ]
-                value["submission"] = (
-                    conn.execute(
-                        sa.select(submissions)
-                        .where(submissions.c.run_id == row["id"])
-                        .order_by(submissions.c.updated_at.desc())
-                    )
-                    .mappings()
-                    .first()
+                workflow_request = (row["attributes"] or {}).get("workflow_request_id")
+                value["submission"] = next(
+                    (
+                        sub
+                        for sub in value["submissions"]
+                        if not workflow_request
+                        or sub["evidence"].get("workflow_request_id")
+                        == workflow_request
+                    ),
+                    None,
                 )
-                if value["submission"]:
-                    value["submission"] = dict(value["submission"])
                 result.append(value)
             return result
 
@@ -509,6 +509,13 @@ class SQLExperimentExecutionStore:
                     .values(state="submission_uncertain")
                 )
                 self.changed(conn, owner, run_id, "submission-uncertain")
+            if report and row["state"] in {
+                "waiting_confirmation",
+                "submitting",
+                "submission_uncertain",
+                "waiting_platform",
+            }:
+                return self._run(conn, owner, run_id)
             if report and row["report_state"] != "ready":
                 result = dict(row.get("result") or {})
                 reason = result.get("registration_error") or text[:16000]
@@ -755,8 +762,13 @@ class SQLExperimentExecutionStore:
         self, owner: PlanOwner, run_id: str, scope: dict, request_id: str
     ) -> None:
         with write_transaction(self.engine) as conn:
-            self.queue.fenced(conn, scope["work_id"], scope["generation"])
+            item = self.queue.fenced(conn, scope["work_id"], scope["generation"])
             row = self._run(conn, owner, run_id)
+            if (
+                item["owner"] != owner_key(owner)
+                or item["payload"].get("run_id") != run_id
+            ):
+                raise PermissionError("work belongs to a different execution")
             policy = (row.get("task_spec") or {}).get("execution_policy") or {}
             if (
                 policy.get("submission_tool") != "submit_workflow"
@@ -765,15 +777,70 @@ class SQLExperimentExecutionStore:
                 raise PermissionError("execution does not allow workflow submission")
             attributes = dict(row.get("attributes") or {})
             previous = attributes.get("workflow_request_id")
-            if previous and previous != request_id:
+            if (
+                previous
+                and previous != request_id
+                and row["state"]
+                not in {
+                    "failed",
+                    "needs_input",
+                }
+            ):
                 raise ValueError("a workflow is already staged for this task")
-            if row["state"] not in {"queued", "preparing", "waiting_confirmation"}:
+            if row["state"] not in {
+                "queued",
+                "preparing",
+                "waiting_confirmation",
+                "failed",
+                "needs_input",
+            }:
                 raise ValueError("task cannot stage another workflow")
+            prior = next(
+                (
+                    sub
+                    for sub in conn.execute(
+                        sa.select(submissions)
+                        .where(submissions.c.run_id == run_id)
+                        .with_for_update()
+                    ).mappings()
+                    if sub["evidence"].get("workflow_request_id") == previous
+                ),
+                None,
+            )
+            if prior is not None and prior["state"] != "failed":
+                raise ValueError("task already has submitted work")
+            if previous != request_id:
+                if prior is not None:
+                    conn.execute(
+                        submissions.update()
+                        .where(submissions.c.id == prior["id"])
+                        .values(
+                            evidence={
+                                **prior["evidence"],
+                                "result": row.get("result"),
+                                "artifacts": attributes.get("artifacts", {}),
+                            }
+                        )
+                    )
+                attributes.pop("artifacts", None)
             attributes["workflow_request_id"] = request_id
             conn.execute(
                 runs.update()
                 .where(runs.c.id == run_id)
-                .values(attributes=attributes, state="waiting_confirmation")
+                .values(
+                    attributes=attributes,
+                    state="waiting_confirmation",
+                    report_state="not_started",
+                    result=None,
+                    metrics=None,
+                    active_key=digest(
+                        owner_key(owner)
+                        + ":"
+                        + row["project_id"]
+                        + ":"
+                        + row["task_id"]
+                    ),
+                )
             )
             self.changed(conn, owner, run_id, "workflow:" + request_id)
 
@@ -789,15 +856,17 @@ class SQLExperimentExecutionStore:
             row = self._run(conn, owner, run_id)
             if (row.get("attributes") or {}).get("workflow_request_id") != request_id:
                 raise PermissionError("workflow belongs to another execution")
-            existing = (
-                conn.execute(
-                    sa.select(submissions).where(
-                        submissions.c.run_id == run_id,
-                        submissions.c.operation_key == "workflow",
-                    )
-                )
-                .mappings()
-                .first()
+            existing = next(
+                (
+                    sub
+                    for sub in conn.execute(
+                        sa.select(submissions).where(
+                            submissions.c.run_id == run_id,
+                        )
+                    ).mappings()
+                    if sub["evidence"].get("workflow_request_id") == request_id
+                ),
+                None,
             )
             if existing:
                 if existing["request_fingerprint"] != definition_fingerprint:
@@ -818,7 +887,7 @@ class SQLExperimentExecutionStore:
                 submissions.insert().values(
                     id=identity,
                     run_id=run_id,
-                    operation_key="workflow",
+                    operation_key="workflow:" + digest(request_id),
                     owner=owner_key(owner),
                     state="submitting",
                     request_fingerprint=definition_fingerprint,
@@ -1384,7 +1453,7 @@ class SQLExperimentExecutionStore:
             if ids:
                 conn.execute(
                     submissions.update()
-                    .where(submissions.c.run_id.in_(ids))
+                    .where(submissions.c.state == "submitting")
                     .values(state="submission_uncertain")
                 )
                 conn.execute(
@@ -1498,6 +1567,28 @@ class SQLExperimentExecutionStore:
                         conn, owner, sub["run_id"], "observation:" + event["id"]
                     )
                     if status in terminal:
+                        attributes = conn.execute(
+                            sa.select(runs.c.attributes).where(
+                                runs.c.id == sub["run_id"]
+                            )
+                        ).scalar_one()
+                        current_workflow = (attributes or {}).get("workflow_request_id")
+                        if (
+                            current_workflow
+                            and sub["evidence"].get("workflow_request_id")
+                            and current_workflow
+                            != sub["evidence"]["workflow_request_id"]
+                        ):
+                            conn.execute(
+                                messages.update()
+                                .where(
+                                    messages.c.direction == "in",
+                                    messages.c.id == event["id"],
+                                )
+                                .values(state="applied")
+                            )
+                            count += 1
+                            continue
                         run_state = conn.execute(
                             sa.select(runs.c.state).where(runs.c.id == sub["run_id"])
                         ).scalar_one()

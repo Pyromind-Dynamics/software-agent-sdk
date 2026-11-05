@@ -12,6 +12,7 @@ import { serveSubagentIpc } from "./subagent-ipc.js";
 import { SubagentDisplay, displayText, transcriptWindow } from "./subagent-display.js";
 import { SubagentActivity } from "./subagent-activity.js";
 import { SubagentRecipients } from "./subagent-recipients.js";
+import { SubagentTerminals, usesAgentTerminal, type SubagentTerminalFactory } from "./subagent-terminals.js";
 import { SubagentReports } from "./subagent-reports.js";
 import { isRecord, type JsonObject, type RunnerEvent, PROTOCOL_VERSION } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
@@ -85,10 +86,11 @@ export class SubagentHost {
   private refreshPending?: Promise<void>;
   private readonly reports: SubagentReports;
   private recipients?: SubagentRecipients;
+  private terminals?: SubagentTerminals;
   readonly paths: ReturnType<typeof prepareSubagentEnvironment>;
 
   constructor(private workspace: string, private sessionId: string, private peer: JsonlRpcPeer,
-    private tools: AgentTool[], private modelRuntime: ModelRuntime, private model: Model<Api>, private instructions: string, private definitions?: SubagentRoleDefinition[], private roleToolSets?: Record<string, AgentTool[]>, private skillPathAliases: Array<{ host: string; alias: string }> = []) {
+    private tools: AgentTool[], private modelRuntime: ModelRuntime, private model: Model<Api>, private instructions: string, private definitions?: SubagentRoleDefinition[], private roleToolSets?: Record<string, AgentTool[]>, private skillPathAliases: Array<{ host: string; alias: string }> = [], terminalFactory?: SubagentTerminalFactory) {
     this.roleTools = definitions ? Object.fromEntries(definitions.map(role => [role.name, role.tools])) : ROLE_TOOLS;
     for (const role of definitions ?? []) {
       const available = new Set((roleToolSets?.[role.name] ?? tools).map(tool => tool.name));
@@ -96,6 +98,7 @@ export class SubagentHost {
       if (missing.length) throw new Error(`Delegated role ${role.name} requests unavailable host tools: ${missing.join(", ")}`);
     }
     this.paths = prepareSubagentEnvironment(workspace, definitions);
+    if (terminalFactory) this.terminals = new SubagentTerminals(this.paths.stateRoot, terminalFactory);
     const activity = new SubagentActivity(this.paths.stateRoot, join(workspace, "pi", "subagent-artifacts"),
       () => this.session ? [this.session.sessionId, this.session.sessionManager.getSessionFile() ?? ""] : []);
     this.display = new SubagentDisplay((method, params) => this.rpc(method, params), id => {
@@ -116,8 +119,18 @@ export class SubagentHost {
         model: publicModel(this.session?.model ?? this.model), instructions: this.instructions,
         skillPathAliases: this.skillPathAliases, scope: this.workScopes.get(request.role),
         workspacePathAlias: this.skillPathAliases.length ? {host: this.workspace, alias: "."} : undefined,
+        terminalTools: this.terminals ? allowed.filter(usesAgentTerminal) : [],
         tools: roleTools.filter((tool) => allowed.includes(tool.name)).map(({ name, label, description, parameters }) => ({ name, label, description: `[Conversation host] ${description}`, parameters })),
       };
+      if (request.method === "terminal.attach" && this.terminals && allowed.some(usesAgentTerminal)) {
+        if (typeof request.session !== "string" || typeof request.session_file !== "string") throw new Error("Missing child session identity");
+        await this.terminals.attach(request.role, request.session, request.session_file, signal, (id) => update({ id }));
+        return null;
+      }
+      if (request.method === "terminal.detach" && this.terminals) {
+        await this.terminals.detach(request);
+        return null;
+      }
       if (request.method === "tool") {
         if (typeof request.name !== "string" || !allowed.includes(request.name)) throw new Error("Child tool is not allowed");
         const tool = roleTools.find((tool) => tool.name === request.name);
@@ -130,14 +143,22 @@ export class SubagentHost {
           if (!path.startsWith(`public_data/experiment-runs/${expected.run_id}/`) || path.split("/").includes("..")) throw new Error("Write only this task's workspace");
         }
         const id = `subagent:${request.session}:${request.id}`;
-        try {
-          if ("executeScoped" in tool && typeof tool.executeScoped === "function") return await tool.executeScoped(id, request.args, signal, supplied, this.recipients!.origin(request.session, request.session_file));
-          return await tool.execute(id, request.args, signal, update);
-        }
-        finally { if (["write", "edit", "terminal"].includes(request.name)) {
-          this.mutatedSessions.add(String(request.session));
-          this.emit(`mutation:${randomUUID()}`, "subagent.workflow_modified", {});
-        } }
+        const execute = async (selected: AgentTool, toolSignal: AbortSignal) => {
+          try {
+            if ("executeScoped" in selected && typeof selected.executeScoped === "function") {
+              const origin = this.recipients!.origin(request.session, request.session_file);
+              return await selected.executeScoped(id, request.args, toolSignal, supplied, origin, update);
+            }
+            return await selected.execute(id, request.args, toolSignal, update);
+          } finally {
+            if (["write", "edit", "terminal"].includes(selected.name)) {
+              this.mutatedSessions.add(String(request.session));
+              this.emit(`mutation:${randomUUID()}`, "subagent.workflow_modified", {});
+            }
+          }
+        };
+        if (this.terminals && usesAgentTerminal(request.name)) return this.terminals.run(request, signal, execute);
+        return execute(tool, signal);
       }
       if (request.method === "model") {
         const options = isRecord(request.options) ? request.options : {};
@@ -473,6 +494,7 @@ export class SubagentHost {
     clearInterval(this.monitor);
     for (const registration of this.registrations) registration.dispose();
     await this.closeIpc?.();
+    await this.terminals?.close();
   }
 }
 

@@ -23,6 +23,19 @@ interface MockApi {
   close: () => Promise<void>;
 }
 
+test("cancelling a file read during sandbox creation leaves the shared endpoint available", async () => {
+  const pending = Promise.withResolvers<SandboxEndpoint>();
+  const endpoints = new SandboxEndpointSession(() => pending.promise);
+  const client = new SandboxFileClient(endpoints);
+  const abort = new AbortController();
+  const read = client.read("/workspace/file", undefined, abort.signal);
+  abort.abort();
+  await assert.rejects(read, /aborted/);
+  assert.equal(endpoints.resolve(), pending.promise);
+  pending.resolve(endpointFor("https://unused.example"));
+  assert.equal((await endpoints.resolve()).sandboxId, "sbx-1");
+});
+
 async function listen(
   handler: (request: IncomingMessage, response: ServerResponse) => void,
 ): Promise<MockApi> {
