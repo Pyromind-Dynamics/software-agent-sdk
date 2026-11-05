@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 
 import httpx
 import pytest
+from PIL import Image
 from pyromind_runtime.domain.experiment_execution import RequestExperimentTask
 from pyromind_runtime.infrastructure.sql_work_queue import StaleLeaseError, now, work
 
@@ -95,7 +96,9 @@ def delivery(experiment):
     async def execute(*_):
         raise AssertionError("file delivery must not start platform work")
 
-    async def record(document=None, active_scope=None, active_owner=None):
+    async def record(
+        document=None, active_scope=None, active_owner=None, verification=None
+    ):
         return await service.role_call(
             active_owner or owner,
             "cleaner",
@@ -104,7 +107,7 @@ def delivery(experiment):
             active_scope or scope,
             execute,
             read,
-            inspect,
+            verification or inspect,
         )
 
     return service, owner, engine, run, scope, files, arguments, record
@@ -203,6 +206,10 @@ async def test_data_files_complete_without_mandatory_report_and_bind_to_train(
     )
     assert json.loads(validation_report.read_text())["validation"]["status"] == "passed"
     content = json.loads(source.read_text())["messages"][1]["content"]
+    for index, part in enumerate(content[:3]):
+        image_path = tmp_path / part["path"].lstrip("/")
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (8, 8), (index * 80, 0, 0)).save(image_path)
     assert [PurePosixPath(part["path"]).stem for part in content[:3]] == [
         "inspection",
         "difference",
@@ -321,6 +328,17 @@ async def test_declarations_alone_do_not_complete_data_task(delivery):
         service.store.record_result(owner, run["id"], scope, arguments, None)
     view = service.list(owner)[0]
     assert view.state != "succeeded" and not view.artifacts
+
+
+async def test_file_prefix_digest_cannot_be_registered_as_complete(delivery):
+    service, owner, _, _, _, _, _, record = delivery
+
+    async def preview(*_):
+        return {"sha256": "a" * 64, "scope": "file prefix"}
+
+    with pytest.raises(ValueError, match="complete file digest"):
+        await record(verification=preview)
+    assert not service.list(owner)[0].artifacts
 
 
 async def test_report_conflict_rolls_back_files_and_success_together(delivery):

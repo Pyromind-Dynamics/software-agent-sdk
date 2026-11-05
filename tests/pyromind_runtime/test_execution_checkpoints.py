@@ -161,6 +161,15 @@ async def test_review_then_single_full_submission_and_verified_result(sample_exe
     assert service.list(owner)[0].state == "waiting_user"
     service.store.continue_task(owner, run["id"], "early", "Discuss this sample")
     assert service.list(owner)[0].checkpoint.status == "pending"
+    with pytest.raises(PermissionError, match="sample review is not approved"):
+        await call(
+            "record_experiment_result",
+            {
+                "run_id": run["id"],
+                "summary": "Attempt to bypass the frozen sample review",
+                "artifacts": [{"name": "data", "uri": "/source.jsonl"}],
+            },
+        )
     with pytest.raises(PermissionError):
         await call("df_submit_pipeline", document["configuration"])
     service.store.resolve_checkpoint(
