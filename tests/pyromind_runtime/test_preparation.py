@@ -919,7 +919,11 @@ def test_catalog_is_profile_owned_and_old_plans_remain_compatible():
     assert nodes["eval"].roles == ("eval",)
     assert {task.id for task in nodes["init"].tasks} == {"bench", "analysis"}
     assert {task.id for task in nodes["eval"].tasks} == {"checkpoint_eval", "analysis"}
-    assert not nodes["train"].roles
+    assert nodes["train"].roles == ("train",)
+    assert nodes["dataset"].roles == ("dataset",)
+    assert nodes["init"].roles == ("init",)
+    assert nodes["eval"].roles == ("eval",)
+    assert not nodes["inference"].roles
     context = ExperimentContext.model_validate(
         {
             "goal": "Baseline",

@@ -18,6 +18,28 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SOFTWARE_AGENT_SDK_DIR="${SOFTWARE_AGENT_SDK_DIR:-${SCRIPT_DIR}}"
 
+# Load local dotenv fields before applying defaults; exported environment wins.
+if [[ -f "${SCRIPT_DIR}/.env.test.local" ]]; then
+  local_env_exports="$(
+    uv run --project "${SOFTWARE_AGENT_SDK_DIR}" python - "${SCRIPT_DIR}/.env.test.local" <<'PYTHON'
+import os
+import re
+import shlex
+import sys
+
+from dotenv import dotenv_values
+
+for name, value in dotenv_values(sys.argv[1], interpolate=False).items():
+    if value is not None and name not in os.environ:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ValueError("Invalid environment variable name in .env.test.local")
+        print(f"export {name}={shlex.quote(value)}")
+PYTHON
+  )"
+  eval "${local_env_exports}"
+  unset local_env_exports
+fi
+
 # Override EXPERIMENT_DB_BACKEND=sqlite to use a local database.
 export EXPERIMENT_DB_BACKEND="${EXPERIMENT_DB_BACKEND:-mariadb}"
 case "${EXPERIMENT_DB_BACKEND}" in
@@ -41,7 +63,7 @@ esac
 export OPENAI_API_KEY
 export OPENROUTER_API_KEY
 export PYROMIND_HARNESS_BACKEND="pi"
-export APP_ENV="${APP_ENV:-dev}"
+export APP_ENV="${APP_ENV:-prod}"
 export PYROMIND_PI_TERMINAL_BACKEND="${PYROMIND_PI_TERMINAL_BACKEND:-sandbox}"
 export PYROMIND_AGENTGENOME_ENABLED=1
 export PYROMIND_PUBLIC_API_BASE="${PYROMIND_PUBLIC_API_BASE:-http://localhost:5173}"
@@ -101,7 +123,7 @@ export OPENAI_API_KEY
 
 export DF_API_BASE_URL="https://openrouter.ai/api/v1"
 export DF_API_URL="https://openrouter.ai/api/v1/chat/completions"
-export DF_MODEL_NAME="google/gemma-4-31b-it"
+export DF_MODEL_NAME="deepseek/deepseek-v4.1-flash-1017"
 export DF_API_KEY="${DF_API_KEY:-${OPENROUTER_API_KEY:-}}"
 if [[ -z "${DF_API_KEY:-}" ]]; then
   echo "ERROR: DF_API_KEY is required. Set DF_API_KEY or OPENROUTER_API_KEY." >&2
@@ -126,8 +148,20 @@ fi
 
 export OH_ENABLE_PYROMIND_JWT_AUTH="${OH_ENABLE_PYROMIND_JWT_AUTH:-true}"
 
-# Keep the server in local development mode while consuming pre workflow events.
-export KAFKA_ENV="${KAFKA_ENV:-prod}"
+# Use the JWT signing key from the selected Studio environment.
+# Export PYROMIND_WEB_SECRET_KEY or provide a web_secret_key file under
+# PYROMIND_SECRET_PATH (defaults to /etc/secrets). Never print the key.
+export PYROMIND_WEB_SECRET_KEY="${PYROMIND_WEB_SECRET_KEY:-}"
+export PYROMIND_SECRET_PATH="${PYROMIND_SECRET_PATH:-/etc/secrets}"
+case "${OH_ENABLE_PYROMIND_JWT_AUTH}" in
+  true|True|TRUE|1)
+    uv run --project "${SOFTWARE_AGENT_SDK_DIR}" python -c \
+      'from openhands.agent_server.pyromind_auth import find_secret_key; find_secret_key()'
+    ;;
+esac
+
+# Consume workflow events from the selected platform environment.
+export KAFKA_ENV="${KAFKA_ENV:-${APP_ENV}}"
 export POD_NAME="${POD_NAME:-local-agent-server-${USER:-unknown}}"
 export KAFKA_URL="${KAFKA_URL:-kafka-portal.pyromind.ai:31011,kafka-portal.pyromind.ai:31012,kafka-portal.pyromind.ai:31013}"
 
@@ -302,13 +336,13 @@ echo " Bash events:       ${OH_BASH_EVENTS_DIR}"
 echo " Config path:       ${OPENHANDS_AGENT_SERVER_CONFIG_PATH}"
 echo " Plan database:     ${EXPERIMENT_DB_BACKEND}"
 echo " Pyromind JWT auth: ${OH_ENABLE_PYROMIND_JWT_AUTH}"
-echo " Server env:        ${APP_ENV:-dev}"
+echo " Server env:        ${APP_ENV:-prod}"
 echo " Kafka env:         ${KAFKA_ENV}"
 echo " Kafka brokers:     ${KAFKA_URL:-cluster-internal default}"
 echo " Kafka group:       ${POD_NAME}"
 echo " Session API key:   $([[ -n "${SESSION_API_KEY}" ]] && echo configured || echo disabled)"
 echo " Host:              127.0.0.1"
-echo " Port:              8000"
+echo " Port:              8001"
 echo " Auto-reload:       enabled"
 echo "============================================"
 echo ""

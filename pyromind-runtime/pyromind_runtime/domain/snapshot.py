@@ -239,6 +239,10 @@ class ConversationSnapshot(ContractModel):
     usage: UsageState = Field(default_factory=UsageState)
     external_tasks: tuple[ExternalTaskState, ...] = ()
 
+    @property
+    def foreground_inputs(self) -> tuple[PendingUserInput, ...]:
+        return tuple(item for item in self.pending_inputs if item.task_run_id is None)
+
     @model_serializer(mode="wrap")
     def _omit_default_input_state(self, handler):
         # Omit empty input state and default policy for disabled sessions so strict

@@ -24,6 +24,89 @@ class DelegatedExecution:
         self.store = store
         self.control = control
 
+    async def steer(self, item: dict) -> dict:
+        owner = PlanOwner.model_validate(item["payload"]["owner"])
+        run_id = item["payload"]["run_id"]
+        row = next(
+            row
+            for row in await asyncio.to_thread(self.store.list, owner)
+            if row["id"] == run_id
+        )
+        role = row["role_id"]
+        message = (
+            item["payload"]["message"]
+            or "Continue the previous task with its existing context."
+        )
+        while True:
+            target = await asyncio.to_thread(
+                self.store.guidance_target,
+                owner,
+                run_id,
+                item["payload"]["target_work_id"],
+            )
+            reference = target["checkpoint"].get("execution_ref")
+            if target["state"] != "running":
+                break
+            if not reference:
+                await asyncio.sleep(0.1)
+                continue
+            scope = {
+                "work_id": target["id"],
+                "generation": target["generation"],
+                "run_id": run_id,
+            }
+            try:
+                result = await self.control(
+                    owner,
+                    role,
+                    {
+                        "action": "status",
+                        "execution_ref": reference,
+                        "scope": scope,
+                    },
+                )
+            except (ValueError, PermissionError):
+                latest_work = await asyncio.to_thread(
+                    self.store.guidance_target, owner, run_id, target["id"]
+                )
+                if latest_work["state"] == "running":
+                    raise
+                break
+            if result["status"] not in {"running", "queued"}:
+                break
+            try:
+                result = await self.control(
+                    owner,
+                    role,
+                    {
+                        "action": "steer",
+                        "execution_ref": reference,
+                        "scope": scope,
+                        "task": message,
+                        "request_id": item["id"],
+                    },
+                )
+            except Exception:
+                # A child can finish between status and steer. Preserve the message
+                # for a normal resume, and surface other delivery failures.
+                latest = await self.control(
+                    owner,
+                    role,
+                    {
+                        "action": "status",
+                        "execution_ref": reference,
+                        "scope": scope,
+                    },
+                )
+                if latest["status"] in {"running", "queued", "unknown"}:
+                    raise
+                break
+            return {"execution_ref": reference, "delivery": "steered"}
+        work_id = await asyncio.to_thread(
+            self.store.enqueue_continuation, owner, run_id, item["id"], message
+        )
+        return {"delivery": "queued", "work_id": work_id}
+
     async def prepare(self, item: dict) -> dict:
         owner = PlanOwner.model_validate(item["payload"]["owner"])
         run_id = item["payload"]["run_id"]
@@ -39,6 +122,7 @@ class DelegatedExecution:
         await asyncio.to_thread(self.store.role_scope, owner, run_id, role, scope)
         specification = row.get("task_spec")
         report = item["kind"] == "generate_report"
+        continuation = item["payload"].get("continuation", False)
         if specification:
             task_name = specification["task"]["name"]
             task_body = {
@@ -46,19 +130,25 @@ class DelegatedExecution:
                 **specification,
                 "phase": "report" if report else "execute",
                 "metrics": row.get("metrics"),
+                "checkpoint": (row.get("attributes") or {}).get("checkpoint"),
+                "artifacts": row.get("artifacts", []),
                 "submission": {
                     key: value
                     for key, value in (row.get("submission") or {}).items()
                     if key in {"task_id", "state", "evidence"}
                 },
                 "message": item["payload"].get("message", ""),
+                "conversation_followup": continuation,
                 "instruction": (
-                    "Use the evaluation Skill and its existing tools. "
+                    "Use your role Skills and tools for the supplied frozen task. "
                     "Execute when intent=execute; prepare only when intent=prepare. "
                     "After submission end this turn; Runtime waits for the platform "
                     "and resumes you for the report. Register a report or essential "
                     "blockers with record_experiment_result. "
-                    "No Graph confirmation is required."
+                    "No Graph confirmation is required. "
+                    "For conversation_followup, respond to the Manager guidance in "
+                    "this same context. Existing task and platform states are facts, "
+                    "not an instruction to repeat submissions."
                 ),
             }
         else:
@@ -77,6 +167,7 @@ class DelegatedExecution:
                     "resources": [
                         r.model_dump(mode="json") for r in revision.plan.resources
                     ],
+                    "message": item["payload"].get("message", ""),
                     "instruction": "Use submit_experiment_evaluation to prepare "
                     "a proposal. Do not start tasks.",
                 }
@@ -145,14 +236,14 @@ class DelegatedExecution:
                         },
                     )
                 if result.get("status") in {"stopped", "paused"} and (
-                    row["state"] in {"queued", "preparing"} or report
+                    row["state"] in {"queued", "preparing"} or report or continuation
                 ):
                     import json
 
                     # A native hard stop seals its session. Once termination is
                     # proven, a fresh child can re-read the durable task facts;
                     # the existing submission ledger still forbids duplicates.
-                    stopped = result["status"] == "stopped"
+                    stopped = result["status"] == "stopped" and not continuation
                     request_id = item["id"] + ":recovery:" + str(item["generation"])
                     await asyncio.to_thread(
                         self.store.save_work_checkpoint,
@@ -187,9 +278,14 @@ class DelegatedExecution:
             prompt = json.dumps(task_body, ensure_ascii=False)
             prior = (
                 await asyncio.to_thread(self.store.native_reference, owner, run_id)
-                if specification
+                if specification or continuation
                 else None
             )
+            if continuation and prior is None:
+                raise ValueError(
+                    "the original child context is unavailable; "
+                    "delegate a fresh task explicitly"
+                )
             await asyncio.to_thread(
                 self.store.save_work_checkpoint,
                 item["id"],
@@ -237,16 +333,36 @@ class DelegatedExecution:
                 self.store.role_scope, owner, run_id, role, scope
             )
             if specification:
-                current = await asyncio.to_thread(
-                    self.store.complete_agent_turn,
-                    owner,
-                    run_id,
-                    scope,
-                    result.get("result_text")
-                    or "The child ended without a submitted evaluation "
-                    "or registered report.",
-                    report,
-                )
+                if not continuation or current["state"] in {"queued", "preparing"}:
+                    current = await asyncio.to_thread(
+                        self.store.complete_agent_turn,
+                        owner,
+                        run_id,
+                        scope,
+                        result.get("result_text")
+                        or "The child ended without a submission or registered result.",
+                        report,
+                    )
+                if continuation:
+                    notice_id = "guidance:" + item["id"]
+                    await asyncio.to_thread(
+                        self.store.enqueue_manager,
+                        owner,
+                        notice_id,
+                        {
+                            "notice_id": notice_id,
+                            "result": {
+                                "run_id": run_id,
+                                "conversation_followup": True,
+                                "state": current["state"],
+                                "report_state": current["report_state"],
+                                "summary": (
+                                    result.get("result_text")
+                                    or "The child ended without a response."
+                                )[:16000],
+                            },
+                        },
+                    )
                 return {
                     "execution_ref": reference,
                     "state": current["state"],

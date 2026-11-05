@@ -15,6 +15,7 @@ test("real plugin bridges tools and model, resumes persisted history, and owns b
   await writeFile(join(root, "public_data", "evidence.txt"), "CHILD_EVIDENCE_937\n");
   const requests: any[] = [];
   let stalled = 0;
+  let finishGuidance: (() => void) | undefined;
   const server = createServer(async (req, res) => {
     let body = ""; for await (const chunk of req) body += chunk;
     const request = JSON.parse(body); requests.push(request);
@@ -25,6 +26,9 @@ test("real plugin bridges tools and model, resumes persisted history, and owns b
     const isTerminalCheck = !isParent && JSON.stringify(request.messages).includes("CHECK_FAILED_TERMINAL");
     const wrote = request.messages.some((m: any) => m.role === "tool");
     const delta = isTerminalCheck && !wrote ? {tool_calls:[{index:0,id:"terminal-1",type:"function",function:{name:"terminal",arguments:JSON.stringify({command:"exit 7"})}}]} : isWriter && !wrote ? {tool_calls:[{index:0,id:"write-1",type:"function",function:{name:"write",arguments:JSON.stringify({path:"public_data/child-output.txt",content:"written by child"})}}]} : (hasRead || wrote) ? { content: `CHILD_EVIDENCE_937; users=${request.messages.filter((m: any) => m.role === "user").length}` } : { tool_calls: [{ index: 0, id: "read-1", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "public_data/evidence.txt" }) } }] };
+    if (!isParent && JSON.stringify(request.messages).includes("WAIT_FOR_GUIDANCE") && !JSON.stringify(request.messages).includes("NEW_GUIDANCE_481")) {
+      await new Promise<void>((resolve) => { finishGuidance = resolve; });
+    }
     res.writeHead(200, { "content-type": "text/event-stream" });
     for (const [d, reason] of [[{role:"assistant"}, null], [delta,null], [{},(hasRead || wrote) ? "stop" : "tool_calls"]]) res.write(`data: ${JSON.stringify({id:"test",object:"chat.completion.chunk",created:1,model:request.model,choices:[{index:0,delta:d,finish_reason:reason}]})}\n\n`);
     res.end("data: [DONE]\n\n");
@@ -93,6 +97,18 @@ test("real plugin bridges tools and model, resumes persisted history, and owns b
   const afterRestart: any = await execute({action:"resume",id:resume.details.asyncId,message:"Continue after host restart"});
   assert.ok(afterRestart.details.asyncId,JSON.stringify(afterRestart));
   await eventually(async()=>{const value=JSON.parse(await readFile(join(subagents.paths.stateRoot,"async-subagent-runs",afterRestart.details.asyncId,"status.json"),"utf8"));assert.equal(value.state,"complete",JSON.stringify(value));assert.match(await readFile(value.sessionFile,"utf8"),/users=3/);});
+  const guided = await subagents.control({action:"spawn",role:"search",task:"WAIT_FOR_GUIDANCE: summarize the evidence",request_id:"guided-start"});
+  await eventually(async () => assert.ok(finishGuidance));
+  const guidance = await subagents.control({action:"steer",role:"search",execution_ref:guided.execution_ref,task:"NEW_GUIDANCE_481: retain prior evidence and explain it",request_id:"guided-message"});
+  assert.equal(guidance.execution_ref, guided.execution_ref);
+  finishGuidance!();
+  await eventually(async () => {
+    const value = JSON.parse(await readFile(join(subagents.paths.stateRoot,"async-subagent-runs",guided.execution_ref,"status.json"),"utf8"));
+    assert.equal(value.state,"complete",JSON.stringify(value));
+    const transcript = await readFile(value.sessionFile,"utf8");
+    assert.match(transcript,/NEW_GUIDANCE_481/);
+    assert.match(transcript,/CHILD_EVIDENCE_937/);
+  });
   const stopped: any = await execute({agent:"search",task:"WAIT_FOR_STOP",async:true});
   await eventually(async()=>assert.equal(stalled,1));
   await subagents.stopAll();

@@ -114,8 +114,8 @@ class SnapshotProjector:
             and event.run_id != snapshot.active_run_id
         ):
             return snapshot
-        if snapshot.pending_inputs:
-            waiting_run = snapshot.active_run_id or snapshot.pending_inputs[0].run_id
+        if snapshot.foreground_inputs:
+            waiting_run = snapshot.active_run_id or snapshot.foreground_inputs[0].run_id
             if event.run_id is not None and event.run_id != waiting_run:
                 return snapshot
             if status in {"running", "idle", "finished"}:
@@ -318,7 +318,7 @@ class SnapshotProjector:
         # present.
         status = (
             "waiting_for_input"
-            if snapshot.pending_inputs
+            if snapshot.foreground_inputs
             else "waiting_for_confirmation"
         )
         return snapshot.model_copy(
@@ -337,7 +337,7 @@ class SnapshotProjector:
             for item in snapshot.pending_permissions
             if item.permission_id != permission_id
         )
-        if snapshot.pending_inputs:
+        if snapshot.foreground_inputs:
             status = "waiting_for_input"
         elif pending:
             status = "waiting_for_confirmation"
@@ -353,13 +353,17 @@ class SnapshotProjector:
         pending = PendingUserInput.model_validate(
             {**event.payload, "run_id": event.run_id}
         )
+        if any(
+            item.request_id == pending.request_id for item in snapshot.pending_inputs
+        ):
+            return snapshot
+        if pending.task_run_id is not None:
+            return snapshot.model_copy(
+                update={"pending_inputs": (*snapshot.pending_inputs, pending)}
+            )
         if (
             snapshot.active_run_id is not None
             and pending.run_id != snapshot.active_run_id
-        ):
-            return snapshot
-        if any(
-            item.request_id == pending.request_id for item in snapshot.pending_inputs
         ):
             return snapshot
         # Keep the owning active_run_id while waiting; the run is active and awaiting
@@ -395,8 +399,10 @@ class SnapshotProjector:
             event.run_id is not None and event.run_id != resolved.run_id
         ):
             return snapshot
-        run_id = event.run_id or (resolved.run_id if resolved is not None else None)
-        if remaining:
+        if resolved.task_run_id is not None:
+            return snapshot.model_copy(update={"pending_inputs": remaining})
+        run_id = event.run_id or resolved.run_id
+        if any(item.task_run_id is None for item in remaining):
             status: str = "waiting_for_input"
             update: dict[str, object] = {"pending_inputs": remaining, "status": status}
         elif snapshot.pending_permissions:
@@ -627,7 +633,7 @@ class SnapshotProjector:
         return (
             snapshot.status in _SETTLED_STATUSES
             or snapshot.status == "waiting_for_input"
-            or bool(snapshot.pending_inputs)
+            or bool(snapshot.foreground_inputs)
         )
 
     def _update_external_task(

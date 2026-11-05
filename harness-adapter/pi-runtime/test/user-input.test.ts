@@ -361,3 +361,28 @@ test("an accepted steer does not lift a newer execution suspension", async () =>
   assert.deepEqual(await message, { accepted: true, steered: true });
   assert.equal(state.executionSuspended, true);
 });
+
+
+test("ask_user forwards the frozen checkpoint reference to the existing input channel", async () => {
+  const checkpoint = { run_id: "task-1", checkpoint_id: "sample-1" };
+  const peer = recordingPeer(() => ({ status: "cancelled" }));
+  const tool = createAskUserTool(peer, toolSpec, new InputWaitRegistry(), () => true);
+  await tool.execute("review-1", { checkpoint, questions: [{ id: "sample_review", prompt: "Confirm?" }] });
+  assert.deepEqual(peer.calls[0]?.params.checkpoint, checkpoint);
+  assert.equal(peer.calls[0]?.method, "input.request");
+});
+
+
+test("ask_user forwards display content without turning it into an action", async () => {
+  const presentation = {title: "Review", content: [{type: "text", text: "| model | score |\n|---|---|\n| A | .9 |"}]};
+  const checkpoint = {run_id: "task", checkpoint_id: "cp"};
+  const peer = recordingPeer((_method, params) => {
+    assert.deepEqual(params.presentation, presentation);
+    assert.deepEqual(params.checkpoint, checkpoint);
+    return {status: "answered", answers: [{question_id: "q", text: "revise"}]};
+  });
+  const tool = createAskUserTool(peer, toolSpec, new InputWaitRegistry(), () => true);
+  await tool.execute("call-display", {questions: [{id:"q", prompt:"Review?"}], presentation, checkpoint});
+  assert.equal(peer.calls.length, 1);
+  assert.equal(peer.calls[0]?.method, "input.request");
+});

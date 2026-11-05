@@ -1,3 +1,4 @@
+import { createDelegatedAskUserTool } from "./user-input.js";
 import { parseSubagentRoles, type SubagentRoleDefinition } from "./subagent-roles.js";
 import { capabilityCeiling, restrictSkillReads } from "./session-policy.js";
 import { SubagentHost } from "./subagent-host.js";
@@ -236,7 +237,9 @@ export async function createPiSession(
         return guarded.execute(id, args, signal, update);
       }) };
     });
-    return [role.name, [...scoped, ...business]];
+    const askUser = sessionOptions.askUserTool && role.tools.includes("ask_user")
+      ? [createDelegatedAskUserTool(peer, sessionOptions.askUserTool, role.name)] : [];
+    return [role.name, [...scoped, ...business, ...askUser]];
   })) : undefined;
   const subagents = new SubagentHost(config.workspaceRoot, config.sessionId, peer, childTools, modelRuntime, model, childInstructions, config.delegatedRoles, roleToolSets, sandboxPathAliases);
   const { default: subagentExtension } = await import("pi-subagents");

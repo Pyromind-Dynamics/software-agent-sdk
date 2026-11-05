@@ -12,7 +12,7 @@ import hashlib
 import json
 import shlex
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
@@ -496,6 +496,8 @@ class DfSubmitPipelineExecutor(
         storage_secret_headers: dict[str, str] | None = None,
         task_store_dir: str | None = None,
         timeout: int = 30,
+        managed_run_id: str | None = None,
+        submission_guard: Callable[[], None] | None = None,
     ) -> None:
         self._submission_config = SubmissionConfig(
             env=env,
@@ -520,6 +522,8 @@ class DfSubmitPipelineExecutor(
         self._task_store_dir = Path(task_store_dir) if task_store_dir else None
         self._timeout = timeout
         self.submission_handler = None
+        self._managed_run_id = managed_run_id
+        self._submission_guard = submission_guard
 
     def __call__(
         self,
@@ -668,7 +672,11 @@ class DfSubmitPipelineExecutor(
                 local_script_path, script_path = _validate_pipeline(
                     files, action.script_path
                 )
-                run_id = uuid.uuid4()
+                run_id = (
+                    uuid.UUID(self._managed_run_id)
+                    if self._managed_run_id
+                    else uuid.uuid4()
+                )
                 output_root = (
                     self._output_root
                     or f"{PYROMIND_AGENT_STORAGE_ROOT}/{conversation.id}/"
@@ -750,6 +758,7 @@ class DfSubmitPipelineExecutor(
                 is_error=True,
             )
 
+        submit_started = False
         try:
             client = submission_client(self._submission_config, conversation)
             node_available = self._node_capability_available(client)
@@ -788,18 +797,27 @@ class DfSubmitPipelineExecutor(
                     conversation,
                     frozen_script_name=support_file_name,
                 )
+            if self._submission_guard is not None:
+                self._submission_guard()
+            submit_started = True
             response = submit_workflow_task(
                 client=client,
                 workflow=workflow,
                 name=str(workflow["name"]),
                 conversation_id=str(conversation.id),
                 task_kind="data_preparation",
+                retry_create=self._submission_guard is None,
                 submission_handler=self.submission_handler,
             )
             task_id = response.task_id
         except Exception as exc:
             return DfSubmitPipelineObservation.from_text(
-                text=f"Failed to submit Python pipeline: {exc}",
+                text=(
+                    "Submission outcome uncertain; reconcile before retrying. "
+                    if self._submission_guard is not None and submit_started
+                    else ""
+                )
+                + f"Failed to submit Python pipeline: {exc}",
                 status="Failed",
                 is_error=True,
             )
@@ -1004,6 +1022,8 @@ class DfSubmitPipelineTool(
         output_root = params.pop("output_root", None)
         runtime_dir = params.pop("runtime_dir", None)
         task_store_dir = params.pop("task_store_dir", None)
+        managed_run_id = params.pop("managed_run_id", None)
+        submission_guard = params.pop("submission_guard", None)
         if params:
             names = ", ".join(sorted(params))
             raise ValueError(f"DfSubmitPipelineTool got unknown params: {names}")
@@ -1025,6 +1045,8 @@ class DfSubmitPipelineTool(
                     storage_secret_headers=config.storage_secret_headers,
                     task_store_dir=task_store_dir,
                     timeout=config.timeout,
+                    managed_run_id=managed_run_id,
+                    submission_guard=submission_guard,
                 ),
                 annotations=ToolAnnotations(
                     title="df_submit_pipeline",

@@ -8,7 +8,7 @@ from typing import Annotated
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
@@ -325,6 +325,61 @@ def create_product_router(
             raise _product_error(exc) from exc
         except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
             raise _not_found(conversation_id) from exc
+
+    @router.get(
+        "/{conversation_id}/pending-inputs/{request_id}/media/{content_index}/{image_index}"
+    )
+    async def read_input_media(
+        conversation_id: str,
+        request_id: str,
+        content_index: int,
+        image_index: int,
+        request: Request,
+    ):
+        try:
+            result = await get_product_runtime(request).read_input_media(
+                conversation_id,
+                request_id,
+                content_index,
+                image_index,
+                context_for(request),
+            )
+            return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
+        except ProductRuntimeError as exc:
+            raise _product_error(exc) from exc
+        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
+            raise _not_found(conversation_id) from exc
+        except ValueError as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
+
+    @router.get(
+        "/{conversation_id}/experiment-executions/{run_id}/checkpoints/"
+        "{checkpoint_id}/media/{sample_index}/{media_index}"
+    )
+    async def read_checkpoint_media(
+        conversation_id: str,
+        run_id: str,
+        checkpoint_id: str,
+        sample_index: int,
+        media_index: int,
+        request: Request,
+    ):
+        try:
+            result = await get_product_runtime(request).read_checkpoint_media(
+                conversation_id,
+                run_id,
+                checkpoint_id,
+                sample_index,
+                media_index,
+                context_for(request),
+            )
+            return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
+        except ProductRuntimeError as exc:
+            raise _product_error(exc) from exc
+        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
+            raise _not_found(conversation_id) from exc
+        except ValueError as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
 
     @router.get("/{conversation_id}/experiment-executions/{run_id}/artifacts/{name}")
     async def read_experiment_artifact(

@@ -163,8 +163,9 @@ class Preparations:
                     )
             if any(item.uri is None for item in plan.resources):
                 raise ValueError("resolve plan resource locations before creation")
-        updated = current.model_copy(
-            update={
+        updated = PreparationView.model_validate(
+            {
+                **current.model_dump(mode="json"),
                 "facts": facts,
                 "missing": missing,
                 "plan": plan,

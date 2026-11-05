@@ -62,6 +62,34 @@ def claim(service, owner, run):
     }
 
 
+def test_proven_unsent_submission_can_continue_the_same_task(experiment):
+    service, owner, _ = experiment
+    run = service.request(owner, request(), ("eval",))
+    scope = claim(service, owner, run)
+    arguments = {"operation": "inference"}
+    first = service.store.managed_submission(owner, run["id"], scope, arguments)
+    operation_id = first["operation_id"]
+    submission_id = operation_id.rsplit(":", 1)[0]
+    service.store.mark_submission_uncertain(owner, run["id"], submission_id)
+    service.store.queue.finish(scope["work_id"], scope["generation"], {})
+    work_id = service.store.continue_task(owner, run["id"], "continue", "")
+    assert service.store.list(owner)[0]["state"] == "submission_uncertain"
+    receipt = {"submission_not_sent": True, "operation_id": operation_id}
+    with pytest.raises(ValueError, match="proof"):
+        service.store.recover_managed_receipt(
+            owner,
+            run["id"],
+            submission_id,
+            {**receipt, "operation_id": "another-attempt"},
+        )
+    service.store.recover_managed_receipt(owner, run["id"], submission_id, receipt)
+    work_id = service.store.continue_task(owner, run["id"], "continue", "")
+    next_scope = claim(service, owner, run)
+    assert next_scope["work_id"] == work_id
+    retry = service.store.managed_submission(owner, run["id"], next_scope, arguments)
+    assert retry["operation_id"] == submission_id + ":1"
+
+
 @pytest.mark.parametrize(
     "case",
     ["allowed", "other_directory", "other_conversation", "other_profile", "stale"],
@@ -546,3 +574,110 @@ def test_early_observations_validate_the_registered_return_address(experiment, f
         },
     )
     assert service.store.apply_observations() == 1
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "needs_input",
+        "waiting_user",
+        "submitting",
+        "submission_uncertain",
+        "waiting_platform",
+        "succeeded",
+        "failed",
+        "cancelled",
+    ],
+)
+def test_continuation_preserves_business_state_and_is_not_submission_authority(
+    experiment, state
+):
+    from pyromind_runtime.infrastructure.sql_experiment_execution import runs
+
+    service, owner, engine = experiment
+    run = service.request(owner, request(), ("eval",))
+    scope = claim(service, owner, run)
+    service.store.queue.finish(
+        scope["work_id"], scope["generation"], {"execution_ref": "original-child"}
+    )
+    with engine.begin() as conn:
+        conn.execute(
+            runs.update()
+            .where(runs.c.id == run["id"])
+            .values(
+                state=state,
+                report_state="ready",
+                attributes={"checkpoint": {"status": "pending"}},
+            )
+        )
+    before = service.store.list(owner)[0]
+    work_id = service.store.continue_task(
+        owner, run["id"], "guidance", "Look at the previous result"
+    )
+    assert (
+        service.store.continue_task(
+            owner, run["id"], "guidance", "Look at the previous result"
+        )
+        == work_id
+    )
+    after = service.store.list(owner)[0]
+    assert (after["state"], after["report_state"], after["attributes"]) == (
+        before["state"],
+        before["report_state"],
+        before["attributes"],
+    )
+    item = service.store.queue.claim(kinds=("execute_task",))
+    assert item["id"] == work_id and item["payload"]["continuation"] is True
+    assert service.store.native_reference(owner, run["id"]) == "original-child"
+    with pytest.raises(ValueError, match="different work"):
+        service.store.continue_task(owner, run["id"], "guidance", "Changed message")
+    with pytest.raises(PermissionError):
+        service.store.continue_task(
+            owner.model_copy(update={"profile_id": "other"}), run["id"], "foreign", "hi"
+        )
+
+
+@pytest.mark.parametrize("finished_before_delivery", [False, True])
+async def test_live_guidance_uses_the_current_child_without_changing_its_scope(
+    experiment, finished_before_delivery
+):
+    from pyromind_runtime.application.delegated_execution import DelegatedExecution
+
+    service, owner, _ = experiment
+    run = service.request(owner, request(), ("eval",))
+    original = claim(service, owner, run)
+    service.store.save_work_checkpoint(
+        original["work_id"], original["generation"], {"execution_ref": "original-child"}
+    )
+    work_id = service.store.continue_task(
+        owner, run["id"], "steer", "Please inspect the error"
+    )
+    item = service.store.queue.claim(kinds=("steer_task",))
+    assert item["id"] == work_id
+    calls = []
+
+    async def control(_owner, _role, args):
+        assert args["scope"] == original
+        calls.append(args)
+        return {
+            "execution_ref": "original-child",
+            "status": "succeeded" if finished_before_delivery else "running",
+        }
+
+    result = await DelegatedExecution(service.plans, service.store, control).steer(item)
+    if finished_before_delivery:
+        assert result["delivery"] == "queued"
+        service.store.queue.finish(original["work_id"], original["generation"], {})
+        resumed = service.store.queue.claim(kinds=("execute_task",))
+        assert resumed["payload"]["message"] == "Please inspect the error"
+        assert resumed["payload"]["continuation"] is True
+    else:
+        assert result["delivery"] == "steered"
+        assert [args["action"] for args in calls] == ["status", "steer"]
+        assert calls[-1]["task"] == "Please inspect the error"
+    service.store.role_scope(
+        owner,
+        run["id"],
+        "eval",
+        {"run_id": run["id"], "work_id": item["id"], "generation": item["generation"]},
+    )

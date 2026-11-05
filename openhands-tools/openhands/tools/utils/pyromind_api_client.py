@@ -79,21 +79,22 @@ def _extract_cookie_header(
 
 @lru_cache
 def _find_secret_key() -> str:
-    env_secret = os.getenv(_SENSITIVE_DATA_REQUEST_SECRET_ENV, "").strip()
-    if not env_secret:
-        env_secret = os.getenv(_LEGACY_AGENT_REQUEST_SECRET_ENV, "").strip()
-    if env_secret:
-        return env_secret
-    if os.getenv("APP_ENV", "dev") == "dev":
-        return _DEV_SECRET_KEY
-    secret_path = os.getenv("PYROMIND_SECRET_PATH", "/etc/secrets")
-    try:
-        with open(f"{secret_path}/web_secret_key") as secret_file:
-            return secret_file.read().strip()
-    except FileNotFoundError as exc:
-        raise RuntimeError("Secret file not found: web_secret_key") from exc
-    except PermissionError as exc:
-        raise RuntimeError("Permission denied reading secret: web_secret_key") from exc
+    return os.getenv(_LEGACY_AGENT_REQUEST_SECRET_ENV, "").strip()
+    # env_secret = os.getenv(_SENSITIVE_DATA_REQUEST_SECRET_ENV, "").strip()
+    # if not env_secret:
+    #     env_secret = os.getenv(_LEGACY_AGENT_REQUEST_SECRET_ENV, "").strip()
+    # if env_secret:
+    #     return env_secret
+    # if os.getenv("APP_ENV", "dev") == "dev":
+    #     return _DEV_SECRET_KEY
+    # secret_path = os.getenv("PYROMIND_SECRET_PATH", "/etc/secrets")
+    # try:
+    #     with open(f"{secret_path}/web_secret_key") as secret_file:
+    #         return secret_file.read().strip()
+    # except FileNotFoundError as exc:
+    #     raise RuntimeError("Secret file not found: web_secret_key") from exc
+    # except PermissionError as exc:
+    #     raise RuntimeError("Permission denied reading secret: web_secret_key") from exc
 
 
 def _user_id_from_auth_token(auth_token: str) -> int:

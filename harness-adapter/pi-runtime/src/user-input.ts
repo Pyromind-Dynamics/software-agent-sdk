@@ -82,6 +82,7 @@ export function createAskUserTool(
   spec: AskUserToolSpec,
   waits: InputWaitRegistry,
   isAvailable: () => boolean,
+  delegated?: { role: string; scope: JsonObject },
 ): AgentTool<TSchema, unknown> {
   return {
     name: "ask_user",
@@ -110,6 +111,9 @@ export function createAskUserTool(
             request_id: requestId,
             tool_call_id: callId,
             questions,
+            ...(params.presentation !== undefined ? { presentation: params.presentation as JsonObject } : {}),
+            ...(delegated ? { delegated } : {}),
+            ...(!delegated && params.checkpoint !== undefined ? { checkpoint: params.checkpoint as JsonObject } : {}),
           },
           signal,
         );
@@ -140,6 +144,22 @@ export function createAskUserTool(
       } finally {
         waits.end(requestId);
       }
+    },
+  };
+}
+
+export function createDelegatedAskUserTool(peer: JsonlRpcPeer, tool: AgentTool, role: string) {
+  const parameters = structuredClone(tool.parameters) as JsonObject;
+  if (isRecord(parameters.properties)) delete parameters.properties.checkpoint;
+  const spec = { description: tool.description, inputSchema: parameters };
+  const waits = new InputWaitRegistry();
+  return {
+    ...tool,
+    parameters: parameters as TSchema,
+    async executeScoped(id: string, args: unknown, signal?: AbortSignal, scope?: JsonObject) {
+      if (!scope) throw new Error("Question requires a live delegated turn");
+      const ask = createAskUserTool(peer, spec, waits, () => true, { role, scope });
+      return ask.execute(id, args, signal);
     },
   };
 }

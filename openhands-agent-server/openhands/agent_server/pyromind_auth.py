@@ -75,6 +75,13 @@ def is_dev() -> bool:
 
 
 def find_secret_key() -> str:
+    configured_key = os.getenv("PYROMIND_WEB_SECRET_KEY", "").strip()
+    if not configured_key:
+        configured_key = os.getenv(
+            "PYROMIND_AGENT_ACCESS_KEY_REQUEST_SECRET", ""
+        ).strip()
+    if configured_key:
+        return configured_key
     if is_dev():
         return _DEV_SECRET_KEY
     return find_secret_key_v2()
@@ -82,7 +89,19 @@ def find_secret_key() -> str:
 
 @lru_cache
 def find_secret_key_v2() -> str:
-    return read_secret("web_secret_key")
+    secret_path = os.getenv("PYROMIND_SECRET_PATH", "/etc/secrets")
+    try:
+        secret = read_secret("web_secret_key", secret_path)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Configure PYROMIND_AGENT_ACCESS_KEY_REQUEST_SECRET, "
+            "PYROMIND_WEB_SECRET_KEY or "
+            "PYROMIND_SECRET_PATH/web_secret_key with the selected "
+            "Studio environment JWT signing key"
+        ) from exc
+    if not secret:
+        raise RuntimeError("Secret file is empty: web_secret_key")
+    return secret
 
 
 def read_secret(secret_name: str, secret_path: str = "/etc/secrets") -> str:

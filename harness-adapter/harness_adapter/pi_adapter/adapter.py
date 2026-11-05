@@ -240,6 +240,7 @@ class _PiSession:
     )
     attach_recovery: AttachRecovery | None = None
     input_calls: dict[str, tuple[str | None, str]] = field(default_factory=dict)
+    delegated_input_ids: set[str] = field(default_factory=set)
     message_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -365,16 +366,15 @@ class PiAdapter:
     ) -> JsonObject:
         session = self._session(handle.session_id)
         session.context = context
-        roles = {
-            role["name"]: role for role in session.config.get("delegated_roles") or []
-        }
+        roles = {role["name"]: role for role in self._delegated_definitions(session)}
         role = str(request.get("role", ""))
         if role not in roles or not session.config.get("managed_delegation"):
             raise PermissionError("delegated role is not enabled")
         scope = request.get("scope")
         if not isinstance(scope, dict):
             raise ValueError("delegation requires a trusted work scope")
-        self._role_scopes[(session.session_id, role)] = dict(scope)
+        if request.get("action") not in {"steer", "status"}:
+            self._role_scopes[(session.session_id, role)] = dict(scope)
         await self._ensure_runner(session)
         assert session.runner is not None
         native_request = dict(request)
@@ -404,6 +404,67 @@ class PiAdapter:
             "result_text": str(raw.get("result_text", "")),
         }
 
+    async def read_submission_receipt(
+        self,
+        handle: SessionHandle,
+        tool_name: str,
+        operation_id: str,
+        context: RequestContext,
+    ) -> JsonObject | None:
+        session = self._session(handle.session_id)
+        if (
+            session.context.user_id != context.user_id
+            or session.context.profile_id != context.profile_id
+        ):
+            raise PermissionError("receipt belongs to another conversation owner")
+        if tool_name != "df_submit_pipeline":
+            return None
+        from uuid import NAMESPACE_URL, uuid5
+
+        from openhands.tools.data_preparation.platform_submit import (
+            TASK_ASSOCIATION_DIRNAME,
+            DataPreparationTaskStore,
+        )
+
+        store = DataPreparationTaskStore(
+            session.workspace_root.parent / TASK_ASSOCIATION_DIRNAME
+        )
+        run_id = str(uuid5(NAMESPACE_URL, f"{handle.session_id}:{operation_id}"))
+        receipt = await asyncio.to_thread(store.get_by_run_id, run_id)
+        if receipt is None or receipt.conversation_id != handle.session_id:
+            return None
+        return {
+            "task_id": receipt.task_id,
+            "run_id": receipt.run_id,
+            "output_dir": receipt.output_dir,
+            "status": receipt.status,
+        }
+
+    def _delegated_definitions(self, session: _PiSession) -> list[dict[str, Any]]:
+        available = {
+            item["name"]
+            for item in self._business_tools.specs(
+                sandbox=self._terminal_backend == "sandbox"
+            )
+        }
+        return [
+            {
+                **role,
+                "tools": list(role["tools"])
+                + (
+                    ["ask_user"]
+                    if session.user_input_enabled and "ask_user" not in role["tools"]
+                    else []
+                )
+                + [
+                    name
+                    for name in role.get("optional_tools", ())
+                    if name in available and name not in role["tools"]
+                ],
+            }
+            for role in session.config.get("delegated_roles") or []
+        ]
+
     def _delegated_tool_specs(self, session: _PiSession) -> dict[str, Any]:
         from pyromind_runtime.domain.experiment_execution import ROLE_TOOLS
 
@@ -418,11 +479,14 @@ class PiAdapter:
                 for name, (model, description) in ROLE_TOOLS.items()
                 if name in role["tools"]
             ]
-            for role in session.config.get("delegated_roles") or []
+            for role in self._delegated_definitions(session)
         }
-        for role in session.config.get("delegated_roles") or []:
+        for role in self._delegated_definitions(session):
             result[role["name"]].extend(
-                spec for spec in specs if spec["name"] in role["tools"]
+                spec
+                for spec in specs
+                if spec["name"] in role["tools"]
+                and spec["name"] not in {item["name"] for item in result[role["name"]]}
             )
         return result
 
@@ -440,7 +504,7 @@ class PiAdapter:
         definition = next(
             (
                 item
-                for item in session.config.get("delegated_roles") or []
+                for item in self._delegated_definitions(session)
                 if item["name"] == role
             ),
             None,
@@ -519,7 +583,10 @@ class PiAdapter:
                 + tool,
             )
         except Exception as error:
-            if tool != "df_submit_evaluation" or submission_admitted:
+            if (
+                tool not in {"df_submit_evaluation", "df_submit_pipeline"}
+                or submission_admitted
+            ):
                 raise
             # The original executor has not crossed its platform-create guard.
             # Schema/configuration failures can be corrected safely; they are
@@ -1118,7 +1185,7 @@ class PiAdapter:
                 session, command.command_id, _runner_content(command.content)
             )
         async with session.message_lock:
-            if session.pending_user_inputs:
+            if session.pending_user_inputs.keys() - session.delegated_input_ids:
                 raise ProductRuntimeError(
                     "input_pending", "Answer or cancel the pending question first."
                 )
@@ -1157,6 +1224,17 @@ class PiAdapter:
     async def _respond_to_input(
         self, session: _PiSession, command: InputResponseCommand
     ) -> JsonObject:
+        future = session.pending_user_inputs.get(command.request_id)
+        if future is None or future.done():
+            raise ValueError(f"input request is not waiting: {command.request_id}")
+        if (
+            command.status == "cancelled"
+            and command.request_id in session.delegated_input_ids
+        ):
+            self._resolve_input_wait(
+                session, command.request_id, {"status": "cancelled"}
+            )
+            return {"resolved": True}
         if command.status == "cancelled":
             self._suspend_inputs(session)
             await self._ensure_runner(session)
@@ -1168,9 +1246,6 @@ class PiAdapter:
                 session, command.request_id, {"status": "cancelled"}
             )
             return result if isinstance(result, dict) else {"suspended": True}
-        future = session.pending_user_inputs.get(command.request_id)
-        if future is None or future.done():
-            raise ValueError(f"input request is not waiting: {command.request_id}")
         future.set_result(
             {
                 "status": "answered",
@@ -1200,7 +1275,8 @@ class PiAdapter:
     ) -> None:
         if request_id not in session.pending_user_inputs:
             return
-        self._suspend_inputs(session)
+        if request_id not in session.delegated_input_ids:
+            self._suspend_inputs(session)
         call = session.input_calls.get(request_id)
         run_id = call[0] if call is not None else None
         outcome = "cancelled" if cancelled else "interrupted"
@@ -1240,8 +1316,28 @@ class PiAdapter:
             raise ValueError("input tool_call_id must be a non-empty string")
         if not session.user_input_enabled:
             raise ValueError("user input is not enabled for this session")
+        task_run_id = None
+        if "delegated" in params:
+            origin = params["delegated"]
+            role = origin.get("role") if isinstance(origin, dict) else None
+            scope = origin.get("scope") if isinstance(origin, dict) else None
+            if (
+                not isinstance(role, str)
+                or not isinstance(scope, dict)
+                or scope != self._role_scopes.get((session.session_id, role))
+                or not isinstance(scope.get("run_id"), str)
+                or not scope["run_id"]
+            ):
+                raise PermissionError(
+                    "question does not belong to a live delegated turn"
+                )
+            task_run_id = scope["run_id"]
         request = UserInputRequest.model_validate(
-            {"questions": params.get("questions")}
+            {
+                key: params[key]
+                for key in ("questions", "checkpoint", "presentation")
+                if key in params and (key != "checkpoint" or task_run_id is None)
+            }
         )
         if request_id in session.pending_user_inputs:
             raise ValueError(f"input request already waiting: {request_id}")
@@ -1250,7 +1346,9 @@ class PiAdapter:
         )
         session.pending_user_inputs[request_id] = future
         inflight = session.files.load_inflight() or {}
-        run_id = inflight.get("run_id")
+        run_id = inflight.get("run_id") if task_run_id is None else None
+        if task_run_id is not None:
+            session.delegated_input_ids.add(request_id)
         session.input_calls[request_id] = (
             run_id if isinstance(run_id, str) else None,
             tool_call_id,
@@ -1264,7 +1362,8 @@ class PiAdapter:
                 payload={
                     "request_id": request_id,
                     "operation_id": tool_call_id,
-                    "questions": request.model_dump(mode="json")["questions"],
+                    **request.model_dump(mode="json"),
+                    **({"task_run_id": task_run_id} if task_run_id is not None else {}),
                 },
             )
         )
@@ -1273,6 +1372,7 @@ class PiAdapter:
         finally:
             session.pending_user_inputs.pop(request_id, None)
             session.input_calls.pop(request_id, None)
+            session.delegated_input_ids.discard(request_id)
 
     async def fork(
         self,
@@ -1713,7 +1813,9 @@ class PiAdapter:
                 "tools": self._tool_specs(session),
                 "tool_allowlist": session.config.get("tool_allowlist"),
                 "skill_allowlist": session.config.get("skill_allowlist"),
-                "delegated_roles": session.config.get("delegated_roles"),
+                "delegated_roles": self._delegated_definitions(session)
+                if session.config.get("delegated_roles") is not None
+                else None,
                 "delegated_tool_specs": self._delegated_tool_specs(session),
                 "managed_delegation": session.config.get("managed_delegation", False),
                 "terminal_environment": (
@@ -1774,7 +1876,7 @@ class PiAdapter:
             configured = next(
                 (
                     item
-                    for item in session.config.get("delegated_roles") or []
+                    for item in self._delegated_definitions(session)
                     if item["name"] == role
                 ),
                 None,
@@ -1991,7 +2093,7 @@ class PiAdapter:
         definition = next(
             (
                 item
-                for item in session.config.get("delegated_roles") or []
+                for item in self._delegated_definitions(session)
                 if item["name"] == role
             ),
             None,

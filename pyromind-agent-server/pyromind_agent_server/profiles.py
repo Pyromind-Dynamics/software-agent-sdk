@@ -8,10 +8,13 @@ from pyromind_runtime.application.product_instructions import DATA_FLYWHEEL_INST
 from pyromind_runtime.domain.preparation import PreparationPolicy
 from pyromind_runtime.ports.harness import DelegatedRole
 
+from openhands.agent_server.agent_profiles.echomind_dataset import ECHOMIND_DATASET_ROLE
 from openhands.agent_server.agent_profiles.echomind_eval import ECHOMIND_EVAL_ROLE
+from openhands.agent_server.agent_profiles.echomind_init import ECHOMIND_INIT_ROLE
 from openhands.agent_server.agent_profiles.echomind_manager import (
     ECHOMIND_MANAGER_PROFILE,
 )
+from openhands.agent_server.agent_profiles.echomind_train import ECHOMIND_TRAIN_ROLE
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +109,7 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=7,
+    configuration_version=13,
     route_prefix="/api/v2/echomind/conversations",
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
     harness_id="pi",
@@ -124,8 +127,38 @@ The user may revise it in chat and creates/starts the Project with the UI button
 Use the Sandbox to inspect data and prepare files. Start business tasks only after
 the user creates the Project.
 After creation, get_experiment_context is the current adaptable workflow plan.
-Delegate complete tasks to eval with a stable request_id and valid stage_id;
-use the generic inference-evaluation skill and pass confirmed scope and facts.
+Use request_experiment_task with a new stable request_id for independent work
+requiring fresh context. Use control_experiment_task(action=continue,run_id,message)
+to guide or adjust an existing child's work in its original context, including
+while it is running, completed, blocked or awaiting a platform response.
+Choose based on context needs, not TaskRun state. A reused request_id returns the
+existing task; it does not send new guidance. A request to retry or investigate
+is guidance for that child, not permission to substitute a different pipeline.
+Delegate complete tasks with a stable request_id and valid stage_id, choosing
+init for baseline work, dataset for cleaning, train for training and eval for
+candidate evaluation. Follow the declared node roles. Init is one business stage.
+Freeze exact source file paths in task.inputs for tasks that review a sample.
+If the approved source is a directory, mark it with input_kind=directory or
+preserve its trailing slash in task.inputs. A bare path is treated as a file.
+Delegated roles can ask the user directly with ask_user. Their answers return
+to the asking role; do not repeat those questions. Resolve technical blockers
+within the accepted scope. Ask only when a decision or missing fact needs the user.
+Use get_experiment_execution and read_experiment_artifact for verified evidence.
+When asking for a decision, use ask_user.presentation for a concise title and
+Chat content blocks. Use absolute Storage image paths without signed URLs or
+credentials. Questions do not grant platform permissions.
+For historical tasks parked at a frozen review checkpoint, use the existing
+sample_review choices (confirm_full or revise), then continue the same TaskRun.
+Do not repeat a submitted task. After successful verified data preparation,
+delegate Train only within the accepted scope. Bind verified outputs using
+task.artifact_refs entries with input_name, task_run_id and artifact_name;
+Runtime resolves and freezes their actual URIs. Bind Dataset's training and
+optional validation files separately to Train inputs, preserving the delivered
+files rather than producing a second frozen dataset. Train uses the existing workflow
+confirmation. After training, bind the verified model artifact to Eval through
+task.artifact_refs, honoring the agreed evaluation scope.
+Missing inputs or failures need user input; do not infer authorization for training
+from a model evaluation. Never enable an unimplemented node.
 Do not use legacy task_id/expected_revision. A model evaluation authorizes no
 training or deployment. Wait for Runtime notifications, verified metrics and
 reports; do not busy-poll. Use read_experiment_artifact for registered reports,
@@ -134,7 +167,12 @@ Use the user's language and keep credentials out of persisted facts and results.
 """,
     tool_allowlist=_PREPARATION_TOOLS,
     skill_allowlist=_PREPARATION_SKILLS,
-    delegated_roles=(ECHOMIND_EVAL_ROLE,),
+    delegated_roles=(
+        ECHOMIND_INIT_ROLE,
+        ECHOMIND_DATASET_ROLE,
+        ECHOMIND_TRAIN_ROLE,
+        ECHOMIND_EVAL_ROLE,
+    ),
     managed_delegation=True,
     development_tool_allowlist=_EXECUTION_TOOLS,
     development_skill_allowlist=_PREPARATION_SKILLS,
@@ -143,6 +181,8 @@ Use the user's language and keep credentials out of persisted facts and results.
         "input_response",
         "cancel",
         "create_project",
+        "permission_response",
+        "workflow_execution",
         "control_experiment_task",
         "resolve_experiment_submission",
     ),

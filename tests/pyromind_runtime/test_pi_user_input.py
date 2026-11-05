@@ -189,12 +189,20 @@ async def test_input_request_emits_event_and_answer_resolves_wait(tmp_path) -> N
                     "request_id": "input:1",
                     "tool_call_id": "call-1",
                     "questions": QUESTIONS,
+                    "presentation": {
+                        "title": "Review",
+                        "content": [{"type": "text", "text": "Model A scores 0.9"}],
+                    },
                 },
             )
         )
         await asyncio.sleep(0.01)
         events = await _drain(session)
         requested = next(event for event in events if event.type == "input.requested")
+        assert (
+            requested.payload["presentation"]["content"][0]["text"]
+            == "Model A scores 0.9"
+        )
         assert requested.run_id == "run-1"
         assert requested.payload["operation_id"] == "call-1"
         assert requested.payload["questions"][0]["id"] == "duplicate_policy"
@@ -661,5 +669,73 @@ async def test_disabled_input_preserves_workflow_sync_before_runner_start(
         )
         assert order == ["sync", "ensure_runner"]
         assert [method for method, _ in session.runner.requests] == ["prompt"]
+    finally:
+        await adapter.close(handle)
+
+
+async def test_child_question_scope_and_cancellation_are_isolated(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle, session = await _new_session(adapter, conversations)
+    scope = {"run_id": "child-task", "work_id": "work", "generation": 1}
+    adapter._role_scopes[(handle.session_id, "worker")] = scope
+    request = {
+        "request_id": "child-question",
+        "tool_call_id": "child-tool",
+        "questions": QUESTIONS,
+        "delegated": {"role": "worker", "scope": scope},
+    }
+    try:
+        with pytest.raises(PermissionError):
+            await adapter._runner_request(
+                session,
+                "input.request",
+                {
+                    **request,
+                    "delegated": {
+                        "role": "worker",
+                        "scope": {**scope, "generation": 0},
+                    },
+                },
+            )
+        child = asyncio.create_task(
+            adapter._runner_request(session, "input.request", request)
+        )
+        manager = asyncio.create_task(
+            adapter._runner_request(
+                session,
+                "input.request",
+                {
+                    "request_id": "manager-question",
+                    "tool_call_id": "manager-tool",
+                    "questions": QUESTIONS,
+                },
+            )
+        )
+        try:
+            async with asyncio.timeout(2):
+                while len(session.pending_user_inputs) < 2:
+                    await asyncio.sleep(0)
+            await adapter.send(
+                handle,
+                InputResponseCommand(
+                    command_id="cancel-child",
+                    request_id="child-question",
+                    status="cancelled",
+                ),
+                session.context,
+            )
+            assert await child == {"status": "cancelled"}
+            assert not manager.done()
+            assert not any(
+                method == "run.suspend"
+                for runner in _RecordingRunner.instances
+                for method, _ in runner.requests
+            )
+        finally:
+            for task in (child, manager):
+                task.cancel()
+            await asyncio.gather(child, manager, return_exceptions=True)
     finally:
         await adapter.close(handle)
