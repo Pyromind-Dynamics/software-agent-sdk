@@ -53,7 +53,8 @@ async def test_actual_manager_and_eval_host_create_through_api(
                 },
             )
             assert created.status_code == 201, created.text
-            assert created.json()["conversation_id"]
+            conversation_id = created.json()["conversation_id"]
+            assert conversation_id
             assert ECHOMIND_PRODUCT_PROFILE.delegated_roles is not None
             role = ECHOMIND_PRODUCT_PROFILE.delegated_roles[0]
             business = {
@@ -64,7 +65,7 @@ async def test_actual_manager_and_eval_host_create_through_api(
             runtime_tools = {"record_experiment_result", "get_experiment_execution"}
             assert set(role.tools) <= business | native | runtime_tools
             assert "upload_file_to_pyromind" not in role.tools
-            session = adapter._sessions[created.json()["conversation_id"]]
+            session = adapter._sessions[conversation_id]
             assert created.json()["preparation"]["phase"] == "collecting"
             assert {"read", "write", "edit", "terminal", "grep", "find", "ls"} <= set(
                 session.config["tool_allowlist"]

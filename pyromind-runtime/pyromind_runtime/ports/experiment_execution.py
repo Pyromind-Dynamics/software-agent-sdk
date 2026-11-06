@@ -8,6 +8,7 @@ from pyromind_runtime.ports.work_queue import WorkQueue
 
 class ExperimentExecutionStore(Protocol):
     def work_items(self, owner: PlanOwner) -> tuple[dict, ...]: ...
+
     def request(
         self,
         owner: PlanOwner,
@@ -18,11 +19,17 @@ class ExperimentExecutionStore(Protocol):
         request_id: str,
         *,
         task_spec: dict | None = None,
+        stage_run_id: str | None = None,
     ) -> dict: ...
 
     def list(self, owner: PlanOwner) -> list[dict]: ...
 
-    def propose(self, owner: PlanOwner, run_id: str, proposal: dict) -> dict: ...
+    def propose(
+        self,
+        owner: PlanOwner,
+        run_id: str,
+        proposal: dict,
+    ) -> dict: ...
 
     def decide(
         self,
@@ -41,27 +48,66 @@ class ExperimentExecutionStore(Protocol):
 
 class ExperimentPlatform(Protocol):
     async def prepare(self, configuration: dict, context: object) -> dict: ...
+
     async def submit(self, frozen: dict, context: object) -> str: ...
+
     async def query(self, task_id: str, context: object) -> dict: ...
+
     async def stop(self, task_id: str, context: object) -> None: ...
 
 
 class DelegatedExecutionStore(ExperimentExecutionStore, Protocol):
     def retire_legacy_work(self, owner: PlanOwner) -> bool: ...
+
     def recover_submissions(self) -> int: ...
-    def recover_managed_receipt(self, owner: PlanOwner, run_id: str, submission_id: str, receipt: dict) -> None: ...
-    def note_wait(self, owner: PlanOwner, run_id: str, reason: str, *, artifact_failure: bool = False) -> None: ...
+
+    def recover_managed_receipt(
+        self, owner: PlanOwner, run_id: str, submission_id: str, receipt: dict
+    ) -> None: ...
+
+    def note_wait(
+        self,
+        owner: PlanOwner,
+        run_id: str,
+        reason: str,
+        *,
+        artifact_failure: bool = False,
+    ) -> None: ...
+
     def conflicting_tasks(self) -> set[str]: ...
-    def abandon(self, owner: PlanOwner, run_id: str, command_id: str) -> dict: ...
-    def resolve(self, owner: PlanOwner, run_id: str, task_id: str, command_id: str, verified_evidence: dict) -> dict: ...
+
+    def abandon(
+        self,
+        owner: PlanOwner,
+        run_id: str,
+        command_id: str,
+    ) -> dict: ...
+
+    def resolve(
+        self,
+        owner: PlanOwner,
+        run_id: str,
+        task_id: str,
+        command_id: str,
+        verified_evidence: dict,
+    ) -> dict: ...
+
     def cancel(self, owner: PlanOwner, run_id: str) -> dict: ...
+
     def enqueue_manager(
-        self, owner: PlanOwner, identity: str, payload: dict, priority: int = 100
+        self,
+        owner: PlanOwner,
+        identity: str,
+        payload: dict,
+        priority: int = 100,
     ) -> str: ...
+
     def continue_task(
         self, owner: PlanOwner, run_id: str, command_id: str, message: str
     ) -> str: ...
+
     def platform_run(self, task_id: str) -> dict | None: ...
+
     def cancellation_result(
         self,
         owner: PlanOwner,
@@ -70,16 +116,29 @@ class DelegatedExecutionStore(ExperimentExecutionStore, Protocol):
         native_stopped: bool,
         platform_stopped: bool,
     ) -> dict: ...
+
     def ingest(
         self, identity: str, task_id: str, source: str, payload: dict
     ) -> None: ...
+
     def apply_observations(self) -> int: ...
+
     def register_artifacts(
-        self, owner: PlanOwner, run_id: str, verified: list[dict], metrics: dict
+        self,
+        owner: PlanOwner,
+        run_id: str,
+        verified: list[dict],
+        metrics: dict,
     ) -> None: ...
+
     def enqueue_report(
-        self, owner: PlanOwner, run_id: str, message: str = "", command_id: str = ""
+        self,
+        owner: PlanOwner,
+        run_id: str,
+        message: str = "",
+        command_id: str = "",
     ) -> str: ...
+
     def complete_agent_turn(
         self,
         owner: PlanOwner,
@@ -88,13 +147,26 @@ class DelegatedExecutionStore(ExperimentExecutionStore, Protocol):
         text: str,
         report: bool = False,
     ) -> dict: ...
-    def native_reference(self, owner: PlanOwner, run_id: str) -> str | None: ...
+
+    def native_reference(
+        self,
+        owner: PlanOwner,
+        run_id: str,
+    ) -> str | None: ...
+
     def managed_submission(
         self, owner: PlanOwner, run_id: str, scope: dict, arguments: dict
     ) -> dict: ...
+
     def managed_receipt(
-        self, owner: PlanOwner, run_id: str, scope: dict, operation: str, receipt: dict
+        self,
+        owner: PlanOwner,
+        run_id: str,
+        scope: dict,
+        operation: str,
+        receipt: dict,
     ) -> None: ...
+
     def record_result(
         self,
         owner: PlanOwner,
@@ -103,7 +175,9 @@ class DelegatedExecutionStore(ExperimentExecutionStore, Protocol):
         result: dict,
         report_artifact: dict | None,
     ) -> None: ...
+
     def pending_runs(self) -> list[dict]: ...
+
     @property
     def queue(self) -> WorkQueue: ...
 
@@ -112,7 +186,12 @@ class DelegatedExecutionStore(ExperimentExecutionStore, Protocol):
     ) -> dict: ...
 
     def propose_from_role(
-        self, owner: PlanOwner, run_id: str, role: str, scope: dict, proposal: dict
+        self,
+        owner: PlanOwner,
+        run_id: str,
+        role: str,
+        scope: dict,
+        proposal: dict,
     ) -> dict: ...
 
     def save_work_checkpoint(

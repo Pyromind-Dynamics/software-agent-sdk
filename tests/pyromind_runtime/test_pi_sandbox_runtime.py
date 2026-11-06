@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import tarfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -409,6 +410,91 @@ def test_ensure_reuses_a_running_sandbox_without_repairing(
     record = files.load_sandbox()
     assert record is not None
     assert record["created_at"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_ensure_reuses_the_authenticated_client_after_pause(
+    tmp_path: Path, files: PiSessionFiles, monkeypatch
+) -> None:
+    """Releasing a runner must not make the next turn exchange the access key again."""
+    files.save_sandbox(
+        {
+            "sandbox_id": "sbx-1",
+            "workspace_path": f"{DEFAULT_MOUNT_PATH}/.pyromind-agent/conv-1",
+            "mount_path": DEFAULT_MOUNT_PATH,
+            "storage_host_path": STORAGE_HOST_PATH,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "workspace_version": _WORKSPACE_LAYOUT_VERSION,
+        }
+    )
+    clients: list[_FakeSandboxClient] = []
+
+    def factory(context: ToolExecutionContext) -> _FakeSandboxClient:
+        client = _FakeSandboxClient(status="running", api_key=f"key-{len(clients)}")
+        clients.append(client)
+        return client
+
+    def terminal(**kwargs: object) -> tuple[str, int, bool]:
+        return "", 0, False
+
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command", terminal
+    )
+    manager = SandboxExecutionManager(client_factory=factory)
+    context = _context(tmp_path)
+
+    first = asyncio.run(manager.ensure(context, files))
+    asyncio.run(manager.pause(context, files))
+    resumed = asyncio.run(manager.ensure(context, files))
+
+    assert len(clients) == 1
+    assert first["api_key"] == resumed["api_key"] == "key-0"
+    assert clients[0].lifecycle_calls == [
+        "get:sbx-1",
+        "pause:sbx-1",
+        "get:sbx-1",
+    ]
+
+
+def test_ensure_replaces_the_authenticated_client_when_credentials_change(
+    tmp_path: Path, files: PiSessionFiles, monkeypatch
+) -> None:
+    files.save_sandbox(
+        {
+            "sandbox_id": "sbx-1",
+            "workspace_path": f"{DEFAULT_MOUNT_PATH}/.pyromind-agent/conv-1",
+            "mount_path": DEFAULT_MOUNT_PATH,
+            "storage_host_path": STORAGE_HOST_PATH,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "workspace_version": _WORKSPACE_LAYOUT_VERSION,
+        }
+    )
+    clients: list[_FakeSandboxClient] = []
+
+    def factory(context: ToolExecutionContext) -> _FakeSandboxClient:
+        client = _FakeSandboxClient(status="running", api_key=f"key-{len(clients)}")
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
+        lambda **kwargs: ("", 0, False),
+    )
+    manager = SandboxExecutionManager(client_factory=factory)
+    context = _context(tmp_path)
+    refreshed_context = replace(
+        context,
+        request_context=replace(
+            context.request_context,
+            authorization="Bearer refreshed-token",
+        ),
+    )
+
+    first = asyncio.run(manager.ensure(context, files))
+    refreshed = asyncio.run(manager.ensure(refreshed_context, files))
+
+    assert len(clients) == 2
+    assert first["api_key"] == "key-0"
+    assert refreshed["api_key"] == "key-1"
 
 
 def test_ensure_rebuilds_a_running_sandbox_whose_terminal_is_dead(

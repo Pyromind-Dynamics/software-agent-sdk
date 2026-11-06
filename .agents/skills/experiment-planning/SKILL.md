@@ -5,14 +5,25 @@ description: Coordinate experiments and delegated work, execute within authoriza
 
 # 实验协调
 
-Manager 对目标负责，可以直接探查数据、分析、配置、执行、调试和解释结果。
+规划阶段先补齐需求，再创建计划。数据位置、任务目标、输入形式或预期产物不明确时，
+先向用户追问一小批聚焦问题，不要扫描 Storage 或列工作区来猜需求。
+规划阶段不查询 AgentGenome 或历史经验；只使用用户消息、用户明确给出的路径和必要的澄清。
+这是软引导：可以先生成带 unresolved 的轻量计划，用户也可以直接继续或确认。
+只有用户明确给出路径时，才读取该路径；创建 Project 后再按开发态能力探查、配置、调试和执行。
+Manager 在开发态对目标负责，可以直接探查数据、分析、配置、执行、调试和解释结果。
 简单操作直接完成；独立工作按当前可用角色的能力委派。
 用户明确指定分工时遵守该边界；委派应包含目标、已知事实、约束和交付要求，
 将范围内的探查与实现选择留给子 Agent，不为委派重复完成同一工作。
 子 Agent 交接结论、证据与产物位置、验证结果和未解决事项。
 Manager 根据交付证据推进或汇总；只有证据缺失、相互矛盾或影响后续决策时才补充核查，
 需要继续原任务时复用已有执行及产物。
-AVI 参考 [AVI 实验](references/avi-single-turn.md)，其他场景不套用 AVI 规则。
+
+准备清单在 [Checklist](checklist.json)。它描述通用训练飞轮的需求字段和可选业务节点，
+不是固定流水线。先将用户事实保存到 Preparation，再生成最贴合当前目标的 Graph 草案。
+首期四节点参考 Dataset、Train、Inference、Evaluator；节点可以跳过、禁用或按需求调整，
+节点标题、输入输出、任务配置和是否启用以用户实际确认的计划为准。
+AVI 只提供数据和评测细节，参考 [AVI 实验](references/avi-single-turn.md)，其他场景不套用
+AVI 规则。
 
 get_experiment_context 读取全局事实。update_experiment_context 完整替换参考计划：
 保留稳定 ID，传入当前 expected_sequence；冲突后重读合并。
@@ -22,6 +33,7 @@ edges 只连接 stage.id；task 间依赖由 task.inputs 表达，不要把 task
 占位阶段同时设置 placeholder=true、enabled=false。未知资源 URI 留空并说明缺口。
 参考图可以不完整、跳过、加阶段或返回，不承担执行调度和审批。
 只补充当前目标需要的细节，不要求先确认 Graph 或补齐全部阶段。
+创建 Project 只物化当前计划，不自动启动节点；开发态继续通过 Project Graph 调试和修改。
 展示阶段结果时，可用 stage_executions 将阶段 ID 关联到已有 TaskRun ID；
 事后整理参考图也可关联，不改写执行快照，不按阶段名或角色名猜测执行状态。
 

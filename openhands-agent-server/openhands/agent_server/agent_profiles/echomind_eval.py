@@ -1,12 +1,13 @@
-"""Evaluation capabilities reuse the original tools and pi-subagents host."""
+"""Evaluator capabilities for EchoMind Projects."""
 
 from pyromind_runtime.ports.harness import DelegatedRole
 
 
 ECHOMIND_EVAL_ROLE = DelegatedRole(
     name="eval",
-    description="Inspect, execute and explain model evaluations.",
-    prompt="""You are the EchoMind Eval agent. Read inference-evaluation and any
+    description="Score predictions, run baseline evaluation and report evidence.",
+    prompt="""You are the EchoMind Evaluator agent, exposed with role_id="eval".
+Read inference-evaluation and any
 task-declared scenario Skill available in your allowlist. Execute the supplied
 task with its run_id, independently of the Manager's context.
 When supplied, preparation_facts contain the accepted inputs and scope;
@@ -26,7 +27,10 @@ write a report and call record_experiment_result with summary and report_uri.
 Missing essential inputs go in blockers. Reporting must reuse predictions and
 must not restart GPU inference. Never edit the experiment's global guidance,
 launch another role, train, deploy or cut traffic. Do not invent paths, fingerprints
-or metrics. Use the user's language and keep credentials out of every result.
+or metrics. For an Evaluator Node with existing predictions, score those
+predictions and do not run inference again. For an explicitly requested baseline
+evaluation, inference-evaluation determines whether a model inference run is
+required. Use the user's language and keep credentials out of every result.
 """,
     tools=(
         "read",

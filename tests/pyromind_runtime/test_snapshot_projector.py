@@ -237,6 +237,29 @@ def test_projector_accepts_environment_processing_kinds() -> None:
         assert completed.status == "idle"
 
 
+def test_projector_preserves_external_task_execution_links() -> None:
+    projector = SnapshotProjector()
+    submitted = {
+        "task_id": "platform-task",
+        "kind": "workflow_run",
+        "status": "running",
+        "project_id": "project-1",
+        "stage_run_id": "stage-run-1",
+        "task_run_id": "task-run-1",
+        "submitted_at": "2026-09-02T06:28:56+00:00",
+        "updated_at": "2026-09-02T06:28:56+00:00",
+    }
+
+    snapshot = projector.reduce(
+        _snapshot(), _event(1, "external_task.submitted", submitted)
+    )
+
+    task = snapshot.external_tasks[0]
+    assert task.project_id == "project-1"
+    assert task.stage_run_id == "stage-run-1"
+    assert task.task_run_id == "task-run-1"
+
+
 def test_late_completion_preserves_new_run_and_message_command_id():
     projector = SnapshotProjector()
     snapshot = projector.reduce(

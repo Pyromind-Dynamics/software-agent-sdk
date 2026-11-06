@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from pyromind_runtime.domain.experiment_plans import PlanOwner, PlanRevision
+from pyromind_runtime.domain.preparation import ProjectView
 
 from openhands.agent_server.echomind_projects import ProjectStore
 
@@ -16,4 +17,14 @@ class EchoMindExperimentPlanProjectBinder:
             revision,
             echomind_conversation_id=owner.conversation_id,
             owner_user_id=owner.user_id,
+        )
+
+
+class EchoMindPreparationProjectMaterializer:
+    def __init__(self, conversations_dir: Path | str) -> None:
+        self._conversations_dir = Path(conversations_dir)
+
+    def materialize(self, project: ProjectView, owner: PlanOwner) -> None:
+        ProjectStore.for_conversations_dir(self._conversations_dir).bind_project(
+            project, owner_user_id=owner.user_id
         )

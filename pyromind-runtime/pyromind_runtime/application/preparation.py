@@ -32,8 +32,6 @@ def validate_workflow_catalog(
         node = nodes.get(stage.kind or "")
         if node is None:
             raise ValueError("select stage.kind from preparation.policy.workflow_nodes")
-        if stage.enabled and not node.roles:
-            raise ValueError("unimplemented catalog nodes must remain disabled")
     for task in plan.tasks:
         node = nodes[stages[task.stage_id].kind or ""]
         if task.kind not in {item.id for item in node.tasks}:
@@ -127,8 +125,6 @@ class Preparations:
         if (current.missing or changed) and request.plan is not None:
             raise ValueError("save the complete checklist before generating a plan")
         plan, entry = request.plan, request.entry_task
-        if (plan is None) != (entry is None):
-            raise ValueError("a plan requires its first executable task")
         if plan is not None and entry is not None:
             validate_workflow_catalog(current.policy, plan)
             validate_workflow_role(current.policy, plan, entry.stage_id, entry.role_id)
@@ -163,6 +159,14 @@ class Preparations:
                     )
             if any(item.uri is None for item in plan.resources):
                 raise ValueError("resolve plan resource locations before creation")
+        elif plan is not None:
+            validate_workflow_catalog(current.policy, plan)
+            if current.policy.create_project_starts_entry_task:
+                raise ValueError(
+                    "a plan that starts on creation requires an entry task"
+                )
+        elif entry is not None:
+            raise ValueError("an entry task requires a workflow plan")
         updated = current.model_copy(
             update={
                 "facts": facts,
@@ -179,31 +183,39 @@ class Preparations:
         self, owner: PlanOwner, request: SetPreparationPlan
     ) -> PreparationView:
         current = self.store.get(owner)
-        task = next(
-            (task for task in request.plan.tasks if task.id == request.entry_task_id),
-            None,
-        )
-        if task is None:
-            raise ValueError("entry_task_id must reference plan.tasks")
-        resources = {resource.id: resource for resource in request.plan.resources}
-        inputs = {}
-        for item in task.inputs:
-            resource = resources.get(item.resource_id or "")
-            if resource is None or resource.uri is None:
-                raise ValueError("the first task requires concrete resource inputs")
-            inputs[item.name] = resource.uri
-        entry = DelegateExperimentTask(
-            role_id=request.role_id,
-            request_id=task.id,
-            stage_id=task.stage_id,
-            task=DelegatedTask(
-                name=task.name,
-                instruction=task.description or request.plan.goal,
-                inputs=inputs,
-                constraints=request.plan.constraints,
-                expected_outputs=tuple(output.name for output in task.outputs),
-            ),
-        )
+        entry = None
+        if (request.entry_task_id is None) != (request.role_id is None):
+            raise ValueError("entry_task_id and role_id must be provided together")
+        if request.entry_task_id is not None and request.role_id is not None:
+            task = next(
+                (
+                    task
+                    for task in request.plan.tasks
+                    if task.id == request.entry_task_id
+                ),
+                None,
+            )
+            if task is None:
+                raise ValueError("entry_task_id must reference plan.tasks")
+            resources = {resource.id: resource for resource in request.plan.resources}
+            inputs = {}
+            for item in task.inputs:
+                resource = resources.get(item.resource_id or "")
+                if resource is None or resource.uri is None:
+                    raise ValueError("the first task requires concrete resource inputs")
+                inputs[item.name] = resource.uri
+            entry = DelegateExperimentTask(
+                role_id=request.role_id,
+                request_id=task.id,
+                stage_id=task.stage_id,
+                task=DelegatedTask(
+                    name=task.name,
+                    instruction=task.description or request.plan.goal,
+                    inputs=inputs,
+                    constraints=request.plan.constraints,
+                    expected_outputs=tuple(output.name for output in task.outputs),
+                ),
+            )
         return self.update(
             owner,
             UpdatePreparation(

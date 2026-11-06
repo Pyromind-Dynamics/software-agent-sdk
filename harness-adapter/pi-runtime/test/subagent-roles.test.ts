@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { parseSubagentRoles, writeSubagentRoles } from "../src/subagent-roles.js";
-import { SubagentHost, validateSubagentCall } from "../src/subagent-host.js";
+import { formatWorkspacePathContract } from "../src/subagent-child-extension.js";
+import {
+  delegatedWriteRoot,
+  SubagentHost,
+  validateSubagentCall,
+} from "../src/subagent-host.js";
 
 const role = { name: "evaluator", description: "Evaluate frozen inputs", prompt: "Return evidence", tools: ["read"], skills: ["evaluation"] };
 
@@ -39,4 +44,20 @@ test("role files disable inherited context and connect only host-mediated tools"
     const extension = await readFile(join(root, "role-extensions/evaluator.mjs"), "utf8");
     assert.match(extension, /installChildHost\(pi, "evaluator"\)/);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("delegated work exposes one run-scoped writable root", () => {
+  assert.equal(
+    delegatedWriteRoot({run_id: "run-123"}),
+    "public_data/experiment-runs/run-123/",
+  );
+  assert.throws(() => delegatedWriteRoot({run_id: "../other"}), /valid run_id/);
+  const contract = formatWorkspacePathContract({
+    cwd: ".",
+    runId: "run-123",
+    writeRoot: "public_data/experiment-runs/run-123/",
+  });
+  assert.match(contract, /public_data\/experiment-runs\/run-123\//);
+  assert.match(contract, /task\.inputs\.path_contract/);
+  assert.match(contract, /rejects writes outside/);
 });

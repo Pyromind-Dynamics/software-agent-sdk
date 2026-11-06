@@ -144,7 +144,7 @@ class SQLPreparationStore:
             plan_sequence=row["context_sequence"],
             plan=ExperimentContext.model_validate(row["context"]),
             creation_command_id=creation["command_id"],
-            initial_run_id=creation["initial_run_id"],
+            initial_run_id=creation.get("initial_run_id"),
         )
 
     def project(self, owner: PlanOwner) -> ProjectView | None:
@@ -181,7 +181,10 @@ class SQLPreparationStore:
                 or view.review_pending
                 or view.missing
                 or view.plan is None
-                or view.entry_task is None
+                or (
+                    view.policy.create_project_starts_entry_task
+                    and view.entry_task is None
+                )
             ):
                 raise ValueError("preparation is not ready")
             identity = uuid4().hex
@@ -197,35 +200,40 @@ class SQLPreparationStore:
                     context=view.plan.model_dump(mode="json"),
                 )
             )
-            entry = view.entry_task
-            stage = next(
-                stage for stage in view.plan.stages if stage.id == entry.stage_id
-            )
-            task_spec = {
-                **entry.model_dump(mode="json"),
-                "plan_sequence": 1,
-                "stage_snapshot": stage.model_dump(mode="json"),
-                "preparation_facts": {
-                    key: fact.value
-                    for key, fact in view.facts.items()
-                    if fact.status == "resolved"
-                },
-            }
-            run = self.executions.request_in_transaction(
-                conn,
-                owner,
-                identity,
-                None,
-                entry.request_id,
-                entry.role_id,
-                "create:" + command_id,
-                task_spec=task_spec,
-            )
+            run = None
+            if view.policy.create_project_starts_entry_task:
+                entry = view.entry_task
+                plan = view.plan
+                assert entry is not None
+                assert plan is not None
+                stage = next(
+                    stage for stage in plan.stages if stage.id == entry.stage_id
+                )
+                task_spec = {
+                    **entry.model_dump(mode="json"),
+                    "plan_sequence": 1,
+                    "stage_snapshot": stage.model_dump(mode="json"),
+                    "preparation_facts": {
+                        key: fact.value
+                        for key, fact in view.facts.items()
+                        if fact.status == "resolved"
+                    },
+                }
+                run = self.executions.request_in_transaction(
+                    conn,
+                    owner,
+                    identity,
+                    None,
+                    entry.request_id,
+                    entry.role_id,
+                    "create:" + command_id,
+                    task_spec=task_spec,
+                )
             creation = {
                 "command_id": command_id,
                 "preparation_revision": expected_revision,
                 "preparation": view.model_dump(mode="json"),
-                "initial_run_id": run["id"],
+                "initial_run_id": run["id"] if run else None,
             }
             conn.execute(
                 projects.update()
@@ -246,5 +254,5 @@ class SQLPreparationStore:
                 plan_sequence=1,
                 plan=view.plan,
                 creation_command_id=command_id,
-                initial_run_id=run["id"],
+                initial_run_id=run["id"] if run else None,
             )

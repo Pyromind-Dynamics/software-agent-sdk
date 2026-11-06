@@ -39,6 +39,7 @@ class PreparationPolicy(ContractModel):
     version: int = Field(ge=1)
     fields: tuple[ChecklistField, ...] = Field(min_length=1)
     allowed_roles: tuple[str, ...] = Field(min_length=1)
+    create_project_starts_entry_task: bool = True
 
     workflow_nodes: tuple[WorkflowNodeDefinition, ...] = Field(
         default=(), exclude_if=lambda value: not value
@@ -107,10 +108,11 @@ class CollectPreparationFacts(ContractModel):
 class SetPreparationPlan(ContractModel):
     expected_revision: int = Field(ge=0)
     plan: ExperimentContext
-    entry_task_id: str = Field(
-        min_length=1, description="ID of the first task in plan.tasks"
+    entry_task_id: str | None = Field(
+        default=None, min_length=1, description="ID of the first task in plan.tasks"
     )
-    role_id: str = Field(
+    role_id: str | None = Field(
+        default=None,
         min_length=1,
         description="Enabled delegated role from preparation.policy.allowed_roles",
     )
@@ -128,7 +130,7 @@ class ProjectView(ContractModel):
     plan_sequence: int
     plan: ExperimentContext
     creation_command_id: str
-    initial_run_id: str
+    initial_run_id: str | None = None
 
 
 PREPARATION_TOOLS = {

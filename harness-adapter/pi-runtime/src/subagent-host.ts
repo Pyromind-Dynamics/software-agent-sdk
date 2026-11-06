@@ -17,6 +17,15 @@ import { isRecord, type JsonObject, type RunnerEvent, PROTOCOL_VERSION } from ".
 import type { JsonlRpcPeer } from "./rpc-peer.js";
 
 const ROLE_TOOLS = { search: ["read", "grep", "find", "ls"], general_purpose: ["read", "grep", "find", "ls", "write", "edit", "terminal"] };
+
+export function delegatedWriteRoot(scope: Record<string, unknown>): string {
+  const runId = scope.run_id;
+  if (typeof runId !== "string" || !/^[A-Za-z0-9._-]+$/.test(runId)) {
+    throw new Error("Delegated scope has no valid run_id");
+  }
+  return `public_data/experiment-runs/${runId}/`;
+}
+
 export function subagentModule(name: string): string {
   const js = fileURLToPath(new URL(`./${name}.js`, import.meta.url));
   return existsSync(js) ? js : js.replace(/\.js$/, ".ts");
@@ -88,7 +97,7 @@ export class SubagentHost {
   readonly paths: ReturnType<typeof prepareSubagentEnvironment>;
 
   constructor(private workspace: string, private sessionId: string, private peer: JsonlRpcPeer,
-    private tools: AgentTool[], private modelRuntime: ModelRuntime, private model: Model<Api>, private instructions: string, private definitions?: SubagentRoleDefinition[], private roleToolSets?: Record<string, AgentTool[]>, private skillPathAliases: Array<{ host: string; alias: string }> = []) {
+    private tools: AgentTool[], private modelRuntime: ModelRuntime, private model: Model<Api>, private instructions: string, private definitions?: SubagentRoleDefinition[], private roleToolSets?: Record<string, AgentTool[]>, private skillPathAliases: Array<{ host: string; alias: string }> = [], private managedDelegation = false) {
     this.roleTools = definitions ? Object.fromEntries(definitions.map(role => [role.name, role.tools])) : ROLE_TOOLS;
     for (const role of definitions ?? []) {
       const available = new Set((roleToolSets?.[role.name] ?? tools).map(tool => tool.name));
@@ -112,10 +121,16 @@ export class SubagentHost {
       if (!isRecord(request) || typeof request.role !== "string" || !Object.hasOwn(this.roleTools, request.role)) throw new Error("Unknown child role");
       const allowed = this.roleTools[request.role];
       const roleTools = this.roleToolSets?.[request.role] ?? this.tools;
+      const scope = this.workScopes.get(request.role);
       if (request.method === "config") return {
         model: publicModel(this.session?.model ?? this.model), instructions: this.instructions,
-        skillPathAliases: this.skillPathAliases, scope: this.workScopes.get(request.role),
+        skillPathAliases: this.skillPathAliases, scope,
         workspacePathAlias: this.skillPathAliases.length ? {host: this.workspace, alias: "."} : undefined,
+        workspacePaths: scope ? {
+          cwd: ".",
+          runId: scope.run_id,
+          writeRoot: delegatedWriteRoot(scope),
+        } : undefined,
         tools: roleTools.filter((tool) => allowed.includes(tool.name)).map(({ name, label, description, parameters }) => ({ name, label, description: `[Conversation host] ${description}`, parameters })),
       };
       if (request.method === "tool") {
@@ -127,7 +142,8 @@ export class SubagentHost {
         if (expected && ["write", "edit"].includes(request.name)) {
           const args = isRecord(request.args) ? request.args : {};
           const path = String(args.path ?? "");
-          if (!path.startsWith(`public_data/experiment-runs/${expected.run_id}/`) || path.split("/").includes("..")) throw new Error("Write only this task's workspace");
+          const writeRoot = delegatedWriteRoot(expected);
+          if (!path.startsWith(writeRoot) || path.split("/").includes("..")) throw new Error(`Write only this task's workspace: ${writeRoot}`);
         }
         const id = `subagent:${request.session}:${request.id}`;
         try {
@@ -193,7 +209,16 @@ export class SubagentHost {
     this.session = session;
     this.recipients = new SubagentRecipients(this.paths.stateRoot, session, (method, params, id) => this.rpc(method, params, id), this.sessionId);
     if (!session.getToolDefinition("subagent")) throw new Error("pi-subagents did not register its native tool");
-    await session.bindExtensions({ mode: "print", onError: (error) => process.stderr.write(`Pi extension ${error.extensionPath}: ${error.error}\n`) });
+    await session.bindExtensions({
+      ...(this.managedDelegation ? {
+        // Runtime owns managed parent-turn completion and delivers child results
+        // through durable callbacks. RPC mode prevents pi-subagents from
+        // auto-draining background children before the parent can become idle.
+        uiContext: { ...session.extensionRunner.getUIContext() },
+        mode: "rpc" as const,
+      } : { mode: "print" as const }),
+      onError: (error) => process.stderr.write(`Pi extension ${error.extensionPath}: ${error.error}\n`),
+    });
     await this.refresh();
     this.monitor = setInterval(() => void this.refresh(false).catch((error) => process.stderr.write(`Subagent reconciliation: ${error.message}\n`)), 1000);
     this.monitor.unref();
@@ -219,6 +244,12 @@ export class SubagentHost {
   async control(input: JsonObject): Promise<any> {
     const action = input.action;
     if (typeof input.role === "string" && isRecord(input.scope) && input.scope.control !== true) this.workScopes.set(input.role, input.scope);
+    if (action === "authorize") {
+      if (typeof input.role !== "string" || !Object.hasOwn(this.roleTools, input.role) || !isRecord(input.scope)) {
+        throw new Error("Invalid delegated authorization");
+      }
+      return { execution_ref: null, status: "authorized", result_text: "" };
+    }
     let result: any;
     if (action === "spawn") {
       if (typeof input.role !== "string" || !Object.hasOwn(this.roleTools, input.role)

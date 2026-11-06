@@ -244,9 +244,9 @@ class FileProductStore:
                     "configuration_version": policy.configuration_version,
                     "tool_allowlist": policy.tool_allowlist,
                     "skill_allowlist": policy.skill_allowlist,
-                    "command_allowlist": policy.command_allowlist,
                     "development_tool_allowlist": policy.development_tool_allowlist,
                     "development_skill_allowlist": policy.development_skill_allowlist,
+                    "command_allowlist": policy.command_allowlist,
                 }
             )
             self._atomic_write(self.metadata_path, updated.model_dump_json())

@@ -6,6 +6,7 @@ from pyromind_agent_server import resource_inspector
 from pyromind_agent_server.resource_inspector import StorageResourceInspector
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.preparation import InspectResource
+from pyromind_runtime.ports.storage import EvaluationStorageUnavailableError
 
 
 def test_storage_preview_is_bounded_and_never_returns_signed_urls(monkeypatch):
@@ -52,3 +53,39 @@ def test_inspection_requires_current_credentials():
         StorageResourceInspector().inspect(
             InspectResource(path="/data"), RequestContext(user_id="42")
         )
+
+
+def test_directory_listing_auth_failure_is_storage_unavailable(monkeypatch):
+    class FailingStorage:
+        def list(self, prefix):
+            raise EvaluationStorageUnavailableError(f"auth rejected for {prefix}")
+
+    monkeypatch.setattr(
+        resource_inspector,
+        "build_evaluation_storage",
+        lambda context: FailingStorage(),
+    )
+    with pytest.raises(EvaluationStorageUnavailableError, match="auth rejected"):
+        StorageResourceInspector().inspect(
+            InspectResource(path="/datasets", kind="directory"),
+            RequestContext(user_id="42", cookie="auth_token=expired"),
+        )
+
+
+def test_file_preview_auth_failure_is_storage_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        resource_inspector,
+        "request_storage_url",
+        lambda **kwargs: "https://storage.example/object",
+    )
+
+    def response(request):
+        return httpx.Response(401, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(response)) as client:
+        monkeypatch.setattr(resource_inspector.httpx, "stream", client.stream)
+        with pytest.raises(EvaluationStorageUnavailableError, match="preview"):
+            StorageResourceInspector().inspect(
+                InspectResource(path="/data.jsonl"),
+                RequestContext(user_id="42", cookie="auth_token=expired"),
+            )

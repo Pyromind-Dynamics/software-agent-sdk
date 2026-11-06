@@ -1,6 +1,7 @@
 {
   "checklist_id": "model-evaluation",
   "version": 2,
+  "create_project_starts_entry_task": false,
   "allowed_roles": [
     "eval"
   ],

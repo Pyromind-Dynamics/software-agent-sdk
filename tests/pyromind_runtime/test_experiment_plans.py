@@ -395,6 +395,80 @@ async def test_http_profile_routing_confirm_conflict_and_cross_profile_denial(
     await runtime.close()
 
 
+async def test_plan_decision_requires_idle_agent(tmp_path, plan_store, plan_payload):
+    adapter = FakeAdapter("pi")
+    runtime = ConversationRuntime(
+        tmp_path / "conversations",
+        {"pi": adapter},
+        default_harness_id="pi",
+        experiment_plan_store=plan_store,
+    )
+    profile = ECHOMIND_PRODUCT_PROFILE
+    context = RequestContext(user_id="42", profile_id=profile.profile_id)
+    conversation_id = "busy-plan-session"
+    try:
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id=conversation_id,
+                user_id="42",
+                profile_id=profile.profile_id,
+                workspace_root=str(tmp_path / "conversations" / conversation_id),
+                tool_allowlist=profile.tool_allowlist,
+                skill_allowlist=profile.skill_allowlist,
+                development_tool_allowlist=profile.development_tool_allowlist,
+                development_skill_allowlist=profile.development_skill_allowlist,
+                command_allowlist=profile.command_allowlist,
+            ),
+            context,
+        )
+        adapter.emit(
+            conversation_id,
+            "status.changed",
+            {"status": "running"},
+            event_id="busy-plan-run-running",
+            run_id="busy-plan-run",
+        )
+        async with asyncio.timeout(5):
+            while (
+                await runtime.get_snapshot(conversation_id, context)
+            ).status != "running":
+                await asyncio.sleep(0.01)
+
+        draft = await runtime.experiment_plan_call(
+            conversation_id,
+            "create_experiment_plan",
+            {"plan": plan_payload},
+            context,
+        )
+        command = ConfirmExperimentPlanCommand(
+            command_id="confirm-busy",
+            proposal_id=str(draft["proposal_id"]),
+            expected_revision=0,
+        )
+        with pytest.raises(PlanConflictError, match="idle Agent"):
+            await runtime.submit_command(conversation_id, command, context)
+
+        adapter.emit(
+            conversation_id,
+            "status.changed",
+            {"status": "idle"},
+            event_id="busy-plan-run-idle",
+            run_id="busy-plan-run",
+        )
+        async with asyncio.timeout(5):
+            while (
+                await runtime.get_snapshot(conversation_id, context)
+            ).status != "idle":
+                await asyncio.sleep(0.01)
+        receipt = await runtime.submit_command(conversation_id, command, context)
+        assert receipt.status == "completed"
+        snapshot = await runtime.get_snapshot(conversation_id, context)
+        assert snapshot.experiment_plan is not None
+        assert snapshot.experiment_plan.current_revision == 1
+    finally:
+        await runtime.close()
+
+
 def test_plan_migration_matches_storage_schema(tmp_path):
     from pyromind_agent_server import plan_migrations
 

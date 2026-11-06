@@ -3,7 +3,10 @@ import { posix } from "node:path";
 
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 
-import type { SandboxFileClientLike } from "./sandbox-operations.js";
+import type {
+  SandboxFileClientLike,
+  SandboxReadWindow,
+} from "./sandbox-operations.js";
 
 /** Directory holding the transient base64 staging file of a terminal write. */
 const STAGING_DIRNAME = ".pyromind-agent-staging";
@@ -47,23 +50,89 @@ export class SandboxTerminalFileClient implements SandboxFileClientLike {
 
   async read(path: string, limit = Number.MAX_SAFE_INTEGER): Promise<Buffer> {
     const chunks: Buffer[] = [];
-    let total = 0;
+    const bounded = limit !== Number.MAX_SAFE_INTEGER;
     const result = await this.terminal.exec(
-      // BSD and GNU base64 both read stdin; only GNU accepts a path argument.
-      `base64 < ${shellQuote(path)} | tr -d '\\n'`,
+      bounded
+        // BSD and GNU `head` both support a byte count. Limiting before base64
+        // keeps the whole read bounded on the socket, not just in this process.
+        ? `test -f ${shellQuote(path)} && ` +
+          `head -c ${limit + 1} ${shellQuote(path)} | base64 | tr -d '\\n'`
+        // BSD and GNU base64 both read stdin; only GNU accepts a path argument.
+        : `test -f ${shellQuote(path)} && ` +
+          `base64 < ${shellQuote(path)} | tr -d '\\n'`,
       ".",
       {
         onData: (data) => {
-          total += data.byteLength;
-          if (total <= limit) chunks.push(data);
+          chunks.push(data);
         },
       },
     );
     if (result.exitCode !== 0) {
       throw new Error(`sandbox terminal read failed (${result.exitCode ?? "signal"}): ${path}`);
     }
-    if (total > limit) throw new Error("file exceeds size limit");
-    return Buffer.from(Buffer.concat(chunks).toString("ascii").replace(/[\r\n]/g, ""), "base64");
+    const content = Buffer.from(
+      Buffer.concat(chunks).toString("ascii").replace(/[\r\n]/g, ""),
+      "base64",
+    );
+    if (content.byteLength > limit) throw new Error("file exceeds size limit");
+    return content;
+  }
+
+  async readHead(path: string, limit: number): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    const result = await this.terminal.exec(
+      `test -f ${shellQuote(path)} && ` +
+      `head -c ${limit} ${shellQuote(path)} | base64 | tr -d '\\n'`,
+      ".",
+      {
+        onData: (data) => {
+          chunks.push(data);
+        },
+      },
+    );
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `sandbox terminal access failed (${result.exitCode ?? "signal"}): ${path}`,
+      );
+    }
+    return Buffer.from(
+      Buffer.concat(chunks).toString("ascii").replace(/[\r\n]/g, ""),
+      "base64",
+    );
+  }
+
+  async readWindow(
+    path: string,
+    offset: number,
+    limit: number,
+    maxBytes: number,
+  ): Promise<SandboxReadWindow> {
+    const chunks: Buffer[] = [];
+    const result = await this.terminal.exec(
+      `test -f ${shellQuote(path)} && ` +
+      `awk -v first=${offset} -v count=${limit} ` +
+      `'NR < first { next } { print; emitted += 1; if (emitted >= count) exit }' ` +
+      `${shellQuote(path)} | head -c ${maxBytes + 1} | base64 | tr -d '\\n'`,
+      ".",
+      {
+        onData: (data) => {
+          chunks.push(data);
+        },
+      },
+    );
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `sandbox terminal read failed (${result.exitCode ?? "signal"}): ${path}`,
+      );
+    }
+    const content = Buffer.from(
+      Buffer.concat(chunks).toString("ascii").replace(/[\r\n]/g, ""),
+      "base64",
+    );
+    if (content.byteLength > maxBytes) {
+      return { content: content.subarray(0, maxBytes), truncated: true };
+    }
+    return { content, truncated: false };
   }
 
   async access(path: string): Promise<void> {

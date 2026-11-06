@@ -9,11 +9,19 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from pyromind_runtime.domain.commands import UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
-from pyromind_runtime.domain.project_graphs import GraphPatch, ProjectGraphView
+from pyromind_runtime.domain.project_graphs import (
+    GraphPatch,
+    ProjectGraphView,
+    canonical_execution_role,
+)
 
 from openhands.agent_server.dependencies import check_session_api_key
+from openhands.agent_server.echomind_dataset_contract import (
+    require_dataset_submission_spec,
+)
 from openhands.agent_server.echomind_projects import (
     ProjectInfo,
+    ProjectNode,
     ProjectNotFoundError,
     ProjectStore,
 )
@@ -21,6 +29,7 @@ from openhands.agent_server.echomind_stage_runs import (
     ProjectArtifactDocument,
     ProjectRunStore,
     StageRun,
+    require_sample_validation,
     run_project_node,
 )
 from openhands.agent_server.pyromind_auth import (
@@ -32,7 +41,13 @@ from pyromind_agent_server.api.router import (
     get_conversation_service,
     get_product_runtime,
 )
-from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
+from pyromind_agent_server.echomind_paths import (
+    storage_path_contract as _storage_path_contract,
+)
+from pyromind_agent_server.profiles import (
+    ECHOMIND_PRODUCT_PROFILE,
+    session_policy_for_profile,
+)
 
 
 router = APIRouter(
@@ -42,6 +57,10 @@ router = APIRouter(
 )
 
 
+class StartEchoMindProjectNodeRequest(BaseModel):
+    request_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
 class StartEchoMindProjectNodeResponse(BaseModel):
     schema_version: Literal[1] = 1
     project_id: str
@@ -49,6 +68,7 @@ class StartEchoMindProjectNodeResponse(BaseModel):
     node_id: str
     conversation_id: str
     event_id: str
+    run: StageRun
     status: Literal["started"] = "started"
 
 
@@ -56,47 +76,110 @@ class RunEchoMindProjectNodeRequest(BaseModel):
     request_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
-def _build_dataset_start_context(project: ProjectInfo, node_id: str) -> str:
+class ContinueEchoMindProjectRunRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=128)
+
+
+class ContinueEchoMindProjectRunResponse(BaseModel):
+    schema_version: Literal[1] = 1
+    project_id: str
+    graph_id: str
+    node_id: str
+    conversation_id: str
+    event_id: str
+    run: StageRun
+    status: Literal["started"] = "started"
+
+
+def _sample_artifact_kind(node: ProjectNode) -> str:
+    configured = node.config.get("sample_report_kind")
+    return (
+        configured
+        if isinstance(configured, str) and configured
+        else ("stage_sample_report")
+    )
+
+
+def _build_agent_stage_start_context(
+    project: ProjectInfo,
+    node_id: str,
+    run: StageRun,
+) -> str:
     node = next(item for item in project.graph.nodes if item.id == node_id)
+    execution_role = canonical_execution_role(node.execution_role)
+    if execution_role == "dataset":
+        execution_instruction = (
+            "After approval, delegate the first TaskRun with "
+            'task.inputs.phase="sample". The Dataset child must validate a real '
+            "sample before the Manager records waiting_user for user confirmation."
+        )
+    else:
+        execution_instruction = (
+            "After approval, delegate one execution TaskRun with "
+            'task.inputs.phase="execute". This node does not require the Dataset '
+            "sample-confirmation cycle."
+        )
+    return (
+        "The user opened Agent-led development for one Project Node. This starts "
+        "only the clarification phase; implementation and execution are not yet "
+        "authorized.\n\n"
+        f"project_id: {project.project.project_id}\n"
+        f"node_id: {node.id}\n"
+        f"run_id: {run.run_id}\n"
+        f"execution_role: {execution_role}\n\n"
+        "Read this Project and StageRun with get_project_graph and "
+        "get_project_stage_run. Use the Project Skill and scenario reference only "
+        "to identify what this Node needs clarified. Then ask the user a small "
+        "batch of essential questions about the Node goal, inputs, outputs, "
+        "constraints, and acceptance criteria. Do not inspect Storage, create or "
+        "modify files, run a sample, submit a platform task, or call "
+        "record_project_stage_result yet.\n\n"
+        "Only after the user explicitly confirms the Node plan, call "
+        "approve_project_stage_plan with a concise summary and the agreed "
+        "decisions. Then delegate the real Node work with "
+        "request_project_stage_task. Use execution_role from this context and "
+        "pass the node inputs, configuration and acceptance criteria. For the "
+        f"{execution_instruction} Do not execute the Node implementation, data "
+        "processing, validator or platform submission in the Manager conversation."
+    )
+
+
+def _build_agent_stage_continuation_context(
+    project: ProjectInfo,
+    run: StageRun,
+    sample_artifact: ProjectArtifactDocument,
+) -> str:
+    node = next(item for item in project.graph.nodes if item.id == run.node_id)
+    sample_details = sample_artifact.content.get("details")
+    if not isinstance(sample_details, dict):
+        sample_details = {}
     context = {
-        "project": {
-            "project_id": project.project.project_id,
-            "graph_id": project.graph.graph_id,
-            "name": project.project.name,
-            "description": project.project.description,
-            "skill": project.project.skill,
-            "lifecycle": project.graph.lifecycle,
-            "requirements": {
-                requirement.key: requirement.value
-                for requirement in project.project.requirements
-            },
-        },
-        "stage": {
-            "node_id": node.id,
-            "node_type": node.type,
-            "title": node.title,
-            "launch_mode": node.launch_mode,
-            "config": node.config,
-        },
+        "project_id": project.project.project_id,
+        "graph_id": project.graph.graph_id,
+        "run_id": run.run_id,
+        "node_id": run.node_id,
+        "task_type": run.task_type,
+        "executor": node.executor.model_dump(mode="json"),
+        "node_config": node.config,
+        "execution_role": canonical_execution_role(node.execution_role),
+        "sample_artifact": sample_artifact.model_dump(mode="json"),
+        "sample_submission_spec": sample_details.get("submission_spec"),
+        "path_contract": _storage_path_contract(dict(node.config)),
     }
     return (
-        "A user explicitly started this Project stage from the EchoMind UI.\n\n"
-        "Server-generated Project and Stage context:\n"
+        "The user explicitly confirmed the sample for this Project Node.\n\n"
+        "Server-generated continuation context:\n"
         f"{json.dumps(context, ensure_ascii=False, indent=2)}\n\n"
-        "Continue in this existing EchoMind conversation and develop only the "
-        "Dataset stage. Use the `data-processing` Skill as the source of truth.\n"
-        "Required development sequence:\n"
-        "1. Inspect the referenced dataset in Storage and determine its actual "
-        "structure. Treat `input_hint` as a hint, not verified metadata.\n"
-        "2. Select the matching data-processing paradigm, create the Pipeline, "
-        "and run a small sample in the conversation sandbox.\n"
-        "3. Show the sample result and wait for explicit user confirmation before "
-        "submitting a full validation task.\n"
-        "4. If the user confirms, submit the validation task through the "
-        "data-processing platform flow and report its task/run/output identifiers.\n\n"
-        "Do not create another Project, do not write `graph.json`, do not invent "
-        "server identifiers, and do not start Inference, Evaluator, or Train. "
-        "Those stages are outside this Dataset development action."
+        "Do not rerun the sample and do not execute the full data-processing "
+        "task in the Manager conversation. Delegate one new TaskRun with "
+        "request_project_stage_task using execution_role from the context and "
+        'task.inputs.phase="submit". The Stage tool injects the frozen '
+        "submission_spec from the accepted sample; do not restate or replace it "
+        "in Manager prose.\n\n"
+        "Use the Dataset child's real result to update the StageRun. Only record "
+        "waiting_external from the child's actual platform receipt, and only "
+        "record succeeded or failed after the child verifies the final output. "
+        "Never submit or resubmit a platform task from the Manager turn."
     )
 
 
@@ -125,7 +208,7 @@ def _require_sandbox_credentials(request: Request) -> None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                "Dataset development runs in the conversation sandbox. "
+                "Agent-led Node development runs in the conversation sandbox. "
                 "Enter a Cookie containing auth_token=... or a Bearer "
                 "Authorization, and set x-cluster, then click Apply."
             ),
@@ -227,6 +310,7 @@ async def start_echomind_project_node(
     project_id: str,
     node_id: str,
     request: Request,
+    payload: StartEchoMindProjectNodeRequest | None = None,
 ) -> StartEchoMindProjectNodeResponse:
     _require_sandbox_credentials(request)
     context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
@@ -251,29 +335,79 @@ async def start_echomind_project_node(
             status_code=status.HTTP_409_CONFLICT,
             detail="Frozen Projects cannot start Agent-led stage development.",
         )
-    if node.type != "dataset" or node.launch_mode != "agent":
+    if not node.execution_role:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Project node is not Agent-led Dataset development: {node_id}",
-        )
-    if node.config.get("capability") != "data-processing":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Dataset node is not bound to the data-processing capability.",
+            detail=f"Project node has no development execution role: {node_id}",
         )
 
     conversation_id = project.project.echomind_conversation_id
     _require_echomind_conversation(request, conversation_id)
-    command = UserMessageCommand(
-        command_id=uuid4().hex,
-        content=(TextContent(text=_build_dataset_start_context(project, node_id)),),
-    )
-    receipt = await get_product_runtime(request).submit_command(
+    runtime = get_product_runtime(request)
+    if not await runtime.apply_session_configuration(
         conversation_id,
-        command,
+        session_policy_for_profile(ECHOMIND_PRODUCT_PROFILE),
         context,
+        activate_development=True,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="EchoMind conversation is busy; retry when it becomes idle.",
+        )
+    run_store = ProjectRunStore(store.root)
+    try:
+        run, created = run_store.start_agent_development(
+            project=project,
+            node=node,
+            request_id=payload.request_id if payload else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    if not created:
+        if run.command_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Stage startup is still in progress; retry shortly.",
+            )
+        return StartEchoMindProjectNodeResponse(
+            project_id=project.project.project_id,
+            graph_id=project.graph.graph_id,
+            node_id=node.id,
+            conversation_id=conversation_id,
+            event_id=run.command_id,
+            run=run,
+        )
+
+    command_id = uuid4().hex
+    run = run_store.attach_command(run, command_id=command_id)
+    command = UserMessageCommand(
+        command_id=command_id,
+        content=(
+            TextContent(
+                text=_build_agent_stage_start_context(project, node_id, run),
+            ),
+        ),
     )
+    try:
+        receipt = await runtime.submit_command(
+            conversation_id,
+            command,
+            context,
+        )
+    except Exception as exc:
+        run_store.fail(run, exc)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Project stage context could not be delivered.",
+        ) from exc
     if receipt.status == "failed":
+        run_store.fail(
+            run,
+            RuntimeError("Project stage context could not be delivered."),
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Project stage context could not be delivered.",
@@ -284,6 +418,207 @@ async def start_echomind_project_node(
         node_id=node.id,
         conversation_id=conversation_id,
         event_id=receipt.command_id,
+        run=run,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/runs/{run_id}/confirm",
+    response_model=ContinueEchoMindProjectRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={404: {"description": "Project, node, or run not found"}},
+)
+async def confirm_echomind_project_run(
+    project_id: str,
+    run_id: str,
+    payload: ContinueEchoMindProjectRunRequest,
+    request: Request,
+) -> ContinueEchoMindProjectRunResponse:
+    _require_sandbox_credentials(request)
+    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
+    service = get_conversation_service(request)
+    store = ProjectStore.for_conversations_dir(service.conversations_dir)
+    try:
+        project = store.load(project_id, owner_user_id=context.user_id)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {project_id}",
+        ) from exc
+    if project.graph.lifecycle != "development":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Frozen Projects cannot continue stage development.",
+        )
+    run_store = ProjectRunStore(store.root)
+    try:
+        run = run_store.get(project_id=project_id, run_id=run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project run not found: {run_id}",
+        ) from exc
+    node = next((item for item in project.graph.nodes if item.id == run.node_id), None)
+    if node is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project node not found: {run.node_id}",
+        )
+    if run.mode != "agent_development" or not node.execution_role:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Only Agent development runs with an execution role can be confirmed."
+            ),
+        )
+    existing_command = next(
+        (
+            update.command_id
+            for update in run.updates
+            if update.request_id == payload.request_id
+        ),
+        None,
+    )
+    if existing_command is not None:
+        return ContinueEchoMindProjectRunResponse(
+            project_id=project.project.project_id,
+            graph_id=project.graph.graph_id,
+            node_id=run.node_id,
+            conversation_id=project.project.echomind_conversation_id,
+            event_id=existing_command,
+            run=run,
+        )
+    sample_artifact = next(
+        (
+            artifact
+            for artifact in reversed(run.artifacts)
+            if artifact.kind == _sample_artifact_kind(node)
+        ),
+        None,
+    )
+    if sample_artifact is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The Dataset run has no completed sample report to confirm.",
+        )
+    try:
+        sample_document = run_store.load_artifact(
+            project_id=project_id,
+            artifact_id=sample_artifact.artifact_id,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The Dataset sample report is missing.",
+        ) from exc
+    try:
+        require_sample_validation(
+            node,
+            sample_document.content.get("details", {}),
+        )
+        if node.type == "dataset":
+            sample_details = sample_document.content.get("details", {})
+            if not isinstance(sample_details, dict):
+                raise ValueError("sample details must be an object")
+            sample_task_run_id = sample_document.content.get("task_run_id")
+            if not isinstance(sample_task_run_id, str) or not sample_task_run_id:
+                raise ValueError("sample report has no TaskRun identity")
+            require_dataset_submission_spec(
+                sample_details,
+                task_run_id=sample_task_run_id,
+            )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"The Node sample report is not valid for confirmation: {exc}",
+        ) from exc
+
+    conversation_id = project.project.echomind_conversation_id
+    _require_echomind_conversation(request, conversation_id)
+    runtime = get_product_runtime(request)
+    if not await runtime.apply_session_configuration(
+        conversation_id,
+        session_policy_for_profile(ECHOMIND_PRODUCT_PROFILE),
+        context,
+        activate_development=True,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="EchoMind conversation is busy; retry when it becomes idle.",
+        )
+
+    command_id = uuid4().hex
+    try:
+        run, created = run_store.begin_continuation(
+            project=project,
+            run_id=run_id,
+            request_id=payload.request_id,
+            command_id=command_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    if not created:
+        existing_command = next(
+            (
+                update.command_id
+                for update in run.updates
+                if update.request_id == payload.request_id
+            ),
+            None,
+        )
+        if existing_command is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Stage continuation is still being prepared; retry shortly.",
+            )
+        return ContinueEchoMindProjectRunResponse(
+            project_id=project.project.project_id,
+            graph_id=project.graph.graph_id,
+            node_id=run.node_id,
+            conversation_id=conversation_id,
+            event_id=existing_command,
+            run=run,
+        )
+
+    command = UserMessageCommand(
+        command_id=command_id,
+        content=(
+            TextContent(
+                text=_build_agent_stage_continuation_context(
+                    project,
+                    run,
+                    sample_document,
+                ),
+            ),
+        ),
+    )
+    try:
+        receipt = await runtime.submit_command(conversation_id, command, context)
+    except Exception as exc:
+        run_store.fail(run, exc)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Node continuation could not be delivered.",
+        ) from exc
+    if receipt.status == "failed":
+        run_store.fail(
+            run,
+            RuntimeError("Node continuation could not be delivered."),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Node continuation could not be delivered.",
+        )
+    return ContinueEchoMindProjectRunResponse(
+        project_id=project.project.project_id,
+        graph_id=project.graph.graph_id,
+        node_id=run.node_id,
+        conversation_id=conversation_id,
+        event_id=receipt.command_id,
+        run=run,
     )
 
 

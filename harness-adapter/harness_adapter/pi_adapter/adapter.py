@@ -11,7 +11,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -214,6 +214,26 @@ class _PendingPermission:
     future: asyncio.Future[tuple[bool, str | None]]
 
 
+@dataclass(frozen=True, slots=True)
+class ToolExtensionSpec:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": self.input_schema,
+        }
+
+
+type ToolExtensionCall = Callable[
+    [str, str, JsonObject, RequestContext],
+    Coroutine[Any, Any, JsonObject],
+]
+
+
 @dataclass(slots=True)
 class _PiSession:
     session_id: str
@@ -241,6 +261,7 @@ class _PiSession:
     attach_recovery: AttachRecovery | None = None
     input_calls: dict[str, tuple[str | None, str]] = field(default_factory=dict)
     message_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    runner_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class PiAdapter:
@@ -266,6 +287,8 @@ class PiAdapter:
         self._workflow_call = workflow_call
         self._plan_call: Any = None
         self._role_call: Any = None
+        self._tool_extension_specs: tuple[ToolExtensionSpec, ...] = ()
+        self._tool_extension_call: ToolExtensionCall | None = None
         self._role_scopes: dict[tuple[str, str], dict[str, Any]] = {}
         self._execution_outputs: dict[str, tuple[str, WorkflowEventSink]] = {}
         self._terminal_backend = validate_pi_terminal_backend(terminal_backend)
@@ -356,6 +379,17 @@ class PiAdapter:
 
     def set_plan_handler(self, callback: Any) -> None:
         self._plan_call = callback
+
+    def set_tool_extensions(
+        self,
+        specs: Sequence[ToolExtensionSpec],
+        callback: ToolExtensionCall,
+    ) -> None:
+        names = [spec.name for spec in specs]
+        if len(names) != len(set(names)):
+            raise ValueError("tool extension names must be unique")
+        self._tool_extension_specs = tuple(specs)
+        self._tool_extension_call = callback
 
     def set_role_handler(self, callback: Any) -> None:
         self._role_call = callback
@@ -649,6 +683,11 @@ class PiAdapter:
                 if session.config.get("tool_allowlist") is not None
                 and self._tool_allowed(session, name)
             ]
+        specs += [
+            spec.as_dict()
+            for spec in self._tool_extension_specs
+            if self._tool_allowed(session, spec.name)
+        ]
         return [spec for spec in specs if self._tool_allowed(session, spec["name"])]
 
     def set_workflow_preparer(self, callback: Any) -> None:
@@ -1029,6 +1068,7 @@ class PiAdapter:
             "product_instructions",
             "delegated_roles",
             "managed_delegation",
+            "agentgenome_enabled",
         ):
             value = getattr(policy, name)
             if value is not None:
@@ -1683,7 +1723,10 @@ class PiAdapter:
         await runner.start(
             {
                 "session_id": session.session_id,
-                "workflows_enabled": self._workflow_call is not None,
+                "workflows_enabled": (
+                    self._workflow_call is not None
+                    and session.config.get("agentgenome_enabled", True)
+                ),
                 "execution_policy": {
                     "automatic_turns_suspended": bool(
                         recovery and recovery.automatic_turns_suspended
@@ -1754,18 +1797,19 @@ class PiAdapter:
         )
 
     async def _ensure_runner(self, session: _PiSession) -> None:
-        if (
-            session.runner is not None
-            and session.runner.running
-            and not session.runner_restart_pending
-        ):
-            return
-        if session.runner is not None:
-            runner = session.runner
-            session.runner = None
-            await runner.close()
-        session.runner_restart_pending = False
-        await self._start_runner(session, _api_key(session.model_configuration))
+        async with session.runner_lock:
+            if (
+                session.runner is not None
+                and session.runner.running
+                and not session.runner_restart_pending
+            ):
+                return
+            if session.runner is not None:
+                runner = session.runner
+                session.runner = None
+                await runner.close()
+            session.runner_restart_pending = False
+            await self._start_runner(session, _api_key(session.model_configuration))
 
     async def _prompt(
         self, session: _PiSession, run_id: str, content: list[dict[str, Any]]
@@ -1902,6 +1946,22 @@ class PiAdapter:
                     raise ValueError("plan tools are not configured")
                 result = await self._plan_call(
                     session.session_id, tool_name, arguments, session.context
+                )
+                return {
+                    "content": [
+                        {"type": "text", "text": json.dumps(result, ensure_ascii=False)}
+                    ],
+                    "details": result,
+                    "is_error": False,
+                }
+            if any(spec.name == tool_name for spec in self._tool_extension_specs):
+                if self._tool_extension_call is None:
+                    raise ValueError("extension tools are not configured")
+                result = await self._tool_extension_call(
+                    session.session_id,
+                    tool_name,
+                    arguments,
+                    session.context,
                 )
                 return {
                     "content": [
@@ -2277,7 +2337,13 @@ class PiAdapter:
         if dsl is None and not snapshot_error:
             try:
                 dsl = await self._read_workflow(session)
-            except (OSError, UnicodeError):
+            except Exception as exc:
+                logger.warning(
+                    "Could not snapshot workflow during run completion "
+                    "conversation_id=%s error=%s",
+                    session.session_id,
+                    type(exc).__name__,
+                )
                 dsl = None
                 snapshot_error = True
         normalized: JsonObject = {
@@ -2573,6 +2639,7 @@ def _session_config(spec: SessionSpec) -> dict[str, Any]:
             else {}
         ),
         "user_input_enabled": spec.user_input_enabled,
+        "agentgenome_enabled": spec.agentgenome_enabled,
         "extra": _safe_session_extra(spec.extra),
     }
 

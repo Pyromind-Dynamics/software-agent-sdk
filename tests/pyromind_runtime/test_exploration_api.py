@@ -4,6 +4,7 @@ import json
 import httpx
 import pytest
 from pyromind_agent_server.api.router import create_product_router
+from pyromind_agent_server.profiles import session_policy_for_profile
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.experiment_plans import PlanOwner
@@ -54,16 +55,36 @@ async def test_new_profile_has_no_graph_gate_and_artifacts_remain_isolated(
             assert spec.tool_allowlist is not None
             assert spec.skill_allowlist is not None
             assert spec.delegated_roles is not None
-            assert {"read", "write", "edit", "terminal", "df_submit_evaluation"} <= set(
-                spec.tool_allowlist
-            )
+            assert {
+                "read",
+                "terminal",
+                "subagent",
+                "create_experiment_plan",
+                "df_submit_evaluation",
+            } <= set(spec.tool_allowlist)
+            assert "experiment-planning" in spec.skill_allowlist
             assert "data-processing" in spec.skill_allowlist
-            assert "inference-evaluation" in spec.skill_allowlist
             assert "read_skill" not in spec.tool_allowlist
-            assert "subagent" not in spec.tool_allowlist
-            assert [role.name for role in spec.delegated_roles] == ["eval"]
+            assert [role.name for role in spec.delegated_roles] == ["eval", "dataset"]
             assert "df_submit_evaluation" in spec.delegated_roles[0].tools
             assert "update_experiment_context" not in spec.delegated_roles[0].tools
+            assert "data-processing" in spec.delegated_roles[1].skills
+            assert "df_submit_pipeline" in spec.delegated_roles[1].tools
+            assert "update_experiment_context" not in spec.delegated_roles[1].tools
+            assert await runtime.apply_session_configuration(
+                identity,
+                session_policy_for_profile(ECHOMIND_PRODUCT_PROFILE),
+                context,
+                activate_development=True,
+            )
+            activated = adapter.session_policies[-1][1]
+            assert activated.tool_allowlist is not None
+            assert activated.skill_allowlist is not None
+            assert {"read", "write", "edit", "terminal", "df_submit_evaluation"} <= set(
+                activated.tool_allowlist
+            )
+            assert "data-processing" in activated.skill_allowlist
+            assert "inference-evaluation" in activated.skill_allowlist
             run = await runtime.request_experiment_task(
                 identity, request(intent="prepare"), context
             )
@@ -174,10 +195,6 @@ async def test_new_profile_has_no_graph_gate_and_artifacts_remain_isolated(
             await runtime.flush_execution_events()
             items = service.store.queue.list(run["owner"])
             assert len([item for item in items if item["kind"] == "manager_turn"]) == 1
-            with pytest.raises(PermissionError):
-                await runtime.experiment_plan_call(
-                    identity, "create_experiment_plan", {}, context
-                )
     finally:
         await runtime.close()
 

@@ -66,6 +66,7 @@ class ExperimentExecutions:
                 request.role_id,
                 request.request_id,
                 task_spec=frozen,
+                stage_run_id=request.stage_run_id,
             )
         view = self.plans.view(owner)
         if not view.current or view.current_revision != request.expected_revision:
@@ -87,6 +88,7 @@ class ExperimentExecutions:
             request.task_id,
             request.role_id,
             request.request_id,
+            stage_run_id=request.stage_run_id,
         )
 
     def decide(
@@ -111,11 +113,15 @@ class ExperimentExecutions:
         for row in self.store.list(owner):
             revision = row["revision"]
             if row.get("task_spec"):
-                spec, details = row["task_spec"], row.get("result") or {}
+                spec, result_payload = row["task_spec"], row.get("result") or {}
+                details = result_payload.get("details")
+                if not isinstance(details, dict):
+                    details = {}
                 submission = row.get("submission") or {}
                 result_view = ExperimentExecutionView(
                     run_id=row["id"],
                     project_id=row["project_id"],
+                    stage_run_id=row.get("stage_run_id"),
                     task_id=row["task_id"],
                     stage_id=spec.get("stage_id"),
                     plan_sequence=spec.get("plan_sequence"),
@@ -125,12 +131,13 @@ class ExperimentExecutions:
                     state=row["state"],
                     report_state=row["report_state"],
                     metrics=row.get("metrics"),
+                    details=details,
                     platform_task_id=submission.get("task_id"),
                     intent=spec["intent"],
-                    summary=details.get("summary"),
-                    report_uri=details.get("report_uri"),
-                    blockers=tuple(details.get("blockers", [])),
-                    waiting_reason=details.get("waiting_reason"),
+                    summary=result_payload.get("summary"),
+                    report_uri=result_payload.get("report_uri"),
+                    blockers=tuple(result_payload.get("blockers", [])),
+                    waiting_reason=result_payload.get("waiting_reason"),
                     artifacts=tuple(
                         {key: a[key] for key in ("name", "uri", "sha256")}
                         for a in row.get("artifacts", [])
@@ -147,6 +154,7 @@ class ExperimentExecutions:
                 ExperimentExecutionView(
                     run_id=row["id"],
                     project_id=row["project_id"],
+                    stage_run_id=row.get("stage_run_id"),
                     plan_revision=revision,
                     task_id=task.id,
                     stage_id=task.stage_id,

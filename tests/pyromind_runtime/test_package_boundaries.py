@@ -437,6 +437,9 @@ def test_return_addresses_stay_in_the_product_contract_and_out_of_model_argument
         "type",
         "subagent_id",
         "task_kind",
+        "project_id",
+        "task_run_id",
+        "stage_run_id",
     }
     for action in (RunWorkflowAction, WorkflowDebugAction, DfSubmitPipelineAction):
         assert not {"correlation", "origin", "subagent_id"}.intersection(
@@ -459,6 +462,23 @@ def test_preparation_policy_is_trusted_profile_configuration():
     assert roles is not None and set(policy.allowed_roles) <= {
         role.name for role in roles
     }
+    assert {role.name for role in roles} == {"dataset", "train", "inference", "eval"}
+    dataset_role = next(role for role in roles if role.name == "dataset")
+    assert dataset_role.skills == ("data-processing",)
+    assert "df_submit_pipeline" in dataset_role.tools
+    assert "df_submit_evaluation" not in dataset_role.tools
+    train_role = next(role for role in roles if role.name == "train")
+    assert train_role.skills == ("generate-workflow-dsl", "training-analysis")
+    assert "validate_workflow_dsl" in train_role.tools
+    assert "submit_workflow" not in train_role.tools
+    inference_role = next(role for role in roles if role.name == "inference")
+    assert inference_role.skills == ("inference-evaluation",)
+    assert "df_submit_evaluation" in inference_role.tools
+    eval_role = next(role for role in roles if role.name == "eval")
+    assert eval_role.skills == (
+        "inference-evaluation",
+        "avi-baseline-evaluation",
+    )
     tools = set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ())
     assert {"read", "write", "edit", "terminal", "grep", "find", "ls"} <= tools
     assert not {
@@ -502,7 +522,7 @@ def test_preparation_checklist_resolves_from_source_bundle_or_configured_root(
         monkeypatch.setenv("PYROMIND_SKILLS_PATH", str(root))
     policy = profiles.ECHOMIND_PRODUCT_PROFILE.preparation_policy
     assert policy is not None
-    target = root / "model-evaluation-preparation/checklist.json"
+    target = root / "experiment-planning/checklist.json"
     target.parent.mkdir(parents=True)
     target.write_text(policy.model_dump_json())
     assert profiles._load_preparation_policy() == policy
@@ -524,5 +544,5 @@ def test_frozen_bundle_includes_preparation_and_role_skill_assets():
         (Path(target) / Path(source).name).as_posix()
         for source, target in namespace["get_pi_skill_datas"]()
     }
-    assert ".agents/skills/model-evaluation-preparation/checklist.json" in targets
+    assert ".agents/skills/experiment-planning/checklist.json" in targets
     assert ".agents/skills/avi-baseline-evaluation/SKILL.md" in targets

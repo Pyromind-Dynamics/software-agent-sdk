@@ -7,6 +7,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import MagicMock
 
 import pytest
 from PIL import Image
@@ -34,7 +35,10 @@ from openhands.tools.data_preparation.runner import (
     summarize_dataflow_env,
     validate_managed_image_pipeline,
 )
-from openhands.tools.data_preparation.sandbox_execution import sandbox_read_text
+from openhands.tools.data_preparation.sandbox_execution import (
+    SandboxExecutionError,
+    sandbox_read_text,
+)
 from openhands.tools.utils.dataflow_config import (
     DEFAULT_DATAFLOW_API_BASE_URL,
     DEFAULT_DATAFLOW_MODEL_NAME,
@@ -2574,6 +2578,104 @@ def _run_vision_sandbox_sample(
         conversation,
     )
     return observation, workspace_dir
+
+
+def test_df_run_pipeline_none_profile_vision_schema_skips_image_preflight(
+    monkeypatch,
+    sandbox_workspace,
+) -> None:
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+    executor = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))
+    pipeline_dir = sandbox_workspace.workspace_dir / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    (pipeline_dir / "pipeline.py").write_text(
+        "\n".join(
+            [
+                "import sys",
+                "for value in range(1):",
+                "    pass",
+                "open(sys.argv[2], 'w').write('{}\\n')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (pipeline_dir / "input.jsonl").write_text("{}\n", encoding="utf-8")
+    preflight = MagicMock()
+    monkeypatch.setattr(executor, "_preflight_managed_image_pipeline", preflight)
+    sandbox_executor = MagicMock(runtime_fingerprint="runtime")
+    sandbox_executor.run.side_effect = SandboxExecutionError("stop after preflight")
+    monkeypatch.setattr(executor, "_sandbox_executor", lambda run: sandbox_executor)
+
+    observation = executor(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/processed.jsonl",
+            ],
+            output_schema="vision",
+            model_profile="none",
+        ),
+        _sandbox_conversation(sandbox_workspace),
+    )
+
+    assert observation.is_error
+    preflight.assert_not_called()
+
+
+def test_df_run_pipeline_vision_profile_runs_image_preflight(
+    monkeypatch,
+    sandbox_workspace,
+) -> None:
+    scripts_dir = (
+        Path(__file__).parents[3]
+        / ".agents"
+        / "skills"
+        / "data-processing"
+        / "scripts"
+        / "preparation"
+    )
+    executor = DfRunPipelineExecutor(runtime_dir=str(scripts_dir))
+    pipeline_dir = sandbox_workspace.workspace_dir / "public_data" / "data-preparation"
+    pipeline_dir.mkdir(parents=True)
+    (pipeline_dir / "pipeline.py").write_text("print('managed image pipeline')")
+    (pipeline_dir / "input.jsonl").write_text("{}\n", encoding="utf-8")
+    preflight = MagicMock()
+    monkeypatch.setattr(executor, "_preflight_managed_image_pipeline", preflight)
+    sandbox_executor = MagicMock(runtime_fingerprint="runtime")
+    sandbox_executor.run.side_effect = SandboxExecutionError("stop after preflight")
+    monkeypatch.setattr(executor, "_sandbox_executor", lambda run: sandbox_executor)
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.definition.build_dataflow_env",
+        lambda conversation, model_profile: {
+            "DF_API_KEY": "secret",
+            "DF_API_BASE_URL": "http://example.test/v1",
+            "DF_MODEL_NAME": "vision-model",
+        },
+    )
+
+    observation = executor(
+        DfRunPipelineAction(
+            pipeline_path="public_data/data-preparation/pipeline.py",
+            args=[
+                "public_data/data-preparation/input.jsonl",
+                "public_data/data-preparation/processed.jsonl",
+            ],
+            output_schema="vision",
+            model_profile="vision",
+        ),
+        _sandbox_conversation(sandbox_workspace),
+    )
+
+    assert observation.is_error
+    preflight.assert_called_once()
 
 
 def test_df_run_pipeline_sandbox_vision_reads_workspace_images_in_place(

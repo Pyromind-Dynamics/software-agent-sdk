@@ -2,6 +2,20 @@ import { createAssistantMessageEventStream, type AssistantMessage } from "@earen
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { callSubagentHost } from "./subagent-ipc.js";
 
+export function formatWorkspacePathContract(paths: {
+  cwd: string;
+  runId: string;
+  writeRoot: string;
+}): string {
+  return [
+    "Execution path contract:",
+    `- Resolve all tool paths in the conversation execution environment, with cwd ${paths.cwd}.`,
+    `- Use write/edit only under ${paths.writeRoot}. The host rejects writes outside this delegated task root.`,
+    `- Keep this TaskRun's generated scripts, configuration, workflow and reports under ${paths.writeRoot}.`,
+    "- Use the Sandbox paths from task.inputs.path_contract for user Storage inputs. Never use host workspace paths.",
+  ].join("\n");
+}
+
 /** Loaded by pi-subagents in both its foreground and detached child sessions. */
 export async function installChildHost(pi: ExtensionAPI, role: string) {
   const socket = process.env.PYROMIND_SUBAGENT_SOCKET;
@@ -56,6 +70,9 @@ export async function installChildHost(pi: ExtensionAPI, role: string) {
         baseDir: skill.baseDir.replace(mapping.host, mapping.alias),
       }));
     }
-    return { systemPrompt: prompt + "\n" + config.instructions };
+    const workspaceContract = config.workspacePaths
+      ? "\n" + formatWorkspacePathContract(config.workspacePaths)
+      : "";
+    return { systemPrompt: prompt + "\n" + config.instructions + workspaceContract };
   });
 }

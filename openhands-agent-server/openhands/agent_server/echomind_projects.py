@@ -10,7 +10,12 @@ from uuid import UUID, uuid4
 
 from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from pyromind_runtime.domain.experiment_plans import PlanRevision, WorkflowPlan
+from pyromind_runtime.domain.experiment_plans import (
+    ExperimentContext,
+    PlanRevision,
+    WorkflowPlan,
+)
+from pyromind_runtime.domain.preparation import ProjectView
 from pyromind_runtime.domain.project_graphs import (
     AddProjectEdge,
     AddProjectNode,
@@ -25,6 +30,7 @@ from pyromind_runtime.domain.project_graphs import (
     RemoveProjectNode,
     UpdateProjectNode,
     UpdateProjectRequirements,
+    canonical_execution_role,
 )
 
 from openhands.agent_server.echomind_graph_templates import (
@@ -91,11 +97,45 @@ class ProjectStore:
         owner_user_id: str | None,
     ) -> ProjectInfo:
         plan = revision.plan
-        project_id = revision.project_id
+        return self._bind(
+            project_id=revision.project_id,
+            plan=plan,
+            name=plan.name,
+            skill=plan.skill or EXPERIMENT_PLANNING_SKILL,
+            echomind_conversation_id=echomind_conversation_id,
+            owner_user_id=owner_user_id,
+        )
+
+    def bind_project(
+        self,
+        project: ProjectView,
+        *,
+        owner_user_id: str | None,
+    ) -> ProjectInfo:
+        goal = project.plan.goal.strip()
+        return self._bind(
+            project_id=project.project_id,
+            plan=project.plan,
+            name=goal.splitlines()[0][:255] if goal else "EchoMind Project",
+            skill=EXPERIMENT_PLANNING_SKILL,
+            echomind_conversation_id=project.conversation_id,
+            owner_user_id=owner_user_id,
+        )
+
+    def _bind(
+        self,
+        *,
+        project_id: str,
+        plan: WorkflowPlan | ExperimentContext,
+        name: str,
+        skill: str,
+        echomind_conversation_id: str,
+        owner_user_id: str | None,
+    ) -> ProjectInfo:
         try:
             canonical_project_id = str(UUID(project_id))
         except ValueError as exc:
-            raise ValueError("plan revision has an invalid project_id") from exc
+            raise ValueError("project has an invalid project_id") from exc
 
         final_dir = self.root / canonical_project_id
         existing = self._load_optional(canonical_project_id)
@@ -105,17 +145,15 @@ class ProjectStore:
                 or existing.project.echomind_conversation_id != echomind_conversation_id
             ):
                 raise PermissionError("Project belongs to another conversation")
-            graph_id = existing.graph.graph_id
             created_at = existing.project.created_at
         else:
-            graph_id = str(uuid4())
             created_at = _utc_now()
+        graph_id = project_id
 
-        skill = plan.skill or EXPERIMENT_PLANNING_SKILL
         node_payloads, edge_payloads = build_graph_payload(plan=plan)
         project = ProjectRecord(
             project_id=project_id,
-            name=plan.name,
+            name=name,
             description=plan.goal,
             skill=skill,
             requirements=_requirements_from_plan(plan),
@@ -129,14 +167,22 @@ class ProjectStore:
             project_id=project_id,
             template=EXPERIMENT_GRAPH_TEMPLATE,
             lifecycle="development",
-            nodes=[
-                ProjectNode.model_validate(node_payload)
-                for node_payload in node_payloads
-            ],
-            edges=[
-                ProjectEdge.model_validate(edge_payload)
-                for edge_payload in edge_payloads
-            ],
+            nodes=(
+                existing.graph.nodes
+                if existing is not None
+                else [
+                    ProjectNode.model_validate(node_payload)
+                    for node_payload in node_payloads
+                ]
+            ),
+            edges=(
+                existing.graph.edges
+                if existing is not None
+                else [
+                    ProjectEdge.model_validate(edge_payload)
+                    for edge_payload in edge_payloads
+                ]
+            ),
         )
 
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -226,6 +272,7 @@ class ProjectStore:
                     "edges": edges,
                 }
             )
+            graph = _normalize_development_graph(graph)
             project = current.project.model_copy(update={"requirements": requirements})
             updated = ProjectInfo(project=project, graph=graph)
 
@@ -250,12 +297,15 @@ class ProjectStore:
             project_path.read_text(encoding="utf-8")
         )
         graph = ProjectGraph.model_validate_json(graph_path.read_text(encoding="utf-8"))
+        graph = _normalize_development_graph(graph)
         if graph.project_id != project.project_id:
             raise ValueError("project graph belongs to another project")
         return ProjectInfo(project=project, graph=graph)
 
 
-def _requirements_from_plan(plan: WorkflowPlan) -> list[ProjectRequirement]:
+def _requirements_from_plan(
+    plan: WorkflowPlan | ExperimentContext,
+) -> list[ProjectRequirement]:
     return [
         ProjectRequirement(
             key=resource.id,
@@ -265,6 +315,34 @@ def _requirements_from_plan(plan: WorkflowPlan) -> list[ProjectRequirement]:
         )
         for resource in plan.resources
     ]
+
+
+def _normalize_development_graph(graph: ProjectGraph) -> ProjectGraph:
+    if graph.template != EXPERIMENT_GRAPH_TEMPLATE or graph.lifecycle != "development":
+        return graph
+
+    changed = False
+    nodes = []
+    for node in graph.nodes:
+        update: dict[str, Any] = {}
+        canonical_role = canonical_execution_role(node.execution_role)
+        if canonical_role != node.execution_role:
+            update["execution_role"] = canonical_role
+        if node.launch_mode == "executor" and node.executor.kind == "contract_probe":
+            update["launch_mode"] = "agent"
+        if update:
+            changed = True
+            node = node.model_copy(update=update)
+        nodes.append(node)
+
+    if not changed:
+        return graph
+    return ProjectGraph.model_validate(
+        {
+            **graph.model_dump(mode="python"),
+            "nodes": nodes,
+        }
+    )
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:

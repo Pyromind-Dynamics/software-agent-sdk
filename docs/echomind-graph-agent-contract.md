@@ -1,13 +1,17 @@
 # EchoMind Graph 与主/子 Agent 交互契约
 
 > 状态：设计稿，待评审
-> 更新时间：2026-10-30
+> 更新时间：2026-11-04
 > 范围：可执行 Graph、运行状态、生产异常暂停与开发分支、主/子 Agent
 > 结构化交互契约
 >
-> 当前轻量实施以 `docs/echomind-four-node-graph-execution-plan.md` 为准：开发态
-> 不创建 GraphRevision，只维护可变 Working Graph；本文的 GraphRevision、
-> Deployment 和 DevelopmentBranch 属于后续生产化契约。
+> 当前单轮实施以 `docs/echomind-graph-executor-implementation.md` 为准。该文档
+> 定义通用 Node、ExecutorBinding、Artifact、NodeRun 和首期发布边界。本文的
+> GraphRevision、Deployment、DevelopmentBranch 和多轮生产闭环属于后续扩展。
+>
+> 当前 Project 身份和运行层级统一为：SQL Project 是唯一 `project_id`，
+> WorkingGraph 按相同 ID 挂接；StageRun 是节点级主运行，TaskRun 是执行明细。
+> 具体接缝规则和 S4 验收见上述实施基线。
 >
 > 本文不定义任务队列、Agent 进程调度、Kafka Transport 和子 Agent 生命周期实现。
 > 这些属于后续执行层设计。
@@ -816,9 +820,9 @@ train.train_run
 
 ## 12. 实现边界
 
-一步一步的执行顺序以 `docs/echomind-avi-single-turn-plan.md` 的 M0 到 M8 为准。
-每个阶段的具体验证步骤见 `docs/echomind-milestone-verification.md`。本节只说明
-各项设计分别落在哪个能力边界。
+一步一步的执行顺序以 `docs/echomind-graph-executor-implementation.md` 的
+S1-S8 为准。每个阶段的具体验证步骤见该文档第 17 节。下文 M1-M8 是长期
+GraphRevision、生产恢复和多轮能力的专项设计，不作为首期实现顺序。
 
 ### Graph Schema v1：M1-M2
 

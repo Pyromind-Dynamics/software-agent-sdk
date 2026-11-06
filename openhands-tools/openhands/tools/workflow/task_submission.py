@@ -89,6 +89,7 @@ def create_workflow_api_client(
     auth_token: str | None,
     headers: dict[str, str],
     timeout: int = 30,
+    max_retries: int = 3,
 ) -> PyroMindAPIClient:
     """Create the authenticated client used by every workflow-producing tool."""
     if not auth_token:
@@ -97,6 +98,8 @@ def create_workflow_api_client(
         raise ValueError("env is required.")
     if not cluster:
         raise ValueError("cluster is required.")
+    if max_retries < 0:
+        raise ValueError("max_retries must be non-negative.")
 
     access_key = _retry_transient(
         lambda: get_api_key(
@@ -111,6 +114,7 @@ def create_workflow_api_client(
         cluster=cluster,
         api_key=access_key,
         timeout=timeout,
+        max_retries=max_retries,
     )
 
 

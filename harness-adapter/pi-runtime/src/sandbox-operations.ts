@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 
 import type {
   EditOperations,
@@ -71,6 +71,8 @@ export class SandboxEndpointSession {
 }
 
 export const SANDBOX_FILE_MAX_BYTES = 1024 * 1024 * 1024;
+/** Bytes needed to identify every image format the read tool accepts. */
+export const SANDBOX_IMAGE_PROBE_BYTES = 16;
 const UPLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 120_000;
 /**
@@ -121,8 +123,23 @@ export class SandboxFileClient {
     });
   }
 
+  async readHead(path: string, limit: number): Promise<Buffer> {
+    return this.withEndpoint(async (endpoint) => {
+      const url = this.url(endpoint, `/sandboxes/${endpoint.sandboxId}/files/read`);
+      url.searchParams.set("path", path);
+      return this.bytes("GET", url, await this.fetch(endpoint, url), limit, true);
+    });
+  }
+
   async access(path: string): Promise<void> {
-    await this.read(path);
+    // The file API has no stat endpoint. The response headers prove the file
+    // is readable, so cancel the body instead of downloading it.
+    await this.withEndpoint(async (endpoint) => {
+      const url = this.url(endpoint, `/sandboxes/${endpoint.sandboxId}/files/read`);
+      url.searchParams.set("path", path);
+      const response = await this.fetch(endpoint, url);
+      await response.body?.cancel().catch(() => undefined);
+    });
   }
 
   async write(path: string, content: string | Buffer, signal?: AbortSignal): Promise<void> {
@@ -213,7 +230,13 @@ export class SandboxFileClient {
     }
   }
 
-  private async bytes(method: string, url: URL, response: Response, limit: number): Promise<Buffer> {
+  private async bytes(
+    method: string,
+    url: URL,
+    response: Response,
+    limit: number,
+    truncate = false,
+  ): Promise<Buffer> {
     try {
       const reader = response.body?.getReader();
       if (!reader) return Buffer.alloc(0);
@@ -224,7 +247,12 @@ export class SandboxFileClient {
           const { value, done } = await reader.read();
           if (done) break;
           total += value.byteLength;
-          if (total > limit) throw new Error("file exceeds size limit");
+          if (total > limit) {
+            if (!truncate) throw new Error("file exceeds size limit");
+            const remaining = limit - (total - value.byteLength);
+            if (remaining > 0) chunks.push(Buffer.from(value.subarray(0, remaining)));
+            break;
+          }
           chunks.push(Buffer.from(value));
         }
         return Buffer.concat(chunks);
@@ -333,6 +361,20 @@ export class FallbackSandboxFileClient implements SandboxFileClientLike {
     }
   }
 
+  async readHead(path: string, limit: number): Promise<Buffer> {
+    if (this.terminalOnly) return this.terminal.readHead?.(path, limit)
+      ?? this.terminal.read(path, limit);
+    try {
+      const content = await this.fileApi.readHead?.(path, limit)
+        ?? this.fileApi.read(path, limit);
+      this.recovered();
+      return content;
+    } catch (error) {
+      return this.fallback(error, () => this.terminal.readHead?.(path, limit)
+        ?? this.terminal.read(path, limit));
+    }
+  }
+
   async access(path: string): Promise<void> {
     if (this.terminalOnly) return this.terminal.access(path);
     try {
@@ -341,6 +383,38 @@ export class FallbackSandboxFileClient implements SandboxFileClientLike {
     } catch (error) {
       return this.fallback(error, () => this.terminal.access(path));
     }
+  }
+
+  async readWindow(
+    path: string,
+    offset: number,
+    limit: number,
+    maxBytes: number,
+  ): Promise<SandboxReadWindow> {
+    // The file API streams from byte zero and cannot seek by line. A small file
+    // can still answer a later line range cheaply; a large one must run awk in
+    // the sandbox so skipped bytes never cross the network.
+    if (!this.terminalOnly) {
+      try {
+        const content = this.fileApi.readHead === undefined
+          ? await this.fileApi.read(path, maxBytes + 1)
+          : await this.fileApi.readHead(path, maxBytes + 1);
+        if (offset <= 1 || content.byteLength <= maxBytes) {
+          this.recovered();
+          return boundedWindow(content, maxBytes, limit, offset);
+        }
+      } catch (error) {
+        return this.fallback(
+          error,
+          () => this.terminal.readWindow?.(path, offset, limit, maxBytes)
+            ?? this.terminal.read(path, maxBytes + 1).then((content) =>
+              boundedWindow(content, maxBytes, limit, offset)),
+        );
+      }
+    }
+    return this.terminal.readWindow?.(path, offset, limit, maxBytes)
+      ?? this.terminal.read(path, maxBytes + 1).then((content) =>
+        boundedWindow(content, maxBytes, limit, offset));
   }
 
   async write(path: string, content: string | Buffer, signal?: AbortSignal): Promise<void> {
@@ -440,7 +514,14 @@ export function detectImageMimeType(buffer: Buffer): string | undefined {
 }
 
 export interface SandboxFileOperations {
-  read: ReadOperations;
+  read: ReadOperations & {
+    readWindow(
+      path: string,
+      offset: number,
+      limit: number,
+      maxBytes: number,
+    ): Promise<SandboxReadWindow>;
+  };
   write: WriteOperations;
   edit: EditOperations;
 }
@@ -454,23 +535,35 @@ export interface SandboxFileOperations {
  */
 export interface SandboxFileClientLike {
   read(path: string, limit?: number): Promise<Buffer>;
+  readHead?(path: string, limit: number): Promise<Buffer>;
   access(path: string): Promise<void>;
+  readWindow?(
+    path: string,
+    offset: number,
+    limit: number,
+    maxBytes: number,
+  ): Promise<SandboxReadWindow>;
   write(path: string, content: string | Buffer, signal?: AbortSignal): Promise<void>;
+}
+
+export interface SandboxReadWindow {
+  content: Buffer;
+  truncated: boolean;
 }
 
 /**
  * Pi file operations backed by a sandbox file transport.
  *
- * The read tool asks for the MIME type before reading the bytes, so the probe
- * keeps the last fetched buffer and lets `readFile` reuse it: one transport
- * round trip per read instead of two.
+ * Checks stay independent from content reads. Priming a cache by downloading
+ * the whole file would make an existence probe as expensive as a full read,
+ * which is especially harmful for large, single-line JSONL datasets.
  */
 export function createSandboxFileOperations(
   client: SandboxFileClientLike,
   mirror?: SandboxReadMirror,
 ): SandboxFileOperations {
-  let cached: { path: string; buffer: Buffer } | undefined;
-  const readBytes = async (path: string): Promise<Buffer> => {
+  const resolveHost = (path: string): string | undefined => mirror?.resolveHost(path);
+  const readBytes = async (path: string, limit?: number): Promise<Buffer> => {
     const host = mirror?.resolveHost(path);
     if (host !== undefined) {
       const buffer = await readMirroredFile(host).catch((error: unknown) => {
@@ -483,29 +576,58 @@ export function createSandboxFileOperations(
       // only ask the sandbox to read a path that exists on neither side.
       throw missingResource(mirror?.resolveHostAlias(host) ?? host);
     }
-    return client.read(path);
+    return client.read(path, limit);
   };
-  const read = async (path: string): Promise<Buffer> => {
-    if (cached?.path === path) {
-      const buffer = cached.buffer;
-      cached = undefined;
-      return buffer;
+  const readHead = async (path: string, limit: number): Promise<Buffer> => {
+    const host = mirror?.resolveHost(path);
+    if (host !== undefined) {
+      const buffer = await readMirroredFile(host).catch((error: unknown) => {
+        if (isMissingFile(error)) {
+          throw missingResource(mirror?.resolveHostAlias(host) ?? host);
+        }
+        throw error;
+      });
+      return buffer.subarray(0, limit);
     }
-    return readBytes(path);
+    return client.readHead?.(path, limit) ?? client.read(path, limit).then((buffer) =>
+      buffer.subarray(0, limit));
   };
-  // The read and edit tools both probe before they read, so priming the cache
-  // lets the read that follows reuse the probe's bytes instead of paying a
-  // second transport round trip for the same file.
-  const primeRead = async (path: string): Promise<void> => {
-    cached = { path, buffer: await readBytes(path) };
+  const accessPath = async (path: string): Promise<void> => {
+    const host = resolveHost(path);
+    if (host !== undefined) {
+      await access(host).catch((error: unknown) => {
+        if (isMissingFile(error)) {
+          throw missingResource(mirror?.resolveHostAlias(host) ?? host);
+        }
+        throw error;
+      });
+      return;
+    }
+    await client.access(path);
+  };
+  const readWindow = async (
+    path: string,
+    offset: number,
+    limit: number,
+    maxBytes: number,
+  ): Promise<SandboxReadWindow> => {
+    const host = resolveHost(path);
+    if (host !== undefined) {
+      const buffer = await readMirroredFile(host);
+      return boundedWindow(buffer, maxBytes, limit, offset);
+    }
+    const window = client.readWindow?.(path, offset, limit, maxBytes);
+    if (window !== undefined) return window;
+    const buffer = await client.read(path, maxBytes + 1);
+    return boundedWindow(buffer, maxBytes, limit, offset);
   };
   return {
     read: {
-      readFile: read,
-      access: primeRead,
+      readFile: (path) => readBytes(path),
+      access: accessPath,
+      readWindow,
       detectImageMimeType: async (path) => {
-        const buffer = cached?.path === path ? cached.buffer : await readBytes(path);
-        cached = { path, buffer };
+        const buffer = await readHead(path, SANDBOX_IMAGE_PROBE_BYTES);
         return detectImageMimeType(buffer);
       },
     },
@@ -516,10 +638,38 @@ export function createSandboxFileOperations(
       mkdir: async () => undefined,
     },
     edit: {
-      readFile: read,
+      readFile: (path) => readBytes(path),
       writeFile: (path, content) => client.write(path, content),
-      access: primeRead,
+      access: accessPath,
     },
+  };
+}
+
+function boundedWindow(
+  buffer: Buffer,
+  maxBytes: number,
+  maxLines: number,
+  offset = 1,
+): SandboxReadWindow {
+  let selected = buffer;
+  if (offset > 1 && buffer.byteLength <= maxBytes) {
+    selected = Buffer.from(
+      buffer.toString("utf8").split("\n")
+        .slice(offset - 1, offset - 1 + maxLines)
+        .join("\n"),
+    );
+  }
+  if (selected.byteLength > maxBytes) {
+    return {
+      content: selected.subarray(0, maxBytes),
+      truncated: true,
+    };
+  }
+  const lines = selected.toString("utf8").split("\n");
+  if (lines.length <= maxLines) return { content: selected, truncated: false };
+  return {
+    content: Buffer.from(lines.slice(0, maxLines).join("\n")),
+    truncated: true,
   };
 }
 

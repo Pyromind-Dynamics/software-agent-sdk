@@ -51,14 +51,15 @@ const ENDPOINT: SandboxEndpoint = {
 test("operator timeouts come from the environment when configured", () => {
   assert.deepEqual(sandboxTerminalTimeouts({}), {
     resolveTimeoutMs: undefined, startupTimeoutMs: undefined,
-    queueTimeoutMs: undefined,
+    queueTimeoutMs: undefined, exchangeTimeoutMs: undefined,
   });
   assert.deepEqual(sandboxTerminalTimeouts({
     PYROMIND_PI_TERMINAL_RESOLVE_TIMEOUT_MS: "60000",
     PYROMIND_PI_TERMINAL_STARTUP_TIMEOUT_MS: " 90000 ",
+    PYROMIND_PI_TERMINAL_EXCHANGE_TIMEOUT_MS: "12000",
   }), {
     resolveTimeoutMs: 60_000, startupTimeoutMs: 90_000,
-    queueTimeoutMs: undefined,
+    queueTimeoutMs: undefined, exchangeTimeoutMs: 12_000,
   });
   assert.throws(() => sandboxTerminalTimeouts({ PYROMIND_PI_TERMINAL_STARTUP_TIMEOUT_MS: "soon" }),
     /must be a positive number of milliseconds/);
@@ -336,12 +337,24 @@ function run(
     signal?: AbortSignal;
     timeout?: number;
     startupTimeoutMs?: number;
+    observeStartTimeoutMs?: number;
+    exchangeTimeoutMs?: number;
   } = {},
 ) {
   const { connect, sockets } = scriptedConnector(episodes);
-  const { command = "ls -la", startupTimeoutMs, ...execOptions } = options;
+  const {
+    command = "ls -la",
+    startupTimeoutMs,
+    observeStartTimeoutMs,
+    exchangeTimeoutMs,
+    ...execOptions
+  } = options;
   const operations = new SandboxTerminalOperations(ENDPOINT, {
-    connect, writeFile: async () => {}, startupTimeoutMs,
+    connect,
+    writeFile: async () => {},
+    startupTimeoutMs,
+    observeStartTimeoutMs,
+    exchangeTimeoutMs,
   });
   const chunks: Buffer[] = [];
   const result = operations.exec(command, "", {
@@ -527,6 +540,64 @@ test("a warm socket which stops answering is replaced before the command runs", 
   assert.ok((recovered.execution.round_trips ?? 0) >= 3);
 });
 
+test("a staging exchange which stops answering is replayed on a fresh socket", async () => {
+  const sockets: FakeSocket[] = [];
+  let harnessOnDisk = false;
+  let silenceNextCommandStage = false;
+  let watchCount = 0;
+  const connect: SandboxTerminalConnector = () => {
+    const socket = new FakeSocket();
+    sockets.push(socket);
+    socket.onSend = (line) => {
+      if (line === "\u0003") return;
+      const ack = /'__PM_ACK__' '([0-9a-f]{18}):([^']+)' '([^']+)'/.exec(line);
+      if (ack) {
+        if (
+          silenceNextCommandStage &&
+          ack[2].startsWith("stage") &&
+          line.includes("cmd.sh")
+        ) {
+          silenceNextCommandStage = false;
+          return;
+        }
+        if (ack[2] === "staged" && line.includes("watch.sh.b64")) {
+          harnessOnDisk = true;
+        }
+        const value = ack[2] === "ready" && !harnessOnDisk
+          ? "missing"
+          : ack[3];
+        socket.emit(`__PM_ACK__${ack[1]}:${ack[2]}:${value}\n`);
+        return;
+      }
+      const token = /([0-9a-f]{18})\s*$/.exec(line)?.[1];
+      assert.ok(token, "watch line carries the run token");
+      watchCount += 1;
+      socket.emit(frames(token).begin);
+      socket.emit(frames(token).end(0));
+    };
+    queueMicrotask(() => socket.open());
+    return socket;
+  };
+  const operations = new SandboxTerminalOperations(ENDPOINT, {
+    connect,
+    writeFile: async () => {},
+    exchangeTimeoutMs: 20,
+  });
+
+  await operations.exec("true", "", { onData: () => {} });
+  silenceNextCommandStage = true;
+  const recovered = await operations.exec(
+    `true # ${"x".repeat(4_000)}`,
+    "",
+    { onData: () => {} },
+  );
+
+  assert.equal(recovered.exitCode, 0);
+  assert.equal(watchCount, 2);
+  assert.equal(sockets.length, 2);
+  assert.equal(sockets.flatMap(launchInvocations).length, 2);
+});
+
 test("a failed script upload falls back to terminal staging", async () => {
   const { connect, sockets } = scriptedConnector([finishEpisode()]);
   let uploads = 0;
@@ -629,6 +700,18 @@ test("terminal operations resume the same run after a dropped connection", async
   assert.equal(sockets.length, 2);
   assert.ok(sockets[1]!.sent.some((line) => line.includes("watch.sh' '")));
   assert.equal(sockets.flatMap(launchInvocations).length, 1);
+});
+
+test("observation moves to a fresh socket when the launch socket goes silent", async () => {
+  const { result, sockets } = run([
+    () => {},
+    finishEpisode(),
+  ], { observeStartTimeoutMs: 20 });
+
+  assert.equal((await result).exitCode, 0);
+  assert.equal(sockets.length, 2);
+  assert.equal(sockets.flatMap(launchInvocations).length, 1);
+  assert.ok(sockets[1]!.sent.some((line) => line.includes("watch.sh' '")));
 });
 
 test("terminal operations replay a handshake which drops before the launch", async () => {
@@ -797,6 +880,7 @@ test("an environment burst which is never acknowledged fails before the launch",
     connect: () => {queueMicrotask(() => socket.open()); return socket;},
     writeFile: async (_path, bytes) => {writes.push(bytes);},
     startupTimeoutMs: 30, stopTimeoutMs: 100,
+    maxReconnects: 0,
   });
   await assert.rejects(operations.exec("true", "", {
     env: {API_KEY: "private-" + "x".repeat(2000)}, onData: () => {},

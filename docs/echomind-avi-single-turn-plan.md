@@ -1,14 +1,17 @@
 # EchoMind 实验工作台技术方案
 
-> 状态：P0、P1、P1.5 和 P2 基础能力已落地；下一步进入 M1。
-> 更新时间：2026-10-30
+> 状态：P0-P2、S1、S2 已落地；S3 按通用 Node/Executor 基线重新拆分。
+> 更新时间：2026-11-04
 > 首期场景：AVI 单轮 SFT/DPO，AVI 仅作为 `experiment-planning` 的一个 reference。
 >
-> 文件名保留历史原因。本文是 EchoMind 当前技术方案，内容以当前代码实现为准。
+> 文件名保留历史原因。本文描述产品方向和系统背景，不再定义 Node/Executor
+> 的最终实现契约。
+> Node、ExecutorBinding、Artifact、NodeRun、发布和 S3 验收以
+> `docs/echomind-graph-executor-implementation.md` 为唯一实施基线。
 > 可执行 Graph、生产异常降级和主/子 Agent 结构化契约见
 > `docs/echomind-graph-agent-contract.md`。
 >
-> 执行层最新渐进方案见 `docs/echomind-four-node-graph-execution-plan.md`。
+> 执行阶段历史记录见 `docs/echomind-four-node-graph-execution-plan.md`。
 > 开发态只保留一张可变的 Working Graph，不引入 GraphRevision；发布时才生成冻结
 > 快照。本文第 9 节中开发态先做 GraphRevision 的路线以新文档 S1-S8 为准。
 
@@ -27,18 +30,20 @@
   -> Graph 节点可分别启动 Agent 开发或执行验证
 ```
 
-但当前完成的是“Graph 和阶段执行契约”，还不是“四个业务阶段都已执行”。
+但当前完成的是“Graph、阶段执行壳和 Dataset 执行代码路径”，还不是“Dataset
+正式验收通过”，更不是“四个业务阶段都已执行”。
 
 准确状态：
 
-- Dataset：可以把阶段开发任务投递给当前 EchoMind 会话，但还没有创建
-  StageRun，也没有把 `data-processing` 小样、用户确认和全量任务绑定到阶段；
+- Dataset：`/start` 已创建持久 StageRun，S3.1 小样、`waiting_user`、确认后
+  全量提交、Kafka 终态和 `dataset_version` 均已有代码路径；但早期自定义
+  validator 曾接受不符合平台契约的标签，S3.1 完成状态已撤销，必须使用正式
+  validator 重新验收。S3.2 也尚无真实平台成功证据；
 - Inference、Evaluator、Train：`/run` 只执行 `contract_probe`，用于验证 Run、
   Artifact、状态和前端接口，不产生真实推理、评估或训练结果；
 - Project 生命周期已有 `development/frozen` 字段，但尚未实现冻结和发布协议；
-- 当前整体目标是先把 Dataset 做成第一条“从阶段启动到 Run 可追溯”的纵向
-  闭环；执行上先通过 M1 收敛现有 Graph 契约，再逐步接入可执行 GraphRevision 和
-  NodeRun，不直接修改 Dataset Executor。
+- 当前整体目标是先把 Dataset 做成第一条“从阶段启动、小样确认、平台全量到
+  DatasetVersion”的纵向闭环；开发态仍只维护一张 Working Graph。
 
 目标设计进一步将当前 Stage 级 Graph 升级为 Task 级 GraphRevision，并明确：
 
@@ -239,7 +244,7 @@ train
 
 | 节点 | launch mode | 启动接口 | 当前实际行为 |
 |---|---|---|---|
-| Dataset | Agent | `POST .../nodes/{node_id}/start` | 向当前 EchoMind 会话投递阶段开发任务 |
+| Dataset | Agent | `POST .../nodes/{node_id}/start` | 创建 clarifying StageRun，先澄清节点方案；用户确认后再进入实现和小样 |
 | Inference | Executor | `POST .../nodes/{node_id}/run` | 生成 `contract_probe` Run 和 Artifact |
 | Evaluator | Executor | `POST .../nodes/{node_id}/run` | 生成 `contract_probe` Run 和 Artifact |
 | Train | Executor | `POST .../nodes/{node_id}/run` | 生成 `contract_probe` Run 和 Artifact |
@@ -258,7 +263,7 @@ train
 当前 StageRun 状态：
 
 ```text
-running | succeeded | failed
+clarifying | running | waiting_user | waiting_external | succeeded | failed
 ```
 
 StageRun 会记录：
@@ -266,13 +271,11 @@ StageRun 会记录：
 - `project_id`、`node_id`、`node_type`、`executor`；
 - 状态、消息、错误和时间；
 - `input_refs` 字段；
+- `command_id`、`external_task_id`、`output_uri` 和幂等 updates；
 - Artifact 元数据。
 
 当前限制：
 
-- `input_refs` 没有实际填充；
-- 没有 `waiting_for_user`、`waiting_for_task`、`cancelled` 等状态；
-- 没有外部任务 ID、平台 Run ID 或 conversation command 绑定；
 - 没有依赖门禁、重试、取消和并发控制；
 - Graph Revision 更新后不会自动让旧 Run 失效；
 - `shell` executor 只是 `contract_probe` 的别名，不执行 shell。
@@ -285,28 +288,55 @@ StageRun 会记录：
 校验 Project、Graph、Dataset 节点和 data-processing capability
   -> 校验 EchoMind 会话归属
   -> 检查远端 Sandbox 所需的 Cookie/Bearer 凭证
-  -> 构造 Project/Stage 上下文
+  -> 创建 clarifying Agent development StageRun
+  -> 注入 project_id、node_id、run_id 和澄清约束
   -> 向当前 EchoMind 会话提交 UserMessageCommand
-  -> 返回 command ID 作为 event_id
+  -> 返回 Run、command ID 和 event_id
 ```
 
-注入给 Agent 的开发顺序：
+注入给 Agent 的入口约束：
 
-1. 检查真实 Storage 数据；
-2. 按 `data-processing` 选择 Pipeline；
-3. 跑小样并展示结果；
-4. 等待用户显式确认；
-5. 提交全量验证任务；
-6. 报告 task/run/output 标识。
+1. StageRun 当前为 `clarifying`，尚未授权实现或执行；
+2. 读取 Project Graph 和 StageRun，围绕节点目标、输入、输出、约束和验收标准
+   提出少量关键问题；
+3. 不检查 Storage、不创建文件、不跑小样、不记录阶段结果；
+4. 用户明确确认节点方案后，调用 `approve_project_stage_plan`；
+5. StageRun 从 `clarifying` 进入 `running` 后，Agent 才按 `data-processing`
+   创建实现、跑小样并记录 `waiting_user`；
+6. 用户确认小样后，通过确认接口提交平台全量任务并记录 `waiting_external`；
+7. 平台终态回调后校验输出并生成 `dataset_version`。
+
+S3.1 代码路径已存在，但验收状态已撤销：
+
+- StageRun 创建、Run ID 返回、`waiting_user`、输入引用和样例 Artifact；
+- 相同 request ID 幂等，投递失败立即落 failed；
+- Runtime 重启会把中断的 Agent development Run 收口为 failed；
+- 前端加载状态、轮询、刷新恢复和“等待确认”展示。
 
 当前缺口：
 
-- 启动 Dataset 时没有创建 StageRun；
-- 返回的 `event_id` 实际是 command ID，不是 Run ID；
-- “正在开发、等待确认、任务已提交、成功、失败”没有阶段级持久化；
-- `df_submit_pipeline` 产生的 task/output 不会自动关联到 StageRun 或 Artifact；
-- 页面刷新后只能从会话和 Graph 恢复上下文，不能从 Dataset StageRun 恢复；
-- 五步顺序主要靠 Prompt，不是平台状态机。
+- 早期小样使用了 Agent 自写 validator，未通过正式
+  `validate_prepared_data.py --schema vision`；
+- 已知错误包括接受 `<thinking>`、错误的 content 结构、绝对图片路径和额外顶层
+  字段；
+- 必须用真实小样重新生成实现和 Artifact，才能把 S3.1 标记为完成。
+
+S3.2 代码路径已存在，但真实平台验收未完成：
+
+- 确认后的全量平台任务固定为 `df_submit_pipeline`；
+- `external_task_id`、`output_uri` 和 `waiting_external` 的状态回写；
+- Kafka 终态唤醒后的输出校验和 `dataset_version` Artifact；
+- 任务创建禁用自动重试，响应不确定时不重复提交；
+- StageRun、确认、阶段 Tool 和提交 transport 的自动化回归。
+
+S3.2 待验收：
+
+- 使用有效平台登录态提交一次真实全量任务；
+- 当前前端已能创建 EchoMind 会话并连接 SSE，但首次远端 `terminal` 返回
+  `Failed to get api key: HTTP 401`，Sandbox 未能启动；
+- 记录真实 `external_task_id` 和 `output_uri`；
+- 等待 Kafka 终态并核对 report、validation、processed 和 eval 产物；
+- 生成真实 `dataset_version` Artifact 后才能完成 S3.2 验收。
 
 ## 8. 当前前端能力
 
@@ -321,20 +351,16 @@ EchoMind 页面已经具备：
 
 当前限制：
 
-- Dataset 启动后只提示“已交给当前 EchoMind 会话继续开发”，Graph 不会立即出现
-  Dataset Run；
-- Project Run 没有实时推送或自动轮询，开发过程主要看 Chat；
-- 页面无法区分“Agent 正在开发”和“平台任务正在运行”；
+- Project Run 使用轮询，不依赖实时推送；
+- 平台任务的最终错误和输出仍需 Chat 与 StageRun 交叉核对；
 - Artifact 目前只支持 JSON。
 
-## 9. 开发实施路线
+## 9. 历史开发路线（已废弃）
 
-后续按 M0 到 M8 推进。每一步都以前一步通过验收为前提，不在一个阶段同时引入
-Graph、Agent、平台任务和前端的大范围改动。
-
-每个阶段的完成目标、验证内容、验证流程和通过证据见
-`docs/echomind-milestone-verification.md`。其中 M4 是协议闭环门禁，M7 是真实业务
-闭环门禁。
+本节 M0-M8 仅保留早期设计记录，不能作为当前实施顺序。后续开发统一使用
+`docs/echomind-graph-executor-implementation.md` 中的
+S3.0-S8 阶段、验收标准和验证矩阵；GraphRevision、Deployment、
+DevelopmentBranch 和多轮生产闭环属于后续扩展，不进入首期实现。
 
 ### M0：当前基线，已完成
 

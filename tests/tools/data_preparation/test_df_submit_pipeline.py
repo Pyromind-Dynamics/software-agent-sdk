@@ -850,6 +850,137 @@ def test_new_full_run_uses_conversation_scoped_output_root(
     conversation.send_agent_message.assert_not_called()
 
 
+def test_full_submission_does_not_retry_task_creation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    executor = _make_executor(tmp_path)
+    script = tmp_path / "pipeline.py"
+    script.write_text("print('hi')")
+    conversation = _make_conversation_with_llm(workspace_dir=tmp_path)
+    conversation.id = "conv-1"
+    client = object()
+
+    monkeypatch.setattr(executor, "_stage_runtime_files", lambda *args, **kwargs: None)
+    monkeypatch.setattr(executor, "_stage_script", lambda *args, **kwargs: None)
+    submission_client = MagicMock(return_value=client)
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.submission_client",
+        submission_client,
+    )
+    response = MagicMock()
+    response.task_id = "task-once"
+    response.status = "Pending"
+    submit = MagicMock(return_value=response)
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.submit_workflow_task",
+        submit,
+    )
+
+    observation = executor(
+        DfSubmitPipelineAction(
+            script_path=str(script),
+            input_path="/data/in.jsonl",
+            output_schema="text",
+        ),
+        conversation=conversation,
+    )
+
+    assert not observation.is_error
+    submission_client.assert_called_once_with(
+        executor._submission_config,
+        conversation,
+        max_retries=0,
+    )
+    assert submit.call_args.kwargs["retry_create"] is False
+
+
+def test_none_profile_with_vision_schema_skips_managed_image_preflight(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    executor = _make_executor(tmp_path)
+    script = tmp_path / "pipeline.py"
+    script.write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                "for path in Path('.').iterdir():",
+                "    pass",
+            ]
+        )
+    )
+    conversation = _make_conversation_with_llm(workspace_dir=tmp_path)
+    conversation.id = "conv-1"
+    preflight = MagicMock()
+    monkeypatch.setattr(executor, "_preflight_managed_image_pipeline", preflight)
+    monkeypatch.setattr(executor, "_stage_runtime_files", lambda *args, **kwargs: None)
+    monkeypatch.setattr(executor, "_stage_script", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.submission_client",
+        lambda *args, **kwargs: object(),
+    )
+    response = MagicMock()
+    response.task_id = "task-vision-schema"
+    response.status = "Pending"
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.submit_workflow_task",
+        lambda **kwargs: response,
+    )
+
+    observation = executor(
+        DfSubmitPipelineAction(
+            script_path=str(script),
+            input_path="/data/in.jsonl",
+            model_profile="none",
+            output_schema="vision",
+        ),
+        conversation=conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    preflight.assert_not_called()
+
+
+def test_vision_profile_runs_managed_image_preflight(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    executor = _make_executor(tmp_path)
+    script = tmp_path / "pipeline.py"
+    script.write_text("print('managed image pipeline')")
+    conversation = _make_conversation_with_llm(workspace_dir=tmp_path)
+    conversation.id = "conv-1"
+    preflight = MagicMock()
+    monkeypatch.setattr(executor, "_preflight_managed_image_pipeline", preflight)
+    monkeypatch.setattr(executor, "_stage_runtime_files", lambda *args, **kwargs: None)
+    monkeypatch.setattr(executor, "_stage_script", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.submission_client",
+        lambda *args, **kwargs: object(),
+    )
+    response = MagicMock()
+    response.task_id = "task-managed-image"
+    response.status = "Pending"
+    monkeypatch.setattr(
+        "openhands.tools.data_preparation.platform_submit.submit_workflow_task",
+        lambda **kwargs: response,
+    )
+
+    observation = executor(
+        DfSubmitPipelineAction(
+            script_path=str(script),
+            input_path="/data/in.jsonl",
+            model_profile="vision",
+            output_schema="vision",
+        ),
+        conversation=conversation,
+    )
+
+    assert not observation.is_error, observation.text
+    preflight.assert_called_once_with(script)
+
+
 def test_remote_workspace_submission_stages_pipeline_script(
     monkeypatch,
     tmp_path: Path,

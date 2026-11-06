@@ -1,7 +1,8 @@
 # EchoMind 双 Agent 改动设计
 
-> 状态：P1/P1.5 已实现，P2 Graph 与阶段执行壳已落地。
-> 当前功能状态和后续路线以 `docs/echomind-avi-single-turn-plan.md` 为准。
+> 状态：P1/P1.5、P2、S1、S2 已实现；S3 按通用 Node/Executor 基线重新拆分。
+> 本文只定义双 Agent 入口和职责边界。当前功能状态、Node、Executor 和 S3
+> 实施路线以 `docs/echomind-graph-executor-implementation.md` 为准。
 > 目标 Graph 和主/子 Agent 交互契约见
 > `docs/echomind-graph-agent-contract.md`。
 > 范围：Pyromind Workbench 与 EchoMind Manager 的入口、Profile、会话策略、
@@ -139,7 +140,7 @@ Pyromind 使用同一个 Sandbox 实现和同一套 Storage 挂载语义。
 通用 Skill 先识别场景，再按需读取 reference。AVI reference 首期使用四阶段：
 
 ```text
-dataset -> inference -> evaluator -> train
+dataset -> train -> inference -> evaluator
 ```
 
 Graph 生成规则：
@@ -148,13 +149,24 @@ Graph 生成规则：
 - 后端统一从计划中的 stages 和 edges 生成节点与边；
 - 节点 title 来自计划；
 - 节点 `config.resources` 和 `config.tasks` 来自计划；
-- Dataset 节点使用 `launch_mode=agent`，绑定 `data-processing` 能力；
-- Inference、Evaluator、Train 首期使用确定性执行器契约壳；
+- 首期四节点在研发态统一使用 `launch_mode=agent`；
+- `execution_role` 是节点正式字段，Dataset、Train、Inference、Evaluator
+  分别映射到同名内部执行角色；
+- `executor` 保留为发布态确定性执行绑定，不作为研发态可启动性的判断依据；
 - Evaluator 标准产物格式为 `atif`；
+- Dataset 的 Schema、脚本和验收建议来自 `data-processing` 在不同场景的
+  reference，不写入 Graph 的通用固定字段；
 - 节点和边不另读 Project Request 或 AVI requirements 文件。
 
-当前 Dataset 节点可以把开发任务投递到 EchoMind 会话，但 `/start` 尚未创建
-StageRun，也尚未把 `data-processing` 的小样、确认和全量任务绑定到阶段记录。
+Dataset 节点由用户在 Manager 对话中明确要求开发后启动。Manager 调用
+`open_project_stage` 创建持久 `clarifying` Agent development StageRun；Agent
+首轮只读取 Graph/StageRun 并提出关键问题，不检查 Storage、不写文件、不跑小样。
+用户明确确认节点方案后，
+Manager 调用 `approve_project_stage_plan` 把同一个 StageRun 切到 `running`，
+再通过 `request_project_stage_task(role_id="dataset")` 创建独立 Dataset TaskRun。
+Dataset 子 Agent 读取通用 `data-processing`，按实际情况选择 processing paradigm，
+完成实现、小样、`waiting_user`、确认后的平台全量和终态产物校验。Manager 只交棒、
+观察和记录 StageRun，不在自己的会话中处理数据或提交平台任务。
 
 Inference、Evaluator、Train 的 `/run` 仍以 `contract_probe` 验证状态、Run、
 Artifact 和前端交互。这不代表真实推理、评估或训练执行器已经完成。
@@ -171,7 +183,7 @@ EchoMind 页面只有一个正式入口：`?chat=echomind`。
 
 计划面板负责草稿、历史 Revision、Diff 和确认操作。计划确认后，前端使用
 `experiment_plan.project_id` 读取 `/api/echomind/projects/{project_id}`，
-展示真实 Graph，并可逐节点启动开发或运行验证。
+展示真实 Graph。节点启动和验证通过 Manager 对话发起，节点卡片只展示状态与结果。
 
 旧的 legacy 页面、project-request 读取和手动创建 Project 不再暴露。
 
@@ -180,7 +192,9 @@ EchoMind 页面只有一个正式入口：`?chat=echomind`。
 | 内容 | 位置 |
 |---|---|
 | EchoMind Profile 与工具清单 | `openhands-agent-server/openhands/agent_server/agent_profiles/echomind_manager.py` |
+| Dataset 子角色与工具清单 | `openhands-agent-server/openhands/agent_server/agent_profiles/echomind_dataset.py` |
 | Product Profile 注册 | `pyromind-agent-server/pyromind_agent_server/profiles.py` |
+| EchoMind Stage Tool | `pyromind-agent-server/pyromind_agent_server/echomind_stage_tools.py` |
 | 通用会话策略 | `pyromind-runtime/pyromind_runtime/domain/session_policy.py` |
 | 确认与策略切换 | `pyromind-runtime/pyromind_runtime/application/conversation_runtime.py` |
 | Project binder | `pyromind-agent-server/pyromind_agent_server/experiment_plan_projects.py` |
@@ -213,6 +227,8 @@ npm run lint
 2. EchoMind 规划阶段看不到开发工具；
 3. 计划确认后同一会话加载完整开发工具；
 4. Project ID 等于 PlanRevision.project_id；
+5. Dataset 交棒使用 `role_id="dataset"`，StageRun 和 TaskRun 共享 project_id；
+6. Manager 不创建 Dataset 处理脚本、不执行 validator、不提交平台任务。
 5. 后续 Revision 更新同一个 Project/Graph；
 6. 前端确认后显示真实 Graph，并可按阶段触发验证；
 7. 旧 EchoMind 路由和兼容入口不存在。

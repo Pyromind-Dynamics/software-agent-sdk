@@ -134,6 +134,31 @@ def test_task_does_not_require_graph_or_plan_and_is_idempotent(experiment):
         service.request(owner, request(role_id="train"), ("eval",))
 
 
+def test_standalone_task_preserves_its_stage_run_link(experiment):
+    service, owner, _ = experiment
+    run = service.request(
+        owner,
+        request(stage_run_id="stage-run-1"),
+        ("eval",),
+    )
+
+    assert run["stage_run_id"] == "stage-run-1"
+    assert (
+        service.request(
+            owner,
+            request(stage_run_id="stage-run-1"),
+            ("eval",),
+        )["id"]
+        == run["id"]
+    )
+    with pytest.raises(ValueError, match="another StageRun"):
+        service.request(
+            owner,
+            request(stage_run_id="stage-run-2"),
+            ("eval",),
+        )
+
+
 def test_advisory_graph_can_loop_and_change_without_changing_task(experiment):
     service, owner, _ = experiment
     run = service.request(owner, request(), ("eval",))
@@ -291,6 +316,17 @@ async def test_verified_result_and_report_retry_do_not_resubmit_evaluation(exper
             "run_id": run["id"],
             "summary": "One sample, no execution errors",
             "report_uri": report_path,
+            "details": {
+                "submission_spec": {
+                    "pipeline_path": (
+                        f"public_data/experiment-runs/{run['id']}/pipeline.py"
+                    ),
+                    "input_path": "/datasets/source.jsonl",
+                    "output_schema": "vision",
+                    "model_profile": "none",
+                    "convert_format": "none",
+                }
+            },
         },
         scope,
         execute,
@@ -298,6 +334,8 @@ async def test_verified_result_and_report_retry_do_not_resubmit_evaluation(exper
     )
     view = service.list(owner)[0]
     assert view.report_state == "ready" and view.summary
+    assert view.details is not None
+    assert view.details["submission_spec"]["pipeline_path"].endswith("/pipeline.py")
     assert (
         next(a for a in view.artifacts if a["name"] == "agent_report")["sha256"]
         == hashlib.sha256(payloads[report_path]).hexdigest()
@@ -317,6 +355,85 @@ async def test_verified_result_and_report_retry_do_not_resubmit_evaluation(exper
         )
         == 1
     )
+
+
+async def test_local_sample_result_can_be_recorded_before_platform_terminal(experiment):
+    service, owner, _ = experiment
+    run = service.request(
+        owner,
+        request(
+            task={
+                "name": "Validate dataset sample",
+                "instruction": "Validate the real sample locally",
+                "inputs": {"phase": "sample"},
+            }
+        ),
+        ("eval",),
+    )
+    scope = claim(service, owner, run)
+    report_path = f"public_data/experiment-runs/{run['id']}/report.json"
+    report = b'{"status":"passed","checked":24,"failed":0}'
+
+    async def execute(*_):
+        raise AssertionError("sample recording must not execute a platform task")
+
+    async def read(_owner, path):
+        assert path == report_path
+        return report
+
+    await service.role_call(
+        owner,
+        "eval",
+        "record_experiment_result",
+        {
+            "run_id": run["id"],
+            "summary": "24 real samples passed",
+            "report_uri": report_path,
+        },
+        scope,
+        execute,
+        read,
+    )
+
+    view = service.list(owner)[0]
+    assert view.state == "needs_input"
+    assert view.report_state == "ready"
+    assert view.summary == "24 real samples passed"
+    artifact = next(item for item in view.artifacts if item["name"] == "agent_report")
+    assert artifact["uri"] == report_path
+    assert artifact["sha256"] == hashlib.sha256(report).hexdigest()
+
+
+async def test_platform_result_still_requires_terminal_execution_state(experiment):
+    service, owner, _ = experiment
+    run = service.request(owner, request("platform-result"), ("eval",))
+    scope = claim(service, owner, run)
+    report_path = f"public_data/experiment-runs/{run['id']}/report.json"
+
+    async def execute(*_):
+        raise AssertionError("recording a result must not execute a platform task")
+
+    async def read(_owner, path):
+        assert path == report_path
+        return b"{}"
+
+    with pytest.raises(
+        ValueError,
+        match="platform-backed result requires terminal execution state",
+    ):
+        await service.role_call(
+            owner,
+            "eval",
+            "record_experiment_result",
+            {
+                "run_id": run["id"],
+                "summary": "Not terminal yet",
+                "report_uri": report_path,
+            },
+            scope,
+            execute,
+            read,
+        )
 
 
 async def test_missing_artifacts_do_not_create_fake_success(experiment):

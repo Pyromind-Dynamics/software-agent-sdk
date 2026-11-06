@@ -5,9 +5,13 @@ from pyromind_agent_server.profiles import (
     DEFAULT_PRODUCT_PROFILE,
 )
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.domain.commands import UserMessageCommand
+from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.experiment_plans import (
     ExperimentContext,
+    PlanOwner,
     UpdateExperimentContext,
 )
 from pyromind_runtime.domain.session_policy import SessionPolicy
@@ -95,6 +99,8 @@ async def test_idle_upgrade_restores_manager_capabilities_without_executing(
         configuration_version=profile.configuration_version,
         tool_allowlist=profile.tool_allowlist,
         skill_allowlist=profile.skill_allowlist,
+        development_tool_allowlist=profile.development_tool_allowlist,
+        development_skill_allowlist=profile.development_skill_allowlist,
         product_instructions=profile.instructions,
         delegated_roles=tuple(
             role.model_dump(mode="json") for role in profile.delegated_roles or ()
@@ -147,6 +153,73 @@ async def test_idle_upgrade_restores_manager_capabilities_without_executing(
         assert DEFAULT_PRODUCT_PROFILE.tool_allowlist is None
         assert DEFAULT_PRODUCT_PROFILE.delegated_roles is None
         assert not DEFAULT_PRODUCT_PROFILE.managed_delegation
+    finally:
+        await runtime.close()
+
+
+async def test_manager_turn_recovery_does_not_replay_accepted_failed_command(
+    tmp_path,
+):
+    context = RequestContext(user_id="42", profile_id="echomind")
+    adapter = FakeAdapter("pi")
+    runtime = ConversationRuntime(
+        tmp_path / "conversations",
+        {"pi": adapter},
+        default_harness_id="pi",
+    )
+    spec = SessionSpec(
+        conversation_id="manager",
+        user_id=context.user_id,
+        profile_id=context.profile_id,
+        workspace_root=str(tmp_path / "conversations" / "manager"),
+    )
+    command = UserMessageCommand(
+        command_id="accepted-message",
+        content=(TextContent(text="Continue the existing task"),),
+    )
+    try:
+        await runtime.create_conversation(spec, context)
+        store = FileProductStore(tmp_path / "conversations" / "manager")
+        receipt, _ = store.claim_command(command)
+        store.complete_command(
+            receipt.model_copy(
+                update={
+                    "status": "failed",
+                    "response": {"message": "transport reported a late failure"},
+                }
+            )
+        )
+        store.append(
+            ProductEvent(
+                event_id="accepted-message:started",
+                conversation_id="manager",
+                run_id=command.command_id,
+                type="message.started",
+                payload={
+                    "message_id": "accepted-message",
+                    "role": "user",
+                    "command_id": command.command_id,
+                    "content": [
+                        TextContent(text="Continue the existing task").model_dump()
+                    ],
+                },
+            )
+        )
+        result = await runtime._manager_turn_active(
+            {
+                "attempts": 2,
+                "payload": {
+                    "owner": PlanOwner(
+                        user_id="42",
+                        conversation_id="manager",
+                        profile_id="echomind",
+                    ).model_dump(mode="json"),
+                    "command": command.model_dump(mode="json"),
+                },
+            }
+        )
+        assert result == {"delivered": True}
+        assert adapter.sent == []
     finally:
         await runtime.close()
 

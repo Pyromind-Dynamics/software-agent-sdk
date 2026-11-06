@@ -615,7 +615,7 @@ class DfSubmitPipelineExecutor(
                     image_utils_api_version = IMAGE_UTILS_API_VERSION
                     should_stage_runtime = True
                     should_stage_script = True
-                    if output_schema in {"vision", "structured"}:
+                    if model_profile == "vision":
                         self._preflight_managed_image_pipeline(Path(local_script_path))
                 if action.support_file_path is None:
                     support_file_name = prior_run.support_file_name
@@ -706,7 +706,7 @@ class DfSubmitPipelineExecutor(
                     should_stage_support_file = True
                 should_stage_runtime = True
                 should_stage_script = True
-                if output_schema in {"vision", "structured"}:
+                if model_profile == "vision":
                     self._preflight_managed_image_pipeline(Path(local_script_path))
                 changed_dimensions = []
 
@@ -751,7 +751,13 @@ class DfSubmitPipelineExecutor(
             )
 
         try:
-            client = submission_client(self._submission_config, conversation)
+            # A task-create response may be lost after the platform accepted it.
+            # Data preparation therefore submits once and reports uncertainty.
+            client = submission_client(
+                self._submission_config,
+                conversation,
+                max_retries=0,
+            )
             node_available = self._node_capability_available(client)
             if node_available is False:
                 return DfSubmitPipelineObservation.from_text(
@@ -795,6 +801,7 @@ class DfSubmitPipelineExecutor(
                 conversation_id=str(conversation.id),
                 task_kind="data_preparation",
                 submission_handler=self.submission_handler,
+                retry_create=False,
             )
             task_id = response.task_id
         except Exception as exc:

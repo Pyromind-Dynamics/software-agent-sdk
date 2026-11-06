@@ -24,6 +24,7 @@ class RequestExperimentTask(ContractModel):
     task: DelegatedTask | None = None
     intent: Literal["execute", "prepare"] = "execute"
     stage_id: str | None = None
+    stage_run_id: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def validate_contract(self):
@@ -81,11 +82,13 @@ class ExecutionBinding(ContractModel):
     task_run_id: str
     stage_id: str
     plan_sequence: int
+    stage_run_id: str | None = None
 
 
 class ExperimentExecutionView(ContractModel):
     run_id: str
     project_id: str
+    stage_run_id: str | None = None
     plan_revision: int | None = None
     plan_sequence: int | None = Field(
         default=None, exclude_if=lambda value: value is None
@@ -102,6 +105,7 @@ class ExperimentExecutionView(ContractModel):
     fingerprint: str | None = None
     proposal: JsonObject | None = None
     metrics: JsonObject | None = None
+    details: JsonObject | None = None
     platform_task_id: str | None = None
     artifacts: tuple[JsonObject, ...] = ()
     intent: str = "prepare"
@@ -116,6 +120,7 @@ class RecordExperimentResult(ContractModel):
     summary: str = Field(min_length=1, max_length=16000)
     report_uri: str | None = None
     blockers: tuple[str, ...] = ()
+    details: JsonObject = Field(default_factory=dict)
 
 
 class ControlExperimentTask(ContractModel):

@@ -35,6 +35,10 @@ class PreparationStore(Protocol):
     ) -> ProjectView: ...
 
 
+class PreparationProjectMaterializer(Protocol):
+    def materialize(self, project: ProjectView, owner: PlanOwner) -> None: ...
+
+
 class ResourceInspector(Protocol):
     def inspect(
         self, request: InspectResource, context: RequestContext

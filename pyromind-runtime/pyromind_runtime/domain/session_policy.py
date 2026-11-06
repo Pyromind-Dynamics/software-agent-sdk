@@ -16,3 +16,4 @@ class SessionPolicy(ContractModel):
     delegated_roles: tuple[JsonObject, ...] | None = None
     managed_delegation: bool | None = None
     command_allowlist: tuple[str, ...] | None = None
+    agentgenome_enabled: bool | None = None

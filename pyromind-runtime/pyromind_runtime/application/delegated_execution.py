@@ -41,10 +41,18 @@ class DelegatedExecution:
         report = item["kind"] == "generate_report"
         if specification:
             task_name = specification["task"]["name"]
+            runtime_phase = "report" if report else "execute"
+            task_inputs = specification["task"].get("inputs", {})
+            child_phase = (
+                task_inputs.get("phase", runtime_phase)
+                if isinstance(task_inputs, dict)
+                else runtime_phase
+            )
             task_body = {
                 "run_id": run_id,
                 **specification,
-                "phase": "report" if report else "execute",
+                "phase": runtime_phase if report else child_phase,
+                "runtime_phase": runtime_phase,
                 "metrics": row.get("metrics"),
                 "submission": {
                     key: value
@@ -52,14 +60,7 @@ class DelegatedExecution:
                     if key in {"task_id", "state", "evidence"}
                 },
                 "message": item["payload"].get("message", ""),
-                "instruction": (
-                    "Use the evaluation Skill and its existing tools. "
-                    "Execute when intent=execute; prepare only when intent=prepare. "
-                    "After submission end this turn; Runtime waits for the platform "
-                    "and resumes you for the report. Register a report or essential "
-                    "blockers with record_experiment_result. "
-                    "No Graph confirmation is required."
-                ),
+                "instruction": specification["task"]["instruction"],
             }
         else:
             revision = await asyncio.to_thread(
@@ -81,7 +82,8 @@ class DelegatedExecution:
                     "a proposal. Do not start tasks.",
                 }
             )
-        display = {"task": task_name, "phase": "report" if report else "execute"}
+            child_phase = "report" if report else "execute"
+        display = {"task": task_name, "phase": child_phase}
         if (
             specification
             and specification.get("stage_id") is not None
@@ -91,6 +93,7 @@ class DelegatedExecution:
                 "project_id": row["project_id"],
                 "task_run_id": run_id,
                 "stage_id": specification["stage_id"],
+                "stage_run_id": specification.get("stage_run_id"),
                 "plan_sequence": specification["plan_sequence"],
             }
         await self.control(owner, role, {"action": "authorize", "scope": scope})
@@ -237,14 +240,19 @@ class DelegatedExecution:
                 self.store.role_scope, owner, run_id, role, scope
             )
             if specification:
+                result_text = _delegated_result_text(
+                    result,
+                    succeeded_fallback=(
+                        "The child ended without a submitted evaluation "
+                        "or registered report."
+                    ),
+                )
                 current = await asyncio.to_thread(
                     self.store.complete_agent_turn,
                     owner,
                     run_id,
                     scope,
-                    result.get("result_text")
-                    or "The child ended without a submitted evaluation "
-                    "or registered report.",
+                    result_text,
                     report,
                 )
                 return {
@@ -258,8 +266,12 @@ class DelegatedExecution:
                     owner,
                     run_id,
                     scope,
-                    result.get("result_text")
-                    or "Preparation needs input; inspect the execution details.",
+                    _delegated_result_text(
+                        result,
+                        succeeded_fallback=(
+                            "Preparation needs input; inspect the execution details."
+                        ),
+                    ),
                 )
                 return {
                     "execution_ref": reference,
@@ -284,3 +296,19 @@ class DelegatedExecution:
             item["checkpoint"].get("execution_ref")
             or item["checkpoint"].get("launch_pending")
         )
+
+
+def _delegated_result_text(result: dict, *, succeeded_fallback: str) -> str:
+    status = str(result.get("status") or "unknown")
+    result_text = str(result.get("result_text") or "").strip()
+    if status == "succeeded":
+        return result_text or succeeded_fallback
+    outcome = {
+        "paused": "paused before completing the task",
+        "stopped": "stopped before completing the task",
+        "failed": "failed before producing a valid result",
+    }.get(status, f"ended with unrecognized status {status}")
+    message = f"Delegated subagent {outcome}. This is not a successful business result."
+    if result_text:
+        message += "\n\nSubagent output:\n" + result_text
+    return message

@@ -1,7 +1,10 @@
 # EchoMind 步骤 1：Manager 规划与 Graph 创建
 
 > 历史步骤记录：本文覆盖 P1/P1.5 和 P2.0 基础能力。
-> 当前完整功能状态与后续路线见 `docs/echomind-avi-single-turn-plan.md`。
+> 当前 Node/Executor/Graph 实现基线见
+> `docs/echomind-graph-executor-implementation.md`。
+> Agent 入口和 Profile 边界见 `docs/echomind-dual-agent-change-design.md`。
+> 本文中的接口、权限和阶段编号仅用于回看当时实现，不作为后续开发依据。
 
 ## 目标
 

@@ -21,7 +21,13 @@ Use `apply_graph_patch` with one atomic patch and a stable `request_id` for retr
 - `add_edge` and `remove_edge` change Graph dependencies.
 - `update_requirements` replaces the complete requirement list.
 
-Keep node IDs stable when only changing a title, executor or configuration.
+Use the top-level `execution_role` field to select the delegated role used during
+development. Do not place `execution_role` inside `config`. New development nodes
+use `launch_mode="agent"`; `executor` describes the deterministic implementation
+that is fixed only when the Graph is published.
+
+Keep node IDs stable when only changing a title, execution role, executor or
+configuration.
 Deleting and recreating a node should be used only when the user explicitly wants
 a different node identity. Do not invent executor names or configuration values.
 The server validates node types, edge references and cycles.

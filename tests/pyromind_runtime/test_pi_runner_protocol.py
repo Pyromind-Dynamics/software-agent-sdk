@@ -160,6 +160,7 @@ def test_runner_environment_keeps_a_configured_ca_bundle(monkeypatch) -> None:
 def test_runner_environment_forwards_operator_tunables(monkeypatch) -> None:
     monkeypatch.setenv("PYROMIND_PI_TERMINAL_STARTUP_TIMEOUT_MS", "300000")
     monkeypatch.setenv("PYROMIND_PI_TERMINAL_RESOLVE_TIMEOUT_MS", "900000")
+    monkeypatch.setenv("PYROMIND_PI_TERMINAL_EXCHANGE_TIMEOUT_MS", "15000")
     monkeypatch.setenv("PYROMIND_PI_TERMINAL_FAST_PATH", "0")
     monkeypatch.setenv("PYROMIND_PI_TERMINAL_TRACE", "1")
     monkeypatch.setenv("PYROMIND_PI_MODEL_MAX_RETRIES", "1")
@@ -170,6 +171,7 @@ def test_runner_environment_forwards_operator_tunables(monkeypatch) -> None:
 
     assert environment["PYROMIND_PI_TERMINAL_STARTUP_TIMEOUT_MS"] == "300000"
     assert environment["PYROMIND_PI_TERMINAL_RESOLVE_TIMEOUT_MS"] == "900000"
+    assert environment["PYROMIND_PI_TERMINAL_EXCHANGE_TIMEOUT_MS"] == "15000"
     assert environment["PYROMIND_PI_TERMINAL_FAST_PATH"] == "0"
     assert environment["PYROMIND_PI_TERMINAL_TRACE"] == "1"
     assert environment["PYROMIND_PI_MODEL_MAX_RETRIES"] == "1"

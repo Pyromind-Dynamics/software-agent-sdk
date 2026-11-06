@@ -1,8 +1,38 @@
 # EchoMind 准备、Project 与阶段执行
 
-新会话使用通用模型评测 Checklist：先收集事实，再生成 workflowPLAN，在对话中审阅修改，
-用户点击“创建并启动”后创建 SQL Project 和首个 Eval TaskRun，继续沿用同一会话。
-已有会话保留原策略与 Project 身份。Dataset、Train 角色及正式运行不在本期范围。
+新会话使用 Preparation Checklist：先收集事实，再生成 workflowPLAN，在对话中审阅修改。
+用户点击“创建 Project”后，SQL Project 成为唯一业务身份；创建动作不自动启动节点。
+
+当前模型评测入口会在创建 SQL Project 的同时创建首个 Eval TaskRun。该行为只属于
+现有评测链路和旧会话兼容；训练飞轮 Project 创建只创建 Project 和 WorkingGraph，
+不自动启动节点。
+
+已有会话保留原准备策略与 Project 身份。新会话使用通用实验规划策略，
+Dataset、Train、Inference、Evaluator 是可调整的首套参考节点。
+
+## 与 WorkingGraph / StageRun 的接缝
+
+统一身份链为：
+
+```text
+SQL Project（唯一 Project ID）
+  -> WorkingGraph（project_id 与 SQL Project 相同）
+  -> StageRun（节点级主运行）
+  -> TaskRun 0..N（确定性执行明细）
+  -> external_task_id（平台任务）
+```
+
+- SQL Project 是身份、权限、创建事务和 TaskRun 的权威来源。
+- 本地 `graph.json` 只承载开发态 WorkingGraph，不是第二个 Project。
+- SQL 提交成功后，Server 使用冻结的 Preparation plan，按相同 `project_id`
+  幂等物化 WorkingGraph。
+- Graph 缺失时按原 Project ID 补齐；重复 `create_project`、刷新和重启都不能生成
+  第二个 Project。
+- 创建 Project 不自动启动节点；用户启动节点后才创建 StageRun。
+- StageRun 增加可选 `task_run_id`，TaskRun 增加可选 `stage_run_id`。
+- TaskCorrelation 需要携带 `project_id / stage_run_id / task_run_id`，使平台 callback
+  能回到准确节点；旧记录允许字段为空。
+- 新 EchoMind 会话不再通过旧 `confirm_experiment_plan` 创建文件型 Project。
 
 ## 分层和契约
 
@@ -20,6 +50,8 @@ Skill 根目录沿用 PYROMIND_SKILLS_PATH；默认兼容源码与 PyInstaller �
 准备阶段开放 read/write/edit、terminal、检索、inspect_resource、get/update_preparation
 和 ask_user，可创建 Sandbox 探查数据、运行分析脚本及准备配置文件。检索工具使用同一
 会话执行环境；inspect_resource 直接通过当前请求凭据读取 Storage 前缀或目录。
+EchoMind Profile 不加载 AgentGenome，也不提供历史经验查询工具；准备事实只来自用户消息、
+用户明确给出的数据路径和必要澄清。Workbench 与其他既有入口保持自己的 AgentGenome 配置。
 用户创建 Project 后才启动业务任务和委派执行。
 
 v2 会话 snapshot 增加可选 preparation、project；新增 GET /{conversation_id}/preparation
@@ -59,9 +91,16 @@ Runtime 从已保存事实和 plan.tasks 的入口任务构造委派，解析资
 平台使用测试替身时，只证明应用链路，不作为真实 GPU 小样验收证据。
 
 
-## 节点库与简洁计划（Profile v6）
+## 通用节点库与简洁计划（Profile v9）
 
-场景声明文件的 workflow_nodes 是可选节点与任务的唯一配置来源。基模推理、评分、报告与基线解读统一属于一个 Init stage（kind=init），底层仍使用 eval 角色；bench 与 analysis 可以是同阶段的任务。训练后候选评测属于 Eval。Dataset、Train、Inference、Tracer、RawData 尚未实现的能力保留禁用占位。Init 的实例上限为 1，不能将基线解读拆成第二个 Init。
+EchoMind 的规划策略来自 `experiment-planning/checklist.json`。workflow_nodes 是计划
+可引用的业务节点目录，不是固定流水线。首套参考包含 Dataset、Train、Inference、
+Evaluator，节点与任务可以从目录中选择、组合、禁用或调整标题和配置；AVI 只是其中一个
+reference，不定义通用节点规范。
+
+`model-evaluation-preparation` 只服务模型评测入口，不再作为 EchoMind 训练飞轮的通用
+规划契约。创建 Project 只物化当前计划，不自动创建入口 TaskRun。当前节点由用户在 Project
+工作台单独启动，Dataset 使用 Agent-led development，其余节点先使用确定性执行器契约壳。
 
 计划实例的 stage.id / task.id 与节点/任务类型 kind 分开保存。Manager 从声明中选择 kind，Runtime 在准备提交和创建后的上下文更新时拒绝库外类型、错误任务归属及超限实例，并检查委派角色。共享层没有场景名或节点类型分支。旧策略未声明节点库时保留原语义，旧计划省略 kind 字段即可读取；不改写正在审阅的旧草稿或历史 TaskRun。
 

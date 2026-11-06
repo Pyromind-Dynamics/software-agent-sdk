@@ -243,6 +243,32 @@ async def test_native_inflight_recovery_keeps_dirty_flag_until_product_finalizes
     assert session.files.load_inflight() is None
 
 
+async def test_inflight_recovery_survives_workflow_snapshot_read_failure(
+    workflow_session, monkeypatch
+):
+    adapter, session, hook, store = workflow_session
+    session.files.save_inflight({"run_id": "run", "operation_id": "tool"})
+
+    async def fail_read(_session):
+        raise RuntimeError("sandbox authorization is unavailable")
+
+    monkeypatch.setattr(adapter, "_read_workflow", fail_read)
+    await adapter._recover_inflight(session)
+
+    recovered = []
+    while not session.queue.empty():
+        recovered.append(session.queue.get_nowait())
+    for event in recovered:
+        session.queue.put_nowait(event)
+    completion = next(event for event in recovered if event.type == "run.finished")
+    assert completion.payload["snapshot_error"] is True
+    assert completion.payload["dsl"] is None
+
+    await drain(session, hook, store)
+    assert store.load_snapshot().status == "paused"
+    assert session.files.load_inflight() is None
+
+
 async def test_snapshot_storage_failure_preserves_terminal_status_and_can_retry(
     workflow_session, monkeypatch
 ):

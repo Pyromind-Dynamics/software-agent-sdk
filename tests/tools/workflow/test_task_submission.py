@@ -11,6 +11,7 @@ import pytest
 
 from openhands.tools.workflow.task_submission import (
     _retry_transient,
+    create_workflow_api_client,
     submit_workflow_task,
 )
 
@@ -144,3 +145,54 @@ async def test_concurrent_submission_scopes_keep_the_origin_and_task_kind():
     submit_workflow_task(client=client, workflow={}, name="main", conversation_id="c")
     main = parse_task_correlation(requests["main"].out_id)
     assert main is not None and main.type == "main" and main.subagent_id is None
+
+
+def test_submit_workflow_task_can_disable_create_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MagicMock()
+    client.studio.create.side_effect = ConnectionResetError("reset")
+
+    with pytest.raises(ConnectionResetError, match="reset"):
+        submit_workflow_task(
+            client=client,
+            workflow={"id": "w"},
+            name="agent-edp",
+            conversation_id="conv-1",
+            retry_create=False,
+        )
+
+    assert client.studio.create.call_count == 1
+
+
+def test_create_workflow_api_client_forwards_max_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = object()
+    get_client = MagicMock(return_value=client)
+    monkeypatch.setattr(
+        "openhands.tools.workflow.task_submission.get_api_key",
+        MagicMock(return_value="access-key"),
+    )
+    monkeypatch.setattr(
+        "openhands.tools.workflow.task_submission.get_pyromind_api_client",
+        get_client,
+    )
+
+    result = create_workflow_api_client(
+        env="pre",
+        cluster="us-west-1",
+        auth_token="jwt-token",
+        headers={"x-cluster": "us-west-1#pre"},
+        timeout=7,
+        max_retries=0,
+    )
+
+    assert result is client
+    get_client.assert_called_once_with(
+        env="pre",
+        cluster="us-west-1",
+        api_key="access-key",
+        timeout=7,
+        max_retries=0,
+    )

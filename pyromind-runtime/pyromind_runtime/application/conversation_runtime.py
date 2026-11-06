@@ -89,6 +89,7 @@ from pyromind_runtime.domain.experiment_plans import (
     CreateExperimentPlan,
     ExperimentPlanView,
     GetExperimentPlan,
+    PlanConflictError,
     PlanOwner,
     PlanRevision,
     ReviseExperimentPlan,
@@ -147,11 +148,16 @@ from pyromind_runtime.ports.harness import (
     SessionHandle,
     SessionSpec,
 )
-from pyromind_runtime.ports.preparation import PreparationStore, ResourceInspector
+from pyromind_runtime.ports.preparation import (
+    PreparationProjectMaterializer,
+    PreparationStore,
+    ResourceInspector,
+)
 from pyromind_runtime.ports.project_graphs import ProjectGraphStore
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
     EvaluationStorageMissingError,
+    EvaluationStorageUnavailableError,
 )
 from pyromind_runtime.ports.workflow_submission import (
     ExternalTaskQueryPort,
@@ -223,6 +229,7 @@ class ConversationRuntime:
         experiment_execution_store: DelegatedExecutionStore | None = None,
         execution_roles: tuple[str, ...] = (),
         preparation_store: PreparationStore | None = None,
+        preparation_project_materializer: PreparationProjectMaterializer | None = None,
         resource_inspector: ResourceInspector | None = None,
         evaluation_config_validator: Callable[[JsonObject], JsonObject] | None = None,
         experiment_plan_project_binder: ExperimentPlanProjectBinder | None = None,
@@ -251,6 +258,7 @@ class ConversationRuntime:
         self._preparations = (
             Preparations(preparation_store) if preparation_store else None
         )
+        self._preparation_project_materializer = preparation_project_materializer
         self._resource_inspector = resource_inspector
         self._experiment_plans = (
             ExperimentPlans(experiment_plan_store) if experiment_plan_store else None
@@ -426,6 +434,18 @@ class ConversationRuntime:
         async with self._use(owner.conversation_id):
             return await self._manager_turn_active(item)
 
+    @staticmethod
+    def _user_message_was_accepted(store: FileProductStore, command_id: str) -> bool:
+        snapshot = store.load_snapshot()
+        if snapshot.active_run_id == command_id:
+            return True
+        return any(
+            item.kind == "message"
+            and item.role == "user"
+            and item.command_id == command_id
+            for item in snapshot.timeline
+        )
+
     async def _manager_turn_active(self, item: dict) -> dict:
         """SQL admits durable inputs; the existing harness owns the model turn."""
         owner = PlanOwner.model_validate(item["payload"]["owner"])
@@ -456,6 +476,8 @@ class ConversationRuntime:
             if "command" in item["payload"]:
                 command = UserMessageCommand.model_validate(item["payload"]["command"])
                 receipt, _ = store.claim_command(command)
+                if self._user_message_was_accepted(store, command.command_id):
+                    return {"delivered": True}
                 if receipt.status == "completed":
                     if completed(command.command_id):
                         return {"delivered": True}
@@ -494,16 +516,34 @@ class ConversationRuntime:
                 expected = f"callback:{notice_id}:succeeded"
                 if completed(expected):
                     return {"delivered": True}
+                result = item["payload"].get("result", {})
+                if item["payload"].get("kind") == "project_created":
+                    hidden_text = (
+                        "Project creation is complete and the confirmed preparation "
+                        "plan is authorized. Do not restart preparation. Call "
+                        "open_project_stage with the project_id, node_id, and stable "
+                        "request_id below. Then approve the confirmed Node plan and "
+                        "delegate the work with request_project_stage_task. Never "
+                        "create a Dataset pipeline, write manifests, run validators, "
+                        "call df_submit_pipeline, or otherwise execute the Node in "
+                        "this Manager turn. If StageRun creation or delegation fails, "
+                        "stop and report the error; do not fall back to Manager-side "
+                        "execution.\n" + json.dumps(result, ensure_ascii=False)
+                    )
+                else:
+                    hidden_text = (
+                        "Delegated task update. Use these verified facts and decide "
+                        "within the user's goal.\n"
+                        + json.dumps(result, ensure_ascii=False)
+                    )
                 response = await active.adapter.notify_external_task(
                     active.handle,
                     ExternalTaskNotification(
                         task_id=notice_id,
-                        kind="experiment_task",
+                        kind=str(item["payload"].get("kind", "experiment_task")),
                         status="succeeded",
                         resume_interrupted=True,
-                        hidden_text="Delegated task update. Use these verified facts "
-                        "and decide within the user's goal.\n"
-                        + json.dumps(item["payload"]["result"], ensure_ascii=False),
+                        hidden_text=hidden_text,
                     ),
                     active.context,
                 )
@@ -664,16 +704,24 @@ class ConversationRuntime:
         return {"state": result["state"]}
 
     async def apply_session_configuration(
-        self, conversation_id: str, policy: SessionPolicy, context: RequestContext
+        self,
+        conversation_id: str,
+        policy: SessionPolicy,
+        context: RequestContext,
+        *,
+        activate_development: bool = False,
     ) -> bool:
         """Apply trusted router configuration only at an idle boundary."""
         store = await self._read_store(conversation_id, context)
         prepared = store.preparation_policy() is not None
         if policy.preparation_policy is not None and not prepared:
             return True
-        if policy.configuration_version <= store.configuration_version():
-            return True
         async with self._activation_locks.setdefault(conversation_id, asyncio.Lock()):
+            if (
+                not activate_development
+                and policy.configuration_version <= store.configuration_version()
+            ):
+                return True
             if store.load_snapshot().status == "running":
                 return False
             if prepared:
@@ -709,11 +757,17 @@ class ConversationRuntime:
                 harness_id=store.harness_id(),
                 capabilities=snapshot.capabilities,
             )
-            changed = store.access_policy()["tool_allowlist"] != policy.tool_allowlist
-            await self._adapter(handle.harness_id).update_session_policy(
-                handle, policy, context
-            )
+            current_tool_allowlist = store.access_policy()["tool_allowlist"]
             await asyncio.to_thread(store.apply_configuration, policy)
+            effective_policy = policy
+            if activate_development:
+                effective_policy = await asyncio.to_thread(
+                    store.activate_development_policy
+                )
+            changed = current_tool_allowlist != effective_policy.tool_allowlist
+            await self._adapter(handle.harness_id).update_session_policy(
+                handle, effective_policy, context
+            )
             if changed:
                 event, _ = store.append(
                     ProductEvent(
@@ -728,6 +782,28 @@ class ConversationRuntime:
                 )
                 self._publish(event)
         return True
+
+    async def activate_development_policy(
+        self,
+        conversation_id: str,
+        context: RequestContext,
+    ) -> bool:
+        store = await self._read_store(conversation_id, context)
+        async with self._activation_locks.setdefault(conversation_id, asyncio.Lock()):
+            if store.load_snapshot().status == "running":
+                return False
+            policy = await asyncio.to_thread(store.activate_development_policy)
+            snapshot = store.load_snapshot()
+            handle = SessionHandle(
+                session_id=conversation_id,
+                adapter_session_ref=conversation_id,
+                harness_id=store.harness_id(),
+                capabilities=snapshot.capabilities,
+            )
+            await self._adapter(handle.harness_id).update_session_policy(
+                handle, policy, context
+            )
+            return True
 
     def _execution_service(
         self, conversation_id: str, context: RequestContext, tool_name: str
@@ -956,6 +1032,9 @@ class ConversationRuntime:
                     type="external_task.updated",
                     payload={
                         **task.model_dump(mode="json"),
+                        "project_id": row["project_id"],
+                        "stage_run_id": row.get("stage_run_id"),
+                        "task_run_id": row["id"],
                         "status": status,
                         "resume_pending": False,
                         "updated_at": datetime.now().astimezone().isoformat(),
@@ -1461,6 +1540,10 @@ class ConversationRuntime:
             conversation_id, context, "get_experiment_plan"
         )
         store = self._store(conversation_id)
+        if store.load_snapshot().status == "running":
+            raise PlanConflictError(
+                "Plan decisions require an idle Agent; retry after the current turn."
+            )
         receipt, claimed = store.claim_command(command)
         if not claimed and receipt.status == "completed":
             return receipt
@@ -1584,7 +1667,21 @@ class ConversationRuntime:
         await self._read_store(conversation_id, context)
         owner = self._preparation_owner(conversation_id, context)
         assert self._preparations is not None
-        return await self._plan_io(self._preparations.store.project, owner)
+        project = await self._plan_io(self._preparations.store.project, owner)
+        if project is not None:
+            await self._materialize_project(project, owner)
+        return project
+
+    async def _materialize_project(
+        self, project: ProjectView, owner: PlanOwner
+    ) -> None:
+        if self._preparation_project_materializer is None:
+            return
+        await self._plan_io(
+            self._preparation_project_materializer.materialize,
+            project,
+            owner,
+        )
 
     async def _preparation_call(
         self,
@@ -1623,7 +1720,15 @@ class ConversationRuntime:
                 "ask the user for missing information"
             )
         request = InspectResource.model_validate(arguments)
-        result = await self._plan_io(self._resource_inspector.inspect, request, context)
+        try:
+            result = await asyncio.to_thread(
+                self._resource_inspector.inspect, request, context
+            )
+        except EvaluationStorageUnavailableError as exc:
+            raise ProductRuntimeError(
+                "storage_unavailable",
+                "Storage inspection is unavailable; retry shortly.",
+            ) from exc
         reference = "resource:" + uuid4().hex
         await self._plan_io(
             self._preparations.store.add_evidence,
@@ -1648,6 +1753,8 @@ class ConversationRuntime:
             conversation_id, asyncio.Lock()
         ):
             project = await self._plan_io(self._preparations.store.project, owner)
+            preparation = await self._plan_io(self._preparations.store.get, owner)
+            creating = project is None
             snapshot = store.load_snapshot()
             if project is None and (
                 snapshot.status == "running"
@@ -1666,12 +1773,39 @@ class ConversationRuntime:
                 command.expected_preparation_revision,
                 command.command_id,
             )
+            await self._materialize_project(project, owner)
             if not store.permits_tool("get_experiment_context"):
                 await self._activate_development_policy(conversation_id, store, context)
             await self._ensure_active(conversation_id, context)
             if self._delegated_store:
                 await self._plan_io(self._delegated_store.resume_authorized, owner)
             self._notify_preparation(conversation_id, "project.changed")
+            entry_task = preparation.entry_task
+            if (
+                creating
+                and self._delegated_store is not None
+                and entry_task is not None
+                and not preparation.policy.create_project_starts_entry_task
+            ):
+                notice_id = "project-created:" + project.project_id
+                result = {
+                    "project_id": project.project_id,
+                    "graph_id": project.project_id,
+                    "node_id": entry_task.stage_id,
+                    "execution_role": entry_task.role_id,
+                    "request_id": notice_id,
+                }
+                await self._plan_io(
+                    self._delegated_store.enqueue_manager,
+                    owner,
+                    notice_id,
+                    {
+                        "kind": "project_created",
+                        "notice_id": notice_id,
+                        "result": result,
+                    },
+                    10,
+                )
             return store.complete_command(
                 receipt.model_copy(
                     update={
@@ -3671,7 +3805,14 @@ class ConversationRuntime:
                     ProductEvent(
                         conversation_id=conversation_id,
                         type="experiment_execution.changed",
-                        payload={"platform_task_id": task_id},
+                        payload={
+                            "platform_task_id": task_id,
+                            "project_id": managed["project_id"] if managed else None,
+                            "stage_run_id": (
+                                managed.get("stage_run_id") if managed else None
+                            ),
+                            "task_run_id": managed["id"] if managed else None,
+                        },
                     )
                 )
                 self._publish(event)

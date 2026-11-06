@@ -163,6 +163,13 @@ class ExternalTaskState(ContractModel):
     correlation: TaskCorrelation | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    project_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    stage_run_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    task_run_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     managed_task_run_id: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )

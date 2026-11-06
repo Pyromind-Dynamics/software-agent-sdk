@@ -230,27 +230,40 @@ test("sandbox file reads report a mirrored miss by alias without touching the sa
   assert.deepEqual(requests, []);
 });
 
-test("an edit probe reuses its bytes for the read that follows", async () => {
+test("an edit probe checks access without fetching file content", async () => {
   const client = new RecordingFileClient();
   const operations = createSandboxFileOperations(client);
 
   await operations.edit.access("public_data/a.py");
-  const buffer = await operations.edit.readFile("public_data/a.py");
 
-  assert.equal(buffer.toString("utf8"), "from terminal");
-  assert.deepEqual(client.reads, ["public_data/a.py"]);
+  assert.deepEqual(client.accesses, ["public_data/a.py"]);
+  assert.deepEqual(client.reads, []);
+});
+
+test("image detection reads only the fixed magic-byte prefix", async () => {
+  const client = new RecordingFileClient();
+  const operations = createSandboxFileOperations(client);
+
+  assert.equal(
+    await operations.read.detectImageMimeType?.("public_data/image.bin"),
+    undefined,
+  );
+  assert.deepEqual(client.readLimits, [16]);
 });
 
 /** Terminal transport stub recording the calls the fallback client makes. */
 class RecordingFileClient implements SandboxFileClientLike {
   readonly reads: string[] = [];
+  readonly readLimits: Array<number | undefined> = [];
   readonly writes: string[] = [];
   readonly accesses: string[] = [];
   constructor(private readonly content = "from terminal") {}
 
-  async read(path: string): Promise<Buffer> {
+  async read(path: string, limit?: number): Promise<Buffer> {
     this.reads.push(path);
-    return Buffer.from(this.content);
+    this.readLimits.push(limit);
+    const buffer = Buffer.from(this.content);
+    return limit === undefined ? buffer : buffer.subarray(0, limit);
   }
 
   async access(path: string): Promise<void> {

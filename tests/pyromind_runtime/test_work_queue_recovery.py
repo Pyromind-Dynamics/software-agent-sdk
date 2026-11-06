@@ -117,3 +117,32 @@ def test_old_recovery_verdict_cannot_recover_a_new_expired_generation(ledger):
         identity, False, generation=replacement["generation"]
     )
     assert queue.list("owner")[0]["state"] == "reconciliation_required"
+
+
+@pytest.mark.parametrize("safe_to_retry", [True, False])
+async def test_worker_recovers_safe_terminal_reconciliation(ledger, safe_to_retry):
+    queue = ledger.queue
+    identity = queue.enqueue("owner", "lane", "notice", "manager_turn", {})
+    original = queue.claim()
+    assert original is not None
+    queue.finish(
+        identity,
+        original["generation"],
+        {"reason": "execution requires reconciliation"},
+        "reconciliation_required",
+    )
+    executed = []
+
+    async def reconcile(item):
+        return safe_to_retry
+
+    async def handle(item):
+        executed.append(item["id"])
+        return {"delivered": True}
+
+    worker = DurableWorker(queue, {"manager_turn": handle}, reconcile)
+    await worker.recover()
+    saved = queue.list("owner")[0]
+    assert saved["state"] == ("queued" if safe_to_retry else "reconciliation_required")
+    assert await worker.run_once() is safe_to_retry
+    assert executed == ([identity] if safe_to_retry else [])

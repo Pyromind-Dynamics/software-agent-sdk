@@ -19,11 +19,23 @@ function fakeTerminal(files: Map<string, Buffer> = new Map()): FakeTerminal {
   const operations: BashOperations = {
     exec: async (command, _cwd, options) => {
       commands.push(command);
-      if (command.startsWith("base64 < ")) {
-        const path = unquote(command.slice("base64 < ".length).split(" | ")[0]!);
-        const content = files.get(path);
+      if (command.startsWith("test -f ") && command.includes("| tr -d")) {
+        const path = readPath(command);
+        const content = path === undefined ? undefined : files.get(path);
         if (content === undefined) return { exitCode: 1 };
-        const encoded = content.toString("base64");
+        let selected = content;
+        const first = /-v first=(\d+)/.exec(command)?.[1];
+        const count = /-v count=(\d+)/.exec(command)?.[1];
+        if (first !== undefined && count !== undefined) {
+          selected = Buffer.from(
+            content.toString("utf8").split("\n")
+              .slice(Number(first) - 1, Number(first) - 1 + Number(count))
+              .join("\n"),
+          );
+        }
+        const head = /head -c (\d+)/.exec(command)?.[1];
+        if (head !== undefined) selected = selected.subarray(0, Number(head));
+        const encoded = selected.toString("base64");
         for (let at = 0; at < encoded.length; at += 512) {
           options.onData(Buffer.from(`${encoded.slice(at, at + 512)}\r\n`));
         }
@@ -63,7 +75,35 @@ test("reads file bytes through the terminal as base64", async () => {
   const terminal = fakeTerminal(new Map([["public_data/script.py", content]]));
   const client = new SandboxTerminalFileClient(terminal.operations);
   assert.deepEqual(await client.read("public_data/script.py"), content);
-  assert.deepEqual(terminal.commands, ["base64 < 'public_data/script.py' | tr -d '\\n'"]);
+  assert.deepEqual(terminal.commands, [
+    "test -f 'public_data/script.py' && base64 < 'public_data/script.py' | tr -d '\\n'",
+  ]);
+});
+
+test("bounded terminal reads stop the byte stream before base64", async () => {
+  const content = Buffer.from("abcdef".repeat(1000));
+  const terminal = fakeTerminal(new Map([["public_data/large.jsonl", content]]));
+  const client = new SandboxTerminalFileClient(terminal.operations);
+
+  assert.equal(
+    (await client.readHead("public_data/large.jsonl", 12)).toString(),
+    "abcdefabcdef",
+  );
+  assert.match(terminal.commands[0]!, /head -c 12 'public_data\/large\.jsonl'/);
+  assert.doesNotMatch(terminal.commands[0]!, /base64 < 'public_data/);
+});
+
+test("line-window reads select lines in the sandbox and cap returned bytes", async () => {
+  const content = Buffer.from(["first", "x".repeat(80), "third", "fourth"].join("\n"));
+  const terminal = fakeTerminal(new Map([["public_data/large.jsonl", content]]));
+  const client = new SandboxTerminalFileClient(terminal.operations);
+
+  const window = await client.readWindow("public_data/large.jsonl", 2, 1, 24);
+
+  assert.equal(window.truncated, true);
+  assert.equal(window.content.toString(), "x".repeat(24));
+  assert.match(terminal.commands[0]!, /-v first=2 -v count=1/);
+  assert.match(terminal.commands[0]!, /'public_data\/large\.jsonl' \| head -c 25 \|/);
 });
 
 test("writes file bytes through one bounded terminal command", async () => {
@@ -104,4 +144,10 @@ test("a larger chunk carries the same bytes in fewer script lines", async () => 
 
 function unquote(value: string): string {
   return value.replace(/^'|'$/g, "").replace(/'\\''/g, "'");
+}
+
+function readPath(command: string): string | undefined {
+  return /base64 < '([^']+)'/.exec(command)?.[1]
+    ?? /head -c \d+ '([^']+)'/.exec(command)?.[1]
+    ?? /exit }' '([^']+)'/.exec(command)?.[1];
 }

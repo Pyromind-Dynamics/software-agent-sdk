@@ -26,6 +26,9 @@ class TaskCorrelation(TaskOrigin):
     source: Literal["agent"] = "agent"
     conversation_id: str = Field(min_length=1)
     task_kind: str = Field(min_length=1)
+    project_id: str | None = Field(default=None, min_length=1)
+    stage_run_id: str | None = Field(default=None, min_length=1)
+    task_run_id: str | None = Field(default=None, min_length=1)
 
     @field_validator("conversation_id")
     @classmethod

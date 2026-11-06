@@ -1,3 +1,4 @@
+import json
 from datetime import timedelta
 
 import pytest
@@ -429,3 +430,150 @@ async def test_pending_launch_recovery_queries_correlation_without_respawning(
     assert [entry["action"] for entry in calls] == ["authorize", "status"]
     assert calls[1]["launch_request_id"] == recovered["id"]
     assert "execution_ref" not in calls[1]
+
+
+async def test_dataset_task_spec_preserves_instruction_and_stage_scope(ledger, owner):
+    from types import SimpleNamespace
+    from typing import cast
+
+    from pyromind_runtime.application.delegated_execution import DelegatedExecution
+    from pyromind_runtime.infrastructure.sql_experiment_plan_store import projects
+    from pyromind_runtime.ports.experiment_plans import ExperimentPlanStore
+
+    with ledger.engine.begin() as conn:
+        conn.execute(
+            projects.update()
+            .where(projects.c.project_id == "project")
+            .values(
+                context={"stages": [{"id": "dataset", "enabled": True}]},
+                context_sequence=0,
+            )
+        )
+    task_spec = {
+        "role_id": "dataset",
+        "request_id": "dataset-sample",
+        "intent": "execute",
+        "stage_id": "dataset",
+        "stage_run_id": "stage-run-1",
+        "plan_sequence": 0,
+        "stage_snapshot": {"id": "dataset", "enabled": True},
+        "task": {
+            "name": "Prepare AVI dataset",
+            "instruction": "Use data-processing and validate the sample.",
+            "inputs": {"phase": "sample"},
+            "constraints": [],
+            "expected_outputs": ["stage_sample_report"],
+        },
+    }
+    run = ledger.request(
+        owner,
+        "project",
+        None,
+        "dataset-sample",
+        "dataset",
+        "dataset-sample",
+        task_spec=task_spec,
+        stage_run_id="stage-run-1",
+    )
+    item = ledger.queue.claim()
+    calls = []
+
+    async def control(owner, role, request):
+        calls.append(request)
+        if request["action"] == "spawn":
+            return {"execution_ref": "dataset-worker", "status": "succeeded"}
+        return {"execution_ref": "dataset-worker", "status": "succeeded"}
+
+    plans = cast(ExperimentPlanStore, SimpleNamespace())
+    await DelegatedExecution(plans, ledger, control).prepare(item)
+
+    authorize = calls[0]
+    assert authorize["scope"]["execution"] == {
+        "project_id": "project",
+        "task_run_id": run["id"],
+        "stage_id": "dataset",
+        "stage_run_id": "stage-run-1",
+        "plan_sequence": 0,
+    }
+    spawn = calls[1]
+    child_task = json.loads(spawn["task"])
+    assert spawn["role"] == "dataset"
+    assert child_task["instruction"] == task_spec["task"]["instruction"]
+    assert child_task["phase"] == "sample"
+    assert child_task["runtime_phase"] == "execute"
+    assert child_task["task"]["inputs"] == {"phase": "sample"}
+
+
+async def test_dataset_task_spec_reports_paused_child_as_failed_outcome(ledger, owner):
+    from types import SimpleNamespace
+    from typing import cast
+
+    from pyromind_runtime.application.delegated_execution import DelegatedExecution
+    from pyromind_runtime.infrastructure.sql_experiment_plan_store import projects
+    from pyromind_runtime.ports.experiment_plans import ExperimentPlanStore
+
+    with ledger.engine.begin() as conn:
+        conn.execute(
+            projects.update()
+            .where(projects.c.project_id == "project")
+            .values(
+                context={"stages": [{"id": "dataset", "enabled": True}]},
+                context_sequence=0,
+            )
+        )
+    task_spec = {
+        "role_id": "dataset",
+        "request_id": "dataset-sample",
+        "intent": "execute",
+        "stage_id": "dataset",
+        "stage_run_id": "stage-run-1",
+        "plan_sequence": 0,
+        "stage_snapshot": {"id": "dataset", "enabled": True},
+        "task": {
+            "name": "Prepare AVI dataset",
+            "instruction": "Use data-processing and validate the sample.",
+            "inputs": {"phase": "sample"},
+            "constraints": [],
+            "expected_outputs": ["stage_sample_report"],
+        },
+    }
+    run = ledger.request(
+        owner,
+        "project",
+        None,
+        "dataset-sample",
+        "dataset",
+        "dataset-sample",
+        task_spec=task_spec,
+        stage_run_id="stage-run-1",
+    )
+    item = ledger.queue.claim()
+    calls = []
+
+    async def control(owner, role, request):
+        calls.append(request)
+        if request["action"] == "spawn":
+            return {
+                "execution_ref": "dataset-worker",
+                "status": "paused",
+                "result_text": "Structured acceptance report not found.",
+            }
+        return {
+            "execution_ref": "dataset-worker",
+            "status": "paused",
+            "result_text": "Structured acceptance report not found.",
+        }
+
+    result = await DelegatedExecution(
+        cast(ExperimentPlanStore, SimpleNamespace()), ledger, control
+    ).prepare(item)
+
+    saved = ledger.list(owner)[0]
+    assert result["state"] == "needs_input"
+    assert calls[0]["action"] == "authorize"
+    assert calls[1]["action"] == "spawn"
+    assert saved["report_state"] == "ready"
+    assert "paused before completing the task" in saved["result"]["summary"]
+    assert "not a successful business result" in saved["result"]["summary"]
+    assert "Structured acceptance report not found." in saved["result"]["summary"]
+    assert saved["id"] == run["id"]

@@ -9,6 +9,7 @@ from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
 from pyromind_runtime.domain.preparation import InspectResource
+from pyromind_runtime.ports.storage import EvaluationStorageUnavailableError
 
 from openhands.tools.pyromind_dataset.definition import (
     _default_storage_base_url,
@@ -84,8 +85,7 @@ class StorageResourceInspector:
             }
             validate_persisted_payload(result)
             return result
-        except (httpx.HTTPError, ValueError):
-            raise ValueError(
-                "Storage preview unavailable; "
-                "request the missing information from the user"
-            ) from None
+        except (httpx.HTTPError, ValueError) as exc:
+            raise EvaluationStorageUnavailableError(
+                f"Storage preview unavailable for {request.path}"
+            ) from exc

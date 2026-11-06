@@ -16,6 +16,14 @@ class WorkQueue(Protocol):
 
     def expired(self) -> list[dict]: ...
 
+    def pending_reconciliation(
+        self, kinds: tuple[str, ...] | None = None
+    ) -> list[dict]: ...
+
     def reconcile_expired(
         self, identity: str, safe_to_retry: bool, *, generation: int
+    ) -> bool: ...
+
+    def requeue_reconciliation_required(
+        self, identity: str, *, generation: int
     ) -> bool: ...

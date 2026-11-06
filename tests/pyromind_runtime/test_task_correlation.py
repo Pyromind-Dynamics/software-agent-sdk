@@ -25,6 +25,23 @@ def test_json_return_address_is_flat_and_versioned(origin):
     assert ('"subagent_id"' in correlation.to_out_id()) == (origin.type == "subagent")
 
 
+def test_project_execution_ids_round_trip_without_changing_legacy_addresses():
+    correlation = TaskCorrelation(
+        conversation_id="c",
+        task_kind="workflow_run",
+        project_id="project-1",
+        stage_run_id="stage-run-1",
+        task_run_id="task-run-1",
+    )
+
+    assert parse_task_correlation(correlation.to_out_id()) == correlation
+    legacy = TaskCorrelation(conversation_id="c", task_kind="workflow_run")
+    assert parse_task_correlation(legacy.to_out_id()) == legacy
+    assert legacy.project_id is None
+    assert legacy.stage_run_id is None
+    assert legacy.task_run_id is None
+
+
 @pytest.mark.parametrize(
     "value",
     [

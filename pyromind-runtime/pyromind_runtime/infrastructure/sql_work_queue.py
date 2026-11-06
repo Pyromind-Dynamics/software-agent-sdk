@@ -268,6 +268,73 @@ class SQLWorkQueue:
                 ).mappings()
             ]
 
+    def pending_reconciliation(
+        self, kinds: tuple[str, ...] | None = None
+    ) -> list[dict]:
+        with self.engine.connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    sa.select(work)
+                    .where(
+                        work.c.state == "reconciliation_required",
+                        work.c.kind.in_(kinds) if kinds is not None else sa.true(),
+                    )
+                    .order_by(work.c.created_at, work.c.id)
+                ).mappings()
+            ]
+
+    def requeue_reconciliation_required(
+        self, identity: str, *, generation: int
+    ) -> bool:
+        with write_transaction(self.engine) as conn:
+            row = (
+                conn.execute(
+                    sa.select(work).where(work.c.id == identity).with_for_update()
+                )
+                .mappings()
+                .first()
+            )
+            if (
+                not row
+                or row["state"] != "reconciliation_required"
+                or row["generation"] != generation
+            ):
+                return False
+            lane = (
+                conn.execute(
+                    sa.select(roles)
+                    .where(roles.c.lane == row["lane"])
+                    .with_for_update()
+                )
+                .mappings()
+                .one()
+            )
+            if lane["active_id"] not in {None, identity}:
+                return False
+            updated = conn.execute(
+                work.update()
+                .where(
+                    work.c.id == identity,
+                    work.c.state == "reconciliation_required",
+                    work.c.generation == generation,
+                )
+                .values(
+                    state="queued",
+                    generation=generation + 1,
+                    available_at=now(),
+                    lease_until=None,
+                )
+            )
+            if updated.rowcount != 1:
+                return False
+            conn.execute(
+                roles.update()
+                .where(roles.c.lane == row["lane"])
+                .values(active_id=None, lease_until=None)
+            )
+            return True
+
     def reconcile_expired(
         self, identity: str, safe_to_retry: bool, *, generation: int
     ) -> bool:

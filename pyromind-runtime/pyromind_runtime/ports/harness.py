@@ -47,6 +47,7 @@ class SessionSpec(ContractModel):
     delegated_roles: tuple[DelegatedRole, ...] | None = None
     managed_delegation: bool = False
     preparation_policy: PreparationPolicy | None = None
+    agentgenome_enabled: bool = True
 
 
 class SessionHandle(ContractModel):

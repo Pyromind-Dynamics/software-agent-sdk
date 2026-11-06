@@ -242,6 +242,22 @@ def _failure_detail(output: str, exit_code: int | None, timed_out: bool) -> str:
     return " (" + ", ".join(detail) + ")"
 
 
+def _sandbox_client_fingerprint(context: ToolExecutionContext) -> str:
+    """Identify the request credentials without retaining the token itself."""
+    env, cluster = _execution_target(context)
+    auth_token = _auth_token(context.request_context) or ""
+    digest = hashlib.sha256()
+    for value in (
+        env or "",
+        cluster or "",
+        context.request_context.user_id,
+        auth_token,
+    ):
+        digest.update(value.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _dataflow_warmup_env() -> dict[str, str]:
     """Operator overrides the DataFlow runner would read, when they are set.
 
@@ -310,6 +326,7 @@ class SandboxExecutionManager:
         self._client_factory = client_factory or _sandbox_client
         self._resource_roots = list(resource_roots or [])
         self._states: dict[str, _SandboxState] = {}
+        self._clients: dict[str, tuple[str, SandboxClientLike]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._warmups: dict[str, asyncio.Task[None]] = {}
         self._prewarms: dict[str, asyncio.Task[None]] = {}
@@ -363,6 +380,7 @@ class SandboxExecutionManager:
         self._cancel_warmup(context.conversation_id)
         self._cancel_prewarm(context.conversation_id)
         state = self._states.pop(context.conversation_id, None)
+        self._clients.pop(context.conversation_id, None)
         record = files.load_sandbox() or {}
         sandbox_id = state.endpoint["sandbox_id"] if state is not None else None
         if sandbox_id is None:
@@ -435,8 +453,19 @@ class SandboxExecutionManager:
                 self._cancel_warmup(context.conversation_id)
                 self._cancel_prewarm(context.conversation_id)
                 self._states.pop(context.conversation_id, None)
+                self._clients.pop(context.conversation_id, None)
             pending_staging = files.load_pending_sandbox_staging()
             existing = self._states.get(context.conversation_id)
+            cached_client = self._clients.get(context.conversation_id)
+            if existing is not None and (
+                cached_client is None
+                or cached_client[0] != _sandbox_client_fingerprint(context)
+            ):
+                # The endpoint bundle embeds the access key, so it cannot cross
+                # a credential boundary even when it still names the same sandbox.
+                self._states.pop(context.conversation_id, None)
+                self._clients.pop(context.conversation_id, None)
+                existing = None
             if existing is not None and pending_staging is None:
                 return existing
             state = await self._ensure_state_locked(context, files, pending_staging)
@@ -451,7 +480,7 @@ class SandboxExecutionManager:
     ) -> _SandboxState:
         settings = SandboxSettings.from_extra(context.extra)
         record = files.load_sandbox() or {}
-        client = await asyncio.to_thread(self._client_factory, context)
+        client = await asyncio.to_thread(self._sandbox_client_for, context)
         ws_base_url = terminal_base_url(
             cluster=client.cluster,
             env=_execution_target(context)[0],
@@ -599,6 +628,24 @@ class SandboxExecutionManager:
             "cluster": client.cluster,
         }
         return _SandboxState(client=client, endpoint=endpoint)
+
+    def _sandbox_client_for(self, context: ToolExecutionContext) -> SandboxClientLike:
+        """Reuse the authenticated client while a conversation stays warm.
+
+        Access-key exchange is a control-plane HTTP call. A released runner is
+        often recreated between turns while the sandbox itself is only paused,
+        so replacing the client every time makes the first terminal/read call
+        wait on the portal again. Keep the client in memory, keyed by the
+        credential identity, and still mint a new one when the conversation is
+        explicitly refreshed or the request credentials change.
+        """
+        fingerprint = _sandbox_client_fingerprint(context)
+        cached = self._clients.get(context.conversation_id)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+        client = self._client_factory(context)
+        self._clients[context.conversation_id] = (fingerprint, client)
+        return client
 
     async def _lookup(
         self, client: SandboxClientLike, sandbox_id: str | None

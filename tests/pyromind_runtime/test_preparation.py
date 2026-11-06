@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from uuid import UUID
 
 import httpx
 import pytest
 import sqlalchemy as sa
 from harness_adapter.pi_adapter.event_translator import translate_runner_event
 from pyromind_agent_server.api.router import create_product_router
+from pyromind_agent_server.experiment_plan_projects import (
+    EchoMindPreparationProjectMaterializer,
+)
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.preparation import Preparations
@@ -16,6 +20,7 @@ from pyromind_runtime.application.snapshot_projector import SnapshotProjector
 from pyromind_runtime.domain.commands import CreateProjectCommand
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.experiment_plans import (
     PlanConflictError,
@@ -24,12 +29,17 @@ from pyromind_runtime.domain.experiment_plans import (
 )
 from pyromind_runtime.domain.preparation import (
     ChecklistField,
+    PreparationFact,
     PreparationPolicy,
+    SetPreparationPlan,
     UpdatePreparation,
+    WorkflowNodeDefinition,
+    WorkflowTaskDefinition,
 )
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.infrastructure.sql_experiment_execution import (
+    SQLExperimentExecutionStore,
     runs,
 )
 from pyromind_runtime.infrastructure.sql_experiment_plan_store import (
@@ -43,6 +53,9 @@ from pyromind_runtime.infrastructure.sql_work_queue import (
     work,
 )
 from pyromind_runtime.ports.harness import DelegatedRole, SessionSpec
+from pyromind_runtime.ports.storage import EvaluationStorageUnavailableError
+
+from openhands.agent_server.echomind_projects import ProjectStore
 
 from .fake_adapter import FakeAdapter
 from .test_product_api import _app
@@ -122,6 +135,15 @@ def make_ready(store, owner, payload):
         owner, UpdatePreparation(expected_revision=0, facts=payload["facts"]), evidence
     )
     return service.update(owner, UpdatePreparation.model_validate(payload), evidence)
+
+
+async def _wait_for(predicate, timeout: float = 3.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not met within timeout")
 
 
 def test_checklist_gates_plan_and_never_creates_project(
@@ -363,6 +385,290 @@ async def test_runtime_creation_restore_permissions_and_stage_protection(
     await restored.close()
 
 
+async def test_create_project_materializes_working_graph_without_starting_task(
+    preparation_setup, tmp_path
+):
+    store, _, _ = preparation_setup
+    owner = PlanOwner(
+        user_id="42",
+        conversation_id="graph-merge",
+        profile_id="prepared",
+    )
+    policy = PreparationPolicy(
+        checklist_id="graph-merge",
+        version=1,
+        allowed_roles=("eval",),
+        create_project_starts_entry_task=False,
+        fields=(ChecklistField(key="dataset", label="Dataset"),),
+        workflow_nodes=(
+            WorkflowNodeDefinition(
+                id="init",
+                name="Init",
+                roles=("eval",),
+                tasks=(WorkflowTaskDefinition(id="bench", description="Baseline"),),
+            ),
+            WorkflowNodeDefinition(
+                id="dataset",
+                name="Dataset",
+                tasks=(
+                    WorkflowTaskDefinition(
+                        id="clean_label",
+                        description="Prepare the dataset",
+                    ),
+                ),
+            ),
+        ),
+    )
+    store.initialize(owner, policy)
+    service = Preparations(store)
+    facts = {
+        "dataset": PreparationFact(
+            value="/datasets/pcb_avi_eval_3",
+            status="resolved",
+            evidence_refs=("message:request",),
+        )
+    }
+    collected = service.update(
+        owner,
+        UpdatePreparation(expected_revision=0, facts=facts),
+        {"message:request"},
+    )
+    plan = {
+        "goal": "Prepare an AVI dataset and then train a model",
+        "resources": [
+            {
+                "id": "source",
+                "name": "Source dataset",
+                "uri": "/datasets/pcb_avi_eval_3",
+            }
+        ],
+        "stages": [
+            {"id": "init", "kind": "init", "name": "Init"},
+            {"id": "dataset", "kind": "dataset", "name": "Dataset"},
+        ],
+        "tasks": [
+            {
+                "id": "bench",
+                "kind": "bench",
+                "name": "Baseline",
+                "stage_id": "init",
+                "inputs": [{"name": "dataset", "resource_id": "source"}],
+            },
+            {
+                "id": "clean_label",
+                "kind": "clean_label",
+                "name": "Prepare dataset",
+                "stage_id": "dataset",
+                "inputs": [{"name": "dataset", "resource_id": "source"}],
+            },
+        ],
+        "edges": [{"source": "init", "target": "dataset"}],
+    }
+    service.set_plan(
+        owner,
+        SetPreparationPlan.model_validate(
+            {
+                "expected_revision": collected.revision,
+                "plan": plan,
+            }
+        ),
+    )
+    context = RequestContext(user_id="42", profile_id="prepared")
+    runtime = ConversationRuntime(
+        tmp_path / "conversations",
+        FakeAdapter(),
+        experiment_plan_store=SQLExperimentPlanStore(store.engine),
+        preparation_store=store,
+        preparation_project_materializer=EchoMindPreparationProjectMaterializer(
+            tmp_path / "conversations"
+        ),
+    )
+    await runtime.create_conversation(
+        SessionSpec(
+            conversation_id=owner.conversation_id,
+            user_id=owner.user_id,
+            profile_id=owner.profile_id,
+            workspace_root=str(tmp_path / "conversations"),
+            preparation_policy=policy,
+            tool_allowlist=("read",),
+            development_tool_allowlist=("read", "get_project_graph"),
+            command_allowlist=("user_message", "create_project"),
+            delegated_roles=(
+                DelegatedRole(
+                    name="eval",
+                    description="Evaluate",
+                    prompt="Evaluate within the supplied scope",
+                ),
+            ),
+        ),
+        context,
+    )
+    try:
+        receipt = await runtime.submit_command(
+            owner.conversation_id,
+            CreateProjectCommand(
+                command_id="create-project",
+                expected_preparation_revision=store.get(owner).revision,
+            ),
+            context,
+        )
+        assert receipt.response["initial_run_id"] is None
+        assert store.executions.list(owner) == []
+
+        project_id = receipt.response["project_id"]
+        assert isinstance(project_id, str)
+        project_store = ProjectStore.for_conversations_dir(tmp_path / "conversations")
+        graph = project_store.get_graph(project_id, owner_user_id=owner.user_id)
+        assert graph.project_id == project_id
+        assert {node.id for node in graph.nodes} == {"dataset"}
+        dataset_node = graph.nodes[0]
+        assert dataset_node.execution_role == "dataset"
+        assert "execution_role" not in dataset_node.config
+        assert "sample_validation" not in dataset_node.config
+
+        graph_path = tmp_path / "projects" / str(UUID(project_id)) / "graph.json"
+        graph_path.unlink()
+        repaired = await runtime.get_project(owner.conversation_id, context)
+        assert repaired is not None and repaired.project_id == project_id
+        assert graph_path.is_file()
+        assert (
+            project_store.get_graph(project_id, owner_user_id=owner.user_id).project_id
+            == project_id
+        )
+    finally:
+        await runtime.close()
+
+
+async def test_create_project_enqueues_project_created_manager_turn_once(
+    preparation_setup, ready_request, tmp_path
+):
+    store, _, _ = preparation_setup
+    owner = PlanOwner(
+        user_id="42",
+        conversation_id="project-created-turn",
+        profile_id="prepared",
+    )
+    policy = PreparationPolicy(
+        checklist_id="project-created-turn",
+        version=1,
+        allowed_roles=("eval",),
+        create_project_starts_entry_task=False,
+        fields=(
+            ChecklistField(key="dataset", label="Dataset"),
+            ChecklistField(key="mapping", label="Mapping"),
+        ),
+    )
+    store.initialize(owner, policy)
+    ready = make_ready(store, owner, ready_request)
+    adapter = FakeAdapter()
+    execution_store = SQLExperimentExecutionStore(store.engine)
+    runtime = ConversationRuntime(
+        tmp_path / "conversations",
+        adapter,
+        experiment_plan_store=SQLExperimentPlanStore(store.engine),
+        experiment_execution_store=execution_store,
+        execution_roles=("eval",),
+        preparation_store=store,
+        preparation_project_materializer=EchoMindPreparationProjectMaterializer(
+            tmp_path / "conversations"
+        ),
+    )
+    context = RequestContext(user_id=owner.user_id, profile_id=owner.profile_id)
+    await runtime.create_conversation(
+        SessionSpec(
+            conversation_id=owner.conversation_id,
+            user_id=owner.user_id,
+            profile_id=owner.profile_id,
+            workspace_root=str(tmp_path / "conversations"),
+            preparation_policy=policy,
+            tool_allowlist=("read",),
+            development_tool_allowlist=("read", "get_experiment_context"),
+            command_allowlist=("user_message", "create_project"),
+            delegated_roles=(
+                DelegatedRole(
+                    name="eval",
+                    description="Evaluate",
+                    prompt="Evaluate within the supplied scope",
+                ),
+            ),
+        ),
+        context,
+    )
+    command = CreateProjectCommand(
+        command_id="create-project",
+        expected_preparation_revision=ready.revision,
+    )
+    try:
+        receipt = await runtime.submit_command(owner.conversation_id, command, context)
+        project_id = receipt.response["project_id"]
+        assert isinstance(project_id, str)
+        assert receipt.response["initial_run_id"] is None
+
+        with store.engine.connect() as conn:
+            rows = (
+                conn.execute(sa.select(work).where(work.c.kind == "manager_turn"))
+                .mappings()
+                .all()
+            )
+        assert len(rows) == 1
+        payload = rows[0]["payload"]
+        notice_id = "project-created:" + project_id
+        assert payload["kind"] == "project_created"
+        assert payload["notice_id"] == notice_id
+        assert payload["result"] == {
+            "project_id": project_id,
+            "graph_id": project_id,
+            "node_id": "evaluation",
+            "execution_role": "eval",
+            "request_id": notice_id,
+        }
+
+        assert (
+            await runtime.submit_command(owner.conversation_id, command, context)
+            == receipt
+        )
+        with store.engine.connect() as conn:
+            assert (
+                conn.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(work)
+                    .where(work.c.kind == "manager_turn")
+                )
+                == 1
+            )
+
+        await runtime.start_execution_events()
+        await _wait_for(lambda: adapter.external_task_notifications)
+        _, notification, _ = adapter.external_task_notifications[0]
+        assert notification.task_id == notice_id
+        assert notification.kind == "project_created"
+        assert notification.visible_text is None
+        assert "open_project_stage" in notification.hidden_text
+        assert "Never create a Dataset pipeline" in notification.hidden_text
+        assert '"node_id": "evaluation"' in notification.hidden_text
+
+        adapter.emit(
+            owner.conversation_id,
+            "status.changed",
+            {"status": "finished"},
+            run_id=f"callback:{notice_id}:succeeded",
+            event_id="project-created-turn-finished",
+        )
+
+        def manager_turn_completed() -> bool:
+            with store.engine.connect() as conn:
+                return (
+                    conn.scalar(
+                        sa.select(work.c.state).where(work.c.kind == "manager_turn")
+                    )
+                    == "completed"
+                )
+
+        await _wait_for(manager_turn_completed)
+    finally:
+        await runtime.close()
+
+
 async def test_http_prepare_create_and_cross_profile_denial(
     preparation_setup, ready_request, tmp_path
 ):
@@ -596,9 +902,70 @@ async def test_inspection_and_terminal_provide_checklist_evidence_without_projec
             context,
         )
         assert result["phase"] == "planning"
+    finally:
+        await runtime.close()
         assert store.project(owner) is None
         assert inspector.inspect.call_args.args[1].cookie == context.cookie
         assert "private" not in str(store.get(owner).model_dump())
+
+
+async def test_storage_inspection_failure_does_not_use_plan_error_or_sandbox(
+    preparation_setup, tmp_path
+):
+    store, owner, policy = preparation_setup
+    from unittest.mock import Mock
+
+    inspector = Mock()
+    inspector.inspect.side_effect = EvaluationStorageUnavailableError(
+        "storage auth rejected"
+    )
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(
+        tmp_path / "conversations",
+        adapter,
+        experiment_plan_store=SQLExperimentPlanStore(store.engine),
+        preparation_store=store,
+        resource_inspector=inspector,
+    )
+    context = RequestContext(
+        user_id=owner.user_id,
+        profile_id=owner.profile_id,
+        cookie="auth_token=expired",
+    )
+    try:
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id=owner.conversation_id,
+                user_id=owner.user_id,
+                profile_id=owner.profile_id,
+                workspace_root=str(tmp_path / "conversations"),
+                tool_allowlist=("inspect_resource",),
+                preparation_policy=policy,
+                delegated_roles=(
+                    DelegatedRole(
+                        name="eval",
+                        description="Evaluate",
+                        prompt="Evaluate within the supplied scope",
+                    ),
+                ),
+            ),
+            context,
+        )
+        before = store.get(owner)
+        created_sessions = len(adapter.created_specs)
+
+        with pytest.raises(ProductRuntimeError) as error:
+            await runtime.experiment_plan_call(
+                owner.conversation_id,
+                "inspect_resource",
+                {"path": "/datasets"},
+                context,
+            )
+
+        assert error.value.code == "storage_unavailable"
+        assert "Plan database" not in error.value.message
+        assert len(adapter.created_specs) == created_sessions
+        assert store.get(owner).revision == before.revision
     finally:
         await runtime.close()
 
@@ -721,7 +1088,6 @@ def test_plan_submission_reuses_collected_facts_and_resolves_entry_resources(
 def test_plan_retry_requires_complete_arguments_and_stage_edges(
     preparation_setup, ready_request
 ):
-    from pydantic import ValidationError
     from pyromind_runtime.domain.preparation import SetPreparationPlan
 
     store, owner, _ = preparation_setup
@@ -742,9 +1108,12 @@ def test_plan_retry_requires_complete_arguments_and_stage_edges(
     with pytest.raises(ValueError, match=r"plan.stages\[\].id.*evaluation.*review"):
         SetPreparationPlan.model_validate(arguments)
     plan["edges"] = [{"source": "evaluation", "target": "review"}]
-    with pytest.raises(ValidationError, match="role_id"):
-        SetPreparationPlan.model_validate(
-            {key: value for key, value in arguments.items() if key != "role_id"}
+    with pytest.raises(ValueError, match="entry_task_id and role_id"):
+        Preparations(store).set_plan(
+            owner,
+            SetPreparationPlan.model_validate(
+                {key: value for key, value in arguments.items() if key != "role_id"}
+            ),
         )
     assert store.get(owner) == ready
     saved = Preparations(store).set_plan(
@@ -907,30 +1276,24 @@ def test_catalog_is_profile_owned_and_old_plans_remain_compatible():
     policy = ECHOMIND_PRODUCT_PROFILE.preparation_policy
     assert policy is not None
     nodes = {node.id: node for node in policy.workflow_nodes}
-    assert set(nodes) == {
-        "init",
-        "dataset",
-        "train",
-        "eval",
-        "inference",
-        "tracer",
-        "rawdata",
-    }
-    assert nodes["eval"].roles == ("eval",)
-    assert {task.id for task in nodes["init"].tasks} == {"bench", "analysis"}
-    assert {task.id for task in nodes["eval"].tasks} == {"checkpoint_eval", "analysis"}
-    assert not nodes["train"].roles
+    assert set(nodes) == {"dataset", "train", "inference", "evaluator"}
+    assert {task.id for task in nodes["dataset"].tasks} == {"prepare_dataset"}
+    assert {task.id for task in nodes["train"].tasks} == {"train_model"}
+    assert {task.id for task in nodes["inference"].tasks} == {"run_inference"}
+    assert {task.id for task in nodes["evaluator"].tasks} == {"evaluate"}
+    assert nodes["dataset"].roles == ("dataset",)
+    assert nodes["evaluator"].roles == ("eval",)
     context = ExperimentContext.model_validate(
         {
-            "goal": "Baseline",
+            "goal": "Dataset",
             "stages": [
-                {"id": "arbitrary-instance", "name": "Renamable", "kind": "init"}
+                {"id": "arbitrary-instance", "name": "Renamable", "kind": "dataset"}
             ],
             "tasks": [
                 {
-                    "id": "baseline",
-                    "kind": "bench",
-                    "name": "Run baseline",
+                    "id": "prepare",
+                    "kind": "prepare_dataset",
+                    "name": "Prepare data",
                     "stage_id": "arbitrary-instance",
                 }
             ],
@@ -938,22 +1301,32 @@ def test_catalog_is_profile_owned_and_old_plans_remain_compatible():
     )
     validate_workflow_catalog(policy, context)
     assert context.stages[0].name == "Renamable"
-    assert context.stages[0].kind == "init"
+    assert context.stages[0].kind == "dataset"
     combined = context.model_copy(
         update={
             "tasks": (
                 *context.tasks,
                 context.tasks[0].model_copy(
-                    update={"id": "read-baseline", "kind": "analysis"}
+                    update={"id": "prepare-again", "kind": "prepare_dataset"}
                 ),
             )
         }
     )
     validate_workflow_catalog(policy, combined)
     assert len(combined.stages) == 1 and len(combined.tasks) == 2
+    limited_policy = policy.model_copy(
+        update={
+            "workflow_nodes": tuple(
+                node.model_copy(update={"max_instances": 1})
+                if node.id == "dataset"
+                else node
+                for node in policy.workflow_nodes
+            )
+        }
+    )
     with pytest.raises(ValueError, match="instance limit"):
         validate_workflow_catalog(
-            policy,
+            limited_policy,
             context.model_copy(
                 update={
                     "stages": (

@@ -1,11 +1,35 @@
 # EchoMind Project 开发态与四节点执行渐进方案
 
-> 状态：实施基线，待评审后从 S1 开始
-> 更新时间：2026-11-02
+> 状态：S1、S2 已实现；Dataset 开发链路已存在；远端 Preparation/Project/TaskCorrelation
+> 已合并；S4 先做身份与执行链接缝，不直接进入 Train
+> 更新时间：2026-11-04
 > 首期场景：AVI 单轮，Dataset / Train / Inference / Evaluator 四节点
-> 关系：本文替代旧方案中“开发态先引入 GraphRevision，再逐步执行”的部分。
+> 关系：本文保留 S1/S2 的实现记录和后续阶段背景。通用 Node、ExecutorBinding、
+> 动态输入、实现固化和 S3 验收以
+> `docs/echomind-graph-executor-implementation.md` 为唯一实施基线。
 > 两个 Agent 的入口和边界分别见 `docs/echomind-dual-agent-change-design.md`，
 > 主/子 Agent 的结构化长周期契约见 `docs/echomind-graph-agent-contract.md`。
+
+## 接缝基线
+
+远端和本地目前同时存在 SQL Project/TaskRun 与文件 Project/WorkingGraph/StageRun。
+新 EchoMind 会话统一采用以下层级，详细契约以
+`docs/echomind-graph-executor-implementation.md` 的“接缝基线”为准：
+
+```text
+SQL Project（唯一 Project ID）
+  -> WorkingGraph（graph.project_id 与 Project ID 相同）
+  -> StageRun（节点级主运行）
+  -> TaskRun 0..N（确定性执行明细）
+  -> external_task_id 0..1（平台任务）
+```
+
+- `graph_id` 只是图实例 ID，不是第二个 Project 身份。
+- 创建 Project 只创建 Project 和 WorkingGraph，不自动启动节点。
+- 用户启动节点时才创建 StageRun；真正委派角色或提交平台任务时才创建 TaskRun。
+- StageRun 增加 `task_run_id`，TaskRun 增加 `stage_run_id`，两边形成显式关联。
+- Project 创建后，WorkingGraph 是节点和边的事实源；Preparation plan 只保留为创建快照。
+- 远端现有 `create_project` 自动创建首个 Eval TaskRun 的行为只保留给模型评测入口和旧会话兼容。
 
 ## 1. 方案结论
 
@@ -98,12 +122,15 @@ Inference 输入，或者刚删除一个节点还没重新连线。只要图的�
 - 没有等待中的节点或发布门禁；
 - Artifact Schema 和完成条件可校验。
 
-### 2.4 主 Agent 不承担逐节点调度
+### 2.4 研发启动由对话驱动
 
 首期采用轻量控制方式：
 
-- 用户可以在页面点击“验证此节点”或“运行整图”；
-- EchoMind Manager 可以通过结构化工具发起相同动作；
+- 用户在 Manager 对话中明确要求开发某个节点，Manager 调用
+  `open_project_stage` 创建该节点的 StageRun 并进入澄清；
+- 节点卡片只展示状态、执行历史和 Artifact，不提供“开始开发/重新开发”按钮；
+- 用户确认节点方案后，Manager 再调用 `approve_project_stage_plan` 和
+  `request_project_stage_task` 推进同一个节点；
 - Runtime 自动推进整图中已经满足依赖的节点；
 - Manager 只在需要用户确认、节点失败、外部提交不确定或 GraphRun 完成时收到通知；
 - Manager 不逐节点下发 start 命令，不处理队列、租约、Kafka 重复消息或心跳。
@@ -118,19 +145,26 @@ Inference 输入，或者刚删除一个节点还没重新连线。只要图的�
 用户通过 EchoMind Chat 描述目标。Manager 使用 `experiment-planning` Skill 完成需求
 澄清，生成 WorkflowPlan。此时没有 Project。
 
+澄清是软引导，不是权限门禁。Manager 可以先生成带 `unresolved` 的轻量草案，再通过
+后续 revise 逐步补齐，不能用“信息未全”作为无法继续对话的硬性拒绝条件。
+
 ### 3.2 Project 创建
 
-用户确认 PlanProposal 后：
+用户通过 Preparation 明确确认 WorkflowPlan 后执行 `create_project`：
 
-1. 保存 PlanRevision；
-2. 创建 Project；
-3. 根据计划生成第一版 Working Graph；
-4. Project 状态为 `development`；
-5. 页面进入开发工作台；
+1. SQL 事务创建 Project；
+2. 以同一个 Project ID 幂等生成第一版 Working Graph；
+3. Project 状态为 `development`；
+4. 页面进入开发工作台；
+5. 不自动创建或启动节点 StageRun；
 6. 后续对话直接修改 Working Graph，不再要求确认新 PlanRevision 才能改图。
 
-PlanRevision 继续作为“用户最初确认了什么”的规划记录，但开发期间的节点微调不强制
-生成新的 PlanRevision。需要追溯需求变化时，由 Graph 修改事件和运行记录承担。
+Preparation 中的 plan 继续作为“用户最初确认了什么”的创建快照，但开发期间不维护
+两份可编辑事实。Plan 不因节点微调重复提交；需要追溯需求变化时，由 Graph 修改事件
+和运行记录承担。
+
+新 EchoMind 会话不再通过旧 `confirm_experiment_plan` 创建文件型 Project。旧会话和
+旧文件 Project 保留只读兼容。
 
 ### 3.3 开发态
 
@@ -202,47 +236,56 @@ Project(development)
 |---|---|
 | 两个独立 Chat | Pyromind Workbench 与 EchoMind Manager |
 | 通用规划 | `experiment-planning`、PlanProposal、PlanRevision |
-| Project 创建 | 用户确认计划后创建文件型 Project/Graph |
-| Graph 模型 | 节点、边、拓扑校验、四种节点类型 |
+| Preparation | 远端 Checklist、证据、review 和 `create_project` 已合并 |
+| Project 创建 | SQL Project 已存在；旧文件 Project 路径仍在，待 S4 收敛 |
+| Graph 模型 | 本地节点、边、拓扑校验、四种节点类型 |
 | 持久任务执行 | `experiment_task_runs` |
 | 队列与恢复 | `runtime_work_items`、租约、代次、对账 |
 | Agent 角色 | Manager 和内部 Eval role |
 | 外部平台提交 | 幂等账本、Kafka/查询观察 |
+| 回调归属 | TaskCorrelation、子 Agent recipient 和恢复机制已合并 |
 | Artifact | 文件登记、SHA-256、基础读取 |
-| 阶段展示壳 | StageRun 和 `contract_probe` |
+| 阶段执行 | Agent-led Dataset StageRun、`waiting_user`、样例 Artifact 和中断回收 |
+| 执行验证壳 | `contract_probe` 节点验证和 Artifact |
 
 ### 4.2 当前缺口
 
 | 缺口 | 影响 |
 |---|---|
-| Working Graph 只能从 Plan 生成，没有开发态修改契约 | 用户不能随对话持续改图 |
-| 没有节点独立验证 API | 四个节点只能启动壳流程，不能按阶段调试 |
-| StageRun 没有关联 Runtime 队列和角色 | 刷新或重启后恢复能力不足 |
+| SQL Project 与文件 Project 仍可能各创建一份 | 出现两个 Project ID，Graph/Run 无法统一查询 |
+| StageRun 与 TaskRun 没有显式父子关联 | 平台回调只能回到会话，不能可靠落到节点运行 |
+| 新会话仍保留旧 `confirm_experiment_plan` 创建路径 | 与 Preparation `create_project` 语义重叠 |
+| Dataset 全量任务尚未完成真实平台闭环 | 小样之后还不能稳定生成 DatasetVersion |
 | 没有整图调试 Run | 无法验证依赖、Artifact 传递和失败传播 |
-| 四个真实 Executor 都未接入 | Dataset、Train、Inference、Evaluator 没有业务闭环 |
+| Train、Inference、Evaluator 真实 Executor 未接入 | 三个节点仍只有开发验证壳 |
 | 没有发布快照 | 无法区分可修改开发图和不可修改生产图 |
-| 前端主要展示 StageRun | 不能按节点查看配置、输入、输出和多次运行 |
+| 前端尚未覆盖完整平台任务恢复反馈 | 页面刷新后仍需从 StageRun 和 Chat 交叉确认 |
 
-### 4.3 两个可用 ID 的边界
+### 4.3 ID 与执行层级
 
 | ID | 含义 |
 |---|---|
-| `project_id` | 一个实验工作台 |
+| `project_id` | SQL Project 是唯一业务身份 |
 | `graph_id` | Project 当前 Working Graph 的稳定身份 |
 | `graph_run_id` | 某一次节点验证、整图调试或生产运行 |
 | `node_id` | Graph 中的节点 |
-| `node_run_id` | 某节点的一次执行 |
+| `stage_run_id` / `node_run_id` | 某节点的一次主运行；首期沿用现有 StageRun ID |
+| `task_run_id` | StageRun 内的一次确定性执行明细 |
 | `attempt` | 同一节点同一输入下的重试序号，仅用于区分执行记录 |
-| `task_id` | 外部平台任务 |
+| `external_task_id` | TaskRun 对应的外部平台任务；不再与 TaskRun ID 混用 |
 | `artifact_id` | 已验证产物 |
 | `conversation_id` | EchoMind Chat 会话 |
 
 `graph_run_id` 在开发态不携带版本语义。它只回答“这次运行使用的是什么快照、产生了
-什么结果”。
+什么结果”。StageRun 与 TaskRun 允许多种对应关系，首期闭环先按一个主要 TaskRun
+实现，但数据模型保留一对多能力。
 
 ## 5. 轻量数据模型
 
 ### 5.1 Project
+
+SQL Project 是身份权威来源。以下 JSON 是本地 Project/Graph 投影，不是第二份可独立
+创建的 Project。
 
 ```json
 {
@@ -295,6 +338,10 @@ development
   "modified_at": "2026-11-02T00:00:00Z"
 }
 ```
+
+`graph.project_id` 必须与 SQL Project ID 相同，并通过 UUID 规范化生成存储路径。
+`graph_id` 只标识图实例；Project API、StageRun、TaskRun 和 Artifact 都直接使用
+`project_id` 关联，不通过 `graph_id` 反查 Project。
 
 Working Graph 不增加：
 
@@ -352,23 +399,40 @@ Working Graph 不增加：
 首期没有 GraphRunCommand 表。用户或 Manager 的启动、重试、取消动作通过 API 请求键
 和 NodeRun/GraphRun 状态保证幂等。
 
-### 5.5 NodeRun
+### 5.5 StageRun 与 TaskRun
 
-继续扩展 `experiment_task_runs`，不新建平行执行表。新增：
+节点级主运行继续使用 `StageRun`，不为了改名重写现有 `/runs` 存储。确定执行明细
+继续使用 `experiment_task_runs`，两者通过显式 ID 关联：
+
+```text
+StageRun(project_id, stage_run_id)
+  -> TaskRun(stage_run_id, task_run_id)
+  -> external_task_id
+```
+
+StageRun 新增：
 
 | 字段 | 说明 |
 |---|---|
-| `graph_run_id` | 所属运行，旧的 standalone task 为 null |
-| `node_id` | Graph Node ID |
-| `attempt` | 该节点在当前 GraphRun 下的重试序号 |
+| `task_run_id` | 当前或主要执行明细；允许为空 |
+| `graph_run_id` | 所属整图运行，单节点验证时可为空 |
+| `node_id` | 所属 Graph Node |
 | `node_config_digest` | 节点配置指纹，用于判断验证是否过期 |
-| `input_bindings` | 本次实际输入 Artifact/Resource |
-| `output_bindings` | 本次已登记输出 Artifact |
+| `input_refs` / `output_refs` | 本次实际输入和输出引用 |
 | `waiting_reason` | 等待用户、平台或外部确认的原因 |
-| `started_at`、`finished_at` | 节点执行时间 |
 
-`task_id` 在 Graph 模式保存 `node_id` 或稳定的 node execution key，避免破坏现有非空
-列；Graph 身份以 `graph_run_id + node_id` 为准。
+TaskRun 新增：
+
+| 字段 | 说明 |
+|---|---|
+| `stage_run_id` | 所属节点级主运行；旧记录允许为空 |
+| `project_id` | 冗余业务索引，必须与 StageRun 相同 |
+| `request_key` | 执行幂等键 |
+| `task_spec` | 冻结的委派/Workflow/执行参数 |
+
+`StageRun.run_id`、`TaskRun` 的 SQL 主键和 `external_task_id` 必须在 API 返回中
+分别命名。平台 callback 先按 `external_task_id` 定位 TaskRun，再反查 StageRun 和
+Graph Node。
 
 ### 5.6 Artifact
 
@@ -566,6 +630,7 @@ Profile 和领域 Skill 不感知 EchoMind Project。
 
 ```text
 queued
+  -> clarifying
   -> running
   -> waiting_user
   -> waiting_external
@@ -951,7 +1016,7 @@ POST /api/echomind/projects/{project_id}/production-runs
 开发态页面需要增加：
 
 - Working Graph 的“开发中”状态；
-- 节点独立验证按钮；
+- 节点级执行历史和状态；
 - 节点最近一次成功验证和“已过期”状态；
 - 节点运行历史；
 - 当前输入和输出 Artifact；
@@ -1001,11 +1066,12 @@ POST /api/echomind/projects/{project_id}/production-runs
 | S1 | Project 开发态与可变 Graph | 否 |
 | S2 | 任意节点独立验证壳 | 否 |
 | S3 | Dataset 真实执行 | 是 |
-| S4 | Train 真实执行 | 是 |
-| S5 | Inference 真实执行 | 是 |
-| S6 | Evaluator 真实执行 | 是 |
-| S7 | 四节点整图调试 | 是 |
-| S8 | 发布冻结与手工生产运行 | 是 |
+| S4 | 统一 Project/Graph/StageRun/TaskRun 身份与执行链 | 否 |
+| S5 | Train 真实执行 | 是 |
+| S6 | Inference 真实执行 | 是 |
+| S7 | Evaluator 真实执行 | 是 |
+| S8 | 四节点整图调试 | 是 |
+| S9 | 发布冻结与手工生产运行 | 是 |
 
 ### 通用启动方式
 
@@ -1148,7 +1214,7 @@ Agent：
 
 前端：
 
-- 每个节点显示“验证”按钮；
+- 每个节点通过 Manager 对话单独发起研发和验证；
 - 展示最近一次验证状态；
 - 展示验证历史、时间、错误和 `node_validation_report`；
 - 配置修改后显示“验证已过期”；
@@ -1203,64 +1269,173 @@ Dataset 节点使用 `data-processing` 和远端 Sandbox 完成真实数据准�
 
 ### 16.2 实现内容
 
-- 新增 Dataset role；
-- role 加载 `data-processing`；
-- 绑定 `df_submit_pipeline`、`df_check_progress`、Storage 和 Sandbox 工具；
-- NodeRun 支持 `waiting_user`；
-- 小样结果和用户确认写回 NodeRun；
-- 全量提交关联 `external_task_submissions`；
-- Kafka/查询终态驱动 NodeRun；
-- ArtifactVerifier 校验数据、报告、split 和 fingerprint；
-- 生成 `avi.dataset_version`。
+S3 由 S3.0 通用契约、S3.1 小样、S3.2 平台全量和 S3.3 实现固化四个门禁组成。
+下面保留 S3.1/S3.2 的执行细节；通用契约和实现固化以新基线为准。
+
+#### S3.1：Agent 小样与用户确认
+
+- 新增独立 `dataset` 子角色，只加载通用 `data-processing` Skill 和数据处理执行工具；
+- EchoMind Manager 负责节点澄清、计划确认、交棒和 StageRun 记录，不亲自处理数据；
+- Manager 通过 `request_project_stage_task(role_id="dataset")` 创建 TaskRun；
+- Dataset `/start` 在投递会话命令前创建持久 StageRun，返回真实 `run_id`；
+- Agent-led StageRun 首先进入 `clarifying`，Manager 只读取 Graph/StageRun 并向用户
+  澄清节点目标、输入、输出和验收标准，不检查 Storage、不写文件、不跑小样；
+- 用户明确确认节点方案后，Manager 调用 `approve_project_stage_plan` 把同一个
+  StageRun 从 `clarifying` 切到 `running`，再进入实现和小样验证；
+- Dataset 子 Agent 从 `data-processing` 的 routing table 选择具体范式；AVI 只是
+  其中一个 reference，不进入通用 Graph schema；
+- EchoMind 专属扩展 Tool 只记录阶段结果，不进入通用 Tool Registry；
+- Dataset 子 Agent 在远端 Sandbox 完成真实小样，并由 Manager 根据真实结果调用
+  `record_project_stage_result`
+  写入 `waiting_user` 和 `dataset_sample_report`；
+- 重复 `request_id` 返回同一 Run，相同请求不会重复投递；
+- Runtime 重启时把失去执行进程的 Agent Run 标记为 failed，不留下永久 running。
+
+AVI reference 此前记录过 3 条源记录和 9 张图片的小样结果，但后续复查发现当时的
+自定义 validator 接受了不符合平台契约的标签。该验收状态已撤销，AVI reference
+必须以正式 `validate_prepared_data.py` 重新验证；其他场景按其 reference 约定执行。
+`waiting_user` 不能只由模型自写校验器触发。
+
+#### S3.2：用户确认后的平台全量
+
+- 前端对 `waiting_user` Run 提供“确认小样并提交全量”动作；
+- 确认接口通过稳定 `request_id` 和 `command_id` 幂等投递同一 EchoMind 会话；
+- Manager 创建新的 Dataset TaskRun，设置 `task.inputs.phase="execute"` 并交棒；
+- Dataset 子 Agent 使用 `df_submit_pipeline(mode="full")` 提交平台任务，不允许
+  用本地全量代替；
+- `df_submit_pipeline` 禁用任务创建重试；响应不确定时直接报错，不盲目提交第二次；
+- StageRun 记录 `external_task_id`、`output_uri`，状态进入 `waiting_external`；
+- Kafka/查询终态唤醒对应 Dataset TaskRun，由 Dataset 子 Agent 读取真实 report
+  和输出并回报；Manager 只记录结果；
+- 校验通过后调用 `record_project_stage_result(outcome="succeeded")`，生成
+  `dataset_version` Artifact；失败则记录真实错误；
+- 已进入 `waiting_external` 或完成的 Run 不自动重复提交平台任务。
+
+当前实现和验收状态：
+
+- StageRun 状态机、确认接口、DatasetVersion Artifact 和单次提交约束已有自动化覆盖；
+- 真实全量任务尚未创建，因为提供的平台 Cookie 被服务端判定为未登录；
+- `/std2/studio_api/api/object_info` 当前返回 401，不能用本地成功或单测替代真实验收；
+- 已在 `http://localhost:5173/?chat=echomind&userId=42` 通过真实前端创建新会话；
+  会话创建和 SSE 正常，首次远端 `terminal` 在页面返回
+  `sandbox terminal endpoint resolution failed: Failed to get api key: HTTP 401`；
+- 换用有效登录态后，只提交一次平台任务，并继续等待真实 callback 和产物校验。
 
 ### 16.3 验证内容
 
 自动化：
 
 - 小样前不提交全量；
-- 用户拒绝后 NodeRun cancelled；
 - 用户确认后只提交一次；
 - 提交响应不确定时不自动重提；
+- 重复确认请求不产生第二条命令或平台任务；
 - Kafka 重放幂等；
 - 缺文件、数量不一致、schema 错误导致 failed；
 - 通用 data-processing 测试无 EchoMind/AVI 分支。
 
+当前自动化回归：S3 StageRun、确认接口、阶段 Tool、Dataset 提交和共享 transport
+相关 62 个测试通过；`tests/pyromind_runtime` 全量回归为
+`702 passed, 8 skipped`。该结果只证明代码契约，不代表平台全量任务已经成功。
+
 手工：
 
 1. 为 Dataset 节点选择真实 Storage 输入；
-2. 点击节点验证；
-3. 检查 Manager/Chat 收到 Dataset role 的小样结果；
-4. 检查 NodeRun 状态为 waiting_user；
-5. 确认小样；
-6. 检查平台任务真实提交；
-7. 检查页面显示 platform task ID、output dir；
-8. 等待终态；
-9. 查看 DatasetVersion Artifact；
-10. 在 Train 节点验证时选择该 Artifact；
-11. 重启后端，确认不会重复提交。
+2. 在 Manager 对话中说明要开发的节点；
+3. 检查 Agent 首轮只提出节点澄清问题，StageRun 为 clarifying；
+4. 在对话中确认节点方案，检查 Agent 调用方案确认工具后 StageRun 变为 running；
+5. 检查 Manager 收到 Dataset 子 Agent 的真实小样结果；
+6. 检查 StageRun 状态为 waiting_user；
+7. 确认小样；
+8. 检查平台任务真实提交；
+9. 检查页面显示 platform task ID、output dir；
+10. 等待终态；
+11. 查看 `dataset_version` Artifact；
+12. 在 Train 节点验证时选择该 Artifact；
+13. 重启后端，确认不会重复提交。
 
 通过标准：
 
 - 真实数据可读；
-- 小样、确认、全量在同一 NodeRun 链路；
+- 小样、确认、全量在同一 StageRun 链路；
 - Artifact 可被下游选择；
 - 重启、重复事件和不确定提交不会重复执行。
 
 ### 16.4 回归影响
 
-- 其他三个节点仍使用 development stub；
-- 原 Dataset `/start` 在兼容模式下可继续投递会话命令；
-- 新路径验证通过后再切换前端主按钮；
+- 其他三个节点仍使用 contract probe；
+- Dataset `/start` 创建 Agent development Run；
+- 节点卡片不提供研发启动按钮，小样确认由 Dataset Run 的明确动作触发；
 - Workbench 通用 data-processing 行为不变。
 
-## 17. S4：Train 真实执行
+## 17. S4：身份与执行链接缝
 
 ### 17.1 阶段目标
+
+把远端 SQL Project/TaskRun 与本地 WorkingGraph/StageRun 收敛成一套身份和执行链。
+本阶段不增加 Train、Inference 或 Evaluator 的真实业务执行。
+
+### 17.2 实现内容
+
+- 新 EchoMind 会话只通过 Preparation + `create_project` 创建 Project；
+- SQL 创建成功后按同一个 `project_id` 幂等物化 WorkingGraph；
+- Graph 读取和 Project 打开时自动修复“Project 存在但 Graph 缺失”；
+- 新会话停止通过旧 `confirm_experiment_plan` 创建第二份文件 Project；
+- WorkingGraph 成为开发态节点和边的事实源；
+- StageRun 增加 `task_run_id`；
+- `experiment_task_runs` 增加 `stage_run_id`；
+- TaskCorrelation 增加 `project_id`、`stage_run_id` 和 `task_run_id`；
+- 创建 Project 不自动启动节点，节点启动时才创建 StageRun；
+- 需要角色、Workflow 或平台任务时，在 StageRun 下创建 TaskRun；
+- EchoMind 专属工具 `request_project_stage_task` 显式提供“在 StageRun 下请求
+  角色任务”的入口，创建 TaskRun 后立即把 `task_run_id` 绑定回 StageRun；
+- 平台执行事件提供 `project_id -> stage_run_id -> task_run_id` 链路，通用 Workbench
+  的 `request_experiment_task` 契约保持不变。
+
+### 17.3 验证内容
+
+自动化：
+
+- Preparation 创建前没有 Project ID；
+- 用户确认后只产生一个 SQL Project；
+- SQL Project、graph.json、StageRun 和 TaskRun 使用同一个 `project_id`；
+- 相同 `create_project` command 幂等；
+- Graph 缺失时按原 Project ID 补齐；
+- 启动 Dataset 节点只创建一个 StageRun；
+- callback 能按 external task -> TaskRun -> StageRun -> Node 回写；
+- 重启和重复请求不会创建重复 Project/Run。
+
+页面：
+
+1. 新建 EchoMind 会话并完成 Preparation；
+2. 确认计划并创建 Project；
+3. 刷新页面，确认 Project 和 Graph 仍使用同一个 ID；
+4. 启动 Dataset 节点，确认出现 StageRun；
+5. 触发一次确定性执行，确认关联 TaskRun；
+6. 检查页面 Run 历史没有重复 Project；
+7. 打开 Workbench 会话，确认不受影响。
+
+通过标准：
+
+- 新链路没有文件型 Project 和 SQL Project 并行创建；
+- Project、Graph、StageRun、TaskRun 可双向定位；
+- 开发态修改 Graph 不需要创建版本；
+- 旧会话可读取，但不能触发新的双创建路径。
+
+### 17.4 回归影响
+
+- Workbench 双 Agent 入口不变；
+- 旧 StageRun、旧 ExperimentExecution 和旧文件 Project 保持可读；
+- 新 EchoMind Project 不再走旧确认创建路径；
+- Dataset 现有小样、确认和提交逻辑复用，不重写数据 Pipeline。
+
+## 18. S5：Train 真实执行
+
+### 18.1 阶段目标
 
 Train 节点消费 DatasetVersion，生成并校验 Workflow，创建真实训练任务，产出完整
 checkpoint Artifact。
 
-### 17.2 实现内容
+### 18.2 实现内容
 
 - 新增 Train role；
 - 加载 `generate-workflow-dsl`；
@@ -1272,7 +1447,7 @@ checkpoint Artifact。
 - checkpoint Manifest 校验；
 - 失败错误结构化。
 
-### 17.3 验证内容
+### 18.3 验证内容
 
 自动化：
 
@@ -1305,21 +1480,21 @@ checkpoint Artifact。
 - checkpoint 可被 Inference 选择；
 - 失败和不确定提交行为正确。
 
-### 17.4 回归影响
+### 18.4 回归影响
 
 - Dataset 节点继续可独立验证；
 - 未完成的 Inference/Evaluator 仍使用 stub；
 - 交互式 `submit_workflow` 的 Workbench 行为不变；
 - Graph 训练提交由独立 port 完成，不污染通用 Tool。
 
-## 18. S5：Inference 真实执行
+## 19. S6：Inference 真实执行
 
-### 18.1 阶段目标
+### 19.1 阶段目标
 
 Inference 节点消费 DatasetVersion 和 checkpoint，提交真实推理任务，生成可验证的
 predictions。
 
-### 18.2 实现内容
+### 19.2 实现内容
 
 - Eval role 增加 Inference Node operation；
 - 绑定 `df_submit_evaluation(operation="inference")`；
@@ -1328,7 +1503,7 @@ predictions。
 - 校验 predictions 覆盖率、sample ID 和模型指纹；
 - 生成 `avi.prediction_set`。
 
-### 18.3 验证内容
+### 19.3 验证内容
 
 自动化：
 
@@ -1358,19 +1533,19 @@ predictions。
 - 失败不会伪造结果；
 - Evaluator 可以选择该 Artifact。
 
-### 18.4 回归影响
+### 19.4 回归影响
 
 - Dataset 和 Train 单独验证仍通过；
 - Evaluator stub 不依赖预测内部格式的额外假设；
 - 通用 inference-evaluation 测试保持通过。
 
-## 19. S6：Evaluator 真实执行
+## 20. S7：Evaluator 真实执行
 
-### 19.1 阶段目标
+### 20.1 阶段目标
 
 Evaluator 节点消费 predictions 和真值，生成确定性指标、评测结果和标准报告。
 
-### 19.2 实现内容
+### 20.2 实现内容
 
 - Eval role 增加 score/report operation；
 - 绑定 `df_submit_evaluation(operation="score")`；
@@ -1379,7 +1554,7 @@ Evaluator 节点消费 predictions 和真值，生成确定性指标、评测结
 - 生成 `avi.metrics`、`avi.eval_result`、`avi.atif_report`；
 - 前端读取并展示指标和报告。
 
-### 19.3 验证内容
+### 20.3 验证内容
 
 自动化：
 
@@ -1410,21 +1585,21 @@ Evaluator 节点消费 predictions 和真值，生成确定性指标、评测结
 - 指标和样本覆盖一致；
 - 可以作为整图调试的最终节点。
 
-### 19.4 回归影响
+### 20.4 回归影响
 
 - 四个节点现在都能独立真实验证；
 - 每个节点仍可反复启动和查看历史；
 - 不引入版本；
 - 整图调试尚未自动启用，避免一次性引入过多行为。
 
-## 20. S7：四节点整图调试
+## 21. S8：四节点整图调试
 
-### 20.1 阶段目标
+### 21.1 阶段目标
 
 使用当前 Working Graph 的快照，从 Dataset 开始串行推进完整四节点，验证依赖、
 Artifact 绑定、失败暂停和重启恢复。
 
-### 20.2 实现内容
+### 21.2 实现内容
 
 - GraphScheduler `tick()`；
 - 当前 Graph 快照；
@@ -1436,7 +1611,7 @@ Artifact 绑定、失败暂停和重启恢复。
 - Manager 读取失败并决定重试；
 - 允许运行期间继续修改 Working Graph。
 
-### 20.3 验证内容
+### 21.3 验证内容
 
 自动化：
 
@@ -1475,21 +1650,21 @@ Artifact 绑定、失败暂停和重启恢复。
 - 失败、重试、恢复可用；
 - 不需要逐节点 Manager 确认。
 
-### 20.4 回归影响
+### 21.4 回归影响
 
 - 单节点验证保持可用；
 - 单节点 Run 不参与整图状态；
 - 旧 StageRun 只读兼容；
 - Workbench 不受影响。
 
-## 21. S8：发布冻结与手工生产运行
+## 22. S9：发布冻结与手工生产运行
 
-### 21.1 阶段目标
+### 22.1 阶段目标
 
 将已验证的当前 Graph 固化为 Published Graph，禁止修改，并支持手工创建只读该快照的
 生产运行。
 
-### 21.2 实现内容
+### 22.2 实现内容
 
 - 发布 readiness 计算；
 - Published Graph 生成；
@@ -1500,7 +1675,7 @@ Artifact 绑定、失败暂停和重启恢复。
 - 前端发布确认和只读页面；
 - 首期手工触发，不接 cron/event。
 
-### 21.3 验证内容
+### 22.3 验证内容
 
 自动化：
 
@@ -1534,17 +1709,18 @@ Artifact 绑定、失败暂停和重启恢复。
 - Production Run 可复现发布图；
 - 首期不依赖版本列表。
 
-### 21.4 回归影响
+### 22.4 回归影响
 
 - Development 历史保持只读；
 - 已发布 Project 的 Chat 只能查询和辅助分析；
 - 新 Project 仍可从 development 开始；
 - 未来版本管理可以在 Published Graph 层追加，不影响开发态。
 
-## 22. 测试矩阵
+## 23. 测试矩阵
 
 | 范围 | 必测 |
 |---|---|
+| Project/Run 接缝 | 唯一 Project、Graph 补齐、StageRun/TaskRun 双向关联、callback |
 | Graph 修改 | add/update/remove、边、环、刷新、并发写 |
 | Project 生命周期 | development 可改、frozen 拒绝改 |
 | Node validation | 四节点启动、成功、失败、取消、重试、过期 |
@@ -1573,29 +1749,34 @@ workspace/acceptance/echomind-project-dev/
   s1-graph-edit.png
   s2-node-runs.json
   s3-dataset-artifact.json
-  s4-train-checkpoint.json
-  s5-predictions.json
-  s6-evaluator-report.json
-  s7-graph-run.jsonl
-  s8-published-graph.json
+  s4-project-run-links.json
+  s5-train-checkpoint.json
+  s6-predictions.json
+  s7-evaluator-report.json
+  s8-graph-run.jsonl
+  s9-published-graph.json
   verification.md
 ```
 
 不得保存 Cookie、Token、Authorization、API key 或签名 URL。
 
-## 23. 分阶段合并策略
+## 24. 分阶段合并策略
 
 建议每个阶段单独提交和验证：
 
 ```text
 S1：Project graph editing + frontend graph refresh
 S2：Node validation shell + frontend controls
-S3：Dataset real executor
-S4：Train real executor
-S5：Inference real executor
-S6：Evaluator real executor
-S7：Graph debug scheduler
-S8：Publish and manual production run
+S3.0：Generic Node/Port/ExecutorBinding/NodeRun contract
+S3.1：Dataset Agent sample + user confirmation
+S3.2：Dataset platform full task + DatasetVersion
+S3.3：Dataset immutable implementation + draft ExecutorBinding
+S4：Project/Graph/StageRun/TaskRun identity seam
+S5：Train real executor
+S6：Inference real executor
+S7：Evaluator real executor
+S8：Graph debug scheduler
+S9：Publish and manual production run
 ```
 
 约束：
@@ -1613,6 +1794,7 @@ S8：Publish and manual production run
 ECHOMIND_PROJECT_GRAPH_EDITING=0
 ECHOMIND_NODE_VALIDATION=0
 ECHOMIND_DATASET_EXECUTOR=0
+ECHOMIND_PROJECT_RUN_SEAM=0
 ECHOMIND_TRAIN_EXECUTOR=0
 ECHOMIND_INFERENCE_EXECUTOR=0
 ECHOMIND_EVALUATOR_EXECUTOR=0
@@ -1620,28 +1802,24 @@ ECHOMIND_GRAPH_DEBUG_RUN=0
 ECHOMIND_PROJECT_PUBLISH=0
 ```
 
-## 24. 首期实现顺序
+## 25. 首期实现顺序
 
-下一步只做 S1，不同时做 NodeRun 和真实 Executor。
+S1 和 S2 已完成：Working Graph 可修改，四个节点都能独立启动验证壳。
+S3 已形成 Dataset 开发链路：通用 Node/Executor 契约、Agent 小样、确认和平台提交
+代码均已存在；真实小样和平台全量的最终验收证据仍以本文 S3 小节记录为准。
+Dataset 使用独立的 `dataset` 子角色；Manager 只负责澄清、交棒和记录。不得在通用
+`data-processing` 中加入 EchoMind/AVI 分支，场景差异只放在 reference 和节点配置。
 
-S1 的交付物：
-
-```text
-Project 保持 development
-  + Working Graph 可修改
-  + Manager 可通过结构化工具改图
-  + 页面刷新可见
-  + 不引入 GraphRevision
-  + 不启动任何业务任务
-```
-
-S1 通过后再做 S2，让四个节点都能单独启动和验证。S2 通过后，按 Dataset、Train、
-Inference、Evaluator 顺序逐阶段接入真实执行。
+远端合并后新增 S4 接缝，用来避免 SQL Project 与文件 Project、StageRun 与 TaskRun
+继续形成两套身份。S4 通过后再进入 Train。
 
 这条路径的关键门禁是：
 
 1. S1 确认“开发态真的是可变的”；
 2. S2 确认“每个阶段都能单独启动和观察”；
-3. S3-S6 确认“每个真实业务节点都能独立验证”；
-4. S7 确认“当前图可以整体调试”；
-5. S8 确认“发布才固化，生产只读发布快照”。
+3. S3.0 确认 Node、Port、ExecutorBinding 和 NodeRun 是通用契约；
+4. S3.1-S3.3 确认 Dataset 从正式小样、平台全量到实现固化可以闭环；
+5. S4 确认 SQL Project、WorkingGraph、StageRun 和 TaskRun 只有一条身份链；
+6. S5-S7 确认 Train、Inference 和 Evaluator 可以独立验证；
+7. S8 确认“当前图可以整体调试”；
+8. S9 确认“发布才固化，生产只读发布快照”。

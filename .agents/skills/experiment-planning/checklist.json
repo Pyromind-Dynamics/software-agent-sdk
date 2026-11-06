@@ -1,0 +1,136 @@
+{
+  "checklist_id": "experiment-planning",
+  "version": 3,
+  "create_project_starts_entry_task": false,
+  "allowed_roles": [
+    "dataset",
+    "train",
+    "inference",
+    "eval"
+  ],
+  "fields": [
+    {
+      "key": "goal",
+      "label": "实验目标",
+      "description": "要解决的问题、期望产物和本轮验收范围",
+      "value_type": "string"
+    },
+    {
+      "key": "dataset",
+      "label": "数据来源",
+      "description": "训练、验证和执行数据的 Storage 位置与格式",
+      "value_type": "object",
+      "required_keys": [
+        "path",
+        "format"
+      ]
+    },
+    {
+      "key": "io_contract",
+      "label": "输入输出契约",
+      "description": "样本字段、提示词、媒体角色和模型输出含义",
+      "value_type": "object",
+      "required_keys": [
+        "input",
+        "output"
+      ],
+      "depends_on": [
+        "dataset"
+      ]
+    },
+    {
+      "key": "training",
+      "label": "训练配置",
+      "description": "基模、训练方式和已知训练约束",
+      "value_type": "object",
+      "required_keys": [
+        "model",
+        "objective"
+      ],
+      "depends_on": [
+        "dataset",
+        "io_contract"
+      ]
+    },
+    {
+      "key": "evaluation",
+      "label": "评测依据",
+      "description": "GT、参考结果或确定性评分规则",
+      "value_type": "object",
+      "required_keys": [
+        "basis"
+      ],
+      "depends_on": [
+        "dataset",
+        "io_contract"
+      ]
+    },
+    {
+      "key": "scope",
+      "label": "执行范围",
+      "description": "本轮只验证哪些节点，以及小样、全量或资源限制",
+      "value_type": "object",
+      "required_keys": [
+        "mode"
+      ]
+    }
+  ],
+  "workflow_nodes": [
+    {
+      "id": "dataset",
+      "name": "Dataset",
+      "description": "读取、校验、转换和划分数据，产出可追溯的数据版本。",
+      "roles": [
+        "dataset"
+      ],
+      "tasks": [
+        {
+          "id": "prepare_dataset",
+          "description": "按目标场景的数据处理能力完成校验、清洗、转换和划分。"
+        }
+      ]
+    },
+    {
+      "id": "train",
+      "name": "Train",
+      "description": "创建或复用平台工作流完成训练，登记 checkpoint 和训练产物。",
+      "roles": [
+        "train"
+      ],
+      "tasks": [
+        {
+          "id": "train_model",
+          "description": "使用确认的数据和训练配置生成模型产物。"
+        }
+      ]
+    },
+    {
+      "id": "inference",
+      "name": "Inference",
+      "description": "使用训练产物或指定模型对评测数据执行推理。",
+      "roles": [
+        "inference"
+      ],
+      "tasks": [
+        {
+          "id": "run_inference",
+          "description": "生成可被 Evaluator 消费的预测结果。"
+        }
+      ]
+    },
+    {
+      "id": "evaluator",
+      "name": "Evaluator",
+      "description": "按确认的评分依据执行确定性评测并生成报告。",
+      "roles": [
+        "eval"
+      ],
+      "tasks": [
+        {
+          "id": "evaluate",
+          "description": "计算指标并输出与标准格式兼容的评测产物。"
+        }
+      ]
+    }
+  ]
+}

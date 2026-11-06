@@ -521,6 +521,54 @@ async def test_stale_runner_exit_does_not_clear_replacement_or_emit_error(
     await adapter.close(handle)
 
 
+async def test_concurrent_runner_restart_waits_for_handshake(
+    tmp_path, monkeypatch
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowStartRunner(_LifecycleFakeRunner):
+        async def start(self, _config) -> None:
+            if len(self.instances) == 1:
+                return
+            started.set()
+            await release.wait()
+
+    _LifecycleFakeRunner.instances.clear()
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", SlowStartRunner)
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="concurrent-restart",
+            user_id="42",
+            workspace_root=str(conversations / "concurrent-restart"),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+        ),
+        RequestContext(user_id="42"),
+    )
+    session = adapter._session(handle.session_id)
+    history = await session.queue.get()
+    assert history is not None and history.type == "history.synced"
+
+    try:
+        session.runner_restart_pending = True
+        first = asyncio.create_task(adapter._ensure_runner(session))
+        async with asyncio.timeout(2):
+            await started.wait()
+        second = asyncio.create_task(adapter._ensure_runner(session))
+        await asyncio.sleep(0)
+        assert not second.done()
+
+        release.set()
+        await asyncio.gather(first, second)
+        assert session.runner is SlowStartRunner.instances[-1]
+        assert len(SlowStartRunner.instances) == 2
+    finally:
+        await adapter.close(handle)
+
+
 async def test_planned_shutdown_preserves_inflight_for_attach_recovery(
     tmp_path, monkeypatch
 ) -> None:
@@ -1755,6 +1803,17 @@ def test_session_config_persists_model_api_resolution() -> None:
         )
     )
     assert config["extra"] == {"training_analysis_timeout_seconds": 45}
+    assert config["agentgenome_enabled"] is True
+
+    disabled = _session_config(
+        SessionSpec(
+            conversation_id="conversation-no-genome",
+            user_id="42",
+            workspace_root="/tmp/conversation-no-genome",
+            agentgenome_enabled=False,
+        )
+    )
+    assert disabled["agentgenome_enabled"] is False
 
 
 def test_pyromind_llm_config_rejects_unknown_model_api() -> None:

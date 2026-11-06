@@ -89,12 +89,18 @@ def submission_config(params: dict[str, Any]) -> SubmissionConfig:
     return config
 
 
-def submission_client(config: SubmissionConfig, conversation: BaseConversation) -> Any:
+def submission_client(
+    config: SubmissionConfig,
+    conversation: BaseConversation,
+    *,
+    max_retries: int = 3,
+) -> Any:
     return create_workflow_api_client(
         env=config.env,
         cluster=config.cluster,
         headers=config.headers,
         timeout=config.timeout,
+        max_retries=max_retries,
         auth_token=cast(
             "ConversationState", conversation.state
         ).secret_registry.get_secret_value(PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET),

@@ -1,6 +1,13 @@
 # EchoMind 实验执行与 Eval
 
-本页描述当前实验模式，替代早期“确认 Graph → 生成执行提案”的流程。旧提案和计划接口保留读取兼容，不用于新任务的执行授权。
+> 历史专项记录：本文记录 2026-11-02 的 Eval baseline、恢复和验收结果。
+> 当前 Graph、Node、Executor、发布与 Runtime 实现基线见
+> `docs/echomind-graph-executor-implementation.md`。
+> Agent 入口和 Profile 边界见 `docs/echomind-dual-agent-change-design.md`。
+> 文中的“当前模式”和“仅启用 Eval”描述只代表当时的实现状态，不作为后续
+> Dataset、Train、Inference 和 Evaluator 的开发范围依据。
+
+本页描述当时的实验模式，替代早期“确认 Graph → 生成执行提案”的流程。旧提案和计划接口保留读取兼容，不用于新任务的执行授权。
 
 ## 执行链路
 
@@ -12,7 +19,8 @@
 
 - Pi 0.87.0 执行 Manager 和 Eval；pi-subagents 0.78.0 负责子角色配置加载、启动、状态、中断、继续和停止。通过公开扩展工厂和 RPC 接入，不修改插件源码。
 - Adapter 关闭受管子任务的原生父级自动唤醒；SQL 队列统一串行投递结果，避免重复回答。非受管会话保留原行为。
-- AgentGenome 0.6.60 保留原集成，不作为 baseline 成功的前提。
+- AgentGenome 0.6.60 保留给原有 Workbench 集成；EchoMind Profile 不加载历史经验查询，
+  也不把它作为 baseline 成功的前提。
 - Eval 复用 `inference-evaluation` Skill、`df_submit_evaluation`、`df_check_progress` 和既有 PipelineRuns、DSL、评分、报告实现。没有新增一套评分执行器。
 - Runtime 只处理归属、委派、状态、幂等、结果证据和持久队列。Harness 差异均在 Adapter 内。场景规则、Prompt、白名单放 Profile 与 Skill。
 

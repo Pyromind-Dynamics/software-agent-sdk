@@ -66,6 +66,8 @@ const DEFAULT_MAX_RECONNECTS = 2;
  * a whole startup budget on a dead connection.
  */
 const DEFAULT_SESSION_PROBE_MS = 30_000;
+/** Budget for one acknowledged control exchange after the socket is open. */
+const DEFAULT_EXCHANGE_TIMEOUT_MS = 15_000;
 /** How many replacement endpoints one command may be replayed on. */
 const MAX_ENDPOINT_REFRESHES = 1;
 /**
@@ -79,6 +81,15 @@ const DEFAULT_RESOLVE_RETRY_BASE_MS = 1_000;
 /** Cap on one backoff between endpoint-resolution retries. */
 const MAX_RESOLVE_RETRY_DELAY_MS = 30_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 180_000;
+/**
+ * How long the launch socket gets to answer a small probe before observation
+ * moves to a fresh terminal connection.
+ *
+ * The remote bridge can accept the launch input and then stop delivering output
+ * from that socket without closing it. The workload is already detached, so a
+ * replacement watcher can safely continue from ``out.log`` without relaunching.
+ */
+const DEFAULT_OBSERVE_START_TIMEOUT_MS = 5_000;
 const DEFAULT_COMMAND_TIMEOUT_SECONDS = 300;
 const DEFAULT_QUEUE_TIMEOUT_MS = 30_000;
 const STOP_TIMEOUT_MS = 10_000;
@@ -146,8 +157,12 @@ export interface SandboxTerminalTimeouts {
   startupTimeoutMs?: number;
   /** Budget for waiting behind another command using the same terminal. */
   queueTimeoutMs?: number;
+  /** Budget for one acknowledged exchange after the socket is open. */
+  exchangeTimeoutMs?: number;
   /** Budget for confirming that a cancelled process group stopped. */
   stopTimeoutMs?: number;
+  /** Budget for proving a watch started before moving it to a fresh socket. */
+  observeStartTimeoutMs?: number;
 }
 
 export interface SandboxTerminalOptions extends SandboxTerminalTimeouts {
@@ -211,6 +226,11 @@ export function sandboxTerminalTimeouts(env: NodeJS.ProcessEnv = process.env): S
     resolveTimeoutMs: positiveNumber(env, "PYROMIND_PI_TERMINAL_RESOLVE_TIMEOUT_MS", "milliseconds"),
     startupTimeoutMs: positiveNumber(env, "PYROMIND_PI_TERMINAL_STARTUP_TIMEOUT_MS", "milliseconds"),
     queueTimeoutMs: positiveNumber(env, "PYROMIND_PI_TERMINAL_QUEUE_TIMEOUT_MS", "milliseconds"),
+    exchangeTimeoutMs: positiveNumber(
+      env,
+      "PYROMIND_PI_TERMINAL_EXCHANGE_TIMEOUT_MS",
+      "milliseconds",
+    ),
   };
 }
 
@@ -365,6 +385,10 @@ export class TerminalMarkerScanner {
 
   get done(): boolean {
     return this.finished;
+  }
+
+  get began(): boolean {
+    return this.begun;
   }
 
   push(data: Buffer): { output: Buffer; exitCode?: number } {
@@ -983,6 +1007,36 @@ export class SandboxTerminalOperations implements BashOperations {
     return Date.now() + (this.settings.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS);
   }
 
+  private exchangeDeadline(deadline: number): number {
+    return Math.min(
+      deadline,
+      Date.now() + (this.settings.exchangeTimeoutMs ?? DEFAULT_EXCHANGE_TIMEOUT_MS),
+    );
+  }
+
+  private async exchangeAcknowledge(
+    channel: TerminalChannel,
+    evidence: TerminalExecutionEvidence,
+    command: string,
+    marker: string,
+    deadline: number,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    try {
+      return await this.acknowledge(
+        channel,
+        evidence,
+        command,
+        marker,
+        this.exchangeDeadline(deadline),
+        signal,
+      );
+    } catch (error) {
+      if (isTimeout(error)) throw new Error("exchange_timeout");
+      throw error;
+    }
+  }
+
   /**
    * One acknowledged exchange, counted for latency diagnosis.
    */
@@ -1111,8 +1165,14 @@ export class SandboxTerminalOperations implements BashOperations {
     let staged = false;
     for (let index = 0; index < batches.length; index += 1) {
       const batch = batches[index]!;
-      const value = await this.acknowledge(channel, evidence, batch.command,
-        `${ACK_MARKER}${token}:${batch.stage}:`, deadline, options.signal);
+      const value = await this.exchangeAcknowledge(
+        channel,
+        evidence,
+        batch.command,
+        `${ACK_MARKER}${token}:${batch.stage}:`,
+        deadline,
+        options.signal,
+      );
       staged = index === batches.length - 1 && value === "ok";
     }
     return staged;
@@ -1137,12 +1197,24 @@ export class SandboxTerminalOperations implements BashOperations {
     privateStaging = false,
   ): Promise<void> {
     for (const line of buildStageLines(dir, token, files, privateStaging, this.scriptChunkChars)) {
-      await this.acknowledge(channel, evidence, line.command,
-        `${ACK_MARKER}${token}:${line.stage}:`, deadline, options.signal);
+      await this.exchangeAcknowledge(
+        channel,
+        evidence,
+        line.command,
+        `${ACK_MARKER}${token}:${line.stage}:`,
+        deadline,
+        options.signal,
+      );
     }
     const check = buildStageCheckLine(dir, token, files);
-    const staged = await this.acknowledge(channel, evidence, check.command,
-      `${ACK_MARKER}${token}:${check.stage}:`, deadline, options.signal);
+    const staged = await this.exchangeAcknowledge(
+      channel,
+      evidence,
+      check.command,
+      `${ACK_MARKER}${token}:${check.stage}:`,
+      deadline,
+      options.signal,
+    );
     if (staged !== "ok") throw new Error("sandbox terminal script staging failed");
   }
 
@@ -1222,7 +1294,6 @@ export class SandboxTerminalOperations implements BashOperations {
         const readyDeadline = warm
           ? Math.min(startupDeadline, Date.now() + this.probeTimeoutMs)
           : startupDeadline;
-        let handshakeDone = false;
         try {
           // Fail closed if echo/history disabling cannot be confirmed. No secrets
           // are sent before this acknowledgement, and no raw setup output is kept.
@@ -1232,7 +1303,6 @@ export class SandboxTerminalOperations implements BashOperations {
           const ready = await this.acknowledge(channel, evidence,
             buildReadyLine(harnessDir, token, harness, environment?.signature),
             `${ACK_MARKER}${token}:ready:`, readyDeadline, options.signal);
-          handshakeDone = true;
           mark("ready", phase);
           if (ready !== "ok") {
             if (ready === "missing") {
@@ -1297,7 +1367,8 @@ export class SandboxTerminalOperations implements BashOperations {
           if (!evidence.started) {
             dispatched = true; // Once sent (or possibly sent), never launch it again.
             phase = Date.now();
-            await this.acknowledge(channel, evidence, buildStartLine(harnessDir, runDir, token, withEnvironment),
+            await this.acknowledge(channel, evidence,
+              buildStartLine(harnessDir, runDir, token, withEnvironment),
               `${ACK_MARKER}${token}:launch:`, startupDeadline, options.signal);
             mark("launch", phase);
             // The acknowledgement proves the launch line ran, so the happy path
@@ -1313,7 +1384,8 @@ export class SandboxTerminalOperations implements BashOperations {
           // is allowed to read a timeout that way: once the shell answered, a
           // later timeout is a slow or lost exchange, not a dead socket.
           const recoverable = isConnectionLost(error) ||
-            (warm && isTimeout(error) && !handshakeDone && !dispatched);
+            isExchangeTimeout(error) ||
+            (warm && isTimeout(error) && !dispatched);
           if (!recoverable) throw error;
           this.retire(channel);
           // Once the launch line is sent the run may exist, so the replacement
@@ -1342,8 +1414,14 @@ export class SandboxTerminalOperations implements BashOperations {
             // the command deadline stays the outer bound.
             const pollDeadline = Math.min(deadline, this.prepareDeadline());
             const phase = Date.now();
-            const state = await this.acknowledge(channel, evidence, buildResumeLine(runDir, token),
-              `${ACK_MARKER}${token}:started:`, pollDeadline, options.signal);
+            const state = await this.exchangeAcknowledge(
+              channel,
+              evidence,
+              buildResumeLine(runDir, token),
+              `${ACK_MARKER}${token}:started:`,
+              pollDeadline,
+              options.signal,
+            );
             mark("started", phase);
             if (state === "ok") evidence.started = true;
             else await bounded(new Promise((resolve) => setTimeout(resolve, 50)), pollDeadline, options.signal);
@@ -1351,24 +1429,49 @@ export class SandboxTerminalOperations implements BashOperations {
           evidence.phase = "observing";
           const scanner = new TerminalMarkerScanner(token);
           const phase = Date.now();
-          const exitCode = await channel.receive<number | null>(
-            `sh ${shellQuote(`${harnessDir}/watch.sh`)} ${shellQuote(runDir)} ${token}\n`, deadline, options.signal,
-            (chunk, resolve) => {
-              const result = scanner.push(chunk);
-              if (result.output.length) options.onData(result.output);
-              if (scanner.done) resolve(result.exitCode ?? null);
-            });
-          mark("watch", phase);
-          // END proves an exit code, but cancellation additionally checks the
-          // process group. Normal completion preserves rc as durable evidence.
-          evidence.phase = "finished";
-          evidence.stopped = true;
-          evidence.timings_ms = { ...timings, total: Date.now() - openedAt };
-          return { exitCode, execution: { ...evidence } };
+          const stall = new AbortController();
+          const observeSignal = combineSignals(options.signal, stall.signal);
+          let begun = false;
+          const startTimer = setTimeout(() => {
+            if (!begun) stall.abort();
+          }, this.settings.observeStartTimeoutMs ?? DEFAULT_OBSERVE_START_TIMEOUT_MS);
+          try {
+            const exitCode = await channel.receive<number | null>(
+              `sh ${shellQuote(`${harnessDir}/watch.sh`)} ${shellQuote(runDir)} ${token}\n`,
+              deadline,
+              observeSignal,
+              (chunk, resolve) => {
+                const result = scanner.push(chunk);
+                if (scanner.began) begun = true;
+                if (result.output.length) options.onData(result.output);
+                if (scanner.done) resolve(result.exitCode ?? null);
+              },
+            );
+            clearTimeout(startTimer);
+            mark("watch", phase);
+            // END proves an exit code, but cancellation additionally checks the
+            // process group. Normal completion preserves rc as durable evidence.
+            evidence.phase = "finished";
+            evidence.stopped = true;
+            evidence.timings_ms = { ...timings, total: Date.now() - openedAt };
+            return { exitCode, execution: { ...evidence } };
+          } catch (error) {
+            if (stall.signal.aborted && !options.signal?.aborted && !begun) {
+              if (attempt === this.maxReconnects) throw new Error("closed");
+              this.retire(channel);
+              channel = this.channel();
+              continue;
+            }
+            if (!isConnectionLost(error) || attempt === this.maxReconnects) throw error;
+            channel.close();
+            channel = this.channel(); // Only observe, never resend the launch.
+          } finally {
+            clearTimeout(startTimer);
+          }
         } catch (error) {
           if (!isConnectionLost(error) || attempt === this.maxReconnects) throw error;
           channel.close();
-          channel = this.channel(); // Only observe, never resend the launch.
+          channel = this.channel();
         }
       }
       throw new Error("closed");
@@ -1563,8 +1666,30 @@ function isTimeout(error: unknown): boolean {
   return error instanceof Error && error.message === "timeout";
 }
 
+function isExchangeTimeout(error: unknown): boolean {
+  return error instanceof Error && error.message === "exchange_timeout";
+}
+
 function isAborted(error: unknown): boolean {
   return error instanceof Error && error.message === "aborted";
+}
+
+function combineSignals(
+  ...signals: (AbortSignal | undefined)[]
+): AbortSignal {
+  const active = signals.filter(
+    (signal): signal is AbortSignal => signal !== undefined,
+  );
+  if (active.length === 1) return active[0]!;
+  const combined = new AbortController();
+  for (const signal of active) {
+    if (signal.aborted) {
+      combined.abort();
+      break;
+    }
+    signal.addEventListener("abort", () => combined.abort(), { once: true });
+  }
+  return combined.signal;
 }
 
 /**

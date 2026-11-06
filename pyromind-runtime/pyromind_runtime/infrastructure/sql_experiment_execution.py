@@ -34,6 +34,7 @@ runs = sa.Table(
     sa.Column("id", sa.String(64), primary_key=True),
     sa.Column("owner", sa.String(64), nullable=False),
     sa.Column("project_id", sa.String(64), nullable=False),
+    sa.Column("stage_run_id", sa.String(64)),
     sa.Column("revision", sa.Integer),
     sa.Column("task_spec", sa.JSON),
     sa.Column("result", sa.JSON),
@@ -50,6 +51,7 @@ runs = sa.Table(
     sa.Column("decision", sa.String(16)),
     sa.Column("metrics", sa.JSON),
     sa.Column("created_at", sa.DateTime, nullable=False),
+    sa.Index("ix_experiment_task_runs_stage_run", "stage_run_id"),
     **_TABLE_OPTIONS,
 )
 submissions = sa.Table(
@@ -176,6 +178,7 @@ class SQLExperimentExecutionStore:
         request_id: str,
         *,
         task_spec: dict | None = None,
+        stage_run_id: str | None = None,
     ) -> dict:
         if task_spec:
             validate_persisted_payload(task_spec)
@@ -189,6 +192,7 @@ class SQLExperimentExecutionStore:
                 role,
                 request_id,
                 task_spec=task_spec,
+                stage_run_id=stage_run_id,
             )
 
     def request_in_transaction(
@@ -202,6 +206,7 @@ class SQLExperimentExecutionStore:
         request_id: str,
         *,
         task_spec: dict | None = None,
+        stage_run_id: str | None = None,
     ) -> dict:
         key = digest(owner_key(owner) + ":" + request_id)
         active = digest(owner_key(owner) + ":" + project + ":" + task)
@@ -211,7 +216,7 @@ class SQLExperimentExecutionStore:
             .first()
         )
         if previous:
-            binding_keys = {"plan_sequence", "stage_snapshot"}
+            binding_keys = {"plan_sequence", "stage_snapshot", "stage_run_id"}
             saved_spec = previous["task_spec"]
             if {
                 key: value
@@ -229,6 +234,8 @@ class SQLExperimentExecutionStore:
                 role,
             ):
                 raise ValueError("request ID reused with different execution")
+            if previous["stage_run_id"] != stage_run_id:
+                raise ValueError("request ID reused with another StageRun")
             return dict(previous)
         if task_spec and task_spec.get("plan_sequence") is not None:
             project_row = (
@@ -269,6 +276,7 @@ class SQLExperimentExecutionStore:
                 id=identity,
                 owner=owner_key(owner),
                 project_id=project,
+                stage_run_id=stage_run_id,
                 revision=revision,
                 task_id=task,
                 role_id=role,
@@ -544,7 +552,16 @@ class SQLExperimentExecutionStore:
             if not row["task_spec"]:
                 raise ValueError("legacy execution cannot use this result contract")
             blocked = bool(result.get("blockers"))
-            prepared = row["task_spec"]["intent"] == "prepare"
+            specification = row["task_spec"]
+            prepared = specification["intent"] == "prepare"
+            task = specification.get("task")
+            inputs = task.get("inputs") if isinstance(task, dict) else None
+            local_sample = (
+                not prepared
+                and row["state"] in {"queued", "preparing"}
+                and isinstance(inputs, dict)
+                and inputs.get("phase") == "sample"
+            )
             if blocked and row["state"] in {
                 "submitting",
                 "submission_uncertain",
@@ -553,16 +570,16 @@ class SQLExperimentExecutionStore:
                 "cancel_requested",
             }:
                 raise ValueError("in-flight work must retain its platform state")
+            if not blocked and not prepared and not report_artifact:
+                raise ValueError("result requires a readable report")
             if (
                 not blocked
                 and not prepared
-                and (
-                    row["state"] not in {"succeeded", "failed", "cancelled"}
-                    or not report_artifact
-                )
+                and not local_sample
+                and row["state"] not in {"succeeded", "failed", "cancelled"}
             ):
                 raise ValueError(
-                    "result requires verified platform artifacts and a readable report"
+                    "platform-backed result requires terminal execution state"
                 )
             if report_artifact:
                 self._register_artifact(
@@ -573,7 +590,7 @@ class SQLExperimentExecutionStore:
                 .where(runs.c.id == run_id)
                 .values(
                     state="needs_input"
-                    if blocked
+                    if blocked or local_sample
                     else "prepared"
                     if prepared
                     else row["state"],

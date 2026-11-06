@@ -11,15 +11,22 @@ import {
   createEditTool as createCodingEditTool,
   createReadTool as createCodingReadTool,
   createWriteTool as createCodingWriteTool,
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_LINES,
+  formatSize,
+  truncateHead,
+  type ReadToolDetails,
 } from "@earendil-works/pi-coding-agent";
 import { isRecord, type JsonObject } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
 import {
   createSandboxFileOperations,
+  detectImageMimeType,
   FallbackSandboxFileClient,
   SANDBOX_FILE_PROBE_TIMEOUT_MS,
   SandboxEndpointSession,
   SandboxFileClient,
+  type SandboxFileOperations,
   type SandboxEndpointProvider,
 } from "./sandbox-operations.js";
 import { SandboxPathPolicy, type SandboxReadMirror } from "./sandbox-paths.js";
@@ -238,7 +245,7 @@ async function createSandboxTools(
     return policy;
   };
 
-  const read = createCodingReadTool(sandboxCwd, {
+  const baseRead = createCodingReadTool(sandboxCwd, {
     operations: {
       readFile: async (path) => fileOperations.read.readFile(path),
       access: async (path) => fileOperations.read.access(path),
@@ -246,6 +253,7 @@ async function createSandboxTools(
         fileOperations.read.detectImageMimeType?.(path),
     },
   });
+  const read = createBoundedSandboxReadTool(baseRead, fileOperations);
   const write = createCodingWriteTool(sandboxCwd, {
     operations: {
       writeFile: async (path, content) => fileOperations.write.writeFile(path, content),
@@ -298,6 +306,65 @@ async function createSandboxTools(
     terminal,
     ...businessTools.map((config) => businessTool(peer, config)),
   ];
+}
+
+function createBoundedSandboxReadTool(
+  base: AgentTool<any, any>,
+  operations: SandboxFileOperations,
+): AgentTool<any, ReadToolDetails | undefined> {
+  return {
+    ...base,
+    async execute(callId, params: any, signal, onUpdate) {
+      if (!isRecord(params) || typeof params.path !== "string") {
+        throw new Error("path must be a string");
+      }
+      if (signal?.aborted) throw new Error("Operation aborted");
+      const offset = positiveInteger(params.offset) ?? 1;
+      const limit = Math.min(
+        positiveInteger(params.limit) ?? DEFAULT_MAX_LINES,
+        DEFAULT_MAX_LINES,
+      );
+      const path = params.path;
+      const window = await operations.read.readWindow(path, offset, limit, DEFAULT_MAX_BYTES);
+      if (signal?.aborted) throw new Error("Operation aborted");
+
+      const mimeType = detectImageMimeType(window.content);
+      if (mimeType) return base.execute(callId, params, signal, onUpdate);
+
+      const text = window.content.toString("utf-8");
+      const truncation = truncateHead(text, {
+        maxBytes: DEFAULT_MAX_BYTES,
+        maxLines: limit,
+      });
+      let output: string;
+      if (
+        truncation.firstLineExceedsLimit ||
+        (window.truncated && truncation.outputLines <= 1)
+      ) {
+        output =
+          `${text}\n\n[Line ${offset} reaches or exceeds the ` +
+          `${formatSize(DEFAULT_MAX_BYTES)} read window and was truncated. ` +
+          `Use terminal for a narrower byte range.]`;
+      } else if (truncation.truncated) {
+        const nextOffset = offset + Math.max(1, truncation.outputLines);
+        output =
+          `${truncation.content}\n\n[Output truncated at ` +
+          `${formatSize(truncation.maxBytes)}. Use offset=${nextOffset} to continue.]`;
+      } else {
+        output = truncation.content;
+      }
+      return {
+        content: [{ type: "text", text: output }],
+        details: { truncation },
+      };
+    },
+  };
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.max(1, Math.floor(value))
+    : undefined;
 }
 
 function bindPathTool(

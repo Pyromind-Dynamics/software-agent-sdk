@@ -30,15 +30,22 @@ from pyromind_runtime.ports.harness import HarnessAdapter
 from pyromind_runtime.ports.workflows import WorkflowEventSink
 
 from openhands.agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
+from openhands.agent_server.echomind_projects import ProjectStore
+from openhands.agent_server.echomind_stage_runs import ProjectRunStore
 from openhands.agent_server.run_workflow_callback import set_workflow_status_dispatcher
 from openhands.agent_server.storage_quota import ensure_conversation_quota
 from pyromind_agent_server.echomind_project_graphs import EchoMindProjectGraphStore
+from pyromind_agent_server.echomind_stage_tools import (
+    ECHOMIND_STAGE_TOOL_SPECS,
+    echomind_stage_tool_handler,
+)
 from pyromind_agent_server.evaluation_configuration import (
     validate_evaluation_configuration,
 )
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_agent_server.experiment_plan_projects import (
     EchoMindExperimentPlanProjectBinder,
+    EchoMindPreparationProjectMaterializer,
 )
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.plan_database import build_experiment_plan_store
@@ -248,6 +255,9 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         preparation_store=SQLPreparationStore(plan_store.engine)
         if plan_store
         else None,
+        preparation_project_materializer=EchoMindPreparationProjectMaterializer(
+            service.conversations_dir
+        ),
         resource_inspector=StorageResourceInspector(),
         execution_roles=tuple(
             role.name for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()
@@ -265,8 +275,23 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         evaluation_storage_factory=build_evaluation_storage,
         evaluation_config_validator=validate_evaluation_configuration,
     )
+    interrupted_runs = ProjectRunStore(
+        ProjectStore.for_conversations_dir(service.conversations_dir).root
+    ).reconcile_interrupted()
+    if interrupted_runs:
+        logger.warning(
+            "Recovered %d interrupted EchoMind Agent development runs",
+            len(interrupted_runs),
+        )
     pi_adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
     pi_adapter.set_plan_handler(runtime.experiment_plan_call)
+    pi_adapter.set_tool_extensions(
+        ECHOMIND_STAGE_TOOL_SPECS,
+        echomind_stage_tool_handler(
+            service.conversations_dir,
+            request_stage_task=runtime.request_experiment_task,
+        ),
+    )
     pi_adapter.set_role_handler(runtime.execution_role_call)
     logger.info(
         "Pyromind product runtime ready: default_harness=%s "

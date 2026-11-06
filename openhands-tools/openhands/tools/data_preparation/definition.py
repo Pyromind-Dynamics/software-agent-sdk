@@ -992,7 +992,7 @@ class DfRunPipelineExecutor(ToolExecutor):
                 code="dataflow_runtime_invalid",
                 message=f"Invalid DataFlow runtime: {exc}",
             )
-        if action.output_schema in {"vision", "structured"}:
+        if action.model_profile == "vision":
             try:
                 with tempfile.TemporaryDirectory(
                     prefix="pyromind-df-preflight-"
@@ -1341,7 +1341,7 @@ class DfRunPipelineExecutor(ToolExecutor):
                 message="Pipeline output must be outside the source directory.",
             )
 
-        if action.output_schema in {"vision", "structured"}:
+        if action.model_profile == "vision":
             try:
                 self._preflight_managed_image_pipeline(pipeline)
             except ValueError as exc:

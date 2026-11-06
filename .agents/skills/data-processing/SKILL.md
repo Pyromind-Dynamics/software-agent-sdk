@@ -64,7 +64,10 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
    什么、该改传什么。
    普通 Python 脚本直接通过 terminal 执行。需要 DataFlow 环境、模型配置、格式校验和报告时，
    阅读 [terminal-cli.md](references/terminal-cli.md)，通过 terminal 调用运行脚本；
-   不要调用旧的专用执行 Tool。模型配置由 SDK 注入，不在命令或配置文件中填写密钥。
+   不要调用旧的专用执行 Tool。skill 自带脚本始终从会话工作区根用
+   `.agents/skills/<skill>/...` 调用；不要为了处理数据先 `cd` 到数据目录，否则会失去
+   这条资源路径。数据和产物通过 `/target-workspace/...` 绝对路径传入。
+   模型配置由 SDK 注入，不在命令或配置文件中填写密钥。
    运行 Pipeline 的解释器由脚本自身解析（镜像内置解释器 → 缓存 venv 首次安装）；
    terminal 的默认 `python3` 不是那个解释器，不要用 `import dataflow`、全盘 `find`
    或翻 site-packages 判断环境是否可用。要确认用 `--check`，要提前准备用 `--prepare`。

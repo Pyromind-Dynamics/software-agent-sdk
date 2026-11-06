@@ -31,6 +31,11 @@ from pyromind_runtime.infrastructure.sql_work_queue import work
 from pyromind_runtime.ports.harness import SessionSpec
 from sqlalchemy import create_engine
 
+from openhands.agent_server.agent_profiles.echomind_manager import (
+    ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
+    ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
+)
+
 from . import test_standalone_experiments as execution_fixtures
 from .legacy_experiment_profile import EXPERIMENT_PROFILE_V4 as ECHOMIND_PRODUCT_PROFILE
 from .test_evaluation_cases import FakeStorage
@@ -327,10 +332,13 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
             )
             values = {
                 "goal": "Evaluate exact label correctness",
-                "model": {"source": "storage", "reference": "/models/base"},
                 "dataset": {"path": "/dataset.jsonl", "format": "jsonl"},
                 "io_contract": {"input": "prompt", "output": "label"},
-                "scoring": {"basis": "exact label match"},
+                "training": {
+                    "model": {"source": "storage", "reference": "/models/base"},
+                    "objective": "baseline evaluation",
+                },
+                "evaluation": {"basis": "exact label match"},
                 "scope": {"mode": "sample", "limit": 1},
             }
             facts = {
@@ -352,7 +360,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
             entry = {
                 "role_id": "eval",
                 "request_id": "baseline",
-                "stage_id": "init",
+                "stage_id": "evaluator",
                 "task": {
                     "name": "自由命名的基模评测",
                     "instruction": "Run one sample baseline",
@@ -364,14 +372,16 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
             }
             guide = {
                 "goal": "One sample baseline",
-                "stages": [{"id": "init", "kind": "init", "name": "Init"}],
+                "stages": [
+                    {"id": "evaluator", "kind": "evaluator", "name": "Evaluator"}
+                ],
                 "resources": [{"id": "data", "name": "Data", "uri": "/dataset.jsonl"}],
                 "tasks": [
                     {
                         "id": "baseline",
-                        "kind": "bench",
+                        "kind": "evaluate",
                         "name": "Baseline",
-                        "stage_id": "init",
+                        "stage_id": "evaluator",
                         "inputs": [{"name": "input_path", "resource_id": "data"}],
                     }
                 ],
@@ -399,10 +409,26 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
                 ),
                 context,
             )
-            row = next(
-                item
-                for item in store.list(owner)
-                if item["id"] == receipt.response["initial_run_id"]
+            assert receipt.response["initial_run_id"] is None
+            assert store.list(owner) == []
+            row = await runtime.request_experiment_task(
+                "manager",
+                RequestExperimentTask.model_validate(
+                    {
+                        "role_id": "eval",
+                        "request_id": "baseline",
+                        "stage_id": "evaluator",
+                        "task": {
+                            "name": "自由命名的基模评测",
+                            "instruction": "Run one sample baseline",
+                            "inputs": {
+                                "model_path": "/models/base",
+                                "input_path": "/dataset.jsonl",
+                            },
+                        },
+                    }
+                ),
+                context,
             )
         else:
             row = await runtime.request_experiment_task(
@@ -517,22 +543,20 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         manager_tools = {
             tool["function"]["name"] for tool in manager_requests[0]["tools"]
         }
+        assert (
+            "df_submit_evaluation" in manager_tools
+            and "terminal" in manager_tools
+            and "read" in manager_tools
+            and "subagent" in manager_tools
+            and "record_experiment_result" not in manager_tools
+            and "read_skill" not in manager_tools
+        )
         if prepared:
-            assert "request_experiment_task" in manager_tools
-            assert "df_submit_evaluation" not in manager_tools
-            assert {"read", "write", "edit", "terminal", "grep", "find", "ls"} <= (
-                manager_tools
-            )
-        else:
-            assert (
-                "df_submit_evaluation" in manager_tools
-                and "terminal" in manager_tools
-                and "read" in manager_tools
-                and "subagent" not in manager_tools
-                and "record_experiment_result" not in manager_tools
-                and "read_skill" not in manager_tools
-            )
-
+            assert {
+                "request_experiment_task",
+                "get_project_graph",
+                "get_preparation",
+            } <= manager_tools
         assert "/dataset.jsonl" not in json.dumps(manager_requests[0]["messages"])
         role_file = (root / "manager/pi/agent/agents/eval.md").read_text()
         assert (
@@ -571,7 +595,8 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
             assert isinstance(binding, dict) and binding["task_run_id"] == row["id"]
             assert report_display["execution"] == first_display["execution"]
             assert all(
-                child.execution is not None and child.execution["stage_id"] == "init"
+                child.execution is not None
+                and child.execution["stage_id"] == "evaluator"
                 for child in children.values()
             )
         assert first_display["phase"] == "execute"
@@ -661,8 +686,8 @@ async def test_manager_inspects_and_plans_without_delegating_or_submitting(
                 profile_id=profile.profile_id,
                 workspace_root=str(root / "manager"),
                 product_instructions=profile.instructions,
-                tool_allowlist=profile.tool_allowlist,
-                skill_allowlist=profile.skill_allowlist,
+                tool_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
+                skill_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
                 delegated_roles=profile.delegated_roles,
                 managed_delegation=True,
                 model_configuration={
@@ -720,7 +745,7 @@ async def test_manager_inspects_and_plans_without_delegating_or_submitting(
             "df_submit_evaluation",
             "read_experiment_artifact",
         } <= names
-        assert not {"read_skill", "subagent", "record_experiment_result"} & names
+        assert not {"read_skill", "record_experiment_result"} & names
         prompt = json.dumps(captured[0]["messages"])
         assert "inference-evaluation" in prompt and "data-processing" in prompt
     finally:

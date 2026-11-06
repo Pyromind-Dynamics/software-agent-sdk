@@ -13,11 +13,17 @@ from pyromind_runtime.domain.project_graphs import (
     AddProjectNode,
     GraphPatch,
     ProjectEdge,
+    ProjectExecutorBinding,
+    ProjectGraph,
+    ProjectInputPort,
     ProjectNode,
+    ProjectOutputPort,
+    ProjectPortBinding,
     ProjectRequirement,
     RemoveProjectNode,
     UpdateProjectNode,
     UpdateProjectRequirements,
+    canonical_execution_role,
 )
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.harness import SessionSpec
@@ -78,7 +84,9 @@ def test_graph_patch_edits_nodes_edges_requirements_and_is_idempotent(tmp_path):
                 node=ProjectNode(
                     id="inference",
                     type="inference",
+                    task_type="inference.run",
                     title="Inference",
+                    executor=ProjectExecutorBinding(kind="contract_probe"),
                 )
             ),
             AddProjectEdge(edge=ProjectEdge(source="train", target="inference")),
@@ -211,6 +219,149 @@ def test_graph_patch_removes_connected_edges_and_rejects_frozen_project(tmp_path
                 operations=(UpdateProjectNode(node_id="train", title="Blocked"),),
             ),
         )
+
+
+def test_legacy_project_graph_migrates_node_contract_fields():
+    project_id = uuid4().hex
+    graph = ProjectGraph.model_validate(
+        {
+            "graph_id": uuid4().hex,
+            "project_id": project_id,
+            "nodes": [
+                {
+                    "id": "dataset",
+                    "type": "dataset",
+                    "title": "Dataset",
+                    "executor": "contract_probe",
+                    "config": {},
+                }
+            ],
+            "edges": [],
+        }
+    )
+
+    node = graph.nodes[0]
+    assert node.task_type == "dataset.prepare"
+    assert node.executor.kind == "contract_probe"
+    assert node.execution_role == "dataset"
+    assert node.inputs == {}
+    assert node.outputs == {}
+    assert node.policies == {}
+
+
+def test_legacy_development_template_loads_nodes_in_agent_launch_mode(tmp_path):
+    store, project = _project(tmp_path)
+    project_dir = tmp_path / "projects" / str(UUID(project.project.project_id))
+    graph_path = project_dir / "graph.json"
+    graph_payload = json.loads(graph_path.read_text(encoding="utf-8"))
+    for node in graph_payload["nodes"]:
+        node["launch_mode"] = "executor"
+        node["executor"] = {"kind": "contract_probe"}
+    graph_path.write_text(json.dumps(graph_payload), encoding="utf-8")
+
+    loaded = store.load(
+        project.project.project_id,
+        owner_user_id="42",
+    )
+
+    assert {node.launch_mode for node in loaded.graph.nodes} == {"agent"}
+    assert {node.id: node.execution_role for node in loaded.graph.nodes} == {
+        "dataset": "dataset",
+        "train": "train",
+    }
+
+
+def test_evaluator_is_the_canonical_alias_for_eval_role():
+    graph = ProjectGraph.model_validate(
+        {
+            "graph_id": uuid4().hex,
+            "project_id": uuid4().hex,
+            "nodes": [
+                {
+                    "id": "evaluator",
+                    "type": "evaluator",
+                    "title": "Evaluator",
+                    "executor": "contract_probe",
+                    "config": {},
+                }
+            ],
+            "edges": [],
+        }
+    )
+
+    assert graph.nodes[0].execution_role == "eval"
+    assert canonical_execution_role("evaluator") == "eval"
+    assert canonical_execution_role("eval") == "eval"
+    assert canonical_execution_role("dataset") == "dataset"
+
+
+def test_graph_patch_persists_generic_ports_and_executor_binding(tmp_path):
+    store, project = _project(tmp_path)
+    patch = GraphPatch(
+        request_id="generic-contract",
+        operations=(
+            UpdateProjectNode(
+                node_id="dataset",
+                type="quality_gate",
+                task_type="vision.dataset_quality",
+                execution_role="dataset",
+                inputs={
+                    "source": ProjectInputPort(
+                        artifact_type="raw_dataset",
+                        schema_ref="raw/v1",
+                        binding=ProjectPortBinding(
+                            kind="run_input",
+                            name="images",
+                        ),
+                    )
+                },
+                outputs={
+                    "dataset_version": ProjectOutputPort(
+                        artifact_type="dataset_version",
+                        schema_ref="dataset/v2",
+                    )
+                },
+                executor=ProjectExecutorBinding(kind="agent_development"),
+                policies={"timeout_seconds": 600},
+            ),
+            AddProjectNode(
+                node=ProjectNode(
+                    id="quality",
+                    type="quality_gate",
+                    task_type="vision.dataset_quality",
+                    title="Dataset quality",
+                    executor=ProjectExecutorBinding(kind="contract_probe"),
+                )
+            ),
+            AddProjectEdge(
+                edge=ProjectEdge(
+                    source="dataset",
+                    source_port="dataset_version",
+                    target="quality",
+                    target_port="dataset",
+                )
+            ),
+        ),
+    )
+
+    updated = store.apply_graph_patch(
+        project.project.project_id,
+        owner_user_id="42",
+        patch=patch,
+    )
+
+    dataset = next(node for node in updated.nodes if node.id == "dataset")
+    assert dataset.type == "quality_gate"
+    assert dataset.task_type == "vision.dataset_quality"
+    assert dataset.executor.kind == "agent_development"
+    assert dataset.execution_role == "dataset"
+    assert dataset.inputs["source"].binding == ProjectPortBinding(
+        kind="run_input",
+        name="images",
+    )
+    assert dataset.outputs["dataset_version"].schema_ref == "dataset/v2"
+    assert updated.edges[-1].source_port == "dataset_version"
+    assert updated.edges[-1].target_port == "dataset"
 
 
 async def test_graph_tools_use_runtime_permissions_and_emit_change_event(tmp_path):

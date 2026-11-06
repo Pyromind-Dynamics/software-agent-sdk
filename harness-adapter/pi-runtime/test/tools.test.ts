@@ -59,8 +59,9 @@ test("sandbox read resolves the remote endpoint for Storage paths", async (conte
   const requested: string[] = [];
   const fileApi = createServer((request, response) => {
     const url = new URL(request.url ?? "/", "http://localhost");
-    requested.push(url.searchParams.get("path") ?? "");
-    response.end("sample");
+    const path = url.searchParams.get("path") ?? "";
+    requested.push(path);
+    response.end(path.endsWith("large.jsonl") ? "x".repeat(100 * 1024) : "sample");
   });
   await new Promise<void>((resolve) => fileApi.listen(0, "127.0.0.1", resolve));
   context.after(() => fileApi.close());
@@ -102,9 +103,20 @@ test("sandbox read resolves the remote endpoint for Storage paths", async (conte
   await restricted.execute("remote-read", {
     path: "/target-workspace/datasets/demo/avi/train.jsonl",
   });
+  const bounded = await restricted.execute("remote-large-read", {
+    path: "/target-workspace/datasets/demo/avi/large.jsonl",
+    offset: 1,
+    limit: 3,
+  });
 
   assert.equal(ensures, 1);
-  assert.deepEqual(requested, ["/target-workspace/datasets/demo/avi/train.jsonl"]);
+  assert.deepEqual(requested, [
+    "/target-workspace/datasets/demo/avi/train.jsonl",
+    "/target-workspace/datasets/demo/avi/large.jsonl",
+  ]);
+  const text = bounded.content[0]?.type === "text" ? bounded.content[0].text : "";
+  assert.ok(text.length <= 51 * 1024, `bounded read returned ${text.length} chars`);
+  assert.match(text, /reaches or exceeds the 50\.0KB read window/);
 });
 
 async function workspaceLayout(prefix = "pi-tools-") {

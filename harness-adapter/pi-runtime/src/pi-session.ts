@@ -63,6 +63,7 @@ interface PiSessionConfig extends PiModelConfig {
   toolAllowlist?: string[];
   skillAllowlist?: string[];
   delegatedRoles?: SubagentRoleDefinition[];
+  managedDelegation: boolean;
 }
 
 export interface ParsedPrompt {
@@ -238,7 +239,7 @@ export async function createPiSession(
     });
     return [role.name, [...scoped, ...business]];
   })) : undefined;
-  const subagents = new SubagentHost(config.workspaceRoot, config.sessionId, peer, childTools, modelRuntime, model, childInstructions, config.delegatedRoles, roleToolSets, sandboxPathAliases);
+  const subagents = new SubagentHost(config.workspaceRoot, config.sessionId, peer, childTools, modelRuntime, model, childInstructions, config.delegatedRoles, roleToolSets, sandboxPathAliases, config.managedDelegation);
   const { default: subagentExtension } = await import("pi-subagents");
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 20_000 },
@@ -399,6 +400,7 @@ function parseConfig(value: JsonObject): PiSessionConfig {
     toolAllowlist: parseAllowlist(value.tool_allowlist),
     skillAllowlist: parseAllowlist(value.skill_allowlist),
     delegatedRoles: parseSubagentRoles(value.delegated_roles),
+    managedDelegation: value.managed_delegation === true,
   };
 }
 

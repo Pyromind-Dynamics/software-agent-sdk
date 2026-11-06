@@ -54,7 +54,7 @@ def migrate(url, target="head"):
         with engine.connect() as conn:
             assert conn.scalar(
                 sa.text("SELECT version_num FROM experiment_plan_schema_version")
-            ) == ("0005_preparation" if target == "head" else target)
+            ) == ("0006_stage_task_links" if target == "head" else target)
     finally:
         engine.dispose()
 

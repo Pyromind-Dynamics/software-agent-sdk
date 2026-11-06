@@ -14,7 +14,6 @@ from pyromind_runtime.application.conversation_runtime import ConversationRuntim
 from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.errors import ProductRuntimeError, UserInputValidationError
-from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 from pyromind_runtime.infrastructure.file_product_store import (
     CommandConflictError,
@@ -31,7 +30,11 @@ from pyromind_agent_server.api.schemas import (
 )
 from pyromind_agent_server.auth_context import request_context
 from pyromind_agent_server.bootstrap import ensure_product_runtime
-from pyromind_agent_server.profiles import DEFAULT_PRODUCT_PROFILE, ConversationProfile
+from pyromind_agent_server.profiles import (
+    DEFAULT_PRODUCT_PROFILE,
+    ConversationProfile,
+    session_policy_for_profile,
+)
 
 
 _SSE_HEARTBEAT_SECONDS = 15.0
@@ -79,21 +82,7 @@ def create_product_router(
         if profile.configuration_version:
             await get_product_runtime(request).apply_session_configuration(
                 conversation_id,
-                SessionPolicy(
-                    configuration_version=profile.configuration_version,
-                    tool_allowlist=profile.tool_allowlist,
-                    skill_allowlist=profile.skill_allowlist,
-                    development_tool_allowlist=profile.development_tool_allowlist,
-                    development_skill_allowlist=profile.development_skill_allowlist,
-                    product_instructions=profile.instructions,
-                    delegated_roles=tuple(
-                        role.model_dump(mode="json")
-                        for role in profile.delegated_roles or ()
-                    ),
-                    managed_delegation=profile.managed_delegation,
-                    command_allowlist=profile.command_allowlist,
-                    preparation_policy=profile.preparation_policy,
-                ),
+                session_policy_for_profile(profile),
                 context_for(request),
             )
 
@@ -164,6 +153,7 @@ def create_product_router(
             delegated_roles=profile.delegated_roles,
             managed_delegation=profile.managed_delegation,
             preparation_policy=profile.preparation_policy,
+            agentgenome_enabled=profile.agentgenome_enabled,
         )
         try:
             snapshot = await get_product_runtime(request).create_conversation(
@@ -471,6 +461,7 @@ def _not_found(conversation_id: str) -> HTTPException:
 def _product_error(error: ProductRuntimeError) -> HTTPException:
     status_code = {
         "plan_store_unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
+        "storage_unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
         "conversation_not_found": status.HTTP_404_NOT_FOUND,
         "checkpoint_not_found": status.HTTP_404_NOT_FOUND,
         "capacity_exceeded": status.HTTP_429_TOO_MANY_REQUESTS,

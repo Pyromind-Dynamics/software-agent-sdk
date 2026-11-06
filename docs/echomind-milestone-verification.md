@@ -2,9 +2,10 @@
 
 > 状态：开发验收基线
 > 更新时间：2026-10-30
-> 主方案：`docs/echomind-avi-single-turn-plan.md`
-> Graph 与 Agent 契约：`docs/echomind-graph-agent-contract.md`
-> 执行阶段基线：`docs/echomind-four-node-graph-execution-plan.md`
+> 产品背景：`docs/echomind-avi-single-turn-plan.md`
+> Graph 与 Agent 长期契约：`docs/echomind-graph-agent-contract.md`
+> 当前实现基线：`docs/echomind-graph-executor-implementation.md`
+> 历史执行阶段：`docs/echomind-four-node-graph-execution-plan.md`
 >
 > 本文保留较早的里程碑验收设计。当前开发态采用可变 Working Graph，执行顺序以
 > 新方案中的 S1-S8 和对应手工验证流程为准。
