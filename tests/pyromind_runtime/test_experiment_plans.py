@@ -346,11 +346,36 @@ async def test_http_profile_routing_confirm_conflict_and_cross_profile_denial(
             "proposal_id": draft["proposal_id"],
             "expected_revision": 0,
         }
+
+        async def set_agent_status(value: str, event_id: str) -> None:
+            adapter.emit(
+                identity,
+                "status.changed",
+                {"status": value},
+                event_id=event_id,
+                run_id="busy-plan-run",
+            )
+            async with asyncio.timeout(5):
+                while (await runtime.get_snapshot(identity, context)).status != value:
+                    await asyncio.sleep(0.01)
+
+        await set_agent_status("running", "plan-running")
+        blocked = await client.post(f"{base}/{identity}/commands", json=command_body)
+        assert blocked.status_code == 409
+        assert "idle Agent" in blocked.json()["detail"]
+        assert (
+            await runtime.get_experiment_plan(identity, context)
+        ).current_revision == 0
+
+        await set_agent_status("idle", "plan-idle")
         saved = await client.post(f"{base}/{identity}/commands", json=command_body)
         assert saved.status_code == 202
-        assert (
-            await client.post(f"{base}/{identity}/commands", json=command_body)
-        ).json() == saved.json()
+
+        await set_agent_status("running", "plan-running-again")
+        replay = await client.post(f"{base}/{identity}/commands", json=command_body)
+        assert replay.status_code == 202
+        assert replay.json() == saved.json()
+        await set_agent_status("idle", "plan-idle-again")
         snapshot = await client.get(f"{base}/{identity}/snapshot")
         assert snapshot.json()["experiment_plan"]["current_revision"] == 1
         assert (

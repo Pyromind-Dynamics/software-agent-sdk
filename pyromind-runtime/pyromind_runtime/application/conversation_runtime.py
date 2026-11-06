@@ -89,6 +89,7 @@ from pyromind_runtime.domain.experiment_plans import (
     CreateExperimentPlan,
     ExperimentPlanView,
     GetExperimentPlan,
+    PlanConflictError,
     PlanOwner,
     PlanRevision,
     ReviseExperimentPlan,
@@ -1638,6 +1639,10 @@ class ConversationRuntime:
         receipt, claimed = store.claim_command(command)
         if not claimed and receipt.status == "completed":
             return receipt
+        if store.load_snapshot().status == "running":
+            raise PlanConflictError(
+                "Plan decisions require an idle Agent; retry after the current turn."
+            )
         if isinstance(command, ConfirmExperimentPlanCommand):
             revision = await self._plan_io(
                 service.store.confirm,

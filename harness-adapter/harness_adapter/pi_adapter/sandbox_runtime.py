@@ -216,6 +216,14 @@ class SandboxClientLike(Protocol):
 class _SandboxState:
     client: SandboxClientLike
     endpoint: dict[str, Any]
+    credential_fingerprint: str
+
+
+def _credential_fingerprint(context: ToolExecutionContext) -> str:
+    request = context.request_context
+    env, cluster = _execution_target(context)
+    identity = (env, cluster, request.user_id, request.profile_id, _auth_token(request))
+    return hashlib.sha256(repr(identity).encode()).hexdigest()
 
 
 def _configured_value(values: dict[str, Any], key: str, env: str) -> str | None:
@@ -436,10 +444,17 @@ class SandboxExecutionManager:
                 self._cancel_prewarm(context.conversation_id)
                 self._states.pop(context.conversation_id, None)
             pending_staging = files.load_pending_sandbox_staging()
+            fingerprint = _credential_fingerprint(context)
             existing = self._states.get(context.conversation_id)
-            if existing is not None and pending_staging is None:
-                return existing
-            state = await self._ensure_state_locked(context, files, pending_staging)
+            if existing is not None:
+                # The endpoint carries an access key minted for this request identity.
+                if existing.credential_fingerprint != fingerprint:
+                    self._states.pop(context.conversation_id)
+                elif pending_staging is None:
+                    return existing
+            state = await self._ensure_state_locked(
+                context, files, pending_staging, fingerprint
+            )
             self._states[context.conversation_id] = state
             return state
 
@@ -448,6 +463,7 @@ class SandboxExecutionManager:
         context: ToolExecutionContext,
         files: PiSessionFiles,
         pending_staging: dict[str, Any] | None,
+        fingerprint: str,
     ) -> _SandboxState:
         settings = SandboxSettings.from_extra(context.extra)
         record = files.load_sandbox() or {}
@@ -598,7 +614,9 @@ class SandboxExecutionManager:
             "storage_path": mount_path,
             "cluster": client.cluster,
         }
-        return _SandboxState(client=client, endpoint=endpoint)
+        return _SandboxState(
+            client=client, endpoint=endpoint, credential_fingerprint=fingerprint
+        )
 
     async def _lookup(
         self, client: SandboxClientLike, sandbox_id: str | None

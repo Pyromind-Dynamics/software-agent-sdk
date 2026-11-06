@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import tarfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -460,8 +461,18 @@ def test_prewarm_logs_why_the_sandbox_could_not_be_prepared(
     assert "quota exceeded for us-west-1" in caplog.text
 
 
-def test_ensure_refreshes_a_cached_endpoint_bundle_on_request(
-    tmp_path: Path, files: PiSessionFiles, monkeypatch
+@pytest.mark.parametrize(
+    "changed_request",
+    [
+        None,
+        {"authorization": "Bearer rotated-token"},
+        {"x_cluster": "us-east-1#pre"},
+        {"profile_id": "other-profile"},
+    ],
+    ids=["explicit-refresh", "rotated-token", "different-cluster", "different-profile"],
+)
+def test_ensure_refreshes_a_cached_endpoint_bundle(
+    tmp_path: Path, files: PiSessionFiles, monkeypatch, changed_request
 ) -> None:
     files.save_sandbox(
         {
@@ -489,10 +500,15 @@ def test_ensure_refreshes_a_cached_endpoint_bundle_on_request(
 
     first = asyncio.run(manager.ensure(context, files))
     cached = asyncio.run(manager.ensure(context, files))
-    refreshed = asyncio.run(manager.ensure(context, files, refresh=True))
+    if changed_request is None:
+        refreshed = asyncio.run(manager.ensure(context, files, refresh=True))
+    else:
+        changed_context = replace(
+            context, request_context=replace(context.request_context, **changed_request)
+        )
+        refreshed = asyncio.run(manager.ensure(changed_context, files))
 
-    # A cached call reuses the bundle; a refresh re-reads the sandbox and mints
-    # the client whose access key replaces the one the runner is holding.
+    # The new request gets a freshly authenticated endpoint for the same sandbox.
     assert len(clients) == 2
     assert clients[1].lifecycle_calls == ["get:sbx-1"]
     assert first["api_key"] == cached["api_key"] == "key-0"
