@@ -486,6 +486,7 @@ class AnalyzeTaskFailureExecutor(
                 text=f"task_status={task_status or 'unknown'} state={state}",
                 task_status=task_status,
                 task_state=state,
+                source="all",
             )
         nodes = [
             TaskNodeInfo(

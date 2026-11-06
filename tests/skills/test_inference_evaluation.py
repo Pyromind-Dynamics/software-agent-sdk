@@ -27,6 +27,26 @@ MODULE_PATH = (
     / "scripts"
     / "evaluate_inference.py"
 )
+SKILL_ROOT = MODULE_PATH.parent.parent
+
+
+def test_evaluator_field_whitelist_keeps_operator_fields_separate():
+    skill_text = (SKILL_ROOT / "SKILL.md").read_text()
+    rubric_text = (SKILL_ROOT / "references" / "rubric-authoring.md").read_text()
+    field_equals_row = next(
+        line
+        for line in rubric_text.splitlines()
+        if line.startswith("| `field_equals` |")
+    )
+
+    assert "字段白名单逐项检查" in skill_text
+    assert "`prediction_path`" in field_equals_row
+    assert "`reference_path`" in field_equals_row
+    assert "`case_sensitive`" in field_equals_row
+    assert "`prediction_paths`" not in field_equals_row
+    assert "`iou_threshold`" not in field_equals_row
+    assert "`prediction_paths` 仅属于 `required_fields`" in rubric_text
+    assert "`iou_threshold` 仅属于 `bbox_iou`" in rubric_text
 
 
 @pytest.fixture

@@ -462,6 +462,76 @@ def test_distribution_failure_preserves_valid_validation_selection(saved_batch):
         )
 
 
+def test_train_profile_derives_stable_ids_from_messages(saved_batch, tmp_path):
+    worker, manifest, spec, _, run_id, mount, output, _ = saved_batch
+    train = mount / "training/train.jsonl"
+    rows = [
+        {
+            "messages": [
+                {"role": "user", "content": "inspect one"},
+                {"role": "assistant", "content": "defect"},
+            ]
+        },
+        {
+            "messages": [
+                {"role": "user", "content": "inspect one"},
+                {"role": "assistant", "content": "defect"},
+            ]
+        },
+        {
+            "messages": [
+                {"role": "user", "content": "inspect two"},
+                {"role": "assistant", "content": "fail"},
+            ]
+        },
+    ]
+    train.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    manifest["datasets"]["train"]["sha256"] = worker._file_digest(train)
+    script = tmp_path / "score_messages.py"
+    script.write_text(
+        """
+def parse_record(raw, context):
+    reference = raw.get("gt", raw.get("target"))
+    if reference is None:
+        reference = next(
+            message.get("content")
+            for message in reversed(raw.get("messages", []))
+            if message.get("role") == "assistant"
+        )
+    return {
+        "id": raw.get("id"),
+        "reference": reference,
+        "prediction": raw.get("answer", raw.get("prediction")),
+        "original_label": reference,
+        "sample": {"prompt": raw.get("prompt", "inspect image")},
+    }
+
+def score_case(case, spec):
+    mapping = {"pass": "pass", "defect": "pass", "fail": "fail"}
+    gt = mapping[case["reference"]]
+    prediction = mapping.get(case["prediction"])
+    return {
+        "passed": gt == prediction,
+        "reference_label": gt,
+        "prediction_label": prediction,
+        "evidence": ["binary business verdict"],
+    }
+"""
+    )
+
+    worker.evaluate_batch(manifest, spec, script, output, run_id, mount)
+
+    profile = json.loads((output / "dataset_profile.json").read_text())
+    assert profile["status"] == "ready"
+    assert profile["issues"] == []
+    train_profile = profile["distribution"]["train"]
+    assert train_profile["total"] == 3
+    assert train_profile["unique_ids"] == 2
+    assert train_profile["duplicate_ids"] == 1
+    assert train_profile["identity_sources"] == {"content_hash": 3}
+    assert profile["distribution"]["validation"]["identity_sources"] == {"provided": 3}
+
+
 def test_review_runtime_and_api_reuse_annotation_protocol_and_refresh_context(
     saved_batch,
     tmp_path,

@@ -33,16 +33,29 @@ def records(path: Path):
                 yield number, line
 
 
-def stable_case(raw: dict, module, context: dict) -> dict:
+def stable_case(
+    raw: dict,
+    module,
+    context: dict,
+    *,
+    derive_id_from_content: bool = False,
+) -> dict:
     case = module.parse_record(raw, context)
     if not isinstance(case, dict) or case.get("reference") is None:
         raise ValueError("parse_record must return an object with a reference")
+    identity_source = "provided"
     if case.get("id") is None or case["id"] == "":
         # A stable input key is explicit evidence; line numbers are never IDs.
-        if not case.get("input_key"):
+        if case.get("input_key"):
+            case["id"] = "input:" + _config_digest(case["input_key"])
+            identity_source = "input_key"
+        elif derive_id_from_content:
+            case["id"] = "content:" + _config_digest(raw)
+            identity_source = "content_hash"
+        else:
             raise ValueError("case requires id or a stable input_key")
-        case["id"] = "input:" + _config_digest(case["input_key"])
     case["id"] = str(case["id"])
+    case["_identity_source"] = identity_source
     return case
 
 
@@ -141,12 +154,19 @@ def _dataset_evidence(source: str, entry: dict, module, mount: Path, spec: dict)
     if not entry.get("sha256") or _file_digest(path) != entry["sha256"]:
         raise ValueError(f"{source} dataset fingerprint changed or missing")
     counts, categories, business, identities = Counter(), Counter(), Counter(), set()
+    identity_sources = Counter()
     total = 0
     for _, line in records(path):
-        case = stable_case(json.loads(line), module, {"source": source})
+        case = stable_case(
+            json.loads(line),
+            module,
+            {"source": source},
+            derive_id_from_content=source == "train",
+        )
         if case["id"] in identities and source == "validation":
             raise ValueError(f"duplicate {source} sample: {case['id']}")
         identities.add(case["id"])
+        identity_sources[case["_identity_source"]] += 1
         total += 1
         label = str(case.get("original_label") or "unknown")
         counts[label] += 1
@@ -169,6 +189,8 @@ def _dataset_evidence(source: str, entry: dict, module, mount: Path, spec: dict)
             "sha256": entry["sha256"],
             "total": total,
             "unique_ids": len(identities),
+            "duplicate_ids": total - len(identities),
+            "identity_sources": dict(identity_sources),
             "labels": {
                 label: {"count": count, "ratio": count / total}
                 for label, count in counts.items()

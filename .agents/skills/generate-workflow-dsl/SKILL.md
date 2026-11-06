@@ -29,6 +29,7 @@ description: >-
 ## DSL 与资料边界
 
 - 文件固定为 `public_data/workflow_canvas/workflow.py`；直接声明节点实例，不写 import，不当普通 Python 在 Agent 本地执行。
+- 顶层赋值只用于声明节点实例；节点参数使用字面量或上游节点输出。禁止模块级字面量常量，如 `TRAIN_DATA = "..."`；需复用时也将值直接写入各节点参数。
 - 数据处理、训练和推理由 Pyromind 平台节点执行；上游数据、模型及训练产物通过输出端口绑定，不写死下游产物路径，不用 Agent 本地运行替代平台节点。
 - SFT/DPO/GRPO 的 `wandb_config`、`accelerate_config` 当前按必填校验，连接对应 Builder 输出。WandB 仅写 Secret 名，不写明文凭据。
 - 内置 Metric/Reward 不满足目标时才读取 `custom-python-assets.md`；脚本校验并上传成功后，使用真实返回的 Storage 路径填写入口，上传失败停止，不伪造路径。
@@ -51,7 +52,7 @@ Reference 路径相对本 `SKILL.md` 所在目录；按 `<available_skills>` 的
 每次写入后调用 `validate_workflow_dsl()`，缺省校验工作区 `workflow.py`，不传 DSL 全文：
 
 1. `valid=true`：完成；最终回复简述 warnings。
-2. `valid=false`：按 `code`、`node_id`、`field` 和 `detail.*_node_code` 最小修复。平台契约漂移以返回结果为准；生成任务只修改当前 DSL，不编辑 Skill 或知识库。
+2. `valid=false`：按 `code`、`node_id`、`field` 和 `detail.*_node_code` 最小修复。`DSL_PARSE_FAILED` 未给位置时，先检查并内联模块级字面量常量。平台契约漂移以返回结果为准；生成任务只修改当前 DSL，不编辑 Skill 或知识库。
 3. `retryable=false`（包括 401）：停止，不重复校验或探测凭据。`retryable=true` 最多重试两次，仍失败则说明平台校验未完成。
 4. 最多修改五轮；同一错误连续两轮未消失则报告阻塞。GPU 枚举或必填端口不确定时，可用只含目标节点与最小依赖的 DSL 做一次校验探测，不用 `run_workflow` 探测。
 
