@@ -23,6 +23,9 @@ class DelegatedRole(ContractModel):
     prompt: str = Field(min_length=1)
     tools: tuple[str, ...] = ()
     skills: tuple[str, ...] = ()
+    optional_tools: tuple[str, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
 
 
 class SessionSpec(ContractModel):
@@ -233,3 +236,14 @@ class OperationActivityReader(Protocol):
     ) -> dict[str, OperationActivity]:
         """Read retained activity without creating resources or a model turn."""
         ...
+
+
+@runtime_checkable
+class SubmissionReceiptReader(Protocol):
+    async def read_submission_receipt(
+        self,
+        handle: SessionHandle,
+        tool_name: str,
+        operation_id: str,
+        context: RequestContext,
+    ) -> JsonObject | None: ...

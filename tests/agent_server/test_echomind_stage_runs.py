@@ -349,7 +349,7 @@ def test_request_id_cannot_be_reused_for_another_node(tmp_path):
         )
 
 
-def test_agent_development_child_task_can_succeed_without_platform_task(tmp_path):
+def test_dataset_stage_cannot_succeed_without_platform_task(tmp_path):
     project_store = ProjectStore.for_conversations_dir(tmp_path / "conversations")
     project = project_store.bind_plan(
         PlanRevision(
@@ -380,21 +380,23 @@ def test_agent_development_child_task_can_succeed_without_platform_task(tmp_path
         role_id="dataset",
     )
 
-    completed = run_store.record_result(
-        project=project,
-        run_id=run.run_id,
-        request_id="complete-dataset",
-        outcome="succeeded",
-        message="Dataset child completed without a platform task.",
-        input_refs=["/datasets/source.jsonl"],
-        details={"verified": True},
-    )
+    with pytest.raises(ValueError, match="waiting_external"):
+        run_store.record_result(
+            project=project,
+            run_id=run.run_id,
+            request_id="complete-dataset",
+            outcome="succeeded",
+            message="Dataset child completed without a platform task.",
+            input_refs=["/datasets/source.jsonl"],
+            details={"verified": True},
+        )
 
-    assert completed.status == "succeeded"
-    assert completed.external_task_id is None
-    assert completed.output_uri is None
-    assert completed.task_runs[0].status == "succeeded"
-    assert completed.task_runs[0].artifact_ids == [completed.artifacts[-1].artifact_id]
+    unchanged = run_store.get(
+        project_id=project.project.project_id,
+        run_id=run.run_id,
+    )
+    assert unchanged.status == "running"
+    assert unchanged.task_runs[0].status == "running"
 
 
 def test_failed_stage_can_retry_with_a_new_task_run(tmp_path):
@@ -412,27 +414,27 @@ def test_failed_stage_can_retry_with_a_new_task_run(tmp_path):
     run_store = ProjectRunStore(project_store.root)
     run, _ = run_store.start_agent_development(
         project=project,
-        node=project.graph.nodes[0],
-        request_id="start-dataset",
+        node=project.graph.nodes[1],
+        request_id="start-inference",
     )
     _approve_plan(
         run_store,
         project,
         run_id=run.run_id,
-        request_id="approve-dataset",
+        request_id="approve-inference",
     )
     run_store.bind_task_run(
         run,
-        request_id="dataset-first-attempt",
+        request_id="inference-first-attempt",
         task_run_id="task-run-1",
-        role_id="dataset",
+        role_id="inference",
     )
     failed = run_store.record_result(
         project=project,
         run_id=run.run_id,
         request_id="failed-first-attempt",
         outcome="failed",
-        message="Dataset preprocessing failed.",
+        message="Inference failed.",
         input_refs=["/datasets/source.jsonl"],
         details={"error": "bad schema"},
         task_run_id="task-run-1",
@@ -440,16 +442,16 @@ def test_failed_stage_can_retry_with_a_new_task_run(tmp_path):
 
     retrying, retry_task, created = run_store.bind_task_run(
         failed,
-        request_id="dataset-retry",
+        request_id="inference-retry",
         task_run_id="task-run-2",
-        role_id="dataset",
+        role_id="inference",
     )
     completed = run_store.record_result(
         project=project,
         run_id=run.run_id,
         request_id="complete-retry",
         outcome="succeeded",
-        message="Dataset retry completed.",
+        message="Inference retry completed.",
         input_refs=["/datasets/source.jsonl"],
         details={"verified": True},
         task_run_id="task-run-2",
@@ -703,6 +705,59 @@ def test_agent_development_run_records_reviewable_dataset_sample(tmp_path):
         )
         == waiting
     )
+
+
+def test_record_result_rejects_request_id_reused_for_another_status(tmp_path):
+    project_store = ProjectStore.for_conversations_dir(tmp_path / "conversations")
+    project = project_store.bind_plan(
+        PlanRevision(
+            project_id=uuid4().hex,
+            revision=1,
+            plan=_plan(),
+            confirmed_by="42",
+        ),
+        echomind_conversation_id="conversation-1",
+        owner_user_id="42",
+    )
+    run_store = ProjectRunStore(project_store.root)
+    run, _ = run_store.start_agent_development(
+        project=project,
+        node=project.graph.nodes[0],
+        request_id="start-dataset",
+    )
+    request_id = f"project-created:{project.project.project_id}"
+    _approve_plan(
+        run_store,
+        project,
+        run_id=run.run_id,
+        request_id=request_id,
+    )
+    run_store.bind_task_run(
+        run,
+        request_id="dataset-sample",
+        task_run_id="task-run-sample",
+        role_id="dataset",
+    )
+
+    with pytest.raises(ValueError, match="already used for status 'running'"):
+        run_store.record_result(
+            project=project,
+            run_id=run.run_id,
+            request_id=request_id,
+            outcome="waiting_user",
+            message="Sample passed.",
+            input_refs=["/datasets/pcb_avi_eval_3/"],
+            details=_sample_details("task-run-sample"),
+            task_run_id="task-run-sample",
+        )
+
+    unchanged = run_store.get(
+        project_id=project.project.project_id,
+        run_id=run.run_id,
+    )
+    assert unchanged.status == "running"
+    assert unchanged.artifacts == []
+    assert unchanged.task_runs[0].status == "running"
 
 
 def test_agent_development_result_rejects_changed_node_configuration(tmp_path):

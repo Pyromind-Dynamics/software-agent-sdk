@@ -5,6 +5,9 @@ from typing import Literal
 from pydantic import Field, model_serializer, model_validator
 
 from pyromind_runtime.domain.base import ContractModel
+from pyromind_runtime.domain.content import ContentBlock
+from pyromind_runtime.domain.execution_policy import CheckpointRef
+from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
 
 
 # Maximum UTF-8 JSON payload size for each request or answer.
@@ -38,9 +41,34 @@ class UserInputQuestion(ContractModel):
         return self
 
 
+class UserInputPresentation(ContractModel):
+    """Agent-authored display only; choices and authorization live outside it."""
+
+    title: str | None = Field(default=None, max_length=200)
+    content: tuple[ContentBlock, ...] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _safe_payload(self) -> UserInputPresentation:
+        validate_persisted_payload(self.model_dump(mode="json"))
+        return self
+
+
 class UserInputRequest(ContractModel):
     """The ask_user tool arguments: one batch of one to three questions."""
 
+    presentation: UserInputPresentation | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Optional display content: title and Chat content blocks. Use text for "
+            "Markdown, tables and file links; images may reference HTTPS URLs or "
+            "absolute Storage paths. Organize evidence here, not in UI templates. "
+            "Display content never grants authorization."
+        ),
+    )
+    checkpoint: CheckpointRef | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     questions: tuple[UserInputQuestion, ...] = Field(min_length=1, max_length=3)
 
     @model_validator(mode="after")
@@ -96,6 +124,22 @@ class PendingUserInput(ContractModel):
     request_id: str = Field(min_length=1)
     run_id: str | None = None
     operation_id: str | None = None
+    task_run_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    presentation: UserInputPresentation | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Optional display content: title and Chat content blocks. Use text for "
+            "Markdown, tables and file links; images may reference HTTPS URLs or "
+            "absolute Storage paths. Organize evidence here, not in UI templates. "
+            "Display content never grants authorization."
+        ),
+    )
+    checkpoint: CheckpointRef | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     questions: tuple[UserInputQuestion, ...] = Field(min_length=1, max_length=3)
 
 

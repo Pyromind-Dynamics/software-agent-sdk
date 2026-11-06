@@ -223,7 +223,7 @@ def test_pyromind_start_scripts_use_composed_server_entrypoint() -> None:
 def test_inference_start_defaults_to_platform_sandbox_for_pi_terminal() -> None:
     script = (ROOT / "start_inference.sh").read_text(encoding="utf-8")
 
-    assert 'export APP_ENV="${APP_ENV:-dev}"' in script
+    assert 'export APP_ENV="${APP_ENV:-prod}"' in script
     assert (
         "export PYROMIND_PI_TERMINAL_BACKEND="
         '"${PYROMIND_PI_TERMINAL_BACKEND:-sandbox}"' in script
@@ -468,9 +468,13 @@ def test_preparation_policy_is_trusted_profile_configuration():
     assert "df_submit_pipeline" in dataset_role.tools
     assert "df_submit_evaluation" not in dataset_role.tools
     train_role = next(role for role in roles if role.name == "train")
-    assert train_role.skills == ("generate-workflow-dsl", "training-analysis")
+    assert train_role.skills == (
+        "generate-workflow-dsl",
+        "workflow-execution",
+        "training-analysis",
+    )
     assert "validate_workflow_dsl" in train_role.tools
-    assert "submit_workflow" not in train_role.tools
+    assert "submit_workflow" in train_role.tools
     inference_role = next(role for role in roles if role.name == "inference")
     assert inference_role.skills == ("inference-evaluation",)
     assert "df_submit_evaluation" in inference_role.tools
@@ -546,3 +550,111 @@ def test_frozen_bundle_includes_preparation_and_role_skill_assets():
     }
     assert ".agents/skills/experiment-planning/checklist.json" in targets
     assert ".agents/skills/avi-baseline-evaluation/SKILL.md" in targets
+
+
+def test_execution_capabilities_are_profile_owned_and_cannot_be_model_supplied():
+    from pydantic import ValidationError
+    from pyromind_agent_server.profiles import (
+        DEFAULT_PRODUCT_PROFILE,
+        ECHOMIND_PRODUCT_PROFILE,
+    )
+    from pyromind_runtime.domain.experiment_execution import RequestExperimentTask
+    from pyromind_runtime.domain.preparation import PreparationPolicy
+
+    roles = {role.name: role for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()}
+    policy = ECHOMIND_PRODUCT_PROFILE.preparation_policy
+    assert policy is not None
+    assert (
+        set(roles)
+        == set(policy.execution_policies)
+        == {
+            "dataset",
+            "train",
+            "inference",
+            "eval",
+        }
+    )
+    assert DEFAULT_PRODUCT_PROFILE.delegated_roles is None
+    for name, execution in policy.execution_policies.items():
+        assert execution.submission_tool in roles[name].tools
+        if execution.require_review:
+            assert "record_execution_checkpoint" in roles[name].tools
+    old = PreparationPolicy.model_validate(
+        {
+            "checklist_id": "old",
+            "version": 1,
+            "fields": [{"key": "goal", "label": "Goal"}],
+            "allowed_roles": ["eval"],
+        }
+    )
+    assert "execution_policies" not in old.model_dump(mode="json")
+    with pytest.raises(ValidationError):
+        RequestExperimentTask.model_validate(
+            {
+                "role_id": "dataset",
+                "request_id": "r",
+                "task": {"name": "Clean", "instruction": "Clean"},
+                "execution_policy": {"require_review": False},
+            }
+        )
+
+
+def test_shared_execution_rules_do_not_dispatch_on_agent_or_role_names():
+    names = {"echomind", "pyromind", "avi", "pcb", "init", "dataset", "train", "eval"}
+    for filename in (
+        "application/experiment_execution.py",
+        "application/execution_checkpoints.py",
+        "application/execution_artifacts.py",
+        "application/delegated_execution.py",
+        "infrastructure/sql_experiment_execution.py",
+    ):
+        path = ROOT / "pyromind-runtime/pyromind_runtime" / filename
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Compare):
+                continue
+            operands = [node.left, *node.comparators]
+            discriminants = [
+                value
+                for value in operands
+                if any(
+                    key in ast.unparse(value).lower()
+                    for key in ("role", "profile", "scenario")
+                )
+            ]
+            literals = {
+                value.value.lower()
+                for value in operands
+                if isinstance(value, ast.Constant) and isinstance(value.value, str)
+            }
+            assert not (discriminants and literals & names), (path, node.lineno)
+
+
+def test_node_requirements_keep_evaluation_ready_gate_without_blocking_data_only():
+    from pydantic import ValidationError
+    from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
+    from pyromind_runtime.domain.preparation import PreparationView
+
+    policy = ECHOMIND_PRODUCT_PROFILE.preparation_policy
+    assert policy is not None
+    facts = {
+        field.key: {"status": "resolved", "value": "provided"}
+        for field in policy.fields
+        if field.required
+    }
+    for kind in ("dataset", "train", "inference", "evaluator"):
+        document = {
+            "policy": policy,
+            "phase": "ready",
+            "facts": facts,
+            "plan": {
+                "goal": "Test",
+                "stages": [{"id": "stage", "kind": kind, "name": kind}],
+            },
+        }
+        if kind in {"dataset", "inference"}:
+            assert PreparationView.model_validate(document).phase == "ready"
+        else:
+            with pytest.raises(
+                ValidationError, match="workflow requires checklist fields"
+            ):
+                PreparationView.model_validate(document)

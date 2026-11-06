@@ -25,6 +25,7 @@ from pyromind_runtime.infrastructure.sql_work_queue import (
     digest,
     metadata,
     now,
+    work,
 )
 
 
@@ -368,11 +369,13 @@ class SQLExperimentExecutionStore:
                 "abandoned",
             }:
                 raise ValueError("execution cannot submit work")
+            policy = (row["task_spec"] or {}).get("execution_policy") or {}
+            if policy.get("require_review"):
+                checkpoint = (row.get("attributes") or {}).get("checkpoint") or {}
+                if checkpoint.get("status") != "approved":
+                    raise PermissionError("submission requires current sample approval")
             operation = str(arguments.get("operation", "inference"))
-            if item["kind"] == "generate_report" and operation in {
-                "inference",
-                "resume",
-            }:
+            if item["kind"] == "generate_report" and operation != "review":
                 raise PermissionError("report retry cannot start GPU evaluation")
             previous = (
                 conn.execute(
@@ -437,7 +440,9 @@ class SQLExperimentExecutionStore:
                     )
                 )
             conn.execute(
-                runs.update().where(runs.c.id == run_id).values(state="submitting")
+                runs.update()
+                .where(runs.c.id == run_id)
+                .values(state="submitting", report_state="not_started")
             )
             return {"operation_id": operation_id}
 
@@ -513,25 +518,30 @@ class SQLExperimentExecutionStore:
                 )
                 self.changed(conn, owner, run_id, "submission-uncertain")
             if report and row["report_state"] != "ready":
+                result = dict(row.get("result") or {})
+                reason = result.get("registration_error") or text[:16000]
+                result.update(summary=reason, waiting_reason=reason)
                 conn.execute(
                     runs.update()
                     .where(runs.c.id == run_id)
-                    .values(report_state="failed")
+                    .values(report_state="failed", result=result)
                 )
                 self.changed(conn, owner, run_id, "report-failed")
             elif row["state"] in {"queued", "preparing"}:
                 prepared = row["task_spec"]["intent"] == "prepare"
+                result = dict(row.get("result") or {})
+                reason = result.get("registration_error") or text[:16000]
+                result.update(summary=reason, blockers=[] if prepared else [reason])
                 conn.execute(
                     runs.update()
                     .where(runs.c.id == run_id)
                     .values(
                         state="prepared" if prepared else "needs_input",
                         active_key=None,
-                        result={
-                            "summary": text[:16000],
-                            "blockers": [] if prepared else [text[:16000]],
-                        },
-                        report_state="ready",
+                        result=result,
+                        report_state="failed"
+                        if result.get("registration_error") and not prepared
+                        else "ready",
                     )
                 )
                 self.changed(conn, owner, run_id, "needs-input")
@@ -544,8 +554,10 @@ class SQLExperimentExecutionStore:
         scope: dict,
         result: dict,
         report_artifact: dict | None,
+        verified: list[dict] | None = None,
     ) -> None:
         validate_persisted_payload(result)
+        validate_persisted_payload(verified)
         with write_transaction(self.engine) as conn:
             self.queue.fenced(conn, scope["work_id"], scope["generation"])
             row = self._run(conn, owner, run_id)
@@ -562,6 +574,56 @@ class SQLExperimentExecutionStore:
                 and isinstance(inputs, dict)
                 and inputs.get("phase") == "sample"
             )
+            policy = specification.get("execution_policy") or {}
+            data_result = policy.get("artifact_contract") == "data"
+            if verified is not None:
+                if not data_result or prepared or blocked:
+                    raise ValueError("execution cannot register these file outputs")
+                if (
+                    policy.get("require_review")
+                    and ((row.get("attributes") or {}).get("checkpoint") or {}).get(
+                        "status"
+                    )
+                    != "approved"
+                ):
+                    raise PermissionError("the frozen sample review is not approved")
+                if row["state"] not in {
+                    "queued",
+                    "preparing",
+                    "needs_input",
+                    "waiting_artifacts",
+                    "succeeded",
+                }:
+                    raise ValueError("execution is not ready to register outputs")
+                platform_states = conn.execute(
+                    sa.select(submissions.c.state).where(submissions.c.run_id == run_id)
+                ).scalars()
+                if any(
+                    state not in {"succeeded", "not_submitted"}
+                    for state in platform_states
+                ):
+                    raise ValueError(
+                        "submitted platform work must succeed before registration"
+                    )
+                declared = [
+                    (item["name"], item["uri"]) for item in result.get("artifacts", [])
+                ]
+                inspected = [(item["name"], item["uri"]) for item in verified]
+                if (
+                    not inspected
+                    or declared != inspected
+                    or len({name for name, _ in inspected}) != len(inspected)
+                ):
+                    raise ValueError("every declared artifact must be verified")
+                for item in verified:
+                    self._register_artifact(conn, row, item)
+                row["state"] = "succeeded"
+            elif data_result and not blocked and not prepared and not local_sample:
+                if result.get("artifacts") or row["state"] not in {
+                    "failed",
+                    "cancelled",
+                }:
+                    raise ValueError("every declared artifact must be verified")
             if blocked and row["state"] in {
                 "submitting",
                 "submission_uncertain",
@@ -570,13 +632,16 @@ class SQLExperimentExecutionStore:
                 "cancel_requested",
             }:
                 raise ValueError("in-flight work must retain its platform state")
-            if not blocked and not prepared and not report_artifact:
+            if not blocked and not prepared and not data_result and not report_artifact:
                 raise ValueError("result requires a readable report")
             if (
                 not blocked
                 and not prepared
                 and not local_sample
-                and row["state"] not in {"succeeded", "failed", "cancelled"}
+                and (
+                    row["state"] not in {"succeeded", "failed", "cancelled"}
+                    or (not data_result and not report_artifact)
+                )
             ):
                 raise ValueError(
                     "platform-backed result requires terminal execution state"
@@ -601,6 +666,191 @@ class SQLExperimentExecutionStore:
             )
             self.changed(conn, owner, run_id, "result:" + fingerprint(result))
 
+    def record_result_failure(
+        self, owner: PlanOwner, run_id: str, scope: dict, reason: str
+    ) -> None:
+        validate_persisted_payload({"reason": reason})
+        with write_transaction(self.engine) as conn:
+            self.queue.fenced(conn, scope["work_id"], scope["generation"])
+            row = self._run(conn, owner, run_id)
+            if row["state"] == "succeeded" and row["report_state"] == "ready":
+                return
+            result = {
+                **(row.get("result") or {}),
+                "registration_error": reason,
+                "waiting_reason": reason,
+            }
+            conn.execute(runs.update().where(runs.c.id == run_id).values(result=result))
+            self.changed(conn, owner, run_id, "registration:" + fingerprint(result))
+
+    def record_checkpoint(
+        self, owner: PlanOwner, run_id: str, scope: dict, checkpoint: dict
+    ) -> None:
+        validate_persisted_payload(checkpoint)
+        with write_transaction(self.engine) as conn:
+            self.queue.fenced(conn, scope["work_id"], scope["generation"])
+            row = self._run(conn, owner, run_id)
+            policy = (row.get("task_spec") or {}).get("execution_policy") or {}
+            if not policy.get("require_review") or row["state"] not in {
+                "queued",
+                "preparing",
+                "waiting_user",
+            }:
+                raise ValueError("execution cannot register a sample checkpoint")
+            attributes = dict(row.get("attributes") or {})
+            attributes["checkpoint"] = checkpoint
+            conn.execute(
+                runs.update()
+                .where(runs.c.id == run_id)
+                .values(
+                    attributes=attributes,
+                    state="waiting_user",
+                    report_state="ready",
+                    result={
+                        "summary": checkpoint["document"]["summary"],
+                        "checkpoint": checkpoint,
+                    },
+                )
+            )
+            self.changed(
+                conn, owner, run_id, "checkpoint:" + checkpoint["checkpoint_id"]
+            )
+
+    def resolve_checkpoint(
+        self,
+        owner: PlanOwner,
+        run_id: str,
+        checkpoint_id: str,
+        command_id: str,
+        approved: bool,
+    ) -> None:
+        with write_transaction(self.engine) as conn:
+            row = self._run(conn, owner, run_id)
+            attributes = dict(row.get("attributes") or {})
+            checkpoint = dict(attributes.get("checkpoint") or {})
+            if checkpoint.get("checkpoint_id") != checkpoint_id:
+                raise ValueError("sample changed; review the current sample")
+            if checkpoint.get("decision_id") == command_id:
+                return
+            if checkpoint.get("status") != "pending" or row["state"] != "waiting_user":
+                raise ValueError("sample is no longer waiting for confirmation")
+            checkpoint.update(
+                status="approved" if approved else "revise", decision_id=command_id
+            )
+            attributes["checkpoint"] = checkpoint
+            result = {**(row.get("result") or {}), "checkpoint": checkpoint}
+            conn.execute(
+                runs.update()
+                .where(runs.c.id == run_id)
+                .values(attributes=attributes, result=result)
+            )
+            self.changed(conn, owner, run_id, "checkpoint-answer:" + command_id)
+
+    def queue_artifact_report(self, owner: PlanOwner, run_id: str) -> None:
+        with write_transaction(self.engine) as conn:
+            row = self._run(conn, owner, run_id)
+            if row["state"] != "waiting_artifacts":
+                raise ValueError("platform artifacts are not ready for inspection")
+            if row["report_state"] != "not_started":
+                return
+            self.queue.put(
+                conn,
+                owner_key(owner),
+                "role:" + row["role_id"],
+                "verify:" + run_id,
+                "generate_report",
+                {
+                    "run_id": run_id,
+                    "owner": owner.model_dump(mode="json"),
+                    "message": "Inspect actual platform outputs. "
+                    "Register required artifacts "
+                    "with record_experiment_result; do not resubmit.",
+                },
+            )
+            conn.execute(
+                runs.update().where(runs.c.id == run_id).values(report_state="queued")
+            )
+
+    def stage_workflow(
+        self, owner: PlanOwner, run_id: str, scope: dict, request_id: str
+    ) -> None:
+        with write_transaction(self.engine) as conn:
+            self.queue.fenced(conn, scope["work_id"], scope["generation"])
+            row = self._run(conn, owner, run_id)
+            policy = (row.get("task_spec") or {}).get("execution_policy") or {}
+            if (
+                policy.get("submission_tool") != "submit_workflow"
+                or row["task_spec"]["intent"] != "execute"
+            ):
+                raise PermissionError("execution does not allow workflow submission")
+            attributes = dict(row.get("attributes") or {})
+            previous = attributes.get("workflow_request_id")
+            if previous and previous != request_id:
+                raise ValueError("a workflow is already staged for this task")
+            if row["state"] not in {"queued", "preparing", "waiting_confirmation"}:
+                raise ValueError("task cannot stage another workflow")
+            attributes["workflow_request_id"] = request_id
+            conn.execute(
+                runs.update()
+                .where(runs.c.id == run_id)
+                .values(attributes=attributes, state="waiting_confirmation")
+            )
+            self.changed(conn, owner, run_id, "workflow:" + request_id)
+
+    def begin_workflow(
+        self,
+        owner: PlanOwner,
+        run_id: str,
+        request_id: str,
+        definition_fingerprint: str,
+        allow: bool,
+    ) -> str | None:
+        with write_transaction(self.engine) as conn:
+            row = self._run(conn, owner, run_id)
+            if (row.get("attributes") or {}).get("workflow_request_id") != request_id:
+                raise PermissionError("workflow belongs to another execution")
+            existing = (
+                conn.execute(
+                    sa.select(submissions).where(
+                        submissions.c.run_id == run_id,
+                        submissions.c.operation_key == "workflow",
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if existing:
+                if existing["request_fingerprint"] != definition_fingerprint:
+                    raise ValueError("workflow definition changed")
+                return existing["id"]
+            if row["state"] != "waiting_confirmation":
+                raise ValueError("execution is not awaiting workflow confirmation")
+            if not allow:
+                conn.execute(
+                    runs.update()
+                    .where(runs.c.id == run_id)
+                    .values(state="cancelled", active_key=None)
+                )
+                self.changed(conn, owner, run_id, "workflow-denied:" + request_id)
+                return None
+            identity = uuid4().hex
+            conn.execute(
+                submissions.insert().values(
+                    id=identity,
+                    run_id=run_id,
+                    operation_key="workflow",
+                    owner=owner_key(owner),
+                    state="submitting",
+                    request_fingerprint=definition_fingerprint,
+                    evidence={"workflow_request_id": request_id},
+                    updated_at=now(),
+                )
+            )
+            conn.execute(
+                runs.update().where(runs.c.id == run_id).values(state="submitting")
+            )
+            return identity
+
     def pending_runs(self) -> list[dict]:
         with self.engine.connect() as conn:
             return [
@@ -617,13 +867,35 @@ class SQLExperimentExecutionStore:
                 ).mappings()
             ]
 
+    def mark_submission_uncertain(
+        self, owner: PlanOwner, run_id: str, submission_id: str
+    ) -> None:
+        with write_transaction(self.engine) as conn:
+            self._run(conn, owner, run_id)
+            updated = conn.execute(
+                submissions.update()
+                .where(
+                    submissions.c.id == submission_id,
+                    submissions.c.run_id == run_id,
+                    submissions.c.state == "submitting",
+                )
+                .values(state="submission_uncertain", updated_at=now())
+            )
+            if updated.rowcount:
+                conn.execute(
+                    runs.update()
+                    .where(runs.c.id == run_id)
+                    .values(state="submission_uncertain")
+                )
+                self.changed(conn, owner, run_id, "uncertain:" + submission_id)
+
     def recover_managed_receipt(
         self, owner: PlanOwner, run_id: str, submission_id: str, receipt: dict
     ) -> None:
         """Repair from the existing tool ledger, never repeat external creation."""
         validate_persisted_payload(receipt)
         with write_transaction(self.engine) as conn:
-            self._run(conn, owner, run_id)
+            row = self._run(conn, owner, run_id)
             sub = (
                 conn.execute(
                     sa.select(submissions)
@@ -638,22 +910,34 @@ class SQLExperimentExecutionStore:
             )
             if sub["state"] not in {"submitting", "submission_uncertain"}:
                 return
-            if not receipt.get("task_id"):
-                raise ValueError("recovery requires a recorded platform task")
+            task_id = receipt.get("task_id")
+            if not task_id:
+                if (
+                    receipt.get("submission_not_sent") is not True
+                    or not receipt.get("operation_id")
+                    or receipt["operation_id"] != sub["evidence"].get("operation_id")
+                    or sub["task_id"] is not None
+                    or row["state"] != "submission_uncertain"
+                ):
+                    raise ValueError(
+                        "recovery requires a recorded task or proof "
+                        "the operation was not sent"
+                    )
+                submission_state, run_state = "not_submitted", "needs_input"
+            else:
+                submission_state = run_state = "waiting_platform"
             conn.execute(
                 submissions.update()
                 .where(submissions.c.id == submission_id)
                 .values(
-                    task_id=receipt["task_id"],
-                    state="waiting_platform",
+                    task_id=task_id,
+                    state=submission_state,
                     evidence={**sub["evidence"], "receipt": receipt},
                     updated_at=now(),
                 )
             )
             conn.execute(
-                runs.update()
-                .where(runs.c.id == run_id)
-                .values(state="waiting_platform")
+                runs.update().where(runs.c.id == run_id).values(state=run_state)
             )
             self.changed(conn, owner, run_id, "recovered:" + submission_id)
 
@@ -667,6 +951,8 @@ class SQLExperimentExecutionStore:
     ) -> None:
         with write_transaction(self.engine) as conn:
             row = self._run(conn, owner, run_id)
+            if not reason and (row.get("result") or {}).get("registration_error"):
+                return
             result = {**(row.get("result") or {}), "waiting_reason": reason}
             conn.execute(
                 runs.update()
@@ -762,28 +1048,96 @@ class SQLExperimentExecutionStore:
     def continue_task(
         self, owner: PlanOwner, run_id: str, command_id: str, message: str
     ) -> str:
+        """Deliver guidance to the child context independently of business state."""
         with write_transaction(self.engine) as conn:
             row = self._run(conn, owner, run_id)
-            if not row["task_spec"] or row["state"] != "needs_input":
-                raise ValueError("task is not waiting for input")
-            identity = self.queue.put(
+            prior = (
+                conn.execute(
+                    sa.select(work).where(
+                        work.c.owner == owner_key(owner),
+                        work.c.dedup_key == digest("continue:" + command_id),
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if prior:
+                if (
+                    prior["payload"].get("run_id") != run_id
+                    or prior["payload"].get("message") != message
+                ):
+                    raise ValueError("continuation command reused with different work")
+                return prior["id"]
+            active = next(
+                (
+                    item
+                    for item in conn.execute(
+                        sa.select(work)
+                        .where(
+                            work.c.owner == owner_key(owner),
+                            work.c.state == "running",
+                            work.c.kind.in_(
+                                ("execute_task", "prepare_execution", "generate_report")
+                            ),
+                        )
+                        .with_for_update()
+                    ).mappings()
+                    if item["payload"].get("run_id") == run_id
+                ),
+                None,
+            )
+            payload = {
+                "run_id": run_id,
+                "owner": owner.model_dump(mode="json"),
+                "message": message,
+                "continuation": True,
+            }
+            if active:
+                payload["target_work_id"] = active["id"]
+            return self.queue.put(
+                conn,
+                owner_key(owner),
+                "guidance:" + row["role_id"] if active else "role:" + row["role_id"],
+                "continue:" + command_id,
+                "steer_task" if active else "execute_task",
+                payload,
+            )
+
+    def guidance_target(self, owner: PlanOwner, run_id: str, work_id: str) -> dict:
+        with self.engine.connect() as conn:
+            self._run(conn, owner, run_id)
+            item = (
+                conn.execute(
+                    sa.select(work).where(
+                        work.c.id == work_id, work.c.owner == owner_key(owner)
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if item is None or item["payload"].get("run_id") != run_id:
+                raise PermissionError("guidance belongs to another execution")
+            return dict(item)
+
+    def enqueue_continuation(
+        self, owner: PlanOwner, run_id: str, guidance_id: str, message: str
+    ) -> str:
+        """The child finished before live guidance arrived; resume its session next."""
+        with write_transaction(self.engine) as conn:
+            row = self._run(conn, owner, run_id)
+            return self.queue.put(
                 conn,
                 owner_key(owner),
                 "role:" + row["role_id"],
-                "continue:" + command_id,
+                "guidance-resume:" + guidance_id,
                 "execute_task",
                 {
                     "run_id": run_id,
                     "owner": owner.model_dump(mode="json"),
                     "message": message,
+                    "continuation": True,
                 },
             )
-            conn.execute(
-                runs.update()
-                .where(runs.c.id == run_id)
-                .values(state="queued", report_state="not_started")
-            )
-            return identity
 
     def platform_run(self, task_id: str) -> dict | None:
         with self.engine.connect() as conn:
@@ -1194,12 +1548,20 @@ class SQLExperimentExecutionStore:
     @staticmethod
     def _register_artifact(conn, row: dict, item: dict) -> None:
         validate_persisted_payload(item)
+        checksum = item["sha256"]
+        if len(checksum) != 64 or any(c not in "0123456789abcdef" for c in checksum):
+            raise ValueError(
+                f"invalid artifact digest for {item['name']!r}: {item['uri']}"
+            )
         attributes = dict(row.get("attributes") or {})
         registered = dict(attributes.get("artifacts", {}))
         previous = registered.get(item["name"])
         if previous:
             if previous["sha256"] != item["sha256"] or previous["uri"] != item["uri"]:
-                raise ValueError("registered artifact changed")
+                raise ValueError(
+                    f"registered artifact changed: {item['name']!r} "
+                    f"({previous['uri']} -> {item['uri']})"
+                )
             return
         registered[item["name"]] = {
             "id": item.get("id") or uuid4().hex,
@@ -1223,8 +1585,14 @@ class SQLExperimentExecutionStore:
             row = self._run(conn, owner, run_id)
             if row["state"] != "waiting_artifacts":
                 raise ValueError("execution is not awaiting verified artifacts")
+            policy = (row.get("task_spec") or {}).get("execution_policy") or {}
+            contract = policy.get("artifact_contract", "evaluation")
+            if contract == "data":
+                raise ValueError("data files must be committed with their task result")
             expected = (
-                {"metrics.json", "report.json", "predictions.jsonl"}
+                {"report", contract}
+                if contract != "evaluation"
+                else {"metrics.json", "report.json", "predictions.jsonl"}
                 if row["task_spec"]
                 else set(row["proposal"].get("expected_artifacts", []))
             )
@@ -1248,30 +1616,31 @@ class SQLExperimentExecutionStore:
                     active_key=None,
                 )
             )
-            self.queue.put(
-                conn,
-                owner_key(owner),
-                "role:" + row["role_id"],
-                "report:" + run_id
-                if not row["task_spec"]
-                else "report:"
-                + run_id
-                + ":"
-                + str(
-                    conn.execute(
-                        sa.select(submissions.c.task_id)
-                        .where(submissions.c.run_id == run_id)
-                        .order_by(submissions.c.updated_at.desc())
-                    ).scalar()
+            if contract == "evaluation":
+                self.queue.put(
+                    conn,
+                    owner_key(owner),
+                    "role:" + row["role_id"],
+                    "report:" + run_id
+                    if not row["task_spec"]
+                    else "report:"
+                    + run_id
+                    + ":"
+                    + str(
+                        conn.execute(
+                            sa.select(submissions.c.task_id)
+                            .where(submissions.c.run_id == run_id)
+                            .order_by(submissions.c.updated_at.desc())
+                        ).scalar()
+                    )
+                    + ":",
+                    "generate_report",
+                    {
+                        "run_id": run_id,
+                        "owner": owner.model_dump(mode="json"),
+                        **({"message": ""} if row["task_spec"] else {}),
+                    },
                 )
-                + ":",
-                "generate_report",
-                {
-                    "run_id": run_id,
-                    "owner": owner.model_dump(mode="json"),
-                    **({"message": ""} if row["task_spec"] else {}),
-                },
-            )
             self.changed(conn, owner, run_id, "artifacts")
 
     def pending_deliveries(self) -> list[dict]:
@@ -1484,6 +1853,7 @@ class SQLExperimentExecutionStore:
                     .order_by(submissions.c.updated_at.desc())
                 ).mappings()
             ]
+            row["submission"] = row["submissions"][0] if row["submissions"] else None
             if row["state"] == "queued" and item["kind"] in {
                 "execute_task",
                 "prepare_execution",

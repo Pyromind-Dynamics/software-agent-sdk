@@ -5,6 +5,10 @@ from dataclasses import replace
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.ports.harness import DelegatedRole
 
+from openhands.agent_server.agent_profiles.echomind_dataset import (
+    ECHOMIND_DATASET_ROLE,
+)
+from openhands.agent_server.agent_profiles.echomind_eval import ECHOMIND_EVAL_ROLE
 from openhands.agent_server.agent_profiles.echomind_manager import (
     ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
     ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
@@ -15,6 +19,7 @@ from openhands.agent_server.agent_profiles.echomind_manager import (
 LEGACY_EXPERIMENT_PROFILE = replace(
     ECHOMIND_PRODUCT_PROFILE,
     configuration_version=0,
+    instructions=ECHOMIND_MANAGER_PROFILE.system_prompt or "",
     preparation_policy=None,
     command_allowlist=(
         "user_message",
@@ -81,6 +86,7 @@ LEGACY_EXPERIMENT_PROFILE = replace(
 EXPERIMENT_PROFILE_V4 = replace(
     ECHOMIND_PRODUCT_PROFILE,
     configuration_version=4,
+    delegated_roles=(ECHOMIND_EVAL_ROLE, ECHOMIND_DATASET_ROLE),
     preparation_policy=None,
     instructions=ECHOMIND_MANAGER_PROFILE.system_prompt or "",
     tool_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,

@@ -57,6 +57,10 @@ class ExperimentPlatform(Protocol):
 
 
 class DelegatedExecutionStore(ExperimentExecutionStore, Protocol):
+    def mark_submission_uncertain(
+        self, owner: PlanOwner, run_id: str, submission_id: str
+    ) -> None: ...
+
     def retire_legacy_work(self, owner: PlanOwner) -> bool: ...
 
     def recover_submissions(self) -> int: ...
@@ -104,6 +108,12 @@ class DelegatedExecutionStore(ExperimentExecutionStore, Protocol):
 
     def continue_task(
         self, owner: PlanOwner, run_id: str, command_id: str, message: str
+    ) -> str: ...
+
+    def guidance_target(self, owner: PlanOwner, run_id: str, work_id: str) -> dict: ...
+
+    def enqueue_continuation(
+        self, owner: PlanOwner, run_id: str, guidance_id: str, message: str
     ) -> str: ...
 
     def platform_run(self, task_id: str) -> dict | None: ...
@@ -174,7 +184,40 @@ class DelegatedExecutionStore(ExperimentExecutionStore, Protocol):
         scope: dict,
         result: dict,
         report_artifact: dict | None,
+        verified: list[dict] | None = None,
     ) -> None: ...
+
+    def record_result_failure(
+        self, owner: PlanOwner, run_id: str, scope: dict, reason: str
+    ) -> None: ...
+
+    def record_checkpoint(
+        self, owner: PlanOwner, run_id: str, scope: dict, checkpoint: dict
+    ) -> None: ...
+
+    def resolve_checkpoint(
+        self,
+        owner: PlanOwner,
+        run_id: str,
+        checkpoint_id: str,
+        command_id: str,
+        approved: bool,
+    ) -> None: ...
+
+    def queue_artifact_report(self, owner: PlanOwner, run_id: str) -> None: ...
+
+    def stage_workflow(
+        self, owner: PlanOwner, run_id: str, scope: dict, request_id: str
+    ) -> None: ...
+
+    def begin_workflow(
+        self,
+        owner: PlanOwner,
+        run_id: str,
+        request_id: str,
+        definition_fingerprint: str,
+        allow: bool,
+    ) -> str | None: ...
 
     def pending_runs(self) -> list[dict]: ...
 

@@ -3,13 +3,16 @@
   "version": 2,
   "create_project_starts_entry_task": false,
   "allowed_roles": [
+    "init",
+    "dataset",
+    "train",
     "eval"
   ],
   "fields": [
     {
       "key": "goal",
-      "label": "评测目标",
-      "description": "任务、期望输出与关注的问题",
+      "label": "实验目标",
+      "description": "任务、期望产物和本轮关注的问题",
       "value_type": "string"
     },
     {
@@ -20,12 +23,13 @@
       "required_keys": [
         "source",
         "reference"
-      ]
+      ],
+      "required": false
     },
     {
       "key": "dataset",
-      "label": "评测数据",
-      "description": "Storage JSONL 位置与格式；无法读取时向用户确认",
+      "label": "数据来源",
+      "description": "Storage 数据位置与实际格式（文件或目录）；无法读取时向用户确认",
       "value_type": "object",
       "required_keys": [
         "path",
@@ -56,7 +60,8 @@
       "depends_on": [
         "dataset",
         "io_contract"
-      ]
+      ],
+      "required": false
     },
     {
       "key": "scope",
@@ -72,9 +77,9 @@
     {
       "id": "init",
       "name": "Init",
-      "description": "基模评测与基线解读，同一 Stage 内完成推理、评分、报告及分析；由 Eval 角色执行。",
+      "description": "基模评测与基线解读，同一 Init Stage 内完成。",
       "roles": [
-        "eval"
+        "init"
       ],
       "max_instances": 1,
       "tasks": [
@@ -86,28 +91,41 @@
           "id": "analysis",
           "description": "基于已有评测或导入结果进行统计、badcase 分析与报告。"
         }
+      ],
+      "required_fields": [
+        "model",
+        "scoring"
       ]
     },
     {
       "id": "dataset",
       "name": "Dataset",
-      "description": "数据清洗、预标注与划分；当前为未实现占位。",
+      "description": "3 条小样清洗，经用户确认后提交 Studio 全量清洗。",
       "tasks": [
         {
           "id": "clean_label",
           "description": "生成可核验的数据版本与统计。"
         }
+      ],
+      "roles": [
+        "dataset"
       ]
     },
     {
       "id": "train",
       "name": "Train",
-      "description": "模型训练；当前为未实现占位。",
+      "description": "复用训练工作流能力，经现有提交确认后在 Studio 执行训练。",
       "tasks": [
         {
           "id": "train_run",
           "description": "训练并登记模型与 checkpoint 产物。"
         }
+      ],
+      "roles": [
+        "train"
+      ],
+      "required_fields": [
+        "model"
       ]
     },
     {
@@ -126,6 +144,10 @@
           "id": "analysis",
           "description": "基于已有评测或导入结果进行统计、badcase 分析与报告。"
         }
+      ],
+      "required_fields": [
+        "model",
+        "scoring"
       ]
     },
     {
@@ -143,5 +165,23 @@
       "name": "RawData",
       "description": "原始数据来源，无执行角色；当前不启用单独节点。"
     }
-  ]
+  ],
+  "execution_policies": {
+    "init": {
+      "submission_tool": "df_submit_evaluation",
+      "artifact_contract": "evaluation"
+    },
+    "eval": {
+      "submission_tool": "df_submit_evaluation",
+      "artifact_contract": "evaluation"
+    },
+    "dataset": {
+      "submission_tool": "df_submit_pipeline",
+      "artifact_contract": "data"
+    },
+    "train": {
+      "submission_tool": "submit_workflow",
+      "artifact_contract": "model"
+    }
+  }
 }

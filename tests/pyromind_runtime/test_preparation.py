@@ -539,8 +539,9 @@ async def test_create_project_materializes_working_graph_without_starting_task(
         await runtime.close()
 
 
+@pytest.mark.parametrize("explicit_entry", [True, False])
 async def test_create_project_enqueues_project_created_manager_turn_once(
-    preparation_setup, ready_request, tmp_path
+    preparation_setup, ready_request, tmp_path, explicit_entry
 ):
     store, _, _ = preparation_setup
     owner = PlanOwner(
@@ -559,7 +560,8 @@ async def test_create_project_enqueues_project_created_manager_turn_once(
         ),
     )
     store.initialize(owner, policy)
-    ready = make_ready(store, owner, ready_request)
+    payload = ready_request if explicit_entry else {**ready_request, "entry_task": None}
+    ready = make_ready(store, owner, payload)
     adapter = FakeAdapter()
     execution_store = SQLExperimentExecutionStore(store.engine)
     runtime = ConversationRuntime(

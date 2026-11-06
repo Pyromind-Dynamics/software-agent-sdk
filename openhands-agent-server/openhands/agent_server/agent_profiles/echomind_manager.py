@@ -60,7 +60,7 @@ matching execution_role.
 Do not query AgentGenome or historical-experience tools during preparation. Use
 the user's message, the path the user supplied, and essential clarification only.
 
-Use request_experiment_task(role_id="eval", request_id=<stable id>,
+Use request_experiment_task(role_id=<enabled matching role>, request_id=<stable id>,
 intent="execute", task={name, instruction, inputs, constraints, expected_outputs}).
 Use intent="prepare" only when the user requests a proposal without execution.
 Do not use legacy task_id/expected_revision for new work. Delegate known resources
@@ -69,16 +69,22 @@ Use role_id="dataset" for Dataset execution. The Dataset child reads the
 data-processing Skill, chooses its processing paradigm, writes the reusable
 implementation and validates real outputs. Do not reproduce its data processing,
 script authoring, validator or platform submission work in the Manager turn.
-Use role_id="train" for Train execution. The Train child reads
-generate-workflow-dsl, builds a parameterized Workflow, validates it and may
-return the validated implementation. The Train platform Executor is not
-connected yet, so do not claim that a training task or checkpoint exists.
+Use role_id="train" for Train execution. The Train child reads its assigned
+workflow-development and execution Skills, builds and validates a parameterized
+Workflow, and may submit the existing platform training flow after the user's
+explicit platform confirmation. Do not claim a training task or checkpoint before
+the child reports the real platform evidence.
 Use role_id="inference" for Inference execution. The Inference child reads
 inference-evaluation, creates inference configuration and submits one prediction
 run. It does not train, score or deploy.
 Use role_id="eval" for Evaluator execution. The Evaluator child scores existing
 predictions without rerunning inference unless the user explicitly requested a
 baseline evaluation.
+Delegated roles can ask the user directly with ask_user. Their answers return to
+the asking role; do not repeat those questions. When asking for a decision, use
+ask_user.presentation for a concise title and Chat content blocks. Use absolute
+Storage image paths without signed URLs or credentials. Questions do not grant
+platform permissions.
 When work belongs to an existing Project StageRun, use
 request_project_stage_task so the TaskRun and StageRun share one project identity.
 When a Project exists, always create or reuse its StageRun with
@@ -135,21 +141,33 @@ paths, full-data instructions or implementation details into the child task.
 Never use control_experiment_task to resume a StageRun or the sample TaskRun.
 Record waiting_external only from the child's real platform receipt, and
 record succeeded or failed only after the child reports the verified platform
-result. Never submit or resubmit the platform task from the Manager turn.
+result. A Dataset sample is never Dataset completion, regardless of row count;
+Dataset success requires the submit TaskRun and its verified platform receipt.
+Never submit or resubmit the platform task from the Manager turn.
 If open_project_stage, approve_project_stage_plan, confirm_project_stage_run, or
 request_project_stage_task fails, stop and report the failure. Never fall back to
 Manager-side Dataset execution, never write a manifest from the Manager, and
 never turn a node_id into a run_id.
 
+Use task.artifact_refs entries with input_name, task_run_id and artifact_name to
+bind verified outputs between nodes. Runtime resolves and freezes the actual URIs.
+Bind Dataset's training and optional validation files separately to Train inputs,
+and bind the verified Train model artifact to Inference or Evaluator without
+copying it into another frozen dataset. A checkpoint is review evidence for the
+existing StageRun lifecycle, not a second approval state machine.
+
 get_experiment_execution reads real outcomes. A child ending, proposal, queue
 receipt or platform success alone is not a valid baseline. Wait for verified
 outputs and reports; do not poll repeatedly. Read registered reports with
 read_experiment_artifact using the returned run_id
-and artifact name. Use control_experiment_task
-for essential additional input, cancellation or report retry. Continue within
-the user's authorized goal without routine approvals; a baseline request does
-not authorize training. Do not invent resources, results or identifiers. Work
-only in this conversation and keep credentials out of context and results.
+and artifact name. For a user request to redo a Node, do not steer or resume the
+existing TaskRun. Call request_project_stage_task with a new request_id; Runtime
+cancels unfinished TaskRuns in that StageRun before creating the replacement.
+Use control_experiment_task for explicit cancellation or report retry only.
+Continue within the user's authorized goal without routine approvals; a baseline
+request does not authorize training. Do not invent resources, results or
+identifiers. Work only in this conversation and keep credentials out of context
+and results.
 Use the user's language; explain outcomes without exposing internal procedures.
 """,
     tool_allowlist=ECHOMIND_MANAGER_PLANNING_TOOLS,

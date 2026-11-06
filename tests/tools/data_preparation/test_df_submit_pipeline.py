@@ -16,6 +16,7 @@ from openhands.tools.data_preparation.platform_submit import (
     DataPreparationTaskStore,
     DfSubmitPipelineAction,
     DfSubmitPipelineExecutor,
+    DfSubmitPipelineTool,
     ReuseAssessment,
     _build_dataflow_command,
     _build_dataflow_workflow,
@@ -429,7 +430,9 @@ def test_task_association_reads_legacy_runtime_location() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_executor(tmp_path: Path, **kwargs: Any) -> DfSubmitPipelineExecutor:
+def _make_executor(
+    tmp_path: Path, *, from_tool: bool = False, **kwargs: Any
+) -> DfSubmitPipelineExecutor:
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir(exist_ok=True)
     for filename in RUNTIME_FILENAMES:
@@ -447,6 +450,10 @@ def _make_executor(tmp_path: Path, **kwargs: Any) -> DfSubmitPipelineExecutor:
         "task_store_dir": str(tmp_path / "tasks"),
     }
     defaults.update(kwargs)
+    if from_tool:
+        executor = DfSubmitPipelineTool.create(**defaults)[0].executor
+        assert isinstance(executor, DfSubmitPipelineExecutor)
+        return executor
     return DfSubmitPipelineExecutor(**defaults)
 
 
@@ -790,11 +797,25 @@ def test_compatible_resume_accepts_agent_assessment(
     assert saved.reuse_assessment["decision"] == "compatible_resume"
 
 
+@pytest.mark.parametrize("managed", [False, True])
 def test_new_full_run_uses_conversation_scoped_output_root(
     monkeypatch,
     tmp_path: Path,
+    managed: bool,
 ) -> None:
-    executor = _make_executor(tmp_path)
+    guarded = []
+    executor = _make_executor(
+        tmp_path,
+        from_tool=True,
+        **(
+            {
+                "managed_run_id": "a8d15e82-1290-46ba-a264-be02242162a4",
+                "submission_guard": lambda: guarded.append(True),
+            }
+            if managed
+            else {}
+        ),
+    )
     script = tmp_path / "public_data" / "data-preparation" / "pipeline.py"
     script.parent.mkdir(parents=True)
     script.write_text("print('hi')")
@@ -818,9 +839,15 @@ def test_new_full_run_uses_conversation_scoped_output_root(
     response = MagicMock()
     response.task_id = "task-new"
     response.status = "Pending"
+
+    def submit(**kwargs):
+        assert kwargs["retry_create"] is False
+        assert guarded == ([True] if managed else [])
+        return response
+
     monkeypatch.setattr(
         "openhands.tools.data_preparation.platform_submit.submit_workflow_task",
-        lambda **kwargs: response,
+        submit,
     )
 
     observation = executor(
@@ -835,6 +862,8 @@ def test_new_full_run_uses_conversation_scoped_output_root(
     assert not observation.is_error
     assert observation.resumed is False
     assert observation.run_id is not None
+    if managed:
+        assert str(observation.run_id) == "a8d15e82-1290-46ba-a264-be02242162a4"
     assert observation.output_dir == (
         f"/.pyromind-agent/conv-1/data_preparation/{observation.run_id}"
     )

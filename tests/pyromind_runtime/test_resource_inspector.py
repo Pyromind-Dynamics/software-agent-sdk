@@ -89,3 +89,68 @@ def test_file_preview_auth_failure_is_storage_unavailable(monkeypatch):
                 InspectResource(path="/data.jsonl"),
                 RequestContext(user_id="42", cookie="auth_token=expired"),
             )
+
+
+def test_complete_digest_streams_beyond_preview_and_counts_real_lines(monkeypatch):
+    data = b'{"text":"sample"}\n' * 10000 + b'\n{"text":"last"}'
+    seen = []
+    monkeypatch.setattr(
+        resource_inspector,
+        "request_storage_url",
+        lambda **_: "https://storage.example/object?signed=private",
+    )
+
+    def response(request):
+        seen.append(request)
+        return httpx.Response(200, content=data)
+
+    with httpx.Client(transport=httpx.MockTransport(response)) as client:
+        monkeypatch.setattr(resource_inspector.httpx, "stream", client.stream)
+        result = StorageResourceInspector().inspect(
+            InspectResource(path="/data.jsonl", max_bytes=32, compute_digest=True),
+            RequestContext(user_id="42", cookie="auth_token=test"),
+        )
+    assert result["sha256"] == hashlib.sha256(data).hexdigest()
+    assert result["nonempty_lines"] == 10001
+    assert result["total_bytes"] == len(data)
+    assert result["content"] == data[:32].decode()
+    assert result["bytes_read"] == 32 and result["truncated"]
+    assert result["digest_scope"] == "complete file"
+    assert "range" not in seen[0].headers
+    assert "signed" not in str(result)
+
+
+@pytest.mark.parametrize(
+    "payload,accepted",
+    [
+        (b"\xff\xd8\xffimage", True),
+        (b"<svg><script>bad</script></svg>", False),
+        (b"\xff\xd8\xff" + b"x" * (8 * 1024 * 1024), False),
+    ],
+    ids=["jpeg", "svg", "too_large"],
+)
+def test_sample_media_streams_bounded_rasters_without_exposing_signed_urls(
+    monkeypatch, payload, accepted
+):
+    monkeypatch.setattr(
+        resource_inspector,
+        "request_storage_url",
+        lambda **_: "https://storage.example/image?signed=private",
+    )
+    seen = []
+
+    def response(request):
+        seen.append(request)
+        return httpx.Response(200, content=payload)
+
+    with httpx.Client(transport=httpx.MockTransport(response)) as client:
+        monkeypatch.setattr(resource_inspector.httpx, "stream", client.stream)
+        reader = StorageResourceInspector()
+        context = RequestContext(user_id="42", cookie="auth_token=current")
+        if accepted:
+            assert reader.read_media("/sample.jpg", context) == (payload, "image/jpeg")
+        else:
+            with pytest.raises(ValueError):
+                reader.read_media("/sample.jpg", context)
+    assert "cookie" not in seen[0].headers
+    assert "authorization" not in seen[0].headers

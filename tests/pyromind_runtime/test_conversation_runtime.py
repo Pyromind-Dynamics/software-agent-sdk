@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
@@ -15,11 +16,44 @@ from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.experiment_execution import ControlExperimentTask
+from pyromind_runtime.domain.experiment_plans import PlanOwner
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
+from pyromind_runtime.ports.experiment_execution import DelegatedExecutionStore
 from pyromind_runtime.ports.harness import SessionSpec
 
 from .fake_adapter import FakeAdapter
+
+
+async def test_stage_task_continue_requires_a_replacement_task() -> None:
+    class DelegatedStore:
+        def list(self, owner):
+            del owner
+            return [
+                {
+                    "id": "task-run",
+                    "role_id": "dataset",
+                    "stage_run_id": "stage-run",
+                }
+            ]
+
+    runtime = object.__new__(ConversationRuntime)
+    runtime._delegated_store = cast(DelegatedExecutionStore, DelegatedStore())
+
+    with pytest.raises(ValueError, match="replacement TaskRun"):
+        await runtime._control_experiment_task(
+            PlanOwner(
+                user_id="42",
+                conversation_id="conversation",
+                profile_id="echomind",
+            ),
+            ControlExperimentTask(
+                run_id="task-run",
+                action="continue",
+                command_id="continue-stage-task",
+            ),
+        )
 
 
 async def test_workspace_read_does_not_attach_an_idle_conversation(tmp_path) -> None:

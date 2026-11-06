@@ -953,6 +953,16 @@ class PyromindBusinessToolHost:
     def _preparation_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         params = self._execution_params(context)
         params["runtime_dir"] = str(self._preparation_runtime)
+        if context.extra.get("managed_operation_id"):
+            from uuid import NAMESPACE_URL, uuid5
+
+            params["managed_run_id"] = str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"{context.conversation_id}:{context.extra['managed_operation_id']}",
+                )
+            )
+            params["submission_guard"] = context.extra.get("managed_submission_guard")
         return params
 
     def _evaluation_params(self, context: ToolExecutionContext) -> dict[str, Any]:

@@ -8,6 +8,24 @@
     "inference",
     "eval"
   ],
+  "execution_policies": {
+    "dataset": {
+      "submission_tool": "df_submit_pipeline",
+      "artifact_contract": "data"
+    },
+    "train": {
+      "submission_tool": "submit_workflow",
+      "artifact_contract": "model"
+    },
+    "inference": {
+      "submission_tool": "df_submit_evaluation",
+      "artifact_contract": "data"
+    },
+    "eval": {
+      "submission_tool": "df_submit_evaluation",
+      "artifact_contract": "evaluation"
+    }
+  },
   "fields": [
     {
       "key": "goal",
@@ -43,6 +61,7 @@
       "label": "训练配置",
       "description": "基模、训练方式和已知训练约束",
       "value_type": "object",
+      "required": false,
       "required_keys": [
         "model",
         "objective"
@@ -57,6 +76,7 @@
       "label": "评测依据",
       "description": "GT、参考结果或确定性评分规则",
       "value_type": "object",
+      "required": false,
       "required_keys": [
         "basis"
       ],
@@ -97,6 +117,9 @@
       "roles": [
         "train"
       ],
+      "required_fields": [
+        "training"
+      ],
       "tasks": [
         {
           "id": "train_model",
@@ -124,6 +147,9 @@
       "description": "按确认的评分依据执行确定性评测并生成报告。",
       "roles": [
         "eval"
+      ],
+      "required_fields": [
+        "evaluation"
       ],
       "tasks": [
         {

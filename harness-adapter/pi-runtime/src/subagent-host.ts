@@ -243,7 +243,7 @@ export class SubagentHost {
 
   async control(input: JsonObject): Promise<any> {
     const action = input.action;
-    if (typeof input.role === "string" && isRecord(input.scope) && input.scope.control !== true) this.workScopes.set(input.role, input.scope);
+    if (!["status", "steer"].includes(String(action)) && typeof input.role === "string" && isRecord(input.scope) && input.scope.control !== true) this.workScopes.set(input.role, input.scope);
     if (action === "authorize") {
       if (typeof input.role !== "string" || !Object.hasOwn(this.roleTools, input.role) || !isRecord(input.scope)) {
         throw new Error("Invalid delegated authorization");
@@ -256,9 +256,10 @@ export class SubagentHost {
         || typeof input.task !== "string" || typeof input.request_id !== "string") throw new Error("Invalid delegated launch");
       result = await this.rpc("spawn", { agent: input.role, task: input.task, context: "fresh" }, input.request_id);
     } else {
-      if (!["status", "resume", "stop", "pause"].includes(String(action)) || typeof input.execution_ref !== "string") throw new Error("Invalid delegated control");
+      if (!["status", "resume", "steer", "stop", "pause"].includes(String(action)) || typeof input.execution_ref !== "string") throw new Error("Invalid delegated control");
       result = await this.rpc(action === "pause" ? "interrupt" : String(action), { id: input.execution_ref,
-        ...(action === "resume" ? { message: String(input.task ?? "") } : {}),
+        ...(["resume", "steer"].includes(String(action)) ? { message: String(input.task ?? "") || "Continue with the existing task context." } : {}),
+        ...(action === "steer" ? { mode: "steer" } : {}),
       }, typeof input.request_id === "string" ? input.request_id : randomUUID());
     }
     const id = result?.details?.runId ?? result?.runId ?? input.execution_ref;
@@ -280,7 +281,18 @@ export class SubagentHost {
         if (changed && this.states.has(id)) this.emit(id, "subagent.progress", { details: this.display.details(id) });
       }
     }
-    return { execution_ref: typeof id === "string" ? id : null, status: state, result_text: displayText(result) };
+    if (action === "status" && typeof id === "string" && !["running", "queued", "stopping"].includes(state)) {
+      await this.display.settled(id);
+      await this.finalizing.get(id);
+      if (!this.handoffs.has(id)) {
+        const transcript = await this.rpc("status", {id, view: "transcript", lines: 200});
+        const transformed = await this.reports.transform([{type: "text", text: displayText(transcript)}], {runs: [{runId: id}]});
+        this.handoffs.set(id, displayText(transformed));
+      }
+    }
+    return { execution_ref: typeof id === "string" ? id : null, status: state,
+      result_text: typeof id === "string" ? this.handoffs.get(id) ?? displayText(result) : displayText(result) };
+
   }
 
   observeCall(id: string, input: unknown) {
@@ -352,6 +364,20 @@ export class SubagentHost {
           this.observe(name, status.state, status.steps?.[0]?.agent ?? "Subagent");
         } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error; }
       }
+      const foreground = join(this.paths.stateRoot, "async-subagent-results", "foreground-history.json");
+      if (existsSync(foreground)) {
+        try {
+          const history = JSON.parse(readFileSync(foreground, "utf8"));
+          if (history.version === 1 && Array.isArray(history.runs)) for (const run of history.runs) {
+            if (!isRecord(run) || typeof run.runId !== "string" || !/^[a-zA-Z0-9-]+$/.test(run.runId) || this.backgroundIds.has(run.runId)
+              || ![this.session!.sessionManager.getSessionFile(), this.session!.sessionId].includes(String(run.sessionId)) || !Array.isArray(run.children)) continue;
+            const children = run.children.filter(isRecord);
+            if (!children.length || children.some(child => !["completed", "failed", "stopped"].includes(String(child.status)))) continue;
+            const state = children.some(child => child.status === "failed") ? "failed" : children.some(child => child.status === "stopped") ? "stopped" : "complete";
+            this.observe(run.runId, state, String(children[0].agent ?? "Subagent"));
+          }
+        } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error; }
+      }
       for (const [id, state] of this.states) {
         if (["running", "queued"].includes(state)) void this.display.poll(id);
         else if (this.display.captureActivity(id)) this.emit(id, "subagent.progress", { details: this.display.details(id) });
@@ -380,7 +406,7 @@ export class SubagentHost {
     this.handoffs.set(id, handoff);
     if (this.states.has(id) && !this.finalizing.has(id)) {
       this.emit(id, "subagent.progress", { result: handoff,
-        ...(this.observedLive.has(id) ? { details: this.display.details(id) } : {}) });
+        ...(this.observedLive.has(id) || this.display.value(id, "activity") ? { details: this.display.details(id) } : {}) });
     }
   }
 

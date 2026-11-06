@@ -80,7 +80,7 @@ class UserInputCoordinator:
 
     @staticmethod
     def require_no_pending_input(snapshot: ConversationSnapshot) -> None:
-        if snapshot.pending_inputs:
+        if snapshot.foreground_inputs:
             raise ProductRuntimeError(
                 "input_pending",
                 "Answer or cancel the pending question before sending a message.",
@@ -107,8 +107,8 @@ class UserInputCoordinator:
                 command_id=command.command_id,
             )
             async with self._lock(conversation_id):
-                self._validate(store, command)
-                if command.status == "cancelled":
+                pending = self._validate(store, command)
+                if command.status == "cancelled" and pending.task_run_id is None:
                     # Persist suspension before resolution. Readers then see a pending
                     # question under suspension and reject messages, rather than briefly
                     # accepting a message before the suspension is written.
@@ -155,7 +155,7 @@ class UserInputCoordinator:
                 event.run_id is not None and event.run_id != pending.run_id
             ):
                 return
-            if resolution.outcome != "answered":
+            if resolution.outcome != "answered" and pending.task_run_id is None:
                 # As in submit_response, persist suspension first to avoid an
                 # interrupted-but-unsuspended window.
                 await self._suspend(store, event.conversation_id, "input_interrupted")
@@ -188,7 +188,9 @@ class UserInputCoordinator:
         self.invalidate(conversation_id)
 
     @staticmethod
-    def _validate(store: FileProductStore, command: InputResponseCommand) -> None:
+    def _validate(
+        store: FileProductStore, command: InputResponseCommand
+    ) -> PendingUserInput:
         snapshot = store.load_snapshot()
         if not snapshot.capabilities.user_input_reply:
             raise ProductRuntimeError(
@@ -210,6 +212,7 @@ class UserInputCoordinator:
             )
         if command.status == "answered":
             validate_answers(pending, command)
+        return pending
 
     @staticmethod
     def _fail_receipt(
@@ -274,6 +277,7 @@ class UserInputCoordinator:
                 )
                 or (
                     item.type == "input.resolved"
+                    and item.payload.get("task_run_id") is None
                     and item.payload.get("outcome") in {"cancelled", "interrupted"}
                 )
                 for item in store.replay(after_seq)
@@ -288,8 +292,10 @@ class UserInputCoordinator:
         conversation_id: str,
         command: InputResponseCommand,
         error: Exception,
+        *,
+        suspend: bool = True,
     ) -> None:
-        """Keep the saved answer, record the failure, and stop auto-resume."""
+        """Keep the saved answer and report a failed delivery."""
         detail = (
             f"{type(error).__name__}: {error}" if str(error) else type(error).__name__
         )
@@ -302,13 +308,14 @@ class UserInputCoordinator:
                 "code": "input_delivery_failed",
                 "message": (
                     "The answer was saved but could not be delivered to the "
-                    f"agent; automatic execution stays suspended ({detail})."
+                    f"agent ({detail})."
                 ),
             },
         )
         persisted, _ = await asyncio.to_thread(store.append, notice)
         self._publish(persisted)
-        await self.suspend(store, conversation_id, "input_delivery_failed")
+        if suspend:
+            await self.suspend(store, conversation_id, "input_delivery_failed")
 
     # -- recovery ------------------------------------------------------------
 
@@ -351,7 +358,7 @@ class UserInputCoordinator:
         # Persist suspension before any resolution so recovery itself cannot expose
         # an interrupted-but-unsuspended window.
         _resolved, history = _scan_input_history(store)
-        if snapshot.pending_inputs or _has_unconsumed_answers(history, snapshot):
+        if snapshot.foreground_inputs or _has_unconsumed_answers(history, snapshot):
             await self._suspend(store, conversation_id, "input_recovery")
         interrupted_requests: dict[str, str | None] = {}
         for pending in snapshot.pending_inputs:
@@ -366,7 +373,8 @@ class UserInputCoordinator:
             if persisted is None:
                 continue
             self._publish(persisted)
-            interrupted_requests[pending.request_id] = pending.operation_id
+            if pending.task_run_id is None:
+                interrupted_requests[pending.request_id] = pending.operation_id
         resolved_commands, requests = _scan_input_history(store)
         self._reconcile_receipts(store, receipts, resolved_commands)
         records = [
@@ -444,7 +452,10 @@ def _scan_input_history(
             request_id = event.payload.get("request_id")
             operation_id = event.payload.get("operation_id")
             if isinstance(request_id, str) and isinstance(operation_id, str):
-                requests[request_id] = {"operation_id": operation_id}
+                requests[request_id] = {
+                    "operation_id": operation_id,
+                    "task_run_id": event.payload.get("task_run_id"),
+                }
         elif event.type == "input.resolved":
             payload = event.payload
             request_id = payload.get("request_id")
@@ -483,7 +494,7 @@ def _needs_native_repair(
     request without an operation link does not.
     """
     outcome = record.get("outcome")
-    if outcome is None:
+    if outcome is None or record.get("task_run_id") is not None:
         return False
     operation_id = record.get("operation_id")
     if not isinstance(operation_id, str):
@@ -502,7 +513,11 @@ def _has_unconsumed_answers(
     """
     consumed = _consumed_operation_ids(snapshot)
     for request_id, record in requests.items():
-        if record.get("outcome") != "answered" or record.get("resumed"):
+        if (
+            record.get("task_run_id") is not None
+            or record.get("outcome") != "answered"
+            or record.get("resumed")
+        ):
             continue
         operation_id = record.get("operation_id")
         if not isinstance(operation_id, str) or operation_id not in consumed:

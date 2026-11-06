@@ -219,6 +219,9 @@ class SQLPreparationStore:
                         if fact.status == "resolved"
                     },
                 }
+                policy = view.policy.execution_policies.get(entry.role_id)
+                if policy is not None:
+                    task_spec["execution_policy"] = policy.model_dump(mode="json")
                 run = self.executions.request_in_transaction(
                     conn,
                     owner,

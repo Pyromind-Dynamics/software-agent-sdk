@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
@@ -36,10 +36,21 @@ class PreparationStore(Protocol):
 
 
 class PreparationProjectMaterializer(Protocol):
-    def materialize(self, project: ProjectView, owner: PlanOwner) -> None: ...
+    def materialize(
+        self, project: ProjectView, owner: PlanOwner
+    ) -> tuple[str, str] | None:
+        """Materialize a Project and return its unique graph entry node, if any."""
+        ...
 
 
 class ResourceInspector(Protocol):
     def inspect(
         self, request: InspectResource, context: RequestContext
     ) -> JsonObject: ...
+
+
+@runtime_checkable
+class ResourceMediaReader(Protocol):
+    def read_media(self, path: str, context: RequestContext) -> tuple[bytes, str]:
+        """Read a bounded raster preview with current request credentials."""
+        ...

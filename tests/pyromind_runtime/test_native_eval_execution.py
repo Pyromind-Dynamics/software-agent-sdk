@@ -11,7 +11,12 @@ from aiohttp import web
 from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE as PREPARED_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
-from pyromind_runtime.domain.commands import CreateProjectCommand, UserMessageCommand
+from pyromind_runtime.domain.commands import (
+    ControlExperimentTaskCommand,
+    CreateProjectCommand,
+    InputResponseCommand,
+    UserMessageCommand,
+)
 from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import ProductEvent
@@ -95,21 +100,23 @@ def stream(name=None, arguments=None, text="Done"):
 
 
 @pytest.mark.parametrize(
-    "restart,prepared",
+    "restart,prepared,direct_question",
     [
-        (False, False),
-        ("platform", False),
-        ("preparation", False),
-        (False, True),
-        ("platform", True),
-        ("preparation", True),
+        (False, False, False),
+        ("platform", False, False),
+        ("preparation", False, False),
+        (False, True, False),
+        ("platform", True, False),
+        ("preparation", True, False),
+        pytest.param(False, True, True, id="direct-child-question"),
     ],
 )
 async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
-    tmp_path, monkeypatch, restart, prepared
+    tmp_path, monkeypatch, restart, prepared, direct_question
 ):
     captured, submitted, manager_requests = [], [], []
     current = {}
+    followups = []
     preparation = asyncio.Event()
     resume_preparation = asyncio.Event()
 
@@ -119,6 +126,8 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         names = {item["function"]["name"] for item in payload.get("tools", [])}
         if "record_experiment_result" not in names:
             manager_requests.append(payload)
+            if "Project creation is complete" in json.dumps(payload["messages"]):
+                return stream(text="Project is ready.")
             if not any(
                 message.get("role") == "tool" for message in payload["messages"]
             ):
@@ -139,6 +148,11 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
             for message in payload["messages"]
             for call in message.get("tool_calls", [])
         ]
+        if "FOLLOWUP_CONTEXT_CHECK" in messages:
+            assert "df_submit_evaluation" in used
+            assert "record_experiment_result" in used
+            followups.append(payload)
+            return stream(text="Original child context retained. No new submission.")
         if (
             '\\"phase\\": \\"report\\"' in messages
             or '"phase": "report"' in messages
@@ -163,6 +177,30 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
                     },
                 )
             return stream(text="Report registered.")
+        if direct_question and "ask_user" not in used:
+            assert "ask_user" in names
+            return stream(
+                "ask_user",
+                {
+                    "presentation": {
+                        "title": "Child needs a decision",
+                        "content": [{"type": "text", "text": "No sample exists yet."}],
+                    },
+                    "questions": [
+                        {
+                            "id": "format",
+                            "prompt": "Use JSONL?",
+                            "options": [{"id": "yes", "label": "Use JSONL"}],
+                        }
+                    ],
+                },
+            )
+        if direct_question and not submitted:
+            assert any(
+                message.get("role") == "tool"
+                and '"option_id":"yes"' in str(message.get("content"))
+                for message in payload["messages"]
+            )
         if not submitted:
             if "df_submit_evaluation" not in used:
                 return stream(
@@ -304,6 +342,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
                 command_allowlist=profile.command_allowlist,
                 delegated_roles=profile.delegated_roles,
                 managed_delegation=True,
+                user_input_enabled=direct_question,
                 model_configuration={
                     "model": "eval-test-model",
                     "base_url": f"http://127.0.0.1:{port}/v1",
@@ -455,6 +494,50 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
             report=f"public_data/experiment-runs/{row['id']}/public_data/report.md",
         )
         await runtime.start_execution_events()
+        if direct_question:
+            async with asyncio.timeout(30):
+                while not (
+                    snapshot := runtime._store("manager").load_snapshot()
+                ).pending_inputs:
+                    await asyncio.sleep(0.05)
+            pending = snapshot.pending_inputs[0]
+            assert pending.task_run_id == row["id"]
+            assert pending.presentation is not None
+            assert pending.presentation.title == "Child needs a decision"
+            assert pending.checkpoint is None and submitted == []
+            guidance = await runtime.submit_command(
+                "manager",
+                ControlExperimentTaskCommand(
+                    command_id="guide-running-child",
+                    run_id=row["id"],
+                    action="continue",
+                    message="LIVE_CONTEXT_GUIDANCE: keep the existing scope "
+                    "and report actual evidence.",
+                ),
+                context,
+            )
+            assert guidance.status == "completed"
+            async with asyncio.timeout(15):
+                while not any(
+                    item["kind"] == "steer_task" and item["state"] == "completed"
+                    for item in store.work_items(owner)
+                ):
+                    await asyncio.sleep(0.05)
+            assert len(runtime._store("manager").load_snapshot().pending_inputs) == 1
+            receipt = await runtime.submit_command(
+                "manager",
+                InputResponseCommand.model_validate(
+                    {
+                        "command_id": "answer-child",
+                        "request_id": pending.request_id,
+                        "status": "answered",
+                        "answers": [{"question_id": "format", "option_id": "yes"}],
+                    }
+                ),
+                context,
+            )
+            assert receipt.status == "completed"
+            assert not runtime._store("manager").load_snapshot().pending_inputs
         if restart:
             if restart == "preparation":
                 await asyncio.wait_for(preparation.wait(), 30)
@@ -506,6 +589,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
                 if (
                     view.report_state == "ready"
                     and manager_requests
+                    and len(manager_requests) >= 2
                     and any(
                         item["kind"] == "manager_turn" and item["state"] == "completed"
                         for item in queue
@@ -523,9 +607,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         )
         assert plans.view(owner).current is None
         assert len(manager_requests) == 2
-        assert "One actual sample was scored" in json.dumps(
-            manager_requests[-1]["messages"]
-        )
+        assert "One sample scored" in json.dumps(manager_requests[-1]["messages"])
         if not restart:
             projected = (await runtime.get_snapshot("manager", context)).external_tasks
             assert len(projected) == 1
@@ -602,6 +684,39 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         assert first_display["phase"] == "execute"
         assert report_display["phase"] == "report"
         assert report_display["previous_run_id"] == first_ref
+        if direct_question:
+            original_ref = store.native_reference(owner, row["id"])
+            receipt = await runtime.submit_command(
+                "manager",
+                ControlExperimentTaskCommand(
+                    command_id="followup-completed",
+                    run_id=row["id"],
+                    action="continue",
+                    message="FOLLOWUP_CONTEXT_CHECK: explain the completed result "
+                    "using your previous context.",
+                ),
+                context,
+            )
+            assert receipt.status == "completed"
+            async with asyncio.timeout(30):
+                while not followups or any(
+                    item["state"] != "completed" for item in store.work_items(owner)
+                ):
+                    await asyncio.sleep(0.05)
+            assert len(submitted) == 1 and len(followups) == 1
+            assert "LIVE_CONTEXT_GUIDANCE" in json.dumps(followups[0]["messages"])
+            assert any(
+                "Original child context retained" in json.dumps(payload["messages"])
+                for payload in manager_requests
+            )
+            assert store.native_reference(owner, row["id"]) != original_ref
+            current_view = (
+                await runtime.get_experiment_executions("manager", context)
+            )[0]
+            assert (
+                current_view.state == "succeeded"
+                and current_view.report_state == "ready"
+            )
     finally:
         await runtime.close()
         await runner.cleanup()
@@ -671,7 +786,7 @@ async def test_manager_inspects_and_plans_without_delegating_or_submitting(
         default_harness_id="pi",
         experiment_plan_store=service.plans,
         experiment_execution_store=service.store,
-        execution_roles=("eval",),
+        execution_roles=("eval", "init"),
     )
     adapter.set_plan_handler(runtime.experiment_plan_call)
     context = RequestContext(user_id="42", profile_id=profile.profile_id)

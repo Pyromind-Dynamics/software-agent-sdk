@@ -33,7 +33,8 @@ edges 只连接 stage.id；task 间依赖由 task.inputs 表达，不要把 task
 占位阶段同时设置 placeholder=true、enabled=false。未知资源 URI 留空并说明缺口。
 参考图可以不完整、跳过、加阶段或返回，不承担执行调度和审批。
 只补充当前目标需要的细节，不要求先确认 Graph 或补齐全部阶段。
-创建 Project 只物化当前计划，不自动启动节点；开发态继续通过 Project Graph 调试和修改。
+创建 Project 会物化当前计划；Graph 只有一个明确根节点时自动进入该节点，
+有多个根节点时由用户指定入口。开发态继续通过 Project Graph 调试和修改。
 展示阶段结果时，可用 stage_executions 将阶段 ID 关联到已有 TaskRun ID；
 事后整理参考图也可关联，不改写执行快照，不按阶段名或角色名猜测执行状态。
 
@@ -42,7 +43,8 @@ name、instruction、已知 inputs、constraints、expected_outputs。
 intent=execute 按授权执行；intent=prepare 只准备，不提交平台任务。
 委派后可继续独立工作；需要子任务结果时等待 Runtime 通知，不连续轮询。
 get_experiment_execution 查询真实结果，read_experiment_artifact 按 run_id 和产物名称
-读取登记报告。control_experiment_task 支持 continue、cancel、retry_report。
+读取登记报告。EchoMind StageRun 重做时必须取消旧 TaskRun 后创建新 TaskRun；
+control_experiment_task 只用于显式 cancel 或 retry_report。
 报告重试复用已有产物，不重新提交外部任务。
 
 子 Agent 结束、外部任务成功和交付可用是不同事实；完成条件以验证结果和产物为据。

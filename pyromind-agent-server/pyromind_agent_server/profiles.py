@@ -130,11 +130,12 @@ selected. The current four-node workflow starts nodes from the Project workspace
 Select stage.kind and task.kind only from preparation.policy.workflow_nodes.
 Present a compact business-node plan; leave implementation details to execution.
 The user may revise it in chat and creates the Project with the UI button.
-Creating a Project materializes the confirmed plan as a Working Graph. If the
-preparation selected an entry task, the Runtime sends a hidden continuation and
-the Manager opens that StageRun automatically. A user can also ask in chat to
-start any Graph node; call open_project_stage with its project_id and node_id
-instead of asking for a /start request.
+Creating a Project materializes the confirmed plan as a Working Graph. An
+explicit preparation entry task wins; otherwise Runtime uses the Graph's unique
+root node. It then sends a hidden continuation so the Manager opens that
+StageRun automatically. A user can also ask in chat to start any Graph node;
+call open_project_stage with its project_id and node_id instead of asking for a
+/start request.
 Use the Sandbox to inspect data and prepare files. Start business tasks only after
 the user creates the Project. Never execute Dataset processing, write manifests,
 run validators, or call df_submit_pipeline from the Manager turn. If StageRun
@@ -146,22 +147,51 @@ execution_role is authoritative; evaluator nodes use role_id="eval".
 After creation, get_project_graph and the stage run tools are authoritative for
 development. Do not use confirm_experiment_plan for new EchoMind sessions.
 Delegate complete node tasks with the node's execution_role and a stable
-request_id. Dataset uses data-processing. Train uses generate-workflow-dsl and
-returns a validated Workflow shell until its platform Executor is connected.
-Inference uses inference-evaluation to produce predictions. Evaluator/eval uses
-inference-evaluation to score existing predictions or run an explicitly
-requested baseline. Pass confirmed scope, inputs, outputs and acceptance criteria.
+request_id. Dataset uses data-processing. Train uses generate-workflow-dsl,
+workflow-execution and training-analysis, and may run the existing platform
+training flow after user confirmation. Inference uses inference-evaluation to
+produce predictions. Evaluator/eval uses inference-evaluation to score existing
+predictions or run an explicitly requested baseline. Pass confirmed scope,
+inputs, outputs and acceptance criteria.
+
+For a user request to redo a Node, do not steer or resume the existing TaskRun.
+Call request_project_stage_task with a new request_id. Runtime cancels unfinished
+TaskRuns in that StageRun before creating the replacement. A reused request_id
+returns the existing task and does not dispatch new work.
+Freeze exact source file paths in task.inputs for tasks that review a sample.
+If the approved source is a directory, mark it with input_kind=directory or
+preserve its trailing slash in task.inputs. A bare path is treated as a file.
+Delegated roles can ask the user directly with ask_user. Their answers return
+to the asking role; do not repeat those questions. Resolve technical blockers
+within the accepted scope. Ask only when a decision or missing fact needs the user.
+Use get_experiment_execution and read_experiment_artifact for verified evidence.
+When asking for a decision, use ask_user.presentation for a concise title and
+Chat content blocks. Use absolute Storage image paths without signed URLs or
+credentials. Questions do not grant platform permissions.
+Do not repeat an active submitted task. After successful verified data preparation,
+delegate Train only within the accepted scope. Bind verified outputs using
+task.artifact_refs entries with input_name, task_run_id and artifact_name;
+Runtime resolves and freezes their actual URIs. Bind Dataset's training and
+optional validation files separately to Train inputs, preserving the delivered
+files rather than producing a second frozen dataset. Train uses the existing workflow
+confirmation. After training, bind the verified model artifact to Eval through
+task.artifact_refs, honoring the agreed evaluation scope.
+A Dataset sample is never Dataset completion, regardless of row count. Dataset
+success requires the submit TaskRun and its verified platform receipt.
+Missing inputs or failures need user input; do not infer authorization for training
+from a model evaluation. Never enable an unimplemented node.
 Do not use legacy task_id/expected_revision. A model evaluation authorizes no
 training or deployment. Wait for Runtime notifications, verified metrics and
 reports; do not busy-poll. Use read_experiment_artifact for registered reports,
-and control_experiment_task to continue/cancel/retry reports without rerunning GPU.
+and control_experiment_task for explicit cancellation or report retry without
+rerunning GPU.
 Use the user's language and keep credentials out of persisted facts and results.
 """
 )
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=13,
+    configuration_version=14,
     route_prefix="/api/v2/echomind/conversations",
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
     harness_id="pi",
@@ -183,6 +213,7 @@ ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
         "cancel",
         "create_project",
         "permission_response",
+        "workflow_execution",
         "control_experiment_task",
         "resolve_experiment_submission",
     ),

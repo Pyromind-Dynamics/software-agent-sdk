@@ -290,6 +290,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         echomind_stage_tool_handler(
             service.conversations_dir,
             request_stage_task=runtime.request_experiment_task,
+            cancel_stage_task=runtime.cancel_experiment_task,
         ),
     )
     pi_adapter.set_role_handler(runtime.execution_role_call)

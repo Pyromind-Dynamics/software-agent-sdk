@@ -10,6 +10,12 @@ from collections.abc import Awaitable, Callable
 from pathlib import PurePosixPath
 from typing import cast
 
+from pyromind_runtime.application.execution_artifacts import verify_task_artifacts
+from pyromind_runtime.application.execution_checkpoints import (
+    require_approved_checkpoint,
+    verify_checkpoint,
+)
+from pyromind_runtime.domain.execution_policy import CheckpointView
 from pyromind_runtime.domain.experiment_execution import (
     ExperimentExecutionView,
     RecordExperimentResult,
@@ -35,6 +41,7 @@ class ExperimentExecutions:
         request: RequestExperimentTask,
         allowed_roles: tuple[str, ...],
         require_stage: bool = False,
+        execution_policy: dict | None = None,
     ) -> dict:
         if request.role_id not in allowed_roles:
             raise PermissionError("execution role is not enabled")
@@ -43,6 +50,48 @@ class ExperimentExecutions:
             if context.project_id is None:
                 raise PermissionError("Project creation is required")
             frozen = request.model_dump(mode="json")
+            if execution_policy is not None:
+                frozen["execution_policy"] = execution_policy
+            if request.task.artifact_refs:
+                rows = {row["id"]: row for row in self.store.list(owner)}
+                inputs = dict(request.task.inputs)
+                resolved = {}
+                for reference in request.task.artifact_refs:
+                    source = rows.get(reference.task_run_id)
+                    if (
+                        not source
+                        or source["project_id"] != context.project_id
+                        or source["state"] != "succeeded"
+                        or source["report_state"] != "ready"
+                    ):
+                        raise ValueError(
+                            "upstream task must have verified outputs "
+                            "and a ready report"
+                        )
+                    artifact = next(
+                        (
+                            item
+                            for item in source.get("artifacts", [])
+                            if item["name"] == reference.artifact_name
+                        ),
+                        None,
+                    )
+                    if artifact is None or reference.input_name in resolved:
+                        raise ValueError("unknown artifact or duplicate input binding")
+                    if (
+                        reference.input_name in inputs
+                        and inputs[reference.input_name] != artifact["uri"]
+                    ):
+                        raise ValueError(
+                            "input differs from its verified artifact reference"
+                        )
+                    inputs[reference.input_name] = artifact["uri"]
+                    resolved[reference.input_name] = {
+                        "task_run_id": source["id"],
+                        **{key: artifact[key] for key in ("name", "uri", "sha256")},
+                    }
+                frozen["task"]["inputs"] = inputs
+                frozen["input_artifacts"] = resolved
             if require_stage:
                 stage = next(
                     (
@@ -134,10 +183,23 @@ class ExperimentExecutions:
                     details=details,
                     platform_task_id=submission.get("task_id"),
                     intent=spec["intent"],
-                    summary=result_payload.get("summary"),
-                    report_uri=result_payload.get("report_uri"),
-                    blockers=tuple(result_payload.get("blockers", [])),
-                    waiting_reason=result_payload.get("waiting_reason"),
+                    summary=details.get("summary") or result_payload.get("summary"),
+                    report_uri=details.get("report_uri")
+                    or result_payload.get("report_uri"),
+                    blockers=tuple(
+                        details.get("blockers") or result_payload.get("blockers", [])
+                    ),
+                    waiting_reason=details.get("waiting_reason")
+                    or result_payload.get("waiting_reason"),
+                    checkpoint=CheckpointView.model_validate(
+                        {
+                            k: v
+                            for k, v in row["attributes"]["checkpoint"].items()
+                            if k != "decision_id"
+                        }
+                    )
+                    if (row.get("attributes") or {}).get("checkpoint")
+                    else None,
                     artifacts=tuple(
                         {key: a[key] for key in ("name", "uri", "sha256")}
                         for a in row.get("artifacts", [])
@@ -183,6 +245,7 @@ class ExperimentExecutions:
         scope: dict,
         execute: Callable[..., Awaitable[dict]],
         read: Callable[..., Awaitable[bytes]],
+        inspect: Callable[..., Awaitable[dict]] | None = None,
     ) -> dict:
         store = cast(DelegatedExecutionStore, self.store)
         row = await asyncio.to_thread(
@@ -190,6 +253,27 @@ class ExperimentExecutions:
         )
         if not row.get("task_spec"):
             raise PermissionError("this task uses the legacy preparation contract")
+        policy = (row.get("task_spec") or {}).get("execution_policy") or {}
+        submission_tool = policy.get("submission_tool", "df_submit_evaluation")
+        if (
+            tool in {"df_submit_evaluation", "df_submit_pipeline", "submit_workflow"}
+            and tool != submission_tool
+        ):
+            raise PermissionError(
+                "submission capability is not enabled for this execution"
+            )
+        if tool == "record_execution_checkpoint":
+            checkpoint = await verify_checkpoint(
+                owner, row, scope, arguments, read, inspect
+            )
+            await asyncio.to_thread(
+                store.record_checkpoint, owner, row["id"], scope, checkpoint
+            )
+            return {
+                "run_id": row["id"],
+                "checkpoint": checkpoint,
+                "state": "waiting_user",
+            }
         if tool == "get_experiment_execution":
             if arguments.get("run_id", row["id"]) != row["id"]:
                 raise PermissionError("execution belongs to another task")
@@ -203,33 +287,68 @@ class ExperimentExecutions:
             result = RecordExperimentResult.model_validate(arguments)
             if result.run_id != row["id"]:
                 raise PermissionError("result belongs to another task")
-            artifact = None
-            if result.report_uri:
-                path = PurePosixPath(result.report_uri)
-                root = PurePosixPath("public_data/experiment-runs") / row["id"]
-                if (
-                    path.is_absolute()
-                    or ".." in path.parts
-                    or "\\" in result.report_uri
-                    or path == root
-                    or not path.is_relative_to(root)
-                ):
-                    raise PermissionError("report must be in this task's workspace")
-                result = result.model_copy(update={"report_uri": path.as_posix()})
-                body = await read(owner, path.as_posix())
-                artifact = {
-                    "uri": result.report_uri,
-                    "sha256": hashlib.sha256(body).hexdigest(),
-                }
-            await asyncio.to_thread(
-                store.record_result,
-                owner,
-                row["id"],
-                scope,
-                result.model_dump(mode="json"),
-                artifact,
-            )
+            try:
+                artifact = None
+                if result.report_uri:
+                    path = PurePosixPath(result.report_uri)
+                    root = PurePosixPath("public_data/experiment-runs") / row["id"]
+                    if (
+                        path.is_absolute()
+                        or ".." in path.parts
+                        or "\\" in result.report_uri
+                        or path == root
+                        or not path.is_relative_to(root)
+                    ):
+                        raise PermissionError("report must be in this task's workspace")
+                    result = result.model_copy(update={"report_uri": path.as_posix()})
+                    try:
+                        body = await read(owner, path.as_posix())
+                    except (OSError, ValueError, KeyError) as exc:
+                        raise ValueError(
+                            f"report is not readable: {result.report_uri}"
+                        ) from exc
+                    artifact = {
+                        "uri": result.report_uri,
+                        "sha256": hashlib.sha256(body).hexdigest(),
+                    }
+                verified = await verify_task_artifacts(
+                    owner, role, row, result, artifact, scope, execute, inspect
+                )
+                data_result = policy.get("artifact_contract") == "data"
+                if verified is not None and not data_result:
+                    await asyncio.to_thread(
+                        store.register_artifacts,
+                        owner,
+                        row["id"],
+                        verified[0],
+                        verified[1],
+                    )
+                await asyncio.to_thread(
+                    store.record_result,
+                    owner,
+                    row["id"],
+                    scope,
+                    result.model_dump(mode="json"),
+                    artifact,
+                    verified=verified[0]
+                    if verified is not None and data_result
+                    else None,
+                )
+            except (OSError, ValueError) as exc:
+                await asyncio.to_thread(
+                    store.record_result_failure,
+                    owner,
+                    row["id"],
+                    scope,
+                    str(exc)[:16000],
+                )
+                raise
             return {"run_id": row["id"], "report_state": "ready"}
+        if tool in {"training_analysis", "analyze_task_failure"}:
+            if arguments.get("task_id") not in {
+                sub.get("task_id") for sub in row.get("submissions", [])
+            }:
+                raise PermissionError("analysis belongs to another execution")
         if tool == "df_check_progress":
             receipts = [
                 sub.get("evidence", {}).get("receipt", {})
@@ -240,9 +359,17 @@ class ExperimentExecutions:
                 for receipt in receipts
             ):
                 raise PermissionError("progress belongs to another execution")
-        if tool == "df_submit_evaluation":
+        if tool == "df_submit_pipeline" and policy.get("require_review"):
+            await require_approved_checkpoint(owner, row, arguments, read, inspect)
+        if tool in {"df_submit_evaluation", "df_submit_pipeline"}:
             reserved = await asyncio.to_thread(
-                store.managed_submission, owner, row["id"], scope, arguments
+                store.managed_submission,
+                owner,
+                row["id"],
+                scope,
+                arguments
+                if tool == "df_submit_evaluation"
+                else {**arguments, "operation": "pipeline"},
             )
             if reserved.get("receipt"):
                 receipt = reserved["receipt"]
@@ -253,7 +380,7 @@ class ExperimentExecutions:
                 }
             scope = {**scope, "operation_id": reserved["operation_id"]}
         result = await execute(owner, role, scope, tool, arguments)
-        if tool == "df_submit_evaluation":
+        if tool in {"df_submit_evaluation", "df_submit_pipeline"}:
             details = result.get("details") or {}
             receipt = {
                 key: details[key]
@@ -274,7 +401,9 @@ class ExperimentExecutions:
                 owner,
                 row["id"],
                 scope,
-                str(arguments.get("operation", "inference")),
+                str(arguments.get("operation", "inference"))
+                if tool == "df_submit_evaluation"
+                else "pipeline",
                 receipt,
             )
         return result
@@ -336,6 +465,16 @@ class ExperimentExecutions:
                     if row["id"] == run_id
                 )
                 await asyncio.to_thread(store.note_wait, owner, run_id, "")
+                if (
+                    current["state"] == "waiting_artifacts"
+                    and (
+                        (current.get("task_spec") or {}).get("execution_policy") or {}
+                    ).get("artifact_contract", "evaluation")
+                    != "evaluation"
+                ):
+                    await asyncio.to_thread(store.queue_artifact_report, owner, run_id)
+                    self._checks[run_id] = (time.monotonic() + 30, 0)
+                    continue
                 if current["state"] == "waiting_artifacts":
                     primary = next(
                         (

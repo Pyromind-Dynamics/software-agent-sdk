@@ -189,6 +189,93 @@ async def test_stage_tool_handler_records_dataset_sample_for_owning_conversation
         )
 
 
+async def test_stage_tool_rejects_request_id_reused_for_another_status(tmp_path):
+    conversations = tmp_path / "conversations"
+    project_store = ProjectStore.for_conversations_dir(conversations)
+    project = project_store.bind_plan(
+        PlanRevision(
+            project_id=uuid4().hex,
+            revision=1,
+            plan=_plan(),
+            confirmed_by="42",
+        ),
+        echomind_conversation_id="conversation-1",
+        owner_user_id="42",
+    )
+    run, _ = ProjectRunStore(project_store.root).start_agent_development(
+        project=project,
+        node=project.graph.nodes[0],
+        request_id="start-dataset",
+    )
+
+    async def request_stage_task(conversation_id, request, context):
+        del conversation_id, request, context
+        return {"id": "task-dataset-sample"}
+
+    handle = echomind_stage_tool_handler(
+        conversations,
+        request_stage_task=request_stage_task,
+    )
+    context = RequestContext(user_id="42")
+    request_id = f"project-created:{project.project.project_id}"
+    await handle(
+        "conversation-1",
+        "approve_project_stage_plan",
+        {
+            "project_id": project.project.project_id,
+            "run_id": run.run_id,
+            "request_id": request_id,
+            "summary": "Dataset scope confirmed.",
+            "decisions": {},
+        },
+        context,
+    )
+    await handle(
+        "conversation-1",
+        "request_project_stage_task",
+        {
+            "project_id": project.project.project_id,
+            "run_id": run.run_id,
+            "role_id": "dataset",
+            "request_id": "dataset-sample",
+            "task": {
+                "name": "Validate sample",
+                "instruction": "Validate the configured sample.",
+                "inputs": {"phase": "sample"},
+            },
+        },
+        context,
+    )
+
+    with pytest.raises(ValueError, match="already used for status 'running'"):
+        await handle(
+            "conversation-1",
+            "record_project_stage_result",
+            {
+                "project_id": project.project.project_id,
+                "run_id": run.run_id,
+                "request_id": request_id,
+                "outcome": "waiting_user",
+                "message": "Sample passed.",
+                "task_run_id": "task-dataset-sample",
+                "details": _sample_details(),
+            },
+            context,
+        )
+
+    unchanged = await handle(
+        "conversation-1",
+        "get_project_stage_run",
+        {
+            "project_id": project.project.project_id,
+            "run_id": run.run_id,
+        },
+        context,
+    )
+    assert unchanged["status"] == "running"
+    assert unchanged["artifacts"] == []
+
+
 async def test_open_project_stage_creates_or_reuses_node_run(tmp_path):
     conversations = tmp_path / "conversations"
     project_store = ProjectStore.for_conversations_dir(conversations)
@@ -260,8 +347,10 @@ async def test_stage_task_request_links_task_run_to_stage_run(tmp_path):
         request_id="start-dataset",
     )
     captured = []
+    events = []
 
     async def request_stage_task(conversation_id, request, context):
+        events.append(("request", request.request_id))
         captured.append((conversation_id, request, context.user_id))
         return {
             "id": f"task-{request.request_id}",
@@ -269,9 +358,14 @@ async def test_stage_task_request_links_task_run_to_stage_run(tmp_path):
             "created_at": datetime(2026, 11, 4, tzinfo=UTC),
         }
 
+    async def cancel_stage_task(conversation_id, task_run_id, command_id, context):
+        events.append(("cancel", task_run_id))
+        return {"run_id": task_run_id, "state": "cancel_requested"}
+
     handle = echomind_stage_tool_handler(
         conversations,
         request_stage_task=request_stage_task,
+        cancel_stage_task=cancel_stage_task,
     )
     context = RequestContext(user_id="42")
     await handle(
@@ -340,6 +434,11 @@ async def test_stage_task_request_links_task_run_to_stage_run(tmp_path):
     )
 
     assert len(captured) == 2
+    assert events == [
+        ("request", "dataset-check"),
+        ("cancel", "task-dataset-check"),
+        ("request", "dataset-sample-2"),
+    ]
     assert captured[0][0] == "conversation-1"
     assert captured[0][1].stage_id == "dataset"
     assert captured[0][1].stage_run_id == run.run_id
@@ -371,6 +470,101 @@ async def test_stage_task_request_links_task_run_to_stage_run(tmp_path):
         "task-dataset-check",
         "task-dataset-sample-2",
     ]
+    assert [item.status for item in reloaded.task_runs] == [
+        "cancelled",
+        "running",
+    ]
+
+
+async def test_stage_task_redispatch_aborts_when_cancel_fails(tmp_path):
+    conversations = tmp_path / "conversations"
+    project_store = ProjectStore.for_conversations_dir(conversations)
+    project = project_store.bind_plan(
+        PlanRevision(
+            project_id=uuid4().hex,
+            revision=1,
+            plan=_plan(),
+            confirmed_by="42",
+        ),
+        echomind_conversation_id="conversation-1",
+        owner_user_id="42",
+    )
+    run_store = ProjectRunStore(project_store.root)
+    run, _ = run_store.start_agent_development(
+        project=project,
+        node=project.graph.nodes[0],
+        request_id="start-dataset",
+    )
+    requested = []
+
+    async def request_stage_task(conversation_id, request, context):
+        del conversation_id, context
+        requested.append(request.request_id)
+        return {"id": f"task-{request.request_id}"}
+
+    async def cancel_stage_task(conversation_id, task_run_id, command_id, context):
+        del conversation_id, task_run_id, command_id, context
+        raise ValueError("submission acceptance is uncertain")
+
+    handle = echomind_stage_tool_handler(
+        conversations,
+        request_stage_task=request_stage_task,
+        cancel_stage_task=cancel_stage_task,
+    )
+    context = RequestContext(user_id="42")
+    await handle(
+        "conversation-1",
+        "approve_project_stage_plan",
+        {
+            "project_id": project.project.project_id,
+            "run_id": run.run_id,
+            "request_id": "approve-1",
+            "summary": "Dataset scope confirmed.",
+            "decisions": {},
+        },
+        context,
+    )
+    await handle(
+        "conversation-1",
+        "request_project_stage_task",
+        {
+            "project_id": project.project.project_id,
+            "run_id": run.run_id,
+            "role_id": "dataset",
+            "request_id": "dataset-sample-initial",
+            "task": {
+                "name": "Validate sample",
+                "instruction": "Validate the configured sample.",
+                "inputs": {"phase": "sample"},
+            },
+        },
+        context,
+    )
+
+    with pytest.raises(ValueError, match="submission acceptance is uncertain"):
+        await handle(
+            "conversation-1",
+            "request_project_stage_task",
+            {
+                "project_id": project.project.project_id,
+                "run_id": run.run_id,
+                "role_id": "dataset",
+                "request_id": "dataset-sample-redo",
+                "task": {
+                    "name": "Redo sample",
+                    "instruction": "Validate the sample again.",
+                    "inputs": {"phase": "sample"},
+                },
+            },
+            context,
+        )
+
+    assert requested == ["dataset-sample-initial"]
+    reloaded = run_store.get(
+        project_id=project.project.project_id,
+        run_id=run.run_id,
+    )
+    assert [item.status for item in reloaded.task_runs] == ["running"]
 
 
 async def test_confirm_waiting_stage_run_allows_new_full_task(tmp_path):
@@ -939,6 +1133,22 @@ async def test_stage_tool_records_platform_submission_and_version(tmp_path):
         task_run_id="task-dataset-full",
         role_id="dataset",
     )
+
+    with pytest.raises(ValueError, match="waiting_external"):
+        await handle(
+            "conversation-1",
+            "record_project_stage_result",
+            {
+                "project_id": project.project.project_id,
+                "run_id": run.run_id,
+                "request_id": "complete-too-early",
+                "outcome": "succeeded",
+                "message": "Dataset version verified without platform submission.",
+                "task_run_id": "task-dataset-full",
+                "details": {},
+            },
+            context,
+        )
 
     submitted = await handle(
         "conversation-1",

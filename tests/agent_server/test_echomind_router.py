@@ -148,6 +148,7 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
         "cancel",
         "create_project",
         "permission_response",
+        "workflow_execution",
         "control_experiment_task",
         "resolve_experiment_submission",
     )

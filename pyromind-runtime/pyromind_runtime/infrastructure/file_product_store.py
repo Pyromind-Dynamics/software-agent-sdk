@@ -596,6 +596,8 @@ class FileProductStore:
             payload = dict(resolution.model_dump(mode="json"))
             if pending.operation_id is not None:
                 payload.setdefault("operation_id", pending.operation_id)
+            if pending.task_run_id is not None:
+                payload["task_run_id"] = pending.task_run_id
             event = ProductEvent(
                 conversation_id=metadata.conversation_id,
                 event_id=f"input:{resolution.request_id}:{resolution.outcome}",

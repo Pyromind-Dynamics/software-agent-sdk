@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import Field, JsonValue, model_validator
 
 from pyromind_runtime.domain.base import ContractModel
+from pyromind_runtime.domain.execution_policy import TaskExecutionPolicy
 from pyromind_runtime.domain.experiment_execution import DelegateExperimentTask
 from pyromind_runtime.domain.experiment_plans import ExperimentContext
 
@@ -30,6 +31,9 @@ class WorkflowNodeDefinition(ContractModel):
     name: str = Field(min_length=1)
     description: str = ""
     roles: tuple[str, ...] = ()
+    required_fields: tuple[str, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
     max_instances: int | None = Field(default=None, ge=1)
     tasks: tuple[WorkflowTaskDefinition, ...] = ()
 
@@ -41,16 +45,24 @@ class PreparationPolicy(ContractModel):
     allowed_roles: tuple[str, ...] = Field(min_length=1)
     create_project_starts_entry_task: bool = True
 
+    execution_policies: dict[str, TaskExecutionPolicy] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
+
     workflow_nodes: tuple[WorkflowNodeDefinition, ...] = Field(
         default=(), exclude_if=lambda value: not value
     )
 
     @model_validator(mode="after")
     def validate_keys(self):
+        if not set(self.execution_policies) <= set(self.allowed_roles):
+            raise ValueError("execution policy role is not enabled")
         node_ids = [node.id for node in self.workflow_nodes]
         if len(node_ids) != len(set(node_ids)):
             raise ValueError("duplicate workflow node type")
         for node in self.workflow_nodes:
+            if not set(node.required_fields) <= {field.key for field in self.fields}:
+                raise ValueError("workflow node references unknown checklist fields")
             task_ids = [task.id for task in node.tasks]
             if len(task_ids) != len(set(task_ids)):
                 raise ValueError("duplicate workflow task type")
@@ -92,6 +104,28 @@ class PreparationView(ContractModel):
     project_id: str | None = None
     evidence: dict[str, str] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def validate_ready_fields(self):
+        if self.phase == "ready" and self.plan is not None:
+            nodes = {node.id: node for node in self.policy.workflow_nodes}
+            required = {field.key for field in self.policy.fields if field.required}
+            required.update(
+                field
+                for stage in self.plan.stages
+                if stage.enabled and not stage.placeholder and stage.kind in nodes
+                for field in nodes[stage.kind].required_fields
+            )
+            missing = sorted(
+                field
+                for field in required
+                if self.facts.get(field, PreparationFact()).status != "resolved"
+            )
+            if missing:
+                raise ValueError(
+                    "workflow requires checklist fields: " + ", ".join(missing)
+                )
+        return self
+
 
 class UpdatePreparation(ContractModel):
     expected_revision: int = Field(ge=0)
@@ -119,6 +153,7 @@ class SetPreparationPlan(ContractModel):
 
 
 class InspectResource(ContractModel):
+    compute_digest: bool = Field(default=False, exclude_if=lambda value: not value)
     path: str = Field(min_length=1, max_length=4096)
     kind: Literal["file", "directory"] = "file"
     max_bytes: int = Field(default=16384, ge=1, le=65536)

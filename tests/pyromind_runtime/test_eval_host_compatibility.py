@@ -31,7 +31,9 @@ async def test_actual_manager_and_eval_host_create_through_api(
         experiment_plan_store=service.plans,
         preparation_store=SQLPreparationStore(service.plans.engine),
         experiment_execution_store=service.store,
-        execution_roles=("eval",),
+        execution_roles=tuple(
+            role.name for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()
+        ),
     )
     adapter.set_plan_handler(runtime.experiment_plan_call)
     adapter.set_role_handler(runtime.execution_role_call)
@@ -61,10 +63,23 @@ async def test_actual_manager_and_eval_host_create_through_api(
                 item["name"]
                 for item in adapter._business_tools.specs(sandbox=backend == "sandbox")
             }
-            native = {"read", "write", "edit", "terminal"}
+            native = {"read", "write", "edit", "terminal", "grep", "find", "ls"}
             runtime_tools = {"record_experiment_result", "get_experiment_execution"}
             assert set(role.tools) <= business | native | runtime_tools
             assert "upload_file_to_pyromind" not in role.tools
+            from pyromind_runtime.domain.experiment_execution import ROLE_TOOLS
+
+            for definition in ECHOMIND_PRODUCT_PROFILE.delegated_roles:
+                assert set(definition.tools) <= business | native | set(ROLE_TOOLS)
+            roles = {
+                definition.name: definition
+                for definition in ECHOMIND_PRODUCT_PROFILE.delegated_roles
+            }
+            assert set(roles) == {"dataset", "train", "inference", "eval"}
+            assert "df_submit_pipeline" in roles["dataset"].tools
+            assert "df_submit_evaluation" not in roles["dataset"].tools
+            assert "submit_workflow" in roles["train"].tools
+            assert "df_submit_evaluation" not in roles["train"].tools
             session = adapter._sessions[conversation_id]
             assert created.json()["preparation"]["phase"] == "collecting"
             assert {"read", "write", "edit", "terminal", "grep", "find", "ls"} <= set(

@@ -102,10 +102,12 @@ ECHOMIND_STAGE_TOOL_SPECS = (
         description=(
             "Create one deterministic TaskRun for an EchoMind StageRun and bind "
             "both records with the same project_id. Reuse request_id for retries; "
-            "use a new request_id for a new sample, submission or retry. Dataset "
-            "uses phase='sample' first and phase='submit' after confirmation; "
-            "phase='sample' may repair a rejected sample in the same StageRun. "
-            "The submit contract is injected from the accepted sample."
+            "use a new request_id when the user asks to redo the Node. Redoing "
+            "cancels unfinished TaskRuns in the same StageRun before creating the "
+            "replacement. Dataset uses phase='sample' first and phase='submit' "
+            "after confirmation; phase='sample' may repair a rejected sample in "
+            "the same StageRun. The submit contract is injected from the accepted "
+            "sample."
         ),
         input_schema=RequestProjectStageTask.model_json_schema(),
     ),
@@ -132,11 +134,14 @@ ECHOMIND_STAGE_TOOL_SPECS = (
     ToolExtensionSpec(
         name="record_project_stage_result",
         description=(
-            "Record verified EchoMind stage evidence for one StageRun. Use "
-            "waiting_user after a real sample confirmation, waiting_external after "
-            "a platform task is submitted, and succeeded only after the child "
-            "verifies its result. A child-only task may succeed without a platform "
-            "task. Pass task_run_id when more than one TaskRun exists."
+            "Record verified EchoMind stage evidence for one StageRun. Use a new "
+            "request_id for each state transition; reuse one only to replay the "
+            "same outcome. Record waiting_user after a real sample confirmation, "
+            "waiting_external after a platform task is submitted, and succeeded "
+            "only after the child verifies its result. Dataset stages require a "
+            "submitted TaskRun in waiting_external before succeeding. A child-only "
+            "non-Dataset task may succeed without a platform task. Pass task_run_id "
+            "when more than one TaskRun exists."
         ),
         input_schema=RecordProjectStageResult.model_json_schema(),
     ),
@@ -147,6 +152,9 @@ def echomind_stage_tool_handler(
     conversations_dir: Path | str,
     request_stage_task: (
         Callable[[str, RequestExperimentTask, RequestContext], Awaitable[dict]] | None
+    ) = None,
+    cancel_stage_task: (
+        Callable[[str, str, str, RequestContext], Awaitable[dict]] | None
     ) = None,
 ):
     project_store = ProjectStore.for_conversations_dir(conversations_dir)
@@ -344,6 +352,31 @@ def echomind_stage_tool_handler(
                     "task_run_id": existing.task_run_id,
                     "idempotent": True,
                 }
+            unfinished = [
+                task_run
+                for task_run in run.task_runs
+                if task_run.status in {"running", "waiting_external"}
+            ]
+            cancel = cancel_stage_task
+            if unfinished and cancel is None:
+                raise ValueError("redoing a TaskRun requires cancellation support")
+            for task_run in unfinished:
+                assert cancel is not None
+                await cancel(
+                    conversation_id,
+                    task_run.task_run_id,
+                    f"supersede:{request.request_id}:{task_run.task_run_id}",
+                    context,
+                )
+            if unfinished:
+                run = await asyncio.to_thread(
+                    run_store.cancel_task_runs,
+                    run,
+                    task_run_ids={task_run.task_run_id for task_run in unfinished},
+                    message=(
+                        f"Cancelled before replacement TaskRun {request.request_id}."
+                    ),
+                )
             task = request.task
             task_inputs = {
                 **task.inputs,

@@ -6,9 +6,23 @@ from pydantic import Field, model_validator
 
 from pyromind_runtime.domain.base import ContractModel
 from pyromind_runtime.domain.content import JsonObject
+from pyromind_runtime.domain.execution_policy import (
+    CheckpointView,
+    ExecutionArtifact,
+    ExecutionCheckpoint,
+)
+
+
+class TaskArtifactRef(ContractModel):
+    input_name: str = Field(min_length=1, max_length=128)
+    task_run_id: str = Field(min_length=1)
+    artifact_name: str = Field(min_length=1, max_length=128)
 
 
 class DelegatedTask(ContractModel):
+    artifact_refs: tuple[TaskArtifactRef, ...] = Field(
+        default=(), max_length=16, exclude_if=lambda value: not value
+    )
     name: str = Field(min_length=1, max_length=255)
     instruction: str = Field(min_length=1, max_length=32000)
     inputs: JsonObject = Field(default_factory=dict)
@@ -113,9 +127,15 @@ class ExperimentExecutionView(ContractModel):
     report_uri: str | None = None
     blockers: tuple[str, ...] = ()
     waiting_reason: str | None = None
+    checkpoint: CheckpointView | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class RecordExperimentResult(ContractModel):
+    artifacts: tuple[ExecutionArtifact, ...] = Field(
+        default=(), max_length=16, exclude_if=lambda value: not value
+    )
     run_id: str
     summary: str = Field(min_length=1, max_length=16000)
     report_uri: str | None = None
@@ -127,7 +147,12 @@ class ControlExperimentTask(ContractModel):
     run_id: str
     action: Literal["continue", "cancel", "retry_report"]
     command_id: str = Field(min_length=1, max_length=128)
-    message: str = ""
+    message: str = Field(
+        default="",
+        description="Guidance for the existing child context, regardless "
+        "of task outcome or platform state. Use request_experiment_task with a new "
+        "request_id for an independent task with fresh context.",
+    )
 
 
 class ReadExperimentResource(ContractModel):
@@ -136,7 +161,21 @@ class ReadExperimentResource(ContractModel):
     max_bytes: int = Field(default=16384, ge=1, le=65536)
 
 
+class SubmitExecutionWorkflow(ContractModel):
+    workflow_path: str = Field(min_length=1, max_length=4096)
+
+
 ROLE_TOOLS = {
+    "submit_workflow": (
+        SubmitExecutionWorkflow,
+        "Stage a validated Storage workflow for the existing user confirmation. "
+        "This does not start training.",
+    ),
+    "record_execution_checkpoint": (
+        ExecutionCheckpoint,
+        "Register verified sample evidence and pause for Manager to ask the user. "
+        "This does not authorize a platform submission.",
+    ),
     "record_experiment_result": (
         RecordExperimentResult,
         "Register a report or essential missing inputs; "

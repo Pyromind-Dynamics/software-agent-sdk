@@ -31,6 +31,7 @@ StageRunStatus = Literal[
     "waiting_external",
     "succeeded",
     "failed",
+    "cancelled",
 ]
 StageRunMode = Literal["node_validation", "agent_development"]
 StageRunConfigDigestVersion = Literal[1, 2]
@@ -367,6 +368,54 @@ class ProjectRunStore:
             self._write_run(updated)
             return updated, task_run, True
 
+    def cancel_task_runs(
+        self,
+        run: StageRun,
+        *,
+        task_run_ids: set[str],
+        message: str,
+    ) -> StageRun:
+        if not task_run_ids:
+            return run
+        project_dir = self._project_dir(run.project_id)
+        lock = FileLock(str(project_dir / ".run-mutation.lock"))
+        with lock:
+            current = self.get(project_id=run.project_id, run_id=run.run_id)
+            now = _utc_now()
+            changed = False
+            task_runs = []
+            for task_run in current.task_runs:
+                if task_run.task_run_id in task_run_ids and task_run.status in {
+                    "running",
+                    "waiting_external",
+                }:
+                    changed = True
+                    task_run = task_run.model_copy(
+                        update={
+                            "status": "cancelled",
+                            "message": message,
+                            "updated_at": now,
+                            "finished_at": now,
+                        }
+                    )
+                task_runs.append(task_run)
+            if not changed:
+                return current
+            changes: dict[str, Any] = {
+                "status": (
+                    "running"
+                    if current.status in {"running", "waiting_external"}
+                    else current.status
+                ),
+                "message": message,
+                "task_runs": task_runs,
+            }
+            if current.status == "waiting_external":
+                changes.update({"external_task_id": None, "output_uri": None})
+            updated = current.model_copy(update=changes)
+            self._write_run(updated)
+            return updated
+
     def get(self, *, project_id: str, run_id: str) -> StageRun:
         canonical_run_id = _canonical_id(run_id, kind="run")
         path = self._project_dir(project_id) / "runs" / f"{canonical_run_id}.json"
@@ -404,14 +453,36 @@ class ProjectRunStore:
             )
             if run.mode != "agent_development":
                 raise ValueError("Only Agent development runs accept stage results")
-            if any(update.request_id == request_id for update in run.updates):
+            selected_task = self._select_task_run(run, task_run_id=task_run_id)
+            previous_update = next(
+                (update for update in run.updates if update.request_id == request_id),
+                None,
+            )
+            if previous_update is not None:
+                if previous_update.status != outcome:
+                    raise ValueError(
+                        f"request_id {request_id!r} was already used for status "
+                        f"{previous_update.status!r}; cannot record {outcome!r}"
+                    )
+                previous_task_run_id = previous_update.task_run_id or run.task_run_id
+                selected_task_run_id = (
+                    selected_task.task_run_id
+                    if selected_task is not None
+                    else run.task_run_id
+                )
+                if previous_task_run_id != selected_task_run_id:
+                    raise ValueError(
+                        f"request_id {request_id!r} was already used for TaskRun "
+                        f"{previous_task_run_id!r}; cannot replay it for "
+                        f"{selected_task_run_id!r}"
+                    )
                 return run
             if run.status in {"succeeded", "failed"}:
                 raise ValueError(f"Stage run is already terminal: {run.status}")
-            selected_task = self._select_task_run(run, task_run_id=task_run_id)
             if selected_task is not None and selected_task.status in {
                 "succeeded",
                 "failed",
+                "cancelled",
             }:
                 raise ValueError(
                     f"TaskRun is already terminal: {selected_task.task_run_id}"
@@ -505,6 +576,17 @@ class ProjectRunStore:
                 raise ValueError("Stage run node no longer exists")
             if _project_node_digest_for_run(node, run) != run.node_config_digest:
                 raise ValueError("Stage run configuration changed during development")
+            if outcome == "succeeded" and node.type == "dataset":
+                if selected_task is None or selected_task.status != "waiting_external":
+                    raise ValueError(
+                        "Dataset stages require a submitted TaskRun in "
+                        "waiting_external before succeeding"
+                    )
+                if not external_task_id or not output_uri:
+                    raise ValueError(
+                        "Dataset success requires the submitted platform task and "
+                        "output_uri"
+                    )
             if outcome == "waiting_user":
                 require_sample_validation(node, details)
                 if node.type == "dataset":

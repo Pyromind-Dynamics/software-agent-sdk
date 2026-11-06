@@ -167,8 +167,9 @@ class Preparations:
                 )
         elif entry is not None:
             raise ValueError("an entry task requires a workflow plan")
-        updated = current.model_copy(
-            update={
+        updated = PreparationView.model_validate(
+            {
+                **current.model_dump(mode="json"),
                 "facts": facts,
                 "missing": missing,
                 "plan": plan,
