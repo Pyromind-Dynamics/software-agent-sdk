@@ -92,8 +92,14 @@ def test_prepare_rejects_non_storage_workflow(path):
 
 
 def test_submit_never_retries_platform_create(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "prod")
     seen: dict = {}
-    monkeypatch.setattr(module, "create_workflow_api_client", lambda **kwargs: object())
+
+    def create_client(**kwargs):
+        seen["routing"] = kwargs
+        return object()
+
+    monkeypatch.setattr(module, "create_workflow_api_client", create_client)
 
     def submit(**kwargs):
         seen.update(kwargs)
@@ -106,5 +112,8 @@ def test_submit_never_retries_platform_create(monkeypatch):
         RequestContext(user_id="42", cookie="auth_token=ephemeral", x_cluster="c#pre"),
     )
     assert task_id == "task-123"
+    assert seen["routing"]["env"] == "prod"
+    assert seen["routing"]["cluster"] == "c"
+    assert seen["routing"]["headers"] == {"x-cluster": "c"}
     assert seen["retry_create"] is False
     assert seen["conversation_id"] == "conversation-1"

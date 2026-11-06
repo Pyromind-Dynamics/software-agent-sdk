@@ -22,6 +22,7 @@ from openhands.tools.pyromind_dataset.definition import (
     download_file_from_pyromind,
     upload_local_file_to_pyromind,
 )
+from openhands.tools.utils.platform_env import platform_cluster_route
 
 
 logger = logging.getLogger(__name__)
@@ -148,7 +149,7 @@ def build_evaluation_storage(context: RequestContext) -> EvaluationStorage:
         headers["cookie"] = context.cookie
     if context.authorization:
         headers["authorization"] = context.authorization
-    if context.x_cluster:
-        headers["x-cluster"] = context.x_cluster
+    if route := platform_cluster_route(context.x_cluster):
+        headers["x-cluster"] = route
     base_url = os.getenv("PYROMIND_STORAGE_BASE_URL") or _default_storage_base_url()
     return PyromindEvaluationStorage(base_url=base_url, headers=headers)

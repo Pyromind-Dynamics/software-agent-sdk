@@ -9,7 +9,6 @@ or resolved from a ``run_id`` / ``output_dir`` recorded by
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
@@ -37,6 +36,11 @@ from openhands.tools.pyromind_dataset.definition import (
     _resolve_secret_headers,
 )
 from openhands.tools.utils.conversation_dirs import conversation_state_dir
+from openhands.tools.utils.platform_env import (
+    platform_endpoint,
+    platform_headers,
+    platform_portal_url,
+)
 
 
 if TYPE_CHECKING:
@@ -46,7 +50,6 @@ if TYPE_CHECKING:
 
 PRE_STOP_URL = "https://pre-api-portal.pyromind.ai/std2/studio_api/api/stop_task"
 PROD_STOP_URL = "https://api-portal.pyromind.ai/std2/studio_api/api/stop_task"
-_PROD_APP_ENVS = {"prod", "production", "online"}
 
 TOOL_DESCRIPTION = """\
 Stop a running DataFlow pipeline task on the platform.
@@ -60,10 +63,7 @@ running task first, then edit and resubmit.
 
 
 def _default_stop_url() -> str:
-    app_env = os.getenv("APP_ENV", "dev").strip().lower()
-    if app_env in _PROD_APP_ENVS:
-        return PROD_STOP_URL
-    return PRE_STOP_URL
+    return platform_endpoint(PROD_STOP_URL, PRE_STOP_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +140,9 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
         task_resolver: Callable[[str | None, str | None, str | None], str | None]
         | None = None,
     ) -> None:
-        self._stop_url = (stop_url or _default_stop_url()).rstrip("/")
+        self._stop_url = platform_portal_url(stop_url or _default_stop_url()).rstrip(
+            "/"
+        )
         self._headers = dict(headers or {})
         self._secret_headers = dict(secret_headers or {})
         self._timeout = timeout
@@ -259,7 +261,7 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
         try:
             response = httpx.post(
                 self._stop_url,
-                headers=headers,
+                headers=platform_headers(headers),
                 json={"task_id": _coerce_task_id(task_id)},
                 timeout=self._timeout,
             )

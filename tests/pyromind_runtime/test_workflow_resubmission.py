@@ -1,9 +1,11 @@
 """Workflow failures do not seal delegated tasks or replace prior receipts."""
 
+import json
 from datetime import timedelta
 
 import pytest
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.application.delegated_execution import DelegatedExecution
 from pyromind_runtime.domain.commands import PermissionResponseCommand
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.infrastructure.sql_experiment_execution import (
@@ -78,6 +80,72 @@ async def approve(runtime, owner, request_id, command_id):
         ),
         RequestContext(user_id=owner.user_id, profile_id=owner.profile_id),
     )
+
+
+@pytest.mark.parametrize(
+    ("prior_status", "launch", "interrupted"),
+    [
+        ("stopped", "spawn", False),
+        ("succeeded", "resume", False),
+        ("unknown", None, False),
+        ("succeeded", "resume", True),
+    ],
+)
+async def test_artifact_report_recovers_only_known_context(
+    training_execution, prior_status, launch, interrupted
+):
+    runtime, service, owner, run, scope, submission, _ = training_execution
+    prepared = await stage(runtime, owner, scope)
+    await approve(runtime, owner, prepared["request_id"], "approval")
+    service.store.queue.finish(
+        scope["work_id"], scope["generation"], {"execution_ref": "previous-child"}
+    )
+    service.store.ingest("done", "task-1", "callback", {"status": "succeeded"})
+    service.store.apply_observations()
+    service.store.queue_artifact_report(owner, run["id"])
+    item = service.store.queue.claim(kinds=("generate_report",))
+    assert item is not None
+    calls = []
+
+    async def control(_owner, _role, request):
+        calls.append(request)
+        if request["action"] == "authorize":
+            return {"status": "authorized"}
+        if request["action"] == "status":
+            return {"status": prior_status, "execution_ref": "previous-child"}
+        if interrupted:
+            return {
+                "status": "failed",
+                "execution_ref": "retry-child"
+                if request["request_id"].endswith(":interruption")
+                else "report-child",
+                "interrupted": True,
+                "result_text": "Execution transport lost",
+            }
+        return {"status": "succeeded", "execution_ref": "report-child"}
+
+    delegated = DelegatedExecution(service.plans, service.store, control)
+    if launch is None:
+        with pytest.raises(ValueError, match="report context requires reconciliation"):
+            await delegated.prepare(item)
+        assert [call["action"] for call in calls] == ["authorize", "status"]
+    else:
+        result = await delegated.prepare(item)
+        expected = ["authorize", "status", launch]
+        if interrupted:
+            expected.append("resume")
+            assert calls[-1]["execution_ref"] == "report-child"
+            assert calls[-1]["request_id"] == item["id"] + ":interruption"
+            assert result["execution_ref"] == "retry-child"
+            assert result["report_state"] == "failed"
+        assert [call["action"] for call in calls] == expected
+        assert calls[2].get("execution_ref") == (
+            "previous-child" if launch == "resume" else None
+        )
+        task = json.loads(calls[-1]["task"])
+        assert task["phase"] == "report"
+        assert task["submission"]["task_id"] == "task-1"
+    assert len(submission.submissions) == 1
 
 
 @pytest.mark.parametrize("reported", [False, True])

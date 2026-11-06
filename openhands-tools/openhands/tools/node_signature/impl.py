@@ -5,7 +5,6 @@ Fetches function signature from the Pyromind middleware nodes API.
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, cast
 
 import httpx
@@ -16,6 +15,7 @@ from openhands.tools.node_signature.definition import (
     NodeSignatureAction,
     NodeSignatureObservation,
 )
+from openhands.tools.utils.platform_env import platform_endpoint
 from openhands.tools.utils.pyromind_api_client import (
     _build_access_key_request_headers,
     decompress_gzip_base64_data,
@@ -32,14 +32,10 @@ PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET = "auth_token"
 
 _PRE_URL = "https://pre-api-portal.pyromind.ai/user_node/function_signature"
 _PROD_URL = "https://api-portal.pyromind.ai/user_node/function_signature"
-_PROD_APP_ENVS = {"prod", "production", "online"}
 
 
 def _resolve_endpoint(env: str | None) -> str:
-    app_env = (env or os.getenv("APP_ENV", "dev")).strip().lower()
-    if app_env in _PROD_APP_ENVS:
-        return _PROD_URL
-    return _PRE_URL
+    return platform_endpoint(_PROD_URL, _PRE_URL, env)
 
 
 class NodeSignatureExecutor(

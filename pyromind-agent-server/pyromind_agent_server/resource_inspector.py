@@ -14,6 +14,7 @@ from openhands.tools.pyromind_dataset.definition import (
     _default_storage_base_url,
     request_storage_url,
 )
+from openhands.tools.utils.platform_env import platform_cluster_route
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 
 
@@ -30,7 +31,7 @@ class StorageResourceInspector:
             for name, value in (
                 ("cookie", context.cookie),
                 ("authorization", context.authorization),
-                ("x-cluster", context.x_cluster),
+                ("x-cluster", platform_cluster_route(context.x_cluster)),
             )
             if value
         }
@@ -92,7 +93,7 @@ class StorageResourceInspector:
             for name, value in (
                 ("cookie", context.cookie),
                 ("authorization", context.authorization),
-                ("x-cluster", context.x_cluster),
+                ("x-cluster", platform_cluster_route(context.x_cluster)),
             )
             if value
         }

@@ -60,7 +60,7 @@ def test_evaluation_auth_boundary_is_separate_from_product_api() -> None:
 def test_evaluation_validation_shares_submission_route_and_identity(
     tmp_path, monkeypatch, env
 ):
-    monkeypatch.setenv("APP_ENV", "prod" if env.startswith("pre") else "dev")
+    monkeypatch.setenv("APP_ENV", env)
     context = ToolExecutionContext(
         conversation_id="test-conversation",
         workspace_root=tmp_path,
@@ -68,7 +68,7 @@ def test_evaluation_validation_shares_submission_route_and_identity(
             user_id="test",
             authorization="Bearer test-token",
             cookie="auth_token=test-cookie",
-            x_cluster=f"test-cluster#{env}",
+            x_cluster="test-cluster#prod" if env != "prod" else "test-cluster#pre",
         ),
         model_configuration={},
     )
@@ -94,7 +94,8 @@ def test_evaluation_validation_shares_submission_route_and_identity(
         f"https://{prefix}api-portal.pyromind.ai/std2/studio_api/api/workflows/dsl/validate"
     )
     headers = requests[0][1]
-    assert headers["x-cluster"] == params["headers"]["x-cluster"]
+    expected_route = "test-cluster" if env == "prod" else f"test-cluster#{env}"
+    assert headers["x-cluster"] == params["headers"]["x-cluster"] == expected_route
     assert headers["authorization"] == "Bearer test-token"
     assert headers["cookie"] == "auth_token=test-cookie"
 

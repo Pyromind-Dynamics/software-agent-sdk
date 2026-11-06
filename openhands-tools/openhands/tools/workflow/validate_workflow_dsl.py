@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
@@ -17,6 +16,11 @@ from openhands.sdk.tool.tool import (
     ToolAnnotations,
     ToolDefinition,
     ToolExecutor,
+)
+from openhands.tools.utils.platform_env import (
+    platform_endpoint,
+    platform_headers,
+    platform_portal_url,
 )
 from openhands.tools.utils.workspace_files import read_workspace_text
 from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
@@ -35,20 +39,11 @@ PROD_VALIDATE_URL = (
 )
 PYROMIND_VALIDATE_AUTH_COOKIE_SECRET = "PYROMIND_VALIDATE_AUTH_COOKIE"
 PYROMIND_VALIDATE_HEADERS_STATE_KEY = "pyromind_validate_workflow_dsl_headers"
-_PROD_APP_ENVS = {"prod", "production", "online"}
 _MAX_DSL_FILE_BYTES = 2 * 1024 * 1024
 
 
 def _default_validate_url(env: str | None = None) -> str:
-    if env is not None:
-        from_env = env.strip().lower()
-        if from_env == "pre2":
-            return PRE_VALIDATE_URL.replace("pre-api-portal", "pre2-api-portal")
-        return PROD_VALIDATE_URL if from_env in _PROD_APP_ENVS else PRE_VALIDATE_URL
-    app_env = os.getenv("APP_ENV", "dev").strip().lower()
-    if app_env in _PROD_APP_ENVS:
-        return PROD_VALIDATE_URL
-    return PRE_VALIDATE_URL
+    return platform_endpoint(PROD_VALIDATE_URL, PRE_VALIDATE_URL, env)
 
 
 DEFAULT_VALIDATE_URL = _default_validate_url()
@@ -299,7 +294,9 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
         *,
         env: str | None = None,
     ) -> None:
-        self._endpoint_url = endpoint_url or _default_validate_url(env)
+        self._endpoint_url = platform_portal_url(
+            endpoint_url or _default_validate_url(env)
+        )
         self._headers = dict(headers or {})
         self._secret_headers = dict(secret_headers or {})
         self._timeout = timeout
@@ -333,7 +330,7 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
         try:
             response = httpx.post(
                 self._endpoint_url,
-                headers=headers,
+                headers=platform_headers(headers),
                 json={"name": action.name, "dsl": dsl},
                 timeout=self._timeout,
             )

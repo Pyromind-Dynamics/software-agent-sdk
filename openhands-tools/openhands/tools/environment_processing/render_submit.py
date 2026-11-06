@@ -37,15 +37,15 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
-from openhands.tools.environment_processing.platform_env import (
-    resolve_platform_env,
-)
 from openhands.tools.pyromind_dataset.definition import (
     _default_storage_base_url,
     _resolve_conversation_headers,
     _resolve_secret_headers,
     download_tail_from_pyromind,
     upload_local_file_to_pyromind,
+)
+from openhands.tools.utils.platform_env import (
+    resolve_platform_env,
 )
 from openhands.tools.utils.storage_paths import to_tool_storage_path
 from openhands.tools.utils.workspace_staging import (

@@ -17,6 +17,10 @@ from openhands.tools.pyromind_dataset.definition import (
     _default_storage_base_url,
     download_file_from_pyromind,
 )
+from openhands.tools.utils.platform_env import (
+    platform_cluster_route,
+    resolve_platform_env,
+)
 from openhands.tools.utils.storage_paths import REMOVED_ALIAS
 from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
 from openhands.tools.workflow.task_submission import (
@@ -63,10 +67,10 @@ class PlatformWorkflowSubmission:
         def fetch():
             if not context.cookie and not context.authorization:
                 raise PermissionError("platform credentials need renewal")
-            route = context.x_cluster or ""
+            route = platform_cluster_route(context.x_cluster) or ""
             cluster, separator, env = route.partition("#")
             client = create_workflow_api_client(
-                env=env if separator else os.getenv("APP_ENV", "prod"),
+                env=resolve_platform_env(env if separator else "prod"),
                 cluster=cluster or os.getenv("PYROMIND_CLUSTER", "default"),
                 auth_token=parse_auth_token_from_cookie_header(context.cookie),
                 headers={
@@ -108,7 +112,7 @@ class PlatformWorkflowSubmission:
             for name, value in (
                 ("cookie", context.cookie),
                 ("authorization", context.authorization),
-                ("x-cluster", context.x_cluster),
+                ("x-cluster", platform_cluster_route(context.x_cluster)),
             )
             if value
         }
@@ -169,9 +173,9 @@ class PlatformWorkflowSubmission:
         *,
         correlation: TaskCorrelation | None = None,
     ) -> str:
-        route = (context.x_cluster or "").strip()
+        route = (platform_cluster_route(context.x_cluster) or "").strip()
         cluster, separator, routed_env = route.partition("#")
-        env = (
+        env = resolve_platform_env(
             routed_env.strip().lower()
             if separator and routed_env.strip()
             else "prod"

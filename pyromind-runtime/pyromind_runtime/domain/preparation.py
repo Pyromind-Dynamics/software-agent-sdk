@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field, JsonValue, model_validator
+from pydantic import Field, GetJsonSchemaHandler, JsonValue, model_validator
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import CoreSchema
 
 from pyromind_runtime.domain.base import ContractModel
 from pyromind_runtime.domain.execution_policy import TaskExecutionPolicy
@@ -132,9 +134,34 @@ class UpdatePreparation(ContractModel):
     entry_task: DelegateExperimentTask | None = None
 
 
+def _require_tool_fields(schema: JsonSchemaValue, *names: str) -> None:
+    required = schema.setdefault("required", [])
+    for name in names:
+        if name not in required:
+            required.append(name)
+        schema["properties"][name].pop("default", None)
+
+
 class CollectPreparationFacts(ContractModel):
     expected_revision: int = Field(ge=0)
     facts: dict[str, PreparationFact]
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, core_schema: CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        schema = handler(core_schema)
+        facts = schema["properties"]["facts"]
+        fact = handler.resolve_ref_schema(facts["additionalProperties"])
+        fact["properties"]["value"] = {
+            "description": "Checklist value in its declared type, or null if unknown.",
+            "anyOf": [
+                {"type": kind}
+                for kind in ("string", "object", "array", "integer", "boolean", "null")
+            ],
+        }
+        _require_tool_fields(fact, "value")
+        return schema
 
 
 class SetPreparationPlan(ContractModel):
@@ -147,6 +174,20 @@ class SetPreparationPlan(ContractModel):
         min_length=1,
         description="Enabled delegated role from preparation.policy.allowed_roles",
     )
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, core_schema: CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        schema = handler(core_schema)
+        plan = handler.resolve_ref_schema(schema["properties"]["plan"])
+        _require_tool_fields(plan, "stages", "tasks")
+        for name in ("stages", "tasks"):
+            collection = plan["properties"][name]
+            collection["minItems"] = 1
+            item = handler.resolve_ref_schema(collection["items"])
+            _require_tool_fields(item, "kind")
+        return schema
 
 
 class InspectResource(ContractModel):

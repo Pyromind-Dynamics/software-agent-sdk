@@ -27,6 +27,11 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
+from openhands.tools.utils.platform_env import (
+    platform_endpoint,
+    platform_headers,
+    platform_portal_url,
+)
 from openhands.tools.utils.workspace_staging import (
     WorkspaceStagingError,
     is_remote_workspace,
@@ -61,7 +66,6 @@ _INLINE_CREDENTIAL = re.compile(
 )
 _PRE_API_BASE = "https://pre-api-portal.pyromind.ai/std2/studio_api/"
 _PROD_API_BASE = "https://api-portal.pyromind.ai/std2/studio_api/"
-_PROD_APP_ENVS = {"prod", "production", "online"}
 
 
 def _default_api_base(configured: str | None = None) -> str:
@@ -70,8 +74,7 @@ def _default_api_base(configured: str | None = None) -> str:
     from_environment = os.environ.get("PYROMIND_API_BASE", "").strip()
     if from_environment:
         return from_environment
-    app_env = os.environ.get("APP_ENV", "").strip().lower()
-    return _PROD_API_BASE if app_env in _PROD_APP_ENVS else _PRE_API_BASE
+    return platform_endpoint(_PROD_API_BASE, _PRE_API_BASE)
 
 
 def _safe_headers(headers: dict[str, Any]) -> dict[str, str]:
@@ -217,7 +220,7 @@ class TrainingAnalysisExecutor(
         timeout_seconds: float = 180.0,
     ) -> None:
         self.runtime_dir = Path(runtime_dir).resolve()
-        self.api_base = _default_api_base(api_base)
+        self.api_base = platform_portal_url(_default_api_base(api_base))
         self.headers = dict(headers or {})
         self.secret_headers = dict(secret_headers or {})
         timeout = float(timeout_seconds)
@@ -558,7 +561,7 @@ class TrainingAnalysisExecutor(
                 output_path.relative_to(host_root).as_posix() if output_path else None
             ),
             "api_base": self.api_base,
-            "headers": headers,
+            "headers": platform_headers(headers),
         }
 
     @staticmethod

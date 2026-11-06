@@ -146,6 +146,27 @@ async def test_progress_checks_submission_ownership_and_live_lease(experiment, c
         assert calls == []
 
 
+async def test_training_analysis_accepts_platform_task_without_local_submission(
+    experiment,
+):
+    service, owner, _ = experiment
+    run = service.request(owner, request(role_id="train"), ("train",))
+    scope = claim(service, owner, run)
+    arguments = {"operation": "artifacts", "task_id": "9892"}
+    result = {"details": {"artifacts": ["/models/final_model"]}}
+
+    async def execute(*args):
+        assert args == (owner, "train", scope, "training_analysis", arguments)
+        return result
+
+    async def read(*_):
+        raise AssertionError("analysis uses the platform tool")
+
+    assert await service.role_call(
+        owner, "train", "training_analysis", arguments, scope, execute, read
+    ) == result
+
+
 def test_task_does_not_require_graph_or_plan_and_is_idempotent(experiment):
     service, owner, _ = experiment
     run = service.request(owner, request(), ("eval",))

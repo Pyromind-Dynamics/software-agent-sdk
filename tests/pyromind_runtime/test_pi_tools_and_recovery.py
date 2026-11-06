@@ -1159,19 +1159,23 @@ async def test_pi_host_bridges_update_plan_and_persists_snapshot(tmp_path) -> No
 
 
 @pytest.mark.parametrize(
-    ("x_cluster", "expected_env", "expected_cluster"),
+    ("app_env", "x_cluster", "expected_env", "expected_cluster", "expected_route"),
     [
-        ("us-west-1#pre", "pre", "us-west-1"),
-        ("us-west-2#pre2", "pre2", "us-west-2"),
-        ("us-east-1", "prod", "us-east-1"),
+        ("prod", "us-west-1#pre", "prod", "us-west-1", "us-west-1"),
+        ("pre2", "us-west-2#pre", "pre2", "us-west-2", "us-west-2#pre2"),
+        ("pre", "us-east-1", "pre", "us-east-1", "us-east-1#pre"),
     ],
 )
 def test_pi_tool_params_parse_request_cluster_route(
     tmp_path,
+    monkeypatch,
+    app_env,
     x_cluster,
     expected_env,
     expected_cluster,
+    expected_route,
 ) -> None:
+    monkeypatch.setenv("APP_ENV", app_env)
     repository = Path(pi_adapter_module.__file__).parents[3]
     host = PyromindBusinessToolHost(
         [
@@ -1189,10 +1193,13 @@ def test_pi_tool_params_parse_request_cluster_route(
     for params in (host._execution_params(context), host._sandbox_params(context)):
         assert params["env"] == expected_env
         assert params["cluster"] == expected_cluster
+        assert params["headers"]["x-cluster"] == expected_route
 
     debug_params = host._workflow_debug_params(context)
     assert debug_params["env"] == expected_env
     assert debug_params["cluster"] == expected_cluster
+
+    assert host._label_studio_params(context)["headers"]["x-cluster"] == x_cluster
 
 
 def test_pi_tool_params_fall_back_to_deployment_target(tmp_path, monkeypatch) -> None:
@@ -1637,7 +1644,7 @@ def test_workflow_debug_params_fall_back_to_deployment_env(
     assert params["cluster"] == "default"
 
 
-def test_workflow_debug_params_prefer_session_context(
+def test_workflow_debug_params_use_deployment_env_and_session_cluster(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("APP_ENV", "pre2")
@@ -1652,7 +1659,7 @@ def test_workflow_debug_params_prefer_session_context(
             extra={"env": "pre"},
         )
     )
-    assert params["env"] == "pre"
+    assert params["env"] == "pre2"
     assert params["cluster"] == "req-cluster"
 
 

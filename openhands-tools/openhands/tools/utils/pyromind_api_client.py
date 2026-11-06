@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import jwt
 
+from openhands.tools.utils.platform_env import configured_platform_env, platform_headers
+
 
 if TYPE_CHECKING:
     from pyromind_sdk.client.client import PyroMindAPIClient
@@ -32,6 +34,7 @@ _DEV_SECRET_KEY = "Kij823420JITRE21i21248cbsxhuexvS"
 
 
 def _get_domain(env: str | None, api_uri: str) -> str:
+    env = configured_platform_env() or env
     if env in _PROD_ENVS:
         return f"https://{_BASE_DOMAIN}{api_uri}"
     if env == "pre2":
@@ -94,7 +97,7 @@ def _find_secret_key() -> str:
     # except FileNotFoundError as exc:
     #     raise RuntimeError("Secret file not found: web_secret_key") from exc
     # except PermissionError as exc:
-    #     raise RuntimeError("Permission denied reading secret: web_secret_key") from exc
+    #     raise RuntimeError("Permission denied reading web_secret_key") from exc
 
 
 def _user_id_from_auth_token(auth_token: str) -> int:
@@ -212,7 +215,7 @@ def _build_access_key_request_headers(
     return {
         "accept": "*/*",
         "content-type": "application/json",
-        **base_headers,
+        **platform_headers(base_headers),
         "auth_token": auth_token,
         "cookie": _serialize_cookie_pairs(cookies),
     }
@@ -238,6 +241,8 @@ def get_pyromind_api_client(
     ``cluster`` 暂仍可通过进程环境变量提供。
     """
     base_url = _api_url(env)
+    if cluster and configured_platform_env() is not None:
+        cluster = cluster.partition("#")[0].strip()
     client_type = _load_pyromind_api_client_type()
     return client_type(
         api_key=api_key,

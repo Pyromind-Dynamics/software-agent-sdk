@@ -36,6 +36,7 @@ from openhands.tools.pyromind_dataset.definition import (
     _resolve_secret_headers,
     _truncate_text,
 )
+from openhands.tools.utils.platform_env import platform_endpoint
 
 
 if TYPE_CHECKING:
@@ -79,9 +80,9 @@ def _default_public_api_base() -> str:
     override = os.getenv("PYROMIND_PUBLIC_API_BASE", "").strip().rstrip("/")
     if override:
         return override
-    if os.getenv("APP_ENV", "dev").strip().lower() in {"prod", "production", "online"}:
-        return "https://agent.pyromind.ai"
-    return "https://pre-agent.pyromind.ai"
+    return platform_endpoint(
+        "https://agent.pyromind.ai", "https://pre-agent.pyromind.ai"
+    )
 
 
 class DfCheckProgressAction(Action):

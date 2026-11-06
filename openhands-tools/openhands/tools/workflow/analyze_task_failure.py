@@ -28,6 +28,11 @@ from openhands.sdk.tool.tool import (
     ToolExecutor,
 )
 from openhands.sdk.utils.deprecation import handle_deprecated_model_fields
+from openhands.tools.utils.platform_env import (
+    platform_endpoint,
+    platform_headers,
+    platform_portal_url,
+)
 from openhands.tools.utils.pyromind_api_client import (
     _build_access_key_request_headers,
     decompress_gzip_base64_data,
@@ -45,7 +50,6 @@ if TYPE_CHECKING:
 
 PRE_API_BASE = "https://pre-api-portal.pyromind.ai/std2/studio_api/"
 PROD_API_BASE = "https://api-portal.pyromind.ai/std2/studio_api/"
-_PROD_APP_ENVS = {"prod", "production", "online"}
 
 # Cloudflare rejects non-browser User-Agents with HTTP 403 browser_signature_banned.
 USER_AGENT = (
@@ -95,10 +99,7 @@ _FAILURE_DIAGNOSIS_PROMPT = """\
 
 
 def _default_api_base() -> str:
-    app_env = os.getenv("APP_ENV", "dev").strip().lower()
-    if app_env in _PROD_APP_ENVS:
-        return PROD_API_BASE
-    return PRE_API_BASE
+    return platform_endpoint(PROD_API_BASE, PRE_API_BASE)
 
 
 def _resolve_api_base() -> str:
@@ -452,7 +453,9 @@ class AnalyzeTaskFailureExecutor(
         secret_headers: Mapping[str, str] | None = None,
         timeout: float = 30.0,
     ) -> None:
-        self._api_base = (api_base or _resolve_api_base()).rstrip("/")
+        self._api_base = platform_portal_url(api_base or _resolve_api_base()).rstrip(
+            "/"
+        )
         parts = urlsplit(self._api_base)
         self._nodes_api_base = f"{parts.scheme}://{parts.netloc}/user_node"
         self._headers = dict(headers or {})
@@ -647,7 +650,7 @@ class AnalyzeTaskFailureExecutor(
                     "max_source_lines": source_lines,
                     "compressed": True,
                 },
-                headers=headers,
+                headers=platform_headers(headers),
                 timeout=self._timeout,
             )
         except httpx.RequestError:
@@ -726,7 +729,10 @@ class AnalyzeTaskFailureExecutor(
         url = f"{self._api_base}/{path}"
         try:
             response = httpx.get(
-                url, params=params, headers=headers, timeout=self._timeout
+                url,
+                params=params,
+                headers=platform_headers(headers),
+                timeout=self._timeout,
             )
         except httpx.RequestError as exc:
             return f"Platform API {path} unreachable: {type(exc).__name__}: {exc}"

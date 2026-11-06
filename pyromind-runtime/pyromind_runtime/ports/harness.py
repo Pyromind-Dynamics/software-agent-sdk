@@ -222,7 +222,9 @@ class DelegationAdapter(Protocol):
 
     async def control_delegation(
         self, handle: SessionHandle, request: JsonObject, context: RequestContext
-    ) -> JsonObject: ...
+    ) -> JsonObject:
+        """Control a child. Interrupted failures indicate lost execution transport."""
+        ...
 
 
 @runtime_checkable

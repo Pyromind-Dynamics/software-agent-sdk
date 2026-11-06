@@ -49,6 +49,10 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
+from openhands.tools.utils.platform_env import (
+    configured_platform_env,
+    platform_cluster_route,
+)
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
     create_workflow_api_client,
@@ -671,8 +675,8 @@ def terminal_base_url(
     the ``pyromind terminal`` CLI. ``fallback`` is used when the cluster route is
     unknown or absent.
     """
-    route = (cluster or "").strip()
-    environment = (env or "").strip()
+    route = (platform_cluster_route(cluster) or "").strip()
+    environment = configured_platform_env() or (env or "").strip()
     if route and "#" not in route and environment and environment not in PROD_ENVS:
         route = f"{route}#{environment}"
     if route:

@@ -254,12 +254,17 @@ export class SubagentHost {
     }
     const id = result?.details?.runId ?? result?.runId ?? input.execution_ref;
     let state = result?.details?.state ?? result?.state ?? "unknown";
+    let interruption: string | undefined;
     if (typeof id === "string" && /^[a-zA-Z0-9-]+$/.test(id)) {
       const path = join(this.paths.stateRoot, "async-subagent-runs", id, "status.json");
       if (existsSync(path)) {
         const status = JSON.parse(readFileSync(path, "utf8"));
         if (status.runId !== id || ![this.session!.sessionManager.getSessionFile(), this.session!.sessionId].includes(status.sessionId)) throw new Error("Delegated run ownership mismatch");
         state = status.state;
+        if (state === "failed" && typeof status.error === "string" &&
+          (status.error.startsWith("Subagent host unavailable:") || status.error === "Subagent host disconnected")) {
+          interruption = status.error;
+        }
       }
       if (action === "spawn" || action === "resume" || (isRecord(input.scope) && isRecord(input.scope.execution))) {
         const changed = this.display.remember(id, {
@@ -281,7 +286,8 @@ export class SubagentHost {
       }
     }
     return { execution_ref: typeof id === "string" ? id : null, status: state,
-      result_text: typeof id === "string" ? this.handoffs.get(id) ?? displayText(result) : displayText(result) };
+      interrupted: interruption !== undefined,
+      result_text: interruption ?? (typeof id === "string" ? this.handoffs.get(id) ?? displayText(result) : displayText(result)) };
 
   }
 

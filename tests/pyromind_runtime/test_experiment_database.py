@@ -107,21 +107,28 @@ def test_selector_ignores_remote_url_and_resolves_paths_independent_of_cwd(
         resolve_database_url({"EXPERIMENT_DB_BACKEND": "mariadb"})
 
 
-def test_startup_sqlite_does_not_source_credentials(tmp_path):
-    forbidden = tmp_path / "credentials.env"
-    forbidden.write_text("exit 88\n")
+@pytest.fixture
+def startup_database_script(tmp_path):
     prefix = (
         (PROJECT_ROOT / "start_inference.sh")
         .read_text()
-        .split("export PYROMIND_HARNESS_BACKEND")[0]
+        .split("export OPENAI_API_KEY\n", 1)[0]
     )
+    script = tmp_path / "start_inference.sh"
+    script.write_text(prefix + '\nprintf "%s" "$EXPERIMENT_DB_BACKEND"\n')
+    return script
+
+
+def test_startup_sqlite_does_not_source_credentials(tmp_path, startup_database_script):
+    forbidden = tmp_path / "credentials.env"
+    forbidden.write_text("exit 88\n")
     environment = {
         **os.environ,
         "EXPERIMENT_PLAN_ENV_FILE": str(forbidden),
         "EXPERIMENT_DB_BACKEND": "sqlite",
     }
     result = subprocess.run(
-        ["bash", "-c", prefix + '\nprintf "%s" "$EXPERIMENT_DB_BACKEND"'],
+        ["bash", str(startup_database_script)],
         env=environment,
         capture_output=True,
         text=True,
@@ -129,22 +136,16 @@ def test_startup_sqlite_does_not_source_credentials(tmp_path):
     assert result.returncode == 0 and result.stdout == "sqlite"
 
 
-def test_startup_defaults_to_mariadb(tmp_path):
+def test_startup_defaults_to_mariadb(tmp_path, startup_database_script):
     config = tmp_path / "database.env"
     config.write_text(
         "EXPERIMENT_PLAN_DATABASE_URL='mysql+pymysql://test@localhost/test_database'\n"
-    )
-    prefix = (
-        (PROJECT_ROOT / "start_inference.sh")
-        .read_text()
-        .split("export PYROMIND_HARNESS_BACKEND")[0]
-        .split("export OPENAI_API_KEY")[0]
     )
     environment = {**os.environ, "EXPERIMENT_PLAN_ENV_FILE": str(config)}
     environment.pop("EXPERIMENT_DB_BACKEND", None)
     environment.pop("EXPERIMENT_PLAN_DATABASE_URL", None)
     result = subprocess.run(
-        ["bash", "-c", prefix + '\nprintf "%s" "$EXPERIMENT_DB_BACKEND"'],
+        ["bash", str(startup_database_script)],
         env=environment,
         capture_output=True,
         text=True,

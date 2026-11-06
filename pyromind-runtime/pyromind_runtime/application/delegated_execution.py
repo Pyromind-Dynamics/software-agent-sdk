@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 
 from pyromind_runtime.domain.experiment_plans import PlanOwner
@@ -186,6 +187,35 @@ class DelegatedExecution:
             }
         await self.control(owner, role, {"action": "authorize", "scope": scope})
         checkpoint = item["checkpoint"]
+        interruption_retried = checkpoint.get("interruption_retried", False)
+
+        async def launch(prior: str | None, request_id: str) -> dict:
+            action = "resume" if prior else "spawn"
+            await asyncio.to_thread(
+                self.store.save_work_checkpoint,
+                item["id"],
+                item["generation"],
+                {
+                    "launch_pending": True,
+                    "launch_kind": action,
+                    "launch_request_id": request_id,
+                    "interruption_retried": interruption_retried,
+                },
+            )
+            return await self.control(
+                owner,
+                role,
+                {
+                    "action": action,
+                    "role": role,
+                    **({"execution_ref": prior} if prior else {}),
+                    "task": json.dumps(task_body, ensure_ascii=False),
+                    "display": display,
+                    "request_id": request_id,
+                    "scope": scope,
+                },
+            )
+
         if checkpoint.get("launch_pending"):
             # A missing response is not permission to start a duplicate child.
             result = await self.control(
@@ -238,100 +268,80 @@ class DelegatedExecution:
                 if result.get("status") in {"stopped", "paused"} and (
                     row["state"] in {"queued", "preparing"} or report or continuation
                 ):
-                    import json
-
                     # A native hard stop seals its session. Once termination is
                     # proven, a fresh child can re-read the durable task facts;
                     # the existing submission ledger still forbids duplicates.
                     stopped = result["status"] == "stopped" and not continuation
-                    request_id = item["id"] + ":recovery:" + str(item["generation"])
-                    await asyncio.to_thread(
-                        self.store.save_work_checkpoint,
-                        item["id"],
-                        item["generation"],
-                        {
-                            "launch_pending": True,
-                            "launch_kind": "spawn" if stopped else "resume",
-                            "launch_request_id": request_id,
-                        },
-                    )
-                    result = await self.control(
-                        owner,
-                        role,
-                        {
-                            "action": "spawn" if stopped else "resume",
-                            "role": role,
-                            **(
-                                {}
-                                if stopped
-                                else {"execution_ref": checkpoint["execution_ref"]}
-                            ),
-                            "task": json.dumps(task_body, ensure_ascii=False),
-                            "display": display,
-                            "request_id": request_id,
-                            "scope": scope,
-                        },
+                    result = await launch(
+                        None if stopped else checkpoint["execution_ref"],
+                        item["id"] + ":recovery:" + str(item["generation"]),
                     )
         else:
-            import json
-
-            prompt = json.dumps(task_body, ensure_ascii=False)
             prior = (
                 await asyncio.to_thread(self.store.native_reference, owner, run_id)
                 if specification or continuation
                 else None
             )
+            if report and prior and not continuation:
+                previous = await self.control(
+                    owner,
+                    role,
+                    {"action": "status", "execution_ref": prior, "scope": scope},
+                )
+                if previous["status"] == "stopped":
+                    prior = None
+                elif previous["status"] not in {"succeeded", "failed", "paused"}:
+                    raise ValueError("report context requires reconciliation")
             if continuation and prior is None:
                 raise ValueError(
                     "the original child context is unavailable; "
                     "delegate a fresh task explicitly"
                 )
-            await asyncio.to_thread(
-                self.store.save_work_checkpoint,
-                item["id"],
-                item["generation"],
-                {"launch_pending": True, "launch_kind": "resume" if prior else "spawn"},
-            )
-            result = await self.control(
-                owner,
-                role,
-                {
-                    "action": "resume" if prior else "spawn",
-                    **({"execution_ref": prior} if prior else {}),
-                    "role": role,
-                    "task": prompt,
-                    "display": display,
-                    "request_id": item["id"],
-                    "scope": scope,
-                },
-            )
-        reference = result.get("execution_ref")
-        if not reference or result.get("status") == "unknown":
-            raise ValueError("delegated launch needs reconciliation")
-        await asyncio.to_thread(
-            self.store.save_work_checkpoint,
-            item["id"],
-            item["generation"],
-            {"execution_ref": reference, "generation": item["generation"]},
-        )
+            result = await launch(prior, item["id"])
+        reference = None
         try:
-            while result["status"] not in {
-                "succeeded",
-                "failed",
-                "stopped",
-                "paused",
-            }:
-                await asyncio.sleep(0.5)
-                result = await self.control(
-                    owner,
-                    role,
-                    {"action": "status", "execution_ref": reference, "scope": scope},
+            while True:
+                reference = result.get("execution_ref")
+                if not reference or result.get("status") == "unknown":
+                    raise ValueError("delegated launch needs reconciliation")
+                await asyncio.to_thread(
+                    self.store.save_work_checkpoint,
+                    item["id"],
+                    item["generation"],
+                    {
+                        "execution_ref": reference,
+                        "generation": item["generation"],
+                        "interruption_retried": interruption_retried,
+                    },
                 )
-                if result.get("status") == "unknown":
+                while result["status"] in {"running", "queued", "stopping"}:
+                    await asyncio.sleep(0.5)
+                    result = await self.control(
+                        owner,
+                        role,
+                        {
+                            "action": "status",
+                            "execution_ref": reference,
+                            "scope": scope,
+                        },
+                    )
+                if result["status"] not in {"succeeded", "failed", "stopped", "paused"}:
                     raise ValueError("delegated state requires reconciliation")
-            current = await asyncio.to_thread(
-                self.store.role_scope, owner, run_id, role, scope
-            )
+                current = await asyncio.to_thread(
+                    self.store.role_scope, owner, run_id, role, scope
+                )
+                if not (
+                    report
+                    and result["status"] == "failed"
+                    and result.get("interrupted")
+                    and not interruption_retried
+                    and current["report_state"] != "ready"
+                    and (current.get("submission") or {}).get("state") == "succeeded"
+                ):
+                    break
+                interruption_retried = True
+                previous_reference, reference = reference, None
+                result = await launch(previous_reference, item["id"] + ":interruption")
             if specification:
                 if not continuation or current["state"] in {"queued", "preparing"}:
                     current = await asyncio.to_thread(
@@ -386,11 +396,12 @@ class DelegatedExecution:
         except asyncio.CancelledError:
             # Stop intent is durable in the native owner; a subsequent recovery
             # still queries actual lifecycle proof before admitting more work.
-            await self.control(
-                owner,
-                role,
-                {"action": "pause", "execution_ref": reference, "scope": scope},
-            )
+            if reference:
+                await self.control(
+                    owner,
+                    role,
+                    {"action": "pause", "execution_ref": reference, "scope": scope},
+                )
             raise
 
     async def reconcile(self, item: dict) -> bool:

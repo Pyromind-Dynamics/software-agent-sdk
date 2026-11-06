@@ -23,6 +23,7 @@ from pyromind_runtime.domain.experiment_plans import (
     UpdateExperimentContext,
 )
 from pyromind_runtime.domain.preparation import (
+    PREPARATION_TOOLS,
     ChecklistField,
     PreparationPolicy,
     UpdatePreparation,
@@ -46,6 +47,25 @@ from pyromind_runtime.ports.harness import DelegatedRole, SessionSpec
 
 from .fake_adapter import FakeAdapter
 from .test_product_api import _app
+
+
+def test_preparation_tool_schemas_require_fields_needed_for_execution():
+    facts = PREPARATION_TOOLS["update_preparation"].model_json_schema()
+    fact = facts["$defs"]["PreparationFact"]
+    assert "value" in fact["required"]
+    assert {entry["type"] for entry in fact["properties"]["value"]["anyOf"]} == {
+        "string",
+        "object",
+        "array",
+        "integer",
+        "boolean",
+        "null",
+    }
+
+    plan = PREPARATION_TOOLS["set_preparation_plan"].model_json_schema()["$defs"]
+    assert {"stages", "tasks"} <= set(plan["ExperimentContext"]["required"])
+    assert "kind" in plan["ExperimentStage"]["required"]
+    assert "kind" in plan["ExperimentTask"]["required"]
 
 
 @pytest.fixture

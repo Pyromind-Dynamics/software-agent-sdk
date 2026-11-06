@@ -8,6 +8,7 @@ from pyromind_runtime.domain.context import RequestContext
 
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.workspace.base import BaseWorkspace
+from openhands.tools.utils.platform_env import platform_cluster_route
 from openhands.tools.workflow.validate_workflow_dsl import (
     ValidateWorkflowDslAction,
     ValidateWorkflowDslExecutor,
@@ -39,7 +40,7 @@ async def execute_validation_tool(
         for name, value in (
             ("cookie", context.cookie),
             ("authorization", context.authorization),
-            ("x-cluster", context.x_cluster),
+            ("x-cluster", platform_cluster_route(context.x_cluster)),
             ("accept-language", context.accept_language),
         )
         if value

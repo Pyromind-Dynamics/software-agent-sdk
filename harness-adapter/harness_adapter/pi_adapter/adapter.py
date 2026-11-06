@@ -404,6 +404,7 @@ class PiAdapter:
                 "paused": "paused",
                 "stopping": "stopping",
             }.get(str(raw.get("status")), "unknown"),
+            "interrupted": raw.get("interrupted") is True,
             "result_text": str(raw.get("result_text", "")),
         }
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -23,6 +22,11 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.utils import default_path_access_policy
+from openhands.tools.utils.platform_env import (
+    platform_endpoint,
+    platform_headers,
+    platform_portal_url,
+)
 from openhands.tools.utils.workspace_staging import (
     WorkspaceStagingError,
     is_remote_workspace,
@@ -78,14 +82,9 @@ def _is_transient_storage_status(status_code: int) -> bool:
 
 _WORKSPACE_PATH_PREFIXES = ("/workspace/", "workspace/")
 
-_PROD_APP_ENVS = {"prod", "production", "online"}
-
 
 def _default_storage_base_url() -> str:
-    app_env = os.getenv("APP_ENV", "dev").strip().lower()
-    if app_env in _PROD_APP_ENVS:
-        return PROD_STORAGE_API_BASE_URL
-    return PRE_STORAGE_API_BASE_URL
+    return platform_endpoint(PROD_STORAGE_API_BASE_URL, PRE_STORAGE_API_BASE_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +283,8 @@ def _upload_local_file_once(
     file_size = local_path.stat().st_size
     try:
         response = httpx.post(
-            f"{storage_base_url.rstrip('/')}/presigned_upload_url",
-            headers=headers,
+            f"{platform_portal_url(storage_base_url).rstrip('/')}/presigned_upload_url",
+            headers=platform_headers(headers),
             json={
                 "filename": filename,
                 "path": target_dir,
@@ -429,8 +428,8 @@ def _upload_local_file_multipart(
 
     try:
         complete_response = httpx.post(
-            f"{storage_base_url.rstrip('/')}/multipart_complete",
-            headers=headers,
+            f"{platform_portal_url(storage_base_url).rstrip('/')}/multipart_complete",
+            headers=platform_headers(headers),
             json={
                 "path": target_dir,
                 "filename": filename,
@@ -473,8 +472,8 @@ def request_storage_url(
         body["force_download"] = force_download
     try:
         response = httpx.post(
-            f"{storage_base_url.rstrip('/')}/get_url",
-            headers=headers,
+            f"{platform_portal_url(storage_base_url).rstrip('/')}/get_url",
+            headers=platform_headers(headers),
             json=body,
             timeout=timeout,
         )
@@ -1083,8 +1082,8 @@ def storage_file_names(
     """
     try:
         response = httpx.post(
-            f"{storage_base_url.rstrip('/')}/file_list",
-            headers=headers,
+            f"{platform_portal_url(storage_base_url).rstrip('/')}/file_list",
+            headers=platform_headers(headers),
             json={"path": directory, "search": search},
             timeout=timeout,
         )

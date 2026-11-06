@@ -18,6 +18,7 @@ from openhands.agent_server.pyromind_auth import (
     get_dev_login_user_from_headers,
     parse_auth_token_from_cookie_header,
 )
+from openhands.tools.utils.platform_env import configured_platform_env
 
 
 # Cookie name used to authenticate the workspace static-file routes.
@@ -117,13 +118,13 @@ def load_base_env(request: Request):
         if "#" not in _x_cluster:
             return _DEFAULT_ENV
         env = _x_cluster.rsplit("#", 1)[-1].strip().lower()
-        ## 这里返回的env 可能是pre 也可能是pre2
+        # 这里返回的 env 可能是 pre 或 pre2。
         return env or _DEFAULT_ENV
 
     def _resolve_cluster_from_conversation(_x_cluster: str | None) -> str:
         """
         根据 x-cluster 头解析集群信息
-        x_cluster 可能的值： us-west-1 us-west-2 us-west-1#pre us-west-1#pre2 us-west-2#pre us-west-2#pre2
+        x_cluster 格式为区域名，或区域名加环境后缀，例如 us-west-1#pre。
         """
         if _x_cluster and "#" in _x_cluster:
             region = _x_cluster.split("#", 1)[0].strip()
@@ -134,13 +135,15 @@ def load_base_env(request: Request):
         raise ValueError(f"Can't resolve cluster from x-cluster: {_x_cluster}.")
 
     if x_cluster := _get_validation_cluster_header(request):
-        request.state.env = _parse_env_from_x_cluster(x_cluster)
+        request.state.env = configured_platform_env() or _parse_env_from_x_cluster(
+            x_cluster
+        )
         request.state.cluster = _resolve_cluster_from_conversation(x_cluster)
 
 
 def _get_validation_cluster_header(
     http_request: Request,
-    extra: dict[str, Any] = {},
+    extra: dict[str, Any] | None = None,
 ) -> str | None:
     current_user = getattr(http_request.state, "current_user", None)
     if isinstance(current_user, CurrentLoginUser) and current_user.x_cluster:
@@ -170,7 +173,7 @@ def check_session_api_key(
     without restarting the server or re-registering routes.
     """
     authenticate_request(request, session_api_key)
-    ## 加载环境信息
+    # 加载环境信息。
     load_base_env(request)
 
 

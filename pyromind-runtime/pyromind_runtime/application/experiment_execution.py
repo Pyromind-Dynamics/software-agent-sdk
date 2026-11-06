@@ -332,7 +332,7 @@ class ExperimentExecutions:
                 )
                 raise
             return {"run_id": row["id"], "report_state": "ready"}
-        if tool in {"training_analysis", "analyze_task_failure"}:
+        if tool == "analyze_task_failure":
             if arguments.get("task_id") not in {
                 sub.get("task_id") for sub in row.get("submissions", [])
             }:
@@ -519,7 +519,8 @@ class ExperimentExecutions:
                         run_id,
                         "Analyze the platform failure and continue the task.",
                     )
-                self._checks[run_id] = (time.monotonic() + 30, 0)
+                interval = 120 if current["state"] == "waiting_platform" else 30
+                self._checks[run_id] = (time.monotonic() + interval, 0)
             except PermissionError:
                 await asyncio.to_thread(
                     store.note_wait,
