@@ -453,9 +453,7 @@ class AnalyzeTaskFailureExecutor(
         secret_headers: Mapping[str, str] | None = None,
         timeout: float = 30.0,
     ) -> None:
-        self._api_base = platform_portal_url(api_base or _resolve_api_base()).rstrip(
-            "/"
-        )
+        self._api_base = (api_base or _resolve_api_base()).rstrip("/")
         parts = urlsplit(self._api_base)
         self._nodes_api_base = f"{parts.scheme}://{parts.netloc}/user_node"
         self._headers = dict(headers or {})
@@ -642,7 +640,7 @@ class AnalyzeTaskFailureExecutor(
         )
         try:
             response = httpx.post(
-                url,
+                platform_portal_url(url, headers),
                 json={
                     "node_names": [node_type],
                     "node_type": None,
@@ -729,7 +727,7 @@ class AnalyzeTaskFailureExecutor(
         url = f"{self._api_base}/{path}"
         try:
             response = httpx.get(
-                url,
+                platform_portal_url(url, headers),
                 params=params,
                 headers=platform_headers(headers),
                 timeout=self._timeout,

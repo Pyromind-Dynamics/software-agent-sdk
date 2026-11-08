@@ -8,7 +8,6 @@ from pyromind_runtime.domain.base import ContractModel
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.execution_policy import (
     CheckpointView,
-    ExecutionArtifact,
     ExecutionCheckpoint,
 )
 
@@ -128,16 +127,6 @@ class ExperimentExecutionView(ContractModel):
     )
 
 
-class RecordExperimentResult(ContractModel):
-    artifacts: tuple[ExecutionArtifact, ...] = Field(
-        default=(), max_length=16, exclude_if=lambda value: not value
-    )
-    run_id: str
-    summary: str = Field(min_length=1, max_length=16000)
-    report_uri: str | None = None
-    blockers: tuple[str, ...] = ()
-
-
 class ControlExperimentTask(ContractModel):
     run_id: str
     action: Literal["continue", "cancel", "retry_report"]
@@ -170,11 +159,6 @@ ROLE_TOOLS = {
         ExecutionCheckpoint,
         "Register verified sample evidence and pause for Manager to ask the user. "
         "This does not authorize a platform submission.",
-    ),
-    "record_experiment_result": (
-        RecordExperimentResult,
-        "Register a report or essential missing inputs; "
-        "Runtime verifies result evidence.",
     ),
     "read_experiment_resource": (
         ReadExperimentResource,

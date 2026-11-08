@@ -140,9 +140,7 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
         task_resolver: Callable[[str | None, str | None, str | None], str | None]
         | None = None,
     ) -> None:
-        self._stop_url = platform_portal_url(stop_url or _default_stop_url()).rstrip(
-            "/"
-        )
+        self._stop_url = (stop_url or _default_stop_url()).rstrip("/")
         self._headers = dict(headers or {})
         self._secret_headers = dict(secret_headers or {})
         self._timeout = timeout
@@ -260,7 +258,7 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
     def _post_stop(self, task_id: str, headers: dict[str, str]) -> dict[str, Any] | str:
         try:
             response = httpx.post(
-                self._stop_url,
+                platform_portal_url(self._stop_url, headers),
                 headers=platform_headers(headers),
                 json={"task_id": _coerce_task_id(task_id)},
                 timeout=self._timeout,

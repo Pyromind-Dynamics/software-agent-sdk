@@ -21,9 +21,10 @@ prefix instead of the Skill's default public_data/ paths in tool arguments. Mode
 references may be Storage directories. After submission return actual task_id,
 run_id and output_dir and end this turn: Runtime waits for the platform and resumes
 you to analyze the result. Do not busy-poll. In the report phase read metrics.json
-and report.json, verify counts and coverage, explain evidence and limitations,
-write a report and call record_experiment_result with summary and report_uri.
-Missing essential inputs go in blockers. Reporting must reuse predictions and
+and report.json, verify counts and coverage, and write the evidence, limitations
+and output paths in a task-local Markdown report. End with a short Markdown
+reply to Manager giving the report path and outcome. Explain missing inputs in
+the reply. Reporting must reuse predictions and
 must not restart GPU inference. Never edit the experiment's global guidance,
 launch another role, train, deploy or cut traffic. Do not invent paths, fingerprints
 or metrics. Use the user's language and keep credentials out of every result.
@@ -37,7 +38,6 @@ or metrics. Use the user's language and keep credentials out of every result.
         "df_check_progress",
         "get_storage_url",
         "get_experiment_execution",
-        "record_experiment_result",
     ),
     skills=("inference-evaluation", "avi-baseline-evaluation"),
 )

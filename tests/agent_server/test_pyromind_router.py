@@ -929,12 +929,12 @@ async def test_pyromind_message_refreshes_storage_auth_context(tmp_path):
         PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: "auth_token=context-token; other=value",
         PYROMIND_AUTH_TOKEN_SECRET: "context-token",
         PYROMIND_STORAGE_AUTH_COOKIE_SECRET: "auth_token=context-token; other=value",
-        PYROMIND_X_CLUSTER_SECRET: "context-cluster",
+        PYROMIND_X_CLUSTER_SECRET: "request-cluster",
         PYROMIND_PRODUCT_USER_ID_SECRET: "42",
     }
     assert service.agent_state == {
-        PYROMIND_VALIDATE_HEADERS_STATE_KEY: {"x-cluster": "context-cluster"},
-        PYROMIND_STORAGE_HEADERS_STATE_KEY: {"x-cluster": "context-cluster"},
+        PYROMIND_VALIDATE_HEADERS_STATE_KEY: {"x-cluster": "request-cluster"},
+        PYROMIND_STORAGE_HEADERS_STATE_KEY: {"x-cluster": "request-cluster"},
     }
     assert service.sent_message is not None
     assert service.run is True
@@ -1042,7 +1042,7 @@ def test_validation_cookie_header_keeps_full_cookie_in_prod(monkeypatch):
     assert _get_validation_cookie_header(request) == cookie_header
 
 
-def test_workflow_validation_tool_uses_user_context_headers():
+def test_workflow_validation_tool_uses_request_cluster_and_user_cookie():
     request = _make_request(
         {
             "cookie": f"{PYROMIND_AUTH_COOKIE_NAME}=request-token",
@@ -1060,7 +1060,7 @@ def test_workflow_validation_tool_uses_user_context_headers():
     tool, secrets = _build_workflow_validation_tool(request, {})
 
     assert tool.params == {
-        "headers": {"x-cluster": "context-cluster"},
+        "headers": {"x-cluster": "request-cluster"},
         "secret_headers": {"cookie": "PYROMIND_VALIDATE_AUTH_COOKIE"},
     }
     assert (
@@ -1069,7 +1069,7 @@ def test_workflow_validation_tool_uses_user_context_headers():
     )
 
 
-def test_pyromind_storage_tools_use_user_context_headers():
+def test_pyromind_storage_tools_use_request_cluster_and_user_cookie():
     request = _make_request(
         {
             "cookie": f"{PYROMIND_AUTH_COOKIE_NAME}=request-token",
@@ -1112,7 +1112,7 @@ def test_pyromind_storage_tools_use_user_context_headers():
     ]
     expected_storage_params = {
         "storage_base_url": "https://storage.test/api",
-        "headers": {"x-cluster": "context-cluster"},
+        "headers": {"x-cluster": "request-cluster"},
         "secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
     cleaning_params = tools[2].params
@@ -1125,15 +1125,15 @@ def test_pyromind_storage_tools_use_user_context_headers():
             x_cluster="context-cluster",
         ),
         "env": "prod",
-        "cluster": "context-cluster",
+        "cluster": "request-cluster",
         "headers": {
-            "x-cluster": "context-cluster",
+            "x-cluster": "request-cluster",
             "request-app": "openhands",
         },
         "output_root": "/agentTest/clean-results",
         "runtime_dir": "/srv/skills/data-processing/scripts/cleaning",
         "storage_base_url": "https://storage.test/api",
-        "storage_headers": {"x-cluster": "context-cluster"},
+        "storage_headers": {"x-cluster": "request-cluster"},
         "storage_secret_headers": {"cookie": "PYROMIND_STORAGE_AUTH_COOKIE"},
     }
     assert tools[0].params == expected_storage_params
@@ -1206,7 +1206,9 @@ async def test_pyromind_validation_context_uses_websocket_user_headers():
         x_cluster="websocket-cluster",
     )
 
-    await apply_pyromind_validation_context(cast(EventService, service), current_user)
+    await apply_pyromind_validation_context(
+        cast(EventService, service), current_user, x_cluster="websocket-cluster"
+    )
 
     assert service.secrets == {
         PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: "auth_token=websocket-token; other=value",
@@ -1256,7 +1258,7 @@ def test_build_analyze_task_failure_tool_matches_create_params():
         }
     )
 
-    tool, secrets = _build_analyze_task_failure_tool(request, {})
+    tool, secrets = _build_analyze_task_failure_tool(request)
 
     assert tool.name == AnalyzeTaskFailureTool.name
     assert secrets["auth_token"].get_value() == "jwt-token"
@@ -1314,7 +1316,9 @@ async def test_pyromind_validation_context_ignores_non_pyromind_conversations():
         x_cluster="websocket-cluster",
     )
 
-    await apply_pyromind_validation_context(cast(EventService, service), current_user)
+    await apply_pyromind_validation_context(
+        cast(EventService, service), current_user, x_cluster="websocket-cluster"
+    )
 
     assert service.secrets == {}
     assert service.agent_state == {}

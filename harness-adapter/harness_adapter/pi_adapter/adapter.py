@@ -1138,6 +1138,8 @@ class PiAdapter:
         if isinstance(command, UserMessageCommand):
             return await self._send_user_message(session, command)
         if isinstance(command, CancelCommand):
+            if handle.adapter_delivers_delegated_results:
+                self._suspend_inputs(session)
             self._business_tools.cancel(session.session_id)
             self._cancel_permissions(session, "Cancelled by user")
             runner_cancel_error = None
@@ -1580,6 +1582,15 @@ class PiAdapter:
 
         return stream()
 
+    async def has_pending_session_work(self, handle: SessionHandle) -> bool:
+        if not handle.adapter_delivers_delegated_results:
+            return False
+        session = self._sessions.get(handle.session_id)
+        runner = session.runner if session else None
+        if runner is None or not runner.running:
+            return False
+        return await runner.request("session.has_pending_work", {}) is not False
+
     async def close(self, handle: SessionHandle) -> None:
         session = await self._remove(handle.session_id)
         if session is None:
@@ -1899,6 +1910,9 @@ class PiAdapter:
             arguments = params.get("arguments")
             if not isinstance(arguments, dict):
                 raise ValueError("role tool arguments must be an object")
+            call_id = params.get("tool_call_id")
+            if isinstance(call_id, str) and call_id:
+                scope = {**scope, "tool_call_id": call_id}
             if params.get("origin") is not None:
                 origin = TaskOrigin.model_validate(params["origin"])
                 if origin.type != "subagent":
@@ -2669,6 +2683,9 @@ class PiAdapter:
             session_id=session.session_id,
             adapter_session_ref=session.session_id,
             harness_id="pi",
+            adapter_delivers_delegated_results=bool(
+                session.config.get("managed_delegation")
+            ),
             # The capability is active only when the adapter supports it and the
             # session explicitly enables it.
             capabilities=PI_CAPABILITIES.model_copy(

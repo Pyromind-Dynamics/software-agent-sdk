@@ -1,6 +1,5 @@
-"""Verified Storage files flow from a data task into training inputs."""
+"""Native Markdown handoffs feed downstream tasks without result registration."""
 
-import hashlib
 import json
 import subprocess
 import sys
@@ -67,57 +66,23 @@ def delivery(experiment):
         "/datasets/clean/val.jsonl": (json.dumps(row) + "\n").encode(),
         "/datasets/clean/stats.json": b'{"train":1,"val":1}\n',
     }
-    arguments = {
-        "run_id": run["id"],
-        "summary": "Delivered training, validation and statistics files.",
-        "artifacts": [
-            {"name": name, "uri": uri}
-            for name, uri in zip(
-                ("train_data", "val_data", "data_stats"), files, strict=True
-            )
-        ],
-    }
+    return service, owner, engine, run, scope, files
 
-    async def read(_owner, path):
-        assert _owner == owner
-        return files[path]
 
-    async def inspect(_owner, path, kind):
-        assert _owner == owner and kind == "file"
-        body = files[path]
-        if not body:
-            raise ValueError("file is empty")
-        return {
-            "sha256": hashlib.sha256(body).hexdigest(),
-            "scope": "complete file",
-            "nonempty_lines": len(body.splitlines()),
-        }
-
-    async def execute(*_):
-        raise AssertionError("file delivery must not start platform work")
-
-    async def record(
-        document=None, active_scope=None, active_owner=None, verification=None
-    ):
-        return await service.role_call(
-            active_owner or owner,
-            "cleaner",
-            "record_experiment_result",
-            document or arguments,
-            active_scope or scope,
-            execute,
-            read,
-            verification or inspect,
-        )
-
-    return service, owner, engine, run, scope, files, arguments, record
+def handoff(service, owner, run, scope, *, report=False, completed=True):
+    return service.store.complete_agent_turn(
+        owner,
+        run["id"],
+        scope,
+        f"Report: `public_data/experiment-runs/{run['id']}/public_data/report.md`",
+        report=report,
+        completed=completed,
+    )
 
 
 @pytest.mark.parametrize("platform", [False, True])
-async def test_data_files_complete_without_mandatory_report_and_bind_to_train(
-    delivery, platform, tmp_path, monkeypatch
-):
-    service, owner, _, run, scope, files, arguments, record = delivery
+def test_data_markdown_handoff_does_not_register_files(delivery, platform):
+    service, owner, _, run, scope, _ = delivery
     if platform:
         service.store.managed_submission(
             owner, run["id"], scope, {"mode": "full", "operation": "pipeline"}
@@ -127,27 +92,48 @@ async def test_data_files_complete_without_mandatory_report_and_bind_to_train(
             run["id"],
             scope,
             "pipeline",
-            {"task_id": "data-task", "output_dir": "/pipeline/unrelated"},
+            {"task_id": "data-task", "output_dir": "/pipeline/result"},
         )
         service.store.ingest(
             "data-complete", "data-task", "callback", {"status": "succeeded"}
         )
         service.store.apply_observations()
-    assert await record() == {"run_id": run["id"], "report_state": "ready"}
-    first = service.list(owner)[0]
-    assert (first.state, first.report_state, first.report_uri) == (
-        "succeeded",
-        "ready",
-        None,
+    report = f"Report: `public_data/experiment-runs/{run['id']}/public_data/report.md`"
+    service.store.complete_agent_turn(
+        owner, run["id"], scope, report, report=platform, completed=True
     )
-    assert {item["name"] for item in first.artifacts} == {
-        "train_data",
-        "val_data",
-        "data_stats",
-    }
-    await record()
-    assert service.list(owner)[0] == first
+    view = service.list(owner)[0]
+    assert view.state == ("succeeded" if platform else "reported")
+    assert view.report_state == "ready" and view.summary == report
+    assert not view.artifacts
+
+
+@pytest.mark.parametrize("platform", [False, True])
+async def test_reported_data_paths_feed_training_without_copying(
+    delivery, platform, tmp_path, monkeypatch
+):
+    service, owner, _, run, scope, files = delivery
+    if platform:
+        service.store.managed_submission(
+            owner, run["id"], scope, {"mode": "full", "operation": "pipeline"}
+        )
+        service.store.managed_receipt(
+            owner, run["id"], scope, "pipeline", {"task_id": "data-task"}
+        )
+        service.store.ingest(
+            "data-complete", "data-task", "callback", {"status": "succeeded"}
+        )
+        service.store.apply_observations()
+    handoff(service, owner, run, scope, report=platform)
+    view = service.list(owner)[0]
+    assert view.report_state == "ready" and view.summary
+    assert not view.artifacts
+    assert view.state == ("succeeded" if platform else "reported")
     service.store.queue.finish(scope["work_id"], scope["generation"], {})
+    paths = {
+        "train_data_path": "/datasets/clean/train.jsonl",
+        "val_data_path": "/datasets/clean/val.jsonl",
+    }
     training = service.request(
         owner,
         RequestExperimentTask.model_validate(
@@ -156,18 +142,8 @@ async def test_data_files_complete_without_mandatory_report_and_bind_to_train(
                 "request_id": "train",
                 "task": {
                     "name": "Train",
-                    "instruction": "Use the delivered messages files",
-                    "artifact_refs": [
-                        {
-                            "input_name": input_name,
-                            "task_run_id": run["id"],
-                            "artifact_name": name,
-                        }
-                        for input_name, name in (
-                            ("train_data_path", "train_data"),
-                            ("val_data_path", "val_data"),
-                        )
-                    ],
+                    "instruction": "Use the paths checked in the Dataset report.",
+                    "inputs": paths,
                 },
             }
         ),
@@ -178,13 +154,7 @@ async def test_data_files_complete_without_mandatory_report_and_bind_to_train(
         },
     )
     inputs = training["task_spec"]["task"]["inputs"]
-    for item in arguments["artifacts"][:2]:
-        input_name = item["name"] + "_path"
-        assert inputs[input_name] == item["uri"]
-        assert (
-            training["task_spec"]["input_artifacts"][input_name]["sha256"]
-            == hashlib.sha256(files[item["uri"]]).hexdigest()
-        )
+    assert inputs == paths and "input_artifacts" not in training["task_spec"]
     source = tmp_path / "messages.jsonl"
     source.write_bytes(files[inputs["train_data_path"]])
     skill = (
@@ -242,128 +212,10 @@ async def test_data_files_complete_without_mandatory_report_and_bind_to_train(
     ] == (["data-task"] if platform else [])
 
 
-@pytest.mark.parametrize(
-    "problem",
-    ["missing", "empty", "duplicate", "relative", "directory", "undeclared"],
-)
-async def test_invalid_delivery_is_visible_and_never_partially_registers(
-    delivery, problem
-):
-    service, owner, _, run, _, files, arguments, record = delivery
-    if problem == "missing":
-        del files[arguments["artifacts"][1]["uri"]]
-    elif problem == "empty":
-        files[arguments["artifacts"][1]["uri"]] = b""
-    elif problem == "duplicate":
-        arguments["artifacts"][1]["name"] = "train_data"
-    elif problem == "relative":
-        arguments["artifacts"][1]["uri"] = "public_data/val.jsonl"
-    elif problem == "directory":
-        arguments["artifacts"][1]["kind"] = "directory"
-    else:
-        arguments["artifacts"] = []
-    with pytest.raises(ValueError):
-        await record()
-    view = service.list(owner)[0]
-    assert view.state == "preparing" and not view.artifacts
-    assert view.waiting_reason
-    if problem in {"missing", "empty", "relative", "directory"}:
-        assert "val_data" in view.waiting_reason
-    service.store.note_wait(owner, run["id"], "")
-    assert service.list(owner)[0].waiting_reason == view.waiting_reason
-
-
-async def test_report_failure_keeps_exact_error_and_can_retry_without_submission(
-    delivery,
-):
-    service, owner, _, run, scope, files, arguments, record = delivery
-    uri = arguments["artifacts"][1]["uri"]
-    original = files.pop(uri)
-    service.store.queue.finish(scope["work_id"], scope["generation"], {})
-    service.store.enqueue_report(owner, run["id"], command_id="inspect")
-    item = service.store.queue.claim(kinds=("generate_report",))
-    report_scope = {
-        "run_id": run["id"],
-        "work_id": item["id"],
-        "generation": item["generation"],
-    }
-    with pytest.raises(ValueError, match="val_data"):
-        await record(active_scope=report_scope)
-    service.store.complete_agent_turn(
-        owner, run["id"], report_scope, "Could not finish delivery.", report=True
-    )
-    failed = service.list(owner)[0]
-    assert failed.report_state == "failed"
-    assert uri in failed.waiting_reason and "val_data" in failed.summary
-    assert service.store.pending_deliveries()
-    service.store.queue.finish(item["id"], item["generation"], {})
-    service.store.enqueue_report(owner, run["id"], command_id="retry")
-    item = service.store.queue.claim(kinds=("generate_report",))
-    report_scope.update(work_id=item["id"], generation=item["generation"])
-    files[uri] = original
-    await record(active_scope=report_scope)
-    completed = service.list(owner)[0]
-    assert completed.state == "succeeded" and completed.report_state == "ready"
-    assert completed.waiting_reason is None
-    assert not service.store.list(owner)[0]["submissions"]
-
-
-async def test_changed_artifact_rolls_back_other_files_and_preserves_success(delivery):
-    service, owner, _, _, _, files, arguments, record = delivery
-    await record()
-    original = service.list(owner)[0]
-    files["/datasets/clean/extra.json"] = b"{}\n"
-    files["/datasets/clean/val.jsonl"] += b'{"changed":true}\n'
-    arguments["artifacts"].insert(
-        0, {"name": "extra", "uri": "/datasets/clean/extra.json"}
-    )
-    with pytest.raises(ValueError, match="registered artifact changed: 'val_data'"):
-        await record()
-    assert service.list(owner)[0] == original
-
-
-async def test_declarations_alone_do_not_complete_data_task(delivery):
-    service, owner, _, run, scope, _, arguments, _ = delivery
-    with pytest.raises(ValueError, match="every declared artifact must be verified"):
-        service.store.record_result(owner, run["id"], scope, arguments, None)
-    view = service.list(owner)[0]
-    assert view.state != "succeeded" and not view.artifacts
-
-
-async def test_file_prefix_digest_cannot_be_registered_as_complete(delivery):
-    service, owner, _, _, _, _, _, record = delivery
-
-    async def preview(*_):
-        return {"sha256": "a" * 64, "scope": "file prefix"}
-
-    with pytest.raises(ValueError, match="complete file digest"):
-        await record(verification=preview)
-    assert not service.list(owner)[0].artifacts
-
-
-async def test_report_conflict_rolls_back_files_and_success_together(delivery):
-    service, owner, _, run, _, files, arguments, record = delivery
-    report_uri = f"public_data/experiment-runs/{run['id']}/report.md"
-    files[report_uri] = b"Delivery report."
-    arguments["report_uri"] = report_uri
-    arguments["artifacts"][0]["name"] = "agent_report"
-    with pytest.raises(ValueError, match="registered artifact changed"):
-        await record()
-    view = service.list(owner)[0]
-    assert view.state != "succeeded" and not view.artifacts
-
-
-async def test_historical_data_name_remains_a_registered_reference(delivery):
-    service, owner, _, _, _, _, arguments, record = delivery
-    arguments["artifacts"] = [{**arguments["artifacts"][0], "name": "data"}]
-    await record()
-    assert service.list(owner)[0].artifacts[0]["name"] == "data"
-
-
 @pytest.mark.parametrize("field", ["profile_id", "conversation_id"])
-async def test_upstream_files_cannot_bind_across_owners(delivery, field):
-    service, owner, _, run, _, _, _, record = delivery
-    await record()
+def test_reported_files_cannot_be_used_as_foreign_registered_artifacts(delivery, field):
+    service, owner, _, run, scope, _ = delivery
+    handoff(service, owner, run, scope)
     with pytest.raises(ValueError, match="upstream task"):
         service.request(
             owner.model_copy(update={field: "another"}),
@@ -389,8 +241,8 @@ async def test_upstream_files_cannot_bind_across_owners(delivery, field):
 
 
 @pytest.mark.parametrize("state", ["waiting_platform", "submission_uncertain"])
-async def test_inflight_platform_submission_cannot_be_bypassed(delivery, state):
-    service, owner, _, run, scope, _, _, record = delivery
+def test_inflight_platform_submission_cannot_be_bypassed(delivery, state):
+    service, owner, _, run, scope, _ = delivery
     service.store.managed_submission(
         owner, run["id"], scope, {"mode": "full", "operation": "pipeline"}
     )
@@ -401,15 +253,15 @@ async def test_inflight_platform_submission_cannot_be_bypassed(delivery, state):
         "pipeline",
         {"task_id": "pending"} if state == "waiting_platform" else {"uncertain": True},
     )
-    with pytest.raises(ValueError):
-        await record()
+    handoff(service, owner, run, scope, report=True)
     view = service.list(owner)[0]
-    assert view.state == state and not view.artifacts
+    assert view.state == state and view.report_state != "ready"
+    assert not view.artifacts
 
 
 @pytest.mark.parametrize("field", ["user_id", "profile_id", "conversation_id", "lease"])
-async def test_file_delivery_preserves_owner_and_lease_boundaries(delivery, field):
-    service, owner, engine, _, scope, _, _, record = delivery
+def test_file_delivery_preserves_owner_and_lease_boundaries(delivery, field):
+    service, owner, engine, run, scope, _ = delivery
     if field == "lease":
         with engine.begin() as conn:
             conn.execute(
@@ -421,5 +273,21 @@ async def test_file_delivery_preserves_owner_and_lease_boundaries(delivery, fiel
     else:
         foreign = owner.model_copy(update={field: "another-owner"})
     with pytest.raises((PermissionError, StaleLeaseError)):
-        await record(active_owner=foreign)
+        handoff(service, foreign, run, scope)
+    assert service.list(owner)[0].report_state != "ready"
     assert not service.list(owner)[0].artifacts
+
+
+def test_failed_handoff_retries_without_submitting_platform_work(delivery):
+    service, owner, _, run, scope, _ = delivery
+    handoff(service, owner, run, scope, completed=False)
+    assert service.list(owner)[0].report_state == "failed"
+    service.store.queue.finish(scope["work_id"], scope["generation"], {})
+    service.store.enqueue_report(owner, run["id"], command_id="retry-report")
+    item = service.store.queue.claim(kinds=("generate_report",))
+    assert item is not None
+    retry_scope = {"work_id": item["id"], "generation": item["generation"]}
+    handoff(service, owner, run, retry_scope, report=True)
+    view = service.list(owner)[0]
+    assert (view.state, view.report_state) == ("reported", "ready")
+    assert not service.store.list(owner)[0]["submissions"]

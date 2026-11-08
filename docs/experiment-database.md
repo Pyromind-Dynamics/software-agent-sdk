@@ -27,6 +27,8 @@ EXPERIMENT_DB_BACKEND=mariadb ./start_inference.sh
 - 数据库切换后使用另一份数据，不会自动复制或同步两个数据库。
 - 直接调用服务端、不经过脚本的旧调用方仍可单独提供数据库 URL；均未配置时，
   保留原先关闭实验存储的行为。非法配置、连接或迁移失败会明确报错，不自动回退。
+- 每个服务实例的实验执行 worker 默认并发为 24，启动时可通过
+  `PYROMIND_EXECUTION_WORKER_CONCURRENCY` 设置为其他正整数。
 
 单独执行迁移：
 

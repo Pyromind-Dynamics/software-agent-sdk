@@ -163,7 +163,7 @@ def _validate_report_target(payload: dict[str, Any]) -> None:
 def _resolve_from_task(payload: dict[str, Any], creds_path: Path) -> dict[str, Any]:
     headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
     target = train_analysis.TrainingAnalysisService().resolve_target(
-        api_base=payload.get("api_base") or train_analysis._default_api_base(),
+        api_base=payload.get("api_base"),
         cookie=str(headers.get("cookie") or ""),
         cluster=str(headers.get("x-cluster") or ""),
         authorization=str(headers.get("authorization") or ""),
@@ -258,7 +258,8 @@ def main() -> int:
 
             headers = payload.get("headers") or {}
             client = train_analysis.PlatformClient(
-                base_url=payload.get("api_base") or train_analysis._default_api_base(),
+                base_url=payload.get("api_base")
+                or train_analysis._default_api_base(headers.get("x-cluster", "")),
                 cookie=headers.get("cookie", ""),
                 authorization=headers.get("authorization", ""),
                 cluster=headers.get("x-cluster", ""),

@@ -17,7 +17,7 @@ pip install pyromind-sdk
 from pyromind_sdk import PyroMindAPIClient
 from pyromind_sdk.client.models import TrainingTaskCreateRequest
 
-client = PyroMindAPIClient(api_key="your-api-key")
+client = PyroMindAPIClient(api_key="your-api-key", cluster="us-west-1")
 
 # 创建并运行一个 Studio 任务
 task = client.studio.create(
@@ -28,6 +28,9 @@ task = client.studio.create(
 )
 print(f"Created task: {task.task_id}")
 ```
+
+Agent 服务会把前端请求的 `X-Cluster` 显式传给 SDK，缺失时使用 `us-west-1`。
+下表是直接调用上游 SDK 时的参数默认值。
 
 ## 客户端参数
 

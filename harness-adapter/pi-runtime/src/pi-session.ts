@@ -2,6 +2,8 @@ import { createDelegatedAskUserTool } from "./user-input.js";
 import { parseSubagentRoles, type SubagentRoleDefinition } from "./subagent-roles.js";
 import { capabilityCeiling, restrictSkillReads } from "./session-policy.js";
 import { SubagentHost } from "./subagent-host.js";
+import { redactSignedUrls } from "./subagent-display.js";
+import { subagentLiveness } from "./subagent-liveness.js";
 import { usesAgentTerminal } from "./subagent-terminals.js";
 import { ToolCoordinator } from "./tool-coordinator.js";
 import { createRetrievalTools, verifyReadScope } from "./retrieval-tools.js";
@@ -12,6 +14,7 @@ import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import {
+  type AgentEndEvent,
   type AgentSession,
   createAgentSession,
   DefaultResourceLoader,
@@ -20,6 +23,7 @@ import {
   type RetrySettings,
   type ToolDefinition,
   type ExtensionAPI,
+  type ExtensionHandler,
 } from "@earendil-works/pi-coding-agent";
 import { createPiModelRuntime, type PiModelConfig } from "./pi-model.js";
 import { createNoProgressGuardExtension } from "./no-progress-guard.js";
@@ -75,6 +79,8 @@ export interface ParsedPrompt {
 
 export interface PiSessionOptions {
   onRepetitionDetected?: () => void;
+  automaticTurnsSuspended?: () => boolean;
+  onSubagentWake?: (text: string) => void;
   /** Test seam: the terminal socket used by a sandbox session. */
   terminalConnect?: SandboxTerminalConnector;
   /** The runner-local ask_user tool, present only for input-enabled sessions. */
@@ -127,6 +133,8 @@ export async function createPiSession(
   execution: WorkflowExecution;
   subagents: SubagentHost;
 }> {
+  const nativeDelivery = params.managed_delegation === true;
+  if (nativeDelivery) subagentLiveness();
   const config = parseConfig(params);
   const { modelRuntime, model } = await createPiModelRuntime(config);
   const env = new NodeExecutionEnv({ cwd: config.workspaceRoot, shellEnv: safeShellEnvironment() });
@@ -277,7 +285,9 @@ export async function createPiSession(
     additionalExtensionPaths: experienceHost.additionalExtensionPaths,
     extensionFactories: [
       subagents.extension,
-      (pi: ExtensionAPI) => subagentExtension(params.managed_delegation === true ? managedSubagentApi(pi) : pi),
+      (pi: ExtensionAPI) => subagentExtension(nativeDelivery
+        ? nativeSubagentApi(pi, sessionOptions)
+        : pi),
       createToolResultExtension(),
       createNoProgressGuardExtension(),
       { name: "no-spin", factory: createNoSpinExtension(sessionOptions.onRepetitionDetected) },
@@ -553,19 +563,31 @@ function safeShellEnvironment(): Record<string, string> {
   return Object.fromEntries(names.flatMap((name) => process.env[name] ? [[name, process.env[name]!]] : []));
 }
 
-/** The product queue owns parent turns; the plugin still owns child lifecycle. */
-export function managedSubagentApi(pi: ExtensionAPI): ExtensionAPI {
+export function nativeSubagentApi(pi: ExtensionAPI, options: PiSessionOptions): ExtensionAPI {
+  const on = ((event: string, handler: ExtensionHandler<AgentEndEvent>) =>
+    pi.on(event as "agent_end", event === "agent_end"
+      // The chat keeps the host alive for background results. Use the plugin's
+      // interactive end-of-turn behavior so it can accept the next user message.
+      ? (data, context) => handler(data, { ...context, hasUI: true })
+      : handler)) as ExtensionAPI["on"];
   return {
     ...pi,
-    sendMessage(message, options) {
-      // Native completion previews belong in the task UI, not the Manager's
-      // context. SubagentHost already observes the plugin's lifecycle/results.
-      if (message.customType === "subagent-notify") return;
-      pi.sendMessage(message, {...options, triggerTurn: false});
+    on,
+    sendMessage(message, delivery) {
+      if (message.customType === "subagent-notify") {
+        const content = typeof message.content === "string" ? redactSignedUrls(message.content)
+          : message.content.map((part) => part.type === "text"
+            ? { ...part, text: redactSignedUrls(part.text) } : part);
+        message = { ...message, content };
+      }
+      pi.sendMessage(message, options.automaticTurnsSuspended?.()
+        ? { ...delivery, triggerTurn: false }
+        : delivery);
     },
-    sendUserMessage() {
-      // pi-subagents uses a user-message wake when an idle parent should run.
-      // Managed work delivers one durable summary through Runtime instead.
+    sendUserMessage(content, delivery) {
+      if (options.automaticTurnsSuspended?.()) return;
+      if (typeof content === "string") options.onSubagentWake?.(content);
+      pi.sendUserMessage(content, delivery);
     },
   };
 }

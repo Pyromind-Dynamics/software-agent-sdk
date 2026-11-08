@@ -9,6 +9,7 @@ terminal (``pyromind terminal``), not the exec API.
 """
 
 from openhands.tools.sandbox.definition import (
+    DEFAULT_SANDBOX_IMAGE,
     SandboxCreateAction,
     SandboxCreateExecutor,
     SandboxCreateObservation,
@@ -37,7 +38,6 @@ from openhands.tools.sandbox.definition import (
     SandboxWriteFileObservation,
     SandboxWriteFileTool,
     create_sandbox_api_client,
-    default_sandbox_image,
     run_terminal_command,
     terminal_base_url,
     terminal_websocket_url,
@@ -57,6 +57,7 @@ from openhands.tools.sandbox.storage_ops import (
 
 __all__ = [
     "SandboxCreateAction",
+    "DEFAULT_SANDBOX_IMAGE",
     "SandboxCreateExecutor",
     "SandboxCreateObservation",
     "SandboxCreateTool",
@@ -92,7 +93,6 @@ __all__ = [
     "SandboxWriteFileObservation",
     "SandboxWriteFileTool",
     "create_sandbox_api_client",
-    "default_sandbox_image",
     "run_terminal_command",
     "terminal_base_url",
     "terminal_websocket_url",

@@ -7,10 +7,8 @@ import hashlib
 import json
 import time
 from collections.abc import Awaitable, Callable
-from pathlib import PurePosixPath
 from typing import cast
 
-from pyromind_runtime.application.execution_artifacts import verify_task_artifacts
 from pyromind_runtime.application.execution_checkpoints import (
     require_approved_checkpoint,
     verify_checkpoint,
@@ -18,7 +16,6 @@ from pyromind_runtime.application.execution_checkpoints import (
 from pyromind_runtime.domain.execution_policy import CheckpointView
 from pyromind_runtime.domain.experiment_execution import (
     ExperimentExecutionView,
-    RecordExperimentResult,
     RequestExperimentTask,
 )
 from pyromind_runtime.domain.experiment_plans import PlanOwner
@@ -271,67 +268,6 @@ class ExperimentExecutions:
                 for item in views
                 if item.run_id == row["id"]
             )
-        if tool == "record_experiment_result":
-            result = RecordExperimentResult.model_validate(arguments)
-            if result.run_id != row["id"]:
-                raise PermissionError("result belongs to another task")
-            try:
-                artifact = None
-                if result.report_uri:
-                    path = PurePosixPath(result.report_uri)
-                    root = PurePosixPath("public_data/experiment-runs") / row["id"]
-                    if (
-                        path.is_absolute()
-                        or ".." in path.parts
-                        or "\\" in result.report_uri
-                        or path == root
-                        or not path.is_relative_to(root)
-                    ):
-                        raise PermissionError("report must be in this task's workspace")
-                    result = result.model_copy(update={"report_uri": path.as_posix()})
-                    try:
-                        body = await read(owner, path.as_posix())
-                    except (OSError, ValueError, KeyError) as exc:
-                        raise ValueError(
-                            f"report is not readable: {result.report_uri}"
-                        ) from exc
-                    artifact = {
-                        "uri": result.report_uri,
-                        "sha256": hashlib.sha256(body).hexdigest(),
-                    }
-                verified = await verify_task_artifacts(
-                    owner, role, row, result, artifact, scope, execute, inspect
-                )
-                data_result = policy.get("artifact_contract") == "data"
-                if verified is not None and not data_result:
-                    await asyncio.to_thread(
-                        store.register_artifacts,
-                        owner,
-                        row["id"],
-                        verified[0],
-                        verified[1],
-                    )
-                await asyncio.to_thread(
-                    store.record_result,
-                    owner,
-                    row["id"],
-                    scope,
-                    result.model_dump(mode="json"),
-                    artifact,
-                    verified=verified[0]
-                    if verified is not None and data_result
-                    else None,
-                )
-            except (OSError, ValueError) as exc:
-                await asyncio.to_thread(
-                    store.record_result_failure,
-                    owner,
-                    row["id"],
-                    scope,
-                    str(exc)[:16000],
-                )
-                raise
-            return {"run_id": row["id"], "report_state": "ready"}
         if tool == "analyze_task_failure":
             if arguments.get("task_id") not in {
                 sub.get("task_id") for sub in row.get("submissions", [])
@@ -402,6 +338,7 @@ class ExperimentExecutions:
         read: Callable[..., Awaitable[bytes]],
     ) -> None:
         store = cast(DelegatedExecutionStore, self.store)
+        failure_message = "Analyze the platform failure and continue the task."
         await asyncio.to_thread(store.apply_observations)
         conflicts = await asyncio.to_thread(store.conflicting_tasks)
         for pending in await asyncio.to_thread(store.pending_runs):
@@ -415,6 +352,24 @@ class ExperimentExecutions:
             row = next(row for row in rows if row["id"] == run_id)
             sub = row.get("submission") or {}
             conflict = sub.get("task_id") in conflicts
+            if (
+                not conflict
+                and row["state"] == "failed"
+                and row["report_state"] == "not_started"
+                and sub.get("state") == "failed"
+                and (
+                    (row.get("attributes") or {}).get("current_submission_id")
+                    or (row.get("attributes") or {}).get("workflow_request_id")
+                )
+            ):
+                await asyncio.to_thread(
+                    store.enqueue_report,
+                    rows_owner,
+                    run_id,
+                    failure_message,
+                    platform_task_id=sub["task_id"],
+                )
+                continue
             if not conflict and pending["state"] not in {
                 "waiting_platform",
                 "waiting_artifacts",
@@ -452,6 +407,8 @@ class ExperimentExecutions:
                     for row in await asyncio.to_thread(store.list, owner)
                     if row["id"] == run_id
                 )
+                if (current.get("submission") or {}).get("id") != sub["id"]:
+                    continue
                 await asyncio.to_thread(store.note_wait, owner, run_id, "")
                 if (
                     current["state"] == "waiting_artifacts"
@@ -460,18 +417,30 @@ class ExperimentExecutions:
                     ).get("artifact_contract", "evaluation")
                     != "evaluation"
                 ):
-                    await asyncio.to_thread(store.queue_artifact_report, owner, run_id)
+                    await asyncio.to_thread(
+                        store.queue_artifact_report,
+                        owner,
+                        run_id,
+                        platform_task_id=sub["task_id"],
+                    )
                     self._checks[run_id] = (time.monotonic() + 30, 0)
                     continue
                 if current["state"] == "waiting_artifacts":
-                    primary = next(
-                        (
-                            entry
-                            for entry in reversed(current["submissions"])
-                            if entry["operation_key"] == "inference"
-                        ),
-                        sub,
-                    )
+                    primary = sub
+                    operation = sub["evidence"].get("operation", sub["operation_key"])
+                    if operation not in {"inference", "resume"}:
+                        primary = next(
+                            (
+                                entry
+                                for entry in current["submissions"]
+                                if entry["evidence"].get(
+                                    "operation", entry["operation_key"]
+                                )
+                                == "inference"
+                                and entry["state"] == "succeeded"
+                            ),
+                            sub,
+                        )
                     root = primary["evidence"]["receipt"]["output_dir"].rstrip("/")
                     files = {
                         name: await read(owner, root + "/" + name)
@@ -510,14 +479,20 @@ class ExperimentExecutions:
                         for name, body in files.items()
                     ]
                     await asyncio.to_thread(
-                        store.register_artifacts, owner, run_id, verified, metrics
+                        store.register_artifacts,
+                        owner,
+                        run_id,
+                        verified,
+                        metrics,
+                        platform_task_id=sub["task_id"],
                     )
                 elif current["state"] == "failed":
                     await asyncio.to_thread(
                         store.enqueue_report,
                         owner,
                         run_id,
-                        "Analyze the platform failure and continue the task.",
+                        failure_message,
+                        platform_task_id=sub["task_id"],
                     )
                 interval = 120 if current["state"] == "waiting_platform" else 30
                 self._checks[run_id] = (time.monotonic() + interval, 0)
@@ -552,6 +527,6 @@ class ExperimentExecutions:
                         store.enqueue_report,
                         owner,
                         run_id,
-                        "Explain missing or invalid artifacts; "
-                        "do not rerun GPU inference.",
+                        "Investigate missing or invalid artifacts and continue.",
+                        platform_task_id=sub["task_id"],
                     )

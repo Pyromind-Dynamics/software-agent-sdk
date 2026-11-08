@@ -12,6 +12,18 @@ export function displayText(value: unknown): string {
     .map(block => block.text).join("\n") : "";
 }
 
+export function redactSignedUrls(text: string): string {
+  return text.replace(/\bhttps?:\/\/[^\s<>"')\]]+/gi, (value) => {
+    const url = URL.parse(value);
+    if (!url) return value;
+    const signed = [...url.searchParams.keys()].some((key) =>
+      /^(signature|xamzsignature|xamzcredential|xgoogsignature|awsaccesskeyid|accesstoken)$/i
+        .test(key.replace(/[^a-z0-9]/gi, "")));
+    if (!signed && !url.username && !url.password) return value;
+    return `${url.origin}${url.pathname}`;
+  });
+}
+
 /** Strip only native metadata before the transcript body, never interpret tool text. */
 export function transcriptWindow(text: string) {
   const lines = text.split(/\r?\n/);

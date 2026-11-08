@@ -15,7 +15,7 @@ from openhands.tools.node_signature.definition import (
     NodeSignatureAction,
     NodeSignatureObservation,
 )
-from openhands.tools.utils.platform_env import platform_endpoint
+from openhands.tools.utils.platform_env import platform_endpoint, platform_portal_url
 from openhands.tools.utils.pyromind_api_client import (
     _build_access_key_request_headers,
     decompress_gzip_base64_data,
@@ -92,7 +92,7 @@ class NodeSignatureExecutor(
 
         return self._batch_query(
             auth_token=auth_token,
-            endpoint=_resolve_endpoint(self._env),
+            endpoint=platform_portal_url(_resolve_endpoint(self._env), self._headers),
             node_names=node_names,
             node_type=node_type,
             include_source=include_source,

@@ -37,7 +37,8 @@ from openhands.tools.pyromind_dataset.definition import (
     upload_local_file_to_pyromind,
 )
 from openhands.tools.utils.platform_env import (
-    resolve_platform_env,
+    platform_client_route,
+    platform_cluster_target,
 )
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
@@ -282,13 +283,10 @@ class EdpAggregateExecutor(ToolExecutor[EdpAggregateAction, EdpAggregateObservat
                 raise ValueError(
                     "Platform auth_token missing from conversation secrets."
                 )
-            platform_env = resolve_platform_env(self._env)
-            cluster = self._cluster or ""
-            if not cluster:
-                raise ValueError(
-                    "cluster not wired into the edp_aggregate tool; the "
-                    "agent-server Pyromind router should inject it."
-                )
+            route = platform_client_route(
+                self._headers, cluster=self._cluster, env=self._env
+            )
+            platform_env, cluster = platform_cluster_target(route)
 
             self._stage_scripts(conversation, out_dir)
 

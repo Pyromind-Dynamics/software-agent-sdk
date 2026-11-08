@@ -36,7 +36,11 @@ from openhands.tools.pyromind_dataset.definition import (
     _resolve_secret_headers,
     _truncate_text,
 )
-from openhands.tools.utils.platform_env import platform_endpoint
+from openhands.tools.utils.platform_env import (
+    platform_endpoint,
+    platform_headers,
+    platform_portal_url,
+)
 
 
 if TYPE_CHECKING:
@@ -364,8 +368,8 @@ class DfCheckProgressExecutor(
     ) -> dict[str, Any] | str:
         try:
             response = httpx.post(
-                f"{self._storage_base_url}/{route}",
-                headers=headers,
+                f"{platform_portal_url(self._storage_base_url, headers)}/{route}",
+                headers=platform_headers(headers),
                 json=body,
                 timeout=self._timeout,
             )

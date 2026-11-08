@@ -13,7 +13,12 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import jwt
 
-from openhands.tools.utils.platform_env import configured_platform_env, platform_headers
+from openhands.tools.utils.platform_env import (
+    cluster_header,
+    platform_cluster_route,
+    platform_cluster_target,
+    platform_headers,
+)
 
 
 if TYPE_CHECKING:
@@ -34,7 +39,6 @@ _DEV_SECRET_KEY = "Kij823420JITRE21i21248cbsxhuexvS"
 
 
 def _get_domain(env: str | None, api_uri: str) -> str:
-    env = configured_platform_env() or env
     if env in _PROD_ENVS:
         return f"https://{_BASE_DOMAIN}{api_uri}"
     if env == "pre2":
@@ -162,6 +166,8 @@ def get_api_key(
     HTTP 错误或响应格式异常时抛出异常。
     """
     # Construct the request
+    if route := cluster_header(origin_headers):
+        env, _ = platform_cluster_target(route)
     endpoint_url = _access_key_url(env)
 
     # 构建请求头
@@ -229,25 +235,16 @@ def get_pyromind_api_client(
     timeout: int = 30,
     max_retries: int = 3,
 ) -> PyroMindAPIClient:
-    """Create a :class:`PyroMindAPIClient` from conversation context and environment.
-
-    ``base_url`` is derived from the user's ``x-cluster`` routing header stored on
-    the conversation. ``api_key`` and ``cluster`` still fall back to process env
-    vars when not yet wired from conversation secrets.
-
-    根据会话上下文与环境变量创建 :class:`PyroMindAPIClient`。
-
-    ``base_url`` 由会话中持久化的 ``x-cluster`` 环境标识解析；``api_key`` 与
-    ``cluster`` 暂仍可通过进程环境变量提供。
-    """
+    """Create an SDK client with an explicit route, defaulting to us-west-1."""
+    route = platform_cluster_route(cluster)
+    if "#" in route:
+        env, _ = platform_cluster_target(route)
     base_url = _api_url(env)
-    if cluster and configured_platform_env() is not None:
-        cluster = cluster.partition("#")[0].strip()
     client_type = _load_pyromind_api_client_type()
     return client_type(
         api_key=api_key,
         base_url=base_url,
-        cluster=cluster,
+        cluster=route,
         timeout=timeout,
         max_retries=max_retries,
     )

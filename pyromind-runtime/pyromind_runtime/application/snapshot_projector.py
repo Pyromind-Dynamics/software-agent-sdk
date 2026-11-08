@@ -342,7 +342,12 @@ class SnapshotProjector:
         elif pending:
             status = "waiting_for_confirmation"
         else:
-            status = "idle" if permission_id.startswith("workflow-run:") else "running"
+            status = (
+                "running"
+                if snapshot.active_run_id is not None
+                and not permission_id.startswith("workflow-run:")
+                else "idle"
+            )
         return snapshot.model_copy(
             update={"pending_permissions": pending, "status": status}
         )

@@ -117,7 +117,9 @@ def claim(service, run_id, kind="execute_task"):
     return {"run_id": run_id, "work_id": item["id"], "generation": item["generation"]}
 
 
-async def test_review_then_single_full_submission_and_verified_result(sample_execution):
+async def test_review_then_idempotent_full_submission_and_verified_result(
+    sample_execution,
+):
     service, owner, run, files, document, read, inspect = sample_execution
     scope = claim(service, run["id"])
     calls = []
@@ -161,15 +163,11 @@ async def test_review_then_single_full_submission_and_verified_result(sample_exe
     assert service.list(owner)[0].state == "waiting_user"
     service.store.continue_task(owner, run["id"], "early", "Discuss this sample")
     assert service.list(owner)[0].checkpoint.status == "pending"
-    with pytest.raises(PermissionError, match="sample review is not approved"):
-        await call(
-            "record_experiment_result",
-            {
-                "run_id": run["id"],
-                "summary": "Attempt to bypass the frozen sample review",
-                "artifacts": [{"name": "data", "uri": "/source.jsonl"}],
-            },
-        )
+    before = service.list(owner)[0]
+    service.store.complete_agent_turn(
+        owner, run["id"], scope, "Sample prepared.", report=True, completed=True
+    )
+    assert service.list(owner)[0] == before
     with pytest.raises(PermissionError):
         await call("df_submit_pipeline", document["configuration"])
     service.store.resolve_checkpoint(
@@ -217,8 +215,9 @@ async def test_review_then_single_full_submission_and_verified_result(sample_exe
         owner, run["id"], "Retry artifact inspection", "retry-report"
     )
     scope = claim(service, run["id"], "generate_report")
-    with pytest.raises(PermissionError, match="report retry"):
-        await call("df_submit_pipeline", document["configuration"])
+    replay = await call("df_submit_pipeline", document["configuration"])
+    assert replay["details"]["task_id"] == "studio-1"
+    assert len(calls) == 1
     report = f"public_data/experiment-runs/{run['id']}/public_data/report.md"
     files[report] = b"Full data verified."
     files["/outputs/full/clean.jsonl"] = files[document["sample_output"]]
@@ -231,25 +230,17 @@ async def test_review_then_single_full_submission_and_verified_result(sample_exe
             "source_integrity": {"unchanged": True},
         }
     ).encode()
-    await call(
-        "record_experiment_result",
-        {
-            "run_id": run["id"],
-            "summary": "Verified clean output",
-            "report_uri": report,
-            "artifacts": [
-                {"name": "data", "uri": "/outputs/full/clean.jsonl"},
-                {"name": "report", "uri": "/outputs/full/report.json"},
-            ],
-        },
+    service.store.complete_agent_turn(
+        owner,
+        run["id"],
+        scope,
+        f"Verified clean output. Report: `{report}`.",
+        report=True,
+        completed=True,
     )
     view = service.list(owner)[0]
     assert (view.state, view.report_state) == ("succeeded", "ready")
-    assert {item["name"] for item in view.artifacts} == {
-        "data",
-        "report",
-        "agent_report",
-    }
+    assert not view.artifacts
     service.store.queue.finish(scope["work_id"], scope["generation"], {})
     assert service.store.queue.claim(kinds=("generate_report",)) is None
     assert len(calls) == 1
@@ -260,13 +251,7 @@ async def test_review_then_single_full_submission_and_verified_result(sample_exe
             "task": {
                 "name": "Train",
                 "instruction": "Use the clean artifact",
-                "artifact_refs": [
-                    {
-                        "input_name": "input_path",
-                        "task_run_id": run["id"],
-                        "artifact_name": "data",
-                    }
-                ],
+                "inputs": {"input_path": "/outputs/full/clean.jsonl"},
             },
         }
     )
@@ -275,13 +260,16 @@ async def test_review_then_single_full_submission_and_verified_result(sample_exe
         next_run["task_spec"]["task"]["inputs"]["input_path"]
         == "/outputs/full/clean.jsonl"
     )
-    assert (
-        next_run["task_spec"]["input_artifacts"]["input_path"]["sha256"]
-        == hashlib.sha256(files["/outputs/full/clean.jsonl"]).hexdigest()
-    )
+    assert "input_artifacts" not in next_run["task_spec"]
     invalid = train_request.model_dump(mode="json")
     invalid["request_id"] = "wrong-artifact"
-    invalid["task"]["artifact_refs"][0]["artifact_name"] = "invented"
+    invalid["task"]["artifact_refs"] = [
+        {
+            "input_name": "input_path",
+            "task_run_id": run["id"],
+            "artifact_name": "invented",
+        }
+    ]
     with pytest.raises(ValueError, match="unknown artifact"):
         service.request(
             owner, RequestExperimentTask.model_validate(invalid), ("trainer",)
@@ -597,104 +585,6 @@ async def test_training_confirmation_uses_existing_permission_path_and_one_task(
         )
     finally:
         await runtime.close()
-
-
-@pytest.mark.parametrize("output", ["valid", "foreign_task", "missing_weights"])
-async def test_model_artifacts_require_weights_and_platform_provenance(
-    sample_execution, output
-):
-    service, owner, initial, files, _, read, _ = sample_execution
-    initial_scope = claim(service, initial["id"])
-    service.store.queue.finish(
-        initial_scope["work_id"], initial_scope["generation"], {}
-    )
-    run = service.request(
-        owner,
-        RequestExperimentTask.model_validate(
-            {
-                "role_id": "trainer",
-                "request_id": "training-result",
-                "task": {"name": "Train", "instruction": "Train"},
-            }
-        ),
-        ("trainer",),
-        execution_policy={
-            "submission_tool": "submit_workflow",
-            "artifact_contract": "model",
-        },
-    )
-    scope = claim(service, run["id"])
-    service.store.stage_workflow(owner, run["id"], scope, "workflow")
-    submission_id = service.store.begin_workflow(
-        owner, run["id"], "workflow", "digest", True
-    )
-    service.store.recover_managed_receipt(
-        owner, run["id"], submission_id, {"task_id": "training-task"}
-    )
-    service.store.queue.finish(scope["work_id"], scope["generation"], {})
-    service.store.ingest(
-        "training-complete", "training-task", "callback", {"status": "succeeded"}
-    )
-    service.store.apply_observations()
-    service.store.queue_artifact_report(owner, run["id"])
-    scope = claim(service, run["id"], "generate_report")
-    report = f"public_data/experiment-runs/{run['id']}/public_data/report.md"
-    files[report] = b"Training output inspected."
-
-    async def inspect(_owner, path, kind):
-        assert _owner == owner and kind == "directory"
-        return {
-            "sha256": "a" * 64,
-            "entries": ["config.json"]
-            + ([] if output == "missing_weights" else ["model.safetensors"]),
-            "scope": "immediate directory listing",
-        }
-
-    async def execute(_owner, role, _scope, tool, arguments):
-        assert _owner == owner and role == "trainer" and tool == "training_analysis"
-        assert arguments == {"operation": "artifacts", "task_id": "training-task"}
-        return {
-            "is_error": False,
-            "details": {
-                "result": {"training_nodes": [{"output_path": "/trained/this-task"}]}
-            },
-        }
-
-    arguments = {
-        "run_id": run["id"],
-        "summary": "Verified training output",
-        "report_uri": report,
-        "artifacts": [
-            {
-                "name": "model",
-                "uri": "/trained/other-task"
-                if output == "foreign_task"
-                else "/trained/this-task/checkpoint-10",
-                "kind": "directory",
-            }
-        ],
-    }
-    call = service.role_call(
-        owner,
-        "trainer",
-        "record_experiment_result",
-        arguments,
-        scope,
-        execute,
-        read,
-        inspect,
-    )
-    if output == "valid":
-        await call
-        view = next(item for item in service.list(owner) if item.run_id == run["id"])
-        assert (view.state, view.report_state) == ("succeeded", "ready")
-    else:
-        with pytest.raises(ValueError):
-            await call
-        assert (
-            next(item for item in service.list(owner) if item.run_id == run["id"]).state
-            == "waiting_artifacts"
-        )
 
 
 @pytest.mark.parametrize("key", ["input_path", "labels_source"])

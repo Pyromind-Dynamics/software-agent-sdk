@@ -2,8 +2,10 @@
 
 import asyncio
 import json
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 import pytest
@@ -12,9 +14,11 @@ from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE as PREPARED_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.commands import (
+    CancelCommand,
     ControlExperimentTaskCommand,
     CreateProjectCommand,
     InputResponseCommand,
+    PermissionResponseCommand,
     UserMessageCommand,
 )
 from pyromind_runtime.domain.content import JsonObject, TextContent
@@ -42,6 +46,128 @@ from .test_evaluation_cases import FakeStorage
 
 
 experiment = execution_fixtures.experiment
+
+
+@pytest.mark.parametrize("delivery", ["pending", "settled", "accepted"])
+async def test_manager_queue_recognizes_completion_of_steered_messages(
+    experiment, tmp_path, delivery
+):
+    from .fake_adapter import FakeAdapter
+
+    service, owner, _ = experiment
+    context = RequestContext(user_id=owner.user_id, profile_id=owner.profile_id)
+
+    def events(
+        command: UserMessageCommand,
+    ) -> Iterator[
+        tuple[Literal["message.completed", "status.changed"], str, JsonObject]
+    ]:
+        run_id = f"extension:{command.command_id}"
+        yield (
+            "message.completed",
+            run_id,
+            {
+                "message_id": command.command_id,
+                "role": "user",
+                "command_id": command.command_id,
+                "content": [block.model_dump(mode="json") for block in command.content],
+            },
+        )
+        yield "status.changed", run_id, {"status": "finished"}
+
+    class SteeringAdapter(FakeAdapter):
+        async def send(self, handle, command, context) -> JsonObject:
+            assert isinstance(command, UserMessageCommand)
+            self.sent.append((handle.session_id, command, context))
+            for kind, run_id, payload in events(command):
+                self.emit(
+                    handle.session_id,
+                    kind,
+                    payload,
+                    event_id=f"{command.command_id}:{kind}",
+                    run_id=run_id,
+                )
+            return {"accepted": True, "steered": True}
+
+        async def notify_external_task(
+            self, handle, notification, context
+        ) -> JsonObject:
+            self.external_task_notifications.append(
+                (handle.session_id, notification, context)
+            )
+            self.emit(
+                handle.session_id,
+                "status.changed",
+                {"status": "finished"},
+                event_id="recovered-message:finished",
+                run_id=f"callback:{notification.task_id}:succeeded",
+            )
+            return {"accepted": True}
+
+    adapter = SteeringAdapter()
+    runtime = ConversationRuntime(
+        tmp_path / "product",
+        adapter,
+        experiment_plan_store=service.plans,
+        experiment_execution_store=service.store,
+        execution_roles=("eval",),
+    )
+    try:
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id=owner.conversation_id,
+                user_id=owner.user_id,
+                profile_id=owner.profile_id,
+                workspace_root=str(tmp_path / "product" / owner.conversation_id),
+                tool_allowlist=("get_experiment_context",),
+            ),
+            context,
+        )
+        first = UserMessageCommand(
+            command_id="first",
+            content=(TextContent(text="Inspect the existing task."),),
+        )
+        receipt = await runtime.submit_command(owner.conversation_id, first, context)
+        product = runtime._store(owner.conversation_id)
+        if delivery != "pending":
+            product.complete_command(receipt.model_copy(update={"status": "completed"}))
+        if delivery == "settled":
+            for kind, run_id, payload in events(first):
+                product.append(
+                    ProductEvent(
+                        conversation_id=owner.conversation_id,
+                        type=kind,
+                        run_id=run_id,
+                        payload=payload,
+                    )
+                )
+        await runtime.submit_command(
+            owner.conversation_id,
+            UserMessageCommand(
+                command_id="second",
+                content=(TextContent(text="Continue from the existing result."),),
+            ),
+            context,
+        )
+        await runtime.start_execution_events()
+        async with asyncio.timeout(5):
+            while any(
+                item["state"] != "completed" for item in service.store.work_items(owner)
+            ):
+                await asyncio.sleep(0.05)
+        assert [command.command_id for _, command, _ in adapter.sent] == (
+            ["first", "second"] if delivery == "pending" else ["second"]
+        )
+        notifications = adapter.external_task_notifications
+        if delivery == "accepted":
+            assert len(notifications) == 1
+            notification = notifications[0][1]
+            assert notification.task_id == "accepted-message:first"
+            assert "Inspect the existing task." in notification.hidden_text
+        else:
+            assert not notifications
+    finally:
+        await runtime.close()
 
 
 def stream(name=None, arguments=None, text="Done"):
@@ -94,43 +220,324 @@ def stream(name=None, arguments=None, text="Done"):
     )
 
 
+@pytest.mark.parametrize("scenario", ["idle", "busy", "restart", "independent"])
+async def test_plugin_delivers_dataset_result_and_manager_delegates_init(
+    tmp_path, monkeypatch, scenario
+):
+    profile = PREPARED_PROFILE
+    assert profile.delegated_roles is not None
+    owner = PlanOwner(
+        user_id="42", conversation_id="manager", profile_id=profile.profile_id
+    )
+    context = RequestContext(user_id=owner.user_id, profile_id=owner.profile_id)
+    artifact = "/datasets/prepared/train.jsonl"
+    dataset_id = ""
+    report_path = ""
+    init_inputs = []
+    manager_queries = []
+    foreground_replies = []
+    busy_started, release_manager = asyncio.Event(), asyncio.Event()
+    report_written, release_dataset = asyncio.Event(), asyncio.Event()
+
+    async def respond(request):
+        payload = await request.json()
+        names = {tool["function"]["name"] for tool in payload.get("tools", [])}
+        messages = payload["messages"]
+        history = json.dumps(messages)
+        used = {
+            call["function"]["name"]
+            for message in messages
+            for call in message.get("tool_calls", [])
+        }
+        assert "record_experiment_result" not in names
+        if "df_submit_evaluation" in names:
+            init_inputs.append(history)
+            return stream(text="Init needs an additional input.")
+        if "df_submit_pipeline" in names:
+            if "terminal" not in used:
+                return stream("terminal", {"command": "rm -rf public_data/test-empty"})
+            if "write" not in used:
+                return stream(
+                    "write",
+                    {
+                        "path": report_path,
+                        "content": f"# Dataset report\nTraining file: `{artifact}`.\n",
+                    },
+                )
+            if scenario == "restart":
+                report_written.set()
+                await release_dataset.wait()
+            return stream(text=f"DATASET_HANDOFF\n\nReport: `{report_path}`.")
+        if (
+            "DATASET_HANDOFF" not in history
+            and "Continue from saved dataset" not in history
+        ):
+            if scenario == "independent":
+                foreground_replies.append(history)
+                return stream(text="Manager can respond while Dataset waits.")
+            busy_started.set()
+            await release_manager.wait()
+            return stream(text="Still working on the project.")
+        if "get_experiment_execution" not in used:
+            manager_queries.append(history)
+            return stream("get_experiment_execution", {"run_id": dataset_id})
+        if "read" not in used:
+            return stream("read", {"path": report_path})
+        if "request_experiment_task" not in used:
+            assert artifact in history
+            return stream(
+                "request_experiment_task",
+                {
+                    "role_id": "init",
+                    "request_id": "init-after-dataset",
+                    "task": {
+                        "name": "Baseline",
+                        "instruction": "Use the verified dataset",
+                        "inputs": {"input_path": artifact},
+                    },
+                },
+            )
+        return stream(text="Baseline delegated.")
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", respond)
+    server = web.AppRunner(app)
+    await server.setup()
+    await web.TCPSite(server, "127.0.0.1", 0).start()
+    port = server.addresses[0][1]
+    monkeypatch.setenv("OPENAI_API_KEY", "local-test-key")
+    monkeypatch.setenv(
+        "PYROMIND_PI_RUNTIME",
+        str(
+            Path(__file__).resolve().parents[2]
+            / "harness-adapter/pi-runtime/dist/index.js"
+        ),
+    )
+    engine = create_engine(f"sqlite:///{tmp_path / 'ledger.db'}")
+    plan_metadata.create_all(engine)
+    metadata.create_all(engine)
+    store = SQLExperimentExecutionStore(engine)
+    root = tmp_path / "conversations"
+    root.mkdir()
+
+    def open_runtime():
+        adapter = PiAdapter(root, terminal_backend="os-sandbox")
+        runtime = ConversationRuntime(
+            root,
+            {"pi": adapter},
+            default_harness_id="pi",
+            experiment_plan_store=SQLExperimentPlanStore(engine),
+            experiment_execution_store=store,
+            execution_roles=("dataset", "init"),
+            release_grace_seconds=1,
+        )
+        adapter.set_plan_handler(runtime.experiment_plan_call)
+        adapter.set_role_handler(runtime.execution_role_call)
+        return runtime, adapter
+
+    runtime, adapter = open_runtime()
+    try:
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id=owner.conversation_id,
+                user_id=owner.user_id,
+                profile_id=profile.profile_id,
+                workspace_root=str(root / owner.conversation_id),
+                product_instructions=profile.instructions,
+                tool_allowlist=profile.development_tool_allowlist,
+                delegated_roles=tuple(
+                    role
+                    for role in profile.delegated_roles
+                    if role.name in {"dataset", "init"}
+                ),
+                managed_delegation=True,
+                model_configuration={
+                    "model": "eval-test-model",
+                    "base_url": f"http://127.0.0.1:{port}/v1",
+                    "api_key": "local-test-key",
+                },
+            ),
+            context,
+        )
+        executions = runtime._experiment_executions
+        assert executions is not None
+        row = executions.request(
+            owner,
+            RequestExperimentTask.model_validate(
+                {
+                    "role_id": "dataset",
+                    "request_id": "prepare-data",
+                    "task": {
+                        "name": "Dataset",
+                        "instruction": "Prepare training JSONL",
+                    },
+                }
+            ),
+            ("dataset",),
+            execution_policy={"artifact_contract": "data"},
+        )
+        dataset_id = row["id"]
+        report_path = f"public_data/experiment-runs/{dataset_id}/public_data/report.md"
+        await runtime.start_execution_events()
+        product = runtime._store(owner.conversation_id)
+        async with asyncio.timeout(25):
+            while not (permissions := product.load_snapshot().pending_permissions):
+                await asyncio.sleep(0.05)
+        assert await adapter.has_pending_session_work(
+            runtime._active[owner.conversation_id].handle
+        )
+        if scenario == "busy":
+            await runtime.submit_command(
+                owner.conversation_id,
+                UserMessageCommand(
+                    command_id="foreground",
+                    content=(TextContent(text="Keep working on the project"),),
+                ),
+                context,
+            )
+            await asyncio.wait_for(busy_started.wait(), 10)
+        if scenario == "independent":
+            for index in (1, 2):
+                command_id = f"foreground-{index}"
+                await runtime.submit_command(
+                    owner.conversation_id,
+                    UserMessageCommand(
+                        command_id=command_id,
+                        content=(TextContent(text=f"Manager message {index}"),),
+                    ),
+                    context,
+                )
+                async with asyncio.timeout(8):
+                    while not any(
+                        event.type == "status.changed"
+                        and event.run_id == command_id
+                        and event.payload.get("status") != "running"
+                        for event in product.replay()
+                    ):
+                        await asyncio.sleep(0.05)
+            assert len(foreground_replies) == 2
+            assert "Manager message 2" in foreground_replies[1]
+            assert product.load_snapshot().pending_permissions
+        await runtime.submit_command(
+            owner.conversation_id,
+            PermissionResponseCommand(
+                command_id="approval",
+                permission_id=permissions[0].permission_id,
+                decision="allow_once",
+            ),
+            context,
+        )
+        if scenario == "restart":
+            await asyncio.wait_for(report_written.wait(), 15)
+            await runtime.submit_command(
+                owner.conversation_id,
+                CancelCommand(command_id="pause-before-handoff"),
+                context,
+            )
+            assert product.load_snapshot().automatic_turns_suspended
+        async with asyncio.timeout(25):
+            while not any(
+                event.type in {"operation.completed", "operation.failed"}
+                and event.payload.get("name") == "dataset"
+                for event in product.replay()
+            ):
+                await asyncio.sleep(0.05)
+        release_manager.set()
+        if scenario == "restart":
+            async with asyncio.timeout(10):
+                while store.work_items(owner)[0]["state"] != "completed":
+                    await asyncio.sleep(0.05)
+            await runtime.close()
+            release_dataset.set()
+            runtime, _ = open_runtime()
+            await runtime.start_execution_events()
+            snapshot = await runtime.get_snapshot(owner.conversation_id, context)
+            assert snapshot.automatic_turns_suspended
+            assert not busy_started.is_set() and not manager_queries
+            await runtime.submit_command(
+                owner.conversation_id,
+                UserMessageCommand(
+                    command_id="resume",
+                    content=(TextContent(text="Continue from saved dataset"),),
+                ),
+                context,
+            )
+        async with asyncio.timeout(25):
+            while not init_inputs or any(
+                item["state"] != "completed" for item in store.work_items(owner)
+            ):
+                await asyncio.sleep(0.05)
+        assert len(manager_queries) == len(init_inputs) == 1
+        assert artifact in init_inputs[0]
+        manager_turns = [
+            item for item in store.work_items(owner) if item["kind"] == "manager_turn"
+        ]
+        expected_manager_turns = {"idle": 0, "busy": 1, "restart": 1, "independent": 2}
+        assert len(manager_turns) == expected_manager_turns[scenario]
+        rows = store.list(owner)
+        assert [(row["role_id"], row["state"]) for row in rows] == [
+            ("dataset", "needs_input" if scenario == "restart" else "reported"),
+            ("init", "needs_input"),
+        ]
+        if scenario == "restart":
+            assert rows[0]["report_state"] == "failed"
+        else:
+            assert rows[0]["report_state"] == "ready"
+            assert report_path in rows[0]["result"]["summary"]
+        assert not product.load_snapshot().pending_permissions
+        assert not any(
+            event.type in {"message.started", "message.completed"}
+            and event.payload.get("role") == "user"
+            and "Inspect subagent updates above" in str(event.payload.get("content"))
+            for event in product.replay()
+        )
+        with pytest.raises(PermissionError):
+            await runtime.get_experiment_executions(
+                owner.conversation_id,
+                RequestContext(user_id=owner.user_id, profile_id="other"),
+            )
+    finally:
+        release_manager.set()
+        release_dataset.set()
+        await runtime.close()
+        await server.cleanup()
+        engine.dispose()
+
+
 @pytest.mark.parametrize(
-    "restart,prepared,direct_question",
+    "restart,direct_question",
     [
-        (False, False, False),
-        ("platform", False, False),
-        ("preparation", False, False),
-        (False, True, False),
-        ("platform", True, False),
-        ("preparation", True, False),
-        pytest.param(False, True, True, id="direct-child-question"),
+        (False, False),
+        ("platform", False),
+        ("preparation", False),
+        pytest.param(False, True, id="direct-child-question"),
     ],
 )
 async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
-    tmp_path, monkeypatch, restart, prepared, direct_question
+    tmp_path, monkeypatch, restart, direct_question
 ):
     captured, submitted, manager_requests = [], [], []
     current = {}
     followups = []
     preparation = asyncio.Event()
     resume_preparation = asyncio.Event()
+    native_waiting = []
 
     async def respond(request):
         payload = await request.json()
         captured.append(payload)
         names = {item["function"]["name"] for item in payload.get("tools", [])}
-        if "record_experiment_result" not in names:
+        assert "record_experiment_result" not in names
+        child_tool = "df_submit_evaluation"
+        if child_tool not in names:
+            if "Baseline report:" not in json.dumps(payload["messages"]):
+                native_waiting.append(payload)
+                return stream(text="Platform result is pending.")
             manager_requests.append(payload)
             if not any(
                 message.get("role") == "tool" for message in payload["messages"]
             ):
-                return stream(
-                    "read_experiment_artifact",
-                    {
-                        "run_id": current["id"],
-                        "name": "agent_report",
-                    },
-                )
+                return stream("read", {"path": current["report"]})
             return stream(text="Baseline completed. Report verified.")
         if restart == "preparation" and not current.get("restarted"):
             preparation.set()
@@ -143,7 +550,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         ]
         if "FOLLOWUP_CONTEXT_CHECK" in messages:
             assert "df_submit_evaluation" in used
-            assert "record_experiment_result" in used
+            assert "write" in used
             followups.append(payload)
             return stream(text="Original child context retained. No new submission.")
         if (
@@ -160,16 +567,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
                         "without errors.\n",
                     },
                 )
-            if "record_experiment_result" not in used:
-                return stream(
-                    "record_experiment_result",
-                    {
-                        "run_id": current["id"],
-                        "summary": "One sample scored, no execution errors.",
-                        "report_uri": current["report"],
-                    },
-                )
-            return stream(text="Report registered.")
+            return stream(text=f"Baseline report: `{current['report']}`.")
         if direct_question and "ask_user" not in used:
             assert "ask_user" in names
             return stream(
@@ -314,7 +712,7 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         }
 
     monkeypatch.setattr(adapter._business_tools, "execute", execute)
-    profile = PREPARED_PROFILE if prepared else ECHOMIND_PRODUCT_PROFILE
+    profile = PREPARED_PROFILE
     context = RequestContext(user_id="42", profile_id=profile.profile_id)
     owner = PlanOwner(
         user_id="42", conversation_id="manager", profile_id=profile.profile_id
@@ -344,122 +742,102 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
             ),
             context,
         )
-        if prepared:
-            runtime._store("manager").append(
-                ProductEvent(
-                    conversation_id="manager",
-                    type="message.completed",
-                    payload={
-                        "message_id": "fixture",
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "Evaluate one sample from /dataset.jsonl "
-                                "with /models/base using exact labels",
-                            }
-                        ],
-                    },
-                )
-            )
-            values = {
-                "goal": "Evaluate exact label correctness",
-                "model": {"source": "storage", "reference": "/models/base"},
-                "dataset": {"path": "/dataset.jsonl", "format": "jsonl"},
-                "io_contract": {"input": "prompt", "output": "label"},
-                "scoring": {"basis": "exact label match"},
-                "scope": {"mode": "sample", "limit": 1},
-            }
-            facts = {
-                key: {
-                    "value": value,
-                    "status": "resolved",
-                    "evidence_refs": ["message:fixture"],
-                }
-                for key, value in values.items()
-            }
-            await runtime.experiment_plan_call(
-                "manager",
-                "update_preparation",
-                UpdatePreparation.model_validate(
-                    {"expected_revision": 0, "facts": facts}
-                ).model_dump(mode="json"),
-                context,
-            )
-            entry = {
-                "role_id": "init",
-                "request_id": "baseline",
-                "stage_id": "init",
-                "task": {
-                    "name": "自由命名的基模评测",
-                    "instruction": "Run one sample baseline",
-                    "inputs": {
-                        "model_path": "/models/base",
-                        "input_path": "/dataset.jsonl",
-                    },
+        runtime._store("manager").append(
+            ProductEvent(
+                conversation_id="manager",
+                type="message.completed",
+                payload={
+                    "message_id": "fixture",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Evaluate one sample from /dataset.jsonl "
+                            "with /models/base using exact labels",
+                        }
+                    ],
                 },
+            )
+        )
+        values = {
+            "goal": "Evaluate exact label correctness",
+            "model": {"source": "storage", "reference": "/models/base"},
+            "dataset": {"path": "/dataset.jsonl", "format": "jsonl"},
+            "io_contract": {"input": "prompt", "output": "label"},
+            "scoring": {"basis": "exact label match"},
+            "scope": {"mode": "sample", "limit": 1},
+        }
+        facts = {
+            key: {
+                "value": value,
+                "status": "resolved",
+                "evidence_refs": ["message:fixture"],
             }
-            guide = {
-                "goal": "One sample baseline",
-                "stages": [{"id": "init", "kind": "init", "name": "Init"}],
-                "resources": [{"id": "data", "name": "Data", "uri": "/dataset.jsonl"}],
-                "tasks": [
-                    {
-                        "id": "baseline",
-                        "kind": "bench",
-                        "name": "Baseline",
-                        "stage_id": "init",
-                        "inputs": [{"name": "input_path", "resource_id": "data"}],
-                    }
-                ],
-            }
-            ready = await runtime.experiment_plan_call(
-                "manager",
-                "update_preparation",
-                UpdatePreparation.model_validate(
-                    {
-                        "expected_revision": 1,
-                        "facts": facts,
-                        "plan": guide,
-                        "entry_task": entry,
-                    }
-                ).model_dump(mode="json"),
-                context,
-            )
-            receipt = await runtime.submit_command(
-                "manager",
-                CreateProjectCommand(
-                    command_id="create",
-                    expected_preparation_revision=PreparationView.model_validate(
-                        ready
-                    ).revision,
-                ),
-                context,
-            )
-            row = next(
-                item
-                for item in store.list(owner)
-                if item["id"] == receipt.response["initial_run_id"]
-            )
-        else:
-            row = await runtime.request_experiment_task(
-                "manager",
-                RequestExperimentTask.model_validate(
-                    {
-                        "role_id": "eval",
-                        "request_id": "baseline",
-                        "task": {
-                            "name": "自由命名的基模评测",
-                            "instruction": "Run one sample baseline",
-                            "inputs": {
-                                "model_path": "/models/base",
-                                "input_path": "/dataset.jsonl",
-                            },
-                        },
-                    }
-                ),
-                context,
-            )
+            for key, value in values.items()
+        }
+        await runtime.experiment_plan_call(
+            "manager",
+            "update_preparation",
+            UpdatePreparation.model_validate(
+                {"expected_revision": 0, "facts": facts}
+            ).model_dump(mode="json"),
+            context,
+        )
+        entry = {
+            "role_id": "init",
+            "request_id": "baseline",
+            "stage_id": "init",
+            "task": {
+                "name": "自由命名的基模评测",
+                "instruction": "Run one sample baseline",
+                "inputs": {
+                    "model_path": "/models/base",
+                    "input_path": "/dataset.jsonl",
+                },
+            },
+        }
+        guide = {
+            "goal": "One sample baseline",
+            "stages": [{"id": "init", "kind": "init", "name": "Init"}],
+            "resources": [{"id": "data", "name": "Data", "uri": "/dataset.jsonl"}],
+            "tasks": [
+                {
+                    "id": "baseline",
+                    "kind": "bench",
+                    "name": "Baseline",
+                    "stage_id": "init",
+                    "inputs": [{"name": "input_path", "resource_id": "data"}],
+                }
+            ],
+        }
+        ready = await runtime.experiment_plan_call(
+            "manager",
+            "update_preparation",
+            UpdatePreparation.model_validate(
+                {
+                    "expected_revision": 1,
+                    "facts": facts,
+                    "plan": guide,
+                    "entry_task": entry,
+                }
+            ).model_dump(mode="json"),
+            context,
+        )
+        receipt = await runtime.submit_command(
+            "manager",
+            CreateProjectCommand(
+                command_id="create",
+                expected_preparation_revision=PreparationView.model_validate(
+                    ready
+                ).revision,
+            ),
+            context,
+        )
+        row = next(
+            item
+            for item in store.list(owner)
+            if item["id"] == receipt.response["initial_run_id"]
+        )
         current.update(
             id=row["id"],
             root=f"public_data/experiment-runs/{row['id']}",
@@ -561,11 +939,8 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
                 if (
                     view.report_state == "ready"
                     and manager_requests
-                    and any(
-                        item["kind"] == "manager_turn" and item["state"] == "completed"
-                        for item in queue
-                    )
                     and all(item["state"] == "completed" for item in queue)
+                    and len(manager_requests) >= 2
                 ):
                     break
                 await asyncio.sleep(0.1)
@@ -574,15 +949,29 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         assert (
             view.state == "succeeded"
             and view.metrics == metrics
-            and view.report_uri == current["report"]
+            and view.report_uri is None
         )
+        assert current["report"] in (view.summary or "")
         assert plans.view(owner).current is None
         assert len(manager_requests) == 2
+        assert all(item["kind"] != "manager_turn" for item in queue)
+        assert len(native_waiting) <= 1
         assert "One actual sample was scored" in json.dumps(
             manager_requests[-1]["messages"]
         )
         if not restart:
-            projected = (await runtime.get_snapshot("manager", context)).external_tasks
+            async with asyncio.timeout(10):
+                while True:
+                    projected = (
+                        await runtime.get_snapshot("manager", context)
+                    ).external_tasks
+                    if (
+                        len(projected) == 1
+                        and projected[0].status == "succeeded"
+                        and not projected[0].resume_pending
+                    ):
+                        break
+                    await asyncio.sleep(0.05)
             assert len(projected) == 1
             assert (
                 projected[0].status == "succeeded" and not projected[0].resume_pending
@@ -598,21 +987,11 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         manager_tools = {
             tool["function"]["name"] for tool in manager_requests[0]["tools"]
         }
-        if prepared:
-            assert "request_experiment_task" in manager_tools
-            assert "df_submit_evaluation" not in manager_tools
-            assert {"read", "write", "edit", "terminal", "grep", "find", "ls"} <= (
-                manager_tools
-            )
-        else:
-            assert (
-                "df_submit_evaluation" in manager_tools
-                and "terminal" in manager_tools
-                and "read" in manager_tools
-                and "subagent" not in manager_tools
-                and "record_experiment_result" not in manager_tools
-                and "read_skill" not in manager_tools
-            )
+        assert "request_experiment_task" in manager_tools
+        assert "df_submit_evaluation" not in manager_tools
+        assert {"read", "write", "edit", "terminal", "grep", "find", "ls"} <= (
+            manager_tools
+        )
 
         assert "/dataset.jsonl" not in json.dumps(manager_requests[0]["messages"])
         role_file = (root / "manager/pi/agent/agents/eval.md").read_text()
@@ -647,14 +1026,13 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
         report_display = report_details["subagent"]
         assert isinstance(first_display, dict) and isinstance(report_display, dict)
         assert first_display["task"] == report_display["task"] == "自由命名的基模评测"
-        if prepared:
-            binding = first_display["execution"]
-            assert isinstance(binding, dict) and binding["task_run_id"] == row["id"]
-            assert report_display["execution"] == first_display["execution"]
-            assert all(
-                child.execution is not None and child.execution["stage_id"] == "init"
-                for child in children.values()
-            )
+        binding = first_display["execution"]
+        assert isinstance(binding, dict) and binding["task_run_id"] == row["id"]
+        assert report_display["execution"] == first_display["execution"]
+        assert all(
+            child.execution is not None and child.execution["stage_id"] == "init"
+            for child in children.values()
+        )
         assert first_display["phase"] == "execute"
         assert report_display["phase"] == "report"
         assert report_display["previous_run_id"] == first_ref
@@ -673,8 +1051,16 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
             )
             assert receipt.status == "completed"
             async with asyncio.timeout(30):
-                while not followups or any(
-                    item["state"] != "completed" for item in store.work_items(owner)
+                while (
+                    not followups
+                    or any(
+                        item["state"] != "completed" for item in store.work_items(owner)
+                    )
+                    or not any(
+                        "Original child context retained"
+                        in json.dumps(payload["messages"])
+                        for payload in manager_requests
+                    )
                 ):
                     await asyncio.sleep(0.05)
             assert len(submitted) == 1 and len(followups) == 1

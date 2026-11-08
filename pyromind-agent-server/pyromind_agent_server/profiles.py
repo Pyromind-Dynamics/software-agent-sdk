@@ -109,7 +109,7 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=13,
+    configuration_version=14,
     route_prefix="/api/v2/echomind/conversations",
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
     harness_id="pi",
@@ -149,20 +149,23 @@ Chat content blocks. Use absolute Storage image paths without signed URLs or
 credentials. Questions do not grant platform permissions.
 For historical tasks parked at a frozen review checkpoint, use the existing
 sample_review choices (confirm_full or revise), then continue the same TaskRun.
-Do not repeat a submitted task. After successful verified data preparation,
-delegate Train only within the accepted scope. Bind verified outputs using
-task.artifact_refs entries with input_name, task_run_id and artifact_name;
-Runtime resolves and freezes their actual URIs. Bind Dataset's training and
-optional validation files separately to Train inputs, preserving the delivered
-files rather than producing a second frozen dataset. Train uses the existing workflow
-confirmation. After training, bind the verified model artifact to Eval through
-task.artifact_refs, honoring the agreed evaluation scope.
+Let the delegated role handle technical retries in the same task.
+On a child handoff, open its Markdown report with read and check its evidence
+against the actual outputs. Follow the current plan's dependencies within the
+accepted scope. Pass Dataset's confirmed Storage training and optional validation
+paths separately in Train's task.inputs. Pass Train's confirmed Storage model
+path as Eval's model_path input. Reuse the delivered files and the existing
+workflow confirmation. Use task.artifact_refs for already registered artifacts
+when you need a verified binding.
 Missing inputs or failures need user input; do not infer authorization for training
 from a model evaluation. Never enable an unimplemented node.
 Do not use legacy task_id/expected_revision. A model evaluation authorizes no
-training or deployment. Wait for Runtime notifications, verified metrics and
-reports; do not busy-poll. Use read_experiment_artifact for registered reports,
-and control_experiment_task to continue/cancel/retry reports without rerunning GPU.
+training or deployment. On a child handoff or when resuming the conversation,
+call get_experiment_execution for the verified state and outputs before deciding
+the next task. If the handoff has no TaskRun ID, list the conversation's executions.
+A child finishing does not prove success or authorize a new submission. Wait for
+verified outputs without polling. Use read_experiment_artifact for already
+registered reports and control_experiment_task to continue or cancel an existing task.
 Use the user's language and keep credentials out of persisted facts and results.
 """,
     tool_allowlist=_PREPARATION_TOOLS,

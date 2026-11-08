@@ -10,6 +10,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
+from pyromind_runtime.domain.commands import UserMessageCommand
 from pyromind_runtime.domain.experiment_plans import PlanOwner
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
@@ -111,6 +112,45 @@ outbox = (
 
 def owner_key(owner: PlanOwner) -> str:
     return digest(owner.model_dump_json())
+
+
+def _submission_key(operation: str, scope: dict) -> str:
+    call_id = scope.get("tool_call_id")
+    if call_id:
+        return "call:" + digest(scope["work_id"] + ":" + call_id)
+    return operation
+
+
+def _current_submission(row: dict, entries: list[dict]) -> dict | None:
+    attributes = row.get("attributes") or {}
+    submission_id = attributes.get("current_submission_id")
+    workflow_id = attributes.get("workflow_request_id")
+    return next(
+        (
+            entry
+            for entry in entries
+            if (not submission_id or entry["id"] == submission_id)
+            and (
+                not workflow_id
+                or entry["evidence"].get("workflow_request_id") == workflow_id
+            )
+        ),
+        None,
+    )
+
+
+def _current_platform_task(conn, row: dict) -> str | None:
+    statement = sa.select(submissions.c.task_id).where(
+        submissions.c.run_id == row["id"]
+    )
+    attributes = row["attributes"] or {}
+    if submission_id := attributes.get("current_submission_id"):
+        statement = statement.where(submissions.c.id == submission_id)
+    elif request_id := attributes.get("workflow_request_id"):
+        statement = statement.where(
+            submissions.c.evidence["workflow_request_id"].as_string() == request_id
+        )
+    return conn.execute(statement.order_by(submissions.c.updated_at.desc())).scalar()
 
 
 def fingerprint(value: dict) -> str:
@@ -323,17 +363,7 @@ class SQLExperimentExecutionStore:
                         .order_by(submissions.c.updated_at.desc())
                     ).mappings()
                 ]
-                workflow_request = (row["attributes"] or {}).get("workflow_request_id")
-                value["submission"] = next(
-                    (
-                        sub
-                        for sub in value["submissions"]
-                        if not workflow_request
-                        or sub["evidence"].get("workflow_request_id")
-                        == workflow_request
-                    ),
-                    None,
-                )
+                value["submission"] = _current_submission(value, value["submissions"])
                 result.append(value)
             return result
 
@@ -367,14 +397,14 @@ class SQLExperimentExecutionStore:
                 if checkpoint.get("status") != "approved":
                     raise PermissionError("submission requires current sample approval")
             operation = str(arguments.get("operation", "inference"))
-            if item["kind"] == "generate_report" and operation != "review":
-                raise PermissionError("report retry cannot start GPU evaluation")
+            operation_key = _submission_key(operation, scope)
+            per_call = operation_key != operation
             previous = (
                 conn.execute(
                     sa.select(submissions)
                     .where(
                         submissions.c.run_id == run_id,
-                        submissions.c.operation_key == operation,
+                        submissions.c.operation_key == operation_key,
                     )
                     .with_for_update()
                 )
@@ -383,28 +413,30 @@ class SQLExperimentExecutionStore:
             )
             attempt = 0
             if previous:
-                if previous["state"] == "not_submitted":
+                if not per_call and previous["state"] == "not_submitted":
                     attempt = previous["evidence"].get("attempt", 0) + 1
-                    if attempt > 3:
-                        raise ValueError("safe preparation retry limit reached")
                 elif previous["request_fingerprint"] != fingerprint(arguments):
                     raise ValueError(
-                        "submitted configuration changed; delegate a new task"
+                        "submission identity reused with different arguments"
                     )
                 elif previous["evidence"].get("receipt"):
                     return {
                         "receipt": previous["evidence"]["receipt"],
-                        "operation_id": previous["id"],
+                        "operation_id": previous["evidence"]["operation_id"],
                     }
                 else:
                     raise ValueError(
                         "submission needs reconciliation; do not repeat it"
                     )
+            if per_call and row["state"] == "submitting":
+                raise ValueError("another submission is awaiting a platform receipt")
             identity = previous["id"] if previous else uuid4().hex
             operation_id = identity + ":" + str(attempt)
             evidence = {
                 "operation_id": operation_id,
+                "operation": operation,
                 "attempt": attempt,
+                "work_id": item["id"],
                 "pipeline_run_id": str(
                     uuid5(NAMESPACE_URL, f"{owner.conversation_id}:{operation_id}")
                 ),
@@ -427,14 +459,32 @@ class SQLExperimentExecutionStore:
                         id=identity,
                         owner=owner_key(owner),
                         run_id=run_id,
-                        operation_key=operation,
+                        operation_key=operation_key,
                         **values,
                     )
                 )
+            run_updates = {}
+            if per_call:
+                attributes = dict(row["attributes"] or {})
+                attributes["current_submission_id"] = identity
+                run_updates["attributes"] = attributes
+                if operation in {"inference", "resume", "pipeline"}:
+                    attributes.pop("artifacts", None)
+                    run_updates.update(
+                        result=None,
+                        metrics=None,
+                        active_key=digest(
+                            owner_key(owner)
+                            + ":"
+                            + row["project_id"]
+                            + ":"
+                            + row["task_id"]
+                        ),
+                    )
             conn.execute(
                 runs.update()
                 .where(runs.c.id == run_id)
-                .values(state="submitting", report_state="not_started")
+                .values(state="submitting", report_state="not_started", **run_updates)
             )
             return {"operation_id": operation_id}
 
@@ -450,7 +500,8 @@ class SQLExperimentExecutionStore:
                     sa.select(submissions)
                     .where(
                         submissions.c.run_id == run_id,
-                        submissions.c.operation_key == operation,
+                        submissions.c.operation_key
+                        == _submission_key(operation, scope),
                     )
                     .with_for_update()
                 )
@@ -488,12 +539,18 @@ class SQLExperimentExecutionStore:
         scope: dict,
         text: str,
         report: bool = False,
+        *,
+        completed: bool = False,
     ) -> dict:
-        """Native process completion is separate from the evaluation outcome."""
-        validate_persisted_payload({"summary": text})
+        """Apply a child turn outcome to the execution ledger."""
         with write_transaction(self.engine) as conn:
-            self.queue.fenced(conn, scope["work_id"], scope["generation"])
+            item = self.queue.fenced(conn, scope["work_id"], scope["generation"])
             row = self._run(conn, owner, run_id)
+            if item["owner"] != owner_key(owner) or item["payload"]["run_id"] != run_id:
+                raise PermissionError("work belongs to a different execution")
+            followup = item["payload"].get("platform_followup")
+            if followup and followup != _current_platform_task(conn, row):
+                return row
             if row["state"] == "submitting":
                 conn.execute(
                     submissions.update()
@@ -516,9 +573,58 @@ class SQLExperimentExecutionStore:
                 "waiting_platform",
             }:
                 return self._run(conn, owner, run_id)
-            if report and row["report_state"] != "ready":
+            state = row["state"]
+            task = row.get("task_spec") or {}
+            policy = task.get("execution_policy") or {}
+            contract = policy.get("artifact_contract")
+            checkpoint = (row.get("attributes") or {}).get("checkpoint") or {}
+            review_satisfied = (
+                not policy.get("require_review")
+                or checkpoint.get("status") == "approved"
+            )
+            local_delivery = state in {"queued", "preparing"} or (
+                report and state == "needs_input"
+            )
+            handoff_state = None
+            if completed and row["report_state"] != "ready":
+                if report and state in {"succeeded", "failed", "cancelled"}:
+                    handoff_state = state
+                elif (
+                    report
+                    and state == "waiting_artifacts"
+                    and contract in {"data", "model"}
+                    and review_satisfied
+                ):
+                    handoff_state = "succeeded"
+                elif (
+                    local_delivery
+                    and contract == "data"
+                    and task.get("intent") == "execute"
+                    and review_satisfied
+                ):
+                    # A local turn has no platform outcome to verify.
+                    handoff_state = "reported"
+            if handoff_state:
                 result = dict(row.get("result") or {})
-                reason = result.get("registration_error") or text[:16000]
+                summary = text[:16000]
+                validate_persisted_payload({"summary": summary})
+                result.pop("waiting_reason", None)
+                result["summary"] = summary
+                conn.execute(
+                    runs.update()
+                    .where(runs.c.id == run_id)
+                    .values(
+                        state=handoff_state,
+                        report_state="ready",
+                        result=result,
+                        active_key=None,
+                    )
+                )
+                self.changed(conn, owner, run_id, "report:" + fingerprint(result))
+            elif report and row["report_state"] != "ready":
+                result = dict(row.get("result") or {})
+                reason = text[:16000]
+                validate_persisted_payload({"summary": reason})
                 result.update(summary=reason, waiting_reason=reason)
                 conn.execute(
                     runs.update()
@@ -529,8 +635,10 @@ class SQLExperimentExecutionStore:
             elif row["state"] in {"queued", "preparing"}:
                 prepared = row["task_spec"]["intent"] == "prepare"
                 result = dict(row.get("result") or {})
-                reason = result.get("registration_error") or text[:16000]
+                reason = text[:16000]
+                validate_persisted_payload({"summary": reason})
                 result.update(summary=reason, blockers=[] if prepared else [reason])
+                delivery_failed = contract == "data" and not completed
                 conn.execute(
                     runs.update()
                     .where(runs.c.id == run_id)
@@ -539,136 +647,12 @@ class SQLExperimentExecutionStore:
                         active_key=None,
                         result=result,
                         report_state="failed"
-                        if result.get("registration_error") and not prepared
+                        if delivery_failed and not prepared
                         else "ready",
                     )
                 )
                 self.changed(conn, owner, run_id, "needs-input")
             return self._run(conn, owner, run_id)
-
-    def record_result(
-        self,
-        owner: PlanOwner,
-        run_id: str,
-        scope: dict,
-        result: dict,
-        report_artifact: dict | None,
-        verified: list[dict] | None = None,
-    ) -> None:
-        validate_persisted_payload(result)
-        validate_persisted_payload(verified)
-        with write_transaction(self.engine) as conn:
-            self.queue.fenced(conn, scope["work_id"], scope["generation"])
-            row = self._run(conn, owner, run_id)
-            if not row["task_spec"]:
-                raise ValueError("legacy execution cannot use this result contract")
-            blocked = bool(result.get("blockers"))
-            prepared = row["task_spec"]["intent"] == "prepare"
-            policy = row["task_spec"].get("execution_policy") or {}
-            data_result = policy.get("artifact_contract") == "data"
-            if verified is not None:
-                if not data_result or prepared or blocked:
-                    raise ValueError("execution cannot register these file outputs")
-                if (
-                    policy.get("require_review")
-                    and ((row.get("attributes") or {}).get("checkpoint") or {}).get(
-                        "status"
-                    )
-                    != "approved"
-                ):
-                    raise PermissionError("the frozen sample review is not approved")
-                if row["state"] not in {
-                    "queued",
-                    "preparing",
-                    "needs_input",
-                    "waiting_artifacts",
-                    "succeeded",
-                }:
-                    raise ValueError("execution is not ready to register outputs")
-                platform_states = conn.execute(
-                    sa.select(submissions.c.state).where(submissions.c.run_id == run_id)
-                ).scalars()
-                if any(
-                    state not in {"succeeded", "not_submitted"}
-                    for state in platform_states
-                ):
-                    raise ValueError(
-                        "submitted platform work must succeed before registration"
-                    )
-                declared = [
-                    (item["name"], item["uri"]) for item in result.get("artifacts", [])
-                ]
-                inspected = [(item["name"], item["uri"]) for item in verified]
-                if (
-                    not inspected
-                    or declared != inspected
-                    or len({name for name, _ in inspected}) != len(inspected)
-                ):
-                    raise ValueError("every declared artifact must be verified")
-                for item in verified:
-                    self._register_artifact(conn, row, item)
-                row["state"] = "succeeded"
-            elif data_result and not blocked and not prepared:
-                if result.get("artifacts") or row["state"] not in {
-                    "failed",
-                    "cancelled",
-                }:
-                    raise ValueError("every declared artifact must be verified")
-            if blocked and row["state"] in {
-                "submitting",
-                "submission_uncertain",
-                "waiting_platform",
-                "waiting_artifacts",
-                "cancel_requested",
-            }:
-                raise ValueError("in-flight work must retain its platform state")
-            if (
-                not blocked
-                and not prepared
-                and (
-                    row["state"] not in {"succeeded", "failed", "cancelled"}
-                    or (not data_result and not report_artifact)
-                )
-            ):
-                raise ValueError(
-                    "result requires verified platform artifacts and a readable report"
-                )
-            if report_artifact:
-                self._register_artifact(
-                    conn, row, {"name": "agent_report", **report_artifact}
-                )
-            conn.execute(
-                runs.update()
-                .where(runs.c.id == run_id)
-                .values(
-                    state="needs_input"
-                    if blocked
-                    else "prepared"
-                    if prepared
-                    else row["state"],
-                    result=result,
-                    report_state="ready",
-                    active_key=None,
-                )
-            )
-            self.changed(conn, owner, run_id, "result:" + fingerprint(result))
-
-    def record_result_failure(
-        self, owner: PlanOwner, run_id: str, scope: dict, reason: str
-    ) -> None:
-        validate_persisted_payload({"reason": reason})
-        with write_transaction(self.engine) as conn:
-            self.queue.fenced(conn, scope["work_id"], scope["generation"])
-            row = self._run(conn, owner, run_id)
-            if row["state"] == "succeeded" and row["report_state"] == "ready":
-                return
-            result = {
-                **(row.get("result") or {}),
-                "registration_error": reason,
-                "waiting_reason": reason,
-            }
-            conn.execute(runs.update().where(runs.c.id == run_id).values(result=result))
-            self.changed(conn, owner, run_id, "registration:" + fingerprint(result))
 
     def record_checkpoint(
         self, owner: PlanOwner, run_id: str, scope: dict, checkpoint: dict
@@ -733,25 +717,34 @@ class SQLExperimentExecutionStore:
             )
             self.changed(conn, owner, run_id, "checkpoint-answer:" + command_id)
 
-    def queue_artifact_report(self, owner: PlanOwner, run_id: str) -> None:
+    def queue_artifact_report(
+        self, owner: PlanOwner, run_id: str, *, platform_task_id: str | None = None
+    ) -> None:
         with write_transaction(self.engine) as conn:
             row = self._run(conn, owner, run_id)
+            task_id = _current_platform_task(conn, row)
+            if platform_task_id and task_id != platform_task_id:
+                return
             if row["state"] != "waiting_artifacts":
                 raise ValueError("platform artifacts are not ready for inspection")
             if row["report_state"] != "not_started":
                 return
+            attributes = row["attributes"] or {}
+            followup = bool(
+                attributes.get("current_submission_id")
+                or attributes.get("workflow_request_id")
+            )
             self.queue.put(
                 conn,
                 owner_key(owner),
                 "role:" + row["role_id"],
-                "verify:" + run_id,
-                "generate_report",
+                f"verify:{run_id}:{task_id}",
+                "execute_task" if followup else "generate_report",
                 {
                     "run_id": run_id,
                     "owner": owner.model_dump(mode="json"),
-                    "message": "Inspect actual platform outputs. "
-                    "Register required artifacts "
-                    "with record_experiment_result; do not resubmit.",
+                    "message": "Inspect platform outputs and report the outcome.",
+                    **({"platform_followup": task_id} if followup else {}),
                 },
             )
             conn.execute(
@@ -777,24 +770,16 @@ class SQLExperimentExecutionStore:
                 raise PermissionError("execution does not allow workflow submission")
             attributes = dict(row.get("attributes") or {})
             previous = attributes.get("workflow_request_id")
-            if (
-                previous
-                and previous != request_id
-                and row["state"]
-                not in {
-                    "failed",
-                    "needs_input",
-                }
-            ):
-                raise ValueError("a workflow is already staged for this task")
-            if row["state"] not in {
-                "queued",
-                "preparing",
-                "waiting_confirmation",
-                "failed",
-                "needs_input",
+            if row["state"] in {
+                "cancel_requested",
+                "cancelled",
+                "submitting",
+                "submission_uncertain",
+                "abandoned",
             }:
                 raise ValueError("task cannot stage another workflow")
+            if previous != request_id and row["state"] == "waiting_confirmation":
+                raise ValueError("resolve the pending workflow confirmation first")
             prior = next(
                 (
                     sub
@@ -807,8 +792,6 @@ class SQLExperimentExecutionStore:
                 ),
                 None,
             )
-            if prior is not None and prior["state"] != "failed":
-                raise ValueError("task already has submitted work")
             if previous != request_id:
                 if prior is not None:
                     conn.execute(
@@ -1000,8 +983,6 @@ class SQLExperimentExecutionStore:
     ) -> None:
         with write_transaction(self.engine) as conn:
             row = self._run(conn, owner, run_id)
-            if not reason and (row.get("result") or {}).get("registration_error"):
-                return
             result = {**(row.get("result") or {}), "waiting_reason": reason}
             conn.execute(
                 runs.update()
@@ -1048,50 +1029,19 @@ class SQLExperimentExecutionStore:
             for item in self.queue.list(owner_key(owner))
         )
 
-    def retire_legacy_work(self, owner: PlanOwner) -> bool:
-        from pyromind_runtime.infrastructure.sql_work_queue import work
-
-        with write_transaction(self.engine) as conn:
-            items = list(
-                conn.execute(
-                    sa.select(work)
-                    .where(work.c.owner == owner_key(owner))
-                    .with_for_update()
-                ).mappings()
-            )
-            if any(
-                item["state"] in {"running", "reconciliation_required"}
-                or (
-                    item["state"] in {"queued", "waiting_authorization"}
-                    and item["checkpoint"].get("launch_pending")
-                )
-                for item in items
-            ):
-                return False
-            # Unstarted legacy preparation is historical, never auto-executed
-            # using the new role's stronger capabilities.
-            for item in items:
-                if item["kind"] == "prepare_execution" and item["state"] in {
-                    "queued",
-                    "waiting_authorization",
-                }:
-                    conn.execute(
-                        work.update()
-                        .where(work.c.id == item["id"])
-                        .values(state="cancelled")
-                    )
-            return True
-
-    def enqueue_manager(
-        self, owner: PlanOwner, identity: str, payload: dict, priority: int = 100
+    def enqueue_manager_message(
+        self, owner: PlanOwner, command: UserMessageCommand
     ) -> str:
         return self.queue.enqueue(
             owner_key(owner),
             "role:manager",
-            identity,
+            "user:" + command.command_id,
             "manager_turn",
-            {"owner": owner.model_dump(mode="json"), **payload},
-            priority,
+            {
+                "owner": owner.model_dump(mode="json"),
+                "command": command.model_dump(mode="json"),
+            },
+            10,
         )
 
     def continue_task(
@@ -1225,7 +1175,7 @@ class SQLExperimentExecutionStore:
                 if native_stopped and platform_stopped
                 else "cancel_requested"
             )
-            if row["state"] in {"succeeded", "waiting_artifacts", "failed"}:
+            if row["state"] in {"succeeded", "waiting_artifacts", "failed", "reported"}:
                 return row
             conn.execute(
                 runs.update()
@@ -1239,25 +1189,35 @@ class SQLExperimentExecutionStore:
             return self._run(conn, owner, run_id)
 
     def enqueue_report(
-        self, owner: PlanOwner, run_id: str, message: str = "", command_id: str = ""
-    ) -> str:
+        self,
+        owner: PlanOwner,
+        run_id: str,
+        message: str = "",
+        command_id: str = "",
+        *,
+        platform_task_id: str | None = None,
+    ) -> str | None:
         with write_transaction(self.engine) as conn:
             row = self._run(conn, owner, run_id)
-            sub = conn.execute(
-                sa.select(submissions.c.task_id)
-                .where(submissions.c.run_id == run_id)
-                .order_by(submissions.c.updated_at.desc())
-            ).scalar()
+            attributes = row["attributes"] or {}
+            current = attributes.get("current_submission_id")
+            sub = _current_platform_task(conn, row)
+            if platform_task_id and sub != platform_task_id:
+                return None
+            followup = bool(
+                (current or attributes.get("workflow_request_id")) and not command_id
+            )
             identity = self.queue.put(
                 conn,
                 owner_key(owner),
                 "role:" + row["role_id"],
                 f"report:{run_id}:{sub}:{command_id}",
-                "generate_report",
+                "execute_task" if followup else "generate_report",
                 {
                     "run_id": run_id,
                     "owner": owner.model_dump(mode="json"),
                     "message": message,
+                    **({"platform_followup": sub} if followup else {}),
                 },
             )
             conn.execute(
@@ -1567,13 +1527,11 @@ class SQLExperimentExecutionStore:
                         conn, owner, sub["run_id"], "observation:" + event["id"]
                     )
                     if status in terminal:
-                        attributes = conn.execute(
-                            sa.select(runs.c.attributes).where(
-                                runs.c.id == sub["run_id"]
-                            )
-                        ).scalar_one()
-                        current_workflow = (attributes or {}).get("workflow_request_id")
-                        if (
+                        run = self._run(conn, owner, sub["run_id"])
+                        attributes = run["attributes"] or {}
+                        current_submission = attributes.get("current_submission_id")
+                        current_workflow = attributes.get("workflow_request_id")
+                        if (current_submission and current_submission != sub["id"]) or (
                             current_workflow
                             and sub["evidence"].get("workflow_request_id")
                             and current_workflow
@@ -1589,9 +1547,7 @@ class SQLExperimentExecutionStore:
                             )
                             count += 1
                             continue
-                        run_state = conn.execute(
-                            sa.select(runs.c.state).where(runs.c.id == sub["run_id"])
-                        ).scalar_one()
+                        run_state = run["state"]
                         conn.execute(
                             runs.update()
                             .where(runs.c.id == sub["run_id"])
@@ -1647,23 +1603,31 @@ class SQLExperimentExecutionStore:
         row["attributes"] = attributes
 
     def register_artifacts(
-        self, owner: PlanOwner, run_id: str, verified: list[dict], metrics: dict
+        self,
+        owner: PlanOwner,
+        run_id: str,
+        verified: list[dict],
+        metrics: dict,
+        *,
+        platform_task_id: str | None = None,
     ) -> None:
         """Accept only results verified by an application-owned artifact reader."""
         validate_persisted_payload(verified)
         validate_persisted_payload(metrics)
         with write_transaction(self.engine) as conn:
             row = self._run(conn, owner, run_id)
+            current = (row["attributes"] or {}).get("current_submission_id")
+            task_id = _current_platform_task(conn, row)
+            if platform_task_id and task_id != platform_task_id:
+                return
             if row["state"] != "waiting_artifacts":
                 raise ValueError("execution is not awaiting verified artifacts")
             policy = (row.get("task_spec") or {}).get("execution_policy") or {}
             contract = policy.get("artifact_contract", "evaluation")
-            if contract == "data":
-                raise ValueError("data files must be committed with their task result")
+            if contract != "evaluation":
+                raise ValueError("only platform evaluation artifacts are registered")
             expected = (
-                {"report", contract}
-                if contract != "evaluation"
-                else {"metrics.json", "report.json", "predictions.jsonl"}
+                {"metrics.json", "report.json", "predictions.jsonl"}
                 if row["task_spec"]
                 else set(row["proposal"].get("expected_artifacts", []))
             )
@@ -1687,31 +1651,21 @@ class SQLExperimentExecutionStore:
                     active_key=None,
                 )
             )
-            if contract == "evaluation":
-                self.queue.put(
-                    conn,
-                    owner_key(owner),
-                    "role:" + row["role_id"],
-                    "report:" + run_id
-                    if not row["task_spec"]
-                    else "report:"
-                    + run_id
-                    + ":"
-                    + str(
-                        conn.execute(
-                            sa.select(submissions.c.task_id)
-                            .where(submissions.c.run_id == run_id)
-                            .order_by(submissions.c.updated_at.desc())
-                        ).scalar()
-                    )
-                    + ":",
-                    "generate_report",
-                    {
-                        "run_id": run_id,
-                        "owner": owner.model_dump(mode="json"),
-                        **({"message": ""} if row["task_spec"] else {}),
-                    },
-                )
+            self.queue.put(
+                conn,
+                owner_key(owner),
+                "role:" + row["role_id"],
+                "report:" + run_id
+                if not row["task_spec"]
+                else "report:" + run_id + ":" + str(task_id) + ":",
+                "execute_task" if current else "generate_report",
+                {
+                    "run_id": run_id,
+                    "owner": owner.model_dump(mode="json"),
+                    **({"message": ""} if row["task_spec"] else {}),
+                    **({"platform_followup": task_id} if current else {}),
+                },
+            )
             self.changed(conn, owner, run_id, "artifacts")
 
     def pending_deliveries(self) -> list[dict]:
@@ -1740,6 +1694,7 @@ class SQLExperimentExecutionStore:
             if row["state"] in {
                 "cancelled",
                 "succeeded",
+                "reported",
                 "failed",
                 "rejected",
                 "abandoned",
@@ -1924,7 +1879,7 @@ class SQLExperimentExecutionStore:
                     .order_by(submissions.c.updated_at.desc())
                 ).mappings()
             ]
-            row["submission"] = row["submissions"][0] if row["submissions"] else None
+            row["submission"] = _current_submission(row, row["submissions"])
             if row["state"] == "queued" and item["kind"] in {
                 "execute_task",
                 "prepare_execution",

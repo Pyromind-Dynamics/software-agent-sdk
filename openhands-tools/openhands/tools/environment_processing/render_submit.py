@@ -45,7 +45,8 @@ from openhands.tools.pyromind_dataset.definition import (
     upload_local_file_to_pyromind,
 )
 from openhands.tools.utils.platform_env import (
-    resolve_platform_env,
+    platform_client_route,
+    platform_cluster_target,
 )
 from openhands.tools.utils.storage_paths import to_tool_storage_path
 from openhands.tools.utils.workspace_staging import (
@@ -533,13 +534,10 @@ class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
                 raise ValueError(
                     "Platform auth_token missing from conversation secrets."
                 )
-            platform_env = resolve_platform_env(self._env)
-            cluster = self._cluster or ""
-            if not cluster:
-                raise ValueError(
-                    "cluster not wired into the edp_render tool; the platform "
-                    "request should provide an x-cluster header."
-                )
+            route = platform_client_route(
+                self._headers, cluster=self._cluster, env=self._env
+            )
+            platform_env, cluster = platform_cluster_target(route)
 
             if self._runtime_dir is None:
                 raise ValueError("render runtime_dir not configured.")

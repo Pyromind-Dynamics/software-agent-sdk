@@ -14,8 +14,8 @@
 平台 API 认证与 validate_workflow 工具对齐: cookie / x-cluster /
 authorization 三个 header 小写透传,分别从环境变量 PYROMIND_COOKIE /
 X_CLUSTER / PYROMIND_AUTHORIZATION 读取,或通过 --cookie / --cluster /
---authorization 参数传入;base URL 按 APP_ENV(prod/production/online 走
-正式环境,否则 pre 环境)推断,可用 --api-base 或 PYROMIND_API_BASE 覆盖。
+--authorization 参数传入。集群缺失时使用 us-west-1，base URL 按集群后缀
+推断，可用 --api-base 或 PYROMIND_API_BASE 覆盖。
 凭证优先从 --api-key 或 --creds-file(resolve-target 的 --creds-out
 产物)读取,否则回退环境变量。
 """
@@ -43,7 +43,7 @@ from data_sources import create_data_source, detect_data_source
 
 PRE_API_BASE = "https://pre-api-portal.pyromind.ai/std2/studio_api/"
 PROD_API_BASE = "https://api-portal.pyromind.ai/std2/studio_api/"
-_PROD_APP_ENVS = {"prod", "production", "online"}
+DEFAULT_CLUSTER = "us-west-1"
 _CREDENTIAL_KEY_MARKERS = (
     "API_KEY",
     "APIKEY",
@@ -106,7 +106,7 @@ def _ssl_context() -> ssl.SSLContext:
 class PlatformClient:
     """Pyromind studio_api 客户端(task_workflow_result / 节点日志 / 节点输出)。"""
 
-    base_url: str = PRE_API_BASE
+    base_url: str = PROD_API_BASE
     cookie: str = ""
     cluster: str = ""
     authorization: str = ""
@@ -118,8 +118,7 @@ class PlatformClient:
         }
         if self.cookie:
             headers["cookie"] = self.cookie
-        if self.cluster:
-            headers["x-cluster"] = self.cluster
+        headers["x-cluster"] = self.cluster.strip() or DEFAULT_CLUSTER
         if self.authorization:
             headers["authorization"] = self.authorization
         return headers
@@ -446,7 +445,7 @@ class TrainingAnalysisService:
         task_id = task_id.strip()
         run_url_entity, run_url_project, run_url_id = _parse_run_url(run_url)
         client = PlatformClient(
-            base_url=api_base or _default_api_base(),
+            base_url=api_base or _default_api_base(cluster),
             cookie=cookie,
             cluster=cluster,
             authorization=authorization,
@@ -837,19 +836,19 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
-def _default_api_base() -> str:
+def _default_api_base(cluster: str = "") -> str:
     configured = os.environ.get("PYROMIND_API_BASE", "").strip()
     if configured:
         return configured
-    app_env = os.environ.get("APP_ENV", "").lower()
-    return PROD_API_BASE if app_env in _PROD_APP_ENVS else PRE_API_BASE
+    env = cluster.partition("#")[2].strip().lower()
+    if env == "pre2":
+        return PRE_API_BASE.replace("pre-api-portal", "pre2-api-portal")
+    return PRE_API_BASE if env == "pre" else PROD_API_BASE
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--api-base", default=os.environ.get("PYROMIND_API_BASE", _default_api_base())
-    )
+    parser.add_argument("--api-base", default="")
     parser.add_argument("--cookie", default=os.environ.get("PYROMIND_COOKIE", ""))
     parser.add_argument("--cluster", default=os.environ.get("X_CLUSTER", ""))
     parser.add_argument(

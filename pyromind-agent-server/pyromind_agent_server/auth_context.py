@@ -4,20 +4,16 @@ from fastapi import Request
 from pyromind_runtime.domain.context import RequestContext
 
 from openhands.agent_server.dependencies import get_current_user_id
-from openhands.agent_server.pyromind_auth import CurrentLoginUser
+from openhands.tools.utils.platform_env import cluster_header
 
 
 def request_context(request: Request) -> RequestContext:
     """Copy request-scoped identity and headers without persisting credentials."""
-    current_user = getattr(request.state, "current_user", None)
-    x_cluster = request.headers.get("x-cluster")
-    if isinstance(current_user, CurrentLoginUser) and current_user.x_cluster:
-        x_cluster = current_user.x_cluster
     return RequestContext(
         user_id=get_current_user_id(request) or "anonymous",
         cookie=request.headers.get("cookie"),
         authorization=request.headers.get("authorization"),
-        x_cluster=x_cluster,
+        x_cluster=cluster_header(request.headers),
         accept_language=request.headers.get("accept-language"),
     )
 
@@ -29,6 +25,6 @@ def evaluation_request_context(request: Request) -> RequestContext:
         or "anonymous",
         cookie=request.headers.get("cookie"),
         authorization=request.headers.get("authorization"),
-        x_cluster=request.headers.get("x-cluster"),
+        x_cluster=cluster_header(request.headers),
         accept_language=request.headers.get("accept-language"),
     )

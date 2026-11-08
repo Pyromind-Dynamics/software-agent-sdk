@@ -220,18 +220,16 @@ test("notifications arriving during a reply are durable, deduplicated and draine
 });
 
 
-test("recovery recognizes native custom_message delivery and legacy receipts", () => {
+test("recovery identifies callback delivery by its notification run ID", () => {
   const runId = "callback:graph-1:succeeded";
-  for (const details of [{ notification_run_id: runId }, { task_id: "graph-1", status: "succeeded" }]) {
-    const manager = SessionManager.inMemory();
-    manager.appendCustomEntry("pyromind.notification", { runId, message: { content: "result" } });
-    assert.equal(notificationWasDelivered(manager.getBranch(), runId), false);
-    manager.appendCustomMessageEntry("pyromind.external_task", "result", false, details);
-    assert.equal(notificationWasDelivered(manager.getBranch(), runId), true);
-    assert.equal(notificationWasDelivered(manager.getBranch(), "callback:other:succeeded"), false);
-  }
+  const manager = SessionManager.inMemory();
+  manager.appendCustomEntry("pyromind.notification", { runId, message: { content: "result" } });
+  assert.equal(notificationWasDelivered(manager.getBranch(), runId), false);
+  manager.appendCustomMessageEntry("pyromind.external_task", "result", false, { notification_run_id: runId });
+  assert.equal(notificationWasDelivered(manager.getBranch(), runId), true);
+  assert.equal(notificationWasDelivered(manager.getBranch(), "callback:other:succeeded"), false);
   const completed = SessionManager.inMemory();
-  completed.appendCustomEntry("pyromind.notification.finished", { runId });
+  completed.appendCustomEntry("pyromind.notification.finished", { runId, status: "completed" });
   assert.equal(notificationWasDelivered(completed.getBranch(), runId), true);
 });
 

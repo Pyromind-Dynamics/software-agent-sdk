@@ -31,9 +31,7 @@ WebSocket 桥接（与 `pyromind terminal <sandbox-id> --cluster <集群>` CLI �
 ## 典型流程
 
 1. **创建**：`sandbox_create(name=..., wait_timeout=600)`；`image` 不传时优先使用
-   服务端配置的 `PYROMIND_SANDBOX_DEFAULT_IMAGE`，未配置时按集群选择默认镜像：
-   - us-west-2 → `pyrominddynamics/jupyter-lab-with-ssh:v0.9-aws`
-   - 其他集群（如 us-west-1）→ `pyrominddynamics/jupyter-lab-with-ssh:v0.9`
+   服务端配置的 `PYROMIND_SANDBOX_DEFAULT_IMAGE`，未配置时使用 `pyrominddynamics/jupyter-lab-with-ssh:v0.9`。
    - 可选：`cpu`（默认 4）、`memory`（默认 cpu×2Gi）、`volume_mounts`
      （如 `[{"host_path": "/workspace", "mount_path": "/data"}]`，之后
      `sandbox_read_file` 用容器内路径 `/data/...`）、`port_mappings`

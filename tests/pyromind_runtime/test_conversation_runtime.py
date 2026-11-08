@@ -1079,6 +1079,29 @@ async def test_promptless_conversation_is_released_after_grace(tmp_path) -> None
     await runtime.close()
 
 
+async def test_session_with_pending_adapter_wake_is_retained(tmp_path) -> None:
+    class WakeAdapter(FakeAdapter):
+        pending = True
+
+        async def has_pending_session_work(self, handle) -> bool:
+            assert handle.session_id == "pending-wake"
+            return self.pending
+
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = WakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter)
+    try:
+        await _create(runtime, conversations, "pending-wake")
+        assert not await runtime._release("pending-wake", reason="idle")
+        assert adapter.closed == []
+        adapter.pending = False
+        assert await runtime._release("pending-wake", reason="idle")
+        assert adapter.closed == ["pending-wake"]
+    finally:
+        await runtime.close()
+
+
 async def test_released_conversation_purges_after_retention_window(tmp_path) -> None:
     conversations = tmp_path / "conversations"
     conversations.mkdir()

@@ -281,9 +281,10 @@ def _upload_local_file_once(
     filename = local_path.name
     storage_path = str(PurePosixPath(target_dir) / filename)
     file_size = local_path.stat().st_size
+    base_url = platform_portal_url(storage_base_url, headers).rstrip("/")
     try:
         response = httpx.post(
-            f"{platform_portal_url(storage_base_url).rstrip('/')}/presigned_upload_url",
+            f"{base_url}/presigned_upload_url",
             headers=platform_headers(headers),
             json={
                 "filename": filename,
@@ -426,9 +427,10 @@ def _upload_local_file_multipart(
                 error_label=part_label,
             )
 
+    base_url = platform_portal_url(storage_base_url, headers).rstrip("/")
     try:
         complete_response = httpx.post(
-            f"{platform_portal_url(storage_base_url).rstrip('/')}/multipart_complete",
+            f"{base_url}/multipart_complete",
             headers=platform_headers(headers),
             json={
                 "path": target_dir,
@@ -470,9 +472,10 @@ def request_storage_url(
     body: dict[str, Any] = {"path": storage_path}
     if force_download is not None:
         body["force_download"] = force_download
+    base_url = platform_portal_url(storage_base_url, headers).rstrip("/")
     try:
         response = httpx.post(
-            f"{platform_portal_url(storage_base_url).rstrip('/')}/get_url",
+            f"{base_url}/get_url",
             headers=platform_headers(headers),
             json=body,
             timeout=timeout,
@@ -1080,9 +1083,10 @@ def storage_file_names(
     Callers use this for advisory checks such as overwrite warnings, so an
     unreachable listing API must never block the operation it guards.
     """
+    base_url = platform_portal_url(storage_base_url, headers).rstrip("/")
     try:
         response = httpx.post(
-            f"{platform_portal_url(storage_base_url).rstrip('/')}/file_list",
+            f"{base_url}/file_list",
             headers=platform_headers(headers),
             json={"path": directory, "search": search},
             timeout=timeout,

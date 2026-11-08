@@ -59,6 +59,16 @@ test('short inline results do not create report copies', async t => {
   assert.equal(f.writes(),0);
 });
 
+test('the managed handoff reads only the final output of the matching child', async t => {
+  const f = await fixture(t);
+  const own = await f.record();
+  const foreign = await f.record(randomUUID(), randomUUID());
+  assert.match(await f.reports.finalOutput(own.id, 'search'), /FINAL_MARKER$/);
+  assert.equal(await f.reports.finalOutput(own.id, 'general_purpose'), '');
+  assert.equal(await f.reports.finalOutput(foreign.id, 'search'), '');
+  assert.equal(f.writes(), 0);
+});
+
 test('failures retain native references, avoid same-turn retries, and retry next turn', async t => {
   const f=await fixture(t);const r=await f.record();f.fail(true);
   const failed=await f.reports.transform(r.content,r.details);

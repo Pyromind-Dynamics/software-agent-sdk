@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, cast
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pyromind_runtime.application.delegated_execution import DelegatedExecution
 from pyromind_runtime.application.evaluation_annotations import (
@@ -139,6 +139,7 @@ from pyromind_runtime.ports.harness import (
     ProductCheckpoint,
     RestoreWorkflowSpec,
     SessionHandle,
+    SessionLivenessAdapter,
     SessionSpec,
     SubmissionReceiptReader,
 )
@@ -155,6 +156,8 @@ from pyromind_runtime.ports.workflows import WorkflowBackend
 
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_EXECUTION_WORKER_CONCURRENCY = 24
 
 _FORK_EVENT_TYPES = frozenset(
     {
@@ -401,12 +404,13 @@ class ConversationRuntime:
         ):
             raise PermissionError("delegated work owner mismatch")
         if tool == "submit_workflow":
-            identity = (
-                "execution-workflow:"
-                + str(scope["run_id"])
-                + ":"
-                + str(scope["work_id"])
+            call_id = scope.get("tool_call_id")
+            call = (
+                uuid5(NAMESPACE_URL, f"{scope['work_id']}:{call_id}")
+                if call_id
+                else scope["work_id"]
             )
+            identity = f"execution-workflow:{scope['run_id']}:{call}"
             assert self._delegated_store is not None
             return await self.prepare_workflow_execution(
                 owner.conversation_id,
@@ -589,59 +593,51 @@ class ConversationRuntime:
         self._subscribers.setdefault(owner.conversation_id, set()).add(updates)
         try:
 
-            def completed(identity: str) -> bool:
-                return any(
+            def message_run(event: ProductEvent, identity: str) -> str | None:
+                if (
+                    event.type == "message.completed"
+                    and event.payload.get("role") == "user"
+                    and event.payload.get("command_id") == identity
+                ):
+                    return event.run_id
+                return None
+
+            def settled(
+                event: ProductEvent, identity: str, delivered_run: str | None
+            ) -> bool:
+                return (
                     event.type == "status.changed"
                     and event.payload.get("status") != "running"
                     and (
                         event.run_id == identity
                         or (event.run_id or "").startswith(identity + ":")
+                        or (delivered_run is not None and event.run_id == delivered_run)
                     )
-                    for event in store.replay()
                 )
+
+            def completed(identity: str) -> bool:
+                delivered_run = None
+                for event in store.replay():
+                    delivered_run = message_run(event, identity) or delivered_run
+                    if settled(event, identity, delivered_run):
+                        return True
+                return False
 
             recovering = item["attempts"] > 1
             response = None
-            while not recovering and store.load_snapshot().status == "running":
+            while not recovering:
+                snapshot = store.load_snapshot()
+                if snapshot.status != "running" or snapshot.active_run_id is None:
+                    break
                 await updates.get()
-            if "command" in item["payload"]:
-                command = UserMessageCommand.model_validate(item["payload"]["command"])
-                receipt, _ = store.claim_command(command)
-                if receipt.status == "completed":
-                    if completed(command.command_id):
-                        return {"delivered": True}
-                    if store.load_snapshot().automatic_turns_suspended:
-                        raise PermissionError("automatic turns are suspended")
-                    notice_id = "accepted-message:" + command.command_id
-                    expected = f"callback:{notice_id}:succeeded"
-                    if completed(expected):
-                        return {"delivered": True}
-                    response = await active.adapter.notify_external_task(
-                        active.handle,
-                        ExternalTaskNotification(
-                            task_id=notice_id,
-                            kind="accepted_message",
-                            status="succeeded",
-                            resume_interrupted=True,
-                            hidden_text=(
-                                "Resume the already accepted user message after "
-                                "interruption. Read the experiment context and "
-                                "existing executions first; continue existing work "
-                                "without launching a duplicate evaluation. "
-                                "Do not append the original user message again."
-                            ),
-                        ),
-                        active.context,
-                    )
-                else:
-                    expected = command.command_id
-                    await self._send_claimed(
-                        owner.conversation_id, command, receipt, active.context
-                    )
-            else:
+            command = UserMessageCommand.model_validate(item["payload"]["command"])
+            receipt, _ = store.claim_command(command)
+            if receipt.status == "completed":
+                if completed(command.command_id):
+                    return {"delivered": True}
                 if store.load_snapshot().automatic_turns_suspended:
                     raise PermissionError("automatic turns are suspended")
-                notice_id = item["payload"]["notice_id"]
+                notice_id = "accepted-message:" + command.command_id
                 expected = f"callback:{notice_id}:succeeded"
                 if completed(expected):
                     return {"delivered": True}
@@ -649,17 +645,33 @@ class ConversationRuntime:
                     active.handle,
                     ExternalTaskNotification(
                         task_id=notice_id,
-                        kind="experiment_task",
+                        kind="accepted_message",
                         status="succeeded",
                         resume_interrupted=True,
-                        hidden_text="Delegated task update. Use these verified facts "
-                        "and decide within the user's goal.\n"
-                        + json.dumps(item["payload"]["result"], ensure_ascii=False),
+                        hidden_text=(
+                            "Resume the already accepted user message after "
+                            "interruption. Read the experiment context and "
+                            "existing executions first; continue existing work "
+                            "without launching a duplicate evaluation. "
+                            "The accepted instruction below may have been "
+                            "queued before the previous run stopped. "
+                            "Do not append it as another user message.\n"
+                            + json.dumps(
+                                [
+                                    block.model_dump(mode="json")
+                                    for block in command.content
+                                ],
+                                ensure_ascii=False,
+                            )
+                        ),
                     ),
                     active.context,
                 )
-                if response.get("duplicate") and completed(expected):
-                    return {"delivered": True}
+            else:
+                expected = command.command_id
+                await self._send_claimed(
+                    owner.conversation_id, command, receipt, active.context
+                )
             if response and response.get("completed"):
                 event, _ = store.append(
                     ProductEvent(
@@ -676,16 +688,11 @@ class ConversationRuntime:
                 )
                 self._publish(event)
                 return {"delivered": True}
+            delivered_run = None
             while True:
                 event = await updates.get()
-                if (
-                    (
-                        event.run_id == expected
-                        or (event.run_id or "").startswith(expected + ":")
-                    )
-                    and event.type == "status.changed"
-                    and event.payload.get("status") != "running"
-                ):
+                delivered_run = message_run(event, expected) or delivered_run
+                if settled(event, expected, delivered_run):
                     break
             return {"delivered": True}
         finally:
@@ -821,11 +828,23 @@ class ConversationRuntime:
         if policy.configuration_version <= store.configuration_version():
             return True
         async with self._activation_locks.setdefault(conversation_id, asyncio.Lock()):
-            if store.load_snapshot().status == "running":
+            snapshot = store.load_snapshot()
+            if snapshot.status == "running" or _has_active_subagents(snapshot):
                 return False
             if prepared:
-                # Refresh capabilities without replacing the saved scenario contract.
+                # Refresh profile prompts and tools within the saved role boundary.
                 active = await self.get_project(conversation_id, context) is not None
+                saved_roles = set(store.access_policy()["delegated_roles"] or ())
+                roles = {
+                    name: role
+                    for role in policy.delegated_roles or ()
+                    if isinstance(name := role.get("name"), str)
+                }
+                refreshed_roles = (
+                    tuple(role for name, role in roles.items() if name in saved_roles)
+                    if saved_roles and saved_roles <= roles.keys()
+                    else None
+                )
                 policy = policy.model_copy(
                     update={
                         "tool_allowlist": policy.development_tool_allowlist
@@ -834,22 +853,13 @@ class ConversationRuntime:
                         "skill_allowlist": policy.development_skill_allowlist
                         if active and policy.development_skill_allowlist is not None
                         else policy.skill_allowlist,
-                        "product_instructions": None,
-                        "delegated_roles": None,
+                        "product_instructions": policy.product_instructions
+                        if refreshed_roles
+                        else None,
+                        "delegated_roles": refreshed_roles or None,
                         "managed_delegation": None,
                     }
                 )
-            owner = PlanOwner(
-                user_id=context.user_id,
-                conversation_id=conversation_id,
-                profile_id=context.profile_id,
-            )
-            if self._delegated_store and not prepared:
-                if not await self._plan_io(
-                    self._delegated_store.retire_legacy_work, owner
-                ):
-                    return False
-            snapshot = store.load_snapshot()
             handle = SessionHandle(
                 session_id=conversation_id,
                 adapter_session_ref=conversation_id,
@@ -1095,7 +1105,8 @@ class ConversationRuntime:
         port = self._experiment_executions.store
         for notification in await self._plan_io(port.pending_deliveries):
             conversation_id = notification["conversation_id"]
-            event, _ = self._store(conversation_id).append(
+            store = self._store(conversation_id)
+            event, _ = store.append(
                 ProductEvent(
                     event_id="execution:" + notification["id"],
                     conversation_id=conversation_id,
@@ -1117,35 +1128,6 @@ class ConversationRuntime:
                 )
                 if row:
                     self._project_managed_tasks(conversation_id, row)
-                if (
-                    row
-                    and row.get("task_spec")
-                    and row["report_state"] in {"ready", "failed"}
-                ):
-                    result = {
-                        "run_id": row["id"],
-                        "state": row["state"],
-                        "report_state": row["report_state"],
-                        "metrics": row.get("metrics"),
-                        **(row.get("result") or {}),
-                    }
-                    import hashlib
-
-                    notice_id = (
-                        row["id"]
-                        + ":"
-                        + hashlib.sha256(
-                            json.dumps(
-                                result, sort_keys=True, ensure_ascii=False
-                            ).encode()
-                        ).hexdigest()
-                    )
-                    await self._plan_io(
-                        self._delegated_store.enqueue_manager,
-                        owner,
-                        "notice:" + notice_id,
-                        {"notice_id": notice_id, "result": result},
-                    )
             await self._plan_io(port.acknowledge_delivery, notification["id"])
 
     def _project_managed_tasks(self, conversation_id: str, row: dict) -> None:
@@ -1189,12 +1171,18 @@ class ConversationRuntime:
                     conversation_id, task.task_id, status
                 )
 
-    async def start_execution_events(self) -> None:
+    async def start_execution_events(
+        self,
+        *,
+        execution_worker_concurrency: int = DEFAULT_EXECUTION_WORKER_CONCURRENCY,
+    ) -> None:
         if (
             self._execution_event_task is not None
             or self._experiment_executions is None
         ):
             return
+        if execution_worker_concurrency < 1:
+            raise ValueError("execution worker concurrency must be positive")
         if self._delegated_store:
             await self._plan_io(self._delegated_store.recover_submissions)
 
@@ -1217,7 +1205,7 @@ class ConversationRuntime:
 
         self._execution_event_task = asyncio.create_task(publish_loop())
         if self._execution_worker:
-            await self._execution_worker.start()
+            await self._execution_worker.start(concurrency=execution_worker_concurrency)
         if self._guidance_worker:
             await self._guidance_worker.start(concurrency=1)
 
@@ -3147,11 +3135,9 @@ class ConversationRuntime:
                 profile_id=context.profile_id,
             )
             await self._plan_io(
-                self._delegated_store.enqueue_manager,
+                self._delegated_store.enqueue_manager_message,
                 owner,
-                "user:" + command.command_id,
-                {"command": command.model_dump(mode="json")},
-                10,
+                command,
             )
             return receipt
         if isinstance(command, InputResponseCommand):
@@ -3232,13 +3218,15 @@ class ConversationRuntime:
                     self._complete_failed_command(store, receipt, error)
                     raise
             try:
-                if (
-                    isinstance(command, CancelCommand)
-                    and store.load_snapshot().pending_inputs
-                ):
-                    await self._user_input.interrupt_pending(
-                        store, conversation_id, "run_cancelled"
-                    )
+                if isinstance(command, CancelCommand):
+                    if active.handle.adapter_delivers_delegated_results:
+                        await self._user_input.suspend(
+                            store, conversation_id, "run_cancelled"
+                        )
+                    if store.load_snapshot().pending_inputs:
+                        await self._user_input.interrupt_pending(
+                            store, conversation_id, "run_cancelled"
+                        )
                 response = await active.adapter.send(active.handle, command, context)
             except Exception as exc:
                 if isinstance(command, UserMessageCommand):
@@ -4941,7 +4929,8 @@ class ConversationRuntime:
                 # work settles, instead of dropping the release for good.
                 self._schedule_release(conversation_id)
                 return
-            await self._release(conversation_id, reason="run_finished_grace")
+            if not await self._release(conversation_id, reason="run_finished_grace"):
+                self._schedule_release(conversation_id)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -4958,7 +4947,9 @@ class ConversationRuntime:
         if timer is not None and timer is not asyncio.current_task():
             timer.cancel()
 
-    def _is_releasable(self, active: _ActiveConversation) -> bool:
+    def _is_releasable(
+        self, active: _ActiveConversation, *, lock_held: bool = False
+    ) -> bool:
         if self._workflows and self._workflows.busy(active.handle.session_id):
             return False
         """Report whether a live conversation can be torn down right now.
@@ -4971,7 +4962,7 @@ class ConversationRuntime:
         if active.inflight > 0:
             return False
         lock = self._activation_locks.get(active.handle.session_id)
-        if lock is not None and lock.locked():
+        if not lock_held and lock is not None and lock.locked():
             return False
         try:
             snapshot = self._store(active.handle.session_id).load_snapshot()
@@ -5004,27 +4995,43 @@ class ConversationRuntime:
                 for active_id, active in self._active.items()
                 if active_id != conversation_id and self._is_releasable(active)
             ]
-            if not candidates:
+            for candidate in sorted(candidates, key=lambda active: active.last_access):
+                if await self._release(candidate.handle.session_id, reason="capacity"):
+                    break
+            else:
                 raise ProductRuntimeError(
                     "capacity_exceeded",
                     "Agent server is at capacity and every active conversation "
                     "is busy; retry shortly.",
                 )
-            oldest = min(candidates, key=lambda active: active.last_access)
-            await self._release(oldest.handle.session_id, reason="capacity")
 
-    async def _release(self, conversation_id: str, *, reason: str) -> None:
+    async def _release(self, conversation_id: str, *, reason: str) -> bool:
         # Keep the activation lock until the harness has released its resources.
         # Removing _active alone must not allow a second runner to start while
         # the previous runner still owns its IPC socket or execution workspace.
         lock = self._activation_locks.setdefault(conversation_id, asyncio.Lock())
         async with lock:
-            await self._release_locked(conversation_id, reason=reason)
+            active = self._active.get(conversation_id)
+            if active is None:
+                return True
+            if isinstance(active.adapter, SessionLivenessAdapter):
+                try:
+                    async with asyncio.timeout(2):
+                        if await active.adapter.has_pending_session_work(active.handle):
+                            return False
+                except (OSError, RuntimeError, TimeoutError):
+                    logger.warning("Unable to check session liveness", exc_info=True)
+                    return False
+            if not self._is_releasable(active, lock_held=True):
+                return False
+            await self._release_locked(active, reason=reason)
+            return True
 
-    async def _release_locked(self, conversation_id: str, *, reason: str) -> None:
-        active = self._active.pop(conversation_id, None)
-        if active is None:
-            return
+    async def _release_locked(
+        self, active: _ActiveConversation, *, reason: str
+    ) -> None:
+        conversation_id = active.handle.session_id
+        self._active.pop(conversation_id)
         self._cancel_release(conversation_id)
         for key in [
             key for key in self._first_delta_started_at if key[0] == conversation_id

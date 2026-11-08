@@ -103,7 +103,7 @@ async def test_artifact_report_recovers_only_known_context(
     service.store.ingest("done", "task-1", "callback", {"status": "succeeded"})
     service.store.apply_observations()
     service.store.queue_artifact_report(owner, run["id"])
-    item = service.store.queue.claim(kinds=("generate_report",))
+    item = service.store.queue.claim(kinds=("execute_task",))
     assert item is not None
     calls = []
 
@@ -148,6 +148,74 @@ async def test_artifact_report_recovers_only_known_context(
     assert len(submission.submissions) == 1
 
 
+@pytest.mark.parametrize(
+    ("child_status", "reply", "expected_state", "report_state"),
+    [
+        (
+            "succeeded",
+            "Training finished. See `{report_path}`.",
+            "succeeded",
+            "ready",
+        ),
+        ("succeeded", " ", "waiting_artifacts", "failed"),
+        ("failed", "Host disconnected", "waiting_artifacts", "failed"),
+    ],
+)
+async def test_model_report_accepts_the_native_completion(
+    training_execution, child_status, reply, expected_state, report_state
+):
+    runtime, service, owner, run, scope, submission, _ = training_execution
+    prepared = await stage(runtime, owner, scope)
+    await approve(runtime, owner, prepared["request_id"], "approval")
+    service.store.queue.finish(scope["work_id"], scope["generation"], {})
+    service.store.ingest("done", "task-1", "callback", {"status": "succeeded"})
+    service.store.apply_observations()
+    service.store.queue_artifact_report(owner, run["id"])
+    item = service.store.queue.claim(kinds=("execute_task",))
+    assert item is not None
+    reply = reply.format(
+        report_path=f"public_data/experiment-runs/{run['id']}/public_data/report.md"
+    )
+
+    async def control(_owner, _role, request):
+        if request["action"] == "authorize":
+            return {"status": "authorized"}
+        assert request["action"] == "spawn"
+        assert "record_experiment_result" not in request["task"]
+        return {
+            "execution_ref": "report-child",
+            "status": child_status,
+            "result_text": reply,
+        }
+
+    delegated = DelegatedExecution(service.plans, service.store, control)
+    await delegated.prepare(item)
+
+    view = service.list(owner)[0]
+    assert (view.state, view.report_state) == (expected_state, report_state)
+    assert view.artifacts == ()
+    assert len(submission.submissions) == 1
+    if report_state == "ready":
+        assert view.summary == reply
+        assert service.store.list(owner)[0]["active_key"] is None
+        eval_request = request(
+            "evaluate-output",
+            task={
+                "name": "Evaluate training output",
+                "instruction": "Use the registered model.",
+                "artifact_refs": [
+                    {
+                        "input_name": "model_path",
+                        "task_run_id": run["id"],
+                        "artifact_name": "model",
+                    }
+                ],
+            },
+        )
+        with pytest.raises(ValueError, match="unknown artifact"):
+            service.request(owner, eval_request, ("eval",))
+
+
 @pytest.mark.parametrize("reported", [False, True])
 @pytest.mark.parametrize("legacy", [False, True])
 async def test_failed_workflow_can_be_revised_and_resubmitted(
@@ -168,7 +236,7 @@ async def test_failed_workflow_can_be_revised_and_resubmitted(
         raise AssertionError("failed tasks have no model artifacts")
 
     await service.poll(query, read)
-    item = service.store.queue.claim(kinds=("generate_report",))
+    item = service.store.queue.claim(kinds=("execute_task",))
     assert item is not None
     assert "without submitting" not in item["payload"]["message"]
     scope = {
@@ -177,12 +245,13 @@ async def test_failed_workflow_can_be_revised_and_resubmitted(
         "generation": item["generation"],
     }
     if reported:
-        service.store.record_result(
+        service.store.complete_agent_turn(
             owner,
             run["id"],
             scope,
-            {"summary": "Configuration failed", "blockers": ["Invalid input"]},
-            {"uri": "failure-report.md", "sha256": "a" * 64},
+            "Configuration failed. See `failure-report.md`.",
+            report=True,
+            completed=True,
         )
         service.store.queue.finish(scope["work_id"], scope["generation"], {})
         service.store.continue_task(owner, run["id"], "continue", "Fix the input")
@@ -203,8 +272,8 @@ async def test_failed_workflow_can_be_revised_and_resubmitted(
     assert row["result"] is None and row["artifacts"] == []
     if reported:
         assert (
-            row["submissions"][0]["evidence"]["artifacts"]["agent_report"]["sha256"]
-            == "a" * 64
+            row["submissions"][0]["evidence"]["result"]["summary"]
+            == "Configuration failed. See `failure-report.md`."
         )
     service.store.queue.finish(scope["work_id"], scope["generation"], {})
 
@@ -266,18 +335,21 @@ async def test_restart_during_resubmission_preserves_failed_receipt(
 
 
 @pytest.mark.parametrize("status", ["pending", "running", "succeeded"])
-async def test_nonfailed_submission_cannot_be_replaced(training_execution, status):
+async def test_new_workflow_call_can_submit_after_platform_acceptance(
+    training_execution, status
+):
     runtime, service, owner, run, scope, submission, _ = training_execution
-    first = await stage(runtime, owner, scope)
+    first = await stage(runtime, owner, {**scope, "tool_call_id": "first"})
     await approve(runtime, owner, first["request_id"], "first-approval")
     service.store.ingest("status", "task-1", "callback", {"status": status})
     service.store.apply_observations()
-    service.store.queue.finish(scope["work_id"], scope["generation"], {})
-    service.store.continue_task(owner, run["id"], "continue", "Inspect")
-    scope = claim(service, owner, run)
-    with pytest.raises(ValueError, match="already staged|cannot stage"):
-        await stage(runtime, owner, scope)
-    assert len(submission.submissions) == 1
+    next_call = {**scope, "tool_call_id": "second"}
+    second = await stage(runtime, owner, next_call)
+    assert second["request_id"] != first["request_id"]
+    assert await stage(runtime, owner, next_call) == second
+    await approve(runtime, owner, second["request_id"], "second-approval")
+    assert len(submission.submissions) == 2
+    assert service.store.list(owner)[0]["submission"]["task_id"] == "task-2"
 
 
 @pytest.mark.parametrize("case", ["profile", "conversation", "lease", "task"])

@@ -90,17 +90,16 @@ Dataset 可用 ask_user 展示真实小样，或询问缺失输入和阻塞决�
 
 Train 的 submit_workflow 复用现有 permission.requested / permission_response；
 等待时 TaskRun 为 waiting_confirmation，用户确认后才创建提交账本并执行冻结工作流。
-平台任务、外部回调与 TaskRun 关联，平台成功后检查真实产物。数据输出必须属于本次
-提交的 output_dir；模型目录必须有配置与权重，且位于 training_analysis 从该平台任务
-解析出的输出目录下。目录摘要标注为目录清单范围，不声称已校验所有权重字节。
+平台任务、外部回调与 TaskRun 关联，评测的指标、预测和覆盖范围由 Runtime 校验。
+所有子 Agent 通过 Pi 原生完成通知返回 Markdown，详细证据和产物路径写入任务工作区
+的报告文件。Manager 用 read 打开报告并核对实际产物，再把 Storage 路径传入下游
+task.inputs。本地数据处理完成后标记为已交付报告，平台任务状态按真实回执流转。
+报告重试复用已有产物。
 
-record_experiment_result 新增可选 artifacts：数据使用 name=data、kind=file；模型使用
-name=model、kind=directory，并提供实际 uri。报告保存在任务工作区中。执行成功、
-产物待核验和报告失败仍为独立状态；报告重试不能重新提交清洗、训练或 GPU 推理。
-
-Manager 用 task.artifact_refs 绑定上游已验证产物，每项含 input_name、task_run_id、
-artifact_name。Runtime 检查同一用户、Profile、会话、Project 及上游报告就绪状态，
-解析并冻结 URI、摘要与来源；不接受与引用不一致的 inputs。已有资产仍可直接传 inputs。
+Manager 将报告中核对过的实际 Storage 路径传入下游 task.inputs。对 Runtime 已校验的
+平台评测文件，可用 task.artifact_refs 指定 input_name、task_run_id 和 artifact_name。
+Runtime 检查同一用户、Profile、会话、Project 和报告就绪状态，解析并冻结 URI、
+摘要与来源。
 Manager 按用户接受的范围推进 Dataset → Train → Eval，不新增 DAG 调度服务。
 
 前端继续复用 ChatPanel 呈现子角色 message/tool call，以及原 UserInputCard 呈现确认。

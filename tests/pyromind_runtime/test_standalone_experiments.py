@@ -162,9 +162,12 @@ async def test_training_analysis_accepts_platform_task_without_local_submission(
     async def read(*_):
         raise AssertionError("analysis uses the platform tool")
 
-    assert await service.role_call(
-        owner, "train", "training_analysis", arguments, scope, execute, read
-    ) == result
+    assert (
+        await service.role_call(
+            owner, "train", "training_analysis", arguments, scope, execute, read
+        )
+        == result
+    )
 
 
 def test_task_does_not_require_graph_or_plan_and_is_idempotent(experiment):
@@ -322,34 +325,29 @@ async def test_verified_result_and_report_retry_do_not_resubmit_evaluation(exper
         "work_id": item["id"],
         "generation": item["generation"],
     }
-    with pytest.raises(PermissionError, match="cannot start GPU"):
-        await service.role_call(
-            owner,
-            "eval",
-            "df_submit_evaluation",
-            {"operation": "inference"},
-            scope,
-            execute,
-            read,
-        )
-    await service.role_call(
+    replay = await service.role_call(
         owner,
         "eval",
-        "record_experiment_result",
-        {
-            "run_id": run["id"],
-            "summary": "One sample, no execution errors",
-            "report_uri": report_path,
-        },
+        "df_submit_evaluation",
+        {"operation": "inference"},
         scope,
         execute,
         read,
     )
+    assert replay["details"]["task_id"] == "platform-1"
+    service.store.complete_agent_turn(
+        owner,
+        run["id"],
+        scope,
+        f"One sample, no execution errors. Report: `{report_path}`.",
+        report=True,
+        completed=True,
+    )
     view = service.list(owner)[0]
     assert view.report_state == "ready" and view.summary
     assert (
-        next(a for a in view.artifacts if a["name"] == "agent_report")["sha256"]
-        == hashlib.sha256(payloads[report_path]).hexdigest()
+        next(a for a in view.artifacts if a["name"] == "report.json")["sha256"]
+        == hashlib.sha256(payloads["/outputs/one/report.json"]).hexdigest()
     )
     service.store.ingest("duplicate", "platform-1", "kafka", {"status": "succeeded"})
     service.store.apply_observations()
@@ -366,6 +364,60 @@ async def test_verified_result_and_report_retry_do_not_resubmit_evaluation(exper
         )
         == 1
     )
+
+
+@pytest.mark.parametrize(
+    "tool,operation",
+    [("df_submit_evaluation", "inference"), ("df_submit_pipeline", "pipeline")],
+)
+async def test_each_tool_call_can_submit_within_the_same_task(
+    experiment, tool, operation
+):
+    service, owner, _ = experiment
+    run = service.request(
+        owner, request(), ("eval",), execution_policy={"submission_tool": tool}
+    )
+    scope = claim(service, owner, run)
+    calls = []
+
+    async def execute(_owner, _role, tool_scope, _tool, arguments):
+        calls.append((tool_scope["operation_id"], arguments["input_path"]))
+        return {"details": {"task_id": f"task-{len(calls)}"}, "is_error": False}
+
+    async def read(*_):
+        raise AssertionError("submission does not read result artifacts")
+
+    async def submit(call_id, path):
+        return await service.role_call(
+            owner,
+            "eval",
+            tool,
+            {"operation": operation, "input_path": path},
+            {**scope, "tool_call_id": call_id},
+            execute,
+            read,
+        )
+
+    await submit("first", "/original")
+    await submit("second", "/revised")
+    assert (await submit("first", "/original"))["details"]["task_id"] == "task-1"
+    assert (await submit("second", "/revised"))["details"]["task_id"] == "task-2"
+    assert [path for _, path in calls] == ["/original", "/revised"]
+    assert calls[0][0] != calls[1][0]
+
+    service.store.ingest("older-result", "task-1", "callback", {"status": "failed"})
+    service.store.apply_observations()
+    view = service.list(owner)[0]
+    assert (view.run_id, view.platform_task_id, view.state) == (
+        run["id"],
+        "task-2",
+        "waiting_platform",
+    )
+    service.store.queue.finish(scope["work_id"], scope["generation"], {})
+    service.store.ingest("current-result", "task-2", "callback", {"status": "failed"})
+    await service.poll(execute, read)
+    followup = service.store.queue.claim(kinds=("execute_task",))
+    assert followup and followup["payload"]["run_id"] == run["id"]
 
 
 async def test_missing_artifacts_do_not_create_fake_success(experiment):

@@ -37,6 +37,18 @@ export class SubagentReports {
 
   beginTurn() { this.failures.clear(); }
 
+  async finalOutput(id: string, role: string): Promise<string> {
+    if (!new RegExp(`^${RUN_ID}$`).test(id) || !this.allowedRoles.includes(role)) return "";
+    for (const suffix of ["", "_0"]) {
+      const path = join(this.root, `${id}_${role}${suffix}_output.md`);
+      try {
+        await this.metadata(path);
+        return (await this.readFile(path, MAX_REPORT_BYTES)).trim().slice(0, 16000);
+      } catch { /* Native runs may use either filename or have no report. */ }
+    }
+    return "";
+  }
+
   async transform<C, D>(content: C, details: D, signal?: AbortSignal): Promise<{ content: C; details: D }> {
     const original = content;
     const text = strings([content, details]).join("\n");

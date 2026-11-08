@@ -1,5 +1,4 @@
 from collections.abc import Mapping
-from typing import Any
 from uuid import UUID
 
 from fastapi import Depends, HTTPException, Request, status
@@ -18,7 +17,11 @@ from openhands.agent_server.pyromind_auth import (
     get_dev_login_user_from_headers,
     parse_auth_token_from_cookie_header,
 )
-from openhands.tools.utils.platform_env import configured_platform_env
+from openhands.tools.utils.platform_env import (
+    cluster_header,
+    platform_cluster_route,
+    platform_cluster_target,
+)
 
 
 # Cookie name used to authenticate the workspace static-file routes.
@@ -110,49 +113,14 @@ def authenticate_request(request: Request, session_api_key: str | None) -> None:
     raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=LOGIN_REQUIRED_DETAIL)
 
 
-def load_base_env(request: Request):
-    def _parse_env_from_x_cluster(_x_cluster: str | None) -> str | None:
-        _DEFAULT_ENV = "prod"
-        if not _x_cluster:
-            return _DEFAULT_ENV
-        if "#" not in _x_cluster:
-            return _DEFAULT_ENV
-        env = _x_cluster.rsplit("#", 1)[-1].strip().lower()
-        # 这里返回的 env 可能是 pre 或 pre2。
-        return env or _DEFAULT_ENV
-
-    def _resolve_cluster_from_conversation(_x_cluster: str | None) -> str:
-        """
-        根据 x-cluster 头解析集群信息
-        x_cluster 格式为区域名，或区域名加环境后缀，例如 us-west-1#pre。
-        """
-        if _x_cluster and "#" in _x_cluster:
-            region = _x_cluster.split("#", 1)[0].strip()
-            if region:
-                return region
-        if _x_cluster:
-            return _x_cluster
-        raise ValueError(f"Can't resolve cluster from x-cluster: {_x_cluster}.")
-
-    if x_cluster := _get_validation_cluster_header(request):
-        request.state.env = configured_platform_env() or _parse_env_from_x_cluster(
-            x_cluster
-        )
-        request.state.cluster = _resolve_cluster_from_conversation(x_cluster)
+def load_base_env(request: Request) -> None:
+    request.state.env, request.state.cluster = platform_cluster_target(
+        cluster_header(request.headers)
+    )
 
 
-def _get_validation_cluster_header(
-    http_request: Request,
-    extra: dict[str, Any] | None = None,
-) -> str | None:
-    current_user = getattr(http_request.state, "current_user", None)
-    if isinstance(current_user, CurrentLoginUser) and current_user.x_cluster:
-        return current_user.x_cluster
-    if extra:
-        cluster = extra.get("x_cluster", extra.get("x-cluster"))
-        if cluster and isinstance(cluster, str):
-            return cluster
-    return http_request.headers.get("x-cluster")
+def _get_validation_cluster_header(http_request: Request) -> str:
+    return platform_cluster_route(cluster_header(http_request.headers))
 
 
 def get_current_user_id(request: Request) -> str | None:

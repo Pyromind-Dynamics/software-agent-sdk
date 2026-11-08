@@ -5,6 +5,8 @@ import httpx
 import pytest
 from pyromind_agent_server.api.router import create_product_router
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.domain.commands import UserMessageCommand
+from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.experiment_plans import PlanOwner
 
@@ -64,9 +66,7 @@ async def test_new_profile_has_no_graph_gate_and_artifacts_remain_isolated(
             assert [role.name for role in spec.delegated_roles] == ["eval"]
             assert "df_submit_evaluation" in spec.delegated_roles[0].tools
             assert "update_experiment_context" not in spec.delegated_roles[0].tools
-            run = await runtime.request_experiment_task(
-                identity, request(intent="prepare"), context
-            )
+            run = await runtime.request_experiment_task(identity, request(), context)
             assert run["revision"] is None and service.plans.view(owner).current is None
             snapshot = await client.get(f"{base}/{identity}/snapshot")
             assert (
@@ -74,29 +74,57 @@ async def test_new_profile_has_no_graph_gate_and_artifacts_remain_isolated(
                 and len(snapshot.json()["experiment_executions"]) == 1
             )
             scope = claim(service, owner, run)
-            body = b"Prepared without GPU execution."
-            path = f"public_data/experiment-runs/{run['id']}/report.md"
+            body = b'{"status":"succeeded","evaluation_status":"validated"}'
+            path = f"public_data/experiment-runs/{run['id']}/report.json"
             destination = tmp_path / "conversations" / identity / path
             destination.parent.mkdir(parents=True)
             destination.write_bytes(body)
-            service.store.record_result(
+            service.store.managed_submission(
+                owner, run["id"], scope, {"operation": "inference"}
+            )
+            service.store.managed_receipt(
                 owner,
                 run["id"],
                 scope,
-                {"summary": "Prepared", "report_uri": path},
-                {"uri": path, "sha256": hashlib.sha256(body).hexdigest()},
+                "inference",
+                {"task_id": "evaluated", "output_dir": "/evaluation"},
+            )
+            service.store.ingest(
+                "evaluation-complete", "evaluated", "callback", {"status": "succeeded"}
+            )
+            service.store.apply_observations()
+            service.store.register_artifacts(
+                owner,
+                run["id"],
+                [
+                    {
+                        "name": name,
+                        "uri": path if name == "report.json" else "/evaluation/" + name,
+                        "sha256": hashlib.sha256(body).hexdigest(),
+                    }
+                    for name in ("metrics.json", "report.json", "predictions.jsonl")
+                ],
+                {},
+            )
+            service.store.complete_agent_turn(
+                owner,
+                run["id"],
+                scope,
+                "Evaluation report ready.",
+                report=True,
+                completed=True,
             )
             route = (
                 f"{base}/{identity}/experiment-executions/"
-                f"{run['id']}/artifacts/agent_report"
+                f"{run['id']}/artifacts/report.json"
             )
             assert (await client.get(route)).json()["content"] == body.decode()
             assert await runtime.experiment_plan_call(
                 identity,
                 "read_experiment_artifact",
-                {"run_id": run["id"], "name": "agent_report"},
+                {"run_id": run["id"], "name": "report.json"},
                 context,
-            ) == {"name": "agent_report", "content": body.decode()}
+            ) == {"name": "report.json", "content": body.decode()}
             association = {
                 "expected_sequence": 0,
                 "context": {
@@ -151,7 +179,7 @@ async def test_new_profile_has_no_graph_gate_and_artifacts_remain_isolated(
                 await runtime.experiment_plan_call(
                     identity,
                     "read_experiment_artifact",
-                    {"run_id": "another-task", "name": "agent_report"},
+                    {"run_id": "another-task", "name": "report.json"},
                     context,
                 )
             with pytest.raises(FileNotFoundError):
@@ -173,7 +201,14 @@ async def test_new_profile_has_no_graph_gate_and_artifacts_remain_isolated(
             await runtime.flush_execution_events()
             await runtime.flush_execution_events()
             items = service.store.queue.list(run["owner"])
-            assert len([item for item in items if item["kind"] == "manager_turn"]) == 1
+            assert all(item["kind"] != "manager_turn" for item in items)
+            events = runtime._store(identity).replay()
+            changes = [
+                event.event_id
+                for event in events
+                if event.type == "experiment_execution.changed"
+            ]
+            assert changes and len(changes) == len(set(changes))
             with pytest.raises(PermissionError):
                 await runtime.experiment_plan_call(
                     identity, "create_experiment_plan", {}, context
@@ -182,17 +217,20 @@ async def test_new_profile_has_no_graph_gate_and_artifacts_remain_isolated(
         await runtime.close()
 
 
-def test_upgrade_retires_unstarted_legacy_work_but_preserves_old_proposal(experiment):
+def test_manager_messages_are_deduplicated_and_scoped_to_the_conversation(experiment):
     service, owner, _ = experiment
-    context = service.plans.context(owner, create=True)
-    old = service.store.request(
-        owner, context.project_id, 4, "baseline", "eval", "legacy"
+    command = UserMessageCommand(
+        command_id="continue",
+        content=(TextContent(text="Continue with the registered result"),),
     )
-    service.store.propose(owner, old["id"], {"configuration": {"model": "old"}})
-    assert service.store.retire_legacy_work(owner)
-    assert service.store.list(owner)[0]["state"] == "awaiting_confirmation"
-    assert service.store.queue.claim() is None
-    new = service.request(owner, request(), ("eval",))
-    scope = claim(service, owner, new)
-    assert not service.store.retire_legacy_work(owner)
-    service.store.queue.finish(scope["work_id"], scope["generation"], {})
+    identity = service.store.enqueue_manager_message(owner, command)
+    assert service.store.enqueue_manager_message(owner, command) == identity
+    foreign = owner.model_copy(update={"conversation_id": "another-conversation"})
+    assert service.store.enqueue_manager_message(foreign, command) != identity
+    item = service.store.queue.claim(kinds=("manager_turn",))
+    assert item is not None
+    assert item["payload"] == {
+        "owner": owner.model_dump(mode="json"),
+        "command": command.model_dump(mode="json"),
+    }
+    service.store.queue.finish(item["id"], item["generation"], {})

@@ -122,6 +122,7 @@ from openhands.tools.sandbox import (
 )
 from openhands.tools.training_analysis import TrainingAnalysisTool
 from openhands.tools.utils import PUBLIC_READ_ALIASES
+from openhands.tools.utils.platform_env import platform_cluster_route
 from openhands.tools.workflow import (
     RunWorkflowTool,
     ValidateWorkflowDslTool,
@@ -223,10 +224,10 @@ def _build_label_studio_tool(
         for name in _PYROMIND_VALIDATE_FORWARD_HEADERS
         if name != "x-cluster" and (value := http_request.headers.get(name))
     }
-    if cluster := _get_validation_cluster_header(http_request, extra):
-        headers["x-cluster"] = cluster
-        # The portal signs media against the storage service of this cluster.
-        params["cluster"] = cluster
+    cluster = _get_validation_cluster_header(http_request)
+    headers["x-cluster"] = cluster
+    # The portal signs media against the storage service of this cluster.
+    params["cluster"] = cluster
     if headers:
         params["headers"] = headers
     secret_headers: dict[str, str] = {}
@@ -342,9 +343,7 @@ def _build_agent_with_profile(
     validation_tool, validation_secrets = _build_workflow_validation_tool(
         http_request, request.extra
     )
-    analysis_tool, analysis_secrets = _build_analyze_task_failure_tool(
-        http_request, request.extra
-    )
+    analysis_tool, analysis_secrets = _build_analyze_task_failure_tool(http_request)
     training_tool, training_secrets = _build_training_analysis_tool(
         http_request, request.extra, skills_path
     )
@@ -439,7 +438,6 @@ def _build_agent_start_request(
 
 def _build_studio_api_auth(
     http_request: Request,
-    extra: dict[str, Any],
 ) -> tuple[dict[str, str], dict[str, str], dict[str, SecretSource]]:
     """Build forwarded headers + secret headers + secrets for studio_api tools."""
     headers = {
@@ -447,8 +445,7 @@ def _build_studio_api_auth(
         for name in _PYROMIND_VALIDATE_FORWARD_HEADERS
         if name != "x-cluster" and (value := http_request.headers.get(name))
     }
-    if cluster := _get_validation_cluster_header(http_request, extra):
-        headers["x-cluster"] = cluster
+    headers["x-cluster"] = _get_validation_cluster_header(http_request)
 
     secret_headers: dict[str, str] = {}
     secrets: dict[str, SecretSource] = {}
@@ -472,7 +469,7 @@ def _build_workflow_validation_tool(
     http_request: Request,
     extra: dict[str, Any],
 ) -> tuple[Tool, dict[str, SecretSource]]:
-    headers, secret_headers, secrets = _build_studio_api_auth(http_request, extra)
+    headers, secret_headers, secrets = _build_studio_api_auth(http_request)
 
     params: dict[str, Any] = {}
     endpoint_url = extra.get("workflow_validation_endpoint_url")
@@ -488,10 +485,9 @@ def _build_workflow_validation_tool(
 
 def _build_analyze_task_failure_tool(
     http_request: Request,
-    extra: dict[str, Any],
 ) -> tuple[Tool, dict[str, SecretSource]]:
     """Build ``analyze_task_failure`` with studio_api auth wiring."""
-    headers, secret_headers, secrets = _build_studio_api_auth(http_request, extra)
+    headers, secret_headers, secrets = _build_studio_api_auth(http_request)
     secrets = _load_auth_token(http_request, secrets)
     params: dict[str, Any] = {}
     if headers:
@@ -507,7 +503,7 @@ def _build_training_analysis_tool(
     skills_path: str | Path,
 ) -> tuple[Tool, dict[str, SecretSource]]:
     """Build ``training_analysis`` with server-only studio auth wiring."""
-    headers, secret_headers, secrets = _build_studio_api_auth(http_request, extra)
+    headers, secret_headers, secrets = _build_studio_api_auth(http_request)
     params: dict[str, Any] = {
         "runtime_dir": str(Path(skills_path) / "training-analysis" / "scripts")
     }
@@ -545,8 +541,7 @@ def _load_env_to_tools(
         for name in _PYROMIND_VALIDATE_FORWARD_HEADERS
         if (_value := http_request.headers.get(name))
     }
-    if cluster := _get_validation_cluster_header(http_request, {}):
-        headers["x-cluster"] = cluster
+    headers["x-cluster"] = _get_validation_cluster_header(http_request)
     headers["request-app"] = "openhands"
     params["headers"] = headers
 
@@ -654,8 +649,7 @@ def _build_pyromind_storage_tools(
         for name in _PYROMIND_VALIDATE_FORWARD_HEADERS
         if name != "x-cluster" and (value := http_request.headers.get(name))
     }
-    if cluster := _get_validation_cluster_header(http_request, extra):
-        headers["x-cluster"] = cluster
+    headers["x-cluster"] = _get_validation_cluster_header(http_request)
 
     params: dict[str, Any] = {}
     storage_base_url = extra.get("storage_base_url", extra.get("storage_api_base_url"))
@@ -709,7 +703,7 @@ def _build_pyromind_storage_tools(
         Path(skills_path) / "data-processing" / "scripts" / "edp"
     )
 
-    # Stop-task tool talks to the studio_api portal (APP_ENV-derived URL),
+    # Stop-task tool talks to the studio_api portal,
     # not the storage API, so only forward auth headers — no storage_base_url.
     stop_params: dict[str, Any] = {}
     if "headers" in params:
@@ -758,12 +752,10 @@ def _build_pyromind_storage_tools(
 async def apply_pyromind_validation_context(
     event_service: EventService,
     current_user: CurrentLoginUser | None,
+    *,
+    x_cluster: str | None,
 ) -> None:
-    """Refresh Pyromind portal auth context when a client (re)connects over WebSocket.
-
-    Updates validate cookie secrets, the run_workflow ``auth_token`` secret, and
-    forwarded ``x-cluster`` agent state from the current login session.
-    """
+    """Refresh portal credentials and the route supplied by the client."""
     if current_user is None:
         return
     if event_service.stored.tags.get(PYROMIND_APP_TAG_KEY) != PYROMIND_APP_TAG_VALUE:
@@ -776,22 +768,15 @@ async def apply_pyromind_validation_context(
     secrets_update[PYROMIND_PRODUCT_USER_ID_SECRET] = str(current_user.user_id)
     if auth_token := parse_auth_token_from_cookie_header(current_user.cookie):
         secrets_update[PYROMIND_AUTH_TOKEN_SECRET] = auth_token
-    if current_user.x_cluster:
-        secrets_update[PYROMIND_X_CLUSTER_SECRET] = current_user.x_cluster
-    if secrets_update:
-        await event_service.update_secrets(secrets_update)
-
-    if current_user.x_cluster:
-        await event_service.update_agent_state(
-            {
-                PYROMIND_VALIDATE_HEADERS_STATE_KEY: {
-                    "x-cluster": current_user.x_cluster
-                },
-                PYROMIND_STORAGE_HEADERS_STATE_KEY: {
-                    "x-cluster": current_user.x_cluster
-                },
-            }
-        )
+    route = platform_cluster_route(x_cluster)
+    secrets_update[PYROMIND_X_CLUSTER_SECRET] = route
+    await event_service.update_secrets(secrets_update)
+    await event_service.update_agent_state(
+        {
+            PYROMIND_VALIDATE_HEADERS_STATE_KEY: {"x-cluster": route},
+            PYROMIND_STORAGE_HEADERS_STATE_KEY: {"x-cluster": route},
+        }
+    )
 
 
 def _get_validation_cookie_header(http_request: Request) -> str | None:
@@ -1508,7 +1493,11 @@ async def send_pyromind_message(
     _require_pyromind_tags(event_service.stored.tags)
     current_user = getattr(http_request.state, "current_user", None)
     if isinstance(current_user, CurrentLoginUser):
-        await apply_pyromind_validation_context(event_service, current_user)
+        await apply_pyromind_validation_context(
+            event_service,
+            current_user,
+            x_cluster=_get_validation_cluster_header(http_request),
+        )
 
     conversation = event_service.get_conversation()
     working_dir = Path(conversation.workspace.working_dir)
@@ -1542,7 +1531,11 @@ async def rollback_pyromind_workflow_at_event(
     _require_pyromind_tags(event_service.stored.tags)
     current_user = getattr(http_request.state, "current_user", None)
     if isinstance(current_user, CurrentLoginUser):
-        await apply_pyromind_validation_context(event_service, current_user)
+        await apply_pyromind_validation_context(
+            event_service,
+            current_user,
+            x_cluster=_get_validation_cluster_header(http_request),
+        )
 
     try:
         snapshot = _workflow_canvas_store(event_service).get_event_snapshot(

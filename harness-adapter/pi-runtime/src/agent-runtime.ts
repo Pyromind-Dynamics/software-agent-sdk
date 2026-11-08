@@ -1,4 +1,5 @@
 import type { SubagentHost } from "./subagent-host.js";
+import { subagentLiveness } from "./subagent-liveness.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -51,6 +52,8 @@ export class PiAgentRuntime {
   private activeRunId: string | undefined;
   private readonly cancelledRuns = new Set<string>();
   private readonly pendingCommandIds: string[] = [];
+  private readonly subagentWakeTexts = new Set<string>();
+  private readonly subagentWakeMessages = new WeakSet<object>();
   private readonly notificationIds = new Set<string>();
   private readonly pendingNotifications: Array<{
     runId: string;
@@ -85,6 +88,14 @@ export class PiAgentRuntime {
     if (method === "stage.execute") return this.executeStage(params);
     if (method === "stage.cancel") return this.cancelStage(requiredString(params, "request_id"));
     if (method === "start") return this.start(params);
+    if (method === "session.has_pending_work") {
+      const session = this.requireSession();
+      return this.normalizer !== undefined || session.isStreaming ||
+        subagentLiveness().hasActiveProvider({
+          sessionId: session.sessionManager.getSessionId(),
+          sessionFile: session.sessionManager.getSessionFile(),
+        });
+    }
     if (method === "prompt.prepare") {
       const session = this.requireSession();
       parsePromptContent(params.content);
@@ -119,7 +130,10 @@ export class PiAgentRuntime {
       params,
       this.peer,
       { ...this.sessionOptions, ...(askUserTool ? { askUserTool } : {}),
-        onRepetitionDetected: () => this.suspendRepetitiveGeneration() },
+        onRepetitionDetected: () => this.suspendRepetitiveGeneration(),
+        automaticTurnsSuspended: () => this.executionSuspended || this.cancelling,
+        onSubagentWake: (text) => this.subagentWakeTexts.add(text),
+      },
     );
     this.execution = execution;
     this.subagents = subagents;
@@ -146,6 +160,16 @@ export class PiAgentRuntime {
         }));
       }
       if (!this.normalizer) return;
+      if ((event.type === "message_start" || event.type === "message_end") &&
+        event.message.role === "user") {
+        const { content } = event.message;
+        const text = typeof content === "string" ? content
+          : content.length === 1 && content[0].type === "text" ? content[0].text : undefined;
+        if (event.type === "message_start" && text !== undefined && this.subagentWakeTexts.delete(text)) {
+          this.subagentWakeMessages.add(event.message);
+        }
+        if (this.subagentWakeMessages.has(event.message)) return;
+      }
       for (const translated of this.normalizer.translate(event)) {
         if (translated.kind !== "usage.updated") this.peer.emit(translated);
       }
@@ -367,7 +391,7 @@ export class PiAgentRuntime {
 
   private async cancel(): Promise<JsonValue> {
     this.cancelling = true;
-    if (this.userInput.hasActive()) {
+    if (this.managedDelegation || this.userInput.hasActive()) {
       this.executionSuspended = true;
       this.suspensionRevision++;
     }
@@ -623,8 +647,7 @@ function requiredString(value: Record<string, unknown>, name: string): string {
 export function notificationWasDelivered(entries: SessionEntry[], runId: string): boolean {
   return entries.some((item) =>
     (item.type === "custom_message" && item.customType === "pyromind.external_task" &&
-      isObject(item.details) && (item.details.notification_run_id === runId ||
-        `callback:${item.details.task_id}:${item.details.status}` === runId)) ||
+      isObject(item.details) && item.details.notification_run_id === runId) ||
     (item.type === "custom" && item.customType === "pyromind.notification.finished" &&
       isObject(item.data) && item.data.runId === runId));
 }
@@ -633,7 +656,7 @@ export function notificationSettled(entries: SessionEntry[], runId: string): str
   const receipt = [...entries].reverse().find(item => item.type === "custom" && item.customType === "pyromind.notification.finished" && isObject(item.data) && item.data.runId === runId);
   if (!receipt || receipt.type !== "custom" || !isObject(receipt.data)) return undefined;
   const status = receipt.data.status;
-  return status === undefined ? "completed" : status === "completed" || status === "failed" ? status : undefined;
+  return status === "completed" || status === "failed" ? status : undefined;
 }
 
 function recoveryMessage(runId: string) {

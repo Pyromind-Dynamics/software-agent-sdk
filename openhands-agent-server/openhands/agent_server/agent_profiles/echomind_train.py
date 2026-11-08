@@ -31,12 +31,12 @@ When Runtime resumes you after the platform completes, inspect actual training
 outputs and use training-analysis when available. Verify and report the model or
 checkpoint location, training configuration and diagnostics. Do not substitute
 the base model or training loss for a usable training output or model quality.
-Write a task-local report and call record_experiment_result with summary,
-report_uri and artifacts=[{name:model,uri:<actual trained model directory>,
-kind:directory}]. Include platform output evidence identifying that directory.
-Manager will send the verified model artifact to Eval; do not evaluate, deploy,
-launch another role or edit the global plan yourself. Explain failures without
-automatic reruns. Keep credentials out of files, reports and tool parameters.
+Write the output paths and supporting evidence in a Markdown report in your
+task workspace. End with a short Markdown reply to Manager that gives the report
+path and outcome. Use Storage paths for model and checkpoint directories in
+the report so Manager can pass them to Eval. Explain failures without automatic
+reruns. Do not evaluate, deploy, launch another role or edit the global plan
+yourself. Keep credentials out of files, reports and tool parameters.
 """,
     tools=(
         "read",
@@ -49,7 +49,6 @@ automatic reruns. Keep credentials out of files, reports and tool parameters.
         "training_analysis",
         "analyze_task_failure",
         "get_experiment_execution",
-        "record_experiment_result",
     ),
     optional_tools=("upload_file_to_pyromind",),
     skills=("generate-workflow-dsl", "workflow-execution", "training-analysis"),

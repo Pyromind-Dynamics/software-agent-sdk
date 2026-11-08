@@ -50,14 +50,13 @@ existing conversion and validation scripts. Preserve media order, prompts and
 supervision; media references must resolve in the training environment. Keep
 statistics and audit fields in separate files. Other data tasks retain their
 own downstream format.
-Call record_experiment_result with summary and the actual Storage files in
-artifacts, using the task's delivery names (for example train_data, val_data,
-data_stats), uri and kind=file for each. A task-local report_uri is optional.
-Deliver the files Train should consume, without requiring another copy or a
-platform-specific directory. Do not declare success from a receipt or process
-exit. Explain failures without automatic resubmission. Never train, evaluate
-models, deploy, change the plan or launch another role. Keep credentials out of
-files and results.
+Write a task-local Markdown report with the actual Storage file paths, what
+each file is for, and the validation evidence. Identify the files Train should
+consume, including separate training and optional validation files. End with a
+short Markdown reply to Manager giving the report path and outcome. Explain
+blockers and failures in Markdown. Do not declare success from a receipt or
+process exit or automatically resubmit. Never train, evaluate models, deploy,
+change the plan or launch another role. Keep credentials out of files and results.
 """,
     tools=(
         "read",
@@ -69,7 +68,6 @@ files and results.
         "df_check_progress",
         "get_experiment_execution",
         "record_execution_checkpoint",
-        "record_experiment_result",
     ),
     skills=("data-processing",),
 )

@@ -1,7 +1,9 @@
+import asyncio
 from datetime import timedelta
 
 import pytest
 import sqlalchemy as sa
+from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.experiment_plans import PlanOwner
 from pyromind_runtime.infrastructure.sql_experiment_execution import (
     SQLExperimentExecutionStore,
@@ -12,6 +14,8 @@ from pyromind_runtime.infrastructure.sql_work_queue import (
     now,
     work,
 )
+
+from .fake_adapter import FakeAdapter
 
 
 @pytest.fixture
@@ -161,6 +165,48 @@ async def test_worker_completes_and_stops_cleanly(ledger):
     assert ledger.queue.list("owner")[0]["checkpoint"] == {"prepared": identity}
     assert not await worker.run_once()
     await worker.close()
+
+
+@pytest.mark.parametrize("override,limit", [(None, 24), (3, 3)])
+async def test_execution_worker_admits_tasks_up_to_configured_concurrency(
+    tmp_path, ledger, monkeypatch, override, limit
+):
+    from pyromind_runtime.infrastructure.sql_experiment_plan_store import (
+        SQLExperimentPlanStore,
+    )
+
+    runtime = ConversationRuntime(
+        tmp_path,
+        FakeAdapter(),
+        experiment_plan_store=SQLExperimentPlanStore(ledger.engine),
+        experiment_execution_store=ledger,
+        execution_roles=("dataset",),
+    )
+    started = asyncio.Queue()
+    release = asyncio.Event()
+
+    async def hold_task(_delegated, item):
+        started.put_nowait(item["id"])
+        await release.wait()
+        return {}
+
+    monkeypatch.setattr(runtime, "_delegated_work", hold_task)
+    queued = [
+        ledger.queue.enqueue(
+            f"owner-{index}", "role:dataset", "first", "execute_task", {}
+        )
+        for index in range(limit + 1)
+    ]
+    settings = {} if override is None else {"execution_worker_concurrency": override}
+    try:
+        await runtime.start_execution_events(**settings)
+        running = {await asyncio.wait_for(started.get(), 5) for _ in range(limit)}
+        assert running == set(queued[:limit])
+        assert ledger.queue.list(f"owner-{limit}")[0]["state"] == "queued"
+        release.set()
+        assert await asyncio.wait_for(started.get(), 5) == queued[-1]
+    finally:
+        await runtime.close()
 
 
 async def test_worker_does_not_replay_external_side_effect_on_handler_failure(ledger):

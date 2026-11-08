@@ -120,9 +120,14 @@ class DelegatedExecution:
             "generation": item["generation"],
             "run_id": run_id,
         }
-        await asyncio.to_thread(self.store.role_scope, owner, run_id, role, scope)
+        scoped = await asyncio.to_thread(
+            self.store.role_scope, owner, run_id, role, scope
+        )
         specification = row.get("task_spec")
-        report = item["kind"] == "generate_report"
+        followup = item["payload"].get("platform_followup")
+        if followup and followup != (scoped.get("submission") or {}).get("task_id"):
+            return {"state": scoped["state"], "report_state": scoped["report_state"]}
+        report = item["kind"] == "generate_report" or bool(followup)
         continuation = item["payload"].get("continuation", False)
         if specification:
             task_name = specification["task"]["name"]
@@ -143,13 +148,12 @@ class DelegatedExecution:
                 "instruction": (
                     "Use your role Skills and tools for the supplied frozen task. "
                     "Execute when intent=execute; prepare only when intent=prepare. "
-                    "After submission end this turn; Runtime waits for the platform "
-                    "and resumes you for the report. Register a report or essential "
-                    "blockers with record_experiment_result. "
+                    "Runtime delivers platform results to this task. Diagnose failures "
+                    "and revise or rerun within the assigned scope. "
+                    "Follow your role instructions for reporting outcomes or blockers. "
                     "No Graph confirmation is required. "
                     "For conversation_followup, respond to the Manager guidance in "
-                    "this same context. Existing task and platform states are facts, "
-                    "not an instruction to repeat submissions."
+                    "this same context."
                 ),
             }
         else:
@@ -330,8 +334,13 @@ class DelegatedExecution:
                 current = await asyncio.to_thread(
                     self.store.role_scope, owner, run_id, role, scope
                 )
-                if not (
+                submission = current.get("submission") or {}
+                report_only = (
                     report
+                    and submission.get("evidence", {}).get("work_id") != item["id"]
+                )
+                if not (
+                    report_only
                     and result["status"] == "failed"
                     and result.get("interrupted")
                     and not interruption_retried
@@ -344,34 +353,15 @@ class DelegatedExecution:
                 result = await launch(previous_reference, item["id"] + ":interruption")
             if specification:
                 if not continuation or current["state"] in {"queued", "preparing"}:
+                    result_text = (result.get("result_text") or "").strip()
                     current = await asyncio.to_thread(
                         self.store.complete_agent_turn,
                         owner,
                         run_id,
                         scope,
-                        result.get("result_text")
-                        or "The child ended without a submission or registered result.",
-                        report,
-                    )
-                if continuation:
-                    notice_id = "guidance:" + item["id"]
-                    await asyncio.to_thread(
-                        self.store.enqueue_manager,
-                        owner,
-                        notice_id,
-                        {
-                            "notice_id": notice_id,
-                            "result": {
-                                "run_id": run_id,
-                                "conversation_followup": True,
-                                "state": current["state"],
-                                "report_state": current["report_state"],
-                                "summary": (
-                                    result.get("result_text")
-                                    or "The child ended without a response."
-                                )[:16000],
-                            },
-                        },
+                        result_text or "The child ended without a result.",
+                        report_only,
+                        completed=bool(result_text) and result["status"] == "succeeded",
                     )
                 return {
                     "execution_ref": reference,

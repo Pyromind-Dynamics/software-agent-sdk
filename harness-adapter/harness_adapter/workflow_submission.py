@@ -19,7 +19,7 @@ from openhands.tools.pyromind_dataset.definition import (
 )
 from openhands.tools.utils.platform_env import (
     platform_cluster_route,
-    resolve_platform_env,
+    platform_cluster_target,
 )
 from openhands.tools.utils.storage_paths import REMOVED_ALIAS
 from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
@@ -67,11 +67,11 @@ class PlatformWorkflowSubmission:
         def fetch():
             if not context.cookie and not context.authorization:
                 raise PermissionError("platform credentials need renewal")
-            route = platform_cluster_route(context.x_cluster) or ""
-            cluster, separator, env = route.partition("#")
+            route = platform_cluster_route(context.x_cluster)
+            env, cluster = platform_cluster_target(route)
             client = create_workflow_api_client(
-                env=resolve_platform_env(env if separator else "prod"),
-                cluster=cluster or os.getenv("PYROMIND_CLUSTER", "default"),
+                env=env,
+                cluster=cluster,
                 auth_token=parse_auth_token_from_cookie_header(context.cookie),
                 headers={
                     key: value
@@ -173,20 +173,13 @@ class PlatformWorkflowSubmission:
         *,
         correlation: TaskCorrelation | None = None,
     ) -> str:
-        route = (platform_cluster_route(context.x_cluster) or "").strip()
-        cluster, separator, routed_env = route.partition("#")
-        env = resolve_platform_env(
-            routed_env.strip().lower()
-            if separator and routed_env.strip()
-            else "prod"
-            if route
-            else os.getenv("PYROMIND_ENV") or os.getenv("APP_ENV")
-        )
+        route = platform_cluster_route(context.x_cluster)
+        env, cluster = platform_cluster_target(route)
         client = create_workflow_api_client(
             env=env,
-            cluster=cluster.strip() or os.getenv("PYROMIND_CLUSTER") or "default",
+            cluster=cluster,
             auth_token=parse_auth_token_from_cookie_header(context.cookie),
-            headers={"x-cluster": route} if route else {},
+            headers={"x-cluster": route},
         )
         response = submit_workflow_task(
             client=client,

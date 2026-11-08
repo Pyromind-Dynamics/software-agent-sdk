@@ -1161,9 +1161,9 @@ async def test_pi_host_bridges_update_plan_and_persists_snapshot(tmp_path) -> No
 @pytest.mark.parametrize(
     ("app_env", "x_cluster", "expected_env", "expected_cluster", "expected_route"),
     [
-        ("prod", "us-west-1#pre", "prod", "us-west-1", "us-west-1"),
-        ("pre2", "us-west-2#pre", "pre2", "us-west-2", "us-west-2#pre2"),
-        ("pre", "us-east-1", "pre", "us-east-1", "us-east-1#pre"),
+        ("prod", "us-west-1#pre", "pre", "us-west-1", "us-west-1#pre"),
+        ("pre2", "us-west-2#pre", "pre", "us-west-2", "us-west-2#pre"),
+        ("pre", "us-east-1", "prod", "us-east-1", "us-east-1"),
     ],
 )
 def test_pi_tool_params_parse_request_cluster_route(
@@ -1202,9 +1202,9 @@ def test_pi_tool_params_parse_request_cluster_route(
     assert host._label_studio_params(context)["headers"]["x-cluster"] == x_cluster
 
 
-def test_pi_tool_params_fall_back_to_deployment_target(tmp_path, monkeypatch) -> None:
+def test_pi_tool_params_fall_back_to_default_cluster(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("APP_ENV", "pre")
-    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
     repository = Path(pi_adapter_module.__file__).parents[3]
     host = PyromindBusinessToolHost(
         [
@@ -1221,8 +1221,9 @@ def test_pi_tool_params_fall_back_to_deployment_target(tmp_path, monkeypatch) ->
 
     params = host._sandbox_params(context)
 
-    assert params["env"] == "pre"
+    assert params["env"] == "prod"
     assert params["cluster"] == "us-west-1"
+    assert params["headers"]["x-cluster"] == "us-west-1"
 
 
 async def test_pi_host_synthesizes_debug_task_and_persists_only_attempt_budget(
@@ -1624,7 +1625,7 @@ async def test_validation_result_uses_the_same_finalizer(
     assert (tmp_path / metadata["path"]).is_file()
 
 
-def test_workflow_debug_params_fall_back_to_deployment_env(
+def test_workflow_debug_params_fall_back_to_default_cluster(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("APP_ENV", "pre2")
@@ -1640,11 +1641,11 @@ def test_workflow_debug_params_fall_back_to_deployment_env(
             extra={},
         )
     )
-    assert params["env"] == "pre2"
-    assert params["cluster"] == "default"
+    assert params["env"] == "prod"
+    assert params["cluster"] == "us-west-1"
 
 
-def test_workflow_debug_params_use_deployment_env_and_session_cluster(
+def test_workflow_debug_params_use_session_route(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("APP_ENV", "pre2")
@@ -1659,7 +1660,7 @@ def test_workflow_debug_params_use_deployment_env_and_session_cluster(
             extra={"env": "pre"},
         )
     )
-    assert params["env"] == "pre2"
+    assert params["env"] == "prod"
     assert params["cluster"] == "req-cluster"
 
 

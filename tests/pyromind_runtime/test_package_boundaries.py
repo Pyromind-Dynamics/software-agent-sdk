@@ -60,7 +60,8 @@ def test_evaluation_auth_boundary_is_separate_from_product_api() -> None:
 def test_evaluation_validation_shares_submission_route_and_identity(
     tmp_path, monkeypatch, env
 ):
-    monkeypatch.setenv("APP_ENV", env)
+    monkeypatch.setenv("APP_ENV", "pre2" if env == "prod" else "prod")
+    route = "test-cluster" if env == "prod" else f"test-cluster#{env}"
     context = ToolExecutionContext(
         conversation_id="test-conversation",
         workspace_root=tmp_path,
@@ -68,7 +69,7 @@ def test_evaluation_validation_shares_submission_route_and_identity(
             user_id="test",
             authorization="Bearer test-token",
             cookie="auth_token=test-cookie",
-            x_cluster="test-cluster#prod" if env != "prod" else "test-cluster#pre",
+            x_cluster=route,
         ),
         model_configuration={},
     )
@@ -94,8 +95,7 @@ def test_evaluation_validation_shares_submission_route_and_identity(
         f"https://{prefix}api-portal.pyromind.ai/std2/studio_api/api/workflows/dsl/validate"
     )
     headers = requests[0][1]
-    expected_route = "test-cluster" if env == "prod" else f"test-cluster#{env}"
-    assert headers["x-cluster"] == params["headers"]["x-cluster"] == expected_route
+    assert headers["x-cluster"] == params["headers"]["x-cluster"] == route
     assert headers["authorization"] == "Bearer test-token"
     assert headers["cookie"] == "auth_token=test-cookie"
 
@@ -376,6 +376,26 @@ def test_native_subagent_report_delivery_stays_in_adapter() -> None:
             assert "SubagentReports" not in source, path
 
 
+def test_delegated_result_projection_cannot_schedule_manager_turns() -> None:
+    application = ROOT / "pyromind-runtime/pyromind_runtime/application"
+    for filename, method in (
+        ("conversation_runtime.py", "flush_execution_events"),
+        ("delegated_execution.py", "prepare"),
+    ):
+        tree = ast.parse((application / filename).read_text())
+        handler = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == method
+        )
+        attributes = {
+            node.attr for node in ast.walk(handler) if isinstance(node, ast.Attribute)
+        }
+        assert not attributes.intersection(
+            {"enqueue_manager_message", "notify_external_task"}
+        ), filename
+
+
 def test_subagent_display_rpc_remains_adapter_private() -> None:
     for package in ("pyromind-runtime", "pyromind-agent-server"):
         for path in (ROOT / package).rglob("*.py"):
@@ -535,7 +555,10 @@ def test_execution_capabilities_are_profile_owned_and_cannot_be_model_supplied()
         DEFAULT_PRODUCT_PROFILE,
         ECHOMIND_PRODUCT_PROFILE,
     )
-    from pyromind_runtime.domain.experiment_execution import RequestExperimentTask
+    from pyromind_runtime.domain.experiment_execution import (
+        ROLE_TOOLS,
+        RequestExperimentTask,
+    )
     from pyromind_runtime.domain.preparation import PreparationPolicy
 
     roles = {role.name: role for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()}
@@ -553,6 +576,12 @@ def test_execution_capabilities_are_profile_owned_and_cannot_be_model_supplied()
             assert "record_execution_checkpoint" in roles[name].tools
     assert roles["init"] is not roles["eval"]
     assert roles["init"].tools == roles["eval"].tools
+    assert all(
+        "record_experiment_result" not in role.tools
+        and "record_experiment_result" not in role.prompt
+        for role in roles.values()
+    )
+    assert "record_experiment_result" not in ROLE_TOOLS
     old = PreparationPolicy.model_validate(
         {
             "checklist_id": "old",
@@ -578,7 +607,6 @@ def test_shared_execution_rules_do_not_dispatch_on_agent_or_role_names():
     for filename in (
         "application/experiment_execution.py",
         "application/execution_checkpoints.py",
-        "application/execution_artifacts.py",
         "application/delegated_execution.py",
         "infrastructure/sql_experiment_execution.py",
     ):

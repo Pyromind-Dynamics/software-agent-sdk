@@ -57,6 +57,7 @@ class SessionHandle(ContractModel):
     adapter_session_ref: str = Field(min_length=1)
     harness_id: str = Field(default="openhands", min_length=1)
     capabilities: HarnessCapabilities
+    adapter_delivers_delegated_results: bool = False
 
 
 class ProductCheckpoint(ContractModel):
@@ -207,6 +208,11 @@ class HarnessAdapter(Protocol):
         survive for the next attach implement this as a no-op.
         """
         ...
+
+
+@runtime_checkable
+class SessionLivenessAdapter(Protocol):
+    async def has_pending_session_work(self, handle: SessionHandle) -> bool: ...
 
 
 class DelegationAdapter(Protocol):

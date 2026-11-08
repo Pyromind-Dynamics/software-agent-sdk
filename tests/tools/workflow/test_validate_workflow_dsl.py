@@ -80,80 +80,38 @@ def _fake_conversation(
     )()
 
 
-def test_validate_workflow_dsl_defaults_to_pre_endpoint_for_local_and_pre(
-    monkeypatch,
-):
-    urls: list[str] = []
-
-    def fake_post(url, *, headers, json, timeout):
-        urls.append(url)
-        return _valid_response()
-
-    monkeypatch.setattr(httpx, "post", fake_post)
-    monkeypatch.delenv("APP_ENV", raising=False)
-    observation = ValidateWorkflowDslExecutor()(
-        ValidateWorkflowDslAction(dsl="# workflow: demo\n")
-    )
-    assert not observation.is_error
-    assert urls[-1] == PRE_VALIDATE_URL
-
-    for app_env in ("dev", "pre", "local"):
-        monkeypatch.setenv("APP_ENV", app_env)
-        observation = ValidateWorkflowDslExecutor()(
-            ValidateWorkflowDslAction(dsl="# workflow: demo\n")
-        )
-        assert not observation.is_error
-        assert urls[-1] == PRE_VALIDATE_URL
-
-
-def test_validate_workflow_dsl_defaults_to_prod_endpoint_for_online_envs(
-    monkeypatch,
-):
-    urls: list[str] = []
-
-    def fake_post(url, *, headers, json, timeout):
-        urls.append(url)
-        return _valid_response()
-
-    monkeypatch.setattr(httpx, "post", fake_post)
-    for app_env in ("prod", "production", "online"):
-        monkeypatch.setenv("APP_ENV", app_env)
-        observation = ValidateWorkflowDslExecutor()(
-            ValidateWorkflowDslAction(dsl="# workflow: demo\n")
-        )
-        assert not observation.is_error
-        assert urls[-1] == PROD_VALIDATE_URL
-
-
 @pytest.mark.parametrize(
-    "app_env,endpoint",
+    ("route", "endpoint", "forwarded"),
     [
-        ("pre", PRE_VALIDATE_URL),
-        ("pre2", PRE_VALIDATE_URL.replace("pre-api-portal", "pre2-api-portal")),
-        ("prod", PROD_VALIDATE_URL),
-        ("production", PROD_VALIDATE_URL),
+        (None, PROD_VALIDATE_URL, "us-west-1"),
+        ("us-west-2", PROD_VALIDATE_URL, "us-west-2"),
+        ("us-west-2#pre", PRE_VALIDATE_URL, "us-west-2#pre"),
+        (
+            "us-west-1#pre2",
+            PRE_VALIDATE_URL.replace("pre-api-portal", "pre2-api-portal"),
+            "us-west-1#pre2",
+        ),
     ],
 )
-def test_validation_app_env_controls_platform_endpoint(monkeypatch, app_env, endpoint):
-    urls = []
+def test_validation_uses_request_route(monkeypatch, route, endpoint, forwarded):
+    calls = []
 
-    def fake_post(url, **kwargs):
-        urls.append(url)
+    def fake_post(url, *, headers, **kwargs):
+        calls.append((url, headers["x-cluster"]))
         return _valid_response()
 
     monkeypatch.setattr(httpx, "post", fake_post)
-    monkeypatch.setenv("APP_ENV", app_env)
-    env = "prod" if app_env.startswith("pre") else "pre"
+    monkeypatch.setenv("APP_ENV", "pre")
+    headers = {"x-cluster": route} if route else {}
     action = ValidateWorkflowDslAction(dsl="# workflow: demo\n")
-    assert ValidateWorkflowDslExecutor(env=env)(action).valid is True
-    assert urls[-1] == endpoint
-    assert ValidateWorkflowDslExecutor(endpoint_url=PRE_VALIDATE_URL)(action).valid
-    assert urls[-1] == endpoint
+    assert ValidateWorkflowDslExecutor(headers=headers)(action).valid
+    assert calls[-1] == (endpoint, forwarded)
+
     custom = "https://validator.example/dsl/validate"
-    assert (
-        ValidateWorkflowDslExecutor(env=env, endpoint_url=custom)(action).valid is True
-    )
-    assert urls[-1] == custom
+    assert ValidateWorkflowDslExecutor(endpoint_url=custom, headers=headers)(
+        action
+    ).valid
+    assert calls[-1] == (custom, forwarded)
 
 
 def test_validate_workflow_dsl_posts_payload_and_preserves_issue_fields(monkeypatch):

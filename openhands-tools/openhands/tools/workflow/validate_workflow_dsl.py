@@ -294,9 +294,7 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
         *,
         env: str | None = None,
     ) -> None:
-        self._endpoint_url = platform_portal_url(
-            endpoint_url or _default_validate_url(env)
-        )
+        self._endpoint_url = endpoint_url or _default_validate_url(env)
         self._headers = dict(headers or {})
         self._secret_headers = dict(secret_headers or {})
         self._timeout = timeout
@@ -329,7 +327,7 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
             )
         try:
             response = httpx.post(
-                self._endpoint_url,
+                platform_portal_url(self._endpoint_url, headers),
                 headers=platform_headers(headers),
                 json={"name": action.name, "dsl": dsl},
                 timeout=self._timeout,

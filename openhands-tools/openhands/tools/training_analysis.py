@@ -220,7 +220,7 @@ class TrainingAnalysisExecutor(
         timeout_seconds: float = 180.0,
     ) -> None:
         self.runtime_dir = Path(runtime_dir).resolve()
-        self.api_base = platform_portal_url(_default_api_base(api_base))
+        self.api_base = _default_api_base(api_base)
         self.headers = dict(headers or {})
         self.secret_headers = dict(secret_headers or {})
         timeout = float(timeout_seconds)
@@ -560,7 +560,7 @@ class TrainingAnalysisExecutor(
             "output_relative": (
                 output_path.relative_to(host_root).as_posix() if output_path else None
             ),
-            "api_base": self.api_base,
+            "api_base": platform_portal_url(self.api_base, headers),
             "headers": platform_headers(headers),
         }
 

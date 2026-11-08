@@ -16,6 +16,11 @@ from pyromind_sdk.client.models import (
     TrainingTaskCreateResponse,
 )
 
+from openhands.tools.utils.platform_env import (
+    platform_client_route,
+    platform_cluster_target,
+    platform_headers,
+)
 from openhands.tools.utils.pyromind_api_client import (
     get_api_key,
     get_pyromind_api_client,
@@ -93,22 +98,20 @@ def create_workflow_api_client(
     """Create the authenticated client used by every workflow-producing tool."""
     if not auth_token:
         raise ValueError("API key is required.")
-    if not env:
-        raise ValueError("env is required.")
-    if not cluster:
-        raise ValueError("cluster is required.")
+    route = platform_client_route(headers, cluster=cluster, env=env)
+    env, _ = platform_cluster_target(route)
 
     access_key = _retry_transient(
         lambda: get_api_key(
             env=env,
             auth_token=auth_token,
-            origin_headers=headers,
+            origin_headers=platform_headers(headers, route=route),
             timeout=timeout,
         )
     )
     return get_pyromind_api_client(
         env=env,
-        cluster=cluster,
+        cluster=route,
         api_key=access_key,
         timeout=timeout,
     )

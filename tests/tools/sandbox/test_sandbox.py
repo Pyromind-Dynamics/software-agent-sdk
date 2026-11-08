@@ -231,7 +231,7 @@ def test_sandbox_create_waits_for_running(monkeypatch: pytest.MonkeyPatch) -> No
     client.sandboxes.get_sandbox.assert_called_once_with(_SANDBOX_ID)
 
 
-def test_sandbox_create_default_image_by_cluster(
+def test_sandbox_create_uses_default_image_for_regional_cluster(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = MagicMock()
@@ -245,7 +245,7 @@ def test_sandbox_create_default_image_by_cluster(
     assert not observation.is_error
     assert (
         client.sandboxes.create.call_args[0][0].image
-        == "pyrominddynamics/jupyter-lab-with-ssh:v0.9-aws"
+        == "pyrominddynamics/jupyter-lab-with-ssh:v0.9"
     )
 
 

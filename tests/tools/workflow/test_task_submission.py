@@ -9,10 +9,33 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
+from openhands.tools.workflow import task_submission
 from openhands.tools.workflow.task_submission import (
     _retry_transient,
     submit_workflow_task,
 )
+
+
+@pytest.mark.parametrize(
+    ("headers", "route", "host"),
+    [
+        ({"X-Cluster": "us-west-2#pre"}, "us-west-2#pre", "pre-api-portal.pyromind.ai"),
+        ({}, "us-west-1", "api-portal.pyromind.ai"),
+    ],
+)
+def test_workflow_sdk_client_uses_request_route(monkeypatch, headers, route, host):
+    monkeypatch.setenv("APP_ENV", "pre2")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "another-cluster")
+    exchange = MagicMock(return_value="access-key")
+    monkeypatch.setattr(task_submission, "get_api_key", exchange)
+
+    client = task_submission.create_workflow_api_client(
+        env=None, cluster=None, auth_token="session-token", headers=headers
+    )
+
+    assert exchange.call_args.kwargs["origin_headers"] == {"x-cluster": route}
+    assert client.sandboxes.session.headers["X-Cluster"] == route
+    assert client.sandboxes.base_url == f"https://{host}/api/v1"
 
 
 class _FakeSSLError(OSError):

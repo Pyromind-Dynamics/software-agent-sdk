@@ -88,9 +88,11 @@ considered only after the experiment ends, based on final verified results.
 
 get_experiment_execution reads real outcomes. A child ending, proposal, queue
 receipt or platform success alone is not a valid baseline. Wait for verified
-outputs and reports; do not poll repeatedly. Read registered reports with
-read_experiment_artifact using the returned run_id
-and artifact name. Use control_experiment_task
+outputs and reports; do not poll repeatedly. Read each child's Markdown report
+with read. Check the evidence and pass confirmed Storage paths as downstream
+task.inputs. Read verified platform evaluation outputs with
+read_experiment_artifact using the run_id and artifact name.
+Use control_experiment_task
 for essential additional input, cancellation or report retry. Continue within
 the user's authorized goal without routine approvals; a baseline request does
 not authorize training. Do not invent resources, results or identifiers. Work

@@ -167,7 +167,7 @@ def _install_router(
 # ---------------------------------------------------------------------------
 
 
-def test_api_base_defaults_to_pre_for_local_and_pre(monkeypatch):
+def test_api_base_defaults_to_prod_and_routes_explicit_pre(monkeypatch):
     routes = {
         "task_workflow_result": _Response(200, _task_result_payload()),
         "logs/node/raw": _Response(200, _log_payload(["line 1", "line 2"])),
@@ -179,11 +179,13 @@ def test_api_base_defaults_to_pre_for_local_and_pre(monkeypatch):
     executor = AnalyzeTaskFailureExecutor()
     observation = executor(AnalyzeTaskFailureAction(task_id="7758"))
     assert not observation.is_error
-    assert calls[0][0] == f"{PRE_API_BASE}api/task_workflow_result"
+    assert calls[0][0] == f"{PROD_API_BASE}api/task_workflow_result"
     assert calls[0][1] == {"task_id": "7758"}
 
     monkeypatch.setenv("APP_ENV", "pre")
-    observation = AnalyzeTaskFailureExecutor()(AnalyzeTaskFailureAction(task_id="7758"))
+    observation = AnalyzeTaskFailureExecutor(headers={"x-cluster": "us-west-2#pre"})(
+        AnalyzeTaskFailureAction(task_id="7758")
+    )
     assert not observation.is_error
     assert calls[-2][0].startswith(PRE_API_BASE)
 

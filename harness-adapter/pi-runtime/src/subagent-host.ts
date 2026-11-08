@@ -9,7 +9,7 @@ import type { AgentSession, ExtensionAPI, ModelRuntime } from "@earendil-works/p
 import { registerSubagentCapabilityCeiling } from "pi-subagents/capability-ceiling";
 import { registerRequiredChildExtensions } from "pi-subagents/required-child-extensions";
 import { serveSubagentIpc } from "./subagent-ipc.js";
-import { SubagentDisplay, displayText, transcriptWindow } from "./subagent-display.js";
+import { SubagentDisplay, displayText, redactSignedUrls, transcriptWindow } from "./subagent-display.js";
 import { SubagentActivity } from "./subagent-activity.js";
 import { SubagentRecipients } from "./subagent-recipients.js";
 import { SubagentTerminals, usesAgentTerminal, type SubagentTerminalFactory } from "./subagent-terminals.js";
@@ -183,7 +183,22 @@ export class SubagentHost {
         if (message.role === "toolResult" && message.toolName === "subagent") {
           messages.push({ ...message, ...await this.reports.transform(message.content, message.details, ctx.signal) });
         } else if (message.role === "custom" && message.customType === "subagent-notify") {
-          messages.push({ ...message, ...await this.reports.transform(message.content, message.details, ctx.signal) });
+          const handoff = await this.reports.transform(message.content, message.details, ctx.signal);
+          const runs = isRecord(message.details) && Array.isArray(message.details.runs) ? message.details.runs : [];
+          const taskRuns = new Set<string>();
+          for (const run of runs) {
+            if (!isRecord(run) || typeof run.runId !== "string") continue;
+            const execution = this.display.value(run.runId, "execution");
+            if (isRecord(execution) && typeof execution.task_run_id === "string") taskRuns.add(execution.task_run_id);
+          }
+          messages.push({
+            ...message,
+            ...handoff,
+            content: !taskRuns.size ? handoff.content
+              : typeof handoff.content === "string"
+                ? `${handoff.content}\n\nProduct task run IDs: ${[...taskRuns].join(", ")}`
+                : [...handoff.content, { type: "text", text: `Product task run IDs: ${[...taskRuns].join(", ")}` }],
+          });
         } else messages.push(message);
       }
       return { messages };
@@ -255,15 +270,19 @@ export class SubagentHost {
     const id = result?.details?.runId ?? result?.runId ?? input.execution_ref;
     let state = result?.details?.state ?? result?.state ?? "unknown";
     let interruption: string | undefined;
+    let failure: string | undefined;
     if (typeof id === "string" && /^[a-zA-Z0-9-]+$/.test(id)) {
       const path = join(this.paths.stateRoot, "async-subagent-runs", id, "status.json");
       if (existsSync(path)) {
         const status = JSON.parse(readFileSync(path, "utf8"));
         if (status.runId !== id || ![this.session!.sessionManager.getSessionFile(), this.session!.sessionId].includes(status.sessionId)) throw new Error("Delegated run ownership mismatch");
         state = status.state;
-        if (state === "failed" && typeof status.error === "string" &&
-          (status.error.startsWith("Subagent host unavailable:") || status.error === "Subagent host disconnected")) {
-          interruption = status.error;
+        if (state === "failed" && typeof status.error === "string") {
+          const error: string = status.error;
+          failure = error;
+          if (error.startsWith("Subagent host unavailable:") || error === "Subagent host disconnected") {
+            interruption = error;
+          }
         }
       }
       if (action === "spawn" || action === "resume" || (isRecord(input.scope) && isRecord(input.scope.execution))) {
@@ -279,15 +298,12 @@ export class SubagentHost {
     if (action === "status" && typeof id === "string" && !["running", "queued", "stopping"].includes(state)) {
       await this.display.settled(id);
       await this.finalizing.get(id);
-      if (!this.handoffs.has(id)) {
-        const transcript = await this.rpc("status", {id, view: "transcript", lines: 200});
-        const transformed = await this.reports.transform([{type: "text", text: displayText(transcript)}], {runs: [{runId: id}]});
-        this.handoffs.set(id, displayText(transformed));
-      }
     }
+    const finalText = typeof id === "string" && typeof input.role === "string" &&
+      ["complete", "completed"].includes(state) ? await this.reports.finalOutput(id, input.role) : "";
     return { execution_ref: typeof id === "string" ? id : null, status: state,
       interrupted: interruption !== undefined,
-      result_text: interruption ?? (typeof id === "string" ? this.handoffs.get(id) ?? displayText(result) : displayText(result)) };
+      result_text: redactSignedUrls(failure ?? finalText) };
 
   }
 
@@ -397,7 +413,7 @@ export class SubagentHost {
     const id = data.runId;
     // The native completion summary is the final handoff, not the activity window.
     const transformed = await this.reports.transform([{ type: "text", text: data.summary }], data);
-    const handoff = displayText(transformed);
+    const handoff = redactSignedUrls(displayText(transformed));
     if (this.disposed || this.handoffs.get(id) === handoff) return;
     this.handoffs.set(id, handoff);
     if (this.states.has(id) && !this.finalizing.has(id)) {
@@ -460,7 +476,7 @@ export class SubagentHost {
     if (this.disposed) return;
     this.emit(id, "subagent.finished", { status: state, label,
       mutated: label === "general_purpose" || this.mutatedSessions.size > 0,
-      ...extra, result: typeof result === "string" ? result.slice(0, 32768) : "",
+      ...extra, result: typeof result === "string" ? redactSignedUrls(result).slice(0, 32768) : "",
       ...(this.observedLive.has(id) ? { details: this.display.details(id) } : {}) });
   }
 

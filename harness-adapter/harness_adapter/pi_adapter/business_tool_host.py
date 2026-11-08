@@ -82,7 +82,7 @@ from openhands.tools.training_analysis import TrainingAnalysisTool
 from openhands.tools.update_plan import UpdatePlanTool
 from openhands.tools.utils.platform_env import (
     platform_cluster_route,
-    resolve_platform_env,
+    platform_cluster_target,
 )
 from openhands.tools.workflow.analyze_task_failure import AnalyzeTaskFailureTool
 from openhands.tools.workflow.run_workflow import WORKFLOW_ATTEMPT_STATE_KEY
@@ -899,18 +899,14 @@ class PyromindBusinessToolHost:
             "details": observation.model_dump(mode="json"),
         }
 
-    def _storage_params(
-        self, context: ToolExecutionContext, *, label_studio: bool = False
-    ) -> dict[str, Any]:
+    def _storage_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         params: dict[str, Any] = {}
         storage_url = context.extra.get(
             "storage_base_url", context.extra.get("storage_api_base_url")
         )
         if isinstance(storage_url, str) and storage_url:
             params["storage_base_url"] = storage_url
-        headers = _forward_headers(
-            context.request_context, include_cookie=False, label_studio=label_studio
-        )
+        headers = _forward_headers(context.request_context, include_cookie=False)
         if headers:
             params["headers"] = headers
         if context.request_context.cookie:
@@ -918,7 +914,7 @@ class PyromindBusinessToolHost:
         return params
 
     def _label_studio_params(self, context: ToolExecutionContext) -> dict[str, Any]:
-        params = self._storage_params(context, label_studio=True)
+        params = self._storage_params(context)
         for key, legacy_key in (
             ("ls_base_url", None),
             ("portal_base_url", "sso_base_url"),
@@ -928,15 +924,13 @@ class PyromindBusinessToolHost:
                 value = context.extra.get(f"label_studio_{legacy_key}")
             if isinstance(value, str) and value.strip():
                 params[key] = value.strip()
-        if cluster := _cluster_route(context):
-            params["cluster"] = cluster
+        params["cluster"] = platform_cluster_route(context.request_context.x_cluster)
         return params
 
     def _execution_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         env, cluster = _execution_target(context)
         params: dict[str, Any] = {"env": env}
-        if cluster:
-            params["cluster"] = cluster
+        params["cluster"] = cluster
         params["headers"] = _forward_headers(
             context.request_context, include_cookie=False
         )
@@ -1016,8 +1010,7 @@ class PyromindBusinessToolHost:
                 include_cookie=False,
             ),
         }
-        if cluster:
-            params["cluster"] = cluster
+        params["cluster"] = cluster
         default_image = context.extra.get("sandbox_default_image")
         if include_default_image and isinstance(default_image, str) and default_image:
             params["default_image"] = default_image
@@ -1053,7 +1046,7 @@ class PyromindBusinessToolHost:
     def _workflow_debug_params(self, context: ToolExecutionContext) -> dict[str, Any]:
         env, cluster = _execution_target(context)
         return {
-            "cluster": cluster or "default",
+            "cluster": cluster,
             "env": env,
             "current_user": current_user_from_context(context.request_context),
             "headers": _forward_headers(context.request_context, include_cookie=False),
@@ -1086,51 +1079,22 @@ class PyromindBusinessToolHost:
 
 
 def _forward_headers(
-    context: RequestContext, *, include_cookie: bool, label_studio: bool = False
+    context: RequestContext, *, include_cookie: bool
 ) -> dict[str, str]:
     return {
         name: value
         for name, value in (
             ("cookie", context.cookie if include_cookie else None),
             ("authorization", context.authorization),
-            (
-                "x-cluster",
-                context.x_cluster
-                if label_studio
-                else platform_cluster_route(context.x_cluster),
-            ),
+            ("x-cluster", platform_cluster_route(context.x_cluster)),
             ("accept-language", context.accept_language),
         )
         if value
     }
 
 
-def _execution_target(
-    context: ToolExecutionContext,
-) -> tuple[str, str | None]:
-    request_route = (context.request_context.x_cluster or "").strip()
-    if request_route:
-        cluster, separator, routed_env = request_route.partition("#")
-        env = routed_env.strip().lower() if separator else "prod"
-        return resolve_platform_env(env or "prod"), cluster.strip() or None
-
-    configured_route = os.getenv("PYROMIND_CLUSTER", "").strip()
-    cluster, separator, routed_env = configured_route.partition("#")
-    explicit_env = context.extra.get("env")
-    env = explicit_env.strip() if isinstance(explicit_env, str) else None
-    if separator and routed_env.strip():
-        env = routed_env.strip().lower()
-    return resolve_platform_env(env), cluster.strip() or None
-
-
-def _cluster_route(context: ToolExecutionContext) -> str:
-    """Raw cluster route (``us-west-1#pre``) this conversation is served from.
-
-    Only the conversation's own routing is used. A process-wide default would
-    hide a session that never carried a cluster, and Storage is replicated per
-    cluster, so falling back to the wrong one reads another cluster's objects.
-    """
-    return (context.request_context.x_cluster or "").strip()
+def _execution_target(context: ToolExecutionContext) -> tuple[str, str]:
+    return platform_cluster_target(context.request_context.x_cluster)
 
 
 async def _publish_tool_output_to_execution_workspace(

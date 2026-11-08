@@ -91,7 +91,11 @@ def test_prepare_rejects_non_storage_workflow(path):
         module.PlatformWorkflowSubmission._prepare(path, RequestContext(user_id="42"))
 
 
-def test_submit_never_retries_platform_create(monkeypatch):
+@pytest.mark.parametrize(
+    ("route", "env", "cluster", "header"),
+    [("c#pre", "pre", "c", "c#pre"), (None, "prod", "us-west-1", "us-west-1")],
+)
+def test_submit_never_retries_platform_create(monkeypatch, route, env, cluster, header):
     monkeypatch.setenv("APP_ENV", "prod")
     seen: dict = {}
 
@@ -109,11 +113,11 @@ def test_submit_never_retries_platform_create(monkeypatch):
     task_id = module.PlatformWorkflowSubmission._submit(
         {"name": "sft"},
         "conversation-1",
-        RequestContext(user_id="42", cookie="auth_token=ephemeral", x_cluster="c#pre"),
+        RequestContext(user_id="42", cookie="auth_token=ephemeral", x_cluster=route),
     )
     assert task_id == "task-123"
-    assert seen["routing"]["env"] == "prod"
-    assert seen["routing"]["cluster"] == "c"
-    assert seen["routing"]["headers"] == {"x-cluster": "c"}
+    assert seen["routing"]["env"] == env
+    assert seen["routing"]["cluster"] == cluster
+    assert seen["routing"]["headers"] == {"x-cluster": header}
     assert seen["retry_create"] is False
     assert seen["conversation_id"] == "conversation-1"

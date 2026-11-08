@@ -12,7 +12,10 @@ from harness_adapter.artifact_snapshots import PlatformArtifactSnapshots
 from harness_adapter.openhands_adapter import OpenHandsAdapter
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.workflow_submission import PlatformWorkflowSubmission
-from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.application.conversation_runtime import (
+    DEFAULT_EXECUTION_WORKER_CONCURRENCY,
+    ConversationRuntime,
+)
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.capabilities import ResourceLimits
@@ -335,7 +338,14 @@ def install_product_api(app: FastAPI) -> FastAPI:
             runtime = ensure_product_runtime(current_app)
             if runtime is not None:
                 await runtime.recover_version_metadata()
-                await runtime.start_execution_events()
+                await runtime.start_execution_events(
+                    execution_worker_concurrency=int(
+                        os.getenv(
+                            "PYROMIND_EXECUTION_WORKER_CONCURRENCY",
+                            str(DEFAULT_EXECUTION_WORKER_CONCURRENCY),
+                        )
+                    )
+                )
                 bus = getattr(current_app.state, "execution_observation_bus", None)
                 if bus:
                     await bus.start_consumer()

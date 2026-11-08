@@ -370,7 +370,11 @@ async def events_socket(
         await websocket.close(code=4004, reason="Conversation not found")
         return
     if isinstance(current_user, CurrentLoginUser):
-        await apply_pyromind_validation_context(event_service, current_user)
+        await apply_pyromind_validation_context(
+            event_service,
+            current_user,
+            x_cluster=_resolve_websocket_x_cluster(websocket),
+        )
 
     try:
         subscriber_id = await event_service.subscribe_to_events(

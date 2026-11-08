@@ -1,46 +1,61 @@
-"""Resolve platform routing from the deployment environment."""
+"""Resolve platform destinations from the request cluster route."""
 
 from __future__ import annotations
 
-import os
+from collections.abc import Mapping
 from urllib.parse import urlsplit
 
 
+DEFAULT_PLATFORM_CLUSTER = "us-west-1"
 _PROD_APP_ENVS = {"prod", "production", "online"}
 
 
-def configured_platform_env() -> str | None:
-    app_env = os.getenv("APP_ENV", "").strip().lower()
-    if not app_env:
-        return None
-    if app_env in _PROD_APP_ENVS:
-        return "prod"
-    return "pre2" if app_env == "pre2" else "pre"
-
-
 def resolve_platform_env(env: str | None = None) -> str:
-    """Prefer APP_ENV, with an explicit fallback for standalone callers."""
-    return configured_platform_env() or (env or "").strip().lower() or "pre"
+    return (env or "").strip().lower() or "prod"
 
 
-def platform_cluster_route(route: str | None) -> str | None:
-    """Keep the region while aligning an outgoing cluster header with APP_ENV."""
-    env = configured_platform_env()
-    if not route or env is None:
+def platform_cluster_route(route: str | None) -> str:
+    route = (route or "").strip()
+    return route if route.partition("#")[0] else DEFAULT_PLATFORM_CLUSTER
+
+
+def platform_cluster_target(route: str | None) -> tuple[str, str]:
+    cluster, _, env = platform_cluster_route(route).partition("#")
+    return resolve_platform_env(env), cluster
+
+
+def cluster_header(headers: Mapping[str, str]) -> str | None:
+    return next(
+        (
+            value.strip()
+            for name, value in headers.items()
+            if name.lower() == "x-cluster" and value.strip()
+        ),
+        None,
+    )
+
+
+def platform_client_route(
+    headers: Mapping[str, str], *, cluster: str | None, env: str | None
+) -> str:
+    """Prefer the request route to the standalone client's explicit arguments."""
+    if route := cluster_header(headers):
         return route
-    cluster = route.partition("#")[0].strip()
-    if not cluster:
-        return None
-    return cluster if env == "prod" else f"{cluster}#{env}"
+    route = platform_cluster_route(cluster)
+    env = resolve_platform_env(env)
+    if (cluster or "").strip() and "#" not in route and env in {"pre", "pre2"}:
+        return f"{route}#{env}"
+    return route
 
 
-def platform_headers(headers: dict[str, str]) -> dict[str, str]:
-    return {
-        name: platform_cluster_route(value) or ""
-        if name.lower() == "x-cluster"
-        else value
-        for name, value in headers.items()
+def platform_headers(
+    headers: Mapping[str, str], *, route: str | None = None
+) -> dict[str, str]:
+    forwarded = {
+        name: value for name, value in headers.items() if name.lower() != "x-cluster"
     }
+    forwarded["x-cluster"] = platform_cluster_route(route or cluster_header(headers))
+    return forwarded
 
 
 def platform_endpoint(prod: str, pre: str, env: str | None = None) -> str:
@@ -52,15 +67,15 @@ def platform_endpoint(prod: str, pre: str, env: str | None = None) -> str:
     )
 
 
-def platform_portal_url(url: str) -> str:
-    """Align configured portal URLs without rewriting custom endpoints."""
-    env = configured_platform_env()
-    if env is None:
+def platform_portal_url(url: str, headers: Mapping[str, str]) -> str:
+    """Select the portal environment while preserving custom endpoints."""
+    route = cluster_header(headers)
+    if route is None:
         return url
+    env, _ = platform_cluster_target(route)
     parsed = urlsplit(url)
     domain = "api-portal.pyromind.ai"
     if parsed.netloc not in {domain, f"pre-{domain}", f"pre2-{domain}"}:
         return url
-    return parsed._replace(
-        netloc=domain if env == "prod" else f"{env}-{domain}"
-    ).geturl()
+    prefix = f"{env}-" if env in {"pre", "pre2"} else ""
+    return parsed._replace(netloc=f"{prefix}{domain}").geturl()

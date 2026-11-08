@@ -44,8 +44,8 @@ Dataset 在需要用户审阅小样、补充信息或处理阻塞时直接调用
 用户回答直接返回发问角色。后续执行遵守冻结任务范围和平台工具的提交校验。
 Train 复用现有工作流提交确认，完成后由 Manager 把实际模型产物交给 Eval。
 
-后续任务引用上游产物时，用 task.artifact_refs 指定 input_name、task_run_id、artifact_name，
-让 Runtime 解析已验证 URI；不猜测尚未产生的数据或模型路径。
-训练准备交付可直接消费的 messages JSONL；训练集、可选验证集和统计分别作为文件登记。
+子 Agent 用 Markdown 回复交付报告路径。Manager 用 read 打开报告，核对实际产物后将
+Storage 路径传入后续 task.inputs。已登记的产物也可通过 task.artifact_refs 引用。
+训练准备交付可直接消费的 messages JSONL，在报告里分别列出训练集、可选验证集和统计路径。
 将 Dataset 交付的训练、验证文件分别绑定给 Train，不另建一份冻结数据。
-格式转换与模型批处理按 data-processing 的对应范式执行，不统一要求平台提交或独立报告。
+格式转换与模型批处理按 data-processing 的对应范式执行。

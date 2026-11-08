@@ -50,7 +50,6 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.utils.platform_env import (
-    configured_platform_env,
     platform_cluster_route,
 )
 from openhands.tools.workflow.task_submission import (
@@ -71,11 +70,7 @@ DEFAULT_WAIT_TIMEOUT = 600
 MAX_FILE_TEXT_CHARS = 20000
 
 
-def default_sandbox_image(cluster: str | None) -> str:
-    """Cluster default Jupyter-lab image when no image is pinned."""
-    if cluster and "us-west-2" in cluster:
-        return "pyrominddynamics/jupyter-lab-with-ssh:v0.9-aws"
-    return "pyrominddynamics/jupyter-lab-with-ssh:v0.9"
+DEFAULT_SANDBOX_IMAGE = "pyrominddynamics/jupyter-lab-with-ssh:v0.9"
 
 
 def create_sandbox_api_client(
@@ -313,11 +308,7 @@ class SandboxCreateExecutor(
             name=action.name,
             sandbox_type=SandboxType.CUSTOM,
             resources=resources,
-            image=(
-                action.image
-                or self.default_image
-                or default_sandbox_image(self.cluster)
-            ),
+            image=(action.image or self.default_image or DEFAULT_SANDBOX_IMAGE),
             volume_mounts=[
                 VolumeMount(
                     host_path=mount.host_path,
@@ -675,8 +666,8 @@ def terminal_base_url(
     the ``pyromind terminal`` CLI. ``fallback`` is used when the cluster route is
     unknown or absent.
     """
-    route = (platform_cluster_route(cluster) or "").strip()
-    environment = configured_platform_env() or (env or "").strip()
+    route = platform_cluster_route(cluster)
+    environment = (env or "").strip()
     if route and "#" not in route and environment and environment not in PROD_ENVS:
         route = f"{route}#{environment}"
     if route:

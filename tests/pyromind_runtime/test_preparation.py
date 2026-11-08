@@ -820,6 +820,11 @@ async def test_preparation_capability_upgrade_preserves_contract_and_project(
             preparation_policy=policy.model_copy(update={"version": 2}),
             tool_allowlist=tools,
             development_tool_allowlist=development,
+            product_instructions="Read the child's Markdown report.",
+            delegated_roles=(
+                {"name": "eval", "prompt": "Return a Markdown report."},
+                {"name": "new-role", "prompt": "A role outside the saved policy."},
+            ),
         )
         foreign = replace(context, profile_id="another-profile")
         with pytest.raises(PermissionError):
@@ -837,7 +842,11 @@ async def test_preparation_capability_upgrade_preserves_contract_and_project(
             expected = development if phase == "active" else tools
             assert store.access_policy()["tool_allowlist"] == expected
             assert adapter.session_policies[-1][1].tool_allowlist == expected
-            assert adapter.session_policies[-1][1].product_instructions is None
+            refreshed = adapter.session_policies[-1][1]
+            assert refreshed.product_instructions == configuration.product_instructions
+            assert configuration.delegated_roles is not None
+            assert refreshed.delegated_roles == configuration.delegated_roles[:1]
+            assert store.access_policy()["delegated_roles"] == ("eval",)
             assert store.preparation_policy() == policy
             assert store.development_policy().tool_allowlist == development
         assert preparations.get(owner) == before

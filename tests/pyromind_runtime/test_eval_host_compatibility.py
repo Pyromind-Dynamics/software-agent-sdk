@@ -63,7 +63,7 @@ async def test_actual_manager_and_eval_host_create_through_api(
                 for item in adapter._business_tools.specs(sandbox=backend == "sandbox")
             }
             native = {"read", "write", "edit", "terminal"}
-            runtime_tools = {"record_experiment_result", "get_experiment_execution"}
+            runtime_tools = {"get_experiment_execution"}
             assert set(role.tools) <= business | native | runtime_tools
             assert "upload_file_to_pyromind" not in role.tools
             from pyromind_runtime.domain.experiment_execution import ROLE_TOOLS

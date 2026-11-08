@@ -138,23 +138,16 @@ def get_pyromind_api_client(
     timeout: int = 30,
     max_retries: int = 3,
 ) -> PyroMindAPIClient:
-    """Create a :class:`PyroMindAPIClient` from conversation context and environment.
-
-    ``base_url`` is derived from the user's ``x-cluster`` routing header stored on
-    the conversation. ``api_key`` and ``cluster`` still fall back to process env
-    vars when not yet wired from conversation secrets.
-
-    根据会话上下文与环境变量创建 :class:`PyroMindAPIClient`。
-
-    ``base_url`` 由会话中持久化的 ``x-cluster`` 环境标识解析；``api_key`` 与
-    ``cluster`` 暂仍可通过进程环境变量提供。
-    """
+    """Create an SDK client with an explicit cluster route."""
+    route = (cluster or "").strip() or "us-west-1"
+    if "#" in route:
+        env = route.partition("#")[2].strip().lower()
     base_url = _api_url(env)
     client_type = _load_pyromind_api_client_type()
     return client_type(
         api_key=api_key,
         base_url=base_url,
-        cluster=cluster,
+        cluster=route,
         timeout=timeout,
         max_retries=max_retries,
     )

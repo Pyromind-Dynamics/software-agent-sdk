@@ -101,7 +101,7 @@ def _project_ref(
     Every input that changes the imported task set is part of the seed, so the
     same dataset, adapter, and label config always resolve to the same project.
     ``cluster`` is part of the seed because Storage is replicated per cluster: the
-    same path names different objects in us-west-1 and us-west-2, and one shared
+    same path names different objects across clusters, and one shared
     Label Studio would otherwise adopt the other cluster's project by title.
     ``field_map_hash`` is part of it because bindings decide where each value
     lands: reusing a project across two different maps would keep serving the

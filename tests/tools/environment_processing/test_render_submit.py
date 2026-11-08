@@ -231,7 +231,7 @@ def test_executor_stages_template_from_remote_workspace(
     assert ("render_template.json", template.read_text()) in uploaded
 
 
-def test_executor_env_falls_back_to_app_env(
+def test_executor_missing_env_uses_production(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_submission(monkeypatch)
@@ -264,11 +264,11 @@ def test_executor_env_falls_back_to_app_env(
     )
 
     assert obs.status == "Pending"
-    assert client_factory.call_args.kwargs["env"] == "pre"
+    assert client_factory.call_args.kwargs["env"] == "prod"
     assert client_factory.call_args.kwargs["cluster"] == "us-west-1"
 
 
-def test_executor_missing_cluster_still_fails(
+def test_executor_missing_cluster_uses_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_submission(monkeypatch)
@@ -296,8 +296,8 @@ def test_executor_missing_cluster_still_fails(
         conversation,
     )
 
-    assert obs.status == "Failed"
-    assert "cluster not wired" in obs.text
+    assert not obs.is_error
+    assert obs.status == "Pending"
 
 
 def test_edp_render_tool_rejects_unknown_params() -> None:

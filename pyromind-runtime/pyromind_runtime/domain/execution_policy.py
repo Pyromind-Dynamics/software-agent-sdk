@@ -22,12 +22,6 @@ class CheckpointRef(ContractModel):
     checkpoint_id: str = Field(min_length=1)
 
 
-class ExecutionArtifact(ContractModel):
-    name: str = Field(min_length=1, max_length=128)
-    uri: str = Field(min_length=1, max_length=4096)
-    kind: Literal["file", "directory"] = "file"
-
-
 class ExecutionCheckpoint(ContractModel):
     run_id: str = Field(min_length=1)
     summary: str = Field(min_length=1, max_length=16000)
