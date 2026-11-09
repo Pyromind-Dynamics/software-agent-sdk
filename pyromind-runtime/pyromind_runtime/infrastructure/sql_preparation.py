@@ -141,6 +141,7 @@ class SQLPreparationStore:
         return ProjectView(
             project_id=row["project_id"],
             conversation_id=row["conversation_id"],
+            cluster=row["cluster"],
             plan_sequence=row["context_sequence"],
             plan=ExperimentContext.model_validate(row["context"]),
             creation_command_id=creation["command_id"],
@@ -159,7 +160,12 @@ class SQLPreparationStore:
             return self._project(row) if row and row["creation_metadata"] else None
 
     def activate(
-        self, owner: PlanOwner, expected_revision: int, command_id: str
+        self,
+        owner: PlanOwner,
+        expected_revision: int,
+        command_id: str,
+        *,
+        cluster: str | None = None,
     ) -> ProjectView:
         with write_transaction(self.engine) as conn:
             row = self._row(conn, owner)
@@ -191,6 +197,7 @@ class SQLPreparationStore:
                     owner_key=owner_key(owner),
                     user_id=owner.user_id,
                     conversation_id=owner.conversation_id,
+                    cluster=cluster,
                     profile_id=owner.profile_id,
                     current_revision=0,
                     context_sequence=1,
@@ -246,6 +253,7 @@ class SQLPreparationStore:
             return ProjectView(
                 project_id=identity,
                 conversation_id=owner.conversation_id,
+                cluster=cluster,
                 plan_sequence=1,
                 plan=view.plan,
                 creation_command_id=command_id,

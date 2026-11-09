@@ -204,6 +204,7 @@ class ProjectView(ContractModel):
     plan: ExperimentContext
     creation_command_id: str
     initial_run_id: str
+    cluster: str | None = None
 
 
 PREPARATION_TOOLS = {

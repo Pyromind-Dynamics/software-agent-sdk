@@ -10,10 +10,17 @@ from pyromind_runtime.domain.experiment_plans import (
     PlanRevision,
     UpdateExperimentContext,
 )
+from pyromind_runtime.domain.preparation import ProjectView
 
 
 class ExperimentPlanProjectBinder(Protocol):
-    def bind(self, revision: PlanRevision, owner: PlanOwner) -> None: ...
+    def bind(
+        self, revision: PlanRevision, owner: PlanOwner, *, cluster: str
+    ) -> None: ...
+
+    def bind_preparation(
+        self, project: ProjectView, owner: PlanOwner, *, cluster: str
+    ) -> None: ...
 
 
 class ExperimentPlanStore(Protocol):
@@ -45,6 +52,8 @@ class ExperimentPlanStore(Protocol):
         proposal_id: str,
         expected_revision: int,
         command_id: str,
+        *,
+        cluster: str | None = None,
     ) -> PlanRevision: ...
 
     def reject(self, owner: PlanOwner, proposal_id: str) -> None: ...

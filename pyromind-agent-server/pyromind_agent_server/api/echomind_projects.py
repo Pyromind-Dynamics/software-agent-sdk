@@ -9,12 +9,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from pyromind_runtime.domain.commands import UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
+from pyromind_runtime.domain.context import RequestContext
 
 from openhands.agent_server.dependencies import check_session_api_key
 from openhands.agent_server.echomind_projects import (
+    ProjectClusterMismatchError,
     ProjectInfo,
     ProjectNotFoundError,
     ProjectStore,
+    ProjectSummary,
 )
 from openhands.agent_server.echomind_stage_executors import (
     get_project_node_executor,
@@ -50,6 +53,7 @@ class StartEchoMindProjectNodeResponse(BaseModel):
     graph_id: str
     node_id: str
     conversation_id: str
+    cluster: str
     event_id: str
     status: Literal["started"] = "started"
 
@@ -130,24 +134,52 @@ def _require_sandbox_credentials(request: Request) -> None:
         )
 
 
+def _load_project(
+    request: Request,
+    project_id: str,
+    *,
+    require_cluster: bool = False,
+) -> tuple[RequestContext, ProjectInfo, ProjectStore]:
+    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
+    service = get_conversation_service(request)
+    store = ProjectStore.for_conversations_dir(service.conversations_dir)
+    try:
+        project = store.load(project_id, owner_user_id=context.user_id)
+        if require_cluster:
+            store.require_cluster(project, context.x_cluster)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {project_id}",
+        ) from exc
+    except ProjectClusterMismatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    return context, project, store
+
+
+@router.get(
+    "/projects",
+    response_model=list[ProjectSummary],
+)
+async def list_echomind_projects(request: Request) -> list[ProjectSummary]:
+    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
+    service = get_conversation_service(request)
+    return ProjectStore.for_conversations_dir(service.conversations_dir).list(
+        owner_user_id=context.user_id
+    )
+
+
 @router.get(
     "/projects/{project_id}",
     response_model=ProjectInfo,
     responses={404: {"description": "Project not found"}},
 )
 async def get_echomind_project(project_id: str, request: Request) -> ProjectInfo:
-    service = get_conversation_service(request)
-    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
-    try:
-        return ProjectStore.for_conversations_dir(service.conversations_dir).load(
-            project_id,
-            owner_user_id=context.user_id,
-        )
-    except ProjectNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project not found: {project_id}",
-        ) from exc
+    _, project, _ = _load_project(request, project_id)
+    return project
 
 
 @router.post(
@@ -162,16 +194,7 @@ async def start_echomind_project_node(
     request: Request,
 ) -> StartEchoMindProjectNodeResponse:
     _require_sandbox_credentials(request)
-    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
-    service = get_conversation_service(request)
-    store = ProjectStore.for_conversations_dir(service.conversations_dir)
-    try:
-        project = store.load(project_id, owner_user_id=context.user_id)
-    except ProjectNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project not found: {project_id}",
-        ) from exc
+    context, project, _ = _load_project(request, project_id, require_cluster=True)
 
     node = next((item for item in project.graph.nodes if item.id == node_id), None)
     if node is None:
@@ -195,7 +218,7 @@ async def start_echomind_project_node(
             detail="Dataset node is not bound to the data-processing capability.",
         )
 
-    conversation_id = project.project.echomind_conversation_id
+    conversation_id = project.project.conversation_id
     _require_echomind_conversation(request, conversation_id)
     command = UserMessageCommand(
         command_id=uuid4().hex,
@@ -216,6 +239,7 @@ async def start_echomind_project_node(
         graph_id=project.graph.graph_id,
         node_id=node.id,
         conversation_id=conversation_id,
+        cluster=project.project.cluster,
         event_id=receipt.command_id,
     )
 
@@ -231,19 +255,7 @@ async def run_echomind_project_node(
     node_id: str,
     request: Request,
 ) -> StageRun:
-    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
-    service = get_conversation_service(request)
-    store = ProjectStore.for_conversations_dir(service.conversations_dir)
-    try:
-        project = store.load(
-            project_id,
-            owner_user_id=context.user_id,
-        )
-    except ProjectNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project not found: {project_id}",
-        ) from exc
+    _, project, store = _load_project(request, project_id, require_cluster=True)
     node = next((item for item in project.graph.nodes if item.id == node_id), None)
     if node is None:
         raise HTTPException(
@@ -278,19 +290,7 @@ async def list_echomind_project_runs(
     project_id: str,
     request: Request,
 ) -> list[StageRun]:
-    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
-    service = get_conversation_service(request)
-    store = ProjectStore.for_conversations_dir(service.conversations_dir)
-    try:
-        store.load(
-            project_id,
-            owner_user_id=context.user_id,
-        )
-    except ProjectNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project not found: {project_id}",
-        ) from exc
+    _, _, store = _load_project(request, project_id)
     return ProjectRunStore(store.root).list(project_id)
 
 
@@ -304,19 +304,7 @@ async def get_echomind_project_artifact(
     artifact_id: str,
     request: Request,
 ) -> ProjectArtifactDocument:
-    context = context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
-    service = get_conversation_service(request)
-    store = ProjectStore.for_conversations_dir(service.conversations_dir)
-    try:
-        store.load(
-            project_id,
-            owner_user_id=context.user_id,
-        )
-    except ProjectNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project not found: {project_id}",
-        ) from exc
+    _, _, store = _load_project(request, project_id)
     try:
         return ProjectRunStore(store.root).load_artifact(
             project_id=project_id,

@@ -41,7 +41,8 @@ def test_stage_runs_and_artifacts_persist_under_canonical_project_directory(
             plan=_plan(),
             confirmed_by="42",
         ),
-        echomind_conversation_id="conversation-1",
+        conversation_id="conversation-1",
+        cluster="us-west-1#pre",
         owner_user_id="42",
     )
 

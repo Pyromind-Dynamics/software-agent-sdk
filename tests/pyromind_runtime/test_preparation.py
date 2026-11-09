@@ -206,7 +206,10 @@ def test_project_creation_is_atomic_and_deduplicated_across_writers(
 
     def create(index):
         return SQLPreparationStore(store.engine).activate(
-            owner, ready.revision, f"button-{index}"
+            owner,
+            ready.revision,
+            f"button-{index}",
+            cluster="us-west-1#pre",
         )
 
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -215,6 +218,7 @@ def test_project_creation_is_atomic_and_deduplicated_across_writers(
     assert len({result.initial_run_id for result in results}) == 1
     with store.engine.connect() as conn:
         assert conn.scalar(sa.select(sa.func.count()).select_from(projects)) == 1
+        assert conn.scalar(sa.select(projects.c.cluster)) == "us-west-1#pre"
         assert conn.scalar(sa.select(sa.func.count()).select_from(runs)) == 1
         assert conn.scalar(sa.select(sa.func.count()).select_from(work)) == 1
     run = store.executions.list(owner)[0]
@@ -299,7 +303,11 @@ async def test_runtime_creation_restore_permissions_and_stage_protection(
 ):
     preparation_store, owner, policy = preparation_setup
     adapter = FakeAdapter()
-    context = RequestContext(user_id=owner.user_id, profile_id=owner.profile_id)
+    context = RequestContext(
+        user_id=owner.user_id,
+        profile_id=owner.profile_id,
+        x_cluster="us-west-1#pre",
+    )
     plans = SQLExperimentPlanStore(preparation_store.engine)
     runtime = ConversationRuntime(
         tmp_path / "conversations",
@@ -346,6 +354,9 @@ async def test_runtime_creation_restore_permissions_and_stage_protection(
         runtime.submit_command(owner.conversation_id, command, context), 5
     )
     assert receipt.status == "completed"
+    project = preparation_store.project(owner)
+    assert project is not None
+    assert project.cluster == "us-west-1#pre"
     assert adapter.session_policies[-1][1].tool_allowlist == development
     assert (
         await runtime.submit_command(owner.conversation_id, command, context) == receipt

@@ -78,8 +78,8 @@ def test_composed_app_mounts_echomind_project_routes(tmp_path) -> None:
 
     assert "/api/v2/echomind/conversations" in paths
     assert "/api/echomind/projects/{project_id}" in paths
+    assert "/api/echomind/projects" in paths
     assert "/api/echomind/conversations" not in paths
-    assert "/api/echomind/projects" not in paths
     assert not any("project-request" in path for path in paths)
 
 

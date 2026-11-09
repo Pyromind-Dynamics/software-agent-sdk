@@ -51,6 +51,7 @@ projects = Table(
     Column("owner_key", String(64), nullable=False, unique=True),
     Column("user_id", String(255), nullable=False),
     Column("conversation_id", String(128), nullable=False),
+    Column("cluster", String(255)),
     Column("profile_id", String(128)),
     Column("current_revision", Integer, nullable=False),
     Column("context", JSON),
@@ -371,6 +372,8 @@ class SQLExperimentPlanStore:
         proposal_id: str,
         expected_revision: int,
         command_id: str,
+        *,
+        cluster: str | None = None,
     ) -> PlanRevision:
         key = _owner_key(owner)
         with self._transaction(owner) as connection:
@@ -425,14 +428,25 @@ class SQLExperimentPlanStore:
                         project_id=project_id,
                         owner_key=key,
                         **owner.model_dump(),
+                        cluster=cluster,
                         current_revision=revision.revision,
                     )
                 )
             else:
+                if (
+                    project["cluster"] is not None
+                    and cluster is not None
+                    and project["cluster"] != cluster
+                ):
+                    raise PlanConflictError("Project belongs to a different cluster")
+                stored_cluster = project["cluster"] or cluster
                 connection.execute(
                     update(projects)
                     .where(projects.c.project_id == project_id)
-                    .values(current_revision=revision.revision)
+                    .values(
+                        current_revision=revision.revision,
+                        cluster=stored_cluster,
+                    )
                 )
             connection.execute(
                 insert(documents).values(

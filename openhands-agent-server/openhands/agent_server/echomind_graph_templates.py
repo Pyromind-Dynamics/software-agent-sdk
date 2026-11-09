@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pyromind_runtime.domain.experiment_plans import ExperimentStage, WorkflowPlan
+from pyromind_runtime.domain.experiment_plans import (
+    ExperimentContext,
+    ExperimentStage,
+    WorkflowPlan,
+)
 
 
 EXPERIMENT_PLANNING_SKILL = "experiment-planning"
@@ -13,7 +17,7 @@ ProjectNodeType = Literal["dataset", "inference", "evaluator", "train"]
 
 def build_graph_payload(
     *,
-    plan: WorkflowPlan,
+    plan: ExperimentContext | WorkflowPlan,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     resources = _resources_payload(plan)
     tasks_by_stage = _tasks_by_stage(plan)
@@ -69,7 +73,9 @@ def _stage_node_type(stage: ExperimentStage) -> ProjectNodeType | None:
     return None
 
 
-def _resources_payload(plan: WorkflowPlan) -> list[dict[str, str | None]]:
+def _resources_payload(
+    plan: ExperimentContext | WorkflowPlan,
+) -> list[dict[str, str | None]]:
     return [
         {
             "id": resource.id,
@@ -81,7 +87,9 @@ def _resources_payload(plan: WorkflowPlan) -> list[dict[str, str | None]]:
     ]
 
 
-def _tasks_by_stage(plan: WorkflowPlan) -> dict[str, list[dict[str, Any]]]:
+def _tasks_by_stage(
+    plan: ExperimentContext | WorkflowPlan,
+) -> dict[str, list[dict[str, Any]]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for task in plan.tasks:
         grouped.setdefault(task.stage_id, []).append(task.model_dump(mode="json"))

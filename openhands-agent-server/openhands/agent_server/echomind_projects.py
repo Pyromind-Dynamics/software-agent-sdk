@@ -7,8 +7,13 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-from pyromind_runtime.domain.experiment_plans import PlanRevision, WorkflowPlan
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pyromind_runtime.domain.experiment_plans import (
+    ExperimentContext,
+    PlanRevision,
+    WorkflowPlan,
+)
+from pyromind_runtime.domain.preparation import ProjectView
 
 from openhands.agent_server.echomind_graph_templates import (
     EXPERIMENT_GRAPH_TEMPLATE,
@@ -66,14 +71,15 @@ class ProjectEdge(BaseModel):
 class ProjectRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     project_id: str
     name: str
     description: str
     skill: str
     requirements: list[ProjectRequirement] = Field(default_factory=list)
     owner_user_id: str | None = None
-    echomind_conversation_id: str
+    conversation_id: str
+    cluster: str
     lifecycle: ProjectLifecycle = "development"
     frozen_at: datetime | None = None
     created_at: datetime = Field(default_factory=_utc_now)
@@ -138,7 +144,27 @@ class ProjectInfo(BaseModel):
         return self
 
 
+class ProjectSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    project_id: str
+    name: str
+    description: str
+    skill: str
+    owner_user_id: str | None = None
+    conversation_id: str
+    cluster: str
+    lifecycle: ProjectLifecycle
+    node_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
 class ProjectNotFoundError(FileNotFoundError):
+    pass
+
+
+class ProjectClusterMismatchError(PermissionError):
     pass
 
 
@@ -156,11 +182,51 @@ class ProjectStore:
         self,
         revision: PlanRevision,
         *,
-        echomind_conversation_id: str,
+        conversation_id: str,
+        cluster: str,
         owner_user_id: str | None,
     ) -> ProjectInfo:
-        plan = revision.plan
-        project_id = revision.project_id
+        return self._bind(
+            project_id=revision.project_id,
+            plan=revision.plan,
+            name=revision.plan.name,
+            description=revision.plan.goal,
+            skill=revision.plan.skill or EXPERIMENT_PLANNING_SKILL,
+            conversation_id=conversation_id,
+            cluster=cluster,
+            owner_user_id=owner_user_id,
+        )
+
+    def bind_preparation(
+        self,
+        project: ProjectView,
+        *,
+        cluster: str,
+        owner_user_id: str | None,
+    ) -> ProjectInfo:
+        return self._bind(
+            project_id=project.project_id,
+            plan=project.plan,
+            name=project.plan.goal,
+            description=project.plan.goal,
+            skill=EXPERIMENT_PLANNING_SKILL,
+            conversation_id=project.conversation_id,
+            cluster=cluster,
+            owner_user_id=owner_user_id,
+        )
+
+    def _bind(
+        self,
+        *,
+        project_id: str,
+        plan: ExperimentContext | WorkflowPlan,
+        name: str,
+        description: str,
+        skill: str,
+        conversation_id: str,
+        cluster: str,
+        owner_user_id: str | None,
+    ) -> ProjectInfo:
         try:
             canonical_project_id = str(UUID(project_id))
         except ValueError as exc:
@@ -170,26 +236,27 @@ class ProjectStore:
         existing = self._load_optional(canonical_project_id)
         if existing is not None:
             if (
-                existing.project.owner_user_id not in {None, owner_user_id}
-                or existing.project.echomind_conversation_id != echomind_conversation_id
+                existing.project.owner_user_id != owner_user_id
+                or existing.project.conversation_id != conversation_id
+                or existing.project.cluster != cluster
             ):
-                raise PermissionError("Project belongs to another conversation")
+                raise PermissionError("Project belongs to another owner")
             graph_id = existing.graph.graph_id
             created_at = existing.project.created_at
         else:
             graph_id = str(uuid4())
             created_at = _utc_now()
 
-        skill = plan.skill or EXPERIMENT_PLANNING_SKILL
         node_payloads, edge_payloads = build_graph_payload(plan=plan)
         project = ProjectRecord(
             project_id=project_id,
-            name=plan.name,
-            description=plan.goal,
+            name=name,
+            description=description,
             skill=skill,
             requirements=_requirements_from_plan(plan),
             owner_user_id=owner_user_id,
-            echomind_conversation_id=echomind_conversation_id,
+            conversation_id=conversation_id,
+            cluster=cluster,
             lifecycle="development",
             created_at=created_at,
         )
@@ -227,13 +294,63 @@ class ProjectStore:
         project = self._load_optional(canonical_project_id)
         if project is None:
             raise ProjectNotFoundError(project_id)
-        if (
-            owner_user_id is not None
-            and project.project.owner_user_id is not None
-            and project.project.owner_user_id != owner_user_id
-        ):
+        if owner_user_id is not None and project.project.owner_user_id != owner_user_id:
             raise ProjectNotFoundError(project_id)
         return project
+
+    def list(self, *, owner_user_id: str | None) -> list[ProjectSummary]:
+        if not self.root.is_dir():
+            return []
+        summaries: list[ProjectSummary] = []
+        for project_dir in self.root.iterdir():
+            if not project_dir.is_dir():
+                continue
+            try:
+                project = self._load_optional(project_dir.name)
+            except (OSError, ValidationError, ValueError):
+                continue
+            if project is None:
+                continue
+            if (
+                owner_user_id is not None
+                and project.project.owner_user_id != owner_user_id
+            ):
+                continue
+            project_path = project_dir / "project.json"
+            graph_path = project_dir / "graph.json"
+            created_at = project.project.created_at
+            updated_at = max(
+                created_at,
+                datetime.fromtimestamp(project_path.stat().st_mtime, UTC),
+                datetime.fromtimestamp(graph_path.stat().st_mtime, UTC),
+            )
+            summaries.append(
+                ProjectSummary(
+                    project_id=project.project.project_id,
+                    name=project.project.name,
+                    description=project.project.description,
+                    skill=project.project.skill,
+                    owner_user_id=project.project.owner_user_id,
+                    conversation_id=project.project.conversation_id,
+                    cluster=project.project.cluster,
+                    lifecycle=project.project.lifecycle,
+                    node_count=len(project.graph.nodes),
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
+            )
+        return sorted(summaries, key=lambda item: item.updated_at, reverse=True)
+
+    def require_cluster(self, project: ProjectInfo, cluster: str | None) -> None:
+        requested = (cluster or "").strip()
+        if not requested:
+            raise ProjectClusterMismatchError(
+                "x-cluster is required for Project writes"
+            )
+        if project.project.cluster != requested:
+            raise ProjectClusterMismatchError(
+                f"Project belongs to cluster {project.project.cluster}"
+            )
 
     def _load_optional(self, canonical_project_id: str) -> ProjectInfo | None:
         project_dir = self.root / canonical_project_id
@@ -250,7 +367,9 @@ class ProjectStore:
         return ProjectInfo(project=project, graph=graph)
 
 
-def _requirements_from_plan(plan: WorkflowPlan) -> list[ProjectRequirement]:
+def _requirements_from_plan(
+    plan: ExperimentContext | WorkflowPlan,
+) -> list[ProjectRequirement]:
     return [
         ProjectRequirement(
             key=resource.id,

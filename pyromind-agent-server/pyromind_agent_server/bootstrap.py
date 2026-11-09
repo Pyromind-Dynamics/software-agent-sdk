@@ -39,6 +39,9 @@ from pyromind_agent_server.evaluation_configuration import (
     validate_evaluation_configuration,
 )
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
+from pyromind_agent_server.experiment_plan_projects import (
+    EchoMindExperimentPlanProjectBinder,
+)
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.observability import build_execution_observer
 from pyromind_agent_server.plan_database import build_experiment_plan_store
@@ -242,6 +245,11 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         experiment_plan_store=plan_store,
         experiment_execution_store=execution_store,
         preparation_store=SQLPreparationStore(plan_store.engine)
+        if plan_store
+        else None,
+        experiment_plan_project_binder=EchoMindExperimentPlanProjectBinder(
+            service.conversations_dir
+        )
         if plan_store
         else None,
         resource_inspector=StorageResourceInspector(),

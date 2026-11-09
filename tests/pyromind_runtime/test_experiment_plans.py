@@ -26,6 +26,7 @@ from pyromind_runtime.domain.commands import ConfirmExperimentPlanCommand
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.experiment_plans import (
     CreateExperimentPlan,
+    ExperimentPlanView,
     PlanConflictError,
     PlanOwner,
     ReviseExperimentPlan,
@@ -180,8 +181,23 @@ def test_proposal_confirmation_revision_rejection_and_isolation(
         ).pending_proposal
         is None
     )
-    revision = plan_store.confirm(owner, draft.proposal_id, 0, "confirm-1")
+    revision = plan_store.confirm(
+        owner,
+        draft.proposal_id,
+        0,
+        "confirm-1",
+        cluster="us-west-1#pre",
+    )
     assert revision.revision == 1
+    with plan_store.engine.connect() as connection:
+        assert (
+            connection.scalar(
+                select(projects.c.cluster).where(
+                    projects.c.project_id == revision.project_id
+                )
+            )
+            == "us-west-1#pre"
+        )
     assert plan_store.confirm(owner, draft.proposal_id, 0, "confirm-1") == revision
     assert plan_store.confirm(owner, draft.proposal_id, 0, "double-click") == revision
     updated = draft.plan.model_copy(update={"goal": "只做评测"})
@@ -243,6 +259,7 @@ async def test_runtime_plans_restore_without_harness_and_refresh_hint_failure(
         profile_id="planning",
         cookie="private-cookie",
         authorization="private-token",
+        x_cluster="us-west-1#pre",
     )
     adapter = FakeAdapter("pi")
     runtime = ConversationRuntime(
@@ -319,7 +336,10 @@ async def test_http_profile_routing_confirm_conflict_and_cross_profile_denial(
     )
     app = _app(tmp_path, runtime)
     app.include_router(create_product_router(ECHOMIND_PRODUCT_PROFILE))
-    headers = {"x-pyromind-debug-user-id": "42"}
+    headers = {
+        "x-pyromind-debug-user-id": "42",
+        "x-cluster": "us-west-1#pre",
+    }
     base = "/api/v2/echomind/conversations"
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test", headers=headers
@@ -328,7 +348,9 @@ async def test_http_profile_routing_confirm_conflict_and_cross_profile_denial(
         assert created.status_code == 201
         identity = created.json()["conversation_id"]
         context = RequestContext(
-            user_id="42", profile_id=ECHOMIND_PRODUCT_PROFILE.profile_id
+            user_id="42",
+            profile_id=ECHOMIND_PRODUCT_PROFILE.profile_id,
+            x_cluster="us-west-1#pre",
         )
         assert "EchoMind Manager" in adapter.created_specs[0].product_instructions
         assert (
@@ -363,9 +385,9 @@ async def test_http_profile_routing_confirm_conflict_and_cross_profile_denial(
         blocked = await client.post(f"{base}/{identity}/commands", json=command_body)
         assert blocked.status_code == 409
         assert "idle Agent" in blocked.json()["detail"]
-        assert (
-            await runtime.get_experiment_plan(identity, context)
-        ).current_revision == 0
+        plan_view = await runtime.get_experiment_plan(identity, context)
+        assert isinstance(plan_view, ExperimentPlanView)
+        assert plan_view.current_revision == 0
 
         await set_agent_status("idle", "plan-idle")
         saved = await client.post(f"{base}/{identity}/commands", json=command_body)
@@ -631,7 +653,11 @@ async def test_plan_tools_through_real_pi_and_restored_session(
     root = tmp_path / "conversations"
     root.mkdir()
     profile = ECHOMIND_PRODUCT_PROFILE
-    context = RequestContext(user_id="42", profile_id=profile.profile_id)
+    context = RequestContext(
+        user_id="42",
+        profile_id=profile.profile_id,
+        x_cluster="us-west-1#pre",
+    )
 
     def build_runtime():
         adapter = PiAdapter(root, terminal_backend="os-sandbox")
@@ -771,7 +797,11 @@ async def test_legacy_optional_plan_binder_activates_legacy_policy(
         experiment_plan_project_binder=binder,
     )
     profile = ECHOMIND_PRODUCT_PROFILE
-    context = RequestContext(user_id="42", profile_id=profile.profile_id)
+    context = RequestContext(
+        user_id="42",
+        profile_id=profile.profile_id,
+        x_cluster="us-west-1#pre",
+    )
     plan = {
         "skill": "experiment-planning",
         "name": "AVI project",
@@ -822,6 +852,7 @@ async def test_legacy_optional_plan_binder_activates_legacy_policy(
         project = ProjectStore.for_conversations_dir(conversations).load(
             revision.project_id, owner_user_id="42"
         )
+        assert project.project.cluster == "us-west-1#pre"
         assert project.graph.template == "experiment-planning/v1"
         assert [node.id for node in project.graph.nodes] == [
             "dataset",

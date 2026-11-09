@@ -1469,9 +1469,9 @@ class ConversationRuntime:
         )
 
     @staticmethod
-    async def _plan_io[T](call: Callable[..., T], *args: Any) -> T:
+    async def _plan_io[T](call: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         try:
-            return await asyncio.to_thread(call, *args)
+            return await asyncio.to_thread(call, *args, **kwargs)
         except (ValueError, PermissionError):
             raise
         except Exception as exc:
@@ -1635,18 +1635,21 @@ class ConversationRuntime:
                 "Plan decisions require an idle Agent; retry after the current turn."
             )
         if isinstance(command, ConfirmExperimentPlanCommand):
+            cluster = self._project_cluster(context)
             revision = await self._plan_io(
                 service.store.confirm,
                 owner,
                 command.proposal_id,
                 command.expected_revision,
                 command.command_id,
+                cluster=cluster,
             )
             if self._experiment_plan_project_binder is not None:
                 await self._plan_io(
                     self._experiment_plan_project_binder.bind,
                     revision,
                     owner,
+                    cluster=cluster,
                 )
             await self._activate_development_policy(conversation_id, store, context)
             response = revision.model_dump(mode="json")
@@ -1707,6 +1710,13 @@ class ConversationRuntime:
             conversation_id=conversation_id,
             profile_id=context.profile_id,
         )
+
+    @staticmethod
+    def _project_cluster(context: RequestContext) -> str:
+        cluster = (context.x_cluster or "").strip()
+        if not cluster:
+            raise ValueError("x-cluster is required to create a Project")
+        return cluster
 
     def _preparation_evidence(self, conversation_id: str) -> dict[str, str]:
         snapshot = self._store(conversation_id).load_snapshot()
@@ -1811,6 +1821,7 @@ class ConversationRuntime:
         command: CreateProjectCommand,
         context: RequestContext,
     ) -> CommandReceipt:
+        cluster = self._project_cluster(context)
         owner = self._preparation_owner(conversation_id, context)
         assert self._preparations is not None
         store = self._store(conversation_id)
@@ -1835,7 +1846,15 @@ class ConversationRuntime:
                 owner,
                 command.expected_preparation_revision,
                 command.command_id,
+                cluster=cluster,
             )
+            if self._experiment_plan_project_binder is not None:
+                await self._plan_io(
+                    self._experiment_plan_project_binder.bind_preparation,
+                    project,
+                    owner,
+                    cluster=cluster,
+                )
             if not store.permits_tool("get_experiment_context"):
                 await self._activate_development_policy(conversation_id, store, context)
             await self._ensure_active(conversation_id, context)
