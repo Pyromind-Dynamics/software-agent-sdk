@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
+
 from pyromind_runtime.domain.experiment_execution import (
     DelegatedTask,
     DelegateExperimentTask,
 )
-from pyromind_runtime.domain.experiment_plans import ExperimentContext, PlanOwner
+from pyromind_runtime.domain.experiment_plans import (
+    ExperimentContext,
+    PlanConflictError,
+    PlanOwner,
+)
 from pyromind_runtime.domain.preparation import (
     PreparationFact,
     PreparationPolicy,
@@ -45,13 +51,41 @@ def validate_workflow_role(
 ) -> None:
     if not policy.workflow_nodes:
         return
-    stage = next((stage for stage in plan.stages if stage.id == stage_id), None)
-    node = next(
-        (node for node in policy.workflow_nodes if stage and node.id == stage.kind),
-        None,
-    )
-    if node is None or role not in node.roles:
-        raise ValueError("execution role is unavailable for this catalog node")
+    nodes = {node.id: node for node in policy.workflow_nodes}
+    targets = [
+        {
+            "stage_id": stage.id,
+            "stage_kind": stage.kind,
+            "stage_name": stage.name,
+            "roles": list(nodes[stage.kind].roles),
+        }
+        for stage in plan.stages
+        if stage.enabled
+        and not stage.placeholder
+        and stage.kind in nodes
+        and nodes[stage.kind].roles
+    ]
+    target = next((item for item in targets if item["stage_id"] == stage_id), None)
+    if target is None or role not in target["roles"]:
+        raise ValueError(
+            json.dumps(
+                {
+                    "error": "invalid_execution_target",
+                    "reason": (
+                        "stage_id is required and must identify an enabled "
+                        "non-placeholder stage whose catalog allows role_id"
+                    ),
+                    "requested": {"stage_id": stage_id, "role_id": role},
+                    "valid_targets": targets,
+                    "action": (
+                        "Choose a stage_id and role_id from valid_targets, then "
+                        "submit the complete task with a new request_id."
+                    ),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
 
 
 class Preparations:
@@ -174,7 +208,29 @@ class Preparations:
                 "review_pending": False,
             }
         )
-        return self.store.save(owner, updated, request.expected_revision)
+        try:
+            return self.store.save(owner, updated, request.expected_revision)
+        except PlanConflictError as exc:
+            latest = self.store.get(owner)
+            raise ValueError(
+                json.dumps(
+                    {
+                        "error": "preparation_revision_conflict",
+                        "reason": str(exc),
+                        "expected_revision": request.expected_revision,
+                        "current_revision": latest.revision,
+                        "current_preparation": latest.model_dump(mode="json"),
+                        "action": (
+                            "Merge the requested fact changes into "
+                            "current_preparation, preserve unrelated current "
+                            "facts, and retry with expected_revision equal to "
+                            "current_revision."
+                        ),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            ) from exc
 
     def set_plan(
         self, owner: PlanOwner, request: SetPreparationPlan

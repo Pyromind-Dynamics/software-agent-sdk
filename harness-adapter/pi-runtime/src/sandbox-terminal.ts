@@ -156,7 +156,7 @@ export interface SandboxTerminalOptions extends SandboxTerminalTimeouts {
   runsRoot?: string;
   /** Runner-assigned lane name. Also keeps the environment in the PTY shell. */
   owner?: string;
-  /** Host-side launch evidence, containing only the sandbox and execution IDs. */
+  /** Active launch evidence; unresolved runs are retained beside it in .unresolved/. */
   journalPath?: string;
   heartbeatSeconds?: number;
   maxReconnects?: number;
@@ -928,8 +928,10 @@ export class SandboxTerminalOperations implements BashOperations {
     return queued.result;
   }
 
-  private quarantined: { runDir: string; token: string; execution: TerminalExecutionEvidence } | undefined;
-  get terminationUnconfirmed(): boolean { return this.quarantined !== undefined; }
+  private readonly unconfirmed = new Map<string, {
+    sandboxId: string; executionId: string; remote_run_dir: string; status: "termination_unknown";
+  }>();
+  get terminationUnconfirmed(): boolean { return this.unconfirmed.size > 0; }
 
   updateEndpoint(endpoint: SandboxEndpoint): boolean {
     if (this.endpoint.sandboxId !== endpoint.sandboxId ||
@@ -962,13 +964,26 @@ export class SandboxTerminalOperations implements BashOperations {
     catch { process.stderr.write("Sandbox terminal launch record could not be cleared\n"); }
   }
 
-  private async confirmPreviousLaunch(signal?: AbortSignal): Promise<boolean> {
+  private preserveUnconfirmedLaunch(sandboxId: string, executionId: string, runDir: string): void {
+    const record = { sandboxId, executionId, remote_run_dir: runDir, status: "termination_unknown" as const };
+    this.unconfirmed.set(executionId, record);
     const path = this.settings.journalPath;
-    if (!path) return true;
+    if (!path) return;
+    const directory = path + ".unresolved";
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const destination = `${directory}/${executionId}.json`;
+    writeFileSync(destination + ".tmp", JSON.stringify(record), { mode: 0o600 });
+    renameSync(destination + ".tmp", destination);
+    this.clearLaunch();
+  }
+
+  private async recoverPreviousLaunch(signal?: AbortSignal): Promise<void> {
+    const path = this.settings.journalPath;
+    if (!path) return;
     let record: { sandboxId: string; executionId: string };
     try { record = JSON.parse(readFileSync(path, "utf8")); }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
       throw error;
     }
     if (!record || typeof record.sandboxId !== "string" ||
@@ -977,21 +992,26 @@ export class SandboxTerminalOperations implements BashOperations {
     }
     if (record.sandboxId !== this.endpoint.sandboxId) {
       this.clearLaunch();
-      return true;
+      return;
     }
     const token = randomBytes(9).toString("hex");
+    const runDir = `${this.runsRoot}/${record.executionId}`;
     const channel = this.channel();
+    let stopped = false;
     try {
-      const result = await channel.acknowledge(buildCheckStoppedLine(`${this.runsRoot}/${record.executionId}`, token),
+      const result = await channel.acknowledge(buildCheckStoppedLine(runDir, token),
         `${ACK_MARKER}${token}:recovery:`, Date.now() + (this.settings.stopTimeoutMs ?? STOP_TIMEOUT_MS), signal);
-      if (result !== "yes") return false;
-      this.clearLaunch();
-      return true;
+      stopped = result === "yes";
     } catch {
-      this.retire(channel);
-      signal?.throwIfAborted();
-      return false;
+      // A failed probe is not evidence that the old process is still running.
     }
+    if (stopped) {
+      this.clearLaunch();
+    } else {
+      this.retire(channel);
+      this.preserveUnconfirmedLaunch(record.sandboxId, record.executionId, runDir);
+    }
+    signal?.throwIfAborted();
   }
 
   private channel(): TerminalChannel {
@@ -1271,24 +1291,7 @@ export class SandboxTerminalOperations implements BashOperations {
     const runDir = `${this.runsRoot}/${callId}`;
     const timeout = options.timeout && options.timeout > 0
       ? options.timeout : DEFAULT_COMMAND_TIMEOUT_SECONDS;
-    let previousStopped: boolean;
-    if (this.quarantined) {
-      const previous = this.quarantined;
-      previousStopped = this.settings.journalPath
-        ? await this.confirmPreviousLaunch(options.signal)
-        : await this.stop(previous.runDir, previous.token);
-      if (previousStopped) {
-        this.clearLaunch();
-        this.quarantined = undefined;
-      }
-    } else {
-      previousStopped = await this.confirmPreviousLaunch(options.signal);
-    }
-    if (!previousStopped) {
-      throw new SandboxTerminalExecutionError("terminal blocked: previous command termination is unconfirmed",
-        { execution_id: callId, remote_run_dir: runDir, phase: "connecting",
-          started: false, stopped: this.settings.owner === undefined, error_code: "termination_unconfirmed" });
-    }
+    await this.recoverPreviousLaunch(options.signal);
     const evidence: TerminalExecutionEvidence = { execution_id: callId, remote_run_dir: runDir,
       phase: "preparing", started: false, stopped: false };
     const openedAt = Date.now();
@@ -1511,7 +1514,12 @@ export class SandboxTerminalOperations implements BashOperations {
       evidence.error_code = reason === "timeout"
         ? (evidence.phase === "observing" ? "execution_timeout" : "startup_timeout")
         : reason === "aborted" ? "aborted" : reason === "closed" ? "connection_lost" : "preparation_failed";
-      if (!evidence.stopped) this.quarantined = { runDir, token, execution: evidence };
+      if (!evidence.stopped) {
+        // New terminal connections open independent PTYs. Retain the old run
+        // for diagnosis, but never reuse its shell or replay its command.
+        this.dispose();
+        this.preserveUnconfirmedLaunch(this.endpoint.sandboxId, callId, runDir);
+      }
       const message = reason === "timeout" ? `timeout:${timeout}`
         : reason === "closed" ? "sandbox terminal connection lost before the command finished"
         : reason === "aborted" ? "aborted" : "sandbox terminal preparation failed";
@@ -1577,7 +1585,7 @@ export class LazySandboxTerminalOperations implements BashOperations {
           // bundle makes the next call ask the control plane again, which
           // rebuilds a sandbox whose pod is gone.
           operations.dispose();
-          if (!this.options.owner || !operations.terminationUnconfirmed) this.operations = undefined;
+          this.operations = undefined;
           this.endpoints.invalidate(this.endpointRequest);
           this.endpointRequest = undefined;
           if (attempt >= MAX_ENDPOINT_REFRESHES || !isPreLaunchDrop(error)) throw error;
@@ -1727,19 +1735,9 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * A session which cannot confirm the previous run stopped has no shell another
- * command may share, so the bundle is retired like a dropped connection.
- */
-function isTerminationUnconfirmed(error: unknown): boolean {
-  return error instanceof SandboxTerminalExecutionError &&
-    error.execution.error_code === "termination_unconfirmed";
-}
-
 /** A connection which dropped in a way the control plane can repair. */
 function isStaleTerminal(error: unknown): boolean {
   return error instanceof SandboxTerminalConnectionError ||
-    isTerminationUnconfirmed(error) ||
     (error instanceof SandboxTerminalExecutionError && error.execution.stopped &&
      error.execution.error_code === "connection_lost");
 }

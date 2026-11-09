@@ -18,6 +18,103 @@ import { SandboxTerminalFileClient } from "../src/sandbox-terminal-files.js";
 const hasPty = process.platform !== "win32" &&
   spawnSync("python3", ["-c", "import pty"]).status === 0;
 
+test("a real timed-out workload with unknown termination does not block a new PTY or file fallback", {
+  skip: !hasPty && "requires Python and a POSIX PTY",
+  timeout: 20000,
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "terminal-unknown-pty-"));
+  const bin = join(root, "bin");
+  await mkdir(bin);
+  const python = spawnSync("which", ["python3"], { encoding: "utf8" }).stdout.trim();
+  await writeFile(join(bin, "setsid"), `#!${python}\nimport os,sys\nos.setsid()\nos.execvp(sys.argv[1],sys.argv[1:])\n`, { mode: 0o755 });
+  const processes: ReturnType<typeof spawn>[] = [];
+  const operations = new SandboxTerminalOperations({
+    baseUrl: "https://unused.example", wsBaseUrl: "https://unused.example",
+    sandboxId: "pty", apiKey: "unused", workspacePath: root, storagePath: root,
+  }, {
+    owner: "main", journalPath: join(root, "main.json"),
+    startupTimeoutMs: 5000, stopTimeoutMs: 500, batchBudgetBytes: 1024,
+    connect: () => {
+      const child = spawn("python3", ["-u", fileURLToPath(new URL("./fixtures/terminal_pty.py", import.meta.url))], {
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      });
+      processes.push(child);
+      let emit: (data: string | ArrayBuffer) => void = () => {};
+      return {
+        send: (data) => {
+          // Model a bridge which cannot confirm or deliver cancellation.
+          if (data === "\u0003") return;
+          const stop = /'__PM_ACK__' '([0-9a-f]{18}):stop'/.exec(data);
+          if (stop) {
+            queueMicrotask(() => emit(`__PM_ACK__${stop[1]}:stop:unknown\n`));
+            return;
+          }
+          child.stdin!.write(data);
+        },
+        close: () => { child.stdin!.end(); },
+        onOpen: (handler) => { queueMicrotask(handler); },
+        onMessage: (handler) => {
+          emit = handler;
+          child.stdout!.on("data", (data: Buffer) => handler(Uint8Array.from(data).buffer));
+        },
+        onClose: (handler) => { child.on("close", handler); },
+        onError: (handler) => { child.on("error", handler); },
+      };
+    },
+  });
+  let oldRunDir: string | undefined;
+  try {
+    await assert.rejects(operations.exec(
+      'printf "old-output\\n"; touch old-ready; while [ ! -f release-old ]; do sleep 0.05; done; printf "old-tail\\n"',
+      root, { timeout: 0.2, onData: () => {} },
+    ), (error: any) => {
+      assert.equal(error.execution.error_code, "execution_timeout");
+      assert.equal(error.execution.started, true);
+      assert.equal(error.execution.stopped, false);
+      oldRunDir = error.execution.remote_run_dir;
+      return true;
+    });
+    // The launch is acknowledged before the detached workload is scheduled.
+    // Under a parallel test load it may reach this marker after the timeout.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        assert.equal(await readFile(join(root, "old-ready"), "utf8"), "");
+        break;
+      } catch (error) {
+        if (attempt >= 200) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    await assert.rejects(readFile(join(oldRunDir!, "rc")), { code: "ENOENT" });
+    const oldExecutionId = oldRunDir!.split("/").at(-1)!;
+    const retained = JSON.parse(await readFile(join(root, `main.json.unresolved/${oldExecutionId}.json`), "utf8"));
+    assert.equal(retained.status, "termination_unknown");
+    const output: string[] = [];
+    assert.equal((await operations.exec('printf "r1\\n"; printf "readable" > new-file', root, {
+      onData: (data) => output.push(data.toString()),
+    })).exitCode, 0);
+    assert.equal(output.join("").trim(), "r1");
+    assert.equal((await new SandboxTerminalFileClient(operations).read(join(root, "new-file"))).toString(), "readable");
+    assert.equal(processes.length, 2, "new work and file fallback use only the replacement PTY");
+    await assert.rejects(readFile(join(oldRunDir!, "rc")), { code: "ENOENT" });
+  } finally {
+    await writeFile(join(root, "release-old"), "");
+    if (oldRunDir) {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        try { await readFile(join(oldRunDir, "rc")); break; }
+        catch { await new Promise((resolve) => setTimeout(resolve, 20)); }
+      }
+    }
+    operations.dispose();
+    for (const child of processes) {
+      child.stdin!.end();
+      if (child.exitCode === null && child.signalCode === null)
+        await new Promise<void>((resolve) => child.once("close", () => resolve()));
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("real PTY stages scripts inline when the file API is unavailable", {
   skip: !hasPty && "requires Python and a POSIX PTY",
   timeout: 20000,
@@ -321,18 +418,28 @@ test("agent lanes in one sandbox use separate PTYs and isolate concurrent enviro
     const journal = join(root, "pi/terminal-runs/main.json");
     await assert.rejects(readFile(journal), { code: "ENOENT" });
     await main.disconnect();
-    // Simulate a restart with unresolved evidence. Recovery can probe an old
-    // PID but must neither signal it nor launch another command on that lane.
+    // Simulate a restart with unresolved evidence. Recovery probes the old
+    // PID without signalling it, retains its record, then uses a fresh PTY.
     const oldPid = join(mainResult.execution.remote_run_dir, "launch_pid");
-    const completedPid = await readFile(oldPid, "utf8");
     await writeFile(oldPid, String(process.pid));
     await writeFile(journal, JSON.stringify(mainJournal));
     const recovered = sandbox.createLane("main").terminal;
-    await assert.rejects(recovered.exec("touch after-restart", root, { onData: () => {} }),
-      (error: any) => error.execution?.error_code === "termination_unconfirmed" && !error.execution.started);
-    await assert.rejects(readFile(join(root, "after-restart")), { code: "ENOENT" });
-    await writeFile(oldPid, completedPid);
-    assert.equal((await recovered.exec("touch after-restart", root, { onData: () => {} })).exitCode, 0);
+    const beforeRecovery = processes.length;
+    const recoveredOutput: string[] = [];
+    assert.equal((await recovered.exec('touch after-restart; printf "%s\\n" "$TEST_OWNER"', root, {
+      env: { TEST_OWNER: "replacement" }, onData: (data) => recoveredOutput.push(data.toString()),
+    })).exitCode, 0);
+    assert.equal(await readFile(join(root, "after-restart"), "utf8"), "");
+    assert.equal(recoveredOutput.join("").trim(), "replacement");
+    assert.equal(processes.length, beforeRecovery + 2, "failed recovery and new command must use separate PTYs");
+    assert.equal(await readFile(oldPid, "utf8"), String(process.pid), "the old run's evidence must remain intact");
+    const retained = JSON.parse(await readFile(`${journal}.unresolved/${mainJournal.executionId}.json`, "utf8"));
+    assert.equal(retained.status, "termination_unknown");
+    assert.equal(retained.executionId, mainJournal.executionId);
+    await assert.rejects(readFile(journal), { code: "ENOENT" });
+    assert.equal((await recovered.exec("echo r1", root, { onData: () => {} })).exitCode, 0);
+    assert.equal(processes.length, beforeRecovery + 2, "subsequent commands reuse only the healthy PTY");
+    await recovered.disconnect();
   } finally {
     await writeFile(join(root, "release"), "");
     controller.abort();

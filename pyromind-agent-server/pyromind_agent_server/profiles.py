@@ -119,6 +119,9 @@ data inspection, workspace scripts and knowledge retrieval. Use get_preparation
 for gaps and valid evidence references. Ask for essential facts that cannot be
 established.
 Persist the complete facts using update_preparation and its current revision.
+If update_preparation reports preparation_revision_conflict, merge the intended
+changes into its returned current_preparation, preserve unrelated facts and
+evidence, and retry using current_revision; never resend the stale payload unchanged.
 Only after the checklist is complete, use set_preparation_plan with the plan,
 entry_task_id and role_id. Runtime reuses the saved facts and resolves inputs.
 Select stage.kind and task.kind only from preparation.policy.workflow_nodes.
@@ -127,6 +130,10 @@ The user may revise it in chat and creates/starts the Project with the UI button
 Use the Sandbox to inspect data and prepare files. Start business tasks only after
 the user creates the Project.
 After creation, get_experiment_context is the current adaptable workflow plan.
+Read it immediately before every independent delegation. Use only an enabled,
+non-placeholder stage_id and a role_id listed for that stage; if Runtime returns
+valid_targets, select from them and retry the complete task with a new request_id.
+Do not repeat an unchanged invalid delegation.
 Use request_experiment_task with a new stable request_id for independent work
 requiring fresh context. Use control_experiment_task(action=continue,run_id,message)
 to guide or adjust an existing child's work in its original context, including

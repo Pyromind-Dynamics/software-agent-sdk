@@ -939,10 +939,14 @@ class ConversationRuntime:
         preparation_policy = store.preparation_policy()
         if preparation_policy is not None and preparation_policy.workflow_nodes:
             assert self._preparations is not None
-            project = await self._plan_io(self._preparations.store.project, owner)
-            assert project is not None
+            current_context = await self._plan_io(
+                self._experiment_plans.context, owner
+            )
             validate_workflow_role(
-                preparation_policy, project.plan, request.stage_id, request.role_id
+                preparation_policy,
+                current_context.context,
+                request.stage_id,
+                request.role_id,
             )
         return await self._plan_io(
             service.request,

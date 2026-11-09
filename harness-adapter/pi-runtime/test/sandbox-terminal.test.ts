@@ -950,8 +950,8 @@ test("the latency trace reports every exchange only when switched on", async () 
   assert.equal(exchanges.at(-1)!.stage, "launch");
 });
 
-test("unconfirmed termination blocks new commands until the same process is confirmed stopped", async () => {
-  let stopped = false;
+test("unconfirmed termination isolates the old PTY without blocking new commands", async () => {
+  const sockets: FakeSocket[] = [];
   let launches = 0;
   const controller = new AbortController();
   const operations = new SandboxTerminalOperations(ENDPOINT, {
@@ -959,18 +959,24 @@ test("unconfirmed termination blocks new commands until the same process is conf
     stopTimeoutMs: 100,
     connect: () => {
       const socket = new FakeSocket();
+      sockets.push(socket);
       socket.onSend = (line) => {
         const ack = /'__PM_ACK__' '([0-9a-f]{18}):([^']+)'/.exec(line);
         if (ack) {
           if (ack[2] === "launch") launches++;
-          socket.emit(`__PM_ACK__${ack[1]}:${ack[2]}:${ack[2] === "stop" ? (stopped ? "yes" : "unknown") : "ok"}\n`);
+          socket.emit(`__PM_ACK__${ack[1]}:${ack[2]}:${ack[2] === "stop" ? "unknown" : "ok"}\n`);
           return;
         }
         const token = /([0-9a-f]{18})\s*$/.exec(line)?.[1];
         if (token) {
           socket.emit(frames(token).begin);
           if (launches === 1) queueMicrotask(() => controller.abort());
-          else socket.emit(frames(token).end(0));
+          else {
+            // Late output on the abandoned socket must not reach this call.
+            sockets[0]!.emit("old-output\n");
+            socket.emit("r1\n");
+            socket.emit(frames(token).end(0));
+          }
         }
       };
       queueMicrotask(() => socket.open());
@@ -979,14 +985,19 @@ test("unconfirmed termination blocks new commands until the same process is conf
   });
   await assert.rejects(operations.exec("sleep 30", "", {signal: controller.signal, onData: () => {}}),
     (error: unknown) => error instanceof SandboxTerminalExecutionError && !error.execution.stopped);
-  await assert.rejects(operations.exec("touch /must-not-start", "", {onData: () => {}}), /terminal blocked/);
   assert.equal(launches, 1);
-  stopped = true;
-  assert.equal((await operations.exec("true", "", {onData: () => {}})).exitCode, 0);
+  const output: Buffer[] = [];
+  assert.equal((await operations.exec("echo r1", "", {onData: (data) => output.push(data)})).exitCode, 0);
+  assert.equal(Buffer.concat(output).toString(), "r1\n");
   assert.equal(launches, 2);
+  assert.equal(sockets.length, 2);
+  assert.equal(operations.terminationUnconfirmed, true, "new success must not declare the old run stopped");
+  assert.equal(launchInvocations(sockets[0]!).length, 1);
+  assert.equal(launchInvocations(sockets[1]!).length, 1);
+  operations.dispose();
 });
 
-test("an unconfirmed termination retires the bundle and replays the command", async () => {
+test("an unconfirmed termination replaces the PTY without refreshing the sandbox or replaying the old command", async () => {
   const sockets: FakeSocket[] = [];
   let launches = 0;
   let resolutions = 0;
@@ -1023,13 +1034,119 @@ test("an unconfirmed termination retires the bundle and replays the command", as
   await assert.rejects(
     terminal.exec("sleep 30", ".", {signal: controller.signal, onData: () => {}}),
     (error: unknown) => error instanceof SandboxTerminalExecutionError && !error.execution.stopped);
-  const completed = await terminal.exec("touch /must-not-start", ".", {onData: () => {}});
+  const completed = await terminal.exec("echo r1", ".", {onData: () => {}});
   assert.equal(completed.exitCode, 0);
-  // A blocked session is not reusable, so the command is replayed on a bundle
-  // resolved after the one which could not confirm the stop was retired.
-  assert.equal(resolutions, 2);
-  assert.equal(sockets.length, 3);
+  assert.equal(resolutions, 1);
+  assert.equal(sockets.length, 2);
+  assert.equal(launches, 2, "each command must launch exactly once");
+  await terminal.close();
 });
+
+test("multiple unknown executions retain separate journals while later calls and file reads succeed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "terminal-unresolved-"));
+  const journalPath = join(root, "main.json");
+  const controllers = [new AbortController(), new AbortController()];
+  let launches = 0;
+  const sockets: FakeSocket[] = [];
+  const operations = new SandboxTerminalOperations(ENDPOINT, {
+    owner: "main", journalPath, stopTimeoutMs: 100,
+    connect: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      socket.onSend = (line) => {
+        const ack = /'__PM_ACK__' '([0-9a-f]{18}):([^']+)'/.exec(line);
+        if (ack) {
+          if (ack[2] === "launch") launches++;
+          socket.emit(`__PM_ACK__${ack[1]}:${ack[2]}:${ack[2] === "stop" ? "unknown" : "ok"}\n`);
+          return;
+        }
+        const token = /([0-9a-f]{18})\s*$/.exec(line)?.[1];
+        if (!token) return;
+        socket.emit(frames(token).begin);
+        const controller = controllers[launches - 1];
+        if (controller) queueMicrotask(() => controller.abort());
+        else socket.emit(frames(token).end(0));
+      };
+      queueMicrotask(() => socket.open());
+      return socket;
+    },
+  });
+  try {
+    const ids: string[] = [];
+    for (const controller of controllers) {
+      await assert.rejects(operations.exec("sleep 30", ".", { signal: controller.signal, onData: () => {} }),
+        (error: unknown) => {
+          assert.ok(error instanceof SandboxTerminalExecutionError);
+          assert.equal(error.execution.stopped, false);
+          ids.push(error.execution.execution_id);
+          return true;
+        });
+      assert.throws(() => readFileSync(journalPath), { code: "ENOENT" });
+    }
+    assert.equal((await operations.exec("echo r1", ".", { onData: () => {} })).exitCode, 0);
+    // File-API fallback uses the same lane and must also recover.
+    const { SandboxTerminalFileClient } = await import("../src/sandbox-terminal-files.js");
+    assert.equal((await new SandboxTerminalFileClient(operations).read("/target-workspace/input")).length, 0);
+    assert.equal(sockets.length, 3, "the healthy replacement socket should be reused");
+    assert.equal(launches, 4);
+    for (const executionId of ids) {
+      const record = JSON.parse(readFileSync(`${journalPath}.unresolved/${executionId}.json`, "utf8"));
+      assert.deepEqual(record, {
+        sandboxId: ENDPOINT.sandboxId, executionId,
+        remote_run_dir: `${ENDPOINT.workspacePath}/.pyromind-agent-runs/v2/main/${executionId}`,
+        status: "termination_unknown",
+      });
+    }
+    assert.throws(() => readFileSync(journalPath), { code: "ENOENT" });
+  } finally {
+    operations.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const probe of ["unknown", "timeout"] as const) {
+  test(`restart archives the old active journal when recovery is ${probe} and launches only the new command`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "terminal-restart-"));
+    const journalPath = join(root, "main.json");
+    const executionId = "a".repeat(32);
+    writeFileSync(journalPath, JSON.stringify({ sandboxId: ENDPOINT.sandboxId, executionId }));
+    const sockets: FakeSocket[] = [];
+    const operations = new SandboxTerminalOperations(ENDPOINT, {
+      owner: "main", journalPath, stopTimeoutMs: 20,
+      connect: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        socket.onSend = (line) => {
+          const ack = /'__PM_ACK__' '([0-9a-f]{18}):([^']+)'/.exec(line);
+          if (ack) {
+            if (ack[2] === "recovery" && probe === "timeout") return;
+            socket.emit(`__PM_ACK__${ack[1]}:${ack[2]}:${ack[2] === "recovery" ? "unknown" : "ok"}\n`);
+            return;
+          }
+          const token = /([0-9a-f]{18})\s*$/.exec(line)?.[1];
+          if (token) {
+            socket.emit(frames(token).begin);
+            socket.emit(frames(token).end(0));
+          }
+        };
+        queueMicrotask(() => socket.open());
+        return socket;
+      },
+    });
+    try {
+      assert.equal((await operations.exec("echo r1", ".", { onData: () => {} })).exitCode, 0);
+      assert.equal(sockets.length, 2, "a recovery socket must not carry the new command after a failed probe");
+      assert.equal(launchInvocations(sockets[0]!).length, 0, "recovery must not replay or kill the old execution");
+      assert.ok(!sockets[0]!.sent.some((line) => line.includes("kill -TERM") || line.includes("kill -KILL")));
+      assert.equal(launchInvocations(sockets[1]!).length, 1);
+      assert.equal(JSON.parse(readFileSync(`${journalPath}.unresolved/${executionId}.json`, "utf8")).executionId, executionId);
+      assert.throws(() => readFileSync(journalPath), { code: "ENOENT" });
+    } finally {
+      operations.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("lost launch acknowledgement does not dispatch a second launch", async () => {
   const socket = new FakeSocket();

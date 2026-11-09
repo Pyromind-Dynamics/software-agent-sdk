@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
@@ -25,6 +26,7 @@ from pyromind_runtime.domain.experiment_plans import (
 from pyromind_runtime.domain.preparation import (
     PREPARATION_TOOLS,
     ChecklistField,
+    PreparationFact,
     PreparationPolicy,
     UpdatePreparation,
 )
@@ -296,6 +298,101 @@ def test_unknown_stage_role_inputs_and_credentials_are_rejected(
                 {"message:request"},
             )
     assert store.get(owner).phase == "planning"
+
+
+def test_stale_preparation_update_returns_latest_revision_and_facts(
+    preparation_setup, ready_request
+):
+    store, owner, _ = preparation_setup
+    first = store.get(owner)
+    concurrent = first.model_copy(
+        update={
+            "facts": {
+                **first.facts,
+                "dataset": PreparationFact(
+                    value="/newer.jsonl",
+                    status="resolved",
+                    evidence_refs=("message:request",),
+                ),
+            }
+        }
+    )
+    store.save(owner, concurrent, first.revision)
+
+    with pytest.raises(ValueError) as exc_info:
+        Preparations(store).update(
+            owner,
+            UpdatePreparation.model_validate(
+                {
+                    "expected_revision": first.revision,
+                    "facts": ready_request["facts"],
+                }
+            ),
+            {"message:request"},
+        )
+
+    details = json.loads(str(exc_info.value))
+    assert details["error"] == "preparation_revision_conflict"
+    assert details["expected_revision"] == first.revision
+    assert details["current_revision"] == first.revision + 1
+    assert (
+        details["current_preparation"]["facts"]["dataset"]["value"]
+        == "/newer.jsonl"
+    )
+    assert "Merge" in details["action"]
+
+
+def test_invalid_workflow_target_returns_current_enabled_targets():
+    from pyromind_runtime.application.preparation import validate_workflow_role
+    from pyromind_runtime.domain.experiment_plans import ExperimentContext
+
+    policy = ECHOMIND_PRODUCT_PROFILE.preparation_policy
+    assert policy is not None
+    plan = ExperimentContext.model_validate(
+        {
+            "goal": "Run evaluation",
+            "stages": [
+                {
+                    "id": "disabled",
+                    "kind": "eval",
+                    "name": "Disabled",
+                    "enabled": False,
+                },
+                {"id": "review", "kind": "eval", "name": "Review"},
+                {"id": "train", "kind": "train", "name": "Training"},
+                {
+                    "id": "placeholder",
+                    "kind": "inference",
+                    "name": "Placeholder",
+                    "placeholder": True,
+                    "enabled": False,
+                },
+            ],
+            "tasks": [],
+        }
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        validate_workflow_role(policy, plan, "train", "eval")
+
+    details = json.loads(str(exc_info.value))
+    assert details["error"] == "invalid_execution_target"
+    assert details["requested"] == {"stage_id": "train", "role_id": "eval"}
+    assert details["valid_targets"] == [
+        {
+            "stage_id": "review",
+            "stage_kind": "eval",
+            "stage_name": "Review",
+            "roles": ["eval"],
+        },
+        {
+            "stage_id": "train",
+            "stage_kind": "train",
+            "stage_name": "Training",
+            "roles": ["train"],
+        },
+    ]
+    assert "new request_id" in details["action"]
 
 
 async def test_runtime_creation_restore_permissions_and_stage_protection(

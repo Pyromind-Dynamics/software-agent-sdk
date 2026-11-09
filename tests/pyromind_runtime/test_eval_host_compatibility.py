@@ -111,5 +111,13 @@ async def test_actual_manager_and_eval_host_create_through_api(
             )["input_schema"]
             assert "task" in delegate["required"]
             assert "task_id" not in delegate["properties"]
+            delegate_description = next(
+                item["description"]
+                for item in adapter._tool_specs(session)
+                if item["name"] == "request_experiment_task"
+            )
+            assert "get_experiment_context" in delegate_description
+            assert "valid_targets" in delegate_description
+            assert "do not repeat the same invalid arguments" in delegate_description
     finally:
         await runtime.close()

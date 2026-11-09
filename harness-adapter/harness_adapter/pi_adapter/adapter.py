@@ -640,6 +640,9 @@ class PiAdapter:
                 "update_preparation": (
                     "Replace checklist facts using expected_revision. Resolved facts "
                     "require evidence_refs from get_preparation or inspect_resource. "
+                    "On preparation_revision_conflict, merge your intended changes "
+                    "into the returned current_preparation and retry with its "
+                    "current_revision; do not resend the stale payload unchanged. "
                     "This only collects information; submit a workflow plan "
                     "separately with set_preparation_plan."
                 ),
@@ -688,10 +691,15 @@ class PiAdapter:
                     "Do not supply a file path or Storage URL."
                 ),
                 "request_experiment_task": (
-                    "Delegate a complete task to an enabled role. A successful "
-                    "receipt means queued, not finished. End this turn after "
-                    "delegation; Runtime will deliver the verified result. "
-                    "Do not poll or create placeholder tasks to wait."
+                    "Before delegation, read get_experiment_context and select "
+                    "stage_id from a current enabled non-placeholder stage; "
+                    "role_id must be allowed for that stage. If the tool returns "
+                    "invalid_execution_target, use its valid_targets and resubmit "
+                    "the complete task with a new request_id; do not repeat the "
+                    "same invalid arguments. A successful receipt means queued, "
+                    "not finished. End this turn after delegation; Runtime will "
+                    "deliver the verified result. Do not poll or create placeholder "
+                    "tasks to wait."
                 ),
             }
             specs += [
