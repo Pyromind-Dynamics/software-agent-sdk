@@ -33,6 +33,8 @@ parse_record 应支持 context.source=test，标识必须与 dataset_config 一�
 [GT 解析与 Rubric 配置](references/rubric-authoring.md)，
 在当前工作区写出 `public_data/inference_dataset_config.json` 和
 `public_data/inference_evaluation_config.json`。
+写完评价配置后，按 Rubric 文档中所选 evaluator 的字段白名单逐项检查；
+不同 evaluator 的字段不得混用，检查通过后再提交。
 
 选择少量互不重复的评价维度，每项包含 name、criterion、weight、required 和 evaluator。
 关键业务正确性高于格式要求；核心项可设 required，失败时整体不通过。

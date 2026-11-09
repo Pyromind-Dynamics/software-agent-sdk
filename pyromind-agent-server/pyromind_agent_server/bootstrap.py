@@ -40,6 +40,7 @@ from pyromind_agent_server.evaluation_configuration import (
 )
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
+from pyromind_agent_server.observability import build_execution_observer
 from pyromind_agent_server.plan_database import build_experiment_plan_store
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_agent_server.resource_inspector import StorageResourceInspector
@@ -248,6 +249,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             role.name for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()
         ),
         external_task_query=PlatformWorkflowSubmission(),
+        observer=build_execution_observer(service.conversations_dir),
         external_tasks=external_tasks,
         idle_eviction_seconds=idle_eviction_seconds,
         release_grace_seconds=release_grace_seconds,

@@ -151,6 +151,18 @@ def test_generate_workflow_skill_uses_progressive_reference_disclosure() -> None
     assert "本轮不得调用 workflow_debug" in debug_skill_text
 
 
+def test_generate_workflow_skill_rejects_module_level_literal_constants() -> None:
+    repo_root = Path(__file__).parents[2]
+    skill_text = (
+        repo_root / ".agents" / "skills" / "generate-workflow-dsl" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    assert "顶层赋值只用于声明节点实例" in skill_text
+    assert "禁止模块级字面量常量" in skill_text
+    assert "字面量或上游节点输出" in skill_text
+    assert "`DSL_PARSE_FAILED`" in skill_text
+
+
 def test_pyromind_instructions_enforce_workflow_skill_reference_order() -> None:
     rendered = PYROMIND_KB_INSTRUCTIONS.format(
         knowledge_alias="knowledge",

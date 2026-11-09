@@ -1,3 +1,4 @@
+import type { ObservationRecorder } from "./observability/recorder.js";
 import type { SubagentHost } from "./subagent-host.js";
 import { subagentLiveness } from "./subagent-liveness.js";
 import { randomUUID } from "node:crypto";
@@ -33,6 +34,7 @@ import {
 import type { WorkflowExecution } from "./workflow-execution.js";
 
 export class PiAgentRuntime {
+  private recorder?: ObservationRecorder;
   private subagents?: SubagentHost;
   private autonomousRunId?: string;
   private cancelling = false;
@@ -126,7 +128,7 @@ export class PiAgentRuntime {
     // Attach applies the recovered policy before the first automatic schedule.
     this.executionSuspended = policy;
     const askUserTool = this.createAskUserTool(params.user_input);
-    const { session, sessionId, execution, subagents } = await createPiSession(
+    const { session, sessionId, execution, subagents, recorder } = await createPiSession(
       params,
       this.peer,
       { ...this.sessionOptions, ...(askUserTool ? { askUserTool } : {}),
@@ -135,6 +137,7 @@ export class PiAgentRuntime {
         onSubagentWake: (text) => this.subagentWakeTexts.add(text),
       },
     );
+    this.recorder = recorder;
     this.execution = execution;
     this.subagents = subagents;
     session.subscribe((event) => {
@@ -323,7 +326,7 @@ export class PiAgentRuntime {
       this.executionSuspended = false;
       this.outcome.reset();
       this.pendingCommandIds.push(runId);
-      setImmediate(() => void this.runPrompt(runId, prompt));
+      setImmediate(() => void this.runPrompt(runId, prompt, params.trace_context));
       return { accepted: true, steered: false };
     } finally {
       this.userInput.releasePrompt(runId);
@@ -335,10 +338,11 @@ export class PiAgentRuntime {
     if (index >= 0) this.pendingCommandIds.splice(index, 1);
   }
 
-  private async runPrompt(runId: string, prompt: ParsedPrompt): Promise<void> {
+  private async runPrompt(runId: string, prompt: ParsedPrompt, trace?: JsonValue): Promise<void> {
     try {
       if (this.cancelledRuns.has(runId)) return this.finishRun(runId, { status: "cancelled" });
       const session = this.requireSession();
+      this.recorder?.begin(runId, trace);
       await session.prompt(prompt.text, {
         images: prompt.images,
       });

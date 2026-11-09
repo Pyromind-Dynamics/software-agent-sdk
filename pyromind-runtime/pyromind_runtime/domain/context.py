@@ -6,6 +6,12 @@ from pyromind_runtime.domain.task_correlation import TaskOrigin
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionTrace:
+    trace_id: str
+    parent_span_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class RequestContext:
     """Ephemeral request credentials; this object must never be persisted."""
 
@@ -16,3 +22,4 @@ class RequestContext:
     accept_language: str | None = None
     profile_id: str | None = None
     task_origin: TaskOrigin | None = None
+    execution_trace: ExecutionTrace | None = None

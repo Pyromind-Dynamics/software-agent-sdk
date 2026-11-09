@@ -49,12 +49,15 @@ Markdown 代码围栏；无法提取对象时保留去除首尾空白的字符�
 | `exact_match` | `case_sensitive` | 整段文本与 GT 一致 |
 | `json_valid` | 无 | 可提取 JSON 对象，不检查字段、类型或枚举值 |
 | `required_fields` | `prediction_paths` | 非空路径列表；得分为存在路径的比例，值为 null 或空列表仍算存在 |
-| `field_equals` | `prediction_path`, `reference_path` | 字段与 GT 相等 |
+| `field_equals` | `prediction_path`, `reference_path`, `case_sensitive` | 字段与 GT 相等 |
 | `non_empty` | `prediction_path` | 字段非空 |
 | `number_range` | `prediction_path`, `min`, `max` | 数值范围，未指定的边界不限制 |
 | `list_count_match` | `prediction_path`, `reference_path` | 列表长度一致 |
 | `bbox_iou` | `prediction_path`, `reference_path`, `iou_threshold` | 框按 IoU 阈值匹配后的 F1，惩罚漏检和多检 |
 
+表中字段是完整白名单，名称相近也不能混用：`prediction_paths` 仅属于 `required_fields`，
+`iou_threshold` 仅属于 `bbox_iou`；`field_equals` 不接受这两个字段。
+字段路径支持点分隔对象字段和列表索引，默认空路径表示整个值。
 `case_sensitive` 默认 false；`iou_threshold` 默认 0.5，范围为 [0, 1]。
 
 `bbox_iou` 接收框列表，单框可为 `[x1,y1,x2,y2]`、包含 `bbox` / `box` 的对象，

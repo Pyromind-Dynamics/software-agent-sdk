@@ -11,6 +11,8 @@ from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
 
 
 class ProductStore(Protocol):
+    def read_execution_evidence(self, digest: str) -> bytes: ...
+
     def load_workflow_execution_requests(
         self,
     ) -> dict[str, WorkflowExecutionRequest]: ...

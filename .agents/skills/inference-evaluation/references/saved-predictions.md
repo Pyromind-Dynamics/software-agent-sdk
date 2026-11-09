@@ -86,6 +86,9 @@ selection.comparison_group 填计算出的组标识并新建评分运行。
 脚本处理真实字段结构，不从文件顺序生成跨 step ID。已知样本的非法/空预测应返回
 passed=false、prediction_label=null；脚本异常会记录为评分故障，不能当作有效选模证据。
 不在评分函数中访问模型、修改源文件或加载另一个评分脚本。
+仅生成训练集画像时，若合法训练记录没有 `id` 或 `input_key`，运行时使用完整记录内容的
+确定性摘要作为派生标识，不改写源文件。画像记录标识来源和重复数；validation、test 与
+evaluation 仍必须提供能跨文件对应的 `id` 或 `input_key`。
 
 validation_examples 是 `{"record": 原始样例, "passed": 预期布尔值}` 的列表，至少
 包含应通过、应失败的案例，并覆盖业务映射与无效预测。先在沙箱用代表性样本验证

@@ -20,16 +20,43 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+import type { ObservationRecorder } from "./observability/recorder.js";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { isRecord } from "./protocol.js";
 
-export function createToolResultExtension(): ExtensionFactory {
+export function createToolResultExtension(recorder?: ObservationRecorder): ExtensionFactory {
   return (pi) => {
     pi.on("tool_result", (event) => {
-      const shouldMarkError = isRecord(event.details) &&
-        event.details.resultCategory === "failure" && event.isError !== true;
-      if (!shouldMarkError) return undefined;
-      return { isError: true };
+      const invoke = () => {
+        const shouldMarkError =
+          isRecord(event.details) &&
+          event.details.resultCategory === "failure" &&
+          event.isError !== true;
+        if (!shouldMarkError) return undefined;
+        return { isError: true };
+      };
+      return recorder
+        ? recorder.hook(
+            "tool-result-status",
+            "tool_result",
+            {
+              tool_name: event.toolName,
+              tool_call_id: event.toolCallId,
+              is_error_before: event.isError ?? false,
+              result_category: isRecord(event.details)
+                ? event.details.resultCategory
+                : undefined,
+              decision:
+                isRecord(event.details) &&
+                event.details.resultCategory === "failure" &&
+                event.isError !== true
+                  ? "set_is_error_true"
+                  : "leave_unchanged",
+            },
+            event.toolCallId,
+            invoke,
+          )
+        : invoke();
     });
   };
 }

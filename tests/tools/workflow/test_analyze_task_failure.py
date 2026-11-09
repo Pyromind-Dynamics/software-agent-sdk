@@ -235,6 +235,38 @@ def test_api_base_override_constructor(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("task_status", "expected_state"),
+    [
+        ("Running", "running"),
+        ("Succeeded", "succeeded"),
+        ("Failed", "failed"),
+    ],
+)
+def test_status_only_returns_complete_observation(
+    monkeypatch, task_status, expected_state
+):
+    routes = {
+        "task_workflow_result": _Response(
+            200, _task_result_payload(task_status=task_status)
+        ),
+    }
+    calls = _install_router(monkeypatch, routes)
+
+    observation = AnalyzeTaskFailureExecutor()(
+        AnalyzeTaskFailureAction(task_id="7758", status_only=True)
+    )
+
+    assert not observation.is_error
+    assert observation.task_status == task_status
+    assert observation.task_state == expected_state
+    assert observation.source == "all"
+    assert observation.nodes == []
+    assert observation.failed_nodes == []
+    assert observation.logs == {}
+    assert len(calls) == 1
+
+
 def test_detects_failed_nodes_from_workflow_nodes(monkeypatch):
     routes = {
         "task_workflow_result": _Response(200, _task_result_payload()),
