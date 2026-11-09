@@ -32,6 +32,10 @@ const BLOCK_REASON =
   "Stop repeating it and report what you have found, or ask the user how to " +
   "proceed.";
 
+const INVALID_ARGUMENTS_BLOCK_REASON =
+  "Blocked: this exact call already failed argument validation. Correct the " +
+  "missing or invalid fields before retrying.";
+
 interface CallOutcome {
   digest: string;
   repeats: number;
@@ -73,16 +77,37 @@ function digestObservation(blocks: readonly ObservationBlock[]): string {
   return `${length}:${hash.toString(16)}`;
 }
 
-export function createNoProgressGuardExtension(recorder?: ObservationRecorder): InlineExtension {
+function isArgumentError(
+  isError: boolean,
+  blocks: readonly ObservationBlock[],
+): boolean {
+  if (!isError) return false;
+  return blocks.some(
+    (block) =>
+      block.type === "text" &&
+      (block.text.includes("Validation failed for tool") ||
+        block.text.includes(" is required for operation=") ||
+        block.text.includes(" is only used for operation=")),
+  );
+}
+
+export function createNoProgressGuardExtension(
+  recorder?: ObservationRecorder,
+): InlineExtension {
   return (pi) => {
     const outcomes = new Map<string, CallOutcome>();
     const blockedCalls = new Set<string>();
+    const invalidCalls = new Set<string>();
 
     pi.on("tool_call", (event) => {
       const key = callKey(event.toolName, event.input);
       const unguarded = UNGUARDED_TOOLS.has(event.toolName);
       const invoke = () => {
         if (unguarded) return undefined;
+        if (invalidCalls.has(key)) {
+          blockedCalls.add(event.toolCallId);
+          return { block: true, reason: INVALID_ARGUMENTS_BLOCK_REASON };
+        }
         const outcome = outcomes.get(key);
         if (outcome === undefined || outcome.repeats < REPEATED_CALL_BLOCK_AT) {
           return undefined;
@@ -116,6 +141,10 @@ export function createNoProgressGuardExtension(recorder?: ObservationRecorder): 
       const unguarded = UNGUARDED_TOOLS.has(event.toolName);
       const invoke = () => {
         if (blockedCalls.delete(event.toolCallId)) return undefined;
+        if (isArgumentError(event.isError, event.content)) {
+          invalidCalls.add(key);
+          return undefined;
+        }
         if (unguarded) return undefined;
         const previous = outcomes.get(key);
         const repeats = previous?.digest === digest ? previous.repeats + 1 : 1;

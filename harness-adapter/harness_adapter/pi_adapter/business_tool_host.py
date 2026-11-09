@@ -9,9 +9,9 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
-from pydantic import SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.versions import VersionToolRequest
@@ -104,6 +104,71 @@ _READ_ONLY_TOOLS = frozenset(
     }
 )
 logger = logging.getLogger(__name__)
+
+
+class _LabelStudioArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class _LabelStudioCreateArgs(_LabelStudioArgs):
+    dataset_path: str = Field(min_length=1)
+    label_config_path: str = Field(min_length=1)
+    adapter: Literal["avi_train", "aoi_export", "jsonl"] = "avi_train"
+    field_map_path: str | None = None
+    idempotency_key: str | None = None
+
+
+class _LabelStudioProjectRefArgs(_LabelStudioArgs):
+    project_ref: str = Field(min_length=1)
+
+
+class _LabelStudioUpdateConfigArgs(_LabelStudioProjectRefArgs):
+    label_config_path: str = Field(min_length=1)
+    expected_config_version: int | None = Field(default=None, ge=1)
+
+
+class _LabelStudioExportArgs(_LabelStudioProjectRefArgs):
+    output_path: str | None = None
+
+
+_LABEL_STUDIO_OPERATIONS: dict[str, tuple[str, type[_LabelStudioArgs], str]] = {
+    "label_studio_create_project": (
+        "create",
+        _LabelStudioCreateArgs,
+        "Create a Label Studio project from a Storage dataset. Inspect the data "
+        "and write label_config.xml first. dataset_path is the source data; "
+        "label_config_path is the XML. Use adapter='jsonl' for JSON Lines. "
+        "field_map_path optionally binds custom fields. Authentication is managed "
+        "by the server.",
+    ),
+    "label_studio_get_project": (
+        "get",
+        _LabelStudioProjectRefArgs,
+        "Get an existing Label Studio project by project_ref.",
+    ),
+    "label_studio_project_status": (
+        "status",
+        _LabelStudioProjectRefArgs,
+        "Inspect import progress and task counts for a Label Studio project.",
+    ),
+    "label_studio_update_config": (
+        "update_config",
+        _LabelStudioUpdateConfigArgs,
+        "Update a Label Studio project's XML. Get its current config_version "
+        "first and pass it as expected_config_version.",
+    ),
+    "label_studio_export_annotations": (
+        "export",
+        _LabelStudioExportArgs,
+        "Export annotations from an existing Label Studio project to Storage. "
+        "output_path is an optional destination directory.",
+    ),
+    "label_studio_refresh_media": (
+        "refresh_media",
+        _LabelStudioProjectRefArgs,
+        "Refresh media URLs for an existing Label Studio project.",
+    ),
+}
 
 _TRUNCATED_SUFFIX = "\n\n[output truncated: exceeded the runner frame budget]"
 # Observation details (e.g. directory entries) are only machine-readable
@@ -473,7 +538,6 @@ class PyromindBusinessToolHost:
             WorkflowDebugTool,
             AnalyzeTaskFailureTool,
             TrainingAnalysisTool,
-            LabelStudioProjectTool,
         ):
             if sandbox and tool_type is UploadFileToPyromindTool:
                 continue
@@ -485,6 +549,12 @@ class PyromindBusinessToolHost:
                 raise TypeError(f"{tool.name} schema must be an object")
             specs.append(
                 BusinessToolSpec(tool.name, tool.description, schema).as_dict()
+            )
+        for name, (_, action_type, description) in _LABEL_STUDIO_OPERATIONS.items():
+            specs.append(
+                BusinessToolSpec(
+                    name, description, action_type.model_json_schema()
+                ).as_dict()
             )
         return specs
 
@@ -579,6 +649,32 @@ class PyromindBusinessToolHost:
             )
             self._log_execution(name, context, started_at, response)
             return response
+        operation = _LABEL_STUDIO_OPERATIONS.get(name)
+        if operation is not None:
+            operation_name, action_type, _ = operation
+            try:
+                validated = action_type.model_validate(arguments)
+            except ValidationError as exc:
+                problems = "; ".join(
+                    f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+                    for error in exc.errors(include_input=False)
+                )
+                return BusinessToolResult(
+                    is_error=True,
+                    content=[
+                        {
+                            "type": "text",
+                            "text": f"Validation failed for tool {name}: {problems}. "
+                            "Correct the arguments before retrying.",
+                        }
+                    ],
+                    details={"error_code": "invalid_tool_arguments"},
+                ).as_dict()
+            arguments = {
+                "operation": operation_name,
+                **validated.model_dump(exclude_none=True),
+            }
+            name = LabelStudioProjectTool.name
         factory = self._factories.get(name)
         if factory is None:
             raise ValueError(f"unsupported business tool: {name}")

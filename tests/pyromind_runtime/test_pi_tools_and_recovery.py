@@ -983,7 +983,12 @@ async def test_runner_loads_sandbox_skills_and_business_tools(
             "workflow_debug",
             "analyze_task_failure",
             "training_analysis",
-            "label_studio_project",
+            "label_studio_create_project",
+            "label_studio_get_project",
+            "label_studio_project_status",
+            "label_studio_update_config",
+            "label_studio_export_annotations",
+            "label_studio_refresh_media",
             "update_plan",
         }
         assert (
@@ -1099,7 +1104,7 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
     ]
     host = PyromindBusinessToolHost(roots)
     specs = host.specs()
-    assert len(specs) == 24
+    assert len(specs) == 29
     assert {"edp_render", "edp_submit", "edp_aggregate", "update_plan"} <= {
         spec["name"] for spec in specs
     }

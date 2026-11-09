@@ -44,6 +44,7 @@ function resultEvent(
   text: string,
   input: Record<string, unknown> = FIND,
   toolName = "terminal",
+  isError = false,
 ): ToolResultEvent {
   return {
     type: "tool_result",
@@ -51,7 +52,7 @@ function resultEvent(
     toolName,
     input,
     content: [{ type: "text", text }],
-    isError: false,
+    isError,
     details: undefined,
   };
 }
@@ -185,4 +186,45 @@ test("guard records the decision basis and block without changing it", () => {
       record.input.tool_call_id === "c2",
   );
   assert.match(String(noticeRecord?.input.added_text), /no new information/);
+});
+
+test("invalid arguments block the exact repeat and allow corrected arguments", () => {
+  const guard = guardHandlers();
+  const invalid = { operation: "create", output_path: "config.xml" };
+  const corrected = {
+    operation: "create",
+    dataset_path: "/datasets/samples.jsonl",
+    label_config_path: "config.xml",
+  };
+  assert.equal(
+    guard.call(callEvent("c1", invalid, "label_studio_project")),
+    undefined,
+  );
+  assert.equal(
+    guard.result(
+      resultEvent(
+        "c1",
+        "dataset_path is required for operation='create'",
+        invalid,
+        "label_studio_project",
+        true,
+      ),
+    ),
+    undefined,
+  );
+  assert.match(
+    guard.call(callEvent("c2", invalid, "label_studio_project"))?.reason ?? "",
+    /Correct the missing or invalid fields/,
+  );
+  assert.equal(
+    guard.call(callEvent("c3", corrected, "label_studio_project")),
+    undefined,
+  );
+});
+
+test("transient errors can be retried", () => {
+  const guard = guardHandlers();
+  assert.equal(guard.call(callEvent("c1")), undefined);
+  assert.equal(guard.result(resultEvent("c1", "HTTP 503", FIND, "terminal", true)), undefined);
+  assert.equal(guard.call(callEvent("c2")), undefined);
 });
