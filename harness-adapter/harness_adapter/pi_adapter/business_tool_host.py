@@ -439,7 +439,7 @@ class PyromindBusinessToolHost:
                                 "type": "string",
                                 "description": (
                                     "Existing Storage Python DSL path, such as "
-                                    "/project/workflow.py"
+                                    "/workspace/project/workflow.py"
                                 ),
                             }
                         },

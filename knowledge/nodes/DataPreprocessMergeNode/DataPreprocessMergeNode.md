@@ -11,7 +11,7 @@ Merge reasoning/category/prompts into training data.
 | 参数 | 数据类型 | 必填 | 描述 |
 |------|---------|------|------|
 | metadata_path | STRING | 是 | Metadata path |
-| output_path | STRING | 是 | 输出目录或文件路径 |
+| output_path | STRING | 是 | 持久化输出目录或文件路径，使用 `/workspace/...` |
 | reasoning_path | STRING | 是 | Reasoning 流水线输出路径 |
 | base_prompt | STRING | 否 | Base prompt。默认值：空字符串 |
 | output_format | STRING | 否 | Output format。默认值：`jsonl` |
@@ -28,4 +28,4 @@ Merge reasoning/category/prompts into training data.
 
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
-| result_output_path | STRING | 流水线输出路径 |
+| result_output_path | STRING | 流水线输出路径，位于 `/workspace/...` |

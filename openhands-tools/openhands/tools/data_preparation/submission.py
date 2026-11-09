@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from rich.text import Text
 
 from openhands.sdk.conversation.state import ActiveLongTask
@@ -28,6 +28,7 @@ from openhands.tools.pyromind_dataset.definition import (
     _resolve_secret_headers,
     upload_local_file_to_pyromind,
 )
+from openhands.tools.utils.storage_paths import to_agent_storage_path
 from openhands.tools.utils.workspace_staging import (
     WorkspaceStagingError,
     is_remote_workspace,
@@ -158,6 +159,13 @@ class SubmissionObservation(Observation):
     retryable: bool | None = Field(default=None)
     validation_errors: list[WorkflowValidationIssue] = Field(default_factory=list)
     validation_warnings: list[WorkflowValidationIssue] = Field(default_factory=list)
+
+    @field_validator("output_dir", mode="before")
+    @classmethod
+    def _agent_output_path(cls, value: Any) -> Any:
+        if isinstance(value, str) and value:
+            return to_agent_storage_path(value)
+        return value
 
     @property
     def to_llm_content(self) -> Sequence[TextContent | ImageContent]:

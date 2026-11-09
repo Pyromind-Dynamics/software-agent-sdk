@@ -7,10 +7,10 @@ import {
   SandboxPathPolicy,
 } from "../src/sandbox-paths.js";
 
-const WORKSPACE = "/target-workspace/.pyromind-agent/conv-1";
+const WORKSPACE = "/workspace/.pyromind-agent/conv-1";
 const SKILLS = "/opt/pi/skills";
 const KNOWLEDGE = "/opt/pi/knowledge";
-const STORAGE = "/target-workspace";
+const STORAGE = "/workspace";
 
 function policy(
   overrides: {
@@ -64,6 +64,13 @@ test("sandbox paths address the Storage mount by its absolute path", () => {
   );
 });
 
+test("sandbox paths accept the former Pi mount as a compatibility input", () => {
+  assert.equal(
+    policy().resolvePath("/target-workspace/datasets/train.jsonl", "read"),
+    "/workspace/datasets/train.jsonl",
+  );
+});
+
 test("the removed storage/ alias fails loudly instead of landing in the workspace", () => {
   assert.throws(
     () => policy().resolvePath("storage/datasets/train.jsonl", "read"),
@@ -79,7 +86,7 @@ test("sandbox paths keep conversation state out of reach under the mount", () =>
   for (const target of [
     `${WORKSPACE}/pi/session.jsonl`,
     `${WORKSPACE}/meta.json`,
-    "/target-workspace/.pyromind-agent/conv-2/public_data/train.csv",
+    "/workspace/.pyromind-agent/conv-2/public_data/train.csv",
   ]) {
     assert.throws(
       () => policy().resolvePath(target, "read"),

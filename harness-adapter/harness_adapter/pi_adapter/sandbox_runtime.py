@@ -50,7 +50,7 @@ from openhands.tools.sandbox import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MOUNT_PATH = "/target-workspace"
+DEFAULT_MOUNT_PATH = "/workspace"
 # Node-side path the platform exposes the user Storage on. The container only
 # sees it when the create request asks for the mount.
 STORAGE_HOST_PATH = "/workspace"
@@ -65,9 +65,9 @@ PYROMIND_AGENT_RESOURCES_ROOT = "/.pyromind-agent-resources"
 # remembered here to clear it out of workspaces laid out by an older runtime.
 LEGACY_STORAGE_ALIAS = "storage"
 # Bumped when the workspace layout changes, so an existing sandbox re-runs the
-# prepare script. 4: the Storage symlink is no longer created, and workspaces
-# laid out by version 3 still carry it until they are prepared again.
-_WORKSPACE_LAYOUT_VERSION = 4
+# prepare script. 5: Pi mounts Storage at the same /workspace path exposed to
+# users and platform tasks.
+_WORKSPACE_LAYOUT_VERSION = 5
 # The platform rejects a create request without memory; mirror the sandbox
 # tool's own fallback (platform minimum 4 vCPU, 1:2 vCPU:memory ratio).
 DEFAULT_CPU = "4"

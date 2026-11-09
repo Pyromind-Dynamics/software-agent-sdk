@@ -163,14 +163,11 @@ Never start both full-run paths for one request."""
 _SANDBOX_SYSTEM_PROMPT = """
 
 This session runs its execution plane in a platform Sandbox with the user's
-Storage mounted at {root}. That mount is the Storage root: {root}/<path> is the
-Storage path /<path> the user and the platform see. When the user asks about
-data or files, inspect and read them there with read; use terminal for searches,
-bulk computation, and saved scripts. Pass {root}/<path> paths directly to
-Python scripts through terminal. Storage is writable: to hand a workspace file
-to a platform task, write it under {root}/<dir>/<name> and pass /<dir>/<name>
-as the Storage path. Every dataset this session works on is a Storage path you
-can read directly.
+Storage mounted at {root}. Use {root}/<path> for Storage files everywhere:
+read, write, edit, terminal commands, platform tools, and workflow nodes. Do not
+remove or replace that prefix. Storage is writable: to hand a workspace file to
+a platform task, write it under {root}/<dir>/<name> and pass that same path.
+Every dataset this session works on is a Storage path you can read directly.
 
 Platform task state comes from the platform tools, never from this workspace.
 task_status, node logs, and workflow runs are reported by analyze_task_failure,
@@ -198,10 +195,6 @@ def _sandbox_system_prompt(mount_path: str, conversation_id: str) -> str:
     skills = f"{workspace}/.agents/skills"
     return (
         f"{_SANDBOX_SYSTEM_PROMPT.replace('{root}', root)}\n\n"
-        "The user may reference /workspace/<path>: that names the same Storage, "
-        f"so use {root}/<path> instead. /workspace/<path> does not resolve "
-        "inside this sandbox, so never run it and never search the filesystem "
-        "for the file.\n\n"
         f"The skills tree is unpacked inside this sandbox (not outside the "
         f"workspace) at {skills}. Every terminal call starts at the workspace "
         "root, so .agents/skills/<skill>/... works as written, and "

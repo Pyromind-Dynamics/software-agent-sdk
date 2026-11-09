@@ -2,6 +2,7 @@ import pytest
 
 from openhands.tools.utils.storage_paths import (
     StoragePathError,
+    to_agent_storage_path,
     to_storage_path,
 )
 
@@ -45,6 +46,20 @@ def test_to_storage_path_accepts_a_known_sandbox_mount(
     value: str, expected: str
 ) -> None:
     assert to_storage_path(value, mount="/target-workspace") == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("/datasets/a.csv", "/workspace/datasets/a.csv"),
+        ("/workspace/datasets/a.csv", "/workspace/datasets/a.csv"),
+        ("/target-workspace/datasets/a.csv", "/workspace/datasets/a.csv"),
+    ],
+)
+def test_to_agent_storage_path_uses_the_public_workspace_root(
+    value: str, expected: str
+) -> None:
+    assert to_agent_storage_path(value) == expected
 
 
 @pytest.mark.parametrize(

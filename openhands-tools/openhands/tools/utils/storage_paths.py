@@ -2,9 +2,10 @@
 
 The user's Storage is a single tree that every layer names differently:
 
-    /datasets/a.csv                   Storage root -- what the Storage API and
-                                      platform tasks read. Canonical form.
-    /target-workspace/datasets/a.csv  the sandbox container's mount point
+    /datasets/a.csv                   Storage root -- what the Storage API reads.
+                                      Canonical internal form.
+    /workspace/datasets/a.csv         the path users, agents, and platform tasks
+                                      read
     public_data/a.csv                 the conversation workspace, which is
                                       itself a directory inside Storage
 
@@ -20,10 +21,9 @@ spellings that work, instead of a lookup that fails somewhere else.
 Two things this module deliberately does not settle, because they belong to the
 caller:
 
-* ``/storage/x`` is a valid *Storage* path but not a resolvable *sandbox* path:
-  the sandbox only admits what sits under its mount, so that file is read there
-  as ``/target-workspace/storage/x``. Keep :func:`to_storage_path` at the
-  Storage-API boundary; the sandbox boundary stays with ``SandboxPathPolicy`` /
+* ``/storage/x`` is a valid *Storage* path, while the removed relative
+  ``storage/x`` alias is not. Keep :func:`to_storage_path` at the Storage-API
+  boundary; the sandbox boundary stays with ``SandboxPathPolicy`` /
   ``resolve_workspace_path``.
 * A **bare** relative path (``datasets/x``) has a different root in each layer:
   platform tools read it against the Storage root, the sandbox against the
@@ -38,7 +38,8 @@ import os
 
 REMOVED_ALIAS = "storage"
 WORKSPACE_DIRNAME = "public_data"
-DEFAULT_MOUNT_PATH = "/target-workspace"
+DEFAULT_MOUNT_PATH = "/workspace"
+LEGACY_MOUNT_PATH = "/target-workspace"
 # The platform's own name for the Storage root, used by workflow DSL nodes and
 # by the commands a task builds from them.
 PLATFORM_ROOT = "/workspace"
@@ -68,10 +69,10 @@ def configured_mount() -> str:
 def to_tool_storage_path(value: str, *, field: str = "path") -> str:
     """Normalize a path a model handed to a platform tool.
 
-    The model reads Storage under the sandbox mount, so the same file reaches a
-    tool as ``/target-workspace/datasets/x.csv``. The platform addresses it as
-    ``/datasets/x.csv``, so the mount prefix is dropped here rather than left to
-    the model to remember.
+    The model reads Storage at ``/workspace/datasets/x.csv``. Storage APIs
+    address the same file as ``/datasets/x.csv``, so the public prefix is
+    dropped here rather than left to the model to remember. The old Pi mount is
+    accepted only so persisted conversations remain resumable.
     """
 
     return to_storage_path(value, field=field, mount=configured_mount())
@@ -85,13 +86,13 @@ def to_storage_path(
 ) -> str:
     """Normalize an accepted spelling to a Storage-root path.
 
-    ``mount`` names the sandbox mount point, so a container-absolute path
-    (``/target-workspace/a.csv``) is accepted wherever the caller knows it.
-    Without it, a mount-absolute path stays what it looks like -- a directory at
-    the Storage root -- because guessing would be worse than failing.
+    ``mount`` names a configured sandbox mount point. The public
+    ``/workspace`` prefix and the former Pi ``/target-workspace`` prefix are
+    also accepted so callers can resume data written before the mount was
+    unified.
 
     Two spellings name the Storage root itself and are read as the root: the
-    sandbox mount (``/target-workspace``) and the platform's own ``/workspace``.
+    configured mount and the platform's own ``/workspace``.
     A *user directory* that happens to be called ``storage`` keeps its absolute
     spelling (``/storage/...``), because that is data rather than a mount name.
     The relative ``storage/...`` form is the removed alias and is rejected.
@@ -106,6 +107,8 @@ def to_storage_path(
         mount_root = "/" + mount.strip("/")
         if raw == mount_root or raw.startswith(mount_root + "/"):
             raw = raw[len(mount_root) :] or "/"
+    if raw == LEGACY_MOUNT_PATH or raw.startswith(LEGACY_MOUNT_PATH + "/"):
+        raw = raw[len(LEGACY_MOUNT_PATH) :] or "/"
     if raw == PLATFORM_ROOT or raw.startswith(PLATFORM_ROOT + "/"):
         raw = raw[len(PLATFORM_ROOT) :] or "/"
 
@@ -125,3 +128,10 @@ def to_storage_path(
     if not absolute and parts[0] == WORKSPACE_DIRNAME:
         raise StoragePathError(f"{field}: {_WORKSPACE_PATH}")
     return "/" + "/".join(parts)
+
+
+def to_agent_storage_path(value: str, *, field: str = "path") -> str:
+    """Return the single Storage spelling exposed to users and agents."""
+
+    storage_path = to_storage_path(value, field=field, mount=configured_mount())
+    return f"{PLATFORM_ROOT}{storage_path}"

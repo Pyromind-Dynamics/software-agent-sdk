@@ -318,7 +318,7 @@ export async function createPiSession(
     settingsManager,
     systemPrompt: config.systemPrompt,
     appendSystemPrompt: params.workflows_enabled === true
-      ? ["历史经验的路径参数使用当前会话执行环境的路径：Storage 文件用挂载点绝对路径（如 /target-workspace/agentTest/input.csv），会话文件使用 public_data/...。与 read/terminal 验证成功的路径保持一致；不要改成服务端路径或平台 /workspace 路径。"]
+      ? ["历史经验中的 Storage 路径统一使用 /workspace/<path>，会话文件使用 public_data/...。旧挂载路径只代表同一份 Storage，复用经验时转换成 /workspace/<path>。"]
       : [],
     eventBus: experienceHost.eventBus,
     additionalExtensionPaths: [

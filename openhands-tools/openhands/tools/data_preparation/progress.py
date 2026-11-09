@@ -36,6 +36,10 @@ from openhands.tools.pyromind_dataset.definition import (
     _resolve_secret_headers,
     _truncate_text,
 )
+from openhands.tools.utils.storage_paths import (
+    to_agent_storage_path,
+    to_tool_storage_path,
+)
 
 
 if TYPE_CHECKING:
@@ -89,8 +93,9 @@ class DfCheckProgressAction(Action):
 
     output_dir: str = Field(
         description=(
-            "Storage output directory of the run, e.g. "
-            "'/.pyromind-agent/<conversation_id>/data_preparation/<run_id>' "
+            "User Storage output directory of the run, e.g. "
+            "'/workspace/.pyromind-agent/<conversation_id>/"
+            "data_preparation/<run_id>' "
             "(the `output_dir` returned by df_submit_pipeline or df_submit_evaluation)."
         )
     )
@@ -196,9 +201,10 @@ class DfCheckProgressExecutor(
         action: DfCheckProgressAction,
         conversation: BaseConversation | None = None,
     ) -> DfCheckProgressObservation:
-        # Storage paths are absolute (e.g. '/.pyromind-agent/...'); keep the
-        # leading slash and only normalize a trailing one.
-        output_dir = action.output_dir.strip().rstrip("/")
+        output_dir = to_tool_storage_path(action.output_dir, field="output_dir").rstrip(
+            "/"
+        )
+        agent_output_dir = to_agent_storage_path(output_dir)
         headers = self._resolved_headers(conversation)
 
         progress_path = f"{output_dir}/{PROGRESS_FILENAME}"
@@ -210,7 +216,7 @@ class DfCheckProgressExecutor(
         latest, tail_error = self._read_tail(processed_path, headers, action.tail_lines)
 
         fields: dict[str, Any] = {
-            "output_dir": output_dir,
+            "output_dir": agent_output_dir,
             "latest_records": latest,
             "report_found": isinstance(report, dict),
             "report": report if isinstance(report, dict) else None,
@@ -260,6 +266,17 @@ class DfCheckProgressExecutor(
         evaluation_report_url = self._stable_report_link(
             report, output_dir, conversation, headers
         )
+        if isinstance(report, dict) and isinstance(report.get("artifacts"), dict):
+            display_artifacts = {
+                name: (
+                    to_agent_storage_path(path)
+                    if isinstance(path, str)
+                    and (path == output_dir or path.startswith(f"{output_dir}/"))
+                    else path
+                )
+                for name, path in report["artifacts"].items()
+            }
+            fields["report"] = {**report, "artifacts": display_artifacts}
         fields["evaluation_report_url"] = evaluation_report_url
         if evaluation_report_url:
             text += (

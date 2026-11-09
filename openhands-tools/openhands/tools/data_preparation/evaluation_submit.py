@@ -73,11 +73,13 @@ Choose operation and pass its fields directly at the top level:
   configuration. Omit cpu/memory to inherit resources. Changed inputs or rules
   require a new run; stop an active task before resuming.
 
-input_path is a Storage path. Configs, manifests and scripts are workspace files.
+input_path is a user Storage path such as `/workspace/datasets/test.jsonl`.
+Configs, manifests and scripts are conversation workspace files.
 No inference/evaluation/products wrapper object, mode, script_path, model_profile
 or output_schema. For user-authored data-processing pipelines use df_submit_pipeline.
 Read inference-evaluation before preparing the task. Submit only when requested.
-Returns task_id, run_id and output_dir asynchronously; df_check_progress and
+Returns task_id, run_id and a `/workspace/...` output_dir asynchronously;
+df_check_progress and
 df_stop_task query or stop it. After the callback, inspect report.json and its
 artifacts; task completion alone does not establish business success. Never
 blindly resubmit when platform acceptance is uncertain.
@@ -92,7 +94,10 @@ class DfSubmitEvaluationAction(Action):
     )
     input_path: str = Field(
         min_length=1,
-        description="Source data path in Pyromind Storage; unchanged on resume.",
+        description=(
+            "Source data path in user Storage, e.g. "
+            "'/workspace/datasets/test.jsonl'; unchanged on resume."
+        ),
     )
     model_path: str | None = Field(
         default=None,

@@ -10,7 +10,7 @@ GRPO training aligned with SFT-style YAML: dataset_config, training_config (shar
 
 | 参数 | 数据类型 | 必填 | 描述 |
 |------|---------|------|------|
-| output_path | STRING | 是 | 输出目录或文件路径 |
+| output_path | STRING | 是 | 持久化训练输出目录，必须使用 `/workspace/...` |
 | dataset_config | STRING\|DATASET_CONFIG | 是 | 已组装的数据集配置 YAML 字符串 |
 | training_config | STRING\|TRAINING_CONFIG | 是 | 训练配置 YAML 字符串（`BaseTrainingConfig` 字段） |
 | grpo_extra_config | STRING\|GRPO_EXTRA_CONFIG | 否 | GRPO 专用额外训练配置 YAML。默认值：空字符串 |

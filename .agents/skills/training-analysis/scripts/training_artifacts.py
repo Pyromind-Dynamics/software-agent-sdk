@@ -12,12 +12,18 @@ from typing import Any
 def storage_path(value: str) -> str:
     if any(marker in value for marker in ("${", "{{", "}}")):
         raise ValueError(f"Unresolved Storage path: {value!r}")
-    if value.startswith("/workspace/"):
-        value = value[len("/workspace") :]
+    for mount in ("/workspace", "/target-workspace"):
+        if value == mount or value.startswith(f"{mount}/"):
+            value = value[len(mount) :] or "/"
+            break
     path = PurePosixPath(value)
     if not path.is_absolute() or ".." in path.parts or str(path) == "/":
         raise ValueError(f"Unresolved Storage path: {value!r}")
     return str(path)
+
+
+def agent_storage_path(value: str) -> str:
+    return f"/workspace{storage_path(value)}"
 
 
 def resolve_artifacts(
@@ -118,7 +124,7 @@ def resolve_artifacts(
         path = None
         try:
             if isinstance(raw_path, str):
-                path = storage_path(raw_path)
+                path = agent_storage_path(raw_path)
         except ValueError as exc:
             issues.append(str(exc))
         if path is None:
@@ -196,6 +202,10 @@ def inspect_checkpoint(
     if kind == "lora":
         config = json.loads((path / "adapter_config.json").read_text())
         base_model = config.get("base_model_name_or_path") or base_model
+        if isinstance(base_model, str) and base_model.startswith(
+            ("/workspace/", "/target-workspace/")
+        ):
+            base_model = agent_storage_path(base_model)
         if not base_model:
             issues.append("missing_base_model")
         required = [
@@ -239,10 +249,11 @@ def inspect_checkpoint(
 
 
 def discover(
-    directory: str, mount: str = "storage", base_model: str | None = None
+    directory: str, mount: str = "/workspace", base_model: str | None = None
 ) -> dict[str, Any]:
-    reference = storage_path(directory)
-    root = Path(mount) / reference.lstrip("/")
+    logical_path = storage_path(directory)
+    reference = agent_storage_path(directory)
+    root = Path(mount) / logical_path.lstrip("/")
     if not root.is_dir():
         raise FileNotFoundError(
             f"Training output directory is unavailable: {reference}"

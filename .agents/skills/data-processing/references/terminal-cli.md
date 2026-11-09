@@ -1,12 +1,12 @@
 # 通过 terminal 执行数据处理
 
-普通脚本直接执行，例如 `python3 public_data/clean.py /target-workspace/input.csv public_data/result.csv`。
+普通脚本直接执行，例如 `python3 public_data/clean.py /workspace/input.csv public_data/result.csv`。
 需要 DataFlow 算子、模型配置或标准输出校验时，用 `sandbox_sample.py`，优先直接传参：
 
 ```sh
 python3 .agents/skills/data-processing/scripts/preparation/sandbox_sample.py \
   --pipeline public_data/pipeline.py \
-  --input /target-workspace/input.jsonl \
+  --input /workspace/input.jsonl \
   --output public_data/result.jsonl \
   --model-profile text \
   --output-schema text \
@@ -23,7 +23,7 @@ python3 .agents/skills/data-processing/scripts/preparation/sandbox_sample.py \
 ```json
 {
   "pipeline_path": "public_data/pipeline.py",
-  "args": ["/target-workspace/input.jsonl", "public_data/result.jsonl"],
+  "args": ["/workspace/input.jsonl", "public_data/result.jsonl"],
   "model_profile": "text",
   "output_schema": "text",
   "timeout": 3600

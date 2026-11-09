@@ -11,7 +11,7 @@ Run data_preprocess reasoning pipeline and emit output path.
 | 参数 | 数据类型 | 必填 | 描述 |
 |------|---------|------|------|
 | input_path | STRING | 是 | Input path |
-| output_path | STRING | 是 | 输出目录或文件路径 |
+| output_path | STRING | 是 | 持久化输出目录或文件路径，使用 `/workspace/...` |
 | api_base | STRING | 是 | Api base |
 | model | STRING | 是 | Model |
 | api_key | STRING | 是 | Api key |

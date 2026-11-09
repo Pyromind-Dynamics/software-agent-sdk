@@ -30,7 +30,7 @@ def test_prepare_uses_storage_dsl_validation_and_marks_training(monkeypatch):
         },
     )
     result = module.PlatformWorkflowSubmission._prepare(
-        "/target-workspace/.pyromind-agent/conversation/workflow.py",
+        "/workspace/.pyromind-agent/conversation/workflow.py",
         RequestContext(user_id="42", cookie="auth_token=ephemeral"),
     )
     assert downloaded == ["/.pyromind-agent/conversation/workflow.py"]
@@ -43,7 +43,8 @@ def test_prepare_uses_storage_dsl_validation_and_marks_training(monkeypatch):
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
-        # The sandbox spelling and the Storage spelling are both accepted.
+        ("/workspace/project/workflow.py", "/project/workflow.py"),
+        # The former Pi mount remains an accepted compatibility input.
         ("/target-workspace/project/workflow.py", "/project/workflow.py"),
         ("/project/workflow.py", "/project/workflow.py"),
     ],
@@ -74,6 +75,36 @@ def test_prepare_accepts_every_spelling_of_the_same_workflow(
     module.PlatformWorkflowSubmission._prepare(path, RequestContext(user_id="42"))
 
     assert downloaded == [expected]
+
+
+@pytest.mark.parametrize("output_path", ["/models/run-1", "models/run-1", "/workspace"])
+def test_training_output_must_be_inside_the_persistent_workspace(output_path):
+    with pytest.raises(ValueError, match="must be under /workspace"):
+        module._validate_persistent_output_paths(
+            [
+                {
+                    "id": "train",
+                    "data": {
+                        "nodeType": "ModelTrainSFTNode",
+                        "config": {"output_path": output_path},
+                    },
+                }
+            ]
+        )
+
+
+def test_training_output_accepts_a_persistent_workspace_directory():
+    module._validate_persistent_output_paths(
+        [
+            {
+                "id": "train",
+                "data": {
+                    "nodeType": "ModelTrainSFTNode",
+                    "config": {"output_path": "/workspace/models/run-1"},
+                },
+            }
+        ]
+    )
 
 
 @pytest.mark.parametrize(

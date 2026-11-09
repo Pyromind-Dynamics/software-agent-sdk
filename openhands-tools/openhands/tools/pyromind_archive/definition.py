@@ -29,6 +29,7 @@ from openhands.tools.pyromind_dataset.definition import (
 )
 from openhands.tools.utils.storage_paths import (
     StoragePathError,
+    to_agent_storage_path,
     to_tool_storage_path,
 )
 from openhands.tools.workflow.task_submission import (
@@ -47,7 +48,9 @@ class ExtractArchiveAction(Action):
     """Submit an archive extraction task as a Studio workflow."""
 
     archive_path: str = Field(
-        description="Storage path of the archive file to extract.",
+        description=(
+            "User Storage path of the archive file, e.g. '/workspace/data.zip'."
+        ),
     )
     format: Literal["auto", "zip", "tar", "tar.gz", "tgz"] = Field(
         default="auto",
@@ -59,7 +62,8 @@ class ExtractArchiveAction(Action):
     output_dir: str | None = Field(
         default=None,
         description=(
-            "Optional explicit target storage directory for extracted files. "
+            "Optional explicit user Storage directory for extracted files, "
+            "e.g. '/workspace/datasets/extracted'. "
             "It must not already exist in storage. When omitted, files are "
             "extracted into a new folder next to the archive named after it "
             "(e.g. datasets/data.zip -> datasets/data/); if that name is "
@@ -113,7 +117,7 @@ overwritten. Pass `output_dir` to choose an explicit target directory; it must
 not already exist in storage.
 
 When the terminal workflow callback resumes the conversation, inspect the
-`output_dir` returned by this tool with the file tools or `terminal` commands.
+returned `/workspace/...` `output_dir` with the file tools or `terminal` commands.
 
 v1 extracts archives in a single pass. Nested archives inside the extracted
 output require a separate call.
@@ -324,6 +328,8 @@ class ExtractArchiveExecutor(
                 is_error=True,
             )
 
+        agent_output_dir = to_agent_storage_path(output_dir)
+
         try:
             state = cast("ConversationState", conversation.state)
             auth_token = state.secret_registry.get_secret_value(
@@ -348,21 +354,22 @@ class ExtractArchiveExecutor(
                 text=f"Failed to submit extraction workflow: {exc}",
                 status="Failed",
                 run_id=str(run_id),
-                output_dir=output_dir,
+                output_dir=agent_output_dir,
                 is_error=True,
             )
 
         return ExtractArchiveObservation.from_text(
             text=(
                 "Archive extraction workflow submitted. "
-                f"task_id={task_id}, run_id={run_id}, output_dir={output_dir}. "
+                f"task_id={task_id}, run_id={run_id}, "
+                f"output_dir={agent_output_dir}. "
                 "After the terminal callback, preview "
-                f"{output_dir}/ to inspect the extracted files."
+                f"{agent_output_dir}/ to inspect the extracted files."
             ),
             status=response.status,
             task_id=task_id,
             run_id=str(run_id),
-            output_dir=output_dir,
+            output_dir=agent_output_dir,
         )
 
     def _resolved_storage_headers(

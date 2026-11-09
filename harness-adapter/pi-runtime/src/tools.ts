@@ -45,9 +45,9 @@ import { createTerminalTool } from "./terminal-tool.js";
 
 const OMITTED_IMAGE_TEXT = "[Image omitted: Pi only accepts inline base64 image data.]";
 const SANDBOX_READ_PATH_SCOPE =
-  "The user Storage mount is addressed by its absolute path and is writable there. Conversation files are read from public_data/. Configured skill directories and knowledge are read-only; .agents/skills/ and knowledge/ address their configured resource directories.";
+  "Use /workspace/<path> for user Storage and public_data/<path> for conversation files. Storage is writable. Configured skill directories and knowledge are read-only; .agents/skills/ and knowledge/ address their configured resource directories.";
 const SANDBOX_WRITE_PATH_SCOPE =
-  "Write and edit paths must stay within public_data/ or the user Storage mount, addressed by its absolute path.";
+  "Use /workspace/<path> for user Storage and public_data/<path> for conversation files.";
 
 export interface BusinessToolConfig {
   name: string;
@@ -298,8 +298,8 @@ function bindPathTool(
   pathScopeOverride?: string,
 ): AgentTool<any, any> {
   const pathScope = pathScopeOverride ?? (operation === "read"
-    ? "Conversation files are read from public_data/. Configured skill directories and knowledge are read-only. .agents/skills/ and knowledge/ address their configured resource directories. Other relative paths start at the conversation root; authorized absolute paths are also accepted."
-    : "Write and edit paths must stay within public_data/. Relative paths start at the conversation root; authorized absolute paths are also accepted.");
+    ? "Use /workspace/<path> for user Storage and public_data/<path> for conversation files. Configured skill directories and knowledge are read-only. .agents/skills/ and knowledge/ address their configured resource directories. Other relative paths start at the conversation root."
+    : "Use /workspace/<path> for user Storage and public_data/<path> for conversation files. Other relative paths start at the conversation root.");
   const parameters = structuredClone(tool.parameters);
   if (isRecord(parameters.properties) && isRecord(parameters.properties.path)) {
     parameters.properties.path.description = pathScope;

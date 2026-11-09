@@ -23,6 +23,10 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.utils import default_path_access_policy
+from openhands.tools.utils.storage_paths import (
+    to_agent_storage_path,
+    to_tool_storage_path,
+)
 from openhands.tools.utils.workspace_staging import (
     WorkspaceStagingError,
     is_remote_workspace,
@@ -94,8 +98,10 @@ class UploadFileToPyromindAction(Action):
     target_dir: str | None = Field(
         default=None,
         description=(
-            "Storage directory to upload into. Defaults to the "
-            "conversation-scoped /.pyromind-agent/<conversation_id>/ directory."
+            "User Storage directory to upload into, for example "
+            "'/workspace/datasets'. Defaults to the "
+            "conversation-scoped /workspace/.pyromind-agent/<conversation_id>/ "
+            "directory."
         ),
     )
 
@@ -113,8 +119,8 @@ class UploadFileToPyromindObservation(Observation):
     storage_path: str | None = Field(
         default=None,
         description=(
-            "Absolute storage path of the uploaded file, usable in node "
-            "parameters (e.g. /.pyromind-agent/<conversation_id>/acc.py)."
+            "Absolute user Storage path of the uploaded file, usable in node "
+            "parameters (e.g. /workspace/.pyromind-agent/<conversation_id>/acc.py)."
         ),
     )
 
@@ -137,16 +143,16 @@ conversation workspace. Two common cases:
 - A workflow node parameter that takes a server-side path, most commonly a
   custom evaluation metric or reward script for MetricsConfigBuilderCustomNode:
   write the Python file locally first, upload it with this tool, then use the
-  returned storage path in the node's `entry` parameter as
+  returned Storage path in the node's `entry` parameter as
   `<storage_path>:<function_name>`
-  (e.g. /.pyromind-agent/<conversation_id>/acc.py:acc_func).
+  (e.g. /workspace/.pyromind-agent/<conversation_id>/acc.py:acc_func).
 - A pipeline input sidecar for `df_submit_pipeline`, for example an image
   manifest. Pass target_dir=<the storage directory that holds the data> so the
   manifest lands beside the files it references, then pass the returned storage
   path as `input_path`. Without target_dir the file goes to the conversation
   directory.
 
-Returns the absolute storage path of the uploaded file.
+Returns the absolute user Storage path of the uploaded file (`/workspace/...`).
 """
 
 
@@ -185,9 +191,16 @@ class UploadFileToPyromindExecutor(
                 is_error=True,
             )
 
-        target_dir = (
-            action.target_dir or f"{PYROMIND_AGENT_STORAGE_ROOT}/{conversation.id}"
-        )
+        try:
+            target_dir = to_tool_storage_path(
+                action.target_dir or f"{PYROMIND_AGENT_STORAGE_ROOT}/{conversation.id}",
+                field="target_dir",
+            )
+        except ValueError as exc:
+            return UploadFileToPyromindObservation.from_text(
+                text=str(exc),
+                is_error=True,
+            )
         overwritten = False
         try:
             with _workspace_upload_path(action.file_path, conversation) as local_path:
@@ -216,12 +229,13 @@ class UploadFileToPyromindExecutor(
                 is_error=True,
             )
 
-        text = f"File uploaded to Pyromind storage: {storage_path}"
+        agent_storage_path = to_agent_storage_path(storage_path)
+        text = f"File uploaded to Pyromind storage: {agent_storage_path}"
         if overwritten:
             text += "\nWarning: an existing file at that Storage path was overwritten."
         return UploadFileToPyromindObservation.from_text(
             text=text,
-            storage_path=storage_path,
+            storage_path=agent_storage_path,
         )
 
     def _resolve_headers(
@@ -664,9 +678,8 @@ _GET_STORAGE_URL_DESCRIPTION = (
     "URLs in your reply as Markdown (`![description](url)` for images, "
     "`[label](url)` for other files). Showing a file to the user never depends "
     "on image support in your own model.\n\n"
-    "Paths may be workspace paths (`public_data/report.html`), the Storage mount "
-    "path (`/target-workspace/datasets/img.png`), absolute sandbox paths, or "
-    "Storage paths (`/datasets/img.png`). The file must live under the mounted "
+    "Paths may be conversation paths (`public_data/report.html`) or user Storage "
+    "paths (`/workspace/datasets/img.png`). The file must live under the mounted "
     "Storage; sandbox paths outside the mount, such as `/tmp`, have no URL, so "
     "copy those into the workspace first (for example under `public_data/`) "
     "and call this tool again. "
@@ -721,9 +734,8 @@ class GetStorageUrlAction(Action):
     paths: list[str] = Field(
         description=(
             "Files to resolve, addressed as workspace paths "
-            "('public_data/report.html'), the Storage mount path "
-            "('/target-workspace/datasets/img.png'), or Storage paths "
-            "('/datasets/img.png')."
+            "('public_data/report.html') or user Storage paths "
+            "('/workspace/datasets/img.png')."
         ),
     )
 
@@ -731,7 +743,7 @@ class GetStorageUrlAction(Action):
 class StoragePreviewUrl(BaseModel):
     """One resolved Storage preview URL."""
 
-    path: str = Field(description="Storage path the URL addresses.")
+    path: str = Field(description="User Storage path the URL addresses.")
     url: str = Field(description="Pre-signed URL that opens the file inline.")
 
 
@@ -799,7 +811,9 @@ class GetStorageUrlExecutor(
             except ValueError as exc:
                 failures.append(f"{path}: {exc}")
                 continue
-            urls.append(StoragePreviewUrl(path=storage_path, url=url))
+            urls.append(
+                StoragePreviewUrl(path=to_agent_storage_path(storage_path), url=url)
+            )
 
         lines: list[str] = []
         for entry in urls:

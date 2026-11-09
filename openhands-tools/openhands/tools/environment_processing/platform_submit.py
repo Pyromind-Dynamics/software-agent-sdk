@@ -32,7 +32,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Self, cast
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from rich.text import Text
 
 from openhands.sdk.conversation.state import ActiveLongTask
@@ -53,6 +53,10 @@ from openhands.tools.pyromind_dataset.definition import (
     _resolve_secret_headers,
     download_file_from_pyromind,
     upload_local_file_to_pyromind,
+)
+from openhands.tools.utils.storage_paths import (
+    to_agent_storage_path,
+    to_tool_storage_path,
 )
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
@@ -118,7 +122,7 @@ verifier -> cleanup), with resume/limit/dedup flags forwarded. Per-record
 progress is logged one line per record in the node log.
 
 Two modes (exactly one required):
-- `manifest`: one Storage shard manifest (e.g. '<render_root>/batch-001/
+- `manifest`: one user Storage shard manifest (e.g. '/workspace/rendered/batch-001/
   manifest.jsonl'). The smoke path: submit a single shard first and check
   the verdict distribution before committing to the full run.
 - `shards` + optional `shard_offset`/`shard_count`: the render step's
@@ -144,7 +148,8 @@ class EdpSubmitAction(Action):
     manifest: str | None = Field(
         default=None,
         description=(
-            "Single Storage shard manifest (e.g. 'edp/batch-001/"
+            "Single user Storage shard manifest (e.g. "
+            "'/workspace/edp/batch-001/"
             "manifest.jsonl'), staged by edp_render. The smoke path: one "
             "shard, check verdicts before committing to the full run. "
             "Mutually exclusive with shards."
@@ -153,7 +158,8 @@ class EdpSubmitAction(Action):
     shards: str | None = Field(
         default=None,
         description=(
-            "Storage path of the shards.json index written by edp_render. "
+            "User Storage path of the shards.json index written by edp_render, "
+            "e.g. '/workspace/edp/shards.json'. "
             "Submit one shard by default; use shard_count only after the "
             "user explicitly requests concurrent shards. Mutually exclusive "
             "with manifest."
@@ -241,6 +247,16 @@ class EdpSubmitObservation(Observation):
     run_ids: list[str] = Field(default_factory=list)
     output_dirs: list[str] = Field(default_factory=list)
     resumed: bool = Field(default=False)
+
+    @field_validator("output_dirs", mode="before")
+    @classmethod
+    def _agent_output_paths(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            return [
+                to_agent_storage_path(path) if isinstance(path, str) and path else path
+                for path in value
+            ]
+        return value
 
     @property
     def visualize(self) -> Text:
@@ -603,9 +619,9 @@ class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
     ) -> list[str]:
         """Return the Storage manifest paths to submit this call."""
         if action.manifest is not None:
-            return [str(PurePosixPath("/" + action.manifest.lstrip("/")))]
+            return [to_tool_storage_path(action.manifest, field="manifest")]
         assert action.shards is not None
-        index_path = str(PurePosixPath("/" + action.shards.lstrip("/")))
+        index_path = to_tool_storage_path(action.shards, field="shards")
         raw = download_file_from_pyromind(
             storage_path=index_path,
             storage_base_url=self._storage_base_url or _default_storage_base_url(),
@@ -631,7 +647,9 @@ class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
                 + (f" shard_count={action.shard_count}")
                 + f" selects no shards from {len(shards)} in {index_path}"
             )
-        return [str(PurePosixPath("/" + str(s).lstrip("/"))) for s in selected]
+        return [
+            to_tool_storage_path(str(path), field="shards entry") for path in selected
+        ]
 
     # -- submission --------------------------------------------------------
 

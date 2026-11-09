@@ -96,7 +96,7 @@ export function applySandboxPathAliases(
 }
 
 export interface SandboxPathPolicyInput {
-  /** Sandbox-side conversation root, e.g. `/target-workspace/.pyromind-agent/<id>`. */
+  /** Sandbox-side conversation root, e.g. `/workspace/.pyromind-agent/<id>`. */
   workspacePath: string;
   readOnlyRoots: string[];
   skillsDirectory?: string;
@@ -210,6 +210,13 @@ export class SandboxPathPolicy {
 
   private resolveInput(input: string): string {
     const parts = input.split("/").filter((part) => part !== "" && part !== ".");
+    if (this.storageRoot) {
+      for (const mount of [PUBLIC_STORAGE_MOUNT, LEGACY_STORAGE_MOUNT]) {
+        if (input === mount || input.startsWith(`${mount}/`)) {
+          return posix.join(this.storageRoot, input.slice(mount.length));
+        }
+      }
+    }
     if (!input.startsWith("/") && parts[0] === ".agents" && parts[1] === "skills") {
       if (!this.skillsDirectory) {
         throw new Error(
@@ -240,6 +247,8 @@ export function insideSandboxPath(target: string, root: string): boolean {
 
 /** The removed workspace symlink; kept only so a stale habit gets a clear error. */
 const LEGACY_STORAGE_ALIAS = "storage";
+const PUBLIC_STORAGE_MOUNT = "/workspace";
+const LEGACY_STORAGE_MOUNT = "/target-workspace";
 
 /** The runner's own bookkeeping inside the conversation workspace. */
 const RUNNER_STATE_DIRNAME = "pi";

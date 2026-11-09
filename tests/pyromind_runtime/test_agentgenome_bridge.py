@@ -20,17 +20,17 @@ from harness_adapter.agentgenome_bridge import (
 )
 
 
-MOUNT = "/target-workspace"
+MOUNT = "/workspace"
 
 
 def test_platform_storage_spelling_gains_the_sandbox_mount() -> None:
     assert (
         _storage_alias("/datasets/test_100/images", MOUNT)
-        == "/target-workspace/datasets/test_100/images"
+        == "/workspace/datasets/test_100/images"
     )
     assert (
         _storage_alias("datasets/test_100/prelabel_manifest.jsonl", MOUNT)
-        == "/target-workspace/datasets/test_100/prelabel_manifest.jsonl"
+        == "/workspace/datasets/test_100/prelabel_manifest.jsonl"
     )
 
 

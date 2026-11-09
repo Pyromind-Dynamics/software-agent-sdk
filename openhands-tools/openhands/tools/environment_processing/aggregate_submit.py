@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Self, cast
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from rich.text import Text
 
 from openhands.sdk.conversation.state import ActiveLongTask
@@ -38,6 +38,10 @@ from openhands.tools.pyromind_dataset.definition import (
     _resolve_conversation_headers,
     _resolve_secret_headers,
     upload_local_file_to_pyromind,
+)
+from openhands.tools.utils.storage_paths import (
+    to_agent_storage_path,
+    to_tool_storage_path,
 )
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
@@ -83,15 +87,16 @@ class EdpAggregateAction(Action):
     run_dirs: list[str] = Field(
         min_length=1,
         description=(
-            "Per-shard output_dir values returned by edp_submit (Storage "
-            "paths). Each must contain run/verdicts.jsonl next to its shard "
-            "manifest."
+            "Per-shard output_dir values returned by edp_submit "
+            "('/workspace/...'). Each must contain "
+            "run/verdicts.jsonl next to its shard manifest."
         ),
     )
     out_dir: str = Field(
         description=(
-            "Storage output directory for the merged dataset + training "
-            "files (verdicts.jsonl / slime.jsonl / sft.jsonl / report.json). "
+            "User Storage output directory for the merged dataset + training "
+            "files, e.g. '/workspace/datasets/merged'. "
+            "It contains verdicts.jsonl / slime.jsonl / sft.jsonl / report.json. "
             "Reuse it to resume: already-aggregated task_ids are skipped."
         ),
     )
@@ -138,6 +143,13 @@ class EdpAggregateObservation(Observation):
     task_id: str | None = Field(default=None)
     run_id: str | None = Field(default=None)
     out_dir: str | None = Field(default=None)
+
+    @field_validator("out_dir", mode="before")
+    @classmethod
+    def _agent_output_path(cls, value: Any) -> Any:
+        if isinstance(value, str) and value:
+            return to_agent_storage_path(value)
+        return value
 
     @property
     def visualize(self) -> Text:
@@ -271,9 +283,12 @@ class EdpAggregateExecutor(ToolExecutor[EdpAggregateAction, EdpAggregateObservat
                 status="Failed",
                 is_error=True,
             )
-        out_dir = str(PurePosixPath("/" + action.out_dir.lstrip("/")))
-
         try:
+            out_dir = to_tool_storage_path(action.out_dir, field="out_dir")
+            run_dirs = [
+                to_tool_storage_path(path, field="run_dirs") for path in action.run_dirs
+            ]
+            agent_out_dir = to_agent_storage_path(out_dir)
             state = cast("ConversationState", conversation.state)
             auth_token = state.secret_registry.get_secret_value(
                 PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET
@@ -295,7 +310,7 @@ class EdpAggregateExecutor(ToolExecutor[EdpAggregateAction, EdpAggregateObservat
             run_id = uuid.uuid4()
             command = build_aggregate_command(
                 out_dir=out_dir,
-                run_dirs=action.run_dirs,
+                run_dirs=run_dirs,
                 protocol=action.protocol,
                 min_reward=action.min_reward,
                 system_prompt=action.system_prompt,
@@ -356,22 +371,22 @@ class EdpAggregateExecutor(ToolExecutor[EdpAggregateAction, EdpAggregateObservat
         return EdpAggregateObservation.from_text(
             text=(
                 "Aggregate task submitted. "
-                f"task_id={task_id}, out_dir={out_dir}. "
+                f"task_id={task_id}, out_dir={agent_out_dir}. "
                 "The platform runs it asynchronously and the terminal callback "
                 "will resume this conversation automatically. NOW reply to "
                 "the user with a short status (what was submitted, task_id, "
                 "that the report will follow on completion) and then END your "
                 "turn — do not poll the output dir or sleep-wait. After the "
                 "terminal callback, read "
-                f"{out_dir}/report.json for the verdict distribution and "
-                f"conversion stats; {out_dir}/slime.jsonl and "
-                f"{out_dir}/sft.jsonl are the training files. Rerun with the "
+                f"{agent_out_dir}/report.json for the verdict distribution and "
+                f"conversion stats; {agent_out_dir}/slime.jsonl and "
+                f"{agent_out_dir}/sft.jsonl are the training files. Rerun with the "
                 "same out_dir (and any new run_dirs) to resume."
             ),
             status=response.status,
             task_id=task_id,
             run_id=str(run_id),
-            out_dir=out_dir,
+            out_dir=agent_out_dir,
         )
 
 

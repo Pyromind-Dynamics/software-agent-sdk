@@ -13,7 +13,7 @@
 | endpoint | STRING | 是 | OpenAI 兼容推理 API 地址 |
 | endpoint_api_key | STRING | 是 | 推理 API Key。默认值：`empty` |
 | endpoint_model | STRING | 是 | 推理端点提供的模型名称。默认值：`default` |
-| output_path | STRING | 是 | 输出目录或文件路径 |
+| output_path | STRING | 是 | 持久化评测输出目录，使用 `/workspace/...` |
 | dataset_config | STRING\|DATASET_CONFIG | 是 | 已组装的数据集配置 YAML 字符串 |
 | metrics_config | STRING\|METRICS_CONFIG | 是 | Metrics config |
 | max_samples | INT | 否 | 最大评测样本数（0 表示全部）。默认值：`0` |
@@ -23,4 +23,4 @@
 
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
-| benchmark_output_path | STRING | 基准评测报告输出路径 |
+| benchmark_output_path | STRING | 基准评测报告输出路径，位于 `/workspace/...` |

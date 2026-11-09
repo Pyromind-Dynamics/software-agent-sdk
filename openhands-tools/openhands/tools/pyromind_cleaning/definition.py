@@ -39,6 +39,7 @@ from openhands.tools.pyromind_dataset.definition import (
 from openhands.tools.utils.conversation_dirs import conversation_state_dir
 from openhands.tools.utils.storage_paths import (
     StoragePathError,
+    to_agent_storage_path,
     to_tool_storage_path,
 )
 from openhands.tools.workflow.task_submission import (
@@ -81,7 +82,7 @@ class RunDatasetCleaningAction(Action):
     """Submit a dataset cleaning script as a Studio workflow."""
 
     input_path: str = Field(
-        description="Source dataset path in the user's Pyromind storage.",
+        description="Source dataset path under /workspace in the user's Storage.",
     )
     script_path: str | None = Field(
         default=None,
@@ -146,7 +147,7 @@ and optional `--limit N`. `--output` is the concrete output.jsonl path, while
 by that invocation. Output is homogeneous messages or text DPO preference JSONL.
 
 The submission is asynchronous. A new run gets a unique result directory under
-`/.pyromind-agent/<conversation_id>/data_cleaning/<run_id>`. The tool uploads
+`/workspace/.pyromind-agent/<conversation_id>/data_cleaning/<run_id>`. The tool uploads
 `cleaning_utils.py` and
 `validate_format.py` beside the frozen `clean_script.py`, runs the cleaner, then
 validates output.jsonl in the same Pod and merges validation into report.json.
@@ -308,6 +309,7 @@ class RunDatasetCleaningExecutor(
             resumed=resumed,
             status=response.status,
         )
+        agent_output_dir = to_agent_storage_path(output_dir, field="output_dir")
         try:
             task_store.save(association)
         except OSError as exc:
@@ -319,7 +321,7 @@ class RunDatasetCleaningExecutor(
                 status=response.status,
                 task_id=task_id,
                 run_id=str(run_id),
-                output_dir=output_dir,
+                output_dir=agent_output_dir,
                 resumed=resumed,
                 is_error=True,
             )
@@ -343,17 +345,17 @@ class RunDatasetCleaningExecutor(
         return RunDatasetCleaningObservation.from_text(
             text=(
                 "Dataset cleaning workflow submitted. "
-                f"task_id={task_id}, run_id={run_id}, output_dir={output_dir}. "
+                f"task_id={task_id}, run_id={run_id}, output_dir={agent_output_dir}. "
                 "A submission confirmation message has already been sent "
                 "to the user, so do not repeat the submission details in "
                 "your reply. "
                 "After the terminal callback, preview "
-                f"{output_dir}/report.json, then output.jsonl."
+                f"{agent_output_dir}/report.json, then output.jsonl."
             ),
             status=response.status,
             task_id=task_id,
             run_id=str(run_id),
-            output_dir=output_dir,
+            output_dir=agent_output_dir,
             resumed=resumed,
         )
 

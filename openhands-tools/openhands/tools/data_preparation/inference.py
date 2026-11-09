@@ -46,6 +46,7 @@ from openhands.tools.data_preparation.submission import (
     submission_client,
     validate_pipeline_topology as validate_pipeline_topology,
 )
+from openhands.tools.utils.storage_paths import to_agent_storage_path
 
 
 logger = get_logger(__name__)
@@ -79,7 +80,8 @@ class InferenceOptions(BaseModel):
         min_length=1,
         description=(
             "Model reference interpreted by model_source in the evaluation config "
-            "JSON: an absolute Storage path for storage (default), a central "
+            "JSON: a user Storage path such as '/workspace/models/model' for "
+            "storage (default), a central "
             "catalog model identifier for clone (exact enum value, including its "
             "namespace), or a repository name for download."
         ),
@@ -614,6 +616,7 @@ class InferencePipelineHandler:
                 / "training-analysis/scripts/training_artifacts.py"
             )
         run_id, output_dir = run["run_id"], run["output_dir"]
+        agent_output_dir = to_agent_storage_path(output_dir)
         revision = run["revision"]
         submitting = False
         task_id = None
@@ -772,7 +775,7 @@ class InferencePipelineHandler:
                     "status": "Failed",
                     "is_error": True,
                     "run_id": run_id,
-                    "output_dir": output_dir,
+                    "output_dir": agent_output_dir,
                     "resumed": request.resume_run_id is not None,
                     "execution_revision": run["execution_revision"],
                     **(
@@ -793,12 +796,13 @@ class InferencePipelineHandler:
         register_submitted_task(conversation, task_id, response_status)
         return {
             "text": (
-                f"Evaluation submitted: {task_id}. Check {output_dir}/report.json "
+                f"Evaluation submitted: {task_id}. Check "
+                f"{agent_output_dir}/report.json "
                 "after the callback; it contains the HTML artifact path." + warning
             ),
             "task_id": task_id,
             "run_id": run_id,
-            "output_dir": output_dir,
+            "output_dir": agent_output_dir,
             "status": response_status,
             "resumed": request.resume_run_id is not None,
             "execution_revision": run["execution_revision"],
