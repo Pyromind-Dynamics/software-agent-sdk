@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import os
-from pathlib import PurePosixPath
 
 import httpx
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
 from pyromind_runtime.domain.preparation import InspectResource
+from pyromind_runtime.domain.storage_paths import (
+    from_storage_api_path,
+    to_storage_api_path,
+)
 
 from openhands.tools.pyromind_dataset.definition import (
     _default_storage_base_url,
@@ -20,10 +23,7 @@ from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 
 class StorageResourceInspector:
     def read_media(self, path: str, context: RequestContext) -> tuple[bytes, str]:
-        if ".." in PurePosixPath(path).parts or any(
-            c in path for c in ("\\", ":", "?", "#")
-        ):
-            raise ValueError("use a Storage path")
+        storage_path = to_storage_api_path(path, field="path")
         if not context.cookie and not context.authorization:
             raise ValueError("Storage preview requires current request credentials")
         headers = {
@@ -37,7 +37,7 @@ class StorageResourceInspector:
         }
         try:
             url = request_storage_url(
-                storage_path=path,
+                storage_path=storage_path,
                 storage_base_url=os.getenv("PYROMIND_STORAGE_BASE_URL")
                 or _default_storage_base_url(),
                 headers=headers,
@@ -66,22 +66,15 @@ class StorageResourceInspector:
         return value, mime_type
 
     def inspect(self, request: InspectResource, context: RequestContext) -> JsonObject:
-        path = PurePosixPath(request.path)
-        if (
-            ".." in path.parts
-            or "\\" in request.path
-            or ":" in request.path
-            or "?" in request.path
-            or "#" in request.path
-        ):
-            raise ValueError("use a Storage path, not a URL or a parent traversal")
-        validate_persisted_payload({"path": request.path})
+        storage_path = to_storage_api_path(request.path, field="path")
+        public_path = from_storage_api_path(storage_path, field="path")
+        validate_persisted_payload({"path": public_path})
         if not context.cookie and not context.authorization:
             raise ValueError("Storage inspection requires current request credentials")
         if request.kind == "directory":
-            names = sorted(build_evaluation_storage(context).list(request.path))
+            names = sorted(build_evaluation_storage(context).list(storage_path))
             directory: JsonObject = {
-                "path": request.path,
+                "path": public_path,
                 "kind": "directory",
                 "entries": [name for name in names[:200]],
                 "truncated": len(names) > 200,
@@ -99,7 +92,7 @@ class StorageResourceInspector:
         }
         try:
             url = request_storage_url(
-                storage_path=request.path,
+                storage_path=storage_path,
                 storage_base_url=os.getenv("PYROMIND_STORAGE_BASE_URL")
                 or _default_storage_base_url(),
                 headers=headers,
@@ -135,7 +128,7 @@ class StorageResourceInspector:
             truncated = len(data) > request.max_bytes
             body = bytes(data[: request.max_bytes])
             result = {
-                "path": request.path,
+                "path": public_path,
                 "kind": "file",
                 "content": body.decode("utf-8", errors="replace"),
                 "bytes_read": len(body),

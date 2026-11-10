@@ -353,7 +353,7 @@ def test_structured_preserves_task_specific_objects_and_ids(
 def test_source_images_keep_repeated_roles_and_strip_the_pod_mount(
     runtime: Any,
 ) -> None:
-    """Two images sharing a role both survive, and pod paths become Storage paths."""
+    """Two images sharing a role survive and use the public Storage spelling."""
     images = runtime._source_images(
         ["待检原图", "辅助图", "辅助图"],
         [
@@ -363,9 +363,14 @@ def test_source_images_keep_repeated_roles_and_strip_the_pod_mount(
         ],
     )
     assert images == {
-        "待检原图": "/datasets/pcb/board.bmp",
-        "辅助图": "/datasets/pcb/diff.bmp",
-        "辅助图#2": "/datasets/pcb/zoom.bmp",
+        "待检原图": "/workspace/datasets/pcb/board.bmp",
+        "辅助图": "/workspace/datasets/pcb/diff.bmp",
+        "辅助图#2": "/workspace/datasets/pcb/zoom.bmp",
     }
+    assert runtime._workspace_image_path("/workspace/datasets/pcb/board.bmp") == (
+        "/workspace/datasets/pcb/board.bmp"
+    )
     # A local sample run has no mount, so its own path is what it records.
-    assert runtime._storage_object_path("/tmp/ws/board.bmp") == "/tmp/ws/board.bmp"
+    assert runtime._workspace_image_path("/tmp/ws/board.bmp") == "/tmp/ws/board.bmp"
+    with pytest.raises(ValueError, match="must not contain"):
+        runtime._workspace_image_path("/workspace/../etc/passwd")

@@ -40,7 +40,7 @@ def _experiment_plan(*, name: str = "AVI experiment") -> WorkflowPlan:
                 {
                     "id": "images",
                     "name": "AVI images",
-                    "uri": "datasets/avi/train.jsonl",
+                    "storage_path": "/workspace/datasets/avi/train.jsonl",
                 }
             ],
             "stages": [

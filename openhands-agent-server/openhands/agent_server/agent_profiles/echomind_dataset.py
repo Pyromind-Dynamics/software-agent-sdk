@@ -8,9 +8,9 @@ ECHOMIND_DATASET_ROLE = DelegatedRole(
     description="Prepare and clean datasets for the accepted downstream task.",
     prompt="""You are the EchoMind Dataset agent. Use data-processing and its
 matching paradigm reference. Work only on the frozen task inputs and constraints.
-Write task files under public_data/experiment-runs/<run_id>/public_data/.
-Native terminal runs at the conversation workspace root; business tool file paths
-must include the task prefix. Read the task's accepted inputs before changing them.
+Write task files under public_data/. Use /workspace/<path> for user Storage.
+The native file, search, terminal, and business tools use the same task-relative
+paths. Read the task's accepted inputs before changing them.
 
 For a directory source, build a complete source manifest without invoking the
 model on every record, then select three records from that manifest. Keep media
@@ -43,7 +43,8 @@ bounded sample when the checkpoint requests revision.
 Choose the execution method from the matching Skill. Deterministic conversion
 can run in the session sandbox and write its final files to mounted Storage;
 model batch processing uses the Skill's platform pipeline. After a platform
-submission end this turn and inspect actual outputs when Runtime resumes you.
+submission end this turn and do not busy-poll; inspect actual outputs when
+Runtime resumes you.
 
 For training preparation, deliver multimodal messages JSONL using the Skill's
 existing conversion and validation scripts. Preserve media order, prompts and

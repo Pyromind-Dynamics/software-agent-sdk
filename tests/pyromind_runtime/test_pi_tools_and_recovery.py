@@ -48,6 +48,7 @@ from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.snapshot import WorkflowState
 from pyromind_runtime.ports.harness import (
+    DelegatedRole,
     ExternalTaskNotification,
     ForkSpec,
     ProductCheckpoint,
@@ -409,6 +410,91 @@ async def test_create_session_quota_hook_failure_aborts_session(
             RequestContext(user_id="42"),
         )
     assert not (conversations / conversation_id).exists()
+
+
+async def test_control_delegation_prepares_task_workspace_before_spawn(
+    tmp_path, monkeypatch
+) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    conversation_root = conversations / "delegated"
+    requests: list[tuple[str, dict[str, Any]]] = []
+
+    class FakeRunner:
+        def __init__(self, **_kwargs) -> None:
+            self.running = True
+
+        async def start(self, _config) -> None:
+            pass
+
+        async def request(self, method, params):
+            requests.append((method, params))
+            if method == "delegation.control":
+                assert (
+                    conversation_root / "public_data/experiment-runs/run-1/public_data"
+                ).is_dir()
+                return {
+                    "execution_ref": "native-1",
+                    "status": "queued",
+                }
+            return {"accepted": True}
+
+        async def close(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    context = RequestContext(user_id="42")
+    handle = await adapter.create_session(
+        SessionSpec(
+            conversation_id="delegated",
+            user_id="42",
+            workspace_root=str(conversation_root),
+            model_configuration={"model": "gpt-5", "api_key": "test-key"},
+            managed_delegation=True,
+            delegated_roles=(
+                DelegatedRole(
+                    name="eval",
+                    description="Evaluate a task",
+                    prompt="Evaluate it.",
+                    tools=("read",),
+                ),
+            ),
+        ),
+        context,
+    )
+    scope = {"work_id": "work-1", "generation": 1, "run_id": "run-1"}
+    try:
+        result = await adapter.control_delegation(
+            handle,
+            {
+                "action": "spawn",
+                "role": "eval",
+                "scope": scope,
+                "launch_request_id": "spawn-1",
+            },
+            context,
+        )
+        assert result["execution_ref"] == "native-1"
+        assert requests[-1][0] == "delegation.control"
+        assert (
+            conversation_root / "public_data/experiment-runs/run-1/public_data"
+        ).is_dir()
+
+        with pytest.raises(ValueError, match="invalid delegated run id"):
+            await adapter.control_delegation(
+                handle,
+                {
+                    "action": "spawn",
+                    "role": "eval",
+                    "scope": {**scope, "run_id": "../escape"},
+                    "launch_request_id": "spawn-invalid",
+                },
+                context,
+            )
+        assert requests[-1][0] == "delegation.control"
+    finally:
+        await adapter.close(handle)
 
 
 async def test_idle_unexpected_runner_exit_is_silent_and_restarts_lazily(
@@ -1033,11 +1119,12 @@ async def test_sandbox_session_prompt_steers_storage_reads(
         assert "Every dataset this session" in prompt
         assert "Platform task state comes from the platform tools" in prompt
         assert "Do not search the filesystem or" in prompt
-        assert f"so use {DEFAULT_MOUNT_PATH}/<path> instead" in prompt
-        assert "/workspace/<path> does not resolve" in prompt
+        assert f"Use {DEFAULT_MOUNT_PATH}/<path> for Storage files everywhere" in prompt
+        assert "remove or replace that prefix" in prompt
         # The removed alias must not come back through the prompt.
         assert "storage/ is" not in prompt
         assert "storage/<path>" not in prompt
+        assert "/target-workspace" not in prompt
         assert DEFAULT_MOUNT_PATH in prompt
         assert (
             f"{DEFAULT_MOUNT_PATH}/.pyromind-agent/sandbox-prompt/.agents/skills"

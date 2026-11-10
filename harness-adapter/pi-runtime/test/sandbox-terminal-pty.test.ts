@@ -438,7 +438,7 @@ test("agent lanes in one sandbox use separate PTYs and isolate concurrent enviro
     assert.equal(retained.executionId, mainJournal.executionId);
     await assert.rejects(readFile(journal), { code: "ENOENT" });
     assert.equal((await recovered.exec("echo r1", root, { onData: () => {} })).exitCode, 0);
-    assert.equal(processes.length, beforeRecovery + 2, "subsequent commands reuse only the healthy PTY");
+    assert.equal(processes.length, beforeRecovery + 3, "unknown termination replaces the sandbox before the next command");
     await recovered.disconnect();
   } finally {
     await writeFile(join(root, "release"), "");

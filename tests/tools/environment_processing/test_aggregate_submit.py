@@ -139,7 +139,7 @@ def test_executor_submits_aggregate_task(
 
     assert observation.status == "Pending"
     assert observation.task_id == "task-77"
-    assert observation.out_dir == "/edp/out"
+    assert observation.out_dir == "/workspace/edp/out"
     # all three aggregation scripts are staged into the out dir
     assert mocks.upload.call_count == 3
     staged = {Path(c.kwargs["local_path"]).name for c in mocks.upload.call_args_list}

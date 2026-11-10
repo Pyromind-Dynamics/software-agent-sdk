@@ -274,13 +274,12 @@ def test_sandbox_settings_read_session_config_then_environment(monkeypatch) -> N
     assert settings.cpu == "8"
     assert settings.memory == "16Gi"
     assert settings.gpu_card == "L40S"
+    assert DEFAULT_MOUNT_PATH == STORAGE_HOST_PATH == "/workspace"
     assert settings.mount_path == DEFAULT_MOUNT_PATH
     assert settings.host_path == STORAGE_HOST_PATH
     assert SandboxSettings.from_extra({}).mount_path == DEFAULT_MOUNT_PATH
-    assert (
-        SandboxSettings.from_extra({"sandbox": {"mount_path": "/data"}}).mount_path
-        == "/data"
-    )
+    with pytest.raises(ValueError, match="mount_path is fixed to /workspace"):
+        SandboxSettings.from_extra({"sandbox": {"mount_path": "/data"}})
     assert (
         SandboxSettings.from_extra({"sandbox": {"host_path": "/mnt"}}).host_path
         == "/mnt"
@@ -410,6 +409,31 @@ def test_ensure_reuses_a_running_sandbox_without_repairing(
     record = files.load_sandbox()
     assert record is not None
     assert record["created_at"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_ensure_recreates_a_sandbox_using_the_former_pi_mount(
+    tmp_path: Path, files: PiSessionFiles, monkeypatch
+) -> None:
+    files.save_sandbox(
+        {
+            "sandbox_id": "sbx-1",
+            "workspace_path": "/target-workspace/.pyromind-agent/conv-1",
+            "mount_path": "/target-workspace",
+            "storage_host_path": STORAGE_HOST_PATH,
+            "workspace_version": 4,
+        }
+    )
+    client = _FakeSandboxClient(status="running")
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
+        lambda **kwargs: ("", 0, False),
+    )
+    manager = SandboxExecutionManager(client_factory=lambda context: client)
+
+    endpoint = asyncio.run(manager.ensure(_context(tmp_path), files))
+
+    assert client.lifecycle_calls == ["get:sbx-1", "delete:sbx-1", "create:running"]
+    assert endpoint["workspace_path"] == "/workspace/.pyromind-agent/conv-1"
 
 
 def test_ensure_rebuilds_a_running_sandbox_whose_terminal_is_dead(
@@ -632,7 +656,7 @@ def test_ensure_recreates_a_sandbox_recorded_without_the_storage_mount(
     tmp_path: Path, files: PiSessionFiles, monkeypatch
 ) -> None:
     # Records written before the mount moved into the create request describe a
-    # container that can never expose /target-workspace.
+    # container that can never expose the configured Storage root.
     files.save_sandbox(
         {
             "sandbox_id": "sbx-1",

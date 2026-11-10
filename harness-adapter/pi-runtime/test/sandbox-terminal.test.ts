@@ -997,7 +997,7 @@ test("unconfirmed termination isolates the old PTY without blocking new commands
   operations.dispose();
 });
 
-test("an unconfirmed termination replaces the PTY without refreshing the sandbox or replaying the old command", async () => {
+test("an unconfirmed termination replaces the sandbox without replaying the old command", async () => {
   const sockets: FakeSocket[] = [];
   let launches = 0;
   let resolutions = 0;
@@ -1036,7 +1036,7 @@ test("an unconfirmed termination replaces the PTY without refreshing the sandbox
     (error: unknown) => error instanceof SandboxTerminalExecutionError && !error.execution.stopped);
   const completed = await terminal.exec("echo r1", ".", {onData: () => {}});
   assert.equal(completed.exitCode, 0);
-  assert.equal(resolutions, 1);
+  assert.equal(resolutions, 2);
   assert.equal(sockets.length, 2);
   assert.equal(launches, 2, "each command must launch exactly once");
   await terminal.close();

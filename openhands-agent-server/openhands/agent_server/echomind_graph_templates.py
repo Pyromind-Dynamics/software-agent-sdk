@@ -80,7 +80,7 @@ def _resources_payload(
         {
             "id": resource.id,
             "name": resource.name,
-            "uri": resource.uri,
+            "uri": resource.storage_path,
             "description": resource.description,
         }
         for resource in plan.resources

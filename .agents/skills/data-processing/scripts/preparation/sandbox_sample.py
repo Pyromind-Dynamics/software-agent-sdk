@@ -47,7 +47,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -883,6 +883,34 @@ def _storage_root(workspace_root: Path) -> Path | None:
     return agent_area.parent if agent_area.name == ".pyromind-agent" else None
 
 
+def _resolve_cli_path(value: str, workspace: Path, storage_root: Path | None) -> Path:
+    raw = value.strip()
+    if not raw:
+        raise ValueError("path must not be empty")
+    if any(ord(character) < 32 for character in raw):
+        raise ValueError("path contains control characters")
+
+    logical = PurePosixPath(raw)
+    if ".." in logical.parts:
+        raise ValueError("path must not contain '..'")
+    if not logical.parts:
+        raise ValueError("path must name a file or directory")
+    if raw.startswith("storage://") or (
+        not logical.is_absolute() and logical.parts[0] == "storage"
+    ):
+        raise ValueError("the storage/ alias was removed; use /workspace/<path>")
+    if raw == "/target-workspace" or raw.startswith("/target-workspace/"):
+        raise ValueError(
+            "/target-workspace is an execution-only path; use /workspace/<path>"
+        )
+    if raw == "/workspace" or raw.startswith("/workspace/"):
+        if storage_root is None:
+            raise ValueError("/workspace paths require a mounted user Storage")
+        suffix = logical.relative_to("/workspace")
+        return (storage_root / Path(*suffix.parts)).resolve()
+    return (workspace / raw).resolve()
+
+
 def _is_json_document(line: str) -> bool:
     try:
         json.loads(line)
@@ -968,11 +996,11 @@ def cli_spec(config: dict[str, Any], workspace: Path) -> dict[str, Any]:
     cwd = workspace.resolve()
     root = _layout_root(cwd)
     public = root / "public_data"
+    storage = _storage_root(root)
 
     def path(value: str, output: bool = False) -> Path:
-        p = (cwd / value).resolve()
+        p = _resolve_cli_path(value, cwd, storage)
         in_public = p.is_relative_to(public)
-        storage = _storage_root(root)
         if storage is None:
             in_storage = False
         else:
@@ -985,7 +1013,7 @@ def cli_spec(config: dict[str, Any], workspace: Path) -> dict[str, Any]:
             in_storage = p.is_relative_to(storage) and not in_agent_area
         if not in_public and (output or not in_storage):
             raise ValueError(
-                "paths must be in public_data/, or read-only under the Storage mount"
+                "paths must be in public_data/, or read-only under /workspace/"
             )
         return p
 

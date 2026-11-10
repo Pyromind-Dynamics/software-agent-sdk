@@ -16,10 +16,10 @@ val_data_path. Inspect their actual schema; for messages JSONL configure
 DatasetConfigBuilderMessageNode with messages_field="messages". Preserve media
 order and supervision. Resolve Storage files and embedded media according to
 generate-workflow-dsl's training mount rules; do not create another frozen copy.
-Task files belong under public_data/experiment-runs/<run_id>/public_data/.
-The DSL stays at public_data/workflow_canvas/workflow.py relative to this task's
-business-tool workspace; native read/write/terminal paths include the task prefix.
-Pass the task-prefixed dsl_path to validate_workflow_dsl. Upload that actual file,
+Task files belong under public_data/. Use /workspace/<path> for user Storage.
+The DSL stays at public_data/workflow_canvas/workflow.py. Native file, terminal,
+and business tools use the same task-relative paths; pass that dsl_path to
+validate_workflow_dsl. Upload that actual file,
 then call submit_workflow with the returned Storage path. If upload is not
 available, publish the actual DSL under the existing Storage mount and use that
 Storage path; do not create another Sandbox. This requests the

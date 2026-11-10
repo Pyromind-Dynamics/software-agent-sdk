@@ -319,7 +319,7 @@ async def test_confirmation_checks_snapshot_before_platform_submit(version_runti
 
     runtime, submission, context = version_runtime
     await runtime.prepare_workflow_execution(
-        "c", "storage/project/workflow.py", context, request_id="request"
+        "c", "/workspace/project/workflow.py", context, request_id="request"
     )
     project = runtime.versions.store.bound_project("c")
     version = runtime.versions.store.list_versions(project.id)[0]

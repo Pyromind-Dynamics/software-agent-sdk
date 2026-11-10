@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING, Any, Self, cast
 from uuid import uuid4
 
 import httpx
-from pydantic import Field
+from pydantic import Field, field_validator
+from pyromind_runtime.domain.storage_paths import (
+    StoragePathError,
+    normalize_workspace_path,
+)
 
 from openhands.sdk.tool.registry import register_tool
 from openhands.sdk.tool.tool import (
@@ -35,8 +39,19 @@ PYROMIND_PRODUCT_USER_ID_SECRET = "pyromind_product_user_id"
 class SubmitWorkflowAction(Action):
     workflow_path: str = Field(
         min_length=1,
-        description=("Existing Storage workflow DSL path, e.g. /project/workflow.py."),
+        description=(
+            "Existing user Storage workflow DSL path, "
+            "e.g. /workspace/project/workflow.py."
+        ),
     )
+
+    @field_validator("workflow_path")
+    @classmethod
+    def validate_workflow_path(cls, value: str) -> str:
+        try:
+            return normalize_workspace_path(value, field="workflow_path")
+        except StoragePathError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 class SubmitWorkflowObservation(Observation):

@@ -11,7 +11,7 @@
 | 参数 | 数据类型 | 必填 | 描述 |
 |------|---------|------|
 | file_path | STRING | 是 | 输入文件路径。 |
-| output_file_path | STRING | 是 | 生成文件的输出路径。默认值：/workspace/output.json |
+| output_file_path | STRING | 是 | 生成文件的持久化输出路径，使用 `/workspace/...`。默认值：`/workspace/output.json` |
 | python_script_path | STRING | 是 | Python 脚本路径；脚本必须定义 process(input_file_path, output_file)。 |
 | overwrite_output | BOOLEAN | 是 | 是否允许覆盖已存在的输出文件。默认值：false |
 

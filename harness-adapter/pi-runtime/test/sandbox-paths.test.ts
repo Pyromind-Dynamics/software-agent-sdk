@@ -7,19 +7,22 @@ import {
   SandboxPathPolicy,
 } from "../src/sandbox-paths.js";
 
-const WORKSPACE = "/target-workspace/.pyromind-agent/conv-1";
+const WORKSPACE = "/workspace/.pyromind-agent/conv-1";
 const SKILLS = "/opt/pi/skills";
 const KNOWLEDGE = "/opt/pi/knowledge";
-const STORAGE = "/target-workspace";
+const STORAGE = "/workspace";
 
 function policy(
   overrides: {
+    conversationRoot?: string;
+    workspacePath?: string;
     skillsDirectory?: string;
     storageRoot?: string;
   } = {},
 ) {
   return SandboxPathPolicy.create({
-    workspacePath: WORKSPACE,
+    workspacePath: overrides.workspacePath ?? WORKSPACE,
+    conversationRoot: overrides.conversationRoot,
     readOnlyRoots: [],
     skillsDirectory: "skillsDirectory" in overrides ? overrides.skillsDirectory : SKILLS,
     knowledgeRoot: KNOWLEDGE,
@@ -64,6 +67,13 @@ test("sandbox paths address the Storage mount by its absolute path", () => {
   );
 });
 
+test("sandbox paths reject the former Pi mount", () => {
+  assert.throws(
+    () => policy().resolvePath("/target-workspace/datasets/train.jsonl", "read"),
+    /PATH_SCOPE_ERROR/,
+  );
+});
+
 test("the removed storage/ alias fails loudly instead of landing in the workspace", () => {
   assert.throws(
     () => policy().resolvePath("storage/datasets/train.jsonl", "read"),
@@ -75,11 +85,25 @@ test("the removed storage/ alias fails loudly instead of landing in the workspac
   );
 });
 
+test("the removed storage:// URI syntax fails instead of becoming a workspace path", () => {
+  assert.throws(
+    () => policy().resolvePath("storage://datasets/train.jsonl", "read"),
+    /storage\/ alias was removed/,
+  );
+});
+
+test("Storage traversal cannot escape the mounted root", () => {
+  assert.throws(
+    () => policy().resolvePath("/workspace/../etc/passwd", "read"),
+    /PATH_SCOPE_ERROR/,
+  );
+});
+
 test("sandbox paths keep conversation state out of reach under the mount", () => {
   for (const target of [
     `${WORKSPACE}/pi/session.jsonl`,
     `${WORKSPACE}/meta.json`,
-    "/target-workspace/.pyromind-agent/conv-2/public_data/train.csv",
+    "/workspace/.pyromind-agent/conv-2/public_data/train.csv",
   ]) {
     assert.throws(
       () => policy().resolvePath(target, "read"),
@@ -126,6 +150,43 @@ test("sandbox paths reject writes outside public_data", () => {
     policy().resolvePath("public_data/out.json", "write"),
     `${WORKSPACE}/public_data/out.json`,
   );
+});
+
+test("delegated lanes resolve logical paths inside their task workspace", () => {
+  const lane = "public_data/experiment-runs/run-1";
+  const delegated = policy({ workspacePath: `${WORKSPACE}/${lane}`, conversationRoot: WORKSPACE });
+
+  assert.equal(
+    delegated.resolvePath("public_data/output.txt", "write"),
+    `${WORKSPACE}/${lane}/public_data/output.txt`,
+  );
+  assert.equal(
+    delegated.resolvePath(`${STORAGE}/datasets/input.jsonl`, "read"),
+    `${STORAGE}/datasets/input.jsonl`,
+  );
+  assert.equal(
+    delegated.resolvePath(`${STORAGE}/datasets/output.jsonl`, "write"),
+    `${STORAGE}/datasets/output.jsonl`,
+  );
+});
+
+test("delegated lanes cannot escape to another task or conversation", () => {
+  const lane = "public_data/experiment-runs/run-1";
+  const delegated = policy({ workspacePath: `${WORKSPACE}/${lane}`, conversationRoot: WORKSPACE });
+
+  for (const target of [
+    "../run-2/public_data/output.txt",
+    "../../../conv-2/public_data/output.txt",
+    `${WORKSPACE}/public_data/experiment-runs/run-2/public_data/output.txt`,
+    "/workspace/.pyromind-agent/conv-2/public_data/output.txt",
+    `${WORKSPACE}/pi/session.jsonl`,
+  ]) {
+    assert.throws(
+      () => delegated.resolvePath(target, "write"),
+      /PATH_SCOPE_ERROR/,
+      target,
+    );
+  }
 });
 
 test("sandbox paths reject reads outside the allowed roots", () => {

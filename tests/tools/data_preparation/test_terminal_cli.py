@@ -34,22 +34,27 @@ def workspace(tmp_path, monkeypatch):
     (dist / "METADATA").write_text("Name: open-dataflow\nVersion: 1.0.13\n")
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     monkeypatch.setenv("PYROMIND_SANDBOX_DATAFLOW_PYTHON", sys.executable)
-    (tmp_path / "public_data").mkdir()
-    (tmp_path / "storage").mkdir()
-    (tmp_path / "storage/input.jsonl").write_text(
+    storage = tmp_path / "storage"
+    workspace = storage / ".pyromind-agent" / "conversation"
+    (workspace / "public_data").mkdir(parents=True)
+    (storage / "input.jsonl").write_text(
         '{"id":"1","system_prompt":"system","user_prompt":"hello","gt":"hi"}\n'
     )
-    (tmp_path / "public_data/pipeline.py").write_text(
+    (workspace / "public_data/pipeline.py").write_text(
         "import sys\nfrom pathlib import Path\n"
         "Path(sys.argv[2]).write_text(Path(sys.argv[1]).read_text())\n"
     )
-    return tmp_path
+    return workspace
+
+
+def storage_root(workspace: Path) -> Path:
+    return workspace.parent.parent
 
 
 def config():
     return {
         "pipeline_path": "public_data/pipeline.py",
-        "args": ["storage/input.jsonl", "public_data/output.jsonl"],
+        "args": ["/workspace/input.jsonl", "public_data/output.jsonl"],
         "model_profile": "none",
         "output_schema": "text",
     }
@@ -70,7 +75,7 @@ def test_cli_executes_validates_and_generates_report(workspace):
     assert envelope["rc"] == 0 and envelope["validation_rc"] == 0
     assert (workspace / "public_data/report.json").is_file()
     assert (workspace / "public_data/output.jsonl").read_text() == (
-        workspace / "storage/input.jsonl"
+        storage_root(workspace) / "input.jsonl"
     ).read_text()
 
 
@@ -82,7 +87,7 @@ def test_cli_direct_flags_run_without_a_config_file(workspace):
             "--pipeline",
             "public_data/pipeline.py",
             "--input",
-            "storage/input.jsonl",
+            "/workspace/input.jsonl",
             "--output",
             "public_data/output.jsonl",
             "--model-profile",
@@ -99,7 +104,7 @@ def test_cli_direct_flags_run_without_a_config_file(workspace):
     envelope = json.loads(result.stdout.splitlines()[-1])
     assert envelope["rc"] == 0 and envelope["validation_rc"] == 0
     assert (workspace / "public_data/output.jsonl").read_text() == (
-        workspace / "storage/input.jsonl"
+        storage_root(workspace) / "input.jsonl"
     ).read_text()
     assert not (workspace / "public_data/run.json").exists()
 
@@ -113,7 +118,7 @@ def test_cli_resolves_the_layout_from_a_nested_run_package(workspace):
     )
     source = package / "artifacts/kept.jsonl"
     source.parent.mkdir()
-    source.write_text((workspace / "storage/input.jsonl").read_text())
+    source.write_text((storage_root(workspace) / "input.jsonl").read_text())
     output = workspace / "public_data/workflow-runs/run-1/artifacts/final.jsonl"
     result = subprocess.run(
         [
@@ -153,7 +158,7 @@ def test_cli_aliases_a_produced_artifact_for_the_dataflow_reader(workspace):
     )
     source = package / "artifacts/filtered.out"
     source.parent.mkdir()
-    source.write_text((workspace / "storage/input.jsonl").read_text())
+    source.write_text((storage_root(workspace) / "input.jsonl").read_text())
     output = workspace / "public_data/workflow-runs/run-2/artifacts/answers.jsonl"
     result = subprocess.run(
         [
@@ -234,7 +239,7 @@ def test_direct_flags_resolve_through_the_config_contract(
     )
     args = argparse.Namespace(
         pipeline="public_data/pipeline.py",
-        input="storage/input.jsonl",
+        input="/workspace/input.jsonl",
         output="public_data/output.jsonl",
         arg=["--limit", "3"],
         model_profile="text",
@@ -243,13 +248,33 @@ def test_direct_flags_resolve_through_the_config_contract(
     )
     spec = runtime.cli_spec(runtime.direct_config(args), workspace)
     assert spec["args"] == [
-        str((workspace / "storage/input.jsonl").resolve()),
+        str((storage_root(workspace) / "input.jsonl").resolve()),
         str((workspace / "public_data/output.jsonl").resolve()),
         "--limit",
         "3",
     ]
     assert spec["model_profile"] == "text" and spec["output_schema"] == "text"
     assert spec["timeout"] == 600 and spec["env"]["DF_API_KEY"] == "model-secret"
+
+
+def test_workspace_cli_paths_require_a_storage_mount(runtime, workspace):
+    with pytest.raises(ValueError, match="require a mounted user Storage"):
+        runtime._resolve_cli_path("/workspace/input.jsonl", workspace, None)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "../outside.jsonl",
+        "/workspace/../outside.jsonl",
+        "storage/input.jsonl",
+        "storage://datasets/input.jsonl",
+        "/target-workspace/input.jsonl",
+    ],
+)
+def test_cli_rejects_ambiguous_and_execution_only_paths(runtime, workspace, value):
+    with pytest.raises(ValueError):
+        runtime._resolve_cli_path(value, workspace, storage_root(workspace))
 
 
 def test_direct_flags_forward_dash_prefixed_pipeline_arguments(workspace):
@@ -264,7 +289,7 @@ def test_direct_flags_forward_dash_prefixed_pipeline_arguments(workspace):
             "--pipeline",
             "public_data/argv_pipeline.py",
             "--input",
-            "storage/input.jsonl",
+            "/workspace/input.jsonl",
             "--output",
             "public_data/argv.jsonl",
             "--arg=--limit",
@@ -303,7 +328,7 @@ def test_cli_model_configuration_is_environment_only(
         runtime.cli_spec({**value, "env": {"DF_API_KEY": "bad"}}, workspace)
     with pytest.raises(ValueError, match="read-only"):
         runtime.cli_spec(
-            {**config(), "args": ["storage/input.jsonl", "storage/output.jsonl"]},
+            {**config(), "args": ["/workspace/input.jsonl", "/workspace/output.jsonl"]},
             workspace,
         )
 

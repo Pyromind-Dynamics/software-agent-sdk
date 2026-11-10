@@ -16,17 +16,17 @@
 
 ## 路径语义
 
-同一 Storage 文件在不同入口使用不同路径：
+用户 Storage 在 Agent、终端和平台节点中统一使用 `/workspace`：
 
 | 使用位置 | 路径示例 |
 |---|---|
-| Agent 的 `read` / `terminal` / `write` | `/target-workspace/datasets/my_data/train.jsonl` |
+| Agent 的 `read` / `terminal` / `write` | `/workspace/datasets/my_data/train.jsonl` |
 | 训练节点访问挂载数据 | `/workspace/datasets/my_data/train.jsonl` |
-| `submit_workflow.workflow_path` | `/target-workspace/.../workflow.py` |
+| `submit_workflow.workflow_path` | `/workspace/.../workflow.py` |
 
 `public_data/...` 是会话文件路径；正式提交按 `workflow-execution` 上传实际生成的
 `workflow.py`，再使用返回位置。上传返回的 Storage 路径按目标工具或节点契约使用，
-不要一律加 `/workspace/`，也不要把沙箱物理挂载路径 `/target-workspace/...` 传给训练节点。
+正式的 Storage 输入和输出统一使用 `/workspace/...`。
 
 数据中的图片引用由训练环境解析。相对路径依赖加载器的解析基准；需要绝对路径时使用训练环境路径。
 Agent 能读到图片不代表训练环境也能读到。路径确有不兼容时再修复。

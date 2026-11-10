@@ -57,7 +57,13 @@ def plan_payload():
     return {
         "name": "图片质检实验",
         "goal": "减少漏检，同时观察误检变化",
-        "resources": [{"id": "bench", "name": "固定评测集", "uri": "storage://bench"}],
+        "resources": [
+            {
+                "id": "bench",
+                "name": "固定评测集",
+                "storage_path": "/workspace/bench",
+            }
+        ],
         "unresolved": ["训练参数待补充"],
         "stages": [
             {"id": key, "name": name}

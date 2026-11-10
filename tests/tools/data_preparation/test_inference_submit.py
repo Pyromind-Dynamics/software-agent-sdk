@@ -169,7 +169,9 @@ def configure_model_source(inference_submission):
     return configure
 
 
-def test_expired_delegation_is_rejected_immediately_before_platform_create(inference_submission):
+def test_expired_delegation_is_rejected_immediately_before_platform_create(
+    inference_submission,
+):
     ctx = inference_submission
 
     def expired():
@@ -698,7 +700,8 @@ def test_fixed_two_node_submission_and_frozen_resume(inference_submission):
     command = workflow["nodes"][1]["data"]["config"]["command"]
     assert '--endpoint "$param"' in command
     assert "--run-id" in command and result.run_id in command
-    assert f"--report-assets-dir /workspace{result.output_dir}" in command
+    assert f"--report-assets-dir {result.output_dir}" in command
+    assert "/workspace/workspace/" not in command
     assert "pip install" not in command and "API_KEY" not in command
     assert len(ctx.uploads) == 5
     assert {name for name, _ in ctx.uploads} == {

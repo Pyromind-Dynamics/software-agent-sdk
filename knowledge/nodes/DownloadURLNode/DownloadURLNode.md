@@ -11,11 +11,11 @@
 | 参数 | 数据类型 | 必填 | 描述 |
 |------|---------|------|------|
 | url | STRING | 是 | 远程文件 URL。 |
-| output_path | STRING | 是 | 合并后文件写入的本地路径。 |
+| output_path | STRING | 是 | 合并后文件写入的持久化路径，使用 `/workspace/...`。 |
 | expected_sha256 | STRING | 否 | 可选的预期 SHA-256 校验值。设置后会对下载文件进行校验。 |
 
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
 |------|---------|------|
-| path | STRING | 下载完成后的本地文件路径。 |
+| path | STRING | 下载完成后的用户 Storage 路径（`/workspace/...`）。 |

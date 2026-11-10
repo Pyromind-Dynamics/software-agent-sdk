@@ -2,19 +2,30 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from pyromind_runtime.domain.base import AwareDatetime, ContractModel, utc_now
+from pyromind_runtime.domain.storage_paths import normalize_workspace_path
 
 
 class PlanResource(ContractModel):
     id: str = Field(min_length=1, max_length=128)
     name: str = Field(min_length=1)
-    uri: str | None = Field(
+    storage_path: str | None = Field(
         default=None,
-        description="Resource URI; if unknown, use null and note it in unresolved.",
+        description=(
+            "User Storage file path such as '/workspace/datasets/train.jsonl'; "
+            "if unknown, use null and note it in unresolved."
+        ),
     )
     description: str = ""
+
+    @field_validator("storage_path")
+    @classmethod
+    def validate_storage_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_workspace_path(value, field="resource.storage_path")
 
 
 class ExperimentStage(ContractModel):
@@ -47,8 +58,8 @@ class PlanInput(ContractModel):
         description=(
             "Reference an entry in plan.resources. Required for external inputs; "
             "use either resource_id or task_id, never both or neither. "
-            "For unknown resources, register a placeholder with uri=null and "
-            "record missing details in unresolved; a name alone is not valid."
+            "For unknown resources, register a placeholder with storage_path=null "
+            "and record missing details in unresolved; a name alone is not valid."
         ),
     )
     task_id: str | None = Field(

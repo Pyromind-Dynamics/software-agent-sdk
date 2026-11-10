@@ -19,9 +19,11 @@ test("child terminal leases are conversation-scoped and a resumed session waits 
   const draining = Promise.withResolvers<void>();
   const tool = { name: "terminal" } as AgentTool;
   const owners: string[] = [];
+  const workspaces: string[] = [];
   const terminals = new SubagentTerminals(root, {
-    createLane(owner) {
+    createLane(owner, workspacePath) {
       owners.push(owner);
+      workspaces.push(workspacePath ?? "");
       return { terminal: {
         async disconnect() { draining.resolve(); await release.promise; },
       } } as SandboxToolLane;
@@ -33,9 +35,9 @@ test("child terminal leases are conversation-scoped and a resumed session waits 
   const resumed = new AbortController();
   const firstReady = Promise.withResolvers<string>();
   const resumedReady = Promise.withResolvers<string>();
-  await assert.rejects(terminals.attach("general_purpose", "child-a", otherFile, first.signal, firstReady.resolve), /another conversation/);
-  await assert.rejects(terminals.attach("general_purpose", "bad-id", file, first.signal, firstReady.resolve), /identity mismatch/);
-  const firstLease = terminals.attach("general_purpose", "child-a", file, first.signal, firstReady.resolve);
+  await assert.rejects(terminals.attach("general_purpose", "child-a", otherFile, ".", first.signal, firstReady.resolve), /another conversation/);
+  await assert.rejects(terminals.attach("general_purpose", "bad-id", file, ".", first.signal, firstReady.resolve), /identity mismatch/);
+  const firstLease = terminals.attach("general_purpose", "child-a", file, "public_data/experiment-runs/run-1", first.signal, firstReady.resolve);
   const binding = { role: "general_purpose", session: "child-a", session_file: file, name: "terminal", terminal_lease: await firstReady.promise };
   const started = Promise.withResolvers<void>();
   const cancelled = Promise.withResolvers<void>();
@@ -50,7 +52,7 @@ test("child terminal leases are conversation-scoped and a resumed session waits 
   await call;
   await draining.promise;
   let opened = false;
-  const nextLease = terminals.attach("general_purpose", "child-a", file, resumed.signal, (id) => {
+  const nextLease = terminals.attach("general_purpose", "child-a", file, "public_data/experiment-runs/run-1", resumed.signal, (id) => {
     opened = true;
     resumedReady.resolve(id);
   });
@@ -61,6 +63,7 @@ test("child terminal leases are conversation-scoped and a resumed session waits 
   const resumedId = await resumedReady.promise;
   assert.notEqual(resumedId, binding.terminal_lease);
   assert.equal(owners[0], owners[1], "native resume must retain terminal ownership");
+  assert.deepEqual(workspaces, ["public_data/experiment-runs/run-1", "public_data/experiment-runs/run-1"]);
   const resumedBinding = { ...binding, terminal_lease: resumedId };
   await terminals.detach(resumedBinding);
   await assert.rejects(terminals.run(resumedBinding, resumed.signal, async () => assert.fail("detached lease")), /expired/);

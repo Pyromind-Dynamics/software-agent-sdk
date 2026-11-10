@@ -48,7 +48,10 @@ from openhands.tools.utils.platform_env import (
     platform_client_route,
     platform_cluster_target,
 )
-from openhands.tools.utils.storage_paths import to_tool_storage_path
+from openhands.tools.utils.storage_paths import (
+    to_agent_storage_path,
+    to_tool_storage_path,
+)
 from openhands.tools.utils.workspace_staging import (
     WorkspaceStagingError,
     is_remote_workspace,
@@ -89,16 +92,17 @@ class EdpRenderAction(Action):
     )
     data_source: str = Field(
         description=(
-            "Storage path of the source data (e.g. "
-            "'datasets/tmax/data/train-*.parquet'). The node reads it from "
+            "User Storage path of the source data (e.g. "
+            "'/workspace/datasets/tmax/data/train-*.parquet'). The node reads it from "
             "its Storage mount."
         )
     )
     output_root: str | None = Field(
         default=None,
         description=(
-            "Storage root for batch-XXX/ shards and shards.json. Defaults to "
-            "~/.pyromind-agent/<conversation>/edp_render/<run_id>."
+            "User Storage root for batch-XXX/ shards and shards.json, e.g. "
+            "'/workspace/datasets/rendered'. Defaults to the conversation's "
+            "edp_render directory."
         ),
     )
     shard_size: int = Field(
@@ -420,7 +424,11 @@ class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
         self._cluster = cluster
         self._headers = headers or {}
         self._runtime_dir = runtime_dir
-        self._output_root = output_root
+        self._output_root = (
+            to_tool_storage_path(output_root, field="output_root")
+            if output_root is not None
+            else None
+        )
         self._storage_base_url = storage_base_url
         self._storage_headers = storage_headers or {}
         self._storage_secret_headers = storage_secret_headers or {}
@@ -500,9 +508,17 @@ class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
                 is_error=True,
             )
 
+        try:
+            data_source = to_tool_storage_path(action.data_source, field="data_source")
+        except ValueError as exc:
+            return EdpRenderObservation.from_text(
+                text=str(exc),
+                status="Failed",
+                is_error=True,
+            )
         preflight = _preflight_template(
             template,
-            action.data_source,
+            data_source,
             storage_base_url=self._storage_base_url or _default_storage_base_url(),
             headers=self._storage_headers_for(conversation),
             timeout=float(self._timeout),
@@ -524,6 +540,7 @@ class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
         # Nest under the requested root so concurrent runs never collide.
         root = str(PurePosixPath("/" + output_root.lstrip("/")) / str(run_id))
         output_dir = root
+        agent_output_dir = to_agent_storage_path(output_dir)
 
         try:
             state = cast("ConversationState", conversation.state)
@@ -556,9 +573,7 @@ class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
 
             command = build_render_command(
                 output_dir=output_dir,
-                data_source=to_tool_storage_path(
-                    action.data_source, field="data_source"
-                ),
+                data_source=data_source,
                 shard_size=action.shard_size,
                 limit=action.limit,
             )
@@ -618,20 +633,21 @@ class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
         return EdpRenderObservation.from_text(
             text=(
                 "Render task submitted. "
-                f"task_id={task_id}, run_id={run_id}, output_dir={output_dir}. "
+                f"task_id={task_id}, run_id={run_id}, "
+                f"output_dir={agent_output_dir}. "
                 "The platform runs it asynchronously and the terminal "
                 "callback will resume this conversation automatically. NOW "
                 "reply to the user with a short status (what was submitted, "
                 "task_id, that you will report back on completion) and then "
                 "END your turn — do not poll the output dir or sleep-wait. "
                 "After the terminal callback, read "
-                f"{output_dir}/shards.json for the shard list, then roll out "
+                f"{agent_output_dir}/shards.json for the shard list, then roll out "
                 "edp_submit per shard."
             ),
             status=response.status,
             task_id=task_id,
             run_id=str(run_id),
-            output_dir=output_dir,
+            output_dir=agent_output_dir,
         )
 
 

@@ -229,7 +229,10 @@ async def test_http_workflow_execution_prepares_confirmation_without_submitting(
         response = await client.post(
             "/api/v2/pyromind/conversations/workflow-api/workflow-executions",
             headers={"x-pyromind-debug-user-id": "42"},
-            json={"workflow_path": "storage/project/workflow.py", "request_id": "r"},
+            json={
+                "workflow_path": "/workspace/project/workflow.py",
+                "request_id": "r",
+            },
         )
     assert response.status_code == 200
     assert response.json()["status"] == "awaiting_confirmation"

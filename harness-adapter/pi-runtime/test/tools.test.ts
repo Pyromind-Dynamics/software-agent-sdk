@@ -8,7 +8,12 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 import { restrictSkillReads } from "../src/session-policy.js";
-import { createTools, normalizeBusinessToolContent, safePath } from "../src/tools.js";
+import {
+  createTools,
+  normalizeBusinessToolContent,
+  safePath,
+  type SandboxTools,
+} from "../src/tools.js";
 import { WorkspaceAccessPolicy } from "../src/workspace-policy.js";
 
 test("business tool content converts OpenHands inline image URLs for Pi", () => {
@@ -83,8 +88,8 @@ test("sandbox read resolves the remote endpoint for Storage paths", async (conte
           wsBaseUrl: endpointUrl,
           sandboxId: "sandbox-1",
           apiKey: "key",
-          workspacePath: "/target-workspace/.pyromind-agent/conv-1",
-          storagePath: "/target-workspace",
+          workspacePath: "/workspace/.pyromind-agent/conv-1",
+          storagePath: "/workspace",
         };
       },
     },
@@ -100,11 +105,60 @@ test("sandbox read resolves the remote endpoint for Storage paths", async (conte
   );
 
   await restricted.execute("remote-read", {
-    path: "/target-workspace/datasets/demo/avi/train.jsonl",
+    path: "/workspace/datasets/demo/avi/train.jsonl",
   });
 
   assert.equal(ensures, 1);
-  assert.deepEqual(requested, ["/target-workspace/datasets/demo/avi/train.jsonl"]);
+  assert.deepEqual(requested, ["/workspace/datasets/demo/avi/train.jsonl"]);
+});
+
+test("sandbox lanes resolve logical task paths without changing Storage paths", async (context) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "pi-tools-lane-")));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const fileApi = createServer((_request, response) => response.end("sample"));
+  await new Promise<void>((resolve) => fileApi.listen(0, "127.0.0.1", resolve));
+  context.after(() => fileApi.close());
+  const endpointUrl = `http://127.0.0.1:${(fileApi.address() as { port: number }).port}`;
+  let sandbox!: SandboxTools;
+  await createTools(
+    {} as JsonlRpcPeer,
+    new NodeExecutionEnv({ cwd: root }),
+    root,
+    "sandbox",
+    [],
+    undefined,
+    undefined,
+    [],
+    {
+      sandbox: async () => ({
+        baseUrl: endpointUrl,
+        wsBaseUrl: endpointUrl,
+        sandboxId: "sandbox-1",
+        apiKey: "key",
+        workspacePath: "/workspace/.pyromind-agent/conv-1",
+        storagePath: "/workspace",
+      }),
+      onSandboxToolsReady: (tools) => { sandbox = tools; },
+    },
+  );
+
+  const lane = sandbox.createLane("child", "public_data/experiment-runs/run-1");
+  assert.equal(lane.access.cwd, "public_data/experiment-runs/run-1");
+  assert.equal(
+    await lane.access.resolvePath("public_data/output.txt", "write"),
+    "/workspace/.pyromind-agent/conv-1/public_data/experiment-runs/run-1/public_data/output.txt",
+  );
+  assert.equal(
+    await lane.access.resolvePath("/workspace/datasets/input.jsonl", "read"),
+    "/workspace/datasets/input.jsonl",
+  );
+  await assert.rejects(
+    () => lane.access.resolvePath(
+      "/workspace/.pyromind-agent/conv-1/public_data/experiment-runs/run-2/public_data/output.txt",
+      "write",
+    ),
+    /PATH_SCOPE_ERROR/,
+  );
 });
 
 async function workspaceLayout(prefix = "pi-tools-") {

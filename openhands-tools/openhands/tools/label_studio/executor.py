@@ -54,6 +54,7 @@ from openhands.tools.pyromind_dataset.definition import (
     download_file_from_pyromind,
     upload_local_file_to_pyromind,
 )
+from openhands.tools.utils.storage_paths import to_agent_storage_path
 from openhands.tools.utils.workspace_staging import (
     WorkspaceStagingError,
     is_remote_workspace,
@@ -307,7 +308,8 @@ class LabelStudioProjectExecutor(
             f"Label Studio project created: project_ref={state.project_ref} "
             f"project_id={state.project_id} status=READY "
             f"tasks={state.imported_count}/{state.total_tasks} "
-            f"manifest_path={artifact_dir}/manifests/manifest.json "
+            "manifest_path="
+            f"{to_agent_storage_path(artifact_dir)}/manifests/manifest.json "
             f"open_url={self._open_url(state.project_id)}"
         )
         if widened is not None and widened.added:
@@ -705,7 +707,8 @@ class LabelStudioProjectExecutor(
                 f"Label Studio export finished: project_ref={state.project_ref} "
                 f"project_id={state.project_id} "
                 f"samples={len(samples)}/{len(export_data)} "
-                f"export_path={output_path}/annotations.json"
+                "export_path="
+                f"{to_agent_storage_path(output_path)}/annotations.json"
             ),
             operation="export",
             project_ref=state.project_ref,
@@ -713,7 +716,7 @@ class LabelStudioProjectExecutor(
             status="EXPORTED",
             task_count=len(export_data),
             annotation_count=len(samples),
-            export_path=f"{output_path}/annotations.json",
+            export_path=(f"{to_agent_storage_path(output_path)}/annotations.json"),
         )
 
     def _export_field_map(self, state: ProjectState) -> FieldMap | None:
@@ -1141,6 +1144,8 @@ class LabelStudioProjectExecutor(
         *,
         summary: str | None = None,
     ) -> LabelStudioProjectObservation:
+        artifact_dir = f"{PYROMIND_AGENT_STORAGE_ROOT}/label-studio/{state.project_ref}"
+        manifest_path = f"{to_agent_storage_path(artifact_dir)}/manifests/manifest.json"
         if summary is None:
             summary = (
                 f"Label Studio project {state.project_ref} "
@@ -1161,10 +1166,7 @@ class LabelStudioProjectExecutor(
             imported_count=state.imported_count,
             next_batch=state.next_batch,
             last_error=state.last_error,
-            manifest_path=(
-                f"{PYROMIND_AGENT_STORAGE_ROOT}/label-studio/{state.project_ref}"
-                "/manifests/manifest.json"
-            ),
+            manifest_path=manifest_path,
             open_url=self._open_url(state.project_id),
             project_url=self._project_url(state.project_id),
         )

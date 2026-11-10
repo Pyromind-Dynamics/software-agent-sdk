@@ -41,6 +41,10 @@ from openhands.tools.pyromind_dataset.definition import (
 from openhands.tools.sandbox.definition import (
     _SandboxExecutorMixin,
 )
+from openhands.tools.utils.storage_paths import (
+    DEFAULT_MOUNT_PATH,
+    to_agent_storage_path,
+)
 
 
 if TYPE_CHECKING:
@@ -62,8 +66,8 @@ class SandboxUploadAction(Action):
     storage_path: str | None = Field(
         default=None,
         description=(
-            "Target storage directory. Defaults to "
-            "'/.pyromind-agent/<conversation_id>/uploads'."
+            "Target user Storage directory. Defaults to "
+            "'/workspace/.pyromind-agent/<conversation_id>/uploads'."
         ),
     )
 
@@ -75,7 +79,8 @@ class SandboxUploadObservation(Observation):
         default=None, description="The sandbox the file was uploaded from."
     )
     storage_path: str | None = Field(
-        default=None, description="Target storage path of the uploaded file."
+        default=None,
+        description="Target user Storage path of the uploaded file (`/workspace/...`).",
     )
 
 
@@ -129,16 +134,15 @@ class SandboxUploadExecutor(
                 "storage_path",
             )
 
-            # 1. Prefer the workspace mount when the sandbox exposes it.
+            # 1. Prefer the Storage mount when the sandbox exposes it.
             probe = client.exec_command(
                 action.sandbox_id,
-                "ls -d /target-workspace 2>/dev/null || echo __NO_MOUNT__",
+                f"ls -d {shlex.quote(DEFAULT_MOUNT_PATH)} 2>/dev/null "
+                "|| echo __NO_MOUNT__",
                 timeout=60,
             )
             if "__NO_MOUNT__" not in probe.output:
-                from openhands.tools.pyromind_archive.definition import _pod_path
-
-                pod_target = _pod_path(storage_path)
+                pod_target = f"{DEFAULT_MOUNT_PATH}{storage_path}"
                 copy_cmd = (
                     f"mkdir -p {shlex.quote(pod_target)} && "
                     f"cp -r {shlex.quote(action.sandbox_path)} "
@@ -156,11 +160,11 @@ class SandboxUploadExecutor(
                     )
                 return SandboxUploadObservation.from_text(
                     text=(
-                        f"Uploaded {action.sandbox_path} to storage path "
-                        f"{storage_path} (workspace mount)."
+                        f"Uploaded {action.sandbox_path} to user Storage path "
+                        f"{to_agent_storage_path(storage_path)} (workspace mount)."
                     ),
                     sandbox_id=action.sandbox_id,
-                    storage_path=storage_path,
+                    storage_path=to_agent_storage_path(storage_path),
                 )
 
             # 2. Fallback: stream the file back as base64.
@@ -195,9 +199,12 @@ class SandboxUploadExecutor(
             finally:
                 tmp_path.unlink(missing_ok=True)
             return SandboxUploadObservation.from_text(
-                text=(f"Uploaded {action.sandbox_path} to storage path {final_path}."),
+                text=(
+                    f"Uploaded {action.sandbox_path} to user Storage path "
+                    f"{to_agent_storage_path(final_path)}."
+                ),
                 sandbox_id=action.sandbox_id,
-                storage_path=final_path,
+                storage_path=to_agent_storage_path(final_path),
             )
         except Exception as exc:  # noqa: BLE001
             return SandboxUploadObservation.from_text(
@@ -216,7 +223,9 @@ class SandboxDownloadAction(Action):
 
     sandbox_id: str = Field(description="The id of the custom sandbox.")
     storage_path: str = Field(
-        description="Storage path of the file to download (source)."
+        description=(
+            "User Storage path of the file to download, e.g. '/workspace/data.csv'."
+        )
     )
     sandbox_path: str = Field(
         description="Absolute destination path inside the container."
@@ -230,7 +239,10 @@ class SandboxDownloadObservation(Observation):
         default=None, description="The sandbox the file was downloaded to."
     )
     storage_path: str | None = Field(
-        default=None, description="Source storage path of the downloaded file."
+        default=None,
+        description=(
+            "Source user Storage path of the downloaded file (`/workspace/...`)."
+        ),
     )
     sandbox_path: str | None = Field(
         default=None, description="Destination path inside the container."
@@ -309,8 +321,9 @@ class SandboxDownloadExecutor(
             )
         try:
             client = self._sandbox_client(conversation)
+            storage_path = _normalize_storage_path(action.storage_path, "storage_path")
             url = self._storage_download_url(
-                action.storage_path,
+                storage_path,
                 self._resolved_storage_headers(conversation),
             )
             parent = str(Path(action.sandbox_path).parent or ".")
@@ -334,11 +347,11 @@ class SandboxDownloadExecutor(
             size = int(size_str) if size_str.isdigit() else 0
             return SandboxDownloadObservation.from_text(
                 text=(
-                    f"Downloaded {action.storage_path} to "
+                    f"Downloaded {to_agent_storage_path(storage_path)} to "
                     f"{action.sandbox_path} ({size} bytes)."
                 ),
                 sandbox_id=action.sandbox_id,
-                storage_path=action.storage_path,
+                storage_path=to_agent_storage_path(storage_path),
                 sandbox_path=action.sandbox_path,
                 size=size,
             )

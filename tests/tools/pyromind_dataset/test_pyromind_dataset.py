@@ -157,7 +157,7 @@ def test_upload_file_to_pyromind_posts_workspace_file(
 
     assert not observation.is_error
     assert observation.storage_path == (
-        f"/.pyromind-agent/{_CONVERSATION_ID}/metric.py"
+        f"/workspace/.pyromind-agent/{_CONVERSATION_ID}/metric.py"
     )
     assert calls["url"] == "https://portal.test/storage_api/presigned_upload_url"
     assert calls["headers"]["cookie"] == "auth_token=session-token"
@@ -217,7 +217,7 @@ def test_upload_file_to_pyromind_explicit_target_dir_wins(
     )
 
     assert not observation.is_error
-    assert observation.storage_path == "/custom/dir/metric.py"
+    assert observation.storage_path == "/workspace/custom/dir/metric.py"
     assert posted_path["path"] == "/custom/dir"
 
 
@@ -379,7 +379,9 @@ def test_upload_file_to_pyromind_multipart_uploads_parts_and_completes(
     )
 
     assert not observation.is_error
-    assert observation.storage_path == (f"/.pyromind-agent/{_CONVERSATION_ID}/big.bin")
+    assert observation.storage_path == (
+        f"/workspace/.pyromind-agent/{_CONVERSATION_ID}/big.bin"
+    )
     assert put_calls == {
         "https://upload.test/part1": b"a" * 50,
         "https://upload.test/part2": b"b" * 10,
@@ -490,9 +492,7 @@ def test_upload_file_to_pyromind_stages_remote_workspace_file(
 class _StorageWorkspace(_FakeWorkspace):
     """Workspace double that also exposes the sandbox Storage mount."""
 
-    def __init__(
-        self, working_dir: Path, storage_path: str = "/target-workspace"
-    ) -> None:
+    def __init__(self, working_dir: Path, storage_path: str = "/workspace") -> None:
         super().__init__(working_dir)
         self.storage_path = storage_path
 
@@ -527,7 +527,7 @@ def test_get_storage_url_maps_workspace_and_storage_paths(
         timeout=7.0,
     )(
         GetStorageUrlAction(
-            paths=["public_data/report.html", "storage/datasets/img.png"]
+            paths=["public_data/report.html", "/workspace/datasets/img.png"]
         ),
         cast(Any, conversation),
     )
@@ -536,19 +536,19 @@ def test_get_storage_url_maps_workspace_and_storage_paths(
     assert not observation.is_error
     assert [(entry.path, entry.url) for entry in observation.urls] == [
         (
-            workspace_path,
+            f"/workspace{workspace_path}",
             f"https://download.test{workspace_path}?X-Amz-Signature=abc123",
         ),
         (
-            "/datasets/img.png",
+            "/workspace/datasets/img.png",
             "https://download.test/datasets/img.png?X-Amz-Signature=abc123",
         ),
     ]
     assert observation.text.splitlines()[:4] == [
-        f"path: {workspace_path}",
+        f"path: /workspace{workspace_path}",
         f"markdown: [report.html](https://download.test{workspace_path}"
         "?X-Amz-Signature=abc123)",
-        "path: /datasets/img.png",
+        "path: /workspace/datasets/img.png",
         "markdown: [img.png](https://download.test/datasets/img.png"
         "?X-Amz-Signature=abc123)",
     ]
@@ -582,6 +582,27 @@ def test_get_storage_url_rejects_workspace_paths_without_a_mount(
     assert "has no Storage mount" in observation.text
 
 
+def test_get_storage_url_rejects_the_pi_mount_path(monkeypatch, tmp_path) -> None:
+    def fake_post(url, *, headers, json, timeout):
+        raise AssertionError("no Storage request expected")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    conversation = _fake_conversation(
+        tmp_path,
+        workspace=_StorageWorkspace(tmp_path),
+    )
+
+    observation = GetStorageUrlExecutor(
+        storage_base_url="https://portal.test/storage_api"
+    )(
+        GetStorageUrlAction(paths=["/target-workspace/datasets/img.png"]),
+        cast(Any, conversation),
+    )
+
+    assert observation.is_error
+    assert "execution-only path" in observation.text
+
+
 def test_get_storage_url_reports_per_path_failures(monkeypatch, tmp_path) -> None:
     def fake_post(url, *, headers, json, timeout):
         if json["path"].endswith("missing.png"):
@@ -600,13 +621,11 @@ def test_get_storage_url_reports_per_path_failures(monkeypatch, tmp_path) -> Non
     observation = GetStorageUrlExecutor(
         storage_base_url="https://portal.test/storage_api"
     )(
-        GetStorageUrlAction(paths=["storage/ok.png", "storage/missing.png"]),
+        GetStorageUrlAction(paths=["/workspace/ok.png", "/workspace/missing.png"]),
         cast(Any, conversation),
     )
 
     assert not observation.is_error
-    assert [entry.path for entry in observation.urls] == ["/ok.png"]
-    assert observation.failures == [
-        "storage/missing.png: Pyromind storage get_url API returned HTTP 404: not found"
-    ]
+    assert [entry.path for entry in observation.urls] == ["/workspace/ok.png"]
+    assert observation.failures == ["/workspace/missing.png: Storage object not found"]
     assert "--- failed ---" in observation.text

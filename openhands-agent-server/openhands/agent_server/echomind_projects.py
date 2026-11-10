@@ -374,8 +374,8 @@ def _requirements_from_plan(
         ProjectRequirement(
             key=resource.id,
             label=resource.name,
-            value=resource.uri or "",
-            status="confirmed" if resource.uri else "missing",
+            value=resource.storage_path or "",
+            status="confirmed" if resource.storage_path else "missing",
         )
         for resource in plan.resources
     ]

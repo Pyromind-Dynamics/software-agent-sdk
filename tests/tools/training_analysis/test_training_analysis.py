@@ -92,12 +92,10 @@ def test_training_analysis_discovers_artifacts_in_execution_workspace(
     tmp_path: Path, sandbox_workspace, truncated_downloads, remote, available
 ) -> None:
     workspace = sandbox_workspace.workspace_dir
-    (workspace / "storage").symlink_to(
-        sandbox_workspace.storage_dir, target_is_directory=True
-    )
     sample = {"prediction": "正常", "label": "正常"}
     if available:
-        output = sandbox_workspace.storage_dir / "runs/training"
+        output_root = sandbox_workspace.storage_dir if remote else workspace
+        output = output_root / "runs/training"
         checkpoint = output / "checkpoint-20"
         checkpoint.mkdir(parents=True)
         (checkpoint / "config.json").write_text("{}")
@@ -368,7 +366,7 @@ def test_artifacts_resolve_executed_inputs_and_multi_node_selection(kind):
 
     result = resolve_artifacts(Client(), "1050")
     assert result["requires_node_selection"]
-    assert result["training_nodes"][0]["output_path"] == "/models/run"
+    assert result["training_nodes"][0]["output_path"] == "/workspace/models/run"
     assert result["training_nodes"][0]["inputs"]["model_path"] == "/models/base"
     assert result["training_nodes"][1]["output_path"] is None
     chosen = resolve_artifacts(Client(), "1050", "train")
@@ -376,6 +374,22 @@ def test_artifacts_resolve_executed_inputs_and_multi_node_selection(kind):
     assert len(chosen["training_nodes"]) == 1
     with pytest.raises(ValueError, match="No matching"):
         resolve_artifacts(Client(), "1050", "absent")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/workspace/models/run",
+        "/target-workspace/models/run",
+        "/models/run",
+    ],
+)
+def test_artifact_paths_use_the_agent_visible_workspace_mount(value):
+    agent_storage_path = importlib.import_module(
+        "training_artifacts"
+    ).agent_storage_path
+
+    assert agent_storage_path(value) == "/workspace/models/run"
 
 
 def test_discover_sorts_numeric_steps_and_checks_lora_and_shards(tmp_path):
@@ -479,7 +493,7 @@ def test_artifact_graph_edges_use_upstream_actual_output_in_nested_snapshot():
 
     result = resolve_artifacts(Client(), "123")
     assert not result["requires_node_selection"]
-    assert result["training_nodes"][0]["output_path"] == "/training/actual"
+    assert result["training_nodes"][0]["output_path"] == ("/workspace/training/actual")
 
 
 def test_numeric_generation_parameters_survive_both_redaction_layers():
@@ -544,7 +558,7 @@ def test_artifacts_decode_platform_terminal_output(terminal_node_output, wrapped
             return {"raw": json.dumps(output)} if wrapped else output
 
     node = resolve_artifacts(Client(), "9175")["training_nodes"][0]
-    assert node["output_path"] == "/models/checkpoints/run"
+    assert node["output_path"] == "/workspace/models/checkpoints/run"
     assert node["inputs"]["dataset_config"] == {
         "train_data_path": "/workspace/data/train.jsonl",
         "val_data_path": "/workspace/data/validation.jsonl",

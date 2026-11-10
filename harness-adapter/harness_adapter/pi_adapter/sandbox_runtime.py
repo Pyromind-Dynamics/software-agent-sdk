@@ -50,7 +50,7 @@ from openhands.tools.sandbox import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MOUNT_PATH = "/target-workspace"
+DEFAULT_MOUNT_PATH = "/workspace"
 # Node-side path the platform exposes the user Storage on. The container only
 # sees it when the create request asks for the mount.
 STORAGE_HOST_PATH = "/workspace"
@@ -65,9 +65,9 @@ PYROMIND_AGENT_RESOURCES_ROOT = "/.pyromind-agent-resources"
 # remembered here to clear it out of workspaces laid out by an older runtime.
 LEGACY_STORAGE_ALIAS = "storage"
 # Bumped when the workspace layout changes, so an existing sandbox re-runs the
-# prepare script. 4: the Storage symlink is no longer created, and workspaces
-# laid out by version 3 still carry it until they are prepared again.
-_WORKSPACE_LAYOUT_VERSION = 4
+# prepare script. 5: Pi mounts Storage at the same /workspace path exposed to
+# users and platform tasks.
+_WORKSPACE_LAYOUT_VERSION = 5
 # The platform rejects a create request without memory; mirror the sandbox
 # tool's own fallback (platform minimum 4 vCPU, 1:2 vCPU:memory ratio).
 DEFAULT_CPU = "4"
@@ -151,6 +151,15 @@ class SandboxSettings:
         memory = _configured_value(
             configured, "memory", "PYROMIND_SANDBOX_MEMORY"
         ) or _memory_for_cpu(cpu)
+        mount_path = (
+            _configured_value(configured, "mount_path", "PYROMIND_SANDBOX_MOUNT_PATH")
+            or DEFAULT_MOUNT_PATH
+        )
+        if mount_path.rstrip("/") != DEFAULT_MOUNT_PATH:
+            raise ValueError(
+                "sandbox mount_path is fixed to /workspace so file tools, "
+                "terminal commands, and scripts use one filesystem path"
+            )
         return cls(
             image=_configured_value(configured, "image", "PYROMIND_SANDBOX_IMAGE"),
             cpu=cpu,
@@ -159,12 +168,7 @@ class SandboxSettings:
             gpu_card=_configured_value(
                 configured, "gpu_card", "PYROMIND_SANDBOX_GPU_CARD"
             ),
-            mount_path=(
-                _configured_value(
-                    configured, "mount_path", "PYROMIND_SANDBOX_MOUNT_PATH"
-                )
-                or DEFAULT_MOUNT_PATH
-            ),
+            mount_path=DEFAULT_MOUNT_PATH,
             host_path=(
                 _configured_value(configured, "host_path", "PYROMIND_SANDBOX_HOST_PATH")
                 or STORAGE_HOST_PATH
@@ -328,8 +332,11 @@ class SandboxExecutionManager:
         files: PiSessionFiles,
         *,
         refresh: bool = False,
+        replace: bool = False,
     ) -> dict[str, Any]:
-        state = await self._ensure_state(context, files, refresh=refresh)
+        state = await self._ensure_state(
+            context, files, refresh=refresh, replace=replace
+        )
         return dict(state.endpoint)
 
     async def workspace(
@@ -365,6 +372,29 @@ class SandboxExecutionManager:
             lambda finished: self._forget_prewarm(conversation_id, finished)
         )
 
+    async def _delete_sandbox(self, client: SandboxClientLike, sandbox_id: str) -> None:
+        """Delete a sandbox even when the platform refuses to remove it running."""
+
+        try:
+            await asyncio.to_thread(client.delete, sandbox_id)
+            return
+        except Exception as delete_error:  # noqa: BLE001
+            logger.info(
+                "Pi sandbox delete requires pausing first sandbox_id=%s error=%s",
+                sandbox_id,
+                type(delete_error).__name__,
+            )
+        await asyncio.to_thread(client.pause, sandbox_id)
+        await asyncio.to_thread(
+            client.wait_for_sandbox_status,
+            sandbox_id,
+            target_status="paused",
+            timeout=_START_TIMEOUT_SECONDS,
+            check_interval=_START_POLL_SECONDS,
+            intermediate_statuses=["running", "stopping"],
+        )
+        await asyncio.to_thread(client.delete, sandbox_id)
+
     async def delete(
         self, context: ToolExecutionContext, files: PiSessionFiles
     ) -> None:
@@ -382,26 +412,14 @@ class SandboxExecutionManager:
             return
         client = state.client if state is not None else self._client_factory(context)
         try:
-            await asyncio.to_thread(client.delete, sandbox_id)
+            await self._delete_sandbox(client, sandbox_id)
         except Exception as delete_error:  # noqa: BLE001
             logger.warning(
-                "Pi sandbox delete failed; pausing before retry "
-                "conversation_id=%s sandbox_id=%s error=%s",
+                "Pi sandbox cleanup failed conversation_id=%s sandbox_id=%s error=%s",
                 context.conversation_id,
                 sandbox_id,
                 type(delete_error).__name__,
             )
-            try:
-                await asyncio.to_thread(client.pause, sandbox_id)
-                await asyncio.to_thread(client.delete, sandbox_id)
-            except Exception as retry_error:  # noqa: BLE001
-                logger.warning(
-                    "Pi sandbox cleanup failed conversation_id=%s sandbox_id=%s "
-                    "error=%s",
-                    context.conversation_id,
-                    sandbox_id,
-                    type(retry_error).__name__,
-                )
         files.clear_sandbox()
         self._locks.pop(context.conversation_id, None)
 
@@ -433,10 +451,11 @@ class SandboxExecutionManager:
         files: PiSessionFiles,
         *,
         refresh: bool = False,
+        replace: bool = False,
     ) -> _SandboxState:
         lock = self._locks.setdefault(context.conversation_id, asyncio.Lock())
         async with lock:
-            if refresh:
+            if refresh or replace:
                 # A failed call means the container may have been rebuilt or
                 # re-keyed behind this process, so re-read the platform state and
                 # mint a fresh access key instead of returning the cached bundle.
@@ -446,14 +465,18 @@ class SandboxExecutionManager:
             pending_staging = files.load_pending_sandbox_staging()
             fingerprint = _credential_fingerprint(context)
             existing = self._states.get(context.conversation_id)
-            if existing is not None:
+            if existing is not None and not replace:
                 # The endpoint carries an access key minted for this request identity.
                 if existing.credential_fingerprint != fingerprint:
                     self._states.pop(context.conversation_id)
                 elif pending_staging is None:
                     return existing
             state = await self._ensure_state_locked(
-                context, files, pending_staging, fingerprint
+                context,
+                files,
+                pending_staging,
+                fingerprint,
+                replace=replace,
             )
             self._states[context.conversation_id] = state
             return state
@@ -464,6 +487,8 @@ class SandboxExecutionManager:
         files: PiSessionFiles,
         pending_staging: dict[str, Any] | None,
         fingerprint: str,
+        *,
+        replace: bool = False,
     ) -> _SandboxState:
         settings = SandboxSettings.from_extra(context.extra)
         record = files.load_sandbox() or {}
@@ -479,6 +504,17 @@ class SandboxExecutionManager:
         )
         created_at = record.get("created_at") or datetime.now(UTC).isoformat()
         recorded_id = record.get("sandbox_id")
+        if replace and isinstance(recorded_id, str):
+            logger.info(
+                "Replacing Pi sandbox after unconfirmed terminal termination "
+                "conversation_id=%s sandbox_id=%s",
+                context.conversation_id,
+                recorded_id,
+            )
+            await self._delete_sandbox(client, recorded_id)
+            files.clear_sandbox()
+            record = {}
+            recorded_id = None
         record_needs_prepare = (
             record.get("workspace_version") != _WORKSPACE_LAYOUT_VERSION
         )
@@ -503,7 +539,7 @@ class SandboxExecutionManager:
                 context.conversation_id,
                 sandbox.id,
             )
-            await asyncio.to_thread(client.delete, sandbox.id)
+            await self._delete_sandbox(client, sandbox.id)
             sandbox = await self._create(client, settings, context.conversation_id)
             prepare = True
         elif sandbox.status.strip().lower() in _RESUMABLE_STATUSES:
@@ -522,7 +558,7 @@ class SandboxExecutionManager:
                 sandbox.id,
                 sandbox.status,
             )
-            await asyncio.to_thread(client.delete, sandbox.id)
+            await self._delete_sandbox(client, sandbox.id)
             sandbox = await self._create(client, settings, context.conversation_id)
             prepare = True
 
@@ -541,7 +577,7 @@ class SandboxExecutionManager:
                 context.conversation_id,
                 sandbox.id,
             )
-            await asyncio.to_thread(client.delete, sandbox.id)
+            await self._delete_sandbox(client, sandbox.id)
             sandbox = await self._create(client, settings, context.conversation_id)
             prepare = True
 

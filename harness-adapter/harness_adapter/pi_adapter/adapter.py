@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import posixpath
+import re
 import shlex
 import shutil
 import sys
@@ -139,6 +140,7 @@ ASK_USER_TOOL_DESCRIPTION = (
     "you can determine yourself with tools or context first. The tool waits "
     "until the user answers or cancels; their answers arrive as the tool result."
 )
+_DELEGATED_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _WORKFLOW_PATH = Path("public_data/workflow_canvas/workflow.py")
 _SYSTEM_PROMPT = """You are a coding agent inside one conversation workspace.
 Prefer read for ordinary file inspection, write for file creation, and edit for
@@ -159,14 +161,11 @@ and do not use it for simple tasks.
 _SANDBOX_SYSTEM_PROMPT = """
 
 This session runs its execution plane in a platform Sandbox with the user's
-Storage mounted at {root}. That mount is the Storage root: {root}/<path> is the
-Storage path /<path> the user and the platform see. When the user asks about
-data or files, inspect and read them there with read; use terminal for searches,
-bulk computation, and saved scripts. Pass {root}/<path> paths directly to
-Python scripts through terminal. Storage is writable: to hand a workspace file
-to a platform task, write it under {root}/<dir>/<name> and pass /<dir>/<name>
-as the Storage path. Every dataset this session works on is a Storage path you
-can read directly.
+Storage mounted at {root}. Use {root}/<path> for Storage files everywhere:
+read, write, edit, terminal commands, platform tools, and workflow nodes. Do not
+remove or replace that prefix. Storage is writable: to hand a workspace file to
+a platform task, write it under {root}/<dir>/<name> and pass that same path.
+Every dataset this session works on is a Storage path you can read directly.
 
 Platform task state comes from the platform tools, never from this workspace.
 task_status, node logs, and workflow runs are reported by analyze_task_failure,
@@ -194,10 +193,6 @@ def _sandbox_system_prompt(mount_path: str, conversation_id: str) -> str:
     skills = f"{workspace}/.agents/skills"
     return (
         f"{_SANDBOX_SYSTEM_PROMPT.replace('{root}', root)}\n\n"
-        "The user may reference /workspace/<path>: that names the same Storage, "
-        f"so use {root}/<path> instead. /workspace/<path> does not resolve "
-        "inside this sandbox, so never run it and never search the filesystem "
-        "for the file.\n\n"
         f"The skills tree is unpacked inside this sandbox (not outside the "
         f"workspace) at {skills}. Every terminal call starts at the workspace "
         "root, so .agents/skills/<skill>/... works as written, and "
@@ -376,10 +371,19 @@ class PiAdapter:
         scope = request.get("scope")
         if not isinstance(scope, dict):
             raise ValueError("delegation requires a trusted work scope")
-        if request.get("action") not in {"steer", "status"}:
+        action = request.get("action")
+        delegated_root = (
+            _delegated_workspace_root(scope)
+            if action in {"spawn", "resume", "steer"}
+            else None
+        )
+        if action not in {"steer", "status"}:
             self._role_scopes[(session.session_id, role)] = dict(scope)
         await self._ensure_runner(session)
         assert session.runner is not None
+        if delegated_root is not None:
+            workspace = await self._workspace(session)
+            await self._prepare_delegated_workspace(workspace, delegated_root)
         native_request = dict(request)
         if request.get("launch_request_id") and not request.get("execution_ref"):
             native_request["execution_ref"] = (
@@ -527,15 +531,10 @@ class PiAdapter:
                 ),
             )
         workspace = tool_context.workspace
-        root = "public_data/experiment-runs/" + str(scope["run_id"])
+        root = _delegated_workspace_root(scope)
         if workspace is not None:
-            import shlex
-
+            await self._prepare_delegated_workspace(workspace, root)
             directory = workspace.working_dir.rstrip("/") + "/" + root
-            await asyncio.to_thread(
-                workspace.execute_command,
-                "mkdir -p " + shlex.quote(directory + "/public_data"),
-            )
             tool_context = replace(
                 tool_context,
                 workspace=workspace.model_copy(update={"working_dir": directory}),
@@ -742,6 +741,21 @@ class PiAdapter:
             )
         session.workspace = workspace
         return workspace
+
+    async def _prepare_delegated_workspace(
+        self, workspace: BaseWorkspace, root: str
+    ) -> None:
+        """Create the lane root before a child can start in that directory."""
+        result = await asyncio.to_thread(
+            workspace.execute_command,
+            "mkdir -p " + shlex.quote(root + "/public_data"),
+        )
+        if result.exit_code != 0:
+            raise OSError(
+                result.stderr
+                or result.stdout
+                or "cannot prepare the delegated workspace"
+            )
 
     def _has_execution_workspace(self, session: _PiSession) -> bool:
         """False when a sandbox session never materialized its execution workspace."""
@@ -2118,6 +2132,7 @@ class PiAdapter:
                 self._control_tool_context(session),
                 session.files,
                 refresh=params.get("refresh") is True,
+                replace=params.get("replace") is True,
             )
         raise ValueError(f"unsupported runner request: {method}")
 
@@ -2941,6 +2956,13 @@ def _external_task_status(value: Any) -> str:
         "running": "running",
         "pending": "pending",
     }.get(normalized, "pending")
+
+
+def _delegated_workspace_root(scope: dict[str, Any]) -> str:
+    run_id = scope.get("run_id")
+    if not isinstance(run_id, str) or _DELEGATED_RUN_ID.fullmatch(run_id) is None:
+        raise ValueError("invalid delegated run id")
+    return f"public_data/experiment-runs/{run_id}"
 
 
 def _restore_active_external_tasks(root: Path) -> dict[str, str]:

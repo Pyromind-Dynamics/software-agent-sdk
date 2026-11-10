@@ -1,7 +1,7 @@
 import { lstat, mkdir, writeFile, open } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import {
   type AgentTool,
   type ExecutionEnv,
@@ -46,9 +46,9 @@ import { bounded } from "./terminal-channel.js";
 
 const OMITTED_IMAGE_TEXT = "[Image omitted: Pi only accepts inline base64 image data.]";
 const SANDBOX_READ_PATH_SCOPE =
-  "The user Storage mount is addressed by its absolute path and is writable there. Conversation files are read from public_data/. Configured skill directories and knowledge are read-only; .agents/skills/ and knowledge/ address their configured resource directories.";
+  "Use /workspace/<path> for user Storage and public_data/<path> for conversation files. Storage is writable. Configured skill directories and knowledge are read-only; .agents/skills/ and knowledge/ address their configured resource directories.";
 const SANDBOX_WRITE_PATH_SCOPE =
-  "Write and edit paths must stay within public_data/ or the user Storage mount, addressed by its absolute path.";
+  "Use /workspace/<path> for user Storage and public_data/<path> for conversation files.";
 
 export interface BusinessToolConfig {
   name: string;
@@ -89,7 +89,7 @@ export interface SandboxToolLane {
 export interface SandboxTools {
   main: SandboxToolLane;
   workflow: SandboxToolLane;
-  createLane(owner: string): SandboxToolLane;
+  createLane(owner: string, workspacePath?: string): SandboxToolLane;
 }
 
 export async function createTools(
@@ -194,9 +194,9 @@ export async function createTools(
  * runner cannot reach the portal. The endpoint is resolved on first use so a
  * conversation that never touches files never creates a sandbox.
  *
- * Every tool is created with a workspace-relative cwd (`"."`): the sandbox
- * operations resolve paths against the sandbox-side conversation root, so the
- * host conversation directory must never leak into a command or file path.
+ * Each lane has a logical workspace rooted either at the conversation or a
+ * delegated task. The sandbox resolves that root to a physical directory, so
+ * the host conversation directory never enters model-visible paths.
  */
 async function createSandboxTools(
   peer: JsonlRpcPeer,
@@ -214,31 +214,50 @@ async function createSandboxTools(
   // than the macOS-safe default the transport itself falls back to.
   const scriptChunkChars = options.scriptChunkChars ?? SANDBOX_SCRIPT_CHUNK_CHARS;
   const fileApi = new SandboxFileClient(endpoints, { probeTimeoutMs: SANDBOX_FILE_PROBE_TIMEOUT_MS });
-  const allowedReadRoots: string[] = [];
-  let policy: SandboxPathPolicy | undefined;
-  const resolvePolicy = async (signal?: AbortSignal): Promise<SandboxPathPolicy> => {
+  const resolvePolicy = async (
+    workspacePath: string,
+    signal?: AbortSignal,
+  ): Promise<SandboxPathPolicy> => {
     signal?.throwIfAborted();
     const resolved = await bounded(endpoints.resolve(), Infinity, signal);
-    if (policy?.workspacePath === resolved.workspacePath &&
-        policy.storageRoot === resolved.storagePath) return policy;
+    const laneWorkspace = posix.resolve(resolved.workspacePath, workspacePath);
     const skillsDirectory = `${resolved.workspacePath}/.agents/skills`;
     const knowledgeRoot = `${resolved.workspacePath}/knowledge`;
-    policy = SandboxPathPolicy.create({
-      workspacePath: resolved.workspacePath,
+    return SandboxPathPolicy.create({
+      workspacePath: laneWorkspace,
+      conversationRoot: resolved.workspacePath,
       readOnlyRoots: [skillsDirectory, knowledgeRoot],
       skillsDirectory,
       knowledgeRoot,
       storageRoot: resolved.storagePath,
     });
-    allowedReadRoots.splice(0, allowedReadRoots.length,
-      resolved.storagePath,
-      policy.publicDataPath,
-      ...policy.readOnlyRoots,
-    );
-    return policy;
   };
 
-  const createLane = (owner: string): SandboxToolLane => {
+  const createLane = (owner: string, workspacePath = sandboxCwd): SandboxToolLane => {
+    const laneWorkspace = posix.normalize(workspacePath);
+    if (
+      posix.isAbsolute(laneWorkspace) ||
+      laneWorkspace === ".." ||
+      laneWorkspace.startsWith("../")
+    ) {
+      throw new Error("sandbox lane workspace must stay inside the conversation root");
+    }
+    const allowedReadRoots: string[] = [];
+    const resolveLanePath = async (
+      path: string,
+      operation: "read" | "write",
+      signal?: AbortSignal,
+    ): Promise<string> => {
+      const policy = await resolvePolicy(laneWorkspace, signal);
+      if (allowedReadRoots.length === 0) {
+        allowedReadRoots.push(
+          ...(policy.storageRoot ? [policy.storageRoot] : []),
+          policy.publicDataPath,
+          ...policy.readOnlyRoots,
+        );
+      }
+      return policy.resolvePath(path, operation);
+    };
     const terminal = new LazySandboxTerminalOperations(endpoints, {
       owner,
       journalPath: join(workspaceRoot, "pi", "terminal-runs", owner + ".json"),
@@ -251,12 +270,12 @@ async function createSandboxTools(
       new SandboxTerminalFileClient(terminal, { chunkChars: scriptChunkChars }),
     );
     const access: ExecutionAccess = {
-      operations: terminal, cwd: sandboxCwd, env: options.terminalEnvironment, allowedReadRoots,
+      operations: terminal, cwd: laneWorkspace, env: options.terminalEnvironment, allowedReadRoots,
       writeFile: (path, content) => fileClient.write(path, content),
       readFile: (path, limit) => fileClient.read(path, limit),
-      resolvePath: async (path, operation, signal) => (await resolvePolicy(signal)).resolvePath(path, operation),
+      resolvePath: resolveLanePath,
     };
-    const tools = createSandboxLaneTools(sandboxCwd, access, fileClient, options);
+    const tools = createSandboxLaneTools(laneWorkspace, access, fileClient, options);
     return { tools, access, terminal };
   };
   const main = createLane("main");
@@ -325,8 +344,8 @@ function bindPathTool(
   pathScopeOverride?: string,
 ): AgentTool<any, any> {
   const pathScope = pathScopeOverride ?? (operation === "read"
-    ? "Conversation files are read from public_data/. Configured skill directories and knowledge are read-only. .agents/skills/ and knowledge/ address their configured resource directories. Other relative paths start at the conversation root; authorized absolute paths are also accepted."
-    : "Write and edit paths must stay within public_data/. Relative paths start at the conversation root; authorized absolute paths are also accepted.");
+    ? "Use /workspace/<path> for user Storage and public_data/<path> for conversation files. Configured skill directories and knowledge are read-only. .agents/skills/ and knowledge/ address their configured resource directories. Other relative paths start at the conversation root."
+    : "Use /workspace/<path> for user Storage and public_data/<path> for conversation files. Other relative paths start at the conversation root.");
   const parameters = structuredClone(tool.parameters);
   if (isRecord(parameters.properties) && isRecord(parameters.properties.path)) {
     parameters.properties.path.description = pathScope;

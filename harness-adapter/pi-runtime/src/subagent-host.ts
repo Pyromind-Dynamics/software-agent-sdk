@@ -18,6 +18,19 @@ import { isRecord, type JsonObject, type RunnerEvent, PROTOCOL_VERSION } from ".
 import type { JsonlRpcPeer } from "./rpc-peer.js";
 
 const ROLE_TOOLS = { search: ["read", "grep", "find", "ls"], general_purpose: ["read", "grep", "find", "ls", "write", "edit", "terminal"] };
+
+export function delegatedWorkspace(scope: JsonObject | undefined): string | undefined {
+  const runId = scope?.run_id;
+  if (typeof runId !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(runId)) return undefined;
+  return `public_data/experiment-runs/${runId}`;
+}
+
+function validateWorkScope(expected: JsonObject | undefined, supplied: unknown): void {
+  if (expected && (!isRecord(supplied) || ["run_id", "work_id", "generation"].some(key => supplied[key] !== expected[key]))) {
+    throw new Error("Stale delegated work scope");
+  }
+}
+
 export function subagentModule(name: string): string {
   const js = fileURLToPath(new URL(`./${name}.js`, import.meta.url));
   return existsSync(js) ? js : js.replace(/\.js$/, ".ts");
@@ -124,7 +137,11 @@ export class SubagentHost {
       };
       if (request.method === "terminal.attach" && this.terminals && allowed.some(usesAgentTerminal)) {
         if (typeof request.session !== "string" || typeof request.session_file !== "string") throw new Error("Missing child session identity");
-        await this.terminals.attach(request.role, request.session, request.session_file, signal, (id) => update({ id }));
+        const expected = this.workScopes.get(request.role);
+        validateWorkScope(expected, request.scope);
+        const workspacePath = expected ? delegatedWorkspace(expected) : ".";
+        if (!workspacePath) throw new Error("Invalid delegated work scope");
+        await this.terminals.attach(request.role, request.session, request.session_file, workspacePath, signal, (id) => update({ id }));
         return null;
       }
       if (request.method === "terminal.detach" && this.terminals) {
@@ -136,8 +153,8 @@ export class SubagentHost {
         const tool = roleTools.find((tool) => tool.name === request.name);
         if (!tool) throw new Error("Child tool is unavailable");
         const expected = this.workScopes.get(request.role), supplied = request.scope;
-        if (expected && (!isRecord(supplied) || ["run_id", "work_id", "generation"].some(key => supplied[key] !== expected[key]))) throw new Error("Stale delegated work scope");
-        if (expected && ["write", "edit"].includes(request.name)) {
+        validateWorkScope(expected, supplied);
+        if (expected && !this.terminals && ["write", "edit"].includes(request.name)) {
           const args = isRecord(request.args) ? request.args : {};
           const path = String(args.path ?? "");
           if (!path.startsWith(`public_data/experiment-runs/${expected.run_id}/`) || path.split("/").includes("..")) throw new Error("Write only this task's workspace");

@@ -16,9 +16,8 @@ the user's constraints, write configuration and use df_submit_evaluation for rea
 inference and deterministic scoring. intent=prepare forbids all platform submits.
 Do not wait for a plan, Graph, version, resource registration or extra approval.
 
-Write task files under public_data/experiment-runs/<run_id>/public_data/; use this
-prefix instead of the Skill's default public_data/ paths in tool arguments. Model
-references may be Storage directories. After submission return actual task_id,
+Write task files under public_data/. Use /workspace/<path> for user Storage.
+After submission return actual task_id,
 run_id and output_dir and end this turn: Runtime waits for the platform and resumes
 you to analyze the result. Do not busy-poll. In the report phase read metrics.json
 and report.json, verify counts and coverage, and write the evidence, limitations

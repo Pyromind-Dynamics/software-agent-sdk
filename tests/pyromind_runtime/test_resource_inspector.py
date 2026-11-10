@@ -8,12 +8,22 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.preparation import InspectResource
 
 
-def test_storage_preview_is_bounded_and_never_returns_signed_urls(monkeypatch):
+@pytest.mark.parametrize(
+    "path",
+    ["/datasets/data.jsonl", "/workspace/datasets/data.jsonl"],
+)
+def test_storage_preview_is_bounded_and_never_returns_signed_urls(monkeypatch, path):
     data = b'{"prompt":"sample","answer":"ok"}\n' * 3000
+    storage_paths = []
+
+    def storage_url(**kwargs):
+        storage_paths.append(kwargs["storage_path"])
+        return "https://storage.example/object?signed=private"
+
     monkeypatch.setattr(
         resource_inspector,
         "request_storage_url",
-        lambda **kwargs: "https://storage.example/object?signed=private",
+        storage_url,
     )
     seen = []
 
@@ -24,9 +34,11 @@ def test_storage_preview_is_bounded_and_never_returns_signed_urls(monkeypatch):
     with httpx.Client(transport=httpx.MockTransport(response)) as client:
         monkeypatch.setattr(resource_inspector.httpx, "stream", client.stream)
         result = StorageResourceInspector().inspect(
-            InspectResource(path="/data.jsonl", max_bytes=32),
+            InspectResource(path=path, max_bytes=32),
             RequestContext(user_id="42", cookie="auth_token=test"),
         )
+    assert storage_paths == ["/datasets/data.jsonl"]
+    assert result["path"] == "/workspace/datasets/data.jsonl"
     assert result["content"] == data[:32].decode()
     assert result["bytes_read"] == 32 and result["truncated"] is True
     assert result["preview_sha256"] == hashlib.sha256(data[:32]).hexdigest()
@@ -40,7 +52,7 @@ def test_storage_preview_is_bounded_and_never_returns_signed_urls(monkeypatch):
     ["../other", "https://example/data", "/data?token=private", "/data#fragment"],
 )
 def test_inspection_rejects_non_storage_paths(path):
-    with pytest.raises(ValueError, match="Storage path"):
+    with pytest.raises(ValueError, match="path"):
         StorageResourceInspector().inspect(
             InspectResource(path=path),
             RequestContext(user_id="42", cookie="auth_token=test"),
@@ -50,7 +62,7 @@ def test_inspection_rejects_non_storage_paths(path):
 def test_inspection_requires_current_credentials():
     with pytest.raises(ValueError, match="credentials"):
         StorageResourceInspector().inspect(
-            InspectResource(path="/data"), RequestContext(user_id="42")
+            InspectResource(path="/workspace/data"), RequestContext(user_id="42")
         )
 
 
@@ -70,7 +82,9 @@ def test_complete_digest_streams_beyond_preview_and_counts_real_lines(monkeypatc
     with httpx.Client(transport=httpx.MockTransport(response)) as client:
         monkeypatch.setattr(resource_inspector.httpx, "stream", client.stream)
         result = StorageResourceInspector().inspect(
-            InspectResource(path="/data.jsonl", max_bytes=32, compute_digest=True),
+            InspectResource(
+                path="/workspace/data.jsonl", max_bytes=32, compute_digest=True
+            ),
             RequestContext(user_id="42", cookie="auth_token=test"),
         )
     assert result["sha256"] == hashlib.sha256(data).hexdigest()

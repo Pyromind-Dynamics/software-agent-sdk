@@ -4,6 +4,8 @@ from types import SimpleNamespace
 from typing import cast
 from uuid import uuid4
 
+import pytest
+
 from openhands.sdk.conversation.base import BaseConversation
 from openhands.tools.workflow import submit_workflow as module
 
@@ -12,6 +14,11 @@ def test_submit_workflow_tool_resolves_without_parameters():
     tools = module.SubmitWorkflowTool.create(conv_state=None)
 
     assert [tool.name for tool in tools] == ["submit_workflow"]
+
+
+def test_submit_workflow_rejects_the_removed_storage_alias():
+    with pytest.raises(ValueError, match="alias was removed"):
+        module.SubmitWorkflowAction(workflow_path="storage/project/workflow.py")
 
 
 def test_submit_workflow_tool_stages_confirmation_with_current_identity(monkeypatch):
@@ -43,7 +50,7 @@ def test_submit_workflow_tool_stages_confirmation_with_current_identity(monkeypa
         state=SimpleNamespace(secret_registry=Secrets(), agent_state={}),
     )
     observation = module.SubmitWorkflowExecutor()(
-        module.SubmitWorkflowAction(workflow_path="storage/project/workflow.py"),
+        module.SubmitWorkflowAction(workflow_path="/workspace/project/workflow.py"),
         cast(BaseConversation, conversation),
     )
     assert observation.status == "awaiting_confirmation"
@@ -52,4 +59,4 @@ def test_submit_workflow_tool_stages_confirmation_with_current_identity(monkeypa
     )
     assert captured["headers"]["x-pyromind-debug-user-id"] == "42"
     assert captured["headers"]["cookie"] == "auth_token=ephemeral"
-    assert captured["body"]["workflow_path"] == "storage/project/workflow.py"
+    assert captured["body"]["workflow_path"] == "/workspace/project/workflow.py"

@@ -62,6 +62,7 @@ from openhands.tools.utils.dataflow_config import (
 )
 from openhands.tools.utils.storage_paths import (
     StoragePathError,
+    to_agent_storage_path,
     to_tool_storage_path,
 )
 from openhands.tools.workflow.task_submission import (
@@ -119,7 +120,7 @@ The tool creates a one-node CustomCommandNode workflow that:
 
 Execution is asynchronous. A terminal Kafka callback resumes the
 conversation when the workflow completes. After the callback, inspect the
-returned Storage `output_dir` artifacts:
+returned `/workspace/...` `output_dir` artifacts:
 - report.json: execution summary, LLM call stats, error samples
 - failure.json / validation.json: detailed failure evidence when present
 - failures.jsonl: retry ledger for skipped records; rows carry the source input
@@ -171,7 +172,11 @@ class DfSubmitPipelineAction(Action):
             " A strict resume may omit it and reuse the prior frozen script."
         ),
     )
-    input_path: str = Field(description="Source data path in Pyromind Storage.")
+    input_path: str = Field(
+        description=(
+            "Source data path in user Storage, e.g. '/workspace/datasets/data.jsonl'."
+        )
+    )
     support_file_path: str | None = Field(
         default=None,
         description=(
@@ -822,6 +827,8 @@ class DfSubmitPipelineExecutor(
                 is_error=True,
             )
 
+        agent_output_dir = to_agent_storage_path(output_dir)
+
         # Persist task association
         association = DataPreparationTaskAssociation(
             task_id=task_id,
@@ -863,7 +870,7 @@ class DfSubmitPipelineExecutor(
                 status=response.status,
                 task_id=task_id,
                 run_id=str(run_id),
-                output_dir=output_dir,
+                output_dir=agent_output_dir,
                 resumed=resumed,
                 execution_revision=execution_revision,
                 is_error=True,
@@ -877,16 +884,15 @@ class DfSubmitPipelineExecutor(
             text=(
                 "Python pipeline submitted. "
                 f"task_id={task_id}, run_id={run_id}, "
-                f"revision={execution_revision}, output_dir={output_dir}. "
-                "While the job runs, check its progress with this "
-                "output_dir to report live progress, ETA, and recent output "
-                "records. After the terminal callback, preview "
-                f"{output_dir}/report.json, then processed.jsonl."
+                f"revision={execution_revision}, "
+                f"output_dir={agent_output_dir}. End this turn now. Runtime will "
+                "wait for the terminal callback and resume you for the report "
+                "phase. Do not poll for progress."
             ),
             status=response.status,
             task_id=task_id,
             run_id=str(run_id),
-            output_dir=output_dir,
+            output_dir=agent_output_dir,
             resumed=resumed,
             execution_revision=execution_revision,
         )

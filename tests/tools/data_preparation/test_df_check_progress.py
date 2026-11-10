@@ -51,7 +51,7 @@ def test_check_progress_full_snapshot() -> None:
 
     obs = executor(DfCheckProgressAction(output_dir="/run/"), conversation=None)
 
-    assert obs.output_dir == "/run"
+    assert obs.output_dir == "/workspace/run"
     assert obs.progress_found is True
     assert obs.total == 100
     assert obs.processed == 40

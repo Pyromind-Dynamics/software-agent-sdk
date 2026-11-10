@@ -15,11 +15,11 @@
 ## 强制边界
 
 - 工作区中间文件放在 `public_data/data-preparation/`。
-- Storage 挂载为 `/target-workspace`，直接用 `read`/`terminal` 查看数据和平台产物，
-  `sandbox_sample.py` 的输入也直接写 `/target-workspace/...`。
+- Storage 挂载为 `/workspace`，直接用 `read`/`terminal` 查看数据和平台产物，
+  `sandbox_sample.py` 的输入也直接写 `/workspace/...`。
 - `sandbox_sample.py` 只运行沙箱小样；用户确认前不得调用 `df_submit_pipeline`。
 - 平台全量输入必须已经存在于 Storage：`df_submit_pipeline` 不接受工作区路径。
-  工作区写好的 Manifest 直接写到图片所在的 Storage 目录 `/target-workspace/<dir>/`
+  工作区写好的 Manifest 直接写到图片所在的 Storage 目录 `/workspace/<dir>/`
   （见[平台全量输入](#平台全量输入)）。
 - Sample 结果不符合预期时自行修正并重跑，迭代过程不向用户展示；只展示符合预期的结果。
 - 新链路直接生成规范 JSONL，不以 Parquet 作为正式产物。
@@ -38,8 +38,8 @@
 ## 平台全量输入
 
 本地试跑只验证链路是否打通，正式批量和正规化执行在平台侧完成。`df_submit_pipeline`
-的 `input_path` 是 Pyromind Storage 路径（平台 pod 把 Storage 挂载到
-`/target-workspace`），工作区文件不会自动上传。按输入形态二选一：
+的 `input_path` 统一使用 `/workspace/...`；工具负责转换成平台 Pod 的内部挂载路径。
+工作区文件不会自动上传。按输入形态二选一：
 
 - **目录输入**：数据都在同一 Storage 目录时可直接传该目录。目录输入按**直接子项**
   划分样本：每个子目录算一个样本（递归收集其中的图片），散落的单张图片各算一个
@@ -48,16 +48,16 @@
   按 Manifest 所在目录解析其中的相对图片路径，越出该目录的路径会被拒绝。
 
 工作区写好的 Manifest 直接写到
-`/target-workspace/<图片所在的 Storage 目录>/<name>`，把对应的 Storage 根路径
-`/<图片所在的 Storage 目录>/<name>` 直接作为 `input_path`。源数据本来就在 Storage
+`/workspace/<图片所在的 Storage 目录>/<name>`，并把同一路径直接作为
+`input_path`。源数据本来就在 Storage
 时，只需要落一个 Manifest 小文件；不要为此创建 sandbox。
 
 ## 执行流程
 
-1. 先确认结构：直接查看 `/target-workspace/<input_path>`（目录先 `ls`，再看 schema 和
-   最多 3 条样例），`sandbox_sample.py` 直接以 `/target-workspace/<input_path>` 作为输入。
+1. 先确认结构：直接查看 `/workspace/<input_path>`（目录先 `ls`，再看 schema 和
+   最多 3 条样例），`sandbox_sample.py` 直接以 `/workspace/<input_path>` 作为输入。
    Storage `source_path` 供全量提交与沙箱直读使用，不得复制 Sample
-   到另一个文件。**vision 小样例外**：图片按 manifest 的相对路径解析，`/target-workspace/...`
+   到另一个文件。**vision 小样例外**：图片按 manifest 的相对路径解析，`/workspace/...`
    的 manifest 与工作区里的 manifest 都在原地解析其图片，工作区里的 manifest 要求
    图片与其同目录，`args[0]` 一律传 manifest 文件本身 —— 传目录会走目录发现，
    丢掉 `image_labels` 等 manifest 字段。同时按
@@ -77,7 +77,7 @@
 6. 展示符合预期的 Sample 结果并等待用户明确确认。
 7. 确认输入已按[平台全量输入](#平台全量输入)落到 Storage 后，调用
    `df_submit_pipeline(mode="full")`。收到 Kafka callback 后，直接读取
-   `/target-workspace/<output_dir>/report.json`；如失败，再查看同目录的
+   `/workspace/<output_dir>/report.json`；如失败，再查看同目录的
    `failure.json`、`validation.json` 和必要的
    `llm_calls.jsonl`。
    图片任务若 `report.json.label_reconciliation.corrected > 0`，继续查看
@@ -121,7 +121,7 @@ messages 时选择 `vision`。具体完成标准见 PCB 场景文档。
 ## 运行与完成条件
 
 - 只读取需求匹配的场景 case 及其模板；例如 DPO 不读取文本清洗等相邻模板。
-- 按 `failure_stage` 修复：`input_resolution` 只改用 `/target-workspace/...` 路径，
+- 按 `failure_stage` 修复：`input_resolution` 只改用 `/workspace/...` 路径，
   `pipeline_resolution` 只修正工作区相对路径，`pipeline_execution` 根据 stderr/report
   修脚本；仅 `runtime_dependency` 可检查运行环境，且不得浏览 SDK 仓库源码。
 - 相同参数得到相同 `error_code` 后不得原样重试；本地输入、输出和报告路径均使用工具

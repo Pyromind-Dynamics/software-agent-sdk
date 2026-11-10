@@ -343,11 +343,7 @@ class Versions:
                 ) + result.storage_ref
             if isinstance(value, str) and value.startswith("version://"):
                 raise ValueError(f"no selected version for {slot}")
-            if (
-                field in roles
-                and isinstance(value, str)
-                and value.startswith(("/", "storage/"))
-            ):
+            if field in roles and isinstance(value, str) and value.startswith("/"):
                 version = self.save(
                     project,
                     key + ":input:" + trail,

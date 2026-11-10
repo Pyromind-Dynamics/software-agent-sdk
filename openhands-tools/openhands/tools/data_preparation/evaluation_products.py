@@ -72,9 +72,9 @@ def prepare_products(
 
 
 def build_products_dsl(definition: dict, output_dir: str, run_id: str) -> str:
-    from openhands.tools.data_preparation.inference import storage_path
+    from openhands.tools.utils.storage_paths import to_agent_storage_path
 
-    output = "/workspace" + storage_path(output_dir)
+    output = to_agent_storage_path(output_dir, field="output_dir")
     command = " ".join(
         map(
             shlex.quote,

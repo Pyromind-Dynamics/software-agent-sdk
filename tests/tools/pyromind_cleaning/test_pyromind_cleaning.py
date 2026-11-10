@@ -155,9 +155,12 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
     assert not observation.is_error
     assert observation.task_id == "9876"
     assert observation.run_id is not None
+    assert observation.output_dir is not None
     assert observation.output_dir == (
-        f"/.pyromind-agent/{_CONVERSATION_ID}/data_cleaning/{observation.run_id}"
+        f"/workspace/.pyromind-agent/{_CONVERSATION_ID}/data_cleaning/"
+        f"{observation.run_id}"
     )
+    storage_output_dir = observation.output_dir.removeprefix("/workspace")
     assert observation.resumed is False
     assert f"{observation.output_dir}/report.json" in observation.text
     assert "then output.jsonl" in observation.text
@@ -167,7 +170,7 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
         call.kwargs["local_path"].name for call in upload_runtime.call_args_list
     } == {"cleaning_utils.py", "validate_format.py"}
     assert all(
-        call.kwargs["target_dir"] == observation.output_dir
+        call.kwargs["target_dir"] == storage_output_dir
         for call in upload_runtime.call_args_list
     )
     client_factory.assert_called_once_with(
@@ -194,7 +197,7 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
     assert node["data"]["nodeType"] == "CustomCommandCPUNode"
     assert node["data"]["config"]["cpu"] == 4
     command = node["data"]["config"]["command"]
-    pod_output_dir = f"/target-workspace{observation.output_dir}"
+    pod_output_dir = f"/target-workspace{storage_output_dir}"
     assert (
         f"mkdir -p /target-workspace/.pyromind-agent/{_CONVERSATION_ID}/data_cleaning"
     ) in command
@@ -217,7 +220,7 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
     assert association is not None
     assert association.conversation_id == str(_CONVERSATION_ID)
     assert association.run_id == observation.run_id
-    assert association.output_dir == observation.output_dir
+    assert association.output_dir == storage_output_dir
     assert association.input_path == "/datasets/source.jsonl"
     assert association.script_path == "/agentTest/clean.py"
     assert association.limit == 25

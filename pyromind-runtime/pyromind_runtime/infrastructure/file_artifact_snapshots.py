@@ -20,8 +20,6 @@ from pyromind_runtime.domain.versions import (
 
 
 def storage_path(value: str) -> str:
-    if value.startswith("storage/"):
-        value = value[len("storage") :]
     path = PurePosixPath(value)
     if not value.startswith("/") or ".." in path.parts or "\\" in value:
         raise ValueError("expected an absolute Storage path")

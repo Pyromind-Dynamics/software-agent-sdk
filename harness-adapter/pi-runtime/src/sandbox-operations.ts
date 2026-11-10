@@ -20,17 +20,15 @@ export interface SandboxEndpoint {
   cluster?: string;
   /** Sandbox-side conversation root. */
   workspacePath: string;
-  /**
-   * Sandbox-side Storage mount root, addressed by its absolute path.
-   * The workspace holds a symlink with that name, so shell and script
-   * relative paths resolve to the same place as the file tools.
-   */
+  /** Sandbox-side Storage mount root, addressed by its absolute path. */
   storagePath: string;
 }
 
 export interface SandboxEndpointRequest {
   /** Re-read the sandbox instead of returning the control plane's cached one. */
   refresh: boolean;
+  /** Replace the current sandbox after an execution may still be running. */
+  replace?: boolean;
 }
 
 export type SandboxEndpointProvider = (
@@ -48,13 +46,18 @@ export type SandboxEndpointProvider = (
 export class SandboxEndpointSession {
   private cached: Promise<SandboxEndpoint> | undefined;
   private stale = false;
+  private replace = false;
 
   constructor(private readonly provider: SandboxEndpointProvider) {}
 
   resolve(): Promise<SandboxEndpoint> {
     if (this.cached === undefined) {
-      const requested = this.provider({ refresh: this.stale });
+      const requested = this.provider({
+        refresh: this.stale,
+        ...(this.replace ? { replace: true } : {}),
+      });
       this.stale = false;
+      this.replace = false;
       // Drop a rejected request so the next call asks again instead of
       // replaying the same failure.
       requested.catch(() => {
@@ -69,6 +72,14 @@ export class SandboxEndpointSession {
     if (expected && this.cached && this.cached !== expected) return;
     this.cached = undefined;
     this.stale = true;
+    this.replace = false;
+  }
+
+  replaceSandbox(expected?: Promise<SandboxEndpoint>): void {
+    if (expected && this.cached && this.cached !== expected) return;
+    this.cached = undefined;
+    this.stale = true;
+    this.replace = true;
   }
 }
 

@@ -307,7 +307,8 @@ for (const workflowsEnabled of [false, true]) {
     assert.equal(events.some((event) => event.kind === "tool.failed"), false);
     if (workflowsEnabled) {
       assert.ok(system.includes("genome_list"));
-      assert.ok(system.includes("历史经验的路径参数使用当前会话执行环境的路径"));
+      assert.ok(system.includes("/workspace/<path>"));
+      assert.ok(!system.includes("/target-workspace"));
     }
   });
 }

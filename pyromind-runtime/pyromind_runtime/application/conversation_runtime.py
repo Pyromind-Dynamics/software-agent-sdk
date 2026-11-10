@@ -111,6 +111,10 @@ from pyromind_runtime.domain.snapshot import (
     TimelineOperation,
     WorkflowState,
 )
+from pyromind_runtime.domain.storage_paths import (
+    from_storage_api_path,
+    to_storage_api_path,
+)
 from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
 from pyromind_runtime.domain.versions import (
     RunSource,
@@ -474,7 +478,7 @@ class ConversationRuntime:
             self._resource_inspector.inspect,
             InspectResource.model_validate(
                 {
-                    "path": path,
+                    "path": from_storage_api_path(path, field="artifact.path"),
                     "kind": kind,
                     "max_bytes": 65536,
                     "compute_digest": kind == "file",
@@ -939,8 +943,9 @@ class ConversationRuntime:
         preparation_policy = store.preparation_policy()
         if preparation_policy is not None and preparation_policy.workflow_nodes:
             assert self._preparations is not None
+            assert self._experiment_plans is not None
             current_context = await self._plan_io(
-                self._experiment_plans.context, owner
+                self._experiment_plans.store.context, owner
             )
             validate_workflow_role(
                 preparation_policy,
@@ -1420,9 +1425,9 @@ class ConversationRuntime:
             resource = next(
                 r for r in revision.plan.resources if r.id == model.resource_id
             )
-            path = resource.uri or ""
-            if not path.startswith("/") or ".." in path.split("/"):
-                raise ValueError("resource needs an absolute Storage file path")
+            path = to_storage_api_path(
+                resource.storage_path or "", field="resource.storage_path"
+            )
             storage = self._evaluation_storage_factory(context)
             content = await asyncio.to_thread(storage.read, path)
             import hashlib
@@ -5529,8 +5534,8 @@ def _build_external_task_notification(
     else:
         instruction = (
             f"The Pyromind {task_label} task is {status}. Follow the matching "
-            "skill's callback contract. Inspect the reported output_dir under "
-            "storage/ with the file tools; do not assume the callback payload "
+            "skill's callback contract. Inspect the reported output_dir "
+            "(/workspace/...) with the file tools; do not assume the callback payload "
             "contains data. For a saved-prediction batch, "
             "read checkpoint_selection.json "
             "and iteration_context.json, link the overview and selected step report, "

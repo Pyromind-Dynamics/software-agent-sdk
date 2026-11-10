@@ -2,8 +2,8 @@
 
 Scans runtime-mounted files in the given log directory and produces a
 ``report.json`` summary with statistics, error samples, and timing. Agents
-read the same artifacts from the mounted Storage under ``storage/``; this
-script does not provide a remote-storage access path.
+read the same artifacts under ``/workspace/``; this script does not provide a
+remote-storage access path.
 
 Usage (called automatically by the platform command after pipeline completes):
 

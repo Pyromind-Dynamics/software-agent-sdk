@@ -101,7 +101,7 @@ def test_extract_archive_submits_zip_workflow(monkeypatch):
     assert not observation.is_error
     assert observation.task_id == "task-123"
     assert observation.run_id is not None
-    assert observation.output_dir == "/datasets/data"
+    assert observation.output_dir == "/workspace/datasets/data"
 
     client_factory.assert_called_once_with(
         env="pre",
@@ -120,7 +120,9 @@ def test_extract_archive_submits_zip_workflow(monkeypatch):
     assert node["data"]["nodeType"] == "CustomCommandCPUNode"
     assert node["data"]["config"]["cpu"] == 1
     command = node["data"]["config"]["command"]
-    pod_output_dir = f"/target-workspace{observation.output_dir}"
+    pod_output_dir = (
+        f"/target-workspace{observation.output_dir.removeprefix('/workspace')}"
+    )
     assert f"mkdir -p {pod_output_dir}" in command
     assert (
         f"python3 -m zipfile -e /target-workspace/datasets/data.zip {pod_output_dir}"
@@ -155,7 +157,7 @@ def test_extract_archive_auto_detects_tar_gz(monkeypatch):
     assert "import tarfile,sys" in command
     assert "tarfile.open" in command
     assert "extractall" in command
-    assert observation.output_dir == "/datasets/data"
+    assert observation.output_dir == "/workspace/datasets/data"
 
 
 def test_extract_archive_requires_conversation():
@@ -228,7 +230,7 @@ def test_extract_archive_custom_output_dir(monkeypatch):
     )
 
     assert not observation.is_error
-    assert observation.output_dir == "/my/custom/output"
+    assert observation.output_dir == "/workspace/my/custom/output"
     request = mock_client.studio.create.call_args.args[0]
     command = request.workflow["nodes"][0]["data"]["config"]["command"]
     assert "/target-workspace/my/custom/output" in command
@@ -270,7 +272,7 @@ def test_extract_archive_strips_workspace_prefix(monkeypatch):
         in command
     )
     assert observation.output_dir == (
-        "/datasets/michaelauli/data/wikipedia-biography-dataset"
+        "/workspace/datasets/michaelauli/data/wikipedia-biography-dataset"
     )
 
 
@@ -360,7 +362,7 @@ def test_extract_archive_appends_suffix_when_default_dir_exists(monkeypatch):
     )
 
     assert not observation.is_error
-    assert observation.output_dir == "/datasets/data_1"
+    assert observation.output_dir == "/workspace/datasets/data_1"
     request = mock_client.studio.create.call_args.args[0]
     command = request.workflow["nodes"][0]["data"]["config"]["command"]
     assert "/target-workspace/datasets/data_1" in command
@@ -395,7 +397,7 @@ def test_extract_archive_skips_existing_suffixed_dirs(monkeypatch):
     )
 
     assert not observation.is_error
-    assert observation.output_dir == "/datasets/data_2"
+    assert observation.output_dir == "/workspace/datasets/data_2"
 
 
 def test_extract_archive_explicit_output_dir_exists_errors(monkeypatch):

@@ -415,7 +415,7 @@ export async function createPiSession(
     settingsManager,
     systemPrompt: config.systemPrompt,
     appendSystemPrompt: params.workflows_enabled === true
-      ? ["历史经验的路径参数使用当前会话执行环境的路径：Storage 文件用挂载点绝对路径（如 /target-workspace/agentTest/input.csv），会话文件使用 public_data/...。与 read/terminal 验证成功的路径保持一致；不要改成服务端路径或平台 /workspace 路径。"]
+      ? ["历史经验复用时，Storage 文件统一写成 /workspace/<path>，会话文件写成 public_data/...。"]
       : [],
     eventBus: experienceHost.eventBus,
     additionalExtensionPaths: experienceHost.additionalExtensionPaths,
@@ -606,8 +606,11 @@ function terminalBackend(value: JsonObject): PiTerminalBackend {
  * access token never travels in the start frame and idle chats create nothing.
  */
 function sandboxEndpointProvider(peer: JsonlRpcPeer): SandboxEndpointProvider {
-  return async ({ refresh }) => {
-    const result = await peer.request("sandbox.ensure", { refresh });
+  return async ({ refresh, replace }) => {
+    const result = await peer.request("sandbox.ensure", {
+      refresh,
+      ...(replace === true ? { replace: true } : {}),
+    });
     if (!isRecord(result)) throw new Error("invalid sandbox.ensure response");
     const endpoint: SandboxEndpoint = {
       baseUrl: requiredString(result, "base_url"),

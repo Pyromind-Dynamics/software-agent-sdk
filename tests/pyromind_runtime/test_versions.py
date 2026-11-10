@@ -15,6 +15,7 @@ from pyromind_runtime.domain.versions import (
 )
 from pyromind_runtime.infrastructure.file_artifact_snapshots import (
     FileArtifactSnapshots,
+    storage_path,
 )
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 
@@ -55,6 +56,12 @@ def test_three_tables_lazy_project_and_idempotent_save(versions):
         assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert b"never-persist-this-cookie" not in service.store.path.read_bytes()
+
+
+@pytest.mark.parametrize("value", ["storage/a.jsonl", "relative/a.jsonl"])
+def test_snapshot_storage_paths_must_be_absolute(value):
+    with pytest.raises(ValueError, match="absolute Storage path"):
+        storage_path(value)
 
 
 def test_concurrent_numbers_and_same_key(versions):

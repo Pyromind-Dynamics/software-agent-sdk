@@ -9,7 +9,7 @@ export function usesAgentTerminal(name: string): boolean {
 }
 
 export interface SubagentTerminalFactory {
-  createLane(owner: string): SandboxToolLane;
+  createLane(owner: string, workspacePath?: string): SandboxToolLane;
   tools(lane: SandboxToolLane, role: string): AgentTool[];
   close(): Promise<void>;
 }
@@ -33,7 +33,14 @@ export class SubagentTerminals {
 
   constructor(private readonly stateRoot: string, private readonly factory: SubagentTerminalFactory) {}
 
-  async attach(role: string, session: string, sessionFile: string, signal: AbortSignal, ready: (id: string) => void): Promise<void> {
+  async attach(
+    role: string,
+    session: string,
+    sessionFile: string,
+    workspacePath: string,
+    signal: AbortSignal,
+    ready: (id: string) => void,
+  ): Promise<void> {
     const path = verifyChildSession(this.stateRoot, session, sessionFile);
     const owner = "child-" + createHash("sha256").update(session + "\0" + path).digest("hex").slice(0, 24);
     let prior = this.leases.get(owner);
@@ -45,7 +52,7 @@ export class SubagentTerminals {
     }
     signal.throwIfAborted();
     if (this.closed) throw new Error("Child terminal host closed");
-    const lane = this.factory.createLane(owner);
+    const lane = this.factory.createLane(owner, workspacePath);
     const { promise: drained, resolve } = Promise.withResolvers<void>();
     const controller = new AbortController();
     const lease: TerminalLease = {

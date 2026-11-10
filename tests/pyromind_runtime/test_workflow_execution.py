@@ -86,7 +86,7 @@ async def test_confirmed_workflow_submits_once_and_resumes_followup(
     conversation_id = "workflow-conversation"
     prepared = await runtime.prepare_workflow_execution(
         conversation_id,
-        "storage/.pyromind-agent/workflow.py",
+        "/workspace/.pyromind-agent/workflow.py",
         context,
         request_id="request-1",
     )
@@ -123,7 +123,7 @@ async def test_confirmed_workflow_submits_once_and_resumes_followup(
     assert reference == {
         "request_id": "request-1",
         "task_id": "task-123",
-        "workflow_path": "storage/.pyromind-agent/workflow.py",
+        "workflow_path": "/workspace/.pyromind-agent/workflow.py",
         "status": "pending",
     }
     assert (
@@ -180,7 +180,10 @@ async def test_workflow_task_reference_is_recovered_before_next_user_turn(
     if fail_initial_sync:
         monkeypatch.setattr(adapter, "notify_external_task", unavailable)
     await runtime.prepare_workflow_execution(
-        "workflow-conversation", "storage/project/workflow.py", context, request_id="r"
+        "workflow-conversation",
+        "/workspace/project/workflow.py",
+        context,
+        request_id="r",
     )
     receipt = await runtime.submit_command(
         "workflow-conversation",
@@ -213,7 +216,7 @@ async def test_workflow_task_reference_is_recovered_before_next_user_turn(
     reference = adapter.external_task_notifications[0][1]
     assert reference.trigger_turn is False
     assert reference.task_id == "task-123"
-    assert "storage/project/workflow.py" in reference.hidden_text
+    assert "/workspace/project/workflow.py" in reference.hidden_text
     assert adapter.sent[-1][1].command_id == "check-task"
     await runtime.close()
 
@@ -222,7 +225,10 @@ async def test_workflow_task_reference_is_recovered_before_next_user_turn(
 async def test_workflow_confirmation_cancel_or_failure(tmp_path, decision):
     runtime, adapter, submission, context = await _runtime(tmp_path)
     await runtime.prepare_workflow_execution(
-        "workflow-conversation", "storage/project/workflow.py", context, request_id="r"
+        "workflow-conversation",
+        "/workspace/project/workflow.py",
+        context,
+        request_id="r",
     )
     if decision == "allow_once":
 
@@ -256,7 +262,10 @@ async def test_workflow_confirmation_cancel_or_failure(tmp_path, decision):
 async def test_failed_workflow_callback_routes_to_failure_analysis(tmp_path):
     runtime, adapter, _, context = await _runtime(tmp_path, training=False)
     await runtime.prepare_workflow_execution(
-        "workflow-conversation", "storage/project/workflow.py", context, request_id="r"
+        "workflow-conversation",
+        "/workspace/project/workflow.py",
+        context,
+        request_id="r",
     )
     await runtime.submit_command(
         "workflow-conversation",
@@ -287,7 +296,10 @@ async def test_failed_workflow_callback_routes_to_failure_analysis(tmp_path):
 async def test_callback_arriving_during_create_waits_for_task_registration(tmp_path):
     runtime, adapter, submission, context = await _runtime(tmp_path)
     await runtime.prepare_workflow_execution(
-        "workflow-conversation", "storage/project/workflow.py", context, request_id="r"
+        "workflow-conversation",
+        "/workspace/project/workflow.py",
+        context,
+        request_id="r",
     )
     callback: asyncio.Task | None = None
 
@@ -339,7 +351,7 @@ async def test_pi_tool_exposes_confirmed_workflow_entry(tmp_path):
     assert "submit_workflow" in {spec["name"] for spec in host.specs()}
     result = await host.execute(
         "submit_workflow",
-        {"workflow_path": "storage/project/workflow.py"},
+        {"workflow_path": "/workspace/project/workflow.py"},
         ToolExecutionContext(
             conversation_id="conversation-1",
             workspace_root=tmp_path,
@@ -349,4 +361,4 @@ async def test_pi_tool_exposes_confirmed_workflow_entry(tmp_path):
         tool_call_id="call-1",
     )
     assert result["details"]["status"] == "awaiting_confirmation"
-    assert calls == [("conversation-1", "storage/project/workflow.py", "call-1")]
+    assert calls == [("conversation-1", "/workspace/project/workflow.py", "call-1")]

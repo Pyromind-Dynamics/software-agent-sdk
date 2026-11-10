@@ -190,12 +190,12 @@ class Preparations:
                 if (
                     item.resource_id is None
                     or entry.task.inputs.get(item.name)
-                    != resources[item.resource_id].uri
+                    != resources[item.resource_id].storage_path
                 ):
                     raise ValueError(
                         "entry task inputs must resolve declared resources"
                     )
-            if any(item.uri is None for item in plan.resources):
+            if any(item.storage_path is None for item in plan.resources):
                 raise ValueError("resolve plan resource locations before creation")
         updated = PreparationView.model_validate(
             {
@@ -246,9 +246,9 @@ class Preparations:
         inputs = {}
         for item in task.inputs:
             resource = resources.get(item.resource_id or "")
-            if resource is None or resource.uri is None:
+            if resource is None or resource.storage_path is None:
                 raise ValueError("the first task requires concrete resource inputs")
-            inputs[item.name] = resource.uri
+            inputs[item.name] = resource.storage_path
         entry = DelegateExperimentTask(
             role_id=request.role_id,
             request_id=task.id,

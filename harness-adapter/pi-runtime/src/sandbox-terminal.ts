@@ -1574,9 +1574,16 @@ export class LazySandboxTerminalOperations implements BashOperations {
       for (let attempt = 0; ; attempt += 1) {
         const operations = await this.resolveOperations(options);
         try {
-          return await operations.exec(command, cwd, options);
+          const result = await operations.exec(command, cwd, options);
+          if (operations.terminationUnconfirmed) {
+            operations.dispose();
+            this.operations = undefined;
+            this.endpoints.replaceSandbox(this.endpointRequest);
+          }
+          return result;
         } catch (error) {
-          if (!isStaleTerminal(error) && !isUnstartedTerminalFailure(error)) {
+          const replace = isUnconfirmedStartedExecution(error);
+          if (!isStaleTerminal(error) && !isUnstartedTerminalFailure(error) && !replace) {
             throw error;
           }
           // The endpoint bundle can outlive the pod it names: a rescheduled
@@ -1586,8 +1593,10 @@ export class LazySandboxTerminalOperations implements BashOperations {
           // rebuilds a sandbox whose pod is gone.
           operations.dispose();
           this.operations = undefined;
-          this.endpoints.invalidate(this.endpointRequest);
+          if (replace) this.endpoints.replaceSandbox(this.endpointRequest);
+          else this.endpoints.invalidate(this.endpointRequest);
           this.endpointRequest = undefined;
+          if (replace) throw error;
           if (attempt >= MAX_ENDPOINT_REFRESHES || !isPreLaunchDrop(error)) throw error;
         }
       }
@@ -1753,6 +1762,13 @@ function isStaleTerminal(error: unknown): boolean {
 export function isUnstartedTerminalFailure(error: unknown): boolean {
   if (error instanceof SandboxTerminalExecutionError) return !error.execution.started;
   return isTimeout(error) || isConnectionLost(error);
+}
+
+/** A command may still be running because its process group was not stopped. */
+export function isUnconfirmedStartedExecution(error: unknown): boolean {
+  return error instanceof SandboxTerminalExecutionError &&
+    error.execution.started &&
+    !error.execution.stopped;
 }
 
 /** A drop before the launch line left no process group behind to repeat. */

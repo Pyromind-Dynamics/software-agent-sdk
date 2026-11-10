@@ -28,6 +28,8 @@ from openhands.tools.sandbox import (
     SandboxReadFileExecutor,
     SandboxTerminalAction,
     SandboxTerminalExecutor,
+    SandboxUploadAction,
+    SandboxUploadExecutor,
     SandboxWriteFileAction,
     SandboxWriteFileExecutor,
     write_sandbox_file,
@@ -229,6 +231,36 @@ def test_sandbox_create_waits_for_running(monkeypatch: pytest.MonkeyPatch) -> No
         _SANDBOX_ID, target_status="running", timeout=30
     )
     client.sandboxes.get_sandbox.assert_called_once_with(_SANDBOX_ID)
+
+
+def test_sandbox_upload_uses_the_workspace_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = SandboxUploadExecutor(storage_base_url="https://storage.test")
+    client = MagicMock()
+    client.exec_command.side_effect = [
+        SimpleNamespace(output="/workspace\n", stderr="", returncode=0),
+        SimpleNamespace(output="", stderr="", returncode=0),
+    ]
+    monkeypatch.setattr(executor, "_sandbox_client", lambda _: client)
+
+    observation = executor(
+        SandboxUploadAction(
+            sandbox_id=_SANDBOX_ID,
+            sandbox_path="/workspace/result.csv",
+            storage_path="/workspace/datasets",
+        ),
+        _fake_conversation(),
+    )
+
+    assert not observation.is_error
+    assert observation.storage_path == "/workspace/datasets"
+    commands = [call.args[1] for call in client.exec_command.call_args_list]
+    assert commands[0].startswith("ls -d /workspace ")
+    assert commands[1] == (
+        "mkdir -p /workspace/datasets && "
+        "cp -r /workspace/result.csv /workspace/datasets/"
+    )
 
 
 def test_sandbox_create_uses_default_image_for_regional_cluster(

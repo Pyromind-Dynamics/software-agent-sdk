@@ -34,9 +34,9 @@ class LabelStudioProjectAction(Action):
     dataset_path: str | None = Field(
         default=None,
         description=(
-            "Storage object path (/datasets/...), absolute Storage mount path "
-            "(/target-workspace/...), or a workspace-relative path. Required for "
-            "operation='create'. A directory of "
+            "User Storage path (/workspace/datasets/...) or a conversation-relative "
+            "path such as public_data/.... Required for operation='create'. A "
+            "directory of "
             "sample directories for the directory adapters, or one JSON Lines "
             "object for adapter='jsonl' -- a pipeline's own output file is "
             "imported as written, without being reshaped first. A Genome run's "
@@ -47,8 +47,8 @@ class LabelStudioProjectAction(Action):
     label_config_path: str | None = Field(
         default=None,
         description=(
-            "label_config.xml in the workspace or Storage (object path or "
-            "absolute mount path). Required for "
+            "label_config.xml in the workspace or user Storage (for example "
+            "'/workspace/config/label_config.xml'). Required for "
             "operation='create' and 'update_config'."
         ),
     )
@@ -98,7 +98,8 @@ class LabelStudioProjectAction(Action):
     output_path: str | None = Field(
         default=None,
         description=(
-            "User storage directory for operation='export'. Defaults to the "
+            "User Storage directory such as '/workspace/datasets/export' for "
+            "operation='export'. Defaults to the "
             "project artifact directory."
         ),
     )
@@ -134,7 +135,8 @@ class LabelStudioProjectObservation(Observation):
         default=None, description="Number of exported annotated samples."
     )
     manifest_path: str | None = Field(
-        default=None, description="User storage path of the task manifest."
+        default=None,
+        description="User Storage path of the task manifest (`/workspace/...`).",
     )
     open_url: str | None = Field(
         default=None,
@@ -155,7 +157,8 @@ class LabelStudioProjectObservation(Observation):
         ),
     )
     export_path: str | None = Field(
-        default=None, description="User storage path of exported annotations."
+        default=None,
+        description="User Storage path of exported annotations (`/workspace/...`).",
     )
 
 
@@ -163,7 +166,7 @@ TOOL_DESCRIPTION = """Create, inspect, update, or export a Label Studio annotati
 
 Required create inputs: dataset_path (source data), label_config_path (label XML).
 For a JSON Lines file, call with operation='create', adapter='jsonl',
-dataset_path='storage/datasets/badcase.jsonl',
+dataset_path='/workspace/datasets/badcase.jsonl',
 label_config_path='public_data/label_config.xml'.
 Add field_map_path when custom bindings are needed. output_path is an export
 destination only; it cannot replace either create input.

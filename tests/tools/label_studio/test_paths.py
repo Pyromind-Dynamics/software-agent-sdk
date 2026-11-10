@@ -10,15 +10,14 @@ from openhands.tools.label_studio.paths import resolve_storage_input
 @pytest.mark.parametrize(
     "path",
     [
-        "/target-workspace/datasets/pcb/defect.jpg",
+        "/workspace/datasets/pcb/defect.jpg",
         "/datasets/pcb/defect.jpg",
-        "datasets/pcb/defect.jpg",
     ],
 )
-def test_storage_alias_mount_and_object_paths_are_equivalent(path):
+def test_workspace_and_storage_api_paths_are_equivalent(path):
     workspace = SimpleNamespace(
-        working_dir="/target-workspace/.pyromind-agent/conversation",
-        storage_path="/target-workspace",
+        working_dir="/workspace/.pyromind-agent/conversation",
+        storage_path="/workspace",
     )
     result = resolve_storage_input(path, workspace, "conversation")
     assert result.original == path
@@ -29,8 +28,8 @@ def test_storage_alias_mount_and_object_paths_are_equivalent(path):
 
 def test_workspace_file_uses_conversation_storage_namespace():
     workspace = SimpleNamespace(
-        working_dir="/target-workspace/.pyromind-agent/one",
-        storage_path="/target-workspace",
+        working_dir="/workspace/.pyromind-agent/one",
+        storage_path="/workspace",
     )
     result = resolve_storage_input("public_data/map.json", workspace, "one")
     assert result.resolved == "/.pyromind-agent/one/public_data/map.json"
@@ -51,7 +50,19 @@ def test_storage_directory_named_storage_is_not_removed():
 
 
 @pytest.mark.parametrize(
-    "path", ["", "/", ".", "storage/", "../a", "storage/../a", "a\nb"]
+    "path",
+    [
+        "",
+        "/",
+        ".",
+        "datasets/pcb/defect.jpg",
+        "storage/",
+        "storage://datasets/pcb/defect.jpg",
+        "/target-workspace/datasets/pcb/defect.jpg",
+        "../a",
+        "storage/../a",
+        "a\nb",
+    ],
 )
 def test_invalid_paths_are_rejected_before_resolution(path):
     with pytest.raises(ValueError):

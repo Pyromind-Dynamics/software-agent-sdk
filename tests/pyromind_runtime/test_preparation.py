@@ -113,7 +113,13 @@ def ready_request():
         },
         "plan": {
             "goal": "Evaluate model",
-            "resources": [{"id": "data", "name": "Data", "uri": "/eval.jsonl"}],
+            "resources": [
+                {
+                    "id": "data",
+                    "name": "Data",
+                    "storage_path": "/workspace/eval.jsonl",
+                }
+            ],
             "stages": [{"id": "evaluation", "name": "Eval"}],
             "tasks": [
                 {
@@ -131,7 +137,11 @@ def ready_request():
             "task": {
                 "name": "Evaluate",
                 "instruction": "Use the confirmed rubric",
-                "inputs": {"dataset": "/eval.jsonl", "model": "/model", "limit": 2},
+                "inputs": {
+                    "dataset": "/workspace/eval.jsonl",
+                    "model": "/workspace/model",
+                    "limit": 2,
+                },
             },
         },
     }
@@ -335,10 +345,7 @@ def test_stale_preparation_update_returns_latest_revision_and_facts(
     assert details["error"] == "preparation_revision_conflict"
     assert details["expected_revision"] == first.revision
     assert details["current_revision"] == first.revision + 1
-    assert (
-        details["current_preparation"]["facts"]["dataset"]["value"]
-        == "/newer.jsonl"
-    )
+    assert details["current_preparation"]["facts"]["dataset"]["value"] == "/newer.jsonl"
     assert "Merge" in details["action"]
 
 
@@ -840,7 +847,7 @@ def test_plan_submission_reuses_collected_facts_and_resolves_entry_resources(
     )
     assert ready.phase == "ready" and ready.facts == collected.facts
     assert ready.entry_task is not None and ready.entry_task.task.inputs == {
-        "dataset": "/eval.jsonl"
+        "dataset": "/workspace/eval.jsonl"
     }
     assert ready.entry_task.task.name == "Evaluate"
     assert store.project(owner) is None

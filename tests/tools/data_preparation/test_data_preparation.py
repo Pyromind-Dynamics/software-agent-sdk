@@ -2087,7 +2087,7 @@ def test_df_run_pipeline_sandbox_reads_storage_without_downloading(
         DfRunPipelineAction(
             pipeline_path="public_data/data-preparation/pipeline.py",
             args=[
-                "storage/datasets/input.jsonl",
+                str(datasets / "input.jsonl"),
                 "public_data/data-preparation/filtered.sample.jsonl",
             ],
             model_profile="none",
@@ -2139,7 +2139,7 @@ def test_df_run_pipeline_sandbox_reads_legacy_storage_without_downloading(
         DfRunPipelineAction(
             pipeline_path="public_data/data-preparation/pipeline.py",
             args=[
-                "storage/datasets/input.jsonl",
+                str(datasets / "input.jsonl"),
                 "public_data/data-preparation/filtered.sample.jsonl",
             ],
             model_profile="none",
@@ -2185,7 +2185,7 @@ def test_df_run_pipeline_sandbox_reads_storage_input(
         DfRunPipelineAction(
             pipeline_path="public_data/data-preparation/pipeline.py",
             args=[
-                "storage/datasets/input.jsonl",
+                str(storage_dir / "datasets" / "input.jsonl"),
                 "public_data/data-preparation/filtered.sample.jsonl",
             ],
             model_profile="none",
@@ -2292,7 +2292,10 @@ def test_df_run_pipeline_sandbox_rejects_storage_output(
     observation = DfRunPipelineExecutor()(
         DfRunPipelineAction(
             pipeline_path="public_data/data-preparation/pipeline.py",
-            args=["storage/datasets/input.jsonl", "storage/output.jsonl"],
+            args=[
+                str(storage_dir / "datasets" / "input.jsonl"),
+                str(storage_dir / "output.jsonl"),
+            ],
             output_schema="text",
             model_profile="none",
         ),
@@ -2526,7 +2529,7 @@ def _run_vision_sandbox_sample(
     if manifest_in_storage:
         sample_dir = sandbox_workspace.storage_dir / "datasets" / "prelabel_in"
         pipeline_path = "public_data/data-preparation/pipeline.py"
-        manifest_arg = "storage/datasets/prelabel_in/sample_manifest.jsonl"
+        manifest_arg = str(sample_dir / "sample_manifest.jsonl")
     else:
         sample_dir = workspace_dir / "public_data" / "data-preparation" / "prelabel_in"
         pipeline_path = "public_data/data-preparation/prelabel_in/pipeline.py"

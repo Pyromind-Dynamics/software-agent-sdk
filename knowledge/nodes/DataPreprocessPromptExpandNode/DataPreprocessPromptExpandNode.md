@@ -11,7 +11,7 @@ Run data_preprocess prompt-expand pipeline and emit output path.
 | 参数 | 数据类型 | 必填 | 描述 |
 |------|---------|------|------|
 | input_path | STRING | 是 | Input path |
-| output_path | STRING | 是 | 输出目录或文件路径 |
+| output_path | STRING | 是 | 持久化输出目录或文件路径，使用 `/workspace/...` |
 | user_prompt | STRING | 否 | User prompt |
 | user_prompt_column | STRING | 否 | User prompt column。默认值：空字符串 |
 | format_lang | STRING | 否 | Format lang。默认值：`en` |

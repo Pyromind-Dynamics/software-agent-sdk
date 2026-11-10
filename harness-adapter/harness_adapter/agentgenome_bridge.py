@@ -238,8 +238,8 @@ def _storage_alias(path: str, mount: str | None) -> str | None:
 
     Platform tools address Storage without the mount prefix (`/datasets/...`,
     `datasets/...`), while the sandbox reads Storage under its mount
-    (`/target-workspace/datasets/...`). A path the sandbox can already resolve
-    is left alone.
+    (`/workspace/datasets/...` by default). A path the sandbox can already
+    resolve is left alone.
     """
     if mount is None:
         return None

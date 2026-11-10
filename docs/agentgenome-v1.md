@@ -10,7 +10,7 @@ AgentGenome 在原生 Pi 与 SDK 中使用同一个默认插件入口。SDK 通�
 
 面向 Agent 和用户，AgentGenome graph 统一称为“历史经验”；“工作流”指 Pyromind 平台 DSL。历史经验（graph + scripts）和 Skill 都可复用：执行任务先查 `genome_list`，用 `genome_get` 确认适用性，合适则复用，否则再选 Skill。闲聊无需查询。工具名 `genome_*` 和内部工作流接口保持兼容。
 
-Storage 输入用挂载点绝对路径，例如 `/target-workspace/agentTest/input.csv`。`agentTest/input.csv` 指当前会话下的相对路径，并非同一文件；平台的 `/workspace/...` 也不能直接当作当前沙箱路径。旧写法 `storage/...` 已移除（会被读成挂载点，但不要再使用）。使用 `read`/`terminal` 已验证成功的原路径。
+Storage 输入统一使用 `/workspace/<path>`，例如 `/workspace/datasets/input.csv`。`datasets/input.csv` 指当前会话下的相对路径，并非同一文件。不要使用已移除的 `storage/` 相对写法；使用 `read`/`terminal` 已验证成功的路径。
 
 ## 快速测试与启动
 
@@ -31,7 +31,7 @@ Storage 输入用挂载点绝对路径，例如 `/target-workspace/agentTest/inp
 
 模板会复制到 `workspace/.pyromind-agent/agentgenome/assets/data-cleaning/1.0.0/`，验收后发布；测试输入和产物在 `workspace/genome-validation/`。重复测试创建新运行，不能用不同内容覆盖已发布版本。测试固定使用本地 `os-sandbox`；真实平台沙箱需在聊天中另测。
 
-资产目录可通过 `AGENTGENOME_HOME` 配置，默认取 `OH_CONVERSATIONS_PATH` 同级的 `.pyromind-agent/agentgenome` 目录。在平台上该路径落在用户 Storage 挂载内（pod 的 `/workspace/.pyromind-agent/agentgenome`），沙箱内同一棵树在 `/target-workspace/.pyromind-agent/agentgenome`，所以 agent 既能用 `genome_*` 工具，也能直接读冻结包里的脚本与 `graph.yaml`。一份目录只能由一个 SDK 执行进程持有。非相邻仓库可配置 `AGENTGENOME_DIR`（SDK 入口）或 `SOFTWARE_AGENT_SDK_DIR`（AgentGenome 入口）。
+资产目录可通过 `AGENTGENOME_HOME` 配置，默认取 `OH_CONVERSATIONS_PATH` 同级的 `.pyromind-agent/agentgenome` 目录。在平台上该路径位于用户 Storage 的 `/workspace/.pyromind-agent/agentgenome`，agent 既能用 `genome_*` 工具，也能直接读冻结包里的脚本与 `graph.yaml`。一份目录只能由一个 SDK 执行进程持有。非相邻仓库可配置 `AGENTGENOME_DIR`（SDK 入口）或 `SOFTWARE_AGENT_SDK_DIR`（AgentGenome 入口）。
 
 启动服务时，执行后端仍由 `PYROMIND_PI_TERMINAL_BACKEND` 决定。无启动选项时插件默认关闭，也可设置 `PYROMIND_AGENTGENOME_ENABLED=1` 启用。Python wheel 和 Pi 扩展 npm tarball 随 SDK 锁定；修改 AgentGenome 源码后需按下文重新打包，启动脚本不会跨仓库加载源码。
 
@@ -55,7 +55,7 @@ Storage 输入用挂载点绝对路径，例如 `/target-workspace/agentTest/inp
 
 历史经验只收完整固化的链路：每条经验都是一个能重跑的 graph，步骤形态只有固定命令（`run`）、宿主工具调用（`tool`）、agent 裁量（`llm`）和人工门禁（`human`）四种。固不下来的步骤不会被声明进 manifest 蒙混过关，沉淀直接失败并列出原因。适用范围靠 `applies_when` / `not_applies_when` / `input_contract` 声明，不靠把具体步骤泛化成描述。完整设计见 AgentGenome 仓库的 `docs/v2-capture.md`。
 
-路径参数使用当前会话可访问的路径，如 `public_data/input.csv`；平台 sandbox 后端也支持 `storage/...`。不能传服务端任意路径。图启动前会冻结版本并校验参数，Pi 本轮结束后才开始运行。
+路径参数使用当前会话可访问的路径：用户 Storage 写成 `/workspace/...`，会话文件写成 `public_data/...`。不能传服务端任意路径。图启动前会冻结版本并校验参数，Pi 本轮结束后才开始运行。
 
 ## 行为与限制
 

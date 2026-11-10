@@ -20,7 +20,7 @@ export async function installChildHost(pi: ExtensionAPI, role: string) {
     const identity = { session: ctx.sessionManager.getSessionId(), session_file: ctx.sessionManager.getSessionFile() };
     attachment = { controller, ready, identity };
     void callSubagentHost(socket, {
-      method: "terminal.attach", role, ...identity,
+      method: "terminal.attach", role, scope: config.scope, ...identity,
     }, controller.signal, (value) => resolve(value.id), true).catch(reject).finally(() => {
       if (attachment?.controller === controller) attachment = undefined;
     });

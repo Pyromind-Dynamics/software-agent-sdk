@@ -96,8 +96,14 @@ export function applySandboxPathAliases(
 }
 
 export interface SandboxPathPolicyInput {
-  /** Sandbox-side conversation root, e.g. `/target-workspace/.pyromind-agent/<id>`. */
+  /** Root used to resolve model-visible relative paths. */
   workspacePath: string;
+  /**
+   * Sandbox-side conversation root. Defaults to `workspacePath`; delegated
+   * lanes pass their task workspace as `workspacePath` while retaining the
+   * conversation root for cross-task and cross-conversation isolation.
+   */
+  conversationRoot?: string;
   readOnlyRoots: string[];
   skillsDirectory?: string;
   knowledgeRoot?: string;
@@ -110,9 +116,11 @@ export interface SandboxPathPolicyInput {
  *
  * The local `WorkspaceAccessPolicy` canonicalizes through the host filesystem,
  * which cannot see the sandbox. This mirrors its model-visible vocabulary
- * (relative paths start at the conversation root, `public_data/` is writable,
+ * (relative paths start at the lane workspace, `public_data/` is writable,
  * `.agents/skills/` and `knowledge/` are read-only aliases) using pure string
- * arithmetic so it works without any filesystem access.
+ * arithmetic so it works without any filesystem access. Delegated lanes can
+ * move that workspace root while `conversationRoot` remains the boundary that
+ * prevents cross-task and cross-conversation access.
  *
  * The user Storage mount is addressed by its absolute path. It used to be
  * reachable through a `storage/` symlink in the workspace; that alias is gone,
@@ -122,6 +130,7 @@ export interface SandboxPathPolicyInput {
 export class SandboxPathPolicy {
   private constructor(
     readonly workspacePath: string,
+    readonly conversationRoot: string,
     readonly publicDataPath: string,
     readonly readOnlyRoots: readonly string[],
     readonly skillsDirectory: string | undefined,
@@ -131,6 +140,7 @@ export class SandboxPathPolicy {
 
   static create(input: SandboxPathPolicyInput): SandboxPathPolicy {
     const workspacePath = posix.resolve(input.workspacePath);
+    const conversationRoot = posix.resolve(input.conversationRoot ?? input.workspacePath);
     const readOnlyRoots = input.readOnlyRoots.map((root) => posix.resolve(root));
     const skillsDirectory = input.skillsDirectory
       ? posix.resolve(input.skillsDirectory)
@@ -143,6 +153,7 @@ export class SandboxPathPolicy {
       : undefined;
     return new SandboxPathPolicy(
       workspacePath,
+      conversationRoot,
       posix.join(workspacePath, "public_data"),
       [
         ...new Set([
@@ -182,23 +193,25 @@ export class SandboxPathPolicy {
     return target;
   }
 
-  /** True for the mount's agent directory: this workspace and its siblings. */
+  /** True for the mount's agent directory: every conversation workspace. */
   private insideAgentArea(target: string): boolean {
-    return insideSandboxPath(target, posix.dirname(this.workspacePath));
+    return insideSandboxPath(target, posix.dirname(this.conversationRoot));
   }
 
   /**
    * Why a path inside the agent directory stays closed, or undefined when it is
    * reachable.
    *
-   * This conversation's own directory is fair game: `public_data/`, the tool
-   * staging under `data_preparation/`, and the product state all live there.
-   * The runner's `pi/` bookkeeping and the loose files at the workspace root
-   * are not, and a sibling conversation is never reachable at all.
+   * The active lane workspace is fair game within its own public_data/ and tool
+   * staging. Other tasks and sibling conversations are not. The runner's `pi/`
+   * bookkeeping and loose files at the workspace root are also closed.
    */
   private agentAreaRefusal(target: string): string | undefined {
-    if (!insideSandboxPath(target, this.workspacePath)) {
+    if (!insideSandboxPath(target, this.conversationRoot)) {
       return "inside another conversation's workspace";
+    }
+    if (!insideSandboxPath(target, this.workspacePath)) {
+      return "outside this task's workspace";
     }
     if (insideSandboxPath(target, posix.join(this.workspacePath, RUNNER_STATE_DIRNAME))) {
       return `the runner's session state (${RUNNER_STATE_DIRNAME}/)`;
@@ -213,6 +226,11 @@ export class SandboxPathPolicy {
 
   private resolveInput(input: string): string {
     const parts = input.split("/").filter((part) => part !== "" && part !== ".");
+    if (this.storageRoot) {
+      if (input === PUBLIC_STORAGE_MOUNT || input.startsWith(`${PUBLIC_STORAGE_MOUNT}/`)) {
+        return posix.join(this.storageRoot, input.slice(PUBLIC_STORAGE_MOUNT.length));
+      }
+    }
     if (!input.startsWith("/") && parts[0] === ".agents" && parts[1] === "skills") {
       if (!this.skillsDirectory) {
         throw new Error(
@@ -229,7 +247,7 @@ export class SandboxPathPolicy {
       }
       return posix.join(this.knowledgeRoot, ...parts.slice(1));
     }
-    if (!input.startsWith("/") && parts[0] === LEGACY_STORAGE_ALIAS) {
+    if (input.startsWith("storage:") || (!input.startsWith("/") && parts[0] === LEGACY_STORAGE_ALIAS)) {
       throw new Error(legacyStorageAliasError(this.storageRoot));
     }
     return input.startsWith("/") ? input : posix.join(this.workspacePath, input);
@@ -241,8 +259,9 @@ export function insideSandboxPath(target: string, root: string): boolean {
   return target.startsWith(root.endsWith("/") ? root : `${root}/`);
 }
 
-/** The removed workspace symlink; kept only so a stale habit gets a clear error. */
+/** The removed Storage alias; kept only so a stale habit gets a clear error. */
 const LEGACY_STORAGE_ALIAS = "storage";
+const PUBLIC_STORAGE_MOUNT = "/workspace";
 
 /** The runner's own bookkeeping inside the conversation workspace. */
 const RUNNER_STATE_DIRNAME = "pi";

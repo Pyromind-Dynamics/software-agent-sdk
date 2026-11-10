@@ -791,15 +791,21 @@ async def test_native_eval_submits_then_resumes_for_report_and_notifies_manager(
                 "name": "自由命名的基模评测",
                 "instruction": "Run one sample baseline",
                 "inputs": {
-                    "model_path": "/models/base",
-                    "input_path": "/dataset.jsonl",
+                    "model_path": "/workspace/models/base",
+                    "input_path": "/workspace/dataset.jsonl",
                 },
             },
         }
         guide = {
             "goal": "One sample baseline",
             "stages": [{"id": "init", "kind": "init", "name": "Init"}],
-            "resources": [{"id": "data", "name": "Data", "uri": "/dataset.jsonl"}],
+            "resources": [
+                {
+                    "id": "data",
+                    "name": "Data",
+                    "storage_path": "/workspace/dataset.jsonl",
+                }
+            ],
             "tasks": [
                 {
                     "id": "baseline",
@@ -1092,7 +1098,11 @@ async def test_manager_inspects_and_plans_without_delegating_or_submitting(
     reference = {
         "goal": "Create a baseline plan without platform submission",
         "resources": [
-            {"id": "bench", "name": "Evaluation data", "uri": "public_data/val.jsonl"}
+            {
+                "id": "bench",
+                "name": "Evaluation data",
+                "storage_path": "/workspace/datasets/val.jsonl",
+            }
         ],
         "stages": [
             {"id": "init", "name": "Init"},

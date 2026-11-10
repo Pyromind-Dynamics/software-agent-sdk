@@ -11,7 +11,6 @@ from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.evaluation_configuration import (
     validate_evaluation_configuration,
 )
-from tests.pyromind_runtime.legacy_experiment_profile import LEGACY_EXPERIMENT_PROFILE as ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.experiment_plans import ExperimentPlans
 from pyromind_runtime.domain.context import RequestContext
@@ -31,6 +30,10 @@ from pyromind_runtime.infrastructure.sql_experiment_plan_store import (
 )
 from pyromind_runtime.ports.harness import SessionSpec
 from sqlalchemy import create_engine
+
+from tests.pyromind_runtime.legacy_experiment_profile import (
+    LEGACY_EXPERIMENT_PROFILE as ECHOMIND_PRODUCT_PROFILE,
+)
 
 
 async def test_legacy_eval_native_child_prepares_proposal_through_scoped_tools(
@@ -221,7 +224,13 @@ async def test_legacy_eval_native_child_prepares_proposal_through_scoped_tools(
             {
                 "name": "Baseline",
                 "goal": "Measure the base model",
-                "resources": [{"id": "data", "name": "Data", "uri": "/dataset.jsonl"}],
+                "resources": [
+                    {
+                        "id": "data",
+                        "name": "Data",
+                        "storage_path": "/workspace/dataset.jsonl",
+                    }
+                ],
                 "stages": [
                     {"id": "init", "name": "Init"},
                     {"id": "data", "name": "Data"},

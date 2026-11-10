@@ -52,10 +52,10 @@ NATIVE_VLM_SUFFIXES = {".jpg", ".jpeg", ".png"}
 CONVERTIBLE_VLM_SUFFIXES = {".gif", ".webp", ".bmp"}
 IMAGE_SUFFIXES = NATIVE_VLM_SUFFIXES | CONVERTIBLE_VLM_SUFFIXES
 
-# Platform pods mount user Storage here. Everything an agent or a downstream
-# tool reads back must be expressed without this prefix, so the object paths
-# written into structured rows are Storage paths rather than pod paths.
-STORAGE_MOUNT_PREFIX = "/target-workspace"
+# Image pipeline output is read by agents and users, so it always uses the
+# product Storage path. Platform Pods may need an internal mount alias.
+WORKSPACE_ROOT = "/workspace"
+PLATFORM_STORAGE_MOUNT = "/target-workspace"
 
 # Run-level failure summary, read back by generate_report.py as ``runtime_failure``
 # and by the host tool as ``report.json.failure``.
@@ -1328,19 +1328,23 @@ def _validate_schema_subset(value: Any, schema: Any, *, path: str) -> None:
             )
 
 
-def _storage_object_path(local_path: str) -> str:
+def _workspace_image_path(local_path: str) -> str:
     """Return the agent-facing path for one source image.
 
-    A platform run materializes user Storage under :data:`STORAGE_MOUNT_PREFIX`,
-    so the object path is the local path without that mount. A local sample run
-    has no mount and keeps its local path, which is the path that run can read.
+    A Pi sandbox mounts user Storage at :data:`WORKSPACE_ROOT`; a platform Pod
+    may expose the same tree through an internal alias. A local sample run has
+    no Storage mount and keeps its local path.
     """
-    path = Path(local_path)
-    try:
-        relative = path.relative_to(STORAGE_MOUNT_PREFIX)
-    except ValueError:
-        return str(path)
-    return f"/{relative.as_posix()}"
+    path = PurePosixPath(local_path)
+    if ".." in path.parts:
+        raise ValueError("source image paths must not contain '..'")
+    for mount in (WORKSPACE_ROOT, PLATFORM_STORAGE_MOUNT):
+        try:
+            relative = path.relative_to(mount)
+        except ValueError:
+            continue
+        return f"{WORKSPACE_ROOT}/{relative.as_posix()}"
+    return str(path)
 
 
 def _source_images(labels: list[str], local_paths: list[str]) -> dict[str, str]:
@@ -1357,7 +1361,7 @@ def _source_images(labels: list[str], local_paths: list[str]) -> dict[str, str]:
     for label, path in zip(labels, local_paths, strict=True):
         counts[label] = counts.get(label, 0) + 1
         key = label if counts[label] == 1 else f"{label}#{counts[label]}"
-        images[key] = _storage_object_path(path)
+        images[key] = _workspace_image_path(path)
     return images
 
 

@@ -316,7 +316,7 @@ def test_executor_submits_single_manifest(
     assert observation.task_ids == ["task-99"]
     assert observation.resumed is False
     assert len(observation.output_dirs) == 1
-    assert observation.output_dirs[0].startswith("/edp/batch-001/")
+    assert observation.output_dirs[0].startswith("/workspace/edp/batch-001/")
     # runner + profile + pod_runtime tree staged; the manifest already lives
     # on Storage and is never re-uploaded
     assert mocks.upload.call_count == 2 + _pod_runtime_file_count()
@@ -356,7 +356,7 @@ def test_executor_resume_reuses_run_id(
 
     assert observation.resumed is True
     assert observation.run_ids == [run_id]
-    assert observation.output_dirs == [f"/edp/batch-001/{run_id}"]
+    assert observation.output_dirs == [f"/workspace/edp/batch-001/{run_id}"]
 
 
 def test_executor_shards_index_download_fails(
@@ -490,8 +490,8 @@ def test_executor_submits_shard_batch_with_offset_and_count(
     ]
     assert "--manifest /target-workspace/edp/batch-002/manifest.jsonl" in commands[0]
     assert "--manifest /target-workspace/edp/batch-003/manifest.jsonl" in commands[1]
-    assert observation.output_dirs[0].startswith("/edp/batch-002/")
-    assert observation.output_dirs[1].startswith("/edp/batch-003/")
+    assert observation.output_dirs[0].startswith("/workspace/edp/batch-002/")
+    assert observation.output_dirs[1].startswith("/workspace/edp/batch-003/")
     # a fresh batch gives each shard an independent run dir
     assert observation.run_ids[0] != observation.run_ids[1]
     assert conversation.register_active_long_task.call_count == 2
@@ -517,7 +517,7 @@ def test_executor_shard_batch_resume_shares_run_id(
     assert observation.resumed is True
     # all shards share the run id so each resume skips its own checkpoint
     assert observation.run_ids == [run_id]
-    assert observation.output_dirs == [f"/edp/batch-001/{run_id}"]
+    assert observation.output_dirs == [f"/workspace/edp/batch-001/{run_id}"]
 
 
 def test_executor_shard_batch_stops_on_first_failure(
@@ -605,10 +605,11 @@ def test_executor_stages_runtime_wheel_and_rewrites_profile(
 
     assert observation.status == "Pending"
     output_dir = observation.output_dirs[0]
-    assert captured[f"{output_dir}/wheels/{wheel_name}"] == b"PK-wheel-bytes"
-    staged_profile = json.loads(captured[f"{output_dir}/tmax-validation.json"])
+    storage_output_dir = output_dir.removeprefix("/workspace")
+    assert captured[f"{storage_output_dir}/wheels/{wheel_name}"] == b"PK-wheel-bytes"
+    staged_profile = json.loads(captured[f"{storage_output_dir}/tmax-validation.json"])
     command = staged_profile["steps"][0]["params"]["command"]
-    assert f"/target-workspace{output_dir}/wheels/{wheel_name}" in command
+    assert f"/target-workspace{storage_output_dir}/wheels/{wheel_name}" in command
     assert "{edp_run_dir}" not in command
 
 

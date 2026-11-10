@@ -279,6 +279,11 @@ class TrainingAnalysisExecutor(
         source = (self.runtime_dir / "training_artifacts.py").read_text()
         discovered = deepcopy(observation.result)
         marker = "__TRAINING_ARTIFACTS__:"
+        storage_mount = (
+            str(workspace.storage_path)
+            if is_remote_workspace(workspace)
+            else str(host_root)
+        )
         for node in discovered.get("training_nodes", []):
             if not node.get("output_path"):
                 continue
@@ -287,6 +292,8 @@ class TrainingAnalysisExecutor(
                 + repr(marker)
                 + " + json.dumps(discover("
                 + repr(node["output_path"])
+                + ", mount="
+                + repr(storage_mount)
                 + ", base_model="
                 + repr(
                     node.get("inputs", {}).get("base_model")

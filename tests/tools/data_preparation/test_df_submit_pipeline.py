@@ -864,12 +864,16 @@ def test_new_full_run_uses_conversation_scoped_output_root(
     assert observation.run_id is not None
     if managed:
         assert str(observation.run_id) == "a8d15e82-1290-46ba-a264-be02242162a4"
+    assert "End this turn now" in observation.text
+    assert "Do not poll for progress" in observation.text
+    assert "While the job runs" not in observation.text
+    assert observation.output_dir is not None
     assert observation.output_dir == (
-        f"/.pyromind-agent/conv-1/data_preparation/{observation.run_id}"
+        f"/workspace/.pyromind-agent/conv-1/data_preparation/{observation.run_id}"
     )
     saved = DataPreparationTaskStore(tmp_path / "tasks").get("task-new")
     assert saved is not None
-    assert saved.output_dir == observation.output_dir
+    assert saved.output_dir == observation.output_dir.removeprefix("/workspace")
     assert saved.script_path == "public_data/data-preparation/pipeline.py"
     assert conversation.state.active_long_tasks[0].model_dump() == {
         "task_id": "task-new",

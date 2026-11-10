@@ -41,6 +41,7 @@ from openhands.tools.utils.platform_env import (
     platform_headers,
     platform_portal_url,
 )
+from openhands.tools.utils.storage_paths import to_tool_storage_path
 
 
 if TYPE_CHECKING:
@@ -87,8 +88,8 @@ class DfStopTaskAction(Action):
     output_dir: str | None = Field(
         default=None,
         description=(
-            "Storage output directory returned by either submission tool, used to "
-            "look up the task."
+            "`/workspace/...` output directory returned by either submission "
+            "tool, used to look up the task."
         ),
     )
 
@@ -200,10 +201,13 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
     def _resolve_task_id(
         self, action: DfStopTaskAction, conversation: BaseConversation | None
     ) -> str | None:
+        output_dir = (
+            to_tool_storage_path(action.output_dir, field="output_dir")
+            if action.output_dir and action.output_dir.strip()
+            else None
+        )
         if self._task_resolver is not None:
-            resolved = self._task_resolver(
-                action.task_id, action.run_id, action.output_dir
-            )
+            resolved = self._task_resolver(action.task_id, action.run_id, output_dir)
             if resolved is not None:
                 return resolved
         if action.task_id and action.task_id.strip():
@@ -227,8 +231,8 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
             association = store.get_by_run_id(action.run_id.strip())
             if association is not None:
                 return association.task_id
-        if action.output_dir and action.output_dir.strip():
-            association = store.get_by_output_dir(action.output_dir.strip())
+        if output_dir is not None:
+            association = store.get_by_output_dir(output_dir)
             if association is not None:
                 return association.task_id
         return None

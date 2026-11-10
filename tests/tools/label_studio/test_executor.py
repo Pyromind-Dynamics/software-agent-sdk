@@ -54,7 +54,7 @@ def conversation(tmp_path: Path, workspace_xml: Path) -> MagicMock:
     conv = MagicMock()
     conv.id = "test-conversation-id"
     conv.workspace.working_dir = str(tmp_path)
-    conv.workspace.storage_path = "/target-workspace"
+    conv.workspace.storage_path = "/workspace"
     conv.state.secret_registry.get_secret_value.return_value = "test-token"
     return conv
 
@@ -216,9 +216,7 @@ def test_read_workspace_file_stages_remote_workspace_file(
     assert executor._read_workspace_file("missing.xml", conversation) is None
 
 
-@pytest.mark.parametrize(
-    "path", ["/target-workspace/review/config.xml", "/review/config.xml"]
-)
+@pytest.mark.parametrize("path", ["/workspace/review/config.xml", "/review/config.xml"])
 def test_storage_config_access_error_keeps_path_diagnostics(
     executor, conversation, monkeypatch, path
 ):
@@ -1552,11 +1550,16 @@ def test_uploads_keep_the_object_name_storage_looks_for(conversation):
 
 @pytest.mark.parametrize(
     "value",
-    ["/workspace/exports/asset", "workspace/exports/asset", "exports/asset"],
+    ["/workspace/exports/asset"],
 )
 def test_workspace_prefixed_paths_name_the_same_storage_object(value):
     """Callers quote platform workspace paths as readily as storage paths."""
     assert _normalize_storage_path(value, "dataset_path") == "/exports/asset"
+
+
+def test_relative_storage_path_is_rejected():
+    with pytest.raises(ValueError, match="must be absolute"):
+        _normalize_storage_path("exports/asset", "dataset_path")
 
 
 def test_ls_api_uses_the_token_the_portal_issues_for_this_caller(

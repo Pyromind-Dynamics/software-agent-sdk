@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import os
 from pathlib import PurePosixPath
 
 from pydantic import JsonValue
@@ -21,7 +20,10 @@ from openhands.tools.utils.platform_env import (
     platform_cluster_route,
     platform_cluster_target,
 )
-from openhands.tools.utils.storage_paths import REMOVED_ALIAS
+from openhands.tools.utils.storage_paths import (
+    StoragePathError,
+    to_tool_storage_path,
+)
 from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
 from openhands.tools.workflow.task_submission import (
     create_workflow_api_client,
@@ -33,33 +35,22 @@ from openhands.tools.workflow.validate_workflow_dsl import (
 )
 
 
-# The sandbox mount point the file is visible under. It names the Storage root,
-# so a workflow path carrying it is restated without it.
-def _mount_prefix() -> str:
-    mount = os.getenv("PYROMIND_SANDBOX_MOUNT_PATH", "/target-workspace")
-    return mount.strip("/").split("/")[0]
-
-
 def _storage_path(workflow_path: str) -> str:
     """Restate the spelling the model used as the Storage path the platform reads."""
     path = PurePosixPath(workflow_path)
     if path.suffix != ".py" or ".." in path.parts:
         raise ValueError("workflow_path must be a workflow .py file inside Storage")
-    parts = [part for part in path.parts if part not in {"", "/", "."}]
-    if parts and parts[0] == REMOVED_ALIAS:
-        raise ValueError(
-            "workflow_path uses the removed 'storage/' alias; pass the mount path "
-            f"('/{_mount_prefix()}/<dir>/workflow.py') or the Storage path "
-            "('/<dir>/workflow.py')"
-        )
-    if parts and parts[0] == _mount_prefix():
-        parts = parts[1:]
+    try:
+        storage_path = to_tool_storage_path(workflow_path, field="workflow_path")
+    except StoragePathError as exc:
+        raise ValueError(str(exc)) from exc
+    parts = PurePosixPath(storage_path).parts[1:]
     if len(parts) < 2:
         raise ValueError(
             "workflow_path must be a workflow .py file inside Storage, "
-            "such as /<dir>/workflow.py"
+            "such as /workspace/<dir>/workflow.py"
         )
-    return "/" + "/".join(parts)
+    return storage_path
 
 
 class PlatformWorkflowSubmission:

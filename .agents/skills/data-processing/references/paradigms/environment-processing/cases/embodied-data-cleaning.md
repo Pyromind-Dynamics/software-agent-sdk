@@ -51,7 +51,7 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
 **数据源索引**：LeRobot v2.1 源用 `meta/episodes/chunk-*.parquet`；
 **S2 自采集源没有 episode 索引**——先用 Terminal 从 episode 目录清单构建一个
 索引 parquet（列：episode_id）并写到 Storage
-（`/target-workspace/episodes_index/episodes_index.parquet`），渲染 `data_source` 指向它。
+（`/workspace/episodes_index/episodes_index.parquet`），渲染 `data_source` 指向它。
 构建 parquet 需要 pyarrow；本地默认 Python 没有且无外网时，改用
 `$DATAFLOW_PYTHON`（即 `/home/openhands/dataflow-venv/bin/python`，镜像内
 自带 pyarrow）。`data_source` 必须指向 Parquet 文件，指向 JSONL 会在
@@ -62,15 +62,15 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
 {
   "schema_version": 1,
   "name": "embodied-cleaning-render",
-  "data_source": "datasets/<name>/meta/episodes/chunk-000.parquet",
+  "data_source": "/workspace/datasets/<name>/meta/episodes/chunk-000.parquet",
   "fields": {
     "task_id": "episode_index",
     "episode_id": "episode_index",
     "image": {"fixed": "pyrominddynamics/jupyter-lab-with-ssh:v0.9"},
     "config_json": {"kind": "json_config", "fields": {
       "episode_id": "episode_index",
-      "source": {"fixed": "/target-workspace/datasets/<name>"},
-      "work_root": {"fixed": "/target-workspace/.pyromind-agent/<conversation>/embodied-cleaning/<run-id>"},
+      "source": {"fixed": "/workspace/datasets/<name>"},
+      "work_root": {"fixed": "/workspace/.pyromind-agent/<conversation>/embodied-cleaning/<run-id>"},
       "task_text": {"fixed": "<一次性向用户确认的 dataset 级 task text>"},
       "motion_speed_threshold": {"fixed": 0.02},
       "idle_min_duration_s": {"fixed": 1.5},
@@ -82,8 +82,8 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
 }
 ```
 
-- 挂载契约：平台节点 `/workspace` 读写挂载进容器 `/target-workspace`（由
-  profile 的 `volume_mounts` 声明），episode 输出/结果 JSON 直接落在共享
+- 挂载契约：Storage 在沙箱中统一挂载为 `/workspace`（由 profile 的
+  `volume_mounts` 声明），episode 输出/结果 JSON 直接落在共享
   work_root，沙箱销毁后仍持久——这是跨记录状态（无 checkpoint 文件）。
 - 沙箱策略：profile 声明 `execution.sandbox_reuse`。本 case 为
   `per_shard`（全量同镜像 + 确定性 runtime：一个分片共享一个沙箱，记录在
@@ -108,7 +108,7 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
 
 ## 门禁与流程
 
-1. 预览探查（直读 `/target-workspace`）→ 确认源形态
+1. 预览探查（直读 `/workspace`）→ 确认源形态
    （LeRobot v2.1 / S2 自采集）；
    自采集源先构建并上传 episode 索引（见上）。
 0. **无需 wheel 预置**：runtime wheel 已内置于 skill bundle，由 edp_submit
@@ -123,4 +123,4 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
 6. 用户确认后默认串行全量提交（每次一片，终态后再提交下一片）；仅当
    用户明确要求时才并发 2-5 片。`df_check_progress` 观察进度。
 7. 全部 episode 终态后提交 merge 记录（`embodied-cleaning-merge`），
-   Kafka 回调后校验 target 发布物与聚合 report（直读 `/target-workspace`）。
+   Kafka 回调后校验 target 发布物与聚合 report（直读 `/workspace`）。

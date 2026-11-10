@@ -30,7 +30,7 @@ def test_prepare_uses_storage_dsl_validation_and_marks_training(monkeypatch):
         },
     )
     result = module.PlatformWorkflowSubmission._prepare(
-        "/target-workspace/.pyromind-agent/conversation/workflow.py",
+        "/workspace/.pyromind-agent/conversation/workflow.py",
         RequestContext(user_id="42", cookie="auth_token=ephemeral"),
     )
     assert downloaded == ["/.pyromind-agent/conversation/workflow.py"]
@@ -43,12 +43,11 @@ def test_prepare_uses_storage_dsl_validation_and_marks_training(monkeypatch):
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
-        # The sandbox spelling and the Storage spelling are both accepted.
-        ("/target-workspace/project/workflow.py", "/project/workflow.py"),
+        ("/workspace/project/workflow.py", "/project/workflow.py"),
         ("/project/workflow.py", "/project/workflow.py"),
     ],
 )
-def test_prepare_accepts_every_spelling_of_the_same_workflow(
+def test_prepare_accepts_public_and_storage_api_workflow_paths(
     monkeypatch, path, expected
 ):
     downloaded: list[str] = []
@@ -74,6 +73,14 @@ def test_prepare_accepts_every_spelling_of_the_same_workflow(
     module.PlatformWorkflowSubmission._prepare(path, RequestContext(user_id="42"))
 
     assert downloaded == [expected]
+
+
+def test_prepare_rejects_the_former_pi_mount():
+    with pytest.raises(ValueError, match="execution-only path"):
+        module.PlatformWorkflowSubmission._prepare(
+            "/target-workspace/project/workflow.py",
+            RequestContext(user_id="42"),
+        )
 
 
 @pytest.mark.parametrize(
