@@ -2219,7 +2219,9 @@ async def test_sandbox_reads_staged_workflow_before_container_exists(tmp_path) -
     assert await adapter._read_workflow(session) == "workflow = InputNode()"
 
 
-async def test_sandbox_reads_project_request_through_workspace_port(tmp_path) -> None:
+async def test_sandbox_reads_project_request_through_workspace_port(
+    tmp_path, monkeypatch
+) -> None:
     conversations = tmp_path / "conversations"
     conversations.mkdir()
     adapter = PiAdapter(conversations, terminal_backend="sandbox")
@@ -2236,13 +2238,13 @@ async def test_sandbox_reads_project_request_through_workspace_port(tmp_path) ->
             "mount_path": "/target-workspace",
         }
     )
+
+    async def local_workspace(_context, _files):
+        return LocalWorkspace(working_dir=str(root))
+
+    monkeypatch.setattr(adapter._sandbox, "workspace", local_workspace)
     session = pi_adapter_module._PiSession(
-        "conversation-1",
-        root,
-        files,
-        {},
-        RequestContext(user_id="42"),
-        workspace=LocalWorkspace(working_dir=str(root)),
+        "conversation-1", root, files, {}, RequestContext(user_id="42")
     )
     await adapter._register(session)
 

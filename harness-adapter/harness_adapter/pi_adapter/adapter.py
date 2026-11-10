@@ -214,7 +214,7 @@ class _PiSession:
     files: PiSessionFiles
     config: dict[str, Any]
     context: RequestContext
-    workspace: BaseWorkspace | None = None
+    workspace: LocalWorkspace | None = None
     model_configuration: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
     queue: asyncio.Queue[HarnessEvent | None] = field(default_factory=asyncio.Queue)
@@ -487,18 +487,13 @@ class PiAdapter:
         )
 
     async def _workspace(self, session: _PiSession) -> BaseWorkspace:
-        if session.workspace is not None:
-            return session.workspace
-        if self._terminal_backend == "os-sandbox":
-            workspace: BaseWorkspace = LocalWorkspace(
-                working_dir=session.workspace_root
-            )
-        else:
-            workspace = await self._sandbox.workspace(
+        if self._terminal_backend == "sandbox":
+            return await self._sandbox.workspace(
                 self._control_tool_context(session), session.files
             )
-        session.workspace = workspace
-        return workspace
+        if session.workspace is None:
+            session.workspace = LocalWorkspace(working_dir=session.workspace_root)
+        return session.workspace
 
     def _has_execution_workspace(self, session: _PiSession) -> bool:
         """False when a sandbox session never materialized its execution workspace."""

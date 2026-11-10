@@ -10,6 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from harness_adapter.pi_adapter.adapter import PiAdapter, _PiSession
 from harness_adapter.pi_adapter.business_tool_host import ToolExecutionContext
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.sandbox_runtime import (
@@ -468,6 +469,41 @@ def test_ensure_rebuilds_a_running_sandbox_whose_terminal_is_dead(
 
     assert "delete:sbx-1" in client.calls
     assert "create:running" in client.calls
+
+
+async def test_business_tool_workspace_follows_sandbox_replacement(
+    tmp_path: Path, files: PiSessionFiles, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _FakeSandboxClient()
+    initial = client._sandbox("running")
+    sandboxes = iter([initial, initial.model_copy(update={"id": "sbx-2"})])
+    monkeypatch.setattr(
+        client, "create_and_wait", lambda *args, **kwargs: next(sandboxes)
+    )
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
+        lambda **kwargs: ("", 0, False),
+    )
+    adapter = PiAdapter(tmp_path, terminal_backend="sandbox")
+    adapter._sandbox = SandboxExecutionManager(client_factory=lambda context: client)
+    context = _context(tmp_path)
+    session = _PiSession(
+        context.conversation_id,
+        context.workspace_root,
+        files,
+        {},
+        context.request_context,
+    )
+
+    before = (await adapter._tool_context(session)).workspace
+    endpoint = await adapter._runner_request(
+        session, "sandbox.ensure", {"replace": True}
+    )
+    after = (await adapter._tool_context(session)).workspace
+
+    assert isinstance(before, SandboxWorkspace) and isinstance(after, SandboxWorkspace)
+    assert before._sandbox_id == "sbx-1"
+    assert after._sandbox_id == endpoint["sandbox_id"] == "sbx-2"
 
 
 def test_prewarm_logs_why_the_sandbox_could_not_be_prepared(
