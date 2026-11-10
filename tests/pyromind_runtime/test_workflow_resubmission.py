@@ -82,6 +82,30 @@ async def approve(runtime, owner, request_id, command_id):
     )
 
 
+async def test_subagent_workflow_path_resolves_under_delegated_workspace(
+    training_execution,
+):
+    runtime, _, owner, run, scope, submission, _ = training_execution
+    workflow_path = "public_data/workflow_canvas/workflow.py"
+
+    prepared = await runtime._execute_role_tool(
+        owner,
+        "trainer",
+        scope,
+        "submit_workflow",
+        {"workflow_path": workflow_path},
+    )
+
+    delegated_path = (
+        f"public_data/experiment-runs/{run['id']}/"
+        "public_data/workflow_canvas/workflow.py"
+    )
+    assert prepared["summary"]["workflow_path"] == delegated_path
+    assert submission.prepared_paths == [
+        f"/workspace/.pyromind-agent/{owner.conversation_id}/{delegated_path}"
+    ]
+
+
 @pytest.mark.parametrize(
     ("prior_status", "launch", "interrupted"),
     [

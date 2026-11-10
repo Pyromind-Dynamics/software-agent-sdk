@@ -14,6 +14,7 @@ from typing import Any, cast
 from pydantic import SecretStr
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.storage_paths import resolve_conversation_storage_path
 from pyromind_runtime.domain.task_correlation import TaskOrigin
 from pyromind_runtime.domain.versions import VersionToolRequest
 
@@ -165,6 +166,13 @@ class ToolExecutionContext:
     model_configuration: dict[str, Any]
     extra: dict[str, Any] = field(default_factory=dict)
     workspace: BaseWorkspace | None = None
+
+
+def _workflow_storage_path(context: ToolExecutionContext, workflow_path: str) -> str:
+    """Resolve a model-visible workflow path to the Storage object to read."""
+    return resolve_conversation_storage_path(
+        context.conversation_id, workflow_path, field="workflow_path"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,8 +454,10 @@ class PyromindBusinessToolHost:
                             "workflow_path": {
                                 "type": "string",
                                 "description": (
-                                    "Existing Storage Python DSL path, such as "
-                                    "/workspace/project/workflow.py"
+                                    "Workflow Python DSL path. Use the conversation "
+                                    "path such as "
+                                    "public_data/workflow_canvas/workflow.py, or an "
+                                    "existing /workspace/<path> Storage file."
                                 ),
                             }
                         },
@@ -544,11 +554,13 @@ class PyromindBusinessToolHost:
             if not isinstance(workflow_path, str) or not workflow_path.strip():
                 raise ValueError("workflow_path is required")
             try:
+                storage_path = _workflow_storage_path(context, workflow_path)
                 prepared = await self._workflow_preparer(
                     context.conversation_id,
                     workflow_path,
                     context.request_context,
                     request_id=tool_call_id,
+                    workflow_storage_path=storage_path,
                     **({"origin": origin} if origin.type == "subagent" else {}),
                 )
                 return BusinessToolResult(

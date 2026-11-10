@@ -1730,7 +1730,7 @@ class SQLExperimentExecutionStore:
                 sa.select(work.c.id).where(
                     work.c.owner == owner_key(owner),
                     work.c.payload["run_id"].as_string() == run_id,
-                    work.c.state == "running",
+                    work.c.state.in_(("running", "reconciliation_required")),
                 )
             ).first()
             remote = any(sub["task_id"] for sub in submitted)

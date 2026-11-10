@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 
 
+AGENT_STORAGE_ROOT = "/.pyromind-agent"
+PUBLIC_WORKSPACE_DIRNAME = "public_data"
 WORKSPACE_ROOT = "/workspace"
 
 
@@ -50,6 +52,29 @@ def from_storage_api_path(value: str, *, field: str = "path") -> str:
     return WORKSPACE_ROOT + to_storage_api_path(value, field=field)
 
 
+def resolve_conversation_storage_path(
+    conversation_id: str, value: str, *, field: str = "path"
+) -> str:
+    """Resolve a conversation-relative path to its model-visible Storage path."""
+    raw = value.strip()
+    path = PurePosixPath(raw)
+    if not raw or ".." in path.parts:
+        raise StoragePathError(f"{field} must stay inside the conversation workspace.")
+    if path.is_absolute():
+        return from_storage_api_path(path.as_posix(), field=field)
+    if not path.parts or path.parts[0] == "storage":
+        raise StoragePathError(
+            f"{field} must name a file in the conversation workspace."
+        )
+    conversation_id = conversation_id.strip()
+    if not conversation_id or "/" in conversation_id or "\\" in conversation_id:
+        raise StoragePathError("conversation id is not a valid Storage path segment.")
+    return from_storage_api_path(
+        str(PurePosixPath(AGENT_STORAGE_ROOT, conversation_id, *path.parts)),
+        field=field,
+    )
+
+
 def _parts(value: str, *, field: str) -> list[str]:
     raw = value.strip()
     if not raw:
@@ -86,6 +111,3 @@ def _parts(value: str, *, field: str) -> list[str]:
             "not a user Storage path."
         )
     return parts
-
-
-PUBLIC_WORKSPACE_DIRNAME = "public_data"

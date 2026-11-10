@@ -22,10 +22,10 @@
 |---|---|
 | Agent 的 `read` / `terminal` / `write` | `/workspace/datasets/my_data/train.jsonl` |
 | 训练节点访问挂载数据 | `/workspace/datasets/my_data/train.jsonl` |
-| `submit_workflow.workflow_path` | `/workspace/.../workflow.py` |
+| `submit_workflow.workflow_path` | `public_data/workflow_canvas/workflow.py`, or an existing `/workspace/.../workflow.py` |
 
-`public_data/...` 是会话文件路径；正式提交按 `workflow-execution` 上传实际生成的
-`workflow.py`，再使用返回位置。上传返回的 Storage 路径按目标工具或节点契约使用，
+`public_data/...` 是会话文件路径，`submit_workflow` 直接接受该路径并在执行边界解析；
+不要先上传或复制 `workflow.py`。已有 Storage 工作流直接使用 `/workspace/...`，
 正式的 Storage 输入和输出统一使用 `/workspace/...`。
 
 数据中的图片引用由训练环境解析。相对路径依赖加载器的解析基准；需要绝对路径时使用训练环境路径。

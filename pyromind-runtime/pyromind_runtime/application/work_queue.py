@@ -37,10 +37,24 @@ class DurableWorker:
         self._closing = asyncio.Event()
 
     async def recover(self) -> None:
-        for item in await asyncio.to_thread(self.queue.expired):
+        expired = await asyncio.to_thread(self.queue.expired)
+        reconciliation = await asyncio.to_thread(self.queue.reconciliation_required)
+        for item in (*expired, *reconciliation):
             if item["kind"] not in self.handlers:
                 continue
-            safe = await self.reconcile(item)
+            try:
+                safe = await self.reconcile(item)
+            except Exception:
+                logger.exception("Work reconciliation failed: %s", item["id"])
+                safe = False
+            if item["state"] == "reconciliation_required":
+                if safe:
+                    await asyncio.to_thread(
+                        self.queue.resume_reconciliation,
+                        item["id"],
+                        generation=item["generation"],
+                    )
+                continue
             await asyncio.to_thread(
                 self.queue.reconcile_expired,
                 item["id"],

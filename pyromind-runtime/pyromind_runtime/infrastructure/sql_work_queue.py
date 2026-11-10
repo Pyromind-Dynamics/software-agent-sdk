@@ -268,6 +268,17 @@ class SQLWorkQueue:
                 ).mappings()
             ]
 
+    def reconciliation_required(self) -> list[dict]:
+        with self.engine.connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    sa.select(work)
+                    .where(work.c.state == "reconciliation_required")
+                    .order_by(work.c.created_at, work.c.id)
+                ).mappings()
+            ]
+
     def reconcile_expired(
         self, identity: str, safe_to_retry: bool, *, generation: int
     ) -> bool:
@@ -308,6 +319,44 @@ class SQLWorkQueue:
                 roles.update()
                 .where(roles.c.lane == row["lane"])
                 .values(active_id=identity, lease_until=None)
+            )
+            return True
+
+    def resume_reconciliation(self, identity: str, *, generation: int) -> bool:
+        """Atomically resume one inspected reconciliation generation."""
+        with write_transaction(self.engine) as conn:
+            row = (
+                conn.execute(
+                    sa.select(work).where(work.c.id == identity).with_for_update()
+                )
+                .mappings()
+                .one()
+            )
+            if (
+                row["state"] != "reconciliation_required"
+                or row["generation"] != generation
+            ):
+                return False
+            updated = conn.execute(
+                work.update()
+                .where(
+                    work.c.id == identity,
+                    work.c.state == "reconciliation_required",
+                    work.c.generation == generation,
+                )
+                .values(
+                    state="queued",
+                    available_at=now(),
+                    generation=generation + 1,
+                    lease_until=None,
+                )
+            )
+            if updated.rowcount != 1:
+                return False
+            conn.execute(
+                roles.update()
+                .where(roles.c.lane == row["lane"], roles.c.active_id == identity)
+                .values(lease_until=None)
             )
             return True
 

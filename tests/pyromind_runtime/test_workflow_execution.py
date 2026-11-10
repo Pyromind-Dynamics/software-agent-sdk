@@ -16,11 +16,21 @@ from pyromind_runtime.domain.commands import (
 )
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.storage_paths import resolve_conversation_storage_path
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.harness import SessionSpec
 
 from .fake_adapter import FakeAdapter
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["../workflow.py", "storage/workflow.py", "/target-workspace/workflow.py"],
+)
+def test_conversation_storage_path_rejects_non_conversation_paths(path):
+    with pytest.raises(ValueError):
+        resolve_conversation_storage_path("conversation-1", path, field="workflow_path")
 
 
 class FakeSubmission:
@@ -29,8 +39,10 @@ class FakeSubmission:
         self.workflow = {"name": "sft", "nodes": [{"data": {"nodeType": "SFTTrain"}}]}
         self.submissions: list[tuple[dict, str]] = []
         self.correlations: list[TaskCorrelation | None] = []
+        self.prepared_paths: list[str] = []
 
     async def prepare(self, workflow_path: str, context: RequestContext) -> dict:
+        self.prepared_paths.append(workflow_path)
         return {
             "workflow": dict(self.workflow),
             "fingerprint": "sha256",
@@ -164,6 +176,27 @@ async def test_confirmed_workflow_submits_once_and_resumes_followup(
     ).read_text()
     assert "auth_token=ephemeral" not in product_text
     assert json.loads(product_text)["request-1"]["task_id"] == "task-123"
+    await runtime.close()
+
+
+async def test_conversation_workflow_path_is_resolved_only_for_preparation(tmp_path):
+    runtime, _, submission, context = await _runtime(tmp_path)
+    conversation_id = "workflow-conversation"
+    workflow_path = "public_data/workflow_canvas/workflow.py"
+    prepared = await runtime.prepare_workflow_execution(
+        conversation_id,
+        workflow_path,
+        context,
+        request_id="request-1",
+        workflow_storage_path=(
+            f"/workspace/.pyromind-agent/{conversation_id}/{workflow_path}"
+        ),
+    )
+
+    assert prepared["summary"]["workflow_path"] == workflow_path
+    assert submission.prepared_paths == [
+        f"/workspace/.pyromind-agent/{conversation_id}/{workflow_path}"
+    ]
     await runtime.close()
 
 
@@ -341,17 +374,26 @@ async def test_pi_tool_exposes_confirmed_workflow_entry(tmp_path):
     host = PyromindBusinessToolHost(
         [skills / "data-processing", skills / "training-analysis"]
     )
-    calls: list[tuple[str, str, str | None]] = []
+    calls: list[tuple[str, str, str, str | None]] = []
 
-    async def prepare(conversation_id, workflow_path, context, *, request_id):
-        calls.append((conversation_id, workflow_path, request_id))
+    async def prepare(
+        conversation_id,
+        workflow_path,
+        context,
+        *,
+        request_id,
+        workflow_storage_path,
+    ):
+        calls.append(
+            (conversation_id, workflow_path, workflow_storage_path, request_id)
+        )
         return {"request_id": request_id, "status": "awaiting_confirmation"}
 
     host.set_workflow_preparer(prepare)
     assert "submit_workflow" in {spec["name"] for spec in host.specs()}
     result = await host.execute(
         "submit_workflow",
-        {"workflow_path": "/workspace/project/workflow.py"},
+        {"workflow_path": "public_data/workflow_canvas/workflow.py"},
         ToolExecutionContext(
             conversation_id="conversation-1",
             workspace_root=tmp_path,
@@ -361,4 +403,12 @@ async def test_pi_tool_exposes_confirmed_workflow_entry(tmp_path):
         tool_call_id="call-1",
     )
     assert result["details"]["status"] == "awaiting_confirmation"
-    assert calls == [("conversation-1", "/workspace/project/workflow.py", "call-1")]
+    assert calls == [
+        (
+            "conversation-1",
+            "public_data/workflow_canvas/workflow.py",
+            "/workspace/.pyromind-agent/conversation-1/"
+            "public_data/workflow_canvas/workflow.py",
+            "call-1",
+        )
+    ]

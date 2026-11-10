@@ -149,6 +149,26 @@ def test_uncertain_process_keeps_role_blocked(ledger):
     assert ledger.queue.claim() is None
 
 
+def test_cancel_does_not_treat_reconciliation_as_inactive(ledger, owner):
+    from pyromind_runtime.infrastructure.sql_experiment_execution import owner_key
+
+    run = ledger.request(owner, "project", 1, "task", "dataset", "request")
+    item = ledger.queue.claim()
+    assert item is not None
+    ledger.queue.finish(
+        item["id"],
+        item["generation"],
+        {"execution_ref": "native-1"},
+        "reconciliation_required",
+    )
+
+    cancelled = ledger.cancel(owner, run["id"])
+
+    assert cancelled["state"] == "cancel_requested"
+    items = ledger.queue.list(owner_key(owner))
+    assert any(item["kind"] == "cancel_execution" for item in items)
+
+
 async def test_worker_completes_and_stops_cleanly(ledger):
     from pyromind_runtime.application.work_queue import DurableWorker
 

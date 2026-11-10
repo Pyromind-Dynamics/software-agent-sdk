@@ -19,11 +19,10 @@ generate-workflow-dsl's training mount rules; do not create another frozen copy.
 Task files belong under public_data/. Use /workspace/<path> for user Storage.
 The DSL stays at public_data/workflow_canvas/workflow.py. Native file, terminal,
 and business tools use the same task-relative paths; pass that dsl_path to
-validate_workflow_dsl. Upload that actual file,
-then call submit_workflow with the returned Storage path. If upload is not
-available, publish the actual DSL under the existing Storage mount and use that
-Storage path; do not create another Sandbox. This requests the
-existing user confirmation; end your turn, do not submit through another tool.
+validate_workflow_dsl, then pass the same path to submit_workflow. The tool
+resolves the conversation file at the execution boundary; do not copy or upload
+it first and do not create another Sandbox. This requests the existing user
+confirmation; end your turn, do not submit through another tool.
 intent=prepare forbids formal submission. The user's platform confirmation is
 required before training. Do not busy-poll or start another training task.
 
@@ -50,6 +49,5 @@ yourself. Keep credentials out of files, reports and tool parameters.
         "analyze_task_failure",
         "get_experiment_execution",
     ),
-    optional_tools=("upload_file_to_pyromind",),
     skills=("generate-workflow-dsl", "workflow-execution", "training-analysis"),
 )

@@ -117,3 +117,83 @@ def test_old_recovery_verdict_cannot_recover_a_new_expired_generation(ledger):
         identity, False, generation=replacement["generation"]
     )
     assert queue.list("owner")[0]["state"] == "reconciliation_required"
+
+
+async def test_reconciliation_with_execution_reference_resumes_and_releases_lane(
+    ledger,
+):
+    queue = ledger.queue
+    first = queue.enqueue("owner", "lane", "first", "prepare", {})
+    second = queue.enqueue("owner", "lane", "second", "prepare", {})
+    claimed = queue.claim()
+    assert claimed is not None and claimed["id"] == first
+    queue.finish(
+        first,
+        claimed["generation"],
+        {"execution_ref": "native-1"},
+        "reconciliation_required",
+    )
+    handled = []
+
+    async def reconcile(item):
+        return bool(item["checkpoint"].get("execution_ref"))
+
+    async def handle(item):
+        handled.append(item["id"])
+        return {}
+
+    worker = DurableWorker(queue, {"prepare": handle}, reconcile)
+    await worker.recover()
+    assert queue.list("owner")[0]["state"] == "queued"
+    assert await worker.run_once()
+    assert handled == [first]
+    assert queue.claim()["id"] == second
+
+
+async def test_reconciliation_without_recovery_evidence_keeps_lane_blocked(ledger):
+    queue = ledger.queue
+    first = queue.enqueue("owner", "lane", "first", "prepare", {})
+    queue.enqueue("owner", "lane", "second", "prepare", {})
+    claimed = queue.claim()
+    assert claimed is not None
+    queue.finish(first, claimed["generation"], {}, "reconciliation_required")
+
+    async def reconcile(_item):
+        return False
+
+    async def handle(_item):
+        raise AssertionError("unproven reconciliation must not execute")
+
+    worker = DurableWorker(queue, {"prepare": handle}, reconcile)
+    await worker.recover()
+    assert queue.list("owner")[0]["state"] == "reconciliation_required"
+    assert queue.claim() is None
+
+
+async def test_failed_reconciliation_does_not_block_other_lanes(ledger):
+    queue = ledger.queue
+    broken = queue.enqueue("owner", "lane-a", "broken", "prepare", {})
+    healthy = queue.enqueue("owner", "lane-b", "healthy", "prepare", {})
+    for identity in (broken, healthy):
+        item = queue.claim()
+        assert item is not None
+        queue.finish(
+            identity,
+            item["generation"],
+            {"execution_ref": identity},
+            "reconciliation_required",
+        )
+
+    async def reconcile(item):
+        if item["id"] == broken:
+            raise RuntimeError("broken checkpoint")
+        return True
+
+    async def handle(_item):
+        return {}
+
+    worker = DurableWorker(queue, {"prepare": handle}, reconcile)
+    await worker.recover()
+
+    assert queue.list("owner")[0]["state"] == "reconciliation_required"
+    assert queue.list("owner")[1]["state"] == "queued"

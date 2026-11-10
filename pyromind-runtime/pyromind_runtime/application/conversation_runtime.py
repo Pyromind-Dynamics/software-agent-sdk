@@ -10,7 +10,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -113,6 +113,7 @@ from pyromind_runtime.domain.snapshot import (
 )
 from pyromind_runtime.domain.storage_paths import (
     from_storage_api_path,
+    resolve_conversation_storage_path,
     to_storage_api_path,
 )
 from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
@@ -419,11 +420,24 @@ class ConversationRuntime:
             )
             identity = f"execution-workflow:{scope['run_id']}:{call}"
             assert self._delegated_store is not None
+            workflow_path = str(arguments["workflow_path"])
+            workflow_reference = PurePosixPath(workflow_path)
+            if not workflow_reference.is_absolute():
+                root = PurePosixPath(
+                    "public_data/experiment-runs", str(scope["run_id"])
+                )
+                if not workflow_reference.is_relative_to(root):
+                    workflow_reference = root / workflow_reference
             return await self.prepare_workflow_execution(
                 owner.conversation_id,
-                str(arguments["workflow_path"]),
+                workflow_reference.as_posix(),
                 active.context,
                 request_id=identity,
+                workflow_storage_path=resolve_conversation_storage_path(
+                    owner.conversation_id,
+                    workflow_reference.as_posix(),
+                    field="workflow_path",
+                ),
                 origin=TaskOrigin.model_validate(scope["task_origin"])
                 if scope.get("task_origin")
                 else None,
@@ -3461,6 +3475,7 @@ class ConversationRuntime:
         context: RequestContext,
         *,
         request_id: str | None = None,
+        workflow_storage_path: str | None = None,
         origin: TaskOrigin | None = None,
         task_run_id: str | None = None,
         execution_scope: dict | None = None,
@@ -3487,7 +3502,9 @@ class ConversationRuntime:
                 "status": previous.status,
                 "summary": previous.summary,
             }
-        prepared = await self._workflow_submission.prepare(workflow_path, context)
+        prepared = await self._workflow_submission.prepare(
+            workflow_storage_path or workflow_path, context
+        )
         workflow = prepared.get("workflow")
         summary = prepared.get("summary")
         fingerprint = prepared.get("fingerprint")
@@ -3497,6 +3514,7 @@ class ConversationRuntime:
             or not isinstance(fingerprint, str)
         ):
             raise ValueError("workflow preparation returned an invalid definition")
+        summary = {**summary, "workflow_path": workflow_path}
         if self.versions is not None:
             source_text = prepared.get("source")
             version_run = await asyncio.to_thread(
