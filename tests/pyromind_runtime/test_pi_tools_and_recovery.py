@@ -981,7 +981,7 @@ async def test_runner_loads_sandbox_skills_and_business_tools(
             "sandbox_upload",
             "sandbox_download",
             "workflow_debug",
-            "analyze_task_failure",
+            "inspect_workflow_task",
             "training_analysis",
             "label_studio_create_project",
             "label_studio_get_project",

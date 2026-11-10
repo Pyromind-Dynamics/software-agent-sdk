@@ -80,7 +80,7 @@ from openhands.tools.sandbox import (
 )
 from openhands.tools.training_analysis import TrainingAnalysisTool
 from openhands.tools.update_plan import UpdatePlanTool
-from openhands.tools.workflow.analyze_task_failure import AnalyzeTaskFailureTool
+from openhands.tools.workflow.inspect_workflow_task import InspectWorkflowTaskTool
 from openhands.tools.workflow.run_workflow import WORKFLOW_ATTEMPT_STATE_KEY
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
@@ -100,7 +100,7 @@ _READ_ONLY_TOOLS = frozenset(
         GetStorageUrlTool.name,
         "df_check_progress",
         SandboxReadFileTool.name,
-        AnalyzeTaskFailureTool.name,
+        InspectWorkflowTaskTool.name,
     }
 )
 logger = logging.getLogger(__name__)
@@ -444,9 +444,9 @@ class PyromindBusinessToolHost:
             WorkflowDebugTool.name: lambda context: WorkflowDebugTool.create(
                 **self._workflow_debug_params(context)
             )[0],
-            AnalyzeTaskFailureTool.name: lambda context: AnalyzeTaskFailureTool.create(
-                **self._analysis_params(context)
-            )[0],
+            InspectWorkflowTaskTool.name: lambda context: (
+                InspectWorkflowTaskTool.create(**self._analysis_params(context))[0]
+            ),
             TrainingAnalysisTool.name: lambda context: TrainingAnalysisTool.create(
                 runtime_dir=str(self._training_runtime),
                 **self._training_analysis_params(context),
@@ -536,7 +536,7 @@ class PyromindBusinessToolHost:
             SandboxUploadTool,
             SandboxDownloadTool,
             WorkflowDebugTool,
-            AnalyzeTaskFailureTool,
+            InspectWorkflowTaskTool,
             TrainingAnalysisTool,
         ):
             if sandbox and tool_type is UploadFileToPyromindTool:

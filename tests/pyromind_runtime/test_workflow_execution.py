@@ -258,7 +258,7 @@ async def test_failed_workflow_callback_routes_to_failure_analysis(tmp_path):
     )
     notification = adapter.external_task_notifications[-1][1]
     assert notification.trigger_turn is True
-    assert "analyze_task_failure" in notification.hidden_text
+    assert "inspect_workflow_task" in notification.hidden_text
     assert "Do not edit or rerun" in notification.hidden_text
     assert (
         FileProductStore(tmp_path / "workflow-conversation")

@@ -29,8 +29,8 @@ from openhands.agent_server.pyromind_router import (
     PyromindLLMConfig,
     PyromindSendMessageRequest,
     PyromindWorkflowRollbackRequest,
-    _build_analyze_task_failure_tool,
     _build_debug_context_headers,
+    _build_inspect_workflow_task_tool,
     _build_label_studio_tool,
     _build_pyromind_storage_tools,
     _build_sandbox_tools,
@@ -87,7 +87,7 @@ from openhands.tools.sandbox import (
 )
 from openhands.tools.training_analysis import TrainingAnalysisTool
 from openhands.tools.workflow import (
-    AnalyzeTaskFailureTool,
+    InspectWorkflowTaskTool,
     RunWorkflowTool,
     ValidateWorkflowDslTool,
 )
@@ -1288,7 +1288,7 @@ def test_build_workflow_run_tool_wires_env_headers_and_auth_token():
     assert secrets["auth_token"].get_value() == "jwt-token"
 
 
-def test_build_analyze_task_failure_tool_matches_create_params():
+def test_build_inspect_workflow_task_tool_matches_create_params():
     request = _make_request(
         {
             "cookie": f"{PYROMIND_AUTH_COOKIE_NAME}=jwt-token",
@@ -1297,16 +1297,18 @@ def test_build_analyze_task_failure_tool_matches_create_params():
         }
     )
 
-    tool, secrets = _build_analyze_task_failure_tool(request, {})
+    tool, secrets = _build_inspect_workflow_task_tool(request, {})
 
-    assert tool.name == AnalyzeTaskFailureTool.name
-    assert secrets["auth_token"].get_value() == "jwt-token"
+    assert tool.name == InspectWorkflowTaskTool.name
+    assert secrets[PYROMIND_VALIDATE_AUTH_COOKIE_SECRET].get_value() == (
+        f"{PYROMIND_AUTH_COOKIE_NAME}=jwt-token"
+    )
     assert tool.params["headers"]["x-cluster"] == "us-west-1#pre"
     assert tool.params["headers"]["accept-language"] == "en-US"
     assert "env" not in tool.params
     assert "cluster" not in tool.params
     # The emitted params must round-trip through create() (no unknown params).
-    instances = AnalyzeTaskFailureTool.create(**tool.params)
+    instances = InspectWorkflowTaskTool.create(**tool.params)
     assert len(instances) == 1
 
 
