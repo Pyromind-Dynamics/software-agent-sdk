@@ -5,9 +5,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from pyromind_runtime.infrastructure.sql_database import create_database_engine
-from pyromind_runtime.infrastructure.sql_experiment_plan_store import (
-    SQLExperimentPlanStore,
-)
+from pyromind_runtime.infrastructure.sql_preparation import SQLPreparationStore
 from sqlalchemy.engine import URL, make_url
 
 
@@ -52,6 +50,6 @@ def resolve_database_url(environment: Mapping[str, str] | None = None) -> URL | 
     return url
 
 
-def build_experiment_plan_store() -> SQLExperimentPlanStore | None:
+def build_experiment_plan_store() -> SQLPreparationStore | None:
     url = resolve_database_url()
-    return SQLExperimentPlanStore(create_database_engine(url)) if url else None
+    return SQLPreparationStore(create_database_engine(url)) if url else None

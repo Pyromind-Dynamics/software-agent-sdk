@@ -21,29 +21,21 @@ from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.experiment_plans import (
     PlanConflictError,
     PlanOwner,
-    UpdateExperimentContext,
 )
 from pyromind_runtime.domain.preparation import (
     PREPARATION_TOOLS,
     ChecklistField,
     PreparationFact,
     PreparationPolicy,
+    SetPreparationPlan,
     UpdatePreparation,
 )
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
-from pyromind_runtime.infrastructure.sql_experiment_execution import (
-    runs,
-)
-from pyromind_runtime.infrastructure.sql_experiment_plan_store import (
-    SQLExperimentPlanStore,
+from pyromind_runtime.infrastructure.sql_preparation import SQLPreparationStore
+from pyromind_runtime.infrastructure.sql_project_store import (
     metadata,
     projects,
-)
-from pyromind_runtime.infrastructure.sql_preparation import SQLPreparationStore
-from pyromind_runtime.infrastructure.sql_work_queue import (
-    metadata as queue_metadata,
-    work,
 )
 from pyromind_runtime.ports.harness import DelegatedRole, SessionSpec
 
@@ -67,7 +59,18 @@ def test_preparation_tool_schemas_require_fields_needed_for_execution():
     plan = PREPARATION_TOOLS["set_preparation_plan"].model_json_schema()["$defs"]
     assert {"stages", "tasks"} <= set(plan["ExperimentContext"]["required"])
     assert "kind" in plan["ExperimentStage"]["required"]
-    assert "kind" in plan["ExperimentTask"]["required"]
+    assert {"kind", "stage_id"} <= set(plan["ExperimentTask"]["required"])
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [{"mode": "replace"}, {"mode": "merge"}, {"plan": {}}, {"entry_task": {}}],
+)
+def test_fact_tool_rejects_removed_legacy_arguments(legacy):
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        PREPARATION_TOOLS["update_preparation"].model_validate(
+            {"expected_revision": 0, "facts": {}, **legacy}
+        )
 
 
 @pytest.fixture
@@ -77,7 +80,6 @@ def preparation_setup(tmp_path):
         connect_args={"check_same_thread": False},
     )
     metadata.create_all(engine)
-    queue_metadata.create_all(engine)
     store = SQLPreparationStore(engine)
     owner = PlanOwner(
         user_id="42", conversation_id="conversation", profile_id="prepared"
@@ -130,20 +132,6 @@ def ready_request():
                 }
             ],
         },
-        "entry_task": {
-            "role_id": "eval",
-            "request_id": "first",
-            "stage_id": "evaluation",
-            "task": {
-                "name": "Evaluate",
-                "instruction": "Use the confirmed rubric",
-                "inputs": {
-                    "dataset": "/workspace/eval.jsonl",
-                    "model": "/workspace/model",
-                    "limit": 2,
-                },
-            },
-        },
     }
 
 
@@ -153,7 +141,15 @@ def make_ready(store, owner, payload):
     service.update(
         owner, UpdatePreparation(expected_revision=0, facts=payload["facts"]), evidence
     )
-    return service.update(owner, UpdatePreparation.model_validate(payload), evidence)
+    return service.set_plan(
+        owner,
+        SetPreparationPlan(
+            expected_revision=payload["expected_revision"],
+            plan=payload["plan"],
+            entry_task_id="first",
+            role_id="eval",
+        ),
+    )
 
 
 def test_checklist_gates_plan_and_never_creates_project(
@@ -161,15 +157,21 @@ def test_checklist_gates_plan_and_never_creates_project(
 ):
     store, owner, _ = preparation_setup
     service = Preparations(store)
-    request = {**ready_request, "expected_revision": 0, "facts": {}}
     with pytest.raises(ValueError, match="checklist"):
-        service.update(owner, UpdatePreparation.model_validate(request), set())
+        service.set_plan(
+            owner,
+            SetPreparationPlan(
+                expected_revision=0,
+                plan=ready_request["plan"],
+                entry_task_id="first",
+                role_id="eval",
+            ),
+        )
     ready = make_ready(store, owner, ready_request)
     assert ready.phase == "ready" and ready.project_id is None
     assert store.project(owner) is None
     with store.engine.connect() as conn:
         assert conn.scalar(sa.select(sa.func.count()).select_from(projects)) == 0
-        assert conn.scalar(sa.select(sa.func.count()).select_from(runs)) == 0
     with pytest.raises(ValueError, match="evidence"):
         service.update(
             owner,
@@ -183,17 +185,102 @@ def test_dataset_change_invalidates_dependent_information(
 ):
     store, owner, _ = preparation_setup
     ready = make_ready(store, owner, ready_request)
-    facts = dict(ready.facts)
-    facts["dataset"] = facts["dataset"].model_copy(update={"value": "/other.jsonl"})
     changed = Preparations(store).update(
         owner,
-        UpdatePreparation(expected_revision=ready.revision, facts=facts),
+        UpdatePreparation(
+            expected_revision=ready.revision,
+            facts={
+                "dataset": ready.facts["dataset"].model_copy(
+                    update={"value": "/other.jsonl"}
+                )
+            },
+        ),
         {"message:request"},
     )
     assert changed.phase == "collecting" and changed.missing == ("mapping",)
     assert changed.plan is None
     with pytest.raises(PlanConflictError):
         store.activate(owner, ready.revision, "old-button")
+
+
+def test_fact_merge_preserves_unrelated_fields_and_reports_reserved_keys(
+    preparation_setup, ready_request
+):
+    store, owner, policy = preparation_setup
+    owner = owner.model_copy(update={"conversation_id": "merge"})
+    store.initialize(
+        owner,
+        policy.model_copy(
+            update={
+                "fields": (
+                    *policy.fields,
+                    ChecklistField(key="scope", label="Scope", value_type="object"),
+                )
+            }
+        ),
+    )
+    service = Preparations(store)
+    evidence = {"message:request"}
+    first = service.update(
+        owner,
+        UpdatePreparation(expected_revision=0, facts=ready_request["facts"]),
+        evidence,
+    )
+    request = UpdatePreparation(
+        expected_revision=first.revision,
+        facts={
+            "scope": PreparationFact(
+                value={"authorization": "User requested training"},
+                status="resolved",
+                evidence_refs=("message:request",),
+            )
+        },
+    )
+    with pytest.raises(ValueError, match=r"facts\.scope\.value\.authorization") as exc:
+        service.update(owner, request, evidence)
+    assert "User requested training" not in str(exc.value)
+    assert store.get(owner) == first
+    with pytest.raises(
+        ValueError, match=r"unknown checklist field\(s\): decision_note"
+    ):
+        service.update(
+            owner,
+            request.model_copy(
+                update={"facts": {"decision_note": request.facts["scope"]}}
+            ),
+            evidence,
+        )
+    assert store.get(owner) == first
+    scope = request.facts["scope"].model_copy(
+        update={"value": {"decision_note": "User requested training"}}
+    )
+    merged = service.update(
+        owner, request.model_copy(update={"facts": {"scope": scope}}), evidence
+    )
+    assert merged.facts == {**first.facts, "scope": scope}
+    cleared = service.update(
+        owner,
+        UpdatePreparation(
+            expected_revision=merged.revision,
+            facts={"scope": PreparationFact()},
+        ),
+        evidence,
+    )
+    assert cleared.facts == {**first.facts, "scope": PreparationFact()}
+    assert cleared.missing == ("scope",)
+
+
+def test_saving_after_inspection_preserves_new_evidence_and_revision(
+    preparation_setup, ready_request
+):
+    store, owner, _ = preparation_setup
+    ready = make_ready(store, owner, ready_request)
+    assert (
+        store.add_evidence(owner, "resource:first", "first preview") == ready.revision
+    )
+    assert store.get(owner).revision == ready.revision
+    saved = store.save(owner, ready, ready.revision)
+    assert saved.evidence == {"resource:first": "first preview"}
 
 
 def test_new_message_withdraws_ready_and_is_idempotent(
@@ -227,17 +314,12 @@ def test_project_creation_is_atomic_and_deduplicated_across_writers(
     with ThreadPoolExecutor(max_workers=3) as pool:
         results = list(pool.map(create, range(3)))
     assert len({result.project_id for result in results}) == 1
-    assert len({result.initial_run_id for result in results}) == 1
     with store.engine.connect() as conn:
         assert conn.scalar(sa.select(sa.func.count()).select_from(projects)) == 1
         assert conn.scalar(sa.select(projects.c.cluster)) == "us-west-1#pre"
-        assert conn.scalar(sa.select(sa.func.count()).select_from(runs)) == 1
-        assert conn.scalar(sa.select(sa.func.count()).select_from(work)) == 1
-    run = store.executions.list(owner)[0]
-    assert run["task_spec"]["stage_id"] == "evaluation"
-    assert run["task_spec"]["plan_sequence"] == 1
-    assert run["task_spec"]["stage_snapshot"]["name"] == "Eval"
-    assert run["task_spec"]["preparation_facts"]["dataset"] == "/eval.jsonl"
+        assert not {"experiment_task_runs", "experiment_work"} & set(
+            sa.inspect(conn).get_table_names()
+        )
     for foreign in (
         owner.model_copy(update={"user_id": "other"}),
         owner.model_copy(update={"profile_id": "other"}),
@@ -246,24 +328,6 @@ def test_project_creation_is_atomic_and_deduplicated_across_writers(
         with pytest.raises(PermissionError):
             store.get(foreign)
         assert store.project(foreign) is None
-
-
-def test_queue_failure_rolls_back_project_and_execution(
-    preparation_setup, ready_request, monkeypatch
-):
-    store, owner, _ = preparation_setup
-    ready = make_ready(store, owner, ready_request)
-
-    def fail(*args, **kwargs):
-        raise RuntimeError("queue write failed")
-
-    monkeypatch.setattr(store.executions.queue, "put", fail)
-    with pytest.raises(RuntimeError, match="queue write"):
-        store.activate(owner, ready.revision, "create")
-    assert store.project(owner) is None
-    assert store.get(owner).phase == "ready"
-    with store.engine.connect() as conn:
-        assert conn.scalar(sa.select(sa.func.count()).select_from(runs)) == 0
 
 
 def test_unknown_stage_role_inputs_and_credentials_are_rejected(
@@ -275,38 +339,51 @@ def test_unknown_stage_role_inputs_and_credentials_are_rejected(
         UpdatePreparation(expected_revision=0, facts=ready_request["facts"]),
         {"message:request"},
     )
-    for entry in (
-        {**ready_request["entry_task"], "stage_id": "unknown"},
-        {**ready_request["entry_task"], "role_id": "train"},
-        {**ready_request["entry_task"], "request_id": "unknown"},
+    request = {
+        "expected_revision": 1,
+        "plan": ready_request["plan"],
+        "entry_task_id": "first",
+        "role_id": "eval",
+    }
+    task = ready_request["plan"]["tasks"][0]
+    for invalid in (
+        {**request, "role_id": "train"},
+        {**request, "entry_task_id": "unknown"},
         {
-            **ready_request["entry_task"],
-            "task": {
-                "name": "Invalid",
-                "instruction": "Invalid",
-                "inputs": {"dataset": "/another.jsonl"},
+            **request,
+            "plan": {
+                **request["plan"],
+                "tasks": [{**task, "stage_id": "unknown"}],
             },
         },
         {
-            **ready_request["entry_task"],
-            "task": {
-                "name": "Invalid",
-                "instruction": "Invalid",
-                "inputs": {
-                    "dataset": "/eval.jsonl",
-                    "authorization": "Bearer forbidden",
-                },
+            **request,
+            "plan": {
+                **request["plan"],
+                "tasks": [
+                    {**task, "inputs": [{"name": "data", "resource_id": "unknown"}]}
+                ],
+            },
+        },
+        {
+            **request,
+            "plan": {
+                **request["plan"],
+                "resources": [
+                    {
+                        "id": "data",
+                        "name": "Data",
+                        "uri": "https://user:secret@example.com",
+                    }
+                ],
             },
         },
     ):
         with pytest.raises(ValueError):
-            Preparations(store).update(
-                owner,
-                UpdatePreparation.model_validate(
-                    {**ready_request, "entry_task": entry}
-                ),
-                {"message:request"},
+            Preparations(store).set_plan(
+                owner, SetPreparationPlan.model_validate(invalid)
             )
+        assert store.get(owner).revision == 1
     assert store.get(owner).phase == "planning"
 
 
@@ -412,21 +489,13 @@ async def test_runtime_creation_restore_permissions_and_stage_protection(
         profile_id=owner.profile_id,
         x_cluster="us-west-1#pre",
     )
-    plans = SQLExperimentPlanStore(preparation_store.engine)
     runtime = ConversationRuntime(
         tmp_path / "conversations",
         adapter,
-        experiment_plan_store=plans,
         preparation_store=preparation_store,
     )
     tools = ("read", "get_preparation", "update_preparation", "inspect_resource")
-    development = tools + (
-        "get_experiment_context",
-        "update_experiment_context",
-        "request_experiment_task",
-        "get_experiment_execution",
-        "control_experiment_task",
-    )
+    development = ("read", "write", "edit", "terminal", "subagent", "ask_user")
     await runtime.create_conversation(
         SessionSpec(
             conversation_id=owner.conversation_id,
@@ -449,7 +518,7 @@ async def test_runtime_creation_restore_permissions_and_stage_protection(
     )
     for tool in ("update_experiment_context", "request_experiment_task"):
         with pytest.raises(PermissionError):
-            await runtime.experiment_plan_call(owner.conversation_id, tool, {}, context)
+            await runtime.preparation_call(owner.conversation_id, tool, {}, context)
     ready = make_ready(preparation_store, owner, ready_request)
     command = CreateProjectCommand(
         command_id="create", expected_preparation_revision=ready.revision
@@ -461,6 +530,11 @@ async def test_runtime_creation_restore_permissions_and_stage_protection(
     project = preparation_store.project(owner)
     assert project is not None
     assert project.cluster == "us-west-1#pre"
+    assert project.initial_run_id is None
+    notification = adapter.external_task_notifications[-1][1]
+    assert notification.kind == "project_start"
+    assert "/eval.jsonl" in notification.hidden_text
+    assert "workflowPLAN.json" in notification.hidden_text
     assert adapter.session_policies[-1][1].tool_allowlist == development
     assert (
         await runtime.submit_command(owner.conversation_id, command, context) == receipt
@@ -475,6 +549,9 @@ async def test_runtime_creation_restore_permissions_and_stage_protection(
     )
     assert another.response["project_id"] == receipt.response["project_id"]
     assert len(adapter.session_policies) == policies
+    assert {notice.task_id for _, notice, _ in adapter.external_task_notifications} == {
+        "project-start:" + project.project_id
+    }
     snapshot = await runtime.get_snapshot(owner.conversation_id, context)
     assert snapshot.project is not None and snapshot.preparation is not None
     assert snapshot.preparation.phase == "active"
@@ -482,13 +559,12 @@ async def test_runtime_creation_restore_permissions_and_stage_protection(
     restored = ConversationRuntime(
         tmp_path / "conversations",
         FakeAdapter(),
-        experiment_plan_store=SQLExperimentPlanStore(preparation_store.engine),
         preparation_store=preparation_store,
     )
     result = await restored.get_snapshot(owner.conversation_id, context)
     assert result.project is not None
     assert result.project.project_id == snapshot.project.project_id
-    assert result.project.initial_run_id == receipt.response["initial_run_id"]
+    assert result.project.initial_run_id is None
     listed = await restored.list_snapshots(context)
     assert listed[0].project == result.project
     with pytest.raises(PermissionError):
@@ -509,7 +585,6 @@ async def test_http_prepare_create_and_cross_profile_denial(
     runtime = ConversationRuntime(
         tmp_path / "conversations",
         adapter,
-        experiment_plan_store=SQLExperimentPlanStore(store.engine),
         preparation_store=store,
     )
     profile = replace(ECHOMIND_PRODUCT_PROFILE, harness_id="openhands")
@@ -537,7 +612,7 @@ async def test_http_prepare_create_and_cross_profile_denial(
                 "expected_revision": 0,
             },
         )
-        assert denied.status_code == 404
+        assert denied.status_code == 422
         before = await client.get(f"{profile.route_prefix}/{identity}/project")
         assert before.status_code == 200 and before.json() is None
         foreign = await client.get(
@@ -592,62 +667,6 @@ def test_adapter_binding_projects_started_progress_and_report_rounds():
     assert snapshot.status == "idle"
 
 
-def test_stage_mutation_and_delegation_preserve_frozen_bindings(
-    preparation_setup, ready_request
-):
-    from pyromind_runtime.application.experiment_execution import ExperimentExecutions
-    from pyromind_runtime.domain.experiment_execution import RequestExperimentTask
-
-    store, owner, _ = preparation_setup
-    ready = make_ready(store, owner, ready_request)
-    project = store.activate(owner, ready.revision, "create")
-    plans = SQLExperimentPlanStore(store.engine)
-    view = plans.context(owner)
-    with pytest.raises(ValueError, match="unfinished"):
-        plans.update_context(
-            owner,
-            UpdateExperimentContext(
-                context=view.context.model_copy(update={"stages": (), "tasks": ()}),
-                expected_sequence=view.sequence,
-            ),
-        )
-    renamed = view.context.model_copy(
-        update={
-            "stages": (view.context.stages[0].model_copy(update={"name": "Renamed"}),)
-        }
-    )
-    plans.update_context(
-        owner, UpdateExperimentContext(context=renamed, expected_sequence=view.sequence)
-    )
-    assert (
-        store.executions.list(owner)[0]["task_spec"]["stage_snapshot"]["name"] == "Eval"
-    )
-    service = ExperimentExecutions(plans, store.executions)
-    request = RequestExperimentTask.model_validate(
-        {**ready_request["entry_task"], "request_id": "second"}
-    )
-    second = service.request(owner, request, ("eval",), True)
-    assert (
-        second["project_id"] == project.project_id
-        and second["task_spec"]["plan_sequence"] == 2
-    )
-    renamed_again = renamed.model_copy(
-        update={
-            "stages": (renamed.stages[0].model_copy(update={"name": "Third name"}),)
-        }
-    )
-    plans.update_context(
-        owner, UpdateExperimentContext(context=renamed_again, expected_sequence=2)
-    )
-    assert service.request(owner, request, ("eval",), True)["id"] == second["id"]
-    for invalid in (
-        request.model_copy(update={"stage_id": None}),
-        request.model_copy(update={"role_id": "train"}),
-    ):
-        with pytest.raises((ValueError, PermissionError)):
-            service.request(owner, invalid, ("eval",), True)
-
-
 async def test_inspection_and_terminal_provide_checklist_evidence_without_project(
     preparation_setup, ready_request, tmp_path
 ):
@@ -663,7 +682,6 @@ async def test_inspection_and_terminal_provide_checklist_evidence_without_projec
     runtime = ConversationRuntime(
         tmp_path / "conversations",
         FakeAdapter(),
-        experiment_plan_store=SQLExperimentPlanStore(store.engine),
         preparation_store=store,
         resource_inspector=inspector,
     )
@@ -695,8 +713,14 @@ async def test_inspection_and_terminal_provide_checklist_evidence_without_projec
             ),
             context,
         )
-        inspected = await runtime.experiment_plan_call(
-            owner.conversation_id, "inspect_resource", {"path": "/eval.jsonl"}, context
+        before = await runtime.get_preparation(owner.conversation_id, context)
+        inspected, second = await asyncio.gather(
+            *(
+                runtime.preparation_call(
+                    owner.conversation_id, "inspect_resource", {"path": path}, context
+                )
+                for path in ("/eval.jsonl", "/model/config.json")
+            )
         )
         product = FileProductStore(tmp_path / "conversations" / owner.conversation_id)
         for operation_id, succeeded in (
@@ -713,6 +737,13 @@ async def test_inspection_and_terminal_provide_checklist_evidence_without_projec
         view = await runtime.get_preparation(owner.conversation_id, context)
         reference = inspected["evidence_ref"]
         assert isinstance(reference, str)
+        assert second["evidence_ref"] in view.evidence
+        assert (
+            view.revision
+            == inspected["revision"]
+            == second["revision"]
+            == before.revision
+        )
         assert reference in view.evidence and "message:initial-message" in view.evidence
         assert "truncated=True" in view.evidence[reference]
         assert view.evidence["operation:count-rows"] == "terminal"
@@ -722,9 +753,9 @@ async def test_inspection_and_terminal_provide_checklist_evidence_without_projec
             for key, fact in ready_request["facts"].items()
         }
         request = UpdatePreparation.model_validate(
-            {"expected_revision": view.revision, "facts": facts}
+            {"expected_revision": before.revision, "facts": facts}
         )
-        result = await runtime.experiment_plan_call(
+        result = await runtime.preparation_call(
             owner.conversation_id,
             "update_preparation",
             request.model_dump(mode="json"),
@@ -736,39 +767,6 @@ async def test_inspection_and_terminal_provide_checklist_evidence_without_projec
         assert "private" not in str(store.get(owner).model_dump())
     finally:
         await runtime.close()
-
-
-def test_report_work_keeps_stage_active_until_report_finishes(
-    preparation_setup, ready_request
-):
-    store, owner, _ = preparation_setup
-    ready = make_ready(store, owner, ready_request)
-    project = store.activate(owner, ready.revision, "create")
-    with store.engine.begin() as connection:
-        connection.execute(
-            runs.update()
-            .where(runs.c.id == project.initial_run_id)
-            .values(state="succeeded", report_state="running", active_key=None)
-        )
-    plans = SQLExperimentPlanStore(store.engine)
-    current = plans.context(owner)
-    request = UpdateExperimentContext(
-        context=current.context.model_copy(update={"stages": (), "tasks": ()}),
-        expected_sequence=current.sequence,
-    )
-    with pytest.raises(ValueError, match="unfinished"):
-        plans.update_context(owner, request)
-    with store.engine.begin() as connection:
-        connection.execute(
-            runs.update()
-            .where(runs.c.id == project.initial_run_id)
-            .values(report_state="ready")
-        )
-    plans.update_context(owner, request)
-    assert (
-        store.executions.list(owner)[0]["task_spec"]["stage_snapshot"]["id"]
-        == "evaluation"
-    )
 
 
 def test_checklist_dependencies_are_order_independent_and_acyclic(
@@ -822,11 +820,13 @@ def test_checklist_dependencies_are_order_independent_and_acyclic(
     assert set(changed.missing) == {"mapping", "scoring"}
 
 
+@pytest.mark.parametrize(
+    "location",
+    [{"storage_path": "/workspace/eval.jsonl"}, {"uri": "/eval.jsonl"}],
+)
 def test_plan_submission_reuses_collected_facts_and_resolves_entry_resources(
-    preparation_setup, ready_request
+    preparation_setup, ready_request, location
 ):
-    from pyromind_runtime.domain.preparation import SetPreparationPlan
-
     store, owner, _ = preparation_setup
     service = Preparations(store)
     collected = service.update(
@@ -834,12 +834,16 @@ def test_plan_submission_reuses_collected_facts_and_resolves_entry_resources(
         UpdatePreparation(expected_revision=0, facts=ready_request["facts"]),
         {"message:request"},
     )
+    plan = {
+        **ready_request["plan"],
+        "resources": [{"id": "data", "name": "Data", **location}],
+    }
     ready = service.set_plan(
         owner,
         SetPreparationPlan.model_validate(
             {
                 "expected_revision": collected.revision,
-                "plan": ready_request["plan"],
+                "plan": plan,
                 "entry_task_id": "first",
                 "role_id": "eval",
             }
@@ -857,7 +861,6 @@ def test_plan_retry_requires_complete_arguments_and_stage_edges(
     preparation_setup, ready_request
 ):
     from pydantic import ValidationError
-    from pyromind_runtime.domain.preparation import SetPreparationPlan
 
     store, owner, _ = preparation_setup
     ready = make_ready(store, owner, ready_request)
@@ -877,6 +880,16 @@ def test_plan_retry_requires_complete_arguments_and_stage_edges(
     with pytest.raises(ValueError, match=r"plan.stages\[\].id.*evaluation.*review"):
         SetPreparationPlan.model_validate(arguments)
     plan["edges"] = [{"source": "evaluation", "target": "review"}]
+    with pytest.raises(ValueError, match=r"Entry task 'first'.*inputs.*resource_id"):
+        Preparations(store).set_plan(
+            owner,
+            SetPreparationPlan.model_validate(
+                {
+                    **arguments,
+                    "plan": {**plan, "tasks": [{**plan["tasks"][0], "inputs": []}]},
+                }
+            ),
+        )
     with pytest.raises(ValidationError, match="role_id"):
         SetPreparationPlan.model_validate(
             {key: value for key, value in arguments.items() if key != "role_id"}
@@ -903,7 +916,6 @@ async def test_preparation_capability_upgrade_preserves_contract_and_project(
     runtime = ConversationRuntime(
         root,
         adapter,
-        experiment_plan_store=SQLExperimentPlanStore(preparations.engine),
         preparation_store=preparations,
     )
     try:
@@ -929,7 +941,7 @@ async def test_preparation_capability_upgrade_preserves_contract_and_project(
         before = preparations.get(owner)
         project = preparations.project(owner)
         tools = ("read", "write", "edit", "terminal", "grep", "find", "ls")
-        development = (*tools, "get_experiment_context")
+        development = (*tools, "subagent")
         configuration = SessionPolicy(
             configuration_version=7,
             preparation_policy=policy.model_copy(update={"version": 2}),
@@ -973,8 +985,6 @@ async def test_preparation_capability_upgrade_preserves_contract_and_project(
 def test_workflow_catalog_rejects_generated_node_and_task_types(
     preparation_setup, ready_request
 ):
-    from pyromind_runtime.domain.preparation import SetPreparationPlan
-
     store, owner, policy = preparation_setup
     owner = owner.model_copy(update={"conversation_id": "catalog"})
     policy = PreparationPolicy.model_validate(
@@ -1009,30 +1019,39 @@ def test_workflow_catalog_rejects_generated_node_and_task_types(
             "role_id": "eval",
         }
     )
-    for invalid in (
-        request.plan.model_copy(
-            update={
-                "stages": (
-                    request.plan.stages[0].model_copy(update={"kind": "invented"}),
-                )
-            }
+    for invalid, error in (
+        (
+            request.plan.model_copy(
+                update={
+                    "stages": (
+                        request.plan.stages[0].model_copy(update={"kind": "invented"}),
+                    )
+                }
+            ),
+            r"plan\.stages\[0\]\.kind",
         ),
-        request.plan.model_copy(
-            update={
-                "tasks": (
-                    request.plan.tasks[0].model_copy(update={"kind": "invented"}),
-                )
-            }
+        (
+            request.plan.model_copy(
+                update={
+                    "tasks": (
+                        request.plan.tasks[0].model_copy(update={"kind": "invented"}),
+                    )
+                }
+            ),
+            r"plan\.tasks\[0\]\.kind.*allowed task kinds: score",
         ),
-        request.plan.model_copy(
-            update={
-                "stages": (
-                    request.plan.stages[0].model_copy(update={"kind": "future"}),
-                )
-            }
+        (
+            request.plan.model_copy(
+                update={
+                    "stages": (
+                        request.plan.stages[0].model_copy(update={"kind": "future"}),
+                    )
+                }
+            ),
+            "unimplemented catalog nodes",
         ),
     ):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=error):
             service.set_plan(owner, request.model_copy(update={"plan": invalid}))
         assert store.get(owner).revision == collected.revision
         assert store.project(owner) is None

@@ -8,35 +8,26 @@ from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.api.router import create_product_router
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
-from pyromind_runtime.infrastructure.sql_preparation import SQLPreparationStore
 
-from . import test_standalone_experiments as storage_fixtures
+from .test_preparation import preparation_setup as preparation_setup
 from .test_product_api import _app
-
-
-experiment = storage_fixtures.experiment
 
 
 @pytest.mark.parametrize("backend", ["sandbox", "os-sandbox"])
 async def test_actual_manager_and_eval_host_create_through_api(
-    tmp_path, monkeypatch, experiment, backend
+    tmp_path, monkeypatch, preparation_setup, backend
 ):
-    service, _, _ = experiment
+    store, _, _ = preparation_setup
     monkeypatch.setenv("OPENAI_API_KEY", "test-key-without-model-request")
     adapter = PiAdapter(tmp_path / "conversations", terminal_backend=backend)
     runtime = ConversationRuntime(
         tmp_path / "conversations",
         {"pi": adapter},
         default_harness_id="pi",
-        experiment_plan_store=service.plans,
-        preparation_store=SQLPreparationStore(service.plans.engine),
-        experiment_execution_store=service.store,
-        execution_roles=tuple(
-            role.name for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()
-        ),
+        preparation_store=store,
     )
-    adapter.set_plan_handler(runtime.experiment_plan_call)
-    adapter.set_role_handler(runtime.execution_role_call)
+    adapter.set_preparation_handler(runtime.preparation_call)
+    adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
     app = _app(tmp_path, runtime)
     app.include_router(create_product_router(ECHOMIND_PRODUCT_PROFILE))
     try:
@@ -66,10 +57,9 @@ async def test_actual_manager_and_eval_host_create_through_api(
             runtime_tools = {"get_experiment_execution"}
             assert set(role.tools) <= business | native | runtime_tools
             assert "upload_file_to_pyromind" not in role.tools
-            from pyromind_runtime.domain.experiment_execution import ROLE_TOOLS
 
             for definition in ECHOMIND_PRODUCT_PROFILE.delegated_roles:
-                assert set(definition.tools) <= business | native | set(ROLE_TOOLS)
+                assert set(definition.tools) <= business | native
             roles = {
                 definition.name: definition
                 for definition in ECHOMIND_PRODUCT_PROFILE.delegated_roles
@@ -79,11 +69,18 @@ async def test_actual_manager_and_eval_host_create_through_api(
             assert roles["init"].skills == roles["eval"].skills
             assert "df_submit_pipeline" in roles["dataset"].tools
             assert "df_submit_evaluation" not in roles["dataset"].tools
-            assert "submit_workflow" in roles["train"].tools
+            assert {
+                "analyze_task_failure",
+                "training_analysis",
+                "submit_workflow",
+            } <= set(roles["train"].tools)
             assert "df_submit_evaluation" not in roles["train"].tools
             session = adapter._sessions[created.json()["conversation_id"]]
             assert created.json()["preparation"]["phase"] == "collecting"
-            assert {"read", "write", "edit", "terminal", "grep", "find", "ls"} <= set(
+            assert {"read", "write", "edit", "terminal"} <= set(
+                session.config["tool_allowlist"]
+            )
+            assert not {"grep", "find", "ls", "subagent"}.intersection(
                 session.config["tool_allowlist"]
             )
             ensure = AsyncMock(return_value={"sandbox_id": "preparation-sandbox"})
@@ -104,20 +101,88 @@ async def test_actual_manager_and_eval_host_create_through_api(
                     user_id="42", profile_id=ECHOMIND_PRODUCT_PROFILE.profile_id
                 ),
             )
-            delegate = next(
-                item
-                for item in adapter._tool_specs(session)
-                if item["name"] == "request_experiment_task"
-            )["input_schema"]
-            assert "task" in delegate["required"]
-            assert "task_id" not in delegate["properties"]
-            delegate_description = next(
-                item["description"]
-                for item in adapter._tool_specs(session)
-                if item["name"] == "request_experiment_task"
+            assert set(session.config["tool_allowlist"]) == {
+                "read",
+                "write",
+                "edit",
+                "terminal",
+                "subagent",
+                "ask_user",
+                "get_storage_url",
+            }
+            assert not session.config["skill_allowlist"]
+            assert {item["name"] for item in adapter._tool_specs(session)} == {
+                "get_storage_url",
+            }
+
+            execute = AsyncMock(
+                return_value={
+                    "is_error": False,
+                    "content": [],
+                    "details": {},
+                    "signals": [],
+                }
             )
-            assert "get_experiment_context" in delegate_description
-            assert "valid_targets" in delegate_description
-            assert "do not repeat the same invalid arguments" in delegate_description
+            monkeypatch.setattr(adapter._business_tools, "execute", execute)
+            from harness_adapter.pi_adapter.business_tool_host import (
+                ToolExecutionContext,
+            )
+
+            monkeypatch.setattr(
+                adapter,
+                "_tool_context",
+                AsyncMock(
+                    return_value=ToolExecutionContext(
+                        conversation_id=session.session_id,
+                        workspace_root=session.workspace_root,
+                        request_context=session.context,
+                        model_configuration={},
+                    )
+                ),
+            )
+            for child, tool in (
+                ("init", "df_submit_evaluation"),
+                ("dataset", "df_submit_pipeline"),
+                ("train", "training_analysis"),
+                ("eval", "df_submit_evaluation"),
+            ):
+                await adapter._runner_request(
+                    session,
+                    "role.tool.execute",
+                    {
+                        "role": child,
+                        "tool_name": tool,
+                        "arguments": {},
+                        "origin": {"type": "subagent", "subagent_id": child},
+                        "tool_call_id": f"native:{child}:call",
+                    },
+                )
+                assert execute.call_args.args[0] == tool
+                assert (
+                    execute.call_args.args[2].request_context.task_origin.subagent_id
+                    == child
+                )
+            assert execute.await_count == 4
+            with pytest.raises(PermissionError):
+                await adapter._runner_request(
+                    session,
+                    "role.tool.execute",
+                    {
+                        "role": "dataset",
+                        "tool_name": "df_submit_evaluation",
+                        "arguments": {},
+                        "origin": {"type": "subagent", "subagent_id": "dataset"},
+                    },
+                )
+            with pytest.raises(PermissionError):
+                await adapter._runner_request(
+                    session,
+                    "tool.execute",
+                    {
+                        "tool_name": "df_submit_evaluation",
+                        "arguments": {},
+                    },
+                )
+            assert execute.await_count == 4
     finally:
         await runtime.close()

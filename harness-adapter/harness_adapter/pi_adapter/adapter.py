@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import posixpath
-import re
 import shlex
 import shutil
 import sys
@@ -140,7 +139,6 @@ ASK_USER_TOOL_DESCRIPTION = (
     "you can determine yourself with tools or context first. The tool waits "
     "until the user answers or cancels; their answers arrive as the tool result."
 )
-_DELEGATED_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _WORKFLOW_PATH = Path("public_data/workflow_canvas/workflow.py")
 _SYSTEM_PROMPT = """You are a coding agent inside one conversation workspace.
 Prefer read for ordinary file inspection, write for file creation, and edit for
@@ -263,9 +261,7 @@ class PiAdapter:
         else:
             repository = Path(__file__).parents[3]
         self._workflow_call = workflow_call
-        self._plan_call: Any = None
-        self._role_call: Any = None
-        self._role_scopes: dict[tuple[str, str], dict[str, Any]] = {}
+        self._preparation_call: Any = None
         self._execution_outputs: dict[str, tuple[str, WorkflowEventSink]] = {}
         self._terminal_backend = validate_pi_terminal_backend(terminal_backend)
         self._conversation_root = Path(conversation_root).resolve()
@@ -353,64 +349,8 @@ class PiAdapter:
         self._business_tools.version_call = callback
         self._business_tools.execution_call = execution
 
-    def set_plan_handler(self, callback: Any) -> None:
-        self._plan_call = callback
-
-    def set_role_handler(self, callback: Any) -> None:
-        self._role_call = callback
-
-    async def control_delegation(
-        self, handle: SessionHandle, request: JsonObject, context: RequestContext
-    ) -> JsonObject:
-        session = self._session(handle.session_id)
-        session.context = context
-        roles = {role["name"]: role for role in self._delegated_definitions(session)}
-        role = str(request.get("role", ""))
-        if role not in roles or not session.config.get("managed_delegation"):
-            raise PermissionError("delegated role is not enabled")
-        scope = request.get("scope")
-        if not isinstance(scope, dict):
-            raise ValueError("delegation requires a trusted work scope")
-        action = request.get("action")
-        delegated_root = (
-            _delegated_workspace_root(scope)
-            if action in {"spawn", "resume", "steer"}
-            else None
-        )
-        if action not in {"steer", "status"}:
-            self._role_scopes[(session.session_id, role)] = dict(scope)
-        await self._ensure_runner(session)
-        assert session.runner is not None
-        if delegated_root is not None:
-            workspace = await self._workspace(session)
-            await self._prepare_delegated_workspace(workspace, delegated_root)
-        native_request = dict(request)
-        if request.get("launch_request_id") and not request.get("execution_ref"):
-            native_request["execution_ref"] = (
-                "rpc-"
-                + ("resume" if request.get("launch_kind") == "resume" else "spawn")
-                + "-"
-                + str(request["launch_request_id"])
-            )
-        raw = await session.runner.request("delegation.control", native_request)
-        if not isinstance(raw, dict):
-            raise ValueError("invalid delegation response")
-        return {
-            "execution_ref": raw.get("execution_ref"),
-            "status": {
-                "complete": "succeeded",
-                "completed": "succeeded",
-                "running": "running",
-                "queued": "queued",
-                "pending": "queued",
-                "failed": "failed",
-                "stopped": "stopped",
-                "paused": "paused",
-                "stopping": "stopping",
-            }.get(str(raw.get("status")), "unknown"),
-            "interrupted": raw.get("interrupted") is True,
-            "result_text": str(raw.get("result_text", "")),
-        }
+    def set_preparation_handler(self, callback: Any) -> None:
+        self._preparation_call = callback
 
     async def read_submission_receipt(
         self,
@@ -474,231 +414,51 @@ class PiAdapter:
         ]
 
     def _delegated_tool_specs(self, session: _PiSession) -> dict[str, Any]:
-        from pyromind_runtime.domain.experiment_execution import ROLE_TOOLS
-
         specs = self._business_tools.specs(sandbox=self._terminal_backend == "sandbox")
-        result = {
-            role["name"]: [
-                {
-                    "name": name,
-                    "description": description,
-                    "input_schema": model.model_json_schema(),
-                }
-                for name, (model, description) in ROLE_TOOLS.items()
-                if name in role["tools"]
-            ]
+        return {
+            role["name"]: [spec for spec in specs if spec["name"] in role["tools"]]
             for role in self._delegated_definitions(session)
         }
-        for role in self._delegated_definitions(session):
-            result[role["name"]].extend(
-                spec
-                for spec in specs
-                if spec["name"] in role["tools"]
-                and spec["name"] not in {item["name"] for item in result[role["name"]]}
-            )
-        return result
-
-    async def execute_delegated_tool(
-        self,
-        handle: SessionHandle,
-        role: str,
-        scope: JsonObject,
-        tool: str,
-        arguments: JsonObject,
-        context: RequestContext,
-    ) -> JsonObject:
-        session = self._session(handle.session_id)
-        session.context = context
-        definition = next(
-            (
-                item
-                for item in self._delegated_definitions(session)
-                if item["name"] == role
-            ),
-            None,
-        )
-        if not definition or (
-            tool not in definition["tools"]
-            and not (tool == "df_stop_task" and scope.get("control") is True)
-        ):
-            raise PermissionError("role tool is not authorized")
-        tool_context = await self._tool_context(session)
-        if scope.get("task_origin") is not None:
-            tool_context = replace(
-                tool_context,
-                request_context=replace(
-                    context, task_origin=TaskOrigin.model_validate(scope["task_origin"])
-                ),
-            )
-        workspace = tool_context.workspace
-        root = _delegated_workspace_root(scope)
-        if workspace is not None:
-            await self._prepare_delegated_workspace(workspace, root)
-            directory = workspace.working_dir.rstrip("/") + "/" + root
-            tool_context = replace(
-                tool_context,
-                workspace=workspace.model_copy(update={"working_dir": directory}),
-            )
-        arguments = {
-            name: value.removeprefix(root + "/")
-            if name.endswith("_path")
-            and isinstance(value, str)
-            and value.startswith(root + "/")
-            else value
-            for name, value in arguments.items()
-        }
-        loop = asyncio.get_running_loop()
-        submission_admitted = False
-
-        def guard():
-            nonlocal submission_admitted
-            if self._role_call is None:
-                raise PermissionError("delegated submission is unavailable")
-            asyncio.run_coroutine_threadsafe(
-                self._role_call(
-                    session.session_id,
-                    role,
-                    "authorize_experiment_submission",
-                    {},
-                    scope,
-                    session.context,
-                ),
-                loop,
-            ).result(timeout=30)
-            submission_admitted = True
-
-        tool_context = replace(
-            tool_context,
-            extra={
-                **tool_context.extra,
-                "managed_operation_id": scope.get("operation_id"),
-                "managed_task_run_id": scope["run_id"],
-                "managed_submission_guard": guard,
-            },
-        )
-        try:
-            result = await self._business_tools.execute(
-                tool,
-                arguments,
-                tool_context,
-                tool_call_id=str(scope.get("operation_id") or scope["work_id"])
-                + ":"
-                + tool,
-            )
-        except Exception as error:
-            if (
-                tool not in {"df_submit_evaluation", "df_submit_pipeline"}
-                or submission_admitted
-            ):
-                raise
-            # The original executor has not crossed its platform-create guard.
-            # Schema/configuration failures can be corrected safely; they are
-            # not evidence of an ambiguous external request.
-            result = {
-                "is_error": True,
-                "content": [{"type": "text", "text": str(error)}],
-                "details": {"submission_not_sent": True},
-                "signals": [],
-            }
-        # Original tool signals and PipelineRuns still use the original parent
-        # conversation identity; only the execution origin is additional.
-        self._emit_tool_signals(session, tool, result)
-        return result
 
     def _tool_allowed(self, session: _PiSession, name: str) -> bool:
         allowed = session.config.get("tool_allowlist")
         return allowed is None or name in allowed
 
     def _tool_specs(self, session: _PiSession) -> list[dict[str, Any]]:
-        from pyromind_runtime.domain.experiment_execution import (
-            ControlExperimentTask,
-            DelegateExperimentTask,
-            GetExperimentExecution,
-            ReadExperimentArtifact,
-        )
-        from pyromind_runtime.domain.experiment_plans import CONTEXT_TOOLS, PLAN_TOOLS
         from pyromind_runtime.domain.preparation import PREPARATION_TOOLS
 
-        tools = {
-            **PREPARATION_TOOLS,
-            **PLAN_TOOLS,
-            **CONTEXT_TOOLS,
-            "control_experiment_task": ControlExperimentTask,
-            "request_experiment_task": DelegateExperimentTask,
-            "get_experiment_execution": GetExperimentExecution,
-            "read_experiment_artifact": ReadExperimentArtifact,
-        }
+        tools = PREPARATION_TOOLS
 
         specs = self._business_tools.specs(sandbox=self._terminal_backend == "sandbox")
-        if self._plan_call is not None:
+        if self._preparation_call is not None:
             descriptions = {
                 "get_preparation": (
                     "Read the scenario checklist, collected facts, evidence "
                     "reference catalog, draft plan and current revision."
                 ),
                 "update_preparation": (
-                    "Replace checklist facts using expected_revision. Resolved facts "
-                    "require evidence_refs from get_preparation or inspect_resource. "
-                    "On preparation_revision_conflict, merge your intended changes "
-                    "into the returned current_preparation and retry with its "
-                    "current_revision; do not resend the stale payload unchanged. "
-                    "This only collects information; submit a workflow plan "
-                    "separately with set_preparation_plan."
+                    "Update only keys listed in get_preparation.policy.fields, "
+                    "using the latest revision; omitted facts are preserved. "
+                    "Supply value and evidence_refs; non-null values default "
+                    "to resolved. "
+                    "Clear a fact with status=missing and value=null. Record decisions "
+                    "in an existing fact value or plan.constraints, never as new "
+                    "checklist keys. Never include credentials."
                 ),
                 "set_preparation_plan": (
-                    "Save a workflow plan after the checklist is complete. Every "
-                    "call, including retries, requires expected_revision, plan, "
-                    "entry_task_id (plan.tasks[].id) and role_id "
-                    "(preparation.policy.allowed_roles). plan.edges connect "
-                    "plan.stages[].id; task dependencies use task.inputs. Runtime "
-                    "reuses saved facts and resolves task.inputs from plan.resources; "
-                    "do not repeat facts or construct a separate delegated task. "
-                    "Does not create a Project or start platform work."
+                    "Save a plan for user review; does not start work. Select stage "
+                    "and task kinds from the catalog. Every task needs stage_id "
+                    "(a plan.stages[].id). Edges connect stage IDs. entry_task_id "
+                    "selects the task to run first; its inputs must reference "
+                    "concrete plan.resources using resource_id, and role_id must "
+                    "be allowed by its stage. Reuse the latest revision."
                 ),
                 "inspect_resource": (
                     "Inspect a Storage file prefix or directory with current "
                     "request credentials. Read-only and bounded; never starts a "
-                    "sandbox. Returns an evidence_ref. A preview does not "
+                    "sandbox. Returns an evidence_ref and the current revision "
+                    "without changing the revision. A preview does not "
                     "validate the full dataset."
-                ),
-                "create_experiment_plan": (
-                    "Create a reviewable experiment plan proposal. "
-                    "Does not create a project or authorize execution."
-                ),
-                "revise_experiment_plan": (
-                    "Propose a complete replacement plan based on expected_revision. "
-                    "Include source_proposal_id when editing a pending draft. "
-                    "Preserve unchanged stage/task IDs. Requires user confirmation."
-                ),
-                "get_experiment_plan": (
-                    "Read the authoritative current plan and pending proposal, "
-                    "or a specified historical revision."
-                ),
-                "get_experiment_context": (
-                    "Read the current reference plan and its sequence. "
-                    "Reference plans do not authorize or gate execution."
-                ),
-                "update_experiment_context": (
-                    "Replace the complete reference plan using expected_sequence. "
-                    "Include resources, stages, tasks and edges to retain. "
-                    "Task inputs reference resource_id or task_id/output_name. "
-                    "Placeholder stages require enabled=false."
-                ),
-                "read_experiment_artifact": (
-                    "Read a registered report by run_id and artifact name from "
-                    "get_experiment_execution. Verifies ownership and content digest. "
-                    "Do not supply a file path or Storage URL."
-                ),
-                "request_experiment_task": (
-                    "Before delegation, read get_experiment_context and select "
-                    "stage_id from a current enabled non-placeholder stage; "
-                    "role_id must be allowed for that stage. If the tool returns "
-                    "invalid_execution_target, use its valid_targets and resubmit "
-                    "the complete task with a new request_id; do not repeat the "
-                    "same invalid arguments. A successful receipt means queued, "
-                    "not finished. End this turn after delegation; Runtime will "
-                    "deliver the verified result. Do not poll or create placeholder "
-                    "tasks to wait."
                 ),
             }
             specs += [
@@ -706,9 +466,7 @@ class PiAdapter:
                     "name": name,
                     "description": descriptions.get(
                         name,
-                        "Request or query a scoped experiment execution. "
-                        "Standalone tasks execute without a Graph "
-                        "or plan confirmation.",
+                        "Update the Project preparation checklist.",
                     ),
                     "input_schema": model.model_json_schema(),
                 }
@@ -741,21 +499,6 @@ class PiAdapter:
             )
         session.workspace = workspace
         return workspace
-
-    async def _prepare_delegated_workspace(
-        self, workspace: BaseWorkspace, root: str
-    ) -> None:
-        """Create the lane root before a child can start in that directory."""
-        result = await asyncio.to_thread(
-            workspace.execute_command,
-            "mkdir -p " + shlex.quote(root + "/public_data"),
-        )
-        if result.exit_code != 0:
-            raise OSError(
-                result.stderr
-                or result.stdout
-                or "cannot prepare the delegated workspace"
-            )
 
     def _has_execution_workspace(self, session: _PiSession) -> bool:
         """False when a sandbox session never materialized its execution workspace."""
@@ -1110,7 +853,6 @@ class PiAdapter:
         for name in (
             "product_instructions",
             "delegated_roles",
-            "managed_delegation",
         ):
             value = getattr(policy, name)
             if value is not None:
@@ -1274,6 +1016,7 @@ class PiAdapter:
             return result if isinstance(result, dict) else {"suspended": True}
         future.set_result(
             {
+                **(session.context.input_response_metadata or {}),
                 "status": "answered",
                 "answers": [
                     answer.model_dump(mode="json") for answer in command.answers
@@ -1346,18 +1089,25 @@ class PiAdapter:
         if "delegated" in params:
             origin = params["delegated"]
             role = origin.get("role") if isinstance(origin, dict) else None
-            scope = origin.get("scope") if isinstance(origin, dict) else None
+            if not isinstance(origin, dict):
+                raise PermissionError("invalid child question origin")
+            definition = next(
+                (
+                    item
+                    for item in self._delegated_definitions(session)
+                    if item["name"] == role
+                ),
+                None,
+            )
+            address = TaskOrigin.model_validate(origin.get("origin", {}))
             if (
-                not isinstance(role, str)
-                or not isinstance(scope, dict)
-                or scope != self._role_scopes.get((session.session_id, role))
-                or not isinstance(scope.get("run_id"), str)
-                or not scope["run_id"]
+                not definition
+                or "ask_user" not in definition["tools"]
+                or address.type != "subagent"
+                or not self._tool_allowed(session, "subagent")
             ):
-                raise PermissionError(
-                    "question does not belong to a live delegated turn"
-                )
-            task_run_id = scope["run_id"]
+                raise PermissionError("child question is not authorized")
+            task_run_id = address.subagent_id
         request = UserInputRequest.model_validate(
             {
                 key: params[key]
@@ -1617,9 +1367,6 @@ class PiAdapter:
         session = await self._remove(handle.session_id)
         if session is None:
             return
-        for key in tuple(self._role_scopes):
-            if key[0] == handle.session_id:
-                self._role_scopes.pop(key, None)
         try:
             self._cancel_permissions(session, "Session closed")
             if session.runner is not None:
@@ -1849,7 +1596,6 @@ class PiAdapter:
                 if session.config.get("delegated_roles") is not None
                 else None,
                 "delegated_tool_specs": self._delegated_tool_specs(session),
-                "managed_delegation": session.config.get("managed_delegation", False),
                 "terminal_environment": (
                     self._business_tools.terminal_environment(
                         replace(
@@ -1929,45 +1675,28 @@ class PiAdapter:
                 ),
                 None,
             )
-            scope = self._role_scopes.get((session.session_id, str(role)))
-            supplied = params.get("scope")
-            if isinstance(supplied, dict):
-                if scope is None or any(
-                    supplied.get(key) != scope.get(key)
-                    for key in ("work_id", "generation", "run_id")
-                ):
-                    raise PermissionError("stale delegated work scope")
-                scope = supplied
             if (
                 not configured
+                or not isinstance(name, str)
                 or name not in configured["tools"]
-                or scope is None
-                or self._role_call is None
+                or not self._tool_allowed(session, "subagent")
             ):
-                raise PermissionError("role tool is not authorized")
+                raise PermissionError("native role tool is not authorized")
+            origin = TaskOrigin.model_validate(params.get("origin", {}))
+            if origin.type != "subagent":
+                raise PermissionError("native role tool requires a child origin")
             arguments = params.get("arguments")
             if not isinstance(arguments, dict):
                 raise ValueError("role tool arguments must be an object")
-            call_id = params.get("tool_call_id")
-            if isinstance(call_id, str) and call_id:
-                scope = {**scope, "tool_call_id": call_id}
-            if params.get("origin") is not None:
-                origin = TaskOrigin.model_validate(params["origin"])
-                if origin.type != "subagent":
-                    raise PermissionError("delegated call requires a child origin")
-                scope = {**scope, "task_origin": origin.model_dump(mode="json")}
-            result = await self._role_call(
-                session.session_id, role, name, arguments, scope, session.context
+            tool_context = replace(
+                await self._tool_context(session),
+                request_context=replace(session.context, task_origin=origin),
             )
-            if isinstance(result, dict) and "content" in result and "details" in result:
-                return result
-            return {
-                "content": [
-                    {"type": "text", "text": json.dumps(result, ensure_ascii=False)}
-                ],
-                "details": result,
-                "is_error": False,
-            }
+            result = await self._business_tools.execute(
+                name, arguments, tool_context, tool_call_id=params.get("tool_call_id")
+            )
+            self._emit_tool_signals(session, name, result)
+            return result
         if method == "workflow.invoke":
             if not self._tool_allowed(
                 session, "genome_" + str(params.get("action", ""))
@@ -2020,27 +1749,12 @@ class PiAdapter:
             arguments = params.get("arguments")
             if not isinstance(arguments, dict):
                 raise ValueError("tool arguments must be an object")
-            from pyromind_runtime.domain.experiment_plans import (
-                CONTEXT_TOOLS,
-                PLAN_TOOLS,
-            )
             from pyromind_runtime.domain.preparation import PREPARATION_TOOLS
 
-            if (
-                tool_name in PREPARATION_TOOLS
-                or tool_name in PLAN_TOOLS
-                or tool_name in CONTEXT_TOOLS
-                or tool_name
-                in {
-                    "control_experiment_task",
-                    "request_experiment_task",
-                    "get_experiment_execution",
-                    "read_experiment_artifact",
-                }
-            ):
-                if self._plan_call is None:
+            if tool_name in PREPARATION_TOOLS:
+                if self._preparation_call is None:
                     raise ValueError("plan tools are not configured")
-                result = await self._plan_call(
+                result = await self._preparation_call(
                     session.session_id, tool_name, arguments, session.context
                 )
                 return {
@@ -2117,13 +1831,11 @@ class PiAdapter:
                 tool_call_id,
                 arguments,
                 role=role,
-                scope=params.get("delegated_scope"),
             )
         if method == "delegation.authorize_tool":
             await self._authorize_native_role_tool(
                 session,
                 params.get("role"),
-                params.get("scope"),
                 params.get("tool_name"),
             )
             return {"authorized": True}
@@ -2140,7 +1852,6 @@ class PiAdapter:
         self,
         session: _PiSession,
         role: Any,
-        scope: Any,
         tool: Any,
     ) -> None:
         definition = next(
@@ -2154,20 +1865,9 @@ class PiAdapter:
         if (
             not definition
             or tool not in definition["tools"]
-            or tool not in {"read", "write", "edit", "terminal"}
-            or not isinstance(scope, dict)
-            or scope != self._role_scopes.get((session.session_id, role))
-            or self._role_call is None
+            or not self._tool_allowed(session, "subagent")
         ):
             raise PermissionError("delegated native tool is not authorized")
-        await self._role_call(
-            session.session_id,
-            role,
-            "authorize_experiment_tool",
-            {},
-            scope,
-            session.context,
-        )
 
     def _emit_tool_signals(
         self, session: _PiSession, tool_name: str, result: dict[str, Any]
@@ -2224,11 +1924,6 @@ class PiAdapter:
                             "submitted_at": now,
                             "updated_at": now,
                             "resume_pending": False,
-                            **(
-                                {"managed_task_run_id": task["managed_task_run_id"]}
-                                if task.get("managed_task_run_id")
-                                else {}
-                            ),
                         },
                     )
                 )
@@ -2292,7 +1987,6 @@ class PiAdapter:
         arguments: dict[str, Any],
         *,
         role: Any = None,
-        scope: Any = None,
     ) -> dict[str, Any]:
         if tool_call_id in session.permission_calls:
             raise ValueError("terminal permission call is already pending")
@@ -2301,7 +1995,7 @@ class PiAdapter:
         session.permission_calls[tool_call_id] = future
         try:
             if role:
-                await self._authorize_native_role_tool(session, role, scope, "terminal")
+                await self._authorize_native_role_tool(session, role, "terminal")
             if future.done():
                 allow, reason = future.result()
                 return {"allow": allow, "reason": reason}
@@ -2723,7 +2417,7 @@ class PiAdapter:
             adapter_session_ref=session.session_id,
             harness_id="pi",
             adapter_delivers_delegated_results=bool(
-                session.config.get("managed_delegation")
+                session.config.get("delegated_roles")
             ),
             # The capability is active only when the adapter supports it and the
             # session explicitly enables it.
@@ -2754,7 +2448,6 @@ def _session_config(spec: SessionSpec) -> dict[str, Any]:
         "session_id": spec.conversation_id,
         "product_instructions": spec.product_instructions,
         "profile_id": spec.profile_id,
-        "managed_delegation": spec.managed_delegation,
         "tool_allowlist": spec.tool_allowlist,
         "skill_allowlist": spec.skill_allowlist,
         "delegated_roles": [
@@ -2956,13 +2649,6 @@ def _external_task_status(value: Any) -> str:
         "running": "running",
         "pending": "pending",
     }.get(normalized, "pending")
-
-
-def _delegated_workspace_root(scope: dict[str, Any]) -> str:
-    run_id = scope.get("run_id")
-    if not isinstance(run_id, str) or _DELEGATED_RUN_ID.fullmatch(run_id) is None:
-        raise ValueError("invalid delegated run id")
-    return f"public_data/experiment-runs/{run_id}"
 
 
 def _restore_active_external_tasks(root: Path) -> dict[str, str]:

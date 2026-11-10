@@ -20,7 +20,7 @@ export async function installChildHost(pi: ExtensionAPI, role: string) {
     const identity = { session: ctx.sessionManager.getSessionId(), session_file: ctx.sessionManager.getSessionFile() };
     attachment = { controller, ready, identity };
     void callSubagentHost(socket, {
-      method: "terminal.attach", role, scope: config.scope, ...identity,
+      method: "terminal.attach", role, ...identity,
     }, controller.signal, (value) => resolve(value.id), true).catch(reject).finally(() => {
       if (attachment?.controller === controller) attachment = undefined;
     });
@@ -50,9 +50,8 @@ export async function installChildHost(pi: ExtensionAPI, role: string) {
   });
   for (const tool of config.tools) {
     pi.registerTool({ ...tool, execute: async (id: string, args: unknown, signal: AbortSignal | undefined, update: any, ctx: ExtensionContext) => {
-      const scope = config.scope;
       const terminal_lease = terminalTools.has(tool.name) ? await terminalLease(ctx) : undefined;
-      return callSubagentHost(socket, { method: "tool", role, scope, terminal_lease, name: tool.name, id: `${ctx.sessionManager.getLeafId()}:${id}`, args, session: ctx.sessionManager.getSessionId(), session_file: ctx.sessionManager.getSessionFile() }, signal, update);
+      return callSubagentHost(socket, { method: "tool", role, terminal_lease, name: tool.name, id: `${ctx.sessionManager.getLeafId()}:${id}`, args, session: ctx.sessionManager.getSessionId(), session_file: ctx.sessionManager.getSessionFile() }, signal, update);
     } });
   }
   pi.on("session_start", async (_event, ctx) => {
@@ -60,10 +59,8 @@ export async function installChildHost(pi: ExtensionAPI, role: string) {
     const allowed = new Set(config.tools.map((tool: any) => tool.name));
     if (pi.getActiveTools().some((name) => !allowed.has(name))) throw new Error("Unexpected tool in subagent session");
   });
-  pi.on("before_agent_start", async (event) => {
-    // Native resume can retain the child session and its tool closures. Bind
-    // the new turn to the newly admitted work lease, while an interrupted
-    // turn keeps its old scope and cannot write through an expired lease.
+  pi.on("before_agent_start", async (event, ctx) => {
+    // Native resume reuses the child context with a fresh terminal attachment.
     const previous = attachment;
     if (previous) {
       attachment = undefined;
@@ -73,8 +70,7 @@ export async function installChildHost(pi: ExtensionAPI, role: string) {
         }, previous.controller.signal);
       } finally { previous.controller.abort(); }
     }
-    const admission = await callSubagentHost(socket, {method: "config", role});
-    config.scope = admission.scope;
+    await callSubagentHost(socket, {method: "config", role});
     let prompt = event.systemPrompt;
     if (config.workspacePathAlias) {
       event.systemPromptOptions.cwd = config.workspacePathAlias.alias;
@@ -88,6 +84,9 @@ export async function installChildHost(pi: ExtensionAPI, role: string) {
         baseDir: skill.baseDir.replace(mapping.host, mapping.alias),
       }));
     }
-    return { systemPrompt: prompt + "\n" + config.instructions };
+    const workspace = `public_data/subagents/${ctx.sessionManager.getSessionId()}/`;
+    return { systemPrompt: prompt + "\n" + config.instructions +
+      `\nTask workspace: ${workspace}. Keep task files and reports there. ` +
+      "When cancelling remote work, call df_stop_task and verify its result. Native stop only stops this Agent." };
   });
 }

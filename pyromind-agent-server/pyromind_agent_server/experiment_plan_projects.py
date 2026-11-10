@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pyromind_runtime.domain.experiment_plans import PlanOwner, PlanRevision
+from pyromind_runtime.domain.experiment_plans import PlanOwner
 from pyromind_runtime.domain.preparation import ProjectView
 
 from openhands.agent_server.echomind_projects import ProjectStore
@@ -11,14 +11,6 @@ from openhands.agent_server.echomind_projects import ProjectStore
 class EchoMindExperimentPlanProjectBinder:
     def __init__(self, conversations_dir: Path | str) -> None:
         self._conversations_dir = Path(conversations_dir)
-
-    def bind(self, revision: PlanRevision, owner: PlanOwner, *, cluster: str) -> None:
-        ProjectStore.for_conversations_dir(self._conversations_dir).bind_plan(
-            revision,
-            conversation_id=owner.conversation_id,
-            cluster=cluster,
-            owner_user_id=owner.user_id,
-        )
 
     def bind_preparation(
         self, project: ProjectView, owner: PlanOwner, *, cluster: str

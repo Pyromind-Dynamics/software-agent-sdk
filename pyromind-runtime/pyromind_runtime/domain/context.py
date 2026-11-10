@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.task_correlation import TaskOrigin
 
 
@@ -23,3 +24,4 @@ class RequestContext:
     profile_id: str | None = None
     task_origin: TaskOrigin | None = None
     execution_trace: ExecutionTrace | None = None
+    input_response_metadata: JsonObject | None = None

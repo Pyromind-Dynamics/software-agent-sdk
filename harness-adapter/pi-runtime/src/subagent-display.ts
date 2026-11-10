@@ -3,7 +3,7 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 
 const MAX_BYTES = 32 * 1024;
 const MARKER = "\n[轨迹窗口已截断]";
-const PRESENTATION_KEYS = ["task", "phase", "previous_run_id"];
+const PRESENTATION_KEYS = ["task", "phase", "previous_run_id", "session_key", "role", "tool_call_id"];
 export function displayText(value: unknown): string {
   if (!isRecord(value)) return "";
   if (typeof value.text === "string") return value.text;

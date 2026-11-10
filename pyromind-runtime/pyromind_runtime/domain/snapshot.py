@@ -164,9 +164,6 @@ class ExternalTaskState(ContractModel):
     correlation: TaskCorrelation | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
-    managed_task_run_id: str | None = Field(
-        default=None, exclude_if=lambda value: value is None
-    )
     task_id: str = Field(min_length=1)
     kind: Literal[
         "historical_experience",

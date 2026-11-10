@@ -18,8 +18,12 @@ class ProductStore(Protocol):
     ) -> dict[str, WorkflowExecutionRequest]: ...
 
     def save_workflow_execution_request(
-        self, state: WorkflowExecutionRequest, *, expected_revision: int | None
-    ) -> None: ...
+        self,
+        state: WorkflowExecutionRequest,
+        *,
+        expected_revision: int | None,
+        reuse_duplicate: bool = False,
+    ) -> WorkflowExecutionRequest: ...
 
     def load_pipeline_runs(self) -> dict[str, PipelineRun]: ...
 

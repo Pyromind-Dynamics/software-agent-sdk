@@ -35,7 +35,7 @@ export function writeSubagentRoles(agentDir: string, definitions: SubagentRoleDe
     const extension = join(extensionDir, `${role.name}.mjs`);
     writeFileSync(extension, `import { installChildHost } from ${JSON.stringify(pathToFileURL(childModule).href)};\nexport default (pi) => installChildHost(pi, ${JSON.stringify(role.name)});\n`, { mode: 0o600 });
     writeFileSync(join(agentDir, "agents", `${role.name}.md`), [
-      "---", `name: ${role.name}`, "advertise: false", `description: ${JSON.stringify(role.description)}`,
+      "---", `name: ${role.name}`, "advertise: true", `description: ${JSON.stringify(role.description)}`,
       `tools: ${role.tools.join(", ")}`, `extensions: ${extension}`,
       ...(role.skills?.length ? [`skills: ${role.skills.join(", ")}`, `skillPath: ${(role.skillPaths ?? []).join(", ")}`] : []),
       "inheritProjectContext: false", "inheritGlobalContext: false", "inheritSkills: false", "---", role.prompt,

@@ -6,11 +6,21 @@ import pytest
 from harness_adapter.pi_adapter.event_translator import translate_runner_event
 from pydantic import ValidationError
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
-from pyromind_runtime.application.snapshot_projector import SnapshotProjector
+from pyromind_runtime.application.snapshot_projector import (
+    SnapshotProjector,
+    project_stage_activity,
+)
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.experiment_plans import ExperimentContext
+from pyromind_runtime.domain.preparation import (
+    ChecklistField,
+    PreparationPolicy,
+    ProjectView,
+    WorkflowNodeDefinition,
+)
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
     OperationActivity,
@@ -44,6 +54,205 @@ def activity():
         ],
         "truncated": False,
     }
+
+
+@pytest.mark.parametrize("status", ["running", "completed", "failed"])
+def test_role_activity_projects_into_existing_stage_columns_without_business_success(
+    status,
+):
+    policy = PreparationPolicy(
+        checklist_id="test",
+        version=1,
+        fields=(ChecklistField(key="goal", label="Goal"),),
+        allowed_roles=("worker",),
+        workflow_nodes=(
+            WorkflowNodeDefinition(id="baseline", name="Baseline", roles=("worker",)),
+        ),
+    )
+    operation = TimelineOperation.model_validate(
+        {
+            "item_id": "child-operation",
+            "started_seq": 1,
+            "name": "worker",
+            "category": "subagent",
+            "status": status,
+            "activity": activity(),
+        }
+    )
+    project = ProjectView(
+        project_id="project",
+        conversation_id="chat",
+        plan_sequence=1,
+        creation_command_id="create",
+        plan=ExperimentContext.model_validate(
+            {
+                "stages": [
+                    {"id": "business-stage", "kind": "baseline", "name": "Measure"}
+                ]
+            }
+        ),
+    )
+    snapshot = ConversationSnapshot(
+        conversation_id="chat",
+        capabilities=HarnessCapabilities(),
+        project=project,
+        timeline=(operation,),
+    )
+    projected = project_stage_activity(snapshot, policy)
+    child = projected.timeline[0]
+    assert isinstance(child, TimelineOperation)
+    assert child.execution == {
+        "project_id": "project",
+        "task_run_id": "child-operation",
+        "stage_id": "business-stage",
+        "plan_sequence": 1,
+    }
+    assert child.activity == operation.activity
+    assert projected.experiment_executions is not None
+    execution = projected.experiment_executions[0]
+    assert child.execution is not None
+    assert execution.run_id == child.execution["task_run_id"]
+    assert (
+        execution.state
+        == {
+            "running": "preparing",
+            "completed": "agent_completed",
+            "failed": "failed",
+        }[status]
+    )
+    assert execution.report_state != "ready"
+    assert operation.execution is None
+    assert snapshot.experiment_executions is None
+    assert project_stage_activity(projected, policy) == projected
+    ambiguous = project.model_copy(
+        update={
+            "plan": project.plan.model_copy(
+                update={
+                    "stages": (
+                        *project.plan.stages,
+                        project.plan.stages[0].model_copy(update={"id": "second"}),
+                    )
+                }
+            )
+        }
+    )
+    unmapped = project_stage_activity(
+        snapshot.model_copy(update={"project": ambiguous}), policy
+    )
+    assert unmapped.timeline == snapshot.timeline
+    assert not unmapped.experiment_executions
+
+
+@pytest.mark.parametrize("link", ["session", "previous"])
+@pytest.mark.parametrize("delivery", ["none", "published"])
+def test_continuations_share_one_stage_execution_and_preserve_all_rounds(
+    link, delivery
+):
+    session_key = "same-context" if link == "session" else None
+    report = "public_data/subagents/first/report.md"
+
+    policy = PreparationPolicy(
+        checklist_id="test",
+        version=1,
+        fields=(ChecklistField(key="goal", label="Goal"),),
+        allowed_roles=("worker",),
+        workflow_nodes=(
+            WorkflowNodeDefinition(id="baseline", name="Baseline", roles=("worker",)),
+        ),
+    )
+    first = TimelineOperation(
+        item_id="subagent:first",
+        run_id="first",
+        name="worker",
+        started_seq=1,
+        category="subagent",
+        status="completed",
+        activity=OperationActivity.model_validate(activity()),
+        details={
+            "subagent": {
+                "session_key": session_key,
+                "report_uri": report if delivery == "published" else None,
+            }
+        },
+    )
+    second = first.model_copy(
+        update={
+            "item_id": "subagent:second",
+            "run_id": "second",
+            "started_seq": 4,
+            "status": "completed",
+            "details": {
+                "subagent": {
+                    "session_key": session_key,
+                    "previous_run_id": "first" if link == "previous" else None,
+                }
+            },
+        }
+    )
+    tool_operations = []
+    if delivery in {"read", "none"}:
+        tool_operations.append(
+            TimelineOperation(
+                item_id="read-report",
+                name="read",
+                started_seq=2,
+                category="tool",
+                status="completed" if delivery == "read" else "failed",
+                arguments={"path": report},
+            )
+        )
+    if link == "tool_result":
+        tool_operations.append(
+            TimelineOperation(
+                item_id="resume",
+                name="subagent",
+                started_seq=3,
+                category="tool",
+                status="completed",
+                arguments={"action": "resume", "id": "first"},
+                details={"runId": "second"},
+            )
+        )
+    fresh = second.model_copy(
+        update={
+            "item_id": "subagent:fresh",
+            "run_id": "fresh",
+            "started_seq": 5,
+            "status": "running",
+            "details": {"subagent": {"session_key": "different-context"}},
+        }
+    )
+    snapshot = ConversationSnapshot(
+        conversation_id="chat",
+        capabilities=HarnessCapabilities(),
+        project=ProjectView(
+            project_id="project",
+            conversation_id="chat",
+            plan_sequence=1,
+            creation_command_id="create",
+            plan=ExperimentContext.model_validate(
+                {
+                    "stages": [{"id": "stage", "kind": "baseline", "name": "Measure"}],
+                }
+            ),
+        ),
+        timeline=(first, *tool_operations, second, fresh),
+    )
+    result = project_stage_activity(snapshot, policy)
+    assert result.experiment_executions is not None
+    continued, independent = result.experiment_executions
+    assert continued.run_id == first.item_id
+    assert continued.state == ("agent_completed" if delivery == "none" else "reported")
+    assert continued.report_uri == (None if delivery == "none" else report)
+    assert continued.report_state == ("not_started" if delivery == "none" else "ready")
+    assert independent.run_id == fresh.item_id
+    assert independent.state == "preparing"
+    assert len(result.timeline) == len(snapshot.timeline)
+    for item in (result.timeline[0], result.timeline[-2]):
+        assert isinstance(item, TimelineOperation)
+        assert item.execution is not None
+        assert item.execution["task_run_id"] == first.item_id
+        assert item.activity == first.activity
 
 
 def test_adapter_translates_native_activity_into_shared_models():

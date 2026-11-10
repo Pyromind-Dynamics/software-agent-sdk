@@ -27,20 +27,24 @@ test("a cancelled waiter returns promptly without overtaking the active job", as
   assert.equal(ran, false); release(); await first; await third; assert.equal(ran, true);
 });
 
-test("delegated native tools require a fenced role scope and keep permission admission", async () => {
+test("native child tools enforce role permissions before execution", async () => {
   const calls: Array<[string, any]> = [];
   const peer = {request: async (method: string, params: any) => {
     calls.push([method, params]); return {allow: true};
   }} as unknown as JsonlRpcPeer;
   const tool = new ToolCoordinator().wrap({name: "terminal", execute: async () => ({content: []})} as unknown as AgentTool, peer, "evaluator") as any;
-  await assert.rejects(tool.execute("unscoped", {}), /work scope/);
-  const scope = {run_id: "run", work_id: "work", generation: 3};
-  await tool.executeScoped("scoped", {command: "true"}, undefined, scope);
+  await tool.execute("native-child", {command: "true"});
   assert.equal(calls[0][0], "delegation.authorize_tool");
-  assert.deepEqual(calls[0][1], {role: "evaluator", scope, tool_name: "terminal"});
+  assert.deepEqual(calls[0][1], {role: "evaluator", tool_name: "terminal"});
   assert.equal(calls[1][0], "permission.check");
-  assert.deepEqual(calls[1][1].delegated_scope, scope);
   assert.equal(calls[1][1].delegated_role, "evaluator");
+  const denied = {request: async () => {throw new Error("role tool denied");}} as unknown as JsonlRpcPeer;
+  let executed = false;
+  const forbidden = new ToolCoordinator().wrap({name: "terminal", execute: async () => {
+    executed = true; return {content: []};
+  }} as unknown as AgentTool, denied, "evaluator");
+  await assert.rejects(forbidden.execute("denied", {}), /role tool denied/);
+  assert.equal(executed, false);
 });
 
 test("stopping a child cancels its pending permission before the next terminal enters", async () => {

@@ -82,7 +82,7 @@ export function createAskUserTool(
   spec: AskUserToolSpec,
   waits: InputWaitRegistry,
   isAvailable: () => boolean,
-  delegated?: { role: string; scope: JsonObject },
+  delegated?: { role: string; origin: JsonObject },
 ): AgentTool<TSchema, unknown> {
   return {
     name: "ask_user",
@@ -156,9 +156,8 @@ export function createDelegatedAskUserTool(peer: JsonlRpcPeer, tool: AgentTool, 
   return {
     ...tool,
     parameters: parameters as TSchema,
-    async executeScoped(id: string, args: unknown, signal?: AbortSignal, scope?: JsonObject) {
-      if (!scope) throw new Error("Question requires a live delegated turn");
-      const ask = createAskUserTool(peer, spec, waits, () => true, { role, scope });
+    async executeChild(id: string, args: unknown, signal: AbortSignal | undefined, origin: JsonObject) {
+      const ask = createAskUserTool(peer, spec, waits, () => true, { role, origin });
       return ask.execute(id, args, signal);
     },
   };

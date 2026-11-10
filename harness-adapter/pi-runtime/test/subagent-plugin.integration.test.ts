@@ -20,6 +20,15 @@ test("real plugin bridges tools and model, resumes persisted history, and owns b
     let body = ""; for await (const chunk of req) body += chunk;
     const request = JSON.parse(body); requests.push(request);
     const isParent = request.tools?.some((tool: any) => tool.function.name === "subagent");
+    const last = request.messages.at(-1);
+    if (isParent && last?.role === "user" && JSON.stringify(last.content).includes('"LAUNCH_WITH_MESSAGE"')) {
+      const args = { agent: "search", async: false, context: "fresh", message: "Read CHILD_TASK_ALIAS evidence" };
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const delta = { role: "assistant", tool_calls: [{ index: 0, id: "launch-with-message", type: "function",
+        function: { name: "subagent", arguments: JSON.stringify(args) } }] };
+      res.end(`data: ${JSON.stringify({id:"test",object:"chat.completion.chunk",created:1,model:request.model,choices:[{index:0,delta,finish_reason:"tool_calls"}]})}\n\ndata: [DONE]\n\n`);
+      return;
+    }
     if (!isParent && JSON.stringify(request.messages).includes("WAIT_FOR_STOP")) { stalled++; return; }
     const hasRead = isParent || request.messages.some((message: any) => message.role === "tool" && JSON.stringify(message).includes("CHILD_EVIDENCE_937"));
     const isWriter = !isParent && request.tools?.some((tool: any) => tool.function.name === "write");
@@ -56,11 +65,19 @@ test("real plugin bridges tools and model, resumes persisted history, and owns b
   assert.match(parentContext, /<advertised_subagents>/);
   assert.match(parentContext, /<name>search<\/name>/);
   assert.match(parentContext, /<name>general_purpose<\/name>/);
-  const description = parentRequest.tools.find((tool: any) => tool.function.name === "subagent").function.description;
+  const { description, parameters } = parentRequest.tools.find((tool: any) => tool.function.name === "subagent").function;
+  assert.deepEqual(Object.keys(parameters.properties).sort(), ["action", "agent", "async", "context", "id", "message", "task"]);
+  assert.deepEqual(parameters.properties.action.enum, ["status", "steer", "resume", "stop", "list"]);
   assert.match(description, /search: read-only research/);
   assert.match(description, /general_purpose: analysis/);
   assert.match(description, /action:"resume"/);
   assert.doesNotMatch(description, /guide tool-reference|guide workflows|fields not in this schema go in options/);
+  await session.prompt("LAUNCH_WITH_MESSAGE");
+  const launch = session.messages.find(m => m.role === "toolResult" && m.toolCallId === "launch-with-message");
+  assert.ok(launch?.role === "toolResult" && !launch.isError, JSON.stringify(launch));
+  assert.match(JSON.stringify(launch.content), /CHILD_EVIDENCE_937/);
+  assert.ok(requests.some(request => request.tools?.every((tool: any) => tool.function.name !== "subagent") &&
+    JSON.stringify(request.messages).includes("CHILD_TASK_ALIAS")));
   const roles: any = await execute({action:"list"});
   assert.ok(!roles.isError, JSON.stringify(roles));
   assert.match(JSON.stringify(roles), /general_purpose/);
@@ -89,21 +106,29 @@ test("real plugin bridges tools and model, resumes persisted history, and owns b
     assert.equal(windows.some((item: any) => item.role === "system"), false);
   });
   assert.equal(session.messages.some((m: any)=>m.role==="toolResult"&&m.toolName==="read"),false);
+  session.sessionManager.appendMessage({
+    role: "system", content: "", timestamp: Date.now(),
+    toolsAdded: [{ name: "subagent", description: "Legacy declaration", parameters: {
+      type: "object", properties: { ...parameters.properties, options: { type: "object" } },
+    } }],
+  });
   await subagents.stopAll(); await session.abort(); await session.waitForIdle();
   await session.extensionRunner.emit({type:"session_shutdown",reason:"quit"}); session.dispose(); await subagents.close();
   ({session,subagents}=await createPiSession(config,peer));
   await subagents.attach(session);
   tool=session.getToolDefinition("subagent")!;
+  assert.match(tool.description, /search: read-only research/);
   const afterRestart: any = await execute({action:"resume",id:resume.details.asyncId,message:"Continue after host restart"});
   assert.ok(afterRestart.details.asyncId,JSON.stringify(afterRestart));
   await eventually(async()=>{const value=JSON.parse(await readFile(join(subagents.paths.stateRoot,"async-subagent-runs",afterRestart.details.asyncId,"status.json"),"utf8"));assert.equal(value.state,"complete",JSON.stringify(value));assert.match(await readFile(value.sessionFile,"utf8"),/users=3/);});
-  const guided = await subagents.control({action:"spawn",role:"search",task:"WAIT_FOR_GUIDANCE: summarize the evidence",request_id:"guided-start"});
+  const guided: any = await execute({agent:"search",task:"WAIT_FOR_GUIDANCE: summarize the evidence",async:true});
+  const guidedId = guided.details.asyncId;
   await eventually(async () => assert.ok(finishGuidance));
-  const guidance = await subagents.control({action:"steer",role:"search",execution_ref:guided.execution_ref,task:"NEW_GUIDANCE_481: retain prior evidence and explain it",request_id:"guided-message"});
-  assert.equal(guidance.execution_ref, guided.execution_ref);
+  const guidance: any = await execute({action:"steer",id:guidedId,message:"NEW_GUIDANCE_481: retain prior evidence and explain it"});
+  assert.ok(!guidance.isError,JSON.stringify(guidance));
   finishGuidance!();
   await eventually(async () => {
-    const value = JSON.parse(await readFile(join(subagents.paths.stateRoot,"async-subagent-runs",guided.execution_ref,"status.json"),"utf8"));
+    const value = JSON.parse(await readFile(join(subagents.paths.stateRoot,"async-subagent-runs",guidedId,"status.json"),"utf8"));
     assert.equal(value.state,"complete",JSON.stringify(value));
     const transcript = await readFile(value.sessionFile,"utf8");
     assert.match(transcript,/NEW_GUIDANCE_481/);

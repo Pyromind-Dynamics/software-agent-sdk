@@ -202,7 +202,7 @@ async def test_confirmation_keeps_the_child_origin_and_rejects_other_profiles(tm
 
     from pyromind_runtime.domain.commands import PermissionResponseCommand
 
-    runtime, _, submission, context = await _runtime(tmp_path)
+    runtime, adapter, submission, context = await _runtime(tmp_path)
     origin = TaskOrigin(type="subagent", subagent_id="worker")
     try:
         with pytest.raises(PermissionError):
@@ -219,6 +219,11 @@ async def test_confirmation_keeps_the_child_origin_and_rejects_other_profiles(tm
             origin=origin,
             request_id="child-request",
         )
+        store = FileProductStore(tmp_path / "workflow-conversation")
+        assert [
+            item.permission_id for item in store.load_snapshot().pending_permissions
+        ] == ["workflow-run:child-request"]
+        assert adapter.sent == []
         await runtime.submit_command(
             "workflow-conversation",
             PermissionResponseCommand(
@@ -231,10 +236,7 @@ async def test_confirmation_keeps_the_child_origin_and_rejects_other_profiles(tm
         assert submission.correlations[0] is not None
         assert submission.correlations[0].origin == origin
         assert (
-            FileProductStore(tmp_path / "workflow-conversation")
-            .load_snapshot()
-            .external_tasks[0]
-            .correlation
+            store.load_snapshot().external_tasks[0].correlation
             == submission.correlations[0]
         )
     finally:

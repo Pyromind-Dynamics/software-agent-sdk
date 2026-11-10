@@ -164,23 +164,5 @@
       "name": "RawData",
       "description": "原始数据来源，无执行角色；当前不启用单独节点。"
     }
-  ],
-  "execution_policies": {
-    "init": {
-      "submission_tool": "df_submit_evaluation",
-      "artifact_contract": "evaluation"
-    },
-    "eval": {
-      "submission_tool": "df_submit_evaluation",
-      "artifact_contract": "evaluation"
-    },
-    "dataset": {
-      "submission_tool": "df_submit_pipeline",
-      "artifact_contract": "data"
-    },
-    "train": {
-      "submission_tool": "submit_workflow",
-      "artifact_contract": "model"
-    }
-  }
+  ]
 }

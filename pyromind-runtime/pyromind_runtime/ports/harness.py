@@ -13,7 +13,10 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.preparation import PreparationPolicy
 from pyromind_runtime.domain.session_policy import SessionPolicy
-from pyromind_runtime.domain.snapshot import OperationActivity, WorkflowState
+from pyromind_runtime.domain.snapshot import (
+    OperationActivity,
+    WorkflowState,
+)
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
 
@@ -48,7 +51,6 @@ class SessionSpec(ContractModel):
     development_skill_allowlist: tuple[str, ...] | None = None
     command_allowlist: tuple[str, ...] | None = None
     delegated_roles: tuple[DelegatedRole, ...] | None = None
-    managed_delegation: bool = False
     preparation_policy: PreparationPolicy | None = None
 
 
@@ -213,24 +215,6 @@ class HarnessAdapter(Protocol):
 @runtime_checkable
 class SessionLivenessAdapter(Protocol):
     async def has_pending_session_work(self, handle: SessionHandle) -> bool: ...
-
-
-class DelegationAdapter(Protocol):
-    async def execute_delegated_tool(
-        self,
-        handle: SessionHandle,
-        role: str,
-        scope: JsonObject,
-        tool: str,
-        arguments: JsonObject,
-        context: RequestContext,
-    ) -> JsonObject: ...
-
-    async def control_delegation(
-        self, handle: SessionHandle, request: JsonObject, context: RequestContext
-    ) -> JsonObject:
-        """Control a child. Interrupted failures indicate lost execution transport."""
-        ...
 
 
 @runtime_checkable

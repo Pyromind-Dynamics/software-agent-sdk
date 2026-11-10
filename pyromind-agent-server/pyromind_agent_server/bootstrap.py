@@ -12,10 +12,7 @@ from harness_adapter.artifact_snapshots import PlatformArtifactSnapshots
 from harness_adapter.openhands_adapter import OpenHandsAdapter
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.workflow_submission import PlatformWorkflowSubmission
-from pyromind_runtime.application.conversation_runtime import (
-    DEFAULT_EXECUTION_WORKER_CONCURRENCY,
-    ConversationRuntime,
-)
+from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.capabilities import ResourceLimits
@@ -24,10 +21,6 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.versions import VersionToolRequest
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
-from pyromind_runtime.infrastructure.sql_experiment_execution import (
-    SQLExperimentExecutionStore,
-)
-from pyromind_runtime.infrastructure.sql_preparation import SQLPreparationStore
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import HarnessAdapter
 from pyromind_runtime.ports.workflows import WorkflowEventSink
@@ -35,9 +28,6 @@ from pyromind_runtime.ports.workflows import WorkflowEventSink
 from openhands.agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
 from openhands.agent_server.run_workflow_callback import set_workflow_status_dispatcher
 from openhands.agent_server.storage_quota import ensure_conversation_quota
-from pyromind_agent_server.evaluation_configuration import (
-    validate_evaluation_configuration,
-)
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_agent_server.experiment_plan_projects import (
     EchoMindExperimentPlanProjectBinder,
@@ -234,28 +224,18 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             harness_eviction_seconds,
             idle_eviction_seconds,
         )
-    plan_store = build_experiment_plan_store()
-    execution_store = (
-        SQLExperimentExecutionStore(plan_store.engine) if plan_store else None
-    )
+    preparation_store = build_experiment_plan_store()
     runtime = ConversationRuntime(
         service.conversations_dir,
         adapters,
         default_harness_id=backend,
-        experiment_plan_store=plan_store,
-        experiment_execution_store=execution_store,
-        preparation_store=SQLPreparationStore(plan_store.engine)
-        if plan_store
-        else None,
+        preparation_store=preparation_store,
         experiment_plan_project_binder=EchoMindExperimentPlanProjectBinder(
             service.conversations_dir
         )
-        if plan_store
+        if preparation_store
         else None,
         resource_inspector=StorageResourceInspector(),
-        execution_roles=tuple(
-            role.name for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()
-        ),
         external_task_query=PlatformWorkflowSubmission(),
         observer=build_execution_observer(service.conversations_dir),
         external_tasks=external_tasks,
@@ -268,11 +248,9 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         workflow_submission=PlatformWorkflowSubmission(),
         versions=versions,
         evaluation_storage_factory=build_evaluation_storage,
-        evaluation_config_validator=validate_evaluation_configuration,
     )
     pi_adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
-    pi_adapter.set_plan_handler(runtime.experiment_plan_call)
-    pi_adapter.set_role_handler(runtime.execution_role_call)
+    pi_adapter.set_preparation_handler(runtime.preparation_call)
     logger.info(
         "Pyromind product runtime ready: default_harness=%s "
         "PYROMIND_HARNESS_BACKEND=%s registered_harnesses=%s "
@@ -291,15 +269,6 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     )
     set_workflow_status_dispatcher(WorkflowStatusDispatcher(runtime).dispatch)
     app.state.product_runtime = runtime
-    if execution_store:
-        from openhands.agent_server.kafka_bus.kafka_bus import KafkaMessageBus
-        from pyromind_agent_server.execution_observations import (
-            ExecutionObservationHandler,
-        )
-
-        bus = KafkaMessageBus(acknowledge_after_handle=True)
-        bus.register_handler(ExecutionObservationHandler(execution_store))
-        app.state.execution_observation_bus = bus
     return runtime
 
 
@@ -348,23 +317,10 @@ def install_product_api(app: FastAPI) -> FastAPI:
             runtime = ensure_product_runtime(current_app)
             if runtime is not None:
                 await runtime.recover_version_metadata()
-                await runtime.start_execution_events(
-                    execution_worker_concurrency=int(
-                        os.getenv(
-                            "PYROMIND_EXECUTION_WORKER_CONCURRENCY",
-                            str(DEFAULT_EXECUTION_WORKER_CONCURRENCY),
-                        )
-                    )
-                )
-                bus = getattr(current_app.state, "execution_observation_bus", None)
-                if bus:
-                    await bus.start_consumer()
+                await runtime.start_execution_events()
             try:
                 yield
             finally:
-                bus = getattr(current_app.state, "execution_observation_bus", None)
-                if bus:
-                    await bus.stop()
                 runtime = getattr(current_app.state, "product_runtime", None)
                 if isinstance(runtime, ConversationRuntime):
                     await runtime.close()

@@ -9,7 +9,11 @@ from pydantic import JsonValue, TypeAdapter, ValidationError
 from pyromind_runtime.domain.base import as_utc
 from pyromind_runtime.domain.content import ContentBlock, JsonObject, TextContent
 from pyromind_runtime.domain.events import ProductEvent
-from pyromind_runtime.domain.experiment_execution import ExecutionBinding
+from pyromind_runtime.domain.experiment_execution import (
+    ExecutionBinding,
+    ExperimentExecutionView,
+)
+from pyromind_runtime.domain.preparation import PreparationPolicy
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
     ExternalTaskState,
@@ -55,6 +59,113 @@ _InputOutcome = Literal["answered", "cancelled", "interrupted"]
 
 class SnapshotProjectionError(RuntimeError):
     pass
+
+
+def project_stage_activity(
+    snapshot: ConversationSnapshot,
+    policy: PreparationPolicy,
+) -> ConversationSnapshot:
+    """Adapt role operations to the existing stage view without scheduling work."""
+    project = snapshot.project
+    if project is None:
+        return snapshot
+    nodes = {node.id: node for node in policy.workflow_nodes}
+    operations = []
+    executions = list(snapshot.experiment_executions or ())
+    roots: dict[tuple[str, str, str], str] = {}
+    sessions: dict[tuple[str, str, str], str] = {}
+    latest: dict[str, tuple[TimelineOperation, str]] = {}
+    reports: dict[str, str] = {}
+    for item in snapshot.timeline:
+        if (
+            not isinstance(item, TimelineOperation)
+            or item.category != "subagent"
+            or item.execution is not None
+        ):
+            operations.append(item)
+            continue
+        stages = [
+            stage
+            for stage in project.plan.stages
+            if stage.enabled
+            and not stage.placeholder
+            and stage.kind in nodes
+            and item.name in nodes[stage.kind].roles
+        ]
+        if len(stages) != 1:
+            operations.append(item)
+            continue
+        stage = stages[0]
+        details = item.details if isinstance(item.details, dict) else {}
+        child = details.get("subagent")
+        child = child if isinstance(child, dict) else {}
+        previous = child.get("previous_run_id")
+        session_key = child.get("session_key")
+        session_key = session_key if isinstance(session_key, str) else None
+        parent = roots.get((stage.id, item.name, str(previous)))
+        root = (
+            parent
+            or (
+                sessions.get((stage.id, item.name, session_key))
+                if session_key
+                else None
+            )
+            or item.item_id
+        )
+        roots[(stage.id, item.name, item.run_id or item.item_id)] = root
+        if session_key:
+            sessions[(stage.id, item.name, session_key)] = root
+        binding = ExecutionBinding(
+            project_id=project.project_id,
+            stage_id=stage.id,
+            task_run_id=root,
+            plan_sequence=project.plan_sequence,
+        )
+        operations.append(
+            item.model_copy(update={"execution": binding.model_dump(mode="json")})
+        )
+        latest[root] = (item, stage.id)
+        report = child.get("report_uri")
+        if item.status == "completed" and isinstance(report, str) and report:
+            reports[root] = report
+    for root, (item, stage_id) in latest.items():
+        stage = next(stage for stage in project.plan.stages if stage.id == stage_id)
+        report_uri = reports.get(root)
+        state = {
+            "running": "preparing",
+            "completed": "reported" if report_uri else "agent_completed",
+            "failed": "failed",
+        }[item.status]
+        waiting_reason = (
+            "子 Agent 本轮已结束，等待交付报告。"
+            if state == "agent_completed"
+            else None
+        )
+        if report_uri and state != "reported":
+            waiting_reason = f"已有交付报告：{report_uri}"
+        executions.append(
+            ExperimentExecutionView(
+                run_id=root,
+                project_id=project.project_id,
+                task_id=root,
+                stage_id=stage.id,
+                stage_snapshot=stage.model_dump(mode="json"),
+                plan_sequence=project.plan_sequence,
+                task_name=stage.name,
+                role_id=item.name,
+                state=state,
+                waiting_reason=waiting_reason,
+                report_state="ready" if report_uri else "not_started",
+                report_uri=report_uri,
+                intent="execute",
+            )
+        )
+    return snapshot.model_copy(
+        update={
+            "timeline": tuple(operations),
+            "experiment_executions": tuple(executions),
+        }
+    )
 
 
 def _latest(current: datetime | None, candidate: datetime) -> datetime:

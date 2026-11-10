@@ -27,12 +27,11 @@ export class ToolCoordinator {
 
   wrap(tool: AgentTool, peer: JsonlRpcPeer, role?: string, recheckAfterApproval = false): AgentTool {
     if (!["terminal", "write", "edit"].includes(tool.name)) return tool;
-    const execute = (id: string, args: any, signal?: AbortSignal, update?: any, scope?: JsonObject) => this.run(signal, async () => {
+    const execute = (id: string, args: any, signal?: AbortSignal, update?: any) => this.run(signal, async () => {
       const authorize = async () => {
         signal?.throwIfAborted();
         if (!role) return;
-        if (!scope) throw new Error("Delegated tool requires a work scope");
-        await peer.request("delegation.authorize_tool", { role, scope, tool_name: tool.name });
+        await peer.request("delegation.authorize_tool", { role, tool_name: tool.name });
         signal?.throwIfAborted();
       };
       const approve = async () => {
@@ -42,7 +41,7 @@ export class ToolCoordinator {
         try {
           decision = await peer.request("permission.check", {
             tool_call_id: id, tool_name: "terminal", arguments: JSON.parse(JSON.stringify(args)) as JsonObject,
-            ...(role ? {delegated_role: role, delegated_scope: scope!} : {}),
+            ...(role ? {delegated_role: role} : {}),
           });
         } finally { signal?.removeEventListener("abort", cancelPermission); }
         signal?.throwIfAborted();
@@ -50,7 +49,6 @@ export class ToolCoordinator {
         if (!decision.allow) throw new Error(typeof decision.reason === "string" ? decision.reason : "User denied terminal command");
       };
       if (tool.name === "terminal" && recheckAfterApproval) {
-        if (role && !scope) throw new Error("Delegated tool requires a work scope");
         await approve();
         await authorize();
       } else {
@@ -59,7 +57,6 @@ export class ToolCoordinator {
       }
       return tool.execute(id, args, signal, update);
     });
-    return { ...tool, execute: (id, args, signal, update) => execute(id, args, signal, update),
-      ...(role ? {executeScoped: (id: string, args: any, signal: AbortSignal | undefined, scope: JsonObject, _origin?: JsonObject, update?: any) => execute(id, args, signal, update, scope)} : {}) };
+    return { ...tool, execute: (id, args, signal, update) => execute(id, args, signal, update) };
   }
 }

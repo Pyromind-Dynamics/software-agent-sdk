@@ -48,7 +48,6 @@ from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.snapshot import WorkflowState
 from pyromind_runtime.ports.harness import (
-    DelegatedRole,
     ExternalTaskNotification,
     ForkSpec,
     ProductCheckpoint,
@@ -412,89 +411,33 @@ async def test_create_session_quota_hook_failure_aborts_session(
     assert not (conversations / conversation_id).exists()
 
 
-async def test_control_delegation_prepares_task_workspace_before_spawn(
-    tmp_path, monkeypatch
+async def test_native_role_tools_require_an_allowed_tool_and_child_origin(
+    tmp_path: Path,
 ) -> None:
-    conversations = tmp_path / "conversations"
-    conversations.mkdir()
-    conversation_root = conversations / "delegated"
-    requests: list[tuple[str, dict[str, Any]]] = []
-
-    class FakeRunner:
-        def __init__(self, **_kwargs) -> None:
-            self.running = True
-
-        async def start(self, _config) -> None:
-            pass
-
-        async def request(self, method, params):
-            requests.append((method, params))
-            if method == "delegation.control":
-                assert (
-                    conversation_root / "public_data/experiment-runs/run-1/public_data"
-                ).is_dir()
-                return {
-                    "execution_ref": "native-1",
-                    "status": "queued",
-                }
-            return {"accepted": True}
-
-        async def close(self) -> None:
-            self.running = False
-
-    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", FakeRunner)
-    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
-    context = RequestContext(user_id="42")
-    handle = await adapter.create_session(
-        SessionSpec(
-            conversation_id="delegated",
-            user_id="42",
-            workspace_root=str(conversation_root),
-            model_configuration={"model": "gpt-5", "api_key": "test-key"},
-            managed_delegation=True,
-            delegated_roles=(
-                DelegatedRole(
-                    name="eval",
-                    description="Evaluate a task",
-                    prompt="Evaluate it.",
-                    tools=("read",),
-                ),
-            ),
-        ),
-        context,
+    adapter = PiAdapter(tmp_path, terminal_backend="os-sandbox")
+    files = PiSessionFiles(tmp_path)
+    config = {
+        "tool_allowlist": ["subagent"],
+        "delegated_roles": [
+            {"name": "eval", "tools": ["get_storage_url"]},
+            {"name": "train", "tools": ["validate_workflow_dsl"]},
+        ],
+    }
+    session = pi_adapter_module._PiSession(
+        "conversation", tmp_path, files, config, RequestContext(user_id="42")
     )
-    scope = {"work_id": "work-1", "generation": 1, "run_id": "run-1"}
-    try:
-        result = await adapter.control_delegation(
-            handle,
-            {
-                "action": "spawn",
-                "role": "eval",
-                "scope": scope,
-                "launch_request_id": "spawn-1",
-            },
-            context,
+    with pytest.raises(PermissionError, match="native role tool is not authorized"):
+        await adapter._runner_request(
+            session,
+            "role.tool.execute",
+            {"role": "eval", "tool_name": "validate_workflow_dsl"},
         )
-        assert result["execution_ref"] == "native-1"
-        assert requests[-1][0] == "delegation.control"
-        assert (
-            conversation_root / "public_data/experiment-runs/run-1/public_data"
-        ).is_dir()
-
-        with pytest.raises(ValueError, match="invalid delegated run id"):
-            await adapter.control_delegation(
-                handle,
-                {
-                    "action": "spawn",
-                    "role": "eval",
-                    "scope": {**scope, "run_id": "../escape"},
-                    "launch_request_id": "spawn-invalid",
-                },
-                context,
-            )
-        assert requests[-1][0] == "delegation.control"
-    finally:
-        await adapter.close(handle)
+    with pytest.raises(PermissionError, match="requires a child origin"):
+        await adapter._runner_request(
+            session,
+            "role.tool.execute",
+            {"role": "eval", "tool_name": "get_storage_url"},
+        )
 
 
 async def test_idle_unexpected_runner_exit_is_silent_and_restarts_lazily(

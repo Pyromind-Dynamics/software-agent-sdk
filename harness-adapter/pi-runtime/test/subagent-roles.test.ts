@@ -4,16 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { parseSubagentRoles, writeSubagentRoles } from "../src/subagent-roles.js";
-import { delegatedWorkspace, SubagentHost, validateSubagentCall } from "../src/subagent-host.js";
+import { SubagentHost, validateSubagentCall } from "../src/subagent-host.js";
 
 const role = { name: "evaluator", description: "Evaluate frozen inputs", prompt: "Return evidence", tools: ["read"], skills: ["evaluation"] };
-
-test("delegated workspaces are derived from trusted run ids only", () => {
-  assert.equal(delegatedWorkspace({ run_id: "run-1" }), "public_data/experiment-runs/run-1");
-  for (const scope of [undefined, {}, { run_id: "../escape" }, { run_id: "/absolute" }]) {
-    assert.equal(delegatedWorkspace(scope), undefined);
-  }
-});
 
 test("missing tools identify the role and cannot be supplied by another role", () => {
   assert.throws(() => new SubagentHost("/unused", "test", {} as any,

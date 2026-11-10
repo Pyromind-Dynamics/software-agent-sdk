@@ -18,11 +18,8 @@ from pyromind_runtime.domain.preparation import ProjectView
 from openhands.agent_server.agent_profiles.echomind_manager import (
     ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
     ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
-    ECHOMIND_MANAGER_PLANNING_SKILLS,
-    ECHOMIND_MANAGER_PLANNING_TOOLS,
     ECHOMIND_MANAGER_PROFILE,
 )
-from openhands.agent_server.agent_profiles.pyromind import PYROMIND_PROFILE
 from openhands.agent_server.echomind_projects import (
     ProjectClusterMismatchError,
     ProjectNotFoundError,
@@ -60,38 +57,45 @@ def _experiment_plan(*, name: str = "AVI experiment") -> WorkflowPlan:
 
 def test_echomind_manager_planning_and_development_capabilities_are_explicit():
     assert ECHOMIND_PRODUCT_PROFILE.profile_id == "echomind"
-    assert ECHOMIND_PRODUCT_PROFILE.tool_allowlist == ECHOMIND_MANAGER_PLANNING_TOOLS
-    assert set(ECHOMIND_MANAGER_PLANNING_TOOLS) == {
+    assert set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ()) == {
         "read",
+        "write",
+        "edit",
         "terminal",
-        "create_experiment_plan",
-        "revise_experiment_plan",
-        "get_experiment_plan",
+        "ask_user",
+        "get_preparation",
+        "update_preparation",
+        "set_preparation_plan",
+        "inspect_resource",
     }
-    assert ECHOMIND_PRODUCT_PROFILE.skill_allowlist == ECHOMIND_MANAGER_PLANNING_SKILLS
+    assert ECHOMIND_PRODUCT_PROFILE.skill_allowlist == ("model-evaluation-preparation",)
     assert ECHOMIND_MANAGER_PROFILE.usage_id == "echomind-manager"
-
     assert set(ECHOMIND_MANAGER_DEVELOPMENT_TOOLS) == {
-        *PYROMIND_PROFILE.tool_allowlist,
-        "create_experiment_plan",
-        "revise_experiment_plan",
-        "get_experiment_plan",
-        "request_experiment_task",
-        "get_experiment_execution",
+        "read",
+        "write",
+        "edit",
+        "terminal",
+        "subagent",
+        "ask_user",
+        "get_storage_url",
     }
-    assert not {"request_experiment_task", "get_experiment_execution"}.intersection(
-        PYROMIND_PROFILE.tool_allowlist
+    assert (
+        ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist
+        == ECHOMIND_MANAGER_DEVELOPMENT_TOOLS
     )
-    assert set(ECHOMIND_MANAGER_DEVELOPMENT_SKILLS) == {
-        *PYROMIND_PROFILE.skill_allowlist,
-        "experiment-planning",
+    assert (
+        ECHOMIND_PRODUCT_PROFILE.development_skill_allowlist
+        == ECHOMIND_MANAGER_DEVELOPMENT_SKILLS
+        == ()
+    )
+    assert set(
+        role.name for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()
+    ) == {
+        "init",
+        "dataset",
+        "train",
+        "eval",
     }
-    assert ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist == (
-        ECHOMIND_MANAGER_DEVELOPMENT_TOOLS
-    )
-    assert ECHOMIND_PRODUCT_PROFILE.development_skill_allowlist == (
-        ECHOMIND_MANAGER_DEVELOPMENT_SKILLS
-    )
 
 
 def test_plan_binding_creates_and_updates_one_project_with_revision_id(tmp_path):
@@ -181,19 +185,21 @@ def test_binder_uses_plan_owner_for_project_identity(tmp_path):
         conversation_id="conversation-1",
         profile_id="echomind",
     )
-    revision = PlanRevision(
+    accepted = ProjectView(
         project_id=uuid4().hex,
-        revision=1,
-        plan=_experiment_plan(),
-        confirmed_by=owner.user_id,
+        conversation_id=owner.conversation_id,
+        plan_sequence=1,
+        creation_command_id="create",
+        plan=ExperimentContext(
+            goal="Accepted goal", stages=(ExperimentStage(id="init", name="Init"),)
+        ),
     )
-
-    EchoMindExperimentPlanProjectBinder(tmp_path / "conversations").bind(
-        revision, owner, cluster="us-west-1#pre"
+    EchoMindExperimentPlanProjectBinder(tmp_path / "conversations").bind_preparation(
+        accepted, owner, cluster="us-west-1#pre"
     )
 
     project = ProjectStore.for_conversations_dir(tmp_path / "conversations").load(
-        revision.project_id, owner_user_id=owner.user_id
+        accepted.project_id, owner_user_id=owner.user_id
     )
     assert project.project.conversation_id == owner.conversation_id
     assert project.project.cluster == "us-west-1#pre"
