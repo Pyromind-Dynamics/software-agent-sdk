@@ -7,29 +7,10 @@ from pydantic import Field, model_validator
 
 from pyromind_runtime.domain.base import ContractModel, utc_now
 from pyromind_runtime.domain.content import ContentBlock, JsonObject
-from pyromind_runtime.domain.experiment_execution import ControlExperimentTask
 from pyromind_runtime.domain.user_input import (
     MAX_USER_INPUT_BYTES,
     UserInputAnswer,
 )
-
-
-class ControlExperimentTaskCommand(ControlExperimentTask):
-    type: Literal["control_experiment_task"] = "control_experiment_task"
-
-
-class ResolveExperimentSubmissionCommand(ContractModel):
-    type: Literal["resolve_experiment_submission"] = "resolve_experiment_submission"
-    command_id: str = Field(min_length=1, max_length=128)
-    run_id: str = Field(min_length=1)
-    action: Literal["bind", "abandon"]
-    task_id: str | None = Field(default=None, min_length=1)
-
-    @model_validator(mode="after")
-    def validate_target(self):
-        if (self.action == "bind") != (self.task_id is not None):
-            raise ValueError("only binding requires a platform task ID")
-        return self
 
 
 class UserMessageCommand(ContractModel):
@@ -91,47 +72,12 @@ class CreateProjectCommand(ContractModel):
     expected_preparation_revision: int = Field(ge=0)
 
 
-class ConfirmExperimentPlanCommand(ContractModel):
-    command_id: str = Field(min_length=1, max_length=128)
-    type: Literal["confirm_experiment_plan"] = "confirm_experiment_plan"
-    proposal_id: str = Field(min_length=1)
-    expected_revision: int = Field(ge=0)
-
-
-class RejectExperimentPlanCommand(ContractModel):
-    command_id: str = Field(min_length=1, max_length=128)
-    type: Literal["reject_experiment_plan"] = "reject_experiment_plan"
-    proposal_id: str = Field(min_length=1)
-
-
-class ConfirmExperimentExecutionCommand(ContractModel):
-    command_id: str = Field(min_length=1, max_length=128)
-    type: Literal["confirm_experiment_execution"] = "confirm_experiment_execution"
-    run_id: str = Field(min_length=1)
-    expected_revision: int = Field(ge=1)
-    fingerprint: str = Field(min_length=64, max_length=64)
-
-
-class RejectExperimentExecutionCommand(ContractModel):
-    command_id: str = Field(min_length=1, max_length=128)
-    type: Literal["reject_experiment_execution"] = "reject_experiment_execution"
-    run_id: str = Field(min_length=1)
-    expected_revision: int = Field(ge=1)
-    fingerprint: str = Field(min_length=64, max_length=64)
-
-
 type ProductCommand = Annotated[
     UserMessageCommand
     | CancelCommand
     | PermissionResponseCommand
     | RollbackWorkflowCommand
     | InputResponseCommand
-    | ConfirmExperimentPlanCommand
-    | RejectExperimentPlanCommand
-    | ConfirmExperimentExecutionCommand
-    | RejectExperimentExecutionCommand
-    | ControlExperimentTaskCommand
-    | ResolveExperimentSubmissionCommand
     | CreateProjectCommand,
     Field(discriminator="type"),
 ]

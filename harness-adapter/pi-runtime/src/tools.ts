@@ -365,11 +365,11 @@ function bindPathTool(
   };
 }
 
-export function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig, role?: string): AgentTool<TSchema, unknown> & { executeScoped: (id: string, args: unknown, signal?: AbortSignal, scope?: JsonObject, origin?: JsonObject) => Promise<any> } {
-  const executeScoped = async (callId: string, params: unknown, signal?: AbortSignal, scope?: JsonObject, origin?: JsonObject) => {
+export function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig, role?: string): AgentTool<TSchema, unknown> & { executeChild: (id: string, args: unknown, signal?: AbortSignal, origin?: JsonObject) => Promise<any> } {
+  const executeChild = async (callId: string, params: unknown, signal?: AbortSignal, origin?: JsonObject) => {
       if (!isRecord(params)) throw new Error("tool arguments must be an object");
       const response = await peer.request(role ? "role.tool.execute" : "tool.execute", {
-        ...(role ? { role, scope } : {}),
+        ...(role ? { role } : {}),
         tool_call_id: callId,
         ...(origin ? { origin } : {}),
         tool_name: config.name,
@@ -388,8 +388,18 @@ export function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig, rol
       };
   };
   return { name: config.name, label: config.name, description: config.description,
-    parameters: config.inputSchema as TSchema, executeScoped,
-    execute: (id, args, signal) => executeScoped(id, args, signal),
+    parameters: config.inputSchema as TSchema, executeChild,
+    ...(config.name === "update_preparation" ? {
+      prepareArguments(args: unknown) {
+        if (!isRecord(args) || typeof args.facts !== "string" || args.facts.length > 262144) return args;
+        try {
+          const facts: unknown = JSON.parse(args.facts);
+          if (isRecord(facts)) return { ...args, facts };
+        } catch { /* Native validation reports malformed facts. */ }
+        return args;
+      },
+    } : {}),
+    execute: (id, args, signal) => executeChild(id, args, signal),
   };
 }
 

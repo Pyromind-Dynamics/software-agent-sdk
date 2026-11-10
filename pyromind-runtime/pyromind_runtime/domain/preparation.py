@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field, GetJsonSchemaHandler, JsonValue, model_validator
+from pydantic import (
+    Field,
+    GetJsonSchemaHandler,
+    JsonValue,
+    field_validator,
+    model_validator,
+)
 from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import CoreSchema
 
 from pyromind_runtime.domain.base import ContractModel
-from pyromind_runtime.domain.execution_policy import TaskExecutionPolicy
 from pyromind_runtime.domain.experiment_execution import DelegateExperimentTask
 from pyromind_runtime.domain.experiment_plans import ExperimentContext
 
@@ -46,18 +51,12 @@ class PreparationPolicy(ContractModel):
     fields: tuple[ChecklistField, ...] = Field(min_length=1)
     allowed_roles: tuple[str, ...] = Field(min_length=1)
 
-    execution_policies: dict[str, TaskExecutionPolicy] = Field(
-        default_factory=dict, exclude_if=lambda value: not value
-    )
-
     workflow_nodes: tuple[WorkflowNodeDefinition, ...] = Field(
         default=(), exclude_if=lambda value: not value
     )
 
     @model_validator(mode="after")
     def validate_keys(self):
-        if not set(self.execution_policies) <= set(self.allowed_roles):
-            raise ValueError("execution policy role is not enabled")
         node_ids = [node.id for node in self.workflow_nodes]
         if len(node_ids) != len(set(node_ids)):
             raise ValueError("duplicate workflow node type")
@@ -130,21 +129,20 @@ class PreparationView(ContractModel):
 class UpdatePreparation(ContractModel):
     expected_revision: int = Field(ge=0)
     facts: dict[str, PreparationFact]
-    plan: ExperimentContext | None = None
-    entry_task: DelegateExperimentTask | None = None
 
-
-def _require_tool_fields(schema: JsonSchemaValue, *names: str) -> None:
-    required = schema.setdefault("required", [])
-    for name in names:
-        if name not in required:
-            required.append(name)
-        schema["properties"][name].pop("default", None)
-
-
-class CollectPreparationFacts(ContractModel):
-    expected_revision: int = Field(ge=0)
-    facts: dict[str, PreparationFact]
+    @field_validator("facts", mode="before")
+    @classmethod
+    def resolve_supplied_values(cls, facts: object) -> object:
+        if not isinstance(facts, dict):
+            return facts
+        return {
+            key: {**fact, "status": "resolved"}
+            if isinstance(fact, dict)
+            and "status" not in fact
+            and fact.get("value") is not None
+            else fact
+            for key, fact in facts.items()
+        }
 
     @classmethod
     def __get_pydantic_json_schema__(
@@ -153,6 +151,9 @@ class CollectPreparationFacts(ContractModel):
         schema = handler(core_schema)
         facts = schema["properties"]["facts"]
         fact = handler.resolve_ref_schema(facts["additionalProperties"])
+        status = fact["properties"]["status"]
+        status.pop("default", None)
+        status["description"] = "If omitted, a non-null value is resolved."
         fact["properties"]["value"] = {
             "description": "Checklist value in its declared type, or null if unknown.",
             "anyOf": [
@@ -164,11 +165,19 @@ class CollectPreparationFacts(ContractModel):
         return schema
 
 
+def _require_tool_fields(schema: JsonSchemaValue, *names: str) -> None:
+    required = schema.setdefault("required", [])
+    for name in names:
+        if name not in required:
+            required.append(name)
+        schema["properties"][name].pop("default", None)
+
+
 class SetPreparationPlan(ContractModel):
     expected_revision: int = Field(ge=0)
     plan: ExperimentContext
     entry_task_id: str = Field(
-        min_length=1, description="ID of the first task in plan.tasks"
+        min_length=1, description="ID from plan.tasks of the task to run first"
     )
     role_id: str = Field(
         min_length=1,
@@ -187,6 +196,10 @@ class SetPreparationPlan(ContractModel):
             collection["minItems"] = 1
             item = handler.resolve_ref_schema(collection["items"])
             _require_tool_fields(item, "kind")
+            if name == "tasks":
+                item["properties"]["stage_id"]["description"] = (
+                    "ID of this task's stage from plan.stages[].id, not the stage kind."
+                )
         return schema
 
 
@@ -203,13 +216,13 @@ class ProjectView(ContractModel):
     plan_sequence: int
     plan: ExperimentContext
     creation_command_id: str
-    initial_run_id: str
+    initial_run_id: str | None = None
     cluster: str | None = None
 
 
 PREPARATION_TOOLS = {
     "get_preparation": ContractModel,
-    "update_preparation": CollectPreparationFacts,
+    "update_preparation": UpdatePreparation,
     "set_preparation_plan": SetPreparationPlan,
     "inspect_resource": InspectResource,
 }

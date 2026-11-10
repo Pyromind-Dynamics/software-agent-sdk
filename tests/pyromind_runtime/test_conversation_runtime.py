@@ -5,17 +5,20 @@ import json
 from datetime import UTC, datetime
 
 import pytest
+from pyromind_runtime.application import conversation_runtime
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import (
     RollbackWorkflowCommand,
     UserMessageCommand,
 )
-from pyromind_runtime.domain.content import TextContent
+from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
+from pyromind_runtime.infrastructure import file_product_store
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.harness import SessionSpec
 
@@ -439,6 +442,116 @@ async def test_runtime_resumes_callback_through_owning_adapter(tmp_path) -> None
     assert snapshot.external_tasks[0].resume_pending is False
     assert adapter.external_task_notifications[0][1].status == "succeeded"
     await runtime.close()
+
+
+@pytest.mark.parametrize("callback_first", [False, True])
+async def test_runtime_polls_restored_studio_task_and_deduplicates_callback(
+    tmp_path, monkeypatch, callback_first
+) -> None:
+    monkeypatch.setattr(conversation_runtime, "_EXTERNAL_TASK_POLL_INTERVAL", 0)
+    monkeypatch.setattr(file_product_store, "_TAIL_WINDOW", 2)
+    conversation_id = "studio-conversation"
+    directory = tmp_path / conversation_id
+    directory.mkdir()
+    store = FileProductStore(directory)
+    store.create(
+        ConversationSnapshot(
+            conversation_id=conversation_id, capabilities=HarnessCapabilities()
+        ),
+        user_id="42",
+    )
+    correlation = TaskCorrelation(
+        conversation_id=conversation_id,
+        task_kind="workflow_run",
+        type="subagent",
+        subagent_id="original-child",
+    )
+    now = datetime.now(UTC).isoformat()
+    store.append(
+        ProductEvent(
+            conversation_id=conversation_id,
+            type="external_task.submitted",
+            payload={
+                "task_id": "task-1",
+                "kind": "workflow_run",
+                "status": "pending",
+                "submitted_at": now,
+                "updated_at": now,
+                "correlation": correlation.model_dump(mode="json"),
+            },
+        )
+    )
+    context = RequestContext(
+        user_id="42", cookie="test-cookie", x_cluster="test-cluster"
+    )
+    queried, release_query, returned, notified = (asyncio.Event() for _ in range(4))
+
+    class Query:
+        async def query(self, task_id: str, context: RequestContext) -> JsonObject:
+            assert task_id == "task-1"
+            assert context.cookie == "test-cookie"
+            queried.set()
+            await release_query.wait()
+            returned.set()
+            return {"status": "Failed"}
+
+    class Adapter(FakeAdapter):
+        async def notify_external_task(self, handle, notification, context):
+            result = await super().notify_external_task(handle, notification, context)
+            notified.set()
+            return result
+
+    adapter = Adapter()
+    runtime = ConversationRuntime(tmp_path, adapter, external_task_query=Query())
+
+    async def callback():
+        return await runtime.deliver_external_task_status(
+            conversation_id,
+            task_id="task-1",
+            status="Failed",
+            correlation=correlation,
+        )
+
+    try:
+        await runtime.start_execution_events()
+        await runtime.get_snapshot(conversation_id, RequestContext(user_id="42"))
+        with pytest.raises(PermissionError):
+            await runtime.get_snapshot(
+                conversation_id,
+                RequestContext(user_id="42", cookie="test-cookie", profile_id="other"),
+            )
+        assert adapter.attached == []
+        assert not queried.is_set()
+        await runtime.get_snapshot(conversation_id, context)
+        await asyncio.wait_for(queried.wait(), timeout=3)
+        if callback_first:
+            await callback()
+        release_query.set()
+        await asyncio.wait_for(returned.wait(), timeout=3)
+        await asyncio.wait_for(notified.wait(), timeout=3)
+        for _ in range(3):
+            store.append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    type="status.changed",
+                    payload={"status": "idle"},
+                )
+            )
+        repeated = await callback()
+        terminal = [
+            event for event in store.replay() if event.type == "external_task.completed"
+        ]
+        assert terminal == [repeated]
+        task = store.load_snapshot().external_tasks[0]
+        assert task.status == "failed" and not task.resume_pending
+        assert len(adapter.external_task_notifications) == 1
+        _, notice, _ = adapter.external_task_notifications[0]
+        assert notice.correlation == correlation
+        assert "analyze_task_failure" in notice.hidden_text
+        assert adapter.sent == []
+        assert "test-cookie" not in store.events_path.read_text()
+    finally:
+        await runtime.close()
 
 
 async def test_runtime_logs_first_message_latency_metrics(tmp_path, caplog) -> None:

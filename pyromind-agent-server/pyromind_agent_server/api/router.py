@@ -90,7 +90,6 @@ def create_product_router(
                         role.model_dump(mode="json")
                         for role in profile.delegated_roles or ()
                     ),
-                    managed_delegation=profile.managed_delegation,
                     command_allowlist=profile.command_allowlist,
                     preparation_policy=profile.preparation_policy,
                 ),
@@ -131,13 +130,8 @@ def create_product_router(
     ) -> ConversationSnapshot:
         context = context_for(request)
         runtime = get_product_runtime(request)
-        if profile.preparation_policy is not None or (
-            profile.tool_allowlist
-            and {"get_experiment_plan", "get_experiment_context"}.intersection(
-                profile.tool_allowlist
-            )
-        ):
-            if not runtime.experiment_plans_available:
+        if profile.preparation_policy is not None:
+            if not runtime.preparation_available:
                 raise HTTPException(503, detail="Plan database is not configured")
             if body.workflow_xyflow is not None:
                 raise HTTPException(422, detail="Workflow execution is not enabled")
@@ -162,7 +156,6 @@ def create_product_router(
             development_skill_allowlist=profile.development_skill_allowlist,
             command_allowlist=profile.command_allowlist,
             delegated_roles=profile.delegated_roles,
-            managed_delegation=profile.managed_delegation,
             preparation_policy=profile.preparation_policy,
         )
         try:
@@ -361,68 +354,6 @@ def create_product_router(
                 context_for(request),
             )
             return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
-        except ProductRuntimeError as exc:
-            raise _product_error(exc) from exc
-        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
-            raise _not_found(conversation_id) from exc
-        except ValueError as exc:
-            raise HTTPException(409, detail=str(exc)) from exc
-
-    @router.get(
-        "/{conversation_id}/experiment-executions/{run_id}/checkpoints/"
-        "{checkpoint_id}/media/{sample_index}/{media_index}"
-    )
-    async def read_checkpoint_media(
-        conversation_id: str,
-        run_id: str,
-        checkpoint_id: str,
-        sample_index: int,
-        media_index: int,
-        request: Request,
-    ):
-        try:
-            result = await get_product_runtime(request).read_checkpoint_media(
-                conversation_id,
-                run_id,
-                checkpoint_id,
-                sample_index,
-                media_index,
-                context_for(request),
-            )
-            return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
-        except ProductRuntimeError as exc:
-            raise _product_error(exc) from exc
-        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
-            raise _not_found(conversation_id) from exc
-        except ValueError as exc:
-            raise HTTPException(409, detail=str(exc)) from exc
-
-    @router.get("/{conversation_id}/experiment-executions/{run_id}/artifacts/{name}")
-    async def read_experiment_artifact(
-        conversation_id: str, run_id: str, name: str, request: Request
-    ):
-        try:
-            return await get_product_runtime(request).read_experiment_artifact(
-                conversation_id, run_id, name, context_for(request)
-            )
-        except ProductRuntimeError as exc:
-            raise _product_error(exc) from exc
-        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
-            raise _not_found(conversation_id) from exc
-        except ValueError as exc:
-            raise HTTPException(409, detail=str(exc)) from exc
-
-    @router.get("/{conversation_id}/experiment-plans")
-    async def get_experiment_plan(
-        conversation_id: str,
-        request: Request,
-        revision: Annotated[int | None, Query(ge=1)] = None,
-    ):
-        _require_profile(request, conversation_id, profile)
-        try:
-            return await get_product_runtime(request).get_experiment_plan(
-                conversation_id, context_for(request), revision
-            )
         except ProductRuntimeError as exc:
             raise _product_error(exc) from exc
         except (FileNotFoundError, PermissionError, ProductStoreError) as exc:

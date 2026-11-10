@@ -207,7 +207,7 @@ export async function createPiSession(
   execution: WorkflowExecution;
   subagents: SubagentHost;
 }> {
-  const nativeDelivery = params.managed_delegation === true;
+  const nativeDelivery = Array.isArray(params.delegated_roles);
   if (nativeDelivery) subagentLiveness();
   const config = parseConfig(params);
   let executionAccess: ExecutionAccess | undefined;
@@ -422,9 +422,9 @@ export async function createPiSession(
     extensionFactories: [
       (pi) => langfusePlugin(pi, recorder),
       subagents.extension,
-      (pi: ExtensionAPI) => subagentExtension(nativeDelivery
-        ? nativeSubagentApi(pi, sessionOptions)
-        : pi),
+      (pi: ExtensionAPI) => subagentExtension(subagents.pluginApi(nativeDelivery
+        ? nativeSubagentApi(pi, sessionOptions, subagents.filterCompletion)
+        : pi)),
       createToolResultExtension(recorder),
       createNoProgressGuardExtension(recorder),
       { name: "no-spin", factory: createNoSpinExtension(sessionOptions.onRepetitionDetected) },
@@ -703,7 +703,11 @@ function safeShellEnvironment(): Record<string, string> {
   return Object.fromEntries(names.flatMap((name) => process.env[name] ? [[name, process.env[name]!]] : []));
 }
 
-export function nativeSubagentApi(pi: ExtensionAPI, options: PiSessionOptions): ExtensionAPI {
+export function nativeSubagentApi(
+  pi: ExtensionAPI, options: PiSessionOptions, filterCompletion?: SubagentHost["filterCompletion"],
+): ExtensionAPI {
+  let suppressWake = false;
+  let skippedWake: (() => void) | undefined;
   const on = ((event: string, handler: ExtensionHandler<AgentEndEvent>) =>
     pi.on(event as "agent_end", event === "agent_end"
       // The chat keeps the host alive for background results. Use the plugin's
@@ -714,7 +718,15 @@ export function nativeSubagentApi(pi: ExtensionAPI, options: PiSessionOptions): 
     ...pi,
     on,
     sendMessage(message, delivery) {
+      suppressWake = false;
       if (message.customType === "subagent-notify") {
+        const completion = filterCompletion ? filterCompletion(message) : message;
+        if (!completion) {
+          suppressWake = true;
+          queueMicrotask(() => { suppressWake = false; });
+          return;
+        }
+        message = completion as typeof message;
         const content = typeof message.content === "string" ? redactSignedUrls(message.content)
           : message.content.map((part) => part.type === "text"
             ? { ...part, text: redactSignedUrls(part.text) } : part);
@@ -723,11 +735,28 @@ export function nativeSubagentApi(pi: ExtensionAPI, options: PiSessionOptions): 
       pi.sendMessage(message, options.automaticTurnsSuspended?.()
         ? { ...delivery, triggerTurn: false }
         : delivery);
+      if (skippedWake && message.customType === "subagent-notify") {
+        const wake = skippedWake;
+        // Reuse the idle wake reserved by the suppressed notice if the plugin
+        // does not send a fresh one for this completion.
+        queueMicrotask(() => {
+          if (skippedWake !== wake) return;
+          skippedWake = undefined;
+          if (!delivery?.triggerTurn) wake();
+        });
+      }
     },
     sendUserMessage(content, delivery) {
-      if (options.automaticTurnsSuspended?.()) return;
-      if (typeof content === "string") options.onSubagentWake?.(content);
-      pi.sendUserMessage(content, delivery);
+      const wake = () => {
+        if (options.automaticTurnsSuspended?.()) return;
+        if (typeof content === "string") options.onSubagentWake?.(content);
+        pi.sendUserMessage(content, delivery);
+      };
+      if (suppressWake) skippedWake = wake;
+      else {
+        skippedWake = undefined;
+        wake();
+      }
     },
   };
 }

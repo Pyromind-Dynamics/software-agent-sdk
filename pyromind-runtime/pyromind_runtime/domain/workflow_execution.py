@@ -28,9 +28,6 @@ class WorkflowExecutionRequest(ContractModel):
     correlation: TaskCorrelation | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
-    task_run_id: str | None = Field(
-        default=None, exclude_if=lambda value: value is None
-    )
     task_id: str | None = None
     error: str | None = None
     revision: int = Field(default=1, ge=1)

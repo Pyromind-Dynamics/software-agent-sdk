@@ -8,15 +8,6 @@ from pyromind_runtime.domain.base import ContractModel
 from pyromind_runtime.domain.content import JsonObject
 
 
-class TaskExecutionPolicy(ContractModel):
-    submission_tool: Literal[
-        "df_submit_evaluation", "df_submit_pipeline", "submit_workflow"
-    ]
-    artifact_contract: Literal["evaluation", "data", "model"]
-    require_review: bool = False
-    sample_limit: int = Field(default=3, ge=1, le=3)
-
-
 class CheckpointRef(ContractModel):
     run_id: str = Field(min_length=1)
     checkpoint_id: str = Field(min_length=1)

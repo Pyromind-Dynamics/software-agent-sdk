@@ -17,7 +17,8 @@ test("real children submit with distinct stable origins and resume only on their
     const body = JSON.parse(raw); requests.push(body);
     const parent = body.tools?.some((tool: any) => tool.function.name === "subagent");
     const submitted = body.messages.some((message: any) => message.role === "tool");
-    const delta = parent || submitted ? {content: "Finished this lane"} : {tool_calls:[{index:0,id:"create",type:"function",function:{name:"submit_workflow",arguments:"{}"}}]};
+    const terminal = JSON.stringify(body.messages).includes("CALLBACK_FOR_FIRST_ONLY");
+    const delta = parent || submitted ? {content: parent ? "Parent result" : terminal ? "FINAL_WORKFLOW_REPORT" : "STAGED_WORKFLOW_REPORT"} : {tool_calls:[{index:0,id:"create",type:"function",function:{name:"submit_workflow",arguments:"{}"}}]};
     res.writeHead(200, {"content-type":"text/event-stream"});
     for (const [value, reason] of [[{role:"assistant"},null],[delta,null],[{},parent || submitted ? "stop":"tool_calls"]]) res.write(`data: ${JSON.stringify({id:"test",object:"chat.completion.chunk",created:1,model:body.model,choices:[{index:0,delta:value,finish_reason:reason}]})}\n\n`);
     res.end("data: [DONE]\n\n");
@@ -27,7 +28,7 @@ test("real children submit with distinct stable origins and resume only on their
   const peer = {emit: () => {}, request: async (method: string, params: any) => {
     if (method === "role.tool.execute") {
       submissions.push(params);
-      return {content:[{type:"text",text:"Accepted platform job"}],details:{task_id:`task-${submissions.length}`},is_error:false};
+      return {content:[{type:"text",text:"Awaiting confirmation"}],details:{status:"awaiting_confirmation",request_id:`request-${submissions.length}`},is_error:false};
     }
     return {allow:true};
   }} as unknown as JsonlRpcPeer;
@@ -42,11 +43,20 @@ test("real children submit with distinct stable origins and resume only on their
   const first: any = await execute("lane-one"), second: any = await execute("lane-two");
   const status = (id: string) => readFile(join(subagents.paths.stateRoot,"async-subagent-runs",id,"status.json"),"utf8").then(JSON.parse);
   await eventually(async () => {assert.equal(submissions.length,2); assert.equal((await status(first.details.asyncId)).state,"complete"); assert.equal((await status(second.details.asyncId)).state,"complete");});
+  await eventually(async () => {
+    for (const id of [first.details.asyncId, second.details.asyncId]) {
+      await readFile(join(subagents.paths.stateRoot, "async-subagent-results", "completion-replay", `${id}.json`));
+    }
+  });
+  const parentRequests = () => requests.filter(body => body.tools?.some((tool: any) => tool.function.name === "subagent"));
+  assert.equal(parentRequests().length, 1, "staged workflow must not wake the parent");
+  assert.doesNotMatch(await readFile(config.session_path, "utf8"), /STAGED_WORKFLOW_REPORT/);
   const one = submissions[0].origin, two = submissions[1].origin;
   assert.equal(one.type,"subagent"); assert.notEqual(one.subagent_id,two.subagent_id);
   const result = await subagents.notifyRecipient({run_id:"callback:task-one:succeeded",content:"CALLBACK_FOR_FIRST_ONLY",trigger_turn:true,details:{correlation:{version:1,source:"agent",conversation_id:"callback-conversation",task_kind:"workflow_run",...one}}});
   assert.equal(result.accepted,true);
   await eventually(async () => assert.ok(requests.some(body => !body.tools?.some((tool:any)=>tool.function.name==="subagent") && JSON.stringify(body.messages).includes("CALLBACK_FOR_FIRST_ONLY"))));
+  await eventually(async () => assert.ok(parentRequests().some(body => JSON.stringify(body.messages).includes("FINAL_WORKFLOW_REPORT"))));
   const recipients = session.sessionManager.getEntries().filter((entry:any)=>entry.type==="custom"&&entry.customType==="pyromind.subagent.recipient") as any[];
   const secondFile = recipients.find(entry=>entry.data.id===two.subagent_id).data.sessionFile;
   assert.equal((await readFile(secondFile,"utf8")).includes("CALLBACK_FOR_FIRST_ONLY"),false);

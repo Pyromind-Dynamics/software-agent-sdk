@@ -376,24 +376,27 @@ def test_native_subagent_report_delivery_stays_in_adapter() -> None:
             assert "SubagentReports" not in source, path
 
 
-def test_delegated_result_projection_cannot_schedule_manager_turns() -> None:
-    application = ROOT / "pyromind-runtime/pyromind_runtime/application"
-    for filename, method in (
-        ("conversation_runtime.py", "flush_execution_events"),
-        ("delegated_execution.py", "prepare"),
+def test_stage_projection_cannot_schedule_manager_turns() -> None:
+    source = (
+        ROOT / "pyromind-runtime/pyromind_runtime/application/snapshot_projector.py"
+    )
+    tree = ast.parse(source.read_text())
+    handler = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "project_stage_activity"
+    )
+    attributes = {
+        node.attr for node in ast.walk(handler) if isinstance(node, ast.Attribute)
+    }
+    assert not attributes & {"enqueue_manager_message", "notify_external_task", "send"}
+    for path in (
+        "application/delegated_execution.py",
+        "application/work_queue.py",
+        "infrastructure/sql_experiment_execution.py",
+        "infrastructure/sql_work_queue.py",
     ):
-        tree = ast.parse((application / filename).read_text())
-        handler = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == method
-        )
-        attributes = {
-            node.attr for node in ast.walk(handler) if isinstance(node, ast.Attribute)
-        }
-        assert not attributes.intersection(
-            {"enqueue_manager_message", "notify_external_task"}
-        ), filename
+        assert not (ROOT / "pyromind-runtime/pyromind_runtime" / path).exists()
 
 
 def test_subagent_display_rpc_remains_adapter_private() -> None:
@@ -481,13 +484,26 @@ def test_preparation_policy_is_trusted_profile_configuration():
         role.name for role in roles
     }
     tools = set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ())
-    assert {"read", "write", "edit", "terminal", "grep", "find", "ls"} <= tools
+    assert {"read", "write", "edit", "terminal"} <= tools
     assert not {
+        "grep",
+        "find",
+        "ls",
         "subagent",
         "sandbox_create",
         "df_submit_evaluation",
         "request_experiment_task",
     }.intersection(tools)
+    assert set(ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist or ()) == {
+        "read",
+        "write",
+        "edit",
+        "terminal",
+        "subagent",
+        "ask_user",
+        "get_storage_url",
+    }
+    assert ECHOMIND_PRODUCT_PROFILE.development_skill_allowlist == ()
     with pytest.raises(ValidationError):
         CreateConversationRequest.model_validate(
             {
@@ -555,60 +571,43 @@ def test_execution_capabilities_are_profile_owned_and_cannot_be_model_supplied()
         DEFAULT_PRODUCT_PROFILE,
         ECHOMIND_PRODUCT_PROFILE,
     )
-    from pyromind_runtime.domain.experiment_execution import (
-        ROLE_TOOLS,
-        RequestExperimentTask,
-    )
     from pyromind_runtime.domain.preparation import PreparationPolicy
 
     roles = {role.name: role for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()}
     policy = ECHOMIND_PRODUCT_PROFILE.preparation_policy
     assert policy is not None
     assert (
-        set(roles)
-        == set(policy.execution_policies)
-        == {"init", "dataset", "train", "eval"}
+        set(roles) == set(policy.allowed_roles) == {"init", "dataset", "train", "eval"}
     )
     assert DEFAULT_PRODUCT_PROFILE.delegated_roles is None
-    for name, execution in policy.execution_policies.items():
-        assert execution.submission_tool in roles[name].tools
-        if execution.require_review:
-            assert "record_execution_checkpoint" in roles[name].tools
     assert roles["init"] is not roles["eval"]
     assert roles["init"].tools == roles["eval"].tools
-    assert all(
-        "record_experiment_result" not in role.tools
-        and "record_experiment_result" not in role.prompt
-        for role in roles.values()
-    )
-    assert "record_experiment_result" not in ROLE_TOOLS
-    old = PreparationPolicy.model_validate(
-        {
-            "checklist_id": "old",
-            "version": 1,
-            "fields": [{"key": "goal", "label": "Goal"}],
-            "allowed_roles": ["eval"],
-        }
-    )
-    assert "execution_policies" not in old.model_dump(mode="json")
+    obsolete = {
+        "request_experiment_task",
+        "get_experiment_execution",
+        "get_experiment_context",
+        "update_experiment_context",
+        "control_experiment_task",
+        "read_experiment_artifact",
+        "record_experiment_result",
+        "record_execution_checkpoint",
+    }
+    for role in roles.values():
+        assert not obsolete & set(role.tools)
+    assert not obsolete & set(ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist or ())
     with pytest.raises(ValidationError):
-        RequestExperimentTask.model_validate(
-            {
-                "role_id": "dataset",
-                "request_id": "r",
-                "task": {"name": "Clean", "instruction": "Clean"},
-                "execution_policy": {"require_review": False},
-            }
+        PreparationPolicy.model_validate(
+            {**policy.model_dump(mode="json"), "execution_policies": {}}
         )
 
 
 def test_shared_execution_rules_do_not_dispatch_on_agent_or_role_names():
     names = {"echomind", "pyromind", "avi", "pcb", "init", "dataset", "train", "eval"}
     for filename in (
-        "application/experiment_execution.py",
-        "application/execution_checkpoints.py",
-        "application/delegated_execution.py",
-        "infrastructure/sql_experiment_execution.py",
+        "application/conversation_runtime.py",
+        "application/snapshot_projector.py",
+        "infrastructure/sql_preparation.py",
+        "infrastructure/file_product_store.py",
     ):
         path = ROOT / "pyromind-runtime/pyromind_runtime" / filename
         for node in ast.walk(ast.parse(path.read_text())):

@@ -15,28 +15,37 @@ Use the Dataset files bound in task inputs as train_data_path and, when supplied
 val_data_path. Inspect their actual schema; for messages JSONL configure
 DatasetConfigBuilderMessageNode with messages_field="messages". Preserve media
 order and supervision. Resolve Storage files and embedded media according to
-generate-workflow-dsl's training mount rules; do not create another frozen copy.
-Task files belong under public_data/. Use /workspace/<path> for user Storage.
-The DSL stays at public_data/workflow_canvas/workflow.py. Native file, terminal,
-and business tools use the same task-relative paths; pass that dsl_path to
-validate_workflow_dsl. Upload that actual file,
+generate-workflow-dsl's training mount rules. For compatibility fixes, verify
+task-local derivatives preserve the samples and supervision. Keep sources intact.
+Task files belong under the task workspace supplied by the host.
+Use /workspace/<path> for user Storage. Write workflow_canvas/workflow.py under
+the task workspace and pass its full task-relative path to validate_workflow_dsl.
+Upload that actual file,
 then call submit_workflow with the returned Storage path. If upload is not
 available, publish the actual DSL under the existing Storage mount and use that
-Storage path; do not create another Sandbox. This requests the
-existing user confirmation; end your turn, do not submit through another tool.
-intent=prepare forbids formal submission. The user's platform confirmation is
-required before training. Do not busy-poll or start another training task.
+Storage path; do not create another Sandbox. submit_workflow opens the user's
+confirmation panel directly. While confirmation or Studio results are pending,
+end the turn without a handoff report. intent=prepare forbids formal submission.
+On continuation, reuse the pending confirmation or submitted task ID. When
+submit_workflow returns reused=true, continue from that receipt and existing
+outputs.
 
-When Runtime resumes you after the platform completes, inspect actual training
-outputs and use training-analysis when available. Verify and report the model or
+On Studio failure, use analyze_task_failure and fix verified technical issues
+within the authorized task. Validate and stage the revised DSL yourself through
+submit_workflow for a new user confirmation. Ask the user directly with
+ask_user if a decision would change the agreed inputs, goal, or resource scope.
+
+On Studio success, inspect actual training outputs and use training-analysis
+when available. Verify and report the model or
 checkpoint location, training configuration and diagnostics. Do not substitute
 the base model or training loss for a usable training output or model quality.
 Write the output paths and supporting evidence in a Markdown report in your
 task workspace. End with a short Markdown reply to Manager that gives the report
 path and outcome. Use Storage paths for model and checkpoint directories in
-the report so Manager can pass them to Eval. Explain failures without automatic
-reruns. Do not evaluate, deploy, launch another role or edit the global plan
-yourself. Keep credentials out of files, reports and tool parameters.
+the report so Manager can pass them to Eval. For a failure you cannot recover,
+report the failed task, diagnosis and blocker. Do not evaluate, deploy, launch
+another role or edit the global plan. Keep credentials out of files, reports
+and tool parameters.
 """,
     tools=(
         "read",
@@ -48,7 +57,7 @@ yourself. Keep credentials out of files, reports and tool parameters.
         "submit_workflow",
         "training_analysis",
         "analyze_task_failure",
-        "get_experiment_execution",
+        "df_stop_task",
     ),
     optional_tools=("upload_file_to_pyromind",),
     skills=("generate-workflow-dsl", "workflow-execution", "training-analysis"),

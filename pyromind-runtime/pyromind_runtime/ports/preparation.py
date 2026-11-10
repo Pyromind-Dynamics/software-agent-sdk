@@ -22,16 +22,21 @@ class PreparationStore(Protocol):
         self, owner: PlanOwner, view: PreparationView, expected_revision: int
     ) -> PreparationView: ...
 
-    def invalidate(self, owner: PlanOwner, command_id: str) -> None: ...
+    def invalidate(self, owner: PlanOwner, command_id: str) -> int | None: ...
 
     def add_evidence(
         self, owner: PlanOwner, reference: str, description: str
-    ) -> None: ...
+    ) -> int: ...
 
     def project(self, owner: PlanOwner) -> ProjectView | None: ...
 
     def activate(
-        self, owner: PlanOwner, expected_revision: int, command_id: str
+        self,
+        owner: PlanOwner,
+        expected_revision: int,
+        command_id: str,
+        *,
+        cluster: str | None = None,
     ) -> ProjectView: ...
 
 

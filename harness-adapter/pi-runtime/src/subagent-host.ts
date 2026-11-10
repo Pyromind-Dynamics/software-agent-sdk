@@ -1,13 +1,14 @@
 import { writeSubagentRoles, type SubagentRoleDefinition } from "./subagent-roles.js";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { AgentSession, ExtensionAPI, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type AgentSession, type ExtensionAPI, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { registerSubagentCapabilityCeiling } from "pi-subagents/capability-ceiling";
 import { registerRequiredChildExtensions } from "pi-subagents/required-child-extensions";
+import { Type } from "typebox";
 import { serveSubagentIpc } from "./subagent-ipc.js";
 import { SubagentDisplay, displayText, redactSignedUrls, transcriptWindow } from "./subagent-display.js";
 import { SubagentActivity } from "./subagent-activity.js";
@@ -18,19 +19,8 @@ import { isRecord, type JsonObject, type RunnerEvent, PROTOCOL_VERSION } from ".
 import type { JsonlRpcPeer } from "./rpc-peer.js";
 
 const ROLE_TOOLS = { search: ["read", "grep", "find", "ls"], general_purpose: ["read", "grep", "find", "ls", "write", "edit", "terminal"] };
-
-export function delegatedWorkspace(scope: JsonObject | undefined): string | undefined {
-  const runId = scope?.run_id;
-  if (typeof runId !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(runId)) return undefined;
-  return `public_data/experiment-runs/${runId}`;
-}
-
-function validateWorkScope(expected: JsonObject | undefined, supplied: unknown): void {
-  if (expected && (!isRecord(supplied) || ["run_id", "work_id", "generation"].some(key => supplied[key] !== expected[key]))) {
-    throw new Error("Stale delegated work scope");
-  }
-}
-
+const SUBAGENT_ACTIONS = ["status", "steer", "resume", "stop", "list"];
+type CompletionMessage = Parameters<ExtensionAPI["sendMessage"]>[0];
 export function subagentModule(name: string): string {
   const js = fileURLToPath(new URL(`./${name}.js`, import.meta.url));
   return existsSync(js) ? js : js.replace(/\.js$/, ".ts");
@@ -64,9 +54,9 @@ Resume restores the child session and returns a new run ID; use the latest retur
 When a result points to Full output in public_data/subagents/, use read with that exact path and paginate as needed. Do not rerun the child to retrieve a truncated report.
 Only these two exact role names and these calls are supported. Do not pass options, model, tools, cwd, workflow, tasks or chain overrides.\n`, { mode: 0o600 });
   if (definitions) writeFileSync(join(agentDir, "subagent-tool-description.md"),
-    `Delegate a bounded task to an enabled role: ${definitions.map(role => role.name).join(", ")}. Use status/resume/stop for lifecycle control; role tools and context are host-controlled.`, { mode: 0o600 });
+    `Delegate a complete task to ${definitions.map(role => role.name).join(", ")} with {agent,task,async:true}. Include goals, actual input paths, constraints and expected outputs in task text. Use {action:"status",id}, {action:"steer",id,message}, {action:"resume",id,message}, {action:"stop",id}. IDs are native run IDs; resume returns a new ID. Read returned report paths with read. Native completion is not business success; native stop does not cancel platform tasks. Role tools and context are host-controlled.`, { mode: 0o600 });
   writeFileSync(join(agentDir, "extensions", "subagent", "config.json"), JSON.stringify({
-    toolActivation: "eager", toolDescriptionMode: "custom", asyncByDefault: true,
+    toolActivation: "eager", toolDescriptionMode: "custom", pinToolDeclarations: false, asyncByDefault: true,
     defaultSubagentContext: "fresh", intercomBridge: { mode: "off" }, maxActiveAsyncRunsPerSession: 4, globalConcurrencyLimit: 4,
     maxSubagentDepth: 1, scheduledRuns: { enabled: false }, missions: { enabled: false },
     defaultSessionDir: join(stateRoot, "sessions"),
@@ -92,7 +82,6 @@ export class SubagentHost {
   private readonly backgroundIds = new Set<string>();
   private lastUsage = "";
   private usagePending = false;
-  private readonly workScopes = new Map<string, JsonObject>();
   private readonly mutatedSessions = new Set<string>();
   private disposed = false;
   private monitor?: NodeJS.Timeout;
@@ -122,6 +111,27 @@ export class SubagentHost {
     this.reports = new SubagentReports(workspace, () => this.session!.sessionId, writer, Object.keys(this.roleTools));
   }
 
+  pluginApi(pi: ExtensionAPI): ExtensionAPI {
+    const parameters = Type.Object({
+      agent: Type.Optional(Type.String({ enum: Object.keys(this.roleTools) })),
+      task: Type.Optional(Type.String({ description: "Required when launching without an action. Put the complete task here." })),
+      async: Type.Optional(Type.Boolean({ description: "Defaults to true. Set false to wait for the result." })),
+      context: Type.Optional(Type.String({ enum: ["fresh"] })),
+      action: Type.Optional(Type.String({ enum: SUBAGENT_ACTIONS, description: "Lifecycle action. Omit when launching a child." })),
+      id: Type.Optional(Type.String({ description: "Native run ID for lifecycle actions." })),
+      message: Type.Optional(Type.String({ description: "Guidance only for action steer or resume." })),
+    }, { additionalProperties: false });
+    return {
+      ...pi,
+      registerTool(tool) {
+        // The restricted parameters are a subset of what the native executor accepts.
+        pi.registerTool(tool.name === "subagent"
+          ? { ...tool, parameters: parameters as unknown as typeof tool.parameters }
+          : tool);
+      },
+    };
+  }
+
   async start() {
     this.closeIpc = await serveSubagentIpc(this.paths.socket, async (request, signal, update) => {
       if (isRecord(request) && request.method === "probe") return { ready: true };
@@ -130,18 +140,14 @@ export class SubagentHost {
       const roleTools = this.roleToolSets?.[request.role] ?? this.tools;
       if (request.method === "config") return {
         model: publicModel(this.session?.model ?? this.model), instructions: this.instructions,
-        skillPathAliases: this.skillPathAliases, scope: this.workScopes.get(request.role),
+        skillPathAliases: this.skillPathAliases,
         workspacePathAlias: this.skillPathAliases.length ? {host: this.workspace, alias: "."} : undefined,
         terminalTools: this.terminals ? allowed.filter(usesAgentTerminal) : [],
         tools: roleTools.filter((tool) => allowed.includes(tool.name)).map(({ name, label, description, parameters }) => ({ name, label, description: `[Conversation host] ${description}`, parameters })),
       };
       if (request.method === "terminal.attach" && this.terminals && allowed.some(usesAgentTerminal)) {
         if (typeof request.session !== "string" || typeof request.session_file !== "string") throw new Error("Missing child session identity");
-        const expected = this.workScopes.get(request.role);
-        validateWorkScope(expected, request.scope);
-        const workspacePath = expected ? delegatedWorkspace(expected) : ".";
-        if (!workspacePath) throw new Error("Invalid delegated work scope");
-        await this.terminals.attach(request.role, request.session, request.session_file, workspacePath, signal, (id) => update({ id }));
+        await this.terminals.attach(request.role, request.session, request.session_file, ".", signal, (id) => update({ id }));
         return null;
       }
       if (request.method === "terminal.detach" && this.terminals) {
@@ -152,19 +158,12 @@ export class SubagentHost {
         if (typeof request.name !== "string" || !allowed.includes(request.name)) throw new Error("Child tool is not allowed");
         const tool = roleTools.find((tool) => tool.name === request.name);
         if (!tool) throw new Error("Child tool is unavailable");
-        const expected = this.workScopes.get(request.role), supplied = request.scope;
-        validateWorkScope(expected, supplied);
-        if (expected && !this.terminals && ["write", "edit"].includes(request.name)) {
-          const args = isRecord(request.args) ? request.args : {};
-          const path = String(args.path ?? "");
-          if (!path.startsWith(`public_data/experiment-runs/${expected.run_id}/`) || path.split("/").includes("..")) throw new Error("Write only this task's workspace");
-        }
         const id = `subagent:${request.session}:${request.id}`;
         const execute = async (selected: AgentTool, toolSignal: AbortSignal) => {
           try {
-            if ("executeScoped" in selected && typeof selected.executeScoped === "function") {
+            if ("executeChild" in selected && typeof selected.executeChild === "function") {
               const origin = this.recipients!.origin(request.session, request.session_file);
-              return await selected.executeScoped(id, request.args, toolSignal, supplied, origin, update);
+              return await selected.executeChild(id, request.args, toolSignal, origin);
             }
             return await selected.execute(id, request.args, toolSignal, update);
           } finally {
@@ -201,21 +200,7 @@ export class SubagentHost {
           messages.push({ ...message, ...await this.reports.transform(message.content, message.details, ctx.signal) });
         } else if (message.role === "custom" && message.customType === "subagent-notify") {
           const handoff = await this.reports.transform(message.content, message.details, ctx.signal);
-          const runs = isRecord(message.details) && Array.isArray(message.details.runs) ? message.details.runs : [];
-          const taskRuns = new Set<string>();
-          for (const run of runs) {
-            if (!isRecord(run) || typeof run.runId !== "string") continue;
-            const execution = this.display.value(run.runId, "execution");
-            if (isRecord(execution) && typeof execution.task_run_id === "string") taskRuns.add(execution.task_run_id);
-          }
-          messages.push({
-            ...message,
-            ...handoff,
-            content: !taskRuns.size ? handoff.content
-              : typeof handoff.content === "string"
-                ? `${handoff.content}\n\nProduct task run IDs: ${[...taskRuns].join(", ")}`
-                : [...handoff.content, { type: "text", text: `Product task run IDs: ${[...taskRuns].join(", ")}` }],
-          });
+          messages.push({ ...message, ...handoff });
         } else messages.push(message);
       }
       return { messages };
@@ -229,7 +214,14 @@ export class SubagentHost {
     });
     pi.on("tool_call", (event) => {
       if (event.toolName !== "subagent") return;
-      const error = validateSubagentCall(event.input, this.roleTools);
+      const { input, toolCallId } = event;
+      if (input.action === undefined && typeof input.agent === "string" && input.task === undefined &&
+          typeof input.message === "string" && input.message.trim()) {
+        input.task = input.message;
+        delete input.message;
+        if (this.launchInputs.has(toolCallId)) this.launchInputs.set(toolCallId, input);
+      }
+      const error = validateSubagentCall(input, this.roleTools);
       if (error) return { block: true, reason: error };
     });
     for (const event of ["subagent:async-started", "subagent:async-complete", "subagent:foreground-complete", "subagent:process-terminal", "subagent:child-status"]) {
@@ -257,6 +249,47 @@ export class SubagentHost {
     return this.recipients.notify(params);
   }
 
+  filterCompletion = (message: CompletionMessage): CompletionMessage | undefined => {
+    if (!isRecord(message.details) || !Array.isArray(message.details.runs)) return message;
+    const runs = message.details.runs;
+    const delivered = runs.filter(run => !isRecord(run) || run.status !== "completed" ||
+      typeof run.runId !== "string" || !this.awaitingWorkflowConfirmation(run.runId));
+    if (delivered.length === runs.length) return message;
+    if (!delivered.length) return;
+    const content = delivered.map(run => {
+      if (!isRecord(run) || typeof run.runId !== "string") return "A subagent completed.";
+      const result = this.completionMessages(run.runId)?.findLast(entry =>
+        entry.type === "message" && entry.message.role === "assistant");
+      const output = result?.type === "message" ? displayText(result.message) : "";
+      const preview = output.length > 2000 ? `${output.slice(0, 2000)}\n[preview truncated]` : output;
+      return `${run.agent} ${run.status}. Run ID: ${run.runId}\n${preview}\nUse subagent status for the full result.`;
+    }).join("\n\n");
+    return { ...message, details: { ...message.details, runs: delivered }, content };
+  };
+
+  private completionMessages(id: string) {
+    if (!this.session || !/^[a-zA-Z0-9-]+$/.test(id)) return;
+    try {
+      const status = JSON.parse(readFileSync(join(this.paths.stateRoot, "async-subagent-runs", id, "status.json"), "utf8"));
+      if (status.lifecycleArtifactVersion !== 3 || status.runId !== id || status.steps?.length !== 1 ||
+          ![this.session.sessionId, this.session.sessionManager.getSessionFile()].includes(status.sessionId)) return;
+      const step = status.steps[0];
+      const start = step.startedAt ?? status.startedAt;
+      if (typeof start !== "number") return;
+      const path = realpathSync(step.sessionFile ?? status.sessionFile);
+      if (!path.startsWith(realpathSync(join(this.paths.stateRoot, "sessions")) + sep)) return;
+      return SessionManager.open(path).getBranch().filter(entry =>
+        entry.type === "message" && entry.message.timestamp >= start);
+    } catch { /* A missing artifact must not hide a completion. */ }
+  }
+
+  private awaitingWorkflowConfirmation(id: string): boolean {
+    const entry = this.completionMessages(id)?.findLast(item => item.type === "message" &&
+      (item.message.role === "user" || item.message.role === "toolResult" && item.message.toolName === "submit_workflow"));
+    return entry?.type === "message" && entry.message.role === "toolResult" && !entry.message.isError &&
+      isRecord(entry.message.details) && entry.message.details.status === "awaiting_confirmation";
+  }
+
   async rpc(method: string, params: Record<string, unknown> = {}, requestId: string = randomUUID()): Promise<any> {
     if (!this.pi) throw new Error("Subagent plugin not loaded");
     return new Promise((resolve, reject) => {
@@ -267,61 +300,6 @@ export class SubagentHost {
       });
       this.pi!.events.emit("subagents:rpc:v1:request", { version: 1, requestId, method, params });
     });
-  }
-
-  async control(input: JsonObject): Promise<any> {
-    const action = input.action;
-    if (!["status", "steer"].includes(String(action)) && typeof input.role === "string" && isRecord(input.scope) && input.scope.control !== true) this.workScopes.set(input.role, input.scope);
-    let result: any;
-    if (action === "spawn") {
-      if (typeof input.role !== "string" || !Object.hasOwn(this.roleTools, input.role)
-        || typeof input.task !== "string" || typeof input.request_id !== "string") throw new Error("Invalid delegated launch");
-      result = await this.rpc("spawn", { agent: input.role, task: input.task, context: "fresh" }, input.request_id);
-    } else {
-      if (!["status", "resume", "steer", "stop", "pause"].includes(String(action)) || typeof input.execution_ref !== "string") throw new Error("Invalid delegated control");
-      result = await this.rpc(action === "pause" ? "interrupt" : String(action), { id: input.execution_ref,
-        ...(["resume", "steer"].includes(String(action)) ? { message: String(input.task ?? "") || "Continue with the existing task context." } : {}),
-        ...(action === "steer" ? { mode: "steer" } : {}),
-      }, typeof input.request_id === "string" ? input.request_id : randomUUID());
-    }
-    const id = result?.details?.runId ?? result?.runId ?? input.execution_ref;
-    let state = result?.details?.state ?? result?.state ?? "unknown";
-    let interruption: string | undefined;
-    let failure: string | undefined;
-    if (typeof id === "string" && /^[a-zA-Z0-9-]+$/.test(id)) {
-      const path = join(this.paths.stateRoot, "async-subagent-runs", id, "status.json");
-      if (existsSync(path)) {
-        const status = JSON.parse(readFileSync(path, "utf8"));
-        if (status.runId !== id || ![this.session!.sessionManager.getSessionFile(), this.session!.sessionId].includes(status.sessionId)) throw new Error("Delegated run ownership mismatch");
-        state = status.state;
-        if (state === "failed" && typeof status.error === "string") {
-          const error: string = status.error;
-          failure = error;
-          if (error.startsWith("Subagent host unavailable:") || error === "Subagent host disconnected") {
-            interruption = error;
-          }
-        }
-      }
-      if (action === "spawn" || action === "resume" || (isRecord(input.scope) && isRecord(input.scope.execution))) {
-        const changed = this.display.remember(id, {
-          ...(isRecord(input.display) ? input.display : {}),
-          ...(isRecord(input.scope) && isRecord(input.scope.execution) ? {execution: input.scope.execution} : {}),
-          ...(action === "resume" && typeof input.execution_ref === "string"
-            ? { previous_run_id: input.execution_ref } : {}),
-        });
-        if (changed && this.states.has(id)) this.emit(id, "subagent.progress", { details: this.display.details(id) });
-      }
-    }
-    if (action === "status" && typeof id === "string" && !["running", "queued", "stopping"].includes(state)) {
-      await this.display.settled(id);
-      await this.finalizing.get(id);
-    }
-    const finalText = typeof id === "string" && typeof input.role === "string" &&
-      ["complete", "completed"].includes(state) ? await this.reports.finalOutput(id, input.role) : "";
-    return { execution_ref: typeof id === "string" ? id : null, status: state,
-      interrupted: interruption !== undefined,
-      result_text: redactSignedUrls(failure ?? finalText) };
-
   }
 
   observeCall(id: string, input: unknown) {
@@ -383,6 +361,8 @@ export class SubagentHost {
           const status = JSON.parse(readFileSync(join(runs, name, "status.json"), "utf8"));
           if (status.lifecycleArtifactVersion !== 3 || status.runId !== name || ![this.session!.sessionManager.getSessionFile(), this.session!.sessionId].includes(status.sessionId)) continue;
           this.backgroundIds.add(name);
+          const steps = Array.isArray(status.steps) ? status.steps : [];
+          if (steps.length === 1) this.rememberContext(name, steps[0].sessionFile ?? status.sessionFile);
           this.display.update(name, {
             ...(typeof status.startedAt === "number" ? { started_at: new Date(status.startedAt).toISOString() } : {}),
             ...(typeof status.endedAt === "number" ? { ended_at: new Date(status.endedAt).toISOString() } : {}),
@@ -402,6 +382,7 @@ export class SubagentHost {
               || ![this.session!.sessionManager.getSessionFile(), this.session!.sessionId].includes(String(run.sessionId)) || !Array.isArray(run.children)) continue;
             const children = run.children.filter(isRecord);
             if (!children.length || children.some(child => !["completed", "failed", "stopped"].includes(String(child.status)))) continue;
+            if (children.length === 1) this.rememberContext(run.runId, children[0].sessionFile);
             const state = children.some(child => child.status === "failed") ? "failed" : children.some(child => child.status === "stopped") ? "stopped" : "complete";
             this.observe(run.runId, state, String(children[0].agent ?? "Subagent"));
           }
@@ -428,26 +409,42 @@ export class SubagentHost {
   private async observeCompletion(data: unknown) {
     if (!isRecord(data) || typeof data.runId !== "string" || typeof data.summary !== "string") return;
     const id = data.runId;
+    if (data.success === true && this.awaitingWorkflowConfirmation(id)) return;
     // The native completion summary is the final handoff, not the activity window.
     const transformed = await this.reports.transform([{ type: "text", text: data.summary }], data);
     const handoff = redactSignedUrls(displayText(transformed));
-    if (this.disposed || this.handoffs.get(id) === handoff) return;
+    if (this.disposed) return;
+    const report = this.reports.publishedPath(id);
+    const reportChanged = report ? this.display.update(id, { report_uri: report }) : false;
+    if (!reportChanged && this.handoffs.get(id) === handoff) return;
     this.handoffs.set(id, handoff);
     if (this.states.has(id) && !this.finalizing.has(id)) {
       this.emit(id, "subagent.progress", { result: handoff,
-        ...(this.observedLive.has(id) || this.display.value(id, "activity") ? { details: this.display.details(id) } : {}) });
+        ...(report || this.observedLive.has(id) || this.display.value(id, "activity") ? { details: this.display.details(id) } : {}) });
     }
   }
 
   private linkRun(id: string, callId: string) {
     const input = this.launchInputs.get(callId) ?? {};
-    const changed = this.display.update(id, {
+    const changed = this.display.remember(id, {
       tool_call_id: callId,
       ...(typeof input.agent === "string" ? { role: input.agent } : {}),
       ...(typeof input.task === "string" ? { task: input.task } : {}),
       ...(input.action === "resume" && typeof input.id === "string" ? { previous_run_id: input.id } : {}),
     });
     if (changed && this.states.has(id)) this.emit(id, "subagent.progress", { details: this.display.details(id) });
+  }
+
+  private rememberContext(id: string, sessionFile: unknown) {
+    if (typeof sessionFile !== "string" || !this.recipients || this.display.value(id, "session_key")) return;
+    try {
+      const path = realpathSync(sessionFile);
+      if (!path.startsWith(realpathSync(join(this.paths.stateRoot, "sessions")) + sep)) return;
+      const header = JSON.parse(readFileSync(path, "utf8").split("\n", 1)[0]);
+      const origin = this.recipients.origin(header.id, path);
+      const changed = this.display.remember(id, { session_key: origin.subagent_id });
+      if (changed && this.states.has(id)) this.emit(id, "subagent.progress", { details: this.display.details(id) });
+    } catch { /* A missing session header must not hide lifecycle events. */ }
   }
 
   private observe(id: string, state: string, label: string, extra: JsonObject = {}) {
@@ -478,8 +475,9 @@ export class SubagentHost {
   private async finishDisplay(id: string, state: string, label: string, extra: JsonObject) {
     await this.display.settled(id);
     this.display.captureActivity(id);
+    const awaitingConfirmation = state === "complete" && this.awaitingWorkflowConfirmation(id);
     let result = this.handoffs.get(id) ?? extra.result;
-    if (!result) {
+    if (!result && !awaitingConfirmation) {
       try {
         const native = await this.rpc("status", { id, view: "transcript", lines: 200 });
         const window = transcriptWindow(displayText(native));
@@ -491,10 +489,12 @@ export class SubagentHost {
     await Promise.resolve();
     result = this.handoffs.get(id) ?? result;
     if (this.disposed) return;
+    const report = this.reports.publishedPath(id);
+    if (report) this.display.update(id, { report_uri: report });
     this.emit(id, "subagent.finished", { status: state, label,
       mutated: label === "general_purpose" || this.mutatedSessions.size > 0,
       ...extra, result: typeof result === "string" ? redactSignedUrls(result).slice(0, 32768) : "",
-      ...(this.observedLive.has(id) ? { details: this.display.details(id) } : {}) });
+      ...(report || this.observedLive.has(id) || this.display.value(id, "session_key") ? { details: this.display.details(id) } : {}) });
   }
 
   private emit(id: string, kind: RunnerEvent["kind"], payload: JsonObject) {
@@ -539,8 +539,8 @@ export class SubagentHost {
 
 export function validateSubagentCall(input: Record<string, unknown>, roles: Record<string, string[]> = ROLE_TOOLS): string | undefined {
   const fields = input.action ? ["action", "id", "message", "options"] : ["agent", "task", "async", "context"];
-  if (Object.keys(input).some((key) => !fields.includes(key))) return 'Supported launch: {agent:"search"|"general_purpose",task:"...",async:true|false}. Management: {action:"status"|"resume"|"stop"|"list",id?,message?}. Other fields, including options, are host-controlled.';
-  if (input.action && !["status", "resume", "stop", "list"].includes(String(input.action))) return "Unsupported subagent action; supported actions: status, resume, stop, list. Available agents: search, general_purpose.";
+  if (Object.keys(input).some((key) => !fields.includes(key))) return `Supported launch: {agent,task,async:true|false}. Lifecycle: {action:"status"|"steer"|"resume"|"stop"|"list",id?,message?}. Roles: ${Object.keys(roles).join(", ")}. Other fields are host-controlled.`;
+  if (input.action && !SUBAGENT_ACTIONS.includes(String(input.action))) return `Supported actions: ${SUBAGENT_ACTIONS.join(", ")}. Available agents: ${Object.keys(roles).join(", ")}.`;
   if (input.agent && !Object.hasOwn(roles, String(input.agent))) return `Unknown subagent role; available agents: ${Object.keys(roles).join(", ")} (use the exact name).`;
   if (input.context !== undefined && input.context !== "fresh") return "Subagents use an independent fresh context";
   if (input.options !== undefined) return "Subagent options are host-controlled";

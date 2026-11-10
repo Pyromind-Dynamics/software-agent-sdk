@@ -40,6 +40,7 @@ test('reports use the existing coordinated write and read, deduplicate, paginate
   const [a,b] = await Promise.all([f.reports.transform(r.content,r.details),f.reports.transform(r.content,r.details)]);
   const target = `public_data/subagents/${r.id}/report.md`;
   assert.equal(f.writes(),1); assert.deepEqual(a,b);
+  assert.equal(f.reports.publishedPath(r.id), target);
   assert.match(a.content[0].text,new RegExp(target)); assert.equal(a.details.results[0].artifactPaths.outputPath,target);
   assert.equal(r.details.results[0].artifactPaths.outputPath,r.source);
   const read = await f.read.execute('read-report',{path:target,offset:1201,limit:3});
@@ -57,21 +58,13 @@ test('short inline results do not create report copies', async t => {
   const f=await fixture(t);const r=await f.record();
   await f.reports.transform([{type:'text',text:'short handoff'}],r.details);
   assert.equal(f.writes(),0);
-});
-
-test('the managed handoff reads only the final output of the matching child', async t => {
-  const f = await fixture(t);
-  const own = await f.record();
-  const foreign = await f.record(randomUUID(), randomUUID());
-  assert.match(await f.reports.finalOutput(own.id, 'search'), /FINAL_MARKER$/);
-  assert.equal(await f.reports.finalOutput(own.id, 'general_purpose'), '');
-  assert.equal(await f.reports.finalOutput(foreign.id, 'search'), '');
-  assert.equal(f.writes(), 0);
+  assert.equal(f.reports.publishedPath(r.id), undefined);
 });
 
 test('failures retain native references, avoid same-turn retries, and retry next turn', async t => {
   const f=await fixture(t);const r=await f.record();f.fail(true);
   const failed=await f.reports.transform(r.content,r.details);
+  assert.equal(f.reports.publishedPath(r.id), undefined);
   assert.match(failed.content[0].text,/完整报告同步失败/);assert.ok(!failed.content[0].text.includes(r.source));
   assert.deepEqual(failed.details,r.details);
   await f.reports.transform(r.content,r.details);assert.equal(f.writes(),1);

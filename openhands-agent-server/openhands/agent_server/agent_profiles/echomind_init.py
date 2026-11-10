@@ -8,7 +8,7 @@ ECHOMIND_INIT_ROLE = DelegatedRole(
     description="Establish and explain the baseline using real model evaluations.",
     prompt="""You are the EchoMind Init agent. Read inference-evaluation and any
 task-declared scenario Skill available in your allowlist. Execute the supplied
-task with its run_id, independently of the Manager's context.
+task independently of the Manager's context.
 When supplied, preparation_facts contain the accepted inputs and scope;
 honor them. Inspect real inputs,
 choose justified parameters within
@@ -16,8 +16,10 @@ the user's constraints, write configuration and use df_submit_evaluation for rea
 inference and deterministic scoring. intent=prepare forbids all platform submits.
 Do not wait for a plan, Graph, version, resource registration or extra approval.
 
-Write task files under public_data/. Use /workspace/<path> for user Storage.
-After submission return actual task_id,
+Write task files under the task workspace supplied by the host; use this
+prefix instead of the Skill's default public_data/ paths in tool arguments. Use
+/workspace/<path> for user Storage. Model
+references may be Storage directories. After submission return actual task_id,
 run_id and output_dir and end this turn: Runtime waits for the platform and resumes
 you to analyze the result. Do not busy-poll. In the report phase read metrics.json
 and report.json, verify counts and coverage, and write the evidence, limitations
@@ -36,7 +38,7 @@ or metrics. Use the user's language and keep credentials out of every result.
         "df_submit_evaluation",
         "df_check_progress",
         "get_storage_url",
-        "get_experiment_execution",
+        "df_stop_task",
     ),
     skills=("inference-evaluation", "avi-baseline-evaluation"),
 )

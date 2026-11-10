@@ -308,17 +308,42 @@ class FileProductStore:
         )
 
     def save_workflow_execution_request(
-        self, state: WorkflowExecutionRequest, *, expected_revision: int | None
-    ) -> None:
+        self,
+        state: WorkflowExecutionRequest,
+        *,
+        expected_revision: int | None,
+        reuse_duplicate: bool = False,
+    ) -> WorkflowExecutionRequest:
         with self._lock():
             requests = self._load_workflow_execution_requests()
-            previous = requests.get(state.request_id)
-            if (previous.revision if previous else None) != expected_revision:
-                raise ValueError("workflow execution request changed concurrently")
             if self._load_metadata().conversation_id != state.conversation_id:
                 raise ValueError(
                     "workflow execution request belongs to another conversation"
                 )
+            previous = requests.get(state.request_id)
+            if previous is not None and expected_revision is None and reuse_duplicate:
+                if (
+                    previous.correlation != state.correlation
+                    or previous.workflow_path != state.workflow_path
+                    or previous.fingerprint != state.fingerprint
+                ):
+                    raise ValueError("request id already belongs to another workflow")
+                return previous
+            if (previous.revision if previous else None) != expected_revision:
+                raise ValueError("workflow execution request changed concurrently")
+            admitted = state
+            if (
+                reuse_duplicate
+                and state.correlation is not None
+                and state.correlation.type == "subagent"
+                and state.status in {"awaiting_confirmation", "submitting"}
+            ):
+                duplicate = self._duplicate_child_workflow(state, requests)
+                if duplicate is not None:
+                    if previous is None:
+                        return duplicate
+                    admitted = duplicate
+                    state = state.model_copy(update={"status": "cancelled"})
             requests[state.request_id] = state
             self._atomic_write(
                 self.directory / "workflow-execution-requests.json",
@@ -326,6 +351,42 @@ class FileProductStore:
                 .dump_json(requests)
                 .decode(),
             )
+            return admitted
+
+    def _duplicate_child_workflow(
+        self,
+        state: WorkflowExecutionRequest,
+        requests: dict[str, WorkflowExecutionRequest],
+    ) -> WorkflowExecutionRequest | None:
+        """Match a frozen submission across child sessions in the conversation."""
+        candidates = [
+            request
+            for request in requests.values()
+            if request.request_id != state.request_id
+            and request.correlation is not None
+            and request.correlation.type == "subagent"
+            and request.workflow_path == state.workflow_path
+            and request.fingerprint == state.fingerprint
+            and request.workflow == state.workflow
+        ]
+        if not candidates:
+            return None
+        failed_tasks = {
+            task.task_id
+            for task in self.load_snapshot().external_tasks
+            if task.status in {"failed", "terminated", "stopped"}
+        }
+        for request in candidates:
+            if request.status in {"submitting", "uncertain"} or (
+                request.status == "submitted" and request.task_id not in failed_tasks
+            ):
+                return request
+        if state.status == "awaiting_confirmation":
+            return next(
+                (request for request in candidates if request.status == state.status),
+                None,
+            )
+        return None
 
     def load_pipeline_runs(self) -> dict[str, PipelineRun]:
         with self._lock():
@@ -495,6 +556,13 @@ class FileProductStore:
         duplicate = self._find_duplicate(window, event)
         if duplicate is not None:
             return duplicate, snapshot
+        if event.type == "external_task.completed" and any(
+            task.task_id == event.payload.get("task_id")
+            and task.status not in {"pending", "running", "waiting"}
+            for task in snapshot.external_tasks
+        ):
+            # A delayed callback can follow a terminal poll beyond the tail window.
+            return self._append_from_full_log(metadata, event)
         return self._commit(metadata, snapshot, event, metadata.last_sequence + 1)
 
     def _append_from_full_log(

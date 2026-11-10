@@ -5,7 +5,10 @@ from typing import Annotated, Literal
 from pydantic import Field, field_validator, model_validator
 
 from pyromind_runtime.domain.base import AwareDatetime, ContractModel, utc_now
-from pyromind_runtime.domain.storage_paths import normalize_workspace_path
+from pyromind_runtime.domain.storage_paths import (
+    from_storage_api_path,
+    normalize_workspace_path,
+)
 
 
 class PlanResource(ContractModel):
@@ -19,6 +22,20 @@ class PlanResource(ContractModel):
         ),
     )
     description: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def convert_legacy_uri(cls, value: object) -> object:
+        if isinstance(value, dict) and "uri" in value and "storage_path" not in value:
+            data = dict(value)
+            uri = data.pop("uri")
+            data["storage_path"] = (
+                from_storage_api_path(uri, field="resource.uri")
+                if isinstance(uri, str)
+                else uri
+            )
+            return data
+        return value
 
     @field_validator("storage_path")
     @classmethod
@@ -249,20 +266,6 @@ class ExperimentPlanView(ContractModel):
     history: tuple[PlanRevisionSummary, ...] = ()
 
 
-class CreateExperimentPlan(ContractModel):
-    plan: WorkflowPlan
-    summary: str = "初始实验计划"
-
-
-class ReviseExperimentPlan(CreateExperimentPlan):
-    expected_revision: int = Field(ge=0)
-    source_proposal_id: str | None = None
-
-
-class GetExperimentPlan(ContractModel):
-    revision: int | None = Field(default=None, ge=1)
-
-
 class ExperimentContext(ContractModel):
     """Optional advice, not an executable plan or an authorization boundary."""
 
@@ -308,30 +311,6 @@ class ExperimentContextView(ContractModel):
     project_id: str | None = None
     sequence: int = 0
     context: ExperimentContext = Field(default_factory=ExperimentContext)
-
-
-class UpdateExperimentContext(ContractModel):
-    context: ExperimentContext = Field(
-        description=(
-            "Complete replacement context, not a patch. Include all resources, "
-            "stages, tasks and edges to keep; omitted arrays become empty. "
-            "Task inputs reference resources or upstream task outputs."
-        )
-    )
-    expected_sequence: int = Field(default=0, ge=0)
-
-
-CONTEXT_TOOLS = {
-    "get_experiment_context": ContractModel,
-    "update_experiment_context": UpdateExperimentContext,
-}
-
-
-PLAN_TOOLS = {
-    "create_experiment_plan": CreateExperimentPlan,
-    "revise_experiment_plan": ReviseExperimentPlan,
-    "get_experiment_plan": GetExperimentPlan,
-}
 
 
 class PlanConflictError(ValueError):

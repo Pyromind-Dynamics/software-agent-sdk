@@ -116,7 +116,6 @@ def get_pi_skill_datas():
     for skill_name in (
         "inference-evaluation",
         "model-evaluation-preparation",
-        "experiment-planning",
         "avi-baseline-evaluation",
         "generate-workflow-dsl",
         "data-processing",

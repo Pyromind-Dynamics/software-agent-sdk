@@ -9,12 +9,26 @@ import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 import { restrictSkillReads } from "../src/session-policy.js";
 import {
+  businessTool,
   createTools,
   normalizeBusinessToolContent,
   safePath,
   type SandboxTools,
 } from "../src/tools.js";
 import { WorkspaceAccessPolicy } from "../src/workspace-policy.js";
+
+test("only update_preparation unwraps a JSON facts object before validation", () => {
+  const peer = {} as JsonlRpcPeer;
+  const config = { name: "update_preparation", description: "", inputSchema: {} };
+  const tool = businessTool(peer, config);
+  const args = { expected_revision: 5, facts: '{"goal":{"value":"train"}}' };
+  assert.deepEqual(tool.prepareArguments?.(args), { ...args, facts: { goal: { value: "train" } } });
+  for (const facts of ["not JSON", "[]", "null"]) {
+    const invalid = { ...args, facts };
+    assert.equal(tool.prepareArguments?.(invalid), invalid);
+  }
+  assert.equal(businessTool(peer, { ...config, name: "set_preparation_plan" }).prepareArguments, undefined);
+});
 
 test("business tool content converts OpenHands inline image URLs for Pi", () => {
   assert.deepEqual(normalizeBusinessToolContent([
@@ -142,6 +156,9 @@ test("sandbox lanes resolve logical task paths without changing Storage paths", 
     },
   );
 
+  for (const path of ["../escape", "/absolute"]) {
+    assert.throws(() => sandbox.createLane("child", path), /inside the conversation root/);
+  }
   const lane = sandbox.createLane("child", "public_data/experiment-runs/run-1");
   assert.equal(lane.access.cwd, "public_data/experiment-runs/run-1");
   assert.equal(

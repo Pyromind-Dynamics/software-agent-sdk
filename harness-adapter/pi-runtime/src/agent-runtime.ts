@@ -43,7 +43,7 @@ export class PiAgentRuntime {
   private sessionId: string | undefined;
   private workspaceRoot: string | undefined;
   private terminalBackend: string | undefined;
-  private managedDelegation = false;
+  private hasDelegatedRoles = false;
   private normalizer: PiEventNormalizer | undefined;
   /** Blocks automatic scheduling (notifications, stages) until a user prompt. */
   private executionSuspended = false;
@@ -76,11 +76,6 @@ export class PiAgentRuntime {
     if (method.startsWith("execution.")) {
       if (!this.execution) throw new Error("execution host not ready");
       return this.execution.handle(method, params);
-    }
-    if (method === "delegation.control") {
-      this.requireSession();
-      if (!this.subagents) throw new Error("Delegation host is unavailable");
-      return await this.subagents.control(params);
     }
     if (method === "recipient.notify") {
       this.requireSession();
@@ -181,7 +176,7 @@ export class PiAgentRuntime {
     this.sessionId = sessionId;
     this.workspaceRoot = requiredString(params, "workspace_root");
     this.terminalBackend = requiredString(params, "terminal_backend");
-    this.managedDelegation = params.managed_delegation === true;
+    this.hasDelegatedRoles = Array.isArray(params.delegated_roles);
     for (const entry of session.sessionManager.getBranch()) {
       if (entry.type !== "custom" || entry.customType !== "pyromind.notification" || !isObject(entry.data)) continue;
       const { runId, message } = entry.data;
@@ -395,7 +390,7 @@ export class PiAgentRuntime {
 
   private async cancel(): Promise<JsonValue> {
     this.cancelling = true;
-    if (this.managedDelegation || this.userInput.hasActive()) {
+    if (this.hasDelegatedRoles || this.userInput.hasActive()) {
       this.executionSuspended = true;
       this.suspensionRevision++;
     }
@@ -623,7 +618,7 @@ export class PiAgentRuntime {
     const session = this.requireSession();
     await session.abort();
     await session.waitForIdle();
-    await this.subagents?.stopAll(this.managedDelegation ? "interrupt" : "stop");
+    await this.subagents?.stopAll(this.hasDelegatedRoles ? "interrupt" : "stop");
     await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     session.dispose();
     await this.subagents?.close();

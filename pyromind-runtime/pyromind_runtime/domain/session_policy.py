@@ -14,5 +14,4 @@ class SessionPolicy(ContractModel):
     configuration_version: int = 0
     product_instructions: str | None = None
     delegated_roles: tuple[JsonObject, ...] | None = None
-    managed_delegation: bool | None = None
     command_allowlist: tuple[str, ...] | None = None

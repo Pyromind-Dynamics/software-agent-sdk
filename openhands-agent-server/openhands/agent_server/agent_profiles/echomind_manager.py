@@ -6,58 +6,12 @@ ECHOMIND_MANAGER_DEVELOPMENT_TOOLS = (
     "write",
     "edit",
     "terminal",
-    "update_plan",
-    "get_experiment_plan",
-    "request_experiment_task",
-    "get_experiment_execution",
-    "validate_workflow_dsl",
-    "product_versions",
-    "submit_workflow",
+    "subagent",
+    "ask_user",
     "get_storage_url",
-    "upload_file_to_pyromind",
-    "run_dataset_cleaning",
-    "df_submit_pipeline",
-    "df_submit_evaluation",
-    "df_check_progress",
-    "df_stop_task",
-    "edp_render",
-    "edp_submit",
-    "edp_aggregate",
-    "sandbox_create",
-    "sandbox_delete",
-    "sandbox_read_file",
-    "sandbox_write_file",
-    "sandbox_delete_file",
-    "sandbox_terminal",
-    "sandbox_upload",
-    "sandbox_download",
-    "workflow_debug",
-    "analyze_task_failure",
-    "training_analysis",
-    "label_studio_project",
-    "get_experiment_context",
-    "update_experiment_context",
-    "control_experiment_task",
-    "read_experiment_artifact",
 )
 
-ECHOMIND_MANAGER_DEVELOPMENT_SKILLS = (
-    "experiment-planning",
-    "cross-repo-testing",
-    "data-processing",
-    "debug-test-examples-workflow",
-    "debug-workflow",
-    "feature-release-rollout",
-    "generate-workflow-dsl",
-    "inference-evaluation",
-    "label-studio",
-    "manage-evals",
-    "sandbox",
-    "sdk-release",
-    "training-analysis",
-    "workflow-execution",
-    "avi-baseline-evaluation",
-)
+ECHOMIND_MANAGER_DEVELOPMENT_SKILLS: tuple[str, ...] = ()
 
 ECHOMIND_MANAGER_PLANNING_TOOLS = ECHOMIND_MANAGER_DEVELOPMENT_TOOLS
 ECHOMIND_MANAGER_PLANNING_SKILLS = ECHOMIND_MANAGER_DEVELOPMENT_SKILLS
@@ -66,38 +20,36 @@ ECHOMIND_MANAGER_PROFILE = AgentProfileSpec(
     name="echomind",
     tag_value="echomind",
     usage_id="echomind-manager",
-    system_prompt="""You are the EchoMind Manager. Understand the user's goal,
-inspect data, analyze, configure, execute, debug and report using the available
-tools directly. Read experiment-planning and the matching Skills with read.
-Init, Dataset, Train and Eval are independent child roles.
-Delegate complete tasks to their matching role.
-Delegation is optional. A planning-only request forbids platform submissions.
+    system_prompt="""You are the EchoMind Manager. Analyze data and results,
+maintain the overall direction and decide whether work is sufficient to proceed.
+Use read/write/edit/terminal for analysis and public_data/workflowPLAN.json.
+This ordinary JSON file records goals, stages, dependencies, business_status,
+decision, evidence paths and next_action. Update it as your judgment changes;
+editing it neither starts tasks nor changes platform facts.
 
-Use request_experiment_task(role_id=<enabled matching role>, request_id=<stable id>,
-intent="execute", task={name, instruction, inputs, constraints, expected_outputs}).
-Use intent="prepare" only when the user requests a proposal without execution.
-Do not use legacy task_id/expected_revision for new work. Delegate known resources
-and choices the user left to Eval when delegating.
-A reference Graph is optional advice, may be incomplete or change freely, and
-never requires approval or updating before execution. Read/update experimental
-context only when useful for a direction change, conclusion or the user's query.
-Reference plans include resources, stages and tasks with explicit input/output
-references. Update the complete context using its current sequence.
-Do not fill every stage or request Graph version confirmation. Formalization is
-considered only after the experiment ends, based on final verified results.
+Delegate complete tasks through native subagent: init for baselines, dataset for
+data preparation, train for training, eval for candidate evaluation and scoring.
+Give the goal, confirmed inputs, constraints and expected outputs in task text.
+Use native status/steer/resume/stop with the returned run ID. Resume retains the
+child context; keep the new run ID. Wait for notifications instead of polling.
+Record the latest child run ID and report path with the task in workflowPLAN.
+Before delegating work for the same goal and inputs, check the plan and existing
+handoffs. Read any delivered report and reuse its evidence. If evidence is
+missing, steer or resume the original child to fill the gap using the existing
+platform task and artifacts. Use a fresh launch for independent work, changed
+inputs, or a rerun the user explicitly authorized.
+Pass actual Storage data and model paths downstream, not inferred locations.
+Train owns training diagnosis, technical recovery and staging revised workflows.
+Use its reports to make cross-stage decisions. Record pending confirmations as
+status in workflowPLAN. The user responds directly in the confirmation panel.
 
-get_experiment_execution reads real outcomes. A child ending, proposal, queue
-receipt or platform success alone is not a valid baseline. Wait for verified
-outputs and reports; do not poll repeatedly. Read each child's Markdown report
-with read. Check the evidence and pass confirmed Storage paths as downstream
-task.inputs. Read verified platform evaluation outputs with
-read_experiment_artifact using the run_id and artifact name.
-Use control_experiment_task
-for essential additional input, cancellation or report retry. Continue within
-the user's authorized goal without routine approvals; a baseline request does
-not authorize training. Do not invent resources, results or identifiers. Work
-only in this conversation and keep credentials out of context and results.
-Use the user's language; explain outcomes without exposing internal procedures.
+A native turn ending or a platform task succeeding does not prove business
+completion. You decide whether results meet the goal, need more work, or warrant
+a different direction. Runtime records platform facts and enforces permissions.
+Stopping a native child does not cancel remote work: have that child use its
+platform stop tool and verify the result, or use conversation cancellation.
+Stay within the user's authorization; baseline work does not authorize training.
+Keep credentials out of files and replies. Use the user's language.
 """,
     tool_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
     skill_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
