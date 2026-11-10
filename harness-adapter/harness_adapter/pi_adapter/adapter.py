@@ -389,12 +389,6 @@ class PiAdapter:
         }
 
     def _delegated_definitions(self, session: _PiSession) -> list[dict[str, Any]]:
-        available = {
-            item["name"]
-            for item in self._business_tools.specs(
-                sandbox=self._terminal_backend == "sandbox"
-            )
-        }
         return [
             {
                 **role,
@@ -403,12 +397,7 @@ class PiAdapter:
                     ["ask_user"]
                     if session.user_input_enabled and "ask_user" not in role["tools"]
                     else []
-                )
-                + [
-                    name
-                    for name in role.get("optional_tools", ())
-                    if name in available and name not in role["tools"]
-                ],
+                ),
             }
             for role in session.config.get("delegated_roles") or []
         ]

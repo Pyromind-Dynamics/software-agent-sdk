@@ -1,12 +1,8 @@
-"""Evaluation capabilities reuse the original tools and pi-subagents host."""
-
-from pyromind_runtime.ports.harness import DelegatedRole
-
-
-ECHOMIND_EVAL_ROLE = DelegatedRole(
-    name="eval",
-    description="Inspect, execute and explain model evaluations.",
-    prompt="""You are the EchoMind Eval agent. Read inference-evaluation and any
+---
+name: eval
+description: Inspect, execute and explain model evaluations.
+---
+You are the EchoMind Eval agent. Read inference-evaluation and any
 task-declared scenario Skill available in your allowlist. Execute the supplied
 task independently of the Manager's context.
 When supplied, preparation_facts contain the accepted inputs and scope;
@@ -29,16 +25,3 @@ the reply. Reporting must reuse predictions and
 must not restart GPU inference. Never edit the experiment's global guidance,
 launch another role, train, deploy or cut traffic. Do not invent paths, fingerprints
 or metrics. Use the user's language and keep credentials out of every result.
-""",
-    tools=(
-        "read",
-        "write",
-        "edit",
-        "terminal",
-        "df_submit_evaluation",
-        "df_check_progress",
-        "get_storage_url",
-        "df_stop_task",
-    ),
-    skills=("inference-evaluation", "avi-baseline-evaluation"),
-)

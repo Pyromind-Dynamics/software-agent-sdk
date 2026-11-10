@@ -49,11 +49,10 @@ export async function serveSubagentIpc(path: string, handle: (request: any, sign
   };
 }
 
-export function callSubagentHost(path: string, request: any, signal?: AbortSignal, update?: (value: any) => void, unref = false): Promise<any> {
+export function callSubagentHost(path: string, request: any, signal?: AbortSignal, update?: (value: any) => void, unrefAfterUpdate = false): Promise<any> {
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     const socket = createConnection(path);
-    if (unref) socket.unref();
     let settled = false;
     const finish = (error?: Error, result?: any) => {
       if (settled) return;
@@ -81,7 +80,10 @@ export function callSubagentHost(path: string, request: any, signal?: AbortSigna
         const message = JSON.parse(line) as IpcMessage;
         if (message.type === "error") finish(new Error(message.error));
         else if (message.type === "result") finish(undefined, message.value);
-        else if (message.type === "update") update?.(message.value);
+        else if (message.type === "update") {
+          update?.(message.value);
+          if (unrefAfterUpdate) socket.unref();
+        }
         else finish(new Error("Invalid subagent IPC response"));
       } catch (error) { finish(error instanceof Error ? error : new Error("Invalid subagent IPC response")); }
     });

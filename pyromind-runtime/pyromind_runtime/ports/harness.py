@@ -21,14 +21,11 @@ from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
 
 class DelegatedRole(ContractModel):
+    """Authorize an adapter-provided role and its tools and skills."""
+
     name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
-    description: str = Field(min_length=1, pattern=r"^[^\r\n]+$")
-    prompt: str = Field(min_length=1)
     tools: tuple[str, ...] = ()
     skills: tuple[str, ...] = ()
-    optional_tools: tuple[str, ...] = Field(
-        default=(), exclude_if=lambda value: not value
-    )
 
 
 class SessionSpec(ContractModel):

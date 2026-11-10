@@ -32,14 +32,14 @@ test("real children submit with distinct stable origins and resume only on their
     }
     return {allow:true};
   }} as unknown as JsonlRpcPeer;
-  const role = {name:"worker", description:"Run a bounded workflow", prompt:"Submit the workflow once, then finish.",tools:["submit_workflow"],skills:[]};
-  const config = {session_id:"callback-conversation", workspace_root:root, terminal_backend:"os-sandbox", session_path:join(root,"pi","session.jsonl"), system_prompt:"Delegate when requested", skills_directory:join(root,"skills"), skill_roots:[], tools:[], delegated_roles:[role], delegated_tool_specs:{worker:[{name:"submit_workflow",description:"Submit the workflow",input_schema:{type:"object",properties:{}}}]}, model:{provider:"openai",id:"custom-chat-model",api_key:"test",base_url:`http://127.0.0.1:${(server.address() as any).port}/v1`}};
+  const role = {name:"train",tools:["submit_workflow"],skills:[]};
+  const config = {session_id:"callback-conversation", workspace_root:root, terminal_backend:"os-sandbox", session_path:join(root,"pi","session.jsonl"), system_prompt:"Delegate when requested", skills_directory:join(root,"skills"), skill_roots:[], tools:[], delegated_roles:[role], delegated_tool_specs:{train:[{name:"submit_workflow",description:"Submit the workflow",input_schema:{type:"object",properties:{}}}]}, model:{provider:"openai",id:"custom-chat-model",api_key:"test",base_url:`http://127.0.0.1:${(server.address() as any).port}/v1`}};
   const {session, subagents} = await createPiSession(config, peer);
   t.after(async () => {await subagents.stopAll(); await session.abort(); await session.waitForIdle(); await session.extensionRunner.emit({type:"session_shutdown",reason:"quit"}); session.dispose(); await subagents.close();});
   await subagents.attach(session);
   await session.prompt("Initialize parent context");
   const tool = session.getToolDefinition("subagent")!;
-  const execute = (task: string) => tool.execute(crypto.randomUUID(),{agent:"worker",task,async:true},undefined,undefined,session.extensionRunner.createContext());
+  const execute = (task: string) => tool.execute(crypto.randomUUID(),{agent:"train",task,async:true},undefined,undefined,session.extensionRunner.createContext());
   const first: any = await execute("lane-one"), second: any = await execute("lane-two");
   const status = (id: string) => readFile(join(subagents.paths.stateRoot,"async-subagent-runs",id,"status.json"),"utf8").then(JSON.parse);
   await eventually(async () => {assert.equal(submissions.length,2); assert.equal((await status(first.details.asyncId)).state,"complete"); assert.equal((await status(second.details.asyncId)).state,"complete");});

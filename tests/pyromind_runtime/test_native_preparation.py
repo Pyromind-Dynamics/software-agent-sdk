@@ -154,11 +154,7 @@ async def test_preparation_plan_uses_revision_delivered_with_answer(
                         "ask_user",
                         "set_preparation_plan",
                     ),
-                    delegated_roles=(
-                        DelegatedRole(
-                            name="eval", description="Eval", prompt="Review data"
-                        ),
-                    ),
+                    delegated_roles=(DelegatedRole(name="eval"),),
                     preparation_policy=PreparationPolicy(
                         checklist_id="review",
                         version=1,

@@ -70,6 +70,11 @@ selection 格式：
 约束只填写用户确认的业务要求；未指定主指标时默认 pass_rate，未指定约束时
 meets_target 为 null。指标相同取较早 step。不同可比组不混排；需要明确比较组时
 selection.comparison_group 填计算出的组标识并新建评分运行。
+按用户指定的顺序填写 primary 和 secondary。分类准确率用 classification.accuracy，
+JSON 解析率可用 aggregate_metrics.json_parse_ok（每条样本输出布尔指标 json_parse_ok）。
+明确要求以训练损失打破并列时，把 training.eval_loss（direction=min）列入 secondary，
+并在来源清单的 telemetry.eval_loss_by_step 按 step 提供真实、有限的数值。
+使用训练损失裁决时，候选缺少指定排序指标就报告缺口，选模以 checkpoint_selection.json 为准。
 
 `score_eval.py` 提供两个函数：
 
@@ -81,6 +86,7 @@ selection.comparison_group 填计算出的组标识并新建评分运行。
 - `score_case(case, scoring_spec)`：返回布尔 `passed`，可选 `overall_score`（0..1）、
   `evidence`、`failure_reason`、`metrics`、`details`。分类任务同时返回业务口径的
   `reference_label` 和 `prediction_label`，以计算混淆矩阵和 P/R/F1。
+  metrics 的值必须是数值或布尔值。字符串、嵌套对象和空值放入 details。
   原始标签统计来自 original_label，业务类别统计来自 reference_label。
 
 脚本处理真实字段结构，不从文件顺序生成跨 step ID。已知样本的非法/空预测应返回
@@ -91,8 +97,8 @@ passed=false、prediction_label=null；脚本异常会记录为评分故障，�
 evaluation 仍必须提供能跨文件对应的 `id` 或 `input_key`。
 
 validation_examples 是 `{"record": 原始样例, "passed": 预期布尔值}` 的列表，至少
-包含应通过、应失败的案例，并覆盖业务映射与无效预测。先在沙箱用代表性样本验证
-生成脚本；CPU 全量任务还会自动运行这些对照案例。所有 step 共用该冻结脚本。
+包含应通过、应失败的案例，并覆盖业务映射与无效预测。工具在会话沙箱可用时
+提交前用 CPU worker 的同一校验逻辑执行样例。所有 step 共用该冻结脚本。
 
 ## 结果
 

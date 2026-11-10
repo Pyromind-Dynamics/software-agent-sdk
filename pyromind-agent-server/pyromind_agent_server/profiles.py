@@ -8,13 +8,9 @@ from pyromind_runtime.application.product_instructions import DATA_FLYWHEEL_INST
 from pyromind_runtime.domain.preparation import PreparationPolicy
 from pyromind_runtime.ports.harness import DelegatedRole
 
-from openhands.agent_server.agent_profiles.echomind_dataset import ECHOMIND_DATASET_ROLE
-from openhands.agent_server.agent_profiles.echomind_eval import ECHOMIND_EVAL_ROLE
-from openhands.agent_server.agent_profiles.echomind_init import ECHOMIND_INIT_ROLE
 from openhands.agent_server.agent_profiles.echomind_manager import (
     ECHOMIND_MANAGER_PROFILE,
 )
-from openhands.agent_server.agent_profiles.echomind_train import ECHOMIND_TRAIN_ROLE
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +66,14 @@ _PREPARATION_TOOLS = (
     "set_preparation_plan",
     "inspect_resource",
 )
+_CHILD_WORKSPACE_TOOLS = ("read", "write", "edit", "terminal")
+_EVALUATION_TOOLS = _CHILD_WORKSPACE_TOOLS + (
+    "df_submit_evaluation",
+    "df_check_progress",
+    "get_storage_url",
+    "df_stop_task",
+)
+_EVALUATION_SKILLS = ("inference-evaluation", "avi-baseline-evaluation")
 
 
 def _load_preparation_policy() -> PreparationPolicy:
@@ -96,7 +100,7 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=21,
+    configuration_version=22,
     route_prefix="/api/v2/echomind/conversations",
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
     harness_id="pi",
@@ -119,10 +123,32 @@ or business run IDs for delegation.
     tool_allowlist=_PREPARATION_TOOLS,
     skill_allowlist=_PREPARATION_SKILLS,
     delegated_roles=(
-        ECHOMIND_INIT_ROLE,
-        ECHOMIND_DATASET_ROLE,
-        ECHOMIND_TRAIN_ROLE,
-        ECHOMIND_EVAL_ROLE,
+        DelegatedRole(name="init", tools=_EVALUATION_TOOLS, skills=_EVALUATION_SKILLS),
+        DelegatedRole(
+            name="dataset",
+            tools=_CHILD_WORKSPACE_TOOLS
+            + (
+                "get_storage_url",
+                "df_submit_pipeline",
+                "df_check_progress",
+                "df_stop_task",
+            ),
+            skills=("data-processing",),
+        ),
+        DelegatedRole(
+            name="train",
+            tools=_CHILD_WORKSPACE_TOOLS
+            + (
+                "get_storage_url",
+                "validate_workflow_dsl",
+                "submit_workflow",
+                "training_analysis",
+                "analyze_task_failure",
+                "df_stop_task",
+            ),
+            skills=("generate-workflow-dsl", "workflow-execution", "training-analysis"),
+        ),
+        DelegatedRole(name="eval", tools=_EVALUATION_TOOLS, skills=_EVALUATION_SKILLS),
     ),
     development_tool_allowlist=ECHOMIND_MANAGER_PROFILE.tool_allowlist,
     development_skill_allowlist=ECHOMIND_MANAGER_PROFILE.skill_allowlist,

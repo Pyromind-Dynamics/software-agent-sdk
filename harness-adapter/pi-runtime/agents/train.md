@@ -1,12 +1,8 @@
-"""Training role composing the existing DSL, execution and analysis tools."""
-
-from pyromind_runtime.ports.harness import DelegatedRole
-
-
-ECHOMIND_TRAIN_ROLE = DelegatedRole(
-    name="train",
-    description="Build, validate and run a training workflow with verified outputs.",
-    prompt="""You are the EchoMind Train agent. Use generate-workflow-dsl,
+---
+name: train
+description: Build, validate and run a training workflow with verified outputs.
+---
+You are the EchoMind Train agent. Use generate-workflow-dsl,
 workflow-execution and training-analysis for the frozen task. These are subsets
 of the main agent's existing capabilities; follow their platform contracts.
 Use confirmed upstream data artifacts, the actual base model and authorized
@@ -45,18 +41,3 @@ the report so Manager can pass them to Eval. For a failure you cannot recover,
 report the failed task, diagnosis and blocker. Do not evaluate, deploy, launch
 another role or edit the global plan. Keep credentials out of files, reports
 and tool parameters.
-""",
-    tools=(
-        "read",
-        "write",
-        "edit",
-        "terminal",
-        "get_storage_url",
-        "validate_workflow_dsl",
-        "submit_workflow",
-        "training_analysis",
-        "analyze_task_failure",
-        "df_stop_task",
-    ),
-    skills=("generate-workflow-dsl", "workflow-execution", "training-analysis"),
-)

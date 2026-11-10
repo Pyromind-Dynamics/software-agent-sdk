@@ -7,11 +7,12 @@ notifications and resume. There is no adapter-owned agent database or scheduler.
 
 ## Roles and calls
 
-`agents/search.md` and `agents/general_purpose.md` use the plugin's native agent
-format. The build copies them to `dist/agents`. On session creation, the adapter
-copies them into the conversation's private Pi agent directory and substitutes
-the compiled host-extension path. The plugin parses the profiles. New launches
-read the configured profiles; resume retains the plugin's saved launch contract.
+The build copies the bundled Markdown roles to `dist/agents`. The adapter
+prepares the roles in each conversation's private Pi agent directory and
+supplies the compiled host-extension paths. Profiles that delegate specialist
+work authorize role names, tools and skills. Each specialist's description and
+prompt come from its bundled Markdown. The plugin parses the resulting role
+files and retains the launch contract for resume.
 
 ```ts
 subagent({ agent: "search", task: "Find the dataset input contract", async: true })
@@ -45,9 +46,9 @@ IPC work. Reconnection uses the current host and credentials.
 
 Only repository-owned roles can be launched. Native capability ceilings, disabled
 plugin features and the host's `tool_call` policy prevent tool, model, cwd,
-session-directory, workflow-script and extension overrides. Children have no
-platform tools, AgentGenome, nested delegation or supervisor tool. A missing
-decision is returned in their handoff. Main-session business tools are unaffected.
+session-directory, workflow-script and extension overrides. Children can use
+platform tools when their profile grants them. The host also applies its
+tool and workspace policies to each child request.
 
 ## Lifecycle and product integration
 

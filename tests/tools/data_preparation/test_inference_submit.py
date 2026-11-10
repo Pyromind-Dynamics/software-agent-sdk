@@ -1,6 +1,8 @@
 import importlib.util
 import json
 import shutil
+import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,6 +33,7 @@ from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionSt
 
 from openhands.tools.data_preparation import (
     inference as inference_module,
+    prediction_evaluation,
     submission as submission_module,
 )
 from openhands.tools.data_preparation.evaluation_submit import (
@@ -1066,11 +1069,33 @@ def test_ambiguous_platform_submission_is_not_repeated(inference_submission):
     ctx.submit.assert_called_once()
 
 
+@pytest.mark.parametrize("invalid_metrics", [False, True])
 def test_saved_prediction_submission_is_cpu_only_and_freezes_scoring(
-    inference_submission,
+    inference_submission, monkeypatch, invalid_metrics
 ):
 
     ctx = inference_submission
+    monkeypatch.setattr(
+        prediction_evaluation, "supports_sandbox_execution", lambda _: True
+    )
+    monkeypatch.setattr(
+        prediction_evaluation,
+        "sandbox_upload",
+        lambda _, source, destination: shutil.copyfile(source, destination),
+    )
+    monkeypatch.setenv(prediction_evaluation.ENV_SANDBOX_SYSTEM_PYTHON, sys.executable)
+
+    def execute(_, command, *, timeout):
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=timeout
+        )
+        return SimpleNamespace(
+            exit_code=result.returncode,
+            stdout=result.stdout + result.stderr,
+            timeout_occurred=False,
+        )
+
+    monkeypatch.setattr(prediction_evaluation, "sandbox_execute", execute)
     public = ctx.workspace / "public_data"
     manifest: dict[str, Any] = {
         "evaluations": [
@@ -1082,15 +1107,27 @@ def test_saved_prediction_submission_is_cpu_only_and_freezes_scoring(
     spec = {
         "business_rule": "confirmed rule",
         "validation_examples": [
-            {"record": {}, "passed": True},
-            {"record": {}, "passed": False},
+            {
+                "record": {"id": "good", "reference": "yes", "prediction": "yes"},
+                "passed": True,
+            },
+            {
+                "record": {"id": "bad", "reference": "yes", "prediction": "no"},
+                "passed": False,
+            },
         ],
     }
     (public / "source.json").write_text(json.dumps(manifest))
     (public / "spec.json").write_text(json.dumps(spec))
     script = (
         "def parse_record(raw, context): return raw\n"
-        'def score_case(case, spec): return {"passed": True}\n'
+        "def score_case(case, spec):\n"
+        '    return {"passed": case["reference"] == case["prediction"], '
+        + (
+            '"metrics": {"iou": {"hits": 1}}}\n'
+            if invalid_metrics
+            else '"metrics": {"iou": 1}}\n'
+        )
     )
     (public / "score.py").write_text(script)
     action = DfSubmitEvaluationAction(
@@ -1101,6 +1138,12 @@ def test_saved_prediction_submission_is_cpu_only_and_freezes_scoring(
         scoring_script_path="public_data/score.py",
     )
     result = ctx.executor(action, cast(Any, ctx.conversation))
+    if invalid_metrics:
+        assert result.is_error
+        assert "evaluator metrics must contain numeric or boolean values" in result.text
+        assert ctx.store.load_pipeline_runs() == {}
+        ctx.submit.assert_not_called()
+        return
     assert not result.is_error, result.text
     workflow = ctx.submit.call_args.kwargs["workflow"]
     assert [node["data"]["nodeType"] for node in workflow["nodes"]] == [

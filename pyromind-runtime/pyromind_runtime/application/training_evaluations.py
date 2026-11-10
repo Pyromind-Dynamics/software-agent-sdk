@@ -9,7 +9,10 @@ from collections import Counter
 from typing import Any, cast
 from uuid import UUID, uuid5
 
-from pyromind_runtime.application.checkpoint_selection import select_checkpoint
+from pyromind_runtime.application.checkpoint_selection import (
+    metric_value,
+    select_checkpoint,
+)
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.training_evaluation import (
     CheckpointSelectionPolicy,
@@ -87,8 +90,25 @@ class TrainingEvaluations:
             if child_id not in runs:
                 self.store.save_pipeline_run(child, expected_revision=None)
         policy = CheckpointSelectionPolicy.model_validate(spec.get("selection", {}))
-        selection = select_checkpoint(steps, policy)
         telemetry = manifest.get("telemetry", {})
+        if any(
+            objective.metric == "training.eval_loss" for objective in policy.secondary
+        ):
+            losses = (
+                telemetry.get("eval_loss_by_step")
+                if isinstance(telemetry, dict)
+                else None
+            )
+            for step in steps:
+                step.metrics.pop("training.eval_loss", None)
+                loss = (
+                    metric_value(losses, str(step.step))
+                    if isinstance(losses, dict)
+                    else None
+                )
+                if loss is not None:
+                    step.metrics["training.eval_loss"] = loss
+        selection = select_checkpoint(steps, policy)
         if isinstance(telemetry, dict):
             selection = selection.model_copy(update={"telemetry": telemetry})
         result = selection.model_dump(mode="json")

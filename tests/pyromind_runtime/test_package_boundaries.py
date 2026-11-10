@@ -580,6 +580,8 @@ def test_execution_capabilities_are_profile_owned_and_cannot_be_model_supplied()
         set(roles) == set(policy.allowed_roles) == {"init", "dataset", "train", "eval"}
     )
     assert DEFAULT_PRODUCT_PROFILE.delegated_roles is None
+    for role in roles.values():
+        assert set(role.model_dump(mode="json")) == {"name", "tools", "skills"}
     assert roles["init"] is not roles["eval"]
     assert roles["init"].tools == roles["eval"].tools
     obsolete = {

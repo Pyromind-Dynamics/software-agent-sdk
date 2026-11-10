@@ -679,20 +679,13 @@ async def test_child_question_identity_and_cancellation_are_isolated(tmp_path) -
     adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
     handle, session = await _new_session(adapter, conversations)
     session.config["tool_allowlist"] = ["subagent", "ask_user"]
-    session.config["delegated_roles"] = [
-        {
-            "name": "worker",
-            "description": "Worker",
-            "prompt": "Work",
-            "tools": ["ask_user"],
-        }
-    ]
+    session.config["delegated_roles"] = [{"name": "dataset", "tools": ["ask_user"]}]
     origin = {"type": "subagent", "subagent_id": "child-task"}
     request = {
         "request_id": "child-question",
         "tool_call_id": "child-tool",
         "questions": QUESTIONS,
-        "delegated": {"role": "worker", "origin": origin},
+        "delegated": {"role": "dataset", "origin": origin},
     }
     try:
         with pytest.raises(PermissionError):

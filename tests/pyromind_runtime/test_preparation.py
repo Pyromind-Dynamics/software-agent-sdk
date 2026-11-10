@@ -506,13 +506,7 @@ async def test_runtime_creation_restore_permissions_and_stage_protection(
             tool_allowlist=tools,
             development_tool_allowlist=development,
             command_allowlist=("user_message", "create_project"),
-            delegated_roles=(
-                DelegatedRole(
-                    name="eval",
-                    description="Evaluate",
-                    prompt="Evaluate within the supplied scope",
-                ),
-            ),
+            delegated_roles=(DelegatedRole(name="eval"),),
         ),
         context,
     )
@@ -703,13 +697,7 @@ async def test_inspection_and_terminal_provide_checklist_evidence_without_projec
                     "inspect_resource",
                 ),
                 preparation_policy=policy,
-                delegated_roles=(
-                    DelegatedRole(
-                        name="eval",
-                        description="Evaluate",
-                        prompt="Evaluate within the supplied scope",
-                    ),
-                ),
+                delegated_roles=(DelegatedRole(name="eval"),),
             ),
             context,
         )
@@ -927,11 +915,7 @@ async def test_preparation_capability_upgrade_preserves_contract_and_project(
                 workspace_root=str(root),
                 tool_allowlist=("read",),
                 preparation_policy=policy if phase != "legacy" else None,
-                delegated_roles=(
-                    DelegatedRole(
-                        name="eval", description="Evaluate", prompt="Evaluate"
-                    ),
-                ),
+                delegated_roles=(DelegatedRole(name="eval"),),
             ),
             context,
         )
@@ -949,8 +933,8 @@ async def test_preparation_capability_upgrade_preserves_contract_and_project(
             development_tool_allowlist=development,
             product_instructions="Read the child's Markdown report.",
             delegated_roles=(
-                {"name": "eval", "prompt": "Return a Markdown report."},
-                {"name": "new-role", "prompt": "A role outside the saved policy."},
+                {"name": "eval", "tools": ["read"]},
+                {"name": "train", "tools": ["submit_workflow"]},
             ),
         )
         foreign = replace(context, profile_id="another-profile")

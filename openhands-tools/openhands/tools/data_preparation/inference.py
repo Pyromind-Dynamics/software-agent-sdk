@@ -542,6 +542,7 @@ class InferencePipelineHandler:
             )
         elif evaluation_options:
             from openhands.tools.data_preparation.prediction_evaluation import (
+                preflight_scoring,
                 prepare_definition,
             )
 
@@ -552,6 +553,9 @@ class InferencePipelineHandler:
                 input_path=request.input_path,
                 cpu=request.cpu,
                 memory=request.memory,
+            )
+            preflight_scoring(
+                cast(Any, conversation).workspace, self.runtime_dir, definition
             )
         elif inference_options:
             options = inference_options

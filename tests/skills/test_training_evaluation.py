@@ -642,10 +642,19 @@ def test_review_runtime_and_api_reuse_annotation_protocol_and_refresh_context(
     assert client.get(url.replace("/test/", "/other/")).status_code == 404
 
 
+@pytest.mark.parametrize(
+    "losses, expected_step",
+    [(None, 20), ({"20": 0.8, "100": 0.2}, 100), ({"20": 0.8}, None)],
+)
 def test_score_every_step_reuse_predictions_select_saved_model_and_register_reports(
-    saved_batch, tmp_path
+    saved_batch, tmp_path, losses, expected_step
 ):
     worker, manifest, spec, script, run_id, mount, output, output_ref = saved_batch
+    if losses is not None:
+        manifest["telemetry"] = {"eval_loss_by_step": losses}
+        spec["selection"]["secondary"] = [
+            {"metric": "training.eval_loss", "direction": "min"}
+        ]
     batch = worker.evaluate_batch(manifest, spec, script, output, run_id, mount)
     assert [row["step"] for row in batch["steps"]] == [20, 100, 200]
     assert all(row["metrics"]["request_count"] == 0 for row in batch["steps"])
@@ -680,11 +689,13 @@ def test_score_every_step_reuse_predictions_select_saved_model_and_register_repo
     store.save_pipeline_run(parent, expected_revision=None)
     service = TrainingEvaluations(store, DiskStorage(mount))
     result = service.finalize(run_id)
-    # 20 and 100 tie on pass rate; the declared default favors the earlier step.
-    assert result["selected_step"] == 20
-    assert result["best_evaluated_step"] == 200
-    assert result["meets_target"] is False
-    assert result["model"]["kind"] == "lora"
+    assert result["selected_step"] == expected_step
+    if expected_step is None:
+        assert result["excluded"]["100"] == ["missing_metric:training.eval_loss"]
+    else:
+        assert result["best_evaluated_step"] == (200 if losses is None else 100)
+        assert result["meets_target"] is False
+        assert result["model"]["kind"] == "lora"
     assert len(store.load_pipeline_runs()) == 4
     assert service.finalize(run_id) == result
     assert "Checkpoint evaluation" in (output / "evaluation_report.html").read_text()

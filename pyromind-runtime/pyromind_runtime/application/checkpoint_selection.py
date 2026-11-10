@@ -29,6 +29,9 @@ def select_checkpoint(
     excluded: dict[str, list[str]] = {}
     candidates: list[StepEvaluation] = []
     objectives = [policy.primary, *policy.secondary]
+    uses_training_loss = any(
+        item.metric == "training.eval_loss" for item in policy.secondary
+    )
     groups = {
         row.comparison_group
         for row in evaluations
@@ -50,6 +53,7 @@ def select_checkpoint(
         ) + (float(row.step),)
 
     comparable: list[StepEvaluation] = []
+    ranking_incomplete = False
     for row in evaluations:
         if row.dataset_role != "validation":
             excluded[str(row.step)] = ["only_validation_can_select_checkpoint"]
@@ -62,9 +66,20 @@ def select_checkpoint(
             issues.append("incomplete_or_unverified_evaluation")
         if group is None or row.comparison_group != group:
             issues.append("comparison_group_not_selected_or_mismatched")
-        for objective in objectives:
-            if metric_value(row.metrics, objective.metric) is None:
-                issues.append(f"missing_metric:{objective.metric}")
+        missing = [
+            f"missing_metric:{objective.metric}"
+            for objective in objectives
+            if metric_value(row.metrics, objective.metric) is None
+        ]
+        if (
+            missing
+            and not issues
+            and row.checkpoint
+            and row.checkpoint.complete
+            and row.checkpoint.step == row.step
+        ):
+            ranking_incomplete = True
+        issues.extend(missing)
         if not issues:
             comparable.append(row)
         if not row.checkpoint or not row.checkpoint.complete:
@@ -90,9 +105,22 @@ def select_checkpoint(
                 )
         return failed
 
+    if uses_training_loss and ranking_incomplete:
+        return CheckpointSelection(
+            excluded=excluded,
+            reason="A comparable checkpoint is missing a required ranking metric.",
+        )
     candidates.sort(key=lambda row: (bool(unmet(row)), rank(row)))
     comparable.sort(key=rank)
     best = candidates[0] if candidates else None
+    reason = "No complete checkpoint with a comparable, valid evaluation."
+    if best:
+        reason = "Best saved checkpoint under the frozen business policy."
+        if not uses_training_loss:
+            reason = (
+                "Best saved checkpoint under the frozen business policy; "
+                "telemetry is diagnostic evidence, not an alternative ranking."
+            )
     return CheckpointSelection(
         selected_step=best.step if best else None,
         selected_run_id=best.run_id if best else None,
@@ -102,10 +130,5 @@ def select_checkpoint(
         ranking=[row.step for row in candidates],
         excluded=excluded,
         best_evaluated_step=comparable[0].step if comparable else None,
-        reason=(
-            "Best saved checkpoint under the frozen business policy; "
-            "telemetry is diagnostic evidence, not an alternative ranking."
-            if best
-            else "No complete checkpoint with a comparable, valid evaluation."
-        ),
+        reason=reason,
     )

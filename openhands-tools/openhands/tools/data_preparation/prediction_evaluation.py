@@ -4,12 +4,70 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import shlex
+import tempfile
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from openhands.tools.data_preparation.sandbox_execution import (
+    DEFAULT_SANDBOX_SYSTEM_PYTHON,
+    ENV_SANDBOX_SYSTEM_PYTHON,
+    require_sandbox_success,
+    sandbox_execute,
+    sandbox_upload,
+    supports_sandbox_execution,
+)
+
+
+_PREFLIGHT = """\
+import datetime
+import json
+import sys
+import types
+from zipfile import ZipFile
+
+# The sandbox can run Python 3.10. The CPU worker runs a newer Python.
+if not hasattr(datetime, "UTC"):
+    datetime.UTC = datetime.timezone.utc
+
+from evaluate_predictions import validate_script
+
+with ZipFile(sys.argv[0]) as files:
+    module = types.ModuleType("frozen_business_scoring")
+    exec(compile(files.read("score_eval.py"), "score_eval.py", "exec"), module.__dict__)
+    validate_script(module, json.loads(files.read("spec.json")))
+"""
+
+
+def preflight_scoring(workspace: Any, runtime_dir: Path, definition: dict) -> None:
+    # User-authored Python only runs in a sandbox or the platform CPU worker.
+    if not supports_sandbox_execution(workspace):
+        return
+    remote = f"/tmp/scoring-preflight-{uuid4().hex}.zip"
+    python = os.environ.get(ENV_SANDBOX_SYSTEM_PYTHON) or DEFAULT_SANDBOX_SYSTEM_PYTHON
+    with tempfile.TemporaryDirectory(prefix="scoring-preflight-") as directory:
+        archive = Path(directory) / "preflight.zip"
+        with ZipFile(archive, "w", compression=ZIP_DEFLATED) as files:
+            for name in ("evaluate_predictions.py", "evaluate_inference.py"):
+                files.write(runtime_dir / name, name)
+            files.writestr("__main__.py", _PREFLIGHT)
+            files.writestr("score_eval.py", definition["scoring_script"])
+            files.writestr("spec.json", json.dumps(definition["scoring_spec"]))
+        try:
+            sandbox_upload(workspace, archive, remote)
+            command = f"trap 'rm -f {remote}' EXIT; {shlex.quote(python)} {remote}"
+            require_sandbox_success(
+                sandbox_execute(workspace, f"sh -c {shlex.quote(command)}", timeout=30),
+                "scoring validation examples",
+            )
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 class PredictionEvaluationOptions(BaseModel):

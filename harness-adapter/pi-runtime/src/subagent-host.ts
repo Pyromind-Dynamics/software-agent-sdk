@@ -1,4 +1,4 @@
-import { writeSubagentRoles, type SubagentRoleDefinition } from "./subagent-roles.js";
+import { readBundledSubagentRole, writeSubagentRoles, type SubagentRoleDefinition } from "./subagent-roles.js";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join, sep } from "node:path";
@@ -33,10 +33,9 @@ export function prepareSubagentEnvironment(workspace: string, definitions?: Suba
   process.env.PI_CODING_AGENT_DIR = agentDir;
   process.env.PI_SUBAGENTS_TEMP_ROOT = stateRoot;
   process.env.PYROMIND_SUBAGENT_SOCKET = `/tmp/pyromind-pi-${createHash("sha256").update(workspace).digest("hex").slice(0, 24)}.sock`;
-  const roleRoot = fileURLToPath(new URL(existsSync(fileURLToPath(new URL("./agents/search.md", import.meta.url))) ? "./agents/" : "../agents/", import.meta.url));
   for (const role of Object.keys(ROLE_TOOLS)) {
     const extension = subagentModule(role === "search" ? "subagent-search-extension" : "subagent-general-extension");
-    writeFileSync(join(agentDir, "agents", `${role}.md`), readFileSync(join(roleRoot, `${role}.md`), "utf8").replace("{{extension}}", extension), { mode: 0o600 });
+    writeFileSync(join(agentDir, "agents", `${role}.md`), readBundledSubagentRole(role).replace("{{extension}}", extension), { mode: 0o600 });
   }
   if (definitions) writeSubagentRoles(agentDir, definitions, subagentModule("subagent-child-extension"));
   writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ subagents: {
