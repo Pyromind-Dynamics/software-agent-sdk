@@ -140,6 +140,7 @@ ASK_USER_TOOL_DESCRIPTION = (
     "until the user answers or cancels; their answers arrive as the tool result."
 )
 _WORKFLOW_PATH = Path("public_data/workflow_canvas/workflow.py")
+_MAX_WORKFLOW_DSL_BYTES = 2 * 1024 * 1024
 _SYSTEM_PROMPT = """You are a coding agent inside one conversation workspace.
 Prefer read for ordinary file inspection, write for file creation, and edit for
 targeted changes. Use terminal for searching, bulk computation, and executing saved
@@ -632,6 +633,19 @@ class PiAdapter:
             )
         else:
             session.context = context
+        return await self._read_session_workspace_text(
+            session,
+            path,
+            max_bytes=max_bytes,
+        )
+
+    async def _read_session_workspace_text(
+        self,
+        session: _PiSession,
+        path: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> str | None:
         if self._terminal_backend == "sandbox" and not self._has_execution_workspace(
             session
         ):
@@ -650,6 +664,30 @@ class PiAdapter:
             return None
         except ValueError as exc:
             raise OSError(str(exc)) from exc
+
+    async def _resolve_validation_arguments(
+        self,
+        session: _PiSession,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self._terminal_backend != "sandbox" or tool_name != "validate_workflow_dsl":
+            return arguments
+        dsl_path = arguments.get("dsl_path")
+        if dsl_path is not None and not isinstance(dsl_path, str):
+            return arguments
+        path = dsl_path or _WORKFLOW_PATH.as_posix()
+        try:
+            dsl = await self._read_session_workspace_text(
+                session,
+                path,
+                max_bytes=_MAX_WORKFLOW_DSL_BYTES,
+            )
+        except (OSError, ProductRuntimeError, ValueError):
+            return arguments
+        if dsl is None:
+            return arguments
+        return {**arguments, "dsl": dsl}
 
     async def _read_stored_workspace_text(
         self,
@@ -1676,6 +1714,11 @@ class PiAdapter:
                 await self._tool_context(session),
                 request_context=replace(session.context, task_origin=origin),
             )
+            arguments = await self._resolve_validation_arguments(
+                session,
+                name,
+                arguments,
+            )
             result = await self._business_tools.execute(
                 name, arguments, tool_context, tool_call_id=params.get("tool_call_id")
             )
@@ -1757,6 +1800,11 @@ class PiAdapter:
                     tool_context,
                     request_context=replace(session.context, task_origin=origin),
                 )
+            arguments = await self._resolve_validation_arguments(
+                session,
+                tool_name,
+                arguments,
+            )
             result = await self._business_tools.execute(
                 tool_name,
                 arguments,

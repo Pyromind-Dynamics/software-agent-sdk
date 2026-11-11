@@ -67,9 +67,8 @@ ETA), the most recent records from `processed.jsonl`, and `report.json` when
 available, so you can report progress and verify output quality.
 When report.json lists HTML artifacts, also returns fresh Storage download URLs.
 
-Use this when the user asks about the status of a submitted pipeline, or
-proactively between submission and the terminal Kafka callback for
-long-running jobs.
+Use this when the user asks about the status of a submitted pipeline. The
+terminal Kafka callback owns completion; do not poll while waiting for it.
 """
 
 

@@ -59,14 +59,13 @@ const TERMINAL_ROWS = 48;
 const DEFAULT_HEARTBEAT_SECONDS = 60;
 const DEFAULT_MAX_RECONNECTS = 2;
 /**
- * Budget for the handshake of an already-warm socket.
+ * Budget for opening a terminal socket and completing its ready handshake.
  *
- * A bridge which drops an idle session without a close frame leaves the socket
- * looking alive; the next handshake is what notices, and it has to fail fast
- * enough to replay the preparation on a replacement socket instead of spending
- * a whole startup budget on a dead connection.
+ * A dead connection must fail fast instead of holding the serialized terminal
+ * queue for the whole startup budget. Staging and launch use that larger budget
+ * only after the connection has answered.
  */
-const DEFAULT_SESSION_PROBE_MS = 30_000;
+const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 /** How many replacement endpoints one command may be replayed on. */
 const MAX_ENDPOINT_REFRESHES = 1;
 /**
@@ -180,8 +179,8 @@ export interface SandboxTerminalOptions extends SandboxTerminalTimeouts {
    */
   scriptChunkChars?: number;
   /**
-   * Budget for the handshake of a socket already used by this session.
-   * Defaults to {@link DEFAULT_SESSION_PROBE_MS}.
+   * Budget for opening the socket and completing its ready handshake.
+   * Defaults to {@link DEFAULT_CONNECT_TIMEOUT_MS}.
    */
   probeTimeoutMs?: number;
   /**
@@ -904,7 +903,7 @@ export class SandboxTerminalOperations implements BashOperations {
     this.fastPath = options.fastPath ?? sandboxTerminalFastPath();
     this.batchBudgetBytes = options.batchBudgetBytes ?? TERMINAL_BATCH_BUDGET_BYTES;
     this.scriptChunkChars = options.scriptChunkChars ?? TERMINAL_SCRIPT_CHUNK_CHARS;
-    this.probeTimeoutMs = options.probeTimeoutMs ?? DEFAULT_SESSION_PROBE_MS;
+    this.probeTimeoutMs = options.probeTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
     this.trace = options.trace ?? sandboxTerminalTrace();
     this.connect = options.connect ?? connectWebSocket;
   }
@@ -1337,14 +1336,10 @@ export class SandboxTerminalOperations implements BashOperations {
         token = randomBytes(9).toString("hex");
         const startupDeadline = this.prepareDeadline();
         channel = this.channel();
-        // A socket this session already used carries no open cost, but it can
-        // have been dropped without a close frame while it sat idle. Its
-        // handshake therefore gets a probe budget: failing fast is what lets
-        // the preparation replay on a replacement socket.
+        // A dead connection must release the terminal queue quickly. The
+        // larger startup budget starts only after this handshake answers.
         const warm = this.sessionExchanges > 0;
-        const readyDeadline = warm
-          ? Math.min(startupDeadline, Date.now() + this.probeTimeoutMs)
-          : startupDeadline;
+        const readyDeadline = Math.min(startupDeadline, Date.now() + this.probeTimeoutMs);
         let handshakeDone = false;
         try {
           // Fail closed if echo/history disabling cannot be confirmed. No secrets

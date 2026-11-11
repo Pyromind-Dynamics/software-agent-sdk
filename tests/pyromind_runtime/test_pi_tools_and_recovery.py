@@ -440,6 +440,93 @@ async def test_native_role_tools_require_an_allowed_tool_and_child_origin(
         )
 
 
+@pytest.mark.parametrize("method", ["tool.execute", "role.tool.execute"])
+async def test_validation_reads_the_dsl_at_the_adapter_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+) -> None:
+    adapter = PiAdapter(tmp_path, terminal_backend="sandbox")
+    files = PiSessionFiles(tmp_path)
+    config = (
+        {"tool_allowlist": ["validate_workflow_dsl"]}
+        if method == "tool.execute"
+        else {
+            "tool_allowlist": ["subagent"],
+            "delegated_roles": [{"name": "train", "tools": ["validate_workflow_dsl"]}],
+        }
+    )
+    session = pi_adapter_module._PiSession(
+        "conversation",
+        tmp_path,
+        files,
+        config,
+        RequestContext(user_id="42"),
+    )
+    captured: dict[str, Any] = {}
+
+    async def read_session_workspace_text(
+        _session,
+        path: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> str:
+        captured["read"] = {"path": path, "max_bytes": max_bytes}
+        return "workflow = InputNode()"
+
+    async def execute(
+        name: str,
+        arguments: dict[str, Any],
+        _context: ToolExecutionContext,
+        **_kwargs,
+    ) -> dict[str, Any]:
+        captured["execute"] = {"name": name, "arguments": arguments}
+        return {
+            "is_error": False,
+            "content": [],
+            "details": {},
+            "signals": [],
+        }
+
+    async def tool_context(_session):
+        return _tool_context(tmp_path, "conversation")
+
+    monkeypatch.setattr(
+        adapter,
+        "_read_session_workspace_text",
+        read_session_workspace_text,
+    )
+    monkeypatch.setattr(adapter, "_tool_context", tool_context)
+    monkeypatch.setattr(adapter._business_tools, "execute", execute)
+
+    arguments = {
+        "dsl_path": "public_data/subagents/task/workflow_canvas/workflow.py",
+        "name": "workflow",
+    }
+    params: dict[str, Any] = {
+        "tool_name": "validate_workflow_dsl",
+        "arguments": arguments,
+    }
+    if method == "role.tool.execute":
+        params.update(
+            {
+                "role": "train",
+                "origin": {"type": "subagent", "subagent_id": "child-1"},
+            }
+        )
+
+    await adapter._runner_request(session, method, params)
+
+    assert captured["read"] == {
+        "path": arguments["dsl_path"],
+        "max_bytes": 2 * 1024 * 1024,
+    }
+    assert captured["execute"] == {
+        "name": "validate_workflow_dsl",
+        "arguments": {**arguments, "dsl": "workflow = InputNode()"},
+    }
+
+
 async def test_idle_unexpected_runner_exit_is_silent_and_restarts_lazily(
     tmp_path, monkeypatch
 ) -> None:

@@ -767,17 +767,38 @@ test("sandbox terminal url uses the cluster WebSocket scheme and carries the tok
   assert.equal(url.searchParams.get("token"), "secret");
 });
 
-test("startup deadline includes a socket which never opens", async () => {
+test("connection deadline bounds a socket which never opens", async () => {
   const operations = new SandboxTerminalOperations(ENDPOINT, {
     writeFile: async () => {},
     connect: () => new FakeSocket(),
-    startupTimeoutMs: 20, stopTimeoutMs: 20,
+    startupTimeoutMs: 500, probeTimeoutMs: 20, stopTimeoutMs: 20,
   });
+  const started = Date.now();
   await assert.rejects(operations.exec("true", "", {onData: () => {}}),
     (error: unknown) => error instanceof SandboxTerminalExecutionError &&
       error.execution.phase === "connecting" &&
       error.execution.error_code === "startup_timeout" &&
       error.execution.stopped === true);
+  assert.ok(Date.now() - started < 200, "connection deadline must beat the startup budget");
+});
+
+test("a dead connection releases the terminal queue on its connection deadline", async () => {
+  let connections = 0;
+  const operations = new SandboxTerminalOperations(ENDPOINT, {
+    writeFile: async () => {},
+    connect: () => {
+      connections += 1;
+      return new FakeSocket();
+    },
+    startupTimeoutMs: 500, probeTimeoutMs: 20, queueTimeoutMs: 100, stopTimeoutMs: 20,
+  });
+  const started = Date.now();
+  const first = operations.exec("true", "", {onData: () => {}});
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const second = operations.exec("true", "", {onData: () => {}});
+  await Promise.allSettled([first, second]);
+  assert.equal(connections, 2, "the queued call must run after the dead connection fails");
+  assert.ok(Date.now() - started < 200, "the queue must not wait for the startup budget");
 });
 
 test("an environment burst which is never acknowledged fails before the launch", async () => {

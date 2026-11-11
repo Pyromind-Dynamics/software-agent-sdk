@@ -20,6 +20,7 @@ import type { JsonlRpcPeer } from "./rpc-peer.js";
 
 const ROLE_TOOLS = { search: ["read", "grep", "find", "ls"], general_purpose: ["read", "grep", "find", "ls", "write", "edit", "terminal"] };
 const SUBAGENT_ACTIONS = ["status", "steer", "resume", "stop", "list"];
+const ASYNC_SUBMISSION_TOOLS = new Set(["df_submit_pipeline", "df_submit_evaluation"]);
 type CompletionMessage = Parameters<ExtensionAPI["sendMessage"]>[0];
 export function subagentModule(name: string): string {
   const js = fileURLToPath(new URL(`./${name}.js`, import.meta.url));
@@ -252,7 +253,7 @@ export class SubagentHost {
     if (!isRecord(message.details) || !Array.isArray(message.details.runs)) return message;
     const runs = message.details.runs;
     const delivered = runs.filter(run => !isRecord(run) || run.status !== "completed" ||
-      typeof run.runId !== "string" || !this.awaitingWorkflowConfirmation(run.runId));
+      typeof run.runId !== "string" || !this.awaitingExternalTask(run.runId));
     if (delivered.length === runs.length) return message;
     if (!delivered.length) return;
     const content = delivered.map(run => {
@@ -282,11 +283,15 @@ export class SubagentHost {
     } catch { /* A missing artifact must not hide a completion. */ }
   }
 
-  private awaitingWorkflowConfirmation(id: string): boolean {
+  private awaitingExternalTask(id: string): boolean {
     const entry = this.completionMessages(id)?.findLast(item => item.type === "message" &&
-      (item.message.role === "user" || item.message.role === "toolResult" && item.message.toolName === "submit_workflow"));
-    return entry?.type === "message" && entry.message.role === "toolResult" && !entry.message.isError &&
-      isRecord(entry.message.details) && entry.message.details.status === "awaiting_confirmation";
+      (item.message.role === "user" || item.message.role === "toolResult" &&
+        (item.message.toolName === "submit_workflow" || ASYNC_SUBMISSION_TOOLS.has(item.message.toolName))));
+    if (entry?.type !== "message" || entry.message.role !== "toolResult" || entry.message.isError ||
+      !isRecord(entry.message.details)) return false;
+    const status = entry.message.details.status;
+    if (entry.message.toolName === "submit_workflow") return status === "awaiting_confirmation";
+    return typeof status === "string" && ["pending", "running"].includes(status.toLowerCase());
   }
 
   async rpc(method: string, params: Record<string, unknown> = {}, requestId: string = randomUUID()): Promise<any> {
@@ -408,7 +413,7 @@ export class SubagentHost {
   private async observeCompletion(data: unknown) {
     if (!isRecord(data) || typeof data.runId !== "string" || typeof data.summary !== "string") return;
     const id = data.runId;
-    if (data.success === true && this.awaitingWorkflowConfirmation(id)) return;
+    if (data.success === true && this.awaitingExternalTask(id)) return;
     // The native completion summary is the final handoff, not the activity window.
     const transformed = await this.reports.transform([{ type: "text", text: data.summary }], data);
     const handoff = redactSignedUrls(displayText(transformed));
@@ -474,9 +479,9 @@ export class SubagentHost {
   private async finishDisplay(id: string, state: string, label: string, extra: JsonObject) {
     await this.display.settled(id);
     this.display.captureActivity(id);
-    const awaitingConfirmation = state === "complete" && this.awaitingWorkflowConfirmation(id);
+    const awaitingExternalTask = state === "complete" && this.awaitingExternalTask(id);
     let result = this.handoffs.get(id) ?? extra.result;
-    if (!result && !awaitingConfirmation) {
+    if (!result && !awaitingExternalTask) {
       try {
         const native = await this.rpc("status", { id, view: "transcript", lines: 200 });
         const window = transcriptWindow(displayText(native));
