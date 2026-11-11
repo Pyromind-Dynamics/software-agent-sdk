@@ -76,6 +76,7 @@ def project_stage_activity(
     sessions: dict[tuple[str, str, str], str] = {}
     latest: dict[str, tuple[TimelineOperation, str]] = {}
     reports: dict[str, str] = {}
+    task_sessions: dict[str, set[str]] = {}
     for item in snapshot.timeline:
         if (
             not isinstance(item, TimelineOperation)
@@ -115,6 +116,7 @@ def project_stage_activity(
         roots[(stage.id, item.name, item.run_id or item.item_id)] = root
         if session_key:
             sessions[(stage.id, item.name, session_key)] = root
+            task_sessions.setdefault(root, set()).add(session_key)
         binding = ExecutionBinding(
             project_id=project.project_id,
             stage_id=stage.id,
@@ -143,6 +145,60 @@ def project_stage_activity(
         )
         if report_uri and state != "reported":
             waiting_reason = f"已有交付报告：{report_uri}"
+        external = [
+            task
+            for task in snapshot.external_tasks
+            if task.correlation is not None
+            and task.correlation.conversation_id == snapshot.conversation_id
+            and task.correlation.type == "subagent"
+            and task.correlation.subagent_id in task_sessions.get(root, set())
+        ]
+        platform_task_id = None
+        if external:
+            pending = [
+                task
+                for task in external
+                if task.status in {"pending", "running", "waiting"}
+            ]
+            task = max(
+                pending or external,
+                key=lambda task: as_utc(datetime.fromisoformat(task.updated_at)),
+            )
+            platform_task_id = task.task_id
+            if pending:
+                state = "waiting_platform"
+                waiting_reason = f"平台任务 {task.task_id} 尚未返回最终结果。"
+            elif task.status in {"failed", "terminated", "stopped"}:
+                state = "failed" if task.status == "failed" else "cancelled"
+                waiting_reason = task.error_summary
+            elif item.status == "running":
+                state = "analyzing"
+                waiting_reason = (
+                    f"平台任务 {task.task_id} 已返回结果，子 Agent 正在分析。"
+                )
+            elif item.status == "completed":
+                child_data = (
+                    item.details.get("subagent", {})
+                    if isinstance(item.details, dict)
+                    else {}
+                )
+                child = child_data if isinstance(child_data, dict) else {}
+                ended_at = child.get("ended_at")
+                try:
+                    report_after_result = bool(
+                        report_uri
+                        and isinstance(ended_at, str)
+                        and as_utc(datetime.fromisoformat(ended_at))
+                        > as_utc(datetime.fromisoformat(task.updated_at))
+                        and child.get("report_uri") == report_uri
+                    )
+                except ValueError:
+                    report_after_result = False
+                if not report_after_result:
+                    state = "waiting_analysis"
+                    waiting_reason = (
+                        f"平台任务 {task.task_id} 已返回结果，等待子 Agent 分析与交付。"
+                    )
         executions.append(
             ExperimentExecutionView(
                 run_id=root,
@@ -155,8 +211,11 @@ def project_stage_activity(
                 role_id=item.name,
                 state=state,
                 waiting_reason=waiting_reason,
-                report_state="ready" if report_uri else "not_started",
+                report_state="ready"
+                if report_uri and state == "reported"
+                else "not_started",
                 report_uri=report_uri,
+                platform_task_id=platform_task_id,
                 intent="execute",
             )
         )
@@ -338,6 +397,7 @@ class SnapshotProjector:
             category=cast(_OperationCategory, category),
             thought=self._content(event.payload, key="thought"),
             arguments=event.payload.get("arguments", {}),
+            details=event.payload.get("details") if category == "subagent" else None,
             execution=ExecutionBinding.model_validate(
                 event.payload["execution"]
             ).model_dump(mode="json")

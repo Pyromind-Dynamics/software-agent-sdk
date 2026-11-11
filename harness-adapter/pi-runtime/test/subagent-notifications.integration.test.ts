@@ -43,6 +43,11 @@ test("two native child completions and a durable platform callback share one par
   for(const event of events){if(event.kind==='agent.started')active.add(event.runId);if(event.kind==='run.finished')active.delete(event.runId);assert.ok(active.size<=1,JSON.stringify(events));}
   const starts=events.filter(event=>event.kind==='subagent.started');
   assert.equal(new Set(starts.map(event=>event.runId)).size,2);
+  for (const start of starts) {
+    assert.match(start.payload.details.subagent.status, /^(queued|running)$/);
+    assert.equal(start.payload.details.subagent.role, 'search');
+    assert.ok(events.some(event => event.runId === start.runId && /^Answer task /.test(event.payload.details?.subagent?.task)));
+  }
   await eventually(()=>assert.equal(events.filter(event=>event.kind==='subagent.finished').length,2));
   for (const terminal of events.filter(event=>event.kind==='subagent.finished')) {
     assert.match(JSON.stringify(terminal.payload.details), /TRACE_EVIDENCE/);

@@ -71,3 +71,20 @@ test("native subagent calls cannot override host paths, tools, agents, or workfl
   assert.equal(validateSubagentCall({agent:"search",task:"x",async:true}),undefined);
   assert.equal(validateSubagentCall({action:"resume",id:"x",message:"continue"}),undefined);
 });
+
+test("subagent validation gives distinct repairs for mixed launch and lifecycle calls", () => {
+  const launchAndAction = validateSubagentCall({
+    agent: "dataset", task: "Check the inputs", async: true, action: "list",
+  });
+  assert.match(launchAndAction ?? "", /mutually exclusive/);
+  assert.match(launchAndAction ?? "", /omit action\/id\/message/);
+
+  const actionAndTask = validateSubagentCall({
+    action: "status", id: "run-1", task: "Check the inputs",
+  });
+  assert.match(actionAndTask ?? "", /mutually exclusive/);
+  assert.match(actionAndTask ?? "", /omit agent\/task\/async\/context/);
+
+  const unscopedId = validateSubagentCall({ agent: "dataset", id: "run-1" });
+  assert.match(unscopedId ?? "", /Lifecycle fields require action/);
+});

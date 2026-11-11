@@ -191,7 +191,7 @@ async def test_product_profiles_isolate_conversations_with_the_same_profile_id(
     await runtime.close()
 
 
-async def test_http_workflow_execution_prepares_confirmation_without_submitting(
+async def test_http_workflow_execution_submits_without_confirmation(
     tmp_path,
 ) -> None:
     class Submission:
@@ -235,12 +235,10 @@ async def test_http_workflow_execution_prepares_confirmation_without_submitting(
             },
         )
     assert response.status_code == 200
-    assert response.json()["status"] == "awaiting_confirmation"
-    assert submission.submitted is False
-    assert (
-        len((await runtime.get_snapshot("workflow-api", context)).pending_permissions)
-        == 1
-    )
+    assert response.json()["status"] == "submitted"
+    assert response.json()["task_id"] == "task-1"
+    assert submission.submitted is True
+    assert not (await runtime.get_snapshot("workflow-api", context)).pending_permissions
     await runtime.close()
 
 

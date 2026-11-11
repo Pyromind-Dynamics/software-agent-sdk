@@ -28,7 +28,7 @@ test("real children submit with distinct stable origins and resume only on their
   const peer = {emit: () => {}, request: async (method: string, params: any) => {
     if (method === "role.tool.execute") {
       submissions.push(params);
-      return {content:[{type:"text",text:"Awaiting confirmation"}],details:{status:"awaiting_confirmation",request_id:`request-${submissions.length}`},is_error:false};
+      return {content:[{type:"text",text:"Workflow submitted"}],details:{status:"submitted",request_id:`request-${submissions.length}`,task_id:`task-${submissions.length}`},is_error:false};
     }
     return {allow:true};
   }} as unknown as JsonlRpcPeer;
@@ -49,7 +49,7 @@ test("real children submit with distinct stable origins and resume only on their
     }
   });
   const parentRequests = () => requests.filter(body => body.tools?.some((tool: any) => tool.function.name === "subagent"));
-  assert.equal(parentRequests().length, 1, "staged workflow must not wake the parent");
+  assert.equal(parentRequests().length, 1, "pending workflow must not wake the parent");
   assert.doesNotMatch(await readFile(config.session_path, "utf8"), /STAGED_WORKFLOW_REPORT/);
   const one = submissions[0].origin, two = submissions[1].origin;
   assert.equal(one.type,"subagent"); assert.notEqual(one.subagent_id,two.subagent_id);

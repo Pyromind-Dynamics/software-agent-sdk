@@ -111,14 +111,16 @@ export class SubagentHost {
   }
 
   pluginApi(pi: ExtensionAPI): ExtensionAPI {
+    const lifecycleOnly = "Lifecycle-only. Do not combine with agent, task, async, or context.";
+    const launchOnly = "Launch-only. Omit action, id, and message.";
     const parameters = Type.Object({
-      agent: Type.Optional(Type.String({ enum: Object.keys(this.roleTools) })),
-      task: Type.Optional(Type.String({ description: "Required when launching without an action. Put the complete task here." })),
-      async: Type.Optional(Type.Boolean({ description: "Defaults to true. Set false to wait for the result." })),
-      context: Type.Optional(Type.String({ enum: ["fresh"] })),
-      action: Type.Optional(Type.String({ enum: SUBAGENT_ACTIONS, description: "Lifecycle action. Omit when launching a child." })),
-      id: Type.Optional(Type.String({ description: "Native run ID for lifecycle actions." })),
-      message: Type.Optional(Type.String({ description: "Guidance only for action steer or resume." })),
+      agent: Type.Optional(Type.String({ enum: Object.keys(this.roleTools), description: launchOnly })),
+      task: Type.Optional(Type.String({ description: `Required for launch. ${launchOnly}` })),
+      async: Type.Optional(Type.Boolean({ description: `Defaults to true. Set false to wait. ${launchOnly}` })),
+      context: Type.Optional(Type.String({ enum: ["fresh"], description: launchOnly })),
+      action: Type.Optional(Type.String({ enum: SUBAGENT_ACTIONS, description: `${lifecycleOnly} For example: {action:"list"} or {action:"resume",id:"<run-id>",message:"..."}.` })),
+      id: Type.Optional(Type.String({ description: `${lifecycleOnly} Native run ID.` })),
+      message: Type.Optional(Type.String({ description: `${lifecycleOnly} Guidance for steer or resume.` })),
     }, { additionalProperties: false });
     return {
       ...pi,
@@ -252,7 +254,7 @@ export class SubagentHost {
     if (!isRecord(message.details) || !Array.isArray(message.details.runs)) return message;
     const runs = message.details.runs;
     const delivered = runs.filter(run => !isRecord(run) || run.status !== "completed" ||
-      typeof run.runId !== "string" || !this.awaitingWorkflowConfirmation(run.runId));
+      typeof run.runId !== "string" || !this.awaitingWorkflowResult(run.runId));
     if (delivered.length === runs.length) return message;
     if (!delivered.length) return;
     const content = delivered.map(run => {
@@ -282,11 +284,11 @@ export class SubagentHost {
     } catch { /* A missing artifact must not hide a completion. */ }
   }
 
-  private awaitingWorkflowConfirmation(id: string): boolean {
+  private awaitingWorkflowResult(id: string): boolean {
     const entry = this.completionMessages(id)?.findLast(item => item.type === "message" &&
       (item.message.role === "user" || item.message.role === "toolResult" && item.message.toolName === "submit_workflow"));
     return entry?.type === "message" && entry.message.role === "toolResult" && !entry.message.isError &&
-      isRecord(entry.message.details) && entry.message.details.status === "awaiting_confirmation";
+      isRecord(entry.message.details) && ["submitting", "submitted"].includes(String(entry.message.details.status));
   }
 
   async rpc(method: string, params: Record<string, unknown> = {}, requestId: string = randomUUID()): Promise<any> {
@@ -313,8 +315,11 @@ export class SubagentHost {
     if (isRecord(result) && isRecord(result.details) && typeof result.details.runId === "string") {
       this.launches.set(callId, result.details.runId);
       this.linkRun(result.details.runId, callId);
-      this.observe(result.details.runId, "running", "Subagent");
-      void this.display.poll(result.details.runId);
+      const input = this.launchInputs.get(callId);
+      if (input?.async === false && !input.action) {
+        this.observe(result.details.runId, "running", String(input.agent ?? "Subagent"));
+        void this.display.poll(result.details.runId);
+      }
     }
   }
 
@@ -325,15 +330,19 @@ export class SubagentHost {
     const details = isRecord(result) && isRecord(result.details) ? result.details : {};
     const id = typeof details.runId === "string" ? details.runId : retainedId;
     if (!id) { this.launchInputs.delete(callId); return; }
+    const failed = isError || (isRecord(result) && result.isError === true);
+    if (failed && !this.states.has(id)) {
+      this.launchInputs.delete(callId);
+      return;
+    }
     this.linkRun(id, callId);
     this.launchInputs.delete(callId);
     const background = typeof details.asyncId === "string";
     if (background) this.backgroundIds.add(id);
-    const failed = isError || (isRecord(result) && result.isError === true);
     const label = String((details.results as any[])?.[0]?.agent ?? "Subagent");
     const output = displayText(result);
     const handoff = output.length > 16000 ? output.slice(0, 16000) + `\n[Truncated; query subagent status with id ${id}.]` : output;
-    this.observe(id, background ? "running" : failed ? "failed" : "complete", label, background ? {} : { result: handoff });
+    if (!background) this.observe(id, failed ? "failed" : "complete", label, { result: handoff });
     void this.refresh().catch(() => {});
   }
 
@@ -343,13 +352,14 @@ export class SubagentHost {
     if (this.refreshPending) return this.refreshPending;
     this.refreshPending = (async () => {
       const data = await this.rpc("status");
+      const observations = new Map<string, { state: string; label: string; details: JsonObject }>();
       for (const run of data.asyncSnapshot?.runs ?? []) {
         this.backgroundIds.add(run.id);
-        this.display.update(run.id, {
+        const details = {
           ...(typeof run.startedAt === "number" ? { started_at: new Date(run.startedAt).toISOString() } : {}),
           ...(typeof run.endedAt === "number" ? { ended_at: new Date(run.endedAt).toISOString() } : {}),
-        });
-        this.observe(run.id, run.state, run.label);
+        };
+        observations.set(run.id, { state: run.state, label: run.label, details });
       }
       // Documented plugin lifecycle artifacts are authoritative after reconnect and
       // after terminal jobs disappear from the active status projection.
@@ -362,15 +372,23 @@ export class SubagentHost {
           this.backgroundIds.add(name);
           const steps = Array.isArray(status.steps) ? status.steps : [];
           if (steps.length === 1) this.rememberContext(name, steps[0].sessionFile ?? status.sessionFile);
-          this.display.update(name, {
+          if (typeof status.toolCallId === "string" && this.launchInputs.has(status.toolCallId)) {
+            this.linkRun(name, status.toolCallId);
+          }
+          const current = observations.get(name);
+          const details = {
+            ...current?.details,
             ...(typeof status.startedAt === "number" ? { started_at: new Date(status.startedAt).toISOString() } : {}),
             ...(typeof status.endedAt === "number" ? { ended_at: new Date(status.endedAt).toISOString() } : {}),
             ...(typeof status.toolCallId === "string" ? { tool_call_id: status.toolCallId } : {}),
-            ...(typeof status.steps?.[0]?.task === "string" ? { task: status.steps[0].task } : {}),
+            ...(typeof steps[0]?.task === "string" && !this.display.value(name, "task") ? { task: steps[0].task } : {}),
             ...(typeof status.steps?.[0]?.agent === "string" ? { role: status.steps[0].agent } : {}),
-          });
-          this.observe(name, status.state, status.steps?.[0]?.agent ?? "Subagent");
+          };
+          observations.set(name, { state: status.state, label: steps[0]?.agent ?? current?.label ?? "Subagent", details });
         } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error; }
+      }
+      for (const [id, { state, label, details }] of observations) {
+        this.observe(id, state, label, {}, this.display.update(id, details));
       }
       const foreground = join(this.paths.stateRoot, "async-subagent-results", "foreground-history.json");
       if (existsSync(foreground)) {
@@ -408,7 +426,7 @@ export class SubagentHost {
   private async observeCompletion(data: unknown) {
     if (!isRecord(data) || typeof data.runId !== "string" || typeof data.summary !== "string") return;
     const id = data.runId;
-    if (data.success === true && this.awaitingWorkflowConfirmation(id)) return;
+    if (data.success === true && this.awaitingWorkflowResult(id)) return;
     // The native completion summary is the final handoff, not the activity window.
     const transformed = await this.reports.transform([{ type: "text", text: data.summary }], data);
     const handoff = redactSignedUrls(displayText(transformed));
@@ -446,19 +464,23 @@ export class SubagentHost {
     } catch { /* A missing session header must not hide lifecycle events. */ }
   }
 
-  private observe(id: string, state: string, label: string, extra: JsonObject = {}) {
+  private observe(id: string, state: string, label: string, extra: JsonObject = {}, detailsChanged = false) {
+    if (state === "pending") state = "queued";
     if (["running", "queued"].includes(state)) this.observedLive.add(id);
     const outputChanged = typeof extra.result === "string" && this.handoffs.get(id) !== extra.result;
     if (typeof extra.result === "string") this.handoffs.set(id, extra.result);
     const previous = this.states.get(id);
     if (previous && !["running", "queued"].includes(previous) && ["running", "queued"].includes(state)) return;
+    const role = Object.hasOwn(this.roleTools, label) ? label : this.display.value(id, "role");
+    const presentationChanged = this.display.update(id, { status: state, ...(typeof role === "string" ? { role } : {}) });
     if (!previous) {
       if (["running", "queued"].includes(state) && !this.display.value(id, "started_at")) this.display.update(id, { started_at: new Date().toISOString() });
-      this.emit(id, "subagent.started", { label, details: this.display.details(id) });
+      this.emit(id, "subagent.started", { label: role ?? label, details: this.display.details(id) });
     }
-    this.display.update(id, { status: state, ...(Object.hasOwn(this.roleTools, label) ? { role: label } : {}) });
     if (previous === state) {
-      if (outputChanged && !this.finalizing.has(id)) this.emit(id, "subagent.progress", { details: this.display.details(id), result: this.handoffs.get(id)! });
+      if ((outputChanged || detailsChanged || presentationChanged) && !this.finalizing.has(id)) this.emit(id, "subagent.progress", {
+        details: this.display.details(id), ...(outputChanged ? { result: this.handoffs.get(id)! } : {}),
+      });
       return;
     }
     this.states.set(id, state);
@@ -474,9 +496,9 @@ export class SubagentHost {
   private async finishDisplay(id: string, state: string, label: string, extra: JsonObject) {
     await this.display.settled(id);
     this.display.captureActivity(id);
-    const awaitingConfirmation = state === "complete" && this.awaitingWorkflowConfirmation(id);
+    const awaitingResult = state === "complete" && this.awaitingWorkflowResult(id);
     let result = this.handoffs.get(id) ?? extra.result;
-    if (!result && !awaitingConfirmation) {
+    if (!result && !awaitingResult) {
       try {
         const native = await this.rpc("status", { id, view: "transcript", lines: 200 });
         const window = transcriptWindow(displayText(native));
@@ -537,8 +559,23 @@ export class SubagentHost {
 }
 
 export function validateSubagentCall(input: Record<string, unknown>, roles: Record<string, string[]> = ROLE_TOOLS): string | undefined {
-  const fields = input.action ? ["action", "id", "message", "options"] : ["agent", "task", "async", "context"];
-  if (Object.keys(input).some((key) => !fields.includes(key))) return `Supported launch: {agent,task,async:true|false}. Lifecycle: {action:"status"|"steer"|"resume"|"stop"|"list",id?,message?}. Roles: ${Object.keys(roles).join(", ")}. Other fields are host-controlled.`;
+  const launchFields = ["agent", "task", "async", "context"];
+  const lifecycleFields = ["id", "message"];
+  const hasLaunchFields = launchFields.some((field) => Object.hasOwn(input, field));
+  const hasLifecycleFields = lifecycleFields.some((field) => Object.hasOwn(input, field));
+  if (typeof input.action === "string" && hasLaunchFields) {
+    return `Launch and lifecycle calls are mutually exclusive. To launch: {agent:"${Object.keys(roles)[0]}",task:"...",async:true} (omit action/id/message). To inspect/control: {action:"status"|"steer"|"resume"|"stop"|"list",id?,message?} (omit agent/task/async/context).`;
+  }
+  if (input.action === undefined && hasLifecycleFields) {
+    return `Lifecycle fields require action. Use {action:"status"|"steer"|"resume"|"stop"|"list",id?,message?}, or omit id/message and launch with {agent,task,async:true}.`;
+  }
+  if (input.action !== undefined && (typeof input.action !== "string" || !input.action.trim())) {
+    return `action must be one of ${SUBAGENT_ACTIONS.join(", ")}. Launch calls omit action and use {agent,task,async:true}.`;
+  }
+  const fields = input.action !== undefined ? ["action", ...lifecycleFields, "options"] : launchFields;
+  if (Object.keys(input).some((key) => !fields.includes(key))) {
+    return `Unsupported subagent parameters. Launch: {agent,task,async:true|false}. Lifecycle: {action:"status"|"steer"|"resume"|"stop"|"list",id?,message?}. Available roles: ${Object.keys(roles).join(", ")}. Keep launch and lifecycle calls separate; other fields are host-controlled.`;
+  }
   if (input.action && !SUBAGENT_ACTIONS.includes(String(input.action))) return `Supported actions: ${SUBAGENT_ACTIONS.join(", ")}. Available agents: ${Object.keys(roles).join(", ")}.`;
   if (input.agent && !Object.hasOwn(roles, String(input.agent))) return `Unknown subagent role; available agents: ${Object.keys(roles).join(", ")} (use the exact name).`;
   if (input.context !== undefined && input.context !== "fresh") return "Subagents use an independent fresh context";

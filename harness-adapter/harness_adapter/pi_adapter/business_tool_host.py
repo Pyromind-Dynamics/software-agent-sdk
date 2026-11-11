@@ -441,10 +441,10 @@ class PyromindBusinessToolHost:
             specs.append(
                 BusinessToolSpec(
                     "submit_workflow",
-                    "Request formal execution of a validated Storage workflow. "
-                    "This opens a user confirmation dialog. No platform task "
-                    "is created until the user confirms. Call only when the "
-                    "user asks to run the workflow.",
+                    "Submit a Storage workflow directly for formal execution. "
+                    "The server validates the frozen definition and returns the "
+                    "platform task ID without a confirmation dialog. "
+                    "Call only when the user asks to run the workflow.",
                     {
                         "type": "object",
                         "properties": {

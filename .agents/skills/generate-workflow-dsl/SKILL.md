@@ -57,6 +57,6 @@ Reference 路径相对本 `SKILL.md` 所在目录；按 `<available_skills>` 的
 3. `retryable=false`（包括 401）：停止，不重复校验或探测凭据。`retryable=true` 最多重试两次，仍失败则说明平台校验未完成。
 4. 最多修改五轮；同一错误连续两轮未消失则报告阻塞。GPU 枚举或必填端口不确定时，可用只含目标节点与最小依赖的 DSL 做一次校验探测，不用 `run_workflow` 探测。
 
-生成任务不调用 `workflow_debug`、`run_workflow` 或 `run_dataset_cleaning`。无配置修改的显式调试请求使用 `debug-workflow`；要求运行时，校验通过后转入 `workflow-execution`，上传实际生成的文件并按其约定提交，由 Copilot 确认。
+生成任务不调用 `workflow_debug`、`run_workflow` 或 `run_dataset_cleaning`。无配置修改的显式调试请求使用 `debug-workflow`；要求运行时，校验通过后转入 `workflow-execution`，使用实际生成的文件路径直接提交。
 
 最终简述所选节点、关键输入、参数依据和校验结果；说明影响执行的假设及未验证项，不复述完整 DSL。训练效果由独立评测报告判断。

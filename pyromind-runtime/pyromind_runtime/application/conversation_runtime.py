@@ -43,7 +43,6 @@ from pyromind_runtime.domain.commands import (
     CommandReceipt,
     CreateProjectCommand,
     InputResponseCommand,
-    PermissionResponseCommand,
     ProductCommand,
     RollbackWorkflowCommand,
     UserMessageCommand,
@@ -809,7 +808,6 @@ class ConversationRuntime:
         request = WorkflowExecutionRequest(
             request_id=identity,
             conversation_id=conversation_id,
-            permission_id=identity,
             workflow_path="version://" + record.id,
             correlation=correlation,
             fingerprint=digest,
@@ -1920,19 +1918,6 @@ class ConversationRuntime:
                 return await self._submit_input_response(
                     active, store, command, receipt, context
                 )
-            if isinstance(command, PermissionResponseCommand):
-                request = next(
-                    (
-                        item
-                        for item in store.load_workflow_execution_requests().values()
-                        if item.permission_id == command.permission_id
-                    ),
-                    None,
-                )
-                if request is not None:
-                    return await self._respond_to_workflow_execution(
-                        store, request, command, receipt, context
-                    )
             first_command = (
                 isinstance(command, UserMessageCommand)
                 and conversation_id in self._first_command_pending
@@ -2204,17 +2189,16 @@ class ConversationRuntime:
         request = WorkflowExecutionRequest(
             request_id=identity,
             conversation_id=conversation_id,
-            permission_id=f"workflow-run:{identity}",
             correlation=correlation,
             workflow_path=workflow_path,
             fingerprint=fingerprint,
             workflow=workflow,
             summary=summary,
         )
-        admitted = store.save_workflow_execution_request(
+        admitted, created = store.save_workflow_execution_request(
             request, expected_revision=None, reuse_duplicate=True
         )
-        if admitted.request_id != request.request_id:
+        if not created:
             return {
                 "request_id": admitted.request_id,
                 "status": admitted.status,
@@ -2222,44 +2206,7 @@ class ConversationRuntime:
                 "task_id": admitted.task_id,
                 "reused": True,
             }
-        event, _ = store.append(
-            ProductEvent(
-                event_id=f"workflow-run:{identity}:permission",
-                conversation_id=conversation_id,
-                type="permission.requested",
-                payload={
-                    "permission_id": request.permission_id,
-                    "operation_ids": [identity],
-                    "description": (
-                        f"确认运行工作流 {summary.get('name', 'workflow')}？"
-                        f"节点数：{summary.get('node_count', '?')}；"
-                        f"版本：{fingerprint[:12]}；路径：{workflow_path}"
-                    ),
-                    "choices": ["allow_once", "deny"],
-                },
-            )
-        )
-        self._publish(event)
-        return {"request_id": identity, "status": request.status, "summary": summary}
-
-    async def _respond_to_workflow_execution(
-        self,
-        store: FileProductStore,
-        request: WorkflowExecutionRequest,
-        command: PermissionResponseCommand,
-        receipt: CommandReceipt,
-        context: RequestContext,
-    ) -> CommandReceipt:
-        if request.status != "awaiting_confirmation":
-            response = {
-                "request_id": request.request_id,
-                "status": request.status,
-                "task_id": request.task_id,
-            }
-            return store.complete_command(
-                receipt.model_copy(update={"status": "completed", "response": response})
-            )
-        if command.decision == "allow_once" and self.versions is not None:
+        if self.versions is not None:
             from pyromind_runtime.application.versions import snapshot_result
 
             project = self.versions.project(
@@ -2279,61 +2226,6 @@ class ConversationRuntime:
                                 snapshot_result(version),
                                 context,
                             )
-        next_status = "submitting" if command.decision == "allow_once" else "cancelled"
-        updated = request.model_copy(
-            update={"status": next_status, "revision": request.revision + 1}
-        )
-        try:
-            admitted = store.save_workflow_execution_request(
-                updated, expected_revision=request.revision, reuse_duplicate=True
-            )
-        except ValueError:
-            latest = store.load_workflow_execution_requests()[request.request_id]
-            response = {
-                "request_id": latest.request_id,
-                "status": latest.status,
-                "task_id": latest.task_id,
-            }
-            return store.complete_command(
-                receipt.model_copy(update={"status": "completed", "response": response})
-            )
-        reused = admitted.request_id != request.request_id
-        resolved, _ = store.append(
-            ProductEvent(
-                event_id=f"workflow-run:{request.request_id}:resolved",
-                conversation_id=request.conversation_id,
-                type="permission.resolved",
-                payload={
-                    "permission_id": request.permission_id,
-                    "decision": "deny" if reused else command.decision,
-                    **(
-                        {"reason": "An identical workflow already has an execution."}
-                        if reused
-                        else {}
-                    ),
-                },
-            )
-        )
-        self._publish(resolved)
-        if reused:
-            response = {
-                "request_id": admitted.request_id,
-                "status": admitted.status,
-                "task_id": admitted.task_id,
-                "reused": True,
-            }
-            return store.complete_command(
-                receipt.model_copy(update={"status": "completed", "response": response})
-            )
-        if next_status == "cancelled":
-            self._emit_workflow_execution_message(
-                store, request, "cancelled", "已取消运行工作流。"
-            )
-            response = {"request_id": request.request_id, "status": "cancelled"}
-            return store.complete_command(
-                receipt.model_copy(update={"status": "completed", "response": response})
-            )
-        assert self._workflow_submission is not None
         try:
             task_id = await self._workflow_submission.submit(
                 request.workflow,
@@ -2349,30 +2241,28 @@ class ConversationRuntime:
                 request.request_id,
                 type(exc).__name__,
             )
-            uncertain = updated.model_copy(
+            uncertain = request.model_copy(
                 update={
                     "status": "uncertain",
-                    "revision": updated.revision + 1,
+                    "revision": request.revision + 1,
                     "error": type(exc).__name__,
                 }
             )
             store.save_workflow_execution_request(
-                uncertain, expected_revision=updated.revision
+                uncertain, expected_revision=request.revision
             )
             message = "提交结果未确认，请先在平台核对是否已产生任务，避免重复运行。"
             self._emit_workflow_execution_message(store, request, "uncertain", message)
-            response = {
+            return {
                 "request_id": request.request_id,
                 "status": "uncertain",
+                "summary": summary,
                 "error": message,
             }
-            return store.complete_command(
-                receipt.model_copy(update={"status": "completed", "response": response})
-            )
-        submitted = updated.model_copy(
+        submitted = request.model_copy(
             update={
                 "status": "submitted",
-                "revision": updated.revision + 1,
+                "revision": request.revision + 1,
                 "task_id": task_id,
             }
         )
@@ -2393,7 +2283,7 @@ class ConversationRuntime:
         }
         self.register_external_task(request.conversation_id, payload)
         store.save_workflow_execution_request(
-            submitted, expected_revision=updated.revision
+            submitted, expected_revision=request.revision
         )
         await self.reconcile_versions(request.conversation_id, context)
         self._emit_workflow_execution_message(
@@ -2403,14 +2293,12 @@ class ConversationRuntime:
         if active is not None:
             async with self._notification_resume_lock:
                 await self._sync_workflow_task_context(active, store)
-        response = {
+        return {
             "request_id": request.request_id,
             "status": "submitted",
             "task_id": task_id,
+            "summary": summary,
         }
-        return store.complete_command(
-            receipt.model_copy(update={"status": "completed", "response": response})
-        )
 
     def _emit_workflow_execution_message(
         self,
@@ -4113,8 +4001,8 @@ def _build_external_task_notification(
                 f"Production workflow task {task.task_id} failed. Call "
                 "analyze_task_failure with this task_id and use the diagnosis "
                 "to continue the user's task. Fix verified technical issues within "
-                "the authorized scope, then validate and stage the revised workflow "
-                "with submit_workflow for user confirmation."
+                "the authorized scope, then validate and submit the revised workflow "
+                "with submit_workflow."
             )
         elif status == "succeeded":
             if has_training_node:

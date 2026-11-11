@@ -11,12 +11,10 @@ from harness_adapter.pi_adapter.business_tool_host import (
 )
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.commands import (
-    PermissionResponseCommand,
     UserMessageCommand,
 )
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.storage_paths import resolve_conversation_storage_path
 from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
@@ -55,7 +53,7 @@ class FakeSubmission:
     ) -> str:
         self.submissions.append((workflow, conversation_id))
         self.correlations.append(correlation)
-        return "task-123"
+        return f"task-{122 + len(self.submissions)}"
 
 
 @pytest.mark.parametrize(
@@ -110,7 +108,7 @@ async def test_conversation_workflow_path_is_resolved_only_for_preparation(tmp_p
     await runtime.close()
 
 
-@pytest.mark.parametrize("status", ["awaiting_confirmation", "uncertain", "submitted"])
+@pytest.mark.parametrize("status", ["submitting", "uncertain", "submitted"])
 async def test_native_workflow_reuses_receipt_across_tool_calls_and_restart(
     tmp_path, status
 ):
@@ -122,17 +120,16 @@ async def test_native_workflow_reuses_receipt_across_tool_calls_and_restart(
     )
     store = FileProductStore(tmp_path / identity)
     request = store.load_workflow_execution_requests()["first"]
-    if status != "awaiting_confirmation":
-        store.save_workflow_execution_request(
-            request.model_copy(
-                update={
-                    "status": status,
-                    "task_id": "task-existing" if status == "submitted" else None,
-                    "revision": 2,
-                }
-            ),
-            expected_revision=1,
-        )
+    store.save_workflow_execution_request(
+        request.model_copy(
+            update={
+                "status": status,
+                "task_id": "task-existing" if status == "submitted" else None,
+                "revision": request.revision + 1,
+            }
+        ),
+        expected_revision=request.revision,
+    )
     await runtime.close()
     runtime = ConversationRuntime(
         tmp_path,
@@ -156,69 +153,46 @@ async def test_native_workflow_reuses_receipt_across_tool_calls_and_restart(
         assert all(reply["request_id"] == first["request_id"] for reply in replies)
         assert all(reply["status"] == status and reply["reused"] for reply in replies)
         assert all(
-            reply["task_id"]
-            == (request.task_id if status != "submitted" else "task-existing")
+            reply["task_id"] == (None if status != "submitted" else "task-existing")
             for reply in replies
         )
         assert len(store.load_workflow_execution_requests()) == 1
-        assert len(store.load_snapshot().pending_permissions) == 1
-        assert submission.submissions == []
+        assert not store.load_snapshot().pending_permissions
+        assert len(submission.submissions) == 1
     finally:
         await runtime.close()
 
 
-async def test_historical_duplicate_confirmations_cannot_submit_same_workflow_twice(
-    tmp_path,
+@pytest.mark.parametrize("same_request_id", [False, True])
+async def test_duplicate_workflow_submissions_reuse_the_same_task(
+    tmp_path, same_request_id
 ):
     runtime, _, submission, context = await _runtime(tmp_path)
     identity = "workflow-conversation"
-    await runtime.prepare_workflow_execution(
-        identity,
-        "/train.py",
-        context,
-        request_id="first",
-        origin=TaskOrigin(type="subagent", subagent_id="original"),
-    )
     store = FileProductStore(tmp_path / identity)
-    first = store.load_workflow_execution_requests()["first"]
-    second = first.model_copy(
-        update={
-            "request_id": "second",
-            "permission_id": "workflow-run:second",
-            "correlation": TaskCorrelation(
-                conversation_id=identity,
-                task_kind="workflow_run",
-                type="subagent",
-                subagent_id="fresh",
-            ),
-        }
-    )
-    store.save_workflow_execution_request(second, expected_revision=None)
-    store.append(
-        ProductEvent(
-            conversation_id=identity,
-            type="permission.requested",
-            payload={"permission_id": second.permission_id},
-        )
-    )
+    original_prepare = submission.prepare
+
+    async def prepare(*args, **kwargs):
+        await asyncio.sleep(0)
+        return await original_prepare(*args, **kwargs)
+
+    submission.prepare = prepare
     try:
         results = await asyncio.gather(
             *(
-                runtime.submit_command(
+                runtime.prepare_workflow_execution(
                     identity,
-                    PermissionResponseCommand(
-                        command_id=f"approve-{key}",
-                        permission_id=f"workflow-run:{key}",
-                        decision="allow_once",
-                    ),
+                    "/train.py",
                     context,
+                    request_id="same" if same_request_id else key,
+                    origin=TaskOrigin(type="subagent", subagent_id="worker"),
                 )
                 for key in ("first", "second")
             )
         )
         assert len(submission.submissions) == 1
-        assert all(reply.response["request_id"] == "first" for reply in results)
-        assert store.load_workflow_execution_requests()["second"].status == "cancelled"
+        assert all(reply["task_id"] == "task-123" for reply in results)
+        assert results[1]["reused"] is True
         assert not store.load_snapshot().pending_permissions
     finally:
         await runtime.close()
@@ -263,7 +237,7 @@ async def test_native_submission_keeps_changed_files_and_non_child_requests_sepa
 
 @pytest.mark.parametrize("training", [True, False])
 @pytest.mark.parametrize("harness_id", ["pi", "openhands"])
-async def test_confirmed_workflow_submits_once_and_resumes_followup(
+async def test_workflow_submits_directly_once_and_resumes_followup(
     tmp_path, training, harness_id
 ):
     runtime, adapter, submission, context = await _runtime(
@@ -276,23 +250,24 @@ async def test_confirmed_workflow_submits_once_and_resumes_followup(
         context,
         request_id="request-1",
     )
-    assert prepared["status"] == "awaiting_confirmation"
-    assert submission.submissions == []
-    assert (await runtime.get_snapshot(conversation_id, context)).pending_permissions
-
-    # Approval runs the definition that the user reviewed, even if the source
-    # workflow changes in Storage while the confirmation dialog is open.
-    submission.workflow["name"] = "changed-after-prepare"
-    receipt = await runtime.submit_command(
-        conversation_id,
-        PermissionResponseCommand(
-            command_id="confirm-1",
-            permission_id="workflow-run:request-1",
-            decision="allow_once",
-        ),
-        context,
+    assert prepared["status"] == "submitted"
+    assert prepared["task_id"] == "task-123"
+    assert not (
+        await runtime.get_snapshot(conversation_id, context)
+    ).pending_permissions
+    assert not any(
+        event.type.startswith("permission.")
+        for event in FileProductStore(tmp_path / conversation_id).replay()
     )
-    assert receipt.response["task_id"] == "task-123"
+
+    submission.workflow["name"] = "changed-after-prepare"
+    repeated = await runtime.prepare_workflow_execution(
+        conversation_id,
+        "/workspace/.pyromind-agent/workflow.py",
+        context,
+        request_id="request-1",
+    )
+    assert repeated["task_id"] == "task-123"
     assert submission.submissions == [
         (
             {"name": "sft", "nodes": [{"data": {"nodeType": "SFTTrain"}}]},
@@ -316,19 +291,6 @@ async def test_confirmed_workflow_submits_once_and_resumes_followup(
         await runtime.get_snapshot(conversation_id, context)
     ).pending_permissions == ()
 
-    repeated = await runtime.submit_command(
-        conversation_id,
-        PermissionResponseCommand(
-            command_id="confirm-2",
-            permission_id="workflow-run:request-1",
-            decision="allow_once",
-        ),
-        context,
-    )
-    assert repeated.response["task_id"] == "task-123"
-    assert len(submission.submissions) == 1
-    assert len(adapter.external_task_notifications) == 1
-
     await runtime.deliver_external_task_status(
         conversation_id, task_id="task-123", status="Succeeded"
     )
@@ -349,6 +311,7 @@ async def test_confirmed_workflow_submits_once_and_resumes_followup(
         tmp_path / conversation_id / "product" / "workflow-execution-requests.json"
     ).read_text()
     assert "auth_token=ephemeral" not in product_text
+    assert "permission_id" not in product_text
     assert json.loads(product_text)["request-1"]["task_id"] == "task-123"
     await runtime.close()
 
@@ -365,20 +328,13 @@ async def test_workflow_task_reference_is_recovered_before_next_user_turn(
 
     if fail_initial_sync:
         monkeypatch.setattr(adapter, "notify_external_task", unavailable)
-    await runtime.prepare_workflow_execution(
+    result = await runtime.prepare_workflow_execution(
         "workflow-conversation",
         "/workspace/project/workflow.py",
         context,
         request_id="r",
     )
-    receipt = await runtime.submit_command(
-        "workflow-conversation",
-        PermissionResponseCommand(
-            command_id="answer", permission_id="workflow-run:r", decision="allow_once"
-        ),
-        context,
-    )
-    assert receipt.response["status"] == "submitted"
+    assert result["status"] == "submitted"
     assert len(submission.submissions) == 1
     if fail_initial_sync:
         assert adapter.external_task_notifications == []
@@ -407,37 +363,31 @@ async def test_workflow_task_reference_is_recovered_before_next_user_turn(
     await runtime.close()
 
 
-@pytest.mark.parametrize("decision", ["deny", "allow_once"])
-async def test_workflow_confirmation_cancel_or_failure(tmp_path, decision):
+async def test_workflow_submission_failure_is_uncertain_and_not_retried(tmp_path):
     runtime, adapter, submission, context = await _runtime(tmp_path)
-    await runtime.prepare_workflow_execution(
-        "workflow-conversation",
-        "/workspace/project/workflow.py",
-        context,
-        request_id="r",
-    )
-    if decision == "allow_once":
+    attempts = 0
 
-        async def failed_submit(
-            workflow: dict,
-            conversation_id: str,
-            context: RequestContext,
-            *,
-            correlation: TaskCorrelation | None = None,
-        ) -> str:
-            raise TimeoutError("platform create response lost")
+    async def failed_submit(
+        workflow: dict,
+        conversation_id: str,
+        context: RequestContext,
+        *,
+        correlation: TaskCorrelation | None = None,
+    ) -> str:
+        nonlocal attempts
+        attempts += 1
+        raise TimeoutError("platform create response lost")
 
-        submission.submit = failed_submit
-    receipt = await runtime.submit_command(
-        "workflow-conversation",
-        PermissionResponseCommand(
-            command_id="answer", permission_id="workflow-run:r", decision=decision
-        ),
-        context,
-    )
-    assert receipt.response["status"] == (
-        "cancelled" if decision == "deny" else "uncertain"
-    )
+    submission.submit = failed_submit
+    for _ in range(2):
+        result = await runtime.prepare_workflow_execution(
+            "workflow-conversation",
+            "/workspace/project/workflow.py",
+            context,
+            request_id="r",
+        )
+        assert result["status"] == "uncertain"
+    assert attempts == 1
     assert submission.submissions == []
     assert not (
         await runtime.get_snapshot("workflow-conversation", context)
@@ -453,13 +403,6 @@ async def test_failed_workflow_callback_routes_to_failure_analysis(tmp_path):
         context,
         request_id="r",
     )
-    await runtime.submit_command(
-        "workflow-conversation",
-        PermissionResponseCommand(
-            command_id="answer", permission_id="workflow-run:r", decision="allow_once"
-        ),
-        context,
-    )
     await runtime.deliver_external_task_status(
         "workflow-conversation", task_id="task-123", status="Failed"
     )
@@ -467,7 +410,8 @@ async def test_failed_workflow_callback_routes_to_failure_analysis(tmp_path):
     assert notification.trigger_turn is True
     assert "analyze_task_failure" in notification.hidden_text
     assert "continue the user's task" in notification.hidden_text
-    assert "with submit_workflow for user confirmation" in notification.hidden_text
+    assert "with submit_workflow" in notification.hidden_text
+    assert "user confirmation" not in notification.hidden_text
     assert "Do not edit or rerun" not in notification.hidden_text
     assert "then stop" not in notification.hidden_text
     assert (
@@ -482,12 +426,6 @@ async def test_failed_workflow_callback_routes_to_failure_analysis(tmp_path):
 
 async def test_callback_arriving_during_create_waits_for_task_registration(tmp_path):
     runtime, adapter, submission, context = await _runtime(tmp_path)
-    await runtime.prepare_workflow_execution(
-        "workflow-conversation",
-        "/workspace/project/workflow.py",
-        context,
-        request_id="r",
-    )
     callback: asyncio.Task | None = None
 
     async def submit_with_fast_callback(
@@ -507,12 +445,11 @@ async def test_callback_arriving_during_create_waits_for_task_registration(tmp_p
         return "task-123"
 
     submission.submit = submit_with_fast_callback
-    await runtime.submit_command(
+    await runtime.prepare_workflow_execution(
         "workflow-conversation",
-        PermissionResponseCommand(
-            command_id="answer", permission_id="workflow-run:r", decision="allow_once"
-        ),
+        "/workspace/project/workflow.py",
         context,
+        request_id="r",
     )
     assert callback is not None
     await callback
@@ -523,7 +460,7 @@ async def test_callback_arriving_during_create_waits_for_task_registration(tmp_p
     await runtime.close()
 
 
-async def test_pi_tool_exposes_confirmed_workflow_entry(tmp_path):
+async def test_pi_tool_exposes_direct_workflow_submission(tmp_path):
     skills = Path(__file__).parents[2] / ".agents" / "skills"
     host = PyromindBusinessToolHost(
         [skills / "data-processing", skills / "training-analysis"]
@@ -536,7 +473,7 @@ async def test_pi_tool_exposes_confirmed_workflow_entry(tmp_path):
         calls.append(
             (conversation_id, workflow_path, workflow_storage_path, request_id)
         )
-        return {"request_id": request_id, "status": "awaiting_confirmation"}
+        return {"request_id": request_id, "status": "submitted", "task_id": "task-123"}
 
     host.set_workflow_preparer(prepare)
     assert "submit_workflow" in {spec["name"] for spec in host.specs()}
@@ -551,7 +488,8 @@ async def test_pi_tool_exposes_confirmed_workflow_entry(tmp_path):
         ),
         tool_call_id="call-1",
     )
-    assert result["details"]["status"] == "awaiting_confirmation"
+    assert result["details"]["status"] == "submitted"
+    assert result["details"]["task_id"] == "task-123"
     assert calls == [
         (
             "conversation-1",

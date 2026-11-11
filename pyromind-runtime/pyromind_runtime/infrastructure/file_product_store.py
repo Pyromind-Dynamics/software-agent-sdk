@@ -313,7 +313,8 @@ class FileProductStore:
         *,
         expected_revision: int | None,
         reuse_duplicate: bool = False,
-    ) -> WorkflowExecutionRequest:
+    ) -> tuple[WorkflowExecutionRequest, bool]:
+        """Save a receipt and indicate whether this call created it."""
         with self._lock():
             requests = self._load_workflow_execution_requests()
             if self._load_metadata().conversation_id != state.conversation_id:
@@ -328,22 +329,19 @@ class FileProductStore:
                     or previous.fingerprint != state.fingerprint
                 ):
                     raise ValueError("request id already belongs to another workflow")
-                return previous
+                return previous, False
             if (previous.revision if previous else None) != expected_revision:
                 raise ValueError("workflow execution request changed concurrently")
-            admitted = state
             if (
                 reuse_duplicate
+                and previous is None
                 and state.correlation is not None
                 and state.correlation.type == "subagent"
-                and state.status in {"awaiting_confirmation", "submitting"}
+                and state.status == "submitting"
             ):
                 duplicate = self._duplicate_child_workflow(state, requests)
                 if duplicate is not None:
-                    if previous is None:
-                        return duplicate
-                    admitted = duplicate
-                    state = state.model_copy(update={"status": "cancelled"})
+                    return duplicate, False
             requests[state.request_id] = state
             self._atomic_write(
                 self.directory / "workflow-execution-requests.json",
@@ -351,7 +349,7 @@ class FileProductStore:
                 .dump_json(requests)
                 .decode(),
             )
-            return admitted
+            return state, previous is None
 
     def _duplicate_child_workflow(
         self,
@@ -381,11 +379,6 @@ class FileProductStore:
                 request.status == "submitted" and request.task_id not in failed_tasks
             ):
                 return request
-        if state.status == "awaiting_confirmation":
-            return next(
-                (request for request in candidates if request.status == state.status),
-                None,
-            )
         return None
 
     def load_pipeline_runs(self) -> dict[str, PipelineRun]:

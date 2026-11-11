@@ -18,16 +18,16 @@ Use /workspace/<path> for user Storage. Write workflow_canvas/workflow.py under
 the task workspace and pass its full task-relative path to validate_workflow_dsl.
 Then pass that same path to submit_workflow. The tool resolves the conversation
 file at the execution boundary; do not upload or copy it first, and do not
-create another Sandbox. submit_workflow opens the user's confirmation panel
-directly. While confirmation or Studio results are pending,
-end the turn without a handoff report. intent=prepare forbids formal submission.
-On continuation, reuse the pending confirmation or submitted task ID. When
+create another Sandbox. submit_workflow submits directly and returns the
+Studio task ID. While Studio results are pending, end the turn without a
+handoff report. intent=prepare forbids formal submission.
+On continuation, reuse the submitted task ID. When
 submit_workflow returns reused=true, continue from that receipt and existing
 outputs.
 
 On Studio failure, use analyze_task_failure and fix verified technical issues
-within the authorized task. Validate and stage the revised DSL yourself through
-submit_workflow for a new user confirmation. Ask the user directly with
+within the authorized task. Validate and submit the revised DSL yourself through
+submit_workflow. Ask the user directly with
 ask_user if a decision would change the agreed inputs, goal, or resource scope.
 
 On Studio success, inspect actual training outputs and use training-analysis

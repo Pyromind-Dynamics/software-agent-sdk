@@ -23,9 +23,11 @@ from pyromind_runtime.domain.preparation import (
 )
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
+    ExternalTaskState,
     OperationActivity,
     TimelineOperation,
 )
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 
 from .fake_adapter import FakeAdapter
@@ -57,8 +59,13 @@ def activity():
 
 
 @pytest.mark.parametrize("status", ["running", "completed", "failed"])
+@pytest.mark.parametrize(
+    "platform_status",
+    [None, "pending", "running", "waiting", "succeeded", "failed", "stopped"],
+)
 def test_role_activity_projects_into_existing_stage_columns_without_business_success(
     status,
+    platform_status,
 ):
     policy = PreparationPolicy(
         checklist_id="test",
@@ -77,6 +84,7 @@ def test_role_activity_projects_into_existing_stage_columns_without_business_suc
             "category": "subagent",
             "status": status,
             "activity": activity(),
+            "details": {"subagent": {"session_key": "child-session"}},
         }
     )
     project = ProjectView(
@@ -97,6 +105,23 @@ def test_role_activity_projects_into_existing_stage_columns_without_business_suc
         capabilities=HarnessCapabilities(),
         project=project,
         timeline=(operation,),
+        external_tasks=(
+            ExternalTaskState(
+                task_id="platform-task",
+                kind="workflow_run",
+                status=platform_status,
+                submitted_at="2026-11-11T03:34:13Z",
+                updated_at="2026-11-11T03:34:13Z",
+                correlation=TaskCorrelation(
+                    conversation_id="chat",
+                    type="subagent",
+                    subagent_id="child-session",
+                    task_kind="workflow_run",
+                ),
+            ),
+        )
+        if platform_status
+        else (),
     )
     projected = project_stage_activity(snapshot, policy)
     child = projected.timeline[0]
@@ -112,14 +137,21 @@ def test_role_activity_projects_into_existing_stage_columns_without_business_suc
     execution = projected.experiment_executions[0]
     assert child.execution is not None
     assert execution.run_id == child.execution["task_run_id"]
-    assert (
-        execution.state
-        == {
-            "running": "preparing",
-            "completed": "agent_completed",
-            "failed": "failed",
-        }[status]
-    )
+    expected = {
+        "running": "preparing",
+        "completed": "agent_completed",
+        "failed": "failed",
+    }[status]
+    if platform_status in {"pending", "running", "waiting"}:
+        expected = "waiting_platform"
+    elif platform_status in {"failed", "stopped"}:
+        expected = "failed" if platform_status == "failed" else "cancelled"
+    elif platform_status == "succeeded" and status == "completed":
+        expected = "waiting_analysis"
+    elif platform_status == "succeeded" and status == "running":
+        expected = "analyzing"
+    assert execution.state == expected
+    assert execution.platform_task_id == ("platform-task" if platform_status else None)
     assert execution.report_state != "ready"
     assert operation.execution is None
     assert snapshot.experiment_executions is None
