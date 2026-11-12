@@ -8,24 +8,25 @@ GRPO training aligned with SFT-style YAML: dataset_config, training_config (shar
 
 ## 1.2 输入类型
 
-| 参数 | 数据类型 | 必填 | 描述 |
-|------|---------|------|------|
-| output_path | STRING | 是 | 持久化训练输出目录，必须使用 `/workspace/...` |
-| dataset_config | STRING\|DATASET_CONFIG | 是 | 已组装的数据集配置 YAML 字符串 |
-| training_config | STRING\|TRAINING_CONFIG | 是 | 训练配置 YAML 字符串（`BaseTrainingConfig` 字段） |
-| grpo_extra_config | STRING\|GRPO_EXTRA_CONFIG | 否 | GRPO 专用额外训练配置 YAML。默认值：空字符串 |
-| model_config | STRING\|MODEL_CONFIG | 是 | 模型配置 YAML 字符串 |
-| lora_config | STRING\|LORA_CONFIG | 否 | 来自 Lora Config Builder 的 LoRA 配置 YAML |
-| reward_config | STRING\|REWARD_CONFIG | 是 | 来自 Reward Config Builder 的奖励配置 YAML |
-| wandb_config | WANDB_CONFIG | 否 | W&B 配置对象 |
-| thinking_as_input_ratio | FLOAT | 否 | 将思维链内容作为输入的比例。默认值：`0.0` |
-| accelerate_config | ACCELERATE_CONFIG | 是 | Accelerate 启动配置 YAML |
-| gpu_count | INT | 是 | GPU 数量。默认值：`1` |
-| gpu_product | STRING | 是 | GPU 型号（以部署环境实际可用的显卡为准）。选项：`NVIDIA-H200`、`NVIDIA-H100-80GB-HBM3` |
+| 参数 | 数据类型 | 必填 | 默认值 | 约束 | 描述 |
+|---|---|---|---|---|---|
+| output_path | STRING | 是 | 未声明 | — | 持久化训练输出目录，必须使用 `/workspace/...` |
+| dataset_config | STRING\|DATASET_CONFIG | 是 | 未声明 | — | 已组装的数据集配置 YAML 字符串 |
+| training_config | STRING\|TRAINING_CONFIG | 是 | 未声明 | — | 训练配置 YAML 字符串（`BaseTrainingConfig` 字段） |
+| model_config | STRING\|MODEL_CONFIG | 是 | 未声明 | — | 模型配置 YAML 字符串 |
+| reward_config | STRING\|REWARD_CONFIG | 是 | 未声明 | — | 来自 Reward Config Builder 的奖励配置 YAML |
+| accelerate_config | ACCELERATE_CONFIG | 是 | 未声明 | — | Accelerate 启动配置 YAML |
+| gpu_count | INT | 是 | `1` | 最小 1；最大 8 | GPU 数量 |
+| gpu_product | STRING | 是 | `"NVIDIA-H100-NVL"` | 可选值：`"NVIDIA-H100-NVL"`、`"NVIDIA-L40S"` | GPU 型号（以部署环境实际可用的显卡为准） |
+| grpo_extra_config | STRING\|GRPO_EXTRA_CONFIG | 否 | `""` | — | GRPO 专用额外训练配置 YAML |
+| lora_config | STRING\|LORA_CONFIG | 否 | 未声明 | — | 来自 Lora Config Builder 的 LoRA 配置 YAML |
+| wandb_config | WANDB_CONFIG | 否 | 未声明 | — | W&B 配置对象 |
+| thinking_as_input_ratio | FLOAT | 否 | `0.0` | — | 将思维链内容作为输入的比例 |
+
 > **注意：** GPU 型号与数量以部署环境实际可用的显卡为准。
 
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
-|------|---------|------|
+|---|---|---|
 | model_output_path | STRING | 训练输出模型目录 |

@@ -10,14 +10,14 @@
 
 ## 1.2 输入类型
 
-| 参数 | 数据类型 | 必填 | 描述 |
-|------|---------|------|------|
-| base_path | STRING | 是 | 基础路径（目录前缀）。默认值：`""`。示例：`/workspace/` |
-| subpath | STRING | 是 | 待拼接的子路径（相对路径或目录名）。默认值：`""`。示例：`models` |
-| environment | ENV | 否 | 可选的环境变量配置。默认值：- |
+| 参数 | 数据类型 | 必填 | 默认值 | 约束 | 描述 |
+|---|---|---|---|---|---|
+| base_path | STRING | 是 | `""` | — | 基础路径（目录前缀） |
+| subpath | STRING | 是 | `""` | — | 待拼接的子路径（相对路径或目录名） |
+| environment | ENV | 否 | 未声明 | — | 可选的环境变量配置 |
 
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
-|------|---------|------|
-| joined_path | STRING | 拼接后的完整路径。例如 `base_path=/workspace/`、`subpath=models` 时输出 `/workspace/models` |
+|---|---|---|
+| joined_path | PATH\|STRING | 拼接后的完整路径。例如 `base_path=/workspace/`、`subpath=models` 时输出 `/workspace/models` |

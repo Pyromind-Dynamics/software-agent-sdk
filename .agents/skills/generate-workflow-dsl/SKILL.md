@@ -32,7 +32,7 @@ description: >-
 - 顶层赋值只用于声明节点实例；节点参数使用字面量或上游节点输出。禁止模块级字面量常量，如 `TRAIN_DATA = "..."`；需复用时也将值直接写入各节点参数。
 - 数据处理、训练和推理由 Pyromind 平台节点执行；上游数据、模型及训练产物通过输出端口绑定，不写死下游产物路径，不用 Agent 本地运行替代平台节点。
 - 节点写入用户 Storage 的持久化输出路径统一使用 `/workspace/...`；不要把 `/models/...`、`/tmp/...` 或其他容器目录当作持久化产物目录。
-- SFT/DPO/GRPO 的 `wandb_config`、`accelerate_config` 当前按必填校验，连接对应 Builder 输出。WandB 仅写 Secret 名，不写明文凭据。
+- SFT 的 `wandb_config` 必填；DPO/GRPO 的该输入可选，保留用户已有有效配置，需记录训练曲线时连接。SFT/DPO/GRPO 的 `accelerate_config` 均必填。WandB 仅写 Secret 名，不写明文凭据。
 - 内置 Metric/Reward 不满足目标时才读取 `custom-python-assets.md`；脚本校验并上传成功后，使用真实返回的 Storage 路径填写入口，上传失败停止，不伪造路径。
 - 节点契约以 `validate_workflow_dsl` 的实时结果为准。缺少契约时先查下列 reference，再从 `knowledge/index.md` 定向读取节点原文；已有信息足够时直接落图。
 

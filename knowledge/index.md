@@ -103,6 +103,7 @@ original pages before answering.
 | [DownloadAndCacheDataset](nodes/DownloadAndCacheDataset/DownloadAndCacheDataset.md) | DownloadAndCacheDataset 节点的功能、输入输出、参数与运行说明 | nodes, downloadandcachedataset |
 | [DownloadAndCacheModel](nodes/DownloadAndCacheModel/DownloadAndCacheModel.md) | DownloadAndCacheModel 节点的功能、输入输出、参数与运行说明 | nodes, downloadandcachemodel |
 | [DownloadURLNode](nodes/DownloadURLNode/DownloadURLNode.md) | 从 URL 下载文件并返回工作区路径，支持断点续传与校验 | nodes, downloadurlnode |
+| [EarlyFusionConfigBuilderNode](nodes/EarlyFusionConfigBuilderNode/EarlyFusionConfigBuilderNode.md) | 为 YOLO 多视图训练生成 Early Fusion 通道配置 | nodes, earlyfusionconfigbuildernode, yolo, 多视图 |
 | [GRPOTrainingExtraConfigBuilderNode](nodes/GRPOTrainingExtraConfigBuilderNode/GRPOTrainingExtraConfigBuilderNode.md) | GRPOTrainingExtraConfigBuilderNode 节点的功能、输入输出、参数与运行说明 | nodes, grpotrainingextraconfigbuildernode |
 | [Inference](nodes/Inference/Inference.md) | Inference 节点的功能、输入输出、参数与运行说明 | nodes, inference |
 | [LoadAnythingFromFileNode](nodes/LoadAnythingFromFileNode/LoadAnythingFromFileNode.md) | LoadAnythingFromFileNode 节点的功能、输入输出、参数与运行说明 | nodes, loadanythingfromfilenode |
@@ -114,14 +115,15 @@ original pages before answering.
 | [MetricsConfigBuilderNode](nodes/MetricsConfigBuilderNode/MetricsConfigBuilderNode.md) | MetricsConfigBuilderNode 节点的功能、输入输出、参数与运行说明 | nodes, metricsconfigbuildernode |
 | [ModelConfigBuilderNode](nodes/ModelConfigBuilderNode/ModelConfigBuilderNode.md) | ModelConfigBuilderNode 节点的功能、输入输出、参数与运行说明 | nodes, modelconfigbuildernode |
 | [ModelEvalApiNode](nodes/ModelEvalApiNode/ModelEvalApiNode.md) | ModelEvalApiNode 节点的功能、输入输出、参数与运行说明 | nodes, modelevalapinode |
+| [ModelInferYoloNode](nodes/ModelInferYoloNode/ModelInferYoloNode.md) | 使用 YOLO 权重对测试 JSONL 执行推理并输出预测结果 | nodes, modelinferyolonode, yolo, inference |
 | [ModelMergeLoraNode](nodes/ModelMergeLoraNode/ModelMergeLoraNode.md) | ModelMergeLoraNode 节点的功能、输入输出、参数与运行说明 | nodes, modelmergeloranode |
 | [ModelTrainDPONode](nodes/ModelTrainDPONode/ModelTrainDPONode.md) | ModelTrainDPONode 节点的功能、输入输出、参数与运行说明 | nodes, modeltraindponode |
 | [ModelTrainGRPONode](nodes/ModelTrainGRPONode/ModelTrainGRPONode.md) | ModelTrainGRPONode 节点的功能、输入输出、参数与运行说明 | nodes, modeltraingrponode |
 | [ModelTrainOPDNode](nodes/ModelTrainOPDNode/ModelTrainOPDNode.md) | ModelTrainOPDNode 节点的功能、输入输出、参数与运行说明 | nodes, modeltrainopdnode |
 | [ModelTrainSFTNode](nodes/ModelTrainSFTNode/ModelTrainSFTNode.md) | ModelTrainSFTNode 节点的功能、输入输出、参数与运行说明 | nodes, modeltrainsftnode |
+| [ModelTrainYoloNode](nodes/ModelTrainYoloNode/ModelTrainYoloNode.md) | 使用共享训练配置执行单视图或 Early Fusion 多视图 YOLO 训练 | nodes, modeltrainyolonode, yolo, training |
 | [ModelValidateGRPODataloaderNode](nodes/ModelValidateGRPODataloaderNode/ModelValidateGRPODataloaderNode.md) | ModelValidateGRPODataloaderNode 节点的功能、输入输出、参数与运行说明 | nodes, modelvalidategrpodataloadernode |
 | [ModelValidateRewardNode](nodes/ModelValidateRewardNode/ModelValidateRewardNode.md) | ModelValidateRewardNode 节点的功能、输入输出、参数与运行说明 | nodes, modelvalidaterewardnode |
-| [OutputPreview](nodes/OutputPreview/OutputPreview.md) | OutputPreview 节点的功能、输入输出、参数与运行说明 | nodes, outputpreview |
 | [PathJoinNode](nodes/PathJoinNode/PathJoinNode.md) | PathJoinNode 节点的功能、输入输出、参数与运行说明 | nodes, pathjoinnode |
 | [PreviewFile](nodes/PreviewFile/PreviewFile.md) | PreviewFile 节点的功能、输入输出、参数与运行说明 | nodes, previewfile |
 | [PreviewImageEx](nodes/PreviewImageEx/PreviewImageEx.md) | PreviewImageEx 节点的功能、输入输出、参数与运行说明 | nodes, previewimageex |
@@ -137,6 +139,7 @@ original pages before answering.
 | [TrainingConfigBuilderNode](nodes/TrainingConfigBuilderNode/TrainingConfigBuilderNode.md) | TrainingConfigBuilderNode 节点的功能、输入输出、参数与运行说明 | nodes, trainingconfigbuildernode |
 | [VLLMInference](nodes/VLLMInference/VLLMInference.md) | VLLMInference 节点的功能、输入输出、参数与运行说明 | nodes, vllminference |
 | [WandbConfigBuilderNode](nodes/WandbConfigBuilderNode/WandbConfigBuilderNode.md) | WandbConfigBuilderNode 节点的功能、输入输出、参数与运行说明 | nodes, wandbconfigbuildernode |
+| [YoloTrainingExtraConfigBuilderNode](nodes/YoloTrainingExtraConfigBuilderNode/YoloTrainingExtraConfigBuilderNode.md) | 生成 YOLO 训练及推理使用的专用配置 | nodes, yolotrainingextraconfigbuildernode, yolo, training |
 
 ## Examples
 

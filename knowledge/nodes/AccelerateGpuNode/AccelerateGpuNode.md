@@ -8,19 +8,19 @@ GPU node example using accelerate launch mode
 
 ## 1.2 输入类型
 
-| 参数 | 数据类型 | 必填 | 描述 |
-|------|---------|------|------|
-| message | STRING | 是 | Message |
-| accelerate_config | ACCELERATE_CONFIG | 是 | Accelerate 启动配置 YAML |
-| gpu_count | INT | 是 | GPU 数量。默认值：`1` |
-| gpu_product | STRING | 是 | GPU 型号（以部署环境实际可用的显卡为准）。选项：`NVIDIA-H200`、`NVIDIA-H100-80GB-HBM3` |
+| 参数 | 数据类型 | 必填 | 默认值 | 约束 | 描述 |
+|---|---|---|---|---|---|
+| message | STRING | 是 | `"Accelerate GPU Node executed successfully"` | — | Message |
+| accelerate_config | ACCELERATE_CONFIG | 是 | 未声明 | — | Accelerate 启动配置 YAML |
+| gpu_count | INT | 是 | `1` | 最小 1；最大 8 | GPU 数量 |
+| gpu_product | STRING | 是 | `"NVIDIA-H100-NVL"` | 可选值：`"NVIDIA-H100-NVL"`、`"NVIDIA-L40S"` | GPU 型号（以部署环境实际可用的显卡为准） |
 
 > **注意：** GPU 型号与数量以部署环境实际可用的显卡为准。
 
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
-|------|---------|------|
+|---|---|---|
 | gpu_info | STRING | GPU 信息字符串 |
 | execution_result | STRING | 命令执行结果 |
 | execution_output | STRING | 命令 stdout/stderr 输出 |
