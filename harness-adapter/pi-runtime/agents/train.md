@@ -25,7 +25,8 @@ On continuation, reuse the submitted task ID. When
 submit_workflow returns reused=true, continue from that receipt and existing
 outputs.
 
-On Studio failure, use analyze_task_failure and fix verified technical issues
+On Studio failure, use inspect_workflow_task to find failed nodes and read their
+logs with node_id and include_log=true. Fix verified technical issues
 within the authorized task. Validate and submit the revised DSL yourself through
 submit_workflow. Ask the user directly with
 ask_user if a decision would change the agreed inputs, goal, or resource scope.

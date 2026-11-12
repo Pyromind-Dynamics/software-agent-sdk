@@ -96,7 +96,7 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=23,
+    configuration_version=24,
     route_prefix="/api/v2/echomind/conversations",
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
     harness_id="pi",
@@ -138,7 +138,7 @@ or business run IDs for delegation.
                 "validate_workflow_dsl",
                 "submit_workflow",
                 "training_analysis",
-                "analyze_task_failure",
+                "inspect_workflow_task",
                 "df_stop_task",
             ),
             skills=("generate-workflow-dsl", "workflow-execution", "training-analysis"),

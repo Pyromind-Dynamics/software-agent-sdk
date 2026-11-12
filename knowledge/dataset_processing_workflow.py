@@ -1,6 +1,8 @@
 # ruff: noqa: F821
 # pyright: reportUndefinedVariable=false
 # workflow: Dataset Processing
+# 当前 us-west-1 校验会对节点 02→03、03→05 返回类型不匹配。
+# 此例保留数据处理拓扑，不作为已通过校验的模板；生成时按实时节点契约重新绑定路径。
 
 dataset = CloneAndCacheDataset(
     id="01",

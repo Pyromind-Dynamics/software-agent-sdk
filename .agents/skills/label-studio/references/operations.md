@@ -20,10 +20,12 @@ python <技能目录>/scripts/validate_label_config.py <label_config.xml> --adap
 
 ## 修改已有项目
 
-`label_studio_project(operation="get", project_ref=...)` 获取当前配置 → 在
-workspace 中修改 XML → 校验 → `operation="update_config"`（带
-`expected_config_version`）。如果新 XML 删除了已有标注使用的控件名，工具会拒绝
-更新。
+`label_studio_get_project(project_ref=...)` 获取当前配置 → 在 workspace 中修改
+XML → 校验 → `label_studio_update_config`，传入 `project_ref`、
+`label_config_path` 和 `expected_config_version`。只有旧入口可用时，分别使用
+`label_studio_project(operation="get", ...)` 和
+`label_studio_project(operation="update_config", ...)`。如果新 XML 删除了已有
+标注使用的控件名，工具会拒绝更新。
 
 ## 按打标属性过滤
 
@@ -34,6 +36,7 @@ workspace 中修改 XML → 校验 → `operation="update_config"`（带
 
 ## 导出标注结果
 
+`label_studio_export_annotations(project_ref=...)`；只有旧入口可用时，用
 `label_studio_project(operation="export", project_ref=...)`。工具自动把标注结果
 转回 PyroMind 格式并保存到用户 Storage，并按该项目建立时的绑定把控件读回字段。
 
@@ -56,5 +59,6 @@ schema 不在本 skill 内定义。
 工具**不提供删除项目**。建错了、或者用户要推倒重来，只能在 Label Studio 界面里
 删（把 `open_url` 给用户，让他自己删）。
 
-如果只是参数写错，先用同参数重跑 create（幂等，会复用已有项目），不要试图"删了
-重建"。确实需要另一个项目时，传一个不同的 `idempotency_key`。
+如果参数校验失败，先按错误提示修正字段，不要用相同参数原样重试。有效请求已提交但
+结果未知时，才用相同参数幂等重试（会复用已有项目）。确实需要另一个项目时，传一
+个不同的 `idempotency_key`。

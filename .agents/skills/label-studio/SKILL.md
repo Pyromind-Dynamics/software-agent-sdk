@@ -1,7 +1,7 @@
 ---
 name: label-studio
 description: >-
-  使用 label_studio_project 工具将用户数据集创建为 Label Studio
+  使用 Label Studio 工具将用户数据集创建为 Label Studio
   标注项目。用户要求创建标注项目、标注数据、打标、review 图片质检
   结果时使用。需要先看清 `/workspace` 里的数据结构再生成 XML。
 ---
@@ -23,7 +23,7 @@ description: >-
 
 | 源数据 / 需求 | 走向 | 读取 |
 |---|---|---|
-| 模型 badcase / 已有评分结果的人工打标 | 按样本形状选择 adapter，用 `label_studio_project` 创建标注项目；字段差异用 `field_map_path` | references/adapters.md、references/custom-bindings.md |
+| 模型 badcase / 已有评分结果的人工打标 | 按样本形状选择 adapter，用 Label Studio 创建工具建项目；字段差异用 `field_map_path` | references/adapters.md、references/custom-bindings.md |
 | 预处理/清洗产出的 JSONL（一行一个样本、行内自带图片路径，如 data-processing 的 `source_images`） | `adapter=jsonl` 直接导入，不再做格式转换 | references/adapters.md |
 | 样本目录含 `meta_vlm.json`（`quality` / `findings`） | `adapter=avi_train`（内置绑定） | references/adapters.md |
 | 样本目录含 `meta.json`（`vlm_verdict` / `note`，无 bbox） | `adapter=aoi_export`（内置绑定） | references/adapters.md |
@@ -76,7 +76,9 @@ Label Studio 本身支持的控件（画笔、多边形、关键点）转换器�
    洗数据、改 XML、反复重试；也不要凭常识刻意收窄。
 4. **校验**（可选）：自检脚本用法见 `references/operations.md`，跳过结论一致，
    create 会在转换**之前**做同样的校验并返回可读错误。
-5. **创建**：`label_studio_project(operation="create", ...)`。
+5. **创建**：优先用 `label_studio_create_project`，传入 `dataset_path` 和
+   `label_config_path`；仅当环境只提供旧入口时，用
+   `label_studio_project(operation="create", dataset_path=..., label_config_path=..., ...)`。
 6. **交付**：给项目名、导入样本数，和一个能点的标注入口（格式见下）。
 
 路径契约：dataset、XML、field map 中的 Storage 文件统一使用
@@ -109,4 +111,5 @@ Label Studio 可识别的原始格式，由 Label Studio 侧完成链接转换�
   契约 —— 形状对不上就用 `field_map` 声明绑定；行内确实缺字段就是上游契约缺口，
   回到 data-processing 补，不在这一侧写转换脚本
 - 把交付给用户的 URL 包进反引号或代码块
-- 试图"删了重建"：工具没有删除项目，参数写错就用同参数重跑 create
+- 试图"删了重建"：工具没有删除项目；参数错误先修正参数，再重试。
+- 对参数校验错误原样重复调用；只有有效请求已提交但结果未知时，才用相同参数做幂等重试。

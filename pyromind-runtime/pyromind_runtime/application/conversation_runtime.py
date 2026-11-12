@@ -3945,7 +3945,8 @@ def _build_external_task_notification(
         if status == "failed":
             instruction = (
                 f"Production workflow task {task.task_id} failed. Call "
-                "analyze_task_failure with this task_id and use the diagnosis "
+                "inspect_workflow_task with this task_id to find failed nodes, then "
+                "call it with each failed node_id and include_log=true. Use the logs "
                 "to continue the user's task. Fix verified technical issues within "
                 "the authorized scope, then validate and submit the revised workflow "
                 "with submit_workflow."
@@ -3994,9 +3995,11 @@ def _build_external_task_notification(
         elif status == "failed":
             visible_text = f"工作流调试运行失败\n\n- task_id: {task.task_id}"
             instruction = (
-                "The workflow debug run failed. Call analyze_task_failure with "
-                f"task_id={task.task_id!r}, fix the workflow using that diagnosis, "
-                "then continue the normal debug loop within the attempt budget."
+                "The workflow debug run failed. Call inspect_workflow_task with "
+                f"task_id={task.task_id!r} to find failed nodes, then call it with "
+                "each failed node_id and include_log=true. Fix the workflow from "
+                "the logs, then continue the normal debug loop within the attempt "
+                "budget."
             )
         else:
             instruction = (

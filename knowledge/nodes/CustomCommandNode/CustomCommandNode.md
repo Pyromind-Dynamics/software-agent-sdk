@@ -8,17 +8,17 @@
 
 ## 1.2 输入类型
 
-| 参数 | 数据类型 | 必填 | 描述 |
-|------|---------|------|------|
-| command | STRING | 是 | 要执行的 shell 命令。默认值：echo hello from custom command |
-| cpu | INT | 是 | CPU 核数限制（1–64）。默认值：4 |
-| memory | INT | 是 | 内存限制，单位 GiB（1–256）。默认值：32 |
-| gpu_count | INT | 是 | 要申请的 GPU 数量（1–8）。默认值：1 |
-| gpu_product | STRING | 是 | gpu_count 大于零时要申请的 GPU 产品型号。枚举：NVIDIA-H200、NVIDIA-H100-80GB-HBM3。（以部署环境实际可用显卡为准） |
-| param | STRING | 否 | 传递给 shell 命令的可选参数，命令中通过 `$param` 引用。默认值：param-value |
+| 参数 | 数据类型 | 必填 | 默认值 | 约束 | 描述 |
+|---|---|---|---|---|---|
+| command | STRING | 是 | `"echo \"hello from custom command\"\necho \"param=[$param]\""` | — | 要执行的 shell 命令 |
+| cpu | INT | 是 | `4` | 最小 1；最大 64 | CPU 核数限制（1–64） |
+| memory | INT | 是 | `32` | 最小 1；最大 256 | 内存限制，单位 GiB（1–256） |
+| gpu_count | INT | 是 | `1` | 最小 1；最大 8 | 要申请的 GPU 数量（1–8） |
+| gpu_product | STRING | 是 | `"NVIDIA-H100-NVL"` | 可选值：`"NVIDIA-H100-NVL"`、`"NVIDIA-L40S"` | gpu_count 大于零时要申请的 GPU 产品型号 |
+| param | STRING | 否 | `"param-value"` | — | 传递给 shell 命令的可选参数，命令中通过 `$param` 引用 |
 
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
-|------|---------|------|
+|---|---|---|
 | result | STRING | 命令捕获到的标准输出和标准错误。 |

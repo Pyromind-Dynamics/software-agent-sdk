@@ -72,7 +72,7 @@ async def test_actual_manager_and_eval_host_create_through_api(
             assert "df_submit_pipeline" in roles["dataset"].tools
             assert "df_submit_evaluation" not in roles["dataset"].tools
             assert {
-                "analyze_task_failure",
+                "inspect_workflow_task",
                 "training_analysis",
                 "submit_workflow",
             } <= set(roles["train"].tools)

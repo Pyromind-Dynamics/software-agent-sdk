@@ -31,7 +31,7 @@ PYROMIND_TOOL_ALLOWLIST = (
     "sandbox_upload",
     "sandbox_download",
     "workflow_debug",
-    "analyze_task_failure",
+    "inspect_workflow_task",
     "training_analysis",
     "label_studio_project",
 )

@@ -408,7 +408,8 @@ async def test_failed_workflow_callback_routes_to_failure_analysis(tmp_path):
     )
     notification = adapter.external_task_notifications[-1][1]
     assert notification.trigger_turn is True
-    assert "analyze_task_failure" in notification.hidden_text
+    assert "inspect_workflow_task" in notification.hidden_text
+    assert "include_log=true" in notification.hidden_text
     assert "continue the user's task" in notification.hidden_text
     assert "with submit_workflow" in notification.hidden_text
     assert "user confirmation" not in notification.hidden_text

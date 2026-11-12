@@ -12,8 +12,10 @@ from typing import Any
 def storage_path(value: str) -> str:
     if any(marker in value for marker in ("${", "{{", "}}")):
         raise ValueError(f"Unresolved Storage path: {value!r}")
-    if value == "/workspace" or value.startswith("/workspace/"):
-        value = value[len("/workspace") :] or "/"
+    for mount in ("/workspace", "/target-workspace"):
+        if value == mount or value.startswith(f"{mount}/"):
+            value = value[len(mount) :] or "/"
+            break
     path = PurePosixPath(value)
     if not path.is_absolute() or ".." in path.parts or str(path) == "/":
         raise ValueError(f"Unresolved Storage path: {value!r}")
@@ -200,7 +202,9 @@ def inspect_checkpoint(
     if kind == "lora":
         config = json.loads((path / "adapter_config.json").read_text())
         base_model = config.get("base_model_name_or_path") or base_model
-        if isinstance(base_model, str) and base_model.startswith("/workspace/"):
+        if isinstance(base_model, str) and base_model.startswith(
+            ("/workspace/", "/target-workspace/")
+        ):
             base_model = agent_storage_path(base_model)
         if not base_model:
             issues.append("missing_base_model")

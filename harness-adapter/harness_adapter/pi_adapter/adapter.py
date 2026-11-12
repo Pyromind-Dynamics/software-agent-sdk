@@ -166,9 +166,10 @@ a platform task, write it under {root}/<dir>/<name> and pass that same path.
 Every dataset this session works on is a Storage path you can read directly.
 
 Platform task state comes from the platform tools, never from this workspace.
-task_status, node logs, and workflow runs are reported by analyze_task_failure,
-df_check_progress, and the workflow tools. Do not search the filesystem or
-Storage for them, and do not read a platform failure out of local files.
+Task status and logs for any workflow node are reported by inspect_workflow_task.
+Data-processing task progress and workflow runs are reported by df_check_progress
+and the workflow tools. Do not search the filesystem or Storage for them, and do
+not read a platform failure out of local files.
 
 To show the user an image, HTML page, PDF, or another artifact, call
 get_storage_url on its paths and embed the returned URLs in your reply as

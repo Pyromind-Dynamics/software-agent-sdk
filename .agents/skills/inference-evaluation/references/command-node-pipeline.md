@@ -30,7 +30,7 @@ served_model_name 来自服务契约，默认 default，不从 checkpoint 路径
 clone 使用 CloneAndCacheModel → Inference → CPU；
 download 使用 DownloadAndCacheModel → Inference → CPU。
 准备节点的 model_path 输出连接 Inference.model_path。
-服务端连接 VLLMInference.endpoint 与 CustomCommandCPUNode.param，CPU 通过
+服务端连接 Inference.endpoint 与 CustomCommandCPUNode.param，CPU 通过
 直接的小写 `$param` 请求内部服务。CPU 不启动或安装 vLLM，不需要外部部署 API Key。
 生成的 DSL 同步到画布，提交的是同一份规范转换得到的工作流。
 
