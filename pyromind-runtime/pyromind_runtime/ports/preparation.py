@@ -2,31 +2,24 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.experiment_plans import PlanOwner
 from pyromind_runtime.domain.preparation import (
-    InspectResource,
-    PreparationPolicy,
-    PreparationView,
+    PreparationState,
     ProjectView,
 )
 
 
 class PreparationStore(Protocol):
-    def initialize(self, owner: PlanOwner, policy: PreparationPolicy) -> None: ...
+    def initialize(self, owner: PlanOwner) -> None: ...
 
-    def get(self, owner: PlanOwner) -> PreparationView: ...
+    def get(self, owner: PlanOwner) -> PreparationState: ...
 
     def save(
-        self, owner: PlanOwner, view: PreparationView, expected_revision: int
-    ) -> PreparationView: ...
+        self, owner: PlanOwner, view: PreparationState, expected_revision: int
+    ) -> PreparationState: ...
 
     def invalidate(self, owner: PlanOwner, command_id: str) -> int | None: ...
-
-    def add_evidence(
-        self, owner: PlanOwner, reference: str, description: str
-    ) -> int: ...
 
     def project(self, owner: PlanOwner) -> ProjectView | None: ...
 
@@ -38,12 +31,6 @@ class PreparationStore(Protocol):
         *,
         cluster: str | None = None,
     ) -> ProjectView: ...
-
-
-class ResourceInspector(Protocol):
-    def inspect(
-        self, request: InspectResource, context: RequestContext
-    ) -> JsonObject: ...
 
 
 @runtime_checkable

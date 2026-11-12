@@ -70,11 +70,9 @@ from pyromind_runtime.domain.experiment_plans import (
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import (
     PREPARATION_TOOLS,
-    InspectResource,
     PreparationView,
     ProjectView,
     SetPreparationPlan,
-    UpdatePreparation,
 )
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import (
@@ -112,7 +110,7 @@ from pyromind_runtime.ports.harness import (
     SessionSpec,
 )
 from pyromind_runtime.ports.observability import ExecutionObserver
-from pyromind_runtime.ports.preparation import PreparationStore, ResourceInspector
+from pyromind_runtime.ports.preparation import PreparationStore, ResourceMediaReader
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
     EvaluationStorageMissingError,
@@ -201,7 +199,7 @@ class ConversationRuntime:
         default_harness_id: str = "openhands",
         external_task_query: ExternalTaskQueryPort | None = None,
         preparation_store: PreparationStore | None = None,
-        resource_inspector: ResourceInspector | None = None,
+        resource_media_reader: ResourceMediaReader | None = None,
         experiment_plan_project_binder: ExperimentPlanProjectBinder | None = None,
         observer: ExecutionObserver | None = None,
         external_tasks: ExternalTaskRegistry | None = None,
@@ -228,7 +226,7 @@ class ConversationRuntime:
         self._preparations = (
             Preparations(preparation_store) if preparation_store else None
         )
-        self._resource_inspector = resource_inspector
+        self._resource_media_reader = resource_media_reader
         self._external_task_query = external_task_query
         self._execution_event_task: asyncio.Task[None] | None = None
         self._experiment_plan_project_binder = experiment_plan_project_binder
@@ -365,7 +363,6 @@ class ConversationRuntime:
         import base64
 
         from pyromind_runtime.application.input_presentation import input_media_path
-        from pyromind_runtime.ports.preparation import ResourceMediaReader
 
         store = await self._read_store(conversation_id, context)
         pending = next(
@@ -379,10 +376,10 @@ class ConversationRuntime:
         if pending is None:
             raise FileNotFoundError("pending input not found")
         path = input_media_path(pending, content_index, image_index)
-        if not isinstance(self._resource_inspector, ResourceMediaReader):
+        if self._resource_media_reader is None:
             raise ValueError("image preview is unavailable")
         body, mime_type = await self._plan_io(
-            self._resource_inspector.read_media, path, context
+            self._resource_media_reader.read_media, path, context
         )
         return {"url": f"data:{mime_type};base64,{base64.b64encode(body).decode()}"}
 
@@ -491,6 +488,16 @@ class ConversationRuntime:
             conversation_id, tool_name, arguments, context
         )
 
+    async def preparation_revision(
+        self, conversation_id: str, context: RequestContext
+    ) -> int:
+        owner = self._preparation_owner(conversation_id, context)
+        if not self._store(conversation_id).permits_tool("set_preparation_plan"):
+            raise PermissionError("plan submission is not enabled")
+        assert self._preparations is not None
+        state = await self._plan_io(self._preparations.store.get, owner)
+        return state.revision
+
     async def _activate_development_policy(
         self,
         conversation_id: str,
@@ -541,45 +548,16 @@ class ConversationRuntime:
             raise ValueError("x-cluster is required to create a Project")
         return cluster
 
-    def _preparation_evidence(self, conversation_id: str) -> dict[str, str]:
-        snapshot = self._store(conversation_id).load_snapshot()
-        result = {}
-        for item in snapshot.timeline:
-            if item.kind == "message" and item.role == "user":
-                result["message:" + item.item_id] = "User message"
-            elif (
-                item.kind == "operation"
-                and item.status == "completed"
-                and item.name
-                in {
-                    "read",
-                    "terminal",
-                    "grep",
-                    "find",
-                    "ls",
-                    "search",
-                    "ask_user",
-                    "inspect_resource",
-                }
-            ):
-                result["operation:" + item.item_id] = item.name
-        return result
-
     async def get_preparation(
         self, conversation_id: str, context: RequestContext
     ) -> PreparationView:
         await self._read_store(conversation_id, context)
         owner = self._preparation_owner(conversation_id, context)
         assert self._preparations is not None
-        view = await self._plan_io(self._preparations.store.get, owner)
-        return view.model_copy(
-            update={
-                "evidence": {
-                    **view.evidence,
-                    **self._preparation_evidence(conversation_id),
-                }
-            }
-        )
+        state = await self._plan_io(self._preparations.store.get, owner)
+        policy = self._store(conversation_id).preparation_policy()
+        assert policy is not None
+        return PreparationView.from_state(state, policy)
 
     async def get_project(
         self, conversation_id: str, context: RequestContext
@@ -600,44 +578,19 @@ class ConversationRuntime:
         if not self._store(conversation_id).permits_tool(tool_name):
             raise PermissionError("preparation tool is not enabled")
         assert self._preparations is not None
-        if tool_name == "get_preparation":
-            view = await self.get_preparation(conversation_id, context)
-            return view.model_dump(mode="json")
-        if tool_name == "update_preparation":
-            view = await self.get_preparation(conversation_id, context)
-            updated = await self._plan_io(
-                self._preparations.update,
-                owner,
-                UpdatePreparation.model_validate(arguments),
-                set(view.evidence),
-            )
-            self._notify_preparation(conversation_id, "preparation.changed")
-            return updated.model_dump(mode="json")
-        if tool_name == "set_preparation_plan":
-            updated = await self._plan_io(
-                self._preparations.set_plan,
-                owner,
-                SetPreparationPlan.model_validate(arguments),
-            )
-            self._notify_preparation(conversation_id, "preparation.changed")
-            return updated.model_dump(mode="json")
-        if self._resource_inspector is None:
-            raise ValueError(
-                "Resource inspection is unavailable; "
-                "ask the user for missing information"
-            )
-        request = InspectResource.model_validate(arguments)
-        result = await self._plan_io(self._resource_inspector.inspect, request, context)
-        reference = "resource:" + uuid4().hex
-        revision = await self._plan_io(
-            self._preparations.store.add_evidence,
+        if context.preparation_revision is None:
+            raise ValueError("plan submission requires its model context revision")
+        policy = self._store(conversation_id).preparation_policy()
+        assert policy is not None
+        updated = await self._plan_io(
+            self._preparations.set_plan,
             owner,
-            reference,
-            f"{request.kind} {request.path}; {result.get('scope', '')}; "
-            f"truncated={result.get('truncated', False)}",
+            SetPreparationPlan.model_validate(arguments),
+            policy,
+            context.preparation_revision,
         )
         self._notify_preparation(conversation_id, "preparation.changed")
-        return {**result, "evidence_ref": reference, "revision": revision}
+        return {"phase": updated.phase, "revision": updated.revision}
 
     async def _create_project(
         self,
@@ -709,11 +662,6 @@ class ConversationRuntime:
                                     )
                                     if preparation.entry_task
                                     else None,
-                                    "facts": {
-                                        key: fact.value
-                                        for key, fact in preparation.facts.items()
-                                        if fact.status == "resolved"
-                                    },
                                 },
                                 ensure_ascii=False,
                             )
@@ -1639,7 +1587,6 @@ class ConversationRuntime:
                     conversation_id=spec.conversation_id,
                     profile_id=context.profile_id,
                 ),
-                spec.preparation_policy,
             )
         handle = await adapter.create_session(spec, context)
         self._log_timing(
@@ -1856,7 +1803,7 @@ class ConversationRuntime:
         ):
             if self._preparations is None:
                 raise ValueError("preparation store is unavailable")
-            revision = await self._plan_io(
+            await self._plan_io(
                 self._preparations.store.invalidate,
                 PlanOwner(
                     user_id=context.user_id,
@@ -1865,14 +1812,6 @@ class ConversationRuntime:
                 ),
                 command.command_id,
             )
-            if (
-                isinstance(command, InputResponseCommand)
-                and command.status == "answered"
-                and revision is not None
-            ):
-                context = replace(
-                    context, input_response_metadata={"preparation_revision": revision}
-                )
             self._notify_preparation(conversation_id, "preparation.changed")
         if isinstance(command, InputResponseCommand):
             # HTTP cancellation must not interrupt a claimed answer between
@@ -2911,11 +2850,18 @@ class ConversationRuntime:
                     preparation = await self._plan_io(
                         self._preparations.store.get, owner
                     )
+                    policy = store.preparation_policy()
+                    assert policy is not None
                     project = await self._plan_io(
                         self._preparations.store.project, owner
                     )
                     snapshot = snapshot.model_copy(
-                        update={"preparation": preparation, "project": project}
+                        update={
+                            "preparation": PreparationView.from_state(
+                                preparation, policy
+                            ),
+                            "project": project,
+                        }
                     )
                 snapshots.append(snapshot)
             except Exception:

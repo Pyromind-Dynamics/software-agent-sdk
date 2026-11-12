@@ -61,10 +61,7 @@ _PREPARATION_TOOLS = (
     "edit",
     "terminal",
     "ask_user",
-    "get_preparation",
-    "update_preparation",
     "set_preparation_plan",
-    "inspect_resource",
 )
 _CHILD_WORKSPACE_TOOLS = ("read", "write", "edit", "terminal")
 _EVALUATION_TOOLS = _CHILD_WORKSPACE_TOOLS + (
@@ -87,12 +84,11 @@ def _load_preparation_policy() -> PreparationPolicy:
             package.parents[2] / ".agents/skills",
         )
     for root in roots:
-        manifest = root / "model-evaluation-preparation/checklist.json"
+        manifest = root / "model-evaluation-preparation/workflow-nodes.json"
         if manifest.is_file():
             return PreparationPolicy.model_validate_json(manifest.read_text())
     raise FileNotFoundError(
-        "Model evaluation preparation checklist is missing "
-        "from the configured skills directory"
+        "Preparation workflow catalog is missing from the configured skills directory"
     )
 
 
@@ -100,17 +96,16 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=22,
+    configuration_version=23,
     route_prefix="/api/v2/echomind/conversations",
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
     harness_id="pi",
     instructions="""Before Project creation only, read model-evaluation-preparation.
-Collect the scenario checklist using user messages, data inspection, workspace
-scripts and knowledge retrieval. Use get_preparation for gaps and evidence.
-Record facts incrementally with update_preparation. After user
-input use preparation_revision from ask_user as expected_revision.
-On revision conflict, check the returned current facts and revision before retrying.
-Once the checklist is complete, save a compact plan using set_preparation_plan.
+Use the Skill to determine the information needed for the user's task. Read
+data and knowledge with the available workspace tools; ask_user only for
+essential information or decisions that cannot be established. Once ready,
+submit a compact review plan with set_preparation_plan(plan, entry_task_id).
+Include confirmed inputs and constraints in the plan, not a separate Checklist.
 The user may revise it in chat and creates/starts the Project with the UI button.
 Use the Sandbox to inspect data and prepare files. Start business tasks only after
 the user creates the Project.

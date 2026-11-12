@@ -102,7 +102,7 @@ async def test_pending_media_and_snapshot_use_owner_scoped_runtime_without_execu
             return b"\x89PNG\r\n\x1a\nimage", "image/png"
 
     runtime = ConversationRuntime(
-        tmp_path / "conversations", FakeAdapter(), resource_inspector=Reader()
+        tmp_path / "conversations", FakeAdapter(), resource_media_reader=Reader()
     )
     (tmp_path / "conversations" / "c").mkdir(parents=True)
     context = RequestContext(user_id="42", profile_id="reviewer")

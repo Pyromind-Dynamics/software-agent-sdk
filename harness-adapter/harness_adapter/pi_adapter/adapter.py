@@ -262,6 +262,7 @@ class PiAdapter:
             repository = Path(__file__).parents[3]
         self._workflow_call = workflow_call
         self._preparation_call: Any = None
+        self._preparation_revision: Any = None
         self._execution_outputs: dict[str, tuple[str, WorkflowEventSink]] = {}
         self._terminal_backend = validate_pi_terminal_backend(terminal_backend)
         self._conversation_root = Path(conversation_root).resolve()
@@ -349,8 +350,9 @@ class PiAdapter:
         self._business_tools.version_call = callback
         self._business_tools.execution_call = execution
 
-    def set_preparation_handler(self, callback: Any) -> None:
+    def set_preparation_handler(self, callback: Any, revision: Any) -> None:
         self._preparation_call = callback
+        self._preparation_revision = revision
 
     async def read_submission_receipt(
         self,
@@ -421,33 +423,13 @@ class PiAdapter:
         specs = self._business_tools.specs(sandbox=self._terminal_backend == "sandbox")
         if self._preparation_call is not None:
             descriptions = {
-                "get_preparation": (
-                    "Read the scenario checklist, collected facts, evidence "
-                    "reference catalog, draft plan and current revision."
-                ),
-                "update_preparation": (
-                    "Update only keys listed in get_preparation.policy.fields, "
-                    "using the latest revision; omitted facts are preserved. "
-                    "Supply value and evidence_refs; non-null values default "
-                    "to resolved. "
-                    "Clear a fact with status=missing and value=null. Record decisions "
-                    "in an existing fact value or plan.constraints, never as new "
-                    "checklist keys. Never include credentials."
-                ),
                 "set_preparation_plan": (
-                    "Save a plan for user review; does not start work. Select stage "
-                    "and task kinds from the catalog. Every task needs stage_id "
-                    "(a plan.stages[].id). Edges connect stage IDs. entry_task_id "
-                    "selects the task to run first; its inputs must reference "
-                    "concrete plan.resources using resource_id, and role_id must "
-                    "be allowed by its stage. Reuse the latest revision."
-                ),
-                "inspect_resource": (
-                    "Inspect a Storage file prefix or directory with current "
-                    "request credentials. Read-only and bounded; never starts a "
-                    "sandbox. Returns an evidence_ref and the current revision "
-                    "without changing the revision. A preview does not "
-                    "validate the full dataset."
+                    "Submit the complete workflow plan for user review once its "
+                    "inputs and scope are understood. Does not create a Project or "
+                    "start work. Select kinds from the Skill's workflow catalog. "
+                    "Tasks use stage_id; edges connect stage IDs. entry_task_id "
+                    "selects the first task with concrete resource inputs. "
+                    "Runtime derives its role and manages review versions."
                 ),
             }
             specs += [
@@ -1000,7 +982,6 @@ class PiAdapter:
             return result if isinstance(result, dict) else {"suspended": True}
         future.set_result(
             {
-                **(session.context.input_response_metadata or {}),
                 "status": "answered",
                 "answers": [
                     answer.model_dump(mode="json") for answer in command.answers
@@ -1724,6 +1705,13 @@ class PiAdapter:
                     raise ValueError("execution belongs to another conversation")
                 await sink(params)
             return {}
+        if method == "preparation.version":
+            if (
+                not self._tool_allowed(session, "set_preparation_plan")
+                or self._preparation_revision is None
+            ):
+                raise PermissionError("plan submission is not enabled")
+            return await self._preparation_revision(session.session_id, session.context)
         if method == "tool.execute":
             tool_name = params.get("tool_name")
             if not isinstance(tool_name, str):
@@ -1738,8 +1726,16 @@ class PiAdapter:
             if tool_name in PREPARATION_TOOLS:
                 if self._preparation_call is None:
                     raise ValueError("plan tools are not configured")
+                revision = params.get("preparation_revision")
+                if type(revision) is not int or revision < 0:
+                    raise ValueError(
+                        "plan submission requires its model context revision"
+                    )
                 result = await self._preparation_call(
-                    session.session_id, tool_name, arguments, session.context
+                    session.session_id,
+                    tool_name,
+                    arguments,
+                    replace(session.context, preparation_revision=revision),
                 )
                 return {
                     "content": [

@@ -484,6 +484,8 @@ def test_preparation_policy_is_trusted_profile_configuration():
         role.name for role in roles
     }
     tools = set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ())
+    assert "set_preparation_plan" in tools
+    assert not {"get_preparation", "update_preparation", "inspect_resource"} & tools
     assert {"read", "write", "edit", "terminal"} <= tools
     assert not {
         "grep",
@@ -539,7 +541,7 @@ def test_preparation_checklist_resolves_from_source_bundle_or_configured_root(
         monkeypatch.setenv("PYROMIND_SKILLS_PATH", str(root))
     policy = profiles.ECHOMIND_PRODUCT_PROFILE.preparation_policy
     assert policy is not None
-    target = root / "model-evaluation-preparation/checklist.json"
+    target = root / "model-evaluation-preparation/workflow-nodes.json"
     target.parent.mkdir(parents=True)
     target.write_text(policy.model_dump_json())
     assert profiles._load_preparation_policy() == policy
@@ -561,7 +563,7 @@ def test_frozen_bundle_includes_preparation_and_role_skill_assets():
         (Path(target) / Path(source).name).as_posix()
         for source, target in namespace["get_pi_skill_datas"]()
     }
-    assert ".agents/skills/model-evaluation-preparation/checklist.json" in targets
+    assert ".agents/skills/model-evaluation-preparation/workflow-nodes.json" in targets
     assert ".agents/skills/avi-baseline-evaluation/SKILL.md" in targets
 
 
@@ -632,32 +634,18 @@ def test_shared_execution_rules_do_not_dispatch_on_agent_or_role_names():
             assert not (discriminants and literals & names), (path, node.lineno)
 
 
-def test_node_requirements_keep_evaluation_ready_gate_without_blocking_data_only():
-    from pydantic import ValidationError
+def test_preparation_exposes_only_review_state_and_catalog():
     from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
-    from pyromind_runtime.domain.preparation import PreparationView
+    from pyromind_runtime.domain.preparation import PreparationState, PreparationView
 
     policy = ECHOMIND_PRODUCT_PROFILE.preparation_policy
     assert policy is not None
-    facts = {
-        field.key: {"status": "resolved", "value": "provided"}
-        for field in policy.fields
-        if field.required
-    }
-    for kind in ("dataset", "init", "eval", "train"):
-        document = {
-            "policy": policy,
-            "phase": "ready",
-            "facts": facts,
-            "plan": {
-                "goal": "Test",
-                "stages": [{"id": "stage", "kind": kind, "name": kind}],
-            },
-        }
-        if kind == "dataset":
-            assert PreparationView.model_validate(document).phase == "ready"
-        else:
-            with pytest.raises(
-                ValidationError, match="workflow requires checklist fields"
-            ):
-                PreparationView.model_validate(document)
+    assert set(type(policy).model_fields) == {"allowed_roles", "workflow_nodes"}
+    for phase in ("collecting", "planning", "ready", "active"):
+        state = PreparationState(phase=phase)
+        view = PreparationView.from_state(state, policy)
+        assert view.phase == phase and view.policy == policy
+        assert set(view.model_dump()) == set(state.model_dump()) | {"policy"}
+        assert (
+            not {"policy", "facts", "missing", "evidence"} & state.model_dump().keys()
+        )

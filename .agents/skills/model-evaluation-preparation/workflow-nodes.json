@@ -1,76 +1,9 @@
 {
-  "checklist_id": "model-evaluation",
-  "version": 3,
   "allowed_roles": [
     "init",
     "dataset",
     "train",
     "eval"
-  ],
-  "fields": [
-    {
-      "key": "goal",
-      "label": "实验目标",
-      "description": "任务、期望产物和本轮关注的问题",
-      "value_type": "string"
-    },
-    {
-      "key": "model",
-      "label": "被评模型",
-      "description": "来源、模型引用和已知版本；来源可为 storage、clone、download",
-      "value_type": "object",
-      "required_keys": [
-        "source",
-        "reference"
-      ],
-      "required": false
-    },
-    {
-      "key": "dataset",
-      "label": "数据来源",
-      "description": "Storage 数据位置与实际格式（文件或目录）；无法读取时向用户确认",
-      "value_type": "object",
-      "required_keys": [
-        "path",
-        "format"
-      ]
-    },
-    {
-      "key": "io_contract",
-      "label": "输入输出约定",
-      "description": "输入字段、提示词、媒体角色与输出含义",
-      "value_type": "object",
-      "required_keys": [
-        "input",
-        "output"
-      ],
-      "depends_on": [
-        "dataset"
-      ]
-    },
-    {
-      "key": "scoring",
-      "label": "评分依据",
-      "description": "GT、参考答案或确定性评分规则；不要求上线阈值",
-      "value_type": "object",
-      "required_keys": [
-        "basis"
-      ],
-      "depends_on": [
-        "dataset",
-        "io_contract"
-      ],
-      "required": false
-    },
-    {
-      "key": "scope",
-      "label": "执行范围",
-      "description": "小样或全量、样本限制及用户明确的资源约束",
-      "value_type": "object",
-      "required_keys": [
-        "mode"
-      ]
-    }
   ],
   "workflow_nodes": [
     {
@@ -90,10 +23,6 @@
           "id": "analysis",
           "description": "基于已有评测或导入结果进行统计、badcase 分析与报告。"
         }
-      ],
-      "required_fields": [
-        "model",
-        "scoring"
       ]
     },
     {
@@ -122,9 +51,6 @@
       ],
       "roles": [
         "train"
-      ],
-      "required_fields": [
-        "model"
       ]
     },
     {
@@ -143,10 +69,6 @@
           "id": "analysis",
           "description": "基于已有评测或导入结果进行统计、badcase 分析与报告。"
         }
-      ],
-      "required_fields": [
-        "model",
-        "scoring"
       ]
     },
     {

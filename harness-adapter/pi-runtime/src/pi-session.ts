@@ -272,7 +272,9 @@ export async function createPiSession(
             : []),
         ].sort((left, right) => right.host.length - left.host.length)
       : [];
+  let preparationRevision: number | undefined;
   const options: CreateToolsOptions = {
+    toolContext: (): JsonObject => preparationRevision === undefined ? {} : { preparation_revision: preparationRevision },
     terminalEnvironment: terminalEnvironment as Record<string, string>,
     terminalTimeouts: sandboxTerminalTimeouts(),
     scriptChunkChars: sandboxTerminalScriptChunkChars(),
@@ -429,6 +431,16 @@ export async function createPiSession(
       createNoProgressGuardExtension(recorder),
       { name: "no-spin", factory: createNoSpinExtension(sessionOptions.onRepetitionDetected) },
       capabilityCeiling(config.toolAllowlist),
+      (pi) => {
+        if (!config.toolAllowlist?.includes("set_preparation_plan")) return;
+        pi.on("context", async () => {
+          const revision = await peer.request("preparation.version", {});
+          if (typeof revision !== "number" || !Number.isInteger(revision) || revision < 0) {
+            throw new Error("invalid preparation context revision");
+          }
+          preparationRevision = revision;
+        });
+      },
       (pi) => {
         if (config.terminalBackend !== "sandbox") return;
         pi.on("before_agent_start", (event) => {

@@ -26,7 +26,9 @@ async def test_actual_manager_and_eval_host_create_through_api(
         default_harness_id="pi",
         preparation_store=store,
     )
-    adapter.set_preparation_handler(runtime.preparation_call)
+    adapter.set_preparation_handler(
+        runtime.preparation_call, runtime.preparation_revision
+    )
     adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
     app = _app(tmp_path, runtime)
     app.include_router(create_product_router(ECHOMIND_PRODUCT_PROFILE))

@@ -16,7 +16,6 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.experiment_plans import ExperimentContext
 from pyromind_runtime.domain.preparation import (
-    ChecklistField,
     PreparationPolicy,
     ProjectView,
     WorkflowNodeDefinition,
@@ -68,9 +67,6 @@ def test_role_activity_projects_into_existing_stage_columns_without_business_suc
     platform_status,
 ):
     policy = PreparationPolicy(
-        checklist_id="test",
-        version=1,
-        fields=(ChecklistField(key="goal", label="Goal"),),
         allowed_roles=("worker",),
         workflow_nodes=(
             WorkflowNodeDefinition(id="baseline", name="Baseline", roles=("worker",)),
@@ -184,9 +180,6 @@ def test_continuations_share_one_stage_execution_and_preserve_all_rounds(
     report = "public_data/subagents/first/report.md"
 
     policy = PreparationPolicy(
-        checklist_id="test",
-        version=1,
-        fields=(ChecklistField(key="goal", label="Goal"),),
         allowed_roles=("worker",),
         workflow_nodes=(
             WorkflowNodeDefinition(id="baseline", name="Baseline", roles=("worker",)),
