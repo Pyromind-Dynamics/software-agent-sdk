@@ -7,7 +7,6 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from pyromind_runtime.domain.experiment_plans import (
-    ExperimentContext,
     PlanConflictError,
     PlanOwner,
 )
@@ -121,27 +120,36 @@ class SQLPreparationStore:
             )
             return view.revision
 
-    def _project(self, row) -> ProjectView:
-        creation = row["creation_metadata"]
+    def _project(self, row, state: PreparationState) -> ProjectView:
+        if state.plan is None:
+            raise ValueError("accepted project plan is missing")
         return ProjectView(
             project_id=row["project_id"],
             conversation_id=row["conversation_id"],
             cluster=row["cluster"],
-            plan_sequence=row["context_sequence"],
-            plan=ExperimentContext.model_validate(row["context"]),
-            creation_command_id=creation["command_id"],
+            plan_sequence=state.revision,
+            plan=state.plan,
+            creation_command_id=row["creation_command_id"],
         )
 
     def project(self, owner: PlanOwner) -> ProjectView | None:
         with self.engine.connect() as conn:
             row = (
                 conn.execute(
-                    sa.select(projects).where(projects.c.owner_key == owner_key(owner))
+                    sa.select(projects, preparations.c.document)
+                    .join(
+                        preparations, projects.c.owner_key == preparations.c.owner_key
+                    )
+                    .where(projects.c.owner_key == owner_key(owner))
                 )
                 .mappings()
                 .first()
             )
-            return self._project(row) if row and row["creation_metadata"] else None
+            return (
+                self._project(row, PreparationState.model_validate(row["document"]))
+                if row and row["creation_command_id"]
+                else None
+            )
 
     def activate(
         self,
@@ -153,6 +161,7 @@ class SQLPreparationStore:
     ) -> ProjectView:
         with write_transaction(self.engine) as conn:
             row = self._row(conn, owner)
+            view = PreparationState.model_validate(row["document"])
             if row["project_id"]:
                 return self._project(
                     conn.execute(
@@ -161,9 +170,9 @@ class SQLPreparationStore:
                         )
                     )
                     .mappings()
-                    .one()
+                    .one(),
+                    view,
                 )
-            view = PreparationState.model_validate(row["document"])
             if row["revision"] != expected_revision:
                 raise PlanConflictError("preparation changed; refresh the current plan")
             if (
@@ -182,20 +191,9 @@ class SQLPreparationStore:
                     conversation_id=owner.conversation_id,
                     cluster=cluster,
                     profile_id=owner.profile_id,
-                    current_revision=0,
-                    context_sequence=1,
-                    context=view.plan.model_dump(mode="json"),
+                    creation_command_id=command_id,
+                    workflow_plan_path="public_data/workflowPLAN.json",
                 )
-            )
-            creation = {
-                "command_id": command_id,
-                "preparation_revision": expected_revision,
-                "preparation": view.model_dump(mode="json"),
-            }
-            conn.execute(
-                projects.update()
-                .where(projects.c.project_id == identity)
-                .values(creation_metadata=creation)
             )
             activated = view.model_copy(
                 update={"phase": "active", "project_id": identity}
@@ -209,7 +207,7 @@ class SQLPreparationStore:
                 project_id=identity,
                 conversation_id=owner.conversation_id,
                 cluster=cluster,
-                plan_sequence=1,
+                plan_sequence=expected_revision,
                 plan=view.plan,
                 creation_command_id=command_id,
             )

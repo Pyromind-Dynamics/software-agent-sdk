@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from pathlib import Path
 
 import httpx
 import pytest
 import sqlalchemy as sa
+from alembic import command
+from alembic.config import Config
 from pyromind_agent_server.api.router import create_product_router
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
@@ -163,6 +166,10 @@ def test_project_creation_is_atomic_deduplicated_and_isolated(
     with store.engine.connect() as conn:
         assert conn.scalar(sa.select(sa.func.count()).select_from(projects)) == 1
         assert conn.scalar(sa.select(projects.c.cluster)) == "us-west-1#pre"
+        assert (
+            conn.scalar(sa.select(projects.c.workflow_plan_path))
+            == "public_data/workflowPLAN.json"
+        )
         assert not {"experiment_task_runs", "experiment_work"} & set(
             sa.inspect(conn).get_table_names()
         )
@@ -175,6 +182,43 @@ def test_project_creation_is_atomic_deduplicated_and_isolated(
         Preparations(store).set_plan(owner, ready_request, policy, ready.revision)
 
 
+def test_project_plan_path_migration_preserves_existing_data(tmp_path):
+    url = f"sqlite:///{tmp_path / 'migration.sqlite'}"
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(
+            Path(__file__).resolve().parents[2]
+            / "pyromind-agent-server/pyromind_agent_server/plan_migrations"
+        ),
+    )
+    config.attributes["database_url"] = url
+    command.upgrade(config, "0006_project_cluster")
+    engine = sa.create_engine(url)
+    try:
+        legacy = sa.Table("experiment_projects", sa.MetaData(), autoload_with=engine)
+        with engine.begin() as conn:
+            conn.execute(
+                legacy.insert().values(
+                    project_id="existing",
+                    owner_key="owner",
+                    user_id="42",
+                    conversation_id="conversation",
+                    current_revision=0,
+                )
+            )
+        command.upgrade(config, "0007_project_plan_path")
+        command.upgrade(config, "0007_project_plan_path")
+        migrated = sa.Table("experiment_projects", sa.MetaData(), autoload_with=engine)
+        with engine.connect() as conn:
+            row = conn.execute(sa.select(migrated)).mappings().one()
+        assert row["project_id"] == "existing"
+        assert row["workflow_plan_path"] is None
+        assert row["current_revision"] == 0
+    finally:
+        engine.dispose()
+
+
 def test_project_creation_failure_rolls_back_without_losing_review(
     preparation_setup, ready_request
 ):
@@ -182,17 +226,35 @@ def test_project_creation_failure_rolls_back_without_losing_review(
     ready = Preparations(store).set_plan(owner, ready_request, policy, 0)
 
     def fail(_conn, _cursor, statement, _parameters, _context, _executemany):
-        if statement.startswith("UPDATE experiment_projects"):
-            raise RuntimeError("creation metadata write failed")
+        if statement.startswith("UPDATE experiment_preparations"):
+            raise RuntimeError("preparation activation failed")
 
     event.listen(store.engine, "before_cursor_execute", fail)
     try:
-        with pytest.raises(RuntimeError, match="metadata write failed"):
+        with pytest.raises(RuntimeError, match="activation failed"):
             store.activate(owner, ready.revision, "create")
     finally:
         event.remove(store.engine, "before_cursor_execute", fail)
     assert store.project(owner) is None
     assert store.get(owner) == ready
+
+
+def test_project_plan_reuses_accepted_preparation(preparation_setup, ready_request):
+    store, owner, policy = preparation_setup
+    first = Preparations(store).set_plan(owner, ready_request, policy, 0)
+    ready = Preparations(store).set_plan(owner, ready_request, policy, first.revision)
+    project = store.activate(owner, ready.revision, "create", cluster="cluster")
+    assert project.plan_sequence == ready.revision
+    assert store.project(owner) == project
+    assert store.activate(owner, 0, "another-command") == project
+    assert not {
+        "current_revision",
+        "context",
+        "context_sequence",
+        "creation_metadata",
+    } & set(projects.c.keys())
+    with store.engine.connect() as conn:
+        assert conn.scalar(sa.select(projects.c.creation_command_id)) == "create"
 
 
 @pytest.mark.parametrize(
